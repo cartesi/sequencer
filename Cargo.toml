@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "sequencer",
+  "app-core",
+  "canonical-app",
+]
+default-members = ["sequencer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Deterministic sequencer prototype with low-latency soft confirmations"
+homepage = "https://github.com/cartesi/sequencer"
+repository = "https://github.com/cartesi/sequencer"
+readme = "../README.md"
+authors = [
+  "Gabriel Coutinho de Paula <gcdepaula@protonmail.com>",
+  "Pedro Argento <pedro.argento@gmail.com>",
+  "Stephen Chen <20940639+stephenctw@users.noreply.github.com>",
+]

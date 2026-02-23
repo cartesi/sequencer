@@ -1,0 +1,18 @@
+[package]
+name = "app-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
+
+[dependencies]
+alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
+alloy-sol-types = "1.4.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+ssz = { package = "ethereum_ssz", version = "0.10" }
+ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
