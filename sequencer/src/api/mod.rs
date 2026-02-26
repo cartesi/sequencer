@@ -7,19 +7,23 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Json, State};
-use axum::routing::post;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Json, Query, State};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendTimeoutError;
 use tokio::sync::oneshot;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use alloy_primitives::{Address, Signature};
 use alloy_sol_types::{Eip712Domain, SolStruct};
 
 use crate::inclusion_lane::{InclusionLaneInput, PendingUserOp};
+use crate::l2_tx_broadcaster::{BroadcastTxMessage, L2TxBroadcaster};
+use crate::storage::Storage;
 use crate::user_op::{SignedUserOp, UserOp};
 
 pub use error::ApiError;
@@ -29,6 +33,7 @@ pub struct AppState {
     pub tx_sender: mpsc::Sender<InclusionLaneInput>,
     pub domain: Eip712Domain,
     pub queue_timeout: Duration,
+    pub broadcaster: L2TxBroadcaster,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,9 +51,15 @@ struct TxResponse {
     nonce: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct SubscribeQuery {
+    from_offset: Option<u64>,
+}
+
 pub fn router(state: Arc<AppState>, max_body_bytes: usize) -> Router {
     Router::new()
         .route("/tx", post(submit_tx))
+        .route("/ws/subscribe", get(subscribe_l2_txs))
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(TraceLayer::new_for_http())
@@ -171,4 +182,151 @@ async fn enqueue_tx(state: &AppState, tx: PendingUserOp) -> Result<(), ApiError>
             Err(ApiError::internal_error("inclusion lane unavailable"))
         }
     }
+}
+
+async fn subscribe_l2_txs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SubscribeQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let from_offset = query.from_offset.unwrap_or(0);
+    let broadcaster = state.broadcaster.clone();
+    ws.on_upgrade(move |socket| run_broadcaster_session(broadcaster, socket, from_offset))
+}
+
+async fn run_broadcaster_session(
+    broadcaster: L2TxBroadcaster,
+    mut socket: WebSocket,
+    from_offset: u64,
+) {
+    let mut subscription = broadcaster.subscribe();
+    let mut next_offset = from_offset;
+
+    if next_offset < subscription.live_start_offset {
+        if send_catch_up(
+            &broadcaster,
+            &mut socket,
+            next_offset,
+            subscription.live_start_offset,
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        next_offset = subscription.live_start_offset;
+    }
+
+    loop {
+        tokio::select! {
+            maybe_event = subscription.receiver.recv() => {
+                let Some(event) = maybe_event else {
+                    break;
+                };
+                let offset = event.offset();
+                if offset < next_offset {
+                    continue;
+                }
+                if offset != next_offset {
+                    warn!(
+                        expected_offset = next_offset,
+                        received_offset = offset,
+                        "broadcaster detected gap in live stream"
+                    );
+                    break;
+                }
+                if send_ws_event(&mut socket, &event).await.is_err() {
+                    break;
+                }
+                next_offset = next_offset.saturating_add(1);
+            }
+            inbound = socket.recv() => {
+                match inbound {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn send_catch_up(
+    broadcaster: &L2TxBroadcaster,
+    socket: &mut WebSocket,
+    from_offset: u64,
+    to_offset: u64,
+) -> Result<(), ()> {
+    if from_offset >= to_offset {
+        return Ok(());
+    }
+
+    let (events_tx, mut events_rx) = mpsc::channel::<BroadcastTxMessage>(1024);
+    let db_path = broadcaster.db_path();
+    let page_size = broadcaster.page_size();
+    let worker = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut storage = Storage::open_read_only(&db_path)
+            .map_err(|err| format!("open catch-up storage failed: {err}"))?;
+        let mut next_offset = from_offset;
+
+        while next_offset < to_offset {
+            let remaining = (to_offset - next_offset) as usize;
+            let page_limit = remaining.min(page_size.max(1));
+            let txs = storage
+                .load_ordered_l2_txs_page_from(next_offset, page_limit)
+                .map_err(|err| format!("read catch-up page from {next_offset} failed: {err}"))?;
+            if txs.is_empty() {
+                return Err(format!(
+                    "catch-up reached sparse range [{next_offset}, {to_offset})"
+                ));
+            }
+
+            for tx in txs {
+                let event = BroadcastTxMessage::from_offset_and_tx(next_offset, tx);
+                next_offset = next_offset.saturating_add(1);
+                if events_tx.blocking_send(event).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    });
+
+    while let Some(event) = events_rx.recv().await {
+        if send_ws_event(socket, &event).await.is_err() {
+            return Err(());
+        }
+    }
+
+    match worker.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(reason)) => {
+            warn!(reason, "broadcaster catch-up worker exited with error");
+            Err(())
+        }
+        Err(err) => {
+            warn!(error = %err, "broadcaster catch-up worker join failed");
+            Err(())
+        }
+    }
+}
+
+async fn send_ws_event(socket: &mut WebSocket, event: &BroadcastTxMessage) -> Result<(), ()> {
+    let payload = match serde_json::to_string(event) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(error = %err, "broadcaster failed to serialize tx event");
+            return Err(());
+        }
+    };
+
+    if socket.send(Message::Text(payload.into())).await.is_err() {
+        return Err(());
+    }
+    Ok(())
 }

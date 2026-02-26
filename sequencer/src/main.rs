@@ -13,6 +13,7 @@ use sequencer::application::{WalletApp, WalletConfig};
 use sequencer::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, InclusionLaneError, InclusionLaneInput,
 };
+use sequencer::l2_tx_broadcaster::{L2TxBroadcaster, L2TxBroadcasterConfig};
 use sequencer::storage;
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
@@ -24,6 +25,9 @@ const DEFAULT_SAFE_DIRECT_BUFFER_CAPACITY: usize = 256;
 const DEFAULT_MAX_BATCH_OPEN_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 const DEFAULT_MAX_BATCH_USER_OP_BYTES: usize = 1_048_576; // 1 MiB
 const DEFAULT_INCLUSION_LANE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const DEFAULT_BROADCASTER_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const DEFAULT_BROADCASTER_PAGE_SIZE: usize = 256;
+const DEFAULT_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY: usize = 1024;
 const DEFAULT_MAX_BODY_BYTES: usize = 128 * 1024;
 const DEFAULT_SQLITE_SYNCHRONOUS: &str = "NORMAL";
 const DEFAULT_DOMAIN_NAME: &str = "CartesiAppSequencer";
@@ -58,11 +62,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let (mut inclusion_lane_handle, inclusion_lane_stop) = inclusion_lane.spawn();
+    let broadcaster = L2TxBroadcaster::start(
+        config.db_path.clone(),
+        L2TxBroadcasterConfig {
+            idle_poll_interval: config.broadcaster_idle_poll_interval,
+            page_size: config.broadcaster_page_size,
+            subscriber_buffer_capacity: config.broadcaster_subscriber_buffer_capacity,
+        },
+    )
+    .map_err(|reason| format!("failed to start l2 tx broadcaster: {reason}"))?;
 
     let state = Arc::new(AppState {
         tx_sender: tx,
         domain,
         queue_timeout: std::time::Duration::from_millis(config.queue_timeout_ms),
+        broadcaster,
     });
 
     let app = sequencer::api::router(state, config.max_body_bytes);
@@ -105,6 +119,9 @@ struct Config {
     max_batch_open: Duration,
     max_batch_user_op_bytes: usize,
     inclusion_lane_idle_poll_interval: Duration,
+    broadcaster_idle_poll_interval: Duration,
+    broadcaster_page_size: usize,
+    broadcaster_subscriber_buffer_capacity: usize,
     max_body_bytes: usize,
     sqlite_synchronous: String,
     domain_name: String,
@@ -155,6 +172,23 @@ impl Config {
                 )
                 .max(1),
             ),
+            broadcaster_idle_poll_interval: Duration::from_millis(
+                env_u64(
+                    "SEQ_BROADCASTER_IDLE_POLL_INTERVAL_MS",
+                    DEFAULT_BROADCASTER_IDLE_POLL_INTERVAL.as_millis() as u64,
+                )
+                .max(1),
+            ),
+            broadcaster_page_size: env_usize(
+                "SEQ_BROADCASTER_PAGE_SIZE",
+                DEFAULT_BROADCASTER_PAGE_SIZE,
+            )
+            .max(1),
+            broadcaster_subscriber_buffer_capacity: env_usize(
+                "SEQ_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY",
+                DEFAULT_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY,
+            )
+            .max(1),
             max_body_bytes: env_usize("SEQ_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
             sqlite_synchronous: env_string("SEQ_SQLITE_SYNCHRONOUS", DEFAULT_SQLITE_SYNCHRONOUS),
             domain_name: env_string("SEQ_DOMAIN_NAME", DEFAULT_DOMAIN_NAME),

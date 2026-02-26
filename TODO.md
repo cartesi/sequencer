@@ -10,13 +10,15 @@ Build a robust sequencer prototype for a future DeFi stack, with deterministic o
 
 ### 1) Sequencer
 
-- Keep and harden write path: API -> inclusion lane -> app execution -> persistence.
+- Keep and harden write path: API -> inclusion lane -> app execution -> persistence -> ack.
 - Implement direct-input reader from blockchain (ingests into `direct_inputs`).
 - Implement batch submitter (reads closed batches and submits on-chain).
 - Implement `L2Tx` broadcaster (WebSocket fanout of ordered `L2Tx`s).
 - Implement inclusion fee estimator module that updates the suggested fee in DB (`recommended_fees`).
 - Add API endpoint to query current suggested inclusion fee.
+- Add API endpoint to query user current tx count.
 - Keep storage/replay semantics deterministic and catch-up-safe.
+- Change `drain_n` design to a "safe block" design.
 
 ---
 
@@ -35,7 +37,7 @@ Build a robust sequencer prototype for a future DeFi stack, with deterministic o
 - Measure ack latency and end-to-end latency.
 - Report p50 / p95 / p99.
 - Measure idle and under-load behavior.
-- Include network-aware runs (client/server on different hosts).
+- Include network-aware runs (client/server on different hosts) like network latency.
 - Note: end-to-end depends on `L2Tx` broadcaster being available.
 
 ---

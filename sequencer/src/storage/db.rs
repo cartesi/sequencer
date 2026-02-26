@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use rusqlite::{Connection, Result, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, Result, Transaction, TransactionBehavior};
 use rusqlite_migration::{M, Migrations};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,7 +9,8 @@ use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_direct_inputs_batch, sql_insert_frame_drain,
     sql_insert_open_batch, sql_insert_open_frame, sql_insert_user_ops_batch,
     sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
-    sql_select_max_direct_input_index, sql_select_ordered_l2_txs_from_offset,
+    sql_select_max_direct_input_index, sql_select_ordered_l2_tx_count,
+    sql_select_ordered_l2_txs_from_offset, sql_select_ordered_l2_txs_page_from_offset,
     sql_select_recommended_fee, sql_select_safe_inputs_range,
     sql_select_total_drained_direct_inputs, sql_update_recommended_fee,
 };
@@ -31,6 +32,19 @@ impl Storage {
         Ok(Self { conn })
     }
 
+    pub fn open_without_migrations(
+        path: &str,
+        synchronous: &str,
+    ) -> std::result::Result<Self, StorageOpenError> {
+        let conn = Self::open_connection(path, synchronous)?;
+        Ok(Self { conn })
+    }
+
+    pub fn open_read_only(path: &str) -> std::result::Result<Self, StorageOpenError> {
+        let conn = Self::open_connection_read_only(path)?;
+        Ok(Self { conn })
+    }
+
     pub fn open_connection(
         path: &str,
         synchronous: &str,
@@ -39,6 +53,15 @@ impl Storage {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", synchronous)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        Ok(conn)
+    }
+
+    pub fn open_connection_read_only(
+        path: &str,
+    ) -> std::result::Result<Connection, StorageOpenError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.pragma_update(None, "query_only", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         Ok(conn)
     }
@@ -238,34 +261,60 @@ impl Storage {
     pub fn load_ordered_l2_txs_from(&mut self, offset: u64) -> Result<Vec<SequencedL2Tx>> {
         // Read the persisted total order used by catch-up and downstream broadcasters.
         let rows = sql_select_ordered_l2_txs_from_offset(&self.conn, u64_to_i64(offset))?;
-        let mut out = Vec::new();
+        Ok(decode_ordered_l2_txs(rows))
+    }
 
-        for row in rows {
-            if row.kind == 0 {
-                let sender_bytes = row.sender.expect("ordered replay row: missing sender");
-                assert_eq!(
-                    sender_bytes.len(),
-                    20,
-                    "ordered replay row: sender must be 20 bytes"
-                );
-
-                let entry = ValidUserOp {
-                    sender: Address::from_slice(sender_bytes.as_slice()),
-                    // Replay uses the persisted batch fee to mirror canonical execution.
-                    fee: i64_to_u64(row.fee.expect("ordered replay row: missing fee")),
-                    data: row.data.expect("ordered replay row: missing data"),
-                };
-                out.push(SequencedL2Tx::UserOp(entry));
-            } else {
-                let direct = DirectInput {
-                    payload: row.payload.expect("ordered replay row: missing payload"),
-                };
-                out.push(SequencedL2Tx::Direct(direct));
-            }
+    pub fn load_ordered_l2_txs_page_from(
+        &mut self,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<SequencedL2Tx>> {
+        if limit == 0 {
+            return Ok(Vec::new());
         }
 
-        Ok(out)
+        let rows = sql_select_ordered_l2_txs_page_from_offset(
+            &self.conn,
+            u64_to_i64(offset),
+            usize_to_i64(limit),
+        )?;
+        Ok(decode_ordered_l2_txs(rows))
     }
+
+    pub fn ordered_l2_tx_count(&mut self) -> Result<u64> {
+        let value = sql_select_ordered_l2_tx_count(&self.conn)?;
+        Ok(i64_to_u64(value))
+    }
+}
+
+fn decode_ordered_l2_txs(rows: Vec<super::sql::OrderedL2TxRow>) -> Vec<SequencedL2Tx> {
+    let mut out = Vec::new();
+
+    for row in rows {
+        if row.kind == 0 {
+            let sender_bytes = row.sender.expect("ordered replay row: missing sender");
+            assert_eq!(
+                sender_bytes.len(),
+                20,
+                "ordered replay row: sender must be 20 bytes"
+            );
+
+            let entry = ValidUserOp {
+                sender: Address::from_slice(sender_bytes.as_slice()),
+                // Replay uses the persisted batch fee to mirror canonical execution.
+                fee: i64_to_u64(row.fee.expect("ordered replay row: missing fee")),
+                data: row.data.expect("ordered replay row: missing data"),
+            };
+            out.push(SequencedL2Tx::UserOp(entry));
+        } else {
+            let direct = DirectInput {
+                payload: row.payload.expect("ordered replay row: missing payload"),
+            };
+            out.push(SequencedL2Tx::Direct(direct));
+        }
+    }
+
+    out
 }
 
 fn load_current_write_head(tx: &Transaction<'_>) -> Result<WriteHead> {
@@ -396,6 +445,10 @@ fn now_unix_ms() -> i64 {
 }
 
 fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn usize_to_i64(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 

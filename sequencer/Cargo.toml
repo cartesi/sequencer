@@ -11,7 +11,7 @@ authors.workspace = true
 
 [dependencies]
 app-core = { path = "../app-core" }
-axum = "0.8.8"
+axum = { version = "0.8.8", features = ["ws"] }
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,3 +25,7 @@ alloy-sol-types = "1.4.1"
 thiserror = "1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.28"
