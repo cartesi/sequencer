@@ -88,7 +88,6 @@ impl L2TxBroadcaster {
             .inner
             .next_subscriber_id
             .fetch_add(1, Ordering::Relaxed);
-        let live_start_offset = self.inner.head_offset.load(Ordering::Acquire);
 
         let mut subscribers = self
             .inner
@@ -96,6 +95,7 @@ impl L2TxBroadcaster {
             .lock()
             .expect("l2 tx broadcaster subscribers mutex poisoned");
         subscribers.insert(subscriber_id, tx);
+        let live_start_offset = self.inner.head_offset.load(Ordering::Acquire);
 
         LiveSubscription {
             receiver: rx,
@@ -199,8 +199,13 @@ fn fanout_event(inner: &L2TxBroadcasterInner, event: BroadcastTxMessage) {
 #[cfg(test)]
 mod tests {
     use super::BroadcastTxMessage;
+    use super::{L2TxBroadcaster, L2TxBroadcasterInner};
     use crate::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
     use alloy_primitives::Address;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn broadcast_user_op_serializes_with_hex_data() {
@@ -231,5 +236,62 @@ mod tests {
         assert!(json.contains("\"kind\":\"direct_input\""));
         assert!(json.contains("\"offset\":9"));
         assert!(json.contains("\"payload\":\"0xccdd\""));
+    }
+
+    #[test]
+    fn subscribe_observes_live_start_after_registering_subscriber() {
+        let broadcaster = L2TxBroadcaster {
+            inner: Arc::new(L2TxBroadcasterInner {
+                db_path: ":memory:".to_string(),
+                page_size: 1,
+                subscriber_buffer_capacity: 1,
+                head_offset: AtomicU64::new(0),
+                next_subscriber_id: AtomicU64::new(0),
+                subscribers: Mutex::new(HashMap::new()),
+            }),
+        };
+
+        for _ in 0..16 {
+            broadcaster
+                .inner
+                .head_offset
+                .store(0, std::sync::atomic::Ordering::Release);
+            broadcaster
+                .inner
+                .subscribers
+                .lock()
+                .expect("subscribers mutex")
+                .clear();
+
+            let guard = broadcaster
+                .inner
+                .subscribers
+                .lock()
+                .expect("subscribers mutex");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cloned = broadcaster.clone();
+            let join = std::thread::spawn(move || {
+                let subscription = cloned.subscribe();
+                tx.send(subscription.live_start_offset)
+                    .expect("send live start offset");
+            });
+
+            std::thread::sleep(Duration::from_millis(2));
+            broadcaster
+                .inner
+                .head_offset
+                .store(1, std::sync::atomic::Ordering::Release);
+            drop(guard);
+
+            let observed = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("recv live start offset");
+            join.join().expect("join subscribe thread");
+
+            assert_eq!(
+                observed, 1,
+                "subscriber must observe current head after it is visible in subscriber set"
+            );
+        }
     }
 }
