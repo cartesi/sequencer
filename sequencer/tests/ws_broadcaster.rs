@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256, Signature};
 use alloy_sol_types::Eip712Domain;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use sequencer::api::{AppState, router};
 use sequencer::inclusion_lane::{InclusionLaneInput, PendingUserOp, SequencerError};
 use sequencer::l2_tx_broadcaster::{L2TxBroadcaster, L2TxBroadcasterConfig};
@@ -106,6 +106,99 @@ async fn ws_subscribe_resumes_from_given_offset() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_receives_live_events_after_subscribing() {
+    let db_path = temp_db_path("ws-subscribe-live");
+    seed_ordered_txs(&db_path);
+
+    let Some((addr, shutdown_tx, server_task)) = start_test_server(&db_path).await else {
+        return;
+    };
+
+    // Existing persisted offsets are [0, 2). Subscribe at 2 to exercise live-only delivery.
+    let url = format!("ws://{addr}/ws/subscribe?from_offset=2");
+    let (mut ws, _) = connect_async(url).await.expect("connect websocket");
+
+    append_drained_direct_input(&db_path, 1, vec![0xbb]);
+    let live = recv_tx_message(&mut ws).await;
+    drop(ws);
+
+    shutdown_tx.send(()).expect("request shutdown");
+    server_task.await.expect("join server task");
+
+    match live {
+        WsTxMessage::DirectInput { offset, payload } => {
+            assert_eq!(offset, 2);
+            assert_eq!(decode_hex_prefixed(payload.as_str()), vec![0xbb]);
+        }
+        value => panic!("expected live direct_input at offset 2, got {value:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_fanout_delivers_live_event_to_multiple_subscribers() {
+    let db_path = temp_db_path("ws-subscribe-fanout");
+    seed_ordered_txs(&db_path);
+
+    let Some((addr, shutdown_tx, server_task)) = start_test_server(&db_path).await else {
+        return;
+    };
+
+    let url = format!("ws://{addr}/ws/subscribe?from_offset=2");
+    let (mut ws_a, _) = connect_async(url.as_str())
+        .await
+        .expect("connect websocket A");
+    let (mut ws_b, _) = connect_async(url).await.expect("connect websocket B");
+
+    append_drained_direct_input(&db_path, 1, vec![0xcd]);
+
+    let event_a = recv_tx_message(&mut ws_a).await;
+    let event_b = recv_tx_message(&mut ws_b).await;
+    drop(ws_a);
+    drop(ws_b);
+
+    shutdown_tx.send(()).expect("request shutdown");
+    server_task.await.expect("join server task");
+
+    let assert_event = |event: WsTxMessage| match event {
+        WsTxMessage::DirectInput { offset, payload } => {
+            assert_eq!(offset, 2);
+            assert_eq!(decode_hex_prefixed(payload.as_str()), vec![0xcd]);
+        }
+        value => panic!("expected live direct_input at offset 2, got {value:?}"),
+    };
+    assert_event(event_a);
+    assert_event(event_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_replies_with_pong_on_ping() {
+    let db_path = temp_db_path("ws-subscribe-ping-pong");
+    seed_ordered_txs(&db_path);
+
+    let Some((addr, shutdown_tx, server_task)) = start_test_server(&db_path).await else {
+        return;
+    };
+
+    let url = format!("ws://{addr}/ws/subscribe?from_offset=2");
+    let (mut ws, _) = connect_async(url).await.expect("connect websocket");
+
+    ws.send(Message::Ping(vec![0x01, 0x02].into()))
+        .await
+        .expect("send ping frame");
+
+    let frame = recv_raw_message(&mut ws).await;
+    drop(ws);
+
+    shutdown_tx.send(()).expect("request shutdown");
+    server_task.await.expect("join server task");
+
+    match frame {
+        Message::Pong(payload) => assert_eq!(payload.as_ref(), [0x01, 0x02]),
+        value => panic!("expected pong frame, got {value:?}"),
+    }
+}
+
 fn seed_ordered_txs(db_path: &str) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
     let mut head = storage.load_open_state().expect("load open state");
@@ -134,6 +227,17 @@ fn seed_ordered_txs(db_path: &str) {
             index: 0,
             payload: vec![0xaa],
         }])
+        .expect("append direct input");
+    storage
+        .close_frame_only(&mut head, 1)
+        .expect("close frame with one drained direct input");
+}
+
+fn append_drained_direct_input(db_path: &str, index: u64, payload: Vec<u8>) {
+    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let mut head = storage.load_open_state().expect("load open state");
+    storage
+        .append_safe_direct_inputs(&[IndexedDirectInput { index, payload }])
         .expect("append direct input");
     storage
         .close_frame_only(&mut head, 1)
@@ -211,6 +315,18 @@ async fn recv_tx_message(
     };
 
     serde_json::from_str(text.as_str()).expect("parse websocket tx message")
+}
+
+async fn recv_raw_message(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Message {
+    tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("wait for websocket message")
+        .expect("websocket stream ended")
+        .expect("receive websocket frame")
 }
 
 fn decode_hex_prefixed(value: &str) -> Vec<u8> {
