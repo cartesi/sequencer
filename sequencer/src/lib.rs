@@ -9,5 +9,6 @@ pub mod api;
 pub mod application;
 pub mod inclusion_lane;
 pub mod l2_tx;
+pub mod l2_tx_broadcaster;
 pub mod storage;
 pub mod user_op;

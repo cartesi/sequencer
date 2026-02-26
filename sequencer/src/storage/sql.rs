@@ -10,6 +10,8 @@ use crate::inclusion_lane::PendingUserOp;
 const SQL_SELECT_SAFE_INPUTS_RANGE: &str = include_str!("queries/select_safe_inputs_range.sql");
 const SQL_SELECT_ORDERED_L2_TXS_FROM_OFFSET: &str =
     include_str!("queries/select_ordered_l2_txs_from_offset.sql");
+const SQL_SELECT_ORDERED_L2_TXS_PAGE_FROM_OFFSET: &str =
+    include_str!("queries/select_ordered_l2_txs_page_from_offset.sql");
 const SQL_SELECT_LATEST_BATCH_WITH_USER_OP_COUNT: &str =
     include_str!("queries/select_latest_batch_with_user_op_count.sql");
 const SQL_SELECT_LATEST_FRAME_IN_BATCH_FOR_BATCH: &str =
@@ -17,6 +19,7 @@ const SQL_SELECT_LATEST_FRAME_IN_BATCH_FOR_BATCH: &str =
 const SQL_SELECT_USER_OP_COUNT_FOR_FRAME: &str =
     include_str!("queries/select_user_op_count_for_frame.sql");
 const SQL_SELECT_MAX_DIRECT_INPUT_INDEX: &str = "SELECT MAX(direct_input_index) FROM direct_inputs";
+const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM ordered_sequenced_l2_txs";
 const SQL_SELECT_RECOMMENDED_FEE: &str =
     "SELECT fee FROM recommended_fees WHERE singleton_id = 0 LIMIT 1";
 const SQL_INSERT_DIRECT_INPUT: &str =
@@ -131,6 +134,20 @@ pub(super) fn sql_select_ordered_l2_txs_from_offset(
     mapped.collect()
 }
 
+pub(super) fn sql_select_ordered_l2_txs_page_from_offset(
+    conn: &Connection,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<OrderedL2TxRow>> {
+    let mut stmt = conn.prepare_cached(SQL_SELECT_ORDERED_L2_TXS_PAGE_FROM_OFFSET)?;
+    let mapped = stmt.query_map(params![offset, limit], convert_row_to_ordered_l2_tx_row)?;
+    mapped.collect()
+}
+
+pub(super) fn sql_select_ordered_l2_tx_count(conn: &Connection) -> Result<i64> {
+    conn.query_row(SQL_SELECT_ORDERED_L2_TX_COUNT, [], |row| row.get(0))
+}
+
 pub(super) fn sql_select_latest_batch_with_user_op_count(
     tx: &Transaction<'_>,
 ) -> Result<(i64, i64, i64, i64)> {
@@ -239,7 +256,8 @@ mod tests {
         sql_count_user_ops_for_frame, sql_insert_direct_inputs_batch, sql_insert_frame_drain,
         sql_insert_open_batch, sql_insert_open_frame, sql_insert_user_ops_batch,
         sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
-        sql_select_max_direct_input_index, sql_select_ordered_l2_txs_from_offset,
+        sql_select_max_direct_input_index, sql_select_ordered_l2_tx_count,
+        sql_select_ordered_l2_txs_from_offset, sql_select_ordered_l2_txs_page_from_offset,
         sql_select_recommended_fee, sql_select_safe_inputs_range,
         sql_select_total_drained_direct_inputs, sql_update_recommended_fee,
     };
@@ -368,6 +386,14 @@ mod tests {
         assert_eq!(rows[0].fee, Some(1));
         assert_eq!(rows[1].kind, 1);
         assert_eq!(rows[1].fee, None);
+
+        let paged = sql_select_ordered_l2_txs_page_from_offset(&conn, 1, 1).expect("query page");
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].kind, 1);
+        assert_eq!(
+            sql_select_ordered_l2_tx_count(&conn).expect("query ordered count"),
+            2
+        );
     }
 
     #[test]

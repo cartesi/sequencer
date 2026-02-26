@@ -7,7 +7,7 @@ Current focus is reliability of sequencing, persistence, and replay semantics.
 ## Status
 
 - Language: Rust (edition 2024)
-- API: Axum (`POST /tx`)
+- API: Axum (`POST /tx`, `GET /ws/subscribe`)
 - Hot path: single blocking inclusion lane
 - Storage: SQLite (`rusqlite`, WAL)
 - Signing: EIP-712 (`alloy`)
@@ -61,12 +61,32 @@ Request shape:
 }
 ```
 
-Notes:
+POST notes:
 
 - `signature` must be 65 bytes.
 - `sender` is optional; if provided, it must match recovered signer.
 - `message.data` is SSZ-encoded method payload bytes.
 - payload size is bounded at ingress; oversized requests are rejected before they enter hot path.
+
+### `GET /ws/subscribe?from_offset=<u64>`
+
+WebSocket stream of sequenced L2 transactions from persisted order.
+
+Notes:
+
+- `from_offset` is optional (defaults to `0`).
+- messages are JSON text frames.
+- binary fields are hex-encoded (`0x`-prefixed).
+
+Message shapes:
+
+```json
+{ "kind": "user_op", "offset": 10, "sender": "0x...", "fee": 1, "data": "0x..." }
+```
+
+```json
+{ "kind": "direct_input", "offset": 11, "payload": "0x..." }
+```
 
 Success response:
 
@@ -94,6 +114,9 @@ Main environment variables:
 - `SEQ_INCLUSION_LANE_IDLE_POLL_INTERVAL_MS`
 - `SEQ_INCLUSION_LANE_TICK_INTERVAL_MS` (legacy alias)
 - `SEQ_COMMIT_LANE_TICK_INTERVAL_MS` (legacy alias)
+- `SEQ_BROADCASTER_IDLE_POLL_INTERVAL_MS`
+- `SEQ_BROADCASTER_PAGE_SIZE`
+- `SEQ_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY`
 - `SEQ_MAX_BODY_BYTES`
 - `SEQ_SQLITE_SYNCHRONOUS`
 - `SEQ_DOMAIN_NAME`
@@ -120,6 +143,7 @@ Views:
 - `sequencer/src/main.rs`: bootstrap, env config, HTTP server + lane lifecycle
 - `sequencer/src/api/`: HTTP API and error mapping
 - `sequencer/src/inclusion_lane/`: hot-path inclusion loop, chunk/frame/batch rotation, catch-up
+- `sequencer/src/l2_tx_broadcaster.rs`: centralized ordered-L2Tx poller + subscriber fanout
 - `sequencer/src/storage/`: schema, migrations, SQLite persistence and replay reads
 - `app-core/src/application/`: app execution/validation interfaces + wallet prototype
 - `app-core/src/user_op.rs`: signed user-op and EIP-712 payload model

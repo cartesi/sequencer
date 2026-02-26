@@ -33,12 +33,13 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 ## Architecture Map
 
 - `sequencer/src/main.rs`: process bootstrap, env config, queue wiring, HTTP server.
-- `sequencer/src/api/mod.rs`: `POST /tx` endpoint, JSON decode, signature recovery, enqueue + wait for commit result.
+- `sequencer/src/api/mod.rs`: `POST /tx` and `GET /ws/subscribe` endpoints (tx ingress + replay broadcaster).
 - `sequencer/src/api/error.rs`: API error model + HTTP mapping.
 - `sequencer/src/inclusion_lane/mod.rs`: inclusion-lane exports and public surface.
 - `sequencer/src/inclusion_lane/lane.rs`: batched execution/commit loop (single lane).
 - `sequencer/src/inclusion_lane/types.rs`: inclusion-lane queue item and pipeline error types.
 - `sequencer/src/inclusion_lane/error.rs`: inclusion-lane runtime and catch-up error types.
+- `sequencer/src/l2_tx_broadcaster.rs`: centralized ordered-L2Tx poller + live fanout to WS subscribers.
 - `sequencer/src/storage/mod.rs`: DB open, migrations, frame persistence, and direct-input broker APIs.
 - `sequencer/src/storage/migrations/`: DB schema/bootstrapping (`0001`) and views (`0002`).
 - `app-core/src/application/mod.rs`: app execution interface (`Application`) and wallet prototype.
@@ -120,6 +121,9 @@ Key env vars:
 - `SEQ_INCLUSION_LANE_IDLE_POLL_INTERVAL_MS` (preferred)
 - `SEQ_INCLUSION_LANE_TICK_INTERVAL_MS` (legacy alias)
 - `SEQ_COMMIT_LANE_TICK_INTERVAL_MS` (legacy alias)
+- `SEQ_BROADCASTER_IDLE_POLL_INTERVAL_MS`
+- `SEQ_BROADCASTER_PAGE_SIZE`
+- `SEQ_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY`
 - `SEQ_MAX_BODY_BYTES`
 - `SEQ_SQLITE_SYNCHRONOUS`
 - `SEQ_DOMAIN_NAME`

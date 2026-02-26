@@ -1,0 +1,235 @@
+// (c) Cartesi and individual authors (see AUTHORS)
+// SPDX-License-Identifier: Apache-2.0 (see LICENSE)
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde::Serialize;
+use tokio::sync::mpsc;
+use tracing::warn;
+
+use crate::l2_tx::SequencedL2Tx;
+use crate::storage::Storage;
+
+#[derive(Debug, Clone, Copy)]
+pub struct L2TxBroadcasterConfig {
+    pub idle_poll_interval: Duration,
+    pub page_size: usize,
+    pub subscriber_buffer_capacity: usize,
+}
+
+#[derive(Clone)]
+pub struct L2TxBroadcaster {
+    inner: Arc<L2TxBroadcasterInner>,
+}
+
+pub struct LiveSubscription {
+    pub receiver: mpsc::Receiver<BroadcastTxMessage>,
+    pub live_start_offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BroadcastTxMessage {
+    UserOp {
+        offset: u64,
+        sender: String,
+        fee: u64,
+        data: String,
+    },
+    DirectInput {
+        offset: u64,
+        payload: String,
+    },
+}
+
+struct L2TxBroadcasterInner {
+    db_path: String,
+    page_size: usize,
+    subscriber_buffer_capacity: usize,
+    head_offset: AtomicU64,
+    next_subscriber_id: AtomicU64,
+    subscribers: Mutex<HashMap<u64, mpsc::Sender<BroadcastTxMessage>>>,
+}
+
+impl L2TxBroadcaster {
+    pub fn start(
+        db_path: String,
+        config: L2TxBroadcasterConfig,
+    ) -> std::result::Result<Self, String> {
+        let mut storage = Storage::open_read_only(&db_path)
+            .map_err(|err| format!("open broadcaster storage failed: {err}"))?;
+        let head_offset = storage
+            .ordered_l2_tx_count()
+            .map_err(|err| format!("load broadcaster head offset failed: {err}"))?;
+
+        let inner = Arc::new(L2TxBroadcasterInner {
+            db_path,
+            page_size: config.page_size.max(1),
+            subscriber_buffer_capacity: config.subscriber_buffer_capacity.max(1),
+            head_offset: AtomicU64::new(head_offset),
+            next_subscriber_id: AtomicU64::new(0),
+            subscribers: Mutex::new(HashMap::new()),
+        });
+
+        let worker_inner = Arc::clone(&inner);
+        tokio::task::spawn_blocking(move || {
+            run_poller(worker_inner, config.idle_poll_interval);
+        });
+
+        Ok(Self { inner })
+    }
+
+    pub fn subscribe(&self) -> LiveSubscription {
+        let (tx, rx) = mpsc::channel(self.inner.subscriber_buffer_capacity);
+        let subscriber_id = self
+            .inner
+            .next_subscriber_id
+            .fetch_add(1, Ordering::Relaxed);
+        let live_start_offset = self.inner.head_offset.load(Ordering::Acquire);
+
+        let mut subscribers = self
+            .inner
+            .subscribers
+            .lock()
+            .expect("l2 tx broadcaster subscribers mutex poisoned");
+        subscribers.insert(subscriber_id, tx);
+
+        LiveSubscription {
+            receiver: rx,
+            live_start_offset,
+        }
+    }
+
+    pub fn db_path(&self) -> String {
+        self.inner.db_path.clone()
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.inner.page_size
+    }
+}
+
+impl BroadcastTxMessage {
+    pub fn offset(&self) -> u64 {
+        match self {
+            Self::UserOp { offset, .. } => *offset,
+            Self::DirectInput { offset, .. } => *offset,
+        }
+    }
+
+    pub fn from_offset_and_tx(offset: u64, tx: SequencedL2Tx) -> Self {
+        match tx {
+            SequencedL2Tx::UserOp(user_op) => Self::UserOp {
+                offset,
+                sender: user_op.sender.to_string(),
+                fee: user_op.fee,
+                data: alloy_primitives::hex::encode_prefixed(user_op.data.as_slice()),
+            },
+            SequencedL2Tx::Direct(direct) => Self::DirectInput {
+                offset,
+                payload: alloy_primitives::hex::encode_prefixed(direct.payload.as_slice()),
+            },
+        }
+    }
+}
+
+fn run_poller(inner: Arc<L2TxBroadcasterInner>, idle_poll_interval: Duration) {
+    let mut storage = match Storage::open_read_only(inner.db_path.as_str()) {
+        Ok(storage) => storage,
+        Err(err) => {
+            warn!(error = %err, "l2 tx broadcaster failed to open read-only storage");
+            return;
+        }
+    };
+    let mut next_offset = inner.head_offset.load(Ordering::Acquire);
+
+    loop {
+        let txs = match storage.load_ordered_l2_txs_page_from(next_offset, inner.page_size) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    offset = next_offset,
+                    "l2 tx broadcaster failed to read ordered tx page"
+                );
+                std::thread::sleep(idle_poll_interval);
+                continue;
+            }
+        };
+
+        if txs.is_empty() {
+            std::thread::sleep(idle_poll_interval);
+            continue;
+        }
+
+        for tx in txs {
+            let event = BroadcastTxMessage::from_offset_and_tx(next_offset, tx);
+            next_offset = next_offset.saturating_add(1);
+            inner.head_offset.store(next_offset, Ordering::Release);
+            fanout_event(Arc::as_ref(&inner), event);
+        }
+    }
+}
+
+fn fanout_event(inner: &L2TxBroadcasterInner, event: BroadcastTxMessage) {
+    let mut to_remove = Vec::new();
+    let mut subscribers = inner
+        .subscribers
+        .lock()
+        .expect("l2 tx broadcaster subscribers mutex poisoned");
+
+    for (subscriber_id, sender) in subscribers.iter() {
+        if sender.try_send(event.clone()).is_err() {
+            to_remove.push(*subscriber_id);
+        }
+    }
+
+    for subscriber_id in to_remove {
+        subscribers.remove(&subscriber_id);
+        warn!(
+            subscriber_id,
+            "l2 tx broadcaster dropped subscriber due to closed/full channel"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BroadcastTxMessage;
+    use crate::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
+    use alloy_primitives::Address;
+
+    #[test]
+    fn broadcast_user_op_serializes_with_hex_data() {
+        let msg = BroadcastTxMessage::from_offset_and_tx(
+            7,
+            SequencedL2Tx::UserOp(ValidUserOp {
+                sender: Address::from_slice(&[0x11; 20]),
+                fee: 3,
+                data: vec![0xaa, 0xbb],
+            }),
+        );
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"kind\":\"user_op\""));
+        assert!(json.contains("\"offset\":7"));
+        assert!(json.contains("\"fee\":3"));
+        assert!(json.contains("\"data\":\"0xaabb\""));
+    }
+
+    #[test]
+    fn broadcast_direct_input_serializes_with_hex_payload() {
+        let msg = BroadcastTxMessage::from_offset_and_tx(
+            9,
+            SequencedL2Tx::Direct(DirectInput {
+                payload: vec![0xcc, 0xdd],
+            }),
+        );
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"kind\":\"direct_input\""));
+        assert!(json.contains("\"offset\":9"));
+        assert!(json.contains("\"payload\":\"0xccdd\""));
+    }
+}
