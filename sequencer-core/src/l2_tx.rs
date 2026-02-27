@@ -11,7 +11,7 @@ pub struct DirectInput {
 #[derive(Debug, Clone)]
 pub struct ValidUserOp {
     pub sender: Address,
-    // Fee committed by the sequencer for the batch that contains this user-op.
+    // Fee committed by the sequencer for the batch/frame that contains this user-op.
     pub fee: u64,
     pub data: Vec<u8>,
 }

@@ -14,6 +14,8 @@ pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
+    PayloadTooLarge(String),
+    #[error("{0}")]
     InvalidSignature(String),
     #[error("{0}")]
     ExecutionRejected(String),
@@ -35,6 +37,10 @@ impl ApiError {
         Self::BadRequest(message.into())
     }
 
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::PayloadTooLarge(message.into())
+    }
+
     pub fn invalid_signature(message: impl Into<String>) -> Self {
         Self::InvalidSignature(message.into())
     }
@@ -50,6 +56,7 @@ impl ApiError {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) | Self::InvalidSignature(_) => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ExecutionRejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Overloaded(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -59,6 +66,7 @@ impl ApiError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "BAD_REQUEST",
+            Self::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
             Self::InvalidSignature(_) => "INVALID_SIGNATURE",
             Self::ExecutionRejected(_) => "EXECUTION_REJECTED",
             Self::InternalError(_) => "INTERNAL_ERROR",

@@ -2,8 +2,11 @@
 resolver = "2"
 members = [
   "sequencer",
-  "app-core",
-  "canonical-app",
+  "sequencer-core",
+  "sdk/rust-client",
+  "examples/app-core",
+  "examples/canonical-app",
+  "benchmarks",
 ]
 default-members = ["sequencer"]
 

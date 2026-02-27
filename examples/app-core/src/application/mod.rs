@@ -1,4 +1,6 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-pub use app_core::user_op::*;
+mod wallet;
+
+pub use wallet::{WalletApp, WalletConfig};

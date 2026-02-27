@@ -27,8 +27,8 @@ pub enum StorageOpenError {
 pub struct WriteHead {
     pub batch_index: u64,
     pub batch_created_at: SystemTime,
-    // Sequencer-chosen fee committed for this open batch.
-    pub batch_fee: u64,
+    // Sequencer-chosen fee committed for this open frame.
+    pub frame_fee: u64,
     pub batch_user_op_count: u64,
     pub frame_in_batch: u32,
 }
@@ -38,19 +38,20 @@ impl WriteHead {
         self.batch_user_op_count = self.batch_user_op_count.saturating_add(count as u64);
     }
 
-    pub fn advance_frame(&mut self) {
+    pub fn advance_frame(&mut self, frame_fee: u64) {
         self.frame_in_batch = self.frame_in_batch.saturating_add(1);
+        self.frame_fee = frame_fee;
     }
 
     pub fn move_to_next_batch(
         &mut self,
         batch_index: u64,
         batch_created_at: SystemTime,
-        batch_fee: u64,
+        frame_fee: u64,
     ) {
         self.batch_index = batch_index;
         self.batch_created_at = batch_created_at;
-        self.batch_fee = batch_fee;
+        self.frame_fee = frame_fee;
         self.batch_user_op_count = 0;
         self.frame_in_batch = 0;
     }

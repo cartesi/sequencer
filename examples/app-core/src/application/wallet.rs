@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, U256};
 use ssz::Decode;
 
-use crate::application::{AppError, Application, InvalidReason, Method};
-use crate::l2_tx::ValidUserOp;
-use crate::user_op::UserOp;
+use sequencer_core::application::{AppError, Application, InvalidReason, Method};
+use sequencer_core::l2_tx::ValidUserOp;
+use sequencer_core::user_op::UserOp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WalletConfig;
@@ -93,7 +93,7 @@ impl Application for WalletApp {
         }
 
         let max_fee = user_op.max_fee;
-        // Users sign a cap; sequencer executes against the batch fee.
+        // Users sign a cap; sequencer executes against the committed frame fee.
         if u64::from(max_fee) < current_fee {
             return Err(InvalidReason::InvalidMaxFee {
                 max_fee,
@@ -159,10 +159,10 @@ impl Application for WalletApp {
 #[cfg(test)]
 mod tests {
     use super::{WalletApp, WalletConfig};
-    use crate::application::{Application, InvalidReason};
-    use crate::l2_tx::ValidUserOp;
-    use crate::user_op::UserOp;
     use alloy_primitives::{Address, U256};
+    use sequencer_core::application::{Application, InvalidReason};
+    use sequencer_core::l2_tx::ValidUserOp;
+    use sequencer_core::user_op::UserOp;
 
     #[test]
     fn validate_rejects_when_max_fee_below_current_fee() {
