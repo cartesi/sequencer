@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 
 use alloy_primitives::{Address, Signature, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer::api::{AppState, router};
-use sequencer::application::{Deposit, Method, WalletApp, WalletConfig};
+use sequencer::application::{Method, WalletApp, WalletConfig, Withdrawal};
 use sequencer::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, InclusionLaneError, InclusionLaneInput,
 };
@@ -20,6 +20,7 @@ use sequencer::l2_tx_broadcaster::{L2TxBroadcaster, L2TxBroadcasterConfig};
 use sequencer::storage::Storage;
 use sequencer::user_op::UserOp;
 use serde::Deserialize;
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::connect_async;
@@ -28,7 +29,6 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Debug, Deserialize)]
 struct TxResponse {
     ok: bool,
-    tx_hash: String,
     sender: String,
     nonce: u32,
 }
@@ -51,22 +51,24 @@ enum WsTxMessage {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_submit_tx_ack_and_broadcast() {
-    let db_path = temp_db_path("full-e2e");
+    let db = temp_db("full-e2e");
     let domain = test_domain();
-    bootstrap_open_batch_fee_zero(&db_path);
+    bootstrap_open_frame_fee_zero(db.path.as_str());
 
-    let Some(runtime) = start_full_server(&db_path, domain.clone()).await else {
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
     };
 
     let ws_url = format!("ws://{}/ws/subscribe?from_offset=0", runtime.addr);
-    let (mut ws, _) = connect_async(ws_url).await.expect("connect websocket");
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(ws_url))
+        .await
+        .expect("timeout connecting websocket")
+        .expect("connect websocket");
 
     let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
     let sender = address_from_signing_key(&signing_key);
-    let method = Method::Deposit(Deposit {
-        amount: U256::from(5_u64),
-        to: sender,
+    let method = Method::Withdrawal(Withdrawal {
+        amount: U256::from(0_u64),
     });
     let user_op = UserOp {
         nonce: 0,
@@ -92,10 +94,6 @@ async fn e2e_submit_tx_ack_and_broadcast() {
     assert!(response.ok);
     assert_eq!(response.nonce, 0);
     assert_eq!(response.sender, sender.to_string());
-    assert!(
-        response.tx_hash.starts_with("0x"),
-        "response tx hash should be 0x-prefixed"
-    );
 
     let first_message = recv_ws_message(&mut ws).await;
     match first_message {
@@ -122,10 +120,27 @@ async fn e2e_submit_tx_ack_and_broadcast() {
 
 struct FullServerRuntime {
     addr: std::net::SocketAddr,
-    shutdown_tx: oneshot::Sender<()>,
-    server_task: tokio::task::JoinHandle<()>,
+    broadcaster: L2TxBroadcaster,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    server_task: Option<tokio::task::JoinHandle<()>>,
     lane_stop: sequencer::inclusion_lane::InclusionLaneStop,
-    lane_handle: tokio::task::JoinHandle<InclusionLaneError>,
+    lane_handle: Option<tokio::task::JoinHandle<InclusionLaneError>>,
+}
+
+impl Drop for FullServerRuntime {
+    fn drop(&mut self) {
+        self.broadcaster.request_shutdown();
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        self.lane_stop.request_shutdown();
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.lane_handle.take() {
+            task.abort();
+        }
+    }
 }
 
 async fn start_full_server(db_path: &str, domain: Eip712Domain) -> Option<FullServerRuntime> {
@@ -154,6 +169,8 @@ async fn start_full_server(db_path: &str, domain: Eip712Domain) -> Option<FullSe
             max_batch_open: Duration::from_secs(60 * 60),
             max_batch_user_op_bytes: 1_048_576,
             idle_poll_interval: Duration::from_millis(2),
+            metrics_enabled: false,
+            metrics_log_interval: Duration::from_secs(5),
         },
     );
     let (lane_handle, lane_stop) = inclusion_lane.spawn();
@@ -164,6 +181,8 @@ async fn start_full_server(db_path: &str, domain: Eip712Domain) -> Option<FullSe
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
             subscriber_buffer_capacity: 256,
+            metrics_enabled: false,
+            metrics_log_interval: Duration::from_secs(5),
         },
     )
     .expect("start broadcaster");
@@ -171,8 +190,12 @@ async fn start_full_server(db_path: &str, domain: Eip712Domain) -> Option<FullSe
     let state = Arc::new(AppState {
         tx_sender: tx,
         domain,
+        queue_capacity: 128,
+        overload_queue_depth_threshold: 115,
+        overload_max_inflight_submissions: 256,
+        inflight_submissions: Arc::new(AtomicUsize::new(0)),
         queue_timeout: Duration::from_millis(100),
-        broadcaster,
+        broadcaster: broadcaster.clone(),
     });
     let app = router(state, 128 * 1024);
 
@@ -186,38 +209,46 @@ async fn start_full_server(db_path: &str, domain: Eip712Domain) -> Option<FullSe
 
     Some(FullServerRuntime {
         addr,
-        shutdown_tx,
-        server_task,
+        broadcaster,
+        shutdown_tx: Some(shutdown_tx),
+        server_task: Some(server_task),
         lane_stop,
-        lane_handle,
+        lane_handle: Some(lane_handle),
     })
 }
 
-async fn shutdown_runtime(runtime: FullServerRuntime) {
-    runtime
-        .shutdown_tx
-        .send(())
-        .expect("request server shutdown");
-    runtime.server_task.await.expect("join server task");
+async fn shutdown_runtime(mut runtime: FullServerRuntime) {
+    runtime.broadcaster.request_shutdown();
+    if let Some(tx) = runtime.shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+    if let Some(task) = runtime.server_task.take() {
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("wait for server task")
+            .expect("join server task");
+    }
     runtime.lane_stop.request_shutdown();
-    let lane_result = tokio::time::timeout(Duration::from_secs(2), runtime.lane_handle)
-        .await
-        .expect("wait for inclusion lane")
-        .expect("join inclusion lane task");
-    assert!(
-        matches!(lane_result, InclusionLaneError::ShutdownRequested),
-        "expected shutdown result, got {lane_result}"
-    );
+    if let Some(task) = runtime.lane_handle.take() {
+        let lane_result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("wait for inclusion lane")
+            .expect("join inclusion lane task");
+        assert!(
+            matches!(lane_result, InclusionLaneError::ShutdownRequested),
+            "expected shutdown result, got {lane_result}"
+        );
+    }
 }
 
-fn bootstrap_open_batch_fee_zero(db_path: &str) {
+fn bootstrap_open_frame_fee_zero(db_path: &str) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
     storage.set_recommended_fee(0).expect("set recommended fee");
     let mut head = storage.load_open_state().expect("load open state");
     storage
-        .close_frame_and_batch(&mut head, 0)
+        .close_frame_and_batch(&mut head, 0, 0)
         .expect("rotate batch to fee=0");
-    assert_eq!(head.batch_fee, 0);
+    assert_eq!(head.frame_fee, 0);
 }
 
 fn sign_user_op_hex(domain: &Eip712Domain, user_op: &UserOp, signing_key: &SigningKey) -> String {
@@ -345,16 +376,19 @@ fn test_domain() -> Eip712Domain {
     }
 }
 
-fn temp_db_path(name: &str) -> String {
-    let mut path = std::env::temp_dir();
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    path.push(format!("sequencer-full-e2e-{name}-{unique}.sqlite"));
-    path_to_string(path)
+struct TestDb {
+    _dir: TempDir,
+    path: String,
 }
 
-fn path_to_string(path: PathBuf) -> String {
-    path.to_string_lossy().into_owned()
+fn temp_db(name: &str) -> TestDb {
+    let dir = tempfile::Builder::new()
+        .prefix(format!("sequencer-full-e2e-{name}-").as_str())
+        .tempdir()
+        .expect("create temporary test directory");
+    let path = dir.path().join("sequencer.sqlite");
+    TestDb {
+        _dir: dir,
+        path: path.to_string_lossy().into_owned(),
+    }
 }

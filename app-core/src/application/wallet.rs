@@ -93,7 +93,7 @@ impl Application for WalletApp {
         }
 
         let max_fee = user_op.max_fee;
-        // Users sign a cap; sequencer executes against the batch fee.
+        // Users sign a cap; sequencer executes against the committed frame fee.
         if u64::from(max_fee) < current_fee {
             return Err(InvalidReason::InvalidMaxFee {
                 max_fee,

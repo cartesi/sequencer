@@ -39,6 +39,7 @@ Build a robust sequencer prototype for a future DeFi stack, with deterministic o
 - Measure idle and under-load behavior.
 - Include network-aware runs (client/server on different hosts) like network latency.
 - Note: end-to-end depends on `L2Tx` broadcaster being available.
+- Possible optimization idea (later): adaptive chunk sizing in inclusion lane based on queue pressure and latency budget.
 
 ---
 

@@ -3,7 +3,6 @@
 
 use std::time::SystemTime;
 
-use alloy_primitives::B256;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
@@ -12,7 +11,6 @@ use crate::user_op::SignedUserOp;
 #[derive(Debug)]
 pub struct PendingUserOp {
     pub signed: SignedUserOp,
-    pub tx_hash: B256,
     pub respond_to: oneshot::Sender<Result<(), SequencerError>>,
     pub received_at: SystemTime,
 }

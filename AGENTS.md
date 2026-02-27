@@ -39,9 +39,9 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - `sequencer/src/inclusion_lane/lane.rs`: batched execution/commit loop (single lane).
 - `sequencer/src/inclusion_lane/types.rs`: inclusion-lane queue item and pipeline error types.
 - `sequencer/src/inclusion_lane/error.rs`: inclusion-lane runtime and catch-up error types.
-- `sequencer/src/l2_tx_broadcaster.rs`: centralized ordered-L2Tx poller + live fanout to WS subscribers.
+- `sequencer/src/l2_tx_broadcaster/mod.rs`: centralized ordered-L2Tx poller + live fanout to WS subscribers.
 - `sequencer/src/storage/mod.rs`: DB open, migrations, frame persistence, and direct-input broker APIs.
-- `sequencer/src/storage/migrations/`: DB schema/bootstrapping (`0001`) and views (`0002`).
+- `sequencer/src/storage/migrations/`: DB schema/bootstrapping (`0001`).
 - `app-core/src/application/mod.rs`: app execution interface (`Application`) and wallet prototype.
 - `app-core/src/user_op.rs`: signed user-op domain types and EIP-712 payload.
 - `app-core/src/l2_tx.rs`: sequenced L2 transaction types used for replay/broadcast boundaries.
@@ -52,9 +52,9 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - This is a **sequencer prototype**, not a full DeFi stack yet.
 - API validates signature and enqueues signed `UserOp`; method decoding happens during application execution.
 - Rejections (`InvalidNonce`, fee cap too low, insufficient gas balance) produce no state mutation and are not persisted.
-- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `direct_inputs`, and `frame_drains`.
-- Batch fee is persisted in `batches.fee` and is fixed for the lifetime of that batch.
-- The next batch fee is sampled from `recommended_fees` when rotating to a new batch (default bootstrap value is `1`).
+- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `direct_inputs`, and `sequenced_l2_txs`.
+- Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame.
+- The next frame fee is sampled from `recommended_fees` when rotating to a new frame (default bootstrap value is `0`).
 - Wallet state (balances/nonces) is in-memory right now (not persisted).
 
 ## Hot-Path Invariants
@@ -69,9 +69,10 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 
 - Storage model is append-oriented; avoid mutable status flags for open/closed entities.
 - Open batch/frame are derived by “latest row” convention.
-- `drain_n` is represented by `frame_drains` rows and is derivable from stored data.
+- `drain_n` is derivable from `sequenced_l2_txs` by counting direct-input rows per frame.
 - Safe cursor/head values should be derived from persisted facts when possible, not duplicated as mutable fields.
-- Replay/catch-up must use persisted ordering plus persisted batch fee (`batches.fee`) to mirror inclusion semantics.
+- Replay/catch-up must use persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics.
+- Included user-op identity is constrained by `UNIQUE(sender, nonce)`.
 
 ## Type Boundaries
 
@@ -113,6 +114,8 @@ Key env vars:
 - `SEQ_DB_PATH`
 - `SEQ_QUEUE_CAP`
 - `SEQ_QUEUE_TIMEOUT_MS`
+- `SEQ_OVERLOAD_QUEUE_DEPTH_THRESHOLD`
+- `SEQ_OVERLOAD_MAX_INFLIGHT_SUBMISSIONS`
 - `SEQ_MAX_USER_OPS_PER_CHUNK` (preferred)
 - `SEQ_MAX_BATCH` (legacy alias)
 - `SEQ_SAFE_DIRECT_BUFFER_CAPACITY`
@@ -124,6 +127,8 @@ Key env vars:
 - `SEQ_BROADCASTER_IDLE_POLL_INTERVAL_MS`
 - `SEQ_BROADCASTER_PAGE_SIZE`
 - `SEQ_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY`
+- `SEQ_RUNTIME_METRICS_ENABLED`
+- `SEQ_RUNTIME_METRICS_LOG_INTERVAL_MS`
 - `SEQ_MAX_BODY_BYTES`
 - `SEQ_SQLITE_SYNCHRONOUS`
 - `SEQ_DOMAIN_NAME`

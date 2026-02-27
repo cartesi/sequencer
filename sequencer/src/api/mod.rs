@@ -4,6 +4,7 @@
 mod error;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
@@ -16,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendTimeoutError;
 use tokio::sync::oneshot;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use alloy_primitives::{Address, Signature};
 use alloy_sol_types::{Eip712Domain, SolStruct};
@@ -32,6 +33,10 @@ pub use error::ApiError;
 pub struct AppState {
     pub tx_sender: mpsc::Sender<InclusionLaneInput>,
     pub domain: Eip712Domain,
+    pub queue_capacity: usize,
+    pub overload_queue_depth_threshold: usize,
+    pub overload_max_inflight_submissions: usize,
+    pub inflight_submissions: Arc<AtomicUsize>,
     pub queue_timeout: Duration,
     pub broadcaster: L2TxBroadcaster,
 }
@@ -46,7 +51,6 @@ struct TxRequest {
 #[derive(Debug, Serialize)]
 struct TxResponse {
     ok: bool,
-    tx_hash: String,
     sender: String,
     nonce: u32,
 }
@@ -69,6 +73,9 @@ async fn submit_tx(
     State(state): State<Arc<AppState>>,
     req: Result<Json<TxRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TxResponse>, ApiError> {
+    ensure_overload_gates(state.as_ref())?;
+    let _inflight_guard = InflightSubmissionGuard::try_acquire(state.as_ref())?;
+
     let Json(req) = req.map_err(|err| ApiError::bad_request(format!("invalid JSON: {err}")))?;
 
     let signature_bytes = decode_hex_0x(&req.signature).map_err(ApiError::bad_request)?;
@@ -91,9 +98,9 @@ async fn submit_tx(
     }
     let nonce = user_op.nonce;
 
-    let tx_hash = user_op.eip712_signing_hash(&state.domain);
+    let signing_hash = user_op.eip712_signing_hash(&state.domain);
     let sender = signature
-        .recover_address_from_prehash(&tx_hash)
+        .recover_address_from_prehash(&signing_hash)
         .map_err(|_| ApiError::invalid_signature("cannot recover sender"))?;
 
     if let Some(sender_hex) = req.sender.as_deref() {
@@ -112,7 +119,6 @@ async fn submit_tx(
     let (respond_to, recv) = oneshot::channel();
     let enqueued = PendingUserOp {
         signed,
-        tx_hash,
         respond_to,
         received_at: SystemTime::now(),
     };
@@ -123,12 +129,10 @@ async fn submit_tx(
         .await
         .map_err(|_| ApiError::internal_error("inclusion lane dropped response"))?;
     commit_result.map_err(ApiError::from)?;
-
-    info!(tx_hash = %encode_hex(&tx_hash), sender = %sender, "tx committed");
+    debug!(sender = %sender, nonce, "tx committed");
 
     Ok(Json(TxResponse {
         ok: true,
-        tx_hash: encode_hex(&tx_hash),
         sender: sender.to_string(),
         nonce,
     }))
@@ -166,10 +170,6 @@ fn parse_signature(bytes: &[u8]) -> Result<Signature, ApiError> {
     })
 }
 
-fn encode_hex(value: &alloy_primitives::B256) -> String {
-    alloy_primitives::hex::encode_prefixed(value.as_slice())
-}
-
 async fn enqueue_tx(state: &AppState, tx: PendingUserOp) -> Result<(), ApiError> {
     match state
         .tx_sender
@@ -181,6 +181,50 @@ async fn enqueue_tx(state: &AppState, tx: PendingUserOp) -> Result<(), ApiError>
         Err(SendTimeoutError::Closed(_)) => {
             Err(ApiError::internal_error("inclusion lane unavailable"))
         }
+    }
+}
+
+fn ensure_overload_gates(state: &AppState) -> Result<(), ApiError> {
+    let queue_depth = queue_depth(state);
+    if queue_depth >= state.overload_queue_depth_threshold {
+        return Err(ApiError::overloaded(format!(
+            "queue depth threshold reached: depth={queue_depth}, threshold={}",
+            state.overload_queue_depth_threshold
+        )));
+    }
+    Ok(())
+}
+
+fn queue_depth(state: &AppState) -> usize {
+    state
+        .queue_capacity
+        .saturating_sub(state.tx_sender.capacity())
+}
+
+struct InflightSubmissionGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InflightSubmissionGuard {
+    fn try_acquire(state: &AppState) -> Result<Self, ApiError> {
+        let current = state.inflight_submissions.fetch_add(1, Ordering::Relaxed);
+        if current >= state.overload_max_inflight_submissions {
+            state.inflight_submissions.fetch_sub(1, Ordering::Relaxed);
+            return Err(ApiError::overloaded(format!(
+                "inflight submission threshold reached: inflight={}, threshold={}",
+                current, state.overload_max_inflight_submissions
+            )));
+        }
+
+        Ok(Self {
+            counter: Arc::clone(&state.inflight_submissions),
+        })
+    }
+}
+
+impl Drop for InflightSubmissionGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

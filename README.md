@@ -16,13 +16,13 @@ Current focus is reliability of sequencing, persistence, and replay semantics.
 ## Core Design
 
 - **User ops** arrive through the API, are validated, executed, and persisted by the inclusion lane.
-- **Direct inputs** are stored in SQLite (`direct_inputs`) and drained by the inclusion lane into frame boundaries (`frame_drains`).
-- **Ordering** is deterministic and persisted. Replay/catch-up reads `ordered_sequenced_l2_txs`.
-- **Batch fee** is fixed per batch (`batches.fee`):
+- **Direct inputs** are stored in SQLite (`direct_inputs`) and sequenced in append-only replay order (`sequenced_l2_txs`).
+- **Ordering** is deterministic and persisted. Replay/catch-up reads `sequenced_l2_txs` (joined with `user_ops` / `direct_inputs`).
+- **Frame fee** is fixed per frame (`frames.fee`):
   - users sign `max_fee`
-  - inclusion validates `max_fee >= current_batch_fee`
-  - execution charges `current_batch_fee` (not signed max)
-  - next batch fee is sampled from `recommended_fees` when rotating to a new batch
+  - inclusion validates `max_fee >= current_frame_fee`
+  - execution charges `current_frame_fee` (not signed max)
+  - next frame fee is sampled from `recommended_fees` when rotating to a new frame
 
 ## Quick Start
 
@@ -93,7 +93,6 @@ Success response:
 ```json
 {
   "ok": true,
-  "tx_hash": "0x...",
   "sender": "0x...",
   "nonce": 0
 }
@@ -126,17 +125,15 @@ Main environment variables:
 
 ## Storage Model (high level)
 
-- `batches`: batch metadata + committed batch fee
+- `batches`: batch metadata
 - `frames`: frame boundaries within each batch
+- `frames.fee`: committed fee for each frame
 - `user_ops`: included user operations
 - `direct_inputs`: direct-input payload stream
-- `frame_drains`: per-frame `drain_n`
-- `recommended_fees`: singleton mutable recommendation for next batch fee
+- `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`)
+- `recommended_fees`: singleton mutable recommendation for next frame fee
 
-Views:
-
-- `ordered_sequenced_l2_txs`: canonical ordered replay stream (`UserOp | DirectInput`)
-- `frame_drain_ranges`, `batch_user_op_counts`, `frame_user_op_counts`
+No SQL views are required in the current prototype schema.
 
 ## Project Layout
 
