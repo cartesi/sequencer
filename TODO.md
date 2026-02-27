@@ -24,7 +24,7 @@ Build a robust sequencer prototype for a future DeFi stack, with deterministic o
 
 ### 2) Canonical App / Scheduler
 
-- Implement scheduler behavior in `canonical-app` using shared `app-core`.
+- Implement scheduler behavior in `examples/canonical-app` using shared `sequencer-core` + `examples/app-core`.
 - Ensure deterministic ordering model compatible with persisted sequencer order.
 - Canonical app is the state-transition artifact used by verification flow (Cartesi Machine / RISC-V path), not by sequencer runtime itself.
 - Add focused tests for queue/drain/backstop behavior and ordering invariants.
@@ -39,16 +39,26 @@ Build a robust sequencer prototype for a future DeFi stack, with deterministic o
 - Measure idle and under-load behavior.
 - Include network-aware runs (client/server on different hosts) like network latency.
 - Note: end-to-end depends on `L2Tx` broadcaster being available.
+- Possible optimization idea (later): adaptive chunk sizing in inclusion lane based on queue pressure and latency budget.
 
 ---
 
 ## Post-MVP (Nice to Have / Dogfooding Artifacts)
 
 - `sdk/ts-client/`: TypeScript client library for browser/server JS callers.
-- `tools/cli/`: Rust CLI for manual tx submission and debugging flows.
+- `sdk/cli/`: Rust CLI for manual tx submission and debugging flows.
 - `examples/web-demo/`: browser demo app consuming `sdk/ts-client`.
 
 Notes:
 
 - These are intentionally outside MVP scope.
 - Still valuable for dogfooding and contributor onboarding.
+
+
+
+
+Dev endpoint for direct inputs?
+
+Endpoints for domain, nonce, fee??
+
+Implement health check?? Ready check??

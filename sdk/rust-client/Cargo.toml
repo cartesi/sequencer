@@ -1,0 +1,17 @@
+[package]
+name = "sequencer-rust-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+authors.workspace = true
+
+[dependencies]
+sequencer-core = { path = "../../sequencer-core" }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1.35", features = ["time", "net", "io-util"] }
+tokio-tungstenite = "0.28"

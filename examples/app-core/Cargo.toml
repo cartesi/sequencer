@@ -1,0 +1,15 @@
+[package]
+name = "app-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+authors.workspace = true
+
+[dependencies]
+sequencer-core = { path = "../../sequencer-core" }
+alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
+ssz = { package = "ethereum_ssz", version = "0.10" }

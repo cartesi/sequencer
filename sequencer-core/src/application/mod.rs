@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 mod method;
-mod wallet;
 
 use crate::l2_tx::ValidUserOp;
 use crate::user_op::UserOp;
@@ -11,7 +10,6 @@ use std::fmt;
 use thiserror::Error;
 
 pub use method::{Deposit, Method, Transfer, Withdrawal};
-pub use wallet::{WalletApp, WalletConfig};
 
 #[derive(Debug, Error)]
 pub enum AppError {

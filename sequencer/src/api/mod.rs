@@ -4,27 +4,34 @@
 mod error;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use axum::Router;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::error_handling::HandleErrorLayer;
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{DefaultBodyLimit, Json, Query, State};
-use axum::response::IntoResponse;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::SendTimeoutError;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tower::limit::ConcurrencyLimitLayer;
+use tower::load_shed::LoadShedLayer;
+use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use alloy_primitives::{Address, Signature};
 use alloy_sol_types::{Eip712Domain, SolStruct};
+use sequencer_core::api::{TxRequest, TxResponse};
+use sequencer_core::user_op::SignedUserOp;
 
 use crate::inclusion_lane::{InclusionLaneInput, PendingUserOp};
 use crate::l2_tx_broadcaster::{BroadcastTxMessage, L2TxBroadcaster};
 use crate::storage::Storage;
-use crate::user_op::{SignedUserOp, UserOp};
 
 pub use error::ApiError;
 
@@ -32,23 +39,10 @@ pub use error::ApiError;
 pub struct AppState {
     pub tx_sender: mpsc::Sender<InclusionLaneInput>,
     pub domain: Eip712Domain,
-    pub queue_timeout: Duration,
+    pub overload_max_inflight_submissions: usize,
+    pub ws_subscriber_limit: Arc<Semaphore>,
+    pub ws_max_catchup_events: u64,
     pub broadcaster: L2TxBroadcaster,
-}
-
-#[derive(Debug, Deserialize)]
-struct TxRequest {
-    message: UserOp,
-    signature: String,
-    sender: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct TxResponse {
-    ok: bool,
-    tx_hash: String,
-    sender: String,
-    nonce: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,10 +51,19 @@ struct SubscribeQuery {
 }
 
 pub fn router(state: Arc<AppState>, max_body_bytes: usize) -> Router {
+    let tx_concurrency_limit = state.overload_max_inflight_submissions;
+    let tx_route = post(submit_tx).layer(
+        ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(handle_tx_route_error))
+            .layer(LoadShedLayer::new())
+            .layer(ConcurrencyLimitLayer::new(tx_concurrency_limit)),
+    );
+
     Router::new()
-        .route("/tx", post(submit_tx))
+        .route("/tx", tx_route)
         .route("/ws/subscribe", get(subscribe_l2_txs))
         .with_state(state)
+        // Enforces a raw request-body cap before JSON deserialization, including whitespace.
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(TraceLayer::new_for_http())
 }
@@ -69,18 +72,26 @@ async fn submit_tx(
     State(state): State<Arc<AppState>>,
     req: Result<Json<TxRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TxResponse>, ApiError> {
-    let Json(req) = req.map_err(|err| ApiError::bad_request(format!("invalid JSON: {err}")))?;
+    let Json(req) = req.map_err(map_json_rejection)?;
 
-    let signature_bytes = decode_hex_0x(&req.signature).map_err(ApiError::bad_request)?;
-    if signature_bytes.len() != 65 {
-        return Err(ApiError::bad_request("signature must be 65 bytes"));
+    if req.signature.len() != TxRequest::SIGNATURE_HEX_LEN {
+        return Err(ApiError::bad_request(format!(
+            "signature must be {} hex chars (0x + 65 bytes)",
+            TxRequest::SIGNATURE_HEX_LEN
+        )));
+    }
+    if req.sender.len() != TxRequest::ADDRESS_HEX_LEN {
+        return Err(ApiError::bad_request(format!(
+            "sender must be {} hex chars (0x + 20 bytes)",
+            TxRequest::ADDRESS_HEX_LEN
+        )));
     }
 
-    let signature = parse_signature(&signature_bytes)?;
     let user_op = req.message;
     let user_op_data_len = user_op.data.len();
     let user_op_size_upper_bound =
         SignedUserOp::batch_bytes_upper_bound_for_data_len(user_op_data_len);
+
     // Keep over-sized payloads out of the hot path so chunk-level batch checks can stay simple.
     if user_op_size_upper_bound > SignedUserOp::max_batch_bytes_upper_bound() {
         return Err(ApiError::bad_request(format!(
@@ -89,18 +100,22 @@ async fn submit_tx(
             user_op_data_len
         )));
     }
+
+    let signature_bytes = decode_hex_0x(&req.signature).map_err(ApiError::bad_request)?;
+    if signature_bytes.len() != 65 {
+        return Err(ApiError::bad_request("signature must be 65 bytes"));
+    }
+    let signature = parse_signature(&signature_bytes)?;
     let nonce = user_op.nonce;
 
-    let tx_hash = user_op.eip712_signing_hash(&state.domain);
+    let signing_hash = user_op.eip712_signing_hash(&state.domain);
     let sender = signature
-        .recover_address_from_prehash(&tx_hash)
+        .recover_address_from_prehash(&signing_hash)
         .map_err(|_| ApiError::invalid_signature("cannot recover sender"))?;
 
-    if let Some(sender_hex) = req.sender.as_deref() {
-        let expected = parse_address(sender_hex).map_err(ApiError::bad_request)?;
-        if expected != sender {
-            return Err(ApiError::invalid_signature("sender mismatch"));
-        }
+    let expected = parse_address(req.sender.as_str()).map_err(ApiError::bad_request)?;
+    if expected != sender {
+        return Err(ApiError::invalid_signature("sender mismatch"));
     }
 
     let signed = SignedUserOp {
@@ -112,23 +127,20 @@ async fn submit_tx(
     let (respond_to, recv) = oneshot::channel();
     let enqueued = PendingUserOp {
         signed,
-        tx_hash,
         respond_to,
         received_at: SystemTime::now(),
     };
 
-    enqueue_tx(&state, enqueued).await?;
+    enqueue_tx(&state, enqueued)?;
 
     let commit_result = recv
         .await
         .map_err(|_| ApiError::internal_error("inclusion lane dropped response"))?;
     commit_result.map_err(ApiError::from)?;
-
-    info!(tx_hash = %encode_hex(&tx_hash), sender = %sender, "tx committed");
+    debug!(sender = %sender, nonce, "tx committed");
 
     Ok(Json(TxResponse {
         ok: true,
-        tx_hash: encode_hex(&tx_hash),
         sender: sender.to_string(),
         nonce,
     }))
@@ -166,21 +178,29 @@ fn parse_signature(bytes: &[u8]) -> Result<Signature, ApiError> {
     })
 }
 
-fn encode_hex(value: &alloy_primitives::B256) -> String {
-    alloy_primitives::hex::encode_prefixed(value.as_slice())
+fn enqueue_tx(state: &AppState, tx: PendingUserOp) -> Result<(), ApiError> {
+    match state.tx_sender.try_send(InclusionLaneInput::UserOp(tx)) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(ApiError::overloaded("queue full")),
+        Err(TrySendError::Closed(_)) => Err(ApiError::internal_error("inclusion lane unavailable")),
+    }
 }
 
-async fn enqueue_tx(state: &AppState, tx: PendingUserOp) -> Result<(), ApiError> {
-    match state
-        .tx_sender
-        .send_timeout(InclusionLaneInput::UserOp(tx), state.queue_timeout)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(SendTimeoutError::Timeout(_)) => Err(ApiError::overloaded("queue full")),
-        Err(SendTimeoutError::Closed(_)) => {
-            Err(ApiError::internal_error("inclusion lane unavailable"))
-        }
+async fn handle_tx_route_error(err: BoxError) -> impl IntoResponse {
+    if err.is::<tower::load_shed::error::Overloaded>() {
+        ApiError::overloaded("tx endpoint overloaded").into_response()
+    } else {
+        warn!(error = %err, "tx endpoint middleware error");
+        ApiError::internal_error("tx endpoint unavailable").into_response()
+    }
+}
+
+// Keep non-413 JSON extractor failures normalized to 400 for a stable API contract.
+fn map_json_rejection(err: axum::extract::rejection::JsonRejection) -> ApiError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::payload_too_large(format!("request body too large: {err}"))
+    } else {
+        ApiError::bad_request(format!("invalid JSON: {err}"))
     }
 }
 
@@ -188,21 +208,53 @@ async fn subscribe_l2_txs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SubscribeQuery>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Response {
     let from_offset = query.from_offset.unwrap_or(0);
+    let permit = match Arc::clone(&state.ws_subscriber_limit).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return ApiError::overloaded("ws subscriber limit reached").into_response(),
+    };
     let broadcaster = state.broadcaster.clone();
-    ws.on_upgrade(move |socket| run_broadcaster_session(broadcaster, socket, from_offset))
+    let ws_max_catchup_events = state.ws_max_catchup_events;
+    ws.on_upgrade(move |socket| {
+        run_broadcaster_session(
+            broadcaster,
+            socket,
+            from_offset,
+            permit,
+            ws_max_catchup_events,
+        )
+    })
+    .into_response()
 }
 
 async fn run_broadcaster_session(
     broadcaster: L2TxBroadcaster,
     mut socket: WebSocket,
     from_offset: u64,
+    _subscriber_permit: OwnedSemaphorePermit,
+    ws_max_catchup_events: u64,
 ) {
     let mut subscription = broadcaster.subscribe();
     let mut next_offset = from_offset;
 
     if next_offset < subscription.live_start_offset {
+        let catchup_events = subscription.live_start_offset - next_offset;
+        if catchup_events > ws_max_catchup_events {
+            warn!(
+                requested_offset = next_offset,
+                live_start_offset = subscription.live_start_offset,
+                max_catchup_events = ws_max_catchup_events,
+                "ws catch-up window exceeded; closing subscriber"
+            );
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: close_code::POLICY,
+                    reason: "catch-up window exceeded".into(),
+                })))
+                .await;
+            return;
+        }
         if send_catch_up(
             &broadcaster,
             &mut socket,
@@ -253,6 +305,37 @@ async fn run_broadcaster_session(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn tx_route_internal_errors_are_sanitized() {
+        let err: BoxError = std::io::Error::other("sensitive middleware detail").into();
+        let response = handle_tx_route_error(err).await.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 response body");
+
+        assert!(
+            body.contains("INTERNAL_ERROR"),
+            "expected internal error code in body: {body}"
+        );
+        assert!(
+            body.contains("tx endpoint unavailable"),
+            "expected sanitized internal message in body: {body}"
+        );
+        assert!(
+            !body.contains("sensitive middleware detail"),
+            "middleware internals leaked in body: {body}"
+        );
     }
 }
 

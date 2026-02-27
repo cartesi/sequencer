@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use crate::application::AppError;
+use sequencer_core::application::AppError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
