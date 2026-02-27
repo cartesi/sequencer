@@ -1254,6 +1254,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2",
+ "signature",
 ]
 
 [[package]]
@@ -1894,6 +1895,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "futures-util",
+ "k256",
  "rusqlite",
  "rusqlite_migration",
  "serde",
