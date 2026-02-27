@@ -29,3 +29,4 @@ ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
 [dev-dependencies]
 futures-util = "0.3"
 tokio-tungstenite = "0.28"
+k256 = "0.13.4"
