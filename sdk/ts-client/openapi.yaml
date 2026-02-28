@@ -1,0 +1,780 @@
+openapi: 3.0.3
+info:
+  title: Cartesi Perp DEX Sequencer API
+  version: 0.1.0
+  description: |
+    HTTP API exposed by the sequencer service.
+
+    Notes:
+    - WebSocket (`exec.input`) events are not covered by this OpenAPI document.
+    - Numeric protocol fields are encoded as decimal strings for bigint safety.
+servers:
+  - url: http://127.0.0.1:18080
+    description: Local default
+tags:
+  - name: Status
+  - name: Grants
+  - name: Envelopes
+  - name: Flush
+  - name: Introspection
+paths:
+  /v0/status:
+    get:
+      tags: [Status]
+      operationId: getStatus
+      summary: Get sequencer status
+      responses:
+        "200":
+          description: Current sequencer status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /v0/snapshot:
+    get:
+      tags: [Status]
+      operationId: getSnapshot
+      summary: Get signing snapshot anchor
+      responses:
+        "200":
+          description: Snapshot used by clients before signing envelopes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /v0/register_grant:
+    post:
+      tags: [Grants]
+      operationId: registerGrant
+      summary: Register owner-signed session grant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterGrantRequest"
+      responses:
+        "200":
+          description: Grant registered (idempotent for same grantId)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterGrantResponse"
+        "400":
+          description: Invalid request body or scope (`INVALID_SCOPE`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Invalid signature (`INVALID_SIGNATURE`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /v0/envelopes:
+    post:
+      tags: [Envelopes]
+      operationId: submitEnvelope
+      summary: Submit signed trading envelope
+      description: Exactly one of `ownerSig` or `sessionSig` must be present.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitEnvelopeRequest"
+      responses:
+        "200":
+          description: Envelope accepted into a batch window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitEnvelopeResponse"
+        "400":
+          description: Invalid request/body/action type/grant format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Invalid envelope signature (`INVALID_SIGNATURE`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Session mode forbidden action or missing scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Unknown `grantId` in session mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Nonce mismatch or `minInputIndexPlusOne` in the future
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Envelope exceeds configured max bytes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /v0/flush:
+    post:
+      tags: [Flush]
+      operationId: flushBatchWindow
+      summary: Flush oldest or selected window to InputBox
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlushRequest"
+      responses:
+        "200":
+          description: Flush result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FlushResponse"
+        "400":
+          description: Invalid `windowId`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /v0/batch/active:
+    get:
+      tags: [Introspection]
+      operationId: getActiveBatchWindow
+      summary: Get active batching window
+      description: |
+        Returns the currently active window that accepts new envelopes.
+        By default, raw bytes and signatures are redacted.
+      parameters:
+        - $ref: "#/components/parameters/IncludeBytesQuery"
+        - $ref: "#/components/parameters/IncludeSigsQuery"
+        - $ref: "#/components/parameters/LimitEnvelopesQuery"
+      responses:
+        "200":
+          description: Active window introspection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WindowIntrospection"
+        "400":
+          description: Invalid query parameter values
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /v0/batch/pending:
+    get:
+      tags: [Introspection]
+      operationId: getPendingBatchWindows
+      summary: Get pending (non-active) windows
+      description: |
+        Returns non-finalized windows excluding the active one, ordered oldest-first by windowId.
+        By default (`includeDetails=false`), returns summary rows only.
+      parameters:
+        - $ref: "#/components/parameters/IncludeDetailsQuery"
+        - $ref: "#/components/parameters/IncludeBytesQuery"
+        - $ref: "#/components/parameters/IncludeSigsQuery"
+        - $ref: "#/components/parameters/LimitEnvelopesQuery"
+      responses:
+        "200":
+          description: Pending windows summary or detailed introspection
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/PendingWindowsSummaryResponse"
+                  - $ref: "#/components/schemas/PendingWindowsDetailResponse"
+        "400":
+          description: Invalid query parameter values
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /v0/batch/{windowId}:
+    get:
+      tags: [Introspection]
+      operationId: getBatchWindowById
+      summary: Get a specific batch window by id
+      parameters:
+        - $ref: "#/components/parameters/WindowIdPath"
+        - $ref: "#/components/parameters/IncludeBytesQuery"
+        - $ref: "#/components/parameters/IncludeSigsQuery"
+        - $ref: "#/components/parameters/LimitEnvelopesQuery"
+      responses:
+        "200":
+          description: Batch window introspection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WindowIntrospection"
+        "400":
+          description: Invalid `windowId` or query parameter values
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Window not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+components:
+  parameters:
+    WindowIdPath:
+      name: windowId
+      in: path
+      required: true
+      description: Window id as a decimal string.
+      schema:
+        $ref: "#/components/schemas/UintString"
+    IncludeBytesQuery:
+      name: includeBytes
+      in: query
+      required: false
+      description: Include raw action/envelope bytes in responses.
+      schema:
+        type: boolean
+        default: false
+    IncludeSigsQuery:
+      name: includeSigs
+      in: query
+      required: false
+      description: Include envelope signatures and grant owner signatures in responses.
+      schema:
+        type: boolean
+        default: false
+    IncludeDetailsQuery:
+      name: includeDetails
+      in: query
+      required: false
+      description: Expand `/v0/batch/pending` from summary rows to full window details.
+      schema:
+        type: boolean
+        default: false
+    LimitEnvelopesQuery:
+      name: limitEnvelopes
+      in: query
+      required: false
+      description: Return only the latest N envelopes for each window.
+      schema:
+        type: integer
+        minimum: 1
+  responses:
+    UpstreamUnavailable:
+      description: Upstream RPC unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    Address:
+      type: string
+      pattern: "^0x[a-fA-F0-9]{40}$"
+      example: "0x1111111111111111111111111111111111111111"
+    Hex:
+      type: string
+      pattern: "^0x[a-fA-F0-9]+$"
+      example: "0xdeadbeef"
+    Hex32:
+      type: string
+      pattern: "^0x[a-fA-F0-9]{64}$"
+      example: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    Signature65:
+      type: string
+      pattern: "^0x[a-fA-F0-9]{130}$"
+      example: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1b"
+    UintString:
+      type: string
+      pattern: "^[0-9]+$"
+      example: "12"
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: string
+    BatchWindowState:
+      type: string
+      enum: [ACTIVE, BUFFERED, POSTED, ACKED, FAILED, EXPIRED]
+    PendingWindowState:
+      type: string
+      enum: [BUFFERED, POSTED, ACKED, FAILED, EXPIRED]
+    IntrospectionLimits:
+      type: object
+      additionalProperties: false
+      required: [maxAgeMs, maxCount, maxBytes]
+      properties:
+        maxAgeMs:
+          type: integer
+          minimum: 0
+        maxCount:
+          type: integer
+          minimum: 0
+        maxBytes:
+          type: integer
+          minimum: 0
+    WindowEnvelopeSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - seq
+        - envelopeHash
+        - owner
+        - authMode
+        - grantId
+        - nonce
+        - minInputIndexPlusOne
+        - validUntilTickId
+        - actionType
+        - actionBytesLen
+      properties:
+        seq:
+          type: integer
+          minimum: 0
+        envelopeHash:
+          $ref: "#/components/schemas/Hex32"
+        owner:
+          $ref: "#/components/schemas/Address"
+        authMode:
+          type: string
+          enum: [OWNER_SIG, SESSION_SIG]
+        grantId:
+          allOf:
+            - $ref: "#/components/schemas/Hex32"
+          nullable: true
+        nonce:
+          $ref: "#/components/schemas/UintString"
+        minInputIndexPlusOne:
+          $ref: "#/components/schemas/UintString"
+        validUntilTickId:
+          $ref: "#/components/schemas/UintString"
+        actionType:
+          type: integer
+          minimum: 0
+          nullable: true
+        actionBytesLen:
+          type: integer
+          minimum: 0
+        actionBytes:
+          $ref: "#/components/schemas/Hex"
+        acceptedEnvelopeBytes:
+          $ref: "#/components/schemas/Hex"
+        signature:
+          $ref: "#/components/schemas/Signature65"
+    WindowGrantFound:
+      type: object
+      additionalProperties: false
+      required: [grantId, owner, sessionKey, validUntilTickId, scopes]
+      properties:
+        grantId:
+          $ref: "#/components/schemas/Hex32"
+        owner:
+          $ref: "#/components/schemas/Address"
+        sessionKey:
+          $ref: "#/components/schemas/Address"
+        validUntilTickId:
+          $ref: "#/components/schemas/UintString"
+        scopes:
+          $ref: "#/components/schemas/UintString"
+        ownerSig:
+          $ref: "#/components/schemas/Signature65"
+    WindowGrantMissing:
+      type: object
+      additionalProperties: false
+      required: [grantId, missing]
+      properties:
+        grantId:
+          $ref: "#/components/schemas/Hex32"
+        missing:
+          type: boolean
+          enum: [true]
+    WindowGrantSummary:
+      oneOf:
+        - $ref: "#/components/schemas/WindowGrantFound"
+        - $ref: "#/components/schemas/WindowGrantMissing"
+    WindowIntrospection:
+      type: object
+      additionalProperties: false
+      required:
+        - windowId
+        - state
+        - openedAtMs
+        - ageMs
+        - limits
+        - count
+        - bytes
+        - grants
+        - envelopes
+      properties:
+        windowId:
+          $ref: "#/components/schemas/UintString"
+        state:
+          $ref: "#/components/schemas/BatchWindowState"
+        openedAtMs:
+          allOf:
+            - $ref: "#/components/schemas/UintString"
+          nullable: true
+        ageMs:
+          allOf:
+            - $ref: "#/components/schemas/UintString"
+          nullable: true
+        limits:
+          $ref: "#/components/schemas/IntrospectionLimits"
+        count:
+          type: integer
+          minimum: 0
+        bytes:
+          type: integer
+          minimum: 0
+        grants:
+          type: array
+          items:
+            $ref: "#/components/schemas/WindowGrantSummary"
+        envelopes:
+          type: array
+          items:
+            $ref: "#/components/schemas/WindowEnvelopeSummary"
+        txHash:
+          allOf:
+            - $ref: "#/components/schemas/Hex32"
+          nullable: true
+        postedAtMs:
+          allOf:
+            - $ref: "#/components/schemas/UintString"
+          nullable: true
+    PendingWindowListItem:
+      type: object
+      additionalProperties: false
+      required: [windowId, state, count, bytes, grantCount]
+      properties:
+        windowId:
+          $ref: "#/components/schemas/UintString"
+        state:
+          $ref: "#/components/schemas/PendingWindowState"
+        count:
+          type: integer
+          minimum: 0
+        bytes:
+          type: integer
+          minimum: 0
+        grantCount:
+          type: integer
+          minimum: 0
+        txHash:
+          $ref: "#/components/schemas/Hex32"
+        postedAtMs:
+          $ref: "#/components/schemas/UintString"
+    PendingWindowsSummaryResponse:
+      type: object
+      additionalProperties: false
+      required: [windows]
+      properties:
+        windows:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingWindowListItem"
+    PendingWindowsDetailResponse:
+      type: object
+      additionalProperties: false
+      required: [windows]
+      properties:
+        windows:
+          type: array
+          items:
+            $ref: "#/components/schemas/WindowIntrospection"
+    PendingWindowSummary:
+      type: object
+      additionalProperties: false
+      required: [windowId, count, totalEnvelopeBytes]
+      properties:
+        windowId:
+          $ref: "#/components/schemas/UintString"
+        count:
+          type: integer
+          minimum: 0
+        totalEnvelopeBytes:
+          type: integer
+          minimum: 0
+    StatusResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - l1Timestamp
+        - windowId
+        - windowEndTs
+        - safeProcessedCount
+        - safeCount
+        - safeHead
+        - emittedNextIndex
+        - readerLag
+        - currentBufferSize
+        - pendingWindowCount
+        - pendingEnvelopeCount
+        - pendingWindows
+        - lifecyclePostedCount
+        - lifecycleFailedCount
+        - lifecycleAckedCount
+      properties:
+        l1Timestamp:
+          $ref: "#/components/schemas/UintString"
+        windowId:
+          $ref: "#/components/schemas/UintString"
+        windowEndTs:
+          $ref: "#/components/schemas/UintString"
+        safeProcessedCount:
+          $ref: "#/components/schemas/UintString"
+        safeCount:
+          $ref: "#/components/schemas/UintString"
+        safeHead:
+          $ref: "#/components/schemas/UintString"
+        emittedNextIndex:
+          $ref: "#/components/schemas/UintString"
+        readerLag:
+          type: string
+          pattern: "^-?[0-9]+$"
+          example: "0"
+        currentBufferSize:
+          type: integer
+          minimum: 0
+        pendingWindowCount:
+          type: integer
+          minimum: 0
+        pendingEnvelopeCount:
+          type: integer
+          minimum: 0
+        pendingWindows:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingWindowSummary"
+        lifecyclePostedCount:
+          type: integer
+          minimum: 0
+        lifecycleFailedCount:
+          type: integer
+          minimum: 0
+        lifecycleAckedCount:
+          type: integer
+          minimum: 0
+    SnapshotResponse:
+      type: object
+      additionalProperties: false
+      required: [chainId, app, minInputIndexPlusOne, windowId, windowEndTs]
+      properties:
+        chainId:
+          type: integer
+          minimum: 0
+        app:
+          $ref: "#/components/schemas/Address"
+        minInputIndexPlusOne:
+          $ref: "#/components/schemas/UintString"
+        windowId:
+          $ref: "#/components/schemas/UintString"
+        windowEndTs:
+          $ref: "#/components/schemas/UintString"
+    SessionKeyGrant:
+      type: object
+      additionalProperties: false
+      required: [owner, sessionKey, validUntilTickId, scopes]
+      properties:
+        owner:
+          $ref: "#/components/schemas/Address"
+        sessionKey:
+          $ref: "#/components/schemas/Address"
+        validUntilTickId:
+          $ref: "#/components/schemas/UintString"
+        scopes:
+          $ref: "#/components/schemas/UintString"
+    RegisterGrantRequest:
+      type: object
+      additionalProperties: false
+      required: [grant, ownerSig]
+      properties:
+        grant:
+          $ref: "#/components/schemas/SessionKeyGrant"
+        ownerSig:
+          $ref: "#/components/schemas/Signature65"
+    RegisterGrantResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, grantId]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        grantId:
+          $ref: "#/components/schemas/Hex32"
+    TradingEnvelopeUnsigned:
+      type: object
+      additionalProperties: false
+      required:
+        - owner
+        - nonce
+        - minInputIndexPlusOne
+        - validUntilTickId
+        - grantId
+        - actionBytes
+      properties:
+        owner:
+          $ref: "#/components/schemas/Address"
+        nonce:
+          $ref: "#/components/schemas/UintString"
+        minInputIndexPlusOne:
+          $ref: "#/components/schemas/UintString"
+        validUntilTickId:
+          $ref: "#/components/schemas/UintString"
+        grantId:
+          $ref: "#/components/schemas/Hex32"
+        actionBytes:
+          $ref: "#/components/schemas/Hex"
+    SubmitEnvelopeRequest:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [envelope, ownerSig]
+          properties:
+            envelope:
+              $ref: "#/components/schemas/TradingEnvelopeUnsigned"
+            ownerSig:
+              $ref: "#/components/schemas/Signature65"
+            sessionSig:
+              nullable: true
+              type: string
+        - type: object
+          additionalProperties: false
+          required: [envelope, sessionSig]
+          properties:
+            envelope:
+              $ref: "#/components/schemas/TradingEnvelopeUnsigned"
+            ownerSig:
+              nullable: true
+              type: string
+            sessionSig:
+              $ref: "#/components/schemas/Signature65"
+    SubmitEnvelopeResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - accepted
+        - windowId
+        - seq
+        - minInputIndexPlusOne
+        - envelopeHash
+        - actionBytes
+        - authMode
+        - signerRecovered
+      properties:
+        accepted:
+          type: boolean
+          enum: [true]
+        windowId:
+          $ref: "#/components/schemas/UintString"
+        seq:
+          type: integer
+          minimum: 0
+        minInputIndexPlusOne:
+          $ref: "#/components/schemas/UintString"
+        envelopeHash:
+          $ref: "#/components/schemas/Hex32"
+        actionBytes:
+          $ref: "#/components/schemas/Hex"
+        authMode:
+          type: string
+          enum: [OWNER_SIG, SESSION_SIG]
+        signerRecovered:
+          $ref: "#/components/schemas/Address"
+        grantId:
+          $ref: "#/components/schemas/Hex32"
+    FlushRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        windowId:
+          $ref: "#/components/schemas/UintString"
+    FlushResponse:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [flushed, windowId, count]
+          properties:
+            flushed:
+              type: boolean
+              enum: [false]
+            windowId:
+              $ref: "#/components/schemas/UintString"
+            count:
+              type: integer
+              minimum: 0
+              example: 0
+        - type: object
+          additionalProperties: false
+          required: [flushed, windowId, count, txHash, status]
+          properties:
+            flushed:
+              type: boolean
+              enum: [true]
+            windowId:
+              $ref: "#/components/schemas/UintString"
+            count:
+              type: integer
+              minimum: 0
+            txHash:
+              $ref: "#/components/schemas/Hex32"
+            status:
+              type: string
+              enum: [POSTED]
+            payloadHash:
+              $ref: "#/components/schemas/Hex32"
