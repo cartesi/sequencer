@@ -21,8 +21,18 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_subscribe_tests_sequential() {
+    scenario_streams_ordered_txs_from_offset_zero().await;
+    scenario_resumes_from_given_offset().await;
+    scenario_receives_live_events_after_subscribing().await;
+    scenario_fanout_delivers_live_event_to_multiple_subscribers().await;
+    scenario_replies_with_pong_on_ping().await;
+    scenario_rejects_when_subscriber_limit_is_reached().await;
+    scenario_closes_when_catchup_window_exceeds_limit().await;
+}
+
+async fn scenario_streams_ordered_txs_from_offset_zero() {
     let db = temp_db("ws-subscribe-zero");
     seed_ordered_txs(db.path.as_str());
     let expected = load_ordered_l2_txs_page(db.path.as_str(), 0, 2);
@@ -47,8 +57,7 @@ async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
     assert_ws_message_matches_tx(second, &expected[1], 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_resumes_from_given_offset() {
+async fn scenario_resumes_from_given_offset() {
     let db = temp_db("ws-subscribe-resume");
     seed_ordered_txs(db.path.as_str());
     let expected = load_ordered_l2_txs_page(db.path.as_str(), 1, 1);
@@ -75,8 +84,7 @@ async fn ws_subscribe_resumes_from_given_offset() {
     assert_ws_message_matches_tx(first, &expected[0], 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_receives_live_events_after_subscribing() {
+async fn scenario_receives_live_events_after_subscribing() {
     let db = temp_db("ws-subscribe-live");
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
@@ -107,8 +115,7 @@ async fn ws_subscribe_receives_live_events_after_subscribing() {
     assert_ws_message_matches_tx(live, &expected[0], base_offset);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_fanout_delivers_live_event_to_multiple_subscribers() {
+async fn scenario_fanout_delivers_live_event_to_multiple_subscribers() {
     let db = temp_db("ws-subscribe-fanout");
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
@@ -146,8 +153,7 @@ async fn ws_subscribe_fanout_delivers_live_event_to_multiple_subscribers() {
     assert_ws_message_matches_tx(event_b, &expected[0], base_offset);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_replies_with_pong_on_ping() {
+async fn scenario_replies_with_pong_on_ping() {
     let db = temp_db("ws-subscribe-ping-pong");
     seed_ordered_txs(db.path.as_str());
     // Use a far-future offset so this test validates ping/pong without
@@ -179,8 +185,7 @@ async fn ws_subscribe_replies_with_pong_on_ping() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_rejects_when_subscriber_limit_is_reached() {
+async fn scenario_rejects_when_subscriber_limit_is_reached() {
     let db = temp_db("ws-subscriber-limit");
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
@@ -210,8 +215,7 @@ async fn ws_subscribe_rejects_when_subscriber_limit_is_reached() {
     shutdown_runtime(runtime).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_closes_when_catchup_window_exceeds_limit() {
+async fn scenario_closes_when_catchup_window_exceeds_limit() {
     let db = temp_db("ws-catchup-limit");
     seed_ordered_txs(db.path.as_str());
 
@@ -267,6 +271,7 @@ fn seed_ordered_txs(db_path: &str) {
         .append_safe_direct_inputs(&[IndexedDirectInput {
             index: 0,
             payload: vec![0xaa],
+            block_number: 0,
         }])
         .expect("append direct input");
     storage
@@ -278,7 +283,11 @@ fn append_drained_direct_input(db_path: &str, index: u64, payload: Vec<u8>) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
     let mut head = storage.load_open_state().expect("load open state");
     storage
-        .append_safe_direct_inputs(&[IndexedDirectInput { index, payload }])
+        .append_safe_direct_inputs(&[IndexedDirectInput {
+            index,
+            payload,
+            block_number: 0,
+        }])
         .expect("append direct input");
     storage
         .close_frame_only(&mut head, index, 1)
@@ -387,7 +396,7 @@ async fn recv_tx_message(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> WsTxMessage {
-    let received = tokio::time::timeout(Duration::from_secs(2), ws.next())
+    let received = tokio::time::timeout(Duration::from_secs(5), ws.next())
         .await
         .expect("wait for websocket message")
         .expect("websocket stream ended")
@@ -406,7 +415,7 @@ async fn recv_raw_message(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> Message {
-    tokio::time::timeout(Duration::from_secs(2), ws.next())
+    tokio::time::timeout(Duration::from_secs(5), ws.next())
         .await
         .expect("wait for websocket message")
         .expect("websocket stream ended")

@@ -13,6 +13,8 @@ pub use db::Storage;
 pub struct IndexedDirectInput {
     pub index: u64,
     pub payload: Vec<u8>,
+    /// Chain block number where this input was included (e.g. InputAdded event block).
+    pub block_number: u64,
 }
 
 #[derive(Debug, Error)]

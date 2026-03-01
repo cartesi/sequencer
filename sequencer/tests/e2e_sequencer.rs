@@ -459,6 +459,9 @@ async fn start_api_only_server(
 
 async fn shutdown_runtime(mut runtime: FullServerRuntime) {
     runtime.broadcaster.request_shutdown();
+    if let Some(stop) = runtime.lane_stop.take() {
+        stop.request_shutdown();
+    }
     if let Some(tx) = runtime.shutdown_tx.take() {
         let _ = tx.send(());
     }
@@ -467,9 +470,6 @@ async fn shutdown_runtime(mut runtime: FullServerRuntime) {
             .await
             .expect("wait for server task")
             .expect("join server task");
-    }
-    if let Some(stop) = runtime.lane_stop.take() {
-        stop.request_shutdown();
     }
     if let Some(task) = runtime.lane_handle.take() {
         let lane_result = tokio::time::timeout(Duration::from_secs(3), task)
