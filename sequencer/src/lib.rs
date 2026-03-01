@@ -7,5 +7,6 @@
 //! The inclusion lane is the single writer that defines execution order.
 pub mod api;
 pub mod inclusion_lane;
+pub mod input_reader;
 pub mod l2_tx_broadcaster;
 pub mod storage;

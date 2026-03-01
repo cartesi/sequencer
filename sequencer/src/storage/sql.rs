@@ -23,13 +23,17 @@ const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_
 const SQL_SELECT_RECOMMENDED_FEE: &str =
     "SELECT fee FROM recommended_fees WHERE singleton_id = 0 LIMIT 1";
 const SQL_INSERT_DIRECT_INPUT: &str =
-    "INSERT INTO direct_inputs (direct_input_index, payload) VALUES (?1, ?2)";
+    "INSERT INTO direct_inputs (direct_input_index, payload, block_number) VALUES (?1, ?2, ?3)";
 const SQL_INSERT_USER_OP: &str = include_str!("queries/insert_user_op.sql");
 const SQL_INSERT_SEQUENCED_USER_OP: &str = include_str!("queries/insert_sequenced_user_op.sql");
 const SQL_INSERT_SEQUENCED_DIRECT_INPUT: &str =
     include_str!("queries/insert_sequenced_direct_input.sql");
 const SQL_UPDATE_RECOMMENDED_FEE: &str =
     "UPDATE recommended_fees SET fee = ?1 WHERE singleton_id = 0";
+const SQL_SELECT_LAST_PROCESSED_BLOCK: &str =
+    "SELECT last_processed_block FROM input_reader_state WHERE singleton_id = 0 LIMIT 1";
+const SQL_UPDATE_LAST_PROCESSED_BLOCK: &str =
+    "UPDATE input_reader_state SET last_processed_block = ?1 WHERE singleton_id = 0";
 
 #[derive(Debug, Clone)]
 pub(super) struct OrderedL2TxRow {
@@ -44,6 +48,7 @@ pub(super) struct OrderedL2TxRow {
 pub(super) struct SafeInputRow {
     pub direct_input_index: i64,
     pub payload: Vec<u8>,
+    pub block_number: i64,
 }
 
 pub(super) fn sql_select_total_drained_direct_inputs(conn: &Connection) -> Result<i64> {
@@ -65,6 +70,14 @@ pub(super) fn sql_select_recommended_fee(conn: &Connection) -> Result<i64> {
 
 pub(super) fn sql_update_recommended_fee(conn: &Connection, fee: i64) -> Result<usize> {
     conn.execute(SQL_UPDATE_RECOMMENDED_FEE, params![fee])
+}
+
+pub(super) fn sql_select_last_processed_block(conn: &Connection) -> Result<i64> {
+    conn.query_row(SQL_SELECT_LAST_PROCESSED_BLOCK, [], |row| row.get(0))
+}
+
+pub(super) fn sql_update_last_processed_block(conn: &Connection, block: i64) -> Result<usize> {
+    conn.execute(SQL_UPDATE_LAST_PROCESSED_BLOCK, params![block])
 }
 
 pub(super) fn sql_select_safe_inputs_range(
@@ -90,7 +103,11 @@ pub(super) fn sql_insert_direct_inputs_batch(
 
     let mut stmt = tx.prepare_cached(SQL_INSERT_DIRECT_INPUT)?;
     for input in direct_inputs {
-        stmt.execute(params![u64_to_i64(input.index), input.payload.as_slice()])?;
+        stmt.execute(params![
+            u64_to_i64(input.index),
+            input.payload.as_slice(),
+            u64_to_i64(input.block_number),
+        ])?;
     }
     Ok(())
 }
@@ -253,6 +270,7 @@ fn convert_row_to_safe_input_row(row: &Row<'_>) -> Result<SafeInputRow> {
     Ok(SafeInputRow {
         direct_input_index: row.get(0)?,
         payload: row.get(1)?,
+        block_number: row.get(2)?,
     })
 }
 
@@ -342,10 +360,16 @@ mod tests {
             None
         );
 
-        conn.execute(SQL_INSERT_DIRECT_INPUT, params![0_i64, vec![0xaa_u8]])
-            .expect("insert direct input 0");
-        conn.execute(SQL_INSERT_DIRECT_INPUT, params![1_i64, vec![0xbb_u8]])
-            .expect("insert direct input 1");
+        conn.execute(
+            SQL_INSERT_DIRECT_INPUT,
+            params![0_i64, vec![0xaa_u8], 0_i64],
+        )
+        .expect("insert direct input 0");
+        conn.execute(
+            SQL_INSERT_DIRECT_INPUT,
+            params![1_i64, vec![0xbb_u8], 0_i64],
+        )
+        .expect("insert direct input 1");
         assert_eq!(
             sql_select_max_direct_input_index(&conn).expect("query max direct input"),
             Some(1)
@@ -375,12 +399,21 @@ mod tests {
     fn safe_inputs_range_is_half_open_and_ordered() {
         let conn = setup_conn();
 
-        conn.execute(SQL_INSERT_DIRECT_INPUT, params![0_i64, vec![0xaa_u8]])
-            .expect("insert direct input 0");
-        conn.execute(SQL_INSERT_DIRECT_INPUT, params![1_i64, vec![0xbb_u8]])
-            .expect("insert direct input 1");
-        conn.execute(SQL_INSERT_DIRECT_INPUT, params![2_i64, vec![0xcc_u8]])
-            .expect("insert direct input 2");
+        conn.execute(
+            SQL_INSERT_DIRECT_INPUT,
+            params![0_i64, vec![0xaa_u8], 0_i64],
+        )
+        .expect("insert direct input 0");
+        conn.execute(
+            SQL_INSERT_DIRECT_INPUT,
+            params![1_i64, vec![0xbb_u8], 0_i64],
+        )
+        .expect("insert direct input 1");
+        conn.execute(
+            SQL_INSERT_DIRECT_INPUT,
+            params![2_i64, vec![0xcc_u8], 0_i64],
+        )
+        .expect("insert direct input 2");
 
         let empty = sql_select_safe_inputs_range(&conn, 1, 1).expect("query empty interval");
         assert!(empty.is_empty());
@@ -410,8 +443,11 @@ mod tests {
             ],
         )
         .expect("insert user op");
-        conn.execute(SQL_INSERT_DIRECT_INPUT, params![0_i64, vec![0xaa_u8]])
-            .expect("insert direct input");
+        conn.execute(
+            SQL_INSERT_DIRECT_INPUT,
+            params![0_i64, vec![0xaa_u8], 0_i64],
+        )
+        .expect("insert direct input");
         conn.execute(SQL_INSERT_SEQUENCED_USER_OP, params![0_i64, 0_i64, 0_i64])
             .expect("insert sequenced user op");
         conn.execute(
@@ -496,10 +532,12 @@ mod tests {
             IndexedDirectInput {
                 index: 0,
                 payload: vec![0xaa_u8],
+                block_number: 0,
             },
             IndexedDirectInput {
                 index: 1,
                 payload: vec![0xbb_u8],
+                block_number: 0,
             },
         ];
         sql_insert_direct_inputs_batch(&tx, direct_inputs.as_slice())

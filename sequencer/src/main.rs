@@ -18,6 +18,7 @@ use sequencer::api::AppState;
 use sequencer::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, InclusionLaneError, InclusionLaneInput,
 };
+use sequencer::input_reader::{InputReader, InputReaderConfig};
 use sequencer::l2_tx_broadcaster::{L2TxBroadcaster, L2TxBroadcasterConfig};
 use sequencer::storage;
 
@@ -30,6 +31,7 @@ const DEFAULT_MAX_BATCH_OPEN_DURATION: Duration = Duration::from_secs(2 * 60 * 6
 const DEFAULT_MAX_BATCH_USER_OP_BYTES: usize = 1_048_576; // 1 MiB
 const DEFAULT_INCLUSION_LANE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const DEFAULT_BROADCASTER_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const DEFAULT_INPUT_READER_POLL_INTERVAL: Duration = Duration::from_secs(12);
 const DEFAULT_BROADCASTER_PAGE_SIZE: usize = 256;
 const DEFAULT_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY: usize = 32_768;
 const DEFAULT_WS_MAX_SUBSCRIBERS: usize = 64;
@@ -42,6 +44,8 @@ const DEFAULT_DOMAIN_NAME: &str = "CartesiAppSequencer";
 const DEFAULT_DOMAIN_VERSION: &str = "1";
 const DEFAULT_DOMAIN_CHAIN_ID: u64 = 1;
 const DEFAULT_DOMAIN_VERIFYING_CONTRACT: &str = "0x0000000000000000000000000000000000000000";
+/// Default RPC URL for the input reader (Anvil's default HTTP endpoint).
+const DEFAULT_INPUT_READER_RPC_URL: &str = "http://127.0.0.1:8545";
 
 fn default_overload_max_inflight_submissions(queue_capacity: usize) -> usize {
     queue_capacity
@@ -74,6 +78,14 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut storage = storage::Storage::open(&config.db_path, config.sqlite_synchronous.pragma())?;
     force_zero_frame_fee_for_now(&mut storage)?;
     let (tx, rx) = tokio::sync::mpsc::channel::<InclusionLaneInput>(config.queue_capacity);
+
+    let storage_ir = storage::Storage::open(&config.db_path, config.sqlite_synchronous.pragma())?;
+    let reader = InputReader::new(config.input_reader.clone(), storage_ir);
+    let (mut reader_handle, reader_stop) = reader.spawn();
+    tracing::info!(
+        "input reader started (reference: {})",
+        config.input_reader.rpc_url
+    );
 
     let inclusion_lane = InclusionLane::new(
         rx,
@@ -120,6 +132,7 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         server_result = axum::serve(listener, app) => {
             broadcaster_shutdown.request_shutdown();
             inclusion_lane_stop.request_shutdown();
+            reader_stop.request_shutdown();
             let lane_result = inclusion_lane_handle.await;
             match lane_result {
                 Ok(InclusionLaneError::ShutdownRequested) => {}
@@ -128,15 +141,31 @@ async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                     return Err(format!("inclusion lane join error during shutdown: {join_err}").into())
                 }
             }
+            let reader_result = reader_handle.await;
+            match reader_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(format!("input reader exited during shutdown: {e}").into()),
+                Err(join_err) => return Err(format!("input reader join error during shutdown: {join_err}").into()),
+            }
             server_result?;
         }
         lane_result = &mut inclusion_lane_handle => {
             broadcaster_shutdown.request_shutdown();
+            reader_stop.request_shutdown();
             match lane_result {
                 Ok(err) => return Err(format!("inclusion lane exited: {err}").into()),
                 Err(join_err) => {
                     return Err(format!("inclusion lane join error: {join_err}").into())
                 }
+            }
+        }
+        reader_result = &mut reader_handle => {
+            broadcaster_shutdown.request_shutdown();
+            inclusion_lane_stop.request_shutdown();
+            match reader_result {
+                Ok(Ok(())) => return Err("input reader exited unexpectedly".into()),
+                Ok(Err(e)) => return Err(format!("input reader exited: {e}").into()),
+                Err(join_err) => return Err(format!("input reader join error: {join_err}").into()),
             }
         }
     }
@@ -195,6 +224,8 @@ struct Config {
     domain_version: String,
     domain_chain_id: u64,
     domain_verifying_contract: String,
+    /// InputReader config (required). Feeds safe inputs from a reference node into storage.
+    input_reader: InputReaderConfig,
 }
 
 #[derive(Debug, Parser)]
@@ -309,6 +340,25 @@ struct RunArgs {
     domain_chain_id: Option<u64>,
     #[arg(long, env = "SEQ_DOMAIN_VERIFYING_CONTRACT")]
     domain_verifying_contract: Option<String>,
+    #[arg(
+        long,
+        env = "SEQ_INPUT_READER_RPC_URL",
+        help = "Ethereum RPC URL for input reader (default: Anvil endpoint)"
+    )]
+    input_reader_rpc_url: Option<String>,
+    #[arg(long, env = "SEQ_INPUT_READER_INPUT_BOX_ADDRESS", required = true)]
+    input_reader_input_box_address: String,
+    #[arg(long, env = "SEQ_INPUT_READER_APP_ADDRESS", required = true)]
+    input_reader_app_address: String,
+    #[arg(long, env = "SEQ_INPUT_READER_GENESIS_BLOCK")]
+    input_reader_genesis_block: Option<u64>,
+    #[arg(
+        long,
+        env = "SEQ_INPUT_READER_POLL_INTERVAL_MS",
+        value_name = "DURATION",
+        value_parser = parse_duration_ms_or_unit
+    )]
+    input_reader_poll_interval: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
@@ -351,6 +401,7 @@ struct ProfileDefaults {
     max_batch_user_op_bytes: usize,
     inclusion_lane_idle_poll_interval: Duration,
     broadcaster_idle_poll_interval: Duration,
+    input_reader_poll_interval: Duration,
     broadcaster_page_size: usize,
     broadcaster_subscriber_buffer_capacity: usize,
     ws_max_subscribers: usize,
@@ -372,6 +423,7 @@ impl Profile {
                 max_batch_user_op_bytes: DEFAULT_MAX_BATCH_USER_OP_BYTES,
                 inclusion_lane_idle_poll_interval: DEFAULT_INCLUSION_LANE_IDLE_POLL_INTERVAL,
                 broadcaster_idle_poll_interval: DEFAULT_BROADCASTER_IDLE_POLL_INTERVAL,
+                input_reader_poll_interval: DEFAULT_INPUT_READER_POLL_INTERVAL,
                 broadcaster_page_size: DEFAULT_BROADCASTER_PAGE_SIZE,
                 broadcaster_subscriber_buffer_capacity:
                     DEFAULT_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY,
@@ -390,6 +442,7 @@ impl Profile {
                 max_batch_user_op_bytes: 1_572_864, // 1.5 MiB
                 inclusion_lane_idle_poll_interval: Duration::from_millis(1),
                 broadcaster_idle_poll_interval: Duration::from_millis(5),
+                input_reader_poll_interval: DEFAULT_INPUT_READER_POLL_INTERVAL,
                 broadcaster_page_size: 1_024,
                 broadcaster_subscriber_buffer_capacity: 131_072,
                 ws_max_subscribers: DEFAULT_WS_MAX_SUBSCRIBERS,
@@ -407,6 +460,7 @@ impl Profile {
                 max_batch_user_op_bytes: DEFAULT_MAX_BATCH_USER_OP_BYTES,
                 inclusion_lane_idle_poll_interval: Duration::from_millis(5),
                 broadcaster_idle_poll_interval: Duration::from_millis(25),
+                input_reader_poll_interval: DEFAULT_INPUT_READER_POLL_INTERVAL,
                 broadcaster_page_size: DEFAULT_BROADCASTER_PAGE_SIZE,
                 broadcaster_subscriber_buffer_capacity:
                     DEFAULT_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY,
@@ -433,8 +487,14 @@ impl Config {
             profile: args.profile,
             http_addr: args
                 .http_addr
-                .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string()),
-            db_path: args.db_path.unwrap_or_else(|| DEFAULT_DB_PATH.to_string()),
+                .as_deref()
+                .unwrap_or(DEFAULT_HTTP_ADDR)
+                .to_string(),
+            db_path: args
+                .db_path
+                .as_deref()
+                .unwrap_or(DEFAULT_DB_PATH)
+                .to_string(),
             queue_capacity,
             overload_max_inflight_submissions,
             max_user_ops_per_chunk: args
@@ -480,14 +540,25 @@ impl Config {
                 .unwrap_or(defaults.sqlite_synchronous),
             domain_name: args
                 .domain_name
-                .unwrap_or_else(|| DEFAULT_DOMAIN_NAME.to_string()),
+                .as_deref()
+                .unwrap_or(DEFAULT_DOMAIN_NAME)
+                .to_string(),
             domain_version: args
                 .domain_version
-                .unwrap_or_else(|| DEFAULT_DOMAIN_VERSION.to_string()),
+                .as_deref()
+                .unwrap_or(DEFAULT_DOMAIN_VERSION)
+                .to_string(),
             domain_chain_id: args.domain_chain_id.unwrap_or(DEFAULT_DOMAIN_CHAIN_ID),
             domain_verifying_contract: args
                 .domain_verifying_contract
-                .unwrap_or_else(|| DEFAULT_DOMAIN_VERIFYING_CONTRACT.to_string()),
+                .as_deref()
+                .unwrap_or(DEFAULT_DOMAIN_VERIFYING_CONTRACT)
+                .to_string(),
+            input_reader: input_reader_config_from_run_args(
+                &args,
+                args.input_reader_poll_interval
+                    .unwrap_or(defaults.input_reader_poll_interval),
+            )?,
         };
         config.validate()?;
         Ok(config)
@@ -529,6 +600,9 @@ impl Config {
         }
         if self.broadcaster_idle_poll_interval.is_zero() {
             return Err("broadcaster_idle_poll_interval must be > 0".to_string());
+        }
+        if self.input_reader.poll_interval.is_zero() {
+            return Err("input_reader_poll_interval must be > 0".to_string());
         }
         if self.broadcaster_page_size == 0 {
             return Err("broadcaster_page_size must be > 0".to_string());
@@ -645,14 +719,35 @@ impl From<Duration> for DurationValue {
 
 fn parse_address(value: &str) -> Result<Address, String> {
     if !value.starts_with("0x") {
-        return Err("verifying contract must be 0x-prefixed".to_string());
+        return Err("address must be 0x-prefixed hex".to_string());
     }
-    let bytes = alloy_primitives::hex::decode(value)
-        .map_err(|err| format!("invalid verifying contract hex: {err}"))?;
+    let bytes =
+        alloy_primitives::hex::decode(value).map_err(|e| format!("invalid address hex: {e}"))?;
     if bytes.len() != 20 {
-        return Err("verifying contract must be 20 bytes".to_string());
+        return Err("address must be 20 bytes".to_string());
     }
     Ok(Address::from_slice(&bytes))
+}
+
+fn input_reader_config_from_run_args(
+    args: &RunArgs,
+    poll_interval: Duration,
+) -> Result<InputReaderConfig, String> {
+    let input_box_address = parse_address(&args.input_reader_input_box_address)?;
+    let app_address_filter = parse_address(&args.input_reader_app_address)?;
+    let genesis_block = args.input_reader_genesis_block.unwrap_or(0);
+    Ok(InputReaderConfig {
+        rpc_url: args
+            .input_reader_rpc_url
+            .as_deref()
+            .unwrap_or(DEFAULT_INPUT_READER_RPC_URL)
+            .to_string(),
+        input_box_address,
+        app_address_filter,
+        genesis_block,
+        poll_interval,
+        long_block_range_error_codes: vec!["rate limit".into(), "too many".into()],
+    })
 }
 
 fn parse_duration_ms_or_unit(raw: &str) -> Result<Duration, String> {

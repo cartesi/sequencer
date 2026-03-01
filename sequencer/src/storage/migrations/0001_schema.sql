@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS user_ops (
 
 CREATE TABLE IF NOT EXISTS direct_inputs (
     direct_input_index INTEGER PRIMARY KEY,
-    payload            BLOB NOT NULL
+    payload            BLOB NOT NULL,
+    -- Block number of the chain block where this direct input was included (e.g. InputAdded event block).
+    block_number       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sequenced_l2_txs (
@@ -72,7 +74,16 @@ CREATE TABLE IF NOT EXISTS recommended_fees (
     fee          INTEGER NOT NULL CHECK (fee >= 0)
 );
 
+-- Input reader: chain sync cursor (last safe block from which direct inputs have been read).
+CREATE TABLE IF NOT EXISTS input_reader_state (
+    singleton_id         INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    last_processed_block INTEGER NOT NULL CHECK (last_processed_block >= 0)
+);
+
 INSERT OR IGNORE INTO recommended_fees (singleton_id, fee)
+VALUES (0, 0);
+
+INSERT OR IGNORE INTO input_reader_state (singleton_id, last_processed_block)
 VALUES (0, 0);
 
 INSERT OR IGNORE INTO batches (batch_index, created_at_ms)

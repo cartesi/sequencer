@@ -8,11 +8,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_direct_inputs_batch, sql_insert_open_batch,
     sql_insert_open_frame, sql_insert_sequenced_direct_inputs_for_frame,
-    sql_insert_user_ops_and_sequenced_batch, sql_select_latest_batch_with_user_op_count,
-    sql_select_latest_frame_in_batch_for_batch, sql_select_max_direct_input_index,
-    sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_from_offset,
-    sql_select_ordered_l2_txs_page_from_offset, sql_select_recommended_fee,
-    sql_select_safe_inputs_range, sql_select_total_drained_direct_inputs,
+    sql_insert_user_ops_and_sequenced_batch, sql_select_last_processed_block,
+    sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
+    sql_select_max_direct_input_index, sql_select_ordered_l2_tx_count,
+    sql_select_ordered_l2_txs_from_offset, sql_select_ordered_l2_txs_page_from_offset,
+    sql_select_recommended_fee, sql_select_safe_inputs_range,
+    sql_select_total_drained_direct_inputs, sql_update_last_processed_block,
     sql_update_recommended_fee,
 };
 use super::{IndexedDirectInput, StorageOpenError, WriteHead};
@@ -86,6 +87,21 @@ impl Storage {
         Ok(i64_to_u64(value))
     }
 
+    /// Last block number from which safe (direct) inputs have been read. Used by InputReader to resume chain sync.
+    pub fn input_reader_last_processed_block(&mut self) -> Result<u64> {
+        let value = sql_select_last_processed_block(&self.conn)?;
+        Ok(i64_to_u64(value))
+    }
+
+    /// Set the last block number processed by the InputReader. Callers must pass a block greater than the current value.
+    pub fn input_reader_set_last_processed_block(&mut self, block: u64) -> Result<()> {
+        let changed = sql_update_last_processed_block(&self.conn, u64_to_i64(block))?;
+        if changed != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed));
+        }
+        Ok(())
+    }
+
     pub fn safe_input_end_exclusive(&mut self) -> Result<u64> {
         let value = sql_select_max_direct_input_index(&self.conn)?;
         Ok(match value {
@@ -128,6 +144,7 @@ impl Storage {
             out.push(IndexedDirectInput {
                 index,
                 payload: row.payload,
+                block_number: i64_to_u64(row.block_number),
             });
             fetched_count = fetched_count.saturating_add(1);
         }
@@ -160,6 +177,38 @@ impl Storage {
         }
 
         sql_insert_direct_inputs_batch(&tx, inputs)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Appends safe direct inputs and advances the input-reader cursor in a single transaction.
+    /// Use this when persisting inputs from the chain so cursor and inputs stay in sync on failure.
+    pub fn append_safe_inputs_and_advance_cursor(
+        &mut self,
+        inputs: &[IndexedDirectInput],
+        new_last_processed_block: u64,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if !inputs.is_empty() {
+            let mut next_expected = query_latest_direct_input_index_exclusive(&tx)?;
+            for input in inputs {
+                assert_eq!(
+                    input.index, next_expected,
+                    "direct input index must be contiguous from storage head"
+                );
+                next_expected = next_expected.saturating_add(1);
+            }
+            sql_insert_direct_inputs_batch(&tx, inputs)?;
+        }
+
+        let changed = sql_update_last_processed_block(&tx, u64_to_i64(new_last_processed_block))?;
+        if changed != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed));
+        }
 
         tx.commit()?;
         Ok(())
@@ -526,6 +575,23 @@ mod tests {
     }
 
     #[test]
+    fn input_reader_last_processed_block_defaults_and_advances() {
+        let db = temp_db("input-reader-state");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        assert_eq!(
+            storage.input_reader_last_processed_block().expect("read"),
+            0
+        );
+        storage
+            .input_reader_set_last_processed_block(100)
+            .expect("set");
+        assert_eq!(
+            storage.input_reader_last_processed_block().expect("read"),
+            100
+        );
+    }
+
+    #[test]
     fn next_frame_fee_comes_from_recommended_fee_singleton() {
         let db = temp_db("recommended-fee");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
@@ -552,10 +618,12 @@ mod tests {
             IndexedDirectInput {
                 index: 0,
                 payload: vec![0xaa],
+                block_number: 0,
             },
             IndexedDirectInput {
                 index: 1,
                 payload: vec![0xbb],
+                block_number: 0,
             },
         ];
         storage
@@ -594,10 +662,12 @@ mod tests {
             IndexedDirectInput {
                 index: 0,
                 payload: vec![0x01],
+                block_number: 0,
             },
             IndexedDirectInput {
                 index: 1,
                 payload: vec![0x02],
+                block_number: 0,
             },
         ];
         storage
@@ -632,10 +702,12 @@ mod tests {
             IndexedDirectInput {
                 index: 0,
                 payload: vec![0xa0],
+                block_number: 0,
             },
             IndexedDirectInput {
                 index: 1,
                 payload: vec![0xb1],
+                block_number: 0,
             },
         ];
         storage
