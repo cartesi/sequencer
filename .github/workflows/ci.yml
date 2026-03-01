@@ -20,6 +20,11 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.3
+
       - name: Check
         run: cargo check --workspace --all-targets --locked
 

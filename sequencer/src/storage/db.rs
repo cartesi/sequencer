@@ -8,10 +8,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_direct_inputs_batch, sql_insert_frame_drain,
     sql_insert_open_batch, sql_insert_open_frame, sql_insert_user_ops_batch,
-    sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
-    sql_select_max_direct_input_index, sql_select_ordered_l2_txs_from_offset,
-    sql_select_recommended_fee, sql_select_safe_inputs_range,
-    sql_select_total_drained_direct_inputs, sql_update_recommended_fee,
+    sql_select_last_processed_block, sql_select_latest_batch_with_user_op_count,
+    sql_select_latest_frame_in_batch_for_batch, sql_select_max_direct_input_index,
+    sql_select_ordered_l2_txs_from_offset, sql_select_recommended_fee,
+    sql_select_safe_inputs_range, sql_select_total_drained_direct_inputs,
+    sql_update_last_processed_block, sql_update_recommended_fee,
 };
 use super::{IndexedDirectInput, StorageOpenError, WriteHead};
 use crate::inclusion_lane::PendingUserOp;
@@ -20,6 +21,10 @@ use alloy_primitives::Address;
 
 const MIGRATION_0001_SCHEMA: &str = include_str!("migrations/0001_schema.sql");
 const MIGRATION_0002_VIEWS: &str = include_str!("migrations/0002_views.sql");
+const MIGRATION_0003_INPUT_READER_STATE: &str =
+    include_str!("migrations/0003_input_reader_state.sql");
+const MIGRATION_0004_DIRECT_INPUTS_BLOCK_NUMBER: &str =
+    include_str!("migrations/0004_direct_inputs_block_number.sql");
 
 pub struct Storage {
     conn: Connection,
@@ -53,14 +58,34 @@ impl Storage {
     }
 
     pub fn run_migrations(conn: &mut Connection) -> std::result::Result<(), StorageOpenError> {
-        Migrations::from_slice(&[M::up(MIGRATION_0001_SCHEMA), M::up(MIGRATION_0002_VIEWS)])
-            .to_latest(conn)?;
+        Migrations::from_slice(&[
+            M::up(MIGRATION_0001_SCHEMA),
+            M::up(MIGRATION_0002_VIEWS),
+            M::up(MIGRATION_0003_INPUT_READER_STATE),
+            M::up(MIGRATION_0004_DIRECT_INPUTS_BLOCK_NUMBER),
+        ])
+        .to_latest(conn)?;
         Ok(())
     }
 
     pub fn load_next_undrained_direct_input_index(&mut self) -> Result<u64> {
         let value = sql_select_total_drained_direct_inputs(&self.conn)?;
         Ok(i64_to_u64(value))
+    }
+
+    /// Last block number from which safe (direct) inputs have been read. Used by InputReader to resume chain sync.
+    pub fn input_reader_last_processed_block(&mut self) -> Result<u64> {
+        let value = sql_select_last_processed_block(&self.conn)?;
+        Ok(i64_to_u64(value))
+    }
+
+    /// Set the last block number processed by the InputReader. Callers must pass a block greater than the current value.
+    pub fn input_reader_set_last_processed_block(&mut self, block: u64) -> Result<()> {
+        let changed = sql_update_last_processed_block(&self.conn, u64_to_i64(block))?;
+        if changed != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed));
+        }
+        Ok(())
     }
 
     pub fn safe_input_end_exclusive(&mut self) -> Result<u64> {
@@ -105,6 +130,7 @@ impl Storage {
             out.push(IndexedDirectInput {
                 index,
                 payload: row.payload,
+                block_number: i64_to_u64(row.block_number),
             });
             fetched_count = fetched_count.saturating_add(1);
         }
@@ -458,6 +484,23 @@ mod tests {
     }
 
     #[test]
+    fn input_reader_last_processed_block_defaults_and_advances() {
+        let db_path = temp_db_path("input-reader-state");
+        let mut storage = Storage::open(&db_path, "NORMAL").expect("open storage");
+        assert_eq!(
+            storage.input_reader_last_processed_block().expect("read"),
+            0
+        );
+        storage
+            .input_reader_set_last_processed_block(100)
+            .expect("set");
+        assert_eq!(
+            storage.input_reader_last_processed_block().expect("read"),
+            100
+        );
+    }
+
+    #[test]
     fn next_batch_fee_comes_from_recommended_fee_singleton() {
         let db_path = temp_db_path("recommended-fee");
         let mut storage = Storage::open(&db_path, "NORMAL").expect("open storage");
@@ -484,10 +527,12 @@ mod tests {
             IndexedDirectInput {
                 index: 0,
                 payload: vec![0xaa],
+                block_number: 0,
             },
             IndexedDirectInput {
                 index: 1,
                 payload: vec![0xbb],
+                block_number: 0,
             },
         ];
         storage
@@ -526,10 +571,12 @@ mod tests {
             IndexedDirectInput {
                 index: 0,
                 payload: vec![0x01],
+                block_number: 0,
             },
             IndexedDirectInput {
                 index: 1,
                 payload: vec![0x02],
+                block_number: 0,
             },
         ];
         storage
@@ -564,10 +611,12 @@ mod tests {
             IndexedDirectInput {
                 index: 0,
                 payload: vec![0xa0],
+                block_number: 0,
             },
             IndexedDirectInput {
                 index: 1,
                 payload: vec![0xb1],
+                block_number: 0,
             },
         ];
         storage

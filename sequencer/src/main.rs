@@ -13,6 +13,7 @@ use sequencer::application::{WalletApp, WalletConfig};
 use sequencer::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, InclusionLaneError, InclusionLaneInput,
 };
+use sequencer::input_reader::{InputReader, InputReaderConfig};
 use sequencer::storage;
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
@@ -39,11 +40,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     let domain = config.build_domain()?;
 
     let storage = storage::Storage::open(&config.db_path, &config.sqlite_synchronous)?;
     let (tx, rx) = tokio::sync::mpsc::channel::<InclusionLaneInput>(config.queue_capacity);
+
+    let storage_ir = storage::Storage::open(&config.db_path, &config.sqlite_synchronous)?;
+    let reader = InputReader::new(config.input_reader.clone(), storage_ir);
+    reader
+        .run_blocking()
+        .map_err(|e| format!("input reader: {e}"))?;
+    tracing::info!(
+        "input reader started (reference: {})",
+        config.input_reader.rpc_url
+    );
 
     let inclusion_lane = InclusionLane::new(
         rx,
@@ -111,11 +122,13 @@ struct Config {
     domain_version: String,
     domain_chain_id: u64,
     domain_verifying_contract: String,
+    /// InputReader config (required). Feeds safe inputs from a reference node into storage.
+    input_reader: InputReaderConfig,
 }
 
 impl Config {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
             http_addr: env_string("SEQ_HTTP_ADDR", DEFAULT_HTTP_ADDR),
             db_path: env_string("SEQ_DB_PATH", DEFAULT_DB_PATH),
             queue_capacity: env_usize("SEQ_QUEUE_CAP", DEFAULT_QUEUE_CAP).max(1),
@@ -164,7 +177,36 @@ impl Config {
                 "SEQ_DOMAIN_VERIFYING_CONTRACT",
                 DEFAULT_DOMAIN_VERIFYING_CONTRACT,
             ),
-        }
+            input_reader: Config::input_reader_from_env()?,
+        })
+    }
+
+    /// Build input reader config from env. All three vars are required: RPC URL, input box address, app address.
+    fn input_reader_from_env() -> Result<InputReaderConfig, String> {
+        let rpc_url = std::env::var("SEQ_INPUT_READER_RPC_URL")
+            .map_err(|_| "SEQ_INPUT_READER_RPC_URL is required".to_string())?;
+        let input_box_str = std::env::var("SEQ_INPUT_READER_INPUT_BOX_ADDRESS")
+            .map_err(|_| "SEQ_INPUT_READER_INPUT_BOX_ADDRESS is required".to_string())?;
+        let app_str = std::env::var("SEQ_INPUT_READER_APP_ADDRESS")
+            .map_err(|_| "SEQ_INPUT_READER_APP_ADDRESS is required".to_string())?;
+        let input_box_address = parse_address(&input_box_str)?;
+        let app_address_filter = parse_address(&app_str)?;
+        let genesis_block = std::env::var("SEQ_INPUT_READER_GENESIS_BLOCK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let poll_interval_ms = std::env::var("SEQ_INPUT_READER_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
+        Ok(InputReaderConfig {
+            rpc_url,
+            input_box_address,
+            app_address_filter,
+            genesis_block,
+            poll_interval: Duration::from_millis(poll_interval_ms),
+            long_block_range_error_codes: vec!["rate limit".into(), "too many".into()],
+        })
     }
 
     fn build_domain(&self) -> Result<Eip712Domain, String> {
@@ -199,12 +241,12 @@ fn env_u64(key: &str, default: u64) -> u64 {
 
 fn parse_address(value: &str) -> Result<Address, String> {
     if !value.starts_with("0x") {
-        return Err("verifying contract must be 0x-prefixed".to_string());
+        return Err("address must be 0x-prefixed hex".to_string());
     }
-    let bytes = alloy_primitives::hex::decode(value)
-        .map_err(|err| format!("invalid verifying contract hex: {err}"))?;
+    let bytes =
+        alloy_primitives::hex::decode(value).map_err(|e| format!("invalid address hex: {e}"))?;
     if bytes.len() != 20 {
-        return Err("verifying contract must be 20 bytes".to_string());
+        return Err("address must be 20 bytes".to_string());
     }
     Ok(Address::from_slice(&bytes))
 }

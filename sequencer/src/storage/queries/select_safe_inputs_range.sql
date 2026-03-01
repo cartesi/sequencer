@@ -1,4 +1,4 @@
-SELECT direct_input_index, payload
+SELECT direct_input_index, payload, block_number
 FROM direct_inputs
 WHERE direct_input_index >= ?1 AND direct_input_index < ?2
 ORDER BY direct_input_index ASC
