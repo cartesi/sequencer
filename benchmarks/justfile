@@ -1,0 +1,55 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set working-directory := ".."
+
+default:
+    @just --justfile benchmarks/justfile --list
+
+bench-unit count="10000" max_fee="0":
+    cargo run -p benchmarks --bin unit_hot_path --release -- --count {{count}} --max-fee {{max_fee}}
+
+bench-ack count="200" url="http://127.0.0.1:3000" max_fee="0" concurrency="1" extra="":
+    cargo run -p benchmarks --bin ack_latency --release -- --endpoint {{url}} --count {{count}} --max-fee {{max_fee}} --concurrency {{concurrency}} {{extra}}
+
+bench-ack-self count="200" max_fee="0" concurrency="1" extra="":
+    cargo build -p sequencer --release
+    cargo run -p benchmarks --bin ack_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --concurrency {{concurrency}} {{extra}}
+
+bench-e2e count="100" url="http://127.0.0.1:3000" max_fee="0" from_offset="0" concurrency="1" extra="":
+    cargo run -p benchmarks --bin e2e_latency --release -- --endpoint {{url}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} {{extra}}
+
+bench-e2e-self count="100" max_fee="0" from_offset="0" concurrency="1" extra="":
+    cargo build -p sequencer --release
+    cargo run -p benchmarks --bin e2e_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} {{extra}}
+
+bench-hammer count="20000" url="http://127.0.0.1:3000" max_fee="0" concurrency="10" from_offset="0" workload="funded-transfer" extra="":
+    cargo run -p benchmarks --bin e2e_latency --release -- --endpoint {{url}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload {{workload}} {{extra}}
+
+bench-hammer-self count="20000" max_fee="0" concurrency="10" from_offset="0" workload="funded-transfer" out="benchmarks/results/hammer-self-latest.json" extra="":
+    cargo build -p sequencer --release
+    cargo run -p benchmarks --bin e2e_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload {{workload}} --json-out {{out}} {{extra}}
+
+bench-sweep mode="e2e" count="1000" url="http://127.0.0.1:3000" max_fee="0" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="":
+    cargo run -p benchmarks --bin sweep --release -- --mode {{mode}} --count {{count}} --endpoint {{url}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency-list "{{conc_list}}" {{extra}}
+
+bench-sweep-self mode="e2e" count="1000" max_fee="0" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="":
+    cargo build -p sequencer --release
+    cargo run -p benchmarks --bin sweep --release -- --self-contained --mode {{mode}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency-list "{{conc_list}}" {{extra}}
+
+bench-soak-low-lat-self count="20000" max_fee="0" out="benchmarks/results/soak-low-lat-self.json" extra="":
+    just --justfile benchmarks/justfile bench-hammer-self {{count}} {{max_fee}} 10 0 funded-transfer {{out}} '{{extra}}'
+
+bench-soak-high-throughput-self count="20000" max_fee="0" out="benchmarks/results/soak-high-throughput-self.json" extra="":
+    cargo build -p sequencer --release
+    cargo run -p benchmarks --bin e2e_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset 0 --concurrency 96 --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload synthetic --json-out {{out}} {{extra}}
+
+bench-capacity-sweep-self count="1000" max_fee="0" from_offset="0" conc_range="32:512:32" out="benchmarks/results/capacity-sweep-self.json" extra="":
+    cargo build -p sequencer --release
+    cargo run -p benchmarks --bin sweep --release -- --self-contained --mode e2e --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --workload synthetic --concurrency-range "{{conc_range}}" --stop-on-first-non-200 --json-out {{out}} {{extra}}
+
+bench-compare-latest kind="all" results_dir="benchmarks/results":
+    cargo run -p benchmarks --bin compare_latest --release -- --results-dir {{results_dir}} --kind {{kind}}
+
+all: bench-unit bench-ack-self bench-e2e-self bench-soak-low-lat-self bench-soak-high-throughput-self bench-capacity-sweep-self
+
+all-and-compare: all
+    just --justfile benchmarks/justfile bench-compare-latest all

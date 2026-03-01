@@ -16,3 +16,4 @@ LEFT JOIN direct_inputs d
   ON d.direct_input_index = s.direct_input_index
 WHERE s.offset >= ?1
 ORDER BY s.offset ASC
+LIMIT ?2

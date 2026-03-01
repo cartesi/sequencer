@@ -8,11 +8,12 @@ use crate::user_op::SignedUserOp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::error::CatchUpError;
+use super::profiling::InclusionLaneMetrics;
 use super::{InclusionLaneError, InclusionLaneInput, PendingUserOp, SequencerError};
 
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +32,8 @@ pub struct InclusionLaneConfig {
     pub max_batch_user_op_bytes: usize,
 
     pub idle_poll_interval: Duration,
+    pub metrics_enabled: bool,
+    pub metrics_log_interval: Duration,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,31 +90,62 @@ impl<A: Application + 'static> InclusionLane<A> {
     fn run_forever(&mut self) -> Result<(), InclusionLaneError> {
         self.run_catch_up()?;
         let (mut next_safe_input_index, mut head) = self.load_lane_state()?;
+        let mut metrics = InclusionLaneMetrics::new(
+            self.config.metrics_enabled,
+            self.config.metrics_log_interval,
+        );
 
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_directs = Vec::with_capacity(self.config.safe_direct_buffer_capacity.max(1));
 
         while !self.stop.is_shutdown_requested() {
+            metrics.on_loop_start(self.rx.len());
+
             // Canonical per-iteration order: include user-ops first, then drain direct inputs.
-            let included_user_op_count = self.process_user_op_chunk(&mut head, &mut included)?;
+            let user_op_started = metrics.phase_started_at();
+            let included_user_op_count =
+                self.process_user_op_chunk(&mut head, &mut included, &mut metrics)?;
+            metrics.on_user_ops_phase_end(user_op_started, included_user_op_count as u64);
+
+            let direct_started = metrics.phase_started_at();
             let drained_safe_direct_count = self.drain_and_execute_safe_direct_inputs(
                 &mut next_safe_input_index,
                 &mut safe_directs,
             )?;
+            metrics.on_directs_phase_end(direct_started, drained_safe_direct_count as u64);
+            let drained_safe_direct_start_index = next_safe_input_index
+                .checked_sub(drained_safe_direct_count as u64)
+                .expect("drained direct-input count cannot exceed next safe-input index");
 
             if head.should_close_batch(&self.config) {
-                self.close_frame_and_batch(&mut head, drained_safe_direct_count)?;
+                let close_started = metrics.phase_started_at();
+                self.close_frame_and_batch(
+                    &mut head,
+                    drained_safe_direct_start_index,
+                    drained_safe_direct_count,
+                )?;
+                metrics.on_close_phase_end(close_started, true);
             } else if drained_safe_direct_count > 0 {
-                self.close_frame_only(&mut head, drained_safe_direct_count)?;
+                let close_started = metrics.phase_started_at();
+                self.close_frame_only(
+                    &mut head,
+                    drained_safe_direct_start_index,
+                    drained_safe_direct_count,
+                )?;
+                metrics.on_close_phase_end(close_started, false);
             }
 
             if included_user_op_count == 0 && drained_safe_direct_count == 0 {
+                let sleep_started = metrics.phase_started_at();
                 thread::sleep(self.config.idle_poll_interval);
+                metrics.on_idle_sleep_end(sleep_started);
             }
 
             safe_directs.clear();
+            metrics.maybe_log_window();
         }
 
+        metrics.log_final();
         Err(InclusionLaneError::ShutdownRequested)
     }
 
@@ -138,20 +172,28 @@ impl<A: Application + 'static> InclusionLane<A> {
         &mut self,
         head: &mut WriteHead,
         included: &mut Vec<PendingUserOp>,
+        metrics: &mut InclusionLaneMetrics,
     ) -> Result<usize, InclusionLaneError> {
-        dequeue_and_execute_user_op_chunk(
+        let timing = dequeue_and_execute_user_op_chunk(
             &mut self.rx,
             &mut self.app,
-            head.batch_fee,
+            head.frame_fee,
             self.config.max_user_ops_per_chunk.max(1),
             included,
         )?;
+        metrics.on_user_op_dequeue_end(timing.dequeue);
+        metrics.on_user_op_app_execute_end(timing.app_execute);
         let included_count = included.len();
 
+        let persist_started = metrics.phase_started_at();
         self.persist_included_user_ops(head, included)?;
+        metrics.on_user_op_persist_end(persist_started);
+
+        let ack_started = metrics.phase_started_at();
         for item in included.drain(..) {
             let _ = item.respond_to.send(Ok(()));
         }
+        metrics.on_user_op_ack_end(ack_started);
 
         Ok(included_count)
     }
@@ -209,20 +251,22 @@ impl<A: Application + 'static> InclusionLane<A> {
     fn close_frame_and_batch(
         &mut self,
         head: &mut WriteHead,
+        drained_direct_start_index: u64,
         drained_direct_count: usize,
     ) -> Result<(), InclusionLaneError> {
         self.storage
-            .close_frame_and_batch(head, drained_direct_count)
+            .close_frame_and_batch(head, drained_direct_start_index, drained_direct_count)
             .map_err(|source| InclusionLaneError::CloseFrameRotate { source })
     }
 
     fn close_frame_only(
         &mut self,
         head: &mut WriteHead,
+        drained_direct_start_index: u64,
         drained_direct_count: usize,
     ) -> Result<(), InclusionLaneError> {
         self.storage
-            .close_frame_only(head, drained_direct_count)
+            .close_frame_only(head, drained_direct_start_index, drained_direct_count)
             .map_err(|source| InclusionLaneError::CloseFrameRotate { source })
     }
 
@@ -259,13 +303,13 @@ impl WriteHead {
 fn execute_user_op(
     app: &mut impl Application,
     item: PendingUserOp,
-    current_batch_fee: u64,
+    current_frame_fee: u64,
     included: &mut Vec<PendingUserOp>,
 ) {
     match app.validate_and_execute_user_op(
         item.signed.sender,
         &item.signed.user_op,
-        current_batch_fee,
+        current_frame_fee,
     ) {
         Ok(ExecutionOutcome::Included) => included.push(item),
         Ok(ExecutionOutcome::Invalid(reason)) => {
@@ -282,28 +326,45 @@ fn execute_user_op(
 fn dequeue_and_execute_user_op_chunk(
     rx: &mut mpsc::Receiver<InclusionLaneInput>,
     app: &mut impl Application,
-    current_batch_fee: u64,
+    current_frame_fee: u64,
     max_chunk: usize,
     included: &mut Vec<PendingUserOp>,
-) -> Result<(), InclusionLaneError> {
+) -> Result<UserOpChunkTiming, InclusionLaneError> {
     let mut executed_user_ops = 0_usize;
+    let mut timing = UserOpChunkTiming::default();
 
     while executed_user_ops < max_chunk {
+        let dequeue_started = Instant::now();
         match rx.try_recv() {
             Ok(InclusionLaneInput::UserOp(item)) => {
-                execute_user_op(app, item, current_batch_fee, included);
+                timing.dequeue = timing.dequeue.saturating_add(dequeue_started.elapsed());
+                let app_exec_started = Instant::now();
+                execute_user_op(app, item, current_frame_fee, included);
+                timing.app_execute = timing
+                    .app_execute
+                    .saturating_add(app_exec_started.elapsed());
                 executed_user_ops = executed_user_ops.saturating_add(1);
             }
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::error::TryRecvError::Empty) => {
+                timing.dequeue = timing.dequeue.saturating_add(dequeue_started.elapsed());
+                return Ok(timing);
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
+                timing.dequeue = timing.dequeue.saturating_add(dequeue_started.elapsed());
                 if executed_user_ops == 0 {
                     return Err(InclusionLaneError::ChannelClosed);
                 }
-                return Ok(());
+                return Ok(timing);
             }
         }
     }
-    Ok(())
+    Ok(timing)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct UserOpChunkTiming {
+    dequeue: Duration,
+    app_execute: Duration,
 }
 
 fn catch_up_application(
@@ -350,11 +411,11 @@ mod tests {
     use crate::l2_tx::ValidUserOp;
     use crate::storage::Storage;
     use crate::user_op::{SignedUserOp, UserOp};
-    use alloy_primitives::{Address, B256, Signature, U256};
-    use rusqlite::{OptionalExtension, params};
+    use alloy_primitives::{Address, Signature, U256};
+    use rusqlite::params;
     use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime};
+    use tempfile::TempDir;
     use tokio::sync::{mpsc, oneshot};
 
     #[derive(Default)]
@@ -398,18 +459,21 @@ mod tests {
         }
     }
 
-    fn temp_db_path(name: &str) -> String {
-        let mut path = std::env::temp_dir();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        path.push(format!("sequencer-inclusion-lane-{name}-{unique}.sqlite"));
-        path_to_string(path)
+    struct TestDb {
+        _dir: TempDir,
+        path: String,
     }
 
-    fn path_to_string(path: PathBuf) -> String {
-        path.to_string_lossy().into_owned()
+    fn temp_db(name: &str) -> TestDb {
+        let dir = tempfile::Builder::new()
+            .prefix(format!("sequencer-inclusion-lane-{name}-").as_str())
+            .tempdir()
+            .expect("create temporary test directory");
+        let path = dir.path().join("sequencer.sqlite");
+        TestDb {
+            _dir: dir,
+            path: path.to_string_lossy().into_owned(),
+        }
     }
 
     fn default_test_config() -> InclusionLaneConfig {
@@ -419,6 +483,8 @@ mod tests {
             max_batch_open: Duration::MAX,
             max_batch_user_op_bytes: 1_000_000_000,
             idle_poll_interval: Duration::from_millis(2),
+            metrics_enabled: false,
+            metrics_log_interval: Duration::from_secs(5),
         }
     }
 
@@ -457,7 +523,6 @@ mod tests {
                     signature: Signature::test_signature(),
                     user_op,
                 },
-                tx_hash: B256::from([seed; 32]),
                 respond_to,
                 received_at: SystemTime::now(),
             },
@@ -472,15 +537,17 @@ mod tests {
             .expect("count rows")
     }
 
-    fn read_frame_drain(db_path: &str, batch_index: i64, frame_in_batch: i64) -> Option<i64> {
+    fn read_frame_direct_count(db_path: &str, batch_index: i64, frame_in_batch: i64) -> i64 {
         let conn = Storage::open_connection(db_path, "NORMAL").expect("open sqlite reader");
         conn.query_row(
-            "SELECT drain_n FROM frame_drains WHERE batch_index = ?1 AND frame_in_batch = ?2",
+            "SELECT COUNT(*) FROM sequenced_l2_txs
+             WHERE batch_index = ?1
+               AND frame_in_batch = ?2
+               AND direct_input_index IS NOT NULL",
             params![batch_index, frame_in_batch],
             |row| row.get(0),
         )
-        .optional()
-        .expect("query frame drain")
+        .expect("query frame direct count")
     }
 
     async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -508,8 +575,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ack_happens_after_chunk_commit_without_closing_frame() {
-        let db_path = temp_db_path("ack-chunk-commit");
-        let (tx, lane_stop, lane_handle) = start_lane(&db_path, default_test_config());
+        let db = temp_db("ack-chunk-commit");
+        let (tx, lane_stop, lane_handle) = start_lane(db.path.as_str(), default_test_config());
         let (pending, recv) = make_pending_user_op(0x11);
 
         tx.send(InclusionLaneInput::UserOp(pending))
@@ -519,23 +586,24 @@ mod tests {
             .await
             .expect("wait for ack")
             .expect("ack channel open");
-        let user_ops_count = read_count(&db_path, "user_ops");
-        let frame_drains_count = read_count(&db_path, "frame_drains");
+        let user_ops_count = read_count(db.path.as_str(), "user_ops");
+        let frame0_direct_count = read_frame_direct_count(db.path.as_str(), 0, 0);
         shutdown_lane(&lane_stop, lane_handle).await;
 
         assert!(ack.is_ok(), "user op should be included");
         assert_eq!(user_ops_count, 1);
         assert_eq!(
-            frame_drains_count, 0,
+            frame0_direct_count, 0,
             "frame should stay open when no directs and no batch close"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_inputs_close_frame_and_persist_drain() {
-        let db_path = temp_db_path("directs-close-frame");
-        let (_tx, lane_stop, lane_handle) = start_lane(&db_path, default_test_config());
-        let mut feeder_storage = Storage::open(&db_path, "NORMAL").expect("open feeder storage");
+        let db = temp_db("directs-close-frame");
+        let (_tx, lane_stop, lane_handle) = start_lane(db.path.as_str(), default_test_config());
+        let mut feeder_storage =
+            Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
 
         feeder_storage
             .append_safe_direct_inputs(&[crate::storage::IndexedDirectInput {
@@ -545,23 +613,24 @@ mod tests {
             .expect("append safe direct input");
 
         let drained = wait_until(Duration::from_secs(2), || {
-            read_frame_drain(&db_path, 0, 0) == Some(1)
+            read_frame_direct_count(db.path.as_str(), 0, 0) == 1
         })
         .await;
-        let frames_count = read_count(&db_path, "frames");
+        let frames_count = read_count(db.path.as_str(), "frames");
         shutdown_lane(&lane_stop, lane_handle).await;
 
-        assert!(drained, "expected frame drain row with drain_n=1");
+        assert!(drained, "expected one drained direct input in frame 0");
         assert_eq!(frames_count, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_inputs_are_paginated_by_buffer_capacity() {
-        let db_path = temp_db_path("directs-pagination");
+        let db = temp_db("directs-pagination");
         let mut config = default_test_config();
         config.safe_direct_buffer_capacity = 2;
-        let (_tx, lane_stop, lane_handle) = start_lane(&db_path, config);
-        let mut feeder_storage = Storage::open(&db_path, "NORMAL").expect("open feeder storage");
+        let (_tx, lane_stop, lane_handle) = start_lane(db.path.as_str(), config);
+        let mut feeder_storage =
+            Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
 
         let mut directs = Vec::new();
         for index in 0..5_u64 {
@@ -575,22 +644,22 @@ mod tests {
             .expect("append safe direct inputs");
 
         let drained = wait_until(Duration::from_secs(2), || {
-            read_frame_drain(&db_path, 0, 0) == Some(5)
+            read_frame_direct_count(db.path.as_str(), 0, 0) == 5
         })
         .await;
-        let frames_count = read_count(&db_path, "frames");
+        let frames_count = read_count(db.path.as_str(), "frames");
         shutdown_lane(&lane_stop, lane_handle).await;
 
-        assert!(drained, "expected frame drain row with drain_n=5");
+        assert!(drained, "expected five drained direct inputs in frame 0");
         assert_eq!(frames_count, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn batch_closes_when_max_open_time_is_reached() {
-        let db_path = temp_db_path("batch-close-time");
+        let db = temp_db("batch-close-time");
         let mut config = default_test_config();
         config.max_batch_open = Duration::from_millis(20);
-        let (tx, lane_stop, lane_handle) = start_lane(&db_path, config);
+        let (tx, lane_stop, lane_handle) = start_lane(db.path.as_str(), config);
         let (pending, recv) = make_pending_user_op(0x22);
 
         tx.send(InclusionLaneInput::UserOp(pending))
@@ -601,23 +670,23 @@ mod tests {
             .expect("wait for ack")
             .expect("ack channel open");
         let rotated = wait_until(Duration::from_secs(2), || {
-            read_count(&db_path, "batches") >= 2
+            read_count(db.path.as_str(), "batches") >= 2
         })
         .await;
-        let drain = read_frame_drain(&db_path, 0, 0);
+        let drain = read_frame_direct_count(db.path.as_str(), 0, 0);
         shutdown_lane(&lane_stop, lane_handle).await;
 
         assert!(ack.is_ok(), "user op should be included");
         assert!(rotated, "expected batch rotation by time");
-        assert_eq!(drain, Some(0));
+        assert_eq!(drain, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn batch_closes_when_max_user_op_bytes_is_reached() {
-        let db_path = temp_db_path("batch-close-size");
+        let db = temp_db("batch-close-size");
         let mut config = default_test_config();
         config.max_batch_user_op_bytes = SignedUserOp::max_batch_bytes_upper_bound();
-        let (tx, lane_stop, lane_handle) = start_lane(&db_path, config);
+        let (tx, lane_stop, lane_handle) = start_lane(db.path.as_str(), config);
         let (pending, recv) = make_pending_user_op(0x33);
 
         tx.send(InclusionLaneInput::UserOp(pending))
@@ -628,15 +697,15 @@ mod tests {
             .expect("wait for ack")
             .expect("ack channel open");
         let rotated = wait_until(Duration::from_secs(2), || {
-            read_count(&db_path, "batches") >= 2
+            read_count(db.path.as_str(), "batches") >= 2
         })
         .await;
-        let drain = read_frame_drain(&db_path, 0, 0);
+        let drain = read_frame_direct_count(db.path.as_str(), 0, 0);
         shutdown_lane(&lane_stop, lane_handle).await;
 
         assert!(ack.is_ok(), "user op should be included");
         assert!(rotated, "expected batch rotation by size");
-        assert_eq!(drain, Some(0));
+        assert_eq!(drain, 0);
     }
 
     #[test]

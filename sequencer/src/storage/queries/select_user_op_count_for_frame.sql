@@ -1,9 +1,3 @@
-SELECT
-    COALESCE(
-        (
-            SELECT user_op_count
-            FROM frame_user_op_counts
-            WHERE batch_index = ?1 AND frame_in_batch = ?2
-        ),
-        0
-    )
+SELECT COUNT(*)
+FROM user_ops
+WHERE batch_index = ?1 AND frame_in_batch = ?2

@@ -1,0 +1,24 @@
+[package]
+name = "benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
+
+[dependencies]
+app-core = { path = "../app-core" }
+alloy-primitives = { version = "1.4.1", features = ["k256"] }
+alloy-sol-types = "1.4.1"
+futures-util = "0.3"
+k256 = "0.13.4"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ssz = { package = "ethereum_ssz", version = "0.10" }
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "process", "sync"] }
+tokio-tungstenite = "0.28"
+tempfile = "3"

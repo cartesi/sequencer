@@ -4,6 +4,7 @@ members = [
   "sequencer",
   "app-core",
   "canonical-app",
+  "benchmarks",
 ]
 default-members = ["sequencer"]
 

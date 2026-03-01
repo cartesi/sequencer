@@ -3,6 +3,7 @@
 
 mod error;
 mod lane;
+mod profiling;
 mod types;
 
 pub use error::InclusionLaneError;
