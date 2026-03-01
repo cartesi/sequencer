@@ -11,17 +11,25 @@ authors.workspace = true
 
 [dependencies]
 app-core = { path = "../app-core" }
+alloy = { version = "1.4", default-features = false, features = ["contract", "provider-http", "rpc-types", "eips"] }
+alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
+cartesi-rollups-contracts = "2.1.1"
+alloy-sol-types = "1.4.1"
+async-recursion = "1.0"
 axum = "0.8.8"
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+rusqlite_migration = "2.3.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ssz = { package = "ethereum_ssz", version = "0.10" }
+ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
+thiserror = "1"
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6.8", features = ["trace"] }
-rusqlite = { version = "0.38.0", features = ["bundled"] }
-rusqlite_migration = "2.3.0"
-alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
-alloy-sol-types = "1.4.1"
-thiserror = "1"
-ssz = { package = "ethereum_ssz", version = "0.10" }
-ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
+
+[dev-dependencies]
+alloy = { version = "1.4", default-features = false, features = ["contract", "provider-http", "rpc-types", "eips", "node-bindings"] }
+tempfile = "3"

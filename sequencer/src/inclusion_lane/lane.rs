@@ -541,6 +541,7 @@ mod tests {
             .append_safe_direct_inputs(&[crate::storage::IndexedDirectInput {
                 index: 0,
                 payload: vec![0xaa],
+                block_number: 0,
             }])
             .expect("append safe direct input");
 
@@ -568,6 +569,7 @@ mod tests {
             directs.push(crate::storage::IndexedDirectInput {
                 index,
                 payload: vec![index as u8],
+                block_number: 0,
             });
         }
         feeder_storage

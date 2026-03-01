@@ -8,6 +8,7 @@
 pub mod api;
 pub mod application;
 pub mod inclusion_lane;
+pub mod input_reader;
 pub mod l2_tx;
 pub mod storage;
 pub mod user_op;
