@@ -308,37 +308,6 @@ async fn run_broadcaster_session(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::to_bytes;
-
-    #[tokio::test]
-    async fn tx_route_internal_errors_are_sanitized() {
-        let err: BoxError = std::io::Error::other("sensitive middleware detail").into();
-        let response = handle_tx_route_error(err).await.into_response();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read response body");
-        let body = String::from_utf8(body.to_vec()).expect("utf8 response body");
-
-        assert!(
-            body.contains("INTERNAL_ERROR"),
-            "expected internal error code in body: {body}"
-        );
-        assert!(
-            body.contains("tx endpoint unavailable"),
-            "expected sanitized internal message in body: {body}"
-        );
-        assert!(
-            !body.contains("sensitive middleware detail"),
-            "middleware internals leaked in body: {body}"
-        );
-    }
-}
-
 async fn send_catch_up(
     broadcaster: &L2TxBroadcaster,
     socket: &mut WebSocket,
@@ -412,4 +381,35 @@ async fn send_ws_event(socket: &mut WebSocket, event: &BroadcastTxMessage) -> Re
         return Err(());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn tx_route_internal_errors_are_sanitized() {
+        let err: BoxError = std::io::Error::other("sensitive middleware detail").into();
+        let response = handle_tx_route_error(err).await.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 response body");
+
+        assert!(
+            body.contains("INTERNAL_ERROR"),
+            "expected internal error code in body: {body}"
+        );
+        assert!(
+            body.contains("tx endpoint unavailable"),
+            "expected sanitized internal message in body: {body}"
+        );
+        assert!(
+            !body.contains("sensitive middleware detail"),
+            "middleware internals leaked in body: {body}"
+        );
+    }
 }
