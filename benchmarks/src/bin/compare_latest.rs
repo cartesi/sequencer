@@ -267,7 +267,7 @@ fn latest_two_files(
         }
     }
 
-    candidates.sort_by(|a, b| a.cmp(b));
+    candidates.sort();
     if candidates.len() < 2 {
         return Err(std::io::Error::other(format!(
             "need at least 2 files for pattern {prefix}*{suffix} in {}",

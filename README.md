@@ -64,7 +64,7 @@ Request shape:
 POST notes:
 
 - `signature` must be 65 bytes.
-- `sender` is optional; if provided, it must match recovered signer.
+- `sender` is required and must match recovered signer.
 - `message.data` is SSZ-encoded method payload bytes.
 - payload size is bounded at ingress; oversized requests are rejected before they enter hot path.
 
