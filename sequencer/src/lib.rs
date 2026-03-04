@@ -6,7 +6,13 @@
 //! Flow: API -> inclusion lane -> SQLite -> catch-up replay.
 //! The inclusion lane is the single writer that defines execution order.
 pub mod api;
+pub mod config;
 pub mod inclusion_lane;
 pub mod input_reader;
-pub mod l2_tx_broadcaster;
+pub mod l2_tx_feed;
+mod runtime;
+pub mod shutdown;
 pub mod storage;
+
+pub use config::RunConfig;
+pub use runtime::{RunError, run};

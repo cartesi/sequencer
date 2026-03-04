@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, U256};
 use ssz::Decode;
 
-use sequencer_core::application::{AppError, Application, InvalidReason, Method};
+use super::{
+    MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES, Method, prefunded_addresses,
+};
+use sequencer_core::application::{AppError, Application, InvalidReason};
 use sequencer_core::l2_tx::ValidUserOp;
 use sequencer_core::user_op::UserOp;
 
@@ -26,10 +29,17 @@ pub struct WalletApp {
     executed_input_count: u64,
 }
 
+pub const PREFUNDED_BALANCE: u64 = 1_000_000;
+
 impl WalletApp {
     pub fn new(_config: WalletConfig) -> Self {
+        let mut balances = HashMap::with_capacity(prefunded_addresses().len());
+        for address in prefunded_addresses() {
+            balances.insert(*address, U256::from(PREFUNDED_BALANCE));
+        }
+
         Self {
-            balances: HashMap::new(),
+            balances,
             nonces: HashMap::new(),
             executed_input_count: 0,
         }
@@ -70,6 +80,8 @@ impl Default for WalletApp {
 }
 
 impl Application for WalletApp {
+    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+
     fn current_user_nonce(&self, sender: Address) -> u32 {
         self.expected_nonce(&sender)
     }
@@ -133,9 +145,6 @@ impl Application for WalletApp {
                     self.credit(transfer.to, transfer.amount);
                 }
             }
-            Some(Method::Deposit(deposit)) => {
-                self.credit(deposit.to, deposit.amount);
-            }
             Some(Method::Withdrawal(withdrawal)) => {
                 let _ = self.debit_if_possible(sender, withdrawal.amount);
             }
@@ -158,8 +167,10 @@ impl Application for WalletApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{WalletApp, WalletConfig};
     use alloy_primitives::{Address, U256};
+    use ssz_derive::{Decode, Encode};
+
+    use super::{WalletApp, WalletConfig};
     use sequencer_core::application::{Application, InvalidReason};
     use sequencer_core::l2_tx::ValidUserOp;
     use sequencer_core::user_op::UserOp;
@@ -203,5 +214,71 @@ mod tests {
 
         assert_eq!(app.current_user_nonce(sender), 1);
         assert_eq!(app.current_user_balance(sender), U256::from(7_u64));
+    }
+
+    #[test]
+    fn wallet_starts_with_prefunded_anvil_accounts() {
+        let app = WalletApp::new(WalletConfig);
+        let addresses = super::prefunded_addresses();
+        assert!(addresses.len() >= 2);
+
+        for address in addresses.iter().take(2) {
+            assert_eq!(
+                app.current_user_balance(*address),
+                U256::from(super::PREFUNDED_BALANCE)
+            );
+        }
+    }
+
+    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
+    struct LegacyDeposit {
+        amount: U256,
+        to: Address,
+    }
+
+    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
+    struct LegacyWithdrawal {
+        amount: U256,
+    }
+
+    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
+    struct LegacyTransfer {
+        amount: U256,
+        to: Address,
+    }
+
+    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
+    #[ssz(enum_behaviour = "union")]
+    enum LegacyMethod {
+        Withdrawal(LegacyWithdrawal),
+        Transfer(LegacyTransfer),
+        Deposit(LegacyDeposit),
+    }
+
+    #[test]
+    fn legacy_deposit_payload_is_included_as_no_op() {
+        let mut app = WalletApp::new(WalletConfig);
+        let sender = super::prefunded_addresses()[0];
+        let recipient = Address::from_slice(&[0x77; 20]);
+        let before_sender_nonce = app.current_user_nonce(sender);
+        let before_sender_balance = app.current_user_balance(sender);
+        let before_recipient = app.current_user_balance(recipient);
+
+        let legacy = LegacyMethod::Deposit(LegacyDeposit {
+            amount: U256::from(123_u64),
+            to: recipient,
+        });
+        let valid = ValidUserOp {
+            sender,
+            fee: 0,
+            data: ssz::Encode::as_ssz_bytes(&legacy),
+        };
+
+        app.execute_valid_user_op(&valid)
+            .expect("execute valid user op");
+
+        assert_eq!(app.current_user_nonce(sender), before_sender_nonce + 1);
+        assert_eq!(app.current_user_balance(sender), before_sender_balance);
+        assert_eq!(app.current_user_balance(recipient), before_recipient);
     }
 }

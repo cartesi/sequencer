@@ -2,28 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::io::ErrorKind;
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, Signature, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
-use app_core::application::{WalletApp, WalletConfig};
+use app_core::application::{
+    MAX_METHOD_PAYLOAD_BYTES, Method, WalletApp, WalletConfig, Withdrawal,
+};
 use futures_util::StreamExt;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
-use sequencer::api::{AppState, router};
-use sequencer::inclusion_lane::{
-    InclusionLane, InclusionLaneConfig, InclusionLaneError, InclusionLaneInput,
-};
-use sequencer::l2_tx_broadcaster::{L2TxBroadcaster, L2TxBroadcasterConfig};
-use sequencer::storage::Storage;
+use sequencer::api::{self, ApiConfig};
+use sequencer::inclusion_lane::{InclusionLane, InclusionLaneConfig, PendingUserOp};
+use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
+use sequencer::shutdown::ShutdownSignal;
+use sequencer::storage::{DirectInputRange, Storage};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
-use sequencer_core::application::{Method, Withdrawal};
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -222,45 +221,13 @@ async fn api_rejects_malformed_json_as_bad_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_returns_429_when_tx_middleware_concurrency_is_exceeded() {
-    let db = temp_db("tx-middleware-overload");
-    let domain = test_domain();
-    bootstrap_open_frame_fee_zero(db.path.as_str());
-
-    let Some(runtime) =
-        start_api_only_server(db.path.as_str(), domain.clone(), 128 * 1024, 8, 1).await
-    else {
-        return;
-    };
-
-    let request = make_valid_request(&domain);
-    let request_json = serde_json::to_string(&request).expect("serialize valid request");
-    let first = tokio::spawn({
-        let body = request_json.clone();
-        let addr = runtime.addr;
-        async move { post_raw_json(addr, body.as_str()).await }
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let (status, body) = post_raw_json(runtime.addr, request_json.as_str()).await;
-    assert_eq!(status, 429, "expected 429 for middleware overload: {body}");
-    assert!(
-        body.contains("OVERLOADED"),
-        "expected OVERLOADED code for middleware overload: {body}"
-    );
-
-    first.abort();
-    shutdown_runtime(runtime).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_returns_429_when_queue_is_full() {
     let db = temp_db("queue-full-overload");
     let domain = test_domain();
     bootstrap_open_frame_fee_zero(db.path.as_str());
 
     let Some(runtime) =
-        start_api_only_server(db.path.as_str(), domain.clone(), 128 * 1024, 1, 8).await
+        start_api_only_server(db.path.as_str(), domain.clone(), 128 * 1024, 1).await
     else {
         return;
     };
@@ -289,25 +256,66 @@ async fn api_returns_429_when_queue_is_full() {
     shutdown_runtime(runtime).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_rejects_user_op_payloads_above_application_limit() {
+    let db = temp_db("user-op-payload-too-large");
+    let domain = test_domain();
+    bootstrap_open_frame_fee_zero(db.path.as_str());
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
+        .expect("build sequencer client");
+
+    let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    let user_op = UserOp {
+        nonce: 0,
+        max_fee: 0,
+        data: vec![0_u8; MAX_METHOD_PAYLOAD_BYTES + 1].into(),
+    };
+    let request = TxRequest {
+        signature: sign_user_op_hex(&domain, &user_op, &signing_key),
+        sender: sender.to_string(),
+        message: user_op,
+    };
+
+    let (status, body) = client
+        .submit_tx_with_status(&request)
+        .await
+        .expect("submit oversized tx");
+
+    assert_eq!(
+        status, 400,
+        "unexpected status for oversized payload: {body}"
+    );
+    assert!(
+        body.contains("user op payload too large"),
+        "expected payload-size validation message, got: {body}"
+    );
+    assert!(
+        body.contains(&MAX_METHOD_PAYLOAD_BYTES.to_string()),
+        "expected max payload size in error body, got: {body}"
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
 struct FullServerRuntime {
     addr: std::net::SocketAddr,
-    broadcaster: L2TxBroadcaster,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    server_task: Option<tokio::task::JoinHandle<()>>,
-    lane_stop: Option<sequencer::inclusion_lane::InclusionLaneStop>,
-    lane_handle: Option<tokio::task::JoinHandle<InclusionLaneError>>,
-    _parked_rx: Option<mpsc::Receiver<InclusionLaneInput>>,
+    shutdown: ShutdownSignal,
+    server_task: Option<api::ApiServerTask>,
+    lane_handle:
+        Option<tokio::task::JoinHandle<Result<(), sequencer::inclusion_lane::InclusionLaneError>>>,
+    _parked_rx: Option<mpsc::Receiver<PendingUserOp>>,
 }
 
 impl Drop for FullServerRuntime {
     fn drop(&mut self) {
-        self.broadcaster.request_shutdown();
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        if let Some(stop) = self.lane_stop.take() {
-            stop.request_shutdown();
-        }
+        self.shutdown.request_shutdown();
         if let Some(task) = self.server_task.take() {
             task.abort();
         }
@@ -339,10 +347,11 @@ async fn start_full_server_with_max_body(
     let addr = listener.local_addr().expect("read listener addr");
 
     let storage = Storage::open(db_path, "NORMAL").expect("open storage");
-    let (tx, rx) = mpsc::channel::<InclusionLaneInput>(128);
+    let shutdown = ShutdownSignal::default();
 
-    let inclusion_lane = InclusionLane::new(
-        rx,
+    let (tx, lane_handle) = InclusionLane::start(
+        128,
+        shutdown.clone(),
         WalletApp::new(WalletConfig),
         storage,
         InclusionLaneConfig {
@@ -351,48 +360,35 @@ async fn start_full_server_with_max_body(
             max_batch_open: Duration::from_secs(60 * 60),
             max_batch_user_op_bytes: 1_048_576,
             idle_poll_interval: Duration::from_millis(2),
-            metrics_enabled: false,
-            metrics_log_interval: Duration::from_secs(5),
         },
     );
-    let (lane_handle, lane_stop) = inclusion_lane.spawn();
 
-    let broadcaster = L2TxBroadcaster::start(
+    let tx_feed = L2TxFeed::new(
         db_path.to_string(),
-        L2TxBroadcasterConfig {
+        shutdown.clone(),
+        L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            subscriber_buffer_capacity: 256,
-            metrics_enabled: false,
-            metrics_log_interval: Duration::from_secs(5),
         },
-    )
-    .expect("start broadcaster");
+    );
 
-    let state = Arc::new(AppState {
-        tx_sender: tx,
+    let server_task = api::start_on_listener(
+        listener,
+        tx,
         domain,
-        overload_max_inflight_submissions: 256,
-        ws_subscriber_limit: Arc::new(Semaphore::new(64)),
-        ws_max_catchup_events: 50_000,
-        broadcaster: broadcaster.clone(),
-    });
-    let app = router(state, max_body_bytes);
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown_rx.await;
-    });
-    let server_task = tokio::spawn(async move {
-        server.await.expect("run test server");
-    });
+        MAX_METHOD_PAYLOAD_BYTES,
+        shutdown.clone(),
+        tx_feed,
+        ApiConfig {
+            max_body_bytes,
+            ..ApiConfig::default()
+        },
+    );
 
     Some(FullServerRuntime {
         addr,
-        broadcaster,
-        shutdown_tx: Some(shutdown_tx),
+        shutdown,
         server_task: Some(server_task),
-        lane_stop: Some(lane_stop),
         lane_handle: Some(lane_handle),
         _parked_rx: None,
     })
@@ -403,7 +399,6 @@ async fn start_api_only_server(
     domain: Eip712Domain,
     max_body_bytes: usize,
     queue_capacity: usize,
-    overload_max_inflight_submissions: usize,
 ) -> Option<FullServerRuntime> {
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(value) => value,
@@ -416,69 +411,58 @@ async fn start_api_only_server(
     let addr = listener.local_addr().expect("read listener addr");
 
     let _storage = Storage::open(db_path, "NORMAL").expect("open storage");
-    let (tx, rx) = mpsc::channel::<InclusionLaneInput>(queue_capacity);
-    let broadcaster = L2TxBroadcaster::start(
+    let (tx, rx) = mpsc::channel::<PendingUserOp>(queue_capacity);
+    let shutdown = ShutdownSignal::default();
+    let tx_feed = L2TxFeed::new(
         db_path.to_string(),
-        L2TxBroadcasterConfig {
+        shutdown.clone(),
+        L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            subscriber_buffer_capacity: 256,
-            metrics_enabled: false,
-            metrics_log_interval: Duration::from_secs(5),
         },
-    )
-    .expect("start broadcaster");
-    let state = Arc::new(AppState {
-        tx_sender: tx,
+    );
+    let server_task = api::start_on_listener(
+        listener,
+        tx,
         domain,
-        overload_max_inflight_submissions,
-        ws_subscriber_limit: Arc::new(Semaphore::new(64)),
-        ws_max_catchup_events: 50_000,
-        broadcaster: broadcaster.clone(),
-    });
-    let app = router(state, max_body_bytes);
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown_rx.await;
-    });
-    let server_task = tokio::spawn(async move {
-        server.await.expect("run test server");
-    });
+        MAX_METHOD_PAYLOAD_BYTES,
+        shutdown.clone(),
+        tx_feed,
+        ApiConfig {
+            max_body_bytes,
+            ..ApiConfig::default()
+        },
+    );
 
     Some(FullServerRuntime {
         addr,
-        broadcaster,
-        shutdown_tx: Some(shutdown_tx),
+        shutdown,
         server_task: Some(server_task),
-        lane_stop: None,
         lane_handle: None,
         _parked_rx: Some(rx),
     })
 }
 
 async fn shutdown_runtime(mut runtime: FullServerRuntime) {
-    runtime.broadcaster.request_shutdown();
-    if let Some(stop) = runtime.lane_stop.take() {
-        stop.request_shutdown();
-    }
-    if let Some(tx) = runtime.shutdown_tx.take() {
-        let _ = tx.send(());
-    }
-    if let Some(task) = runtime.server_task.take() {
-        tokio::time::timeout(Duration::from_secs(3), task)
-            .await
-            .expect("wait for server task")
-            .expect("join server task");
-    }
+    runtime.shutdown.request_shutdown();
     if let Some(task) = runtime.lane_handle.take() {
         let lane_result = tokio::time::timeout(Duration::from_secs(3), task)
             .await
             .expect("wait for inclusion lane")
             .expect("join inclusion lane task");
         assert!(
-            matches!(lane_result, InclusionLaneError::ShutdownRequested),
-            "expected shutdown result, got {lane_result}"
+            lane_result.is_ok(),
+            "expected clean shutdown, got {lane_result:?}"
+        );
+    }
+    if let Some(task) = runtime.server_task.take() {
+        let server_result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("wait for server task")
+            .expect("join server task");
+        assert!(
+            server_result.is_ok(),
+            "expected clean server shutdown, got {server_result:?}"
         );
     }
 }
@@ -486,10 +470,9 @@ async fn shutdown_runtime(mut runtime: FullServerRuntime) {
 fn bootstrap_open_frame_fee_zero(db_path: &str) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
     storage.set_recommended_fee(0).expect("set recommended fee");
-    let mut head = storage.load_open_state().expect("load open state");
-    storage
-        .close_frame_and_batch(&mut head, 0, 0)
-        .expect("rotate batch to fee=0");
+    let head = storage
+        .initialize_open_state(0, DirectInputRange::empty_at(0))
+        .expect("initialize open state");
     assert_eq!(head.frame_fee, 0);
 }
 

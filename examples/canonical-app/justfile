@@ -1,0 +1,47 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+out_dir := "out"
+linux_kernel := out_dir + "/linux.bin"
+rootfs_tar := out_dir + "/canonical-rootfs.tar"
+rootfs_ext2 := out_dir + "/canonical-rootfs.ext2"
+machine_image := out_dir + "/canonical-machine-image"
+dapp_binary := out_dir + "/dapp"
+
+download-deps:
+    mkdir -p {{out_dir}}
+    wget https://github.com/cartesi/image-kernel/releases/download/v0.20.0/linux-6.5.13-ctsi-1-v0.20.0.bin \
+      -O {{linux_kernel}}
+
+build-dapp:
+    mkdir -p {{out_dir}}
+    CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --target riscv64gc-unknown-linux-musl --release
+    cp ../../target/riscv64gc-unknown-linux-musl/release/canonical-app {{dapp_binary}}
+
+build-rootfs: build-dapp
+    mkdir -p {{out_dir}}
+    docker buildx build \
+      --platform linux/riscv64 \
+      --output type=tar,dest={{rootfs_tar}} \
+      --file Dockerfile \
+      ../..
+    xgenext2fs -f -z -B 4096 -i 4096 -r +4096 -a {{rootfs_tar}} -L rootfs {{rootfs_ext2}}
+
+clean-machine-image:
+    rm -rf {{machine_image}}
+
+clean:
+    rm -rf {{out_dir}}
+
+build-machine-image: clean-machine-image build-rootfs
+    test -f {{linux_kernel}} || { echo "missing {{linux_kernel}}; run 'just setup' first"; exit 1; }
+    cartesi-machine \
+      --ram-length=128Mi \
+      --ram-image={{linux_kernel}} \
+      --flash-drive=label:root,data_filename:{{rootfs_ext2}} \
+      --append-init=WORKDIR="/dapp" \
+      --append-entrypoint="/dapp/dapp" \
+      --assert-rolling-template --final-hash \
+      --store={{machine_image}}
+
+test-guest: build-machine-image
+    cargo run -p canonical-test

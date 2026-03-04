@@ -1,15 +1,11 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-mod method;
-
 use crate::l2_tx::ValidUserOp;
 use crate::user_op::UserOp;
 use alloy_primitives::{Address, U256};
 use std::fmt;
 use thiserror::Error;
-
-pub use method::{Deposit, Method, Transfer, Withdrawal};
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -62,6 +58,8 @@ impl fmt::Display for InvalidReason {
 }
 
 pub trait Application: Send {
+    const MAX_METHOD_PAYLOAD_BYTES: usize;
+
     fn current_user_nonce(&self, sender: Address) -> u32;
 
     fn current_user_balance(&self, sender: Address) -> U256;

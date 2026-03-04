@@ -1,53 +1,70 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set working-directory := ".."
 
+anvil_dump_name := "rollups-contracts-2.2.0-anvil-v1.4.3"
+anvil_dump_dir := "benchmarks/.deps/" + anvil_dump_name
+anvil_dump_tar := "benchmarks/.deps/" + anvil_dump_name + ".tar.gz"
+anvil_dump_url := "https://github.com/cartesi/rollups-contracts/releases/download/v2.2.0/rollups-contracts-2.2.0-anvil-v1.4.3.tar.gz"
+root_anvil_dump_tar := "rollups-contracts-2.2.0-anvil-v1.4.3.tar.gz"
+template_machine_image := "examples/canonical-app/out/canonical-machine-image"
+
 default:
     @just --justfile benchmarks/justfile --list
+
+setup:
+    mkdir -p benchmarks/.deps
+    if [[ ! -f {{anvil_dump_tar}} ]]; then if [[ -f {{root_anvil_dump_tar}} ]]; then cp {{root_anvil_dump_tar}} {{anvil_dump_tar}}; else wget {{anvil_dump_url}} -O {{anvil_dump_tar}}; fi; fi
+    if [[ ! -f {{anvil_dump_dir}}/state.json ]]; then rm -rf {{anvil_dump_dir}}; mkdir -p {{anvil_dump_dir}}; tar -xzf {{anvil_dump_tar}} -C {{anvil_dump_dir}}; fi
+
+clean:
+    rm -rf benchmarks/.deps
+
+ensure-machine-image:
+    test -d {{template_machine_image}} || { echo "missing {{template_machine_image}}; run 'just canonical-build-machine-image' first"; exit 1; }
 
 bench-unit count="10000" max_fee="0":
     cargo run -p benchmarks --bin unit_hot_path --release -- --count {{count}} --max-fee {{max_fee}}
 
-bench-ack count="200" url="http://127.0.0.1:3000" max_fee="0" concurrency="1" extra="":
-    cargo run -p benchmarks --bin ack_latency --release -- --endpoint {{url}} --count {{count}} --max-fee {{max_fee}} --concurrency {{concurrency}} {{extra}}
+bench-ack domain_chain_id verifying_contract count="200" url="http://127.0.0.1:3000" max_fee="0" concurrency="1" extra="":
+    cargo run -p benchmarks --bin ack_latency --release -- --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --count {{count}} --max-fee {{max_fee}} --concurrency {{concurrency}} {{extra}}
 
-bench-ack-self count="200" max_fee="0" concurrency="1" extra="":
+bench-ack-self count="200" max_fee="0" concurrency="1" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin ack_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --concurrency {{concurrency}} {{extra}}
 
-bench-e2e count="100" url="http://127.0.0.1:3000" max_fee="0" from_offset="0" concurrency="1" extra="":
-    cargo run -p benchmarks --bin e2e_latency --release -- --endpoint {{url}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} {{extra}}
+bench-e2e domain_chain_id verifying_contract count="100" url="http://127.0.0.1:3000" max_fee="0" from_offset="0" concurrency="1" extra="":
+    cargo run -p benchmarks --bin e2e_latency --release -- --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} {{extra}}
 
-bench-e2e-self count="100" max_fee="0" from_offset="0" concurrency="1" extra="":
+bench-e2e-self count="100" max_fee="0" from_offset="0" concurrency="1" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin e2e_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} {{extra}}
 
-bench-hammer count="20000" url="http://127.0.0.1:3000" max_fee="0" concurrency="10" from_offset="0" workload="funded-transfer" extra="":
-    cargo run -p benchmarks --bin e2e_latency --release -- --endpoint {{url}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload {{workload}} {{extra}}
+bench-hammer domain_chain_id verifying_contract count="20000" url="http://127.0.0.1:3000" max_fee="0" concurrency="10" from_offset="0" workload="funded-transfer" extra="":
+    cargo run -p benchmarks --bin e2e_latency --release -- --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload {{workload}} {{extra}}
 
-bench-hammer-self count="20000" max_fee="0" concurrency="10" from_offset="0" workload="funded-transfer" out="benchmarks/results/hammer-self-latest.json" extra="":
+bench-hammer-self count="20000" max_fee="0" concurrency="10" from_offset="0" workload="funded-transfer" out="benchmarks/results/hammer-self-latest.json" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin e2e_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload {{workload}} --json-out {{out}} {{extra}}
 
-bench-sweep mode="e2e" count="1000" url="http://127.0.0.1:3000" max_fee="0" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="":
-    cargo run -p benchmarks --bin sweep --release -- --mode {{mode}} --count {{count}} --endpoint {{url}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency-list "{{conc_list}}" {{extra}}
+bench-sweep domain_chain_id verifying_contract mode="e2e" count="1000" url="http://127.0.0.1:3000" max_fee="0" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="":
+    cargo run -p benchmarks --bin sweep --release -- --mode {{mode}} --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency-list "{{conc_list}}" {{extra}}
 
-bench-sweep-self mode="e2e" count="1000" max_fee="0" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="":
+bench-sweep-self mode="e2e" count="1000" max_fee="0" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --self-contained --mode {{mode}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency-list "{{conc_list}}" {{extra}}
 
-bench-soak-low-lat-self count="20000" max_fee="0" out="benchmarks/results/soak-low-lat-self.json" extra="":
-    just --justfile benchmarks/justfile bench-hammer-self {{count}} {{max_fee}} 10 0 funded-transfer {{out}} '{{extra}}'
+bench-soak-low-lat-self count="20000" max_fee="0" out="" extra="": ensure-machine-image
+    out_path="{{out}}"; if [[ -z "${out_path}" ]]; then out_path="benchmarks/results/soak-low-lat-self-$(date +%s).json"; fi; just --justfile benchmarks/justfile bench-hammer-self {{count}} {{max_fee}} 10 0 funded-transfer "${out_path}" '{{extra}}'
 
-bench-soak-high-throughput-self count="20000" max_fee="0" out="benchmarks/results/soak-high-throughput-self.json" extra="":
-    cargo build -p sequencer --release
-    cargo run -p benchmarks --bin e2e_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset 0 --concurrency 96 --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload synthetic --json-out {{out}} {{extra}}
+bench-soak-high-throughput-self count="20000" max_fee="0" out="" extra="": ensure-machine-image
+    out_path="{{out}}"; if [[ -z "${out_path}" ]]; then out_path="benchmarks/results/soak-high-throughput-self-$(date +%s).json"; fi; cargo build -p sequencer --release; cargo run -p benchmarks --bin e2e_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset 0 --concurrency 96 --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload synthetic --json-out "${out_path}" {{extra}}
 
-bench-capacity-sweep-self count="1000" max_fee="0" from_offset="0" conc_range="32:512:32" out="benchmarks/results/capacity-sweep-self.json" extra="":
+bench-capacity-sweep-self count="1000" max_fee="0" from_offset="0" conc_range="32:512:32" out="benchmarks/results/capacity-sweep-self.json" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --self-contained --mode e2e --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --workload synthetic --concurrency-range "{{conc_range}}" --stop-on-first-non-200 --json-out {{out}} {{extra}}
 
-bench-compare-latest kind="all" results_dir="benchmarks/results":
-    cargo run -p benchmarks --bin compare_latest --release -- --results-dir {{results_dir}} --kind {{kind}}
+bench-compare-latest kind="all" sweep_mode="e2e" results_dir="benchmarks/results":
+    cargo run -p benchmarks --bin compare_latest --release -- --results-dir {{results_dir}} --kind {{kind}} --sweep-mode {{sweep_mode}}
 
 all: bench-unit bench-ack-self bench-e2e-self bench-soak-low-lat-self bench-soak-high-throughput-self bench-capacity-sweep-self
 

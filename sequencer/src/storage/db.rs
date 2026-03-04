@@ -7,16 +7,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_direct_inputs_batch, sql_insert_open_batch,
-    sql_insert_open_frame, sql_insert_sequenced_direct_inputs_for_frame,
-    sql_insert_user_ops_and_sequenced_batch, sql_select_last_processed_block,
+    sql_insert_open_batch_with_index, sql_insert_open_frame,
+    sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_and_sequenced_batch,
     sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
     sql_select_max_direct_input_index, sql_select_ordered_l2_tx_count,
     sql_select_ordered_l2_txs_from_offset, sql_select_ordered_l2_txs_page_from_offset,
-    sql_select_recommended_fee, sql_select_safe_inputs_range,
-    sql_select_total_drained_direct_inputs, sql_update_last_processed_block,
-    sql_update_recommended_fee,
+    sql_select_recommended_fee, sql_select_safe_block, sql_select_safe_inputs_range,
+    sql_select_total_drained_direct_inputs, sql_update_recommended_fee, sql_update_safe_block,
 };
-use super::{IndexedDirectInput, StorageOpenError, WriteHead};
+use super::{DirectInputRange, SafeFrontier, StorageOpenError, StoredDirectInput, WriteHead};
 use crate::inclusion_lane::PendingUserOp;
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
@@ -87,21 +86,6 @@ impl Storage {
         Ok(i64_to_u64(value))
     }
 
-    /// Last block number from which safe (direct) inputs have been read. Used by InputReader to resume chain sync.
-    pub fn input_reader_last_processed_block(&mut self) -> Result<u64> {
-        let value = sql_select_last_processed_block(&self.conn)?;
-        Ok(i64_to_u64(value))
-    }
-
-    /// Set the last block number processed by the InputReader. Callers must pass a block greater than the current value.
-    pub fn input_reader_set_last_processed_block(&mut self, block: u64) -> Result<()> {
-        let changed = sql_update_last_processed_block(&self.conn, u64_to_i64(block))?;
-        if changed != 1 {
-            return Err(rusqlite::Error::StatementChangedRows(changed));
-        }
-        Ok(())
-    }
-
     pub fn safe_input_end_exclusive(&mut self) -> Result<u64> {
         let value = sql_select_max_direct_input_index(&self.conn)?;
         Ok(match value {
@@ -110,11 +94,44 @@ impl Storage {
         })
     }
 
+    pub fn current_safe_block(&mut self) -> Result<u64> {
+        let value = sql_select_safe_block(&self.conn)?;
+        Ok(i64_to_u64(value))
+    }
+
+    pub fn ensure_minimum_safe_block(&mut self, minimum_safe_block: u64) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_safe_block = query_current_safe_block(&tx)?;
+        if current_safe_block < minimum_safe_block {
+            let changed_rows = sql_update_safe_block(&tx, u64_to_i64(minimum_safe_block))?;
+            if changed_rows != 1 {
+                return Err(rusqlite::Error::StatementChangedRows(changed_rows));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_safe_frontier(&mut self) -> Result<SafeFrontier> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let safe_block = query_current_safe_block(&tx)?;
+        let end_exclusive = query_latest_direct_input_index_exclusive(&tx)?;
+        tx.commit()?;
+        Ok(SafeFrontier {
+            safe_block,
+            end_exclusive,
+        })
+    }
+
     pub fn fill_safe_inputs(
         &mut self,
         from_inclusive: u64,
         to_exclusive: u64,
-        out: &mut Vec<IndexedDirectInput>,
+        out: &mut Vec<StoredDirectInput>,
     ) -> Result<()> {
         assert!(
             from_inclusive <= to_exclusive,
@@ -141,8 +158,7 @@ impl Storage {
                 "non-contiguous safe-input index: expected {expected}, found {index}"
             );
 
-            out.push(IndexedDirectInput {
-                index,
+            out.push(StoredDirectInput {
                 payload: row.payload,
                 block_number: i64_to_u64(row.block_number),
             });
@@ -158,69 +174,74 @@ impl Storage {
         Ok(())
     }
 
-    pub fn append_safe_direct_inputs(&mut self, inputs: &[IndexedDirectInput]) -> Result<()> {
-        if inputs.is_empty() {
-            return Ok(());
-        }
-
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        let mut next_expected = query_latest_direct_input_index_exclusive(&tx)?;
-        for input in inputs {
-            assert_eq!(
-                input.index, next_expected,
-                "direct input index must be contiguous from storage head"
-            );
-            next_expected = next_expected.saturating_add(1);
-        }
-
-        sql_insert_direct_inputs_batch(&tx, inputs)?;
-
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Appends safe direct inputs and advances the input-reader cursor in a single transaction.
-    /// Use this when persisting inputs from the chain so cursor and inputs stay in sync on failure.
-    pub fn append_safe_inputs_and_advance_cursor(
+    pub fn append_safe_direct_inputs(
         &mut self,
-        inputs: &[IndexedDirectInput],
-        new_last_processed_block: u64,
+        safe_block: u64,
+        inputs: &[StoredDirectInput],
     ) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if !inputs.is_empty() {
-            let mut next_expected = query_latest_direct_input_index_exclusive(&tx)?;
-            for input in inputs {
-                assert_eq!(
-                    input.index, next_expected,
-                    "direct input index must be contiguous from storage head"
-                );
-                next_expected = next_expected.saturating_add(1);
-            }
-            sql_insert_direct_inputs_batch(&tx, inputs)?;
-        }
+        let current_safe_block = query_current_safe_block(&tx)?;
+        assert!(
+            safe_block >= current_safe_block,
+            "safe block regressed: current={current_safe_block}, next={safe_block}"
+        );
+        assert!(
+            safe_block > current_safe_block || inputs.is_empty(),
+            "safe block must advance when appending new safe direct inputs"
+        );
 
-        let changed = sql_update_last_processed_block(&tx, u64_to_i64(new_last_processed_block))?;
-        if changed != 1 {
-            return Err(rusqlite::Error::StatementChangedRows(changed));
+        let next_expected = query_latest_direct_input_index_exclusive(&tx)?;
+        sql_insert_direct_inputs_batch(&tx, next_expected, inputs)?;
+        let changed_rows = sql_update_safe_block(&tx, u64_to_i64(safe_block))?;
+        if changed_rows != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed_rows));
         }
 
         tx.commit()?;
         Ok(())
     }
 
-    pub fn load_open_state(&mut self) -> Result<WriteHead> {
+    pub fn load_open_state(&mut self) -> Result<Option<WriteHead>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let head = load_current_write_head(&tx)?;
         tx.commit()?;
         Ok(head)
+    }
+
+    pub fn initialize_open_state(
+        &mut self,
+        safe_block: u64,
+        leading_direct_range: DirectInputRange,
+    ) -> Result<WriteHead> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert!(
+            load_current_write_head(&tx)?.is_none(),
+            "open state already exists"
+        );
+
+        let now_ms = now_unix_ms();
+        let frame_fee = query_recommended_fee(&tx)?;
+        insert_open_batch_with_index(&tx, 0, now_ms)?;
+        insert_open_frame(&tx, 0, 0, now_ms, frame_fee, safe_block)?;
+        persist_frame_direct_sequence(&tx, 0, 0, leading_direct_range)?;
+        tx.commit()?;
+
+        Ok(WriteHead {
+            batch_index: 0,
+            batch_created_at: from_unix_ms(now_ms),
+            frame_fee,
+            safe_block,
+            batch_user_op_count: 0,
+            open_frame_user_op_count: 0,
+            frame_in_batch: 0,
+        })
     }
 
     pub fn recommended_fee(&mut self) -> Result<u64> {
@@ -252,14 +273,11 @@ impl Storage {
         // observe the same database snapshot.
         assert_write_head_matches_open_state(&tx, head)?;
 
-        let frame_user_op_count =
-            query_frame_user_op_count(&tx, head.batch_index, head.frame_in_batch)?;
-
         sql_insert_user_ops_and_sequenced_batch(
             &tx,
             u64_to_i64(head.batch_index),
             i64::from(head.frame_in_batch),
-            frame_user_op_count,
+            head.open_frame_user_op_count,
             user_ops,
         )?;
 
@@ -271,8 +289,8 @@ impl Storage {
     pub fn close_frame_only(
         &mut self,
         head: &mut WriteHead,
-        drained_direct_start_index: u64,
-        drained_direct_count: usize,
+        next_safe_block: u64,
+        leading_direct_range: DirectInputRange,
     ) -> Result<()> {
         let tx = self
             .conn
@@ -280,7 +298,6 @@ impl Storage {
         assert_write_head_matches_open_state(&tx, head)?;
         let now_ms = now_unix_ms();
         let next_frame_fee = query_recommended_fee(&tx)?;
-        persist_frame_direct_sequence(&tx, head, drained_direct_start_index, drained_direct_count)?;
         let next_frame_in_batch = head.frame_in_batch.saturating_add(1);
         insert_open_frame(
             &tx,
@@ -288,17 +305,23 @@ impl Storage {
             next_frame_in_batch,
             now_ms,
             next_frame_fee,
+            next_safe_block,
+        )?;
+        persist_frame_direct_sequence(
+            &tx,
+            head.batch_index,
+            next_frame_in_batch,
+            leading_direct_range,
         )?;
         tx.commit()?;
-        head.advance_frame(next_frame_fee);
+        head.advance_frame(next_frame_fee, next_safe_block);
         Ok(())
     }
 
     pub fn close_frame_and_batch(
         &mut self,
         head: &mut WriteHead,
-        drained_direct_start_index: u64,
-        drained_direct_count: usize,
+        next_safe_block: u64,
     ) -> Result<()> {
         let tx = self
             .conn
@@ -308,16 +331,27 @@ impl Storage {
         // Frame fee is committed here: we sample the current recommendation once and
         // assign it to the newly opened frame.
         let next_frame_fee = query_recommended_fee(&tx)?;
-        persist_frame_direct_sequence(&tx, head, drained_direct_start_index, drained_direct_count)?;
         let next_batch_index = insert_open_batch(&tx, now_ms)?;
-        insert_open_frame(&tx, next_batch_index, 0, now_ms, next_frame_fee)?;
+        insert_open_frame(
+            &tx,
+            next_batch_index,
+            0,
+            now_ms,
+            next_frame_fee,
+            next_safe_block,
+        )?;
         tx.commit()?;
-        head.move_to_next_batch(next_batch_index, from_unix_ms(now_ms), next_frame_fee);
+        head.move_to_next_batch(
+            next_batch_index,
+            from_unix_ms(now_ms),
+            next_frame_fee,
+            next_safe_block,
+        );
         Ok(())
     }
 
     pub fn load_ordered_l2_txs_from(&mut self, offset: u64) -> Result<Vec<SequencedL2Tx>> {
-        // Read the persisted total order used by catch-up and downstream broadcasters.
+        // Read the persisted total order used by catch-up and downstream feed readers.
         let rows = sql_select_ordered_l2_txs_from_offset(&self.conn, u64_to_i64(offset))?;
         Ok(decode_ordered_l2_txs(rows))
     }
@@ -375,20 +409,25 @@ fn decode_ordered_l2_txs(rows: Vec<super::sql::OrderedL2TxRow>) -> Vec<Sequenced
     out
 }
 
-fn load_current_write_head(tx: &Transaction<'_>) -> Result<WriteHead> {
-    let (batch_index, batch_created_at, batch_user_op_count) = query_latest_batch(tx)?;
-    let (frame_in_batch, frame_fee) = query_latest_frame_in_batch(tx, batch_index)?;
-    Ok(WriteHead {
+fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
+    let Some((batch_index, batch_created_at, batch_user_op_count)) = query_latest_batch(tx)? else {
+        return Ok(None);
+    };
+    let (frame_in_batch, frame_fee, safe_block) = query_latest_frame_in_batch(tx, batch_index)?;
+    let open_frame_user_op_count = query_frame_user_op_count(tx, batch_index, frame_in_batch)?;
+    Ok(Some(WriteHead {
         batch_index,
         batch_created_at,
         frame_fee,
+        safe_block,
         batch_user_op_count,
+        open_frame_user_op_count,
         frame_in_batch,
-    })
+    }))
 }
 
 fn assert_write_head_matches_open_state(tx: &Transaction<'_>, expected: &WriteHead) -> Result<()> {
-    let actual = load_current_write_head(tx)?;
+    let actual = load_current_write_head(tx)?.expect("stale WriteHead: storage has no open state");
     assert_eq!(
         expected.batch_index, actual.batch_index,
         "stale WriteHead: batch_index mismatch"
@@ -402,8 +441,16 @@ fn assert_write_head_matches_open_state(tx: &Transaction<'_>, expected: &WriteHe
         "stale WriteHead: batch_user_op_count mismatch"
     );
     assert_eq!(
+        expected.open_frame_user_op_count, actual.open_frame_user_op_count,
+        "stale WriteHead: open_frame_user_op_count mismatch"
+    );
+    assert_eq!(
         expected.frame_fee, actual.frame_fee,
         "stale WriteHead: frame_fee mismatch"
+    );
+    assert_eq!(
+        expected.safe_block, actual.safe_block,
+        "stale WriteHead: safe_block mismatch"
     );
     assert_eq!(
         to_unix_ms(expected.batch_created_at),
@@ -413,20 +460,26 @@ fn assert_write_head_matches_open_state(tx: &Transaction<'_>, expected: &WriteHe
     Ok(())
 }
 
-fn query_latest_batch(tx: &Transaction<'_>) -> Result<(u64, SystemTime, u64)> {
-    let (batch_index, batch_created_at_ms, batch_user_op_count) =
-        sql_select_latest_batch_with_user_op_count(tx)?;
-    Ok((
-        i64_to_u64(batch_index),
-        from_unix_ms(batch_created_at_ms),
-        i64_to_u64(batch_user_op_count),
-    ))
+fn query_latest_batch(tx: &Transaction<'_>) -> Result<Option<(u64, SystemTime, u64)>> {
+    match sql_select_latest_batch_with_user_op_count(tx) {
+        Ok((batch_index, batch_created_at_ms, batch_user_op_count)) => Ok(Some((
+            i64_to_u64(batch_index),
+            from_unix_ms(batch_created_at_ms),
+            i64_to_u64(batch_user_op_count),
+        ))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(source),
+    }
 }
 
-fn query_latest_frame_in_batch(tx: &Transaction<'_>, batch_index: u64) -> Result<(u32, u64)> {
-    let (frame_in_batch, frame_fee) =
+fn query_latest_frame_in_batch(tx: &Transaction<'_>, batch_index: u64) -> Result<(u32, u64, u64)> {
+    let (frame_in_batch, frame_fee, safe_block) =
         sql_select_latest_frame_in_batch_for_batch(tx, u64_to_i64(batch_index))?;
-    Ok((i64_to_u32(frame_in_batch), i64_to_u64(frame_fee)))
+    Ok((
+        i64_to_u32(frame_in_batch),
+        i64_to_u64(frame_fee),
+        i64_to_u64(safe_block),
+    ))
 }
 
 fn query_frame_user_op_count(
@@ -447,6 +500,11 @@ fn query_latest_direct_input_index_exclusive(tx: &Connection) -> Result<u64> {
     })
 }
 
+fn query_current_safe_block(tx: &Connection) -> Result<u64> {
+    let value = sql_select_safe_block(tx)?;
+    Ok(i64_to_u64(value))
+}
+
 fn query_recommended_fee(tx: &Transaction<'_>) -> Result<u64> {
     let value = sql_select_recommended_fee(tx)?;
     Ok(i64_to_u64(value))
@@ -454,16 +512,15 @@ fn query_recommended_fee(tx: &Transaction<'_>) -> Result<u64> {
 
 fn persist_frame_direct_sequence(
     tx: &Transaction<'_>,
-    head: &WriteHead,
-    drained_direct_start_index: u64,
-    drained_direct_count: usize,
+    batch_index: u64,
+    frame_in_batch: u32,
+    drained_direct_range: DirectInputRange,
 ) -> Result<()> {
     sql_insert_sequenced_direct_inputs_for_frame(
         tx,
-        u64_to_i64(head.batch_index),
-        i64::from(head.frame_in_batch),
-        drained_direct_start_index,
-        drained_direct_count,
+        u64_to_i64(batch_index),
+        i64::from(frame_in_batch),
+        drained_direct_range,
     )
 }
 
@@ -472,12 +529,22 @@ fn insert_open_batch(tx: &Transaction<'_>, created_at_ms: i64) -> Result<u64> {
     Ok(i64_to_u64(tx.last_insert_rowid()))
 }
 
+fn insert_open_batch_with_index(
+    tx: &Transaction<'_>,
+    batch_index: u64,
+    created_at_ms: i64,
+) -> Result<()> {
+    sql_insert_open_batch_with_index(tx, u64_to_i64(batch_index), created_at_ms)?;
+    Ok(())
+}
+
 fn insert_open_frame(
     tx: &Transaction<'_>,
     batch_index: u64,
     frame_in_batch: u32,
     created_at_ms: i64,
     frame_fee: u64,
+    safe_block: u64,
 ) -> Result<()> {
     sql_insert_open_frame(
         tx,
@@ -485,6 +552,7 @@ fn insert_open_frame(
         i64::from(frame_in_batch),
         created_at_ms,
         u64_to_i64(frame_fee),
+        u64_to_i64(safe_block),
     )?;
     Ok(())
 }
@@ -525,7 +593,7 @@ fn i64_to_u32(value: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::Storage;
-    use crate::storage::IndexedDirectInput;
+    use crate::storage::{DirectInputRange, StoredDirectInput};
     use sequencer_core::l2_tx::SequencedL2Tx;
     use tempfile::TempDir;
 
@@ -551,8 +619,21 @@ mod tests {
         let db = temp_db("open-state");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
 
-        let head_a = storage.load_open_state().expect("load open state");
-        let head_b = storage.load_open_state().expect("load existing open state");
+        assert!(
+            storage
+                .load_open_state()
+                .expect("load open state")
+                .is_none(),
+            "fresh storage should not have an open frame yet"
+        );
+
+        let head_a = storage
+            .initialize_open_state(0, DirectInputRange::empty_at(0))
+            .expect("initialize open state");
+        let head_b = storage
+            .load_open_state()
+            .expect("load existing open state")
+            .expect("open state should now exist");
 
         assert_eq!(head_a.batch_index, head_b.batch_index);
         assert_eq!(head_a.frame_in_batch, head_b.frame_in_batch);
@@ -560,35 +641,20 @@ mod tests {
         assert_eq!(head_a.frame_fee, 0);
 
         let mut head_c = head_b;
+        let next_safe_block = head_c.safe_block;
         storage
-            .close_frame_only(&mut head_c, 0, 0)
+            .close_frame_only(&mut head_c, next_safe_block, DirectInputRange::empty_at(0))
             .expect("rotate within same batch");
         assert_eq!(head_c.batch_index, head_b.batch_index);
         assert_eq!(head_c.frame_in_batch, 1);
 
         let mut head_d = head_c;
+        let next_safe_block = head_d.safe_block;
         storage
-            .close_frame_and_batch(&mut head_d, 0, 0)
+            .close_frame_and_batch(&mut head_d, next_safe_block)
             .expect("close batch and rotate");
         assert!(head_d.batch_index > head_c.batch_index);
         assert_eq!(head_d.frame_in_batch, 0);
-    }
-
-    #[test]
-    fn input_reader_last_processed_block_defaults_and_advances() {
-        let db = temp_db("input-reader-state");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        assert_eq!(
-            storage.input_reader_last_processed_block().expect("read"),
-            0
-        );
-        storage
-            .input_reader_set_last_processed_block(100)
-            .expect("set");
-        assert_eq!(
-            storage.input_reader_last_processed_block().expect("read"),
-            100
-        );
     }
 
     #[test]
@@ -599,9 +665,12 @@ mod tests {
 
         storage.set_recommended_fee(7).expect("set recommended fee");
 
-        let mut head = storage.load_open_state().expect("load open state");
+        let mut head = storage
+            .initialize_open_state(0, DirectInputRange::empty_at(0))
+            .expect("initialize open state");
+        let next_safe_block = head.safe_block;
         storage
-            .close_frame_and_batch(&mut head, 0, 0)
+            .close_frame_and_batch(&mut head, next_safe_block)
             .expect("rotate batch");
 
         assert_eq!(head.frame_fee, 7);
@@ -612,26 +681,30 @@ mod tests {
     fn replay_returns_direct_inputs_in_drain_order() {
         let db = temp_db("replay-order");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        let head = storage.load_open_state().expect("load open state");
+        let head = storage
+            .initialize_open_state(0, DirectInputRange::empty_at(0))
+            .expect("initialize open state");
 
         let drained = vec![
-            IndexedDirectInput {
-                index: 0,
+            StoredDirectInput {
                 payload: vec![0xaa],
-                block_number: 0,
+                block_number: 10,
             },
-            IndexedDirectInput {
-                index: 1,
+            StoredDirectInput {
                 payload: vec![0xbb],
-                block_number: 0,
+                block_number: 10,
             },
         ];
         storage
-            .append_safe_direct_inputs(drained.as_slice())
+            .append_safe_direct_inputs(10, drained.as_slice())
             .expect("insert direct inputs");
         let mut head = head;
         storage
-            .close_frame_only(&mut head, 0, drained.len())
+            .close_frame_only(
+                &mut head,
+                10,
+                DirectInputRange::new(0, drained.len() as u64),
+            )
             .expect("close frame with directs");
 
         let replay = storage.load_ordered_l2_txs_from(0).expect("load replay");
@@ -657,25 +730,29 @@ mod tests {
             0
         );
 
-        let head = storage.load_open_state().expect("load open state");
+        let head = storage
+            .initialize_open_state(0, DirectInputRange::empty_at(0))
+            .expect("initialize open state");
         let drained = vec![
-            IndexedDirectInput {
-                index: 0,
+            StoredDirectInput {
                 payload: vec![0x01],
-                block_number: 0,
+                block_number: 10,
             },
-            IndexedDirectInput {
-                index: 1,
+            StoredDirectInput {
                 payload: vec![0x02],
-                block_number: 0,
+                block_number: 10,
             },
         ];
         storage
-            .append_safe_direct_inputs(drained.as_slice())
+            .append_safe_direct_inputs(10, drained.as_slice())
             .expect("insert direct inputs");
         let mut head = head;
         storage
-            .close_frame_only(&mut head, 0, drained.len())
+            .close_frame_only(
+                &mut head,
+                10,
+                DirectInputRange::new(0, drained.len() as u64),
+            )
             .expect("close frame with directs");
 
         assert_eq!(
@@ -699,19 +776,17 @@ mod tests {
         assert!(out.is_empty());
 
         let inserted = vec![
-            IndexedDirectInput {
-                index: 0,
+            StoredDirectInput {
                 payload: vec![0xa0],
-                block_number: 0,
+                block_number: 10,
             },
-            IndexedDirectInput {
-                index: 1,
+            StoredDirectInput {
                 payload: vec![0xb1],
-                block_number: 0,
+                block_number: 10,
             },
         ];
         storage
-            .append_safe_direct_inputs(inserted.as_slice())
+            .append_safe_direct_inputs(10, inserted.as_slice())
             .expect("insert safe directs");
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 2);
@@ -726,5 +801,43 @@ mod tests {
             .fill_safe_inputs(1, 1, &mut out)
             .expect("query empty half-open interval");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ensure_minimum_safe_block_only_moves_forward() {
+        let db = temp_db("ensure-min-safe-block");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        storage
+            .ensure_minimum_safe_block(7)
+            .expect("advance bootstrap safe head");
+        assert_eq!(storage.current_safe_block().expect("read advanced"), 7);
+
+        storage
+            .ensure_minimum_safe_block(3)
+            .expect("do not regress bootstrap safe head");
+        assert_eq!(storage.current_safe_block().expect("read unchanged"), 7);
+    }
+
+    #[test]
+    fn initialize_open_state_creates_first_real_batch_and_frame() {
+        let db = temp_db("initialize-open-state");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        let head = storage
+            .initialize_open_state(12, DirectInputRange::empty_at(0))
+            .expect("initialize open state");
+
+        assert_eq!(head.batch_index, 0);
+        assert_eq!(head.frame_in_batch, 0);
+        assert_eq!(head.safe_block, 12);
+
+        let loaded = storage
+            .load_open_state()
+            .expect("load open state")
+            .expect("open state should exist");
+        assert_eq!(loaded.batch_index, 0);
+        assert_eq!(loaded.frame_in_batch, 0);
+        assert_eq!(loaded.safe_block, 12);
     }
 }

@@ -8,8 +8,6 @@ use thiserror::Error;
 pub enum InclusionLaneError {
     #[error("inclusion lane input channel closed")]
     ChannelClosed,
-    #[error("inclusion lane shutdown requested")]
-    ShutdownRequested,
     #[error("application catchup failed")]
     CatchUp {
         #[source]
@@ -49,8 +47,9 @@ pub enum InclusionLaneError {
 
 #[derive(Debug, Error)]
 pub enum CatchUpError {
-    #[error("cannot load replay entries")]
+    #[error("cannot load replay entries from offset {offset}")]
     LoadReplay {
+        offset: u64,
         #[source]
         source: rusqlite::Error,
     },

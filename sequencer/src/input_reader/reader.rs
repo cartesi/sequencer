@@ -1,38 +1,30 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use alloy::contract::Error as ContractError;
-use alloy::contract::Event;
 use alloy::eips::BlockNumberOrTag::Safe;
 use alloy::providers::Provider;
-use alloy::rpc::types::Topic;
-use alloy::sol_types::SolEvent;
+use alloy::providers::ProviderBuilder;
 use alloy_primitives::Address;
-use async_recursion::async_recursion;
-use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
-use tokio::runtime::Builder;
+use cartesi_rollups_contracts::application::Application;
+use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
-use tracing::{info, trace};
+use tracing::{info, warn};
 
-use crate::storage::{IndexedDirectInput, Storage};
+use super::logs::get_input_added_events;
+use crate::shutdown::ShutdownSignal;
+use crate::storage::{Storage, StorageOpenError, StoredDirectInput};
+
+const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 
 #[derive(Debug, Clone)]
 pub struct InputReaderConfig {
-    /// RPC URL for the reference node (e.g. L1 or authority node).
     pub rpc_url: String,
-    /// Contract address that emits InputAdded (e.g. InputBox).
     pub input_box_address: Address,
-    /// Application address to filter inputs (topic1). Only InputAdded events for this app are ingested.
     pub app_address_filter: Address,
-    /// First block to scan (e.g. InputBox deployment block).
     pub genesis_block: u64,
-    /// Poll interval when no new blocks.
     pub poll_interval: Duration,
-    /// RPC error substrings that trigger partition retry for large block ranges.
     pub long_block_range_error_codes: Vec<String>,
 }
 
@@ -40,215 +32,139 @@ pub struct InputReaderConfig {
 pub enum InputReaderError {
     #[error("provider/transport: {0}")]
     Provider(String),
-    #[error("storage: {0}")]
+    #[error(transparent)]
+    OpenStorage(#[from] StorageOpenError),
+    #[error(transparent)]
     Storage(#[from] rusqlite::Error),
-    #[error("shutdown requested")]
-    ShutdownRequested,
-}
-
-/// Reads InputAdded events in a block range. Retries with half-range partition on configured RPC errors.
-#[async_recursion]
-async fn get_input_added_events(
-    provider: &impl Provider,
-    topic1: Option<&Topic>,
-    read_from: &Address,
-    start_block: u64,
-    end_block: u64,
-    long_block_range_error_codes: &[String],
-) -> Result<Vec<(InputAdded, alloy::rpc::types::Log)>, Vec<ContractError>> {
-    let event = {
-        let mut e = Event::new_sol(provider, read_from)
-            .from_block(start_block)
-            .to_block(end_block)
-            .event(InputAdded::SIGNATURE);
-        if let Some(t) = topic1 {
-            e = e.topic1(t.clone());
-        }
-        e
-    };
-
-    match event.query().await {
-        Ok(logs) => Ok(logs),
-        Err(e) => {
-            if should_retry_with_partition(&e, long_block_range_error_codes) {
-                if start_block >= end_block {
-                    return Err(vec![e]);
-                }
-                let middle = start_block + (end_block - start_block) / 2;
-
-                let first = get_input_added_events(
-                    provider,
-                    topic1,
-                    read_from,
-                    start_block,
-                    middle,
-                    long_block_range_error_codes,
-                )
-                .await;
-                let second = get_input_added_events(
-                    provider,
-                    topic1,
-                    read_from,
-                    middle + 1,
-                    end_block,
-                    long_block_range_error_codes,
-                )
-                .await;
-
-                match (first, second) {
-                    (Ok(mut a), Ok(b)) => {
-                        a.extend(b);
-                        Ok(a)
-                    }
-                    (Err(mut a), Err(b)) => {
-                        a.extend(b);
-                        Err(a)
-                    }
-                    (Err(e), _) | (_, Err(e)) => Err(e),
-                }
-            } else {
-                Err(vec![e])
-            }
-        }
-    }
-}
-
-fn should_retry_with_partition(err: &ContractError, codes: &[String]) -> bool {
-    error_message_matches_retry_codes(&format!("{err:?}"), codes)
-}
-
-/// Pure predicate: true if `error_message` contains any of `codes`. Used for partition retry.
-/// Exposed for unit tests.
-pub(crate) fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) -> bool {
-    codes.iter().any(|c| error_message.contains(c))
-}
-
-/// Builds a contiguous batch of `IndexedDirectInput` from payloads and block numbers.
-/// Exposed for unit tests.
-pub(crate) fn build_indexed_direct_input_batch(
-    payloads_with_blocks: impl IntoIterator<Item = (Vec<u8>, u64)>,
-    next_index: u64,
-) -> Vec<IndexedDirectInput> {
-    payloads_with_blocks
-        .into_iter()
-        .enumerate()
-        .map(|(i, (payload, block_number))| IndexedDirectInput {
-            index: next_index + i as u64,
-            payload,
-            block_number,
-        })
-        .collect()
-}
-
-/// Returns the current chain head using the standard "safe" block tag (alloy `BlockNumberOrTag::Safe`).
-async fn latest_safe_block(provider: &impl Provider) -> Result<u64, InputReaderError> {
-    let block = provider
-        .get_block(Safe.into())
-        .await
-        .map_err(|e| InputReaderError::Provider(e.to_string()))?
-        .ok_or_else(|| InputReaderError::Provider("get_block returned None".to_string()))?;
-    let number = block.header.number;
-    Ok(number)
-}
-
-/// Token used by main to request input reader shutdown and then join the worker.
-#[derive(Debug, Clone)]
-pub struct InputReaderStop {
-    stop: Arc<AtomicBool>,
-}
-
-impl InputReaderStop {
-    pub fn request_shutdown(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
+    #[error("input reader join error: {0}")]
+    Join(String),
 }
 
 pub struct InputReader {
     config: InputReaderConfig,
-    storage: Storage,
-    stop: Arc<AtomicBool>,
+    db_path: String,
+    shutdown: ShutdownSignal,
 }
 
 impl InputReader {
-    pub fn new(config: InputReaderConfig, storage: Storage) -> Self {
+    pub async fn discover_input_box(
+        rpc_url: &str,
+        application_address: Address,
+    ) -> Result<Address, InputReaderError> {
+        let provider = ProviderBuilder::new()
+            .connect(rpc_url)
+            .await
+            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        let application = Application::new(application_address, &provider);
+        let data_availability = application
+            .getDataAvailability()
+            .call()
+            .await
+            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+
+        decode_input_box_address(&data_availability)
+    }
+
+    pub async fn discover_input_box_deployment_block(
+        rpc_url: &str,
+        input_box_address: Address,
+    ) -> Result<u64, InputReaderError> {
+        let provider = ProviderBuilder::new()
+            .connect(rpc_url)
+            .await
+            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        let input_box = InputBox::new(input_box_address, &provider);
+        input_box
+            .getDeploymentBlockNumber()
+            .call()
+            .await
+            .map_err(|e| InputReaderError::Provider(e.to_string()))?
+            .try_into()
+            .map_err(|_| {
+                InputReaderError::Provider(
+                    "input box deployment block number did not fit into u64".to_string(),
+                )
+            })
+    }
+
+    pub fn new(config: InputReaderConfig, db_path: String, shutdown: ShutdownSignal) -> Self {
         Self {
             config,
-            storage,
-            stop: Arc::new(AtomicBool::new(false)),
+            db_path,
+            shutdown,
         }
     }
 
-    pub fn request_shutdown(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+    pub fn start(
+        db_path: &str,
+        config: InputReaderConfig,
+        shutdown: ShutdownSignal,
+    ) -> Result<JoinHandle<Result<(), InputReaderError>>, StorageOpenError> {
+        let _ = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+        let reader = Self::new(config, db_path.to_string(), shutdown);
+        Ok(tokio::spawn(async move { reader.run_forever().await }))
     }
 
-    /// Spawn the input reader loop on a blocking task. Returns a join handle and a stop token
-    /// so main can request shutdown and await the worker (same pattern as inclusion lane).
-    pub fn spawn(self) -> (JoinHandle<Result<(), InputReaderError>>, InputReaderStop) {
-        let stop = InputReaderStop {
-            stop: Arc::clone(&self.stop),
-        };
-        let handle = tokio::task::spawn_blocking(move || {
-            let rt = Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("input reader runtime");
-            let mut reader = self;
-            while !reader.stop.load(Ordering::Relaxed) {
-                if let Err(e) = rt.block_on(reader.advance_once()) {
-                    match &e {
-                        InputReaderError::ShutdownRequested => break,
-                        _ => {
-                            tracing::warn!(error = %e, "input reader advance failed, will retry");
-                        }
-                    }
-                }
-                std::thread::sleep(reader.config.poll_interval);
-            }
-            Ok(())
-        });
-        (handle, stop)
+    pub async fn sync_to_current_safe_head(
+        db_path: &str,
+        config: InputReaderConfig,
+    ) -> Result<(), InputReaderError> {
+        let mut reader = Self::new(config, db_path.to_string(), ShutdownSignal::default());
+        reader.bootstrap_safe_head().await?;
+
+        let provider = ProviderBuilder::new()
+            .connect(reader.config.rpc_url.as_str())
+            .await
+            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        reader.advance_once(&provider).await
     }
 
-    /// Returns true if shutdown has been requested. For tests.
-    #[cfg(test)]
-    pub(crate) fn is_shutdown_requested(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
-    }
+    async fn run_forever(mut self) -> Result<(), InputReaderError> {
+        self.bootstrap_safe_head().await?;
 
-    /// Run the input reader loop in the background (spawns then returns; no join handle).
-    /// Prefer `spawn()` so main can request shutdown and join the worker.
-    pub fn run_blocking(self) -> Result<(), InputReaderError> {
-        drop(self.spawn());
-        Ok(())
-    }
-
-    /// One iteration of the input reader loop. Public for tests.
-    pub(crate) async fn advance_once(&mut self) -> Result<(), InputReaderError> {
-        let provider = alloy::providers::ProviderBuilder::new()
+        let provider = ProviderBuilder::new()
             .connect(self.config.rpc_url.as_str())
             .await
             .map_err(|e| InputReaderError::Provider(e.to_string()))?;
 
-        let current = latest_safe_block(&provider).await?;
-        let mut prev = self.storage.input_reader_last_processed_block()?;
-        if prev == 0 && self.config.genesis_block > 0 {
-            prev = self.config.genesis_block.saturating_sub(1);
-        }
+        loop {
+            if self.shutdown.is_shutdown_requested() {
+                return Ok(());
+            }
 
-        if current <= prev {
+            match self.advance_once(&provider).await {
+                Ok(()) => {}
+                Err(InputReaderError::Provider(error)) => {
+                    warn!(error, "input reader advance failed, will retry");
+                }
+                Err(err) => return Err(err),
+            }
+
+            tokio::select! {
+                _ = self.shutdown.wait_for_shutdown() => return Ok(()),
+                _ = tokio::time::sleep(self.config.poll_interval) => {}
+            }
+        }
+    }
+
+    pub(crate) async fn advance_once(
+        &mut self,
+        provider: &impl Provider,
+    ) -> Result<(), InputReaderError> {
+        let current_safe_block = latest_safe_block(provider).await?;
+        let previous_safe_block = self.current_safe_block().await?;
+
+        if current_safe_block <= previous_safe_block {
             return Ok(());
         }
 
-        let start_block = prev + 1;
-        let topic1 = self.config.app_address_filter.into_word().into();
-
+        let start_block = previous_safe_block + 1;
         let events = get_input_added_events(
-            &provider,
-            Some(&topic1),
+            provider,
+            self.config.app_address_filter,
             &self.config.input_box_address,
             start_block,
-            current,
+            current_safe_block,
             &self.config.long_block_range_error_codes,
         )
         .await
@@ -262,162 +178,119 @@ impl InputReader {
             ))
         })?;
 
-        if events.is_empty() {
-            self.storage
-                .input_reader_set_last_processed_block(current)?;
-            return Ok(());
-        }
-
-        let next_index = self.storage.safe_input_end_exclusive()?;
-        let payloads_with_blocks: Vec<(Vec<u8>, u64)> = events
+        let batch: Vec<StoredDirectInput> = events
             .into_iter()
-            .map(|(ev, log)| {
-                let block_number = log
-                    .block_number
-                    .and_then(|n| n.try_into().ok())
-                    .unwrap_or(0u64);
-                (ev.input.to_vec(), block_number)
-            })
-            .collect();
-        let batch = build_indexed_direct_input_batch(payloads_with_blocks, next_index);
+            .map(|(event, log)| {
+                let block_number = log.block_number.ok_or_else(|| {
+                    InputReaderError::Provider("InputAdded log missing block_number".to_string())
+                })?;
 
-        for item in &batch {
-            trace!(
-                index = item.index,
-                block_number = item.block_number,
-                payload_len = item.payload.len(),
-                "safe input"
-            );
-        }
+                Ok(StoredDirectInput {
+                    payload: event.input.to_vec(),
+                    block_number,
+                })
+            })
+            .collect::<Result<Vec<_>, InputReaderError>>()?;
+
         info!(
-            block_range = %format!("{}..={}", start_block, current),
+            block_range = %format!("{}..={}", start_block, current_safe_block),
             count = batch.len(),
             "appending safe inputs"
         );
 
-        self.storage
-            .append_safe_inputs_and_advance_cursor(&batch, current)?;
-
-        Ok(())
+        self.append_safe_direct_inputs(current_safe_block, batch)
+            .await
     }
+
+    async fn current_safe_block(&self) -> Result<u64, InputReaderError> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            storage.current_safe_block().map_err(InputReaderError::from)
+        })
+        .await
+        .map_err(|err| InputReaderError::Join(err.to_string()))?
+    }
+
+    async fn bootstrap_safe_head(&self) -> Result<(), InputReaderError> {
+        let db_path = self.db_path.clone();
+        let minimum_safe_block = self.config.genesis_block.saturating_sub(1);
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            storage
+                .ensure_minimum_safe_block(minimum_safe_block)
+                .map_err(InputReaderError::from)
+        })
+        .await
+        .map_err(|err| InputReaderError::Join(err.to_string()))?
+    }
+
+    async fn append_safe_direct_inputs(
+        &self,
+        current_safe_block: u64,
+        batch: Vec<StoredDirectInput>,
+    ) -> Result<(), InputReaderError> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            storage
+                .append_safe_direct_inputs(current_safe_block, &batch)
+                .map_err(InputReaderError::from)
+        })
+        .await
+        .map_err(|err| InputReaderError::Join(err.to_string()))?
+    }
+}
+
+fn decode_input_box_address(data_availability: &[u8]) -> Result<Address, InputReaderError> {
+    if data_availability.len() != 20 {
+        return Err(InputReaderError::Provider(format!(
+            "application getDataAvailability returned {} bytes; expected 20-byte InputBox address",
+            data_availability.len()
+        )));
+    }
+
+    Ok(Address::from_slice(data_availability))
+}
+
+async fn latest_safe_block(provider: &impl Provider) -> Result<u64, InputReaderError> {
+    let block = provider
+        .get_block(Safe.into())
+        .await
+        .map_err(|e| InputReaderError::Provider(e.to_string()))?
+        .ok_or_else(|| InputReaderError::Provider("get_block returned None".to_string()))?;
+    Ok(block.header.number)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::node_bindings::Anvil;
-    use alloy_primitives::Address;
-    use std::time::Duration;
     use tempfile::NamedTempFile;
 
-    // ----- Unit tests: retry predicate -----------------------------------------
-
-    #[test]
-    fn error_message_matches_retry_codes_returns_true_when_message_contains_code() {
-        assert!(error_message_matches_retry_codes(
-            "RPC error: block range too large",
-            &["block range".to_string(), "timeout".to_string()]
-        ));
-        assert!(error_message_matches_retry_codes(
-            "timeout after 30s",
-            &["timeout".to_string()]
-        ));
+    fn require_anvil_tests() -> bool {
+        std::env::var_os("RUN_ANVIL_TESTS").is_some()
     }
 
-    #[test]
-    fn error_message_matches_retry_codes_returns_false_when_no_match() {
-        assert!(!error_message_matches_retry_codes(
-            "connection refused",
-            &["block range".to_string(), "timeout".to_string()]
-        ));
-        assert!(!error_message_matches_retry_codes("ok", &[]));
-    }
-
-    #[test]
-    fn error_message_matches_retry_codes_returns_false_when_codes_empty() {
-        assert!(!error_message_matches_retry_codes(
-            "any error message",
-            &[] as &[String]
-        ));
-    }
-
-    // ----- Unit tests: batch builder -------------------------------------------
-
-    #[test]
-    fn build_indexed_direct_input_batch_empty() {
-        let batch = build_indexed_direct_input_batch(Vec::<(Vec<u8>, u64)>::new(), 0);
-        assert!(batch.is_empty());
-    }
-
-    #[test]
-    fn build_indexed_direct_input_batch_contiguous_indices_and_block_numbers() {
-        let payloads = vec![
-            (vec![0x01], 100_u64),
-            (vec![0x02, 0x03], 101),
-            (vec![], 102),
-        ];
-        let batch = build_indexed_direct_input_batch(payloads, 5);
-        assert_eq!(batch.len(), 3);
-        assert_eq!(batch[0].index, 5);
-        assert_eq!(batch[0].payload, vec![0x01]);
-        assert_eq!(batch[0].block_number, 100);
-        assert_eq!(batch[1].index, 6);
-        assert_eq!(batch[1].payload, vec![0x02, 0x03]);
-        assert_eq!(batch[1].block_number, 101);
-        assert_eq!(batch[2].index, 7);
-        assert!(batch[2].payload.is_empty());
-        assert_eq!(batch[2].block_number, 102);
-    }
-
-    #[test]
-    fn build_indexed_direct_input_batch_single_item() {
-        let batch = build_indexed_direct_input_batch(vec![(vec![0xaa, 0xbb], 1_u64)], 0);
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].index, 0);
-        assert_eq!(batch[0].payload, vec![0xaa, 0xbb]);
-        assert_eq!(batch[0].block_number, 1);
-    }
-
-    // ----- Unit tests: InputReader construction and shutdown -------------------
-
-    #[test]
-    fn input_reader_new_and_request_shutdown_sets_stop_flag() {
-        let db_file = NamedTempFile::new().expect("temp file");
-        let storage =
-            crate::storage::Storage::open(db_file.path().to_string_lossy().as_ref(), "NORMAL")
-                .expect("open storage");
-        let config = InputReaderConfig {
-            rpc_url: "http://127.0.0.1:0".to_string(),
-            input_box_address: Address::ZERO,
-            app_address_filter: Address::ZERO,
-            genesis_block: 0,
-            poll_interval: Duration::from_secs(1),
-            long_block_range_error_codes: vec![],
-        };
-        let reader = InputReader::new(config, storage);
-        assert!(!reader.is_shutdown_requested());
-        reader.request_shutdown();
-        assert!(reader.is_shutdown_requested());
-    }
-
-    /// Spawn reader, request shutdown via stop token, then join. Handle should return Ok(Ok(())).
     #[tokio::test]
-    async fn spawn_then_request_shutdown_joins_with_ok() {
+    async fn start_then_request_shutdown_joins_with_ok() {
         let db_file = NamedTempFile::new().expect("temp file");
-        let storage =
-            crate::storage::Storage::open(db_file.path().to_string_lossy().as_ref(), "NORMAL")
-                .expect("open storage");
-        let config = InputReaderConfig {
-            rpc_url: "http://127.0.0.1:0".to_string(),
-            input_box_address: Address::ZERO,
-            app_address_filter: Address::ZERO,
-            genesis_block: 0,
-            poll_interval: Duration::from_millis(20),
-            long_block_range_error_codes: vec![],
-        };
-        let reader = InputReader::new(config, storage);
-        let (handle, stop) = reader.spawn();
-        stop.request_shutdown();
+        let shutdown = ShutdownSignal::default();
+        let handle = InputReader::start(
+            db_file.path().to_string_lossy().as_ref(),
+            InputReaderConfig {
+                rpc_url: "http://127.0.0.1:0".to_string(),
+                input_box_address: Address::ZERO,
+                app_address_filter: Address::ZERO,
+                genesis_block: 0,
+                poll_interval: Duration::from_millis(20),
+                long_block_range_error_codes: vec![],
+            },
+            shutdown.clone(),
+        )
+        .expect("start input reader");
+
+        shutdown.request_shutdown();
         let join_result = tokio::time::timeout(Duration::from_secs(2), handle).await;
         let join_result = join_result.expect("reader should exit within timeout");
         assert!(
@@ -427,28 +300,31 @@ mod tests {
         );
     }
 
-    /// Spawn reader against Anvil, let one advance complete, then request shutdown and join.
     #[tokio::test]
-    async fn spawn_with_anvil_request_shutdown_then_join_returns_ok() {
-        let anvil = Anvil::default().block_time(1).spawn();
-        let rpc_url = anvil.endpoint_url().to_string();
-        let db_file = NamedTempFile::new().expect("temp file");
-        let db_path = db_file.path().to_string_lossy();
-        let storage = crate::storage::Storage::open(&db_path, "NORMAL").expect("open storage");
+    async fn start_with_anvil_request_shutdown_then_join_returns_ok() {
+        if !require_anvil_tests() {
+            return;
+        }
 
-        let config = InputReaderConfig {
-            rpc_url,
-            input_box_address: Address::ZERO,
-            app_address_filter: Address::ZERO,
-            genesis_block: 0,
-            poll_interval: Duration::from_millis(50),
-            long_block_range_error_codes: vec![],
-        };
-        let reader = InputReader::new(config, storage);
-        let (handle, stop) = reader.spawn();
+        let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
+        let shutdown = ShutdownSignal::default();
+        let db_file = NamedTempFile::new().expect("temp file");
+        let handle = InputReader::start(
+            db_file.path().to_string_lossy().as_ref(),
+            InputReaderConfig {
+                rpc_url: anvil.endpoint_url().to_string(),
+                input_box_address: Address::ZERO,
+                app_address_filter: Address::ZERO,
+                genesis_block: 0,
+                poll_interval: Duration::from_millis(50),
+                long_block_range_error_codes: vec![],
+            },
+            shutdown.clone(),
+        )
+        .expect("start input reader");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        stop.request_shutdown();
+        shutdown.request_shutdown();
 
         let join_result = tokio::time::timeout(Duration::from_secs(3), handle).await;
         let join_result = join_result.expect("reader should exit within timeout");
@@ -459,106 +335,151 @@ mod tests {
         );
     }
 
-    // ----- Integration tests (Anvil) -----------------------------------------
-
-    /// Spawn Anvil, run one advance_once with no InputAdded contract (empty events).
-    /// Asserts the reader connects, reads safe block, and updates last_processed_block when block > 0.
     #[tokio::test]
-    async fn advance_once_with_anvil_updates_cursor_when_block_available() {
-        let anvil = Anvil::default().block_time(1).spawn();
-        let rpc_url = anvil.endpoint_url().to_string();
+    async fn advance_once_with_anvil_updates_safe_head_when_block_available() {
+        if !require_anvil_tests() {
+            return;
+        }
+
+        let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
         let db_file = NamedTempFile::new().expect("temp file");
-        let db_path = db_file.path().to_string_lossy();
-        let storage = crate::storage::Storage::open(&db_path, "NORMAL").expect("open storage");
-
-        let config = InputReaderConfig {
-            rpc_url: rpc_url.to_string(),
-            input_box_address: Address::ZERO,
-            app_address_filter: Address::ZERO,
-            genesis_block: 0,
-            poll_interval: Duration::from_secs(1),
-            long_block_range_error_codes: vec![],
-        };
-        let mut reader = InputReader::new(config, storage);
-
-        reader.advance_once().await.expect("advance_once");
-
-        let _last = reader
-            .storage
-            .input_reader_last_processed_block()
-            .expect("read cursor");
-        assert_eq!(
-            reader.storage.safe_input_end_exclusive().expect("safe end"),
-            0,
-            "no InputAdded contract so no direct inputs"
+        let mut reader = InputReader::new(
+            InputReaderConfig {
+                rpc_url: anvil.endpoint_url().to_string(),
+                input_box_address: Address::ZERO,
+                app_address_filter: Address::ZERO,
+                genesis_block: 0,
+                poll_interval: Duration::from_secs(1),
+                long_block_range_error_codes: vec![],
+            },
+            db_file.path().to_string_lossy().into_owned(),
+            ShutdownSignal::default(),
         );
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect(anvil.endpoint_url().to_string().as_str())
+            .await
+            .expect("connect provider");
+
+        reader.advance_once(&provider).await.expect("advance_once");
+        let safe_block = reader.current_safe_block().await.expect("read safe block");
+        let safe_end = {
+            let mut storage = Storage::open(
+                db_file.path().to_string_lossy().as_ref(),
+                SQLITE_SYNCHRONOUS_PRAGMA,
+            )
+            .expect("open storage");
+            storage.safe_input_end_exclusive().expect("safe end")
+        };
+        assert_eq!(safe_end, 0, "no InputAdded contract so no direct inputs");
+        let _ = safe_block;
     }
 
-    /// When genesis_block is set and cursor is 0, effective prev becomes genesis_block - 1,
-    /// so we never read before genesis_block and never set cursor in [1, genesis_block).
     #[tokio::test]
     async fn advance_once_with_genesis_block_uses_genesis_as_effective_prev() {
-        let anvil = Anvil::default().block_time(1).spawn();
-        let rpc_url = anvil.endpoint_url().to_string();
         let db_file = NamedTempFile::new().expect("temp file");
-        let db_path = db_file.path().to_string_lossy();
-        let storage = crate::storage::Storage::open(&db_path, "NORMAL").expect("open storage");
+        let genesis_block = 2_u64;
+        let reader = InputReader::new(
+            InputReaderConfig {
+                rpc_url: "http://127.0.0.1:0".to_string(),
+                input_box_address: Address::ZERO,
+                app_address_filter: Address::ZERO,
+                genesis_block,
+                poll_interval: Duration::from_secs(1),
+                long_block_range_error_codes: vec![],
+            },
+            db_file.path().to_string_lossy().into_owned(),
+            ShutdownSignal::default(),
+        );
 
-        let genesis_block = 2u64;
-        let config = InputReaderConfig {
-            rpc_url,
-            input_box_address: Address::ZERO,
-            app_address_filter: Address::ZERO,
-            genesis_block,
-            poll_interval: Duration::from_secs(1),
-            long_block_range_error_codes: vec![],
-        };
-        let mut reader = InputReader::new(config, storage);
+        reader
+            .bootstrap_safe_head()
+            .await
+            .expect("bootstrap safe head");
 
-        reader.advance_once().await.expect("advance_once");
+        let safe_block = reader.current_safe_block().await.expect("read safe block");
+        assert_eq!(safe_block, genesis_block - 1);
+    }
 
-        let cursor = reader
-            .storage
-            .input_reader_last_processed_block()
-            .expect("read cursor");
-        assert!(
-            cursor == 0 || cursor >= genesis_block,
-            "cursor must be 0 (no advance) or >= genesis_block (never in [1, genesis_block))"
+    #[tokio::test]
+    async fn sync_to_current_safe_head_with_genesis_block_bootstraps_safe_head() {
+        let db_file = NamedTempFile::new().expect("temp file");
+        let genesis_block = 5_u64;
+
+        let result = InputReader::sync_to_current_safe_head(
+            db_file.path().to_string_lossy().as_ref(),
+            InputReaderConfig {
+                rpc_url: "http://127.0.0.1:0".to_string(),
+                input_box_address: Address::ZERO,
+                app_address_filter: Address::ZERO,
+                genesis_block,
+                poll_interval: Duration::from_secs(1),
+                long_block_range_error_codes: vec![],
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(InputReaderError::Provider(_))));
+
+        let mut storage = Storage::open(
+            db_file.path().to_string_lossy().as_ref(),
+            SQLITE_SYNCHRONOUS_PRAGMA,
+        )
+        .expect("open storage");
+        assert_eq!(
+            storage.current_safe_block().expect("read safe block"),
+            genesis_block - 1
         );
     }
 
-    /// When storage cursor is already ahead of chain head, advance_once does nothing
-    /// and does not overwrite last_processed_block.
     #[tokio::test]
-    async fn advance_once_when_cursor_ahead_of_chain_is_no_op() {
-        let anvil = Anvil::default().block_time(1).spawn();
-        let rpc_url = anvil.endpoint_url().to_string();
+    async fn advance_once_when_safe_head_ahead_of_chain_is_no_op() {
+        if !require_anvil_tests() {
+            return;
+        }
+
+        let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
         let db_file = NamedTempFile::new().expect("temp file");
-        let db_path = db_file.path().to_string_lossy();
-        let mut storage = crate::storage::Storage::open(&db_path, "NORMAL").expect("open storage");
+        let db_path = db_file.path().to_string_lossy().into_owned();
+        let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
         storage
-            .input_reader_set_last_processed_block(1000)
-            .expect("set cursor ahead of chain");
+            .append_safe_direct_inputs(1000, &[])
+            .expect("set safe head ahead of chain");
 
-        let config = InputReaderConfig {
-            rpc_url,
-            input_box_address: Address::ZERO,
-            app_address_filter: Address::ZERO,
-            genesis_block: 0,
-            poll_interval: Duration::from_secs(1),
-            long_block_range_error_codes: vec![],
-        };
-        let mut reader = InputReader::new(config, storage);
-
-        reader.advance_once().await.expect("advance_once");
-
-        assert_eq!(
-            reader
-                .storage
-                .input_reader_last_processed_block()
-                .expect("read"),
-            1000,
-            "cursor must not be overwritten when chain is behind"
+        let mut reader = InputReader::new(
+            InputReaderConfig {
+                rpc_url: anvil.endpoint_url().to_string(),
+                input_box_address: Address::ZERO,
+                app_address_filter: Address::ZERO,
+                genesis_block: 0,
+                poll_interval: Duration::from_secs(1),
+                long_block_range_error_codes: vec![],
+            },
+            db_path,
+            ShutdownSignal::default(),
         );
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect(anvil.endpoint_url().to_string().as_str())
+            .await
+            .expect("connect provider");
+
+        reader.advance_once(&provider).await.expect("advance_once");
+        assert_eq!(
+            reader.current_safe_block().await.expect("read"),
+            1000,
+            "safe head should remain unchanged when already ahead of chain"
+        );
+    }
+
+    #[test]
+    fn decode_input_box_address_requires_exactly_20_bytes() {
+        let err = decode_input_box_address(&[0_u8; 19]).expect_err("short bytes should fail");
+        assert!(
+            err.to_string()
+                .contains("expected 20-byte InputBox address")
+        );
+
+        let address =
+            decode_input_box_address(&[0x22; 20]).expect("20-byte data availability address");
+        assert_eq!(address, Address::from([0x22; 20]));
     }
 }

@@ -12,29 +12,26 @@ authors.workspace = true
 [dependencies]
 app-core = { path = "../examples/app-core" }
 sequencer-core = { path = "../sequencer-core" }
-alloy = { version = "1.4", default-features = false, features = ["contract", "provider-http", "rpc-types", "eips"] }
-alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
-alloy-sol-types = "1.4.1"
-cartesi-rollups-contracts = "2.1.1"
-async-recursion = "1.0"
 axum = { version = "0.8.8", features = ["ws"] }
-rusqlite = { version = "0.38.0", features = ["bundled"] }
-rusqlite_migration = "2.3.0"
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ssz = { package = "ethereum_ssz", version = "0.10" }
-ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
-thiserror = "1"
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
-url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6.8", features = ["trace"] }
-tower = { version = "0.5", features = ["limit", "load-shed", "util"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+rusqlite_migration = "2.3.0"
+alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
+alloy-sol-types = "1.4.1"
+alloy = { version = "1.0", features = ["contract", "network", "reqwest", "rpc-types", "sol-types", "node-bindings"] }
+thiserror = "1"
+ssz = { package = "ethereum_ssz", version = "0.10" }
+ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
 clap = { version = "4", features = ["derive", "env"] }
+async-recursion = "1"
+cartesi-rollups-contracts = "=2.2.0"
 
 [dev-dependencies]
-alloy = { version = "1.4", default-features = false, features = ["contract", "provider-http", "rpc-types", "eips", "node-bindings"] }
 futures-util = "0.3"
 tokio-tungstenite = "0.28"
 k256 = "0.13.4"

@@ -1,12 +1,15 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use benchmarks::BenchResult;
+use benchmarks::{
+    AckRunReport, BenchResult, BenchmarkJsonOutput, E2eRunReport, runtime::MemoryReport,
+};
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CompareKind {
@@ -14,6 +17,28 @@ enum CompareKind {
     E2e,
     Sweep,
     All,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SweepMode {
+    Ack,
+    E2e,
+}
+
+impl SweepMode {
+    fn file_prefix(self) -> &'static str {
+        match self {
+            Self::Ack => "ack-sweep-",
+            Self::E2e => "e2e-sweep-",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ack => "ack",
+            Self::E2e => "e2e",
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -24,67 +49,8 @@ struct Cli {
     results_dir: PathBuf,
     #[arg(long, value_enum, default_value_t = CompareKind::All)]
     kind: CompareKind,
-}
-
-#[derive(Debug, Deserialize)]
-struct DurationJson {
-    secs: u64,
-    nanos: u32,
-}
-
-impl DurationJson {
-    fn as_secs_f64(&self) -> f64 {
-        self.secs as f64 + f64::from(self.nanos) / 1_000_000_000.0
-    }
-
-    fn as_ms_f64(&self) -> f64 {
-        self.as_secs_f64() * 1_000.0
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct StatsJson {
-    p50: DurationJson,
-    p95: DurationJson,
-    p99: DurationJson,
-    p999: DurationJson,
-    max: DurationJson,
-}
-
-#[derive(Debug, Deserialize)]
-struct MemoryJson {
-    rss_start_mb: f64,
-    rss_peak_mb: f64,
-    rss_growth_mb: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct AckFileJson {
-    report: AckReportJson,
-}
-
-#[derive(Debug, Deserialize)]
-struct AckReportJson {
-    accepted: u64,
-    rejected: u64,
-    total_wall: DurationJson,
-    ack_latency_accepted: StatsJson,
-    memory: Option<MemoryJson>,
-}
-
-#[derive(Debug, Deserialize)]
-struct E2eFileJson {
-    report: E2eReportJson,
-}
-
-#[derive(Debug, Deserialize)]
-struct E2eReportJson {
-    accepted: u64,
-    rejected: u64,
-    total_wall: DurationJson,
-    ack_latency_accepted: StatsJson,
-    e2e_latency_accepted: StatsJson,
-    memory: Option<MemoryJson>,
+    #[arg(long, value_enum, default_value_t = SweepMode::E2e)]
+    sweep_mode: SweepMode,
 }
 
 #[derive(Debug, Clone)]
@@ -92,9 +58,21 @@ struct SweepCsvRow {
     concurrency: u64,
     accepted_tps: f64,
     rejected_count: u64,
+    http_rejected_count: u64,
     p95_ms: f64,
     p99_ms: f64,
     p999_ms: f64,
+    client_failure_count: u64,
+    http_429_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SweepSummaryView {
+    tps_at_first_any_rejection: Option<f64>,
+    tps_at_first_non_200: Option<f64>,
+    tps_at_first_429: Option<f64>,
+    tps_at_first_client_failure: Option<f64>,
+    max_sustainable_tps_at_0_rejections: Option<f64>,
 }
 
 fn main() -> BenchResult<()> {
@@ -102,13 +80,13 @@ fn main() -> BenchResult<()> {
     match cli.kind {
         CompareKind::Ack => compare_ack(&cli.results_dir)?,
         CompareKind::E2e => compare_e2e(&cli.results_dir)?,
-        CompareKind::Sweep => compare_sweep(&cli.results_dir)?,
+        CompareKind::Sweep => compare_sweep(&cli.results_dir, cli.sweep_mode)?,
         CompareKind::All => {
             compare_ack(&cli.results_dir)?;
             println!();
             compare_e2e(&cli.results_dir)?;
             println!();
-            compare_sweep(&cli.results_dir)?;
+            compare_sweep(&cli.results_dir, cli.sweep_mode)?;
         }
     }
     Ok(())
@@ -116,8 +94,8 @@ fn main() -> BenchResult<()> {
 
 fn compare_ack(results_dir: &Path) -> BenchResult<()> {
     let (old_path, new_path) = latest_two_files(results_dir, "ack-latency-", ".json")?;
-    let old = read_json::<AckFileJson>(&old_path)?;
-    let new = read_json::<AckFileJson>(&new_path)?;
+    let old = read_json::<BenchmarkJsonOutput<AckRunReport, Value>>(&old_path)?;
+    let new = read_json::<BenchmarkJsonOutput<AckRunReport, Value>>(&new_path)?;
 
     println!(
         "ACK latest two:\n  old: {}\n  new: {}",
@@ -127,15 +105,15 @@ fn compare_ack(results_dir: &Path) -> BenchResult<()> {
     print_common(
         old.report.accepted,
         old.report.rejected,
-        &old.report.total_wall,
+        old.report.total_wall,
     );
     print_common_delta(
         old.report.accepted,
         old.report.rejected,
-        &old.report.total_wall,
+        old.report.total_wall,
         new.report.accepted,
         new.report.rejected,
-        &new.report.total_wall,
+        new.report.total_wall,
     );
     print_stats_delta(
         "ack latency",
@@ -148,8 +126,8 @@ fn compare_ack(results_dir: &Path) -> BenchResult<()> {
 
 fn compare_e2e(results_dir: &Path) -> BenchResult<()> {
     let (old_path, new_path) = latest_two_files(results_dir, "e2e-latency-", ".json")?;
-    let old = read_json::<E2eFileJson>(&old_path)?;
-    let new = read_json::<E2eFileJson>(&new_path)?;
+    let old = read_json::<BenchmarkJsonOutput<E2eRunReport, Value>>(&old_path)?;
+    let new = read_json::<BenchmarkJsonOutput<E2eRunReport, Value>>(&new_path)?;
 
     println!(
         "E2E latest two:\n  old: {}\n  new: {}",
@@ -159,15 +137,15 @@ fn compare_e2e(results_dir: &Path) -> BenchResult<()> {
     print_common(
         old.report.accepted,
         old.report.rejected,
-        &old.report.total_wall,
+        old.report.total_wall,
     );
     print_common_delta(
         old.report.accepted,
         old.report.rejected,
-        &old.report.total_wall,
+        old.report.total_wall,
         new.report.accepted,
         new.report.rejected,
-        &new.report.total_wall,
+        new.report.total_wall,
     );
     print_stats_delta(
         "ack latency",
@@ -183,13 +161,14 @@ fn compare_e2e(results_dir: &Path) -> BenchResult<()> {
     Ok(())
 }
 
-fn compare_sweep(results_dir: &Path) -> BenchResult<()> {
-    let (old_path, new_path) = latest_two_files(results_dir, "e2e-sweep-", ".csv")?;
+fn compare_sweep(results_dir: &Path, sweep_mode: SweepMode) -> BenchResult<()> {
+    let (old_path, new_path) = latest_two_files(results_dir, sweep_mode.file_prefix(), ".csv")?;
     let old_rows = read_sweep_rows(&old_path)?;
     let new_rows = read_sweep_rows(&new_path)?;
 
     println!(
-        "SWEEP latest two:\n  old: {}\n  new: {}",
+        "{} SWEEP latest two:\n  old: {}\n  new: {}",
+        sweep_mode.as_str().to_uppercase(),
         old_path.display(),
         new_path.display()
     );
@@ -198,7 +177,9 @@ fn compare_sweep(results_dir: &Path) -> BenchResult<()> {
     let new_by_concurrency = map_sweep_rows(&new_rows);
 
     println!("  deltas by concurrency:");
-    println!("  c,accepted_tps_delta,p95_ms_delta,p99_ms_delta,p999_ms_delta,rejected_delta");
+    println!(
+        "  c,accepted_tps_delta,p95_ms_delta,p99_ms_delta,p999_ms_delta,rejected_delta,client_failure_delta,http_429_delta"
+    );
 
     let mut all_concurrency: Vec<u64> = old_by_concurrency
         .keys()
@@ -213,35 +194,59 @@ fn compare_sweep(results_dir: &Path) -> BenchResult<()> {
         let new = new_by_concurrency.get(&concurrency);
         if let (Some(old), Some(new)) = (old, new) {
             println!(
-                "  {},{:+.3},{:+.3},{:+.3},{:+.3},{:+}",
+                "  {},{:+.3},{:+.3},{:+.3},{:+.3},{:+},{:+},{:+}",
                 concurrency,
                 new.accepted_tps - old.accepted_tps,
                 new.p95_ms - old.p95_ms,
                 new.p99_ms - old.p99_ms,
                 new.p999_ms - old.p999_ms,
                 i128::from(new.rejected_count) - i128::from(old.rejected_count),
+                i128::from(new.client_failure_count) - i128::from(old.client_failure_count),
+                i128::from(new.http_429_count) - i128::from(old.http_429_count),
             );
         } else {
-            println!("  {concurrency},n/a,n/a,n/a,n/a,n/a");
+            println!("  {concurrency},n/a,n/a,n/a,n/a,n/a,n/a,n/a");
         }
     }
 
-    let old_max_zero_rejection_tps = max_zero_rejection_tps(&old_rows);
-    let new_max_zero_rejection_tps = max_zero_rejection_tps(&new_rows);
-    let old_first_rejection_tps = first_rejection_tps(&old_rows);
-    let new_first_rejection_tps = first_rejection_tps(&new_rows);
+    let old_summary = compute_sweep_summary(old_rows.as_slice());
+    let new_summary = compute_sweep_summary(new_rows.as_slice());
 
     println!("  summary:");
     println!(
         "    max_sustainable_tps_at_0_rejections: old={:.3}, new={:.3}, delta={:+.3}",
-        old_max_zero_rejection_tps,
-        new_max_zero_rejection_tps,
-        new_max_zero_rejection_tps - old_max_zero_rejection_tps
+        old_summary
+            .max_sustainable_tps_at_0_rejections
+            .unwrap_or(0.0),
+        new_summary
+            .max_sustainable_tps_at_0_rejections
+            .unwrap_or(0.0),
+        new_summary
+            .max_sustainable_tps_at_0_rejections
+            .unwrap_or(0.0)
+            - old_summary
+                .max_sustainable_tps_at_0_rejections
+                .unwrap_or(0.0)
+    );
+    println!(
+        "    tps_at_first_any_rejection: old={}, new={}",
+        fmt_opt(old_summary.tps_at_first_any_rejection),
+        fmt_opt(new_summary.tps_at_first_any_rejection),
     );
     println!(
         "    tps_at_first_non_200: old={}, new={}",
-        fmt_opt(old_first_rejection_tps),
-        fmt_opt(new_first_rejection_tps),
+        fmt_opt(old_summary.tps_at_first_non_200),
+        fmt_opt(new_summary.tps_at_first_non_200),
+    );
+    println!(
+        "    tps_at_first_429: old={}, new={}",
+        fmt_opt(old_summary.tps_at_first_429),
+        fmt_opt(new_summary.tps_at_first_429),
+    );
+    println!(
+        "    tps_at_first_client_failure: old={}, new={}",
+        fmt_opt(old_summary.tps_at_first_client_failure),
+        fmt_opt(new_summary.tps_at_first_client_failure),
     );
     Ok(())
 }
@@ -297,7 +302,7 @@ fn trailing_number(file_name: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> BenchResult<T> {
+fn read_json<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> BenchResult<T> {
     let raw = fs::read_to_string(path)?;
     let parsed = serde_json::from_str::<T>(&raw)?;
     Ok(parsed)
@@ -324,16 +329,22 @@ fn read_sweep_rows(path: &Path) -> BenchResult<Vec<SweepCsvRow>> {
         let concurrency = parse_csv_u64(&cols, &header_idx, "concurrency")?;
         let accepted_tps = parse_csv_f64(&cols, &header_idx, "accepted_tps")?;
         let rejected_count = parse_csv_u64(&cols, &header_idx, "rejected_count")?;
+        let http_rejected_count = parse_csv_u64(&cols, &header_idx, "http_rejected_count")?;
         let p95_ms = parse_csv_f64(&cols, &header_idx, "p95_ms")?;
         let p99_ms = parse_csv_f64(&cols, &header_idx, "p99_ms")?;
         let p999_ms = parse_csv_f64(&cols, &header_idx, "p999_ms")?;
+        let client_failure_count = parse_csv_u64(&cols, &header_idx, "client_failure_count")?;
+        let http_429_count = parse_csv_u64(&cols, &header_idx, "http_429_count")?;
         rows.push(SweepCsvRow {
             concurrency,
             accepted_tps,
             rejected_count,
+            http_rejected_count,
             p95_ms,
             p99_ms,
             p999_ms,
+            client_failure_count,
+            http_429_count,
         });
     }
     Ok(rows)
@@ -373,20 +384,33 @@ fn map_sweep_rows(rows: &[SweepCsvRow]) -> BTreeMap<u64, SweepCsvRow> {
     out
 }
 
-fn max_zero_rejection_tps(rows: &[SweepCsvRow]) -> f64 {
-    rows.iter()
-        .filter(|row| row.rejected_count == 0)
-        .map(|row| row.accepted_tps)
-        .fold(0.0, f64::max)
+fn compute_sweep_summary(rows: &[SweepCsvRow]) -> SweepSummaryView {
+    SweepSummaryView {
+        tps_at_first_any_rejection: rows
+            .iter()
+            .find(|row| row.rejected_count > 0)
+            .map(|row| row.accepted_tps),
+        tps_at_first_non_200: rows
+            .iter()
+            .find(|row| row.http_rejected_count > 0)
+            .map(|row| row.accepted_tps),
+        tps_at_first_429: rows
+            .iter()
+            .find(|row| row.http_429_count > 0)
+            .map(|row| row.accepted_tps),
+        tps_at_first_client_failure: rows
+            .iter()
+            .find(|row| row.client_failure_count > 0)
+            .map(|row| row.accepted_tps),
+        max_sustainable_tps_at_0_rejections: rows
+            .iter()
+            .filter(|row| row.rejected_count == 0)
+            .map(|row| row.accepted_tps)
+            .max_by(|a, b| a.total_cmp(b)),
+    }
 }
 
-fn first_rejection_tps(rows: &[SweepCsvRow]) -> Option<f64> {
-    rows.iter()
-        .find(|row| row.rejected_count > 0)
-        .map(|row| row.accepted_tps)
-}
-
-fn print_common(accepted: u64, rejected: u64, total_wall: &DurationJson) {
+fn print_common(accepted: u64, rejected: u64, total_wall: Duration) {
     let throughput = throughput(accepted, total_wall);
     println!("  old summary:");
     println!("    accepted: {accepted}");
@@ -397,10 +421,10 @@ fn print_common(accepted: u64, rejected: u64, total_wall: &DurationJson) {
 fn print_common_delta(
     old_accepted: u64,
     old_rejected: u64,
-    old_total_wall: &DurationJson,
+    old_total_wall: Duration,
     new_accepted: u64,
     new_rejected: u64,
-    new_total_wall: &DurationJson,
+    new_total_wall: Duration,
 ) {
     let old_tps = throughput(old_accepted, old_total_wall);
     let new_tps = throughput(new_accepted, new_total_wall);
@@ -421,23 +445,23 @@ fn print_common_delta(
     );
 }
 
-fn print_stats_delta(name: &str, old: &StatsJson, new: &StatsJson) {
+fn print_stats_delta(name: &str, old: &benchmarks::Stats, new: &benchmarks::Stats) {
     println!("  {name} delta (new - old):");
-    print_metric_delta("p50", old.p50.as_ms_f64(), new.p50.as_ms_f64());
-    print_metric_delta("p95", old.p95.as_ms_f64(), new.p95.as_ms_f64());
-    print_metric_delta("p99", old.p99.as_ms_f64(), new.p99.as_ms_f64());
-    print_metric_delta("p99.9", old.p999.as_ms_f64(), new.p999.as_ms_f64());
-    print_metric_delta("max", old.max.as_ms_f64(), new.max.as_ms_f64());
+    print_metric_delta("p50", duration_ms(old.p50), duration_ms(new.p50));
+    print_metric_delta("p95", duration_ms(old.p95), duration_ms(new.p95));
+    print_metric_delta("p99", duration_ms(old.p99), duration_ms(new.p99));
+    print_metric_delta("p99.9", duration_ms(old.p999), duration_ms(new.p999));
+    print_metric_delta("max", duration_ms(old.max), duration_ms(new.max));
 }
 
-fn print_memory_delta(old: Option<&MemoryJson>, new: Option<&MemoryJson>) {
+fn print_memory_delta(old: Option<&MemoryReport>, new: Option<&MemoryReport>) {
     let (Some(old), Some(new)) = (old, new) else {
         return;
     };
     println!("  memory delta (new - old):");
-    print_metric_delta("rss_start_mb", old.rss_start_mb, new.rss_start_mb);
-    print_metric_delta("rss_peak_mb", old.rss_peak_mb, new.rss_peak_mb);
-    print_metric_delta("rss_growth_mb", old.rss_growth_mb, new.rss_growth_mb);
+    print_optional_metric_delta("rss_start_mb", old.rss_start_mb, new.rss_start_mb);
+    print_optional_metric_delta("rss_peak_mb", old.rss_peak_mb, new.rss_peak_mb);
+    print_optional_metric_delta("rss_growth_mb", old.rss_growth_mb, new.rss_growth_mb);
 }
 
 fn print_metric_delta(label: &str, old_value: f64, new_value: f64) {
@@ -450,12 +474,24 @@ fn print_metric_delta(label: &str, old_value: f64, new_value: f64) {
     );
 }
 
-fn throughput(accepted: u64, total_wall: &DurationJson) -> f64 {
+fn print_optional_metric_delta(label: &str, old_value: Option<f64>, new_value: Option<f64>) {
+    let (Some(old_value), Some(new_value)) = (old_value, new_value) else {
+        println!("    {label}: n/a");
+        return;
+    };
+    print_metric_delta(label, old_value, new_value);
+}
+
+fn throughput(accepted: u64, total_wall: Duration) -> f64 {
     let secs = total_wall.as_secs_f64();
     if secs == 0.0 {
         return 0.0;
     }
     accepted as f64 / secs
+}
+
+fn duration_ms(value: Duration) -> f64 {
+    value.as_secs_f64() * 1000.0
 }
 
 fn pct(new_value: f64, old_value: f64) -> f64 {

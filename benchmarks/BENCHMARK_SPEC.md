@@ -24,8 +24,10 @@ This spec makes that requirement measurable and repeatable.
 ### 2.3 Capacity and Overload Metrics
 
 1. `max_sustainable_tps_at_0_rejections`: highest accepted TPS observed while `rejection_rate == 0%`.
-2. `tps_at_first_non_200`: throughput point where first non-`200` response appears.
-3. `tps_at_first_429`: throughput point where first `429 OVERLOADED` response appears.
+2. `tps_at_first_any_rejection`: throughput point where the first rejection of any kind appears.
+3. `tps_at_first_non_200`: throughput point where the first HTTP non-`200` response appears.
+4. `tps_at_first_429`: throughput point where the first `429 OVERLOADED` response appears.
+5. `tps_at_first_client_failure`: throughput point where the first timeout/network/client-side submission failure appears.
 
 ### 2.4 Memory Metrics
 
@@ -54,7 +56,9 @@ This spec makes that requirement measurable and repeatable.
 
 1. Target evaluation must use valid-only benchmark traffic (no intentionally invalid transactions).
 2. Non-`200` responses must be broken down by status code so overload (`429`) is distinguishable from invalid-input failures (`400`/`422`).
-3. If no non-`200` appears, `tps_at_first_non_200` and `tps_at_first_429` must be reported as `not reached`.
+3. Client/network failures must be reported separately from HTTP non-`200` responses so client saturation is not mistaken for sequencer overload.
+4. If no non-`200` appears, `tps_at_first_non_200` and `tps_at_first_429` must be reported as `not reached`.
+5. If no client/network failure appears, `tps_at_first_client_failure` must be reported as `not reached`.
 
 ### 3.4 Memory Collection Rules
 
@@ -121,9 +125,10 @@ Each benchmark report must include:
 4. Rejection reason breakdown (when available).
 5. Network profile and shaping method/config.
 6. Memory metrics and memory sampling method/interval.
-7. Full run configuration (command, concurrency/arrival settings, timeout settings).
+7. Full run configuration (command, deployment domain, concurrency/arrival settings, timeout settings).
 8. Target verdict lines: `ACK_TARGET` and `SOFT_CONFIRM_TARGET` (when target evaluation is performed).
 9. Sanity assertion status and failure summary (if any).
+10. For sweeps, separate first-knee metrics for any rejection, HTTP non-`200`, `429`, and client-side failure.
 
 ## 7. Mapping to Current Harnesses
 
@@ -135,8 +140,5 @@ Each benchmark report must include:
 ## 8. Current Gaps
 
 1. Add first-class support for canonical injected-latency runs.
-2. Add explicit `p99.9` export in sweep CSV/JSON outputs.
-3. Add standard `ACK_TARGET` and `SOFT_CONFIRM_TARGET` verdict lines in benchmark outputs.
-4. Add rejection-reason breakdown consistently across relevant reports.
-5. Ensure reports always include network shaping tool and exact shaping config.
-6. Add first-class memory collection/reporting in benchmark tooling.
+2. Ensure reports always include network shaping tool and exact shaping config.
+3. Strengthen tx identity matching for e2e correlation if workloads ever stop guaranteeing effectively unique sender/payload pairs.

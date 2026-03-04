@@ -8,7 +8,6 @@ Build and evolve a **sequencer prototype** for a future DeFi stack.
 
 Current scope is intentionally small: a **dummy wallet app** that supports:
 - `Transfer`
-- `Deposit`
 - `Withdrawal`
 
 Primary objective in this phase: make sequencer behavior, safety checks, and persistence reliable before adding "real world" execution logic.
@@ -26,36 +25,42 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 ## Glossary
 
 - `chunk`: small bounded list of user ops processed/executed and persisted together to amortize SQLite cost and keep low-latency ack behavior.
-- `frame`: canonical ordering boundary that contains user ops plus a `drain_n` decision for direct-input execution.
+- `frame`: canonical ordering boundary that commits a `safe_block` plus a list of user ops; canonical execution drains all direct inputs safe at that block before executing the frame’s user ops.
 - `batch`: list of frames that will be posted on-chain as one unit.
 - `inclusion lane`: the hot-path single-lane loop that dequeues user ops, executes app logic, persists ordering, and rotates frame/batch boundaries.
 
 ## Architecture Map
 
-- `sequencer/src/main.rs`: process bootstrap, env config, queue wiring, HTTP server.
-- `sequencer/src/api/mod.rs`: `POST /tx` and `GET /ws/subscribe` endpoints (tx ingress + replay broadcaster).
+- `sequencer/src/main.rs`: thin binary entrypoint.
+- `sequencer/src/lib.rs`: public sequencer API (`run`, `RunConfig`).
+- `sequencer/src/config.rs`: runtime input parsing and EIP-712 domain construction.
+- `sequencer/src/runtime.rs`: bootstrap and runtime wiring.
+- `sequencer/src/api/mod.rs`: `POST /tx` and `GET /ws/subscribe` endpoints (tx ingress + replay feed).
 - `sequencer/src/api/error.rs`: API error model + HTTP mapping.
 - `sequencer/src/inclusion_lane/mod.rs`: inclusion-lane exports and public surface.
 - `sequencer/src/inclusion_lane/lane.rs`: batched execution/commit loop (single lane).
 - `sequencer/src/inclusion_lane/types.rs`: inclusion-lane queue item and pipeline error types.
 - `sequencer/src/inclusion_lane/error.rs`: inclusion-lane runtime and catch-up error types.
-- `sequencer/src/l2_tx_broadcaster/mod.rs`: centralized ordered-L2Tx poller + live fanout to WS subscribers.
+- `sequencer/src/input_reader/`: safe-input ingestion from InputBox into SQLite.
+- `sequencer/src/l2_tx_feed/mod.rs`: DB-backed ordered-L2Tx feed used by WS subscriptions.
 - `sequencer/src/storage/mod.rs`: DB open, migrations, frame persistence, and direct-input broker APIs.
 - `sequencer/src/storage/migrations/`: DB schema/bootstrapping (`0001`).
 - `sequencer-core/src/`: shared domain types/interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, broadcast message model).
 - `examples/app-core/src/application/mod.rs`: wallet prototype implementing `Application`.
-- `examples/canonical-app/src/main.rs`: placeholder canonical scheduler binary entrypoint.
+- `benchmarks/src/`: benchmark harnesses and self-contained benchmark runtime.
 
 ## Domain Truths (Important)
 
 - This is a **sequencer prototype**, not a full DeFi stack yet.
 - API validates signature and enqueues signed `UserOp`; method decoding happens during application execution.
+- Deposits are direct-input-only (L1 -> L2) and must not be represented as user ops.
 - Rejections (`InvalidNonce`, fee cap too low, insufficient gas balance) produce no state mutation and are not persisted.
 - Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `direct_inputs`, and `sequenced_l2_txs`.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame.
 - The next frame fee is sampled from `recommended_fees` when rotating to a new frame (default bootstrap value is `0`).
-- `/ws/subscribe` has soft operational guardrails: subscriber cap (`SEQ_WS_MAX_SUBSCRIBERS`, default `64`) and catch-up cap (`SEQ_WS_MAX_CATCHUP_EVENTS`, default `50000`).
+- `/ws/subscribe` currently has internal guardrails: subscriber cap `64`, catch-up cap `50000`.
 - Wallet state (balances/nonces) is in-memory right now (not persisted).
+- EIP-712 domain name/version are fixed in code; chain ID and verifying contract are deployment-specific inputs.
 
 ## Hot-Path Invariants
 
@@ -69,7 +74,7 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 
 - Storage model is append-oriented; avoid mutable status flags for open/closed entities.
 - Open batch/frame are derived by “latest row” convention.
-- `drain_n` is derivable from `sequenced_l2_txs` by counting direct-input rows per frame.
+- A frame’s leading direct-input prefix is derivable from `sequenced_l2_txs` plus `frames.safe_block`.
 - Safe cursor/head values should be derived from persisted facts when possible, not duplicated as mutable fields.
 - Replay/catch-up must use persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics.
 - Included user-op identity is constrained by `UNIQUE(sender, nonce)`.
@@ -101,38 +106,22 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Run server (defaults shown):
+Run server:
 
 ```bash
-SEQ_HTTP_ADDR=127.0.0.1:3000 \
-SEQ_DB_PATH=sequencer.db \
+SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \
+SEQ_DOMAIN_CHAIN_ID=31337 \
+SEQ_DOMAIN_VERIFYING_CONTRACT=0x1111111111111111111111111111111111111111 \
 cargo run -p sequencer
 ```
 
-Key env vars:
+Optional env vars:
 - `SEQ_HTTP_ADDR`
 - `SEQ_DB_PATH`
-- `SEQ_QUEUE_CAP`
-- `SEQ_OVERLOAD_MAX_INFLIGHT_SUBMISSIONS`
-- `SEQ_MAX_USER_OPS_PER_CHUNK` (preferred)
-- `SEQ_MAX_BATCH` (legacy alias)
-- `SEQ_SAFE_DIRECT_BUFFER_CAPACITY`
-- `SEQ_MAX_BATCH_OPEN_MS`
-- `SEQ_MAX_BATCH_USER_OP_BYTES`
-- `SEQ_INCLUSION_LANE_IDLE_POLL_INTERVAL_MS` (preferred)
-- `SEQ_INCLUSION_LANE_TICK_INTERVAL_MS` (legacy alias)
-- `SEQ_COMMIT_LANE_TICK_INTERVAL_MS` (legacy alias)
-- `SEQ_BROADCASTER_IDLE_POLL_INTERVAL_MS`
-- `SEQ_BROADCASTER_PAGE_SIZE`
-- `SEQ_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY`
-- `SEQ_WS_MAX_SUBSCRIBERS`
-- `SEQ_WS_MAX_CATCHUP_EVENTS`
-- `SEQ_RUNTIME_METRICS_ENABLED`
-- `SEQ_RUNTIME_METRICS_LOG_INTERVAL_MS`
-- `SEQ_MAX_BODY_BYTES`
-- `SEQ_SQLITE_SYNCHRONOUS`
-- `SEQ_DOMAIN_NAME`
-- `SEQ_DOMAIN_VERSION`
+- `SEQ_LONG_BLOCK_RANGE_ERROR_CODES`
+
+Required env vars:
+- `SEQ_ETH_RPC_URL`
 - `SEQ_DOMAIN_CHAIN_ID`
 - `SEQ_DOMAIN_VERIFYING_CONTRACT`
 
@@ -177,6 +166,12 @@ Focus tests on:
 - storage batch atomicity and uniqueness constraints
 
 If adding integration tests, prefer black-box tests around `POST /tx` and commit outcomes.
+
+Some `sequencer` tests use Anvil and are opt-in locally:
+
+```bash
+RUN_ANVIL_TESTS=1 cargo test -p sequencer --lib
+```
 
 ## Definition of Done for Agent Changes
 

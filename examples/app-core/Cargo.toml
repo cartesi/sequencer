@@ -13,3 +13,4 @@ authors.workspace = true
 sequencer-core = { path = "../../sequencer-core" }
 alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
 ssz = { package = "ethereum_ssz", version = "0.10" }
+ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
