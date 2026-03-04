@@ -342,6 +342,7 @@ async fn send_catch_up(
                 let event = BroadcastTxMessage::from_offset_and_tx(next_offset, tx);
                 next_offset = next_offset.saturating_add(1);
                 if events_tx.blocking_send(event).is_err() {
+                    debug!("broadcaster catch-up worker stopping early: receiver channel closed");
                     return Ok(());
                 }
             }
@@ -349,13 +350,16 @@ async fn send_catch_up(
         Ok(())
     });
 
+    let mut ws_send_failed = false;
     while let Some(event) = events_rx.recv().await {
         if send_ws_event(socket, &event).await.is_err() {
-            return Err(());
+            ws_send_failed = true;
+            break;
         }
     }
+    drop(events_rx);
 
-    match worker.await {
+    let worker_result = match worker.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(reason)) => {
             warn!(reason, "broadcaster catch-up worker exited with error");
@@ -365,7 +369,12 @@ async fn send_catch_up(
             warn!(error = %err, "broadcaster catch-up worker join failed");
             Err(())
         }
+    };
+
+    if ws_send_failed {
+        return Err(());
     }
+    worker_result
 }
 
 async fn send_ws_event(socket: &mut WebSocket, event: &BroadcastTxMessage) -> Result<(), ()> {
