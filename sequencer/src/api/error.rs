@@ -8,6 +8,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::inclusion_lane::SequencerError;
+use sequencer_core::api::TxRequestError;
 
 #[derive(Debug, Error, Clone)]
 pub enum ApiError {
@@ -19,6 +20,8 @@ pub enum ApiError {
     InvalidSignature(String),
     #[error("{0}")]
     ExecutionRejected(String),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("{0}")]
     InternalError(String),
     #[error("{0}")]
@@ -49,6 +52,10 @@ impl ApiError {
         Self::InternalError(message.into())
     }
 
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
+    }
+
     pub fn overloaded(message: impl Into<String>) -> Self {
         Self::Overloaded(message.into())
     }
@@ -58,6 +65,7 @@ impl ApiError {
             Self::BadRequest(_) | Self::InvalidSignature(_) => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ExecutionRejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Overloaded(_) => StatusCode::TOO_MANY_REQUESTS,
         }
@@ -69,6 +77,7 @@ impl ApiError {
             Self::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
             Self::InvalidSignature(_) => "INVALID_SIGNATURE",
             Self::ExecutionRejected(_) => "EXECUTION_REJECTED",
+            Self::Unavailable(_) => "UNAVAILABLE",
             Self::InternalError(_) => "INTERNAL_ERROR",
             Self::Overloaded(_) => "OVERLOADED",
         }
@@ -79,7 +88,17 @@ impl From<SequencerError> for ApiError {
     fn from(value: SequencerError) -> Self {
         match value {
             SequencerError::Invalid(message) => Self::ExecutionRejected(message),
+            SequencerError::Unavailable(message) => Self::Unavailable(message),
             SequencerError::Internal(message) => Self::InternalError(message),
+        }
+    }
+}
+
+impl From<TxRequestError> for ApiError {
+    fn from(value: TxRequestError) -> Self {
+        match value {
+            TxRequestError::BadRequest(message) => Self::BadRequest(message),
+            TxRequestError::InvalidSignature(message) => Self::InvalidSignature(message),
         }
     }
 }

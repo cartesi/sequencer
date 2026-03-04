@@ -2,37 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::io::ErrorKind;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
+use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
 use futures_util::{SinkExt, StreamExt};
-use sequencer::api::{AppState, router};
-use sequencer::inclusion_lane::{InclusionLaneInput, PendingUserOp, SequencerError};
-use sequencer::l2_tx_broadcaster::{L2TxBroadcaster, L2TxBroadcasterConfig};
-use sequencer::storage::{IndexedDirectInput, Storage};
+use sequencer::api::{self, ApiConfig};
+use sequencer::inclusion_lane::{PendingUserOp, SequencerError};
+use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
+use sequencer::shutdown::ShutdownSignal;
+use sequencer::storage::{DirectInputRange, Storage, StoredDirectInput};
 use sequencer_core::api::WsTxMessage;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 use sequencer_rust_client::SequencerClient;
 use tempfile::TempDir;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ws_subscribe_tests_sequential() {
-    scenario_streams_ordered_txs_from_offset_zero().await;
-    scenario_resumes_from_given_offset().await;
-    scenario_receives_live_events_after_subscribing().await;
-    scenario_fanout_delivers_live_event_to_multiple_subscribers().await;
-    scenario_replies_with_pong_on_ping().await;
-    scenario_rejects_when_subscriber_limit_is_reached().await;
-    scenario_closes_when_catchup_window_exceeds_limit().await;
-}
-
-async fn scenario_streams_ordered_txs_from_offset_zero() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
     let db = temp_db("ws-subscribe-zero");
     seed_ordered_txs(db.path.as_str());
     let expected = load_ordered_l2_txs_page(db.path.as_str(), 0, 2);
@@ -57,7 +48,8 @@ async fn scenario_streams_ordered_txs_from_offset_zero() {
     assert_ws_message_matches_tx(second, &expected[1], 1);
 }
 
-async fn scenario_resumes_from_given_offset() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_resumes_from_given_offset() {
     let db = temp_db("ws-subscribe-resume");
     seed_ordered_txs(db.path.as_str());
     let expected = load_ordered_l2_txs_page(db.path.as_str(), 1, 1);
@@ -84,7 +76,8 @@ async fn scenario_resumes_from_given_offset() {
     assert_ws_message_matches_tx(first, &expected[0], 1);
 }
 
-async fn scenario_receives_live_events_after_subscribing() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_receives_live_events_after_subscribing() {
     let db = temp_db("ws-subscribe-live");
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
@@ -100,7 +93,7 @@ async fn scenario_receives_live_events_after_subscribing() {
         .expect("timeout connecting websocket")
         .expect("connect websocket");
 
-    append_drained_direct_input(db.path.as_str(), 1, vec![0xbb]);
+    append_drained_direct_input(db.path.as_str(), vec![0xbb]);
     let expected = load_ordered_l2_txs_page(db.path.as_str(), base_offset, 1);
     assert_eq!(
         expected.len(),
@@ -115,7 +108,8 @@ async fn scenario_receives_live_events_after_subscribing() {
     assert_ws_message_matches_tx(live, &expected[0], base_offset);
 }
 
-async fn scenario_fanout_delivers_live_event_to_multiple_subscribers() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_fanout_delivers_live_event_to_multiple_subscribers() {
     let db = temp_db("ws-subscribe-fanout");
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
@@ -134,7 +128,7 @@ async fn scenario_fanout_delivers_live_event_to_multiple_subscribers() {
         .expect("timeout connecting websocket B")
         .expect("connect websocket B");
 
-    append_drained_direct_input(db.path.as_str(), 1, vec![0xcd]);
+    append_drained_direct_input(db.path.as_str(), vec![0xcd]);
     let expected = load_ordered_l2_txs_page(db.path.as_str(), base_offset, 1);
     assert_eq!(
         expected.len(),
@@ -153,7 +147,8 @@ async fn scenario_fanout_delivers_live_event_to_multiple_subscribers() {
     assert_ws_message_matches_tx(event_b, &expected[0], base_offset);
 }
 
-async fn scenario_replies_with_pong_on_ping() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_replies_with_pong_on_ping() {
     let db = temp_db("ws-subscribe-ping-pong");
     seed_ordered_txs(db.path.as_str());
     // Use a far-future offset so this test validates ping/pong without
@@ -185,7 +180,8 @@ async fn scenario_replies_with_pong_on_ping() {
     }
 }
 
-async fn scenario_rejects_when_subscriber_limit_is_reached() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_rejects_when_subscriber_limit_is_reached() {
     let db = temp_db("ws-subscriber-limit");
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
@@ -215,7 +211,8 @@ async fn scenario_rejects_when_subscriber_limit_is_reached() {
     shutdown_runtime(runtime).await;
 }
 
-async fn scenario_closes_when_catchup_window_exceeds_limit() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_closes_when_catchup_window_exceeds_limit() {
     let db = temp_db("ws-catchup-limit");
     seed_ordered_txs(db.path.as_str());
 
@@ -245,9 +242,45 @@ async fn scenario_closes_when_catchup_window_exceeds_limit() {
     shutdown_runtime(runtime).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_closes_on_oversized_inbound_message() {
+    let db = temp_db("ws-oversized-inbound");
+    seed_ordered_txs(db.path.as_str());
+
+    let Some(runtime) = start_test_server(db.path.as_str()).await else {
+        return;
+    };
+
+    let url = ws_subscribe_url(runtime.addr, u64::MAX);
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
+        .await
+        .expect("timeout connecting websocket")
+        .expect("connect websocket");
+
+    ws.send(Message::Text("x".repeat(64 * 1024).into()))
+        .await
+        .expect("send oversized text frame");
+
+    let received = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("wait for websocket close after oversized inbound message");
+
+    match received {
+        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {}
+        other => {
+            panic!("expected websocket to close after oversized inbound message, got {other:?}")
+        }
+    }
+
+    drop(ws);
+    shutdown_runtime(runtime).await;
+}
+
 fn seed_ordered_txs(db_path: &str) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
-    let mut head = storage.load_open_state().expect("load open state");
+    let mut head = storage
+        .initialize_open_state(0, DirectInputRange::empty_at(0))
+        .expect("initialize open state");
 
     let (respond_to, _recv) = oneshot::channel::<Result<(), SequencerError>>();
     let pending = PendingUserOp {
@@ -268,45 +301,59 @@ fn seed_ordered_txs(db_path: &str) {
         .append_user_ops_chunk(&mut head, &[pending])
         .expect("append user-op chunk");
     storage
-        .append_safe_direct_inputs(&[IndexedDirectInput {
-            index: 0,
-            payload: vec![0xaa],
-            block_number: 0,
-        }])
+        .append_safe_direct_inputs(
+            10,
+            &[StoredDirectInput {
+                payload: vec![0xaa],
+                block_number: 10,
+            }],
+        )
         .expect("append direct input");
     storage
-        .close_frame_only(&mut head, 0, 1)
+        .close_frame_only(&mut head, 10, DirectInputRange::new(0, 1))
         .expect("close frame with one drained direct input");
 }
 
-fn append_drained_direct_input(db_path: &str, index: u64, payload: Vec<u8>) {
+fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
-    let mut head = storage.load_open_state().expect("load open state");
+    let mut head = storage
+        .load_open_state()
+        .expect("load open state")
+        .expect("open state should exist");
+    let safe_block = storage
+        .current_safe_block()
+        .expect("read current safe block")
+        .saturating_add(1);
+    let next_direct_index = storage
+        .safe_input_end_exclusive()
+        .expect("read next direct input index");
     storage
-        .append_safe_direct_inputs(&[IndexedDirectInput {
-            index,
-            payload,
-            block_number: 0,
-        }])
+        .append_safe_direct_inputs(
+            safe_block,
+            &[StoredDirectInput {
+                payload,
+                block_number: safe_block,
+            }],
+        )
         .expect("append direct input");
     storage
-        .close_frame_only(&mut head, index, 1)
+        .close_frame_only(
+            &mut head,
+            safe_block,
+            DirectInputRange::new(next_direct_index, next_direct_index.saturating_add(1)),
+        )
         .expect("close frame with one drained direct input");
 }
 
 struct WsServerRuntime {
     addr: std::net::SocketAddr,
-    broadcaster: L2TxBroadcaster,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    server_task: Option<tokio::task::JoinHandle<()>>,
+    shutdown: ShutdownSignal,
+    server_task: Option<api::ApiServerTask>,
 }
 
 impl Drop for WsServerRuntime {
     fn drop(&mut self) {
-        self.broadcaster.request_shutdown();
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
+        self.shutdown.request_shutdown();
         if let Some(task) = self.server_task.take() {
             task.abort();
         }
@@ -334,60 +381,54 @@ async fn start_test_server_with_limits(
     };
     let addr = listener.local_addr().expect("read listener addr");
 
-    let (tx_sender, _rx) = mpsc::channel::<InclusionLaneInput>(1);
-    let broadcaster = L2TxBroadcaster::start(
+    let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
+    let shutdown = ShutdownSignal::default();
+    let tx_feed = L2TxFeed::new(
         db_path.to_string(),
-        L2TxBroadcasterConfig {
+        shutdown.clone(),
+        L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            subscriber_buffer_capacity: 256,
-            metrics_enabled: false,
-            metrics_log_interval: Duration::from_secs(5),
         },
-    )
-    .expect("start broadcaster");
-    let state = Arc::new(AppState {
+    );
+    let task = api::start_on_listener(
+        listener,
         tx_sender,
-        domain: Eip712Domain {
+        Eip712Domain {
             name: None,
             version: None,
             chain_id: None,
             verifying_contract: None,
             salt: None,
         },
-        overload_max_inflight_submissions: 16,
-        ws_subscriber_limit: Arc::new(Semaphore::new(ws_max_subscribers)),
-        ws_max_catchup_events,
-        broadcaster: broadcaster.clone(),
-    });
-    let app = router(state, 128 * 1024);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown_rx.await;
-    });
-    let task = tokio::spawn(async move {
-        server.await.expect("run test server");
-    });
+        MAX_METHOD_PAYLOAD_BYTES,
+        shutdown.clone(),
+        tx_feed,
+        ApiConfig {
+            ws_max_subscribers,
+            ws_max_catchup_events,
+            ..ApiConfig::default()
+        },
+    );
 
     Some(WsServerRuntime {
         addr,
-        broadcaster,
-        shutdown_tx: Some(shutdown_tx),
+        shutdown,
         server_task: Some(task),
     })
 }
 
 async fn shutdown_runtime(mut runtime: WsServerRuntime) {
-    runtime.broadcaster.request_shutdown();
-    if let Some(tx) = runtime.shutdown_tx.take() {
-        let _ = tx.send(());
-    }
+    runtime.shutdown.request_shutdown();
     if let Some(task) = runtime.server_task.take() {
-        tokio::time::timeout(Duration::from_secs(3), task)
+        let server_result = tokio::time::timeout(Duration::from_secs(3), task)
             .await
             .expect("wait for server task")
             .expect("join server task");
+        assert!(
+            server_result.is_ok(),
+            "expected clean server shutdown, got {server_result:?}"
+        );
     }
 }
 
@@ -396,7 +437,7 @@ async fn recv_tx_message(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> WsTxMessage {
-    let received = tokio::time::timeout(Duration::from_secs(5), ws.next())
+    let received = tokio::time::timeout(Duration::from_secs(2), ws.next())
         .await
         .expect("wait for websocket message")
         .expect("websocket stream ended")
@@ -415,7 +456,7 @@ async fn recv_raw_message(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> Message {
-    tokio::time::timeout(Duration::from_secs(5), ws.next())
+    tokio::time::timeout(Duration::from_secs(2), ws.next())
         .await
         .expect("wait for websocket message")
         .expect("websocket stream ended")
@@ -490,7 +531,7 @@ struct TestDb {
 
 fn temp_db(name: &str) -> TestDb {
     let dir = tempfile::Builder::new()
-        .prefix(format!("sequencer-ws-broadcaster-{name}-").as_str())
+        .prefix(format!("sequencer-ws-feed-{name}-").as_str())
         .tempdir()
         .expect("create temporary test directory");
     let path = dir.path().join("sequencer.sqlite");

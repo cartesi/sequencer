@@ -14,15 +14,12 @@ pub struct PendingUserOp {
     pub received_at: SystemTime,
 }
 
-#[derive(Debug)]
-pub enum InclusionLaneInput {
-    UserOp(PendingUserOp),
-}
-
 #[derive(Debug, Error, Clone)]
 pub enum SequencerError {
     #[error("{0}")]
     Invalid(String),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -34,5 +31,9 @@ impl SequencerError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
     }
 }

@@ -4,7 +4,7 @@
 use rusqlite::{Connection, Result, Row, Transaction, params};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::IndexedDirectInput;
+use super::{DirectInputRange, StoredDirectInput};
 use crate::inclusion_lane::PendingUserOp;
 
 const SQL_SELECT_SAFE_INPUTS_RANGE: &str = include_str!("queries/select_safe_inputs_range.sql");
@@ -22,6 +22,8 @@ const SQL_SELECT_MAX_DIRECT_INPUT_INDEX: &str = "SELECT MAX(direct_input_index) 
 const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_txs";
 const SQL_SELECT_RECOMMENDED_FEE: &str =
     "SELECT fee FROM recommended_fees WHERE singleton_id = 0 LIMIT 1";
+const SQL_SELECT_SAFE_BLOCK: &str =
+    "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1";
 const SQL_INSERT_DIRECT_INPUT: &str =
     "INSERT INTO direct_inputs (direct_input_index, payload, block_number) VALUES (?1, ?2, ?3)";
 const SQL_INSERT_USER_OP: &str = include_str!("queries/insert_user_op.sql");
@@ -30,10 +32,8 @@ const SQL_INSERT_SEQUENCED_DIRECT_INPUT: &str =
     include_str!("queries/insert_sequenced_direct_input.sql");
 const SQL_UPDATE_RECOMMENDED_FEE: &str =
     "UPDATE recommended_fees SET fee = ?1 WHERE singleton_id = 0";
-const SQL_SELECT_LAST_PROCESSED_BLOCK: &str =
-    "SELECT last_processed_block FROM input_reader_state WHERE singleton_id = 0 LIMIT 1";
-const SQL_UPDATE_LAST_PROCESSED_BLOCK: &str =
-    "UPDATE input_reader_state SET last_processed_block = ?1 WHERE singleton_id = 0";
+const SQL_UPDATE_SAFE_BLOCK: &str =
+    "UPDATE l1_safe_head SET block_number = ?1 WHERE singleton_id = 0";
 
 #[derive(Debug, Clone)]
 pub(super) struct OrderedL2TxRow {
@@ -72,12 +72,12 @@ pub(super) fn sql_update_recommended_fee(conn: &Connection, fee: i64) -> Result<
     conn.execute(SQL_UPDATE_RECOMMENDED_FEE, params![fee])
 }
 
-pub(super) fn sql_select_last_processed_block(conn: &Connection) -> Result<i64> {
-    conn.query_row(SQL_SELECT_LAST_PROCESSED_BLOCK, [], |row| row.get(0))
+pub(super) fn sql_select_safe_block(conn: &Connection) -> Result<i64> {
+    conn.query_row(SQL_SELECT_SAFE_BLOCK, [], |row| row.get(0))
 }
 
-pub(super) fn sql_update_last_processed_block(conn: &Connection, block: i64) -> Result<usize> {
-    conn.execute(SQL_UPDATE_LAST_PROCESSED_BLOCK, params![block])
+pub(super) fn sql_update_safe_block(conn: &Connection, safe_block: i64) -> Result<usize> {
+    conn.execute(SQL_UPDATE_SAFE_BLOCK, params![safe_block])
 }
 
 pub(super) fn sql_select_safe_inputs_range(
@@ -95,18 +95,19 @@ pub(super) fn sql_select_safe_inputs_range(
 
 pub(super) fn sql_insert_direct_inputs_batch(
     tx: &Transaction<'_>,
-    direct_inputs: &[IndexedDirectInput],
+    start_index: u64,
+    direct_inputs: &[StoredDirectInput],
 ) -> Result<()> {
     if direct_inputs.is_empty() {
         return Ok(());
     }
 
     let mut stmt = tx.prepare_cached(SQL_INSERT_DIRECT_INPUT)?;
-    for input in direct_inputs {
+    for (offset, input) in direct_inputs.iter().enumerate() {
         stmt.execute(params![
-            u64_to_i64(input.index),
+            u64_to_i64(start_index.saturating_add(offset as u64)),
             input.payload.as_slice(),
-            u64_to_i64(input.block_number),
+            u64_to_i64(input.block_number)
         ])?;
     }
     Ok(())
@@ -152,16 +153,14 @@ pub(super) fn sql_insert_sequenced_direct_inputs(
     tx: &Transaction<'_>,
     batch_index: i64,
     frame_in_batch: i64,
-    direct_start_index: u64,
-    direct_input_count: usize,
+    direct_range: DirectInputRange,
 ) -> Result<()> {
-    if direct_input_count == 0 {
+    if direct_range.is_empty() {
         return Ok(());
     }
 
     let mut stmt = tx.prepare_cached(SQL_INSERT_SEQUENCED_DIRECT_INPUT)?;
-    for offset in 0..direct_input_count {
-        let direct_input_index = direct_start_index.saturating_add(offset as u64);
+    for direct_input_index in direct_range.start_inclusive..direct_range.end_exclusive {
         stmt.execute(params![
             batch_index,
             frame_in_batch,
@@ -207,11 +206,11 @@ pub(super) fn sql_select_latest_batch_with_user_op_count(
 pub(super) fn sql_select_latest_frame_in_batch_for_batch(
     tx: &Transaction<'_>,
     batch_index: i64,
-) -> Result<(i64, i64)> {
+) -> Result<(i64, i64, i64)> {
     tx.query_row(
         SQL_SELECT_LATEST_FRAME_IN_BATCH_FOR_BATCH,
         params![batch_index],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
 }
 
@@ -231,21 +230,23 @@ pub(super) fn sql_insert_sequenced_direct_inputs_for_frame(
     tx: &Transaction<'_>,
     batch_index: i64,
     frame_in_batch: i64,
-    direct_start_index: u64,
-    direct_input_count: usize,
+    direct_range: DirectInputRange,
 ) -> Result<()> {
-    sql_insert_sequenced_direct_inputs(
-        tx,
-        batch_index,
-        frame_in_batch,
-        direct_start_index,
-        direct_input_count,
-    )
+    sql_insert_sequenced_direct_inputs(tx, batch_index, frame_in_batch, direct_range)
 }
 
 pub(super) fn sql_insert_open_batch(tx: &Transaction<'_>, created_at_ms: i64) -> Result<usize> {
     const SQL: &str = "INSERT INTO batches (created_at_ms) VALUES (?1)";
     tx.execute(SQL, params![created_at_ms])
+}
+
+pub(super) fn sql_insert_open_batch_with_index(
+    tx: &Transaction<'_>,
+    batch_index: i64,
+    created_at_ms: i64,
+) -> Result<usize> {
+    const SQL: &str = "INSERT INTO batches (batch_index, created_at_ms) VALUES (?1, ?2)";
+    tx.execute(SQL, params![batch_index, created_at_ms])
 }
 
 pub(super) fn sql_insert_open_frame(
@@ -254,11 +255,12 @@ pub(super) fn sql_insert_open_frame(
     frame_in_batch: i64,
     created_at_ms: i64,
     fee: i64,
+    safe_block: i64,
 ) -> Result<usize> {
-    const SQL: &str = "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee) VALUES (?1, ?2, ?3, ?4)";
+    const SQL: &str = "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) VALUES (?1, ?2, ?3, ?4, ?5)";
     tx.execute(
         SQL,
-        params![batch_index, frame_in_batch, created_at_ms, fee],
+        params![batch_index, frame_in_batch, created_at_ms, fee, safe_block],
     )
 }
 
@@ -304,18 +306,18 @@ fn u64_to_i64(value: u64) -> i64 {
 mod tests {
     use super::{
         SQL_INSERT_DIRECT_INPUT, SQL_INSERT_SEQUENCED_DIRECT_INPUT, SQL_INSERT_SEQUENCED_USER_OP,
-        SQL_INSERT_USER_OP, sql_count_user_ops_for_frame, sql_insert_direct_inputs_batch,
-        sql_insert_open_batch, sql_insert_open_frame, sql_insert_sequenced_direct_inputs_for_frame,
-        sql_insert_user_ops_and_sequenced_batch, sql_select_latest_batch_with_user_op_count,
-        sql_select_latest_frame_in_batch_for_batch, sql_select_max_direct_input_index,
+        SQL_INSERT_USER_OP, sql_insert_direct_inputs_batch, sql_insert_open_batch,
+        sql_insert_open_batch_with_index, sql_insert_open_frame,
+        sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_and_sequenced_batch,
+        sql_select_latest_batch_with_user_op_count, sql_select_max_direct_input_index,
         sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_from_offset,
         sql_select_ordered_l2_txs_page_from_offset, sql_select_recommended_fee,
-        sql_select_safe_inputs_range, sql_select_total_drained_direct_inputs,
-        sql_update_recommended_fee,
+        sql_select_safe_block, sql_select_safe_inputs_range,
+        sql_select_total_drained_direct_inputs, sql_update_recommended_fee, sql_update_safe_block,
     };
     use crate::inclusion_lane::PendingUserOp;
-    use crate::storage::IndexedDirectInput;
     use crate::storage::db::Storage;
+    use crate::storage::{DirectInputRange, StoredDirectInput};
     use alloy_primitives::{Address, Signature};
     use rusqlite::{Connection, params};
     use sequencer_core::user_op::{SignedUserOp, UserOp};
@@ -347,6 +349,13 @@ mod tests {
         }
     }
 
+    fn seed_open_batch0_frame0(conn: &mut Connection) {
+        let tx = conn.transaction().expect("start tx");
+        sql_insert_open_batch_with_index(&tx, 0, 123).expect("insert batch 0");
+        sql_insert_open_frame(&tx, 0, 0, 123, 0, 0).expect("insert frame 0");
+        tx.commit().expect("commit tx");
+    }
+
     #[test]
     fn max_index_helpers_work_for_empty_and_non_empty_tables() {
         let mut conn = setup_conn();
@@ -362,12 +371,12 @@ mod tests {
 
         conn.execute(
             SQL_INSERT_DIRECT_INPUT,
-            params![0_i64, vec![0xaa_u8], 0_i64],
+            params![0_i64, vec![0xaa_u8], 10_i64],
         )
         .expect("insert direct input 0");
         conn.execute(
             SQL_INSERT_DIRECT_INPUT,
-            params![1_i64, vec![0xbb_u8], 0_i64],
+            params![1_i64, vec![0xbb_u8], 11_i64],
         )
         .expect("insert direct input 1");
         assert_eq!(
@@ -375,6 +384,7 @@ mod tests {
             Some(1)
         );
 
+        seed_open_batch0_frame0(&mut conn);
         let tx = conn.transaction().expect("start tx");
         tx.execute(
             SQL_INSERT_SEQUENCED_DIRECT_INPUT,
@@ -401,17 +411,17 @@ mod tests {
 
         conn.execute(
             SQL_INSERT_DIRECT_INPUT,
-            params![0_i64, vec![0xaa_u8], 0_i64],
+            params![0_i64, vec![0xaa_u8], 10_i64],
         )
         .expect("insert direct input 0");
         conn.execute(
             SQL_INSERT_DIRECT_INPUT,
-            params![1_i64, vec![0xbb_u8], 0_i64],
+            params![1_i64, vec![0xbb_u8], 11_i64],
         )
         .expect("insert direct input 1");
         conn.execute(
             SQL_INSERT_DIRECT_INPUT,
-            params![2_i64, vec![0xcc_u8], 0_i64],
+            params![2_i64, vec![0xcc_u8], 12_i64],
         )
         .expect("insert direct input 2");
 
@@ -425,8 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn ordered_l2_query_returns_user_ops_before_drained_directs_in_frame() {
-        let conn = setup_conn();
+    fn ordered_l2_query_follows_sequenced_offset_order() {
+        let mut conn = setup_conn();
+        seed_open_batch0_frame0(&mut conn);
 
         conn.execute(
             SQL_INSERT_USER_OP,
@@ -445,7 +456,7 @@ mod tests {
         .expect("insert user op");
         conn.execute(
             SQL_INSERT_DIRECT_INPUT,
-            params![0_i64, vec![0xaa_u8], 0_i64],
+            params![0_i64, vec![0xaa_u8], 10_i64],
         )
         .expect("insert direct input");
         conn.execute(SQL_INSERT_SEQUENCED_USER_OP, params![0_i64, 0_i64, 0_i64])
@@ -463,7 +474,7 @@ mod tests {
         assert_eq!(rows[1].kind, 1);
         assert_eq!(rows[1].fee, None);
 
-        let paged = sql_select_ordered_l2_txs_page_from_offset(&conn, 2, 1).expect("query page");
+        let paged = sql_select_ordered_l2_txs_page_from_offset(&conn, 1, 1).expect("query page");
         assert_eq!(paged.len(), 1);
         assert_eq!(paged[0].kind, 1);
         assert_eq!(
@@ -473,23 +484,12 @@ mod tests {
     }
 
     #[test]
-    fn batch_and_frame_helpers_reflect_bootstrapped_open_state() {
+    fn batch_and_frame_helpers_start_empty_before_lane_initialization() {
         let mut conn = setup_conn();
         let tx = conn.transaction().expect("start tx");
 
-        let (batch_index, _created_at_ms, user_op_count) =
-            sql_select_latest_batch_with_user_op_count(&tx).expect("query latest batch");
-        assert_eq!(batch_index, 0);
-        assert_eq!(user_op_count, 0);
-
-        let (frame_in_batch, frame_fee) =
-            sql_select_latest_frame_in_batch_for_batch(&tx, batch_index).expect("latest frame");
-        assert_eq!(frame_in_batch, 0);
-        assert_eq!(frame_fee, 0);
-
-        let frame_user_op_count =
-            sql_count_user_ops_for_frame(&tx, batch_index, frame_in_batch).expect("count user ops");
-        assert_eq!(frame_user_op_count, 0);
+        let err = sql_select_latest_batch_with_user_op_count(&tx).expect_err("no batch yet");
+        assert!(matches!(err, rusqlite::Error::QueryReturnedNoRows));
     }
 
     #[test]
@@ -499,7 +499,7 @@ mod tests {
 
         sql_insert_open_batch(&tx, 123).expect("insert open batch");
         let new_batch = tx.last_insert_rowid();
-        sql_insert_open_frame(&tx, new_batch, 0, 123, 7).expect("insert open frame");
+        sql_insert_open_frame(&tx, new_batch, 0, 123, 7, 9).expect("insert open frame");
         tx.commit().expect("commit tx");
 
         let batch_count: i64 = conn
@@ -508,8 +508,8 @@ mod tests {
         let frame_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM frames", [], |row| row.get(0))
             .expect("count frames");
-        assert!(batch_count >= 2);
-        assert!(frame_count >= 2);
+        assert_eq!(batch_count, 1);
+        assert_eq!(frame_count, 1);
     }
 
     #[test]
@@ -524,23 +524,30 @@ mod tests {
     }
 
     #[test]
+    fn l1_safe_head_helpers_read_and_update_singleton() {
+        let conn = setup_conn();
+        assert_eq!(sql_select_safe_block(&conn).expect("read safe block"), 0);
+        sql_update_safe_block(&conn, 12).expect("update safe block");
+        assert_eq!(sql_select_safe_block(&conn).expect("read updated"), 12);
+    }
+
+    #[test]
     fn batch_insert_helpers_insert_multiple_rows() {
         let mut conn = setup_conn();
+        seed_open_batch0_frame0(&mut conn);
         let tx = conn.transaction().expect("start tx");
 
         let direct_inputs = vec![
-            IndexedDirectInput {
-                index: 0,
+            StoredDirectInput {
                 payload: vec![0xaa_u8],
-                block_number: 0,
+                block_number: 10,
             },
-            IndexedDirectInput {
-                index: 1,
+            StoredDirectInput {
                 payload: vec![0xbb_u8],
-                block_number: 0,
+                block_number: 11,
             },
         ];
-        sql_insert_direct_inputs_batch(&tx, direct_inputs.as_slice())
+        sql_insert_direct_inputs_batch(&tx, 0, direct_inputs.as_slice())
             .expect("insert direct inputs batch");
 
         let user_ops = vec![
@@ -550,8 +557,13 @@ mod tests {
         sql_insert_user_ops_and_sequenced_batch(&tx, 0, 0, 0, user_ops.as_slice())
             .expect("insert user ops + sequenced batch");
 
-        sql_insert_sequenced_direct_inputs_for_frame(&tx, 0, 0, 0, direct_inputs.len())
-            .expect("insert sequenced direct inputs batch");
+        sql_insert_sequenced_direct_inputs_for_frame(
+            &tx,
+            0,
+            0,
+            DirectInputRange::new(0, direct_inputs.len() as u64),
+        )
+        .expect("insert sequenced direct inputs batch");
 
         tx.commit().expect("commit tx");
 
@@ -574,7 +586,8 @@ mod tests {
 
     #[test]
     fn user_op_uniqueness_is_sender_nonce() {
-        let conn = setup_conn();
+        let mut conn = setup_conn();
+        seed_open_batch0_frame0(&mut conn);
 
         // Same nonce with different senders should be accepted.
         conn.execute(

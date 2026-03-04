@@ -1,22 +1,21 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use alloy_primitives::Address;
 use benchmarks::{
-    AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_WORKLOAD_INITIAL_BALANCE,
-    DEFAULT_WORKLOAD_TRANSFER_AMOUNT, WorkloadConfig, WorkloadKind, default_seed_offset,
-    print_ack_report, run_ack_benchmark,
+    AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME,
+    DOMAIN_VERSION, NetworkProfile, WorkloadConfig, WorkloadKind, default_json_output_path,
+    default_seed_offset, evaluate_ack_target, parse_address, print_ack_report,
+    print_target_evaluation, resolve_external_benchmark_domain, run_ack_benchmark,
     runtime::{
-        DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RUNTIME_METRICS_LOG_INTERVAL_MS,
-        DEFAULT_SEQUENCER_BIN, DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT_MS,
-        DEFAULT_SEQUENCER_START_TIMEOUT_MS, ManagedSequencer, ManagedSequencerConfig,
-        MemorySampler, default_sequencer_log_path, parse_inclusion_lane_profile_from_log,
+        DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_SEQUENCER_BIN, ManagedSequencer,
+        ManagedSequencerConfig, MemorySampler,
     },
+    write_json_output,
 };
-use clap::{Parser, ValueEnum};
-use serde::Serialize;
-use std::fs;
+use clap::Parser;
+use serde_json::json;
 use std::path::Path;
-use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
@@ -24,37 +23,23 @@ use std::time::Duration;
     name = "ack_latency",
     about = "ack latency benchmark",
     version,
-    after_help = "Examples:\n  cargo run -p benchmarks --bin ack_latency -- --endpoint http://127.0.0.1:3000 --count 1000 --concurrency 32 --max-fee 0\n  cargo run -p benchmarks --bin ack_latency --release -- --count 5000 --allow-rejections"
+    after_help = "Examples:\n  cargo run -p benchmarks --bin ack_latency -- --self-contained --count 1000 --concurrency 32 --max-fee 0\n  cargo run -p benchmarks --bin ack_latency -- --endpoint http://127.0.0.1:3000 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --count 1000 --concurrency 32 --max-fee 0\n  cargo run -p benchmarks --bin ack_latency -- --self-contained --count 5000 --concurrency 32 --evaluate"
 )]
 struct Args {
-    #[arg(long, visible_alias = "http-url", default_value = DEFAULT_ENDPOINT)]
+    #[arg(long, default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
     #[arg(long, default_value_t = false)]
     self_contained: bool,
     #[arg(long, default_value = DEFAULT_SEQUENCER_BIN)]
     sequencer_bin: String,
-    #[arg(long, default_value_t = DEFAULT_SEQUENCER_START_TIMEOUT_MS)]
-    sequencer_start_timeout_ms: u64,
-    #[arg(long, default_value_t = DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT_MS)]
-    sequencer_shutdown_timeout_ms: u64,
-    #[arg(long, default_value_t = true)]
-    temp_db: bool,
     #[arg(long)]
-    sequencer_log_path: Option<PathBuf>,
-    #[arg(long, default_value_t = true)]
-    sequencer_runtime_metrics_enabled: bool,
-    #[arg(long, default_value_t = DEFAULT_RUNTIME_METRICS_LOG_INTERVAL_MS)]
-    sequencer_runtime_metrics_log_interval_ms: u64,
-    #[arg(long, default_value = "info")]
-    sequencer_rust_log: String,
-    #[arg(long, default_value_t = DEFAULT_MEMORY_SAMPLE_INTERVAL_MS)]
-    memory_sample_interval_ms: u64,
-    #[arg(long, value_enum, default_value_t = CliWorkload::Synthetic)]
-    workload: CliWorkload,
+    domain_chain_id: Option<u64>,
+    #[arg(long, value_parser = parse_address)]
+    domain_verifying_contract: Option<Address>,
+    #[arg(long, value_enum, default_value_t = WorkloadKind::Synthetic)]
+    workload: WorkloadKind,
     #[arg(long)]
     accounts_file: Option<String>,
-    #[arg(long, default_value_t = DEFAULT_WORKLOAD_INITIAL_BALANCE)]
-    initial_balance: u64,
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TRANSFER_AMOUNT)]
     transfer_amount: u64,
     #[arg(long, default_value_t = 200_u64)]
@@ -67,65 +52,19 @@ struct Args {
     max_fee: u32,
     #[arg(long, default_value_t = 3_000_u64)]
     request_timeout_ms: u64,
-    #[arg(long, default_value_t = 0_u64)]
-    progress_every: u64,
     #[arg(long, default_value_t = false)]
     allow_rejections: bool,
+    #[arg(long, default_value_t = false)]
+    evaluate: bool,
     #[arg(long)]
     json_out: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CliWorkload {
-    #[value(name = "synthetic")]
-    Synthetic,
-    #[value(name = "funded-transfer")]
-    FundedTransfer,
-}
-
-impl From<CliWorkload> for WorkloadKind {
-    fn from(value: CliWorkload) -> Self {
-        match value {
-            CliWorkload::Synthetic => Self::Synthetic,
-            CliWorkload::FundedTransfer => Self::FundedTransfer,
-        }
-    }
-}
-
-impl CliWorkload {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Synthetic => "synthetic",
-            Self::FundedTransfer => "funded-transfer",
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct AckJsonConfig {
-    endpoint: String,
-    self_contained: bool,
-    count: u64,
-    concurrency: usize,
-    max_fee: u32,
-    request_timeout_ms: u64,
-    allow_rejections: bool,
-    workload: String,
-    accounts_file: Option<String>,
-    initial_balance: u64,
-    transfer_amount: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct AckJsonOutput {
-    benchmark: &'static str,
-    config: AckJsonConfig,
-    report: benchmarks::AckRunReport,
 }
 
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     let args = Args::parse();
+    let effective_concurrency = args.concurrency.max(1);
+    let network_profile = NetworkProfile::same_host_baseline();
     let json_out = args.json_out.clone().or_else(|| {
         args.self_contained
             .then(|| default_json_output_path("ack-latency"))
@@ -134,23 +73,23 @@ async fn main() -> BenchResult<()> {
         Some(
             ManagedSequencer::spawn(ManagedSequencerConfig {
                 sequencer_bin: args.sequencer_bin.clone(),
-                start_timeout: Duration::from_millis(args.sequencer_start_timeout_ms),
-                shutdown_timeout: Duration::from_millis(args.sequencer_shutdown_timeout_ms),
-                temp_db: args.temp_db,
-                log_path: args
-                    .sequencer_log_path
-                    .clone()
-                    .or_else(|| Some(default_sequencer_log_path("ack-latency-self-contained"))),
-                runtime_metrics_enabled: args.sequencer_runtime_metrics_enabled,
-                runtime_metrics_log_interval: Duration::from_millis(
-                    args.sequencer_runtime_metrics_log_interval_ms,
-                ),
-                rust_log: args.sequencer_rust_log.clone(),
+                log_prefix: "ack-latency-self-contained",
             })
             .await?,
         )
     } else {
         None
+    };
+    let domain = if let Some(value) = managed.as_ref() {
+        if args.domain_chain_id.is_some() || args.domain_verifying_contract.is_some() {
+            return Err(std::io::Error::other(
+                "self-contained benchmarks use the deployed local Application; remove explicit --domain-* args",
+            )
+            .into());
+        }
+        value.domain()
+    } else {
+        resolve_external_benchmark_domain(args.domain_chain_id, args.domain_verifying_contract)?
     };
     let endpoint = managed
         .as_ref()
@@ -158,34 +97,39 @@ async fn main() -> BenchResult<()> {
         .unwrap_or_else(|| args.endpoint.clone());
 
     println!(
-        "ack config: endpoint={}, self_contained={}, count={}, concurrency={}, max_fee={}, request_timeout_ms={}, allow_rejections={}, workload={:?}",
+        "ack config: endpoint={}, self_contained={}, domain_chain_id={}, domain_verifying_contract={}, count={}, concurrency={}, max_fee={}, request_timeout_ms={}, allow_rejections={}, evaluate={}, workload={}",
         endpoint,
         args.self_contained,
+        domain.chain_id,
+        domain.verifying_contract,
         args.count,
-        args.concurrency.max(1),
+        effective_concurrency,
         args.max_fee,
         args.request_timeout_ms,
         args.allow_rejections,
-        args.workload
+        args.evaluate,
+        args.workload.as_str(),
     );
 
     let memory_sampler = managed.as_ref().and_then(|value| value.pid()).map(|pid| {
-        MemorySampler::start(pid, Duration::from_millis(args.memory_sample_interval_ms))
+        MemorySampler::start(
+            pid,
+            Duration::from_millis(DEFAULT_MEMORY_SAMPLE_INTERVAL_MS),
+        )
     });
 
     let config = AckRunConfig {
         endpoint,
+        domain,
         count: args.count,
-        concurrency: args.concurrency.max(1),
+        concurrency: effective_concurrency,
         seed_offset: args.seed_offset.unwrap_or_else(default_seed_offset),
         max_fee: args.max_fee,
         request_timeout_ms: args.request_timeout_ms,
-        progress_every: args.progress_every,
         fail_on_rejection: !args.allow_rejections,
         workload: WorkloadConfig {
-            kind: args.workload.into(),
+            kind: args.workload,
             accounts_file: args.accounts_file.clone(),
-            initial_balance: args.initial_balance,
             transfer_amount: args.transfer_amount,
         },
     };
@@ -215,49 +159,43 @@ async fn main() -> BenchResult<()> {
         }
     }
 
-    if let Some(path) = report_result
-        .as_ref()
-        .ok()
-        .and_then(|report| report.sequencer_log_path.clone())
-        && let Some(profile) = parse_inclusion_lane_profile_from_log(PathBuf::from(path).as_path())?
-        && let Ok(report) = report_result.as_mut()
-    {
-        report.inclusion_lane_profile = Some(profile);
+    let report = report_result?;
+    let evaluation = args
+        .evaluate
+        .then(|| evaluate_ack_target(&report, network_profile.clone()));
+
+    print_ack_report(&report);
+    if let Some(value) = evaluation.as_ref() {
+        print_target_evaluation(value);
     }
 
-    let report = report_result?;
-    print_ack_report(&report);
     if let Some(path) = json_out.as_ref() {
-        if let Some(parent) = Path::new(path).parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let payload = AckJsonOutput {
-            benchmark: "ack_latency",
-            config: AckJsonConfig {
-                endpoint: report.endpoint.clone(),
-                self_contained: args.self_contained,
-                count: args.count,
-                concurrency: args.concurrency.max(1),
-                max_fee: args.max_fee,
-                request_timeout_ms: args.request_timeout_ms,
-                allow_rejections: args.allow_rejections,
-                workload: args.workload.as_str().to_string(),
-                accounts_file: args.accounts_file.clone(),
-                initial_balance: args.initial_balance,
-                transfer_amount: args.transfer_amount,
-            },
-            report,
-        };
-        fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+        let config_json = json!({
+            "endpoint": report.endpoint,
+            "self_contained": args.self_contained,
+            "domain_name": DOMAIN_NAME,
+            "domain_version": DOMAIN_VERSION,
+            "domain_chain_id": domain.chain_id,
+            "domain_verifying_contract": domain.verifying_contract.to_string(),
+            "count": args.count,
+            "concurrency": effective_concurrency,
+            "max_fee": args.max_fee,
+            "request_timeout_ms": args.request_timeout_ms,
+            "allow_rejections": args.allow_rejections,
+            "evaluation_requested": args.evaluate,
+            "network_profile": network_profile,
+            "workload": args.workload.as_str(),
+            "accounts_file": args.accounts_file,
+            "transfer_amount": args.transfer_amount,
+        });
+        write_json_output(
+            Path::new(path),
+            "ack_latency",
+            &config_json,
+            &report,
+            evaluation.as_ref(),
+        )?;
         println!("ack json: {path}");
     }
     Ok(())
-}
-
-fn default_json_output_path(prefix: &str) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_secs())
-        .unwrap_or(0);
-    format!("benchmarks/results/{prefix}-{ts}.json")
 }

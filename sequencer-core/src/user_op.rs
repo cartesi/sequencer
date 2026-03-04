@@ -25,18 +25,11 @@ impl SignedUserOp {
     pub const SIGNATURE_BYTES: usize = 65;
     pub const NONCE_BYTES: usize = 4;
     pub const MAX_FEE_BYTES: usize = 4;
-    // Method is SSZ enum-union encoded; Transfer includes a 1-byte union tag + 32-byte amount + 20-byte recipient.
-    pub const MAX_METHOD_PAYLOAD_BYTES: usize = 1 + 32 + 20;
-    pub const MAX_BATCH_BYTES_UPPER_BOUND: usize = Self::SIGNATURE_BYTES
-        + Self::NONCE_BYTES
-        + Self::MAX_FEE_BYTES
-        + Self::MAX_METHOD_PAYLOAD_BYTES;
 
-    pub const fn max_batch_bytes_upper_bound() -> usize {
-        Self::MAX_BATCH_BYTES_UPPER_BOUND
-    }
+    pub const MAX_BATCH_METADATA_BYTES: usize =
+        Self::SIGNATURE_BYTES + Self::NONCE_BYTES + Self::MAX_FEE_BYTES;
 
-    pub const fn batch_bytes_upper_bound_for_data_len(data_len: usize) -> usize {
-        Self::SIGNATURE_BYTES + Self::NONCE_BYTES + Self::MAX_FEE_BYTES + data_len
+    pub const fn max_batch_metadata() -> usize {
+        Self::MAX_BATCH_METADATA_BYTES
     }
 }

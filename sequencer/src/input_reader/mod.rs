@@ -4,6 +4,7 @@
 //! Reads safe (direct) inputs from a reference source (e.g. InputBox contract) and appends them
 //! to sequencer storage. Minimal design: no epochs or consensus; flat contiguous indices only.
 
+mod logs;
 mod reader;
 
-pub use reader::{InputReader, InputReaderConfig, InputReaderError, InputReaderStop};
+pub use reader::{InputReader, InputReaderConfig, InputReaderError};

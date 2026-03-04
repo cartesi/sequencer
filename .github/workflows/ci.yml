@@ -13,6 +13,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            lua5.4 \
+            liblua5.4-dev \
+            libslirp-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -37,4 +45,4 @@ jobs:
 
       - name: Test
         timeout-minutes: 15
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: RUN_ANVIL_TESTS=1 cargo test --workspace --all-targets --all-features --locked

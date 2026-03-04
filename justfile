@@ -18,7 +18,23 @@ test-sequencer:
     cargo test -p sequencer --test ws_broadcaster -- --test-threads=1
 
 bench target="all":
-    just --justfile benchmarks/justfile {{target}}
+    just -f benchmarks/justfile {{target}}
+
+setup:
+    just -f examples/canonical-app/justfile download-deps
+    just -f benchmarks/justfile setup
+
+canonical-build-machine-image:
+    just -f examples/canonical-app/justfile build-machine-image
+
+canonical-test-guest:
+    just -f examples/canonical-app/justfile test-guest
+
+clean:
+    cargo clean
+    rm -f sequencer.db sequencer.db-shm sequencer.db-wal
+    just -f examples/canonical-app/justfile clean
+    just -f benchmarks/justfile clean
 
 fmt:
     cargo fmt --all

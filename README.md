@@ -1,6 +1,6 @@
 # Sequencer Prototype
 
-Prototype sequencer, currently backed by a dummy wallet app (`Transfer`, `Deposit`, `Withdrawal`).
+Prototype sequencer, currently backed by a dummy wallet app (`Transfer`, `Withdrawal`).
 
 Current focus is reliability of sequencing, persistence, and replay semantics.
 
@@ -17,12 +17,13 @@ Current focus is reliability of sequencing, persistence, and replay semantics.
 
 - **User ops** arrive through the API, are validated, executed, and persisted by the inclusion lane.
 - **Direct inputs** are stored in SQLite (`direct_inputs`) and sequenced in append-only replay order (`sequenced_l2_txs`).
-- **Ordering** is deterministic and persisted. Replay/catch-up reads `sequenced_l2_txs` (joined with `user_ops` / `direct_inputs`).
+- **Deposits** are direct-input-only (L1 -> L2) and are not accepted as user ops.
+- **Ordering** is deterministic and persisted. Replay/catch-up reads `sequenced_l2_txs` joined with `user_ops` and `direct_inputs`.
 - **Frame fee** is fixed per frame (`frames.fee`):
   - users sign `max_fee`
   - inclusion validates `max_fee >= current_frame_fee`
-  - execution charges `current_frame_fee` (not signed max)
-  - next frame fee is sampled from `recommended_fees` when rotating to a new frame
+  - execution charges `current_frame_fee`
+  - the next frame fee is sampled from `recommended_fees` when rotating to a new frame
 
 ## Quick Start
 
@@ -35,13 +36,33 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Run server with defaults:
+Run the server with a local deployment domain:
 
 ```bash
-SEQ_HTTP_ADDR=127.0.0.1:3000 \
-SEQ_DB_PATH=sequencer.db \
+SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \
+SEQ_DOMAIN_CHAIN_ID=31337 \
+SEQ_DOMAIN_VERIFYING_CONTRACT=0x1111111111111111111111111111111111111111 \
 cargo run -p sequencer
 ```
+
+Optional runtime inputs:
+
+- `SEQ_HTTP_ADDR` defaults to `127.0.0.1:3000`
+- `SEQ_DB_PATH` defaults to `sequencer.db`
+- `SEQ_LONG_BLOCK_RANGE_ERROR_CODES` defaults to `-32005,-32600,-32602,-32616`
+
+Required runtime inputs:
+
+- `SEQ_ETH_RPC_URL`
+- `SEQ_DOMAIN_CHAIN_ID`
+- `SEQ_DOMAIN_VERIFYING_CONTRACT`
+
+Fixed protocol identity:
+
+- domain name: `CartesiAppSequencer`
+- domain version: `1`
+
+Most queue sizes, polling intervals, and safety limits are now internal runtime constants instead of public launch-time configuration.
 
 ## API
 
@@ -57,16 +78,16 @@ Request shape:
     "data": "0x..."
   },
   "signature": "0x...",
-  "sender": "0x..." 
+  "sender": "0x..."
 }
 ```
 
-POST notes:
+Notes:
 
 - `signature` must be 65 bytes.
-- `sender` is required and must match recovered signer.
+- `sender` is required and must match the recovered signer.
 - `message.data` is SSZ-encoded method payload bytes.
-- payload size is bounded at ingress; oversized requests are rejected before they enter hot path.
+- payload size is bounded at ingress; oversized requests are rejected before entering the hot path.
 
 ### `GET /ws/subscribe?from_offset=<u64>`
 
@@ -74,11 +95,10 @@ WebSocket stream of sequenced L2 transactions from persisted order.
 
 Notes:
 
-- `from_offset` is optional (defaults to `0`).
+- `from_offset` is optional and defaults to `0`.
 - messages are JSON text frames.
 - binary fields are hex-encoded (`0x`-prefixed).
-- handshake is rejected with `429` when `SEQ_WS_MAX_SUBSCRIBERS` is exceeded (default `64`).
-- connections with `live_start_offset - from_offset > SEQ_WS_MAX_CATCHUP_EVENTS` are closed immediately (default `50000`).
+- the current runtime enforces a subscriber cap of `64` and a catch-up cap of `50000` events.
 
 Message shapes:
 
@@ -100,34 +120,7 @@ Success response:
 }
 ```
 
-## Configuration
-
-Main environment variables:
-
-- `SEQ_HTTP_ADDR`
-- `SEQ_DB_PATH`
-- `SEQ_QUEUE_CAP`
-- `SEQ_OVERLOAD_MAX_INFLIGHT_SUBMISSIONS`
-- `SEQ_MAX_USER_OPS_PER_CHUNK` (`SEQ_MAX_BATCH` is legacy alias)
-- `SEQ_SAFE_DIRECT_BUFFER_CAPACITY`
-- `SEQ_MAX_BATCH_OPEN_MS`
-- `SEQ_MAX_BATCH_USER_OP_BYTES`
-- `SEQ_INCLUSION_LANE_IDLE_POLL_INTERVAL_MS`
-- `SEQ_INCLUSION_LANE_TICK_INTERVAL_MS` (legacy alias)
-- `SEQ_COMMIT_LANE_TICK_INTERVAL_MS` (legacy alias)
-- `SEQ_BROADCASTER_IDLE_POLL_INTERVAL_MS`
-- `SEQ_BROADCASTER_PAGE_SIZE`
-- `SEQ_BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY`
-- `SEQ_WS_MAX_SUBSCRIBERS`
-- `SEQ_WS_MAX_CATCHUP_EVENTS`
-- `SEQ_MAX_BODY_BYTES`
-- `SEQ_SQLITE_SYNCHRONOUS`
-- `SEQ_DOMAIN_NAME`
-- `SEQ_DOMAIN_VERSION`
-- `SEQ_DOMAIN_CHAIN_ID`
-- `SEQ_DOMAIN_VERIFYING_CONTRACT`
-
-## Storage Model (high level)
+## Storage Model
 
 - `batches`: batch metadata
 - `frames`: frame boundaries within each batch
@@ -135,26 +128,48 @@ Main environment variables:
 - `user_ops`: included user operations
 - `direct_inputs`: direct-input payload stream
 - `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`)
-- `recommended_fees`: singleton mutable recommendation for next frame fee
-
-No SQL views are required in the current prototype schema.
+- `recommended_fees`: singleton mutable recommendation for the next frame fee
 
 ## Project Layout
 
-- `sequencer/src/main.rs`: bootstrap, env config, HTTP server + lane lifecycle
+- `sequencer/src/main.rs`: thin binary entrypoint
+- `sequencer/src/lib.rs`: public crate surface
+- `sequencer/src/config.rs`: runtime input parsing and EIP-712 domain construction
+- `sequencer/src/runtime.rs`: sequencer bootstrap and component wiring
 - `sequencer/src/api/`: HTTP API and error mapping
 - `sequencer/src/inclusion_lane/`: hot-path inclusion loop, chunk/frame/batch rotation, catch-up
-- `sequencer/src/l2_tx_broadcaster/`: centralized ordered-L2Tx poller + subscriber fanout
-- `sequencer/src/storage/`: schema, migrations, SQLite persistence and replay reads
-- `sequencer-core/src/`: shared sequencer domain types and interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, broadcaster message types)
-- `examples/app-core/src/`: wallet prototype implementing the shared `Application` trait
-- `examples/canonical-app/src/main.rs`: placeholder canonical runtime entrypoint
+- `sequencer/src/input_reader/`: safe-input ingestion from InputBox into SQLite
+- `sequencer/src/l2_tx_feed/`: DB-backed ordered-L2Tx feed for WS subscriptions
+- `sequencer/src/storage/`: schema, migrations, SQLite persistence, and replay reads
+- `sequencer-core/src/`: shared domain types and interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, feed message types)
+- `examples/app-core/src/`: wallet prototype implementing `Application`
+- `benchmarks/`: benchmark harnesses and benchmark spec
 
 ## Prototype Limits
 
-- Wallet state is in-memory (not persisted).
-- Direct-input ingestion from chain is not implemented yet (currently append via storage APIs).
-- Schema/migrations are still in prototype mode and may change.
+- Wallet state is in-memory and not persisted.
+- Schema and migrations are still in prototype mode and may change.
+
+## Local Test Prerequisites
+
+- Some `sequencer` tests spin up `Anvil`; install Foundry locally if you want the full test suite:
+- Self-contained benchmarks also spawn `Anvil` from a preloaded rollups state dump.
+
+```bash
+foundryup
+```
+
+- Prepare local benchmark + guest build dependencies:
+
+```bash
+just setup
+```
+
+- Enable the Anvil-backed reader tests explicitly:
+
+```bash
+RUN_ANVIL_TESTS=1 cargo test -p sequencer --lib
+```
 
 ## License
 

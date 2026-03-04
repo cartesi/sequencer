@@ -6,6 +6,7 @@ members = [
   "sdk/rust-client",
   "examples/app-core",
   "examples/canonical-app",
+  "examples/canonical-test",
   "benchmarks",
 ]
 default-members = ["sequencer"]
@@ -23,3 +24,10 @@ authors = [
   "Pedro Argento <pedro.argento@gmail.com>",
   "Stephen Chen <20940639+stephenctw@users.noreply.github.com>",
 ]
+
+[workspace.dependencies]
+libcmt-sys = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "27b457994546ea4a8345ed078031782f155d3013" }
+trolley = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "27b457994546ea4a8345ed078031782f155d3013" }
+testsi = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "27b457994546ea4a8345ed078031782f155d3013" }
+types = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "27b457994546ea4a8345ed078031782f155d3013" }
+cartesi-machine = { version = "2", git = "https://github.com/cartesi/dave", rev = "5d0560a04f623318af9ef5b7f193170b618b6ced", features = ["download_uarch"] }

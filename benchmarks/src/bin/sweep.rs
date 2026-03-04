@@ -1,22 +1,22 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use alloy_primitives::Address;
 use benchmarks::{
-    AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_WORKLOAD_INITIAL_BALANCE,
-    DEFAULT_WORKLOAD_TRANSFER_AMOUNT, E2eRunConfig, WorkloadConfig, WorkloadKind,
-    default_seed_offset, print_ack_report, print_e2e_report, run_ack_benchmark, run_e2e_benchmark,
+    AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME,
+    DOMAIN_VERSION, E2eRunConfig, NetworkProfile, SweepRow, SweepRunReport, WorkloadConfig,
+    WorkloadKind, compute_capacity_summary, default_json_output_path, default_seed_offset,
+    parse_address, print_ack_report, print_e2e_report, print_sweep_report,
+    resolve_external_benchmark_domain, run_ack_benchmark, run_e2e_benchmark,
     runtime::{
-        DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RUNTIME_METRICS_LOG_INTERVAL_MS,
-        DEFAULT_SEQUENCER_BIN, DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT_MS,
-        DEFAULT_SEQUENCER_START_TIMEOUT_MS, ManagedSequencer, ManagedSequencerConfig,
-        MemorySampler, default_sequencer_log_path, parse_inclusion_lane_profile_from_log,
+        DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_SEQUENCER_BIN, ManagedSequencer,
+        ManagedSequencerConfig, MemorySampler,
     },
+    write_json_output, write_sweep_csv,
 };
 use clap::{Parser, ValueEnum};
-use serde::Serialize;
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::PathBuf;
+use serde_json::json;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,63 +38,32 @@ impl SweepMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CliWorkload {
-    #[value(name = "synthetic")]
-    Synthetic,
-    #[value(name = "funded-transfer")]
-    FundedTransfer,
-}
-
-impl From<CliWorkload> for WorkloadKind {
-    fn from(value: CliWorkload) -> Self {
-        match value {
-            CliWorkload::Synthetic => Self::Synthetic,
-            CliWorkload::FundedTransfer => Self::FundedTransfer,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "sweep",
     about = "benchmark sweep runner",
     version,
-    after_help = "Examples:\n  cargo run -p benchmarks --bin sweep -- --mode e2e --endpoint http://127.0.0.1:3000 --count 1000 --concurrency-list \"1 2 4 8 16 32 64\"\n  cargo run -p benchmarks --bin sweep -- --mode e2e --concurrency-range 1:128:8 --json-out benchmarks/results/e2e-latest.json\n  cargo run -p benchmarks --bin sweep --release -- --mode ack --count 5000 --concurrency-list \"1 2 4 8 16 32 64 96 128\""
+    after_help = "Examples:\n  cargo run -p benchmarks --bin sweep -- --self-contained --mode e2e --count 1000 --concurrency-list \"1 2 4 8 16 32 64\"\n  cargo run -p benchmarks --bin sweep -- --endpoint http://127.0.0.1:3000 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --mode e2e --count 1000 --concurrency-range 1:128:8 --json-out benchmarks/results/e2e-sweep-latest.json"
 )]
 struct Args {
     #[arg(long, value_enum, default_value_t = SweepMode::E2e)]
     mode: SweepMode,
     #[arg(long, default_value_t = 1_000_u64)]
     count: u64,
-    #[arg(long, visible_alias = "url", default_value = DEFAULT_ENDPOINT)]
+    #[arg(long, default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
     #[arg(long, default_value_t = false)]
     self_contained: bool,
     #[arg(long, default_value = DEFAULT_SEQUENCER_BIN)]
     sequencer_bin: String,
-    #[arg(long, default_value_t = DEFAULT_SEQUENCER_START_TIMEOUT_MS)]
-    sequencer_start_timeout_ms: u64,
-    #[arg(long, default_value_t = DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT_MS)]
-    sequencer_shutdown_timeout_ms: u64,
-    #[arg(long, default_value_t = true)]
-    temp_db: bool,
     #[arg(long)]
-    sequencer_log_path: Option<PathBuf>,
-    #[arg(long, default_value_t = true)]
-    sequencer_runtime_metrics_enabled: bool,
-    #[arg(long, default_value_t = DEFAULT_RUNTIME_METRICS_LOG_INTERVAL_MS)]
-    sequencer_runtime_metrics_log_interval_ms: u64,
-    #[arg(long, default_value = "info")]
-    sequencer_rust_log: String,
-    #[arg(long, default_value_t = DEFAULT_MEMORY_SAMPLE_INTERVAL_MS)]
-    memory_sample_interval_ms: u64,
-    #[arg(long, value_enum, default_value_t = CliWorkload::Synthetic)]
-    workload: CliWorkload,
+    domain_chain_id: Option<u64>,
+    #[arg(long, value_parser = parse_address)]
+    domain_verifying_contract: Option<Address>,
+    #[arg(long, value_enum, default_value_t = WorkloadKind::Synthetic)]
+    workload: WorkloadKind,
     #[arg(long)]
     accounts_file: Option<String>,
-    #[arg(long, default_value_t = DEFAULT_WORKLOAD_INITIAL_BALANCE)]
-    initial_balance: u64,
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TRANSFER_AMOUNT)]
     transfer_amount: u64,
     #[arg(long, default_value_t = 0_u32)]
@@ -126,104 +95,76 @@ struct Args {
     stop_on_first_non_200: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct SweepRow {
-    concurrency: usize,
-    accepted_tps: f64,
-    accepted_count: u64,
-    rejected_count: u64,
-    rejection_rate: f64,
-    p95_ms: f64,
-    p99_ms: f64,
-    p999_ms: f64,
-    rejection_breakdown: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SweepSummary {
-    tps_at_first_non_200: Option<f64>,
-    tps_at_first_429: Option<f64>,
-    max_sustainable_tps_at_0_rejections: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SweepJson {
-    mode: String,
-    endpoint: String,
-    count: u64,
-    max_fee: u32,
-    from_offset: u64,
-    rows: Vec<SweepRow>,
-    summary: SweepSummary,
-    memory: Option<benchmarks::runtime::MemoryReport>,
-    sequencer_log_path: Option<String>,
-    inclusion_lane_profile: Option<benchmarks::runtime::InclusionLaneProfileReport>,
-}
-
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     let args = Args::parse();
+    let network_profile = NetworkProfile::same_host_baseline();
+    let json_prefix = format!("{}-sweep", args.mode.as_str());
     let json_out = args.json_out.clone().or_else(|| {
         args.self_contained
-            .then(|| default_json_output_path("sweep"))
+            .then(|| default_json_output_path(json_prefix.as_str()))
     });
     let concurrencies = resolve_concurrency_list(&args)?;
     if concurrencies.is_empty() {
         return Err(std::io::Error::other("concurrency list cannot be empty").into());
     }
 
-    fs::create_dir_all(args.results_dir.as_str())?;
+    std::fs::create_dir_all(args.results_dir.as_str())?;
     let timestamp = timestamp_string();
-    let csv_path = format!(
+    let csv_path = PathBuf::from(format!(
         "{}/{}-sweep-{}.csv",
         args.results_dir,
         args.mode.as_str(),
         timestamp
-    );
+    ));
 
     let mut managed = if args.self_contained {
         Some(
             ManagedSequencer::spawn(ManagedSequencerConfig {
                 sequencer_bin: args.sequencer_bin.clone(),
-                start_timeout: Duration::from_millis(args.sequencer_start_timeout_ms),
-                shutdown_timeout: Duration::from_millis(args.sequencer_shutdown_timeout_ms),
-                temp_db: args.temp_db,
-                log_path: args
-                    .sequencer_log_path
-                    .clone()
-                    .or_else(|| Some(default_sequencer_log_path("sweep-self-contained"))),
-                runtime_metrics_enabled: args.sequencer_runtime_metrics_enabled,
-                runtime_metrics_log_interval: Duration::from_millis(
-                    args.sequencer_runtime_metrics_log_interval_ms,
-                ),
-                rust_log: args.sequencer_rust_log.clone(),
+                log_prefix: "sweep-self-contained",
             })
             .await?,
         )
     } else {
         None
     };
+    let domain = if let Some(value) = managed.as_ref() {
+        if args.domain_chain_id.is_some() || args.domain_verifying_contract.is_some() {
+            return Err(std::io::Error::other(
+                "self-contained benchmarks use the deployed local Application; remove explicit --domain-* args",
+            )
+            .into());
+        }
+        value.domain()
+    } else {
+        resolve_external_benchmark_domain(args.domain_chain_id, args.domain_verifying_contract)?
+    };
 
     let endpoint = managed
         .as_ref()
         .map(|value| value.endpoint.clone())
         .unwrap_or_else(|| args.endpoint.clone());
-    let ws_subscribe_url = managed.as_ref().map(|value| value.ws_subscribe_url.clone());
     let sequencer_log_path = managed
         .as_ref()
         .map(|value| value.log_path().to_string_lossy().to_string());
     let memory_sampler = managed.as_ref().and_then(|value| value.pid()).map(|pid| {
-        MemorySampler::start(pid, Duration::from_millis(args.memory_sample_interval_ms))
+        MemorySampler::start(
+            pid,
+            Duration::from_millis(DEFAULT_MEMORY_SAMPLE_INTERVAL_MS),
+        )
     });
 
     println!(
-        "starting {} sweep: endpoint={} self_contained={} count={} max_fee={} workload={:?} stop_on_first_non_200={} concs={:?}",
+        "starting {} sweep: endpoint={} self_contained={} domain_chain_id={} domain_verifying_contract={} count={} max_fee={} workload={} stop_on_first_non_200={} concs={:?}",
         args.mode.as_str(),
         endpoint,
         args.self_contained,
+        domain.chain_id,
+        domain.verifying_contract,
         args.count,
         args.max_fee,
-        args.workload,
+        args.workload.as_str(),
         args.stop_on_first_non_200,
         concurrencies
     );
@@ -235,9 +176,8 @@ async fn main() -> BenchResult<()> {
     let mut seed_offset = default_seed_offset();
 
     let workload = WorkloadConfig {
-        kind: args.workload.into(),
+        kind: args.workload,
         accounts_file: args.accounts_file.clone(),
-        initial_balance: args.initial_balance,
         transfer_amount: args.transfer_amount,
     };
 
@@ -255,35 +195,35 @@ async fn main() -> BenchResult<()> {
             SweepMode::Ack => {
                 let config = AckRunConfig {
                     endpoint: endpoint.clone(),
+                    domain,
                     count: args.count,
                     concurrency,
                     seed_offset,
                     max_fee: args.max_fee,
                     request_timeout_ms: 3_000,
-                    progress_every: 500,
                     fail_on_rejection: false,
                     workload: workload.clone(),
                 };
                 run_ack_benchmark(config).await.map(|report| {
                     seed_offset = seed_offset.saturating_add(args.count);
                     print_ack_report(&report);
-                    SweepRow {
+                    SweepRow::new(
                         concurrency,
-                        accepted_tps: tx_per_second(report.accepted as usize, report.total_wall),
-                        accepted_count: report.accepted,
-                        rejected_count: report.rejected,
-                        rejection_rate: report.rejection_rate,
-                        p95_ms: report.ack_latency_accepted.p95.as_secs_f64() * 1000.0,
-                        p99_ms: report.ack_latency_accepted.p99.as_secs_f64() * 1000.0,
-                        p999_ms: report.ack_latency_accepted.p999.as_secs_f64() * 1000.0,
-                        rejection_breakdown: report.rejection_breakdown,
-                    }
+                        tx_per_second(report.accepted as usize, report.total_wall),
+                        report.accepted,
+                        report.rejected,
+                        report.rejection_rate,
+                        report.ack_latency_accepted.p95.as_secs_f64() * 1000.0,
+                        report.ack_latency_accepted.p99.as_secs_f64() * 1000.0,
+                        report.ack_latency_accepted.p999.as_secs_f64() * 1000.0,
+                        report.rejection_breakdown,
+                    )
                 })
             }
             SweepMode::E2e => {
                 let config = E2eRunConfig {
                     endpoint: endpoint.clone(),
-                    ws_subscribe_url: ws_subscribe_url.clone(),
+                    domain,
                     from_offset: current_from_offset,
                     count: args.count,
                     concurrency,
@@ -291,10 +231,6 @@ async fn main() -> BenchResult<()> {
                     max_fee: args.max_fee,
                     request_timeout_ms: args.e2e_request_timeout_ms,
                     max_ws_wait_ms: args.e2e_max_ws_wait_ms,
-                    progress_every: 500,
-                    drain_backlog_before_bench: true,
-                    backlog_drain_idle_ms: 25,
-                    backlog_drain_max_ms: 2_000,
                     fail_on_rejection: false,
                     workload: workload.clone(),
                 };
@@ -303,17 +239,17 @@ async fn main() -> BenchResult<()> {
                     current_from_offset =
                         current_from_offset.saturating_add(report.consumed_ws_events_total);
                     print_e2e_report(&report);
-                    SweepRow {
+                    SweepRow::new(
                         concurrency,
-                        accepted_tps: tx_per_second(report.accepted as usize, report.total_wall),
-                        accepted_count: report.accepted,
-                        rejected_count: report.rejected,
-                        rejection_rate: report.rejection_rate,
-                        p95_ms: report.e2e_latency_accepted.p95.as_secs_f64() * 1000.0,
-                        p99_ms: report.e2e_latency_accepted.p99.as_secs_f64() * 1000.0,
-                        p999_ms: report.e2e_latency_accepted.p999.as_secs_f64() * 1000.0,
-                        rejection_breakdown: report.rejection_breakdown,
-                    }
+                        tx_per_second(report.accepted as usize, report.total_wall),
+                        report.accepted,
+                        report.rejected,
+                        report.rejection_rate,
+                        report.e2e_latency_accepted.p95.as_secs_f64() * 1000.0,
+                        report.e2e_latency_accepted.p99.as_secs_f64() * 1000.0,
+                        report.e2e_latency_accepted.p999.as_secs_f64() * 1000.0,
+                        report.rejection_breakdown,
+                    )
                 })
             }
         };
@@ -321,7 +257,7 @@ async fn main() -> BenchResult<()> {
         match result {
             Ok(row) => {
                 total_accepted = total_accepted.saturating_add(row.accepted_count);
-                let should_stop = args.stop_on_first_non_200 && row.rejected_count > 0;
+                let should_stop = args.stop_on_first_non_200 && row.has_http_rejection();
                 rows.push(row);
                 if should_stop {
                     println!("stopping sweep at first non-200 response");
@@ -357,78 +293,53 @@ async fn main() -> BenchResult<()> {
             return shutdown_result;
         }
     }
-    let inclusion_lane_profile = if let Some(path) = sequencer_log_path.as_ref() {
-        parse_inclusion_lane_profile_from_log(PathBuf::from(path).as_path())?
-    } else {
-        None
-    };
-
     if let Some(err) = run_error {
         return Err(err);
     }
 
-    write_csv(csv_path.as_str(), rows.as_slice())?;
+    write_sweep_csv(csv_path.as_path(), rows.as_slice())?;
     let summary = compute_capacity_summary(rows.as_slice());
+    let report = SweepRunReport {
+        rows,
+        summary,
+        memory: memory_report,
+        sequencer_log_path,
+    };
 
     println!();
-    println!("sweep csv: {csv_path}");
-    println!(
-        "tps_at_first_non_200: {}",
-        format_optional(summary.tps_at_first_non_200)
-    );
-    println!(
-        "tps_at_first_429: {}",
-        format_optional(summary.tps_at_first_429)
-    );
-    println!(
-        "max_sustainable_tps_at_0_rejections: {}",
-        format_optional(summary.max_sustainable_tps_at_0_rejections)
-    );
-    if let Some(memory) = memory_report.as_ref() {
-        benchmarks::print_memory_report(memory);
-    }
-    if let Some(path) = sequencer_log_path.as_ref() {
-        println!("sequencer_log_path: {path}");
-    }
-    if let Some(profile) = inclusion_lane_profile.as_ref() {
-        println!("inclusion_lane_profile:");
-        println!("  samples: {}", profile.samples);
-        println!(
-            "  latest_user_op_app_share_pct_of_app_plus_persist: {}",
-            format_optional(profile.latest_user_op_app_share_pct_of_app_plus_persist)
-        );
-        println!(
-            "  latest_user_op_persist_share_pct_of_app_plus_persist: {}",
-            format_optional(profile.latest_user_op_persist_share_pct_of_app_plus_persist)
-        );
-        println!(
-            "  avg_user_op_app_share_pct_of_app_plus_persist: {}",
-            format_optional(profile.avg_user_op_app_share_pct_of_app_plus_persist)
-        );
-        println!(
-            "  avg_user_op_persist_share_pct_of_app_plus_persist: {}",
-            format_optional(profile.avg_user_op_persist_share_pct_of_app_plus_persist)
-        );
-    }
+    println!("sweep csv: {}", csv_path.display());
+    print_sweep_report(&report);
 
     if let Some(path) = json_out.as_ref() {
-        let json_path = PathBuf::from(path);
-        if let Some(parent) = json_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let payload = SweepJson {
-            mode: args.mode.as_str().to_string(),
-            endpoint,
-            count: args.count,
-            max_fee: args.max_fee,
-            from_offset: args.from_offset,
-            rows,
-            summary,
-            memory: memory_report,
-            sequencer_log_path,
-            inclusion_lane_profile,
-        };
-        fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+        let config_json = json!({
+            "mode": args.mode.as_str(),
+            "endpoint": endpoint,
+            "self_contained": args.self_contained,
+            "domain_name": DOMAIN_NAME,
+            "domain_version": DOMAIN_VERSION,
+            "domain_chain_id": domain.chain_id,
+            "domain_verifying_contract": domain.verifying_contract.to_string(),
+            "count": args.count,
+            "max_fee": args.max_fee,
+            "from_offset": args.from_offset,
+            "results_dir": args.results_dir,
+            "stop_on_first_non_200": args.stop_on_first_non_200,
+            "network_profile": network_profile,
+            "workload": args.workload.as_str(),
+            "accounts_file": args.accounts_file,
+            "transfer_amount": args.transfer_amount,
+            "concurrency_list": concurrencies,
+            "e2e_request_timeout_ms": args.e2e_request_timeout_ms,
+            "e2e_max_ws_wait_ms": args.e2e_max_ws_wait_ms,
+            "csv_path": csv_path,
+        });
+        write_json_output(
+            Path::new(path),
+            "sweep",
+            &config_json,
+            &report,
+            Option::<&serde_json::Value>::None,
+        )?;
         println!("sweep json: {path}");
     }
     Ok(())
@@ -488,60 +399,6 @@ fn parse_concurrency_range(value: &str) -> BenchResult<Vec<usize>> {
     Ok(out)
 }
 
-fn write_csv(path: &str, rows: &[SweepRow]) -> BenchResult<()> {
-    let mut out = String::from(
-        "concurrency,accepted_tps,accepted_count,rejected_count,rejection_rate,p95_ms,p99_ms,p999_ms\n",
-    );
-    for row in rows {
-        out.push_str(
-            format!(
-                "{},{:.6},{},{},{:.6},{:.6},{:.6},{:.6}\n",
-                row.concurrency,
-                row.accepted_tps,
-                row.accepted_count,
-                row.rejected_count,
-                row.rejection_rate,
-                row.p95_ms,
-                row.p99_ms,
-                row.p999_ms,
-            )
-            .as_str(),
-        );
-    }
-    fs::write(path, out)?;
-    Ok(())
-}
-
-fn compute_capacity_summary(rows: &[SweepRow]) -> SweepSummary {
-    let tps_at_first_non_200 = rows
-        .iter()
-        .find(|row| row.rejected_count > 0)
-        .map(|row| row.accepted_tps);
-
-    let tps_at_first_429 = rows
-        .iter()
-        .find(|row| {
-            row.rejection_breakdown
-                .get("http_429")
-                .copied()
-                .unwrap_or(0)
-                > 0
-        })
-        .map(|row| row.accepted_tps);
-
-    let max_sustainable_tps_at_0_rejections = rows
-        .iter()
-        .filter(|row| row.rejected_count == 0)
-        .map(|row| row.accepted_tps)
-        .max_by(|a, b| a.total_cmp(b));
-
-    SweepSummary {
-        tps_at_first_non_200,
-        tps_at_first_429,
-        max_sustainable_tps_at_0_rejections,
-    }
-}
-
 fn tx_per_second(count: usize, total_wall: std::time::Duration) -> f64 {
     if total_wall.is_zero() {
         0.0
@@ -556,21 +413,6 @@ fn timestamp_string() -> String {
         .unwrap_or_default()
         .as_secs();
     secs.to_string()
-}
-
-fn default_json_output_path(prefix: &str) -> String {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_secs())
-        .unwrap_or(0);
-    format!("benchmarks/results/{prefix}-{ts}.json")
-}
-
-fn format_optional(value: Option<f64>) -> String {
-    match value {
-        Some(v) => format!("{v:.2}"),
-        None => "not reached".to_string(),
-    }
 }
 
 fn fd_soft_limit_string() -> String {
@@ -588,88 +430,5 @@ fn fd_soft_limit_string() -> String {
     #[cfg(not(unix))]
     {
         "n/a".to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SweepRow, compute_capacity_summary};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn capacity_summary_equal_case() {
-        let rows = vec![
-            SweepRow {
-                concurrency: 1,
-                accepted_tps: 10.0,
-                accepted_count: 100,
-                rejected_count: 0,
-                rejection_rate: 0.0,
-                p95_ms: 1.0,
-                p99_ms: 1.0,
-                p999_ms: 1.0,
-                rejection_breakdown: BTreeMap::new(),
-            },
-            SweepRow {
-                concurrency: 2,
-                accepted_tps: 20.0,
-                accepted_count: 100,
-                rejected_count: 1,
-                rejection_rate: 1.0,
-                p95_ms: 2.0,
-                p99_ms: 2.0,
-                p999_ms: 2.0,
-                rejection_breakdown: BTreeMap::from([("http_429".to_string(), 1_u64)]),
-            },
-        ];
-
-        let summary = compute_capacity_summary(rows.as_slice());
-        assert_eq!(summary.tps_at_first_non_200, Some(20.0));
-        assert_eq!(summary.tps_at_first_429, Some(20.0));
-        assert_eq!(summary.max_sustainable_tps_at_0_rejections, Some(10.0));
-    }
-
-    #[test]
-    fn capacity_summary_diverging_case() {
-        let rows = vec![
-            SweepRow {
-                concurrency: 1,
-                accepted_tps: 10.0,
-                accepted_count: 100,
-                rejected_count: 0,
-                rejection_rate: 0.0,
-                p95_ms: 1.0,
-                p99_ms: 1.0,
-                p999_ms: 1.0,
-                rejection_breakdown: BTreeMap::new(),
-            },
-            SweepRow {
-                concurrency: 2,
-                accepted_tps: 18.0,
-                accepted_count: 100,
-                rejected_count: 1,
-                rejection_rate: 1.0,
-                p95_ms: 1.5,
-                p99_ms: 1.5,
-                p999_ms: 1.5,
-                rejection_breakdown: BTreeMap::from([("http_422".to_string(), 1_u64)]),
-            },
-            SweepRow {
-                concurrency: 4,
-                accepted_tps: 25.0,
-                accepted_count: 100,
-                rejected_count: 1,
-                rejection_rate: 1.0,
-                p95_ms: 2.0,
-                p99_ms: 2.0,
-                p999_ms: 2.0,
-                rejection_breakdown: BTreeMap::from([("http_429".to_string(), 1_u64)]),
-            },
-        ];
-
-        let summary = compute_capacity_summary(rows.as_slice());
-        assert_eq!(summary.tps_at_first_non_200, Some(18.0));
-        assert_eq!(summary.tps_at_first_429, Some(25.0));
-        assert_eq!(summary.max_sustainable_tps_at_0_rejections, Some(10.0));
     }
 }

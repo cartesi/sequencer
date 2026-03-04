@@ -12,8 +12,11 @@ authors.workspace = true
 [dependencies]
 sequencer-rust-client = { path = "../sdk/rust-client" }
 sequencer-core = { path = "../sequencer-core" }
+app-core = { path = "../examples/app-core" }
+alloy = { version = "1.0", features = ["contract", "network", "reqwest", "signer-local"] }
 alloy-primitives = { version = "1.4.1", features = ["k256"] }
 alloy-sol-types = "1.4.1"
+cartesi-rollups-contracts = "=2.2.0"
 futures-util = "0.3"
 k256 = "0.13.4"
 clap = { version = "4", features = ["derive"] }

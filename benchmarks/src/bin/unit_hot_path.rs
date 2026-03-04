@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use benchmarks::{
-    BenchResult, default_domain, make_signed_fixture, now, print_stats, summarize,
+    BenchResult, make_signed_fixture, now, print_stats, self_contained_domain, summarize,
     throughput_tx_per_s,
 };
 use clap::Parser;
@@ -27,7 +27,7 @@ fn main() -> BenchResult<()> {
         "unit config: count={}, max_fee={}",
         args.count, args.max_fee
     );
-    let domain = default_domain();
+    let domain = self_contained_domain().eip712_domain();
 
     let mut fixture_build_samples = Vec::with_capacity(args.count as usize);
     let mut json_encode_samples = Vec::with_capacity(args.count as usize);
