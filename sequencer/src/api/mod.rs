@@ -13,7 +13,7 @@ use axum::extract::{DefaultBodyLimit, Json, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
@@ -62,6 +62,9 @@ pub fn router(state: Arc<AppState>, max_body_bytes: usize) -> Router {
     Router::new()
         .route("/tx", tx_route)
         .route("/ws/subscribe", get(subscribe_l2_txs))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .route("/healthz", get(healthz))
         .with_state(state)
         // Enforces a raw request-body cap before JSON deserialization, including whitespace.
         .layer(DefaultBodyLimit::max(max_body_bytes))
@@ -390,6 +393,49 @@ async fn send_ws_event(socket: &mut WebSocket, event: &BroadcastTxMessage) -> Re
         return Err(());
     }
     Ok(())
+}
+
+// ── Health endpoints ──────────────────────────────────────────────────────────
+
+/// GET /livez — liveness probe: returns 200 as long as the process can respond.
+async fn livez() -> StatusCode {
+    StatusCode::OK
+}
+
+/// GET /readyz — readiness probe: returns 200 only when the sequencer is ready
+/// to accept transactions (inclusion lane running, broadcaster running).
+async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
+    if state.tx_sender.is_closed() || !state.broadcaster.is_running() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    StatusCode::OK
+}
+
+#[derive(Serialize)]
+struct HealthStatus {
+    status: &'static str,
+    inclusion_lane: &'static str,
+    broadcaster: &'static str,
+}
+
+/// GET /healthz — detailed JSON health status.
+async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let inclusion_lane_ok = !state.tx_sender.is_closed();
+    let broadcaster_ok = state.broadcaster.is_running();
+    let all_ok = inclusion_lane_ok && broadcaster_ok;
+
+    let body = HealthStatus {
+        status: if all_ok { "ok" } else { "degraded" },
+        inclusion_lane: if inclusion_lane_ok { "ok" } else { "stopped" },
+        broadcaster: if broadcaster_ok { "ok" } else { "stopped" },
+    };
+
+    let status = if all_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(body))
 }
 
 #[cfg(test)]

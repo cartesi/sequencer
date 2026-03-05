@@ -104,6 +104,10 @@ impl L2TxBroadcaster {
         }
     }
 
+    pub fn is_running(&self) -> bool {
+        !self.inner.stop_requested.load(Ordering::Relaxed)
+    }
+
     pub fn db_path(&self) -> String {
         self.inner.db_path.clone()
     }
