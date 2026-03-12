@@ -23,13 +23,15 @@ rusqlite = { version = "0.38.0", features = ["bundled"] }
 rusqlite_migration = "2.3.0"
 alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
 alloy-sol-types = "1.4.1"
-alloy = { version = "1.0", features = ["contract", "network", "reqwest", "rpc-types", "sol-types", "node-bindings"] }
+alloy = { version = "1.0", features = ["contract", "network", "reqwest", "rpc-types", "sol-types", "node-bindings", "signer-local", "signers"] }
+alloy-network-primitives = "1.7"
 thiserror = "1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
 clap = { version = "4", features = ["derive", "env"] }
 async-recursion = "1"
 cartesi-rollups-contracts = "=2.2.0"
+async-trait = "0.1"
 
 [dev-dependencies]
 futures-util = "0.3"

@@ -77,6 +77,7 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - Storage model is append-oriented; avoid mutable status flags for open/closed entities.
 - Open batch/frame are derived by “latest row” convention.
 - A frame’s leading direct-input prefix is derivable from `sequenced_l2_txs` plus `frames.safe_block`.
+- `direct_inputs` contains only L1 app direct input **bodies**. InputBox payload first byte: **0x00** = direct input (tag stripped, body stored and executed), **0x01** = batch submission (for scheduler, not stored), **others** = discarded (invalid/garbage). The input reader only accepts 0x00-tagged payloads and stores `payload[1..]`.
 - Safe cursor/head values should be derived from persisted facts when possible, not duplicated as mutable fields.
 - Replay/catch-up must use persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics.
 - Included user-op identity is constrained by `UNIQUE(sender, nonce)`.

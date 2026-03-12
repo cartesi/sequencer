@@ -53,6 +53,13 @@ pub struct SafeFrontier {
     pub end_exclusive: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+    pub frame_in_batch: u32,
+    pub fee: u64,
+    pub safe_block: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageOpenError {
     #[error(transparent)]

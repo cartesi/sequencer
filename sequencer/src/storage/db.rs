@@ -9,15 +9,21 @@ use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_direct_inputs_batch, sql_insert_open_batch,
     sql_insert_open_batch_with_index, sql_insert_open_frame,
     sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_and_sequenced_batch,
-    sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
-    sql_select_max_direct_input_index, sql_select_ordered_l2_tx_count,
+    sql_select_frames_for_batch, sql_select_last_submitted_batch_index,
+    sql_select_latest_batch_index, sql_select_latest_batch_with_user_op_count,
+    sql_select_latest_frame_in_batch_for_batch, sql_select_max_direct_input_index,
+    sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_for_batch,
     sql_select_ordered_l2_txs_from_offset, sql_select_ordered_l2_txs_page_from_offset,
     sql_select_recommended_fee, sql_select_safe_block, sql_select_safe_inputs_range,
-    sql_select_total_drained_direct_inputs, sql_update_recommended_fee, sql_update_safe_block,
+    sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
+    sql_update_last_submitted_batch_index, sql_update_recommended_fee, sql_update_safe_block,
 };
-use super::{DirectInputRange, SafeFrontier, StorageOpenError, StoredDirectInput, WriteHead};
+use super::{
+    DirectInputRange, FrameHeader, SafeFrontier, StorageOpenError, StoredDirectInput, WriteHead,
+};
 use crate::inclusion_lane::PendingUserOp;
 use alloy_primitives::Address;
+use sequencer_core::batch::{Batch, BatchForSubmission, Frame as BatchFrame, WireUserOp};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 
 const MIGRATION_0001_SCHEMA: &str = include_str!("migrations/0001_schema.sql");
@@ -99,6 +105,13 @@ impl Storage {
         Ok(i64_to_u64(value))
     }
 
+    /// Returns the latest batch index observed as submitted on L1, or `None` if
+    /// no batch has been submitted yet (submitter should start from batch 0).
+    pub fn latest_submitted_batch_index(&mut self) -> Result<Option<u64>> {
+        let value = sql_select_last_submitted_batch_index(&self.conn)?;
+        Ok(value.map(i64_to_u64))
+    }
+
     pub fn ensure_minimum_safe_block(&mut self, minimum_safe_block: u64) -> Result<()> {
         let tx = self
             .conn
@@ -178,6 +191,7 @@ impl Storage {
         &mut self,
         safe_block: u64,
         inputs: &[StoredDirectInput],
+        max_batch_nonce: Option<u64>,
     ) -> Result<()> {
         let tx = self
             .conn
@@ -198,6 +212,17 @@ impl Storage {
         let changed_rows = sql_update_safe_block(&tx, u64_to_i64(safe_block))?;
         if changed_rows != 1 {
             return Err(rusqlite::Error::StatementChangedRows(changed_rows));
+        }
+
+        if let Some(nonce) = max_batch_nonce {
+            let current = sql_select_last_submitted_batch_index(&tx)?;
+            let current_u64 = current.map(i64_to_u64).unwrap_or(0);
+            if nonce > current_u64 {
+                let changed = sql_update_last_submitted_batch_index(&tx, u64_to_i64(nonce))?;
+                if changed != 1 {
+                    return Err(rusqlite::Error::StatementChangedRows(changed));
+                }
+            }
         }
 
         tx.commit()?;
@@ -251,6 +276,18 @@ impl Storage {
 
     pub fn set_recommended_fee(&mut self, fee: u64) -> Result<()> {
         let changed_rows = sql_update_recommended_fee(&self.conn, u64_to_i64(fee))?;
+        if changed_rows != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed_rows));
+        }
+        Ok(())
+    }
+
+    /// Test helper to force the last-submitted batch index singleton. The worker no longer
+    /// reads this; it derives S from the chain each tick. This is only for tests that need
+    /// to seed storage for other code paths.
+    #[cfg(test)]
+    pub fn set_latest_submitted_batch_index_for_test(&mut self, index: u64) -> Result<()> {
+        let changed_rows = sql_update_last_submitted_batch_index(&self.conn, u64_to_i64(index))?;
         if changed_rows != 1 {
             return Err(rusqlite::Error::StatementChangedRows(changed_rows));
         }
@@ -376,6 +413,75 @@ impl Storage {
     pub fn ordered_l2_tx_count(&mut self) -> Result<u64> {
         let value = sql_select_ordered_l2_tx_count(&self.conn)?;
         Ok(i64_to_u64(value))
+    }
+
+    pub fn latest_batch_index(&mut self) -> Result<Option<u64>> {
+        let value = sql_select_latest_batch_index(&self.conn)?;
+        Ok(value.map(i64_to_u64))
+    }
+
+    pub fn load_frames_for_batch(&mut self, batch_index: u64) -> Result<Vec<FrameHeader>> {
+        let rows = sql_select_frames_for_batch(&self.conn, u64_to_i64(batch_index))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| FrameHeader {
+                frame_in_batch: i64_to_u32(row.frame_in_batch),
+                fee: i64_to_u64(row.fee),
+                safe_block: i64_to_u64(row.safe_block),
+            })
+            .collect())
+    }
+
+    pub fn load_ordered_l2_txs_for_batch(
+        &mut self,
+        batch_index: u64,
+    ) -> Result<Vec<SequencedL2Tx>> {
+        let rows = sql_select_ordered_l2_txs_for_batch(&self.conn, u64_to_i64(batch_index))?;
+        Ok(decode_ordered_l2_txs(rows))
+    }
+
+    pub fn load_batch_for_submission(&mut self, batch_index: u64) -> Result<BatchForSubmission> {
+        let created_at_ms: i64 = self.conn.query_row(
+            "SELECT created_at_ms FROM batches WHERE batch_index = ?1 LIMIT 1",
+            [u64_to_i64(batch_index)],
+            |row| row.get(0),
+        )?;
+
+        let frame_headers = self.load_frames_for_batch(batch_index)?;
+        let mut frames = Vec::with_capacity(frame_headers.len());
+
+        for header in frame_headers {
+            let rows = sql_select_user_ops_for_frame(
+                &self.conn,
+                u64_to_i64(batch_index),
+                i64::from(header.frame_in_batch),
+            )?;
+
+            let user_ops = rows
+                .into_iter()
+                .map(|row| WireUserOp {
+                    nonce: i64_to_u32(row.nonce),
+                    max_fee: i64_to_u32(row.max_fee),
+                    data: row.data,
+                    signature: row.sig,
+                })
+                .collect();
+
+            frames.push(BatchFrame {
+                user_ops,
+                safe_block: header.safe_block,
+                fee_price: header.fee,
+            });
+        }
+
+        let batch = Batch { nonce: 0, frames };
+        let created_at_ms_u64 = created_at_ms.max(0) as u64;
+
+        Ok(BatchForSubmission {
+            batch_index,
+            created_at_ms: created_at_ms_u64,
+            batch,
+        })
     }
 }
 
@@ -696,7 +802,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_direct_inputs(10, drained.as_slice())
+            .append_safe_direct_inputs(10, drained.as_slice(), None)
             .expect("insert direct inputs");
         let mut head = head;
         storage
@@ -735,7 +841,7 @@ mod tests {
             .expect("initialize open state");
         let drained = vec![
             StoredDirectInput {
-                payload: vec![0x01],
+                payload: vec![0x00],
                 block_number: 10,
             },
             StoredDirectInput {
@@ -744,7 +850,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_direct_inputs(10, drained.as_slice())
+            .append_safe_direct_inputs(10, drained.as_slice(), None)
             .expect("insert direct inputs");
         let mut head = head;
         storage
@@ -786,7 +892,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_direct_inputs(10, inserted.as_slice())
+            .append_safe_direct_inputs(10, inserted.as_slice(), None)
             .expect("insert safe directs");
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 2);
@@ -839,5 +945,75 @@ mod tests {
         assert_eq!(loaded.batch_index, 0);
         assert_eq!(loaded.frame_in_batch, 0);
         assert_eq!(loaded.safe_block, 12);
+    }
+
+    #[test]
+    fn batch_for_submission_builds_from_storage() {
+        let db = temp_db("batch-for-submission");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        let head = storage
+            .initialize_open_state(12, DirectInputRange::empty_at(0))
+            .expect("initialize open state");
+        assert_eq!(head.batch_index, 0);
+
+        let batch = storage
+            .load_batch_for_submission(0)
+            .expect("load batch for submission");
+
+        assert_eq!(batch.batch_index, 0);
+        assert_eq!(batch.batch.frames.len(), 1);
+        let frame = &batch.batch.frames[0];
+        assert!(frame.user_ops.is_empty());
+        assert_eq!(frame.safe_block, 12);
+        assert_eq!(frame.fee_price, 0);
+        assert!(batch.created_at_ms > 0);
+    }
+
+    #[test]
+    fn batch_level_helpers_expose_latest_index_frames_and_txs() {
+        let db = temp_db("batch-level-helpers");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        // Before initialization there should be no batches.
+        assert!(
+            storage
+                .latest_batch_index()
+                .expect("query latest batch nonce on empty db")
+                .is_none()
+        );
+
+        // Initialize first batch/frame and append some data.
+        let mut head = storage
+            .initialize_open_state(0, DirectInputRange::empty_at(0))
+            .expect("initialize open state");
+
+        // Close current batch and move to next so batch 0 becomes closed.
+        let next_safe_block = head.safe_block;
+        storage
+            .close_frame_and_batch(&mut head, next_safe_block)
+            .expect("close batch and rotate");
+
+        // Latest batch nonce should now be 1 (open), with batch 0 closed.
+        let latest = storage
+            .latest_batch_index()
+            .expect("query latest batch nonce")
+            .expect("latest batch should exist");
+        assert_eq!(latest, 1);
+
+        // Batch 0 should still have at least one frame header.
+        let frames = storage
+            .load_frames_for_batch(0)
+            .expect("load frames for batch 0");
+        assert!(!frames.is_empty());
+
+        // Ordered L2 txs for batch 0 should be queryable (even if empty).
+        let txs = storage
+            .load_ordered_l2_txs_for_batch(0)
+            .expect("load l2 txs for batch 0");
+        assert!(
+            txs.is_empty(),
+            "fresh batch should not have sequenced txs yet"
+        );
     }
 }
