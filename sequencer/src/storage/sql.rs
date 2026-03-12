@@ -18,12 +18,18 @@ const SQL_SELECT_LATEST_FRAME_IN_BATCH_FOR_BATCH: &str =
     include_str!("queries/select_latest_frame_in_batch_for_batch.sql");
 const SQL_SELECT_USER_OP_COUNT_FOR_FRAME: &str =
     include_str!("queries/select_user_op_count_for_frame.sql");
+const SQL_SELECT_ORDERED_L2_TXS_FOR_BATCH: &str =
+    include_str!("queries/select_ordered_l2_txs_for_batch.sql");
+const SQL_SELECT_LATEST_BATCH_INDEX: &str = "SELECT MAX(batch_index) FROM batches";
+const SQL_SELECT_USER_OPS_FOR_FRAME: &str = "SELECT nonce, max_fee, data, sig FROM user_ops WHERE batch_index = ?1 AND frame_in_batch = ?2 ORDER BY pos_in_frame ASC";
 const SQL_SELECT_MAX_DIRECT_INPUT_INDEX: &str = "SELECT MAX(direct_input_index) FROM direct_inputs";
 const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_txs";
 const SQL_SELECT_RECOMMENDED_FEE: &str =
     "SELECT fee FROM recommended_fees WHERE singleton_id = 0 LIMIT 1";
 const SQL_SELECT_SAFE_BLOCK: &str =
     "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1";
+const SQL_SELECT_LAST_SUBMITTED_BATCH_INDEX: &str =
+    "SELECT last_submitted_batch_index FROM submitted_batches_state WHERE singleton_id = 0 LIMIT 1";
 const SQL_INSERT_DIRECT_INPUT: &str =
     "INSERT INTO direct_inputs (direct_input_index, payload, block_number) VALUES (?1, ?2, ?3)";
 const SQL_INSERT_USER_OP: &str = include_str!("queries/insert_user_op.sql");
@@ -34,6 +40,8 @@ const SQL_UPDATE_RECOMMENDED_FEE: &str =
     "UPDATE recommended_fees SET fee = ?1 WHERE singleton_id = 0";
 const SQL_UPDATE_SAFE_BLOCK: &str =
     "UPDATE l1_safe_head SET block_number = ?1 WHERE singleton_id = 0";
+const SQL_UPDATE_LAST_SUBMITTED_BATCH_INDEX: &str =
+    "UPDATE submitted_batches_state SET last_submitted_batch_index = ?1 WHERE singleton_id = 0";
 
 #[derive(Debug, Clone)]
 pub(super) struct OrderedL2TxRow {
@@ -51,6 +59,21 @@ pub(super) struct SafeInputRow {
     pub block_number: i64,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct FrameHeaderRow {
+    pub frame_in_batch: i64,
+    pub fee: i64,
+    pub safe_block: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct FrameUserOpRow {
+    pub nonce: i64,
+    pub max_fee: i64,
+    pub data: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
 pub(super) fn sql_select_total_drained_direct_inputs(conn: &Connection) -> Result<i64> {
     const SQL: &str = "SELECT COUNT(*) FROM sequenced_l2_txs WHERE direct_input_index IS NOT NULL";
     conn.query_row(SQL, [], |row| row.get(0))
@@ -59,6 +82,14 @@ pub(super) fn sql_select_total_drained_direct_inputs(conn: &Connection) -> Resul
 pub(super) fn sql_select_max_direct_input_index(conn: &Connection) -> Result<Option<i64>> {
     conn.query_row(
         SQL_SELECT_MAX_DIRECT_INPUT_INDEX,
+        [],
+        convert_row_to_optional_i64,
+    )
+}
+
+pub(super) fn sql_select_latest_batch_index(conn: &Connection) -> Result<Option<i64>> {
+    conn.query_row(
+        SQL_SELECT_LATEST_BATCH_INDEX,
         [],
         convert_row_to_optional_i64,
     )
@@ -80,6 +111,17 @@ pub(super) fn sql_update_safe_block(conn: &Connection, safe_block: i64) -> Resul
     conn.execute(SQL_UPDATE_SAFE_BLOCK, params![safe_block])
 }
 
+pub(super) fn sql_select_last_submitted_batch_index(conn: &Connection) -> Result<Option<i64>> {
+    conn.query_row(SQL_SELECT_LAST_SUBMITTED_BATCH_INDEX, [], |row| row.get(0))
+}
+
+pub(super) fn sql_update_last_submitted_batch_index(
+    conn: &Connection,
+    index: i64,
+) -> Result<usize> {
+    conn.execute(SQL_UPDATE_LAST_SUBMITTED_BATCH_INDEX, params![index])
+}
+
 pub(super) fn sql_select_safe_inputs_range(
     conn: &Connection,
     from_inclusive: i64,
@@ -89,6 +131,29 @@ pub(super) fn sql_select_safe_inputs_range(
     let mapped = stmt.query_map(
         params![from_inclusive, to_exclusive],
         convert_row_to_safe_input_row,
+    )?;
+    mapped.collect()
+}
+
+pub(super) fn sql_select_frames_for_batch(
+    conn: &Connection,
+    batch_index: i64,
+) -> Result<Vec<FrameHeaderRow>> {
+    const SQL: &str = "SELECT frame_in_batch, fee, safe_block FROM frames WHERE batch_index = ?1 ORDER BY frame_in_batch ASC";
+    let mut stmt = conn.prepare_cached(SQL)?;
+    let mapped = stmt.query_map(params![batch_index], convert_row_to_frame_header_row)?;
+    mapped.collect()
+}
+
+pub(super) fn sql_select_user_ops_for_frame(
+    conn: &Connection,
+    batch_index: i64,
+    frame_in_batch: i64,
+) -> Result<Vec<FrameUserOpRow>> {
+    let mut stmt = conn.prepare_cached(SQL_SELECT_USER_OPS_FOR_FRAME)?;
+    let mapped = stmt.query_map(
+        params![batch_index, frame_in_batch],
+        convert_row_to_frame_user_op_row,
     )?;
     mapped.collect()
 }
@@ -176,6 +241,15 @@ pub(super) fn sql_select_ordered_l2_txs_from_offset(
 ) -> Result<Vec<OrderedL2TxRow>> {
     let mut stmt = conn.prepare_cached(SQL_SELECT_ORDERED_L2_TXS_FROM_OFFSET)?;
     let mapped = stmt.query_map(params![offset], convert_row_to_ordered_l2_tx_row)?;
+    mapped.collect()
+}
+
+pub(super) fn sql_select_ordered_l2_txs_for_batch(
+    conn: &Connection,
+    batch_index: i64,
+) -> Result<Vec<OrderedL2TxRow>> {
+    let mut stmt = conn.prepare_cached(SQL_SELECT_ORDERED_L2_TXS_FOR_BATCH)?;
+    let mapped = stmt.query_map(params![batch_index], convert_row_to_ordered_l2_tx_row)?;
     mapped.collect()
 }
 
@@ -276,6 +350,23 @@ fn convert_row_to_safe_input_row(row: &Row<'_>) -> Result<SafeInputRow> {
     })
 }
 
+fn convert_row_to_frame_header_row(row: &Row<'_>) -> Result<FrameHeaderRow> {
+    Ok(FrameHeaderRow {
+        frame_in_batch: row.get(0)?,
+        fee: row.get(1)?,
+        safe_block: row.get(2)?,
+    })
+}
+
+fn convert_row_to_frame_user_op_row(row: &Row<'_>) -> Result<FrameUserOpRow> {
+    Ok(FrameUserOpRow {
+        nonce: row.get(0)?,
+        max_fee: row.get(1)?,
+        data: row.get(2)?,
+        sig: row.get(3)?,
+    })
+}
+
 fn convert_row_to_ordered_l2_tx_row(row: &Row<'_>) -> Result<OrderedL2TxRow> {
     Ok(OrderedL2TxRow {
         kind: row.get(0)?,
@@ -305,15 +396,17 @@ fn u64_to_i64(value: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SQL_INSERT_DIRECT_INPUT, SQL_INSERT_SEQUENCED_DIRECT_INPUT, SQL_INSERT_SEQUENCED_USER_OP,
-        SQL_INSERT_USER_OP, sql_insert_direct_inputs_batch, sql_insert_open_batch,
-        sql_insert_open_batch_with_index, sql_insert_open_frame,
+        FrameHeaderRow, SQL_INSERT_DIRECT_INPUT, SQL_INSERT_SEQUENCED_DIRECT_INPUT,
+        SQL_INSERT_SEQUENCED_USER_OP, SQL_INSERT_USER_OP, sql_insert_direct_inputs_batch,
+        sql_insert_open_batch, sql_insert_open_batch_with_index, sql_insert_open_frame,
         sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_and_sequenced_batch,
+        sql_select_frames_for_batch, sql_select_latest_batch_index,
         sql_select_latest_batch_with_user_op_count, sql_select_max_direct_input_index,
         sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_from_offset,
         sql_select_ordered_l2_txs_page_from_offset, sql_select_recommended_fee,
         sql_select_safe_block, sql_select_safe_inputs_range,
-        sql_select_total_drained_direct_inputs, sql_update_recommended_fee, sql_update_safe_block,
+        sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
+        sql_update_recommended_fee, sql_update_safe_block,
     };
     use crate::inclusion_lane::PendingUserOp;
     use crate::storage::db::Storage;
@@ -490,6 +583,87 @@ mod tests {
 
         let err = sql_select_latest_batch_with_user_op_count(&tx).expect_err("no batch yet");
         assert!(matches!(err, rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn latest_batch_index_and_frames_for_batch_helpers_work() {
+        let mut conn = setup_conn();
+        // No batches yet.
+        assert_eq!(
+            sql_select_latest_batch_index(&conn).expect("query latest batch nonce"),
+            None
+        );
+
+        // Seed batch 0 / frame 0, then batch 1 / frame 0.
+        seed_open_batch0_frame0(&mut conn);
+        {
+            let tx = conn.transaction().expect("start tx");
+            sql_insert_open_batch(&tx, 456).expect("insert batch 1");
+            let next_batch = tx.last_insert_rowid();
+            sql_insert_open_frame(&tx, next_batch, 0, 456, 3, 5)
+                .expect("insert frame 0 for batch 1");
+            tx.commit().expect("commit tx");
+        }
+
+        let latest = sql_select_latest_batch_index(&conn)
+            .expect("query latest batch nonce")
+            .expect("latest batch should exist");
+        assert_eq!(latest, 1);
+
+        let frames = sql_select_frames_for_batch(&conn, 1).expect("query frames for batch 1");
+        assert_eq!(frames.len(), 1);
+        let FrameHeaderRow {
+            frame_in_batch,
+            fee,
+            safe_block,
+        } = frames[0].clone();
+        assert_eq!(frame_in_batch, 0);
+        assert_eq!(fee, 3);
+        assert_eq!(safe_block, 5);
+    }
+
+    #[test]
+    fn user_ops_for_frame_helper_returns_ordered_rows() {
+        let mut conn = setup_conn();
+        seed_open_batch0_frame0(&mut conn);
+
+        // Insert two user-ops with different pos_in_frame values.
+        conn.execute(
+            SQL_INSERT_USER_OP,
+            params![
+                0_i64,
+                0_i64,
+                1_i64,
+                vec![0x10_u8; 20],
+                0_i64,
+                1_i64,
+                vec![0x01_u8],
+                vec![0x55_u8; 65],
+                0_i64
+            ],
+        )
+        .expect("insert first user op");
+        conn.execute(
+            SQL_INSERT_USER_OP,
+            params![
+                0_i64,
+                0_i64,
+                0_i64,
+                vec![0x20_u8; 20],
+                1_i64,
+                2_i64,
+                vec![0x02_u8],
+                vec![0x66_u8; 65],
+                0_i64
+            ],
+        )
+        .expect("insert second user op");
+
+        let rows = sql_select_user_ops_for_frame(&conn, 0, 0).expect("query user ops for frame");
+        assert_eq!(rows.len(), 2);
+        // Ordered by pos_in_frame ASC: nonce 1 comes from pos 1, then nonce 0 from pos 0.
+        assert_eq!(rows[0].nonce, 1);
+        assert_eq!(rows[1].nonce, 0);
     }
 
     #[test]

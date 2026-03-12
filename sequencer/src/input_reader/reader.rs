@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use alloy::eips::BlockNumberOrTag::Safe;
+use alloy::eips::BlockNumberOrTag::{Latest, Safe};
 use alloy::providers::Provider;
 use alloy::providers::ProviderBuilder;
 use alloy_primitives::Address;
@@ -12,9 +12,10 @@ use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use super::logs::get_input_added_events;
+use super::logs::{get_input_added_events, get_transaction_sender};
 use crate::shutdown::ShutdownSignal;
 use crate::storage::{Storage, StorageOpenError, StoredDirectInput};
+use sequencer_core::batch::INPUT_TAG_DIRECT_INPUT;
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 
@@ -23,6 +24,8 @@ pub struct InputReaderConfig {
     pub rpc_url: String,
     pub input_box_address: Address,
     pub app_address_filter: Address,
+    /// EOA whose inputs are batch submissions (not persisted as direct inputs). All other senders = direct.
+    pub batch_submitter_address: Address,
     pub genesis_block: u64,
     pub poll_interval: Duration,
     pub long_block_range_error_codes: Vec<String>,
@@ -152,9 +155,12 @@ impl InputReader {
         provider: &impl Provider,
     ) -> Result<(), InputReaderError> {
         let current_safe_block = latest_safe_block(provider).await?;
+        let current_head_block = latest_head_block(provider).await?;
         let previous_safe_block = self.current_safe_block().await?;
 
-        if current_safe_block <= previous_safe_block {
+        // If our persisted safe head is already ahead of or equal to the chain head,
+        // there is nothing new to scan.
+        if current_head_block <= previous_safe_block {
             return Ok(());
         }
 
@@ -164,7 +170,7 @@ impl InputReader {
             self.config.app_address_filter,
             &self.config.input_box_address,
             start_block,
-            current_safe_block,
+            current_head_block,
             &self.config.long_block_range_error_codes,
         )
         .await
@@ -178,27 +184,45 @@ impl InputReader {
             ))
         })?;
 
-        let batch: Vec<StoredDirectInput> = events
-            .into_iter()
-            .map(|(event, log)| {
-                let block_number = log.block_number.ok_or_else(|| {
-                    InputReaderError::Provider("InputAdded log missing block_number".to_string())
-                })?;
-
-                Ok(StoredDirectInput {
-                    payload: event.input.to_vec(),
+        // Classify by tx sender: inputs from the batch submitter are batch submissions (skip);
+        // all others with tag 0x00 and block_number <= Safe are direct inputs (persist).
+        let mut batch = Vec::new();
+        for (event, log) in events {
+            let block_number = match log.block_number {
+                Some(n) => n,
+                None => continue,
+            };
+            let tx_hash = match log.transaction_hash {
+                Some(h) => h,
+                None => continue,
+            };
+            let sender = match get_transaction_sender(provider, tx_hash).await {
+                Some(s) => s,
+                None => continue,
+            };
+            if sender == self.config.batch_submitter_address {
+                continue;
+            }
+            let first = match event.input.first().copied() {
+                Some(b) => b,
+                None => continue,
+            };
+            if first == INPUT_TAG_DIRECT_INPUT && block_number <= current_safe_block {
+                let body = event.input.get(1..).unwrap_or_default().to_vec();
+                batch.push(StoredDirectInput {
+                    payload: body,
                     block_number,
-                })
-            })
-            .collect::<Result<Vec<_>, InputReaderError>>()?;
+                });
+            }
+        }
 
         info!(
-            block_range = %format!("{}..={}", start_block, current_safe_block),
+            block_range = %format!("{}..={}", start_block, current_head_block),
             count = batch.len(),
-            "appending safe inputs"
+            "appending safe direct inputs"
         );
 
-        self.append_safe_direct_inputs(current_safe_block, batch)
+        self.append_safe_direct_inputs(current_safe_block, batch, None)
             .await
     }
 
@@ -229,12 +253,13 @@ impl InputReader {
         &self,
         current_safe_block: u64,
         batch: Vec<StoredDirectInput>,
+        max_batch_nonce: Option<u64>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
             storage
-                .append_safe_direct_inputs(current_safe_block, &batch)
+                .append_safe_direct_inputs(current_safe_block, &batch, max_batch_nonce)
                 .map_err(InputReaderError::from)
         })
         .await
@@ -262,6 +287,17 @@ async fn latest_safe_block(provider: &impl Provider) -> Result<u64, InputReaderE
     Ok(block.header.number)
 }
 
+async fn latest_head_block(provider: &impl Provider) -> Result<u64, InputReaderError> {
+    let block = provider
+        .get_block(Latest.into())
+        .await
+        .map_err(|e| InputReaderError::Provider(e.to_string()))?
+        .ok_or_else(|| {
+            InputReaderError::Provider("get_block (latest) returned None".to_string())
+        })?;
+    Ok(block.header.number)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +318,7 @@ mod tests {
                 rpc_url: "http://127.0.0.1:0".to_string(),
                 input_box_address: Address::ZERO,
                 app_address_filter: Address::ZERO,
+                batch_submitter_address: Address::ZERO,
                 genesis_block: 0,
                 poll_interval: Duration::from_millis(20),
                 long_block_range_error_codes: vec![],
@@ -315,6 +352,7 @@ mod tests {
                 rpc_url: anvil.endpoint_url().to_string(),
                 input_box_address: Address::ZERO,
                 app_address_filter: Address::ZERO,
+                batch_submitter_address: Address::ZERO,
                 genesis_block: 0,
                 poll_interval: Duration::from_millis(50),
                 long_block_range_error_codes: vec![],
@@ -348,6 +386,7 @@ mod tests {
                 rpc_url: anvil.endpoint_url().to_string(),
                 input_box_address: Address::ZERO,
                 app_address_filter: Address::ZERO,
+                batch_submitter_address: Address::ZERO,
                 genesis_block: 0,
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: vec![],
@@ -383,6 +422,7 @@ mod tests {
                 rpc_url: "http://127.0.0.1:0".to_string(),
                 input_box_address: Address::ZERO,
                 app_address_filter: Address::ZERO,
+                batch_submitter_address: Address::ZERO,
                 genesis_block,
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: vec![],
@@ -411,6 +451,7 @@ mod tests {
                 rpc_url: "http://127.0.0.1:0".to_string(),
                 input_box_address: Address::ZERO,
                 app_address_filter: Address::ZERO,
+                batch_submitter_address: Address::ZERO,
                 genesis_block,
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: vec![],
@@ -442,7 +483,7 @@ mod tests {
         let db_path = db_file.path().to_string_lossy().into_owned();
         let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
         storage
-            .append_safe_direct_inputs(1000, &[])
+            .append_safe_direct_inputs(1000, &[], None)
             .expect("set safe head ahead of chain");
 
         let mut reader = InputReader::new(
@@ -450,6 +491,7 @@ mod tests {
                 rpc_url: anvil.endpoint_url().to_string(),
                 input_box_address: Address::ZERO,
                 app_address_filter: Address::ZERO,
+                batch_submitter_address: Address::ZERO,
                 genesis_block: 0,
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: vec![],

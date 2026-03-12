@@ -5,10 +5,12 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::api::{self, ApiConfig};
-use crate::config::RunConfig;
+use crate::batch_submitter::{BatchSubmitter, BatchSubmitterConfig};
+use crate::config::{L1Config, RunConfig};
 use crate::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
 use crate::input_reader::{InputReader, InputReaderConfig, InputReaderError};
 use crate::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
+use crate::onchain::{BatchPosterConfig, EthereumBatchPoster};
 use crate::shutdown::ShutdownSignal;
 use crate::storage::{self, StorageOpenError};
 use sequencer_core::application::Application;
@@ -61,6 +63,7 @@ enum FirstExit {
     Server(RunError),
     InclusionLane(RunError),
     InputReader(RunError),
+    BatchSubmitter(RunError),
 }
 
 pub async fn run<A>(app: A, config: RunConfig) -> Result<(), RunError>
@@ -77,8 +80,40 @@ where
         InputReader::discover_input_box_deployment_block(&config.eth_rpc_url, input_box_address)
             .await
             .map_err(|source| RunError::InputReader { source })?;
-    let input_reader_config =
-        build_input_reader_config(&config, input_box_address, input_reader_genesis_block);
+
+    // Single L1/InputBox config shared by input reader and batch submitter (no duplicate RPC URL or addresses).
+    // Resolve batch-submitter private key (exactly one of inline or file is required at the CLI layer).
+    let batch_submitter_private_key = if let Some(file) = &config.batch_submitter_private_key_file {
+        let contents =
+            std::fs::read_to_string(file).map_err(|e| RunError::Io(std::io::Error::other(e)))?;
+        contents.lines().next().unwrap_or("").trim().to_string()
+    } else {
+        config
+            .batch_submitter_private_key
+            .clone()
+            .expect("batch submitter private key is required by CLI arg group")
+    };
+
+    let batch_submitter_address = {
+        use alloy::signers::local::PrivateKeySigner;
+        use std::str::FromStr;
+        PrivateKeySigner::from_str(&batch_submitter_private_key)
+            .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?
+            .address()
+    };
+
+    let l1_config = L1Config {
+        eth_rpc_url: config.eth_rpc_url.clone(),
+        input_box_address,
+        app_address: config.domain_verifying_contract,
+        batch_submitter_private_key,
+        batch_submitter_address,
+    };
+    let input_reader_config = build_input_reader_config(
+        &l1_config,
+        input_reader_genesis_block,
+        config.long_block_range_error_codes.clone(),
+    );
     InputReader::sync_to_current_safe_head(&config.db_path, input_reader_config.clone())
         .await
         .map_err(|source| RunError::InputReader { source })?;
@@ -86,11 +121,11 @@ where
     tracing::info!(
         http_addr = %config.http_addr,
         db_path = %config.db_path,
-        eth_rpc_url = %config.eth_rpc_url,
-        input_box_address = %input_box_address,
+        eth_rpc_url = %l1_config.eth_rpc_url,
+        input_box_address = %l1_config.input_box_address,
         input_reader_genesis_block,
         domain_chain_id = config.domain_chain_id,
-        domain_verifying_contract = %config.domain_verifying_contract,
+        domain_verifying_contract = %l1_config.app_address,
         "starting sequencer"
     );
 
@@ -104,6 +139,28 @@ where
     );
     let mut input_reader_handle =
         InputReader::start(&config.db_path, input_reader_config, shutdown.clone())?;
+
+    // Batch submitter uses the same L1 config (InputBox address and RPC URL) as the input reader.
+    let batch_submitter_config = BatchSubmitterConfig {
+        idle_poll_interval_ms: config.batch_submitter_idle_poll_interval_ms,
+        max_batches_per_loop: config.batch_submitter_max_batches_per_loop,
+    };
+    let poster_config = BatchPosterConfig {
+        rpc_url: l1_config.eth_rpc_url.clone(),
+        l1_submit_address: l1_config.input_box_address,
+        app_address: l1_config.app_address,
+        batch_submitter_address: l1_config.batch_submitter_address,
+        scan_depth: config.batch_submitter_scan_depth,
+    };
+    let provider = build_batch_submitter_provider(&l1_config).await?;
+    let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
+    let submitter = BatchSubmitter::new(
+        config.db_path.clone(),
+        poster,
+        shutdown.clone(),
+        batch_submitter_config,
+    );
+    let mut batch_submitter_handle = submitter.start().map_err(RunError::OpenStorage)?;
 
     let tx_feed = L2TxFeed::new(
         config.db_path.clone(),
@@ -140,6 +197,9 @@ where
         reader_result = &mut input_reader_handle => {
             FirstExit::InputReader(map_input_reader_exit(reader_result))
         }
+        submitter_result = &mut batch_submitter_handle => {
+            FirstExit::BatchSubmitter(map_batch_submitter_exit(submitter_result))
+        }
     };
 
     begin_runtime_shutdown(&shutdown);
@@ -148,6 +208,7 @@ where
         server_task,
         inclusion_lane_handle,
         input_reader_handle,
+        batch_submitter_handle,
     )
     .await
 }
@@ -160,10 +221,12 @@ async fn wait_for_clean_shutdown(
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
     inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
     input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
+    batch_submitter_handle: tokio::task::JoinHandle<()>,
 ) -> Result<(), RunError> {
     wait_for_server_shutdown(server_task).await?;
     wait_for_lane_shutdown(inclusion_lane_handle).await?;
     wait_for_input_reader_shutdown(input_reader_handle).await?;
+    let _ = batch_submitter_handle.await;
     Ok(())
 }
 
@@ -172,12 +235,17 @@ async fn finish_runtime(
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
     inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
     input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
+    batch_submitter_handle: tokio::task::JoinHandle<()>,
 ) -> Result<(), RunError> {
     match first_exit {
         FirstExit::Signal(signal_error) => {
-            let shutdown_result =
-                wait_for_clean_shutdown(server_task, inclusion_lane_handle, input_reader_handle)
-                    .await;
+            let shutdown_result = wait_for_clean_shutdown(
+                server_task,
+                inclusion_lane_handle,
+                input_reader_handle,
+                batch_submitter_handle,
+            )
+            .await;
             match (signal_error, shutdown_result) {
                 (Some(err), _) => Err(err),
                 (None, Ok(())) => Ok(()),
@@ -193,6 +261,10 @@ async fn finish_runtime(
                 "input reader",
                 wait_for_input_reader_shutdown(input_reader_handle).await,
             );
+            log_cleanup_result(
+                "batch submitter",
+                wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
+            );
             Err(primary)
         }
         FirstExit::InclusionLane(primary) => {
@@ -201,6 +273,10 @@ async fn finish_runtime(
                 "input reader",
                 wait_for_input_reader_shutdown(input_reader_handle).await,
             );
+            log_cleanup_result(
+                "batch submitter",
+                wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
+            );
             Err(primary)
         }
         FirstExit::InputReader(primary) => {
@@ -208,6 +284,22 @@ async fn finish_runtime(
             log_cleanup_result(
                 "inclusion lane",
                 wait_for_lane_shutdown(inclusion_lane_handle).await,
+            );
+            log_cleanup_result(
+                "batch submitter",
+                wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
+            );
+            Err(primary)
+        }
+        FirstExit::BatchSubmitter(primary) => {
+            log_cleanup_result("server", wait_for_server_shutdown(server_task).await);
+            log_cleanup_result(
+                "inclusion lane",
+                wait_for_lane_shutdown(inclusion_lane_handle).await,
+            );
+            log_cleanup_result(
+                "input reader",
+                wait_for_input_reader_shutdown(input_reader_handle).await,
             );
             Err(primary)
         }
@@ -244,6 +336,15 @@ async fn wait_for_input_reader_shutdown(
     }
 }
 
+async fn wait_for_batch_submitter_shutdown(
+    batch_submitter_handle: tokio::task::JoinHandle<()>,
+) -> Result<(), RunError> {
+    match batch_submitter_handle.await {
+        Ok(()) => Ok(()),
+        Err(source) => Err(RunError::ServerJoin { source }),
+    }
+}
+
 fn map_server_exit(result: Result<std::io::Result<()>, tokio::task::JoinError>) -> RunError {
     match result {
         Ok(Ok(())) => RunError::ServerStoppedUnexpectedly,
@@ -272,18 +373,26 @@ fn map_input_reader_exit(
     }
 }
 
+fn map_batch_submitter_exit(result: Result<(), tokio::task::JoinError>) -> RunError {
+    match result {
+        Ok(()) => RunError::ServerStoppedUnexpectedly,
+        Err(source) => RunError::ServerJoin { source },
+    }
+}
+
 fn build_input_reader_config(
-    config: &RunConfig,
-    input_box_address: alloy_primitives::Address,
+    l1: &L1Config,
     genesis_block: u64,
+    long_block_range_error_codes: Vec<String>,
 ) -> InputReaderConfig {
     InputReaderConfig {
-        rpc_url: config.eth_rpc_url.clone(),
-        input_box_address,
-        app_address_filter: config.domain_verifying_contract,
+        rpc_url: l1.eth_rpc_url.clone(),
+        input_box_address: l1.input_box_address,
+        app_address_filter: l1.app_address,
+        batch_submitter_address: l1.batch_submitter_address,
         genesis_block,
         poll_interval: INPUT_READER_POLL_INTERVAL,
-        long_block_range_error_codes: config.long_block_range_error_codes.clone(),
+        long_block_range_error_codes,
     }
 }
 
@@ -291,4 +400,21 @@ fn log_cleanup_result(component: &str, result: Result<(), RunError>) {
     if let Err(err) = result {
         warn!(component, error = %err, "component shutdown after primary failure also errored");
     }
+}
+
+async fn build_batch_submitter_provider(
+    l1: &L1Config,
+) -> Result<impl alloy::providers::Provider + Clone + 'static, std::io::Error> {
+    use alloy::providers::ProviderBuilder;
+    use alloy::signers::local::PrivateKeySigner;
+    use std::str::FromStr;
+
+    let signer = PrivateKeySigner::from_str(&l1.batch_submitter_private_key)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    ProviderBuilder::new()
+        .wallet(signer)
+        .connect(l1.eth_rpc_url.as_str())
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }

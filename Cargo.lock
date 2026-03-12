@@ -3765,10 +3765,12 @@ name = "sequencer"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-network-primitives",
  "alloy-primitives",
  "alloy-sol-types",
  "app-core",
  "async-recursion",
+ "async-trait",
  "axum",
  "cartesi-rollups-contracts",
  "clap",
