@@ -88,6 +88,8 @@ Notes:
 - `sender` is required and must match the recovered signer.
 - `message.data` is SSZ-encoded method payload bytes.
 - payload size is bounded at ingress; oversized requests are rejected before entering the hot path.
+- overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
+- queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
 
 ### `GET /ws/subscribe?from_offset=<u64>`
 
@@ -99,6 +101,7 @@ Notes:
 - messages are JSON text frames.
 - binary fields are hex-encoded (`0x`-prefixed).
 - the current runtime enforces a subscriber cap of `64` and a catch-up cap of `50000` events.
+- if the requested catch-up window exceeds that cap, the server upgrades and then immediately closes the socket with close code `1008` (`POLICY`) and reason `catch-up window exceeded`.
 
 Message shapes:
 

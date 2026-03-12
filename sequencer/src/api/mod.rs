@@ -28,6 +28,7 @@ use sequencer_core::api::TxRequest;
 const DEFAULT_WS_MAX_SUBSCRIBERS: usize = 64;
 const DEFAULT_WS_MAX_CATCHUP_EVENTS: u64 = 50_000;
 const DEFAULT_MAX_BODY_BYTES: usize = TxRequest::MAX_JSON_BYTES_RECOMMENDED;
+pub const WS_CATCHUP_WINDOW_EXCEEDED_REASON: &str = "catch-up window exceeded";
 
 pub type ApiServerTask = tokio::task::JoinHandle<std::io::Result<()>>;
 

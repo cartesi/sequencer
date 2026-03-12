@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::l2_tx_feed::{BroadcastTxMessage, L2TxFeed, SubscribeError};
 
-use super::ApiState;
+use super::{ApiState, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
 
 const MAX_INBOUND_WS_MESSAGE_SIZE: usize = 8 * 1024;
 const MAX_INBOUND_WS_FRAME_SIZE: usize = 8 * 1024;
@@ -70,7 +70,7 @@ async fn run_ws_session(
             let _ = socket
                 .send(Message::Close(Some(CloseFrame {
                     code: close_code::POLICY,
-                    reason: "catch-up window exceeded".into(),
+                    reason: WS_CATCHUP_WINDOW_EXCEEDED_REASON.into(),
                 })))
                 .await;
             return;

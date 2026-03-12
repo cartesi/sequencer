@@ -8,7 +8,7 @@ use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
 use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
 use futures_util::{SinkExt, StreamExt};
-use sequencer::api::{self, ApiConfig};
+use sequencer::api::{self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
 use sequencer::inclusion_lane::{PendingUserOp, SequencerError};
 use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::shutdown::ShutdownSignal;
@@ -229,17 +229,44 @@ async fn ws_subscribe_closes_when_catchup_window_exceeds_limit() {
     let frame = recv_raw_message(&mut ws).await;
     match frame {
         Message::Close(Some(close_frame)) => {
-            assert!(
-                close_frame.reason.contains("catch-up window exceeded"),
-                "expected close reason to mention catch-up window: {:?}",
-                close_frame.reason
+            assert_eq!(
+                close_frame.code,
+                tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
             );
+            assert_eq!(close_frame.reason, WS_CATCHUP_WINDOW_EXCEEDED_REASON);
         }
         other => panic!("expected close frame for catch-up limit, got {other:?}"),
     }
 
     drop(ws);
     shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_allows_catchup_exactly_at_limit() {
+    let db = temp_db("ws-catchup-boundary");
+    seed_ordered_txs(db.path.as_str());
+    let expected = load_ordered_l2_txs_page(db.path.as_str(), 0, 2);
+    assert_eq!(expected.len(), 2, "seeded replay must contain two txs");
+
+    let Some(runtime) = start_test_server_with_limits(db.path.as_str(), 64, 2).await else {
+        return;
+    };
+
+    let url = ws_subscribe_url(runtime.addr, 0);
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
+        .await
+        .expect("timeout connecting websocket")
+        .expect("connect websocket");
+
+    let first = recv_tx_message(&mut ws).await;
+    let second = recv_tx_message(&mut ws).await;
+    drop(ws);
+
+    shutdown_runtime(runtime).await;
+
+    assert_ws_message_matches_tx(first, &expected[0], 0);
+    assert_ws_message_matches_tx(second, &expected[1], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

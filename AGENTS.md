@@ -59,6 +59,7 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame.
 - The next frame fee is sampled from `recommended_fees` when rotating to a new frame (default bootstrap value is `0`).
 - `/ws/subscribe` currently has internal guardrails: subscriber cap `64`, catch-up cap `50000`.
+- When that catch-up window is exceeded, `/ws/subscribe` upgrades and then closes with websocket close code `1008` (`POLICY`) and reason `catch-up window exceeded`.
 - Wallet state (balances/nonces) is in-memory right now (not persisted).
 - EIP-712 domain name/version are fixed in code; chain ID and verifying contract are deployment-specific inputs.
 
@@ -66,6 +67,7 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 
 - API ack is tied to chunk durability, not frame/batch closure.
 - Chunk commit and ack remain low-latency; frame closure is orthogonal and can happen less frequently.
+- API overload for `POST /tx` is currently defined by inclusion-lane queue admission: if `try_send` hits a full queue, the handler returns `429 OVERLOADED` with message `queue full`.
 - Frame closure happens when direct inputs are drained, and also whenever batch closure happens.
 - Batch closure is controlled by batch policy (size and/or deadline).
 - Preserve single-lane deterministic ordering; do not introduce extra concurrency in hot-path ordering logic without explicit approval.

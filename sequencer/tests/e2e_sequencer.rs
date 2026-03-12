@@ -16,8 +16,9 @@ use sequencer::api::{self, ApiConfig};
 use sequencer::inclusion_lane::{InclusionLane, InclusionLaneConfig, PendingUserOp};
 use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::shutdown::ShutdownSignal;
-use sequencer::storage::{DirectInputRange, Storage};
+use sequencer::storage::{DirectInputRange, Storage, StoredDirectInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
+use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
 use tempfile::TempDir;
@@ -304,6 +305,75 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
     shutdown_runtime(runtime).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
+    let db = temp_db("restart-replay-golden");
+    let domain = test_domain();
+    seed_safe_direct_input(db.path.as_str(), 10, vec![0xaa]);
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint.clone(), Duration::from_secs(2))
+        .expect("build sequencer client");
+    let ws_url = client.ws_subscribe_url(0);
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(ws_url))
+        .await
+        .expect("timeout connecting websocket")
+        .expect("connect websocket");
+
+    let first_live = recv_ws_message(&mut ws).await;
+
+    let request = make_valid_request(&domain);
+    let (status, response_body) = client
+        .submit_tx_with_status(&request)
+        .await
+        .expect("submit tx");
+    assert_eq!(
+        status, 200,
+        "submit tx should succeed before restart: body={response_body}"
+    );
+
+    let second_live = recv_ws_message(&mut ws).await;
+    drop(ws);
+
+    let expected = load_all_ordered_l2_txs(db.path.as_str());
+    assert_eq!(
+        expected.len(),
+        2,
+        "expected one direct input and one user op"
+    );
+    assert_ws_message_matches_tx(first_live, &expected[0], 0);
+    assert_ws_message_matches_tx(second_live, &expected[1], 1);
+
+    shutdown_runtime(runtime).await;
+
+    let Some(restarted) = start_full_server(db.path.as_str(), domain).await else {
+        return;
+    };
+
+    let restarted_endpoint = format!("http://{}", restarted.addr);
+    let restarted_client =
+        SequencerClient::new_with_timeout(restarted_endpoint, Duration::from_secs(2))
+            .expect("build sequencer client after restart");
+    let restarted_ws_url = restarted_client.ws_subscribe_url(0);
+    let (mut restarted_ws, _) =
+        tokio::time::timeout(Duration::from_secs(5), connect_async(restarted_ws_url))
+            .await
+            .expect("timeout connecting websocket after restart")
+            .expect("connect websocket after restart");
+
+    for (offset, expected_tx) in expected.iter().enumerate() {
+        let replayed = recv_ws_message(&mut restarted_ws).await;
+        assert_ws_message_matches_tx(replayed, expected_tx, offset as u64);
+    }
+    drop(restarted_ws);
+
+    shutdown_runtime(restarted).await;
+}
+
 struct FullServerRuntime {
     addr: std::net::SocketAddr,
     shutdown: ShutdownSignal,
@@ -492,6 +562,67 @@ fn make_valid_request(domain: &Eip712Domain) -> TxRequest {
         message: user_op,
         signature: signature_hex,
         sender: sender.to_string(),
+    }
+}
+
+fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
+    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    storage
+        .append_safe_direct_inputs(
+            safe_block,
+            &[StoredDirectInput {
+                payload,
+                block_number: safe_block,
+            }],
+        )
+        .expect("append safe direct input");
+}
+
+fn load_all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
+    let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
+    let total = storage
+        .ordered_l2_tx_count()
+        .expect("query ordered l2 tx count");
+    storage
+        .load_ordered_l2_txs_page_from(0, total as usize)
+        .expect("load ordered l2 txs")
+}
+
+fn assert_ws_message_matches_tx(
+    actual: WsTxMessage,
+    expected: &SequencedL2Tx,
+    expected_offset: u64,
+) {
+    match (actual, expected) {
+        (
+            WsTxMessage::UserOp {
+                offset,
+                sender,
+                fee,
+                data,
+            },
+            SequencedL2Tx::UserOp(expected),
+        ) => {
+            assert_eq!(offset, expected_offset);
+            assert_eq!(
+                decode_hex_prefixed(sender.as_str()),
+                expected.sender.as_slice()
+            );
+            assert_eq!(fee, expected.fee);
+            assert_eq!(decode_hex_prefixed(data.as_str()), expected.data.as_slice());
+        }
+        (WsTxMessage::DirectInput { offset, payload }, SequencedL2Tx::Direct(expected)) => {
+            assert_eq!(offset, expected_offset);
+            assert_eq!(
+                decode_hex_prefixed(payload.as_str()),
+                expected.payload.as_slice()
+            );
+        }
+        (actual, expected) => {
+            panic!(
+                "expected websocket message to match persisted tx, got {actual:?} vs {expected:?}"
+            );
+        }
     }
 }
 
