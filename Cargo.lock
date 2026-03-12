@@ -3769,6 +3769,7 @@ dependencies = [
  "alloy-sol-types",
  "app-core",
  "async-recursion",
+ "async-trait",
  "axum",
  "cartesi-rollups-contracts",
  "clap",

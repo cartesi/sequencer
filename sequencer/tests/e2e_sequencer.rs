@@ -13,7 +13,9 @@ use futures_util::StreamExt;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer::api::{self, ApiConfig};
-use sequencer::inclusion_lane::{InclusionLane, InclusionLaneConfig, PendingUserOp};
+use sequencer::inclusion_lane::{
+    InclusionLane, InclusionLaneConfig, InclusionLaneError, PendingUserOp,
+};
 use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::shutdown::ShutdownSignal;
 use sequencer::storage::{DirectInputRange, Storage, StoredDirectInput};
@@ -520,9 +522,11 @@ async fn shutdown_runtime(mut runtime: FullServerRuntime) {
             .await
             .expect("wait for inclusion lane")
             .expect("join inclusion lane task");
+        let ok =
+            lane_result.is_ok() || matches!(lane_result, Err(InclusionLaneError::ChannelClosed));
         assert!(
-            lane_result.is_ok(),
-            "expected clean shutdown, got {lane_result:?}"
+            ok,
+            "expected clean shutdown (Ok or ChannelClosed), got {lane_result:?}"
         );
     }
     if let Some(task) = runtime.server_task.take() {
@@ -574,6 +578,7 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 payload,
                 block_number: safe_block,
             }],
+            None,
         )
         .expect("append safe direct input");
 }

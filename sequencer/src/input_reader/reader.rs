@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use alloy::eips::BlockNumberOrTag::Safe;
+use alloy::eips::BlockNumberOrTag::{Latest, Safe};
 use alloy::providers::Provider;
 use alloy::providers::ProviderBuilder;
 use alloy_primitives::Address;
@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use super::logs::get_input_added_events;
 use crate::shutdown::ShutdownSignal;
 use crate::storage::{Storage, StorageOpenError, StoredDirectInput};
+use sequencer_core::batch::{INPUT_TAG_BATCH_SUBMISSION, INPUT_TAG_DIRECT_INPUT};
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 
@@ -152,9 +153,12 @@ impl InputReader {
         provider: &impl Provider,
     ) -> Result<(), InputReaderError> {
         let current_safe_block = latest_safe_block(provider).await?;
+        let current_head_block = latest_head_block(provider).await?;
         let previous_safe_block = self.current_safe_block().await?;
 
-        if current_safe_block <= previous_safe_block {
+        // If our persisted safe head is already ahead of or equal to the chain head,
+        // there is nothing new to scan.
+        if current_head_block <= previous_safe_block {
             return Ok(());
         }
 
@@ -164,7 +168,7 @@ impl InputReader {
             self.config.app_address_filter,
             &self.config.input_box_address,
             start_block,
-            current_safe_block,
+            current_head_block,
             &self.config.long_block_range_error_codes,
         )
         .await
@@ -178,27 +182,49 @@ impl InputReader {
             ))
         })?;
 
+        // Classify InputAdded payloads by tag, with different effective finality thresholds:
+        // - 0x00 (direct input): only inputs with block_number <= Safe are persisted.
+        // - 0x01 (batch submission): batch index S is advanced using inputs up to Latest
+        //   (0-confirmation for S). Other tags are discarded as garbage.
+        let mut max_batch_nonce: Option<u64> = None;
         let batch: Vec<StoredDirectInput> = events
             .into_iter()
-            .map(|(event, log)| {
-                let block_number = log.block_number.ok_or_else(|| {
-                    InputReaderError::Provider("InputAdded log missing block_number".to_string())
-                })?;
+            .filter_map(|(event, log)| {
+                let Some(first) = event.input.first().copied() else {
+                    return None;
+                };
 
-                Ok(StoredDirectInput {
-                    payload: event.input.to_vec(),
-                    block_number,
-                })
+                let block_number = log.block_number?;
+
+                if first == INPUT_TAG_DIRECT_INPUT && block_number <= current_safe_block {
+                    let body = event.input.get(1..).unwrap_or_default().to_vec();
+                    return Some(Ok(StoredDirectInput {
+                        payload: body,
+                        block_number,
+                    }));
+                }
+
+                if first == INPUT_TAG_BATCH_SUBMISSION && event.input.len() >= 9 {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&event.input[1..9]);
+                    let nonce = u64::from_be_bytes(bytes);
+                    max_batch_nonce = Some(match max_batch_nonce {
+                        Some(current) if current >= nonce => current,
+                        _ => nonce,
+                    });
+                }
+
+                None
             })
             .collect::<Result<Vec<_>, InputReaderError>>()?;
 
         info!(
-            block_range = %format!("{}..={}", start_block, current_safe_block),
+            block_range = %format!("{}..={}", start_block, current_head_block),
             count = batch.len(),
-            "appending safe inputs"
+            "appending safe direct inputs"
         );
 
-        self.append_safe_direct_inputs(current_safe_block, batch)
+        self.append_safe_direct_inputs(current_safe_block, batch, max_batch_nonce)
             .await
     }
 
@@ -229,12 +255,13 @@ impl InputReader {
         &self,
         current_safe_block: u64,
         batch: Vec<StoredDirectInput>,
+        max_batch_nonce: Option<u64>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
             storage
-                .append_safe_direct_inputs(current_safe_block, &batch)
+                .append_safe_direct_inputs(current_safe_block, &batch, max_batch_nonce)
                 .map_err(InputReaderError::from)
         })
         .await
@@ -259,6 +286,17 @@ async fn latest_safe_block(provider: &impl Provider) -> Result<u64, InputReaderE
         .await
         .map_err(|e| InputReaderError::Provider(e.to_string()))?
         .ok_or_else(|| InputReaderError::Provider("get_block returned None".to_string()))?;
+    Ok(block.header.number)
+}
+
+async fn latest_head_block(provider: &impl Provider) -> Result<u64, InputReaderError> {
+    let block = provider
+        .get_block(Latest.into())
+        .await
+        .map_err(|e| InputReaderError::Provider(e.to_string()))?
+        .ok_or_else(|| {
+            InputReaderError::Provider("get_block (latest) returned None".to_string())
+        })?;
     Ok(block.header.number)
 }
 
@@ -442,7 +480,7 @@ mod tests {
         let db_path = db_file.path().to_string_lossy().into_owned();
         let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
         storage
-            .append_safe_direct_inputs(1000, &[])
+            .append_safe_direct_inputs(1000, &[], None)
             .expect("set safe head ahead of chain");
 
         let mut reader = InputReader::new(

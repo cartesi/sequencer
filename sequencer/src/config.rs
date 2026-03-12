@@ -3,7 +3,7 @@
 
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::Eip712Domain;
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 pub const DOMAIN_NAME: &str = "CartesiAppSequencer";
 pub const DOMAIN_VERSION: &str = "1";
@@ -16,12 +16,54 @@ const DEFAULT_DB_PATH: &str = "sequencer.db";
 /// `-32616` QuickNode
 const DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES: &[&str] = &["-32005", "-32600", "-32602", "-32616"];
 
+/// Shared L1 / InputBox configuration used by both the input reader and the batch submitter.
+///
+/// Built once at startup from `RunConfig` plus the discovered InputBox address, so RPC URL,
+/// InputBox address, and app (verifying contract) address are defined in a single place and
+/// not duplicated across component configs.
+#[derive(Debug, Clone)]
+pub struct L1Config {
+    /// L1 Ethereum RPC URL (e.g. for reading safe blocks and posting batch inputs).
+    pub eth_rpc_url: String,
+    /// InputBox contract address (same contract for ingesting direct inputs and for submitting batches).
+    pub input_box_address: Address,
+    /// Application / verifying contract address (used to discover InputBox and filter inputs).
+    pub app_address: Address,
+    /// Hex-encoded private key used by the batch submitter for posting batches to L1.
+    ///
+    /// `RunConfig` is responsible for resolving whether this comes from an inline
+    /// value or a key file; by the time `L1Config` is constructed this is always
+    /// the fully resolved private key.
+    pub batch_submitter_private_key: String,
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "sequencer",
     about = "Deterministic sequencer prototype with low-latency soft confirmations",
     version,
-    after_help = "Examples:\n  sequencer --eth-rpc-url http://127.0.0.1:8545 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111\n  sequencer --http-addr 0.0.0.0:3000 --db-path ./sequencer.db --eth-rpc-url https://eth.example --domain-chain-id 1 --domain-verifying-contract 0x4444444444444444444444444444444444444444"
+    after_help = "\
+Examples:
+  sequencer \\
+    --eth-rpc-url http://127.0.0.1:8545 \\
+    --domain-chain-id 31337 \\
+    --domain-verifying-contract 0x1111111111111111111111111111111111111111 \\
+    --batch-submitter-private-key 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+  sequencer \\
+    --http-addr 0.0.0.0:3000 \\
+    --db-path ./sequencer.db \\
+    --eth-rpc-url https://eth.example \\
+    --domain-chain-id 1 \\
+    --domain-verifying-contract 0x4444444444444444444444444444444444444444 \\
+    --batch-submitter-private-key 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+",
+    group(
+        ArgGroup::new("batch_submitter_key_source")
+            .args(&["batch_submitter_private_key", "batch_submitter_private_key_file"])
+            .required(true)
+            .multiple(false)
+    )
 )]
 pub struct RunConfig {
     #[arg(long, env = "SEQ_HTTP_ADDR", default_value = DEFAULT_HTTP_ADDR, value_parser = parse_non_empty_string)]
@@ -37,6 +79,23 @@ pub struct RunConfig {
     pub domain_chain_id: u64,
     #[arg(long, env = "SEQ_DOMAIN_VERIFYING_CONTRACT", value_parser = parse_address)]
     pub domain_verifying_contract: Address,
+    /// Hex-encoded private key used by the batch submitter for posting batches to L1.
+    /// Exactly one of this or `batch_submitter_private_key_file` must be set when a signer
+    /// is desired.
+    #[arg(
+        long,
+        env = "SEQ_BATCH_SUBMITTER_PRIVATE_KEY",
+        group = "batch_submitter_key_source"
+    )]
+    pub batch_submitter_private_key: Option<String>,
+    /// Path to a file whose first line contains the batch submitter private key. Takes
+    /// precedence over `batch_submitter_private_key` if both are set (checked by clap group).
+    #[arg(
+        long,
+        env = "SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE",
+        group = "batch_submitter_key_source"
+    )]
+    pub batch_submitter_private_key_file: Option<String>,
 }
 
 impl RunConfig {
@@ -80,7 +139,12 @@ mod tests {
 
     #[test]
     fn run_config_requires_deployment_domain_inputs() {
-        let err = RunConfig::try_parse_from(["sequencer"]).expect_err("domain inputs are required");
+        let err = RunConfig::try_parse_from([
+            "sequencer",
+            "--batch-submitter-private-key",
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ])
+        .expect_err("domain inputs are required");
 
         let message = err.to_string();
         assert!(message.contains("--eth-rpc-url"));
@@ -98,6 +162,8 @@ mod tests {
             "31337",
             "--domain-verifying-contract",
             "0x1111111111111111111111111111111111111111",
+            "--batch-submitter-private-key",
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ])
         .expect("parse run config");
 
@@ -122,6 +188,8 @@ mod tests {
             "31337",
             "--domain-verifying-contract",
             "0x1111111111111111111111111111111111111111",
+            "--batch-submitter-private-key",
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ])
         .expect("parse run config");
 

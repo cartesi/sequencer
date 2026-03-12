@@ -227,6 +227,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
+            None,
         )
         .expect("append first direct input");
     storage
@@ -244,6 +245,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 payload: vec![0xbb],
                 block_number: 20,
             }],
+            None,
         )
         .expect("append second direct input");
     storage
@@ -257,6 +259,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 payload: vec![0xcc],
                 block_number: 30,
             }],
+            None,
         )
         .expect("append third direct input");
     storage
@@ -362,6 +365,7 @@ async fn direct_inputs_close_frame_and_persist_drain() {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
+            None,
         )
         .expect("append safe direct input");
 
@@ -388,12 +392,12 @@ async fn direct_inputs_are_paginated_by_buffer_capacity() {
     let mut directs = Vec::new();
     for index in 0..5_u64 {
         directs.push(StoredDirectInput {
-            payload: vec![index as u8],
+            payload: vec![0x10 + index as u8],
             block_number: 10,
         });
     }
     feeder_storage
-        .append_safe_direct_inputs(10, directs.as_slice())
+        .append_safe_direct_inputs(10, directs.as_slice(), None)
         .expect("append safe direct inputs");
 
     let drained = wait_until(Duration::from_secs(2), || {
@@ -421,6 +425,7 @@ async fn safe_directs_already_available_are_sequenced_before_later_user_ops() {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
+            None,
         )
         .expect("append safe direct input");
 

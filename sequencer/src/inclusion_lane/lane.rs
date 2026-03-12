@@ -252,8 +252,10 @@ impl<A: Application + 'static> InclusionLane<A> {
         chunk: &[StoredDirectInput],
     ) -> Result<(), InclusionLaneError> {
         for input in chunk {
+            let payload = input.payload.as_slice();
+
             self.app
-                .execute_direct_input(input.payload.as_slice())
+                .execute_direct_input(payload)
                 .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?;
         }
         Ok(())

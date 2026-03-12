@@ -157,6 +157,7 @@ fn seed_ordered_txs(db_path: &str) {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
+            None,
         )
         .expect("append direct input");
     storage
