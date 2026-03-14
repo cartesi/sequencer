@@ -70,6 +70,9 @@ impl ManagedSequencer {
             .open(log_path.as_path())?;
         let stderr_log = stdout_log.try_clone()?;
 
+        let batch_submitter_key = default_private_keys().first().cloned().unwrap_or_else(|| {
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()
+        });
         let mut child = Command::new(config.sequencer_bin.as_str())
             .arg("--http-addr")
             .arg(http_addr)
@@ -81,6 +84,8 @@ impl ManagedSequencer {
             .arg(domain.chain_id.to_string())
             .arg("--domain-verifying-contract")
             .arg(domain.verifying_contract.to_string())
+            .arg("--batch-submitter-private-key")
+            .arg(&batch_submitter_key)
             .env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG)
             .stdout(Stdio::from(stdout_log))
             .stderr(Stdio::from(stderr_log))

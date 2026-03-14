@@ -105,13 +105,11 @@ impl Storage {
         Ok(i64_to_u64(value))
     }
 
-    /// Returns the latest batch index that has been observed as submitted on L1
-    /// (as derived from InputAdded events scanned by the input reader). This is
-    /// persisted in the `submitted_batches_state` singleton and is updated by
-    /// the input reader.
-    pub fn latest_submitted_batch_index(&mut self) -> Result<u64> {
+    /// Returns the latest batch index observed as submitted on L1, or `None` if
+    /// no batch has been submitted yet (submitter should start from batch 0).
+    pub fn latest_submitted_batch_index(&mut self) -> Result<Option<u64>> {
         let value = sql_select_last_submitted_batch_index(&self.conn)?;
-        Ok(i64_to_u64(value))
+        Ok(value.map(i64_to_u64))
     }
 
     pub fn ensure_minimum_safe_block(&mut self, minimum_safe_block: u64) -> Result<()> {
@@ -218,7 +216,7 @@ impl Storage {
 
         if let Some(nonce) = max_batch_nonce {
             let current = sql_select_last_submitted_batch_index(&tx)?;
-            let current_u64 = i64_to_u64(current);
+            let current_u64 = current.map(i64_to_u64).unwrap_or(0);
             if nonce > current_u64 {
                 let changed = sql_update_last_submitted_batch_index(&tx, u64_to_i64(nonce))?;
                 if changed != 1 {
@@ -284,9 +282,9 @@ impl Storage {
         Ok(())
     }
 
-    /// Test and maintenance helper to force the last-submitted batch index singleton to
-    /// a specific value. In normal operation this is advanced by the input reader based
-    /// on safe InputAdded events.
+    /// Test helper to force the last-submitted batch index singleton. The worker no longer
+    /// reads this; it derives S from the chain each tick. This is only for tests that need
+    /// to seed storage for other code paths.
     #[cfg(test)]
     pub fn set_latest_submitted_batch_index_for_test(&mut self, index: u64) -> Result<()> {
         let changed_rows = sql_update_last_submitted_batch_index(&self.conn, u64_to_i64(index))?;
@@ -476,7 +474,7 @@ impl Storage {
             });
         }
 
-        let batch = Batch { frames };
+        let batch = Batch { nonce: 0, frames };
         let created_at_ms_u64 = created_at_ms.max(0) as u64;
 
         Ok(BatchForSubmission {

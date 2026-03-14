@@ -35,6 +35,9 @@ pub struct L1Config {
     /// value or a key file; by the time `L1Config` is constructed this is always
     /// the fully resolved private key.
     pub batch_submitter_private_key: String,
+    /// EOA address of the batch submitter (derived from `batch_submitter_private_key`).
+    /// Inputs from this sender are batch submissions; all others are direct inputs.
+    pub batch_submitter_address: Address,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -96,6 +99,27 @@ pub struct RunConfig {
         group = "batch_submitter_key_source"
     )]
     pub batch_submitter_private_key_file: Option<String>,
+
+    /// How often the batch submitter polls for new work when idle.
+    #[arg(
+        long,
+        env = "SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS",
+        default_value = "5000"
+    )]
+    pub batch_submitter_idle_poll_interval_ms: u64,
+
+    /// Maximum number of batches to submit in a single loop iteration.
+    #[arg(
+        long,
+        env = "SEQ_BATCH_SUBMITTER_MAX_BATCHES_PER_LOOP",
+        default_value = "4"
+    )]
+    pub batch_submitter_max_batches_per_loop: usize,
+
+    /// Number of blocks to scan back from Latest when deriving the latest submitted batch index.
+    /// 0 means use only the latest block. Used for at-least-once recovery (reorg-safe).
+    #[arg(long, env = "SEQ_BATCH_SUBMITTER_SCAN_DEPTH", default_value = "0")]
+    pub batch_submitter_scan_depth: u64,
 }
 
 impl RunConfig {

@@ -11,6 +11,7 @@ use sequencer::batch_submitter::{BatchSubmitter, BatchSubmitterConfig};
 use sequencer::onchain::{BatchPoster, BatchPosterError, TxHash};
 use sequencer::shutdown::ShutdownSignal;
 use sequencer::storage::{DirectInputRange, Storage};
+use sequencer_core::batch::Batch;
 use tempfile::TempDir;
 
 /// Minimal mock for integration tests: records submissions.
@@ -32,19 +33,24 @@ impl TestMock {
 #[async_trait]
 impl BatchPoster for TestMock {
     async fn submit_batch(&self, payload: Vec<u8>) -> Result<TxHash, BatchPosterError> {
-        // Decode batch index from payload header for assertions.
-        let batch_index = if payload.len() >= 9 {
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&payload[1..9]);
-            u64::from_be_bytes(bytes)
-        } else {
-            0
-        };
+        let batch_index = ssz::Decode::from_ssz_bytes(payload.as_slice())
+            .map(|b: Batch| b.nonce)
+            .unwrap_or(0);
         self.submissions
             .lock()
             .expect("lock")
             .push((batch_index, payload.len()));
         Ok(TxHash::ZERO)
+    }
+
+    async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError> {
+        Ok(self
+            .submissions
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(idx, _)| *idx)
+            .max())
     }
 }
 
@@ -99,10 +105,11 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
 
     let submissions = mock.submissions();
     assert!(
-        submissions.len() >= 2,
-        "submitter should have submitted at least batch 1 and 2, got {:?}",
+        submissions.len() >= 3,
+        "submitter should have submitted at least batch 0, 1, and 2, got {:?}",
         submissions
     );
-    assert_eq!(submissions[0].0, 1, "first submission should be batch 1");
-    assert_eq!(submissions[1].0, 2, "second submission should be batch 2");
+    assert_eq!(submissions[0].0, 0, "first submission should be batch 0");
+    assert_eq!(submissions[1].0, 1, "second submission should be batch 1");
+    assert_eq!(submissions[2].0, 2, "third submission should be batch 2");
 }

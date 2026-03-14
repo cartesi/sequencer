@@ -1,11 +1,16 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use std::sync::Mutex;
+
 use alloy::providers::Provider;
 use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
 use cartesi_rollups_contracts::input_box::InputBox;
+use sequencer_core::batch::Batch;
 use thiserror::Error;
+
+use crate::input_reader::logs::{get_input_added_events, get_transaction_sender};
 
 /// Alias for the transaction hash type returned by the L1 provider.
 pub type TxHash = B256;
@@ -19,6 +24,10 @@ pub struct BatchPosterConfig {
     /// `InputBox.addInput`. This is the same contract used as the EIP-712
     /// verifying contract in the sequencer API.
     pub app_address: Address,
+    /// EOA whose inputs are batch submissions. Only these are counted when deriving latest submitted batch index.
+    pub batch_submitter_address: Address,
+    /// Number of blocks behind Latest to treat as confirmed; scan range is [previous_scanned+1 ..= Latest-scan_depth].
+    pub scan_depth: u64,
 }
 
 #[derive(Debug, Error)]
@@ -36,6 +45,20 @@ pub trait BatchPoster: Send + Sync {
     /// Same batch may be submitted more than once (at-least-once); the scheduler invalidates
     /// duplicates by nonce based on the encoded batch index.
     async fn submit_batch(&self, payload: Vec<u8>) -> Result<TxHash, BatchPosterError>;
+
+    /// Returns the highest batch index observed as submitted on the chain in the confirmed
+    /// range [next_scan_block_start ..= Latest - scan_depth]. Used each tick so S is not
+    /// persisted and reorgs are recovered automatically.
+    async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError>;
+}
+
+/// State shared across clones for incremental scan and max nonce.
+#[derive(Debug, Default)]
+struct ScanState {
+    /// Inclusive start block for the next scan (0 = start from genesis).
+    next_scan_block_start: u64,
+    /// Highest batch nonce seen in confirmed range.
+    max_nonce_seen: Option<u64>,
 }
 
 /// Ethereum implementation of the `BatchPoster` trait backed by an Alloy provider.
@@ -47,6 +70,8 @@ pub trait BatchPoster: Send + Sync {
 pub struct EthereumBatchPoster<P: Provider + Send + Sync + Clone + 'static> {
     provider: P,
     config: BatchPosterConfig,
+    /// Shared state for incremental scan [next_scan_block_start ..= Latest-scan_depth].
+    state: std::sync::Arc<Mutex<ScanState>>,
 }
 
 impl<P> EthereumBatchPoster<P>
@@ -54,7 +79,11 @@ where
     P: Provider + Send + Sync + Clone + 'static,
 {
     pub fn new(provider: P, config: BatchPosterConfig) -> Self {
-        Self { provider, config }
+        Self {
+            provider,
+            config,
+            state: std::sync::Arc::new(Mutex::new(ScanState::default())),
+        }
     }
 }
 
@@ -73,13 +102,76 @@ where
 
         Ok(*pending.tx_hash())
     }
+
+    async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError> {
+        let latest = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(|e| BatchPosterError::Provider(e.to_string()))?;
+        let end_block = latest.saturating_sub(self.config.scan_depth);
+        let (start_block, current_max) = {
+            let state = self.state.lock().map_err(|e| {
+                BatchPosterError::Provider(format!("scan state lock poisoned: {e}"))
+            })?;
+            (state.next_scan_block_start, state.max_nonce_seen)
+        };
+        if start_block > end_block {
+            return Ok(current_max);
+        }
+        let events = get_input_added_events(
+            &self.provider,
+            self.config.app_address,
+            &self.config.l1_submit_address,
+            start_block,
+            end_block,
+            &[],
+        )
+        .await
+        .map_err(|errs| {
+            BatchPosterError::Provider(
+                errs.into_iter()
+                    .next()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default(),
+            )
+        })?;
+        // Only events from the sequencer (batch submitter) count; batch index comes from SSZ decode.
+        let mut scan_max = current_max;
+        for (event, log) in &events {
+            let tx_hash = match log.transaction_hash {
+                Some(h) => h,
+                None => continue,
+            };
+            let sender = match get_transaction_sender(&self.provider, tx_hash).await {
+                Some(s) => s,
+                None => continue,
+            };
+            if sender != self.config.batch_submitter_address {
+                continue;
+            }
+            let batch: Batch = match ssz::Decode::from_ssz_bytes(event.input.as_ref()) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            scan_max = Some(scan_max.map_or(batch.nonce, |m| m.max(batch.nonce)));
+        }
+        {
+            let mut state = self.state.lock().map_err(|e| {
+                BatchPosterError::Provider(format!("scan state lock poisoned: {e}"))
+            })?;
+            state.next_scan_block_start = end_block.saturating_add(1);
+            state.max_nonce_seen = scan_max;
+        }
+        Ok(scan_max)
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod mock {
     //! Mock `BatchPoster` for unit and integration tests.
 
-    use super::{BatchPoster, BatchPosterError, TxHash};
+    use super::{Batch, BatchPoster, BatchPosterError, TxHash};
     use alloy_primitives::B256;
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -112,19 +204,24 @@ pub(crate) mod mock {
             if *self.fail_submit.lock().expect("lock") {
                 return Err(BatchPosterError::Provider("mock submit fail".into()));
             }
-            // Decode batch index from payload header for tests: [tag, nonce_be, body...].
-            let batch_index = if payload.len() >= 9 {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&payload[1..9]);
-                u64::from_be_bytes(bytes)
-            } else {
-                0
-            };
+            let batch_index = ssz::Decode::from_ssz_bytes(payload.as_ref())
+                .map(|b: Batch| b.nonce)
+                .unwrap_or(0);
             self.submissions
                 .lock()
                 .expect("lock")
                 .push((batch_index, payload.len()));
             Ok(B256::ZERO)
+        }
+
+        async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError> {
+            Ok(self
+                .submissions
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|(idx, _)| *idx)
+                .max())
         }
     }
 }

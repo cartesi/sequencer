@@ -5,9 +5,19 @@ use alloy::contract::Error as ContractError;
 use alloy::contract::Event;
 use alloy::providers::Provider;
 use alloy::sol_types::SolEvent;
-use alloy_primitives::Address;
+use alloy_network_primitives::TransactionResponse;
+use alloy_primitives::{Address, B256};
 use async_recursion::async_recursion;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
+
+/// Returns the sender (tx.from) of the transaction, or None if the tx is missing or the fetch fails.
+pub(crate) async fn get_transaction_sender(
+    provider: &impl Provider,
+    tx_hash: B256,
+) -> Option<Address> {
+    let tx = provider.get_transaction_by_hash(tx_hash).await.ok()??;
+    Some(tx.from())
+}
 
 #[async_recursion]
 pub(crate) async fn get_input_added_events(

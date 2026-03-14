@@ -1,7 +1,6 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use clap::Parser;
 use thiserror::Error;
 use tracing::warn;
 
@@ -95,11 +94,20 @@ where
             .expect("batch submitter private key is required by CLI arg group")
     };
 
+    let batch_submitter_address = {
+        use alloy::signers::local::PrivateKeySigner;
+        use std::str::FromStr;
+        PrivateKeySigner::from_str(&batch_submitter_private_key)
+            .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?
+            .address()
+    };
+
     let l1_config = L1Config {
         eth_rpc_url: config.eth_rpc_url.clone(),
         input_box_address,
         app_address: config.domain_verifying_contract,
         batch_submitter_private_key,
+        batch_submitter_address,
     };
     let input_reader_config = build_input_reader_config(
         &l1_config,
@@ -133,11 +141,16 @@ where
         InputReader::start(&config.db_path, input_reader_config, shutdown.clone())?;
 
     // Batch submitter uses the same L1 config (InputBox address and RPC URL) as the input reader.
-    let batch_submitter_config = BatchSubmitterConfig::parse();
+    let batch_submitter_config = BatchSubmitterConfig {
+        idle_poll_interval_ms: config.batch_submitter_idle_poll_interval_ms,
+        max_batches_per_loop: config.batch_submitter_max_batches_per_loop,
+    };
     let poster_config = BatchPosterConfig {
         rpc_url: l1_config.eth_rpc_url.clone(),
         l1_submit_address: l1_config.input_box_address,
         app_address: l1_config.app_address,
+        batch_submitter_address: l1_config.batch_submitter_address,
+        scan_depth: config.batch_submitter_scan_depth,
     };
     let provider = build_batch_submitter_provider(&l1_config).await?;
     let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
@@ -376,6 +389,7 @@ fn build_input_reader_config(
         rpc_url: l1.eth_rpc_url.clone(),
         input_box_address: l1.input_box_address,
         app_address_filter: l1.app_address,
+        batch_submitter_address: l1.batch_submitter_address,
         genesis_block,
         poll_interval: INPUT_READER_POLL_INTERVAL,
         long_block_range_error_codes,
@@ -390,7 +404,7 @@ fn log_cleanup_result(component: &str, result: Result<(), RunError>) {
 
 async fn build_batch_submitter_provider(
     l1: &L1Config,
-) -> Result<impl alloy::providers::Provider + Send + Sync + Clone + 'static, std::io::Error> {
+) -> Result<impl alloy::providers::Provider + Clone + 'static, std::io::Error> {
     use alloy::providers::ProviderBuilder;
     use alloy::signers::local::PrivateKeySigner;
     use std::str::FromStr;

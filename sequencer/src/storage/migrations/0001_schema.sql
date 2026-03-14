@@ -88,14 +88,12 @@ CREATE TABLE IF NOT EXISTS recommended_fees (
 INSERT OR IGNORE INTO recommended_fees (singleton_id, fee)
 VALUES (0, 0);
 
--- Tracks the latest batch index that has been observed as submitted on L1 via
--- InputBox inputs for this app. This is derived from safe InputAdded events
--- by the input reader and is used by the batch submitter to decide which
--- closed batches still need to be posted.
+-- Tracks the latest batch index that has been observed as submitted on L1.
+-- NULL means no batch has been submitted yet (so the submitter will start from batch 0).
 CREATE TABLE IF NOT EXISTS submitted_batches_state (
-    singleton_id             INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    last_submitted_batch_index INTEGER NOT NULL CHECK (last_submitted_batch_index >= 0)
+    singleton_id              INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    last_submitted_batch_index INTEGER CHECK (last_submitted_batch_index IS NULL OR last_submitted_batch_index >= 0)
 );
 
 INSERT OR IGNORE INTO submitted_batches_state (singleton_id, last_submitted_batch_index)
-VALUES (0, 0);
+VALUES (0, NULL);

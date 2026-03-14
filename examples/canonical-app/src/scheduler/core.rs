@@ -46,6 +46,7 @@ pub struct Scheduler<A: Application> {
     app: A,
     config: SchedulerConfig,
     direct_q: VecDeque<QueuedDirectInput>,
+    next_expected_batch_nonce: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,7 @@ impl<A: Application> Scheduler<A> {
             app,
             config,
             direct_q: VecDeque::new(),
+            next_expected_batch_nonce: 0,
         }
     }
 
@@ -93,7 +95,12 @@ impl<A: Application> Scheduler<A> {
             return ProcessOutcome::BatchInvalid;
         };
 
+        if batch.nonce != self.next_expected_batch_nonce {
+            return ProcessOutcome::BatchInvalid;
+        }
+
         let Some((frame_head, frame_tail)) = batch.frames.split_first() else {
+            self.next_expected_batch_nonce = batch.nonce + 1;
             return ProcessOutcome::BatchExecuted;
         };
 
@@ -115,6 +122,7 @@ impl<A: Application> Scheduler<A> {
             self.execute_frame_user_ops(domain, frame);
         }
 
+        self.next_expected_batch_nonce = batch.nonce + 1;
         ProcessOutcome::BatchExecuted
     }
 
@@ -428,6 +436,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes((&[1_u8; 32]).into()).expect("signing key");
 
         let batch = Batch {
+            nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![sign_wire_user_op(
                     &test_domain(),
@@ -465,6 +474,7 @@ mod tests {
         scheduler.process_input(direct_input(1, 1));
         let signing_key = SigningKey::from_bytes((&[2_u8; 32]).into()).expect("signing key");
         let batch = Batch {
+            nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![sign_wire_user_op(
                     &test_domain(),
@@ -498,6 +508,7 @@ mod tests {
         scheduler.process_input(direct_input(1, 9));
         let signing_key = SigningKey::from_bytes((&[3_u8; 32]).into()).expect("signing key");
         let stale_batch = Batch {
+            nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![sign_wire_user_op(
                     &test_domain(),
@@ -529,6 +540,7 @@ mod tests {
         let signing_key_a = SigningKey::from_bytes((&[4_u8; 32]).into()).expect("signing key a");
         let signing_key_b = SigningKey::from_bytes((&[5_u8; 32]).into()).expect("signing key b");
         let invalid = Batch {
+            nonce: 0,
             frames: vec![
                 Frame {
                     user_ops: vec![sign_wire_user_op(
@@ -574,6 +586,7 @@ mod tests {
 
         let signing_key = SigningKey::from_bytes((&[6_u8; 32]).into()).expect("signing key");
         let invalid = Batch {
+            nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![sign_wire_user_op(
                     &test_domain(),
@@ -607,6 +620,7 @@ mod tests {
         scheduler.process_input(direct_input(10, 1));
         scheduler.process_input(direct_input(11, 2));
         let batch = Batch {
+            nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![],
                 safe_block: 10,
@@ -679,6 +693,7 @@ mod tests {
         );
 
         let batch = Batch {
+            nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![WireUserOp {
                     nonce: 0,
@@ -717,6 +732,7 @@ mod tests {
         let valid = sign_wire_user_op(&test_domain(), &signing_key, 0, 10, vec![4]);
 
         let batch = Batch {
+            nonce: 0,
             frames: vec![
                 Frame {
                     user_ops: vec![bad_nonce],
@@ -758,7 +774,10 @@ mod tests {
             },
         );
 
-        let batch = Batch { frames: vec![] };
+        let batch = Batch {
+            nonce: 0,
+            frames: vec![],
+        };
 
         assert_eq!(
             scheduler.process_input(batch_input(10, batch)),
@@ -784,6 +803,7 @@ mod tests {
             address!("0x3333333333333333333333333333333333333333"),
         );
         let batch = Batch {
+            nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![sign_wire_user_op(
                     &batch_domain,

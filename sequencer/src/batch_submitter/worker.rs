@@ -9,8 +9,8 @@
 //!
 //! Loop each tick:
 //! 1. **Wake up** (start of tick).
-//! 2. **Read last submitted batch S** from storage (maintained by the input reader).
-//! 3. **Compare with S**: see if the DB has closed batches that have not been submitted yet.
+//! 2. **Read S from the chain** via the poster (Latest minus scan_depth); S is not persisted.
+//! 3. **Compare with local closed batches**: see if the DB has closed batches not yet submitted.
 //! 4. **If there are unsubmitted batches**, submit them (each with its batch index as nonce).
 //! 5. **Sleep** for `idle_poll_interval` when no work was done, then loop.
 
@@ -73,43 +73,47 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
     }
 
-    /// One iteration: compare local last-submitted index S from storage with DB, submit any
-    /// unsubmitted closed batches.
+    /// One iteration: derive S from the chain via the poster, compare with local closed batches,
+    /// submit any unsubmitted ones.
     pub(crate) async fn tick_once(&self) -> bool {
-        // 1. Read last submitted batch S and latest local batch index from storage; the latest row
-        // is the open batch, all smaller are closed.
+        // 1. Read latest local batch index from storage (open batch); S is derived from chain each tick.
         let db_path = self.db_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open_read_only(&db_path)?;
             let latest = storage
                 .latest_batch_index()
                 .map_err(StorageOpenError::from)?;
-            let last_submitted = storage
-                .latest_submitted_batch_index()
-                .map_err(StorageOpenError::from)?;
-            Ok::<_, StorageOpenError>((latest, last_submitted))
+            Ok::<_, StorageOpenError>(latest)
         })
         .await;
 
-        let Ok(Ok((latest_batch_opt, latest_submitted))) = result else {
+        let Ok(Ok(latest_batch_opt)) = result else {
             return false;
         };
+
+        let latest_submitted = self
+            .poster
+            .latest_submitted_batch_index()
+            .await
+            .ok()
+            .flatten();
 
         let Some(latest_batch_index) = latest_batch_opt else {
             return false;
         };
 
+        // When only batch 0 exists it is still open; no closed batch to submit.
         if latest_batch_index == 0 {
             return false;
         }
 
+        // Last closed batch index (open batch is latest_batch_index).
         let last_closed = latest_batch_index.saturating_sub(1);
-        if latest_submitted >= last_closed {
+        // No batch submitted yet => None; first to submit is 0. Otherwise first_to_submit = S + 1.
+        let first_to_submit = latest_submitted.map(|s| s + 1).unwrap_or(0);
+        if first_to_submit > last_closed {
             return false;
         }
-
-        // 3. We have unsubmitted closed batches in [first_to_submit, last_closed]; submit them.
-        let first_to_submit = latest_submitted.saturating_add(1);
         let mut any_submitted = false;
 
         for batch_index in first_to_submit..=last_closed {
@@ -204,11 +208,12 @@ mod tests {
         let submissions = mock.submissions();
         assert_eq!(
             submissions.len(),
-            2,
-            "should submit batch 1 and batch 2 (both closed)"
+            3,
+            "should submit batch 0, 1, and 2 (all closed)"
         );
-        assert_eq!(submissions[0].0, 1);
-        assert_eq!(submissions[1].0, 2);
+        assert_eq!(submissions[0].0, 0);
+        assert_eq!(submissions[1].0, 1);
+        assert_eq!(submissions[2].0, 2);
     }
 
     #[tokio::test]
@@ -227,7 +232,7 @@ mod tests {
         let done = submitter.tick_once().await;
         assert!(done);
         assert_eq!(mock.submissions().len(), 1, "only one batch per loop");
-        assert_eq!(mock.submissions()[0].0, 1);
+        assert_eq!(mock.submissions()[0].0, 0);
     }
 
     #[tokio::test]
@@ -249,18 +254,9 @@ mod tests {
 
         let first_done = submitter.tick_once().await;
         assert!(first_done);
-        assert_eq!(mock.submissions().len(), 2);
+        assert_eq!(mock.submissions().len(), 3, "batches 0, 1, 2");
 
-        // Simulate input reader having observed both batches as submitted on L1 by advancing S
-        // in storage before the next tick.
-        {
-            let mut storage =
-                Storage::open(&path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
-            storage
-                .set_latest_submitted_batch_index_for_test(2)
-                .expect("set last submitted index");
-        }
-
+        // Second tick: poster reports S=2 (from its submissions), so first_to_submit=3 > last_closed=2.
         let second_done = submitter.tick_once().await;
         assert!(!second_done);
     }

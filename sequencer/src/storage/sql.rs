@@ -111,7 +111,7 @@ pub(super) fn sql_update_safe_block(conn: &Connection, safe_block: i64) -> Resul
     conn.execute(SQL_UPDATE_SAFE_BLOCK, params![safe_block])
 }
 
-pub(super) fn sql_select_last_submitted_batch_index(conn: &Connection) -> Result<i64> {
+pub(super) fn sql_select_last_submitted_batch_index(conn: &Connection) -> Result<Option<i64>> {
     conn.query_row(SQL_SELECT_LAST_SUBMITTED_BATCH_INDEX, [], |row| row.get(0))
 }
 
