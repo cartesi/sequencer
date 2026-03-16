@@ -14,8 +14,9 @@ use super::sql::{
     sql_select_max_safe_input_index, sql_select_ordered_l2_tx_count,
     sql_select_ordered_l2_txs_for_batch, sql_select_ordered_l2_txs_from_offset,
     sql_select_ordered_l2_txs_page_from_offset, sql_select_recommended_fee, sql_select_safe_block,
-    sql_select_safe_inputs_range, sql_select_total_drained_direct_inputs,
-    sql_select_user_ops_for_frame, sql_update_recommended_fee, sql_update_safe_block,
+    sql_select_safe_input_payloads_for_sender, sql_select_safe_inputs_range,
+    sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
+    sql_update_recommended_fee, sql_update_safe_block,
 };
 use super::{
     FrameHeader, SafeFrontier, SafeInputRange, StorageOpenError, StoredSafeInput, WriteHead,
@@ -130,6 +131,19 @@ impl Storage {
             safe_block,
             end_exclusive,
         })
+    }
+
+    pub fn load_safe_input_payloads_for_sender(
+        &mut self,
+        sender: Address,
+    ) -> Result<(u64, Vec<Vec<u8>>)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let safe_block = query_current_safe_block(&tx)?;
+        let payloads = sql_select_safe_input_payloads_for_sender(&tx, sender.as_slice())?;
+        tx.commit()?;
+        Ok((safe_block, payloads))
     }
 
     pub fn fill_safe_inputs(

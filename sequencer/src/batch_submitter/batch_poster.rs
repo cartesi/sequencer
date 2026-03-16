@@ -30,7 +30,10 @@ pub enum BatchPosterError {
 pub trait BatchPoster: Send + Sync {
     async fn submit_batch(&self, payload: Vec<u8>) -> Result<TxHash, BatchPosterError>;
 
-    async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError>;
+    async fn observed_submitted_batch_nonces(
+        &self,
+        from_block: u64,
+    ) -> Result<Vec<u64>, BatchPosterError>;
 }
 
 #[derive(Clone)]
@@ -71,22 +74,26 @@ where
         Ok(tx_hash)
     }
 
-    async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError> {
+    async fn observed_submitted_batch_nonces(
+        &self,
+        from_block: u64,
+    ) -> Result<Vec<u64>, BatchPosterError> {
         let latest = self
             .provider
             .get_block_number()
             .await
             .map_err(|err| BatchPosterError::Provider(err.to_string()))?;
         let end_block = latest.saturating_sub(self.config.confirmation_depth);
-        if self.config.start_block > end_block {
-            return Ok(None);
+        let start_block = from_block.max(self.config.start_block);
+        if start_block > end_block {
+            return Ok(Vec::new());
         }
 
         let events = get_input_added_events(
             &self.provider,
             self.config.app_address,
             &self.config.l1_submit_address,
-            self.config.start_block,
+            start_block,
             end_block,
             &[],
         )
@@ -112,24 +119,13 @@ where
             observed_nonces.push(batch.nonce);
         }
 
-        Ok(latest_accepted_batch_nonce(observed_nonces))
+        Ok(observed_nonces)
     }
-}
-
-fn latest_accepted_batch_nonce(observed_nonces: Vec<u64>) -> Option<u64> {
-    let mut expected = 0_u64;
-    for nonce in observed_nonces {
-        if nonce == expected {
-            expected = expected.saturating_add(1);
-        }
-    }
-
-    expected.checked_sub(1)
 }
 
 #[cfg(test)]
 pub(crate) mod mock {
-    use super::{Batch, BatchPoster, BatchPosterError, TxHash, latest_accepted_batch_nonce};
+    use super::{Batch, BatchPoster, BatchPosterError, TxHash};
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -137,8 +133,9 @@ pub(crate) mod mock {
     pub struct MockBatchPoster {
         pub submissions: Mutex<Vec<(u64, usize)>>,
         pub fail_submit: Mutex<bool>,
-        pub latest_submitted: Mutex<Option<u64>>,
-        pub latest_submitted_error: Mutex<Option<String>>,
+        pub observed_submitted_nonces: Mutex<Vec<u64>>,
+        pub observed_submitted_error: Mutex<Option<String>>,
+        pub last_from_block: Mutex<Option<u64>>,
     }
 
     impl MockBatchPoster {
@@ -146,8 +143,9 @@ pub(crate) mod mock {
             Self {
                 submissions: Mutex::new(Vec::new()),
                 fail_submit: Mutex::new(false),
-                latest_submitted: Mutex::new(None),
-                latest_submitted_error: Mutex::new(None),
+                observed_submitted_nonces: Mutex::new(Vec::new()),
+                observed_submitted_error: Mutex::new(None),
+                last_from_block: Mutex::new(None),
             }
         }
 
@@ -155,12 +153,16 @@ pub(crate) mod mock {
             self.submissions.lock().expect("lock").clone()
         }
 
-        pub fn set_latest_submitted(&self, value: Option<u64>) {
-            *self.latest_submitted.lock().expect("lock") = value;
+        pub fn set_observed_submitted_nonces(&self, value: Vec<u64>) {
+            *self.observed_submitted_nonces.lock().expect("lock") = value;
         }
 
-        pub fn set_latest_submitted_error(&self, value: Option<&str>) {
-            *self.latest_submitted_error.lock().expect("lock") = value.map(str::to_string);
+        pub fn set_observed_submitted_error(&self, value: Option<&str>) {
+            *self.observed_submitted_error.lock().expect("lock") = value.map(str::to_string);
+        }
+
+        pub fn last_from_block(&self) -> Option<u64> {
+            *self.last_from_block.lock().expect("lock")
         }
     }
 
@@ -180,40 +182,42 @@ pub(crate) mod mock {
             Ok(TxHash::ZERO)
         }
 
-        async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError> {
-            if let Some(err) = self.latest_submitted_error.lock().expect("lock").clone() {
+        async fn observed_submitted_batch_nonces(
+            &self,
+            from_block: u64,
+        ) -> Result<Vec<u64>, BatchPosterError> {
+            *self.last_from_block.lock().expect("lock") = Some(from_block);
+            if let Some(err) = self.observed_submitted_error.lock().expect("lock").clone() {
                 return Err(BatchPosterError::Provider(err));
             }
-            if let Some(value) = *self.latest_submitted.lock().expect("lock") {
-                return Ok(Some(value));
+            let configured = self.observed_submitted_nonces.lock().expect("lock").clone();
+            if !configured.is_empty() {
+                return Ok(configured);
             }
-            let observed_nonces = self
+            Ok(self
                 .submissions
                 .lock()
                 .expect("lock")
                 .iter()
                 .map(|(idx, _)| *idx)
-                .collect();
-            Ok(latest_accepted_batch_nonce(observed_nonces))
+                .collect())
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::latest_accepted_batch_nonce;
+    use super::{BatchPoster, mock::MockBatchPoster};
 
-    #[test]
-    fn latest_accepted_batch_nonce_matches_scheduler_nonce_rule() {
-        assert_eq!(latest_accepted_batch_nonce(Vec::new()), None);
-        assert_eq!(latest_accepted_batch_nonce(vec![0, 1, 2]), Some(2));
-        assert_eq!(latest_accepted_batch_nonce(vec![0, 2, 3]), Some(0));
-        assert_eq!(latest_accepted_batch_nonce(vec![1, 2, 3]), None);
-        assert_eq!(latest_accepted_batch_nonce(vec![0, 1, 1, 2]), Some(2));
-        assert_eq!(
-            latest_accepted_batch_nonce(vec![6, 4, 3, 2, 2, 0, 1]),
-            Some(1)
-        );
-        assert_eq!(latest_accepted_batch_nonce(vec![0, 2, 1]), Some(1));
+    #[tokio::test]
+    async fn mock_poster_tracks_requested_suffix_start_block() {
+        let poster = MockBatchPoster::new();
+        let observed = poster
+            .observed_submitted_batch_nonces(42)
+            .await
+            .expect("observe submitted batches");
+
+        assert!(observed.is_empty());
+        assert_eq!(poster.last_from_block(), Some(42));
     }
 }

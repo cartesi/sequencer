@@ -8,6 +8,8 @@ use super::{SafeInputRange, StoredSafeInput};
 use crate::inclusion_lane::PendingUserOp;
 
 const SQL_SELECT_SAFE_INPUTS_RANGE: &str = include_str!("queries/select_safe_inputs_range.sql");
+const SQL_SELECT_SAFE_INPUT_PAYLOADS_FOR_SENDER: &str =
+    "SELECT payload FROM safe_inputs WHERE sender = ?1 ORDER BY safe_input_index ASC";
 const SQL_SELECT_ORDERED_L2_TXS_FROM_OFFSET: &str =
     include_str!("queries/select_ordered_l2_txs_from_offset.sql");
 const SQL_SELECT_ORDERED_L2_TXS_PAGE_FROM_OFFSET: &str =
@@ -117,6 +119,15 @@ pub(super) fn sql_select_safe_inputs_range(
         params![from_inclusive, to_exclusive],
         convert_row_to_safe_input_row,
     )?;
+    mapped.collect()
+}
+
+pub(super) fn sql_select_safe_input_payloads_for_sender(
+    conn: &Connection,
+    sender: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    let mut stmt = conn.prepare_cached(SQL_SELECT_SAFE_INPUT_PAYLOADS_FOR_SENDER)?;
+    let mapped = stmt.query_map(params![sender], |row| row.get(0))?;
     mapped.collect()
 }
 
