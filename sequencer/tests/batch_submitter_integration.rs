@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sequencer::batch_submitter::{BatchPoster, BatchPosterError, TxHash};
 use sequencer::batch_submitter::{BatchSubmitter, BatchSubmitterConfig};
-use sequencer::onchain::{BatchPoster, BatchPosterError, TxHash};
 use sequencer::shutdown::ShutdownSignal;
-use sequencer::storage::{DirectInputRange, Storage};
+use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
 use tempfile::TempDir;
 
@@ -44,13 +44,13 @@ impl BatchPoster for TestMock {
     }
 
     async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError> {
-        Ok(self
-            .submissions
-            .lock()
-            .expect("lock")
-            .iter()
-            .map(|(idx, _)| *idx)
-            .max())
+        let mut next_expected = 0_u64;
+        for (nonce, _) in self.submissions.lock().expect("lock").iter().copied() {
+            if nonce == next_expected {
+                next_expected = next_expected.saturating_add(1);
+            }
+        }
+        Ok(next_expected.checked_sub(1))
     }
 }
 
@@ -69,7 +69,7 @@ fn temp_db(name: &str) -> (TempDir, String) {
 fn seed_two_closed_batches(db_path: &str) {
     let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
     let mut head = storage
-        .initialize_open_state(0, DirectInputRange::empty_at(0))
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
     let next_safe = head.safe_block;
     storage
@@ -92,7 +92,6 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
     let shutdown = ShutdownSignal::default();
     let config = BatchSubmitterConfig {
         idle_poll_interval_ms: 5000,
-        max_batches_per_loop: 10,
     };
     let submitter = BatchSubmitter::new(path, mock.clone(), shutdown.clone(), config);
     let handle = submitter.start().expect("start batch submitter");

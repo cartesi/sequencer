@@ -12,7 +12,7 @@ use sequencer::api::{self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
 use sequencer::inclusion_lane::{PendingUserOp, SequencerError};
 use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::shutdown::ShutdownSignal;
-use sequencer::storage::{DirectInputRange, Storage, StoredDirectInput};
+use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::WsTxMessage;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::user_op::{SignedUserOp, UserOp};
@@ -306,7 +306,7 @@ async fn ws_subscribe_closes_on_oversized_inbound_message() {
 fn seed_ordered_txs(db_path: &str) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
     let mut head = storage
-        .initialize_open_state(0, DirectInputRange::empty_at(0))
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
 
     let (respond_to, _recv) = oneshot::channel::<Result<(), SequencerError>>();
@@ -328,17 +328,17 @@ fn seed_ordered_txs(db_path: &str) {
         .append_user_ops_chunk(&mut head, &[pending])
         .expect("append user-op chunk");
     storage
-        .append_safe_direct_inputs(
+        .append_safe_inputs(
             10,
-            &[StoredDirectInput {
+            &[StoredSafeInput {
+                sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            None,
         )
         .expect("append direct input");
     storage
-        .close_frame_only(&mut head, 10, DirectInputRange::new(0, 1))
+        .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
         .expect("close frame with one drained direct input");
 }
 
@@ -356,20 +356,20 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
         .safe_input_end_exclusive()
         .expect("read next direct input index");
     storage
-        .append_safe_direct_inputs(
+        .append_safe_inputs(
             safe_block,
-            &[StoredDirectInput {
+            &[StoredSafeInput {
+                sender: Address::ZERO,
                 payload,
                 block_number: safe_block,
             }],
-            None,
         )
         .expect("append direct input");
     storage
         .close_frame_only(
             &mut head,
             safe_block,
-            DirectInputRange::new(next_direct_index, next_direct_index.saturating_add(1)),
+            SafeInputRange::new(next_direct_index, next_direct_index.saturating_add(1)),
         )
         .expect("close frame with one drained direct input");
 }
@@ -418,6 +418,7 @@ async fn start_test_server_with_limits(
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
+            batch_submitter_address: None,
         },
     );
     let task = api::start_on_listener(
@@ -540,8 +541,21 @@ fn assert_ws_message_matches_tx(
             assert_eq!(fee, expected.fee);
             assert_eq!(decode_hex_prefixed(data.as_str()), expected.data.as_slice());
         }
-        (WsTxMessage::DirectInput { offset, payload }, SequencedL2Tx::Direct(expected)) => {
+        (
+            WsTxMessage::DirectInput {
+                offset,
+                sender,
+                block_number,
+                payload,
+            },
+            SequencedL2Tx::Direct(expected),
+        ) => {
             assert_eq!(offset, expected_offset);
+            assert_eq!(
+                decode_hex_prefixed(sender.as_str()),
+                expected.sender.as_slice()
+            );
+            assert_eq!(block_number, expected.block_number);
             assert_eq!(
                 decode_hex_prefixed(payload.as_str()),
                 expected.payload.as_slice()

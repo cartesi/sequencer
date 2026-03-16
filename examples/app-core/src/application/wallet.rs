@@ -155,7 +155,10 @@ impl Application for WalletApp {
         Ok(())
     }
 
-    fn execute_direct_input(&mut self, _payload: &[u8]) -> Result<(), AppError> {
+    fn execute_direct_input(
+        &mut self,
+        _input: &sequencer_core::l2_tx::DirectInput,
+    ) -> Result<(), AppError> {
         self.executed_input_count = self.executed_input_count.saturating_add(1);
         Ok(())
     }

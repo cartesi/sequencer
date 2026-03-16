@@ -18,7 +18,7 @@ use sequencer::inclusion_lane::{
 };
 use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::shutdown::ShutdownSignal;
-use sequencer::storage::{DirectInputRange, Storage, StoredDirectInput};
+use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::user_op::UserOp;
@@ -427,8 +427,9 @@ async fn start_full_server_with_max_body(
         WalletApp::new(WalletConfig),
         storage,
         InclusionLaneConfig {
+            batch_submitter_address: Address::from([0xff; 20]),
             max_user_ops_per_chunk: 32,
-            safe_direct_buffer_capacity: 32,
+            safe_input_buffer_capacity: 32,
             max_batch_open: Duration::from_secs(60 * 60),
             max_batch_user_op_bytes: 1_048_576,
             idle_poll_interval: Duration::from_millis(2),
@@ -441,6 +442,7 @@ async fn start_full_server_with_max_body(
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
+            batch_submitter_address: None,
         },
     );
 
@@ -491,6 +493,7 @@ async fn start_api_only_server(
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
+            batch_submitter_address: None,
         },
     );
     let server_task = api::start_on_listener(
@@ -545,7 +548,7 @@ fn bootstrap_open_frame_fee_zero(db_path: &str) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
     storage.set_recommended_fee(0).expect("set recommended fee");
     let head = storage
-        .initialize_open_state(0, DirectInputRange::empty_at(0))
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
     assert_eq!(head.frame_fee, 0);
 }
@@ -572,13 +575,13 @@ fn make_valid_request(domain: &Eip712Domain) -> TxRequest {
 fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
     storage
-        .append_safe_direct_inputs(
+        .append_safe_inputs(
             safe_block,
-            &[StoredDirectInput {
+            &[StoredSafeInput {
+                sender: Address::ZERO,
                 payload,
                 block_number: safe_block,
             }],
-            None,
         )
         .expect("append safe direct input");
 }
@@ -616,8 +619,21 @@ fn assert_ws_message_matches_tx(
             assert_eq!(fee, expected.fee);
             assert_eq!(decode_hex_prefixed(data.as_str()), expected.data.as_slice());
         }
-        (WsTxMessage::DirectInput { offset, payload }, SequencedL2Tx::Direct(expected)) => {
+        (
+            WsTxMessage::DirectInput {
+                offset,
+                sender,
+                block_number,
+                payload,
+            },
+            SequencedL2Tx::Direct(expected),
+        ) => {
             assert_eq!(offset, expected_offset);
+            assert_eq!(
+                decode_hex_prefixed(sender.as_str()),
+                expected.sender.as_slice()
+            );
+            assert_eq!(block_number, expected.block_number);
             assert_eq!(
                 decode_hex_prefixed(payload.as_str()),
                 expected.payload.as_slice()

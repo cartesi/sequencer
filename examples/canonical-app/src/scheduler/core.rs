@@ -6,6 +6,7 @@ use alloy_sol_types::Eip712Domain;
 use alloy_sol_types::SolStruct;
 use sequencer_core::application::Application;
 use sequencer_core::batch::{Batch, Frame, WireUserOp};
+use sequencer_core::l2_tx::DirectInput;
 use std::collections::VecDeque;
 
 pub const SEQUENCER_ADDRESS: Address = address!("0x1111111111111111111111111111111111111111");
@@ -51,6 +52,7 @@ pub struct Scheduler<A: Application> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedDirectInput {
+    sender: Address,
     payload: Vec<u8>,
     inclusion_block: u64,
 }
@@ -76,6 +78,7 @@ impl<A: Application> Scheduler<A> {
 
         if input.sender != self.config.sequencer_address {
             self.direct_q.push_back(QueuedDirectInput {
+                sender: input.sender,
                 payload: input.payload,
                 inclusion_block: input.inclusion_block,
             });
@@ -179,7 +182,12 @@ impl<A: Application> Scheduler<A> {
                 break;
             }
             let queued = self.direct_q.pop_front().expect("queue front must exist");
-            if let Err(err) = self.app.execute_direct_input(queued.payload.as_slice()) {
+            let input = DirectInput {
+                sender: queued.sender,
+                block_number: queued.inclusion_block,
+                payload: queued.payload,
+            };
+            if let Err(err) = self.app.execute_direct_input(&input) {
                 eprintln!("scheduler failed to execute drained direct input: {err}");
             }
         }
@@ -192,7 +200,12 @@ impl<A: Application> Scheduler<A> {
                 self.config.max_wait_blocks,
                 current_block,
             ) {
-                let status = self.app.execute_direct_input(front.payload.as_slice());
+                let input = DirectInput {
+                    sender: front.sender,
+                    block_number: front.inclusion_block,
+                    payload: front.payload.clone(),
+                };
+                let status = self.app.execute_direct_input(&input);
                 if let Err(err) = status {
                     eprintln!("scheduler failed to execute overdue direct input: {err}");
                 }
@@ -340,9 +353,9 @@ mod tests {
 
         fn execute_direct_input(
             &mut self,
-            payload: &[u8],
+            input: &DirectInput,
         ) -> Result<(), sequencer_core::application::AppError> {
-            let marker = payload.first().copied().unwrap_or(0);
+            let marker = input.payload.first().copied().unwrap_or(0);
             self.executed.push(RecordedTx::Direct(marker));
             Ok(())
         }
@@ -419,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_drains_safe_directs_before_executing_user_ops() {
+    fn batch_drains_safe_inputs_before_executing_user_ops() {
         let mut scheduler = Scheduler::new(
             RecordingApp::default(),
             SchedulerConfig {

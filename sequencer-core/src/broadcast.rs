@@ -15,6 +15,8 @@ pub enum BroadcastTxMessage {
     },
     DirectInput {
         offset: u64,
+        sender: String,
+        block_number: u64,
         payload: String,
     },
 }
@@ -37,6 +39,8 @@ impl BroadcastTxMessage {
             },
             SequencedL2Tx::Direct(direct) => Self::DirectInput {
                 offset,
+                sender: direct.sender.to_string(),
+                block_number: direct.block_number,
                 payload: alloy_primitives::hex::encode_prefixed(direct.payload.as_slice()),
             },
         }
