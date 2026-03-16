@@ -167,6 +167,7 @@ where
     let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
     let submitter = BatchSubmitter::new(
         config.db_path.clone(),
+        l1_config.batch_submitter_address,
         poster,
         shutdown.clone(),
         batch_submitter_config,
