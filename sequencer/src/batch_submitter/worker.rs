@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::Address;
+use sequencer_core::batch::Batch;
 use thiserror::Error;
 use tracing::warn;
 
@@ -25,6 +27,8 @@ pub enum BatchSubmitterError {
     Storage(#[from] rusqlite::Error),
     #[error("batch submitter join error: {0}")]
     Join(String),
+    #[error("failed to decode stored safe batch input: {0}")]
+    StoredBatchDecode(String),
     #[error(transparent)]
     Poster(#[from] BatchPosterError),
 }
@@ -37,6 +41,7 @@ pub enum TickOutcome {
 
 pub struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
+    batch_submitter_address: Address,
     poster: Arc<P>,
     idle_poll_interval: Duration,
     shutdown: ShutdownSignal,
@@ -45,12 +50,14 @@ pub struct BatchSubmitter<P: BatchPoster> {
 impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     pub fn new(
         db_path: impl Into<String>,
+        batch_submitter_address: Address,
         poster: Arc<P>,
         shutdown: ShutdownSignal,
         config: BatchSubmitterConfig,
     ) -> Self {
         Self {
             db_path: db_path.into(),
+            batch_submitter_address,
             poster,
             idle_poll_interval: config.idle_poll_interval(),
             shutdown,
@@ -97,7 +104,17 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
 
         let last_closed = latest_batch_index - 1;
-        let latest_submitted = self.poster.latest_submitted_batch_index().await?;
+        let next_expected = {
+            let (safe_block, safe_observed_nonces) = self.load_safe_observed_batch_nonces().await?;
+            let safe_next_expected = advance_expected_batch_nonce(0, safe_observed_nonces);
+
+            let recent_observed_nonces = self
+                .poster
+                .observed_submitted_batch_nonces(safe_block.saturating_add(1))
+                .await?;
+            advance_expected_batch_nonce(safe_next_expected, recent_observed_nonces)
+        };
+        let latest_submitted = next_expected.checked_sub(1);
         let first_to_submit = latest_submitted.map(|s| s + 1).unwrap_or(0);
         if first_to_submit > last_closed {
             return Ok(TickOutcome::Idle);
@@ -134,6 +151,30 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
 
+    async fn load_safe_observed_batch_nonces(
+        &self,
+    ) -> Result<(u64, Vec<u64>), BatchSubmitterError> {
+        let db_path = self.db_path.clone();
+        let batch_submitter_address = self.batch_submitter_address;
+        let (safe_block, payloads) = tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open_read_only(&db_path)?;
+            storage
+                .load_safe_input_payloads_for_sender(batch_submitter_address)
+                .map_err(BatchSubmitterError::from)
+        })
+        .await
+        .map_err(|err| BatchSubmitterError::Join(err.to_string()))??;
+
+        let mut observed_nonces = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let batch: Batch = ssz::Decode::from_ssz_bytes(payload.as_ref())
+                .map_err(|err| BatchSubmitterError::StoredBatchDecode(format!("{err:?}")))?;
+            observed_nonces.push(batch.nonce);
+        }
+
+        Ok((safe_block, observed_nonces))
+    }
+
     async fn load_batch_for_submission(
         &self,
         batch_index: u64,
@@ -150,18 +191,33 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 }
 
+fn advance_expected_batch_nonce(
+    mut expected: u64,
+    observed_nonces: impl IntoIterator<Item = u64>,
+) -> u64 {
+    for nonce in observed_nonces {
+        if nonce == expected {
+            expected = expected.saturating_add(1);
+        }
+    }
+    expected
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use alloy_primitives::Address;
 
     use crate::batch_submitter::{
         BatchSubmitterConfig, BatchSubmitterError, TickOutcome, batch_poster::mock::MockBatchPoster,
     };
     use crate::shutdown::ShutdownSignal;
-    use crate::storage::{SafeInputRange, Storage};
+    use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use tempfile::TempDir;
 
     const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
+    const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
 
     fn temp_db(name: &str) -> (TempDir, String) {
         let dir = tempfile::Builder::new()
@@ -189,6 +245,24 @@ mod tests {
             .expect("close batch 2");
     }
 
+    fn seed_safe_submitted_batches(db_path: &str, safe_block: u64, nonces: &[u64]) {
+        let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let inputs: Vec<_> = nonces
+            .iter()
+            .map(|nonce| StoredSafeInput {
+                sender: BATCH_SUBMITTER_ADDRESS,
+                payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+                    nonce: *nonce,
+                    frames: Vec::new(),
+                }),
+                block_number: safe_block,
+            })
+            .collect();
+        storage
+            .append_safe_inputs(safe_block, inputs.as_slice())
+            .expect("append safe submitted batches");
+    }
+
     #[tokio::test]
     async fn tick_once_submits_first_missing_closed_batch() {
         let (_dir, path) = temp_db("tick-submits");
@@ -200,6 +274,7 @@ mod tests {
         };
         let submitter = super::BatchSubmitter::new(
             path.clone(),
+            BATCH_SUBMITTER_ADDRESS,
             mock.clone(),
             ShutdownSignal::default(),
             config,
@@ -223,14 +298,16 @@ mod tests {
     async fn tick_once_submits_nothing_when_already_caught_up() {
         let (_dir, path) = temp_db("tick-caught-up");
         seed_two_closed_batches(&path);
+        seed_safe_submitted_batches(&path, 10, &[0, 1]);
 
         let mock = Arc::new(MockBatchPoster::new());
-        mock.set_latest_submitted(Some(2));
+        mock.set_observed_submitted_nonces(vec![2]);
         let config = BatchSubmitterConfig {
             idle_poll_interval_ms: 1000,
         };
         let submitter = super::BatchSubmitter::new(
             path.clone(),
+            BATCH_SUBMITTER_ADDRESS,
             mock.clone(),
             ShutdownSignal::default(),
             config,
@@ -239,6 +316,36 @@ mod tests {
         let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Idle);
         assert!(mock.submissions().is_empty());
+        assert_eq!(mock.last_from_block(), Some(11));
+    }
+
+    #[tokio::test]
+    async fn tick_once_combines_safe_prefix_with_recent_chain_suffix() {
+        let (_dir, path) = temp_db("tick-combines-prefix-and-suffix");
+        seed_two_closed_batches(&path);
+        seed_safe_submitted_batches(&path, 10, &[0]);
+
+        let mock = Arc::new(MockBatchPoster::new());
+        mock.set_observed_submitted_nonces(vec![1]);
+        let submitter = super::BatchSubmitter::new(
+            path.clone(),
+            BATCH_SUBMITTER_ADDRESS,
+            mock.clone(),
+            ShutdownSignal::default(),
+            BatchSubmitterConfig {
+                idle_poll_interval_ms: 1000,
+            },
+        );
+
+        let outcome = submitter.tick_once().await.expect("tick once");
+        assert_eq!(
+            outcome,
+            TickOutcome::Submitted {
+                batch_index: 2,
+                tx_hash: alloy_primitives::B256::ZERO
+            }
+        );
+        assert_eq!(mock.last_from_block(), Some(11));
     }
 
     #[tokio::test]
@@ -247,9 +354,10 @@ mod tests {
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
-        mock.set_latest_submitted_error(Some("rpc fail"));
+        mock.set_observed_submitted_error(Some("rpc fail"));
         let submitter = super::BatchSubmitter::new(
             path,
+            BATCH_SUBMITTER_ADDRESS,
             mock,
             ShutdownSignal::default(),
             BatchSubmitterConfig {
@@ -262,5 +370,20 @@ mod tests {
             .await
             .expect_err("poster error should propagate");
         assert!(matches!(err, BatchSubmitterError::Poster(_)));
+    }
+
+    #[test]
+    fn advance_expected_batch_nonce_matches_scheduler_nonce_rule() {
+        assert_eq!(super::advance_expected_batch_nonce(0, Vec::<u64>::new()), 0);
+        assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 1, 2]), 3);
+        assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 2, 3]), 1);
+        assert_eq!(super::advance_expected_batch_nonce(0, vec![1, 2, 3]), 0);
+        assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 1, 1, 2]), 3);
+        assert_eq!(
+            super::advance_expected_batch_nonce(0, vec![6, 4, 3, 2, 2, 0, 1]),
+            2
+        );
+        assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 2, 1]), 2);
+        assert_eq!(super::advance_expected_batch_nonce(2, vec![2, 3]), 4);
     }
 }

@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::Address;
 use async_trait::async_trait;
 use sequencer::batch_submitter::{BatchPoster, BatchPosterError, TxHash};
 use sequencer::batch_submitter::{BatchSubmitter, BatchSubmitterConfig};
@@ -13,6 +14,8 @@ use sequencer::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
 use tempfile::TempDir;
+
+const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
 
 /// Minimal mock for integration tests: records submissions.
 struct TestMock {
@@ -43,14 +46,17 @@ impl BatchPoster for TestMock {
         Ok(TxHash::ZERO)
     }
 
-    async fn latest_submitted_batch_index(&self) -> Result<Option<u64>, BatchPosterError> {
-        let mut next_expected = 0_u64;
-        for (nonce, _) in self.submissions.lock().expect("lock").iter().copied() {
-            if nonce == next_expected {
-                next_expected = next_expected.saturating_add(1);
-            }
-        }
-        Ok(next_expected.checked_sub(1))
+    async fn observed_submitted_batch_nonces(
+        &self,
+        _from_block: u64,
+    ) -> Result<Vec<u64>, BatchPosterError> {
+        Ok(self
+            .submissions
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(nonce, _)| *nonce)
+            .collect())
     }
 }
 
@@ -93,7 +99,13 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
     let config = BatchSubmitterConfig {
         idle_poll_interval_ms: 5000,
     };
-    let submitter = BatchSubmitter::new(path, mock.clone(), shutdown.clone(), config);
+    let submitter = BatchSubmitter::new(
+        path,
+        BATCH_SUBMITTER_ADDRESS,
+        mock.clone(),
+        shutdown.clone(),
+        config,
+    );
     let handle = submitter.start().expect("start batch submitter");
 
     // Allow at least one tick to run (worker may submit batch 1 and 2 in one tick).
