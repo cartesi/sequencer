@@ -8,8 +8,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::shutdown::ShutdownSignal;
-use crate::storage::{DirectInputRange, Storage, StoredDirectInput, WriteHead};
+use crate::storage::{SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::application::{AppError, Application, ExecutionOutcome};
+use sequencer_core::l2_tx::DirectInput;
 use sequencer_core::user_op::SignedUserOp;
 
 use super::catch_up::catch_up_application;
@@ -52,8 +53,8 @@ impl<A: Application + 'static> InclusionLane<A> {
     fn run_forever(&mut self) -> Result<(), InclusionLaneError> {
         self.run_catch_up()?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
-        let mut safe_directs = Vec::with_capacity(self.config.safe_direct_buffer_capacity.max(1));
-        let mut lane_state = self.load_or_initialize_lane_state(&mut safe_directs)?;
+        let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
+        let mut lane_state = self.load_or_initialize_lane_state(&mut safe_inputs)?;
 
         loop {
             if self.shutdown.is_shutdown_requested() {
@@ -62,7 +63,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             }
 
             let advanced_safe_frontier =
-                self.maybe_advance_safe_frontier(&mut lane_state, &mut safe_directs)?;
+                self.maybe_advance_safe_frontier(&mut lane_state, &mut safe_inputs)?;
 
             let included_user_op_count =
                 self.process_user_op_chunk(&mut lane_state.head, &mut included)?;
@@ -77,20 +78,24 @@ impl<A: Application + 'static> InclusionLane<A> {
     }
 
     fn run_catch_up(&mut self) -> Result<(), InclusionLaneError> {
-        catch_up_application(&mut self.app, &mut self.storage)
-            .map_err(|source| InclusionLaneError::CatchUp { source })
+        catch_up_application(
+            &mut self.app,
+            &mut self.storage,
+            self.config.batch_submitter_address,
+        )
+        .map_err(|source| InclusionLaneError::CatchUp { source })
     }
 
     fn load_or_initialize_lane_state(
         &mut self,
-        safe_directs: &mut Vec<StoredDirectInput>,
+        safe_inputs: &mut Vec<StoredSafeInput>,
     ) -> Result<LaneState, InclusionLaneError> {
         let next_safe_input_index = self
             .storage
-            .load_next_undrained_direct_input_index()
+            .load_next_undrained_safe_input_index()
             .map_err(|source| InclusionLaneError::LoadNextUndrainedDirectInputIndex { source })?;
 
-        let last_drained_direct_range = DirectInputRange::empty_at(next_safe_input_index);
+        let last_drained_direct_range = SafeInputRange::empty_at(next_safe_input_index);
         if let Some(head) = self
             .storage
             .load_open_state()
@@ -105,16 +110,16 @@ impl<A: Application + 'static> InclusionLane<A> {
         let frontier = self
             .storage
             .load_safe_frontier()
-            .map_err(|source| InclusionLaneError::LoadSafeDirectInputs { source })?;
+            .map_err(|source| InclusionLaneError::LoadSafeInputs { source })?;
         assert!(
             frontier.end_exclusive >= last_drained_direct_range.end_exclusive,
-            "safe direct-input head regressed during lane initialization: safe_end={}, next={}",
+            "safe-input head regressed during lane initialization: safe_end={}, next={}",
             frontier.end_exclusive,
             last_drained_direct_range.end_exclusive
         );
 
         let leading_direct_range = last_drained_direct_range.advance_to(frontier.end_exclusive);
-        self.execute_safe_direct_inputs_range(leading_direct_range, safe_directs)?;
+        self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
         let head = self
             .storage
             .initialize_open_state(frontier.safe_block, leading_direct_range)
@@ -153,15 +158,15 @@ impl<A: Application + 'static> InclusionLane<A> {
     fn maybe_advance_safe_frontier(
         &mut self,
         lane_state: &mut LaneState,
-        safe_directs: &mut Vec<StoredDirectInput>,
+        safe_inputs: &mut Vec<StoredSafeInput>,
     ) -> Result<bool, InclusionLaneError> {
         let frontier = self
             .storage
             .load_safe_frontier()
-            .map_err(|source| InclusionLaneError::LoadSafeDirectInputs { source })?;
+            .map_err(|source| InclusionLaneError::LoadSafeInputs { source })?;
         assert!(
             frontier.end_exclusive >= lane_state.last_drained_direct_range.end_exclusive,
-            "safe direct-input head regressed: safe_end={}, next={}",
+            "safe-input head regressed: safe_end={}, next={}",
             frontier.end_exclusive,
             lane_state.last_drained_direct_range.end_exclusive
         );
@@ -172,7 +177,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         let leading_direct_range = lane_state
             .last_drained_direct_range
             .advance_to(frontier.end_exclusive);
-        self.execute_safe_direct_inputs_range(leading_direct_range, safe_directs)?;
+        self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
         self.close_frame_only(
             &mut lane_state.head,
             frontier.safe_block,
@@ -195,19 +200,19 @@ impl<A: Application + 'static> InclusionLane<A> {
             })
     }
 
-    fn execute_safe_direct_inputs_range(
+    fn execute_safe_inputs_range(
         &mut self,
-        direct_range: DirectInputRange,
-        chunk: &mut Vec<StoredDirectInput>,
-    ) -> Result<DirectInputRange, InclusionLaneError> {
-        let max_chunk_len = self.config.safe_direct_buffer_capacity.max(1) as u64;
+        direct_range: SafeInputRange,
+        chunk: &mut Vec<StoredSafeInput>,
+    ) -> Result<SafeInputRange, InclusionLaneError> {
+        let max_chunk_len = self.config.safe_input_buffer_capacity.max(1) as u64;
         let mut chunk_start = direct_range.start_inclusive;
         while chunk_start < direct_range.end_exclusive {
             let chunk_end_exclusive = direct_range
                 .end_exclusive
                 .min(chunk_start.saturating_add(max_chunk_len));
-            self.load_safe_direct_inputs_chunk(chunk_start, chunk_end_exclusive, chunk)?;
-            self.execute_safe_direct_inputs_chunk(chunk.as_slice())?;
+            self.load_safe_inputs_chunk(chunk_start, chunk_end_exclusive, chunk)?;
+            self.execute_safe_inputs_chunk(chunk.as_slice())?;
             chunk_start = chunk_end_exclusive;
         }
 
@@ -228,34 +233,41 @@ impl<A: Application + 'static> InclusionLane<A> {
         &mut self,
         head: &mut WriteHead,
         next_safe_block: u64,
-        leading_direct_range: DirectInputRange,
+        leading_direct_range: SafeInputRange,
     ) -> Result<(), InclusionLaneError> {
         self.storage
             .close_frame_only(head, next_safe_block, leading_direct_range)
             .map_err(|source| InclusionLaneError::CloseFrameRotate { source })
     }
 
-    fn load_safe_direct_inputs_chunk(
+    fn load_safe_inputs_chunk(
         &mut self,
         start_inclusive: u64,
         end_exclusive: u64,
-        chunk: &mut Vec<StoredDirectInput>,
+        chunk: &mut Vec<StoredSafeInput>,
     ) -> Result<(), InclusionLaneError> {
         chunk.clear();
         self.storage
             .fill_safe_inputs(start_inclusive, end_exclusive, chunk)
-            .map_err(|source| InclusionLaneError::LoadSafeDirectInputs { source })
+            .map_err(|source| InclusionLaneError::LoadSafeInputs { source })
     }
 
-    fn execute_safe_direct_inputs_chunk(
+    fn execute_safe_inputs_chunk(
         &mut self,
-        chunk: &[StoredDirectInput],
+        chunk: &[StoredSafeInput],
     ) -> Result<(), InclusionLaneError> {
         for input in chunk {
-            let payload = input.payload.as_slice();
+            if input.sender == self.config.batch_submitter_address {
+                continue;
+            }
+            let direct_input = DirectInput {
+                sender: input.sender,
+                block_number: input.block_number,
+                payload: input.payload.clone(),
+            };
 
             self.app
-                .execute_direct_input(payload)
+                .execute_direct_input(&direct_input)
                 .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?;
         }
         Ok(())
@@ -359,6 +371,6 @@ fn user_op_count_to_bytes<A: Application>(user_op_count: u64) -> u64 {
 }
 
 struct LaneState {
-    last_drained_direct_range: DirectInputRange,
+    last_drained_direct_range: SafeInputRange,
     head: WriteHead,
 }

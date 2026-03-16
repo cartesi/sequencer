@@ -13,13 +13,13 @@ pub enum InclusionLaneError {
         #[source]
         source: CatchUpError,
     },
-    #[error("cannot load next undrained direct-input index")]
+    #[error("cannot load next undrained safe-input index")]
     LoadNextUndrainedDirectInputIndex {
         #[source]
         source: rusqlite::Error,
     },
-    #[error("cannot load safe direct inputs")]
-    LoadSafeDirectInputs {
+    #[error("cannot load safe inputs")]
+    LoadSafeInputs {
         #[source]
         source: rusqlite::Error,
     },

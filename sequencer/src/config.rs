@@ -108,18 +108,14 @@ pub struct RunConfig {
     )]
     pub batch_submitter_idle_poll_interval_ms: u64,
 
-    /// Maximum number of batches to submit in a single loop iteration.
+    /// Number of blocks behind Latest that the batch submitter treats as confirmed.
+    /// The submitter scans only up to `Latest - depth`, and waits for the same depth after posting.
     #[arg(
         long,
-        env = "SEQ_BATCH_SUBMITTER_MAX_BATCHES_PER_LOOP",
-        default_value = "4"
+        env = "SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH",
+        default_value = "0"
     )]
-    pub batch_submitter_max_batches_per_loop: usize,
-
-    /// Number of blocks to scan back from Latest when deriving the latest submitted batch index.
-    /// 0 means use only the latest block. Used for at-least-once recovery (reorg-safe).
-    #[arg(long, env = "SEQ_BATCH_SUBMITTER_SCAN_DEPTH", default_value = "0")]
-    pub batch_submitter_scan_depth: u64,
+    pub batch_submitter_confirmation_depth: u64,
 }
 
 impl RunConfig {

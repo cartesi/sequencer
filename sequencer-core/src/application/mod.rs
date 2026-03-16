@@ -1,6 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use crate::l2_tx::DirectInput;
 use crate::l2_tx::ValidUserOp;
 use crate::user_op::UserOp;
 use alloy_primitives::{Address, U256};
@@ -92,7 +93,7 @@ pub trait Application: Send {
         Ok(ExecutionOutcome::Included)
     }
 
-    fn execute_direct_input(&mut self, _payload: &[u8]) -> Result<(), AppError> {
+    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<(), AppError> {
         Ok(())
     }
 

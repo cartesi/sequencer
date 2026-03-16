@@ -89,6 +89,7 @@ mod tests {
             crate::l2_tx_feed::L2TxFeedConfig {
                 idle_poll_interval: std::time::Duration::from_millis(2),
                 page_size: 64,
+                batch_submitter_address: None,
             },
         );
 

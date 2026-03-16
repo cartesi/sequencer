@@ -1,6 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use alloy_primitives::Address;
+
 use crate::storage::Storage;
 use sequencer_core::application::Application;
 use sequencer_core::l2_tx::SequencedL2Tx;
@@ -12,16 +14,23 @@ const DEFAULT_CATCH_UP_PAGE_SIZE: usize = 256;
 pub(super) fn catch_up_application(
     app: &mut impl Application,
     storage: &mut Storage,
+    batch_submitter_address: Address,
 ) -> Result<(), CatchUpError> {
-    catch_up_application_paged(app, storage, DEFAULT_CATCH_UP_PAGE_SIZE)
+    catch_up_application_paged(
+        app,
+        storage,
+        batch_submitter_address,
+        DEFAULT_CATCH_UP_PAGE_SIZE,
+    )
 }
 
 pub(super) fn catch_up_application_paged(
     app: &mut impl Application,
     storage: &mut Storage,
+    batch_submitter_address: Address,
     page_size: usize,
 ) -> Result<(), CatchUpError> {
-    let mut next_offset = app.executed_input_count();
+    let mut next_offset = 0;
     let page_size = page_size.max(1);
 
     loop {
@@ -37,7 +46,7 @@ pub(super) fn catch_up_application_paged(
         }
 
         for item in replay {
-            replay_sequenced_l2_tx(app, item)?;
+            replay_sequenced_l2_tx(app, batch_submitter_address, item)?;
             next_offset = next_offset.saturating_add(1);
         }
     }
@@ -45,6 +54,7 @@ pub(super) fn catch_up_application_paged(
 
 fn replay_sequenced_l2_tx(
     app: &mut impl Application,
+    batch_submitter_address: Address,
     item: SequencedL2Tx,
 ) -> Result<(), CatchUpError> {
     match item {
@@ -54,10 +64,16 @@ fn replay_sequenced_l2_tx(
                     reason: err.to_string(),
                 })
         }
-        SequencedL2Tx::Direct(direct) => app
-            .execute_direct_input(direct.payload.as_slice())
-            .map_err(|err| CatchUpError::ReplayDirectInputInternal {
-                reason: err.to_string(),
-            }),
+        SequencedL2Tx::Direct(direct) => {
+            if direct.sender == batch_submitter_address {
+                return Ok(());
+            }
+
+            app.execute_direct_input(&direct).map_err(|err| {
+                CatchUpError::ReplayDirectInputInternal {
+                    reason: err.to_string(),
+                }
+            })
+        }
     }
 }

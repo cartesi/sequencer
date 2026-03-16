@@ -10,23 +10,24 @@ use thiserror::Error;
 pub use db::Storage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredDirectInput {
+pub struct StoredSafeInput {
+    pub sender: alloy_primitives::Address,
     pub payload: Vec<u8>,
     /// Chain block number where this input was included (e.g. InputAdded event block).
     pub block_number: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DirectInputRange {
+pub struct SafeInputRange {
     pub start_inclusive: u64,
     pub end_exclusive: u64,
 }
 
-impl DirectInputRange {
+impl SafeInputRange {
     pub fn new(start_inclusive: u64, end_exclusive: u64) -> Self {
         assert!(
             end_exclusive >= start_inclusive,
-            "direct-input range must be half-open and non-negative: start={start_inclusive}, end={end_exclusive}"
+            "safe-input range must be half-open and non-negative: start={start_inclusive}, end={end_exclusive}"
         );
         Self {
             start_inclusive,
