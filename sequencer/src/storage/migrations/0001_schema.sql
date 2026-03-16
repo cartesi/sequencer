@@ -29,8 +29,9 @@ CREATE TABLE IF NOT EXISTS user_ops (
     UNIQUE(sender, nonce)
 );
 
-CREATE TABLE IF NOT EXISTS direct_inputs (
-    direct_input_index INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS safe_inputs (
+    safe_input_index INTEGER PRIMARY KEY,
+    sender             BLOB NOT NULL CHECK (length(sender) = 20),
     payload            BLOB NOT NULL,
     -- Block number of the chain block where this direct input was included (e.g. InputAdded event block).
     block_number       INTEGER NOT NULL CHECK (block_number >= 0)
@@ -45,26 +46,26 @@ CREATE TABLE IF NOT EXISTS sequenced_l2_txs (
     -- User-op branch: references user_ops(..., pos_in_frame).
     user_op_pos_in_frame INTEGER,
 
-    -- Direct-input branch: references direct_inputs(direct_input_index).
-    direct_input_index   INTEGER,
+    -- Direct-input branch: references safe_inputs(safe_input_index).
+    safe_input_index   INTEGER,
 
     FOREIGN KEY(batch_index, frame_in_batch)
         REFERENCES frames(batch_index, frame_in_batch),
     FOREIGN KEY(batch_index, frame_in_batch, user_op_pos_in_frame)
         REFERENCES user_ops(batch_index, frame_in_batch, pos_in_frame),
-    FOREIGN KEY(direct_input_index)
-        REFERENCES direct_inputs(direct_input_index),
+    FOREIGN KEY(safe_input_index)
+        REFERENCES safe_inputs(safe_input_index),
 
     -- XOR invariant: row is either a sequenced user-op OR a drained direct input.
     CHECK (
-        (user_op_pos_in_frame IS NOT NULL AND direct_input_index IS NULL) OR
-        (user_op_pos_in_frame IS NULL AND direct_input_index IS NOT NULL)
+        (user_op_pos_in_frame IS NOT NULL AND safe_input_index IS NULL) OR
+        (user_op_pos_in_frame IS NULL AND safe_input_index IS NOT NULL)
     ),
 
     -- At most one sequenced user-op row for each user-op key.
     UNIQUE(batch_index, frame_in_batch, user_op_pos_in_frame),
     -- A direct input can only be sequenced once.
-    UNIQUE(direct_input_index)
+    UNIQUE(safe_input_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sequenced_l2_txs_frame
@@ -87,13 +88,3 @@ CREATE TABLE IF NOT EXISTS recommended_fees (
 
 INSERT OR IGNORE INTO recommended_fees (singleton_id, fee)
 VALUES (0, 0);
-
--- Tracks the latest batch index that has been observed as submitted on L1.
--- NULL means no batch has been submitted yet (so the submitter will start from batch 0).
-CREATE TABLE IF NOT EXISTS submitted_batches_state (
-    singleton_id              INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    last_submitted_batch_index INTEGER CHECK (last_submitted_batch_index IS NULL OR last_submitted_batch_index >= 0)
-);
-
-INSERT OR IGNORE INTO submitted_batches_state (singleton_id, last_submitted_batch_index)
-VALUES (0, NULL);

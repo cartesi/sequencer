@@ -7,8 +7,12 @@
 //! strictly increasing and invalidates otherwise, so duplicates are deduplicated at the
 //! scheduler level. See `worker` for the wake → read S → compare → submit → sleep loop.
 
+mod batch_poster;
 mod config;
 mod worker;
 
+pub use batch_poster::{
+    BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster, TxHash,
+};
 pub use config::BatchSubmitterConfig;
-pub use worker::BatchSubmitter;
+pub use worker::{BatchSubmitter, BatchSubmitterError, TickOutcome};

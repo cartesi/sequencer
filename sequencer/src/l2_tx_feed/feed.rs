@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
+use alloy_primitives::Address;
 pub use sequencer_core::broadcast::BroadcastTxMessage;
+use sequencer_core::l2_tx::SequencedL2Tx;
 use tokio::sync::mpsc;
 
 use super::{SubscribeError, SubscriptionError};
@@ -14,6 +16,7 @@ use crate::storage::Storage;
 pub struct L2TxFeedConfig {
     pub idle_poll_interval: Duration,
     pub page_size: usize,
+    pub batch_submitter_address: Option<Address>,
 }
 
 #[derive(Clone)]
@@ -21,6 +24,7 @@ pub struct L2TxFeed {
     db_path: String,
     page_size: usize,
     idle_poll_interval: Duration,
+    batch_submitter_address: Option<Address>,
     shutdown: ShutdownSignal,
 }
 
@@ -41,6 +45,7 @@ impl Default for L2TxFeedConfig {
         Self {
             idle_poll_interval: DEFAULT_IDLE_POLL_INTERVAL,
             page_size: DEFAULT_PAGE_SIZE,
+            batch_submitter_address: None,
         }
     }
 }
@@ -51,6 +56,7 @@ impl L2TxFeed {
             db_path,
             page_size: config.page_size.max(1),
             idle_poll_interval: config.idle_poll_interval,
+            batch_submitter_address: config.batch_submitter_address,
             shutdown,
         }
     }
@@ -74,12 +80,14 @@ impl L2TxFeed {
         let db_path = self.db_path.clone();
         let page_size = self.page_size;
         let idle_poll_interval = self.idle_poll_interval;
+        let batch_submitter_address = self.batch_submitter_address;
         let shutdown = self.shutdown.clone();
         let task = tokio::task::spawn_blocking(move || {
             run_subscription(
                 db_path.as_str(),
                 page_size,
                 idle_poll_interval,
+                batch_submitter_address,
                 from_offset,
                 shutdown,
                 events_tx,
@@ -130,6 +138,7 @@ fn run_subscription(
     db_path: &str,
     page_size: usize,
     idle_poll_interval: Duration,
+    batch_submitter_address: Option<Address>,
     from_offset: u64,
     shutdown: ShutdownSignal,
     events_tx: mpsc::Sender<BroadcastTxMessage>,
@@ -160,6 +169,11 @@ fn run_subscription(
                 return Ok(());
             }
 
+            if should_filter_from_broadcast(&tx, batch_submitter_address) {
+                next_offset = next_offset.saturating_add(1);
+                continue;
+            }
+
             let event = BroadcastTxMessage::from_offset_and_tx(next_offset, tx);
             next_offset = next_offset.saturating_add(1);
             if events_tx.blocking_send(event).is_err() {
@@ -167,4 +181,15 @@ fn run_subscription(
             }
         }
     }
+}
+
+fn should_filter_from_broadcast(
+    tx: &SequencedL2Tx,
+    batch_submitter_address: Option<Address>,
+) -> bool {
+    matches!(
+        (tx, batch_submitter_address),
+        (SequencedL2Tx::Direct(direct), Some(batch_submitter_address))
+            if direct.sender == batch_submitter_address
+    )
 }

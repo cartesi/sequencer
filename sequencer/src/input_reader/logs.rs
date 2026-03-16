@@ -4,20 +4,11 @@
 use alloy::contract::Error as ContractError;
 use alloy::contract::Event;
 use alloy::providers::Provider;
-use alloy::sol_types::SolEvent;
-use alloy_network_primitives::TransactionResponse;
-use alloy_primitives::{Address, B256};
+use alloy::sol_types::{SolCall, SolEvent};
+use alloy_primitives::Address;
 use async_recursion::async_recursion;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
-
-/// Returns the sender (tx.from) of the transaction, or None if the tx is missing or the fetch fails.
-pub(crate) async fn get_transaction_sender(
-    provider: &impl Provider,
-    tx_hash: B256,
-) -> Option<Address> {
-    let tx = provider.get_transaction_by_hash(tx_hash).await.ok()??;
-    Some(tx.from())
-}
+use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
 
 #[async_recursion]
 pub(crate) async fn get_input_added_events(
@@ -83,13 +74,21 @@ fn should_retry_with_partition(err: &ContractError, codes: &[String]) -> bool {
     error_message_matches_retry_codes(&format!("{err:?}"), codes)
 }
 
+pub(crate) fn decode_evm_advance_input(input: &[u8]) -> Result<EvmAdvanceCall, String> {
+    EvmAdvanceCall::abi_decode(input).map_err(|err| err.to_string())
+}
+
 pub(crate) fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) -> bool {
     codes.iter().any(|c| error_message.contains(c))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::error_message_matches_retry_codes;
+    use alloy_primitives::{U256, address};
+    use alloy_sol_types::SolCall;
+    use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
+
+    use super::{decode_evm_advance_input, error_message_matches_retry_codes};
 
     #[test]
     fn error_message_matches_retry_codes_returns_true_when_message_contains_code() {
@@ -110,5 +109,28 @@ mod tests {
             &["block range".to_string(), "timeout".to_string()]
         ));
         assert!(!error_message_matches_retry_codes("ok", &[]));
+    }
+
+    #[test]
+    fn decode_evm_advance_input_round_trips() {
+        let encoded = EvmAdvanceCall {
+            chainId: U256::from(31337_u64),
+            appContract: address!("0x1111111111111111111111111111111111111111"),
+            msgSender: address!("0x2222222222222222222222222222222222222222"),
+            blockNumber: U256::from(99_u64),
+            blockTimestamp: U256::from(1234_u64),
+            prevRandao: U256::from(7_u64),
+            index: U256::from(3_u64),
+            payload: vec![0xaa, 0xbb].into(),
+        }
+        .abi_encode();
+
+        let decoded = decode_evm_advance_input(encoded.as_slice()).expect("decode evm advance");
+        assert_eq!(
+            decoded.msgSender,
+            address!("0x2222222222222222222222222222222222222222")
+        );
+        assert_eq!(decoded.blockNumber, U256::from(99_u64));
+        assert_eq!(decoded.payload.as_ref(), &[0xaa, 0xbb]);
     }
 }

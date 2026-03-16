@@ -11,7 +11,6 @@ pub mod config;
 pub mod inclusion_lane;
 pub mod input_reader;
 pub mod l2_tx_feed;
-pub mod onchain;
 mod runtime;
 pub mod shutdown;
 pub mod storage;

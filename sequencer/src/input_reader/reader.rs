@@ -3,30 +3,25 @@
 
 use std::time::Duration;
 
-use alloy::eips::BlockNumberOrTag::{Latest, Safe};
+use alloy::eips::BlockNumberOrTag::Safe;
 use alloy::providers::Provider;
 use alloy::providers::ProviderBuilder;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use cartesi_rollups_contracts::application::Application;
 use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use super::logs::{get_input_added_events, get_transaction_sender};
+use super::logs::{decode_evm_advance_input, get_input_added_events};
 use crate::shutdown::ShutdownSignal;
-use crate::storage::{Storage, StorageOpenError, StoredDirectInput};
-use sequencer_core::batch::INPUT_TAG_DIRECT_INPUT;
+use crate::storage::{Storage, StorageOpenError, StoredSafeInput};
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 
 #[derive(Debug, Clone)]
 pub struct InputReaderConfig {
     pub rpc_url: String,
-    pub input_box_address: Address,
-    pub app_address_filter: Address,
-    /// EOA whose inputs are batch submissions (not persisted as direct inputs). All other senders = direct.
-    pub batch_submitter_address: Address,
-    pub genesis_block: u64,
+    pub app_address: Address,
     pub poll_interval: Duration,
     pub long_block_range_error_codes: Vec<String>,
 }
@@ -45,39 +40,32 @@ pub enum InputReaderError {
 
 pub struct InputReader {
     config: InputReaderConfig,
+    input_box_address: Address,
+    genesis_block: u64,
     db_path: String,
     shutdown: ShutdownSignal,
 }
 
 impl InputReader {
-    pub async fn discover_input_box(
-        rpc_url: &str,
-        application_address: Address,
-    ) -> Result<Address, InputReaderError> {
+    pub async fn new(
+        db_path: impl Into<String>,
+        shutdown: ShutdownSignal,
+        config: InputReaderConfig,
+    ) -> Result<Self, InputReaderError> {
         let provider = ProviderBuilder::new()
-            .connect(rpc_url)
+            .connect(config.rpc_url.as_str())
             .await
             .map_err(|e| InputReaderError::Provider(e.to_string()))?;
-        let application = Application::new(application_address, &provider);
+        let application = Application::new(config.app_address, &provider);
         let data_availability = application
             .getDataAvailability()
             .call()
             .await
             .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        let input_box_address = decode_input_box_address(&data_availability)?;
 
-        decode_input_box_address(&data_availability)
-    }
-
-    pub async fn discover_input_box_deployment_block(
-        rpc_url: &str,
-        input_box_address: Address,
-    ) -> Result<u64, InputReaderError> {
-        let provider = ProviderBuilder::new()
-            .connect(rpc_url)
-            .await
-            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
         let input_box = InputBox::new(input_box_address, &provider);
-        input_box
+        let genesis_block = input_box
             .getDeploymentBlockNumber()
             .call()
             .await
@@ -87,39 +75,54 @@ impl InputReader {
                 InputReaderError::Provider(
                     "input box deployment block number did not fit into u64".to_string(),
                 )
-            })
+            })?;
+
+        Ok(Self::from_parts(
+            config,
+            input_box_address,
+            genesis_block,
+            db_path.into(),
+            shutdown,
+        ))
     }
 
-    pub fn new(config: InputReaderConfig, db_path: String, shutdown: ShutdownSignal) -> Self {
+    fn from_parts(
+        config: InputReaderConfig,
+        input_box_address: Address,
+        genesis_block: u64,
+        db_path: String,
+        shutdown: ShutdownSignal,
+    ) -> Self {
         Self {
             config,
+            input_box_address,
+            genesis_block,
             db_path,
             shutdown,
         }
     }
 
-    pub fn start(
-        db_path: &str,
-        config: InputReaderConfig,
-        shutdown: ShutdownSignal,
-    ) -> Result<JoinHandle<Result<(), InputReaderError>>, StorageOpenError> {
-        let _ = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
-        let reader = Self::new(config, db_path.to_string(), shutdown);
-        Ok(tokio::spawn(async move { reader.run_forever().await }))
+    pub fn input_box_address(&self) -> Address {
+        self.input_box_address
     }
 
-    pub async fn sync_to_current_safe_head(
-        db_path: &str,
-        config: InputReaderConfig,
-    ) -> Result<(), InputReaderError> {
-        let mut reader = Self::new(config, db_path.to_string(), ShutdownSignal::default());
-        reader.bootstrap_safe_head().await?;
+    pub fn genesis_block(&self) -> u64 {
+        self.genesis_block
+    }
+
+    pub fn start(self) -> Result<JoinHandle<Result<(), InputReaderError>>, StorageOpenError> {
+        let _ = Storage::open(self.db_path.as_str(), SQLITE_SYNCHRONOUS_PRAGMA)?;
+        Ok(tokio::spawn(async move { self.run_forever().await }))
+    }
+
+    pub async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
+        self.bootstrap_safe_head().await?;
 
         let provider = ProviderBuilder::new()
-            .connect(reader.config.rpc_url.as_str())
+            .connect(self.config.rpc_url.as_str())
             .await
             .map_err(|e| InputReaderError::Provider(e.to_string()))?;
-        reader.advance_once(&provider).await
+        self.advance_once(&provider).await
     }
 
     async fn run_forever(mut self) -> Result<(), InputReaderError> {
@@ -155,22 +158,21 @@ impl InputReader {
         provider: &impl Provider,
     ) -> Result<(), InputReaderError> {
         let current_safe_block = latest_safe_block(provider).await?;
-        let current_head_block = latest_head_block(provider).await?;
         let previous_safe_block = self.current_safe_block().await?;
 
-        // If our persisted safe head is already ahead of or equal to the chain head,
+        // If our persisted safe head is already at the current safe frontier,
         // there is nothing new to scan.
-        if current_head_block <= previous_safe_block {
+        if current_safe_block <= previous_safe_block {
             return Ok(());
         }
 
         let start_block = previous_safe_block + 1;
         let events = get_input_added_events(
             provider,
-            self.config.app_address_filter,
-            &self.config.input_box_address,
+            self.config.app_address,
+            &self.input_box_address,
             start_block,
-            current_head_block,
+            current_safe_block,
             &self.config.long_block_range_error_codes,
         )
         .await
@@ -184,46 +186,34 @@ impl InputReader {
             ))
         })?;
 
-        // Classify by tx sender: inputs from the batch submitter are batch submissions (skip);
-        // all others with tag 0x00 and block_number <= Safe are direct inputs (persist).
-        let mut batch = Vec::new();
+        let mut batch = Vec::with_capacity(events.len());
         for (event, log) in events {
-            let block_number = match log.block_number {
-                Some(n) => n,
-                None => continue,
-            };
-            let tx_hash = match log.transaction_hash {
-                Some(h) => h,
-                None => continue,
-            };
-            let sender = match get_transaction_sender(provider, tx_hash).await {
-                Some(s) => s,
-                None => continue,
-            };
-            if sender == self.config.batch_submitter_address {
-                continue;
-            }
-            let first = match event.input.first().copied() {
-                Some(b) => b,
-                None => continue,
-            };
-            if first == INPUT_TAG_DIRECT_INPUT && block_number <= current_safe_block {
-                let body = event.input.get(1..).unwrap_or_default().to_vec();
-                batch.push(StoredDirectInput {
-                    payload: body,
-                    block_number,
-                });
-            }
+            let block_number = log.block_number.ok_or_else(|| {
+                InputReaderError::Provider("InputAdded log missing block_number".to_string())
+            })?;
+            let evm_advance = decode_evm_advance_input(event.input.as_ref())
+                .map_err(InputReaderError::Provider)?;
+            assert_eq!(
+                evm_advance.blockNumber,
+                U256::from(block_number),
+                "InputAdded block number mismatch: log={block_number}, payload={}",
+                evm_advance.blockNumber
+            );
+
+            batch.push(StoredSafeInput {
+                sender: evm_advance.msgSender,
+                payload: evm_advance.payload.into(),
+                block_number,
+            });
         }
 
         info!(
-            block_range = %format!("{}..={}", start_block, current_head_block),
+            block_range = %format!("{}..={}", start_block, current_safe_block),
             count = batch.len(),
-            "appending safe direct inputs"
+            "appending safe inputs"
         );
 
-        self.append_safe_direct_inputs(current_safe_block, batch, None)
-            .await
+        self.append_safe_inputs(current_safe_block, batch).await
     }
 
     async fn current_safe_block(&self) -> Result<u64, InputReaderError> {
@@ -238,7 +228,7 @@ impl InputReader {
 
     async fn bootstrap_safe_head(&self) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
-        let minimum_safe_block = self.config.genesis_block.saturating_sub(1);
+        let minimum_safe_block = self.genesis_block.saturating_sub(1);
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
             storage
@@ -249,17 +239,16 @@ impl InputReader {
         .map_err(|err| InputReaderError::Join(err.to_string()))?
     }
 
-    async fn append_safe_direct_inputs(
+    async fn append_safe_inputs(
         &self,
         current_safe_block: u64,
-        batch: Vec<StoredDirectInput>,
-        max_batch_nonce: Option<u64>,
+        batch: Vec<StoredSafeInput>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
             storage
-                .append_safe_direct_inputs(current_safe_block, &batch, max_batch_nonce)
+                .append_safe_inputs(current_safe_block, &batch)
                 .map_err(InputReaderError::from)
         })
         .await
@@ -287,22 +276,32 @@ async fn latest_safe_block(provider: &impl Provider) -> Result<u64, InputReaderE
     Ok(block.header.number)
 }
 
-async fn latest_head_block(provider: &impl Provider) -> Result<u64, InputReaderError> {
-    let block = provider
-        .get_block(Latest.into())
-        .await
-        .map_err(|e| InputReaderError::Provider(e.to_string()))?
-        .ok_or_else(|| {
-            InputReaderError::Provider("get_block (latest) returned None".to_string())
-        })?;
-    Ok(block.header.number)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::node_bindings::Anvil;
     use tempfile::NamedTempFile;
+
+    fn test_reader(
+        db_path: String,
+        rpc_url: String,
+        genesis_block: u64,
+        poll_interval: Duration,
+        shutdown: ShutdownSignal,
+    ) -> InputReader {
+        InputReader::from_parts(
+            InputReaderConfig {
+                rpc_url,
+                app_address: Address::ZERO,
+                poll_interval,
+                long_block_range_error_codes: vec![],
+            },
+            Address::ZERO,
+            genesis_block,
+            db_path,
+            shutdown,
+        )
+    }
 
     fn require_anvil_tests() -> bool {
         std::env::var_os("RUN_ANVIL_TESTS").is_some()
@@ -312,20 +311,14 @@ mod tests {
     async fn start_then_request_shutdown_joins_with_ok() {
         let db_file = NamedTempFile::new().expect("temp file");
         let shutdown = ShutdownSignal::default();
-        let handle = InputReader::start(
-            db_file.path().to_string_lossy().as_ref(),
-            InputReaderConfig {
-                rpc_url: "http://127.0.0.1:0".to_string(),
-                input_box_address: Address::ZERO,
-                app_address_filter: Address::ZERO,
-                batch_submitter_address: Address::ZERO,
-                genesis_block: 0,
-                poll_interval: Duration::from_millis(20),
-                long_block_range_error_codes: vec![],
-            },
+        let reader = test_reader(
+            db_file.path().to_string_lossy().into_owned(),
+            "http://127.0.0.1:0".to_string(),
+            0,
+            Duration::from_millis(20),
             shutdown.clone(),
-        )
-        .expect("start input reader");
+        );
+        let handle = reader.start().expect("start input reader");
 
         shutdown.request_shutdown();
         let join_result = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -346,20 +339,14 @@ mod tests {
         let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
         let shutdown = ShutdownSignal::default();
         let db_file = NamedTempFile::new().expect("temp file");
-        let handle = InputReader::start(
-            db_file.path().to_string_lossy().as_ref(),
-            InputReaderConfig {
-                rpc_url: anvil.endpoint_url().to_string(),
-                input_box_address: Address::ZERO,
-                app_address_filter: Address::ZERO,
-                batch_submitter_address: Address::ZERO,
-                genesis_block: 0,
-                poll_interval: Duration::from_millis(50),
-                long_block_range_error_codes: vec![],
-            },
+        let reader = test_reader(
+            db_file.path().to_string_lossy().into_owned(),
+            anvil.endpoint_url().to_string(),
+            0,
+            Duration::from_millis(50),
             shutdown.clone(),
-        )
-        .expect("start input reader");
+        );
+        let handle = reader.start().expect("start input reader");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         shutdown.request_shutdown();
@@ -381,17 +368,11 @@ mod tests {
 
         let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
         let db_file = NamedTempFile::new().expect("temp file");
-        let mut reader = InputReader::new(
-            InputReaderConfig {
-                rpc_url: anvil.endpoint_url().to_string(),
-                input_box_address: Address::ZERO,
-                app_address_filter: Address::ZERO,
-                batch_submitter_address: Address::ZERO,
-                genesis_block: 0,
-                poll_interval: Duration::from_secs(1),
-                long_block_range_error_codes: vec![],
-            },
+        let mut reader = test_reader(
             db_file.path().to_string_lossy().into_owned(),
+            anvil.endpoint_url().to_string(),
+            0,
+            Duration::from_secs(1),
             ShutdownSignal::default(),
         );
         let provider = alloy::providers::ProviderBuilder::new()
@@ -417,17 +398,11 @@ mod tests {
     async fn advance_once_with_genesis_block_uses_genesis_as_effective_prev() {
         let db_file = NamedTempFile::new().expect("temp file");
         let genesis_block = 2_u64;
-        let reader = InputReader::new(
-            InputReaderConfig {
-                rpc_url: "http://127.0.0.1:0".to_string(),
-                input_box_address: Address::ZERO,
-                app_address_filter: Address::ZERO,
-                batch_submitter_address: Address::ZERO,
-                genesis_block,
-                poll_interval: Duration::from_secs(1),
-                long_block_range_error_codes: vec![],
-            },
+        let reader = test_reader(
             db_file.path().to_string_lossy().into_owned(),
+            "http://127.0.0.1:0".to_string(),
+            genesis_block,
+            Duration::from_secs(1),
             ShutdownSignal::default(),
         );
 
@@ -444,20 +419,15 @@ mod tests {
     async fn sync_to_current_safe_head_with_genesis_block_bootstraps_safe_head() {
         let db_file = NamedTempFile::new().expect("temp file");
         let genesis_block = 5_u64;
+        let mut reader = test_reader(
+            db_file.path().to_string_lossy().into_owned(),
+            "http://127.0.0.1:0".to_string(),
+            genesis_block,
+            Duration::from_secs(1),
+            ShutdownSignal::default(),
+        );
 
-        let result = InputReader::sync_to_current_safe_head(
-            db_file.path().to_string_lossy().as_ref(),
-            InputReaderConfig {
-                rpc_url: "http://127.0.0.1:0".to_string(),
-                input_box_address: Address::ZERO,
-                app_address_filter: Address::ZERO,
-                batch_submitter_address: Address::ZERO,
-                genesis_block,
-                poll_interval: Duration::from_secs(1),
-                long_block_range_error_codes: vec![],
-            },
-        )
-        .await;
+        let result = reader.sync_to_current_safe_head().await;
 
         assert!(matches!(result, Err(InputReaderError::Provider(_))));
 
@@ -483,20 +453,14 @@ mod tests {
         let db_path = db_file.path().to_string_lossy().into_owned();
         let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
         storage
-            .append_safe_direct_inputs(1000, &[], None)
+            .append_safe_inputs(1000, &[])
             .expect("set safe head ahead of chain");
 
-        let mut reader = InputReader::new(
-            InputReaderConfig {
-                rpc_url: anvil.endpoint_url().to_string(),
-                input_box_address: Address::ZERO,
-                app_address_filter: Address::ZERO,
-                batch_submitter_address: Address::ZERO,
-                genesis_block: 0,
-                poll_interval: Duration::from_secs(1),
-                long_block_range_error_codes: vec![],
-            },
+        let mut reader = test_reader(
             db_path,
+            anvil.endpoint_url().to_string(),
+            0,
+            Duration::from_secs(1),
             ShutdownSignal::default(),
         );
         let provider = alloy::providers::ProviderBuilder::new()

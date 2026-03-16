@@ -5,12 +5,12 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::api::{self, ApiConfig};
-use crate::batch_submitter::{BatchSubmitter, BatchSubmitterConfig};
+use crate::batch_submitter::{BatchPosterConfig, EthereumBatchPoster};
+use crate::batch_submitter::{BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError};
 use crate::config::{L1Config, RunConfig};
 use crate::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
 use crate::input_reader::{InputReader, InputReaderConfig, InputReaderError};
 use crate::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
-use crate::onchain::{BatchPosterConfig, EthereumBatchPoster};
 use crate::shutdown::ShutdownSignal;
 use crate::storage::{self, StorageOpenError};
 use sequencer_core::application::Application;
@@ -56,6 +56,18 @@ pub enum RunError {
         #[source]
         source: tokio::task::JoinError,
     },
+    #[error("batch submitter stopped unexpectedly")]
+    BatchSubmitterStoppedUnexpectedly,
+    #[error("batch submitter exited: {source}")]
+    BatchSubmitter {
+        #[source]
+        source: BatchSubmitterError,
+    },
+    #[error("batch submitter join error: {source}")]
+    BatchSubmitterJoin {
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
 enum FirstExit {
@@ -72,14 +84,6 @@ where
 {
     let domain = config.build_domain();
     let shutdown = ShutdownSignal::default();
-    let input_box_address =
-        InputReader::discover_input_box(&config.eth_rpc_url, config.domain_verifying_contract)
-            .await
-            .map_err(|source| RunError::InputReader { source })?;
-    let input_reader_genesis_block =
-        InputReader::discover_input_box_deployment_block(&config.eth_rpc_url, input_box_address)
-            .await
-            .map_err(|source| RunError::InputReader { source })?;
 
     // Single L1/InputBox config shared by input reader and batch submitter (no duplicate RPC URL or addresses).
     // Resolve batch-submitter private key (exactly one of inline or file is required at the CLI layer).
@@ -102,19 +106,28 @@ where
             .address()
     };
 
+    let mut input_reader = InputReader::new(
+        config.db_path.clone(),
+        shutdown.clone(),
+        InputReaderConfig {
+            rpc_url: config.eth_rpc_url.clone(),
+            app_address: config.domain_verifying_contract,
+            poll_interval: INPUT_READER_POLL_INTERVAL,
+            long_block_range_error_codes: config.long_block_range_error_codes.clone(),
+        },
+    )
+    .await
+    .map_err(|source| RunError::InputReader { source })?;
+    let input_reader_genesis_block = input_reader.genesis_block();
     let l1_config = L1Config {
         eth_rpc_url: config.eth_rpc_url.clone(),
-        input_box_address,
+        input_box_address: input_reader.input_box_address(),
         app_address: config.domain_verifying_contract,
         batch_submitter_private_key,
         batch_submitter_address,
     };
-    let input_reader_config = build_input_reader_config(
-        &l1_config,
-        input_reader_genesis_block,
-        config.long_block_range_error_codes.clone(),
-    );
-    InputReader::sync_to_current_safe_head(&config.db_path, input_reader_config.clone())
+    input_reader
+        .sync_to_current_safe_head()
         .await
         .map_err(|source| RunError::InputReader { source })?;
 
@@ -135,22 +148,20 @@ where
         shutdown.clone(),
         app,
         storage,
-        InclusionLaneConfig::for_app::<A>(),
+        InclusionLaneConfig::for_app::<A>(l1_config.batch_submitter_address),
     );
-    let mut input_reader_handle =
-        InputReader::start(&config.db_path, input_reader_config, shutdown.clone())?;
+    let mut input_reader_handle = input_reader.start()?;
 
     // Batch submitter uses the same L1 config (InputBox address and RPC URL) as the input reader.
     let batch_submitter_config = BatchSubmitterConfig {
         idle_poll_interval_ms: config.batch_submitter_idle_poll_interval_ms,
-        max_batches_per_loop: config.batch_submitter_max_batches_per_loop,
     };
     let poster_config = BatchPosterConfig {
-        rpc_url: l1_config.eth_rpc_url.clone(),
         l1_submit_address: l1_config.input_box_address,
         app_address: l1_config.app_address,
         batch_submitter_address: l1_config.batch_submitter_address,
-        scan_depth: config.batch_submitter_scan_depth,
+        start_block: input_reader_genesis_block,
+        confirmation_depth: config.batch_submitter_confirmation_depth,
     };
     let provider = build_batch_submitter_provider(&l1_config).await?;
     let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
@@ -165,7 +176,10 @@ where
     let tx_feed = L2TxFeed::new(
         config.db_path.clone(),
         shutdown.clone(),
-        L2TxFeedConfig::default(),
+        L2TxFeedConfig {
+            batch_submitter_address: Some(l1_config.batch_submitter_address),
+            ..L2TxFeedConfig::default()
+        },
     );
 
     let mut server_task = api::start(
@@ -221,12 +235,12 @@ async fn wait_for_clean_shutdown(
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
     inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
     input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
-    batch_submitter_handle: tokio::task::JoinHandle<()>,
+    batch_submitter_handle: tokio::task::JoinHandle<Result<(), BatchSubmitterError>>,
 ) -> Result<(), RunError> {
     wait_for_server_shutdown(server_task).await?;
     wait_for_lane_shutdown(inclusion_lane_handle).await?;
     wait_for_input_reader_shutdown(input_reader_handle).await?;
-    let _ = batch_submitter_handle.await;
+    wait_for_batch_submitter_shutdown(batch_submitter_handle).await?;
     Ok(())
 }
 
@@ -235,7 +249,7 @@ async fn finish_runtime(
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
     inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
     input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
-    batch_submitter_handle: tokio::task::JoinHandle<()>,
+    batch_submitter_handle: tokio::task::JoinHandle<Result<(), BatchSubmitterError>>,
 ) -> Result<(), RunError> {
     match first_exit {
         FirstExit::Signal(signal_error) => {
@@ -337,11 +351,12 @@ async fn wait_for_input_reader_shutdown(
 }
 
 async fn wait_for_batch_submitter_shutdown(
-    batch_submitter_handle: tokio::task::JoinHandle<()>,
+    batch_submitter_handle: tokio::task::JoinHandle<Result<(), BatchSubmitterError>>,
 ) -> Result<(), RunError> {
     match batch_submitter_handle.await {
-        Ok(()) => Ok(()),
-        Err(source) => Err(RunError::ServerJoin { source }),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(source)) => Err(RunError::BatchSubmitter { source }),
+        Err(source) => Err(RunError::BatchSubmitterJoin { source }),
     }
 }
 
@@ -373,26 +388,13 @@ fn map_input_reader_exit(
     }
 }
 
-fn map_batch_submitter_exit(result: Result<(), tokio::task::JoinError>) -> RunError {
+fn map_batch_submitter_exit(
+    result: Result<Result<(), BatchSubmitterError>, tokio::task::JoinError>,
+) -> RunError {
     match result {
-        Ok(()) => RunError::ServerStoppedUnexpectedly,
-        Err(source) => RunError::ServerJoin { source },
-    }
-}
-
-fn build_input_reader_config(
-    l1: &L1Config,
-    genesis_block: u64,
-    long_block_range_error_codes: Vec<String>,
-) -> InputReaderConfig {
-    InputReaderConfig {
-        rpc_url: l1.eth_rpc_url.clone(),
-        input_box_address: l1.input_box_address,
-        app_address_filter: l1.app_address,
-        batch_submitter_address: l1.batch_submitter_address,
-        genesis_block,
-        poll_interval: INPUT_READER_POLL_INTERVAL,
-        long_block_range_error_codes,
+        Ok(Ok(())) => RunError::BatchSubmitterStoppedUnexpectedly,
+        Ok(Err(source)) => RunError::BatchSubmitter { source },
+        Err(source) => RunError::BatchSubmitterJoin { source },
     }
 }
 

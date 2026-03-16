@@ -3,31 +3,42 @@
 
 //! Batch submitter worker: at-least-once submission to L1, deduplicated by the scheduler.
 //!
-//! We use **at-least-once** semantics (same batch may be submitted more than once). The scheduler
-//! deduplicates by **batch nonce** (batch index): it checks whether the nonce is the next expected
-//! one and invalidates otherwise, so duplicate submissions of the same batch are harmless.
-//!
-//! Loop each tick:
-//! 1. **Wake up** (start of tick).
-//! 2. **Read S from the chain** via the poster (Latest minus scan_depth); S is not persisted.
-//! 3. **Compare with local closed batches**: see if the DB has closed batches not yet submitted.
-//! 4. **If there are unsubmitted batches**, submit them (each with its batch index as nonce).
-//! 5. **Sleep** for `idle_poll_interval` when no work was done, then loop.
+//! The worker is intentionally stateless with respect to submitted-batch progress.
+//! On each tick it derives the highest submitted batch nonce from L1, compares that
+//! with locally closed batches, submits the first missing batch if any, then loops.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::batch_submitter::BatchSubmitterConfig;
-use crate::onchain::BatchPoster;
+use thiserror::Error;
+use tracing::warn;
+
+use crate::batch_submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig, TxHash};
 use crate::shutdown::ShutdownSignal;
-use crate::storage::Storage;
-use crate::storage::StorageOpenError;
+use crate::storage::{Storage, StorageOpenError};
+
+#[derive(Debug, Error)]
+pub enum BatchSubmitterError {
+    #[error(transparent)]
+    OpenStorage(#[from] StorageOpenError),
+    #[error(transparent)]
+    Storage(#[from] rusqlite::Error),
+    #[error("batch submitter join error: {0}")]
+    Join(String),
+    #[error(transparent)]
+    Poster(#[from] BatchPosterError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    Idle,
+    Submitted { batch_index: u64, tx_hash: TxHash },
+}
 
 pub struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
     poster: Arc<P>,
     idle_poll_interval: Duration,
-    max_batches_per_loop: usize,
     shutdown: ShutdownSignal,
 }
 
@@ -42,107 +53,100 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             db_path: db_path.into(),
             poster,
             idle_poll_interval: config.idle_poll_interval(),
-            max_batches_per_loop: config.max_batches_per_loop,
             shutdown,
         }
     }
 
-    pub fn start(self) -> Result<tokio::task::JoinHandle<()>, StorageOpenError> {
-        // Fail fast if storage cannot be opened (read-only is enough for the submitter).
+    pub fn start(
+        self,
+    ) -> Result<tokio::task::JoinHandle<Result<(), BatchSubmitterError>>, StorageOpenError> {
         let _ = Storage::open_read_only(self.db_path.as_str())?;
-        Ok(tokio::spawn(async move {
-            self.run_forever().await;
-        }))
+        Ok(tokio::spawn(async move { self.run_forever().await }))
     }
 
-    async fn run_forever(self) {
+    async fn run_forever(self) -> Result<(), BatchSubmitterError> {
         loop {
             if self.shutdown.is_shutdown_requested() {
-                return;
+                return Ok(());
             }
 
-            // One tick: wake → read S → compare → submit (if any) → then sleep if idle.
-            let work_done = self.tick_once().await;
-
-            if !work_done {
-                tokio::select! {
-                    _ = self.shutdown.wait_for_shutdown() => return,
-                    _ = tokio::time::sleep(self.idle_poll_interval) => {}
+            match self.tick_once().await {
+                Ok(TickOutcome::Submitted { .. }) => continue,
+                Ok(TickOutcome::Idle) => {}
+                Err(BatchSubmitterError::Poster(source)) => {
+                    warn!(error = %source, "batch submitter tick failed, will retry");
                 }
+                Err(err) => return Err(err),
+            }
+
+            tokio::select! {
+                _ = self.shutdown.wait_for_shutdown() => return Ok(()),
+                _ = tokio::time::sleep(self.idle_poll_interval) => {}
             }
         }
     }
 
-    /// One iteration: derive S from the chain via the poster, compare with local closed batches,
-    /// submit any unsubmitted ones.
-    pub(crate) async fn tick_once(&self) -> bool {
-        // 1. Read latest local batch index from storage (open batch); S is derived from chain each tick.
-        let db_path = self.db_path.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open_read_only(&db_path)?;
-            let latest = storage
-                .latest_batch_index()
-                .map_err(StorageOpenError::from)?;
-            Ok::<_, StorageOpenError>(latest)
-        })
-        .await;
-
-        let Ok(Ok(latest_batch_opt)) = result else {
-            return false;
-        };
-
-        let latest_submitted = self
-            .poster
-            .latest_submitted_batch_index()
-            .await
-            .ok()
-            .flatten();
-
+    pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
+        let latest_batch_opt = self.load_latest_batch_index().await?;
         let Some(latest_batch_index) = latest_batch_opt else {
-            return false;
+            return Ok(TickOutcome::Idle);
         };
 
-        // When only batch 0 exists it is still open; no closed batch to submit.
         if latest_batch_index == 0 {
-            return false;
+            return Ok(TickOutcome::Idle);
         }
 
-        // Last closed batch index (open batch is latest_batch_index).
-        let last_closed = latest_batch_index.saturating_sub(1);
-        // No batch submitted yet => None; first to submit is 0. Otherwise first_to_submit = S + 1.
+        let last_closed = latest_batch_index - 1;
+        let latest_submitted = self.poster.latest_submitted_batch_index().await?;
         let first_to_submit = latest_submitted.map(|s| s + 1).unwrap_or(0);
         if first_to_submit > last_closed {
-            return false;
+            return Ok(TickOutcome::Idle);
         }
-        let mut any_submitted = false;
-
-        for batch_index in first_to_submit..=last_closed {
-            if (batch_index - first_to_submit) as usize >= self.max_batches_per_loop {
-                break;
-            }
-
-            let db_path = self.db_path.clone();
-            let load_result = tokio::task::spawn_blocking(move || {
-                let mut storage = Storage::open_read_only(&db_path)?;
-                storage
-                    .load_batch_for_submission(batch_index)
-                    .map_err(StorageOpenError::from)
-            })
-            .await;
-
-            let Ok(Ok(batch)) = load_result else {
-                // Storage error; stop this tick.
-                break;
-            };
-
-            let payload = batch.encode_for_scheduler();
-            if self.poster.submit_batch(payload).await.is_err() {
-                break;
-            }
-            any_submitted = true;
+        if first_to_submit < last_closed {
+            let pending_batches = last_closed - first_to_submit + 1;
+            warn!(
+                first_to_submit,
+                last_closed, pending_batches, "multiple closed batches are pending submission"
+            );
         }
 
-        any_submitted
+        let batch = self.load_batch_for_submission(first_to_submit).await?;
+        let tx_hash = self
+            .poster
+            .submit_batch(batch.encode_for_scheduler())
+            .await?;
+
+        Ok(TickOutcome::Submitted {
+            batch_index: first_to_submit,
+            tx_hash,
+        })
+    }
+
+    async fn load_latest_batch_index(&self) -> Result<Option<u64>, BatchSubmitterError> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open_read_only(&db_path)?;
+            storage
+                .latest_batch_index()
+                .map_err(BatchSubmitterError::from)
+        })
+        .await
+        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
+    }
+
+    async fn load_batch_for_submission(
+        &self,
+        batch_index: u64,
+    ) -> Result<sequencer_core::batch::BatchForSubmission, BatchSubmitterError> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open_read_only(&db_path)?;
+            storage
+                .load_batch_for_submission(batch_index)
+                .map_err(BatchSubmitterError::from)
+        })
+        .await
+        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
 }
 
@@ -150,10 +154,11 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::batch_submitter::BatchSubmitterConfig;
-    use crate::onchain::batch_poster::mock::MockBatchPoster;
+    use crate::batch_submitter::{
+        BatchSubmitterConfig, BatchSubmitterError, TickOutcome, batch_poster::mock::MockBatchPoster,
+    };
     use crate::shutdown::ShutdownSignal;
-    use crate::storage::{DirectInputRange, Storage};
+    use crate::storage::{SafeInputRange, Storage};
     use tempfile::TempDir;
 
     const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
@@ -167,11 +172,10 @@ mod tests {
         (dir, path.to_string_lossy().into_owned())
     }
 
-    /// Seed storage so batches 1 and 2 are closed and batch 3 is open.
     fn seed_two_closed_batches(db_path: &str) {
         let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
         let mut head = storage
-            .initialize_open_state(0, DirectInputRange::empty_at(0))
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
         let next_safe = head.safe_block;
         storage
@@ -186,14 +190,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_once_submits_closed_batches_not_open() {
+    async fn tick_once_submits_first_missing_closed_batch() {
         let (_dir, path) = temp_db("tick-submits");
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
         let config = BatchSubmitterConfig {
             idle_poll_interval_ms: 1000,
-            max_batches_per_loop: 10,
         };
         let submitter = super::BatchSubmitter::new(
             path.clone(),
@@ -202,37 +205,18 @@ mod tests {
             config,
         );
 
-        let done = submitter.tick_once().await;
-        assert!(done, "one or more batches should have been submitted");
+        let outcome = submitter.tick_once().await.expect("tick once");
+        assert_eq!(
+            outcome,
+            TickOutcome::Submitted {
+                batch_index: 0,
+                tx_hash: alloy_primitives::B256::ZERO
+            }
+        );
 
         let submissions = mock.submissions();
-        assert_eq!(
-            submissions.len(),
-            3,
-            "should submit batch 0, 1, and 2 (all closed)"
-        );
+        assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].0, 0);
-        assert_eq!(submissions[1].0, 1);
-        assert_eq!(submissions[2].0, 2);
-    }
-
-    #[tokio::test]
-    async fn tick_once_respects_max_batches_per_loop() {
-        let (_dir, path) = temp_db("tick-max-per-loop");
-        seed_two_closed_batches(&path);
-
-        let mock = Arc::new(MockBatchPoster::new());
-        let config = BatchSubmitterConfig {
-            idle_poll_interval_ms: 1000,
-            max_batches_per_loop: 1,
-        };
-        let submitter =
-            super::BatchSubmitter::new(path, mock.clone(), ShutdownSignal::default(), config);
-
-        let done = submitter.tick_once().await;
-        assert!(done);
-        assert_eq!(mock.submissions().len(), 1, "only one batch per loop");
-        assert_eq!(mock.submissions()[0].0, 0);
     }
 
     #[tokio::test]
@@ -241,9 +225,9 @@ mod tests {
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
+        mock.set_latest_submitted(Some(2));
         let config = BatchSubmitterConfig {
             idle_poll_interval_ms: 1000,
-            max_batches_per_loop: 10,
         };
         let submitter = super::BatchSubmitter::new(
             path.clone(),
@@ -252,29 +236,31 @@ mod tests {
             config,
         );
 
-        let first_done = submitter.tick_once().await;
-        assert!(first_done);
-        assert_eq!(mock.submissions().len(), 3, "batches 0, 1, 2");
-
-        // Second tick: poster reports S=2 (from its submissions), so first_to_submit=3 > last_closed=2.
-        let second_done = submitter.tick_once().await;
-        assert!(!second_done);
+        let outcome = submitter.tick_once().await.expect("tick once");
+        assert_eq!(outcome, TickOutcome::Idle);
+        assert!(mock.submissions().is_empty());
     }
 
     #[tokio::test]
-    async fn tick_once_returns_false_when_poster_fails_submit() {
-        let (_dir, path) = temp_db("tick-fail-latest");
+    async fn tick_once_propagates_poster_errors() {
+        let (_dir, path) = temp_db("tick-poster-error");
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
-        *mock.fail_submit.lock().expect("lock") = true;
-        let config = BatchSubmitterConfig {
-            idle_poll_interval_ms: 1000,
-            max_batches_per_loop: 10,
-        };
-        let submitter = super::BatchSubmitter::new(path, mock, ShutdownSignal::default(), config);
+        mock.set_latest_submitted_error(Some("rpc fail"));
+        let submitter = super::BatchSubmitter::new(
+            path,
+            mock,
+            ShutdownSignal::default(),
+            BatchSubmitterConfig {
+                idle_poll_interval_ms: 1000,
+            },
+        );
 
-        let done = submitter.tick_once().await;
-        assert!(!done);
+        let err = submitter
+            .tick_once()
+            .await
+            .expect_err("poster error should propagate");
+        assert!(matches!(err, BatchSubmitterError::Poster(_)));
     }
 }

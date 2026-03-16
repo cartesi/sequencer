@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use alloy_primitives::{Address, Signature, U256};
@@ -11,9 +13,9 @@ use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::shutdown::ShutdownSignal;
-use crate::storage::{DirectInputRange, Storage, StoredDirectInput};
+use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::application::{AppError, Application, InvalidReason};
-use sequencer_core::l2_tx::{SequencedL2Tx, ValidUserOp};
+use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 
 use super::catch_up::catch_up_application_paged;
@@ -54,7 +56,7 @@ impl Application for TestApp {
         Ok(())
     }
 
-    fn execute_direct_input(&mut self, _payload: &[u8]) -> Result<(), AppError> {
+    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<(), AppError> {
         self.executed_input_count = self.executed_input_count.saturating_add(1);
         Ok(())
     }
@@ -71,13 +73,54 @@ struct TestDb {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplayEvent {
-    UserOp { sender: Address, data: Vec<u8> },
-    DirectInput(Vec<u8>),
+    UserOp {
+        sender: Address,
+        data: Vec<u8>,
+    },
+    DirectInput {
+        sender: Address,
+        block_number: u64,
+        payload: Vec<u8>,
+    },
 }
 
 struct ReplayRecordingApp {
     executed_input_count: u64,
     replayed: Vec<ReplayEvent>,
+}
+
+struct SharedCountingApp {
+    executed_direct_inputs: Arc<AtomicU64>,
+}
+
+impl Application for SharedCountingApp {
+    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+
+    fn current_user_nonce(&self, _sender: Address) -> u32 {
+        0
+    }
+
+    fn current_user_balance(&self, _sender: Address) -> U256 {
+        U256::MAX
+    }
+
+    fn validate_user_op(
+        &self,
+        _sender: Address,
+        _user_op: &UserOp,
+        _current_fee: u64,
+    ) -> Result<(), InvalidReason> {
+        Ok(())
+    }
+
+    fn execute_valid_user_op(&mut self, _user_op: &ValidUserOp) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<(), AppError> {
+        self.executed_direct_inputs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl ReplayRecordingApp {
@@ -124,9 +167,12 @@ impl Application for ReplayRecordingApp {
         Ok(())
     }
 
-    fn execute_direct_input(&mut self, payload: &[u8]) -> Result<(), AppError> {
-        self.replayed
-            .push(ReplayEvent::DirectInput(payload.to_vec()));
+    fn execute_direct_input(&mut self, input: &DirectInput) -> Result<(), AppError> {
+        self.replayed.push(ReplayEvent::DirectInput {
+            sender: input.sender,
+            block_number: input.block_number,
+            payload: input.payload.clone(),
+        });
         self.executed_input_count = self.executed_input_count.saturating_add(1);
         Ok(())
     }
@@ -150,8 +196,9 @@ fn temp_db(name: &str) -> TestDb {
 
 fn default_test_config() -> InclusionLaneConfig {
     InclusionLaneConfig {
+        batch_submitter_address: Address::from_slice(&[0xff; 20]),
         max_user_ops_per_chunk: 16,
-        safe_direct_buffer_capacity: 16,
+        safe_input_buffer_capacity: 16,
         max_batch_open: Duration::MAX,
         max_batch_user_op_bytes: 1_000_000_000,
         idle_poll_interval: Duration::from_millis(2),
@@ -212,7 +259,7 @@ fn make_pending_user_op(
 fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
     let mut head = storage
-        .initialize_open_state(0, DirectInputRange::empty_at(0))
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
 
     let user_op_a = make_pending_user_op(0x51).0;
@@ -221,17 +268,17 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
         .append_user_ops_chunk(&mut head, &[user_op_a, user_op_b])
         .expect("append first frame user ops");
     storage
-        .append_safe_direct_inputs(
+        .append_safe_inputs(
             10,
-            &[StoredDirectInput {
+            &[StoredSafeInput {
+                sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            None,
         )
         .expect("append first direct input");
     storage
-        .close_frame_only(&mut head, 10, DirectInputRange::new(0, 1))
+        .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
         .expect("close first frame");
 
     let user_op_c = make_pending_user_op(0x53).0;
@@ -239,31 +286,31 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
         .append_user_ops_chunk(&mut head, &[user_op_c])
         .expect("append second frame user op");
     storage
-        .append_safe_direct_inputs(
+        .append_safe_inputs(
             20,
-            &[StoredDirectInput {
+            &[StoredSafeInput {
+                sender: Address::ZERO,
                 payload: vec![0xbb],
                 block_number: 20,
             }],
-            None,
         )
         .expect("append second direct input");
     storage
-        .close_frame_only(&mut head, 20, DirectInputRange::new(1, 2))
+        .close_frame_only(&mut head, 20, SafeInputRange::new(1, 2))
         .expect("close second frame");
 
     storage
-        .append_safe_direct_inputs(
+        .append_safe_inputs(
             30,
-            &[StoredDirectInput {
+            &[StoredSafeInput {
+                sender: Address::ZERO,
                 payload: vec![0xcc],
                 block_number: 30,
             }],
-            None,
         )
         .expect("append third direct input");
     storage
-        .close_frame_only(&mut head, 30, DirectInputRange::new(2, 3))
+        .close_frame_only(&mut head, 30, SafeInputRange::new(2, 3))
         .expect("close third frame");
 
     vec![
@@ -275,13 +322,25 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             sender: Address::from_slice(&[0x52; 20]),
             data: vec![0x52; 4],
         },
-        ReplayEvent::DirectInput(vec![0xaa]),
+        ReplayEvent::DirectInput {
+            sender: Address::ZERO,
+            block_number: 10,
+            payload: vec![0xaa],
+        },
         ReplayEvent::UserOp {
             sender: Address::from_slice(&[0x53; 20]),
             data: vec![0x53; 4],
         },
-        ReplayEvent::DirectInput(vec![0xbb]),
-        ReplayEvent::DirectInput(vec![0xcc]),
+        ReplayEvent::DirectInput {
+            sender: Address::ZERO,
+            block_number: 20,
+            payload: vec![0xbb],
+        },
+        ReplayEvent::DirectInput {
+            sender: Address::ZERO,
+            block_number: 30,
+            payload: vec![0xcc],
+        },
     ]
 }
 
@@ -298,7 +357,7 @@ fn read_frame_direct_count(db_path: &str, batch_index: i64, frame_in_batch: i64)
         "SELECT COUNT(*) FROM sequenced_l2_txs
          WHERE batch_index = ?1
            AND frame_in_batch = ?2
-           AND direct_input_index IS NOT NULL",
+           AND safe_input_index IS NOT NULL",
         params![batch_index, frame_in_batch],
         |row| row.get(0),
     )
@@ -359,13 +418,13 @@ async fn direct_inputs_close_frame_and_persist_drain() {
         Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
 
     feeder_storage
-        .append_safe_direct_inputs(
+        .append_safe_inputs(
             10,
-            &[StoredDirectInput {
+            &[StoredSafeInput {
+                sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            None,
         )
         .expect("append safe direct input");
 
@@ -381,23 +440,84 @@ async fn direct_inputs_close_frame_and_persist_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequenced_safe_inputs_are_drained_but_not_executed() {
+    let db = temp_db("sequenced-safe-inputs-skip");
+    let batch_submitter_address = Address::from([0xfe; 20]);
+    let executed_direct_inputs = Arc::new(AtomicU64::new(0));
+    let storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    let shutdown = ShutdownSignal::default();
+    let (tx, lane_handle) = InclusionLane::start(
+        128,
+        shutdown.clone(),
+        SharedCountingApp {
+            executed_direct_inputs: executed_direct_inputs.clone(),
+        },
+        storage,
+        InclusionLaneConfig {
+            batch_submitter_address,
+            ..default_test_config()
+        },
+    );
+    let initialized = wait_until(Duration::from_secs(2), || {
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        storage
+            .load_open_state()
+            .expect("load open state")
+            .is_some()
+    })
+    .await;
+    assert!(initialized, "lane should initialize open state");
+
+    let mut feeder_storage =
+        Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
+    feeder_storage
+        .append_safe_inputs(
+            10,
+            &[StoredSafeInput {
+                sender: batch_submitter_address,
+                payload: vec![0xaa],
+                block_number: 10,
+            }],
+        )
+        .expect("append safe batch-submitter input");
+
+    let drained = wait_until(Duration::from_secs(2), || {
+        read_frame_direct_count(db.path.as_str(), 0, 1) == 1
+    })
+    .await;
+    drop(tx);
+    shutdown_lane(&shutdown, lane_handle).await;
+
+    assert!(
+        drained,
+        "expected sequenced safe input to be drained into frame 1"
+    );
+    assert_eq!(
+        executed_direct_inputs.load(Ordering::SeqCst),
+        0,
+        "batch-submitter safe input should be skipped by the local app"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_inputs_are_paginated_by_buffer_capacity() {
     let db = temp_db("directs-pagination");
     let mut config = default_test_config();
-    config.safe_direct_buffer_capacity = 2;
+    config.safe_input_buffer_capacity = 2;
     let (_tx, shutdown, lane_handle) = start_lane(db.path.as_str(), config).await;
     let mut feeder_storage =
         Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
 
     let mut directs = Vec::new();
     for index in 0..5_u64 {
-        directs.push(StoredDirectInput {
+        directs.push(StoredSafeInput {
+            sender: Address::ZERO,
             payload: vec![0x10 + index as u8],
             block_number: 10,
         });
     }
     feeder_storage
-        .append_safe_direct_inputs(10, directs.as_slice(), None)
+        .append_safe_inputs(10, directs.as_slice())
         .expect("append safe direct inputs");
 
     let drained = wait_until(Duration::from_secs(2), || {
@@ -412,20 +532,20 @@ async fn direct_inputs_are_paginated_by_buffer_capacity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn safe_directs_already_available_are_sequenced_before_later_user_ops() {
+async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
     let db = temp_db("directs-before-later-userops");
     let (tx, shutdown, lane_handle) = start_lane(db.path.as_str(), default_test_config()).await;
     let mut feeder_storage =
         Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
 
     feeder_storage
-        .append_safe_direct_inputs(
+        .append_safe_inputs(
             10,
-            &[StoredDirectInput {
+            &[StoredSafeInput {
+                sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            None,
         )
         .expect("append safe direct input");
 
@@ -570,23 +690,25 @@ fn catch_up_replays_multiple_pages() {
     let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
     let mut app = ReplayRecordingApp::default();
 
-    catch_up_application_paged(&mut app, &mut storage, 2).expect("catch up in pages");
+    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
+        .expect("catch up in pages");
 
     assert_eq!(app.replayed, expected);
     assert_eq!(app.executed_input_count(), expected.len() as u64);
 }
 
 #[test]
-fn catch_up_starts_from_executed_input_count_offset() {
+fn catch_up_replays_from_storage_even_when_app_reports_executed_inputs() {
     let db = temp_db("catch-up-offset");
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
     let mut app = ReplayRecordingApp::with_executed_input_count(3);
 
-    catch_up_application_paged(&mut app, &mut storage, 2).expect("catch up from offset");
+    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
+        .expect("catch up from storage");
 
-    assert_eq!(app.replayed, expected[3..].to_vec());
-    assert_eq!(app.executed_input_count(), expected.len() as u64);
+    assert_eq!(app.replayed, expected);
+    assert_eq!(app.executed_input_count(), 3 + expected.len() as u64);
 }
 
 #[test]
@@ -596,7 +718,8 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
     let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
     let mut app = ReplayRecordingApp::default();
 
-    catch_up_application_paged(&mut app, &mut storage, 4).expect("catch up across page boundary");
+    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 4)
+        .expect("catch up across page boundary");
 
     assert_eq!(app.replayed, expected);
 }
@@ -608,7 +731,7 @@ fn catch_up_load_error_reports_offset() {
         Storage::open_without_migrations(db.path.as_str(), "NORMAL").expect("open raw storage");
     let mut app = ReplayRecordingApp::default();
 
-    let err = catch_up_application_paged(&mut app, &mut storage, 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
         .expect_err("catch up should fail without schema");
 
     assert!(matches!(err, CatchUpError::LoadReplay { offset: 0, .. }));

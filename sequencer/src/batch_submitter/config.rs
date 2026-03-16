@@ -10,8 +10,6 @@ use std::time::Duration;
 pub struct BatchSubmitterConfig {
     /// How often the submitter polls for new work when idle.
     pub idle_poll_interval_ms: u64,
-    /// Maximum number of batches to submit in a single loop iteration.
-    pub max_batches_per_loop: usize,
 }
 
 impl BatchSubmitterConfig {
