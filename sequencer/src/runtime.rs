@@ -11,6 +11,7 @@ use crate::config::{L1Config, RunConfig};
 use crate::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
 use crate::input_reader::{InputReader, InputReaderConfig, InputReaderError};
 use crate::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
+use crate::partition;
 use crate::shutdown::ShutdownSignal;
 use crate::storage::{self, StorageOpenError};
 use sequencer_core::application::Application;
@@ -106,6 +107,9 @@ where
             .address()
     };
 
+    partition::init(partition::PartitionConfig::new(
+        config.long_block_range_error_codes,
+    ));
     let mut input_reader = InputReader::new(
         config.db_path.clone(),
         shutdown.clone(),
@@ -113,7 +117,6 @@ where
             rpc_url: config.eth_rpc_url.clone(),
             app_address: config.domain_verifying_contract,
             poll_interval: INPUT_READER_POLL_INTERVAL,
-            long_block_range_error_codes: config.long_block_range_error_codes.clone(),
         },
     )
     .await
