@@ -7,8 +7,7 @@ use cartesi_rollups_contracts::input_box::InputBox;
 use sequencer_core::batch::Batch;
 use thiserror::Error;
 
-use crate::input_reader::logs::decode_evm_advance_input;
-use crate::partition::get_input_added_events;
+use crate::partition::{decode_evm_advance_input, get_input_added_events};
 
 pub type TxHash = alloy_primitives::B256;
 
@@ -19,6 +18,8 @@ pub struct BatchPosterConfig {
     pub batch_submitter_address: alloy_primitives::Address,
     pub start_block: u64,
     pub confirmation_depth: u64,
+    /// Error codes that trigger `get_logs` retries with a shorter block range.
+    pub long_block_range_error_codes: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -96,6 +97,7 @@ where
             &self.config.l1_submit_address,
             start_block,
             end_block,
+            self.config.long_block_range_error_codes.as_slice(),
         )
         .await
         .map_err(|errs| {

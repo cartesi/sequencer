@@ -12,8 +12,7 @@ use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use super::logs::decode_evm_advance_input;
-use crate::partition::get_input_added_events;
+use crate::partition::{decode_evm_advance_input, get_input_added_events};
 use crate::shutdown::ShutdownSignal;
 use crate::storage::{Storage, StorageOpenError, StoredSafeInput};
 
@@ -24,6 +23,8 @@ pub struct InputReaderConfig {
     pub rpc_url: String,
     pub app_address: Address,
     pub poll_interval: Duration,
+    /// Error codes that trigger `get_logs` retries with a shorter block range.
+    pub long_block_range_error_codes: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -173,6 +174,7 @@ impl InputReader {
             &self.input_box_address,
             start_block,
             current_safe_block,
+            self.config.long_block_range_error_codes.as_slice(),
         )
         .await
         .map_err(|errs| {
@@ -293,6 +295,7 @@ mod tests {
                 rpc_url,
                 app_address: Address::ZERO,
                 poll_interval,
+                long_block_range_error_codes: Vec::new(),
             },
             Address::ZERO,
             genesis_block,
