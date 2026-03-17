@@ -11,11 +11,6 @@ pub const DOMAIN_VERSION: &str = "1";
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_DB_PATH: &str = "sequencer.db";
 
-/// `-32005` Infura
-/// `-32600`, `-32602` Alchemy
-/// `-32616` QuickNode
-const DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES: &[&str] = &["-32005", "-32600", "-32602", "-32616"];
-
 /// Shared L1 / InputBox configuration used by both the input reader and the batch submitter.
 ///
 /// Built once at startup from `RunConfig` plus the discovered InputBox address, so RPC URL,
@@ -76,7 +71,7 @@ pub struct RunConfig {
     #[arg(long, env = "SEQ_ETH_RPC_URL", value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
-    #[arg(long, env = "SEQ_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
+    #[arg(long, env = "SEQ_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
     pub long_block_range_error_codes: Vec<String>,
     #[arg(long, env = "SEQ_DOMAIN_CHAIN_ID")]
     pub domain_chain_id: u64,

@@ -12,10 +12,12 @@ check-all-targets:
 test:
     cargo test --workspace
 
+# Run sequencer tests sequentially so partition static config (init) is not shared across parallel tests.
 test-sequencer:
-    cargo test -p sequencer --lib
+    cargo test -p sequencer --lib -- --test-threads=1
     cargo test -p sequencer --test e2e_sequencer -- --test-threads=1
     cargo test -p sequencer --test ws_broadcaster -- --test-threads=1
+    cargo test -p sequencer --test batch_submitter_integration -- --test-threads=1
 
 bench target="all":
     just -f benchmarks/justfile {{target}}

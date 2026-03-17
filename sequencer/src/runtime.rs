@@ -105,7 +105,6 @@ where
             .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?
             .address()
     };
-
     let mut input_reader = InputReader::new(
         config.db_path.clone(),
         shutdown.clone(),
@@ -162,6 +161,7 @@ where
         batch_submitter_address: l1_config.batch_submitter_address,
         start_block: input_reader_genesis_block,
         confirmation_depth: config.batch_submitter_confirmation_depth,
+        long_block_range_error_codes: config.long_block_range_error_codes,
     };
     let provider = build_batch_submitter_provider(&l1_config).await?;
     let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));

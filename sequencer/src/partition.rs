@@ -1,17 +1,28 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! Block-range partition retry: when a log query fails with a "long block range" RPC error,
+//! split the range in half and retry. Shared by the input reader (safe-head advancement)
+//! and the batch submitter (latest batch submitted scan).
+//!
+//! This module is stateless: callers pass the retry error codes explicitly. There is no
+//! global mutable state; `RunConfig` owns the codes and passes them down via configs.
+
+/// Default RPC error codes that trigger partition retry (e.g. Infura -32005, Alchemy -32600/-32602, QuickNode -32616).
+pub const DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES: &[&str] = &["-32005", "-32600", "-32602", "-32616"];
+
 use alloy::contract::Error as ContractError;
 use alloy::contract::Event;
 use alloy::providers::Provider;
-use alloy::sol_types::{SolCall, SolEvent};
+use alloy::sol_types::SolCall;
+use alloy::sol_types::SolEvent;
 use alloy_primitives::Address;
 use async_recursion::async_recursion;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
 
 #[async_recursion]
-pub(crate) async fn get_input_added_events(
+pub async fn get_input_added_events(
     provider: &impl Provider,
     app_address_filter: Address,
     input_box_address: &Address,
@@ -74,12 +85,12 @@ fn should_retry_with_partition(err: &ContractError, codes: &[String]) -> bool {
     error_message_matches_retry_codes(&format!("{err:?}"), codes)
 }
 
-pub(crate) fn decode_evm_advance_input(input: &[u8]) -> Result<EvmAdvanceCall, String> {
-    EvmAdvanceCall::abi_decode(input).map_err(|err| err.to_string())
+pub fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) -> bool {
+    codes.iter().any(|c| error_message.contains(c))
 }
 
-pub(crate) fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) -> bool {
-    codes.iter().any(|c| error_message.contains(c))
+pub fn decode_evm_advance_input(input: &[u8]) -> Result<EvmAdvanceCall, String> {
+    EvmAdvanceCall::abi_decode(input).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
