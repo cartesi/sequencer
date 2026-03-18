@@ -753,6 +753,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "sequencer-core",
+ "tracing",
 ]
 
 [[package]]
@@ -2675,7 +2676,7 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 [[package]]
 name = "libcmt-sys"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=27b457994546ea4a8345ed078031782f155d3013#27b457994546ea4a8345ed078031782f155d3013"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
 dependencies = [
  "ar",
  "bindgen",
@@ -4187,7 +4188,7 @@ dependencies = [
 [[package]]
 name = "testsi"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=27b457994546ea4a8345ed078031782f155d3013#27b457994546ea4a8345ed078031782f155d3013"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
 dependencies = [
  "cartesi-machine",
  "inventory",
@@ -4200,7 +4201,7 @@ dependencies = [
 [[package]]
 name = "testsi-macros"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=27b457994546ea4a8345ed078031782f155d3013#27b457994546ea4a8345ed078031782f155d3013"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4537,7 +4538,7 @@ dependencies = [
 [[package]]
 name = "trolley"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=27b457994546ea4a8345ed078031782f155d3013#27b457994546ea4a8345ed078031782f155d3013"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
 dependencies = [
  "libcmt-sys",
  "types",
@@ -4575,7 +4576,7 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 [[package]]
 name = "types"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=27b457994546ea4a8345ed078031782f155d3013#27b457994546ea4a8345ed078031782f155d3013"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",

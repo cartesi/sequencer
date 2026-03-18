@@ -3,8 +3,9 @@
 
 use std::collections::HashMap;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, U256, address};
 use ssz::Decode;
+use tracing::{error, warn};
 
 use super::{
     MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES, Method, prefunded_addresses,
@@ -30,6 +31,16 @@ pub struct WalletApp {
 }
 
 pub const PREFUNDED_BALANCE: u64 = 1_000_000;
+const ERC20_PORTAL_ADDRESS: Address = address!("0xACA6586A0Cf05bD831f2501E7B4aea550dA6562D");
+const USDC_ADDRESS: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+const ERC20_DEPOSIT_PREFIX_BYTES: usize = 20 + 20 + 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Erc20Deposit {
+    token: Address,
+    sender: Address,
+    value: U256,
+}
 
 impl WalletApp {
     pub fn new(_config: WalletConfig) -> Self {
@@ -70,6 +81,27 @@ impl WalletApp {
     fn bump_nonce(&mut self, addr: Address) {
         let next = self.expected_nonce(&addr).wrapping_add(1);
         self.nonces.insert(addr, next);
+    }
+
+    fn decode_portal_erc20_deposit(
+        input: &sequencer_core::l2_tx::DirectInput,
+    ) -> Result<Option<Erc20Deposit>, String> {
+        if input.sender != ERC20_PORTAL_ADDRESS {
+            return Ok(None);
+        }
+
+        if input.payload.len() < ERC20_DEPOSIT_PREFIX_BYTES {
+            return Err(format!(
+                "trusted ERC-20 portal payload too short: expected at least {ERC20_DEPOSIT_PREFIX_BYTES} bytes, got {}",
+                input.payload.len()
+            ));
+        }
+
+        Ok(Some(Erc20Deposit {
+            token: Address::from_slice(&input.payload[0..20]),
+            sender: Address::from_slice(&input.payload[20..40]),
+            value: U256::from_be_slice(&input.payload[40..72]),
+        }))
     }
 }
 
@@ -157,8 +189,33 @@ impl Application for WalletApp {
 
     fn execute_direct_input(
         &mut self,
-        _input: &sequencer_core::l2_tx::DirectInput,
+        input: &sequencer_core::l2_tx::DirectInput,
     ) -> Result<(), AppError> {
+        match Self::decode_portal_erc20_deposit(input) {
+            Ok(Some(deposit)) => {
+                if deposit.token == USDC_ADDRESS {
+                    self.credit(deposit.sender, deposit.value);
+                } else {
+                    warn!(
+                        portal = %input.sender,
+                        token = %deposit.token,
+                        sender = %deposit.sender,
+                        block_number = input.block_number,
+                        "ignoring unsupported ERC-20 deposit token"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                error!(
+                    portal = %input.sender,
+                    block_number = input.block_number,
+                    error = %reason,
+                    "ignoring malformed trusted ERC-20 deposit payload"
+                );
+            }
+        }
+
         self.executed_input_count = self.executed_input_count.saturating_add(1);
         Ok(())
     }
@@ -170,12 +227,12 @@ impl Application for WalletApp {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{Address, U256};
+    use alloy_primitives::{Address, U256, address};
     use ssz_derive::{Decode, Encode};
 
     use super::{WalletApp, WalletConfig};
     use sequencer_core::application::{Application, InvalidReason};
-    use sequencer_core::l2_tx::ValidUserOp;
+    use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
     use sequencer_core::user_op::UserOp;
 
     #[test]
@@ -283,5 +340,94 @@ mod tests {
         assert_eq!(app.current_user_nonce(sender), before_sender_nonce + 1);
         assert_eq!(app.current_user_balance(sender), before_sender_balance);
         assert_eq!(app.current_user_balance(recipient), before_recipient);
+    }
+
+    fn encode_erc20_deposit_payload(token: Address, sender: Address, value: U256) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(super::ERC20_DEPOSIT_PREFIX_BYTES);
+        payload.extend_from_slice(token.as_slice());
+        payload.extend_from_slice(sender.as_slice());
+        payload.extend_from_slice(value.to_be_bytes::<32>().as_slice());
+        payload
+    }
+
+    #[test]
+    fn trusted_portal_usdc_deposit_credits_nested_sender() {
+        let mut app = WalletApp::new(WalletConfig);
+        let nested_sender = address!("0x7777777777777777777777777777777777777777");
+
+        let before = app.current_user_balance(nested_sender);
+        app.execute_direct_input(&DirectInput {
+            sender: super::ERC20_PORTAL_ADDRESS,
+            block_number: 123,
+            payload: encode_erc20_deposit_payload(
+                super::USDC_ADDRESS,
+                nested_sender,
+                U256::from(250_u64),
+            ),
+        })
+        .expect("execute deposit direct input");
+
+        assert_eq!(
+            app.current_user_balance(nested_sender),
+            before + U256::from(250_u64)
+        );
+        assert_eq!(app.executed_input_count(), 1);
+    }
+
+    #[test]
+    fn non_portal_direct_input_remains_no_op() {
+        let mut app = WalletApp::new(WalletConfig);
+        let nested_sender = address!("0x7777777777777777777777777777777777777777");
+
+        let before = app.current_user_balance(nested_sender);
+        app.execute_direct_input(&DirectInput {
+            sender: address!("0x3333333333333333333333333333333333333333"),
+            block_number: 123,
+            payload: encode_erc20_deposit_payload(
+                super::USDC_ADDRESS,
+                nested_sender,
+                U256::from(250_u64),
+            ),
+        })
+        .expect("execute non-portal direct input");
+
+        assert_eq!(app.current_user_balance(nested_sender), before);
+        assert_eq!(app.executed_input_count(), 1);
+    }
+
+    #[test]
+    fn trusted_portal_unsupported_token_is_a_no_op() {
+        let mut app = WalletApp::new(WalletConfig);
+        let nested_sender = address!("0x7777777777777777777777777777777777777777");
+        let unsupported_token = address!("0x9999999999999999999999999999999999999999");
+
+        let before = app.current_user_balance(nested_sender);
+        app.execute_direct_input(&DirectInput {
+            sender: super::ERC20_PORTAL_ADDRESS,
+            block_number: 123,
+            payload: encode_erc20_deposit_payload(
+                unsupported_token,
+                nested_sender,
+                U256::from(250_u64),
+            ),
+        })
+        .expect("unsupported token should be ignored");
+
+        assert_eq!(app.current_user_balance(nested_sender), before);
+        assert_eq!(app.executed_input_count(), 1);
+    }
+
+    #[test]
+    fn malformed_trusted_portal_deposit_is_a_no_op() {
+        let mut app = WalletApp::new(WalletConfig);
+
+        app.execute_direct_input(&DirectInput {
+            sender: super::ERC20_PORTAL_ADDRESS,
+            block_number: 123,
+            payload: vec![0xaa; 10],
+        })
+        .expect("malformed trusted portal payload should be ignored");
+
+        assert_eq!(app.executed_input_count(), 1);
     }
 }
