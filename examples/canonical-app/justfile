@@ -23,7 +23,7 @@ build-rootfs: build-dapp
       --platform linux/riscv64 \
       --output type=tar,dest={{rootfs_tar}} \
       --file Dockerfile \
-      ../..
+      .
     xgenext2fs -f -z -B 4096 -i 4096 -r +4096 -a {{rootfs_tar}} -L rootfs {{rootfs_ext2}}
 
 clean-machine-image:

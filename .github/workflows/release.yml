@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0-alpha.1)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as GitHub pre-release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-sequencer:
+    name: Build sequencer (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates \
+            lua5.4 \
+            liblua5.4-dev \
+            libslirp-dev \
+            build-essential \
+            pkg-config \
+            libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (release)
+        run: cross build -p sequencer --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          mkdir -p "package/sequencer-${TAG}-linux-${ARCH}"
+          cp "target/${TARGET}/release/sequencer" "package/sequencer-${TAG}-linux-${ARCH}/sequencer"
+
+          cat > "package/sequencer-${TAG}-linux-${ARCH}/RUNNING.md" <<'EOF'
+          ## Running
+
+          Required environment variables:
+
+          - `SEQ_ETH_RPC_URL`
+          - `SEQ_DOMAIN_CHAIN_ID`
+          - `SEQ_DOMAIN_VERIFYING_CONTRACT`
+
+          Example:
+
+          ```bash
+          SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \
+          SEQ_DOMAIN_CHAIN_ID=31337 \
+          SEQ_DOMAIN_VERIFYING_CONTRACT=0x1111111111111111111111111111111111111111 \
+          ./sequencer
+          ```
+          EOF
+
+          tar -C package -czf "dist/sequencer-${TAG}-linux-${ARCH}.tar.gz" "sequencer-${TAG}-linux-${ARCH}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sequencer-linux-${{ matrix.arch }}
+          path: dist/sequencer-*.tar.gz
+
+  build-canonical-machine-image:
+    name: Build canonical machine image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates \
+            wget \
+            xz-utils
+
+      - name: Install xgenext2fs
+        run: |
+          set -euo pipefail
+          ARCH="$(dpkg --print-architecture)"
+          VERSION="v1.5.5"
+
+          case "${ARCH}" in
+            amd64)
+              DEB_SHA256="e42857c454a772553e2bec5e73ac499b39d35dbf622bdb4cbb1b19fe98f62999"
+              ;;
+            arm64)
+              DEB_SHA256="a9964903e9d4c1006dc9d88b4823be14d2eccaf66007c48e76c883e17db2880c"
+              ;;
+            *)
+              echo "unsupported arch for xgenext2fs: ${ARCH}" >&2
+              exit 1
+              ;;
+          esac
+
+          wget -O /tmp/xgenext2fs.deb "https://github.com/cartesi/genext2fs/releases/download/${VERSION}/xgenext2fs_${ARCH}.deb"
+          echo "${DEB_SHA256}  /tmp/xgenext2fs.deb" | sha256sum --check
+          sudo apt-get update
+          sudo apt-get install -y /tmp/xgenext2fs.deb
+
+      - name: Install cartesi-machine (machine emulator CLI)
+        run: |
+          set -euo pipefail
+          ARCH="$(dpkg --print-architecture)"
+          VERSION="v0.20.0-test2"
+
+          case "${ARCH}" in
+            amd64)
+              DEB_SHA256="39bbfc96a6cc6606307294b719df65f4f2725e8d200d062bcbd8c22355b99b56"
+              ;;
+            arm64)
+              DEB_SHA256="787d823756000cdecd72da8a3494b4c08613087379035959e561bbaef7a220ba"
+              ;;
+            *)
+              echo "unsupported arch for machine-emulator: ${ARCH}" >&2
+              exit 1
+              ;;
+          esac
+
+          wget -O /tmp/machine-emulator.deb "https://github.com/cartesi/machine-emulator/releases/download/${VERSION}/machine-emulator_${ARCH}.deb"
+          echo "${DEB_SHA256}  /tmp/machine-emulator.deb" | sha256sum --check
+          sudo apt-get update
+          sudo apt-get install -y /tmp/machine-emulator.deb
+          cartesi-machine --version
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Download canonical app deps
+        run: just -f examples/canonical-app/justfile download-deps
+
+      - name: Build machine image
+        run: just canonical-build-machine-image
+
+      - name: Package machine image store
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -d examples/canonical-app/out/canonical-machine-image
+          mkdir -p dist
+          tar -C examples/canonical-app/out -czf "dist/canonical-machine-image-${TAG}.tar.gz" canonical-machine-image
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-machine-image
+          path: dist/canonical-machine-image-*.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-sequencer
+      - build-canonical-machine-image
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find dist -type f -name '*.tar.gz' -exec cp -v '{}' out/ \;
+
+      - name: Generate checksums
+        working-directory: out
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          prerelease: ${{ inputs.prerelease || true }}
+          fail_on_unmatched_files: true
+          files: |
+            out/*.tar.gz
+            out/SHA256SUMS
+
