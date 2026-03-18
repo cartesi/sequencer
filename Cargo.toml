@@ -30,4 +30,4 @@ libcmt-sys = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tool
 trolley = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "27b457994546ea4a8345ed078031782f155d3013" }
 testsi = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "27b457994546ea4a8345ed078031782f155d3013" }
 types = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "27b457994546ea4a8345ed078031782f155d3013" }
-cartesi-machine = { version = "2", git = "https://github.com/cartesi/dave", rev = "5d0560a04f623318af9ef5b7f193170b618b6ced", features = ["download_uarch"] }
+cartesi-machine = { version = "2", git = "https://github.com/cartesi/dave", rev = "5d0560a04f623318af9ef5b7f193170b618b6ced", default-features = false, features = ["download_uarch"] }
