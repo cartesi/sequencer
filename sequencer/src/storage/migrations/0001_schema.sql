@@ -37,8 +37,9 @@ CREATE TABLE IF NOT EXISTS safe_inputs (
     block_number       INTEGER NOT NULL CHECK (block_number >= 0)
 );
 
+-- Global append-only replay order consumed by catch-up and feed readers.
+-- It is a cache, containing the merged and flattened txs of safe_inputs and user_ops.
 CREATE TABLE IF NOT EXISTS sequenced_l2_txs (
-    -- Global append-only replay order consumed by catch-up and feed readers.
     offset               INTEGER PRIMARY KEY,
     batch_index          INTEGER NOT NULL,
     frame_in_batch       INTEGER NOT NULL,
