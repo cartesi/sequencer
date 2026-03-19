@@ -7,7 +7,9 @@ members = [
   "examples/app-core",
   "examples/canonical-app",
   "examples/canonical-test",
-  "benchmarks",
+  "tests/benchmarks",
+  "tests/harness",
+  "tests/e2e",
 ]
 default-members = ["sequencer"]
 

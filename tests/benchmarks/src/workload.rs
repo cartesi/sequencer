@@ -25,6 +25,12 @@ pub struct SignedTxFixture {
     pub expected_data_hex: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct FundedAccountPlan {
+    pub(crate) address: Address,
+    pub(crate) required_balance: U256,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadKind {
@@ -71,6 +77,38 @@ enum WorkloadStateInner {
         round_robin_index: usize,
         transfer_amount: u64,
     },
+}
+
+pub(crate) fn funded_account_plans(
+    config: &WorkloadConfig,
+    total_count: u64,
+) -> BenchResult<Vec<FundedAccountPlan>> {
+    if config.kind != WorkloadKind::FundedTransfer {
+        return Ok(Vec::new());
+    }
+
+    let keys = match config.accounts_file.as_deref() {
+        Some(path) => load_private_keys_from_file(path)?,
+        None => default_private_keys().to_vec(),
+    };
+    if keys.is_empty() {
+        return Err(err("no private keys available for funded workload"));
+    }
+
+    let account_count = keys.len() as u64;
+    let mut plans = Vec::with_capacity(keys.len());
+    for (index, private_key) in keys.into_iter().enumerate() {
+        let signing_key = signing_key_from_hex(private_key.as_str())?;
+        let address = address_from_signing_key(&signing_key);
+        let send_count = round_robin_send_count(total_count, account_count, index as u64);
+        let required_balance = required_funded_transfer_balance(send_count, config.transfer_amount);
+        plans.push(FundedAccountPlan {
+            address,
+            required_balance,
+        });
+    }
+
+    Ok(plans)
 }
 
 #[derive(Clone)]
@@ -213,6 +251,24 @@ fn load_funded_accounts(accounts_file: Option<&str>) -> BenchResult<Vec<FundedAc
         });
     }
     Ok(accounts)
+}
+
+fn round_robin_send_count(total_count: u64, account_count: u64, account_index: u64) -> u64 {
+    if account_index >= total_count {
+        return 0;
+    }
+    1 + (total_count - 1 - account_index) / account_count
+}
+
+fn required_funded_transfer_balance(send_count: u64, transfer_amount: u64) -> U256 {
+    if send_count == 0 {
+        return U256::ZERO;
+    }
+
+    let send_count_u256 = U256::from(send_count);
+    let transfer_amount_u256 = U256::from(transfer_amount);
+    let arithmetic_sum = send_count_u256 * U256::from(send_count - 1) / U256::from(2_u64);
+    (send_count_u256 * transfer_amount_u256) + arithmetic_sum
 }
 
 fn load_private_keys_from_file(path: &str) -> BenchResult<Vec<String>> {
@@ -361,11 +417,15 @@ fn address_from_signing_key(signing_key: &SigningKey) -> Address {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{
-        FundedAccount, WorkloadState, WorkloadStateInner, address_from_signing_key,
-        default_private_keys, signing_key_from_hex,
+        FundedAccount, WorkloadConfig, WorkloadKind, WorkloadState, WorkloadStateInner,
+        address_from_signing_key, default_private_keys, funded_account_plans,
+        required_funded_transfer_balance, round_robin_send_count, signing_key_from_hex,
     };
     use crate::self_contained_domain;
+    use alloy_primitives::U256;
 
     #[test]
     fn funded_transfer_round_robin_nonce_progression() {
@@ -397,5 +457,44 @@ mod tests {
         assert_eq!(one.request.message.nonce, 1);
         assert_eq!(two.request.message.nonce, 1);
         assert_eq!(three.request.message.nonce, 2);
+    }
+
+    #[test]
+    fn funding_plan_matches_round_robin_workload() {
+        let temp_path =
+            std::env::temp_dir().join(format!("funded-account-plans-{}.txt", std::process::id()));
+        let mut contents = String::new();
+        for key in default_private_keys().iter().take(3) {
+            let signing_key = signing_key_from_hex(key.as_str()).expect("signing key");
+            let address = address_from_signing_key(&signing_key);
+            contents.push_str(address.to_string().as_str());
+            contents.push(' ');
+            contents.push_str(key);
+            contents.push('\n');
+        }
+        fs::write(&temp_path, contents).expect("accounts file");
+
+        let config = WorkloadConfig {
+            kind: WorkloadKind::FundedTransfer,
+            accounts_file: Some(temp_path.to_string_lossy().to_string()),
+            transfer_amount: 5,
+        };
+
+        let plans = funded_account_plans(&config, 5).expect("funding plan");
+        let _ = fs::remove_file(&temp_path);
+        assert!(plans.len() >= 3);
+        assert_eq!(plans[0].required_balance, U256::from(11_u64));
+        assert_eq!(plans[1].required_balance, U256::from(11_u64));
+        assert_eq!(plans[2].required_balance, U256::from(5_u64));
+    }
+
+    #[test]
+    fn round_robin_count_and_required_balance_helpers_work() {
+        assert_eq!(round_robin_send_count(0, 3, 0), 0);
+        assert_eq!(round_robin_send_count(5, 3, 0), 2);
+        assert_eq!(round_robin_send_count(5, 3, 1), 2);
+        assert_eq!(round_robin_send_count(5, 3, 2), 1);
+        assert_eq!(required_funded_transfer_balance(0, 5), U256::ZERO);
+        assert_eq!(required_funded_transfer_balance(3, 5), U256::from(18_u64));
     }
 }

@@ -5,6 +5,6 @@ mod anvil_accounts;
 mod method;
 mod wallet;
 
-pub use anvil_accounts::{default_private_keys, prefunded_addresses};
+pub use anvil_accounts::default_private_keys;
 pub use method::{MAX_METHOD_PAYLOAD_BYTES, Method, Transfer, Withdrawal};
 pub use wallet::{WalletApp, WalletConfig};

@@ -21,7 +21,7 @@ Build a robust sequencer prototype for a future DeFi stack, with deterministic o
 
 ### Benchmarks & Tooling
 
-- Benchmark harnesses in `benchmarks/` for ack latency, end-to-end latency, sweeps, and unit hot path.
+- Benchmark harnesses in `tests/benchmarks/` for ack latency, round-trip latency, sweeps, and unit hot path.
 - Baseline reporting for p50 / p95 / p99, throughput, and RSS trends.
 - Same-host benchmark workflows and docs aligned with the current runtime/config model.
 

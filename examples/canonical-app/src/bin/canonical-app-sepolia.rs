@@ -7,6 +7,6 @@ use trolley::cmt::RollupCmt;
 
 fn main() {
     let rollup = RollupCmt::try_new().expect("failed to initialize rollup");
-    let app = WalletApp::new(WalletConfig);
+    let app = WalletApp::new(WalletConfig::sepolia());
     run_scheduler_forever(rollup, app, SchedulerConfig::default());
 }

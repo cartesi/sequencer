@@ -4,13 +4,14 @@
 use alloy_primitives::Address;
 use benchmarks::{
     AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME,
-    DOMAIN_VERSION, E2eRunConfig, NetworkProfile, SweepRow, SweepRunReport, WorkloadConfig,
-    WorkloadKind, compute_capacity_summary, default_json_output_path, default_seed_offset,
-    parse_address, print_ack_report, print_e2e_report, print_sweep_report,
-    resolve_external_benchmark_domain, run_ack_benchmark, run_e2e_benchmark,
+    DOMAIN_VERSION, NetworkProfile, RoundTripRunConfig, SweepMeasurements, SweepRow,
+    SweepRunReport, WorkloadConfig, WorkloadKind, compute_capacity_summary,
+    default_json_output_path, default_seed_offset, parse_address, print_ack_report,
+    print_round_trip_report, print_sweep_report, resolve_external_benchmark_domain,
+    run_ack_benchmark, run_round_trip_benchmark,
     runtime::{
-        DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_SEQUENCER_BIN, ManagedSequencer,
-        ManagedSequencerConfig, MemorySampler,
+        DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RESULTS_DIR, DEFAULT_SEQUENCER_BIN,
+        MemorySampler, benchmark_domain, managed_sequencer_config,
     },
     write_json_output, write_sweep_csv,
 };
@@ -25,15 +26,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 enum SweepMode {
     #[value(name = "ack")]
     Ack,
-    #[value(name = "e2e")]
-    E2e,
+    #[value(name = "round-trip")]
+    RoundTrip,
 }
 
 impl SweepMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Ack => "ack",
-            Self::E2e => "e2e",
+            Self::RoundTrip => "round-trip",
         }
     }
 }
@@ -43,10 +44,10 @@ impl SweepMode {
     name = "sweep",
     about = "benchmark sweep runner",
     version,
-    after_help = "Examples:\n  cargo run -p benchmarks --bin sweep -- --self-contained --mode e2e --count 1000 --concurrency-list \"1 2 4 8 16 32 64\"\n  cargo run -p benchmarks --bin sweep -- --endpoint http://127.0.0.1:3000 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --mode e2e --count 1000 --concurrency-range 1:128:8 --json-out benchmarks/results/e2e-sweep-latest.json"
+    after_help = "Examples:\n  cargo run -p benchmarks --bin sweep -- --self-contained --mode round-trip --count 1000 --concurrency-list \"1 2 4 8 16 32 64\"\n  cargo run -p benchmarks --bin sweep -- --endpoint http://127.0.0.1:3000 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --mode round-trip --count 1000 --concurrency-range 1:128:8 --json-out tests/benchmarks/results/round-trip-sweep-latest.json"
 )]
 struct Args {
-    #[arg(long, value_enum, default_value_t = SweepMode::E2e)]
+    #[arg(long, value_enum, default_value_t = SweepMode::RoundTrip)]
     mode: SweepMode,
     #[arg(long, default_value_t = 1_000_u64)]
     count: u64,
@@ -83,14 +84,14 @@ struct Args {
         value_name = "START:END:STEP"
     )]
     concurrency_range: Option<String>,
-    #[arg(long, default_value = "benchmarks/results")]
+    #[arg(long, default_value = DEFAULT_RESULTS_DIR)]
     results_dir: String,
     #[arg(long)]
     json_out: Option<String>,
     #[arg(long, default_value_t = 10_000_u64)]
-    e2e_request_timeout_ms: u64,
+    round_trip_request_timeout_ms: u64,
     #[arg(long, default_value_t = 20_000_u64)]
-    e2e_max_ws_wait_ms: u64,
+    round_trip_max_ws_wait_ms: u64,
     #[arg(long, default_value_t = false)]
     stop_on_first_non_200: bool,
 }
@@ -98,6 +99,12 @@ struct Args {
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     let args = Args::parse();
+    if args.workload == WorkloadKind::FundedTransfer {
+        return Err(std::io::Error::other(
+            "funded-transfer sweep is not supported yet; use synthetic or a single-run benchmark",
+        )
+        .into());
+    }
     let network_profile = NetworkProfile::same_host_baseline();
     let json_prefix = format!("{}-sweep", args.mode.as_str());
     let json_out = args.json_out.clone().or_else(|| {
@@ -120,10 +127,10 @@ async fn main() -> BenchResult<()> {
 
     let mut managed = if args.self_contained {
         Some(
-            ManagedSequencer::spawn(ManagedSequencerConfig {
-                sequencer_bin: args.sequencer_bin.clone(),
-                log_prefix: "sweep-self-contained",
-            })
+            rollups_harness::ManagedSequencer::spawn(managed_sequencer_config(
+                "sweep-self-contained",
+                &args.sequencer_bin,
+            ))
             .await?,
         )
     } else {
@@ -136,14 +143,14 @@ async fn main() -> BenchResult<()> {
             )
             .into());
         }
-        value.domain()
+        benchmark_domain(value)
     } else {
         resolve_external_benchmark_domain(args.domain_chain_id, args.domain_verifying_contract)?
     };
 
     let endpoint = managed
         .as_ref()
-        .map(|value| value.endpoint.clone())
+        .map(|value| value.endpoint().to_string())
         .unwrap_or_else(|| args.endpoint.clone());
     let sequencer_log_path = managed
         .as_ref()
@@ -210,18 +217,20 @@ async fn main() -> BenchResult<()> {
                     SweepRow::new(
                         concurrency,
                         tx_per_second(report.accepted as usize, report.total_wall),
-                        report.accepted,
-                        report.rejected,
-                        report.rejection_rate,
-                        report.ack_latency_accepted.p95.as_secs_f64() * 1000.0,
-                        report.ack_latency_accepted.p99.as_secs_f64() * 1000.0,
-                        report.ack_latency_accepted.p999.as_secs_f64() * 1000.0,
-                        report.rejection_breakdown,
+                        SweepMeasurements {
+                            accepted_count: report.accepted,
+                            rejected_count: report.rejected,
+                            rejection_rate: report.rejection_rate,
+                            p95_ms: report.ack_latency_accepted.p95.as_secs_f64() * 1000.0,
+                            p99_ms: report.ack_latency_accepted.p99.as_secs_f64() * 1000.0,
+                            p999_ms: report.ack_latency_accepted.p999.as_secs_f64() * 1000.0,
+                            rejection_breakdown: report.rejection_breakdown,
+                        },
                     )
                 })
             }
-            SweepMode::E2e => {
-                let config = E2eRunConfig {
+            SweepMode::RoundTrip => {
+                let config = RoundTripRunConfig {
                     endpoint: endpoint.clone(),
                     domain,
                     from_offset: current_from_offset,
@@ -229,26 +238,28 @@ async fn main() -> BenchResult<()> {
                     concurrency,
                     seed_offset,
                     max_fee: args.max_fee,
-                    request_timeout_ms: args.e2e_request_timeout_ms,
-                    max_ws_wait_ms: args.e2e_max_ws_wait_ms,
+                    request_timeout_ms: args.round_trip_request_timeout_ms,
+                    max_ws_wait_ms: args.round_trip_max_ws_wait_ms,
                     fail_on_rejection: false,
                     workload: workload.clone(),
                 };
-                run_e2e_benchmark(config).await.map(|report| {
+                run_round_trip_benchmark(config).await.map(|report| {
                     seed_offset = seed_offset.saturating_add(args.count);
                     current_from_offset =
                         current_from_offset.saturating_add(report.consumed_ws_events_total);
-                    print_e2e_report(&report);
+                    print_round_trip_report(&report);
                     SweepRow::new(
                         concurrency,
                         tx_per_second(report.accepted as usize, report.total_wall),
-                        report.accepted,
-                        report.rejected,
-                        report.rejection_rate,
-                        report.e2e_latency_accepted.p95.as_secs_f64() * 1000.0,
-                        report.e2e_latency_accepted.p99.as_secs_f64() * 1000.0,
-                        report.e2e_latency_accepted.p999.as_secs_f64() * 1000.0,
-                        report.rejection_breakdown,
+                        SweepMeasurements {
+                            accepted_count: report.accepted,
+                            rejected_count: report.rejected,
+                            rejection_rate: report.rejection_rate,
+                            p95_ms: report.round_trip_latency_accepted.p95.as_secs_f64() * 1000.0,
+                            p99_ms: report.round_trip_latency_accepted.p99.as_secs_f64() * 1000.0,
+                            p999_ms: report.round_trip_latency_accepted.p999.as_secs_f64() * 1000.0,
+                            rejection_breakdown: report.rejection_breakdown,
+                        },
                     )
                 })
             }
@@ -329,8 +340,8 @@ async fn main() -> BenchResult<()> {
             "accounts_file": args.accounts_file,
             "transfer_amount": args.transfer_amount,
             "concurrency_list": concurrencies,
-            "e2e_request_timeout_ms": args.e2e_request_timeout_ms,
-            "e2e_max_ws_wait_ms": args.e2e_max_ws_wait_ms,
+            "round_trip_request_timeout_ms": args.round_trip_request_timeout_ms,
+            "round_trip_max_ws_wait_ms": args.round_trip_max_ws_wait_ms,
             "csv_path": csv_path,
         });
         write_json_output(

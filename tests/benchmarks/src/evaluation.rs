@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AckRunReport, E2eRunReport};
+use crate::{AckRunReport, RoundTripRunReport};
 
 pub const TARGET_EVALUATION_MIN_ACCEPTED_COUNT: u64 = 5_000;
 pub const DIAGNOSTIC_P999_MIN_ACCEPTED_COUNT: u64 = 10_000;
@@ -98,15 +98,15 @@ pub fn evaluate_ack_target(
 }
 
 pub fn evaluate_soft_confirm_target(
-    report: &E2eRunReport,
+    report: &RoundTripRunReport,
     network_profile: NetworkProfile,
 ) -> TargetEvaluation {
     build_target_evaluation(
         "SOFT_CONFIRM_TARGET",
         report.accepted,
         report.rejected,
-        report.e2e_latency_accepted.p99.as_secs_f64() * 1000.0,
-        report.e2e_latency_accepted.p999.as_secs_f64() * 1000.0,
+        report.round_trip_latency_accepted.p99.as_secs_f64() * 1000.0,
+        report.round_trip_latency_accepted.p999.as_secs_f64() * 1000.0,
         SOFT_CONFIRM_P99_TARGET_MS,
         network_profile,
     )

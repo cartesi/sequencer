@@ -47,7 +47,7 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - `sequencer/src/storage/migrations/`: DB schema/bootstrapping (`0001`).
 - `sequencer-core/src/`: shared domain types/interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, broadcast message model).
 - `examples/app-core/src/application/mod.rs`: wallet prototype implementing `Application`.
-- `benchmarks/src/`: benchmark harnesses and self-contained benchmark runtime.
+- `tests/benchmarks/src/`: benchmark harnesses and self-contained benchmark runtime.
 
 ## Domain Truths (Important)
 

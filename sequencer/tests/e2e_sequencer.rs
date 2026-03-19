@@ -424,7 +424,7 @@ async fn start_full_server_with_max_body(
     let (tx, lane_handle) = InclusionLane::start(
         128,
         shutdown.clone(),
-        WalletApp::new(WalletConfig),
+        WalletApp::new(WalletConfig::default()),
         storage,
         InclusionLaneConfig {
             batch_submitter_address: Address::from([0xff; 20]),

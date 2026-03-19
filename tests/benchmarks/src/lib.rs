@@ -3,10 +3,10 @@
 
 mod ack;
 mod domain;
-mod e2e;
 mod evaluation;
 mod rejection;
 mod report;
+mod round_trip;
 pub mod runtime;
 mod stats;
 mod support;
@@ -19,7 +19,6 @@ pub use domain::{
     SELF_CONTAINED_DOMAIN_VERIFYING_CONTRACT, parse_address, resolve_external_benchmark_domain,
     self_contained_domain,
 };
-pub use e2e::{E2eRunConfig, E2eRunReport, run_e2e_benchmark};
 pub use evaluation::{
     ACK_P99_TARGET_MS, DIAGNOSTIC_P999_MIN_ACCEPTED_COUNT, NetworkProfile, NetworkProfileKind,
     P999Confidence, SOFT_CONFIRM_P99_TARGET_MS, TARGET_EVALUATION_MIN_ACCEPTED_COUNT,
@@ -27,14 +26,15 @@ pub use evaluation::{
     print_target_evaluation,
 };
 pub use report::{
-    BenchmarkJsonOutput, default_json_output_path, print_ack_report, print_e2e_report,
-    print_memory_report, write_json_output,
+    BenchmarkJsonOutput, default_json_output_path, print_ack_report, print_memory_report,
+    print_round_trip_report, write_json_output,
 };
+pub use round_trip::{RoundTripRunConfig, RoundTripRunReport, run_round_trip_benchmark};
 pub use stats::{Stats, print_stats, rejection_rate, summarize, throughput_tx_per_s};
 pub use support::{default_seed_offset, now};
 pub use sweep::{
-    SweepRow, SweepRunReport, SweepSummary, compute_capacity_summary, print_sweep_report,
-    write_csv as write_sweep_csv,
+    SweepMeasurements, SweepRow, SweepRunReport, SweepSummary, compute_capacity_summary,
+    print_sweep_report, write_csv as write_sweep_csv,
 };
 pub use workload::{
     DEFAULT_WORKLOAD_TRANSFER_AMOUNT, SignedTxFixture, WorkloadConfig, WorkloadKind,

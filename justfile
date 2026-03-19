@@ -19,15 +19,23 @@ test-sequencer:
     cargo test -p sequencer --test ws_broadcaster -- --test-threads=1
     cargo test -p sequencer --test batch_submitter_integration -- --test-threads=1
 
+run-rollups-e2e: setup canonical-build-machine-image
+    cargo build -p sequencer --bin sequencer-devnet
+    cargo build -p rollups-e2e
+    cargo run -p rollups-e2e
+
 bench target="all":
-    just -f benchmarks/justfile {{target}}
+    just -f tests/benchmarks/justfile {{target}}
 
 setup:
     just -f examples/canonical-app/justfile download-deps
-    just -f benchmarks/justfile setup
+    just -f tests/benchmarks/justfile setup
 
 canonical-build-machine-image:
     just -f examples/canonical-app/justfile build-machine-image
+
+canonical-build-machine-image-sepolia:
+    just -f examples/canonical-app/justfile build-machine-image-sepolia
 
 canonical-test-guest:
     just -f examples/canonical-app/justfile test-guest
@@ -36,7 +44,7 @@ clean:
     cargo clean
     rm -f sequencer.db sequencer.db-shm sequencer.db-wal
     just -f examples/canonical-app/justfile clean
-    just -f benchmarks/justfile clean
+    just -f tests/benchmarks/justfile clean
 
 fmt:
     cargo fmt --all

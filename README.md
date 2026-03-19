@@ -146,7 +146,7 @@ Success response:
 - `sequencer/src/storage/`: schema, migrations, SQLite persistence, and replay reads
 - `sequencer-core/src/`: shared domain types and interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, feed message types)
 - `examples/app-core/src/`: wallet prototype implementing `Application`
-- `benchmarks/`: benchmark harnesses and benchmark spec
+- `tests/benchmarks/`: benchmark harnesses and benchmark spec
 
 ## Prototype Limits
 

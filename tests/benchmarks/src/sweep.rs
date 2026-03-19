@@ -32,18 +32,28 @@ pub struct SweepRow {
     pub rejection_breakdown: BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepMeasurements {
+    pub accepted_count: u64,
+    pub rejected_count: u64,
+    pub rejection_rate: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub p999_ms: f64,
+    pub rejection_breakdown: BTreeMap<String, u64>,
+}
+
 impl SweepRow {
-    pub fn new(
-        concurrency: usize,
-        accepted_tps: f64,
-        accepted_count: u64,
-        rejected_count: u64,
-        rejection_rate: f64,
-        p95_ms: f64,
-        p99_ms: f64,
-        p999_ms: f64,
-        rejection_breakdown: BTreeMap<String, u64>,
-    ) -> Self {
+    pub fn new(concurrency: usize, accepted_tps: f64, metrics: SweepMeasurements) -> Self {
+        let SweepMeasurements {
+            accepted_count,
+            rejected_count,
+            rejection_rate,
+            p95_ms,
+            p99_ms,
+            p999_ms,
+            rejection_breakdown,
+        } = metrics;
         let http_rejected_count = http_rejection_count(&rejection_breakdown);
         let http_429_count = http_429_count(&rejection_breakdown);
         let client_failure_count = client_failure_count(rejected_count, &rejection_breakdown);
@@ -194,34 +204,50 @@ fn format_optional(value: Option<f64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SweepRow, compute_capacity_summary};
+    use super::{SweepMeasurements, SweepRow, compute_capacity_summary};
     use std::collections::BTreeMap;
 
     #[test]
     fn capacity_summary_tracks_http_and_client_failures_separately() {
         let rows = vec![
-            SweepRow::new(1, 10.0, 100, 0, 0.0, 1.0, 1.0, 1.0, BTreeMap::new()),
+            SweepRow::new(
+                1,
+                10.0,
+                SweepMeasurements {
+                    accepted_count: 100,
+                    rejected_count: 0,
+                    rejection_rate: 0.0,
+                    p95_ms: 1.0,
+                    p99_ms: 1.0,
+                    p999_ms: 1.0,
+                    rejection_breakdown: BTreeMap::new(),
+                },
+            ),
             SweepRow::new(
                 2,
                 20.0,
-                100,
-                1,
-                1.0,
-                2.0,
-                2.0,
-                2.0,
-                BTreeMap::from([("io_connect".to_string(), 1_u64)]),
+                SweepMeasurements {
+                    accepted_count: 100,
+                    rejected_count: 1,
+                    rejection_rate: 1.0,
+                    p95_ms: 2.0,
+                    p99_ms: 2.0,
+                    p999_ms: 2.0,
+                    rejection_breakdown: BTreeMap::from([("io_connect".to_string(), 1_u64)]),
+                },
             ),
             SweepRow::new(
                 3,
                 30.0,
-                100,
-                1,
-                1.0,
-                3.0,
-                3.0,
-                3.0,
-                BTreeMap::from([("http_429".to_string(), 1_u64)]),
+                SweepMeasurements {
+                    accepted_count: 100,
+                    rejected_count: 1,
+                    rejection_rate: 1.0,
+                    p95_ms: 3.0,
+                    p99_ms: 3.0,
+                    p999_ms: 3.0,
+                    rejection_breakdown: BTreeMap::from([("http_429".to_string(), 1_u64)]),
+                },
             ),
         ];
 

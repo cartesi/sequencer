@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    AckRunReport, BenchResult, E2eRunReport, TargetEvaluation, runtime,
+    AckRunReport, BenchResult, RoundTripRunReport, TargetEvaluation, runtime,
     stats::{format_optional_f64, print_stats, throughput_tx_per_s},
 };
 
@@ -51,7 +51,7 @@ pub fn default_json_output_path(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or(0);
-    format!("benchmarks/results/{prefix}-{ts}.json")
+    format!("{}/{prefix}-{ts}.json", runtime::DEFAULT_RESULTS_DIR)
 }
 
 pub fn print_ack_report(report: &AckRunReport) {
@@ -87,9 +87,9 @@ pub fn print_ack_report(report: &AckRunReport) {
     }
 }
 
-pub fn print_e2e_report(report: &E2eRunReport) {
+pub fn print_round_trip_report(report: &RoundTripRunReport) {
     println!(
-        "e2e benchmark completed: count={}, endpoint={}, ws={}, concurrency={}",
+        "round-trip benchmark completed: count={}, endpoint={}, ws={}, concurrency={}",
         report.count, report.endpoint, report.ws_subscribe_url, report.concurrency
     );
     println!("  accepted: {}", report.accepted);
@@ -97,7 +97,7 @@ pub fn print_e2e_report(report: &E2eRunReport) {
     println!("  rejection_rate: {:.4}%", report.rejection_rate);
     println!(
         "accepted_completed_per_s: {:.2} tx/s",
-        throughput_tx_per_s(report.e2e_latency_accepted.count, report.total_wall)
+        throughput_tx_per_s(report.round_trip_latency_accepted.count, report.total_wall)
     );
     println!(
         "consumed_ws_events_total: {}",
@@ -116,7 +116,10 @@ pub fn print_e2e_report(report: &E2eRunReport) {
     if let Some(stats) = report.ack_latency_rejected.as_ref() {
         print_stats("ack_latency_rejected", stats);
     }
-    print_stats("e2e_latency_accepted", &report.e2e_latency_accepted);
+    print_stats(
+        "round_trip_latency_accepted",
+        &report.round_trip_latency_accepted,
+    );
     if let Some(memory) = report.memory.as_ref() {
         print_memory_report(memory);
     }

@@ -2,8 +2,6 @@
 sequencer.db
 sequencer.db-shm
 sequencer.db-wal
-benchmarks/results/
-/benchmarks/.deps/
-/examples/canonical-app/out/
 /out/
 /.DS_Store
+soljson-latest.js
