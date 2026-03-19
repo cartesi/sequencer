@@ -7,32 +7,53 @@ use alloy_primitives::{Address, U256, address};
 use ssz::Decode;
 use tracing::{error, warn};
 
-use super::{
-    MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES, Method, prefunded_addresses,
-};
+use super::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
+use super::Method;
 use sequencer_core::application::{AppError, Application, InvalidReason};
 use sequencer_core::l2_tx::ValidUserOp;
 use sequencer_core::user_op::UserOp;
 
 #[derive(Debug, Clone, Copy)]
-pub struct WalletConfig;
+pub struct WalletConfig {
+    pub erc20_portal_address: Address,
+    pub supported_erc20_token: Address,
+}
+
+impl WalletConfig {
+    pub const fn sepolia() -> Self {
+        Self {
+            erc20_portal_address: SEPOLIA_ERC20_PORTAL_ADDRESS,
+            supported_erc20_token: SEPOLIA_USDC_ADDRESS,
+        }
+    }
+
+    pub const fn devnet() -> Self {
+        Self {
+            erc20_portal_address: SEPOLIA_ERC20_PORTAL_ADDRESS,
+            supported_erc20_token: DEVNET_MOCK_USDC_ADDRESS,
+        }
+    }
+}
 
 impl Default for WalletConfig {
     fn default() -> Self {
-        Self
+        Self::sepolia()
     }
 }
 
 #[derive(Debug)]
 pub struct WalletApp {
+    config: WalletConfig,
     balances: HashMap<Address, U256>,
     nonces: HashMap<Address, u32>,
     executed_input_count: u64,
 }
 
-pub const PREFUNDED_BALANCE: u64 = 1_000_000;
-const ERC20_PORTAL_ADDRESS: Address = address!("0xACA6586A0Cf05bD831f2501E7B4aea550dA6562D");
-const USDC_ADDRESS: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+pub const SEPOLIA_ERC20_PORTAL_ADDRESS: Address =
+    address!("0xACA6586A0Cf05bD831f2501E7B4aea550dA6562D");
+pub const SEPOLIA_USDC_ADDRESS: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+pub const DEVNET_MOCK_USDC_ADDRESS: Address =
+    address!("0x95d0c8A7d11342299807A2Fc19ac44C2321cCc68");
 const ERC20_DEPOSIT_PREFIX_BYTES: usize = 20 + 20 + 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,14 +64,10 @@ struct Erc20Deposit {
 }
 
 impl WalletApp {
-    pub fn new(_config: WalletConfig) -> Self {
-        let mut balances = HashMap::with_capacity(prefunded_addresses().len());
-        for address in prefunded_addresses() {
-            balances.insert(*address, U256::from(PREFUNDED_BALANCE));
-        }
-
+    pub fn new(config: WalletConfig) -> Self {
         Self {
-            balances,
+            config,
+            balances: HashMap::new(),
             nonces: HashMap::new(),
             executed_input_count: 0,
         }
@@ -84,9 +101,10 @@ impl WalletApp {
     }
 
     fn decode_portal_erc20_deposit(
+        portal_address: Address,
         input: &sequencer_core::l2_tx::DirectInput,
     ) -> Result<Option<Erc20Deposit>, String> {
-        if input.sender != ERC20_PORTAL_ADDRESS {
+        if input.sender != portal_address {
             return Ok(None);
         }
 
@@ -107,7 +125,7 @@ impl WalletApp {
 
 impl Default for WalletApp {
     fn default() -> Self {
-        Self::new(WalletConfig)
+        Self::new(WalletConfig::default())
     }
 }
 
@@ -191,9 +209,9 @@ impl Application for WalletApp {
         &mut self,
         input: &sequencer_core::l2_tx::DirectInput,
     ) -> Result<(), AppError> {
-        match Self::decode_portal_erc20_deposit(input) {
+        match Self::decode_portal_erc20_deposit(self.config.erc20_portal_address, input) {
             Ok(Some(deposit)) => {
-                if deposit.token == USDC_ADDRESS {
+                if deposit.token == self.config.supported_erc20_token {
                     self.credit(deposit.sender, deposit.value);
                 } else {
                     warn!(
@@ -237,7 +255,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_when_max_fee_below_current_fee() {
-        let mut app = WalletApp::new(WalletConfig);
+        let mut app = WalletApp::new(WalletConfig::default());
         let sender = Address::from_slice(&[0x11; 20]);
         app.balances.insert(sender, U256::from(10_u64));
 
@@ -261,7 +279,7 @@ mod tests {
 
     #[test]
     fn execute_valid_user_op_charges_current_fee() {
-        let mut app = WalletApp::new(WalletConfig);
+        let mut app = WalletApp::new(WalletConfig::default());
         let sender = Address::from_slice(&[0x22; 20]);
         app.balances.insert(sender, U256::from(10_u64));
 
@@ -277,17 +295,13 @@ mod tests {
     }
 
     #[test]
-    fn wallet_starts_with_prefunded_anvil_accounts() {
-        let app = WalletApp::new(WalletConfig);
-        let addresses = super::prefunded_addresses();
-        assert!(addresses.len() >= 2);
+    fn wallet_starts_with_zero_balances() {
+        let app = WalletApp::new(WalletConfig::default());
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
 
-        for address in addresses.iter().take(2) {
-            assert_eq!(
-                app.current_user_balance(*address),
-                U256::from(super::PREFUNDED_BALANCE)
-            );
-        }
+        assert_eq!(app.current_user_balance(sender), U256::ZERO);
+        assert_eq!(app.current_user_balance(recipient), U256::ZERO);
     }
 
     #[derive(PartialEq, Debug, Encode, Decode, Clone)]
@@ -317,9 +331,10 @@ mod tests {
 
     #[test]
     fn legacy_deposit_payload_is_included_as_no_op() {
-        let mut app = WalletApp::new(WalletConfig);
-        let sender = super::prefunded_addresses()[0];
+        let mut app = WalletApp::new(WalletConfig::default());
+        let sender = address!("0x1111111111111111111111111111111111111111");
         let recipient = Address::from_slice(&[0x77; 20]);
+        app.balances.insert(sender, U256::from(500_u64));
         let before_sender_nonce = app.current_user_nonce(sender);
         let before_sender_balance = app.current_user_balance(sender);
         let before_recipient = app.current_user_balance(recipient);
@@ -352,15 +367,15 @@ mod tests {
 
     #[test]
     fn trusted_portal_usdc_deposit_credits_nested_sender() {
-        let mut app = WalletApp::new(WalletConfig);
+        let mut app = WalletApp::new(WalletConfig::default());
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
 
         let before = app.current_user_balance(nested_sender);
         app.execute_direct_input(&DirectInput {
-            sender: super::ERC20_PORTAL_ADDRESS,
+            sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
             block_number: 123,
             payload: encode_erc20_deposit_payload(
-                super::USDC_ADDRESS,
+                super::SEPOLIA_USDC_ADDRESS,
                 nested_sender,
                 U256::from(250_u64),
             ),
@@ -376,7 +391,7 @@ mod tests {
 
     #[test]
     fn non_portal_direct_input_remains_no_op() {
-        let mut app = WalletApp::new(WalletConfig);
+        let mut app = WalletApp::new(WalletConfig::default());
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
 
         let before = app.current_user_balance(nested_sender);
@@ -384,7 +399,7 @@ mod tests {
             sender: address!("0x3333333333333333333333333333333333333333"),
             block_number: 123,
             payload: encode_erc20_deposit_payload(
-                super::USDC_ADDRESS,
+                super::SEPOLIA_USDC_ADDRESS,
                 nested_sender,
                 U256::from(250_u64),
             ),
@@ -397,13 +412,13 @@ mod tests {
 
     #[test]
     fn trusted_portal_unsupported_token_is_a_no_op() {
-        let mut app = WalletApp::new(WalletConfig);
+        let mut app = WalletApp::new(WalletConfig::default());
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
         let unsupported_token = address!("0x9999999999999999999999999999999999999999");
 
         let before = app.current_user_balance(nested_sender);
         app.execute_direct_input(&DirectInput {
-            sender: super::ERC20_PORTAL_ADDRESS,
+            sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
             block_number: 123,
             payload: encode_erc20_deposit_payload(
                 unsupported_token,
@@ -419,15 +434,28 @@ mod tests {
 
     #[test]
     fn malformed_trusted_portal_deposit_is_a_no_op() {
-        let mut app = WalletApp::new(WalletConfig);
+        let mut app = WalletApp::new(WalletConfig::default());
 
         app.execute_direct_input(&DirectInput {
-            sender: super::ERC20_PORTAL_ADDRESS,
+            sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
             block_number: 123,
             payload: vec![0xaa; 10],
         })
         .expect("malformed trusted portal payload should be ignored");
 
         assert_eq!(app.executed_input_count(), 1);
+    }
+
+    #[test]
+    fn devnet_config_uses_deterministic_mock_usdc_address() {
+        let config = WalletConfig::devnet();
+        assert_eq!(
+            config.erc20_portal_address,
+            super::SEPOLIA_ERC20_PORTAL_ADDRESS
+        );
+        assert_eq!(
+            config.supported_erc20_token,
+            super::DEVNET_MOCK_USDC_ADDRESS
+        );
     }
 }

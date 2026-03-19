@@ -133,7 +133,7 @@ Each benchmark report must include:
 ## 7. Mapping to Current Harnesses
 
 1. `ack_latency`: primary path for `ack_latency_ms`.
-2. `e2e_latency`: primary path for `soft_confirm_latency_ms`.
+2. `round_trip_latency`: primary path for `soft_confirm_latency_ms`.
 3. `sweep`: capacity exploration and overload discovery.
 4. `unit_hot_path`: micro profiling.
 
@@ -141,4 +141,4 @@ Each benchmark report must include:
 
 1. Add first-class support for canonical injected-latency runs.
 2. Ensure reports always include network shaping tool and exact shaping config.
-3. Strengthen tx identity matching for e2e correlation if workloads ever stop guaranteeing effectively unique sender/payload pairs.
+3. Strengthen tx identity matching for round-trip correlation if workloads ever stop guaranteeing effectively unique sender/payload pairs.

@@ -1,5 +1,5 @@
 [package]
-name = "benchmarks"
+name = "rollups-harness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,19 +10,17 @@ readme.workspace = true
 authors.workspace = true
 
 [dependencies]
-sequencer-rust-client = { path = "../sdk/rust-client" }
-sequencer-core = { path = "../sequencer-core" }
-app-core = { path = "../examples/app-core" }
-alloy = { version = "1.0", features = ["contract", "network", "reqwest", "signer-local"] }
+app-core = { path = "../../examples/app-core" }
+alloy = { version = "1.0", features = ["contract", "network", "provider-anvil-api", "reqwest", "rpc-types", "signer-local"] }
 alloy-primitives = { version = "1.4.1", features = ["k256"] }
 alloy-sol-types = "1.4.1"
 cartesi-rollups-contracts = "=2.2.0"
 futures-util = "0.3"
 k256 = "0.13.4"
-clap = { version = "4", features = ["derive"] }
+sequencer-core = { path = "../../sequencer-core" }
+sequencer-rust-client = { path = "../../sdk/rust-client" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "process", "sync"] }
+tokio = { version = "1.35", features = ["net", "io-util", "process", "time"] }
 tokio-tungstenite = "0.28"
-tempfile = "3"

@@ -3,22 +3,15 @@
 
 use std::sync::OnceLock;
 
-use alloy_primitives::{Address, hex};
-
 const ANVIL_ACCOUNTS_RAW: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/anvil_accounts.txt"));
 
 #[derive(Debug)]
 struct ParsedAnvilAccounts {
-    addresses: Vec<Address>,
     private_keys: Vec<String>,
 }
 
 static PARSED_ANVIL_ACCOUNTS: OnceLock<ParsedAnvilAccounts> = OnceLock::new();
-
-pub fn prefunded_addresses() -> &'static [Address] {
-    parsed_anvil_accounts().addresses.as_slice()
-}
 
 pub fn default_private_keys() -> &'static [String] {
     parsed_anvil_accounts().private_keys.as_slice()
@@ -32,7 +25,6 @@ fn parsed_anvil_accounts() -> &'static ParsedAnvilAccounts {
 }
 
 fn parse_accounts(raw: &str) -> Result<ParsedAnvilAccounts, String> {
-    let mut addresses = Vec::new();
     let mut private_keys = Vec::new();
 
     for (line_no, line) in raw.lines().enumerate() {
@@ -54,37 +46,16 @@ fn parse_accounts(raw: &str) -> Result<ParsedAnvilAccounts, String> {
                 line_no + 1
             ));
         }
-
-        addresses.push(parse_hex_address(address, line_no + 1)?);
+        validate_hex_token(address, 42, "address", line_no + 1)?;
         validate_hex_token(private_key, 66, "private key", line_no + 1)?;
         private_keys.push(private_key.to_string());
     }
 
-    if addresses.is_empty() {
+    if private_keys.is_empty() {
         return Err("file does not contain any account records".to_string());
     }
-    if addresses.len() != private_keys.len() {
-        return Err("internal parser mismatch between addresses and keys".to_string());
-    }
 
-    Ok(ParsedAnvilAccounts {
-        addresses,
-        private_keys,
-    })
-}
-
-fn parse_hex_address(value: &str, line_no: usize) -> Result<Address, String> {
-    validate_hex_token(value, 42, "address", line_no)?;
-    let decoded = hex::decode(value)
-        .map_err(|err| format!("line {}: invalid address hex: {err}", line_no))?;
-    if decoded.len() != 20 {
-        return Err(format!(
-            "line {}: invalid address byte length: expected 20, got {}",
-            line_no,
-            decoded.len()
-        ));
-    }
-    Ok(Address::from_slice(decoded.as_slice()))
+    Ok(ParsedAnvilAccounts { private_keys })
 }
 
 fn validate_hex_token(
@@ -125,7 +96,6 @@ mod tests {
 0x2222222222222222222222222222222222222222 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 ";
         let parsed = parse_accounts(raw).expect("valid accounts");
-        assert_eq!(parsed.addresses.len(), 2);
         assert_eq!(parsed.private_keys.len(), 2);
     }
 

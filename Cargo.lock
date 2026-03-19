@@ -454,6 +454,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bdcbf9dfd5eea8bfeb078b1d906da8cd3a39c4d4dbe7a628025648e323611f6"
 dependencies = [
  "alloy-primitives",
+ "alloy-rpc-types-anvil",
  "alloy-rpc-types-eth",
  "alloy-serde",
  "serde",
@@ -1113,11 +1114,11 @@ dependencies = [
  "ethereum_ssz",
  "futures-util",
  "k256",
+ "rollups-harness",
  "sequencer-core",
  "sequencer-rust-client",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -3498,6 +3499,47 @@ checksum = "bb919243f34364b6bd2fc10ef797edbfa75f33c252e7998527479c6d6b47e1ec"
 dependencies = [
  "bytes",
  "rustc-hex",
+]
+
+[[package]]
+name = "rollups-e2e"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "alloy-sol-types",
+ "app-core",
+ "cartesi-rollups-contracts",
+ "ethereum_ssz",
+ "futures-util",
+ "k256",
+ "libtest-mimic",
+ "rollups-harness",
+ "sequencer-core",
+ "sequencer-rust-client",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "rollups-harness"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "alloy-sol-types",
+ "app-core",
+ "cartesi-rollups-contracts",
+ "ethereum_ssz",
+ "futures-util",
+ "k256",
+ "sequencer-core",
+ "sequencer-rust-client",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

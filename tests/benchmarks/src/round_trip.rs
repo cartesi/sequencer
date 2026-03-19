@@ -6,10 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use sequencer_core::api::WsTxMessage;
-use sequencer_rust_client::SequencerClient;
+use sequencer_rust_client::{SequencerClient, SubscribeStream};
 
 use crate::{
     BenchResult,
@@ -25,7 +24,7 @@ const DEFAULT_BACKLOG_DRAIN_IDLE_MS: u64 = 25;
 const DEFAULT_BACKLOG_DRAIN_MAX_MS: u64 = 2_000;
 
 #[derive(Debug, Clone)]
-pub struct E2eRunConfig {
+pub struct RoundTripRunConfig {
     pub endpoint: String,
     pub domain: BenchmarkDomain,
     pub from_offset: u64,
@@ -40,7 +39,7 @@ pub struct E2eRunConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct E2eRunReport {
+pub struct RoundTripRunReport {
     pub count: u64,
     pub endpoint: String,
     pub ws_subscribe_url: String,
@@ -55,12 +54,14 @@ pub struct E2eRunReport {
     pub total_wall: Duration,
     pub ack_latency_accepted: Stats,
     pub ack_latency_rejected: Option<Stats>,
-    pub e2e_latency_accepted: Stats,
+    pub round_trip_latency_accepted: Stats,
     pub memory: Option<runtime::MemoryReport>,
     pub sequencer_log_path: Option<String>,
 }
 
-pub async fn run_e2e_benchmark(config: E2eRunConfig) -> BenchResult<E2eRunReport> {
+pub async fn run_round_trip_benchmark(
+    config: RoundTripRunConfig,
+) -> BenchResult<RoundTripRunReport> {
     let timeout = Duration::from_millis(config.request_timeout_ms);
     let client = SequencerClient::new_with_timeout(config.endpoint.clone(), timeout)
         .map_err(|e| crate::support::err(format!("invalid endpoint '{}': {e}", config.endpoint)))?;
@@ -80,14 +81,11 @@ pub async fn run_e2e_benchmark(config: E2eRunConfig) -> BenchResult<E2eRunReport
         config.concurrency
     };
 
-    let mut ws = connect_async(ws_subscribe_url.as_str())
-        .await
-        .map(|(stream, _)| stream)
-        .map_err(|e| {
-            io_err(format!(
-                "ws connect failed: url={ws_subscribe_url}, error={e}"
-            ))
-        })?;
+    let mut ws = client.subscribe(config.from_offset).await.map_err(|err| {
+        io_err(format!(
+            "ws connect failed: url={ws_subscribe_url}, error={err}"
+        ))
+    })?;
     let mut consumed_ws_events_total = 0_u64;
 
     let drained_ws_backlog_events = drain_existing_ws_backlog(
@@ -101,7 +99,7 @@ pub async fn run_e2e_benchmark(config: E2eRunConfig) -> BenchResult<E2eRunReport
 
     let mut accepted_ack_samples = Vec::with_capacity(config.count as usize);
     let mut rejected_ack_samples = Vec::new();
-    let mut e2e_samples = Vec::with_capacity(config.count as usize);
+    let mut round_trip_samples = Vec::with_capacity(config.count as usize);
     let mut accepted = 0_u64;
     let mut rejected = 0_u64;
     let mut first_rejection: Option<String> = None;
@@ -161,7 +159,7 @@ pub async fn run_e2e_benchmark(config: E2eRunConfig) -> BenchResult<E2eRunReport
             .await?;
             consumed_ws_events_total =
                 consumed_ws_events_total.saturating_add(matched.consumed_events);
-            e2e_samples.append(&mut matched.e2e_samples);
+            round_trip_samples.append(&mut matched.round_trip_samples);
         }
 
         processed = processed.saturating_add(batch_size as u64);
@@ -181,32 +179,32 @@ pub async fn run_e2e_benchmark(config: E2eRunConfig) -> BenchResult<E2eRunReport
             .clone()
             .unwrap_or_else(|| "unknown rejection".to_string());
         return Err(std::io::Error::other(format!(
-            "e2e benchmark saw {rejected} rejection(s): {reason}"
+            "round-trip benchmark saw {rejected} rejection(s): {reason}"
         ))
         .into());
     }
 
     if accepted_ack_samples.is_empty() {
-        return Err(std::io::Error::other("e2e benchmark had no accepted txs").into());
+        return Err(std::io::Error::other("round-trip benchmark had no accepted txs").into());
     }
-    if e2e_samples.len() != accepted as usize {
+    if round_trip_samples.len() != accepted as usize {
         return Err(std::io::Error::other(format!(
-            "e2e sample mismatch: accepted={accepted}, matched_ws_events={}",
-            e2e_samples.len()
+            "round-trip sample mismatch: accepted={accepted}, matched_ws_events={}",
+            round_trip_samples.len()
         ))
         .into());
     }
 
     let total_wall = started.elapsed();
     let ack_stats = summarize(accepted_ack_samples.as_slice())?;
-    let e2e_stats = summarize(e2e_samples.as_slice())?;
+    let round_trip_stats = summarize(round_trip_samples.as_slice())?;
     let rejected_stats = if rejected_ack_samples.is_empty() {
         None
     } else {
         Some(summarize(rejected_ack_samples.as_slice())?)
     };
 
-    Ok(E2eRunReport {
+    Ok(RoundTripRunReport {
         count: config.count,
         endpoint: config.endpoint,
         ws_subscribe_url,
@@ -221,25 +219,25 @@ pub async fn run_e2e_benchmark(config: E2eRunConfig) -> BenchResult<E2eRunReport
         total_wall,
         ack_latency_accepted: ack_stats,
         ack_latency_rejected: rejected_stats,
-        e2e_latency_accepted: e2e_stats,
+        round_trip_latency_accepted: round_trip_stats,
         memory: None,
         sequencer_log_path: None,
     })
 }
 
 struct MatchResult {
-    e2e_samples: Vec<Duration>,
+    round_trip_samples: Vec<Duration>,
     consumed_events: u64,
 }
 
 async fn wait_for_matching_user_ops(
-    ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: &mut SubscribeStream,
     expected_submit_starts: &mut HashMap<String, Vec<Instant>>,
     max_wait: Duration,
 ) -> BenchResult<MatchResult> {
     let deadline = tokio::time::Instant::now() + max_wait;
     let expected_total: usize = expected_submit_starts.values().map(Vec::len).sum();
-    let mut e2e_samples = Vec::with_capacity(expected_total);
+    let mut round_trip_samples = Vec::with_capacity(expected_total);
     let mut consumed_events = 0_u64;
 
     while expected_submit_starts
@@ -272,19 +270,19 @@ async fn wait_for_matching_user_ops(
             if let Some(entries) = expected_submit_starts.get_mut(key.as_str())
                 && let Some(submit_started) = entries.pop()
             {
-                e2e_samples.push(submit_started.elapsed());
+                round_trip_samples.push(submit_started.elapsed());
             }
         }
     }
 
     Ok(MatchResult {
-        e2e_samples,
+        round_trip_samples,
         consumed_events,
     })
 }
 
 async fn drain_existing_ws_backlog(
-    ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: &mut SubscribeStream,
     idle_quiet_window: Duration,
     max_total: Duration,
 ) -> BenchResult<u64> {

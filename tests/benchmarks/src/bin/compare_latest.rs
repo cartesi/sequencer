@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use benchmarks::{
-    AckRunReport, BenchResult, BenchmarkJsonOutput, E2eRunReport, runtime::MemoryReport,
+    AckRunReport, BenchResult, BenchmarkJsonOutput, RoundTripRunReport,
+    runtime::{DEFAULT_RESULTS_DIR, MemoryReport},
 };
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
@@ -14,7 +15,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CompareKind {
     Ack,
-    E2e,
+    RoundTrip,
     Sweep,
     All,
 }
@@ -22,21 +23,21 @@ enum CompareKind {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SweepMode {
     Ack,
-    E2e,
+    RoundTrip,
 }
 
 impl SweepMode {
     fn file_prefix(self) -> &'static str {
         match self {
             Self::Ack => "ack-sweep-",
-            Self::E2e => "e2e-sweep-",
+            Self::RoundTrip => "round-trip-sweep-",
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Ack => "ack",
-            Self::E2e => "e2e",
+            Self::RoundTrip => "round-trip",
         }
     }
 }
@@ -45,11 +46,11 @@ impl SweepMode {
 #[command(name = "compare_latest")]
 #[command(about = "Compare the latest two benchmark result files")]
 struct Cli {
-    #[arg(long, default_value = "benchmarks/results")]
+    #[arg(long, default_value = DEFAULT_RESULTS_DIR)]
     results_dir: PathBuf,
     #[arg(long, value_enum, default_value_t = CompareKind::All)]
     kind: CompareKind,
-    #[arg(long, value_enum, default_value_t = SweepMode::E2e)]
+    #[arg(long, value_enum, default_value_t = SweepMode::RoundTrip)]
     sweep_mode: SweepMode,
 }
 
@@ -79,12 +80,12 @@ fn main() -> BenchResult<()> {
     let cli = Cli::parse();
     match cli.kind {
         CompareKind::Ack => compare_ack(&cli.results_dir)?,
-        CompareKind::E2e => compare_e2e(&cli.results_dir)?,
+        CompareKind::RoundTrip => compare_round_trip(&cli.results_dir)?,
         CompareKind::Sweep => compare_sweep(&cli.results_dir, cli.sweep_mode)?,
         CompareKind::All => {
             compare_ack(&cli.results_dir)?;
             println!();
-            compare_e2e(&cli.results_dir)?;
+            compare_round_trip(&cli.results_dir)?;
             println!();
             compare_sweep(&cli.results_dir, cli.sweep_mode)?;
         }
@@ -124,13 +125,13 @@ fn compare_ack(results_dir: &Path) -> BenchResult<()> {
     Ok(())
 }
 
-fn compare_e2e(results_dir: &Path) -> BenchResult<()> {
-    let (old_path, new_path) = latest_two_files(results_dir, "e2e-latency-", ".json")?;
-    let old = read_json::<BenchmarkJsonOutput<E2eRunReport, Value>>(&old_path)?;
-    let new = read_json::<BenchmarkJsonOutput<E2eRunReport, Value>>(&new_path)?;
+fn compare_round_trip(results_dir: &Path) -> BenchResult<()> {
+    let (old_path, new_path) = latest_two_files(results_dir, "round-trip-latency-", ".json")?;
+    let old = read_json::<BenchmarkJsonOutput<RoundTripRunReport, Value>>(&old_path)?;
+    let new = read_json::<BenchmarkJsonOutput<RoundTripRunReport, Value>>(&new_path)?;
 
     println!(
-        "E2E latest two:\n  old: {}\n  new: {}",
+        "ROUND-TRIP latest two:\n  old: {}\n  new: {}",
         old_path.display(),
         new_path.display()
     );
@@ -153,9 +154,9 @@ fn compare_e2e(results_dir: &Path) -> BenchResult<()> {
         &new.report.ack_latency_accepted,
     );
     print_stats_delta(
-        "e2e latency",
-        &old.report.e2e_latency_accepted,
-        &new.report.e2e_latency_accepted,
+        "round-trip latency",
+        &old.report.round_trip_latency_accepted,
+        &new.report.round_trip_latency_accepted,
     );
     print_memory_delta(old.report.memory.as_ref(), new.report.memory.as_ref());
     Ok(())

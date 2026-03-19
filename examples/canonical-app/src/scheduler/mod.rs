@@ -141,7 +141,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_scheduler_forever(
                 rollup,
-                WalletApp::new(WalletConfig),
+                WalletApp::new(WalletConfig::default()),
                 SchedulerConfig::default(),
             )
         }));
