@@ -6,8 +6,12 @@ use std::time::Duration;
 use alloy::eips::BlockNumberOrTag::Safe;
 use alloy::providers::Provider;
 use alloy::providers::ProviderBuilder;
+use alloy::sol_types::SolInterface;
 use alloy_primitives::{Address, U256};
 use cartesi_rollups_contracts::application::Application;
+use cartesi_rollups_contracts::data_availability::DataAvailability::{
+    DataAvailabilityCalls, InputBoxAndEspressoCall, InputBoxCall,
+};
 use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -258,14 +262,22 @@ impl InputReader {
 }
 
 fn decode_input_box_address(data_availability: &[u8]) -> Result<Address, InputReaderError> {
-    if data_availability.len() != 20 {
-        return Err(InputReaderError::Provider(format!(
-            "application getDataAvailability returned {} bytes; expected 20-byte InputBox address",
-            data_availability.len()
-        )));
-    }
+    let call = DataAvailabilityCalls::abi_decode(data_availability).map_err(|err| {
+        InputReaderError::Provider(format!(
+            "application getDataAvailability returned invalid DataAvailability calldata: {err}"
+        ))
+    })?;
 
-    Ok(Address::from_slice(data_availability))
+    match call {
+        DataAvailabilityCalls::InputBox(InputBoxCall { inputBox }) => Ok(inputBox),
+        DataAvailabilityCalls::InputBoxAndEspresso(InputBoxAndEspressoCall {
+            inputBox,
+            fromBlock,
+            namespaceId,
+        }) => Err(InputReaderError::Provider(format!(
+            "application getDataAvailability returned unsupported DataAvailability.InputBoxAndEspresso(inputBox={inputBox}, fromBlock={fromBlock}, namespaceId={namespaceId})"
+        ))),
+    }
 }
 
 async fn latest_safe_block(provider: &impl Provider) -> Result<u64, InputReaderError> {
@@ -281,6 +293,7 @@ async fn latest_safe_block(provider: &impl Provider) -> Result<u64, InputReaderE
 mod tests {
     use super::*;
     use alloy::node_bindings::Anvil;
+    use alloy::sol_types::SolCall;
     use tempfile::NamedTempFile;
 
     fn test_reader(
@@ -478,15 +491,43 @@ mod tests {
     }
 
     #[test]
-    fn decode_input_box_address_requires_exactly_20_bytes() {
+    fn decode_input_box_address_rejects_non_abi_payloads() {
         let err = decode_input_box_address(&[0_u8; 19]).expect_err("short bytes should fail");
         assert!(
             err.to_string()
-                .contains("expected 20-byte InputBox address")
+                .contains("invalid DataAvailability calldata")
         );
 
-        let address =
-            decode_input_box_address(&[0x22; 20]).expect("20-byte data availability address");
-        assert_eq!(address, Address::from([0x22; 20]));
+        let err = decode_input_box_address(&[0x22; 20]).expect_err("raw address bytes should fail");
+        assert!(
+            err.to_string()
+                .contains("invalid DataAvailability calldata")
+        );
+    }
+
+    #[test]
+    fn decode_input_box_address_decodes_input_box_call() {
+        let expected = Address::from([0x22; 20]);
+        let encoded = InputBoxCall { inputBox: expected }.abi_encode();
+
+        let address = decode_input_box_address(&encoded).expect("InputBox call should decode");
+        assert_eq!(address, expected);
+    }
+
+    #[test]
+    fn decode_input_box_address_rejects_unsupported_variants() {
+        let encoded = InputBoxAndEspressoCall {
+            inputBox: Address::from([0x33; 20]),
+            fromBlock: U256::from(123_u64),
+            namespaceId: 42,
+        }
+        .abi_encode();
+
+        let err = decode_input_box_address(&encoded)
+            .expect_err("InputBoxAndEspresso should be rejected");
+        assert!(
+            err.to_string()
+                .contains("unsupported DataAvailability.InputBoxAndEspresso")
+        );
     }
 }
