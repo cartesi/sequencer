@@ -60,6 +60,7 @@ fn replay_sequenced_l2_tx(
     match item {
         SequencedL2Tx::UserOp(value) => {
             app.execute_valid_user_op(&value)
+                .map(|_| ())
                 .map_err(|err| CatchUpError::ReplayUserOpInternal {
                     reason: err.to_string(),
                 })
@@ -69,11 +70,11 @@ fn replay_sequenced_l2_tx(
                 return Ok(());
             }
 
-            app.execute_direct_input(&direct).map_err(|err| {
-                CatchUpError::ReplayDirectInputInternal {
+            app.execute_direct_input(&direct)
+                .map(|_| ())
+                .map_err(|err| CatchUpError::ReplayDirectInputInternal {
                     reason: err.to_string(),
-                }
-            })
+                })
         }
     }
 }

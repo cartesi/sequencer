@@ -325,7 +325,7 @@ fn execute_user_op(
         &item.signed.user_op,
         current_frame_fee,
     ) {
-        Ok(ExecutionOutcome::Included) => included.push(item),
+        Ok(ExecutionOutcome::Included { .. }) => included.push(item),
         Ok(ExecutionOutcome::Invalid(reason)) => {
             let _ = item
                 .respond_to

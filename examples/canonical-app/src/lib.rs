@@ -3,4 +3,6 @@
 
 pub mod scheduler;
 
-pub use scheduler::{SEQUENCER_ADDRESS, SchedulerConfig, run_scheduler_forever};
+pub use scheduler::{
+    DEVNET_SEQUENCER_ADDRESS, SEPOLIA_SEQUENCER_ADDRESS, SchedulerConfig, run_scheduler_forever,
+};

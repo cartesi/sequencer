@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::shutdown::ShutdownSignal;
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
-use sequencer_core::application::{AppError, Application, InvalidReason};
+use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 
@@ -49,16 +49,16 @@ impl Application for TestApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<(), AppError> {
+    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
         let next_nonce = self.current_user_nonce(user_op.sender).wrapping_add(1);
         self.nonces.insert(user_op.sender, next_nonce);
         self.executed_input_count = self.executed_input_count.saturating_add(1);
-        Ok(())
+        Ok(Vec::new())
     }
 
-    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<(), AppError> {
+    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
         self.executed_input_count = self.executed_input_count.saturating_add(1);
-        Ok(())
+        Ok(Vec::new())
     }
 
     fn executed_input_count(&self) -> u64 {
@@ -113,13 +113,13 @@ impl Application for SharedCountingApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, _user_op: &ValidUserOp) -> Result<(), AppError> {
-        Ok(())
+    fn execute_valid_user_op(&mut self, _user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
+        Ok(Vec::new())
     }
 
-    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<(), AppError> {
+    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
         self.executed_direct_inputs.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
@@ -158,23 +158,23 @@ impl Application for ReplayRecordingApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<(), AppError> {
+    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
         self.replayed.push(ReplayEvent::UserOp {
             sender: user_op.sender,
             data: user_op.data.clone(),
         });
         self.executed_input_count = self.executed_input_count.saturating_add(1);
-        Ok(())
+        Ok(Vec::new())
     }
 
-    fn execute_direct_input(&mut self, input: &DirectInput) -> Result<(), AppError> {
+    fn execute_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
         self.replayed.push(ReplayEvent::DirectInput {
             sender: input.sender,
             block_number: input.block_number,
             payload: input.payload.clone(),
         });
         self.executed_input_count = self.executed_input_count.saturating_add(1);
-        Ok(())
+        Ok(Vec::new())
     }
 
     fn executed_input_count(&self) -> u64 {

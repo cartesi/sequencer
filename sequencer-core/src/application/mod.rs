@@ -14,20 +14,32 @@ pub enum AppError {
     Internal { reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionOutcome {
     // NOTE: this is a transaction that may fail execution but still be included.
     // We don't need to differentiate it now necessarily, but we can.
-    Included,
+    Included { outputs: AppOutputs },
 
     Invalid(InvalidReason),
 }
 
 impl ExecutionOutcome {
     pub fn is_included(&self) -> bool {
-        matches!(self, Self::Included)
+        matches!(self, Self::Included { .. })
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppOutput {
+    Notice(Vec<u8>),
+    Voucher {
+        destination: Address,
+        value: U256,
+        payload: Vec<u8>,
+    },
+}
+
+pub type AppOutputs = Vec<AppOutput>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidReason {
@@ -72,7 +84,7 @@ pub trait Application: Send {
         current_fee: u64,
     ) -> Result<(), InvalidReason>;
 
-    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<(), AppError>;
+    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError>;
 
     fn validate_and_execute_user_op(
         &mut self,
@@ -89,12 +101,12 @@ pub trait Application: Send {
             fee: current_fee,
             data: user_op.data.to_vec(),
         };
-        self.execute_valid_user_op(&valid)?;
-        Ok(ExecutionOutcome::Included)
+        let outputs = self.execute_valid_user_op(&valid)?;
+        Ok(ExecutionOutcome::Included { outputs })
     }
 
-    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<(), AppError> {
-        Ok(())
+    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
+        Ok(Vec::new())
     }
 
     fn executed_input_count(&self) -> u64 {

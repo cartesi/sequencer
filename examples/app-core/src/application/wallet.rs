@@ -6,10 +6,13 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, U256, address};
 use ssz::Decode;
 use tracing::{error, warn};
+use types::alloy_sol_types::SolCall;
+use types::{Erc20Deposit, Erc20Transfer};
 
 use super::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
 use super::Method;
-use sequencer_core::application::{AppError, Application, InvalidReason};
+use super::{DepositNotice, TransferNotice};
+use sequencer_core::application::{AppError, AppOutput, AppOutputs, Application, InvalidReason};
 use sequencer_core::l2_tx::ValidUserOp;
 use sequencer_core::user_op::UserOp;
 
@@ -54,15 +57,6 @@ pub const SEPOLIA_ERC20_PORTAL_ADDRESS: Address =
 pub const SEPOLIA_USDC_ADDRESS: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
 pub const DEVNET_MOCK_USDC_ADDRESS: Address =
     address!("0x95d0c8A7d11342299807A2Fc19ac44C2321cCc68");
-const ERC20_DEPOSIT_PREFIX_BYTES: usize = 20 + 20 + 32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Erc20Deposit {
-    token: Address,
-    sender: Address,
-    value: U256,
-}
-
 impl WalletApp {
     pub fn new(config: WalletConfig) -> Self {
         Self {
@@ -103,23 +97,12 @@ impl WalletApp {
     fn decode_portal_erc20_deposit(
         portal_address: Address,
         input: &sequencer_core::l2_tx::DirectInput,
-    ) -> Result<Option<Erc20Deposit>, String> {
+    ) -> Result<Option<Erc20Deposit>, types::Erc20DepositDecodeError> {
         if input.sender != portal_address {
             return Ok(None);
         }
 
-        if input.payload.len() < ERC20_DEPOSIT_PREFIX_BYTES {
-            return Err(format!(
-                "trusted ERC-20 portal payload too short: expected at least {ERC20_DEPOSIT_PREFIX_BYTES} bytes, got {}",
-                input.payload.len()
-            ));
-        }
-
-        Ok(Some(Erc20Deposit {
-            token: Address::from_slice(&input.payload[0..20]),
-            sender: Address::from_slice(&input.payload[20..40]),
-            value: U256::from_be_slice(&input.payload[40..72]),
-        }))
+        Erc20Deposit::decode(&input.payload).map(Some)
     }
 }
 
@@ -175,7 +158,7 @@ impl Application for WalletApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<(), AppError> {
+    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
         let sender = user_op.sender;
         let gas_cost = U256::from(user_op.fee);
         let balance = self.balance_of(&sender);
@@ -187,32 +170,60 @@ impl Application for WalletApp {
 
         self.bump_nonce(sender);
         self.balances.insert(sender, balance - gas_cost);
+        let mut outputs = Vec::new();
 
         let method = Method::from_ssz_bytes(user_op.data.as_slice()).ok();
         match method.as_ref() {
             Some(Method::Transfer(transfer)) => {
                 if self.debit_if_possible(sender, transfer.amount) {
                     self.credit(transfer.to, transfer.amount);
+                    outputs.push(AppOutput::Notice(
+                        TransferNotice {
+                            sender,
+                            recipient: transfer.to,
+                            amount: transfer.amount,
+                        }
+                        .abi_encode(),
+                    ));
                 }
             }
             Some(Method::Withdrawal(withdrawal)) => {
-                let _ = self.debit_if_possible(sender, withdrawal.amount);
+                if self.debit_if_possible(sender, withdrawal.amount) {
+                    outputs.push(AppOutput::Voucher {
+                        destination: self.config.supported_erc20_token,
+                        value: U256::ZERO,
+                        payload: Erc20Transfer {
+                            recipient: sender,
+                            amount: withdrawal.amount,
+                        }
+                        .abi_encode(),
+                    });
+                }
             }
             None => {}
         }
 
         self.executed_input_count = self.executed_input_count.saturating_add(1);
-        Ok(())
+        Ok(outputs)
     }
 
     fn execute_direct_input(
         &mut self,
         input: &sequencer_core::l2_tx::DirectInput,
-    ) -> Result<(), AppError> {
+    ) -> Result<AppOutputs, AppError> {
+        let mut outputs = Vec::new();
         match Self::decode_portal_erc20_deposit(self.config.erc20_portal_address, input) {
             Ok(Some(deposit)) => {
                 if deposit.token == self.config.supported_erc20_token {
                     self.credit(deposit.sender, deposit.value);
+                    outputs.push(AppOutput::Notice(
+                        DepositNotice {
+                            token: deposit.token,
+                            sender: deposit.sender,
+                            amount: deposit.value,
+                        }
+                        .abi_encode(),
+                    ));
                 } else {
                     warn!(
                         portal = %input.sender,
@@ -235,7 +246,7 @@ impl Application for WalletApp {
         }
 
         self.executed_input_count = self.executed_input_count.saturating_add(1);
-        Ok(())
+        Ok(outputs)
     }
 
     fn executed_input_count(&self) -> u64 {
@@ -247,9 +258,13 @@ impl Application for WalletApp {
 mod tests {
     use alloy_primitives::{Address, U256, address};
     use ssz_derive::{Decode, Encode};
+    use types::ERC20_DEPOSIT_PREFIX_BYTES;
+    use types::Erc20Transfer;
+    use types::alloy_sol_types::SolCall;
 
     use super::{WalletApp, WalletConfig};
-    use sequencer_core::application::{Application, InvalidReason};
+    use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};
+    use sequencer_core::application::{AppOutput, Application, InvalidReason};
     use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
     use sequencer_core::user_op::UserOp;
 
@@ -288,10 +303,11 @@ mod tests {
             fee: 3,
             data: Vec::new(),
         };
-        app.execute_valid_user_op(&valid).expect("execute valid op");
+        let outputs = app.execute_valid_user_op(&valid).expect("execute valid op");
 
         assert_eq!(app.current_user_nonce(sender), 1);
         assert_eq!(app.current_user_balance(sender), U256::from(7_u64));
+        assert!(outputs.is_empty());
     }
 
     #[test]
@@ -349,16 +365,18 @@ mod tests {
             data: ssz::Encode::as_ssz_bytes(&legacy),
         };
 
-        app.execute_valid_user_op(&valid)
+        let outputs = app
+            .execute_valid_user_op(&valid)
             .expect("execute valid user op");
 
         assert_eq!(app.current_user_nonce(sender), before_sender_nonce + 1);
         assert_eq!(app.current_user_balance(sender), before_sender_balance);
         assert_eq!(app.current_user_balance(recipient), before_recipient);
+        assert!(outputs.is_empty());
     }
 
     fn encode_erc20_deposit_payload(token: Address, sender: Address, value: U256) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(super::ERC20_DEPOSIT_PREFIX_BYTES);
+        let mut payload = Vec::with_capacity(ERC20_DEPOSIT_PREFIX_BYTES);
         payload.extend_from_slice(token.as_slice());
         payload.extend_from_slice(sender.as_slice());
         payload.extend_from_slice(value.to_be_bytes::<32>().as_slice());
@@ -371,22 +389,33 @@ mod tests {
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
 
         let before = app.current_user_balance(nested_sender);
-        app.execute_direct_input(&DirectInput {
-            sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
-            block_number: 123,
-            payload: encode_erc20_deposit_payload(
-                super::SEPOLIA_USDC_ADDRESS,
-                nested_sender,
-                U256::from(250_u64),
-            ),
-        })
-        .expect("execute deposit direct input");
+        let outputs = app
+            .execute_direct_input(&DirectInput {
+                sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
+                block_number: 123,
+                payload: encode_erc20_deposit_payload(
+                    super::SEPOLIA_USDC_ADDRESS,
+                    nested_sender,
+                    U256::from(250_u64),
+                ),
+            })
+            .expect("execute deposit direct input");
 
         assert_eq!(
             app.current_user_balance(nested_sender),
             before + U256::from(250_u64)
         );
         assert_eq!(app.executed_input_count(), 1);
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            AppOutput::Notice(payload) => {
+                let notice = DepositNotice::abi_decode(payload).expect("decode deposit notice");
+                assert_eq!(notice.token, super::SEPOLIA_USDC_ADDRESS);
+                assert_eq!(notice.sender, nested_sender);
+                assert_eq!(notice.amount, U256::from(250_u64));
+            }
+            other => panic!("expected deposit notice, got {other:?}"),
+        }
     }
 
     #[test]
@@ -395,19 +424,21 @@ mod tests {
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
 
         let before = app.current_user_balance(nested_sender);
-        app.execute_direct_input(&DirectInput {
-            sender: address!("0x3333333333333333333333333333333333333333"),
-            block_number: 123,
-            payload: encode_erc20_deposit_payload(
-                super::SEPOLIA_USDC_ADDRESS,
-                nested_sender,
-                U256::from(250_u64),
-            ),
-        })
-        .expect("execute non-portal direct input");
+        let outputs = app
+            .execute_direct_input(&DirectInput {
+                sender: address!("0x3333333333333333333333333333333333333333"),
+                block_number: 123,
+                payload: encode_erc20_deposit_payload(
+                    super::SEPOLIA_USDC_ADDRESS,
+                    nested_sender,
+                    U256::from(250_u64),
+                ),
+            })
+            .expect("execute non-portal direct input");
 
         assert_eq!(app.current_user_balance(nested_sender), before);
         assert_eq!(app.executed_input_count(), 1);
+        assert!(outputs.is_empty());
     }
 
     #[test]
@@ -417,33 +448,106 @@ mod tests {
         let unsupported_token = address!("0x9999999999999999999999999999999999999999");
 
         let before = app.current_user_balance(nested_sender);
-        app.execute_direct_input(&DirectInput {
-            sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
-            block_number: 123,
-            payload: encode_erc20_deposit_payload(
-                unsupported_token,
-                nested_sender,
-                U256::from(250_u64),
-            ),
-        })
-        .expect("unsupported token should be ignored");
+        let outputs = app
+            .execute_direct_input(&DirectInput {
+                sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
+                block_number: 123,
+                payload: encode_erc20_deposit_payload(
+                    unsupported_token,
+                    nested_sender,
+                    U256::from(250_u64),
+                ),
+            })
+            .expect("unsupported token should be ignored");
 
         assert_eq!(app.current_user_balance(nested_sender), before);
         assert_eq!(app.executed_input_count(), 1);
+        assert!(outputs.is_empty());
     }
 
     #[test]
     fn malformed_trusted_portal_deposit_is_a_no_op() {
         let mut app = WalletApp::new(WalletConfig::default());
 
-        app.execute_direct_input(&DirectInput {
-            sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
-            block_number: 123,
-            payload: vec![0xaa; 10],
-        })
-        .expect("malformed trusted portal payload should be ignored");
+        let outputs = app
+            .execute_direct_input(&DirectInput {
+                sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
+                block_number: 123,
+                payload: vec![0xaa; 10],
+            })
+            .expect("malformed trusted portal payload should be ignored");
 
         assert_eq!(app.executed_input_count(), 1);
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn transfer_emits_notice() {
+        let mut app = WalletApp::new(WalletConfig::default());
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        app.balances.insert(sender, U256::from(500_u64));
+
+        let valid = ValidUserOp {
+            sender,
+            fee: 10,
+            data: ssz::Encode::as_ssz_bytes(&super::Method::Transfer(Transfer {
+                amount: U256::from(123_u64),
+                to: recipient,
+            })),
+        };
+
+        let outputs = app.execute_valid_user_op(&valid).expect("execute transfer");
+
+        assert_eq!(app.current_user_balance(sender), U256::from(367_u64));
+        assert_eq!(app.current_user_balance(recipient), U256::from(123_u64));
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            AppOutput::Notice(payload) => {
+                let notice = TransferNotice::abi_decode(payload).expect("decode transfer notice");
+                assert_eq!(notice.sender, sender);
+                assert_eq!(notice.recipient, recipient);
+                assert_eq!(notice.amount, U256::from(123_u64));
+            }
+            other => panic!("expected transfer notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn withdrawal_emits_voucher() {
+        let mut app = WalletApp::new(WalletConfig::default());
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        app.balances.insert(sender, U256::from(500_u64));
+
+        let valid = ValidUserOp {
+            sender,
+            fee: 10,
+            data: ssz::Encode::as_ssz_bytes(&super::Method::Withdrawal(Withdrawal {
+                amount: U256::from(123_u64),
+            })),
+        };
+
+        let outputs = app
+            .execute_valid_user_op(&valid)
+            .expect("execute withdrawal");
+
+        assert_eq!(app.current_user_balance(sender), U256::from(367_u64));
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            AppOutput::Voucher {
+                destination,
+                value,
+                payload,
+            } => {
+                assert_eq!(*destination, super::SEPOLIA_USDC_ADDRESS);
+                assert_eq!(*value, U256::ZERO);
+                let transfer =
+                    Erc20Transfer::abi_decode(payload).expect("decode withdrawal voucher");
+                assert_eq!(transfer.recipient, sender);
+                assert_eq!(transfer.amount, U256::from(123_u64));
+            }
+            other => panic!("expected withdrawal voucher, got {other:?}"),
+        }
     }
 
     #[test]

@@ -14,6 +14,10 @@ name = "canonical-test"
 path = "src/main.rs"
 
 [dependencies]
+app-core = { path = "../app-core" }
 canonical-app = { path = "../canonical-app" }
+sequencer-core = { path = "../../sequencer-core" }
+ssz = { package = "ethereum_ssz", version = "0.10" }
 testsi = { workspace = true }
 types = { workspace = true }
+k256 = "0.13"

@@ -16,7 +16,7 @@ trolley = { workspace = true }
 alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
 alloy-sol-types = "1.4.1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
+types = { workspace = true }
 
 [dev-dependencies]
 k256 = "0.13"
-types = { workspace = true }

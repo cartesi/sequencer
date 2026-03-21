@@ -751,10 +751,12 @@ name = "app-core"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-sol-types",
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "sequencer-core",
  "tracing",
+ "types",
 ]
 
 [[package]]
@@ -1296,7 +1298,11 @@ dependencies = [
 name = "canonical-test"
 version = "0.1.0"
 dependencies = [
+ "app-core",
  "canonical-app",
+ "ethereum_ssz",
+ "k256",
+ "sequencer-core",
  "testsi",
  "types",
 ]
@@ -2677,7 +2683,7 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 [[package]]
 name = "libcmt-sys"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86#c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86"
 dependencies = [
  "ar",
  "bindgen",
@@ -4230,7 +4236,7 @@ dependencies = [
 [[package]]
 name = "testsi"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86#c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86"
 dependencies = [
  "cartesi-machine",
  "inventory",
@@ -4243,7 +4249,7 @@ dependencies = [
 [[package]]
 name = "testsi-macros"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86#c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4580,7 +4586,7 @@ dependencies = [
 [[package]]
 name = "trolley"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86#c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86"
 dependencies = [
  "libcmt-sys",
  "types",
@@ -4618,7 +4624,7 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 [[package]]
 name = "types"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=786e0529cb802aa1675f6f42c06d86a302ab515b#786e0529cb802aa1675f6f42c06d86a302ab515b"
+source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86#c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
