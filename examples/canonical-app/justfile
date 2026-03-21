@@ -11,8 +11,8 @@ dapp_binary_sepolia := out_dir + "/dapp-sepolia"
 machine_image_sepolia := out_dir + "/canonical-machine-image-sepolia"
 
 download-deps:
-    mkdir -p {{out_dir}}
-    if [[ ! -f {{linux_kernel}} ]]; then wget https://github.com/cartesi/image-kernel/releases/download/v0.20.0/linux-6.5.13-ctsi-1-v0.20.0.bin -O {{linux_kernel}}; fi
+    @mkdir -p {{out_dir}}
+    @if [[ ! -f {{linux_kernel}} ]]; then wget https://github.com/cartesi/image-kernel/releases/download/v0.20.0/linux-6.5.13-ctsi-1-v0.20.0.bin -O {{linux_kernel}}; fi
 
 build-dapp: build-dapp-devnet
 

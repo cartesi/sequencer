@@ -49,9 +49,7 @@ pub fn run_scheduler_forever<R: Rollup, A: Application>(
             Ok(RollupRequest::Inspect { .. }) => {
                 rollup
                     .emit_report(b"scheduler inspect endpoint not implemented")
-                    .unwrap_or_else(|err| {
-                        panic!("scheduler failed to emit inspect report: {err}")
-                    });
+                    .unwrap_or_else(|err| panic!("scheduler failed to emit inspect report: {err}"));
             }
             Err(err) => panic!("scheduler failed while reading next input: {err}"),
         }

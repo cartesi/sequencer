@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -98,7 +98,7 @@ jobs:
           tar -C package -czf "dist/sequencer-${TAG}-linux-${ARCH}.tar.gz" "sequencer-${TAG}-linux-${ARCH}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sequencer-linux-${{ matrix.arch }}
           path: dist/sequencer-*.tar.gz
@@ -108,7 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -205,7 +205,7 @@ jobs:
           tar -C examples/canonical-app/out -czf "dist/canonical-machine-image-${TAG}.tar.gz" canonical-machine-image
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: canonical-machine-image
           path: dist/canonical-machine-image-*.tar.gz
@@ -218,7 +218,7 @@ jobs:
       - build-canonical-machine-image
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
 
@@ -243,4 +243,3 @@ jobs:
           files: |
             out/*.tar.gz
             out/SHA256SUMS
-
