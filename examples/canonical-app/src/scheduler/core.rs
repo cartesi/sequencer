@@ -4,12 +4,15 @@
 use alloy_primitives::{Address, Signature, U256, address};
 use alloy_sol_types::Eip712Domain;
 use alloy_sol_types::SolStruct;
-use sequencer_core::application::Application;
+use sequencer_core::application::{AppOutputs, Application};
 use sequencer_core::batch::{Batch, Frame, WireUserOp};
 use sequencer_core::l2_tx::DirectInput;
 use std::collections::VecDeque;
 
-pub const SEQUENCER_ADDRESS: Address = address!("0x1111111111111111111111111111111111111111");
+pub const DEVNET_SEQUENCER_ADDRESS: Address =
+    address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+pub const SEPOLIA_SEQUENCER_ADDRESS: Address =
+    address!("0x16d5FF3Fdd14e2a86FBA77cbcE6B3Cd9C32b8Ff3");
 pub const MAX_WAIT_BLOCKS: u64 = 1200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,12 +21,25 @@ pub struct SchedulerConfig {
     pub max_wait_blocks: u64,
 }
 
-impl Default for SchedulerConfig {
-    fn default() -> Self {
+impl SchedulerConfig {
+    pub const fn devnet() -> Self {
         Self {
-            sequencer_address: SEQUENCER_ADDRESS,
+            sequencer_address: DEVNET_SEQUENCER_ADDRESS,
             max_wait_blocks: MAX_WAIT_BLOCKS,
         }
+    }
+
+    pub const fn sepolia() -> Self {
+        Self {
+            sequencer_address: SEPOLIA_SEQUENCER_ADDRESS,
+            max_wait_blocks: MAX_WAIT_BLOCKS,
+        }
+    }
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self::sepolia()
     }
 }
 
@@ -39,7 +55,44 @@ pub(super) struct SchedulerInput {
 pub(super) enum ProcessOutcome {
     DirectEnqueued,
     BatchExecuted,
-    BatchInvalid,
+    BatchSkippedStale,
+    BatchRejected(BatchRejectReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProcessResult {
+    pub outcome: ProcessOutcome,
+    pub outputs: AppOutputs,
+}
+
+impl ProcessResult {
+    fn new(outcome: ProcessOutcome, outputs: AppOutputs) -> Self {
+        Self { outcome, outputs }
+    }
+
+    fn without_outputs(outcome: ProcessOutcome) -> Self {
+        Self::new(outcome, Vec::new())
+    }
+}
+
+impl PartialEq<ProcessOutcome> for ProcessResult {
+    fn eq(&self, other: &ProcessOutcome) -> bool {
+        self.outcome == *other
+    }
+}
+
+impl PartialEq<ProcessResult> for ProcessOutcome {
+    fn eq(&self, other: &ProcessResult) -> bool {
+        *self == other.outcome
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BatchRejectReason {
+    DecodeFailed,
+    WrongNonce { expected: u64, got: u64 },
+    SafeBlockAboveInclusionBlock,
+    NonMonotonicSafeBlocks,
 }
 
 #[derive(Debug)]
@@ -72,9 +125,15 @@ impl<A: Application> Scheduler<A> {
         self.direct_q.len()
     }
 
-    pub(super) fn process_input(&mut self, input: SchedulerInput) -> ProcessOutcome {
+    #[cfg(test)]
+    pub fn next_expected_batch_nonce(&self) -> u64 {
+        self.next_expected_batch_nonce
+    }
+
+    pub(super) fn process_input(&mut self, input: SchedulerInput) -> ProcessResult {
         // Execute overdue directs before any input to keep backstop semantics explicit.
-        self.force_execute_overdue(input.inclusion_block);
+        let mut outputs = Vec::new();
+        self.force_execute_overdue(input.inclusion_block, &mut outputs);
 
         if input.sender != self.config.sequencer_address {
             self.direct_q.push_back(QueuedDirectInput {
@@ -82,9 +141,12 @@ impl<A: Application> Scheduler<A> {
                 payload: input.payload,
                 inclusion_block: input.inclusion_block,
             });
-            ProcessOutcome::DirectEnqueued
+            ProcessResult::new(ProcessOutcome::DirectEnqueued, outputs)
         } else {
-            self.process_batch_payload(input.inclusion_block, &input.domain, &input.payload)
+            let batch_result =
+                self.process_batch_payload(input.inclusion_block, &input.domain, &input.payload);
+            outputs.extend(batch_result.outputs);
+            ProcessResult::new(batch_result.outcome, outputs)
         }
     }
 
@@ -93,22 +155,31 @@ impl<A: Application> Scheduler<A> {
         inclusion_block: u64,
         domain: &Eip712Domain,
         payload: &[u8],
-    ) -> ProcessOutcome {
+    ) -> ProcessResult {
         let Ok(batch): Result<Batch, _> = ssz::Decode::from_ssz_bytes(payload) else {
-            return ProcessOutcome::BatchInvalid;
+            return ProcessResult::without_outputs(ProcessOutcome::BatchRejected(
+                BatchRejectReason::DecodeFailed,
+            ));
         };
 
         if batch.nonce != self.next_expected_batch_nonce {
-            return ProcessOutcome::BatchInvalid;
+            return ProcessResult::without_outputs(ProcessOutcome::BatchRejected(
+                BatchRejectReason::WrongNonce {
+                    expected: self.next_expected_batch_nonce,
+                    got: batch.nonce,
+                },
+            ));
         }
 
         let Some((frame_head, frame_tail)) = batch.frames.split_first() else {
-            self.next_expected_batch_nonce = batch.nonce + 1;
-            return ProcessOutcome::BatchExecuted;
+            self.advance_expected_batch_nonce();
+            return ProcessResult::without_outputs(ProcessOutcome::BatchExecuted);
         };
 
-        if !self.batch_is_valid_for_block(inclusion_block, frame_head, frame_tail) {
-            return ProcessOutcome::BatchInvalid;
+        if let Some(reason) =
+            self.batch_reject_reason_for_block(inclusion_block, frame_head, frame_tail)
+        {
+            return ProcessResult::without_outputs(ProcessOutcome::BatchRejected(reason));
         }
 
         if has_elapsed_since(
@@ -116,37 +187,57 @@ impl<A: Application> Scheduler<A> {
             self.config.max_wait_blocks,
             inclusion_block,
         ) {
-            // Invalidate old batches
-            return ProcessOutcome::BatchInvalid;
+            self.advance_expected_batch_nonce();
+            return ProcessResult::without_outputs(ProcessOutcome::BatchSkippedStale);
         }
 
+        let mut outputs = Vec::new();
         for frame in &batch.frames {
-            self.drain_directs_safe_at(frame.safe_block);
-            self.execute_frame_user_ops(domain, frame);
+            self.drain_directs_safe_at(frame.safe_block, &mut outputs);
+            self.execute_frame_user_ops(domain, frame, &mut outputs);
         }
 
-        self.next_expected_batch_nonce = batch.nonce + 1;
-        ProcessOutcome::BatchExecuted
+        self.advance_expected_batch_nonce();
+        ProcessResult::new(ProcessOutcome::BatchExecuted, outputs)
     }
 
-    fn batch_is_valid_for_block(&self, inclusion_block: u64, head: &Frame, tail: &[Frame]) -> bool {
+    fn advance_expected_batch_nonce(&mut self) {
+        self.next_expected_batch_nonce = self
+            .next_expected_batch_nonce
+            .checked_add(1)
+            .expect("batch nonce overflow");
+    }
+
+    fn batch_reject_reason_for_block(
+        &self,
+        inclusion_block: u64,
+        head: &Frame,
+        tail: &[Frame],
+    ) -> Option<BatchRejectReason> {
         if head.safe_block > inclusion_block {
-            return false;
+            return Some(BatchRejectReason::SafeBlockAboveInclusionBlock);
         }
 
         let mut previous_safe_block = head.safe_block;
         for frame in tail {
-            if frame.safe_block > inclusion_block || frame.safe_block < previous_safe_block {
-                return false;
+            if frame.safe_block > inclusion_block {
+                return Some(BatchRejectReason::SafeBlockAboveInclusionBlock);
+            } else if frame.safe_block < previous_safe_block {
+                return Some(BatchRejectReason::NonMonotonicSafeBlocks);
+            } else {
+                previous_safe_block = frame.safe_block;
             }
-
-            previous_safe_block = frame.safe_block;
         }
 
-        true
+        None
     }
 
-    fn execute_frame_user_ops(&mut self, domain: &Eip712Domain, frame: &Frame) {
+    fn execute_frame_user_ops(
+        &mut self,
+        domain: &Eip712Domain,
+        frame: &Frame,
+        outputs: &mut AppOutputs,
+    ) {
         for user_op in &frame.user_ops {
             if let Some(sender) = self.recover_sender(domain, user_op) {
                 let plain = user_op.to_user_op();
@@ -154,11 +245,17 @@ impl<A: Application> Scheduler<A> {
                     eprintln!("scheduler skipped frame user-op due to max_fee < fee_price");
                     continue;
                 }
-                if let Err(err) =
-                    self.app
-                        .validate_and_execute_user_op(sender, &plain, frame.fee_price)
+                match self
+                    .app
+                    .validate_and_execute_user_op(sender, &plain, frame.fee_price)
                 {
-                    eprintln!("scheduler skipped frame user-op due to app error: {err}");
+                    Ok(sequencer_core::application::ExecutionOutcome::Included {
+                        outputs: user_op_outputs,
+                    }) => outputs.extend(user_op_outputs),
+                    Ok(sequencer_core::application::ExecutionOutcome::Invalid(_)) => {}
+                    Err(err) => {
+                        eprintln!("scheduler skipped frame user-op due to app error: {err}");
+                    }
                 }
             } else {
                 eprintln!("scheduler skipped frame user-op due to invalid signature");
@@ -176,7 +273,7 @@ impl<A: Application> Scheduler<A> {
         signature.recover_address_from_prehash(&signing_hash).ok()
     }
 
-    fn drain_directs_safe_at(&mut self, safe_block: u64) {
+    fn drain_directs_safe_at(&mut self, safe_block: u64, outputs: &mut AppOutputs) {
         while let Some(front) = self.direct_q.front() {
             if front.inclusion_block > safe_block {
                 break;
@@ -187,13 +284,14 @@ impl<A: Application> Scheduler<A> {
                 block_number: queued.inclusion_block,
                 payload: queued.payload,
             };
-            if let Err(err) = self.app.execute_direct_input(&input) {
-                eprintln!("scheduler failed to execute drained direct input: {err}");
+            match self.app.execute_direct_input(&input) {
+                Ok(direct_outputs) => outputs.extend(direct_outputs),
+                Err(err) => eprintln!("scheduler failed to execute drained direct input: {err}"),
             }
         }
     }
 
-    fn force_execute_overdue(&mut self, current_block: u64) {
+    fn force_execute_overdue(&mut self, current_block: u64, outputs: &mut AppOutputs) {
         while let Some(front) = self.direct_q.front() {
             if has_elapsed_since(
                 front.inclusion_block,
@@ -205,9 +303,11 @@ impl<A: Application> Scheduler<A> {
                     block_number: front.inclusion_block,
                     payload: front.payload.clone(),
                 };
-                let status = self.app.execute_direct_input(&input);
-                if let Err(err) = status {
-                    eprintln!("scheduler failed to execute overdue direct input: {err}");
+                match self.app.execute_direct_input(&input) {
+                    Ok(direct_outputs) => outputs.extend(direct_outputs),
+                    Err(err) => {
+                        eprintln!("scheduler failed to execute overdue direct input: {err}")
+                    }
                 }
 
                 self.direct_q.pop_front().expect("queue front must exist");
@@ -333,7 +433,8 @@ mod tests {
         fn execute_valid_user_op(
             &mut self,
             user_op: &sequencer_core::l2_tx::ValidUserOp,
-        ) -> Result<(), sequencer_core::application::AppError> {
+        ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
+        {
             let sender = user_op.sender;
             let fee = U256::from(user_op.fee);
             let balance = self.balance_of(sender);
@@ -348,16 +449,17 @@ mod tests {
 
             let marker = user_op.data.first().copied().unwrap_or_default();
             self.executed.push(RecordedTx::UserOp(marker));
-            Ok(())
+            Ok(Vec::new())
         }
 
         fn execute_direct_input(
             &mut self,
             input: &DirectInput,
-        ) -> Result<(), sequencer_core::application::AppError> {
+        ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
+        {
             let marker = input.payload.first().copied().unwrap_or(0);
             self.executed.push(RecordedTx::Direct(marker));
-            Ok(())
+            Ok(Vec::new())
         }
     }
 
@@ -509,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_batch_is_invalidated() {
+    fn stale_batch_is_skipped_and_consumes_nonce() {
         let mut scheduler = Scheduler::new(
             RecordingApp::default(),
             SchedulerConfig {
@@ -536,8 +638,31 @@ mod tests {
         };
 
         let outcome = scheduler.process_input(batch_input(10, stale_batch));
-        assert_eq!(outcome, ProcessOutcome::BatchInvalid);
+        assert_eq!(outcome, ProcessOutcome::BatchSkippedStale);
         assert_eq!(scheduler.app.events(), [RecordedTx::Direct(9)]);
+        assert_eq!(scheduler.next_expected_batch_nonce(), 1);
+
+        let fresh_signing_key =
+            SigningKey::from_bytes((&[13_u8; 32]).into()).expect("fresh signing key");
+        let fresh_batch = Batch {
+            nonce: 1,
+            frames: vec![Frame {
+                user_ops: vec![sign_wire_user_op(
+                    &test_domain(),
+                    &fresh_signing_key,
+                    0,
+                    1,
+                    vec![8],
+                )],
+                safe_block: 10,
+                fee_price: 0,
+            }],
+        };
+
+        assert_eq!(
+            scheduler.process_input(batch_input(10, fresh_batch)),
+            ProcessOutcome::BatchExecuted
+        );
     }
 
     #[test]
@@ -582,9 +707,10 @@ mod tests {
 
         assert_eq!(
             scheduler.process_input(batch_input(10, invalid)),
-            ProcessOutcome::BatchInvalid
+            ProcessOutcome::BatchRejected(BatchRejectReason::NonMonotonicSafeBlocks)
         );
         assert!(scheduler.app.events().is_empty());
+        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
     }
 
     #[test]
@@ -615,9 +741,10 @@ mod tests {
 
         assert_eq!(
             scheduler.process_input(batch_input(10, invalid)),
-            ProcessOutcome::BatchInvalid
+            ProcessOutcome::BatchRejected(BatchRejectReason::SafeBlockAboveInclusionBlock)
         );
         assert!(scheduler.app.events().is_empty());
+        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
     }
 
     #[test]
@@ -664,8 +791,9 @@ mod tests {
         };
         assert_eq!(
             scheduler.process_input(bad_batch),
-            ProcessOutcome::BatchInvalid
+            ProcessOutcome::BatchRejected(BatchRejectReason::DecodeFailed)
         );
+        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
 
         assert_eq!(
             scheduler.process_input(direct_input(11, 3)),
@@ -724,6 +852,7 @@ mod tests {
             ProcessOutcome::BatchExecuted
         );
         assert!(scheduler.app.events().is_empty());
+        assert_eq!(scheduler.next_expected_batch_nonce(), 1);
     }
 
     #[test]
@@ -797,6 +926,7 @@ mod tests {
             ProcessOutcome::BatchExecuted
         );
         assert!(scheduler.app.events().is_empty());
+        assert_eq!(scheduler.next_expected_batch_nonce(), 1);
     }
 
     #[test]
@@ -842,5 +972,35 @@ mod tests {
             ProcessOutcome::BatchExecuted
         );
         assert_eq!(scheduler.app.events(), [RecordedTx::UserOp(9)]);
+    }
+
+    #[test]
+    fn wrong_batch_nonce_is_rejected_without_consuming_nonce() {
+        let mut scheduler = Scheduler::new(
+            RecordingApp::default(),
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 100,
+            },
+        );
+
+        let batch = Batch {
+            nonce: 1,
+            frames: vec![Frame {
+                user_ops: vec![],
+                safe_block: 1,
+                fee_price: 0,
+            }],
+        };
+
+        assert_eq!(
+            scheduler.process_input(batch_input(1, batch)),
+            ProcessOutcome::BatchRejected(BatchRejectReason::WrongNonce {
+                expected: 0,
+                got: 1,
+            })
+        );
+        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
+        assert!(scheduler.app.events().is_empty());
     }
 }

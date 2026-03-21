@@ -3,10 +3,12 @@
 
 mod core;
 
-pub use core::{SEQUENCER_ADDRESS, SchedulerConfig};
+pub use core::{DEVNET_SEQUENCER_ADDRESS, SEPOLIA_SEQUENCER_ADDRESS, SchedulerConfig};
 
+use sequencer_core::application::AppOutput;
 use sequencer_core::application::Application;
 use trolley::{Rollup, RollupRequest};
+use types::{Notice, Voucher};
 
 pub fn run_scheduler_forever<R: Rollup, A: Application>(
     mut rollup: R,
@@ -31,17 +33,50 @@ pub fn run_scheduler_forever<R: Rollup, A: Application>(
                     payload,
                 };
 
-                if matches!(
-                    scheduler.process_input(input),
-                    core::ProcessOutcome::BatchInvalid
-                ) {
-                    let _ = rollup.emit_report(b"scheduler dropped invalid batch");
+                let result = scheduler.process_input(input);
+                for output in &result.outputs {
+                    emit_app_output(&mut rollup, output)
+                        .unwrap_or_else(|err| panic!("scheduler failed to emit app output: {err}"));
+                }
+                if matches!(result.outcome, core::ProcessOutcome::BatchRejected(_)) {
+                    rollup
+                        .emit_report(b"scheduler dropped invalid batch")
+                        .unwrap_or_else(|err| {
+                            panic!("scheduler failed to emit invalid-batch report: {err}")
+                        });
                 }
             }
             Ok(RollupRequest::Inspect { .. }) => {
-                let _ = rollup.emit_report(b"scheduler inspect endpoint not implemented");
+                rollup
+                    .emit_report(b"scheduler inspect endpoint not implemented")
+                    .unwrap_or_else(|err| {
+                        panic!("scheduler failed to emit inspect report: {err}")
+                    });
             }
             Err(err) => panic!("scheduler failed while reading next input: {err}"),
+        }
+    }
+}
+
+fn emit_app_output<R: Rollup>(rollup: &mut R, output: &AppOutput) -> trolley::RollupResult<()> {
+    match output {
+        AppOutput::Notice(payload) => {
+            let notice = Notice {
+                payload: payload.clone().into(),
+            };
+            rollup.emit_notice(&notice)
+        }
+        AppOutput::Voucher {
+            destination,
+            value,
+            payload,
+        } => {
+            let voucher = Voucher {
+                destination: *destination,
+                value: *value,
+                payload: payload.clone().into(),
+            };
+            rollup.emit_voucher(&voucher)
         }
     }
 }

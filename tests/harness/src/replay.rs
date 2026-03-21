@@ -47,18 +47,22 @@ pub(crate) fn apply_ws_message<A: Application>(
             block_number,
             payload,
             ..
-        } => app.execute_direct_input(&DirectInput {
-            sender: decode_address(sender.as_str()),
-            block_number,
-            payload: decode_hex_prefixed(payload.as_str()),
-        })?,
+        } => {
+            app.execute_direct_input(&DirectInput {
+                sender: decode_address(sender.as_str()),
+                block_number,
+                payload: decode_hex_prefixed(payload.as_str()),
+            })?;
+        }
         WsTxMessage::UserOp {
             sender, fee, data, ..
-        } => app.execute_valid_user_op(&ValidUserOp {
-            sender: decode_address(sender.as_str()),
-            fee,
-            data: decode_hex_prefixed(data.as_str()),
-        })?,
+        } => {
+            app.execute_valid_user_op(&ValidUserOp {
+                sender: decode_address(sender.as_str()),
+                fee,
+                data: decode_hex_prefixed(data.as_str()),
+            })?;
+        }
     }
     Ok(())
 }
