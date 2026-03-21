@@ -11,9 +11,11 @@ use alloy::providers::ext::AnvilApi;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol_types::SolCall;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use app_core::application::{WalletConfig, default_private_keys};
 use cartesi_rollups_contracts::application_factory::ApplicationFactory;
+use cartesi_rollups_contracts::data_availability::DataAvailability::InputBoxCall;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
 
@@ -429,7 +431,11 @@ async fn deploy_devnet_application(
 
     let factory = ApplicationFactory::new(application_factory_address, &provider);
     let template_hash = load_template_hash(paths::devnet_machine_image_path().as_path())?;
-    let data_availability: Bytes = input_box_address.as_slice().to_vec().into();
+    let data_availability: Bytes = InputBoxCall {
+        inputBox: input_box_address,
+    }
+    .abi_encode()
+    .into();
     let create_application =
         factory.newApplication_1(Address::ZERO, app_owner, template_hash, data_availability);
     let application_address = create_application
