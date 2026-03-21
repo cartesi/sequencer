@@ -12,9 +12,9 @@ default:
     @just --justfile tests/benchmarks/justfile --list
 
 setup:
-    mkdir -p tests/benchmarks/.deps
-    if [[ ! -f {{anvil_dump_tar}} ]]; then if [[ -f {{root_anvil_dump_tar}} ]]; then cp {{root_anvil_dump_tar}} {{anvil_dump_tar}}; else wget {{anvil_dump_url}} -O {{anvil_dump_tar}}; fi; fi
-    if [[ ! -f {{anvil_dump_dir}}/state.json ]]; then rm -rf {{anvil_dump_dir}}; mkdir -p {{anvil_dump_dir}}; tar -xzf {{anvil_dump_tar}} -C {{anvil_dump_dir}}; fi
+    @mkdir -p tests/benchmarks/.deps
+    @if [[ ! -f {{anvil_dump_tar}} ]]; then if [[ -f {{root_anvil_dump_tar}} ]]; then cp {{root_anvil_dump_tar}} {{anvil_dump_tar}}; else wget {{anvil_dump_url}} -O {{anvil_dump_tar}}; fi; fi
+    @if [[ ! -f {{anvil_dump_dir}}/state.json ]]; then rm -rf {{anvil_dump_dir}}; mkdir -p {{anvil_dump_dir}}; tar -xzf {{anvil_dump_tar}} -C {{anvil_dump_dir}}; fi
     forge build --root tests/contracts
 
 clean:

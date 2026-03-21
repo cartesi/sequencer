@@ -19,7 +19,7 @@ test-sequencer:
     cargo test -p sequencer --test ws_broadcaster -- --test-threads=1
     cargo test -p sequencer --test batch_submitter_integration -- --test-threads=1
 
-run-rollups-e2e: setup canonical-build-machine-image
+test-rollups-e2e: setup canonical-build-machine-image
     cargo build -p sequencer --bin sequencer-devnet
     cargo build -p rollups-e2e
     cargo run -p rollups-e2e

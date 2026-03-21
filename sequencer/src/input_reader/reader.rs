@@ -523,8 +523,8 @@ mod tests {
         }
         .abi_encode();
 
-        let err = decode_input_box_address(&encoded)
-            .expect_err("InputBoxAndEspresso should be rejected");
+        let err =
+            decode_input_box_address(&encoded).expect_err("InputBoxAndEspresso should be rejected");
         assert!(
             err.to_string()
                 .contains("unsupported DataAvailability.InputBoxAndEspresso")
