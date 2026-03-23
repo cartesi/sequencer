@@ -104,7 +104,7 @@ jobs:
           path: dist/sequencer-*.tar.gz
 
   build-canonical-machine-image:
-    name: Build canonical machine image
+    name: Build canonical machine images
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -192,22 +192,27 @@ jobs:
       - name: Download canonical app deps
         run: just -f examples/canonical-app/justfile download-deps
 
-      - name: Build machine image
+      - name: Build machine image (devnet)
         run: just canonical-build-machine-image
 
-      - name: Package machine image store
+      - name: Build machine image (sepolia)
+        run: just canonical-build-machine-image-sepolia
+
+      - name: Package machine image stores
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           test -d examples/canonical-app/out/canonical-machine-image
+          test -d examples/canonical-app/out/canonical-machine-image-sepolia
           mkdir -p dist
-          tar -C examples/canonical-app/out -czf "dist/canonical-machine-image-${TAG}.tar.gz" canonical-machine-image
+          tar -C examples/canonical-app/out -czf "dist/canonical-machine-image-devnet-${TAG}.tar.gz" canonical-machine-image
+          tar -C examples/canonical-app/out -czf "dist/canonical-machine-image-sepolia-${TAG}.tar.gz" canonical-machine-image-sepolia
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: canonical-machine-image
+          name: canonical-machine-images
           path: dist/canonical-machine-image-*.tar.gz
 
   publish:
