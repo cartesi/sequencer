@@ -16,8 +16,13 @@ RUN echo "${TOOLS_SHA512}  /tmp/tools.deb" | sha512sum -c - \
 # alpine:3.22.2 (riscv64/alpine)
 FROM riscv64/alpine@sha256:372839ff152f938e12282226fb5f9ddaef72f9662dcadbf9dd0de5ce287c694e
 
+ARG ALPINE_MAIN_REPOSITORY=https://dl-cdn.alpinelinux.org/alpine/v3.22/main
+ARG LIBGCC_VERSION=14.2.0-r6
+
 # Add libgcc for Rust
-RUN apk add --no-cache libgcc
+RUN apk add --no-cache \
+    --repository="${ALPINE_MAIN_REPOSITORY}" \
+    "libgcc=${LIBGCC_VERSION}"
 
 # Copy `cartesi-init`
 COPY --from=extractor --chmod=755 /tmp/out/usr/sbin/cartesi-init /usr/sbin/cartesi-init
