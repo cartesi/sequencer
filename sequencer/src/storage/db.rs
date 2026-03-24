@@ -9,17 +9,18 @@ use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_open_batch, sql_insert_open_batch_with_index,
     sql_insert_open_frame, sql_insert_safe_inputs_batch,
     sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_and_sequenced_batch,
-    sql_select_frames_for_batch, sql_select_latest_batch_index,
+    sql_select_batch_policy, sql_select_frames_for_batch, sql_select_latest_batch_index,
     sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
     sql_select_max_safe_input_index, sql_select_ordered_l2_tx_count,
     sql_select_ordered_l2_txs_for_batch, sql_select_ordered_l2_txs_from_offset,
-    sql_select_ordered_l2_txs_page_from_offset, sql_select_recommended_fee, sql_select_safe_block,
+    sql_select_ordered_l2_txs_page_from_offset, sql_select_safe_block,
     sql_select_safe_input_payloads_for_sender, sql_select_safe_inputs_range,
     sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
-    sql_update_recommended_fee, sql_update_safe_block,
+    sql_update_batch_policy_alpha, sql_update_batch_policy_gas_price, sql_update_safe_block,
 };
 use super::{
-    FrameHeader, SafeFrontier, SafeInputRange, StorageOpenError, StoredSafeInput, WriteHead,
+    BatchPolicy, FrameHeader, SafeFrontier, SafeInputRange, StorageOpenError, StoredSafeInput,
+    WriteHead,
 };
 use crate::inclusion_lane::PendingUserOp;
 use alloy_primitives::Address;
@@ -247,30 +248,44 @@ impl Storage {
         );
 
         let now_ms = now_unix_ms();
-        let frame_fee = query_recommended_fee(&tx)?;
+        let policy = query_batch_policy(&tx)?;
         insert_open_batch_with_index(&tx, 0, now_ms)?;
-        insert_open_frame(&tx, 0, 0, now_ms, frame_fee, safe_block)?;
+        insert_open_frame(&tx, 0, 0, now_ms, policy.recommended_fee, safe_block)?;
         persist_frame_direct_sequence(&tx, 0, 0, leading_direct_range)?;
         tx.commit()?;
 
         Ok(WriteHead {
             batch_index: 0,
             batch_created_at: from_unix_ms(now_ms),
-            frame_fee,
+            frame_fee: policy.recommended_fee,
             safe_block,
             batch_user_op_count: 0,
             open_frame_user_op_count: 0,
             frame_in_batch: 0,
+            max_batch_user_op_bytes: policy.batch_size_target,
         })
     }
 
-    pub fn recommended_fee(&mut self) -> Result<u64> {
-        let value = sql_select_recommended_fee(&self.conn)?;
-        Ok(i64_to_u64(value))
+    pub fn batch_policy(&mut self) -> Result<BatchPolicy> {
+        let (fee, target) = sql_select_batch_policy(&self.conn)?;
+        Ok(BatchPolicy {
+            recommended_fee: i64_to_u64(fee),
+            batch_size_target: i64_to_u64(target),
+        })
     }
 
-    pub fn set_recommended_fee(&mut self, fee: u64) -> Result<()> {
-        let changed_rows = sql_update_recommended_fee(&self.conn, u64_to_i64(fee))?;
+    pub fn set_gas_price(&mut self, gas_price: u64) -> Result<()> {
+        let changed_rows =
+            sql_update_batch_policy_gas_price(&self.conn, u64_to_i64(gas_price))?;
+        if changed_rows != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed_rows));
+        }
+        Ok(())
+    }
+
+    pub fn set_alpha(&mut self, num: u64, denom: u64) -> Result<()> {
+        let changed_rows =
+            sql_update_batch_policy_alpha(&self.conn, u64_to_i64(num), u64_to_i64(denom))?;
         if changed_rows != 1 {
             return Err(rusqlite::Error::StatementChangedRows(changed_rows));
         }
@@ -317,14 +332,14 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_write_head_matches_open_state(&tx, head)?;
         let now_ms = now_unix_ms();
-        let next_frame_fee = query_recommended_fee(&tx)?;
+        let policy = query_batch_policy(&tx)?;
         let next_frame_in_batch = head.frame_in_batch.saturating_add(1);
         insert_open_frame(
             &tx,
             head.batch_index,
             next_frame_in_batch,
             now_ms,
-            next_frame_fee,
+            policy.recommended_fee,
             next_safe_block,
         )?;
         persist_frame_direct_sequence(
@@ -334,7 +349,7 @@ impl Storage {
             leading_direct_range,
         )?;
         tx.commit()?;
-        head.advance_frame(next_frame_fee, next_safe_block);
+        head.advance_frame(policy, next_safe_block);
         Ok(())
     }
 
@@ -348,23 +363,23 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_write_head_matches_open_state(&tx, head)?;
         let now_ms = now_unix_ms();
-        // Frame fee is committed here: we sample the current recommendation once and
-        // assign it to the newly opened frame.
-        let next_frame_fee = query_recommended_fee(&tx)?;
+        // Batch policy is sampled here: the derived fee is committed to the newly
+        // opened frame, and the batch size target is stored on the write head.
+        let policy = query_batch_policy(&tx)?;
         let next_batch_index = insert_open_batch(&tx, now_ms)?;
         insert_open_frame(
             &tx,
             next_batch_index,
             0,
             now_ms,
-            next_frame_fee,
+            policy.recommended_fee,
             next_safe_block,
         )?;
         tx.commit()?;
         head.move_to_next_batch(
             next_batch_index,
             from_unix_ms(now_ms),
-            next_frame_fee,
+            policy,
             next_safe_block,
         );
         Ok(())
@@ -516,6 +531,7 @@ fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
     };
     let (frame_in_batch, frame_fee, safe_block) = query_latest_frame_in_batch(tx, batch_index)?;
     let open_frame_user_op_count = query_frame_user_op_count(tx, batch_index, frame_in_batch)?;
+    let policy = query_batch_policy(tx)?;
     Ok(Some(WriteHead {
         batch_index,
         batch_created_at,
@@ -524,6 +540,7 @@ fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
         batch_user_op_count,
         open_frame_user_op_count,
         frame_in_batch,
+        max_batch_user_op_bytes: policy.batch_size_target,
     }))
 }
 
@@ -606,9 +623,12 @@ fn query_current_safe_block(tx: &Connection) -> Result<u64> {
     Ok(i64_to_u64(value))
 }
 
-fn query_recommended_fee(tx: &Transaction<'_>) -> Result<u64> {
-    let value = sql_select_recommended_fee(tx)?;
-    Ok(i64_to_u64(value))
+fn query_batch_policy(tx: &Transaction<'_>) -> Result<BatchPolicy> {
+    let (fee, target) = sql_select_batch_policy(tx)?;
+    Ok(BatchPolicy {
+        recommended_fee: i64_to_u64(fee),
+        batch_size_target: i64_to_u64(target),
+    })
 }
 
 fn persist_frame_direct_sequence(
@@ -761,12 +781,13 @@ mod tests {
     }
 
     #[test]
-    fn next_frame_fee_comes_from_recommended_fee_singleton() {
-        let db = temp_db("recommended-fee");
+    fn next_frame_fee_comes_from_batch_policy() {
+        let db = temp_db("batch-policy-fee");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        assert_eq!(storage.recommended_fee().expect("default recommended"), 0);
+        let policy = storage.batch_policy().expect("default policy");
+        assert_eq!(policy.recommended_fee, 0);
 
-        storage.set_recommended_fee(7).expect("set recommended fee");
+        storage.set_gas_price(100).expect("set gas price");
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -776,8 +797,10 @@ mod tests {
             .close_frame_and_batch(&mut head, next_safe_block)
             .expect("rotate batch");
 
-        assert_eq!(head.frame_fee, 7);
-        assert_eq!(storage.recommended_fee().expect("read recommended"), 7);
+        let policy = storage.batch_policy().expect("read policy");
+        assert!(head.frame_fee > 0, "frame fee should be derived from gas_price");
+        assert_eq!(head.frame_fee, policy.recommended_fee);
+        assert!(head.max_batch_user_op_bytes > 0, "batch size target should be set");
     }
 
     #[test]

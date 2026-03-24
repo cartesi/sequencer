@@ -431,7 +431,6 @@ async fn start_full_server_with_max_body(
             max_user_ops_per_chunk: 32,
             safe_input_buffer_capacity: 32,
             max_batch_open: Duration::from_secs(60 * 60),
-            max_batch_user_op_bytes: 1_048_576,
             idle_poll_interval: Duration::from_millis(2),
         },
     );
@@ -546,7 +545,7 @@ async fn shutdown_runtime(mut runtime: FullServerRuntime) {
 
 fn bootstrap_open_frame_fee_zero(db_path: &str) {
     let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
-    storage.set_recommended_fee(0).expect("set recommended fee");
+    // gas_price defaults to 0 → recommended_fee = 0.
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");

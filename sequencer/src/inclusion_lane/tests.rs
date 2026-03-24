@@ -200,7 +200,6 @@ fn default_test_config() -> InclusionLaneConfig {
         max_user_ops_per_chunk: 16,
         safe_input_buffer_capacity: 16,
         max_batch_open: Duration::MAX,
-        max_batch_user_op_bytes: 1_000_000_000,
         idle_poll_interval: Duration::from_millis(2),
     }
 }
@@ -634,9 +633,13 @@ async fn empty_batches_close_when_max_open_time_is_reached() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_closes_when_max_user_op_bytes_is_reached() {
     let db = temp_db("batch-close-size");
-    let mut config = default_test_config();
-    config.max_batch_user_op_bytes =
-        SignedUserOp::max_batch_metadata() + <TestApp as Application>::MAX_METHOD_PAYLOAD_BYTES;
+    // Set alpha high enough that batch_size_target ≤ one user op (126 bytes).
+    // 55000*1000/(17000*26) = 124 bytes < 126.
+    {
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        storage.set_alpha(17000, 1000).expect("set alpha");
+    }
+    let config = default_test_config();
     let (tx, shutdown, lane_handle) = start_lane(db.path.as_str(), config).await;
     let (pending, recv) = make_pending_user_op(0x33);
 
