@@ -69,6 +69,13 @@ pub enum StorageOpenError {
     Migration(#[from] rusqlite_migration::Error),
 }
 
+/// Derived batch policy read from the `batch_policy_derived` view.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchPolicy {
+    pub recommended_fee: u64,
+    pub batch_size_target: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct WriteHead {
     pub batch_index: u64,
@@ -79,6 +86,8 @@ pub struct WriteHead {
     pub batch_user_op_count: u64,
     pub open_frame_user_op_count: u32,
     pub frame_in_batch: u32,
+    // Soft batch size threshold read from batch_policy at each frame/batch transition.
+    pub max_batch_user_op_bytes: u64,
 }
 
 impl WriteHead {
@@ -91,26 +100,28 @@ impl WriteHead {
         self.open_frame_user_op_count > 0
     }
 
-    pub fn advance_frame(&mut self, frame_fee: u64, safe_block: u64) {
+    pub fn advance_frame(&mut self, policy: BatchPolicy, safe_block: u64) {
         self.frame_in_batch = self.frame_in_batch.saturating_add(1);
-        self.frame_fee = frame_fee;
+        self.frame_fee = policy.recommended_fee;
         self.safe_block = safe_block;
         self.open_frame_user_op_count = 0;
+        self.max_batch_user_op_bytes = policy.batch_size_target;
     }
 
     pub fn move_to_next_batch(
         &mut self,
         batch_index: u64,
         batch_created_at: SystemTime,
-        frame_fee: u64,
+        policy: BatchPolicy,
         safe_block: u64,
     ) {
         self.batch_index = batch_index;
         self.batch_created_at = batch_created_at;
-        self.frame_fee = frame_fee;
+        self.frame_fee = policy.recommended_fee;
         self.safe_block = safe_block;
         self.batch_user_op_count = 0;
         self.open_frame_user_op_count = 0;
         self.frame_in_batch = 0;
+        self.max_batch_user_op_bytes = policy.batch_size_target;
     }
 }

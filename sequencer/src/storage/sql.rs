@@ -26,8 +26,8 @@ const SQL_SELECT_LATEST_BATCH_INDEX: &str = "SELECT MAX(batch_index) FROM batche
 const SQL_SELECT_USER_OPS_FOR_FRAME: &str = "SELECT nonce, max_fee, data, sig FROM user_ops WHERE batch_index = ?1 AND frame_in_batch = ?2 ORDER BY pos_in_frame ASC";
 const SQL_SELECT_MAX_SAFE_INPUT_INDEX: &str = "SELECT MAX(safe_input_index) FROM safe_inputs";
 const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_txs";
-const SQL_SELECT_RECOMMENDED_FEE: &str =
-    "SELECT fee FROM recommended_fees WHERE singleton_id = 0 LIMIT 1";
+const SQL_SELECT_BATCH_POLICY: &str =
+    "SELECT recommended_fee, batch_size_target FROM batch_policy_derived WHERE singleton_id = 0 LIMIT 1";
 const SQL_SELECT_SAFE_BLOCK: &str =
     "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1";
 const SQL_INSERT_SAFE_INPUT: &str = "INSERT INTO safe_inputs (safe_input_index, sender, payload, block_number) VALUES (?1, ?2, ?3, ?4)";
@@ -35,8 +35,10 @@ const SQL_INSERT_USER_OP: &str = include_str!("queries/insert_user_op.sql");
 const SQL_INSERT_SEQUENCED_USER_OP: &str = include_str!("queries/insert_sequenced_user_op.sql");
 const SQL_INSERT_SEQUENCED_DIRECT_INPUT: &str =
     include_str!("queries/insert_sequenced_direct_input.sql");
-const SQL_UPDATE_RECOMMENDED_FEE: &str =
-    "UPDATE recommended_fees SET fee = ?1 WHERE singleton_id = 0";
+const SQL_UPDATE_BATCH_POLICY_GAS_PRICE: &str =
+    "UPDATE batch_policy SET gas_price = ?1 WHERE singleton_id = 0";
+const SQL_UPDATE_BATCH_POLICY_ALPHA: &str =
+    "UPDATE batch_policy SET alpha_num = ?1, alpha_denom = ?2 WHERE singleton_id = 0";
 const SQL_UPDATE_SAFE_BLOCK: &str =
     "UPDATE l1_safe_head SET block_number = ?1 WHERE singleton_id = 0";
 #[derive(Debug, Clone)]
@@ -93,12 +95,25 @@ pub(super) fn sql_select_latest_batch_index(conn: &Connection) -> Result<Option<
     )
 }
 
-pub(super) fn sql_select_recommended_fee(conn: &Connection) -> Result<i64> {
-    conn.query_row(SQL_SELECT_RECOMMENDED_FEE, [], |row| row.get(0))
+pub(super) fn sql_select_batch_policy(conn: &Connection) -> Result<(i64, i64)> {
+    conn.query_row(SQL_SELECT_BATCH_POLICY, [], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })
 }
 
-pub(super) fn sql_update_recommended_fee(conn: &Connection, fee: i64) -> Result<usize> {
-    conn.execute(SQL_UPDATE_RECOMMENDED_FEE, params![fee])
+pub(super) fn sql_update_batch_policy_gas_price(
+    conn: &Connection,
+    gas_price: i64,
+) -> Result<usize> {
+    conn.execute(SQL_UPDATE_BATCH_POLICY_GAS_PRICE, params![gas_price])
+}
+
+pub(super) fn sql_update_batch_policy_alpha(
+    conn: &Connection,
+    alpha_num: i64,
+    alpha_denom: i64,
+) -> Result<usize> {
+    conn.execute(SQL_UPDATE_BATCH_POLICY_ALPHA, params![alpha_num, alpha_denom])
 }
 
 pub(super) fn sql_select_safe_block(conn: &Connection) -> Result<i64> {
@@ -399,13 +414,13 @@ mod tests {
         SQL_INSERT_SEQUENCED_USER_OP, SQL_INSERT_USER_OP, sql_insert_open_batch,
         sql_insert_open_batch_with_index, sql_insert_open_frame, sql_insert_safe_inputs_batch,
         sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_and_sequenced_batch,
-        sql_select_frames_for_batch, sql_select_latest_batch_index,
+        sql_select_batch_policy, sql_select_frames_for_batch, sql_select_latest_batch_index,
         sql_select_latest_batch_with_user_op_count, sql_select_max_safe_input_index,
         sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_from_offset,
-        sql_select_ordered_l2_txs_page_from_offset, sql_select_recommended_fee,
-        sql_select_safe_block, sql_select_safe_inputs_range,
-        sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
-        sql_update_recommended_fee, sql_update_safe_block,
+        sql_select_ordered_l2_txs_page_from_offset, sql_select_safe_block,
+        sql_select_safe_inputs_range, sql_select_total_drained_direct_inputs,
+        sql_select_user_ops_for_frame, sql_update_batch_policy_alpha,
+        sql_update_batch_policy_gas_price, sql_update_safe_block,
     };
     use crate::inclusion_lane::PendingUserOp;
     use crate::storage::db::Storage;
@@ -686,14 +701,28 @@ mod tests {
     }
 
     #[test]
-    fn recommended_fee_helpers_read_and_update_singleton() {
+    fn batch_policy_helpers_read_defaults_and_update_knobs() {
         let conn = setup_conn();
-        assert_eq!(
-            sql_select_recommended_fee(&conn).expect("read recommended"),
-            0
-        );
-        sql_update_recommended_fee(&conn, 9).expect("update recommended");
-        assert_eq!(sql_select_recommended_fee(&conn).expect("read updated"), 9);
+        // Default: gas_price=0 → recommended_fee=0, alpha=168/1000 → batch_size_target=12591
+        let (fee, target) = sql_select_batch_policy(&conn).expect("read policy");
+        assert_eq!(fee, 0);
+        assert_eq!(target, 55000 * 1000 / (168 * 26)); // 12591
+
+        sql_update_batch_policy_gas_price(&conn, 100).expect("update gas price");
+        let (fee, _) = sql_select_batch_policy(&conn).expect("read updated policy");
+        assert!(fee > 0, "fee should be derived from gas_price");
+
+        sql_update_batch_policy_alpha(&conn, 200, 1000).expect("update alpha");
+        let (_, target) = sql_select_batch_policy(&conn).expect("read updated target");
+        assert_eq!(target, 55000 * 1000 / (200 * 26)); // 10576
+    }
+
+    #[test]
+    fn batch_policy_check_rejects_unsafe_alpha() {
+        let conn = setup_conn();
+        // alpha_num=1 → batch_size_target = 55000*1000/(1*26) = 2_115_384 → way over 32000
+        let err = sql_update_batch_policy_alpha(&conn, 1, 1000);
+        assert!(err.is_err(), "CHECK should reject unsafe alpha");
     }
 
     #[test]

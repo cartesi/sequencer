@@ -147,7 +147,7 @@ where
         shutdown.clone(),
         app,
         storage,
-        InclusionLaneConfig::for_app::<A>(l1_config.batch_submitter_address),
+        InclusionLaneConfig::new(l1_config.batch_submitter_address),
     );
     let mut input_reader_handle = input_reader.start()?;
 

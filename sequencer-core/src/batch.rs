@@ -8,6 +8,23 @@ use ssz_derive::{Decode, Encode};
 /// L1/app must post such inputs as `0x00 || body`. Only these are stored (body only) and executed.
 pub const INPUT_TAG_DIRECT_INPUT: u8 = 0x00;
 
+// ---------------------------------------------------------------------------
+// Gas-economics-derived batch sizing
+//
+// The InputBox contract charges roughly:
+//   total_gas ≈ base_gas + delta × payload_bytes
+//
+// We charge each user-op a DA fee of (1 + α) × δ per byte, where α amortizes
+// the base cost across the batch:
+//
+//   α × δ × n = base_gas   ⟹   n = base_gas / (α × δ)
+//
+// Choosing α (the overhead fraction) determines the batch size n in bytes.
+// All parameters live in the `batch_policy` SQLite singleton table so they
+// can be hot-swapped at runtime (see 0001_schema.sql). A CHECK constraint
+// on that table ensures batch_size_target < const_max_batch_bytes.
+// ---------------------------------------------------------------------------
+
 /// Batch submissions are sent as raw `ssz(Batch)` with no tag; classification at L1 is by
 /// attempting SSZ decode, and at the rollup by msg_sender.
 

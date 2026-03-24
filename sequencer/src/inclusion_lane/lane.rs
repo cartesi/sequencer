@@ -297,7 +297,7 @@ impl<A: Application + 'static> InclusionLane<A> {
 }
 
 fn should_close_batch<A: Application>(head: &WriteHead, config: &InclusionLaneConfig) -> bool {
-    should_close_batch_by_time(head, config) || should_close_batch_by_size::<A>(head, config)
+    should_close_batch_by_time(head, config) || should_close_batch_by_size::<A>(head)
 }
 
 fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) -> bool {
@@ -307,11 +307,8 @@ fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) ->
     age >= config.max_batch_open
 }
 
-fn should_close_batch_by_size<A: Application>(
-    head: &WriteHead,
-    config: &InclusionLaneConfig,
-) -> bool {
-    user_op_count_to_bytes::<A>(head.batch_user_op_count) >= config.max_batch_user_op_bytes as u64
+fn should_close_batch_by_size<A: Application>(head: &WriteHead) -> bool {
+    user_op_count_to_bytes::<A>(head.batch_user_op_count) >= head.max_batch_user_op_bytes
 }
 
 fn execute_user_op(

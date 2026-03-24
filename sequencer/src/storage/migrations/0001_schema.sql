@@ -81,11 +81,68 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
 INSERT OR IGNORE INTO l1_safe_head (singleton_id, block_number)
 VALUES (0, 0);
 
-CREATE TABLE IF NOT EXISTS recommended_fees (
-    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    -- Mutable recommendation consumed when opening the next frame.
-    fee          INTEGER NOT NULL CHECK (fee >= 0)
+-- ---------------------------------------------------------------------------
+-- Batch policy singleton
+--
+-- Contains operator-tunable knobs (alpha, gas_price) and on-chain constants
+-- (delta, base_gas, etc.). A view derives `batch_size_target` and
+-- `recommended_fee` from these columns, and a CHECK constraint prevents
+-- updates that would violate the batch size limit.
+--
+-- Gas economics:
+--   batch_size_target = const_base_gas * alpha_denom / (alpha_num * const_delta)
+--   recommended_fee   = gas_price * (alpha_num + alpha_denom)
+--                        * const_delta * const_user_op_bytes / alpha_denom
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS batch_policy (
+    singleton_id             INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+
+    -- Knobs (operator-tunable via sqlite3 CLI):
+    alpha_num                INTEGER NOT NULL CHECK (alpha_num > 0),
+    alpha_denom              INTEGER NOT NULL CHECK (alpha_denom > 0),
+    gas_price                INTEGER NOT NULL CHECK (gas_price >= 0),
+
+    -- Constants (in DB so the CHECK can reference them):
+    const_delta              INTEGER NOT NULL CHECK (const_delta > 0),
+    const_base_gas           INTEGER NOT NULL CHECK (const_base_gas > 0),
+    const_user_op_bytes      INTEGER NOT NULL CHECK (const_user_op_bytes > 0),
+    -- Effective max batch payload. Already includes slack for chunk overshoot
+    -- and SSZ framing, so the CHECK is simply batch_size_target < this value.
+    const_max_batch_bytes    INTEGER NOT NULL CHECK (const_max_batch_bytes > 0),
+
+    -- Safety: batch_size_target < const_max_batch_bytes.
+    CHECK (
+        const_base_gas * alpha_denom / (alpha_num * const_delta)
+        < const_max_batch_bytes
+    )
 );
 
-INSERT OR IGNORE INTO recommended_fees (singleton_id, fee)
-VALUES (0, 0);
+INSERT OR IGNORE INTO batch_policy(
+    singleton_id,
+
+    alpha_num, alpha_denom, gas_price,
+
+    const_delta, const_base_gas,
+    const_user_op_bytes, const_max_batch_bytes
+)
+VALUES (
+    -- Fixed id
+    0,
+
+    -- Knobs
+    168, 1000, 0,
+
+    -- Constants
+    26, 55000,
+    126, 32000
+);
+
+-- Derived view for reads.
+CREATE VIEW IF NOT EXISTS batch_policy_derived AS
+SELECT *,
+    const_base_gas * alpha_denom / (alpha_num * const_delta)
+        AS batch_size_target,
+
+    gas_price * (alpha_num + alpha_denom) * const_delta * const_user_op_bytes / alpha_denom
+        AS recommended_fee
+FROM batch_policy;
