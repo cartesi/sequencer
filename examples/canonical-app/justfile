@@ -1,6 +1,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 out_dir := "out"
+source_date_epoch := "0"
 linux_kernel := out_dir + "/linux.bin"
 rootfs_tar := out_dir + "/canonical-rootfs.tar"
 rootfs_ext2 := out_dir + "/canonical-rootfs.ext2"
@@ -18,13 +19,13 @@ build-dapp: build-dapp-devnet
 
 build-dapp-devnet:
     mkdir -p {{out_dir}}
-    CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --bin canonical-app-devnet --target riscv64gc-unknown-linux-musl --release
+    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --bin canonical-app-devnet --target riscv64gc-unknown-linux-musl --release
     cp ../../target/riscv64gc-unknown-linux-musl/release/canonical-app-devnet {{dapp_binary_devnet}}
     cp {{dapp_binary_devnet}} {{dapp_binary}}
 
 build-dapp-sepolia:
     mkdir -p {{out_dir}}
-    CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --bin canonical-app-sepolia --target riscv64gc-unknown-linux-musl --release
+    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --bin canonical-app-sepolia --target riscv64gc-unknown-linux-musl --release
     cp ../../target/riscv64gc-unknown-linux-musl/release/canonical-app-sepolia {{dapp_binary_sepolia}}
     cp {{dapp_binary_sepolia}} {{dapp_binary}}
 
@@ -32,7 +33,7 @@ build-rootfs: build-rootfs-devnet
 
 build-rootfs-devnet: build-dapp-devnet
     mkdir -p {{out_dir}}
-    docker buildx build \
+    SOURCE_DATE_EPOCH={{source_date_epoch}} docker buildx build \
       --platform linux/riscv64 \
       --output type=tar,dest={{rootfs_tar}} \
       --file Dockerfile \
@@ -41,7 +42,7 @@ build-rootfs-devnet: build-dapp-devnet
 
 build-rootfs-sepolia: build-dapp-sepolia
     mkdir -p {{out_dir}}
-    docker buildx build \
+    SOURCE_DATE_EPOCH={{source_date_epoch}} docker buildx build \
       --platform linux/riscv64 \
       --output type=tar,dest={{rootfs_tar}} \
       --file Dockerfile \
@@ -81,3 +82,14 @@ build-machine-image-sepolia: clean-machine-image-sepolia build-rootfs-sepolia
 
 test-guest: build-machine-image
     cargo run -p canonical-test
+
+print-build-hashes: build-machine-image
+    echo "== tool versions =="
+    cartesi-machine --version
+    xgenext2fs --version
+    cross --version || true
+    docker buildx version
+    echo
+    echo "== artifact hashes =="
+    python3 scripts/sha256_files.py {{dapp_binary_devnet}} {{rootfs_tar}} {{rootfs_ext2}}
+    cartesi-machine --load={{machine_image}} --initial-hash

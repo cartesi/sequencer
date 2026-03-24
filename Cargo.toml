@@ -28,8 +28,8 @@ authors = [
 ]
 
 [workspace.dependencies]
-libcmt-sys = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86" }
-trolley = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86" }
-testsi = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86" }
-types = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "c2b2f65bc6a3d4ddf80b3a0c5a1673fbf22e9f86" }
-cartesi-machine = { version = "2", git = "https://github.com/cartesi/dave", rev = "5d0560a04f623318af9ef5b7f193170b618b6ced", features = ["download_uarch"] }
+libcmt-sys = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22" }
+trolley = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22" }
+testsi = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22" }
+types = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22" }
+cartesi-machine = { version = "2", git = "https://github.com/cartesi/dave", rev = "317a88a32a1b4a6002d561f37bb833843df55cba", features = ["download_uarch"] }

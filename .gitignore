@@ -1,4 +1,6 @@
 /target
+.env
+.env.fish
 sequencer.db
 sequencer.db-shm
 sequencer.db-wal

@@ -40,6 +40,9 @@ canonical-build-machine-image-sepolia:
 canonical-test-guest:
     just -f examples/canonical-app/justfile test-guest
 
+canonical-print-build-hashes:
+    just -f examples/canonical-app/justfile print-build-hashes
+
 clean:
     cargo clean
     rm -f sequencer.db sequencer.db-shm sequencer.db-wal
