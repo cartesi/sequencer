@@ -41,7 +41,7 @@ pub struct ManagedSequencer {
     sequencer_bin: PathBuf,
     log_prefix: String,
     logs_dir: PathBuf,
-    db_path: PathBuf,
+    data_dir: PathBuf,
     endpoint: String,
     log_path: PathBuf,
 }
@@ -61,6 +61,16 @@ pub fn teardown_sqlite_artifacts(logs_dir: &Path) -> HarnessResult<()> {
 
     for entry in fs::read_dir(logs_dir)? {
         let entry = entry?;
+        let path = entry.path();
+        // Remove sequencer data directories (contain sequencer.db).
+        if path.is_dir() && path.join("sequencer.db").exists() {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            continue;
+        }
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             continue;
@@ -68,7 +78,7 @@ pub fn teardown_sqlite_artifacts(logs_dir: &Path) -> HarnessResult<()> {
         if !matches_sqlite_artifact(file_name) {
             continue;
         }
-        match fs::remove_file(entry.path()) {
+        match fs::remove_file(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
@@ -86,8 +96,7 @@ impl ManagedSequencer {
         let rollups = DevnetRollupsStack::spawn(log_prefix.as_str(), logs_dir.as_path()).await?;
 
         fs::create_dir_all(logs_dir.as_path())?;
-        let db_path = timestamped_log_path(logs_dir.as_path(), &format!("{log_prefix}-db"))
-            .with_extension("sqlite");
+        let data_dir = timestamped_log_path(logs_dir.as_path(), &format!("{log_prefix}-data"));
         let SpawnedSequencerProcess {
             child,
             endpoint,
@@ -96,7 +105,7 @@ impl ManagedSequencer {
             sequencer_bin.as_path(),
             log_prefix.as_str(),
             logs_dir.as_path(),
-            db_path.as_path(),
+            data_dir.as_path(),
             &rollups,
         )
         .await?;
@@ -108,7 +117,7 @@ impl ManagedSequencer {
             sequencer_bin,
             log_prefix,
             logs_dir,
-            db_path,
+            data_dir,
             endpoint,
             log_path,
         })
@@ -126,8 +135,8 @@ impl ManagedSequencer {
         self.log_path.as_path()
     }
 
-    pub fn db_path(&self) -> &Path {
-        self.db_path.as_path()
+    pub fn data_dir(&self) -> &Path {
+        self.data_dir.as_path()
     }
 
     pub fn domain_chain_id(&self) -> u64 {
@@ -172,7 +181,7 @@ impl ManagedSequencer {
             self.sequencer_bin.as_path(),
             self.log_prefix.as_str(),
             self.logs_dir.as_path(),
-            self.db_path.as_path(),
+            self.data_dir.as_path(),
             &self.rollups,
         )
         .await?;
@@ -247,7 +256,7 @@ async fn spawn_sequencer_process(
     sequencer_bin: &Path,
     log_prefix: &str,
     logs_dir: &Path,
-    db_path: &Path,
+    data_dir: &Path,
     rollups: &DevnetRollupsStack,
 ) -> HarnessResult<SpawnedSequencerProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;
@@ -265,13 +274,13 @@ async fn spawn_sequencer_process(
     let mut child = Command::new(path_as_str(sequencer_bin)?)
         .arg("--http-addr")
         .arg(http_addr)
-        .arg("--db-path")
-        .arg(path_as_str(db_path)?)
+        .arg("--data-dir")
+        .arg(path_as_str(data_dir)?)
         .arg("--eth-rpc-url")
         .arg(rollups.l1_endpoint())
-        .arg("--domain-chain-id")
+        .arg("--chain-id")
         .arg(DEVNET_CHAIN_ID.to_string())
-        .arg("--domain-verifying-contract")
+        .arg("--app-address")
         .arg(rollups.app_address().to_string())
         .arg("--batch-submitter-private-key")
         .arg(&batch_submitter_key)
