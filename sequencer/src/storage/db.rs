@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_open_batch, sql_insert_open_batch_with_index,
     sql_insert_open_frame, sql_insert_safe_inputs_batch,
-    sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_and_sequenced_batch,
+    sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_batch,
     sql_select_batch_policy, sql_select_frames_for_batch, sql_select_latest_batch_index,
     sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
     sql_select_max_safe_input_index, sql_select_ordered_l2_tx_count,
@@ -275,8 +275,7 @@ impl Storage {
     }
 
     pub fn set_gas_price(&mut self, gas_price: u64) -> Result<()> {
-        let changed_rows =
-            sql_update_batch_policy_gas_price(&self.conn, u64_to_i64(gas_price))?;
+        let changed_rows = sql_update_batch_policy_gas_price(&self.conn, u64_to_i64(gas_price))?;
         if changed_rows != 1 {
             return Err(rusqlite::Error::StatementChangedRows(changed_rows));
         }
@@ -308,7 +307,7 @@ impl Storage {
         // observe the same database snapshot.
         assert_write_head_matches_open_state(&tx, head)?;
 
-        sql_insert_user_ops_and_sequenced_batch(
+        sql_insert_user_ops_batch(
             &tx,
             u64_to_i64(head.batch_index),
             i64::from(head.frame_in_batch),
@@ -798,9 +797,15 @@ mod tests {
             .expect("rotate batch");
 
         let policy = storage.batch_policy().expect("read policy");
-        assert!(head.frame_fee > 0, "frame fee should be derived from gas_price");
+        assert!(
+            head.frame_fee > 0,
+            "frame fee should be derived from gas_price"
+        );
         assert_eq!(head.frame_fee, policy.recommended_fee);
-        assert!(head.max_batch_user_op_bytes > 0, "batch size target should be set");
+        assert!(
+            head.max_batch_user_op_bytes > 0,
+            "batch size target should be set"
+        );
     }
 
     #[test]

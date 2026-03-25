@@ -147,8 +147,8 @@ fn parse_address(raw: &str) -> Result<Address, String> {
         return Err("address must be 0x-prefixed".to_string());
     }
 
-    let bytes = alloy_primitives::hex::decode(raw)
-        .map_err(|err| format!("invalid address hex: {err}"))?;
+    let bytes =
+        alloy_primitives::hex::decode(raw).map_err(|err| format!("invalid address hex: {err}"))?;
     if bytes.len() != 20 {
         return Err("address must be 20 bytes".to_string());
     }
