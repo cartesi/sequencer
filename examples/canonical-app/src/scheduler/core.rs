@@ -232,6 +232,16 @@ impl<A: Application> Scheduler<A> {
         None
     }
 
+    /// Execute user-ops in a frame, skipping any whose `max_fee` is below the frame's `fee_price`.
+    ///
+    /// `fee_price` is in "L2 smallest-token-unit per user-op-byte", derived from the sequencer's
+    /// `gas_price` DB knob.  That knob is "L2 smallest-token-unit per L1 gas unit" — whoever
+    /// feeds it must convert `L1_gas_price_in_wei × exchange_rate` into this integer.
+    ///
+    /// For native tokens with few decimals (e.g. USDC with 6 decimals), the feeder should
+    /// pre-scale `gas_price` by multiplying by 10^k before writing it to the DB, so that
+    /// sub-unit precision is not lost to integer truncation.  The scheduler itself does not
+    /// need to know about the scaling — it simply compares `max_fee` against `fee_price`.
     fn execute_frame_user_ops(
         &mut self,
         domain: &Eip712Domain,

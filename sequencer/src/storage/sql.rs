@@ -26,7 +26,7 @@ const SQL_SELECT_LATEST_BATCH_INDEX: &str = "SELECT MAX(batch_index) FROM batche
 const SQL_SELECT_USER_OPS_FOR_FRAME: &str = "SELECT nonce, max_fee, data, sig FROM user_ops WHERE batch_index = ?1 AND frame_in_batch = ?2 ORDER BY pos_in_frame ASC";
 const SQL_SELECT_MAX_SAFE_INPUT_INDEX: &str = "SELECT MAX(safe_input_index) FROM safe_inputs";
 const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_txs";
-const SQL_SELECT_BATCH_POLICY: &str = "SELECT recommended_fee, batch_size_target FROM batch_policy_derived WHERE singleton_id = 0 LIMIT 1";
+const SQL_SELECT_BATCH_POLICY: &str = "SELECT gas_price, alpha_num, alpha_denom, const_delta, const_user_op_bytes, batch_size_target FROM batch_policy_derived WHERE singleton_id = 0 LIMIT 1";
 const SQL_SELECT_SAFE_BLOCK: &str =
     "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1";
 const SQL_INSERT_SAFE_INPUT: &str = "INSERT INTO safe_inputs (safe_input_index, sender, payload, block_number) VALUES (?1, ?2, ?3, ?4)";
@@ -93,9 +93,17 @@ pub(super) fn sql_select_latest_batch_index(conn: &Connection) -> Result<Option<
     )
 }
 
-pub(super) fn sql_select_batch_policy(conn: &Connection) -> Result<(i64, i64)> {
+/// Raw batch policy columns: (gas_price, alpha_num, alpha_denom, const_delta, const_user_op_bytes, batch_size_target).
+pub(super) fn sql_select_batch_policy(conn: &Connection) -> Result<(i64, i64, i64, i64, i64, i64)> {
     conn.query_row(SQL_SELECT_BATCH_POLICY, [], |row| {
-        Ok((row.get(0)?, row.get(1)?))
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
     })
 }
 
@@ -310,15 +318,6 @@ pub(super) fn sql_count_user_ops_for_frame(
     )
 }
 
-pub(super) fn sql_insert_sequenced_direct_inputs_for_frame(
-    tx: &Transaction<'_>,
-    batch_index: i64,
-    frame_in_batch: i64,
-    direct_range: SafeInputRange,
-) -> Result<()> {
-    sql_insert_sequenced_direct_inputs(tx, batch_index, frame_in_batch, direct_range)
-}
-
 pub(super) fn sql_insert_open_batch(tx: &Transaction<'_>, created_at_ms: i64) -> Result<usize> {
     const SQL: &str = "INSERT INTO batches (created_at_ms) VALUES (?1)";
     tx.execute(SQL, params![created_at_ms])
@@ -411,7 +410,7 @@ mod tests {
         FrameHeaderRow, SQL_INSERT_SAFE_INPUT, SQL_INSERT_SEQUENCED_DIRECT_INPUT,
         SQL_INSERT_USER_OP, sql_insert_open_batch, sql_insert_open_batch_with_index,
         sql_insert_open_frame, sql_insert_safe_inputs_batch,
-        sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_batch,
+        sql_insert_sequenced_direct_inputs, sql_insert_user_ops_batch,
         sql_select_batch_policy, sql_select_frames_for_batch, sql_select_latest_batch_index,
         sql_select_latest_batch_with_user_op_count, sql_select_max_safe_input_index,
         sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_from_offset,
@@ -701,16 +700,17 @@ mod tests {
     fn batch_policy_helpers_read_defaults_and_update_knobs() {
         let conn = setup_conn();
         // Default: gas_price=0 → recommended_fee=0, alpha=168/1000 → batch_size_target=12591
-        let (fee, target) = sql_select_batch_policy(&conn).expect("read policy");
-        assert_eq!(fee, 0);
+        let (gas_price, _anum, _adenom, _delta, _uob, target) =
+            sql_select_batch_policy(&conn).expect("read policy");
+        assert_eq!(gas_price, 0);
         assert_eq!(target, 55000 * 1000 / (168 * 26)); // 12591
 
         sql_update_batch_policy_gas_price(&conn, 100).expect("update gas price");
-        let (fee, _) = sql_select_batch_policy(&conn).expect("read updated policy");
-        assert!(fee > 0, "fee should be derived from gas_price");
+        let (gas_price, ..) = sql_select_batch_policy(&conn).expect("read updated policy");
+        assert!(gas_price > 0, "gas_price should have been updated");
 
         sql_update_batch_policy_alpha(&conn, 200, 1000).expect("update alpha");
-        let (_, target) = sql_select_batch_policy(&conn).expect("read updated target");
+        let (.., target) = sql_select_batch_policy(&conn).expect("read updated target");
         assert_eq!(target, 55000 * 1000 / (200 * 26)); // 10576
     }
 
@@ -758,7 +758,7 @@ mod tests {
         sql_insert_user_ops_batch(&tx, 0, 0, 0, user_ops.as_slice())
             .expect("insert user ops + sequenced batch");
 
-        sql_insert_sequenced_direct_inputs_for_frame(
+        sql_insert_sequenced_direct_inputs(
             &tx,
             0,
             0,

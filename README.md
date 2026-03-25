@@ -16,9 +16,9 @@ Current focus is reliability of sequencing, persistence, and replay semantics.
 ## Core Design
 
 - **User ops** arrive through the API, are validated, executed, and persisted by the inclusion lane.
-- **Direct inputs** are stored in SQLite (`direct_inputs`) and sequenced in append-only replay order (`sequenced_l2_txs`).
+- **Direct inputs** are stored in SQLite (`safe_inputs`) and sequenced in append-only replay order (`sequenced_l2_txs`).
 - **Deposits** are direct-input-only (L1 -> L2) and are not accepted as user ops.
-- **Ordering** is deterministic and persisted. Replay/catch-up reads `sequenced_l2_txs` joined with `user_ops` and `direct_inputs`.
+- **Ordering** is deterministic and persisted. Replay/catch-up reads `sequenced_l2_txs` joined with `user_ops` and `safe_inputs`.
 - **Frame fee** is fixed per frame (`frames.fee`):
   - users sign `max_fee`
   - inclusion validates `max_fee >= current_frame_fee`
@@ -138,7 +138,7 @@ Success response:
 - `frames.fee`: committed fee for each frame
 - `user_ops`: included user operations
 - `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`); inserting into `user_ops` also appends the corresponding replay row via trigger `trg_sequence_user_op`
-- `direct_inputs`: direct-input payload stream
+- `safe_inputs`: direct-input payload stream
 - `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` view exposes `recommended_fee` and `batch_size_target`
 
 ## Project Layout

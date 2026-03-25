@@ -31,7 +31,7 @@ Build a robust sequencer prototype for a future DeFi stack, with deterministic o
 
 ### 1) Sequencer Core
 
-- Implement direct-input reader from blockchain (ingests into `direct_inputs`).
+- Implement direct-input reader from blockchain (ingests into `safe_inputs`).
 - Implement batch submitter (reads closed batches and submits on-chain).
 - Implement inclusion fee estimator module that updates the suggested fee in DB (`batch_policy`, e.g. `gas_price` or related knobs).
 - Add paginated historical `L2Tx` sync endpoint so lagging readers can backfill over HTTP before switching to `/ws/subscribe` for live updates.

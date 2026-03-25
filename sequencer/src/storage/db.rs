@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_open_batch, sql_insert_open_batch_with_index,
     sql_insert_open_frame, sql_insert_safe_inputs_batch,
-    sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_batch,
-    sql_select_batch_policy, sql_select_frames_for_batch, sql_select_latest_batch_index,
+    sql_insert_sequenced_direct_inputs, sql_insert_user_ops_batch, sql_select_batch_policy,
+    sql_select_frames_for_batch, sql_select_latest_batch_index,
     sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
     sql_select_max_safe_input_index, sql_select_ordered_l2_tx_count,
     sql_select_ordered_l2_txs_for_batch, sql_select_ordered_l2_txs_from_offset,
@@ -267,11 +267,16 @@ impl Storage {
     }
 
     pub fn batch_policy(&mut self) -> Result<BatchPolicy> {
-        let (fee, target) = sql_select_batch_policy(&self.conn)?;
-        Ok(BatchPolicy {
-            recommended_fee: i64_to_u64(fee),
-            batch_size_target: i64_to_u64(target),
-        })
+        let (gas_price, alpha_num, alpha_denom, const_delta, const_user_op_bytes, batch_size_target) =
+            sql_select_batch_policy(&self.conn)?;
+        Ok(batch_policy_from_raw(
+            gas_price,
+            alpha_num,
+            alpha_denom,
+            const_delta,
+            const_user_op_bytes,
+            batch_size_target,
+        ))
     }
 
     pub fn set_gas_price(&mut self, gas_price: u64) -> Result<()> {
@@ -623,11 +628,43 @@ fn query_current_safe_block(tx: &Connection) -> Result<u64> {
 }
 
 fn query_batch_policy(tx: &Transaction<'_>) -> Result<BatchPolicy> {
-    let (fee, target) = sql_select_batch_policy(tx)?;
-    Ok(BatchPolicy {
-        recommended_fee: i64_to_u64(fee),
-        batch_size_target: i64_to_u64(target),
-    })
+    let (gas_price, alpha_num, alpha_denom, const_delta, const_user_op_bytes, batch_size_target) =
+        sql_select_batch_policy(tx)?;
+    Ok(batch_policy_from_raw(
+        gas_price,
+        alpha_num,
+        alpha_denom,
+        const_delta,
+        const_user_op_bytes,
+        batch_size_target,
+    ))
+}
+
+/// Compute `BatchPolicy` from raw DB columns using checked arithmetic.
+///
+/// Formula: `recommended_fee = gas_price * (alpha_num + alpha_denom) * delta * user_op_bytes / alpha_denom`
+///
+/// Panics if the intermediate product overflows u64 (should not happen with
+/// the `gas_price <= 2_000_000_000_000` CHECK in the schema).
+fn batch_policy_from_raw(
+    gas_price: i64,
+    alpha_num: i64,
+    alpha_denom: i64,
+    const_delta: i64,
+    const_user_op_bytes: i64,
+    batch_size_target: i64,
+) -> BatchPolicy {
+    let recommended_fee = (gas_price as u64)
+        .checked_mul((alpha_num + alpha_denom) as u64)
+        .and_then(|v| v.checked_mul(const_delta as u64))
+        .and_then(|v| v.checked_mul(const_user_op_bytes as u64))
+        .map(|v| v / alpha_denom as u64)
+        .expect("recommended_fee overflow: gas_price is too large for the current constants");
+
+    BatchPolicy {
+        recommended_fee,
+        batch_size_target: i64_to_u64(batch_size_target),
+    }
 }
 
 fn persist_frame_direct_sequence(
@@ -636,7 +673,7 @@ fn persist_frame_direct_sequence(
     frame_in_batch: u32,
     drained_direct_range: SafeInputRange,
 ) -> Result<()> {
-    sql_insert_sequenced_direct_inputs_for_frame(
+    sql_insert_sequenced_direct_inputs(
         tx,
         u64_to_i64(batch_index),
         i64::from(frame_in_batch),

@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS user_ops (
 );
 
 -- Automatically sequence every user-op into the global replay order on insert.
+-- Note: safe_inputs do NOT have an analogous trigger because their
+-- batch_index/frame_in_batch are not known at INSERT time — safe inputs
+-- are ingested by the input reader independently, and only assigned to a
+-- frame when the frame is closed.  The Rust code inserts into
+-- sequenced_l2_txs explicitly at frame-close time.
 CREATE TRIGGER IF NOT EXISTS trg_sequence_user_op AFTER INSERT ON user_ops
 BEGIN
     INSERT INTO sequenced_l2_txs (
@@ -101,6 +106,24 @@ VALUES (0, 0);
 --   batch_size_target = const_base_gas * alpha_denom / (alpha_num * const_delta)
 --   recommended_fee   = gas_price * (alpha_num + alpha_denom)
 --                        * const_delta * const_user_op_bytes / alpha_denom
+--
+-- Fee unit:
+--   `gas_price` is denominated in "L2 smallest-token-unit per L1 gas unit".
+--   The entity feeding this value (e.g. a scheduler/price-oracle) must
+--   convert the L1 gas price in wei and the L1↔L2 exchange rate into this
+--   single number.  For tokens with few decimals (e.g. USDC, 6 decimals)
+--   the scheduler should pre-scale the value (multiply by 10^k) so that
+--   sub-unit precision is not lost to integer truncation.
+--
+-- Overflow safety:
+--   The intermediate product in `recommended_fee` is:
+--     gas_price * (alpha_num + alpha_denom) * const_delta * const_user_op_bytes
+--   With the current constants this equals gas_price × 1168 × 26 × 126
+--   = gas_price × 3,826,368.  SQLite uses signed 64-bit integers and
+--   silently wraps on overflow (no detection mechanism).  The CHECK on
+--   gas_price caps it at 2 × 10^12, keeping the intermediate product
+--   well below i64::MAX ≈ 9.2 × 10^18.  The Rust reader additionally
+--   validates with checked arithmetic.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS batch_policy (
     singleton_id             INTEGER PRIMARY KEY CHECK (singleton_id = 0),
@@ -108,7 +131,8 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     -- Knobs (operator-tunable via sqlite3 CLI):
     alpha_num                INTEGER NOT NULL CHECK (alpha_num > 0),
     alpha_denom              INTEGER NOT NULL CHECK (alpha_denom > 0),
-    gas_price                INTEGER NOT NULL CHECK (gas_price >= 0),
+    -- See "Fee unit" and "Overflow safety" in the comment block above.
+    gas_price                INTEGER NOT NULL CHECK (gas_price >= 0 AND gas_price <= 2000000000000),
 
     -- Constants (in DB so the CHECK can reference them):
     const_delta              INTEGER NOT NULL CHECK (const_delta > 0),
