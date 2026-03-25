@@ -26,13 +26,11 @@ const SQL_SELECT_LATEST_BATCH_INDEX: &str = "SELECT MAX(batch_index) FROM batche
 const SQL_SELECT_USER_OPS_FOR_FRAME: &str = "SELECT nonce, max_fee, data, sig FROM user_ops WHERE batch_index = ?1 AND frame_in_batch = ?2 ORDER BY pos_in_frame ASC";
 const SQL_SELECT_MAX_SAFE_INPUT_INDEX: &str = "SELECT MAX(safe_input_index) FROM safe_inputs";
 const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_txs";
-const SQL_SELECT_BATCH_POLICY: &str =
-    "SELECT recommended_fee, batch_size_target FROM batch_policy_derived WHERE singleton_id = 0 LIMIT 1";
+const SQL_SELECT_BATCH_POLICY: &str = "SELECT recommended_fee, batch_size_target FROM batch_policy_derived WHERE singleton_id = 0 LIMIT 1";
 const SQL_SELECT_SAFE_BLOCK: &str =
     "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1";
 const SQL_INSERT_SAFE_INPUT: &str = "INSERT INTO safe_inputs (safe_input_index, sender, payload, block_number) VALUES (?1, ?2, ?3, ?4)";
 const SQL_INSERT_USER_OP: &str = include_str!("queries/insert_user_op.sql");
-const SQL_INSERT_SEQUENCED_USER_OP: &str = include_str!("queries/insert_sequenced_user_op.sql");
 const SQL_INSERT_SEQUENCED_DIRECT_INPUT: &str =
     include_str!("queries/insert_sequenced_direct_input.sql");
 const SQL_UPDATE_BATCH_POLICY_GAS_PRICE: &str =
@@ -113,7 +111,10 @@ pub(super) fn sql_update_batch_policy_alpha(
     alpha_num: i64,
     alpha_denom: i64,
 ) -> Result<usize> {
-    conn.execute(SQL_UPDATE_BATCH_POLICY_ALPHA, params![alpha_num, alpha_denom])
+    conn.execute(
+        SQL_UPDATE_BATCH_POLICY_ALPHA,
+        params![alpha_num, alpha_denom],
+    )
 }
 
 pub(super) fn sql_select_safe_block(conn: &Connection) -> Result<i64> {
@@ -190,7 +191,10 @@ pub(super) fn sql_insert_safe_inputs_batch(
     Ok(())
 }
 
-pub(super) fn sql_insert_user_ops_and_sequenced_batch(
+/// Insert user-ops into the `user_ops` table.
+/// The `trg_sequence_user_op` trigger automatically appends a corresponding row
+/// to `sequenced_l2_txs` for each inserted user-op.
+pub(super) fn sql_insert_user_ops_batch(
     tx: &Transaction<'_>,
     batch_index: i64,
     frame_in_batch: i64,
@@ -201,12 +205,11 @@ pub(super) fn sql_insert_user_ops_and_sequenced_batch(
         return Ok(());
     }
 
-    let mut user_ops_stmt = tx.prepare_cached(SQL_INSERT_USER_OP)?;
-    let mut sequenced_stmt = tx.prepare_cached(SQL_INSERT_SEQUENCED_USER_OP)?;
+    let mut stmt = tx.prepare_cached(SQL_INSERT_USER_OP)?;
     for (offset, item) in user_ops.iter().enumerate() {
         let pos_in_frame = frame_pos_start.saturating_add(offset as u32);
         let sig = item.signed.signature.as_bytes();
-        user_ops_stmt.execute(params![
+        stmt.execute(params![
             batch_index,
             frame_in_batch,
             i64::from(pos_in_frame),
@@ -216,11 +219,6 @@ pub(super) fn sql_insert_user_ops_and_sequenced_batch(
             item.signed.user_op.data.as_ref(),
             &sig[..],
             to_unix_ms(item.received_at),
-        ])?;
-        sequenced_stmt.execute(params![
-            batch_index,
-            frame_in_batch,
-            i64::from(pos_in_frame),
         ])?;
     }
     Ok(())
@@ -411,9 +409,9 @@ fn u64_to_i64(value: u64) -> i64 {
 mod tests {
     use super::{
         FrameHeaderRow, SQL_INSERT_SAFE_INPUT, SQL_INSERT_SEQUENCED_DIRECT_INPUT,
-        SQL_INSERT_SEQUENCED_USER_OP, SQL_INSERT_USER_OP, sql_insert_open_batch,
-        sql_insert_open_batch_with_index, sql_insert_open_frame, sql_insert_safe_inputs_batch,
-        sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_and_sequenced_batch,
+        SQL_INSERT_USER_OP, sql_insert_open_batch, sql_insert_open_batch_with_index,
+        sql_insert_open_frame, sql_insert_safe_inputs_batch,
+        sql_insert_sequenced_direct_inputs_for_frame, sql_insert_user_ops_batch,
         sql_select_batch_policy, sql_select_frames_for_batch, sql_select_latest_batch_index,
         sql_select_latest_batch_with_user_op_count, sql_select_max_safe_input_index,
         sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_from_offset,
@@ -561,13 +559,12 @@ mod tests {
             ],
         )
         .expect("insert user op");
+        // The trg_sequence_user_op trigger automatically inserts the sequenced row.
         conn.execute(
             SQL_INSERT_SAFE_INPUT,
             params![0_i64, vec![0x11_u8; 20], vec![0xaa_u8], 10_i64],
         )
         .expect("insert direct input");
-        conn.execute(SQL_INSERT_SEQUENCED_USER_OP, params![0_i64, 0_i64, 0_i64])
-            .expect("insert sequenced user op");
         conn.execute(
             SQL_INSERT_SEQUENCED_DIRECT_INPUT,
             params![0_i64, 0_i64, 0_i64],
@@ -758,7 +755,7 @@ mod tests {
             sample_pending_user_op(0x20, 0, 1),
             sample_pending_user_op(0x21, 1, 1),
         ];
-        sql_insert_user_ops_and_sequenced_batch(&tx, 0, 0, 0, user_ops.as_slice())
+        sql_insert_user_ops_batch(&tx, 0, 0, 0, user_ops.as_slice())
             .expect("insert user ops + sequenced batch");
 
         sql_insert_sequenced_direct_inputs_for_frame(

@@ -161,7 +161,9 @@ where
 
     // Validate that the RPC chain ID matches --chain-id.
     use alloy::providers::Provider;
-    let rpc_chain_id = provider.get_chain_id().await
+    let rpc_chain_id = provider
+        .get_chain_id()
+        .await
         .map_err(|e| std::io::Error::other(format!("failed to query RPC chain ID: {e}")))?;
     assert_eq!(
         rpc_chain_id, config.chain_id,

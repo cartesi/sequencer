@@ -29,6 +29,14 @@ CREATE TABLE IF NOT EXISTS user_ops (
     UNIQUE(sender, nonce)
 );
 
+-- Automatically sequence every user-op into the global replay order on insert.
+CREATE TRIGGER IF NOT EXISTS trg_sequence_user_op AFTER INSERT ON user_ops
+BEGIN
+    INSERT INTO sequenced_l2_txs (
+        batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index
+    ) VALUES (NEW.batch_index, NEW.frame_in_batch, NEW.pos_in_frame, NULL);
+END;
+
 CREATE TABLE IF NOT EXISTS safe_inputs (
     safe_input_index INTEGER PRIMARY KEY,
     sender             BLOB NOT NULL CHECK (length(sender) = 20),
