@@ -23,7 +23,8 @@ Current focus is reliability of sequencing, persistence, and replay semantics.
   - users sign `max_fee`
   - inclusion validates `max_fee >= current_frame_fee`
   - execution charges `current_frame_fee`
-  - the next frame fee is sampled from `recommended_fees` when rotating to a new frame
+  - when opening a new frame or batch, the sequencer samples **`recommended_fee`** from the `batch_policy_derived` SQLite view (derived from `gas_price`, amortization `alpha`, and on-chain DA constants in `batch_policy`)
+- **Batch closure by size** uses **`batch_size_target`** from the same view (stored on `WriteHead` as `max_batch_user_op_bytes`). The inclusion lane compares it to a **worst-case estimate** of in-batch user-op bytes (`batch_user_op_count × (per-op metadata cap + max method payload)`), not the exact SSZ-encoded batch size. A **time-based** max open duration also closes batches.
 
 ## Quick Start
 
@@ -36,31 +37,38 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Run the server with a local deployment domain:
+Run the server (example uses Anvil account #0 as batch submitter; use your own key in production):
 
 ```bash
 SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \
-SEQ_DOMAIN_CHAIN_ID=31337 \
-SEQ_DOMAIN_VERIFYING_CONTRACT=0x1111111111111111111111111111111111111111 \
+SEQ_CHAIN_ID=31337 \
+SEQ_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
+SEQ_BATCH_SUBMITTER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
 cargo run -p sequencer
 ```
+
+At startup the process checks that the RPC `eth_chainId` matches `SEQ_CHAIN_ID`.
 
 Optional runtime inputs:
 
 - `SEQ_HTTP_ADDR` defaults to `127.0.0.1:3000`
-- `SEQ_DB_PATH` defaults to `sequencer.db`
+- `SEQ_DATA_DIR` defaults to `sequencer-data` (SQLite file is `sequencer.db` inside that directory; the directory is created if missing)
 - `SEQ_LONG_BLOCK_RANGE_ERROR_CODES` defaults to `-32005,-32600,-32602,-32616`
+- `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE` instead of `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` (first line of the file is the key)
+- `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH`
 
 Required runtime inputs:
 
 - `SEQ_ETH_RPC_URL`
-- `SEQ_DOMAIN_CHAIN_ID`
-- `SEQ_DOMAIN_VERIFYING_CONTRACT`
+- `SEQ_CHAIN_ID`
+- `SEQ_APP_ADDRESS`
+- `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` or `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE`
 
-Fixed protocol identity:
+Fixed protocol identity (EIP-712):
 
 - domain name: `CartesiAppSequencer`
 - domain version: `1`
+- `chain_id` and `verifying_contract` come from `SEQ_CHAIN_ID` and `SEQ_APP_ADDRESS`
 
 Most queue sizes, polling intervals, and safety limits are now internal runtime constants instead of public launch-time configuration.
 
@@ -129,9 +137,9 @@ Success response:
 - `frames`: frame boundaries within each batch
 - `frames.fee`: committed fee for each frame
 - `user_ops`: included user operations
+- `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`); inserting into `user_ops` also appends the corresponding replay row via trigger `trg_sequence_user_op`
 - `direct_inputs`: direct-input payload stream
-- `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`)
-- `recommended_fees`: singleton mutable recommendation for the next frame fee
+- `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` view exposes `recommended_fee` and `batch_size_target`
 
 ## Project Layout
 

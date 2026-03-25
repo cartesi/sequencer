@@ -57,11 +57,11 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - Rejections (`InvalidNonce`, fee cap too low, insufficient gas balance) produce no state mutation and are not persisted.
 - Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `direct_inputs`, and `sequenced_l2_txs`.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame.
-- The next frame fee is sampled from `recommended_fees` when rotating to a new frame (default bootstrap value is `0`).
+- The next frame fee is sampled from `batch_policy_derived.recommended_fee` when rotating to a new frame (defaults follow `batch_policy` bootstrap rows; tune `gas_price` / `alpha` via SQLite if needed).
 - `/ws/subscribe` currently has internal guardrails: subscriber cap `64`, catch-up cap `50000`.
 - When that catch-up window is exceeded, `/ws/subscribe` upgrades and then closes with websocket close code `1008` (`POLICY`) and reason `catch-up window exceeded`.
 - Wallet state (balances/nonces) is in-memory right now (not persisted).
-- EIP-712 domain name/version are fixed in code; chain ID and verifying contract are deployment-specific inputs.
+- EIP-712 domain name/version are fixed in code; chain ID and verifying contract come from `SEQ_CHAIN_ID` and `SEQ_APP_ADDRESS` (validated against the RPC chain id at startup).
 
 ## Hot-Path Invariants
 
@@ -113,20 +113,24 @@ Run server:
 
 ```bash
 SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \
-SEQ_DOMAIN_CHAIN_ID=31337 \
-SEQ_DOMAIN_VERIFYING_CONTRACT=0x1111111111111111111111111111111111111111 \
+SEQ_CHAIN_ID=31337 \
+SEQ_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
+SEQ_BATCH_SUBMITTER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
 cargo run -p sequencer
 ```
 
 Optional env vars:
 - `SEQ_HTTP_ADDR`
-- `SEQ_DB_PATH`
+- `SEQ_DATA_DIR` (default `sequencer-data`; DB file `sequencer.db` inside it)
 - `SEQ_LONG_BLOCK_RANGE_ERROR_CODES`
+- `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE` (alternative to `SEQ_BATCH_SUBMITTER_PRIVATE_KEY`)
+- `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH`
 
 Required env vars:
 - `SEQ_ETH_RPC_URL`
-- `SEQ_DOMAIN_CHAIN_ID`
-- `SEQ_DOMAIN_VERIFYING_CONTRACT`
+- `SEQ_CHAIN_ID`
+- `SEQ_APP_ADDRESS`
+- `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` or `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE`
 
 ## Always / Ask First / Never
 
