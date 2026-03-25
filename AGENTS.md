@@ -55,7 +55,7 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - API validates signature and enqueues signed `UserOp`; method decoding happens during application execution.
 - Deposits are direct-input-only (L1 -> L2) and must not be represented as user ops.
 - Rejections (`InvalidNonce`, fee cap too low, insufficient gas balance) produce no state mutation and are not persisted.
-- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `direct_inputs`, and `sequenced_l2_txs`.
+- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame.
 - The next frame fee is sampled from `batch_policy_derived.recommended_fee` when rotating to a new frame (defaults follow `batch_policy` bootstrap rows; tune `gas_price` / `alpha` via SQLite if needed).
 - `/ws/subscribe` currently has internal guardrails: subscriber cap `64`, catch-up cap `50000`.
@@ -77,7 +77,7 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - Storage model is append-oriented; avoid mutable status flags for open/closed entities.
 - Open batch/frame are derived by “latest row” convention.
 - A frame’s leading direct-input prefix is derivable from `sequenced_l2_txs` plus `frames.safe_block`.
-- `direct_inputs` contains only L1 app direct input **bodies**. InputBox payload first byte: **0x00** = direct input (tag stripped, body stored and executed), **0x01** = batch submission (for scheduler, not stored), **others** = discarded (invalid/garbage). The input reader only accepts 0x00-tagged payloads and stores `payload[1..]`.
+- `safe_inputs` contains only L1 app direct input **bodies**. InputBox payload first byte: **0x00** = direct input (tag stripped, body stored and executed), **0x01** = batch submission (for scheduler, not stored), **others** = discarded (invalid/garbage). The input reader only accepts 0x00-tagged payloads and stores `payload[1..]`.
 - Safe cursor/head values should be derived from persisted facts when possible, not duplicated as mutable fields.
 - Replay/catch-up must use persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics.
 - Included user-op identity is constrained by `UNIQUE(sender, nonce)`.
