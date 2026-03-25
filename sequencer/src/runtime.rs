@@ -85,18 +85,12 @@ where
     let domain = config.build_domain();
     let shutdown = ShutdownSignal::default();
 
+    // Ensure the data directory exists before any component tries to open the DB.
+    std::fs::create_dir_all(&config.data_dir)?;
+    let db_path = config.db_path();
+
     // Single L1/InputBox config shared by input reader and batch submitter (no duplicate RPC URL or addresses).
-    // Resolve batch-submitter private key (exactly one of inline or file is required at the CLI layer).
-    let batch_submitter_private_key = if let Some(file) = &config.batch_submitter_private_key_file {
-        let contents =
-            std::fs::read_to_string(file).map_err(|e| RunError::Io(std::io::Error::other(e)))?;
-        contents.lines().next().unwrap_or("").trim().to_string()
-    } else {
-        config
-            .batch_submitter_private_key
-            .clone()
-            .expect("batch submitter private key is required by CLI arg group")
-    };
+    let batch_submitter_private_key = config.resolve_private_key()?;
 
     let batch_submitter_address = {
         use alloy::signers::local::PrivateKeySigner;
@@ -106,11 +100,11 @@ where
             .address()
     };
     let mut input_reader = InputReader::new(
-        config.db_path.clone(),
+        db_path.clone(),
         shutdown.clone(),
         InputReaderConfig {
             rpc_url: config.eth_rpc_url.clone(),
-            app_address: config.domain_verifying_contract,
+            app_address: config.app_address,
             poll_interval: INPUT_READER_POLL_INTERVAL,
             long_block_range_error_codes: config.long_block_range_error_codes.clone(),
         },
@@ -121,7 +115,7 @@ where
     let l1_config = L1Config {
         eth_rpc_url: config.eth_rpc_url.clone(),
         input_box_address: input_reader.input_box_address(),
-        app_address: config.domain_verifying_contract,
+        app_address: config.app_address,
         batch_submitter_private_key,
         batch_submitter_address,
     };
@@ -132,16 +126,16 @@ where
 
     tracing::info!(
         http_addr = %config.http_addr,
-        db_path = %config.db_path,
+        data_dir = %config.data_dir,
         eth_rpc_url = %l1_config.eth_rpc_url,
         input_box_address = %l1_config.input_box_address,
         input_reader_genesis_block,
-        domain_chain_id = config.domain_chain_id,
-        domain_verifying_contract = %l1_config.app_address,
+        chain_id = config.chain_id,
+        app_address = %l1_config.app_address,
         "starting sequencer"
     );
 
-    let storage = storage::Storage::open(&config.db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+    let storage = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
     let (tx, mut inclusion_lane_handle) = InclusionLane::start(
         QUEUE_CAPACITY,
         shutdown.clone(),
@@ -164,9 +158,20 @@ where
         long_block_range_error_codes: config.long_block_range_error_codes,
     };
     let provider = build_batch_submitter_provider(&l1_config).await?;
+
+    // Validate that the RPC chain ID matches --chain-id.
+    use alloy::providers::Provider;
+    let rpc_chain_id = provider.get_chain_id().await
+        .map_err(|e| std::io::Error::other(format!("failed to query RPC chain ID: {e}")))?;
+    assert_eq!(
+        rpc_chain_id, config.chain_id,
+        "RPC chain ID {rpc_chain_id} does not match --chain-id {}",
+        config.chain_id
+    );
+
     let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
     let submitter = BatchSubmitter::new(
-        config.db_path.clone(),
+        db_path.clone(),
         l1_config.batch_submitter_address,
         poster,
         shutdown.clone(),
@@ -175,7 +180,7 @@ where
     let mut batch_submitter_handle = submitter.start().map_err(RunError::OpenStorage)?;
 
     let tx_feed = L2TxFeed::new(
-        config.db_path.clone(),
+        db_path.clone(),
         shutdown.clone(),
         L2TxFeedConfig {
             batch_submitter_address: Some(l1_config.batch_submitter_address),

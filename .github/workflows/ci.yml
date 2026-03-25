@@ -6,6 +6,11 @@ on:
 
 env:
   XGENEXT2FS_VERSION: v1.5.6
+  XGENEXT2FS_SHA256_AMD64: 996e4e68a638b5dc5967d3410f92ecb8d2f41e32218bbe0f8b4c4474d7eebc59
+  XGENEXT2FS_SHA256_ARM64: e5aca81164b762bbe5447bacef41e4fa9e357fd9c8f44e519c5206227d43144d
+  CARTESI_MACHINE_VERSION: v0.20.0-test2
+  CARTESI_MACHINE_SHA256_AMD64: 39bbfc96a6cc6606307294b719df65f4f2725e8d200d062bcbd8c22355b99b56
+  CARTESI_MACHINE_SHA256_ARM64: 787d823756000cdecd72da8a3494b4c08613087379035959e561bbaef7a220ba
 
 jobs:
   rust:
@@ -27,7 +32,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -37,14 +42,14 @@ jobs:
         with:
           version: v1.4.3
 
-      - name: Check
-        run: cargo check --workspace --all-targets --locked
-
       - name: Build
         run: cargo build --workspace --all-targets --locked
 
       - name: Format
         run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test
         timeout-minutes: 15
@@ -59,90 +64,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            lua5.4 \
-            liblua5.4-dev \
-            libslirp-dev \
-            ca-certificates \
-            wget \
-            xz-utils
-
-      - name: Install xgenext2fs
-        run: |
-          set -euo pipefail
-          ARCH="$(dpkg --print-architecture)"
-          VERSION="${XGENEXT2FS_VERSION}"
-
-          case "${ARCH}" in
-            amd64)
-              ASSET_NAME="xgenext2fs_amd64.deb"
-              ;;
-            arm64)
-              ASSET_NAME="xgenext2fs_arm64.deb"
-              ;;
-            *)
-              echo "unsupported arch for xgenext2fs: ${ARCH}" >&2
-              exit 1
-              ;;
-          esac
-
-          ASSET_URL="https://github.com/cartesi/genext2fs/releases/download/${VERSION}/${ASSET_NAME}"
-          wget -O /tmp/xgenext2fs.deb "${ASSET_URL}"
-          sha256sum /tmp/xgenext2fs.deb
-          sudo apt-get update
-          sudo apt-get install -y /tmp/xgenext2fs.deb
-
-      - name: Install cartesi-machine (machine emulator CLI)
-        run: |
-          set -euo pipefail
-          ARCH="$(dpkg --print-architecture)"
-          VERSION="v0.20.0-test2"
-
-          case "${ARCH}" in
-            amd64)
-              DEB_SHA256="39bbfc96a6cc6606307294b719df65f4f2725e8d200d062bcbd8c22355b99b56"
-              ;;
-            arm64)
-              DEB_SHA256="787d823756000cdecd72da8a3494b4c08613087379035959e561bbaef7a220ba"
-              ;;
-            *)
-              echo "unsupported arch for machine-emulator: ${ARCH}" >&2
-              exit 1
-              ;;
-          esac
-
-          wget -O /tmp/machine-emulator.deb "https://github.com/cartesi/machine-emulator/releases/download/${VERSION}/machine-emulator_${ARCH}.deb"
-          echo "${DEB_SHA256}  /tmp/machine-emulator.deb" | sha256sum --check
-          sudo apt-get update
-          sudo apt-get install -y /tmp/machine-emulator.deb
-          cartesi-machine --version
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup guest toolchain
+        uses: ./.github/actions/setup-guest-toolchain
         with:
-          components: rustfmt
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+          xgenext2fs-version: ${{ env.XGENEXT2FS_VERSION }}
+          xgenext2fs-sha256-amd64: ${{ env.XGENEXT2FS_SHA256_AMD64 }}
+          xgenext2fs-sha256-arm64: ${{ env.XGENEXT2FS_SHA256_ARM64 }}
+          cartesi-machine-version: ${{ env.CARTESI_MACHINE_VERSION }}
+          cartesi-machine-sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
+          cartesi-machine-sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
 
       - name: Download canonical app deps
         run: just -f examples/canonical-app/justfile download-deps
@@ -159,95 +89,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            lua5.4 \
-            liblua5.4-dev \
-            libslirp-dev \
-            ca-certificates \
-            wget \
-            xz-utils
-
-      - name: Install xgenext2fs
-        run: |
-          set -euo pipefail
-          ARCH="$(dpkg --print-architecture)"
-          VERSION="${XGENEXT2FS_VERSION}"
-
-          case "${ARCH}" in
-            amd64)
-              ASSET_NAME="xgenext2fs_amd64.deb"
-              ;;
-            arm64)
-              ASSET_NAME="xgenext2fs_arm64.deb"
-              ;;
-            *)
-              echo "unsupported arch for xgenext2fs: ${ARCH}" >&2
-              exit 1
-              ;;
-          esac
-
-          ASSET_URL="https://github.com/cartesi/genext2fs/releases/download/${VERSION}/${ASSET_NAME}"
-          wget -O /tmp/xgenext2fs.deb "${ASSET_URL}"
-          sha256sum /tmp/xgenext2fs.deb
-          sudo apt-get update
-          sudo apt-get install -y /tmp/xgenext2fs.deb
-
-      - name: Install cartesi-machine (machine emulator CLI)
-        run: |
-          set -euo pipefail
-          ARCH="$(dpkg --print-architecture)"
-          VERSION="v0.20.0-test2"
-
-          case "${ARCH}" in
-            amd64)
-              DEB_SHA256="39bbfc96a6cc6606307294b719df65f4f2725e8d200d062bcbd8c22355b99b56"
-              ;;
-            arm64)
-              DEB_SHA256="787d823756000cdecd72da8a3494b4c08613087379035959e561bbaef7a220ba"
-              ;;
-            *)
-              echo "unsupported arch for machine-emulator: ${ARCH}" >&2
-              exit 1
-              ;;
-          esac
-
-          wget -O /tmp/machine-emulator.deb "https://github.com/cartesi/machine-emulator/releases/download/${VERSION}/machine-emulator_${ARCH}.deb"
-          echo "${DEB_SHA256}  /tmp/machine-emulator.deb" | sha256sum --check
-          sudo apt-get update
-          sudo apt-get install -y /tmp/machine-emulator.deb
-          cartesi-machine --version
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup guest toolchain
+        uses: ./.github/actions/setup-guest-toolchain
         with:
-          components: rustfmt
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.4.3
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+          xgenext2fs-version: ${{ env.XGENEXT2FS_VERSION }}
+          xgenext2fs-sha256-amd64: ${{ env.XGENEXT2FS_SHA256_AMD64 }}
+          xgenext2fs-sha256-arm64: ${{ env.XGENEXT2FS_SHA256_ARM64 }}
+          cartesi-machine-version: ${{ env.CARTESI_MACHINE_VERSION }}
+          cartesi-machine-sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
+          cartesi-machine-sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
+          install-foundry: "true"
 
       - name: Run rollups E2E tests
         run: just test-rollups-e2e

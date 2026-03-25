@@ -9,52 +9,42 @@ pub const DOMAIN_NAME: &str = "CartesiAppSequencer";
 pub const DOMAIN_VERSION: &str = "1";
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
-const DEFAULT_DB_PATH: &str = "sequencer.db";
+const DEFAULT_DATA_DIR: &str = "sequencer-data";
+const DB_FILENAME: &str = "sequencer.db";
 
 /// Shared L1 / InputBox configuration used by both the input reader and the batch submitter.
 ///
 /// Built once at startup from `RunConfig` plus the discovered InputBox address, so RPC URL,
-/// InputBox address, and app (verifying contract) address are defined in a single place and
-/// not duplicated across component configs.
+/// InputBox address, and app address are defined in a single place and not duplicated across
+/// component configs.
 #[derive(Debug, Clone)]
 pub struct L1Config {
-    /// L1 Ethereum RPC URL (e.g. for reading safe blocks and posting batch inputs).
     pub eth_rpc_url: String,
-    /// InputBox contract address (same contract for ingesting direct inputs and for submitting batches).
     pub input_box_address: Address,
-    /// Application / verifying contract address (used to discover InputBox and filter inputs).
     pub app_address: Address,
-    /// Hex-encoded private key used by the batch submitter for posting batches to L1.
-    ///
-    /// `RunConfig` is responsible for resolving whether this comes from an inline
-    /// value or a key file; by the time `L1Config` is constructed this is always
-    /// the fully resolved private key.
     pub batch_submitter_private_key: String,
-    /// EOA address of the batch submitter (derived from `batch_submitter_private_key`).
-    /// Inputs from this sender are batch submissions; all others are direct inputs.
     pub batch_submitter_address: Address,
 }
 
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "sequencer",
-    about = "Deterministic sequencer prototype with low-latency soft confirmations",
+    about = "Deterministic sequencer prototype with low-latency soft confirmations.\n\n\
+             All options can also be set via environment variables (shown in brackets).",
     version,
     after_help = "\
 Examples:
   sequencer \\
     --eth-rpc-url http://127.0.0.1:8545 \\
-    --domain-chain-id 31337 \\
-    --domain-verifying-contract 0x1111111111111111111111111111111111111111 \\
-    --batch-submitter-private-key 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    --chain-id 31337 \\
+    --app-address 0x1111111111111111111111111111111111111111 \\
+    --batch-submitter-private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
-  sequencer \\
-    --http-addr 0.0.0.0:3000 \\
-    --db-path ./sequencer.db \\
-    --eth-rpc-url https://eth.example \\
-    --domain-chain-id 1 \\
-    --domain-verifying-contract 0x4444444444444444444444444444444444444444 \\
-    --batch-submitter-private-key 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+  SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \\
+  SEQ_CHAIN_ID=31337 \\
+  SEQ_APP_ADDRESS=0x1111111111111111111111111111111111111111 \\
+  SEQ_BATCH_SUBMITTER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \\
+  sequencer\
 ",
     group(
         ArgGroup::new("batch_submitter_key_source")
@@ -66,34 +56,33 @@ Examples:
 pub struct RunConfig {
     #[arg(long, env = "SEQ_HTTP_ADDR", default_value = DEFAULT_HTTP_ADDR, value_parser = parse_non_empty_string)]
     pub http_addr: String,
-    #[arg(long, env = "SEQ_DB_PATH", default_value = DEFAULT_DB_PATH, value_parser = parse_non_empty_string)]
-    pub db_path: String,
+    #[arg(long, env = "SEQ_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
+    pub data_dir: String,
     #[arg(long, env = "SEQ_ETH_RPC_URL", value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
     #[arg(long, env = "SEQ_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
     pub long_block_range_error_codes: Vec<String>,
-    #[arg(long, env = "SEQ_DOMAIN_CHAIN_ID")]
-    pub domain_chain_id: u64,
-    #[arg(long, env = "SEQ_DOMAIN_VERIFYING_CONTRACT", value_parser = parse_address)]
-    pub domain_verifying_contract: Address,
-    /// Hex-encoded private key used by the batch submitter for posting batches to L1.
-    /// Exactly one of this or `batch_submitter_private_key_file` must be set when a signer
-    /// is desired.
+    /// Expected chain ID. Validated against the RPC at startup.
+    #[arg(long, env = "SEQ_CHAIN_ID")]
+    pub chain_id: u64,
+    /// Application (EIP-712 verifying contract) address.
+    #[arg(long, env = "SEQ_APP_ADDRESS", value_parser = parse_address)]
+    pub app_address: Address,
+    /// Hex-encoded private key for the batch submitter.
     #[arg(
         long,
         env = "SEQ_BATCH_SUBMITTER_PRIVATE_KEY",
         group = "batch_submitter_key_source"
     )]
-    pub batch_submitter_private_key: Option<String>,
-    /// Path to a file whose first line contains the batch submitter private key. Takes
-    /// precedence over `batch_submitter_private_key` if both are set (checked by clap group).
+    batch_submitter_private_key: Option<String>,
+    /// Path to a file whose first line contains the batch submitter private key.
     #[arg(
         long,
         env = "SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE",
         group = "batch_submitter_key_source"
     )]
-    pub batch_submitter_private_key_file: Option<String>,
+    batch_submitter_private_key_file: Option<String>,
 
     /// How often the batch submitter polls for new work when idle.
     #[arg(
@@ -104,7 +93,6 @@ pub struct RunConfig {
     pub batch_submitter_idle_poll_interval_ms: u64,
 
     /// Number of blocks behind Latest that the batch submitter treats as confirmed.
-    /// The submitter scans only up to `Latest - depth`, and waits for the same depth after posting.
     #[arg(
         long,
         env = "SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH",
@@ -118,9 +106,30 @@ impl RunConfig {
         Eip712Domain {
             name: Some(DOMAIN_NAME.into()),
             version: Some(DOMAIN_VERSION.into()),
-            chain_id: Some(U256::from(self.domain_chain_id)),
-            verifying_contract: Some(self.domain_verifying_contract),
+            chain_id: Some(U256::from(self.chain_id)),
+            verifying_contract: Some(self.app_address),
             salt: None,
+        }
+    }
+
+    /// Full path to the SQLite database file inside `data_dir`.
+    pub fn db_path(&self) -> String {
+        std::path::Path::new(&self.data_dir)
+            .join(DB_FILENAME)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Resolve the batch submitter private key from either the inline value or a key file.
+    pub fn resolve_private_key(&self) -> Result<String, std::io::Error> {
+        if let Some(file) = &self.batch_submitter_private_key_file {
+            let contents = std::fs::read_to_string(file)?;
+            Ok(contents.lines().next().unwrap_or("").trim().to_string())
+        } else {
+            Ok(self
+                .batch_submitter_private_key
+                .clone()
+                .expect("batch submitter private key is required by CLI arg group"))
         }
     }
 }
@@ -135,13 +144,13 @@ fn parse_non_empty_string(raw: &str) -> Result<String, String> {
 
 fn parse_address(raw: &str) -> Result<Address, String> {
     if !raw.starts_with("0x") {
-        return Err("verifying contract must be 0x-prefixed".to_string());
+        return Err("address must be 0x-prefixed".to_string());
     }
 
     let bytes = alloy_primitives::hex::decode(raw)
-        .map_err(|err| format!("invalid verifying contract hex: {err}"))?;
+        .map_err(|err| format!("invalid address hex: {err}"))?;
     if bytes.len() != 20 {
-        return Err("verifying contract must be 20 bytes".to_string());
+        return Err("address must be 20 bytes".to_string());
     }
     Ok(Address::from_slice(&bytes))
 }
@@ -152,35 +161,36 @@ mod tests {
     use alloy_primitives::{Address, U256};
     use clap::Parser;
 
+    const TEST_ARGS: [&str; 9] = [
+        "sequencer",
+        "--eth-rpc-url",
+        "http://127.0.0.1:8545",
+        "--chain-id",
+        "31337",
+        "--app-address",
+        "0x1111111111111111111111111111111111111111",
+        "--batch-submitter-private-key",
+        "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    ];
+
     #[test]
-    fn run_config_requires_deployment_domain_inputs() {
+    fn run_config_requires_essential_inputs() {
         let err = RunConfig::try_parse_from([
             "sequencer",
             "--batch-submitter-private-key",
             "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ])
-        .expect_err("domain inputs are required");
+        .expect_err("essential inputs are required");
 
         let message = err.to_string();
         assert!(message.contains("--eth-rpc-url"));
-        assert!(message.contains("--domain-chain-id"));
-        assert!(message.contains("--domain-verifying-contract"));
+        assert!(message.contains("--chain-id"));
+        assert!(message.contains("--app-address"));
     }
 
     #[test]
     fn run_config_uses_default_block_range_retry_codes() {
-        let config = RunConfig::try_parse_from([
-            "sequencer",
-            "--eth-rpc-url",
-            "http://127.0.0.1:8545",
-            "--domain-chain-id",
-            "31337",
-            "--domain-verifying-contract",
-            "0x1111111111111111111111111111111111111111",
-            "--batch-submitter-private-key",
-            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        ])
-        .expect("parse run config");
+        let config = RunConfig::try_parse_from(TEST_ARGS).expect("parse run config");
 
         assert_eq!(
             config.long_block_range_error_codes,
@@ -195,18 +205,7 @@ mod tests {
 
     #[test]
     fn run_config_builds_domain_with_fixed_name_and_version() {
-        let config = RunConfig::try_parse_from([
-            "sequencer",
-            "--eth-rpc-url",
-            "http://127.0.0.1:8545",
-            "--domain-chain-id",
-            "31337",
-            "--domain-verifying-contract",
-            "0x1111111111111111111111111111111111111111",
-            "--batch-submitter-private-key",
-            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        ])
-        .expect("parse run config");
+        let config = RunConfig::try_parse_from(TEST_ARGS).expect("parse run config");
 
         let domain = config.build_domain();
         assert_eq!(domain.name.as_deref(), Some(DOMAIN_NAME));

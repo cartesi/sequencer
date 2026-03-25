@@ -45,7 +45,7 @@ canonical-print-build-hashes:
 
 clean:
     cargo clean
-    rm -f sequencer.db sequencer.db-shm sequencer.db-wal
+    rm -rf sequencer-data
     just -f examples/canonical-app/justfile clean
     just -f tests/benchmarks/justfile clean
 
@@ -66,6 +66,6 @@ ci:
     cargo fmt --all -- --check
     cargo test --workspace --all-targets --all-features --locked
 
-run addr="127.0.0.1:3000" db="sequencer.db":
-    rm -f {{db}} {{db}}-shm {{db}}-wal
-    SEQ_HTTP_ADDR={{addr}} SEQ_DB_PATH={{db}} cargo run -p sequencer --release
+run addr="127.0.0.1:3000" data_dir="sequencer-data":
+    rm -rf {{data_dir}}
+    SEQ_HTTP_ADDR={{addr}} SEQ_DATA_DIR={{data_dir}} cargo run -p sequencer --release

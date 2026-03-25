@@ -1,0 +1,131 @@
+name: "Setup guest toolchain"
+description: "Install system deps, xgenext2fs, cartesi-machine, QEMU/Buildx, Rust, just, and cross."
+
+inputs:
+  xgenext2fs-version:
+    description: "xgenext2fs release tag"
+    required: true
+  cartesi-machine-version:
+    description: "cartesi-machine release tag"
+    required: true
+  cartesi-machine-sha256-amd64:
+    description: "SHA-256 for the amd64 .deb"
+    required: true
+  cartesi-machine-sha256-arm64:
+    description: "SHA-256 for the arm64 .deb"
+    required: true
+  xgenext2fs-sha256-amd64:
+    description: "SHA-256 for the amd64 xgenext2fs .deb"
+    required: true
+  xgenext2fs-sha256-arm64:
+    description: "SHA-256 for the arm64 xgenext2fs .deb"
+    required: true
+  install-foundry:
+    description: "Whether to install Foundry (for anvil)"
+    required: false
+    default: "false"
+  foundry-version:
+    description: "Foundry version tag"
+    required: false
+    default: "v1.4.3"
+  rust-components:
+    description: "Extra rustup components (comma-separated)"
+    required: false
+    default: "rustfmt"
+
+runs:
+  using: composite
+  steps:
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          lua5.4 \
+          liblua5.4-dev \
+          libslirp-dev \
+          ca-certificates \
+          wget \
+          xz-utils
+
+    - name: Install xgenext2fs
+      shell: bash
+      run: |
+        set -euo pipefail
+        ARCH="$(dpkg --print-architecture)"
+        VERSION="${{ inputs.xgenext2fs-version }}"
+
+        case "${ARCH}" in
+          amd64)
+            ASSET_NAME="xgenext2fs_amd64.deb"
+            EXPECTED_SHA="${{ inputs.xgenext2fs-sha256-amd64 }}"
+            ;;
+          arm64)
+            ASSET_NAME="xgenext2fs_arm64.deb"
+            EXPECTED_SHA="${{ inputs.xgenext2fs-sha256-arm64 }}"
+            ;;
+          *)
+            echo "unsupported arch for xgenext2fs: ${ARCH}" >&2
+            exit 1
+            ;;
+        esac
+
+        ASSET_URL="https://github.com/cartesi/genext2fs/releases/download/${VERSION}/${ASSET_NAME}"
+        wget -O /tmp/xgenext2fs.deb "${ASSET_URL}"
+        echo "${EXPECTED_SHA}  /tmp/xgenext2fs.deb" | sha256sum --check
+        sudo apt-get install -y /tmp/xgenext2fs.deb
+
+    - name: Install cartesi-machine
+      shell: bash
+      run: |
+        set -euo pipefail
+        ARCH="$(dpkg --print-architecture)"
+        VERSION="${{ inputs.cartesi-machine-version }}"
+
+        case "${ARCH}" in
+          amd64)
+            DEB_SHA256="${{ inputs.cartesi-machine-sha256-amd64 }}"
+            ;;
+          arm64)
+            DEB_SHA256="${{ inputs.cartesi-machine-sha256-arm64 }}"
+            ;;
+          *)
+            echo "unsupported arch for machine-emulator: ${ARCH}" >&2
+            exit 1
+            ;;
+        esac
+
+        wget -O /tmp/machine-emulator.deb "https://github.com/cartesi/machine-emulator/releases/download/${VERSION}/machine-emulator_${ARCH}.deb"
+        echo "${DEB_SHA256}  /tmp/machine-emulator.deb" | sha256sum --check
+        sudo apt-get install -y /tmp/machine-emulator.deb
+        cartesi-machine --version
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.rust-components }}
+
+    - name: Cache Rust artifacts
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install Foundry
+      if: inputs.install-foundry == 'true'
+      uses: foundry-rs/foundry-toolchain@v1
+      with:
+        version: ${{ inputs.foundry-version }}
+
+    - name: Install just
+      uses: taiki-e/install-action@v2
+      with:
+        tool: just
+
+    - name: Install cross
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cross
