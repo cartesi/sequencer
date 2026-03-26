@@ -13,8 +13,9 @@ pub struct DirectInput {
 #[derive(Debug, Clone)]
 pub struct ValidUserOp {
     pub sender: Address,
-    // Fee committed by the sequencer for the batch/frame that contains this user-op.
-    pub fee: u64,
+    /// Log-space fee exponent (base 129/128) committed by the sequencer for this frame.
+    /// Use [`crate::fee::fee_to_linear`] to convert to a linear amount for charging.
+    pub fee: u16,
     pub data: Vec<u8>,
 }
 

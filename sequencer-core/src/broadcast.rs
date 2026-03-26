@@ -10,7 +10,8 @@ pub enum BroadcastTxMessage {
     UserOp {
         offset: u64,
         sender: String,
-        fee: u64,
+        /// Log-space fee exponent (base 129/128). See [`crate::fee`].
+        fee: u16,
         data: String,
     },
     DirectInput {

@@ -42,8 +42,9 @@ pub async fn bootstrap_funded_workload(
     runtime: &ManagedSequencer,
     workload: &WorkloadConfig,
     total_count: u64,
+    max_fee: u16,
 ) -> BenchResult<()> {
-    let plans = funded_account_plans(workload, total_count)?;
+    let plans = funded_account_plans(workload, total_count, max_fee)?;
     if plans.is_empty() {
         return Ok(());
     }

@@ -16,7 +16,7 @@ use super::sql::{
     sql_select_ordered_l2_txs_page_from_offset, sql_select_safe_block,
     sql_select_safe_input_payloads_for_sender, sql_select_safe_inputs_range,
     sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
-    sql_update_batch_policy_alpha, sql_update_batch_policy_gas_price, sql_update_safe_block,
+    sql_update_batch_policy_alpha, sql_update_batch_policy_log_gas_price, sql_update_safe_block,
 };
 use super::{
     BatchPolicy, FrameHeader, SafeFrontier, SafeInputRange, StorageOpenError, StoredSafeInput,
@@ -262,25 +262,21 @@ impl Storage {
             batch_user_op_count: 0,
             open_frame_user_op_count: 0,
             frame_in_batch: 0,
-            max_batch_user_op_bytes: policy.batch_size_target,
+            max_batch_user_op_bytes: super::batch_size_target_bytes(policy),
         })
     }
 
     pub fn batch_policy(&mut self) -> Result<BatchPolicy> {
-        let (gas_price, alpha_num, alpha_denom, const_delta, const_user_op_bytes, batch_size_target) =
-            sql_select_batch_policy(&self.conn)?;
-        Ok(batch_policy_from_raw(
-            gas_price,
-            alpha_num,
-            alpha_denom,
-            const_delta,
-            const_user_op_bytes,
-            batch_size_target,
-        ))
+        let (log_recommended_fee, log_batch_size_target) = sql_select_batch_policy(&self.conn)?;
+        Ok(BatchPolicy {
+            recommended_fee: i64_to_u16(log_recommended_fee),
+            batch_size_target: i64_to_u16(log_batch_size_target),
+        })
     }
 
-    pub fn set_gas_price(&mut self, gas_price: u64) -> Result<()> {
-        let changed_rows = sql_update_batch_policy_gas_price(&self.conn, u64_to_i64(gas_price))?;
+    pub fn set_log_gas_price(&mut self, log_gas_price: u16) -> Result<()> {
+        let changed_rows =
+            sql_update_batch_policy_log_gas_price(&self.conn, i64::from(log_gas_price))?;
         if changed_rows != 1 {
             return Err(rusqlite::Error::StatementChangedRows(changed_rows));
         }
@@ -288,8 +284,16 @@ impl Storage {
     }
 
     pub fn set_alpha(&mut self, num: u64, denom: u64) -> Result<()> {
-        let changed_rows =
-            sql_update_batch_policy_alpha(&self.conn, u64_to_i64(num), u64_to_i64(denom))?;
+        use sequencer_core::fee::log_fee_ratio;
+
+        let log_alpha = log_fee_ratio(num, denom);
+        let log_one_plus_alpha = log_fee_ratio(num + denom, denom);
+
+        let changed_rows = sql_update_batch_policy_alpha(
+            &self.conn,
+            i64::from(log_alpha),
+            i64::from(log_one_plus_alpha),
+        )?;
         if changed_rows != 1 {
             return Err(rusqlite::Error::StatementChangedRows(changed_rows));
         }
@@ -428,7 +432,7 @@ impl Storage {
             .into_iter()
             .map(|row| FrameHeader {
                 frame_in_batch: i64_to_u32(row.frame_in_batch),
-                fee: i64_to_u64(row.fee),
+                fee: i64_to_u16(row.fee),
                 safe_block: i64_to_u64(row.safe_block),
             })
             .collect())
@@ -463,7 +467,7 @@ impl Storage {
                 .into_iter()
                 .map(|row| WireUserOp {
                     nonce: i64_to_u32(row.nonce),
-                    max_fee: i64_to_u32(row.max_fee),
+                    max_fee: i64_to_u16(row.max_fee),
                     data: row.data,
                     signature: row.sig,
                 })
@@ -504,8 +508,8 @@ fn decode_ordered_l2_txs(rows: Vec<super::sql::OrderedL2TxRow>) -> Vec<Sequenced
 
             let entry = ValidUserOp {
                 sender: Address::from_slice(sender_bytes.as_slice()),
-                // Replay uses the persisted frame fee to mirror canonical execution.
-                fee: i64_to_u64(row.fee.expect("ordered replay row: missing fee")),
+                // Replay uses the persisted frame fee (log-space exponent) to mirror canonical execution.
+                fee: i64_to_u16(row.fee.expect("ordered replay row: missing fee")),
                 data: row.data.expect("ordered replay row: missing data"),
             };
             out.push(SequencedL2Tx::UserOp(entry));
@@ -544,7 +548,7 @@ fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
         batch_user_op_count,
         open_frame_user_op_count,
         frame_in_batch,
-        max_batch_user_op_bytes: policy.batch_size_target,
+        max_batch_user_op_bytes: super::batch_size_target_bytes(policy),
     }))
 }
 
@@ -594,12 +598,12 @@ fn query_latest_batch(tx: &Transaction<'_>) -> Result<Option<(u64, SystemTime, u
     }
 }
 
-fn query_latest_frame_in_batch(tx: &Transaction<'_>, batch_index: u64) -> Result<(u32, u64, u64)> {
+fn query_latest_frame_in_batch(tx: &Transaction<'_>, batch_index: u64) -> Result<(u32, u16, u64)> {
     let (frame_in_batch, frame_fee, safe_block) =
         sql_select_latest_frame_in_batch_for_batch(tx, u64_to_i64(batch_index))?;
     Ok((
         i64_to_u32(frame_in_batch),
-        i64_to_u64(frame_fee),
+        i64_to_u16(frame_fee),
         i64_to_u64(safe_block),
     ))
 }
@@ -628,43 +632,11 @@ fn query_current_safe_block(tx: &Connection) -> Result<u64> {
 }
 
 fn query_batch_policy(tx: &Transaction<'_>) -> Result<BatchPolicy> {
-    let (gas_price, alpha_num, alpha_denom, const_delta, const_user_op_bytes, batch_size_target) =
-        sql_select_batch_policy(tx)?;
-    Ok(batch_policy_from_raw(
-        gas_price,
-        alpha_num,
-        alpha_denom,
-        const_delta,
-        const_user_op_bytes,
-        batch_size_target,
-    ))
-}
-
-/// Compute `BatchPolicy` from raw DB columns using checked arithmetic.
-///
-/// Formula: `recommended_fee = gas_price * (alpha_num + alpha_denom) * delta * user_op_bytes / alpha_denom`
-///
-/// Panics if the intermediate product overflows u64 (should not happen with
-/// the `gas_price <= 2_000_000_000_000` CHECK in the schema).
-fn batch_policy_from_raw(
-    gas_price: i64,
-    alpha_num: i64,
-    alpha_denom: i64,
-    const_delta: i64,
-    const_user_op_bytes: i64,
-    batch_size_target: i64,
-) -> BatchPolicy {
-    let recommended_fee = (gas_price as u64)
-        .checked_mul((alpha_num + alpha_denom) as u64)
-        .and_then(|v| v.checked_mul(const_delta as u64))
-        .and_then(|v| v.checked_mul(const_user_op_bytes as u64))
-        .map(|v| v / alpha_denom as u64)
-        .expect("recommended_fee overflow: gas_price is too large for the current constants");
-
-    BatchPolicy {
-        recommended_fee,
-        batch_size_target: i64_to_u64(batch_size_target),
-    }
+    let (log_recommended_fee, log_batch_size_target) = sql_select_batch_policy(tx)?;
+    Ok(BatchPolicy {
+        recommended_fee: i64_to_u16(log_recommended_fee),
+        batch_size_target: i64_to_u16(log_batch_size_target),
+    })
 }
 
 fn persist_frame_direct_sequence(
@@ -700,7 +672,7 @@ fn insert_open_frame(
     batch_index: u64,
     frame_in_batch: u32,
     created_at_ms: i64,
-    frame_fee: u64,
+    frame_fee: u16,
     safe_block: u64,
 ) -> Result<()> {
     sql_insert_open_frame(
@@ -708,7 +680,7 @@ fn insert_open_frame(
         u64_to_i64(batch_index),
         i64::from(frame_in_batch),
         created_at_ms,
-        u64_to_i64(frame_fee),
+        i64::from(frame_fee),
         u64_to_i64(safe_block),
     )?;
     Ok(())
@@ -741,6 +713,10 @@ fn usize_to_i64(value: usize) -> i64 {
 
 fn i64_to_u64(value: i64) -> u64 {
     value.max(0) as u64
+}
+
+fn i64_to_u16(value: i64) -> u16 {
+    u16::try_from(value.max(0)).unwrap_or(u16::MAX)
 }
 
 fn i64_to_u32(value: i64) -> u32 {
@@ -797,7 +773,8 @@ mod tests {
         assert_eq!(head_a.batch_index, head_b.batch_index);
         assert_eq!(head_a.frame_in_batch, head_b.frame_in_batch);
         assert_eq!(head_a.frame_fee, head_b.frame_fee);
-        assert_eq!(head_a.frame_fee, 0);
+        // Default log_recommended_fee = 0+20+419+621 = 1060
+        assert_eq!(head_a.frame_fee, 1060);
 
         let mut head_c = head_b;
         let next_safe_block = head_c.safe_block;
@@ -821,9 +798,10 @@ mod tests {
         let db = temp_db("batch-policy-fee");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
         let policy = storage.batch_policy().expect("default policy");
-        assert_eq!(policy.recommended_fee, 0);
+        // Default: log_gas_price=0, log_recommended_fee = 0+20+419+621 = 1060
+        assert_eq!(policy.recommended_fee, 1060);
 
-        storage.set_gas_price(100).expect("set gas price");
+        storage.set_log_gas_price(100).expect("set log gas price");
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -834,10 +812,8 @@ mod tests {
             .expect("rotate batch");
 
         let policy = storage.batch_policy().expect("read policy");
-        assert!(
-            head.frame_fee > 0,
-            "frame fee should be derived from gas_price"
-        );
+        // log_recommended_fee = 100+20+419+621 = 1160
+        assert_eq!(head.frame_fee, 1160);
         assert_eq!(head.frame_fee, policy.recommended_fee);
         assert!(
             head.max_batch_user_op_bytes > 0,
@@ -1026,7 +1002,8 @@ mod tests {
         let frame = &batch.batch.frames[0];
         assert!(frame.user_ops.is_empty());
         assert_eq!(frame.safe_block, 12);
-        assert_eq!(frame.fee_price, 0);
+        // Default log_recommended_fee = 0+20+419+621 = 1060
+        assert_eq!(frame.fee_price, 1060);
         assert!(batch.created_at_ms > 0);
     }
 

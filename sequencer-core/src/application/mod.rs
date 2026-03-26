@@ -44,7 +44,8 @@ pub type AppOutputs = Vec<AppOutput>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidReason {
     InvalidNonce { expected: u32, got: u32 },
-    InvalidMaxFee { max_fee: u32, base_fee: u64 },
+    /// Both values are log-space exponents (base 129/128).
+    InvalidMaxFee { max_fee: u16, base_fee: u16 },
     InsufficientGasBalance { required: U256, available: U256 },
 }
 
@@ -81,7 +82,7 @@ pub trait Application: Send {
         &self,
         sender: Address,
         user_op: &UserOp,
-        current_fee: u64,
+        current_fee: u16,
     ) -> Result<(), InvalidReason>;
 
     fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError>;
@@ -90,7 +91,7 @@ pub trait Application: Send {
         &mut self,
         sender: Address,
         user_op: &UserOp,
-        current_fee: u64,
+        current_fee: u16,
     ) -> Result<ExecutionOutcome, AppError> {
         if let Err(reason) = self.validate_user_op(sender, user_op, current_fee) {
             return Ok(ExecutionOutcome::Invalid(reason));

@@ -48,8 +48,8 @@ struct Args {
     concurrency: usize,
     #[arg(long)]
     seed_offset: Option<u64>,
-    #[arg(long, default_value_t = 0_u32)]
-    max_fee: u32,
+    #[arg(long, default_value_t = 1200_u16)]
+    max_fee: u16,
     #[arg(long, default_value_t = 3_000_u64)]
     request_timeout_ms: u64,
     #[arg(long, default_value_t = false)]
@@ -86,7 +86,7 @@ async fn main() -> BenchResult<()> {
         None
     };
     if let Some(runtime) = managed.as_ref() {
-        bootstrap_funded_workload(runtime, &workload, args.count).await?;
+        bootstrap_funded_workload(runtime, &workload, args.count, args.max_fee).await?;
     }
     let domain = if let Some(value) = managed.as_ref() {
         if args.domain_chain_id.is_some() || args.domain_verifying_contract.is_some() {

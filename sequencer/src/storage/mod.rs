@@ -57,7 +57,8 @@ pub struct SafeFrontier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     pub frame_in_batch: u32,
-    pub fee: u64,
+    /// Log-space fee exponent (base 129/128).
+    pub fee: u16,
     pub safe_block: u64,
 }
 
@@ -70,18 +71,21 @@ pub enum StorageOpenError {
 }
 
 /// Derived batch policy read from the `batch_policy_derived` view.
+/// Both fields are log-space exponents (base 129/128).
 #[derive(Debug, Clone, Copy)]
 pub struct BatchPolicy {
-    pub recommended_fee: u64,
-    pub batch_size_target: u64,
+    /// Log-space fee exponent (base 129/128).
+    pub recommended_fee: u16,
+    /// Log-space batch size target (base 129/128). Convert via `fee_to_linear()` for byte comparison.
+    pub batch_size_target: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteHead {
     pub batch_index: u64,
     pub batch_created_at: SystemTime,
-    // Sequencer-chosen fee committed for this open frame.
-    pub frame_fee: u64,
+    /// Log-space fee exponent (base 129/128) committed for this open frame.
+    pub frame_fee: u16,
     pub safe_block: u64,
     pub batch_user_op_count: u64,
     pub open_frame_user_op_count: u32,
@@ -105,7 +109,7 @@ impl WriteHead {
         self.frame_fee = policy.recommended_fee;
         self.safe_block = safe_block;
         self.open_frame_user_op_count = 0;
-        self.max_batch_user_op_bytes = policy.batch_size_target;
+        self.max_batch_user_op_bytes = batch_size_target_bytes(policy);
     }
 
     pub fn move_to_next_batch(
@@ -122,6 +126,13 @@ impl WriteHead {
         self.batch_user_op_count = 0;
         self.open_frame_user_op_count = 0;
         self.frame_in_batch = 0;
-        self.max_batch_user_op_bytes = policy.batch_size_target;
+        self.max_batch_user_op_bytes = batch_size_target_bytes(policy);
     }
+}
+
+/// Convert the log-space `batch_size_target` to a linear byte count for the inclusion lane.
+fn batch_size_target_bytes(policy: BatchPolicy) -> u64 {
+    let linear = sequencer_core::fee::fee_to_linear(policy.batch_size_target);
+    // batch_size_target is always a reasonable byte count; clamp to u64.
+    linear.try_into().unwrap_or(u64::MAX)
 }

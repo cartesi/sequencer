@@ -25,44 +25,44 @@ clean:
 ensure-machine-image:
     test -d {{template_machine_image}} || { echo "missing {{template_machine_image}}; run 'just canonical-build-machine-image' first"; exit 1; }
 
-bench-unit count="10000" max_fee="0":
+bench-unit count="10000" max_fee="1200":
     cargo run -p benchmarks --bin unit_hot_path --release -- --count {{count}} --max-fee {{max_fee}}
 
-bench-ack domain_chain_id verifying_contract count="200" url="http://127.0.0.1:3000" max_fee="0" concurrency="1" extra="":
+bench-ack domain_chain_id verifying_contract count="200" url="http://127.0.0.1:3000" max_fee="1200" concurrency="1" extra="":
     cargo run -p benchmarks --bin ack_latency --release -- --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --count {{count}} --max-fee {{max_fee}} --concurrency {{concurrency}} {{extra}}
 
-bench-ack-self count="200" max_fee="0" concurrency="1" extra="": ensure-machine-image
+bench-ack-self count="200" max_fee="1200" concurrency="1" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin ack_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --concurrency {{concurrency}} {{extra}}
 
-bench-round-trip domain_chain_id verifying_contract count="100" url="http://127.0.0.1:3000" max_fee="0" from_offset="0" concurrency="1" extra="":
+bench-round-trip domain_chain_id verifying_contract count="100" url="http://127.0.0.1:3000" max_fee="1200" from_offset="0" concurrency="1" extra="":
     cargo run -p benchmarks --bin round_trip_latency --release -- --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} {{extra}}
 
-bench-round-trip-self count="100" max_fee="0" from_offset="0" concurrency="1" extra="": ensure-machine-image
+bench-round-trip-self count="100" max_fee="1200" from_offset="0" concurrency="1" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} {{extra}}
 
-bench-hammer domain_chain_id verifying_contract count="20000" url="http://127.0.0.1:3000" max_fee="0" concurrency="10" from_offset="0" workload="funded-transfer" extra="":
+bench-hammer domain_chain_id verifying_contract count="20000" url="http://127.0.0.1:3000" max_fee="1200" concurrency="10" from_offset="0" workload="funded-transfer" extra="":
     cargo run -p benchmarks --bin round_trip_latency --release -- --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload {{workload}} {{extra}}
 
-bench-hammer-self count="20000" max_fee="0" concurrency="10" from_offset="0" workload="funded-transfer" out="tests/benchmarks/results/hammer-self-latest.json" extra="": ensure-machine-image
+bench-hammer-self count="20000" max_fee="1200" concurrency="10" from_offset="0" workload="funded-transfer" out="tests/benchmarks/results/hammer-self-latest.json" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency {{concurrency}} --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload {{workload}} --json-out {{out}} {{extra}}
 
-bench-sweep domain_chain_id verifying_contract mode="round-trip" count="1000" url="http://127.0.0.1:3000" max_fee="0" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="":
+bench-sweep domain_chain_id verifying_contract mode="round-trip" count="1000" url="http://127.0.0.1:3000" max_fee="1200" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="":
     cargo run -p benchmarks --bin sweep --release -- --mode {{mode}} --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency-list "{{conc_list}}" {{extra}}
 
-bench-sweep-self mode="round-trip" count="1000" max_fee="0" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="": ensure-machine-image
+bench-sweep-self mode="round-trip" count="1000" max_fee="1200" from_offset="0" conc_list="1 2 4 8 16 32 64 96 128" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --self-contained --mode {{mode}} --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --concurrency-list "{{conc_list}}" {{extra}}
 
-bench-soak-low-lat-self count="20000" max_fee="0" out="" extra="": ensure-machine-image
+bench-soak-low-lat-self count="20000" max_fee="1200" out="" extra="": ensure-machine-image
     out_path="{{out}}"; if [[ -z "${out_path}" ]]; then out_path="tests/benchmarks/results/soak-low-lat-self-$(date +%s).json"; fi; just --justfile tests/benchmarks/justfile bench-hammer-self {{count}} {{max_fee}} 10 0 funded-transfer "${out_path}" '{{extra}}'
 
-bench-soak-high-throughput-self count="20000" max_fee="0" out="" extra="": ensure-machine-image
+bench-soak-high-throughput-self count="20000" max_fee="1200" out="" extra="": ensure-machine-image
     out_path="{{out}}"; if [[ -z "${out_path}" ]]; then out_path="tests/benchmarks/results/soak-high-throughput-self-$(date +%s).json"; fi; cargo build -p sequencer --release; cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset 0 --concurrency 96 --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload synthetic --json-out "${out_path}" {{extra}}
 
-bench-capacity-sweep-self count="1000" max_fee="0" from_offset="0" conc_range="32:512:32" out="tests/benchmarks/results/capacity-sweep-self.json" extra="": ensure-machine-image
+bench-capacity-sweep-self count="1000" max_fee="1200" from_offset="0" conc_range="32:512:32" out="tests/benchmarks/results/capacity-sweep-self.json" extra="": ensure-machine-image
     cargo build -p sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --self-contained --mode round-trip --count {{count}} --max-fee {{max_fee}} --from-offset {{from_offset}} --workload synthetic --concurrency-range "{{conc_range}}" --stop-on-first-non-200 --json-out {{out}} {{extra}}
 

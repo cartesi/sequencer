@@ -234,14 +234,8 @@ impl<A: Application> Scheduler<A> {
 
     /// Execute user-ops in a frame, skipping any whose `max_fee` is below the frame's `fee_price`.
     ///
-    /// `fee_price` is in "L2 smallest-token-unit per user-op-byte", derived from the sequencer's
-    /// `gas_price` DB knob.  That knob is "L2 smallest-token-unit per L1 gas unit" — whoever
-    /// feeds it must convert `L1_gas_price_in_wei × exchange_rate` into this integer.
-    ///
-    /// For native tokens with few decimals (e.g. USDC with 6 decimals), the feeder should
-    /// pre-scale `gas_price` by multiplying by 10^k before writing it to the DB, so that
-    /// sub-unit precision is not lost to integer truncation.  The scheduler itself does not
-    /// need to know about the scaling — it simply compares `max_fee` against `fee_price`.
+    /// Both `max_fee` and `fee_price` are log-space exponents (base 129/128).
+    /// See [`sequencer_core::fee`] for conversion to linear amounts.
     fn execute_frame_user_ops(
         &mut self,
         domain: &Eip712Domain,
@@ -251,7 +245,7 @@ impl<A: Application> Scheduler<A> {
         for user_op in &frame.user_ops {
             if let Some(sender) = self.recover_sender(domain, user_op) {
                 let plain = user_op.to_user_op();
-                if u64::from(plain.max_fee) < frame.fee_price {
+                if plain.max_fee < frame.fee_price {
                     eprintln!("scheduler skipped frame user-op due to max_fee < fee_price");
                     continue;
                 }
@@ -412,7 +406,7 @@ mod tests {
             &self,
             sender: Address,
             user_op: &sequencer_core::user_op::UserOp,
-            current_fee: u64,
+            current_fee: u16,
         ) -> Result<(), sequencer_core::application::InvalidReason> {
             let expected_nonce = self.nonce_of(sender);
             if user_op.nonce != expected_nonce {
@@ -421,13 +415,13 @@ mod tests {
                     got: user_op.nonce,
                 });
             }
-            if u64::from(user_op.max_fee) < current_fee {
+            if user_op.max_fee < current_fee {
                 return Err(sequencer_core::application::InvalidReason::InvalidMaxFee {
                     max_fee: user_op.max_fee,
                     base_fee: current_fee,
                 });
             }
-            let required = U256::from(current_fee);
+            let required = sequencer_core::fee::fee_to_linear(current_fee);
             let balance = self.balance_of(sender);
             if balance < required {
                 return Err(
@@ -446,7 +440,7 @@ mod tests {
         ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
         {
             let sender = user_op.sender;
-            let fee = U256::from(user_op.fee);
+            let fee = sequencer_core::fee::fee_to_linear(user_op.fee);
             let balance = self.balance_of(sender);
             if balance < fee {
                 return Err(sequencer_core::application::AppError::Internal {
@@ -509,7 +503,7 @@ mod tests {
         domain: &Eip712Domain,
         signing_key: &SigningKey,
         nonce: u32,
-        max_fee: u32,
+        max_fee: u16,
         data: Vec<u8>,
     ) -> WireUserOp {
         let user_op = UserOp {
@@ -559,6 +553,8 @@ mod tests {
         );
 
         let signing_key = SigningKey::from_bytes((&[1_u8; 32]).into()).expect("signing key");
+        let sender = address_from_signing_key(&signing_key);
+        scheduler.app.credit(sender, 1);
 
         let batch = Batch {
             nonce: 0,
@@ -598,6 +594,8 @@ mod tests {
 
         scheduler.process_input(direct_input(1, 1));
         let signing_key = SigningKey::from_bytes((&[2_u8; 32]).into()).expect("signing key");
+        let sender = address_from_signing_key(&signing_key);
+        scheduler.app.credit(sender, 1);
         let batch = Batch {
             nonce: 0,
             frames: vec![Frame {
@@ -654,6 +652,8 @@ mod tests {
 
         let fresh_signing_key =
             SigningKey::from_bytes((&[13_u8; 32]).into()).expect("fresh signing key");
+        let fresh_sender = address_from_signing_key(&fresh_signing_key);
+        scheduler.app.credit(fresh_sender, 1);
         let fresh_batch = Batch {
             nonce: 1,
             frames: vec![Frame {
@@ -876,11 +876,13 @@ mod tests {
         );
         let signing_key = SigningKey::from_bytes((&[9_u8; 32]).into()).expect("signing key");
         let sender = address_from_signing_key(&signing_key);
+        // fee_to_linear(0) = 1, so credit 1 unit — just enough for the cheapest fee.
         scheduler.app.credit(sender, 1);
 
         let bad_nonce = sign_wire_user_op(&test_domain(), &signing_key, 1, 10, vec![1]);
         let bad_max_fee = sign_wire_user_op(&test_domain(), &signing_key, 0, 0, vec![2]);
-        let insufficient = sign_wire_user_op(&test_domain(), &signing_key, 0, 10, vec![3]);
+        // max_fee=1000 is high enough, but fee_to_linear(1000) ≈ 2397 > balance of 1.
+        let insufficient = sign_wire_user_op(&test_domain(), &signing_key, 0, 1000, vec![3]);
         let valid = sign_wire_user_op(&test_domain(), &signing_key, 0, 10, vec![4]);
 
         let batch = Batch {
@@ -899,12 +901,12 @@ mod tests {
                 Frame {
                     user_ops: vec![insufficient],
                     safe_block: 1,
-                    fee_price: 2,
+                    fee_price: 1000,
                 },
                 Frame {
                     user_ops: vec![valid],
                     safe_block: 1,
-                    fee_price: 1,
+                    fee_price: 0,
                 },
             ],
         };

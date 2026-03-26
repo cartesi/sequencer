@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use alloy_primitives::{Address, Signature, U256};
+use sequencer_core::fee::fee_to_linear;
 use alloy_sol_types::{Eip712Domain, SolStruct};
 use app_core::application::{
     MAX_METHOD_PAYLOAD_BYTES, Method, Transfer, Withdrawal, default_private_keys,
@@ -82,6 +83,7 @@ enum WorkloadStateInner {
 pub(crate) fn funded_account_plans(
     config: &WorkloadConfig,
     total_count: u64,
+    max_fee: u16,
 ) -> BenchResult<Vec<FundedAccountPlan>> {
     if config.kind != WorkloadKind::FundedTransfer {
         return Ok(Vec::new());
@@ -101,7 +103,7 @@ pub(crate) fn funded_account_plans(
         let signing_key = signing_key_from_hex(private_key.as_str())?;
         let address = address_from_signing_key(&signing_key);
         let send_count = round_robin_send_count(total_count, account_count, index as u64);
-        let required_balance = required_funded_transfer_balance(send_count, config.transfer_amount);
+        let required_balance = required_funded_transfer_balance(send_count, config.transfer_amount, max_fee);
         plans.push(FundedAccountPlan {
             address,
             required_balance,
@@ -141,7 +143,7 @@ impl WorkloadState {
 
     pub(crate) fn next_fixture(
         &mut self,
-        max_fee: u32,
+        max_fee: u16,
         domain: &Eip712Domain,
     ) -> BenchResult<SignedTxFixture> {
         match &mut self.inner {
@@ -202,7 +204,7 @@ impl WorkloadState {
 
 pub fn make_signed_fixture(
     seed: u64,
-    max_fee: u32,
+    max_fee: u16,
     domain: &Eip712Domain,
 ) -> BenchResult<SignedTxFixture> {
     let signing_key = signing_key_for_seed(seed)?;
@@ -260,7 +262,7 @@ fn round_robin_send_count(total_count: u64, account_count: u64, account_index: u
     1 + (total_count - 1 - account_index) / account_count
 }
 
-fn required_funded_transfer_balance(send_count: u64, transfer_amount: u64) -> U256 {
+fn required_funded_transfer_balance(send_count: u64, transfer_amount: u64, max_fee: u16) -> U256 {
     if send_count == 0 {
         return U256::ZERO;
     }
@@ -268,7 +270,10 @@ fn required_funded_transfer_balance(send_count: u64, transfer_amount: u64) -> U2
     let send_count_u256 = U256::from(send_count);
     let transfer_amount_u256 = U256::from(transfer_amount);
     let arithmetic_sum = send_count_u256 * U256::from(send_count - 1) / U256::from(2_u64);
-    (send_count_u256 * transfer_amount_u256) + arithmetic_sum
+    // Each send also costs fee_to_linear(frame_fee) gas. Use max_fee as an upper
+    // bound so accounts are funded even if frame_fee == max_fee.
+    let gas_per_op = fee_to_linear(max_fee);
+    (send_count_u256 * transfer_amount_u256) + arithmetic_sum + (send_count_u256 * gas_per_op)
 }
 
 fn load_private_keys_from_file(path: &str) -> BenchResult<Vec<String>> {
@@ -480,12 +485,16 @@ mod tests {
             transfer_amount: 5,
         };
 
-        let plans = funded_account_plans(&config, 5).expect("funding plan");
+        // Use max_fee=0 so fee_to_linear(0)=1, adding 1 gas per send.
+        let plans = funded_account_plans(&config, 5, 0).expect("funding plan");
         let _ = fs::remove_file(&temp_path);
         assert!(plans.len() >= 3);
-        assert_eq!(plans[0].required_balance, U256::from(11_u64));
-        assert_eq!(plans[1].required_balance, U256::from(11_u64));
-        assert_eq!(plans[2].required_balance, U256::from(5_u64));
+        // Account 0: send_count=2 → 2*5 + 2*1/2 + 2*1 = 13
+        assert_eq!(plans[0].required_balance, U256::from(13_u64));
+        // Account 1: send_count=2 → same
+        assert_eq!(plans[1].required_balance, U256::from(13_u64));
+        // Account 2: send_count=1 → 1*5 + 0 + 1*1 = 6
+        assert_eq!(plans[2].required_balance, U256::from(6_u64));
     }
 
     #[test]
@@ -494,7 +503,9 @@ mod tests {
         assert_eq!(round_robin_send_count(5, 3, 0), 2);
         assert_eq!(round_robin_send_count(5, 3, 1), 2);
         assert_eq!(round_robin_send_count(5, 3, 2), 1);
-        assert_eq!(required_funded_transfer_balance(0, 5), U256::ZERO);
-        assert_eq!(required_funded_transfer_balance(3, 5), U256::from(18_u64));
+        // max_fee=0 → fee_to_linear(0)=1, so gas adds send_count to the total.
+        assert_eq!(required_funded_transfer_balance(0, 5, 0), U256::ZERO);
+        // 3*5 + 3*2/2 + 3*1 = 15 + 3 + 3 = 21
+        assert_eq!(required_funded_transfer_balance(3, 5, 0), U256::from(21_u64));
     }
 }
