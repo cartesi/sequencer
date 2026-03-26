@@ -12,13 +12,13 @@ use clap::Parser;
     name = "unit_hot_path",
     about = "unit benchmark for signing + request JSON encoding",
     version,
-    after_help = "Examples:\n  cargo run -p benchmarks --bin unit_hot_path -- --count 10000 --max-fee 0\n  cargo run -p benchmarks --bin unit_hot_path --release -- --count 50000"
+    after_help = "Examples:\n  cargo run -p benchmarks --bin unit_hot_path -- --count 10000 --max-fee 1200\n  cargo run -p benchmarks --bin unit_hot_path --release -- --count 50000"
 )]
 struct Args {
     #[arg(long, default_value_t = 10_000_u64)]
     count: u64,
-    #[arg(long, default_value_t = 0_u32)]
-    max_fee: u32,
+    #[arg(long, default_value_t = 1200_u16)]
+    max_fee: u16,
 }
 
 fn main() -> BenchResult<()> {

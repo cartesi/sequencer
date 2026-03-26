@@ -3898,6 +3898,7 @@ dependencies = [
  "alloy-sol-types",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "ruint",
  "serde",
  "thiserror 1.0.69",
 ]

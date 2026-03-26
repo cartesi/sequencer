@@ -33,7 +33,13 @@ use tokio_tungstenite::tungstenite::Message;
 async fn e2e_submit_tx_ack_and_broadcast() {
     let db = temp_db("full-e2e");
     let domain = test_domain();
-    bootstrap_open_frame_fee_zero(db.path.as_str());
+    let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    // Fund the sender so the user-op passes the balance check.
+    bootstrap_open_frame_with_deposits(
+        db.path.as_str(),
+        &[(sender, U256::from(1_000_000_u64))],
+    );
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
@@ -48,14 +54,18 @@ async fn e2e_submit_tx_ack_and_broadcast() {
         .expect("timeout connecting websocket")
         .expect("connect websocket");
 
-    let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
-    let sender = address_from_signing_key(&signing_key);
+    // The deposit is broadcast first.
+    let deposit_message = recv_ws_message(&mut ws).await;
+    match deposit_message {
+        WsTxMessage::DirectInput { offset, .. } => assert_eq!(offset, 0),
+        other => panic!("expected deposit direct input as first WS message, got {other:?}"),
+    }
     let method = Method::Withdrawal(Withdrawal {
         amount: U256::from(0_u64),
     });
     let user_op = UserOp {
         nonce: 0,
-        max_fee: 0,
+        max_fee: TEST_MAX_FEE,
         data: ssz::Encode::as_ssz_bytes(&method).into(),
     };
     let signature_hex = sign_user_op_hex(&domain, &user_op, &signing_key);
@@ -89,9 +99,10 @@ async fn e2e_submit_tx_ack_and_broadcast() {
             fee,
             data,
         } => {
-            assert_eq!(offset, 0);
+            assert_eq!(offset, 1);
             assert_eq!(ws_sender, sender.to_string());
-            assert_eq!(fee, 0);
+            // Frame fee is the default log_recommended_fee = 1060.
+            assert_eq!(fee, 1060);
             assert_eq!(
                 decode_hex_prefixed(data.as_str()),
                 ssz::Encode::as_ssz_bytes(&method)
@@ -108,7 +119,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
 async fn api_rejects_signature_with_wrong_hex_length() {
     let db = temp_db("bad-signature-hex-len");
     let domain = test_domain();
-    bootstrap_open_frame_fee_zero(db.path.as_str());
+    bootstrap_open_frame(db.path.as_str());
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
@@ -141,7 +152,7 @@ async fn api_rejects_signature_with_wrong_hex_length() {
 async fn api_rejects_sender_with_wrong_hex_length() {
     let db = temp_db("bad-sender-hex-len");
     let domain = test_domain();
-    bootstrap_open_frame_fee_zero(db.path.as_str());
+    bootstrap_open_frame(db.path.as_str());
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
@@ -171,7 +182,7 @@ async fn api_rejects_sender_with_wrong_hex_length() {
 async fn api_rejects_oversized_json_body_before_parsing() {
     let db = temp_db("oversized-json");
     let domain = test_domain();
-    bootstrap_open_frame_fee_zero(db.path.as_str());
+    bootstrap_open_frame(db.path.as_str());
 
     let Some(runtime) = start_full_server_with_max_body(db.path.as_str(), domain, 256).await else {
         return;
@@ -200,7 +211,7 @@ async fn api_rejects_oversized_json_body_before_parsing() {
 async fn api_rejects_malformed_json_as_bad_request() {
     let db = temp_db("malformed-json");
     let domain = test_domain();
-    bootstrap_open_frame_fee_zero(db.path.as_str());
+    bootstrap_open_frame(db.path.as_str());
 
     let Some(runtime) = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await
     else {
@@ -227,7 +238,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
 async fn api_returns_429_when_queue_is_full() {
     let db = temp_db("queue-full-overload");
     let domain = test_domain();
-    bootstrap_open_frame_fee_zero(db.path.as_str());
+    bootstrap_open_frame(db.path.as_str());
 
     let Some(runtime) =
         start_api_only_server(db.path.as_str(), domain.clone(), 128 * 1024, 1).await
@@ -263,7 +274,7 @@ async fn api_returns_429_when_queue_is_full() {
 async fn api_rejects_user_op_payloads_above_application_limit() {
     let db = temp_db("user-op-payload-too-large");
     let domain = test_domain();
-    bootstrap_open_frame_fee_zero(db.path.as_str());
+    bootstrap_open_frame(db.path.as_str());
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
@@ -277,7 +288,7 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
     let sender = address_from_signing_key(&signing_key);
     let user_op = UserOp {
         nonce: 0,
-        max_fee: 0,
+        max_fee: TEST_MAX_FEE,
         data: vec![0_u8; MAX_METHOD_PAYLOAD_BYTES + 1].into(),
     };
     let request = TxRequest {
@@ -311,6 +322,14 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
 async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     let db = temp_db("restart-replay-golden");
     let domain = test_domain();
+    let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    // Fund the sender via an ERC-20 deposit (becomes leading-range direct input).
+    bootstrap_open_frame_with_deposits(
+        db.path.as_str(),
+        &[(sender, U256::from(1_000_000_u64))],
+    );
+    // Seed an additional safe direct input (arbitrary payload) for the restart-replay test.
     seed_safe_direct_input(db.path.as_str(), 10, vec![0xaa]);
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
@@ -326,6 +345,9 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
         .expect("timeout connecting websocket")
         .expect("connect websocket");
 
+    // First WS message: the deposit direct input from the leading range.
+    let deposit_live = recv_ws_message(&mut ws).await;
+    // Second WS message: the seeded safe direct input.
     let first_live = recv_ws_message(&mut ws).await;
 
     let request = make_valid_request(&domain);
@@ -344,11 +366,12 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     let expected = load_all_ordered_l2_txs(db.path.as_str());
     assert_eq!(
         expected.len(),
-        2,
-        "expected one direct input and one user op"
+        3,
+        "expected deposit, direct input, and user op"
     );
-    assert_ws_message_matches_tx(first_live, &expected[0], 0);
-    assert_ws_message_matches_tx(second_live, &expected[1], 1);
+    assert_ws_message_matches_tx(deposit_live, &expected[0], 0);
+    assert_ws_message_matches_tx(first_live, &expected[1], 1);
+    assert_ws_message_matches_tx(second_live, &expected[2], 2);
 
     shutdown_runtime(runtime).await;
 
@@ -543,14 +566,47 @@ async fn shutdown_runtime(mut runtime: FullServerRuntime) {
     }
 }
 
-fn bootstrap_open_frame_fee_zero(db_path: &str) {
-    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
-    // gas_price defaults to 0 → recommended_fee = 0.
-    let head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .expect("initialize open state");
-    assert_eq!(head.frame_fee, 0);
+fn bootstrap_open_frame(db_path: &str) {
+    bootstrap_open_frame_with_deposits(db_path, &[]);
 }
+
+/// Bootstrap open frame, optionally seeding ERC-20 deposits for the given senders.
+/// Each sender receives `amount` tokens before the frame is opened.
+fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)]) {
+    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let config = WalletConfig::default();
+
+    if !deposits.is_empty() {
+        let safe_inputs: Vec<StoredSafeInput> = deposits
+            .iter()
+            .map(|(sender, amount)| {
+                let mut payload = Vec::with_capacity(72);
+                payload.extend_from_slice(config.supported_erc20_token.as_slice());
+                payload.extend_from_slice(sender.as_slice());
+                payload.extend_from_slice(amount.to_be_bytes::<32>().as_slice());
+                StoredSafeInput {
+                    sender: config.erc20_portal_address,
+                    payload,
+                    block_number: 1,
+                }
+            })
+            .collect();
+        storage
+            .append_safe_inputs(1, &safe_inputs)
+            .expect("seed deposits");
+    }
+
+    let safe_input_count = deposits.len() as u64;
+    let leading_range = SafeInputRange::new(0, safe_input_count);
+    // Default log_gas_price=0 → log_recommended_fee = 0+20+419+621 = 1060.
+    let head = storage
+        .initialize_open_state(1, leading_range)
+        .expect("initialize open state");
+    assert_eq!(head.frame_fee, 1060);
+}
+
+/// Default max_fee for test fixtures: must be >= default log_recommended_fee (1060).
+const TEST_MAX_FEE: u16 = 1200;
 
 fn make_valid_request(domain: &Eip712Domain) -> TxRequest {
     let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
@@ -560,7 +616,7 @@ fn make_valid_request(domain: &Eip712Domain) -> TxRequest {
     });
     let user_op = UserOp {
         nonce: 0,
-        max_fee: 0,
+        max_fee: TEST_MAX_FEE,
         data: ssz::Encode::as_ssz_bytes(&method).into(),
     };
     let signature_hex = sign_user_op_hex(domain, &user_op, &signing_key);

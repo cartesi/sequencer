@@ -44,7 +44,7 @@ impl Application for TestApp {
         &self,
         _sender: Address,
         _user_op: &UserOp,
-        _current_fee: u64,
+        _current_fee: u16,
     ) -> Result<(), InvalidReason> {
         Ok(())
     }
@@ -108,7 +108,7 @@ impl Application for SharedCountingApp {
         &self,
         _sender: Address,
         _user_op: &UserOp,
-        _current_fee: u64,
+        _current_fee: u16,
     ) -> Result<(), InvalidReason> {
         Ok(())
     }
@@ -153,7 +153,7 @@ impl Application for ReplayRecordingApp {
         &self,
         _sender: Address,
         _user_op: &UserOp,
-        _current_fee: u64,
+        _current_fee: u16,
     ) -> Result<(), InvalidReason> {
         Ok(())
     }

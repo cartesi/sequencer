@@ -31,7 +31,7 @@ pub struct RoundTripRunConfig {
     pub count: u64,
     pub concurrency: usize,
     pub seed_offset: u64,
-    pub max_fee: u32,
+    pub max_fee: u16,
     pub request_timeout_ms: u64,
     pub max_ws_wait_ms: u64,
     pub fail_on_rejection: bool,

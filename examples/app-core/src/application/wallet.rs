@@ -127,7 +127,7 @@ impl Application for WalletApp {
         &self,
         sender: Address,
         user_op: &UserOp,
-        current_fee: u64,
+        current_fee: u16,
     ) -> Result<(), InvalidReason> {
         let expected_nonce = self.expected_nonce(&sender);
         if user_op.nonce != expected_nonce {
@@ -138,15 +138,15 @@ impl Application for WalletApp {
         }
 
         let max_fee = user_op.max_fee;
-        // Users sign a cap; sequencer executes against the committed frame fee.
-        if u64::from(max_fee) < current_fee {
+        // Users sign a cap (log-space exponent); sequencer executes against the committed frame fee.
+        if max_fee < current_fee {
             return Err(InvalidReason::InvalidMaxFee {
                 max_fee,
                 base_fee: current_fee,
             });
         }
 
-        let gas_cost = U256::from(current_fee);
+        let gas_cost = sequencer_core::fee::fee_to_linear(current_fee);
         let balance = self.balance_of(&sender);
         if balance < gas_cost {
             return Err(InvalidReason::InsufficientGasBalance {
@@ -160,7 +160,7 @@ impl Application for WalletApp {
 
     fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
         let sender = user_op.sender;
-        let gas_cost = U256::from(user_op.fee);
+        let gas_cost = sequencer_core::fee::fee_to_linear(user_op.fee);
         let balance = self.balance_of(&sender);
         if balance < gas_cost {
             return Err(AppError::Internal {
@@ -296,17 +296,21 @@ mod tests {
     fn execute_valid_user_op_charges_current_fee() {
         let mut app = WalletApp::new(WalletConfig::default());
         let sender = Address::from_slice(&[0x22; 20]);
-        app.balances.insert(sender, U256::from(10_u64));
+        let initial_balance = U256::from(1000_u64);
+        app.balances.insert(sender, initial_balance);
 
+        // fee exponent 100 → fee_to_linear(100) ≈ 2 ((129/128)^100 ≈ 2.17, truncated)
+        let fee_exponent: u16 = 100;
         let valid = ValidUserOp {
             sender,
-            fee: 3,
+            fee: fee_exponent,
             data: Vec::new(),
         };
+        let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
         let outputs = app.execute_valid_user_op(&valid).expect("execute valid op");
 
         assert_eq!(app.current_user_nonce(sender), 1);
-        assert_eq!(app.current_user_balance(sender), U256::from(7_u64));
+        assert_eq!(app.current_user_balance(sender), initial_balance - gas_cost);
         assert!(outputs.is_empty());
     }
 
@@ -359,6 +363,7 @@ mod tests {
             amount: U256::from(123_u64),
             to: recipient,
         });
+        // fee exponent 0 → fee_to_linear(0) = 1 (minimum fee)
         let valid = ValidUserOp {
             sender,
             fee: 0,
@@ -370,7 +375,11 @@ mod tests {
             .expect("execute valid user op");
 
         assert_eq!(app.current_user_nonce(sender), before_sender_nonce + 1);
-        assert_eq!(app.current_user_balance(sender), before_sender_balance);
+        // Gas cost of 1 unit (fee_to_linear(0) = 1) is deducted
+        assert_eq!(
+            app.current_user_balance(sender),
+            before_sender_balance - U256::from(1u64)
+        );
         assert_eq!(app.current_user_balance(recipient), before_recipient);
         assert!(outputs.is_empty());
     }
@@ -488,9 +497,12 @@ mod tests {
         let recipient = address!("0x2222222222222222222222222222222222222222");
         app.balances.insert(sender, U256::from(500_u64));
 
+        // fee exponent 10 → fee_to_linear(10) = 1 ((129/128)^10 ≈ 1.08, truncated)
+        let fee_exponent: u16 = 10;
+        let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
         let valid = ValidUserOp {
             sender,
-            fee: 10,
+            fee: fee_exponent,
             data: ssz::Encode::as_ssz_bytes(&super::Method::Transfer(Transfer {
                 amount: U256::from(123_u64),
                 to: recipient,
@@ -499,7 +511,10 @@ mod tests {
 
         let outputs = app.execute_valid_user_op(&valid).expect("execute transfer");
 
-        assert_eq!(app.current_user_balance(sender), U256::from(367_u64));
+        assert_eq!(
+            app.current_user_balance(sender),
+            U256::from(500_u64) - gas_cost - U256::from(123_u64)
+        );
         assert_eq!(app.current_user_balance(recipient), U256::from(123_u64));
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
@@ -519,9 +534,11 @@ mod tests {
         let sender = address!("0x1111111111111111111111111111111111111111");
         app.balances.insert(sender, U256::from(500_u64));
 
+        let fee_exponent: u16 = 10;
+        let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
         let valid = ValidUserOp {
             sender,
-            fee: 10,
+            fee: fee_exponent,
             data: ssz::Encode::as_ssz_bytes(&super::Method::Withdrawal(Withdrawal {
                 amount: U256::from(123_u64),
             })),
@@ -531,7 +548,10 @@ mod tests {
             .execute_valid_user_op(&valid)
             .expect("execute withdrawal");
 
-        assert_eq!(app.current_user_balance(sender), U256::from(367_u64));
+        assert_eq!(
+            app.current_user_balance(sender),
+            U256::from(500_u64) - gas_cost - U256::from(123_u64)
+        );
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
             AppOutput::Voucher {

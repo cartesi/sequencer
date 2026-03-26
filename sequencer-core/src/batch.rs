@@ -24,17 +24,17 @@ pub const INPUT_TAG_DIRECT_INPUT: u8 = 0x00;
 // can be hot-swapped at runtime (see 0001_schema.sql). A CHECK constraint
 // on that table ensures batch_size_target < const_max_batch_bytes.
 //
-// Fee unit:
-//   `fee_price` (Frame field) is denominated in "L2 smallest-token-unit per
-//   user-op-byte".  It is derived from `gas_price` in the batch_policy table,
-//   which is "L2 smallest-token-unit per L1 gas unit".  The formula is:
+// Fee encoding:
+//   All fees are **log-space exponents** with base 129/128 (see `crate::fee`).
+//   An exponent N represents a linear fee of `(129/128)^N` smallest-token-units.
+//   Exponent 0 = 1 unit (minimum). No sentinel.
 //
-//     recommended_fee = gas_price * (alpha_num + alpha_denom) * delta * user_op_bytes / alpha_denom
+//   The DB computes `log_recommended_fee` via pure addition of log terms:
+//     log_recommended_fee = log_gas_price + log_one_plus_alpha + log_delta + log_user_op_bytes
 //
-//   The entity writing `gas_price` to the DB (e.g. a price oracle / scheduler)
-//   must convert the L1 gas price and the L1↔L2 token exchange rate into this
-//   single integer.  For tokens with few decimals (e.g. USDC, 6 decimals) the
-//   writer should pre-scale by 10^k to avoid sub-unit truncation.
+//   The oracle feeds `log_gas_price` directly in log space. For tokens with
+//   few decimals (e.g. USDC, 6 decimals) the oracle should pre-scale the
+//   linear gas price before converting to log space.
 // ---------------------------------------------------------------------------
 
 /// Batch submissions are sent as raw `ssz(Batch)` with no tag; classification at L1 is by
@@ -51,13 +51,15 @@ pub struct Batch {
 pub struct Frame {
     pub user_ops: Vec<WireUserOp>,
     pub safe_block: u64,
-    pub fee_price: u64,
+    /// Log-space fee exponent (base 129/128). See [`crate::fee`].
+    pub fee_price: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct WireUserOp {
     pub nonce: u32,
-    pub max_fee: u32,
+    /// Log-space fee exponent (base 129/128). See [`crate::fee`].
+    pub max_fee: u16,
     pub data: Vec<u8>,
     pub signature: Vec<u8>,
 }

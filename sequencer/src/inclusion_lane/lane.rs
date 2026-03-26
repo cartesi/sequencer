@@ -314,7 +314,7 @@ fn should_close_batch_by_size<A: Application>(head: &WriteHead) -> bool {
 fn execute_user_op(
     app: &mut impl Application,
     item: PendingUserOp,
-    current_frame_fee: u64,
+    current_frame_fee: u16,
     included: &mut Vec<PendingUserOp>,
 ) {
     match app.validate_and_execute_user_op(
@@ -337,7 +337,7 @@ fn execute_user_op(
 pub(super) fn dequeue_and_execute_user_op_chunk(
     rx: &mut mpsc::Receiver<PendingUserOp>,
     app: &mut impl Application,
-    current_frame_fee: u64,
+    current_frame_fee: u16,
     max_chunk: usize,
     included: &mut Vec<PendingUserOp>,
 ) -> Result<(), InclusionLaneError> {

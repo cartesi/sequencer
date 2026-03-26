@@ -23,6 +23,10 @@ use crate::util::io_other;
 
 const DEFAULT_SEQUENCER_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default max_fee for harness-submitted transactions.
+/// Must be >= the default log_recommended_fee (1060).
+const DEFAULT_MAX_FEE: u16 = 1200;
+
 sol! {
     #[sol(rpc)]
     interface MockERC20 {
@@ -275,7 +279,7 @@ impl WalletL2Client {
             &self.domain,
             UserOp {
                 nonce: expected_nonce,
-                max_fee: 0,
+                max_fee: DEFAULT_MAX_FEE,
                 data: ssz::Encode::as_ssz_bytes(&method).into(),
             },
         )?;

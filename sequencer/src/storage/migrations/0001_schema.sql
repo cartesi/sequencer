@@ -97,84 +97,81 @@ VALUES (0, 0);
 -- ---------------------------------------------------------------------------
 -- Batch policy singleton
 --
--- Contains operator-tunable knobs (alpha, gas_price) and on-chain constants
--- (delta, base_gas, etc.). A view derives `batch_size_target` and
--- `recommended_fee` from these columns, and a CHECK constraint prevents
--- updates that would violate the batch size limit.
---
--- Gas economics:
---   batch_size_target = const_base_gas * alpha_denom / (alpha_num * const_delta)
---   recommended_fee   = gas_price * (alpha_num + alpha_denom)
---                        * const_delta * const_user_op_bytes / alpha_denom
+-- Every value is a log-space exponent with base 129/128 (see sequencer_core::fee).
+-- Exponent N represents a linear value of (129/128)^N.
 --
 -- Fee unit:
 --   `gas_price` is denominated in "L2 smallest-token-unit per L1 gas unit".
 --   The entity feeding this value (e.g. a scheduler/price-oracle) must
 --   convert the L1 gas price in wei and the L1↔L2 exchange rate into this
---   single number.  For tokens with few decimals (e.g. USDC, 6 decimals)
---   the scheduler should pre-scale the value (multiply by 10^k) so that
---   sub-unit precision is not lost to integer truncation.
+--   single number.
 --
--- Overflow safety:
---   The intermediate product in `recommended_fee` is:
---     gas_price * (alpha_num + alpha_denom) * const_delta * const_user_op_bytes
---   With the current constants this equals gas_price × 1168 × 26 × 126
---   = gas_price × 3,826,368.  SQLite uses signed 64-bit integers and
---   silently wraps on overflow (no detection mechanism).  The CHECK on
---   gas_price caps it at 2 × 10^12, keeping the intermediate product
---   well below i64::MAX ≈ 9.2 × 10^18.  The Rust reader additionally
---   validates with checked arithmetic.
+-- Fee derivation (view):
+--   log_recommended_fee = log_gas_price + log_one_plus_alpha + log_delta + log_user_op_bytes
+--   Pure addition — no overflow possible. The oracle feeds log_gas_price
+--   directly in log space.
+--
+-- Batch sizing (view):
+--   log_batch_size_target = log_base_gas - log_alpha - log_delta
+--   batch_size_target = base_gas / (alpha * delta). The inclusion lane converts
+--   to linear bytes via fee_to_linear() for its byte-count comparison.
+--
+-- Batch size invariant (CHECK):
+--   log_base_gas - log_alpha - log_delta < log_max_batch_bytes
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS batch_policy (
     singleton_id             INTEGER PRIMARY KEY CHECK (singleton_id = 0),
 
-    -- Knobs (operator-tunable via sqlite3 CLI):
-    alpha_num                INTEGER NOT NULL CHECK (alpha_num > 0),
-    alpha_denom              INTEGER NOT NULL CHECK (alpha_denom > 0),
-    -- See "Fee unit" and "Overflow safety" in the comment block above.
-    gas_price                INTEGER NOT NULL CHECK (gas_price >= 0 AND gas_price <= 2000000000000),
+    -- Knobs (operator-tunable, set via set_alpha(num, denom)):
+    -- log_alpha = log(alpha) where alpha = num/denom. Can be negative (alpha < 1).
+    log_alpha                INTEGER NOT NULL,
+    -- log_one_plus_alpha = log(1 + alpha). Always >= 0.
+    log_one_plus_alpha       INTEGER NOT NULL CHECK (log_one_plus_alpha >= 0),
+    -- Log-space fee exponent fed by the oracle.
+    log_gas_price            INTEGER NOT NULL CHECK (log_gas_price >= 0),
 
-    -- Constants (in DB so the CHECK can reference them):
-    const_delta              INTEGER NOT NULL CHECK (const_delta > 0),
-    const_base_gas           INTEGER NOT NULL CHECK (const_base_gas > 0),
-    const_user_op_bytes      INTEGER NOT NULL CHECK (const_user_op_bytes > 0),
-    -- Effective max batch payload. Already includes slack for chunk overshoot
-    -- and SSZ framing, so the CHECK is simply batch_size_target < this value.
-    const_max_batch_bytes    INTEGER NOT NULL CHECK (const_max_batch_bytes > 0),
+    -- Constants (log-space):
+    log_base_gas             INTEGER NOT NULL CHECK (log_base_gas > 0),
+    log_delta                INTEGER NOT NULL CHECK (log_delta > 0),
+    log_user_op_bytes        INTEGER NOT NULL CHECK (log_user_op_bytes > 0),
+    log_max_batch_bytes      INTEGER NOT NULL CHECK (log_max_batch_bytes > 0),
 
-    -- Safety: batch_size_target < const_max_batch_bytes.
-    CHECK (
-        const_base_gas * alpha_denom / (alpha_num * const_delta)
-        < const_max_batch_bytes
-    )
+    CHECK (log_base_gas - log_alpha - log_delta < log_max_batch_bytes)
 );
 
+-- Default values. All log-space exponents with base 129/128:
+--   log_alpha            = log_{129/128}(0.168)          = -229
+--   log_one_plus_alpha   = log_{129/128}(1.168)          = 20
+--   log_base_gas         = log_{129/128}(55000)          = 1403
+--   log_delta            = log_{129/128}(26)             = 419
+--   log_user_op_bytes    = log_{129/128}(126)            = 621
+--   log_max_batch_bytes  = log_{129/128}(32000)          = 1333
+--
+-- Derived by view:
+--   log_recommended_fee  = 0 + 20 + 419 + 621            = 1060
+--   log_batch_size_target = 1403 - (-229) - 419           = 1213
 INSERT OR IGNORE INTO batch_policy(
     singleton_id,
 
-    alpha_num, alpha_denom, gas_price,
+    log_alpha, log_one_plus_alpha, log_gas_price,
 
-    const_delta, const_base_gas,
-    const_user_op_bytes, const_max_batch_bytes
+    log_base_gas, log_delta, log_user_op_bytes, log_max_batch_bytes
 )
 VALUES (
-    -- Fixed id
     0,
 
-    -- Knobs
-    168, 1000, 0,
+    -229, 20, 0,
 
-    -- Constants
-    26, 55000,
-    126, 32000
+    1403, 419, 621, 1333
 );
 
--- Derived view for reads.
+-- Derived view for reads. All outputs are log-space exponents (base 129/128).
 CREATE VIEW IF NOT EXISTS batch_policy_derived AS
 SELECT *,
-    const_base_gas * alpha_denom / (alpha_num * const_delta)
-        AS batch_size_target,
-
-    gas_price * (alpha_num + alpha_denom) * const_delta * const_user_op_bytes / alpha_denom
-        AS recommended_fee
+    -- Fee per user-op byte.
+    log_gas_price + log_one_plus_alpha + log_delta + log_user_op_bytes
+        AS log_recommended_fee,
+    -- Batch size target in log-space (convert via fee_to_linear for bytes).
+    log_base_gas - log_alpha - log_delta
+        AS log_batch_size_target
 FROM batch_policy;

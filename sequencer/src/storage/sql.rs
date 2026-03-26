@@ -26,17 +26,17 @@ const SQL_SELECT_LATEST_BATCH_INDEX: &str = "SELECT MAX(batch_index) FROM batche
 const SQL_SELECT_USER_OPS_FOR_FRAME: &str = "SELECT nonce, max_fee, data, sig FROM user_ops WHERE batch_index = ?1 AND frame_in_batch = ?2 ORDER BY pos_in_frame ASC";
 const SQL_SELECT_MAX_SAFE_INPUT_INDEX: &str = "SELECT MAX(safe_input_index) FROM safe_inputs";
 const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_txs";
-const SQL_SELECT_BATCH_POLICY: &str = "SELECT gas_price, alpha_num, alpha_denom, const_delta, const_user_op_bytes, batch_size_target FROM batch_policy_derived WHERE singleton_id = 0 LIMIT 1";
+const SQL_SELECT_BATCH_POLICY: &str = "SELECT log_recommended_fee, log_batch_size_target FROM batch_policy_derived WHERE singleton_id = 0 LIMIT 1";
 const SQL_SELECT_SAFE_BLOCK: &str =
     "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1";
 const SQL_INSERT_SAFE_INPUT: &str = "INSERT INTO safe_inputs (safe_input_index, sender, payload, block_number) VALUES (?1, ?2, ?3, ?4)";
 const SQL_INSERT_USER_OP: &str = include_str!("queries/insert_user_op.sql");
 const SQL_INSERT_SEQUENCED_DIRECT_INPUT: &str =
     include_str!("queries/insert_sequenced_direct_input.sql");
-const SQL_UPDATE_BATCH_POLICY_GAS_PRICE: &str =
-    "UPDATE batch_policy SET gas_price = ?1 WHERE singleton_id = 0";
+const SQL_UPDATE_BATCH_POLICY_LOG_GAS_PRICE: &str =
+    "UPDATE batch_policy SET log_gas_price = ?1 WHERE singleton_id = 0";
 const SQL_UPDATE_BATCH_POLICY_ALPHA: &str =
-    "UPDATE batch_policy SET alpha_num = ?1, alpha_denom = ?2 WHERE singleton_id = 0";
+    "UPDATE batch_policy SET log_alpha = ?1, log_one_plus_alpha = ?2 WHERE singleton_id = 0";
 const SQL_UPDATE_SAFE_BLOCK: &str =
     "UPDATE l1_safe_head SET block_number = ?1 WHERE singleton_id = 0";
 #[derive(Debug, Clone)]
@@ -93,35 +93,28 @@ pub(super) fn sql_select_latest_batch_index(conn: &Connection) -> Result<Option<
     )
 }
 
-/// Raw batch policy columns: (gas_price, alpha_num, alpha_denom, const_delta, const_user_op_bytes, batch_size_target).
-pub(super) fn sql_select_batch_policy(conn: &Connection) -> Result<(i64, i64, i64, i64, i64, i64)> {
+/// Derived batch policy: (log_recommended_fee, log_batch_size_target).
+pub(super) fn sql_select_batch_policy(conn: &Connection) -> Result<(i64, i64)> {
     conn.query_row(SQL_SELECT_BATCH_POLICY, [], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-        ))
+        Ok((row.get(0)?, row.get(1)?))
     })
 }
 
-pub(super) fn sql_update_batch_policy_gas_price(
+pub(super) fn sql_update_batch_policy_log_gas_price(
     conn: &Connection,
-    gas_price: i64,
+    log_gas_price: i64,
 ) -> Result<usize> {
-    conn.execute(SQL_UPDATE_BATCH_POLICY_GAS_PRICE, params![gas_price])
+    conn.execute(SQL_UPDATE_BATCH_POLICY_LOG_GAS_PRICE, params![log_gas_price])
 }
 
 pub(super) fn sql_update_batch_policy_alpha(
     conn: &Connection,
-    alpha_num: i64,
-    alpha_denom: i64,
+    log_alpha: i64,
+    log_one_plus_alpha: i64,
 ) -> Result<usize> {
     conn.execute(
         SQL_UPDATE_BATCH_POLICY_ALPHA,
-        params![alpha_num, alpha_denom],
+        params![log_alpha, log_one_plus_alpha],
     )
 }
 
@@ -417,7 +410,7 @@ mod tests {
         sql_select_ordered_l2_txs_page_from_offset, sql_select_safe_block,
         sql_select_safe_inputs_range, sql_select_total_drained_direct_inputs,
         sql_select_user_ops_for_frame, sql_update_batch_policy_alpha,
-        sql_update_batch_policy_gas_price, sql_update_safe_block,
+        sql_update_batch_policy_log_gas_price, sql_update_safe_block,
     };
     use crate::inclusion_lane::PendingUserOp;
     use crate::storage::db::Storage;
@@ -434,7 +427,7 @@ mod tests {
         conn
     }
 
-    fn sample_pending_user_op(seed: u8, nonce: u32, max_fee: u32) -> PendingUserOp {
+    fn sample_pending_user_op(seed: u8, nonce: u32, max_fee: u16) -> PendingUserOp {
         let sender = Address::from_slice(&[seed; 20]);
         let signature = Signature::test_signature();
         let (respond_to, _recv) = oneshot::channel();
@@ -699,27 +692,30 @@ mod tests {
     #[test]
     fn batch_policy_helpers_read_defaults_and_update_knobs() {
         let conn = setup_conn();
-        // Default: gas_price=0 → recommended_fee=0, alpha=168/1000 → batch_size_target=12591
-        let (gas_price, _anum, _adenom, _delta, _uob, target) =
-            sql_select_batch_policy(&conn).expect("read policy");
-        assert_eq!(gas_price, 0);
-        assert_eq!(target, 55000 * 1000 / (168 * 26)); // 12591
+        // Default: log_gas_price=0 → log_recommended_fee=0+20+419+621=1060
+        // log_batch_size_target = 1403 - (-229) - 419 = 1213
+        let (log_fee, log_target) = sql_select_batch_policy(&conn).expect("read policy");
+        assert_eq!(log_fee, 20 + 419 + 621); // 1060
+        assert_eq!(log_target, 1403 - (-229) - 419); // 1213
 
-        sql_update_batch_policy_gas_price(&conn, 100).expect("update gas price");
-        let (gas_price, ..) = sql_select_batch_policy(&conn).expect("read updated policy");
-        assert!(gas_price > 0, "gas_price should have been updated");
+        sql_update_batch_policy_log_gas_price(&conn, 100).expect("update log gas price");
+        let (log_fee, _) = sql_select_batch_policy(&conn).expect("read updated policy");
+        assert_eq!(log_fee, 100 + 20 + 419 + 621); // 1160
 
-        sql_update_batch_policy_alpha(&conn, 200, 1000).expect("update alpha");
-        let (.., target) = sql_select_batch_policy(&conn).expect("read updated target");
-        assert_eq!(target, 55000 * 1000 / (200 * 26)); // 10576
+        // Update alpha: num=200, denom=1000 → log_alpha=-207, log_one_plus_alpha=23
+        // View derives: log_batch_size_target = 1403 - (-207) - 419 = 1191
+        sql_update_batch_policy_alpha(&conn, -207, 23).expect("update alpha");
+        let (log_fee, log_target) = sql_select_batch_policy(&conn).expect("read updated target");
+        assert_eq!(log_target, 1403 - (-207) - 419); // 1191
+        assert_eq!(log_fee, 100 + 23 + 419 + 621); // 1163
     }
 
     #[test]
     fn batch_policy_check_rejects_unsafe_alpha() {
         let conn = setup_conn();
-        // alpha_num=1 → batch_size_target = 55000*1000/(1*26) = 2_115_384 → way over 32000
-        let err = sql_update_batch_policy_alpha(&conn, 1, 1000);
-        assert!(err.is_err(), "CHECK should reject unsafe alpha");
+        // log_alpha=-350 → log_batch_size_target = 1403-(-350)-419 = 1334 >= log_max_batch_bytes=1333
+        let err = sql_update_batch_policy_alpha(&conn, -350, 0);
+        assert!(err.is_err(), "CHECK should reject unsafe alpha (log_batch_size_target >= log_max_batch_bytes)");
     }
 
     #[test]

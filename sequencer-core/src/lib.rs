@@ -5,5 +5,6 @@ pub mod api;
 pub mod application;
 pub mod batch;
 pub mod broadcast;
+pub mod fee;
 pub mod l2_tx;
 pub mod user_op;

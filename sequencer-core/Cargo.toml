@@ -16,3 +16,6 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
+
+[build-dependencies]
+ruint = "1.17"
