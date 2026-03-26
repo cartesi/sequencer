@@ -42,6 +42,8 @@ struct Args {
     accounts_file: Option<String>,
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TRANSFER_AMOUNT)]
     transfer_amount: u64,
+    #[arg(long, default_value_t = 0_u32)]
+    starting_nonce: u32,
     #[arg(long, default_value_t = 200_u64)]
     count: u64,
     #[arg(long, default_value_t = 1_usize)]
@@ -73,6 +75,7 @@ async fn main() -> BenchResult<()> {
         kind: args.workload,
         accounts_file: args.accounts_file.clone(),
         transfer_amount: args.transfer_amount,
+        starting_nonce: args.starting_nonce,
     };
     let mut managed = if args.self_contained {
         Some(
@@ -191,6 +194,7 @@ async fn main() -> BenchResult<()> {
             "workload": args.workload.as_str(),
             "accounts_file": args.accounts_file,
             "transfer_amount": args.transfer_amount,
+            "starting_nonce": args.starting_nonce,
         });
         write_json_output(
             Path::new(path),

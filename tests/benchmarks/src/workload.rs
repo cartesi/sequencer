@@ -52,6 +52,7 @@ pub struct WorkloadConfig {
     pub kind: WorkloadKind,
     pub accounts_file: Option<String>,
     pub transfer_amount: u64,
+    pub starting_nonce: u32,
 }
 
 impl Default for WorkloadConfig {
@@ -60,6 +61,7 @@ impl Default for WorkloadConfig {
             kind: WorkloadKind::Synthetic,
             accounts_file: None,
             transfer_amount: DEFAULT_WORKLOAD_TRANSFER_AMOUNT,
+            starting_nonce: 0,
         }
     }
 }
@@ -127,7 +129,8 @@ impl WorkloadState {
                 },
             }),
             WorkloadKind::FundedTransfer => {
-                let accounts = load_funded_accounts(config.accounts_file.as_deref())?;
+                let accounts =
+                    load_funded_accounts(config.accounts_file.as_deref(), config.starting_nonce)?;
                 Ok(Self {
                     inner: WorkloadStateInner::FundedTransfer {
                         accounts,
@@ -231,7 +234,10 @@ pub fn make_signed_fixture(
     Ok(fixture)
 }
 
-fn load_funded_accounts(accounts_file: Option<&str>) -> BenchResult<Vec<FundedAccount>> {
+fn load_funded_accounts(
+    accounts_file: Option<&str>,
+    starting_nonce: u32,
+) -> BenchResult<Vec<FundedAccount>> {
     let keys = match accounts_file {
         Some(path) => load_private_keys_from_file(path)?,
         None => default_private_keys().to_vec(),
@@ -247,7 +253,7 @@ fn load_funded_accounts(accounts_file: Option<&str>) -> BenchResult<Vec<FundedAc
         accounts.push(FundedAccount {
             signing_key,
             sender,
-            next_nonce: 0,
+            next_nonce: starting_nonce,
         });
     }
     Ok(accounts)
@@ -478,6 +484,7 @@ mod tests {
             kind: WorkloadKind::FundedTransfer,
             accounts_file: Some(temp_path.to_string_lossy().to_string()),
             transfer_amount: 5,
+            starting_nonce: 0,
         };
 
         let plans = funded_account_plans(&config, 5).expect("funding plan");

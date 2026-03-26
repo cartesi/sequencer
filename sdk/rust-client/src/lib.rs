@@ -7,7 +7,6 @@ pub use errors::{ClientBuildError, SubmitRejected, SubmitTxError, SubscribeError
 
 use sequencer_core::api::{TxRequest, TxResponse};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
@@ -16,7 +15,6 @@ pub type SubscribeStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Debug, Clone)]
 pub struct SequencerClient {
     endpoint: String,
-    host_port: String,
     path_prefix: String,
     request_timeout: Duration,
 }
@@ -31,11 +29,10 @@ impl SequencerClient {
         request_timeout: Duration,
     ) -> Result<Self, ClientBuildError> {
         let endpoint = endpoint.into();
-        let (host_port, path_prefix) =
+        let path_prefix =
             parse_http_url(endpoint.as_str()).map_err(ClientBuildError::InvalidEndpoint)?;
         Ok(Self {
             endpoint,
-            host_port,
             path_prefix,
             request_timeout,
         })
@@ -43,10 +40,6 @@ impl SequencerClient {
 
     pub fn endpoint(&self) -> &str {
         self.endpoint.as_str()
-    }
-
-    pub fn host_port(&self) -> &str {
-        self.host_port.as_str()
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -70,7 +63,7 @@ impl SequencerClient {
         req: &TxRequest,
     ) -> Result<(u16, String), SubmitTxError> {
         submit_tx_with_status_parsed(
-            self.host_port.as_str(),
+            self.endpoint.as_str(),
             self.path_prefix.as_str(),
             req,
             self.request_timeout,
@@ -116,102 +109,60 @@ fn with_from_offset(ws_subscribe_url: &str, from_offset: u64) -> String {
 }
 
 async fn submit_tx_with_status_parsed(
-    host_port: &str,
+    endpoint: &str,
     path_prefix: &str,
     req: &TxRequest,
     timeout: Duration,
 ) -> Result<(u16, String), SubmitTxError> {
-    let path = format!("{}/tx", path_prefix.trim_end_matches('/'));
-    let body = serde_json::to_string(req).map_err(|e| SubmitTxError::Parse(e.to_string()))?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(host_port))
-        .await
-        .map_err(|_| SubmitTxError::TimeoutConnect)?
-        .map_err(|e| SubmitTxError::IoConnect(e.to_string()))?;
-
-    tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
-        .await
-        .map_err(|_| SubmitTxError::TimeoutWrite)?
-        .map_err(|e| SubmitTxError::IoWrite(e.to_string()))?;
-
-    tokio::time::timeout(timeout, stream.flush())
-        .await
-        .map_err(|_| SubmitTxError::TimeoutFlush)?
-        .map_err(|e| SubmitTxError::IoFlush(e.to_string()))?;
-
-    let mut response = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    loop {
-        let read = tokio::time::timeout(timeout, stream.read(&mut chunk))
-            .await
-            .map_err(|_| SubmitTxError::TimeoutRead)?
-            .map_err(|e| SubmitTxError::IoRead(e.to_string()))?;
-        if read == 0 {
-            break;
-        }
-        response.extend_from_slice(&chunk[..read]);
-
-        if let Some((header_end, content_length)) = response_content_len(response.as_slice())
-            && response.len() >= header_end.saturating_add(content_length)
-        {
-            break;
-        }
-    }
-
-    parse_http_response(response.as_slice()).map_err(SubmitTxError::Parse)
-}
-
-fn parse_http_url(http_url: &str) -> Result<(String, String), String> {
-    let stripped = http_url
-        .trim_end_matches('/')
-        .strip_prefix("http://")
-        .ok_or_else(|| "only http:// URLs are supported".to_string())?;
-
-    let (host_port, path_prefix) = if let Some((host, path)) = stripped.split_once('/') {
-        (host.to_string(), format!("/{}", path))
+    let mut submit_url =
+        reqwest::Url::parse(endpoint).map_err(|e| SubmitTxError::Parse(e.to_string()))?;
+    let tx_path = if path_prefix.is_empty() {
+        "/tx".to_string()
     } else {
-        (stripped.to_string(), String::new())
+        format!("{}/tx", path_prefix.trim_end_matches('/'))
     };
-    if host_port.is_empty() {
-        return Err("missing host in http URL".to_string());
-    }
-    Ok((host_port, path_prefix))
-}
+    submit_url.set_path(tx_path.as_str());
+    submit_url.set_query(None);
 
-fn parse_http_response(raw: &[u8]) -> Result<(u16, String), String> {
-    let text = String::from_utf8(raw.to_vec()).map_err(|e| e.to_string())?;
-    let mut sections = text.splitn(2, "\r\n\r\n");
-    let headers = sections.next().unwrap_or_default();
-    let body = sections.next().unwrap_or_default().to_string();
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| SubmitTxError::Parse(e.to_string()))?;
 
-    let status_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| "missing HTTP status line".to_string())?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "missing HTTP status code".to_string())?
-        .parse::<u16>()
-        .map_err(|e| e.to_string())?;
+    let response = client
+        .post(submit_url)
+        .json(req)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                SubmitTxError::TimeoutConnect
+            } else {
+                SubmitTxError::IoConnect(e.to_string())
+            }
+        })?;
+
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| SubmitTxError::IoRead(e.to_string()))?;
     Ok((status, body))
 }
 
-fn response_content_len(raw: &[u8]) -> Option<(usize, usize)> {
-    let header_end = raw.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
-    let headers = std::str::from_utf8(&raw[..header_end]).ok()?;
-    let mut content_length = None;
-    for line in headers.lines() {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse::<usize>().ok();
-            break;
-        }
+fn parse_http_url(http_url: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(http_url).map_err(|e| e.to_string())?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err("only http:// or https:// URLs are supported".to_string());
     }
-    content_length.map(|len| (header_end, len))
+    if url.host_str().is_none() {
+        return Err("missing host in URL".to_string());
+    }
+    let path = url.path().trim_end_matches('/').to_string();
+    if path.is_empty() || path == "/" {
+        Ok(String::new())
+    } else {
+        Ok(path)
+    }
 }

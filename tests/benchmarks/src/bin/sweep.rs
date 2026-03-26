@@ -186,6 +186,7 @@ async fn main() -> BenchResult<()> {
         kind: args.workload,
         accounts_file: args.accounts_file.clone(),
         transfer_amount: args.transfer_amount,
+        starting_nonce: 0,
     };
 
     let mut run_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;

@@ -7,3 +7,4 @@ sequencer.db-wal
 /out/
 /.DS_Store
 soljson-latest.js
+/benchmarks
