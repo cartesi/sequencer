@@ -7,8 +7,12 @@ use crate::{ScenarioFn, ScenarioResult};
 use alloy_primitives::{Address, U256};
 use rollups_harness::{ManagedSequencer, ReplayWalletApp, TestSigner, WalletL1Client, WsClient};
 use sequencer_core::api::WsTxMessage;
+use sequencer_core::fee::fee_to_linear;
 
 const NO_WS_MESSAGE_WAIT: Duration = Duration::from_secs(1);
+
+/// Default log_recommended_fee exponent (0 + 20 + 419 + 621 = 1060).
+const DEFAULT_FRAME_FEE: u16 = 1060;
 
 struct ExpectedWalletState {
     address: Address,
@@ -56,6 +60,7 @@ async fn run_deposit_transfer_withdrawal_test(
     let deposit_amount = U256::from(600_000_u64);
     let transfer_amount = U256::from(400_000_u64);
     let withdrawal_amount = U256::from(150_000_u64);
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
     apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
 
@@ -65,16 +70,17 @@ async fn run_deposit_transfer_withdrawal_test(
     bob_l2.withdraw(withdrawal_amount).await?;
     replay.apply(ws.expect_user_op_from(bob_address).await?)?;
 
+    // Alice: 600_000 - 400_000 - gas. Bob: 400_000 - 150_000 - gas.
     assert_wallet_state(
         &replay,
         ExpectedWalletState {
             address: alice_address,
-            balance: U256::from(200_000_u64),
+            balance: deposit_amount - transfer_amount - gas,
             nonce: 1,
         },
         ExpectedWalletState {
             address: bob_address,
-            balance: U256::from(250_000_u64),
+            balance: transfer_amount - withdrawal_amount - gas,
             nonce: 1,
         },
         3,
@@ -96,6 +102,7 @@ async fn run_direct_input_not_safe_yet_test(runtime: &mut ManagedSequencer) -> S
     let initial_funding_amount = U256::from(700_000_u64);
     let pending_deposit_amount = U256::from(600_000_u64);
     let transfer_amount = U256::from(400_000_u64);
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
     apply_safe_supported_deposit(
         runtime,
@@ -122,16 +129,17 @@ async fn run_direct_input_not_safe_yet_test(runtime: &mut ManagedSequencer) -> S
             .await?,
     )?;
 
+    // Alice: 700_000 - 400_000 - gas + 600_000. Bob: 400_000 (no ops from Bob).
     assert_wallet_state(
         &replay,
         ExpectedWalletState {
             address: alice_address,
-            balance: U256::from(900_000_u64),
+            balance: initial_funding_amount - transfer_amount - gas + pending_deposit_amount,
             nonce: 1,
         },
         ExpectedWalletState {
             address: bob_address,
-            balance: U256::from(400_000_u64),
+            balance: transfer_amount,
             nonce: 0,
         },
         3,
@@ -153,17 +161,21 @@ async fn run_rejected_user_op_not_broadcast_test(
     let mut stale_alice_l2 = runtime.wallet_l2(alice)?;
     let mut replay = ReplayWalletApp::devnet();
 
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(100_000_u64);
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
+
     apply_safe_supported_deposit(
         runtime,
         &mut ws,
         &mut replay,
         &alice_l1,
-        U256::from(600_000_u64),
+        deposit_amount,
     )
     .await?;
 
     alice_l2
-        .transfer(bob_address, U256::from(100_000_u64))
+        .transfer(bob_address, transfer_amount)
         .await?;
     replay.apply(ws.expect_user_op_from(alice_address).await?)?;
 
@@ -178,16 +190,17 @@ async fn run_rejected_user_op_not_broadcast_test(
     );
     ws.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
 
+    // Alice: 600_000 - 100_000 - gas. Bob: 100_000 (rejected op not charged).
     assert_wallet_state(
         &replay,
         ExpectedWalletState {
             address: alice_address,
-            balance: U256::from(500_000_u64),
+            balance: deposit_amount - transfer_amount - gas,
             nonce: 1,
         },
         ExpectedWalletState {
             address: bob_address,
-            balance: U256::from(100_000_u64),
+            balance: transfer_amount,
             nonce: 0,
         },
         2,
@@ -207,36 +220,42 @@ async fn run_reconnect_from_offset_test(runtime: &mut ManagedSequencer) -> Scena
     let mut bob_l2 = runtime.wallet_l2(bob)?;
     let mut replay = ReplayWalletApp::devnet();
 
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(250_000_u64);
+    let withdrawal_amount = U256::from(100_000_u64);
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
+
     let deposit_message = apply_safe_supported_deposit(
         runtime,
         &mut ws,
         &mut replay,
         &alice_l1,
-        U256::from(600_000_u64),
+        deposit_amount,
     )
     .await?;
     let reconnect_offset = deposit_message.offset().saturating_add(1);
     drop(ws);
 
     alice_l2
-        .transfer(bob_address, U256::from(250_000_u64))
+        .transfer(bob_address, transfer_amount)
         .await?;
-    bob_l2.withdraw(U256::from(100_000_u64)).await?;
+    bob_l2.withdraw(withdrawal_amount).await?;
 
     let mut resumed_ws = runtime.ws(reconnect_offset).await?;
     replay.apply(resumed_ws.expect_user_op_from(alice_address).await?)?;
     replay.apply(resumed_ws.expect_user_op_from(bob_address).await?)?;
 
+    // Alice: 600_000 - 250_000 - gas. Bob: 250_000 - 100_000 - gas.
     assert_wallet_state(
         &replay,
         ExpectedWalletState {
             address: alice_address,
-            balance: U256::from(350_000_u64),
+            balance: deposit_amount - transfer_amount - gas,
             nonce: 1,
         },
         ExpectedWalletState {
             address: bob_address,
-            balance: U256::from(150_000_u64),
+            balance: transfer_amount - withdrawal_amount - gas,
             nonce: 1,
         },
         3,
@@ -256,19 +275,24 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
     let mut bob_l2 = runtime.wallet_l2(bob.clone())?;
     let mut replay_before_restart = ReplayWalletApp::devnet();
 
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(400_000_u64);
+    let withdrawal_amount = U256::from(150_000_u64);
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
+
     apply_safe_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before_restart,
         &alice_l1,
-        U256::from(600_000_u64),
+        deposit_amount,
     )
     .await?;
     alice_l2
-        .transfer(bob_address, U256::from(400_000_u64))
+        .transfer(bob_address, transfer_amount)
         .await?;
     replay_before_restart.apply(ws.expect_user_op_from(alice_address).await?)?;
-    bob_l2.withdraw(U256::from(150_000_u64)).await?;
+    bob_l2.withdraw(withdrawal_amount).await?;
     replay_before_restart.apply(ws.expect_user_op_from(bob_address).await?)?;
 
     drop(ws);
@@ -287,16 +311,19 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
         .expect_no_message_for(NO_WS_MESSAGE_WAIT)
         .await?;
 
+    // Alice: 600_000 - 400_000 - gas. Bob: 400_000 - 150_000 - gas.
+    let expected_alice = deposit_amount - transfer_amount - gas;
+    let expected_bob = transfer_amount - withdrawal_amount - gas;
     assert_wallet_state(
         &replay_before_restart,
         ExpectedWalletState {
             address: alice_address,
-            balance: U256::from(200_000_u64),
+            balance: expected_alice,
             nonce: 1,
         },
         ExpectedWalletState {
             address: bob_address,
-            balance: U256::from(250_000_u64),
+            balance: expected_bob,
             nonce: 1,
         },
         3,
@@ -305,12 +332,12 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
         &replay_after_restart,
         ExpectedWalletState {
             address: alice_address,
-            balance: U256::from(200_000_u64),
+            balance: expected_alice,
             nonce: 1,
         },
         ExpectedWalletState {
             address: bob_address,
-            balance: U256::from(250_000_u64),
+            balance: expected_bob,
             nonce: 1,
         },
         3,

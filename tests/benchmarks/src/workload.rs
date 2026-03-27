@@ -58,7 +58,7 @@ pub struct WorkloadConfig {
 impl Default for WorkloadConfig {
     fn default() -> Self {
         Self {
-            kind: WorkloadKind::Synthetic,
+            kind: WorkloadKind::FundedTransfer,
             accounts_file: None,
             transfer_amount: DEFAULT_WORKLOAD_TRANSFER_AMOUNT,
         }

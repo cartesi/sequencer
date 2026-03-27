@@ -3,6 +3,7 @@
 
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
+use sequencer_core::fee::fee_to_linear;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -64,6 +65,13 @@ pub async fn bootstrap_funded_workload(
         return Ok(());
     }
 
+    // The funding signer will do one L2 transfer per plan. Each transfer costs gas
+    // at the frame fee (currently 1060), so we must deposit enough to cover both the
+    // workload balances AND the funding transfers themselves.
+    let transfer_count = plans.iter().filter(|p| !p.required_balance.is_zero()).count();
+    let funding_gas = U256::from(transfer_count as u64) * fee_to_linear(max_fee);
+    let deposit_amount = total_required_balance.saturating_add(funding_gas);
+
     let mut ws = runtime.ws(0).await?;
     let l1_funder = runtime.wallet_l1(TestSigner::from_default(0)?).await?;
     l1_funder
@@ -74,7 +82,7 @@ pub async fn bootstrap_funded_workload(
         .await?;
 
     let l1 = runtime.wallet_l1(funding_signer.clone()).await?;
-    l1.mint_and_deposit_supported_token(total_required_balance)
+    l1.mint_and_deposit_supported_token(deposit_amount)
         .await?;
     runtime.mine_l1_blocks(1).await?;
     let _ = ws
