@@ -43,10 +43,19 @@ pub type AppOutputs = Vec<AppOutput>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidReason {
-    InvalidNonce { expected: u32, got: u32 },
+    InvalidNonce {
+        expected: u32,
+        got: u32,
+    },
     /// Both values are log-space exponents (base 129/128).
-    InvalidMaxFee { max_fee: u16, base_fee: u16 },
-    InsufficientGasBalance { required: U256, available: U256 },
+    InvalidMaxFee {
+        max_fee: u16,
+        base_fee: u16,
+    },
+    InsufficientGasBalance {
+        required: U256,
+        available: U256,
+    },
 }
 
 impl fmt::Display for InvalidReason {

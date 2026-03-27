@@ -36,10 +36,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
     let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
     let sender = address_from_signing_key(&signing_key);
     // Fund the sender so the user-op passes the balance check.
-    bootstrap_open_frame_with_deposits(
-        db.path.as_str(),
-        &[(sender, U256::from(1_000_000_u64))],
-    );
+    bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
@@ -325,10 +322,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
     let sender = address_from_signing_key(&signing_key);
     // Fund the sender via an ERC-20 deposit (becomes leading-range direct input).
-    bootstrap_open_frame_with_deposits(
-        db.path.as_str(),
-        &[(sender, U256::from(1_000_000_u64))],
-    );
+    bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
     // Seed an additional safe direct input (arbitrary payload) for the restart-replay test.
     seed_safe_direct_input(db.path.as_str(), 10, vec![0xaa]);
 

@@ -165,18 +165,9 @@ async fn run_rejected_user_op_not_broadcast_test(
     let transfer_amount = U256::from(100_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    apply_safe_supported_deposit(
-        runtime,
-        &mut ws,
-        &mut replay,
-        &alice_l1,
-        deposit_amount,
-    )
-    .await?;
+    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
 
-    alice_l2
-        .transfer(bob_address, transfer_amount)
-        .await?;
+    alice_l2.transfer(bob_address, transfer_amount).await?;
     replay.apply(ws.expect_user_op_from(alice_address).await?)?;
 
     let rejected = stale_alice_l2
@@ -225,20 +216,13 @@ async fn run_reconnect_from_offset_test(runtime: &mut ManagedSequencer) -> Scena
     let withdrawal_amount = U256::from(100_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    let deposit_message = apply_safe_supported_deposit(
-        runtime,
-        &mut ws,
-        &mut replay,
-        &alice_l1,
-        deposit_amount,
-    )
-    .await?;
+    let deposit_message =
+        apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
+            .await?;
     let reconnect_offset = deposit_message.offset().saturating_add(1);
     drop(ws);
 
-    alice_l2
-        .transfer(bob_address, transfer_amount)
-        .await?;
+    alice_l2.transfer(bob_address, transfer_amount).await?;
     bob_l2.withdraw(withdrawal_amount).await?;
 
     let mut resumed_ws = runtime.ws(reconnect_offset).await?;
@@ -288,9 +272,7 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
         deposit_amount,
     )
     .await?;
-    alice_l2
-        .transfer(bob_address, transfer_amount)
-        .await?;
+    alice_l2.transfer(bob_address, transfer_amount).await?;
     replay_before_restart.apply(ws.expect_user_op_from(alice_address).await?)?;
     bob_l2.withdraw(withdrawal_amount).await?;
     replay_before_restart.apply(ws.expect_user_op_from(bob_address).await?)?;
