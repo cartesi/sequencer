@@ -31,7 +31,8 @@ use alloy_primitives::U256;
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/fee_table.rs"));
 }
-use generated::{MAX_EXPONENT, TABLE};
+pub use generated::MAX_EXPONENT;
+use generated::TABLE;
 
 /// Fee base numerator.
 pub const FEE_BASE_NUM: u64 = 129;
@@ -257,5 +258,36 @@ mod tests {
     fn fee_from_linear_zero_and_one() {
         assert_eq!(fee_from_linear(U256::ZERO), 0);
         assert_eq!(fee_from_linear(U256::from(1u64)), 0);
+    }
+
+    #[test]
+    fn fee_to_linear_at_max_exponent() {
+        // Should not panic and should return a large value.
+        let v = fee_to_linear(MAX_EXPONENT);
+        assert!(v > U256::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_EXPONENT")]
+    fn fee_to_linear_above_max_exponent_panics() {
+        fee_to_linear(MAX_EXPONENT + 1);
+    }
+
+    #[test]
+    fn fee_from_linear_saturates_to_max_exponent() {
+        assert_eq!(fee_from_linear(U256::MAX), MAX_EXPONENT);
+        // A value well above the max representable fee should also saturate.
+        let huge = fee_to_linear(MAX_EXPONENT) + U256::from(1u64);
+        assert_eq!(fee_from_linear(huge), MAX_EXPONENT);
+    }
+
+    #[test]
+    fn log_fee_ratio_large_ratio() {
+        // log_{129/128}(2^64 - 1) ≈ 5700
+        let v = log_fee_ratio(u64::MAX, 1);
+        assert!(
+            (5690..=5710).contains(&v),
+            "log(u64::MAX) = {v}, expected ~5700"
+        );
     }
 }
