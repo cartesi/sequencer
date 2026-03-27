@@ -14,7 +14,7 @@ use super::sql::{
     sql_select_max_safe_input_index, sql_select_ordered_l2_tx_count,
     sql_select_ordered_l2_txs_for_batch, sql_select_ordered_l2_txs_from_offset,
     sql_select_ordered_l2_txs_page_from_offset, sql_select_safe_block,
-    sql_select_safe_input_payloads_for_sender, sql_select_safe_inputs_range,
+    sql_select_safe_inputs_range,
     sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
     sql_update_batch_policy_alpha, sql_update_batch_policy_log_gas_price, sql_update_safe_block,
 };
@@ -134,17 +134,47 @@ impl Storage {
         })
     }
 
-    pub fn load_safe_input_payloads_for_sender(
+    /// Scan safe-input payloads for `sender` in pages, SSZ-decode each payload
+    /// to extract the batch nonce, and compute the longest contiguous nonce
+    /// prefix starting from 0.  Memory is bounded by `page_size` payloads per
+    /// iteration rather than the full table.
+    pub fn advance_safe_batch_nonce_for_sender(
         &mut self,
         sender: Address,
-    ) -> Result<(u64, Vec<Vec<u8>>)> {
+        page_size: u64,
+    ) -> Result<(u64, u64)> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let safe_block = query_current_safe_block(&tx)?;
-        let payloads = sql_select_safe_input_payloads_for_sender(&tx, sender.as_slice())?;
+
+        const SQL: &str = "SELECT payload FROM safe_inputs \
+                           WHERE sender = ?1 AND safe_input_index >= ?2 \
+                           ORDER BY safe_input_index ASC LIMIT ?3";
+        let mut expected: u64 = 0;
+        let mut offset: i64 = 0;
+        let limit = i64::try_from(page_size).unwrap_or(i64::MAX);
+        loop {
+            let mut stmt = tx.prepare_cached(SQL)?;
+            let mut rows = stmt.query(rusqlite::params![sender.as_slice(), offset, limit])?;
+            let mut page_count: i64 = 0;
+            while let Some(row) = rows.next()? {
+                page_count += 1;
+                let payload: Vec<u8> = row.get(0)?;
+                if let Ok(batch) = <Batch as ssz::Decode>::from_ssz_bytes(&payload) {
+                    if batch.nonce == expected {
+                        expected = expected.saturating_add(1);
+                    }
+                }
+            }
+            if page_count < limit {
+                break;
+            }
+            offset = offset.saturating_add(page_count);
+        }
+
         tx.commit()?;
-        Ok((safe_block, payloads))
+        Ok((safe_block, expected))
     }
 
     pub fn fill_safe_inputs(
@@ -1052,5 +1082,124 @@ mod tests {
             txs.is_empty(),
             "fresh batch should not have sequenced txs yet"
         );
+    }
+
+    /// Helper: insert safe inputs whose payloads are SSZ-encoded batches with
+    /// the given nonces, all attributed to `sender`.
+    fn seed_safe_inputs_with_batch_nonces(
+        storage: &mut Storage,
+        sender: Address,
+        safe_block: u64,
+        nonces: &[u64],
+    ) {
+        let inputs: Vec<StoredSafeInput> = nonces
+            .iter()
+            .map(|nonce| StoredSafeInput {
+                sender,
+                payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+                    nonce: *nonce,
+                    frames: Vec::new(),
+                }),
+                block_number: safe_block,
+            })
+            .collect();
+        storage
+            .append_safe_inputs(safe_block, inputs.as_slice())
+            .expect("append safe inputs");
+    }
+
+    const SENDER_A: Address = Address::repeat_byte(0xAA);
+    const SENDER_B: Address = Address::repeat_byte(0xBB);
+
+    #[test]
+    fn advance_safe_batch_nonce_returns_zero_when_no_inputs_exist() {
+        let db = temp_db("advance-nonce-empty");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let (_, next) = storage
+            .advance_safe_batch_nonce_for_sender(SENDER_A, 256)
+            .expect("advance nonce");
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn advance_safe_batch_nonce_contiguous_prefix() {
+        let db = temp_db("advance-nonce-contiguous");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 2]);
+
+        let (safe_block, next) = storage
+            .advance_safe_batch_nonce_for_sender(SENDER_A, 256)
+            .expect("advance nonce");
+        assert_eq!(safe_block, 10);
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn advance_safe_batch_nonce_stops_at_gap() {
+        let db = temp_db("advance-nonce-gap");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        // nonces: 0, 1, 3, 4, 5 — gap at 2
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4, 5]);
+
+        let (_, next) = storage
+            .advance_safe_batch_nonce_for_sender(SENDER_A, 256)
+            .expect("advance nonce");
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn advance_safe_batch_nonce_works_across_page_boundaries() {
+        let db = temp_db("advance-nonce-paged");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        // 5 contiguous nonces with page_size=2 → 3 pages
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 2, 3, 4]);
+
+        let (_, next) = storage
+            .advance_safe_batch_nonce_for_sender(SENDER_A, 2)
+            .expect("advance nonce");
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn advance_safe_batch_nonce_gap_spans_page_boundary() {
+        let db = temp_db("advance-nonce-gap-across-page");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        // page_size=2: page0=[0,1], page1=[3,4], page2=[5]
+        // gap at nonce 2 — should still detect it
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4, 5]);
+
+        let (_, next) = storage
+            .advance_safe_batch_nonce_for_sender(SENDER_A, 2)
+            .expect("advance nonce");
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn advance_safe_batch_nonce_filters_by_sender() {
+        let db = temp_db("advance-nonce-sender-filter");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 2]);
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_B, 11, &[0]);
+
+        let (_, next_a) = storage
+            .advance_safe_batch_nonce_for_sender(SENDER_A, 2)
+            .expect("advance nonce A");
+        let (_, next_b) = storage
+            .advance_safe_batch_nonce_for_sender(SENDER_B, 2)
+            .expect("advance nonce B");
+        assert_eq!(next_a, 3);
+        assert_eq!(next_b, 1);
+    }
+
+    #[test]
+    fn advance_safe_batch_nonce_page_size_one() {
+        let db = temp_db("advance-nonce-page-1");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 2]);
+
+        let (_, next) = storage
+            .advance_safe_batch_nonce_for_sender(SENDER_A, 1)
+            .expect("advance nonce");
+        assert_eq!(next, 3);
     }
 }

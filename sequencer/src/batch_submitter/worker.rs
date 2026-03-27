@@ -11,9 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use sequencer_core::batch::Batch;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::batch_submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig, TxHash};
 use crate::shutdown::ShutdownSignal;
@@ -27,8 +26,6 @@ pub enum BatchSubmitterError {
     Storage(#[from] rusqlite::Error),
     #[error("batch submitter join error: {0}")]
     Join(String),
-    #[error("failed to decode stored safe batch input: {0}")]
-    StoredBatchDecode(String),
     #[error(transparent)]
     Poster(#[from] BatchPosterError),
 }
@@ -105,8 +102,8 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
 
         let last_closed = latest_batch_index - 1;
         let next_expected = {
-            let (safe_block, safe_observed_nonces) = self.load_safe_observed_batch_nonces().await?;
-            let safe_next_expected = advance_expected_batch_nonce(0, safe_observed_nonces);
+            let (safe_block, safe_next_expected) =
+                self.load_safe_next_expected_batch_nonce().await?;
 
             let recent_observed_nonces = self
                 .poster
@@ -128,10 +125,12 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
 
         let batch = self.load_batch_for_submission(first_to_submit).await?;
+        debug!(batch_index = first_to_submit, "submitting batch to L1");
         let tx_hash = self
             .poster
             .submit_batch(batch.encode_for_scheduler())
             .await?;
+        info!(batch_index = first_to_submit, %tx_hash, "batch submitted to L1");
 
         Ok(TickOutcome::Submitted {
             batch_index: first_to_submit,
@@ -151,28 +150,24 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
 
-    async fn load_safe_observed_batch_nonces(
+    const SAFE_NONCE_PAGE_SIZE: u64 = 256;
+
+    async fn load_safe_next_expected_batch_nonce(
         &self,
-    ) -> Result<(u64, Vec<u64>), BatchSubmitterError> {
+    ) -> Result<(u64, u64), BatchSubmitterError> {
         let db_path = self.db_path.clone();
         let batch_submitter_address = self.batch_submitter_address;
-        let (safe_block, payloads) = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open_read_only(&db_path)?;
             storage
-                .load_safe_input_payloads_for_sender(batch_submitter_address)
+                .advance_safe_batch_nonce_for_sender(
+                    batch_submitter_address,
+                    Self::SAFE_NONCE_PAGE_SIZE,
+                )
                 .map_err(BatchSubmitterError::from)
         })
         .await
-        .map_err(|err| BatchSubmitterError::Join(err.to_string()))??;
-
-        let mut observed_nonces = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            let batch: Batch = ssz::Decode::from_ssz_bytes(payload.as_ref())
-                .map_err(|err| BatchSubmitterError::StoredBatchDecode(format!("{err:?}")))?;
-            observed_nonces.push(batch.nonce);
-        }
-
-        Ok((safe_block, observed_nonces))
+        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
 
     async fn load_batch_for_submission(
