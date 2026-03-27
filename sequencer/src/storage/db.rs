@@ -7,16 +7,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::sql::{
     sql_count_user_ops_for_frame, sql_insert_open_batch, sql_insert_open_batch_with_index,
-    sql_insert_open_frame, sql_insert_safe_inputs_batch,
-    sql_insert_sequenced_direct_inputs, sql_insert_user_ops_batch, sql_select_batch_policy,
-    sql_select_frames_for_batch, sql_select_latest_batch_index,
-    sql_select_latest_batch_with_user_op_count, sql_select_latest_frame_in_batch_for_batch,
-    sql_select_max_safe_input_index, sql_select_ordered_l2_tx_count,
-    sql_select_ordered_l2_txs_for_batch, sql_select_ordered_l2_txs_from_offset,
-    sql_select_ordered_l2_txs_page_from_offset, sql_select_safe_block,
-    sql_select_safe_inputs_range,
-    sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
-    sql_update_batch_policy_alpha, sql_update_batch_policy_log_gas_price, sql_update_safe_block,
+    sql_insert_open_frame, sql_insert_safe_inputs_batch, sql_insert_sequenced_direct_inputs,
+    sql_insert_user_ops_batch, sql_select_batch_policy, sql_select_frames_for_batch,
+    sql_select_latest_batch_index, sql_select_latest_batch_with_user_op_count,
+    sql_select_latest_frame_in_batch_for_batch, sql_select_max_safe_input_index,
+    sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_for_batch,
+    sql_select_ordered_l2_txs_from_offset, sql_select_ordered_l2_txs_page_from_offset,
+    sql_select_safe_block, sql_select_safe_inputs_range, sql_select_total_drained_direct_inputs,
+    sql_select_user_ops_for_frame, sql_update_batch_policy_alpha,
+    sql_update_batch_policy_log_gas_price, sql_update_safe_block,
 };
 use super::{
     BatchPolicy, FrameHeader, SafeFrontier, SafeInputRange, StorageOpenError, StoredSafeInput,
@@ -161,10 +160,10 @@ impl Storage {
             while let Some(row) = rows.next()? {
                 page_count += 1;
                 let payload: Vec<u8> = row.get(0)?;
-                if let Ok(batch) = <Batch as ssz::Decode>::from_ssz_bytes(&payload) {
-                    if batch.nonce == expected {
-                        expected = expected.saturating_add(1);
-                    }
+                if let Ok(batch) = <Batch as ssz::Decode>::from_ssz_bytes(&payload)
+                    && batch.nonce == expected
+                {
+                    expected = expected.saturating_add(1);
                 }
             }
             if page_count < limit {

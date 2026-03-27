@@ -137,7 +137,10 @@ pub fn fee_from_linear(value: U256) -> u16 {
 ///
 /// Panics if `num == 0` or `denom == 0`.
 pub fn log_fee_ratio(num: u64, denom: u64) -> i32 {
-    assert!(num > 0 && denom > 0, "log_fee_ratio requires positive values");
+    assert!(
+        num > 0 && denom > 0,
+        "log_fee_ratio requires positive values"
+    );
     if num >= denom {
         // log(num/denom) is non-negative. Binary search for n where
         // fee_to_linear_fixed(n) * denom >= num * FIXED_ONE.
@@ -245,7 +248,10 @@ mod tests {
     fn log_fee_ratio_negative() {
         // log_{129/128}(0.168) = log_{129/128}(168/1000) ≈ -229
         let v = log_fee_ratio(168, 1000);
-        assert!((-231..=-227).contains(&v), "log(0.168) = {v}, expected ~-229");
+        assert!(
+            (-231..=-227).contains(&v),
+            "log(0.168) = {v}, expected ~-229"
+        );
     }
 
     #[test]

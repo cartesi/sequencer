@@ -8,7 +8,7 @@ use alloy::{
     providers::{DynProvider, Provider, ProviderBuilder},
     rpc::client::RpcClient,
     signers::local::PrivateKeySigner,
-    transports::http::{reqwest, Http, reqwest::Url},
+    transports::http::{Http, reqwest, reqwest::Url},
 };
 use alloy_transport::layers::RetryBackoffLayer;
 
@@ -51,8 +51,6 @@ pub fn create_signer_provider(url: &str, private_key: &str) -> Result<DynProvide
     let client = create_client(url)?;
     let signer =
         PrivateKeySigner::from_str(private_key).map_err(|e| format!("invalid private key: {e}"))?;
-    let provider = ProviderBuilder::new()
-        .wallet(signer)
-        .connect_client(client);
+    let provider = ProviderBuilder::new().wallet(signer).connect_client(client);
     Ok(provider.erased())
 }

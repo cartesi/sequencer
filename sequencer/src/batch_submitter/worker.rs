@@ -152,9 +152,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
 
     const SAFE_NONCE_PAGE_SIZE: u64 = 256;
 
-    async fn load_safe_next_expected_batch_nonce(
-        &self,
-    ) -> Result<(u64, u64), BatchSubmitterError> {
+    async fn load_safe_next_expected_batch_nonce(&self) -> Result<(u64, u64), BatchSubmitterError> {
         let db_path = self.db_path.clone();
         let batch_submitter_address = self.batch_submitter_address;
         tokio::task::spawn_blocking(move || {

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use alloy_primitives::{Address, Signature, U256};
-use sequencer_core::fee::fee_to_linear;
 use alloy_sol_types::{Eip712Domain, SolStruct};
 use app_core::application::{
     MAX_METHOD_PAYLOAD_BYTES, Method, Transfer, Withdrawal, default_private_keys,
@@ -11,6 +10,7 @@ use clap::ValueEnum;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer_core::api::TxRequest;
+use sequencer_core::fee::fee_to_linear;
 use sequencer_core::user_op::UserOp;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -103,7 +103,8 @@ pub(crate) fn funded_account_plans(
         let signing_key = signing_key_from_hex(private_key.as_str())?;
         let address = address_from_signing_key(&signing_key);
         let send_count = round_robin_send_count(total_count, account_count, index as u64);
-        let required_balance = required_funded_transfer_balance(send_count, config.transfer_amount, max_fee);
+        let required_balance =
+            required_funded_transfer_balance(send_count, config.transfer_amount, max_fee);
         plans.push(FundedAccountPlan {
             address,
             required_balance,
@@ -506,6 +507,9 @@ mod tests {
         // max_fee=0 → fee_to_linear(0)=1, so gas adds send_count to the total.
         assert_eq!(required_funded_transfer_balance(0, 5, 0), U256::ZERO);
         // 3*5 + 3*2/2 + 3*1 = 15 + 3 + 3 = 21
-        assert_eq!(required_funded_transfer_balance(3, 5, 0), U256::from(21_u64));
+        assert_eq!(
+            required_funded_transfer_balance(3, 5, 0),
+            U256::from(21_u64)
+        );
     }
 }
