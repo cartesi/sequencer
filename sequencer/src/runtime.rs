@@ -157,7 +157,7 @@ where
         confirmation_depth: config.batch_submitter_confirmation_depth,
         long_block_range_error_codes: config.long_block_range_error_codes,
     };
-    let provider = build_batch_submitter_provider(&l1_config).await?;
+    let provider = build_batch_submitter_provider(&l1_config)?;
 
     // Validate that the RPC chain ID matches --chain-id.
     use alloy::providers::Provider;
@@ -412,19 +412,9 @@ fn log_cleanup_result(component: &str, result: Result<(), RunError>) {
     }
 }
 
-async fn build_batch_submitter_provider(
+fn build_batch_submitter_provider(
     l1: &L1Config,
-) -> Result<impl alloy::providers::Provider + Clone + 'static, std::io::Error> {
-    use alloy::providers::ProviderBuilder;
-    use alloy::signers::local::PrivateKeySigner;
-    use std::str::FromStr;
-
-    let signer = PrivateKeySigner::from_str(&l1.batch_submitter_private_key)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    ProviderBuilder::new()
-        .wallet(signer)
-        .connect(l1.eth_rpc_url.as_str())
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))
+) -> Result<alloy::providers::DynProvider, std::io::Error> {
+    crate::provider::create_signer_provider(&l1.eth_rpc_url, &l1.batch_submitter_private_key)
+        .map_err(std::io::Error::other)
 }

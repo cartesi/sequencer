@@ -3865,6 +3865,7 @@ dependencies = [
  "alloy-network-primitives",
  "alloy-primitives",
  "alloy-sol-types",
+ "alloy-transport",
  "app-core",
  "async-recursion",
  "async-trait",
