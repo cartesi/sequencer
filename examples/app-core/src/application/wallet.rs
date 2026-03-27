@@ -20,6 +20,8 @@ use sequencer_core::user_op::UserOp;
 pub struct WalletConfig {
     pub erc20_portal_address: Address,
     pub supported_erc20_token: Address,
+    /// Address that receives fee revenue. Defaults to `Address::ZERO` (burned).
+    pub sequencer_address: Address,
 }
 
 impl WalletConfig {
@@ -27,6 +29,7 @@ impl WalletConfig {
         Self {
             erc20_portal_address: SEPOLIA_ERC20_PORTAL_ADDRESS,
             supported_erc20_token: SEPOLIA_USDC_ADDRESS,
+            sequencer_address: SEPOLIA_SEQUENCER_ADDRESS,
         }
     }
 
@@ -34,6 +37,7 @@ impl WalletConfig {
         Self {
             erc20_portal_address: SEPOLIA_ERC20_PORTAL_ADDRESS,
             supported_erc20_token: DEVNET_MOCK_USDC_ADDRESS,
+            sequencer_address: DEVNET_SEQUENCER_ADDRESS,
         }
     }
 }
@@ -57,6 +61,10 @@ pub const SEPOLIA_ERC20_PORTAL_ADDRESS: Address =
 pub const SEPOLIA_USDC_ADDRESS: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
 pub const DEVNET_MOCK_USDC_ADDRESS: Address =
     address!("0x95d0c8A7d11342299807A2Fc19ac44C2321cCc68");
+pub const SEPOLIA_SEQUENCER_ADDRESS: Address =
+    address!("0x16d5FF3Fdd14e2a86FBA77cbcE6B3Cd9C32b8Ff3");
+pub const DEVNET_SEQUENCER_ADDRESS: Address =
+    address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 impl WalletApp {
     pub fn new(config: WalletConfig) -> Self {
         Self {
@@ -170,6 +178,7 @@ impl Application for WalletApp {
 
         self.bump_nonce(sender);
         self.balances.insert(sender, balance - gas_cost);
+        self.credit(self.config.sequencer_address, gas_cost);
         let mut outputs = Vec::new();
 
         let method = Method::from_ssz_bytes(user_op.data.as_slice()).ok();
@@ -581,5 +590,63 @@ mod tests {
             config.supported_erc20_token,
             super::DEVNET_MOCK_USDC_ADDRESS
         );
+    }
+
+    #[test]
+    fn fee_credits_sequencer_address() {
+        let sequencer = address!("0x9999999999999999999999999999999999999999");
+        let config = WalletConfig {
+            sequencer_address: sequencer,
+            ..WalletConfig::default()
+        };
+        let mut app = WalletApp::new(config);
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        app.balances.insert(sender, U256::from(10_000_u64));
+
+        let fee_exponent: u16 = 100;
+        let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
+        let valid = ValidUserOp {
+            sender,
+            fee: fee_exponent,
+            data: Vec::new(),
+        };
+        app.execute_valid_user_op(&valid).expect("execute op");
+
+        assert_eq!(
+            app.current_user_balance(sender),
+            U256::from(10_000_u64) - gas_cost
+        );
+        assert_eq!(
+            app.current_user_balance(sequencer),
+            gas_cost,
+            "sequencer should receive the fee"
+        );
+    }
+
+    #[test]
+    fn fee_sent_to_zero_address_when_default() {
+        let config = WalletConfig {
+            sequencer_address: Address::ZERO,
+            ..WalletConfig::default()
+        };
+        let mut app = WalletApp::new(config);
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        app.balances.insert(sender, U256::from(10_000_u64));
+
+        let fee_exponent: u16 = 100;
+        let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
+        let valid = ValidUserOp {
+            sender,
+            fee: fee_exponent,
+            data: Vec::new(),
+        };
+        app.execute_valid_user_op(&valid).expect("execute op");
+
+        assert_eq!(
+            app.current_user_balance(sender),
+            U256::from(10_000_u64) - gas_cost
+        );
+        // Fee goes to address zero — effectively burned.
+        assert_eq!(app.current_user_balance(Address::ZERO), gas_cost);
     }
 }

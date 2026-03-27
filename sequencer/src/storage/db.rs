@@ -298,9 +298,11 @@ impl Storage {
 
     pub fn batch_policy(&mut self) -> Result<BatchPolicy> {
         let (log_recommended_fee, log_batch_size_target) = sql_select_batch_policy(&self.conn)?;
+        let max_exp = sequencer_core::fee::MAX_EXPONENT;
         Ok(BatchPolicy {
-            recommended_fee: i64_to_u16(log_recommended_fee),
-            batch_size_target: i64_to_u16(log_batch_size_target),
+            // Clamp to MAX_EXPONENT to prevent panics in fee_to_linear.
+            recommended_fee: i64_to_u16(log_recommended_fee).min(max_exp),
+            batch_size_target: i64_to_u16(log_batch_size_target).min(max_exp),
         })
     }
 
@@ -317,7 +319,10 @@ impl Storage {
         use sequencer_core::fee::log_fee_ratio;
 
         let log_alpha = log_fee_ratio(num, denom);
-        let log_one_plus_alpha = log_fee_ratio(num + denom, denom);
+        let one_plus_alpha_num = num.checked_add(denom).expect(
+            "set_alpha: num + denom overflows u64; use smaller values for the alpha fraction",
+        );
+        let log_one_plus_alpha = log_fee_ratio(one_plus_alpha_num, denom);
 
         let changed_rows = sql_update_batch_policy_alpha(
             &self.conn,
@@ -663,9 +668,11 @@ fn query_current_safe_block(tx: &Connection) -> Result<u64> {
 
 fn query_batch_policy(tx: &Transaction<'_>) -> Result<BatchPolicy> {
     let (log_recommended_fee, log_batch_size_target) = sql_select_batch_policy(tx)?;
+    let max_exp = sequencer_core::fee::MAX_EXPONENT;
     Ok(BatchPolicy {
-        recommended_fee: i64_to_u16(log_recommended_fee),
-        batch_size_target: i64_to_u16(log_batch_size_target),
+        // Clamp to MAX_EXPONENT to prevent panics in fee_to_linear.
+        recommended_fee: i64_to_u16(log_recommended_fee).min(max_exp),
+        batch_size_target: i64_to_u16(log_batch_size_target).min(max_exp),
     })
 }
 
@@ -849,6 +856,37 @@ mod tests {
             head.max_batch_user_op_bytes > 0,
             "batch size target should be set"
         );
+    }
+
+    #[test]
+    fn high_gas_price_clamps_recommended_fee_to_max_exponent() {
+        let db = temp_db("clamp-fee");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        // Set gas price high enough that log_recommended_fee > MAX_EXPONENT (17101).
+        // Default: log_recommended_fee = gas_price + 20 + 419 + 621.
+        // With gas_price = 17000: 17000 + 1060 = 18060 > 17101.
+        storage
+            .set_log_gas_price(17000)
+            .expect("set high gas price");
+
+        let policy = storage.batch_policy().expect("read policy");
+        assert_eq!(
+            policy.recommended_fee,
+            sequencer_core::fee::MAX_EXPONENT,
+            "recommended_fee should be clamped to MAX_EXPONENT"
+        );
+
+        // fee_to_linear must not panic with the clamped value.
+        let _ = sequencer_core::fee::fee_to_linear(policy.recommended_fee);
+    }
+
+    #[test]
+    #[should_panic(expected = "num + denom overflows u64")]
+    fn set_alpha_rejects_overflow() {
+        let db = temp_db("alpha-overflow");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        storage.set_alpha(u64::MAX, 1).unwrap();
     }
 
     #[test]
