@@ -19,10 +19,12 @@ test-sequencer:
     cargo test -p sequencer --test ws_broadcaster -- --test-threads=1
     cargo test -p sequencer --test batch_submitter_integration -- --test-threads=1
 
-test-rollups-e2e: setup canonical-build-machine-image
-    cargo build -p sequencer --bin sequencer-devnet
-    cargo build -p rollups-e2e
+test-rollups-e2e: setup ensure-machine-image
+    cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e
     cargo run -p rollups-e2e
+
+ensure-machine-image:
+    @test -d examples/canonical-app/out/canonical-machine-image || just canonical-build-machine-image
 
 bench target="all":
     just -f tests/benchmarks/justfile {{target}}

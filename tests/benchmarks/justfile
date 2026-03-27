@@ -60,7 +60,7 @@ bench-soak-low-lat-self count="20000" max_fee="1200" out="" extra="": ensure-mac
     out_path="{{out}}"; if [[ -z "${out_path}" ]]; then out_path="tests/benchmarks/results/soak-low-lat-self-$(date +%s).json"; fi; just --justfile tests/benchmarks/justfile bench-hammer-self {{count}} {{max_fee}} 10 0 funded-transfer "${out_path}" '{{extra}}'
 
 bench-soak-high-throughput-self count="20000" max_fee="1200" out="" extra="": ensure-machine-image
-    out_path="{{out}}"; if [[ -z "${out_path}" ]]; then out_path="tests/benchmarks/results/soak-high-throughput-self-$(date +%s).json"; fi; cargo build -p sequencer --release; cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset 0 --concurrency 96 --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload synthetic --json-out "${out_path}" {{extra}}
+    out_path="{{out}}"; if [[ -z "${out_path}" ]]; then out_path="tests/benchmarks/results/soak-high-throughput-self-$(date +%s).json"; fi; cargo build -p sequencer --release; cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --count {{count}} --max-fee {{max_fee}} --from-offset 0 --concurrency 96 --request-timeout-ms 10000 --max-ws-wait-ms 20000 --workload funded-transfer --json-out "${out_path}" {{extra}}
 
 bench-capacity-sweep-self count="1000" max_fee="1200" from_offset="0" conc_range="32:512:32" out="tests/benchmarks/results/capacity-sweep-self.json" extra="": ensure-machine-image
     cargo build -p sequencer --release
@@ -69,7 +69,10 @@ bench-capacity-sweep-self count="1000" max_fee="1200" from_offset="0" conc_range
 bench-compare-latest kind="all" sweep_mode="round-trip" results_dir="tests/benchmarks/results":
     cargo run -p benchmarks --bin compare_latest --release -- --results-dir {{results_dir}} --kind {{kind}} --sweep-mode {{sweep_mode}}
 
-all: bench-unit bench-ack-self bench-round-trip-self bench-soak-low-lat-self bench-soak-high-throughput-self bench-capacity-sweep-self
+# NOTE: bench-capacity-sweep-self is excluded because it uses the synthetic workload,
+# which requires unfunded accounts and is incompatible with non-zero fees.
+# Run it manually with --allow-rejections if needed for raw throughput testing.
+all: bench-unit bench-ack-self bench-round-trip-self bench-soak-low-lat-self bench-soak-high-throughput-self
 
 all-and-compare: all
     just --justfile tests/benchmarks/justfile bench-compare-latest all

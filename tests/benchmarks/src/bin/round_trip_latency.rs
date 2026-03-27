@@ -36,7 +36,7 @@ struct Args {
     domain_chain_id: Option<u64>,
     #[arg(long, value_parser = parse_address)]
     domain_verifying_contract: Option<Address>,
-    #[arg(long, value_enum, default_value_t = WorkloadKind::Synthetic)]
+    #[arg(long, value_enum, default_value_t = WorkloadKind::FundedTransfer)]
     workload: WorkloadKind,
     #[arg(long)]
     accounts_file: Option<String>,
