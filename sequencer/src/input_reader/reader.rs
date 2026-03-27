@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use alloy::eips::BlockNumberOrTag::Safe;
 use alloy::providers::Provider;
-use alloy::providers::ProviderBuilder;
 use alloy::sol_types::SolInterface;
 use alloy_primitives::{Address, U256};
 use cartesi_rollups_contracts::application::Application;
@@ -57,10 +56,8 @@ impl InputReader {
         shutdown: ShutdownSignal,
         config: InputReaderConfig,
     ) -> Result<Self, InputReaderError> {
-        let provider = ProviderBuilder::new()
-            .connect(config.rpc_url.as_str())
-            .await
-            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        let provider = crate::provider::create_provider(&config.rpc_url)
+            .map_err(InputReaderError::Provider)?;
         let application = Application::new(config.app_address, &provider);
         let data_availability = application
             .getDataAvailability()
@@ -123,20 +120,16 @@ impl InputReader {
     pub async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
         self.bootstrap_safe_head().await?;
 
-        let provider = ProviderBuilder::new()
-            .connect(self.config.rpc_url.as_str())
-            .await
-            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        let provider = crate::provider::create_provider(&self.config.rpc_url)
+            .map_err(InputReaderError::Provider)?;
         self.advance_once(&provider).await
     }
 
     async fn run_forever(mut self) -> Result<(), InputReaderError> {
         self.bootstrap_safe_head().await?;
 
-        let provider = ProviderBuilder::new()
-            .connect(self.config.rpc_url.as_str())
-            .await
-            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        let provider = crate::provider::create_provider(&self.config.rpc_url)
+            .map_err(InputReaderError::Provider)?;
 
         loop {
             if self.shutdown.is_shutdown_requested() {

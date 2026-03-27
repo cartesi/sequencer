@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use alloy::providers::Provider;
+use alloy::providers::{DynProvider, Provider};
 use async_trait::async_trait;
 use cartesi_rollups_contracts::input_box::InputBox;
 use sequencer_core::batch::Batch;
@@ -39,25 +39,19 @@ pub trait BatchPoster: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct EthereumBatchPoster<P: Provider + Send + Sync + Clone + 'static> {
-    provider: P,
+pub struct EthereumBatchPoster {
+    provider: DynProvider,
     config: BatchPosterConfig,
 }
 
-impl<P> EthereumBatchPoster<P>
-where
-    P: Provider + Send + Sync + Clone + 'static,
-{
-    pub fn new(provider: P, config: BatchPosterConfig) -> Self {
+impl EthereumBatchPoster {
+    pub fn new(provider: DynProvider, config: BatchPosterConfig) -> Self {
         Self { provider, config }
     }
 }
 
 #[async_trait]
-impl<P> BatchPoster for EthereumBatchPoster<P>
-where
-    P: Provider + Send + Sync + Clone + 'static,
-{
+impl BatchPoster for EthereumBatchPoster {
     async fn submit_batch(&self, payload: Vec<u8>) -> Result<TxHash, BatchPosterError> {
         let input_box = InputBox::new(self.config.l1_submit_address, &self.provider);
         let pending = input_box
