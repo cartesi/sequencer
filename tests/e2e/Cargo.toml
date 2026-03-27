@@ -11,17 +11,12 @@ authors.workspace = true
 
 [dependencies]
 rollups-harness = { path = "../harness" }
-sequencer-rust-client = { path = "../../sdk/rust-client" }
-sequencer-core = { path = "../../sequencer-core" }
 app-core = { path = "../../examples/app-core" }
-alloy = { version = "1.0", features = ["contract", "network", "reqwest", "signer-local"] }
+sequencer-core = { path = "../../sequencer-core" }
+sequencer-rust-client = { path = "../../sdk/rust-client" }
 alloy-primitives = { version = "1.4.1", features = ["k256"] }
 alloy-sol-types = "1.4.1"
-cartesi-rollups-contracts = "=2.2.0"
-futures-util = "0.3"
-k256 = "0.13.4"
+futures = "0.3"
 libtest-mimic = "0.6.1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net"] }
-tokio-tungstenite = "0.28"
-serde_json = "1"

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::{BenchResult, support::err};
+use crate::{BenchResult, support::io_err};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stats {
@@ -18,9 +18,36 @@ pub struct Stats {
     pub p999: Duration,
 }
 
+impl Stats {
+    pub fn to_ms(&self) -> StatsMs {
+        StatsMs {
+            count: self.count,
+            min_ms: self.min.as_secs_f64() * 1000.0,
+            max_ms: self.max.as_secs_f64() * 1000.0,
+            mean_ms: self.mean.as_secs_f64() * 1000.0,
+            p50_ms: self.p50.as_secs_f64() * 1000.0,
+            p95_ms: self.p95.as_secs_f64() * 1000.0,
+            p99_ms: self.p99.as_secs_f64() * 1000.0,
+            p999_ms: self.p999.as_secs_f64() * 1000.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsMs {
+    pub count: usize,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub mean_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub p999_ms: f64,
+}
+
 pub fn summarize(samples: &[Duration]) -> BenchResult<Stats> {
     if samples.is_empty() {
-        return Err(err("cannot summarize empty sample set"));
+        return Err(io_err("cannot summarize empty sample set"));
     }
 
     let mut nanos: Vec<u128> = samples.iter().map(Duration::as_nanos).collect();
@@ -69,7 +96,7 @@ pub fn rejection_rate(accepted: u64, rejected: u64) -> f64 {
     }
 }
 
-pub(crate) fn format_optional_f64(value: Option<f64>) -> String {
+pub fn format_optional_f64(value: Option<f64>) -> String {
     match value {
         Some(v) => format!("{v:.3}"),
         None => "n/a".to_string(),

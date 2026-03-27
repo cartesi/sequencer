@@ -7,6 +7,7 @@ mod evaluation;
 mod rejection;
 mod report;
 mod round_trip;
+mod rt_sweep;
 pub mod runtime;
 mod stats;
 mod support;
@@ -15,9 +16,8 @@ mod workload;
 
 pub use ack::{AckRunConfig, AckRunReport, run_ack_benchmark};
 pub use domain::{
-    BenchmarkDomain, DEFAULT_ENDPOINT, DOMAIN_NAME, DOMAIN_VERSION, SELF_CONTAINED_DOMAIN_CHAIN_ID,
-    SELF_CONTAINED_DOMAIN_VERIFYING_CONTRACT, parse_address, resolve_external_benchmark_domain,
-    self_contained_domain,
+    BenchmarkDomain, DEFAULT_ENDPOINT, DOMAIN_NAME, DOMAIN_VERSION, parse_address,
+    resolve_external_benchmark_domain,
 };
 pub use evaluation::{
     ACK_P99_TARGET_MS, DIAGNOSTIC_P999_MIN_ACCEPTED_COUNT, NetworkProfile, NetworkProfileKind,
@@ -30,15 +30,19 @@ pub use report::{
     print_round_trip_report, write_json_output,
 };
 pub use round_trip::{RoundTripRunConfig, RoundTripRunReport, run_round_trip_benchmark};
-pub use stats::{Stats, print_stats, rejection_rate, summarize, throughput_tx_per_s};
-pub use support::{default_seed_offset, now};
+pub use rt_sweep::{
+    RtSweepMeasurements, RtSweepRow, RtSweepRunReport, RtSweepSummary, compute_rt_sweep_summary,
+    print_rt_sweep_report, write_csv as write_rt_sweep_csv,
+};
+pub use stats::{
+    Stats, StatsMs, format_optional_f64, print_stats, rejection_rate, summarize,
+    throughput_tx_per_s,
+};
+pub use support::trailing_number;
 pub use sweep::{
     SweepMeasurements, SweepRow, SweepRunReport, SweepSummary, compute_capacity_summary,
     print_sweep_report, write_csv as write_sweep_csv,
 };
-pub use workload::{
-    DEFAULT_WORKLOAD_TRANSFER_AMOUNT, SignedTxFixture, WorkloadConfig, WorkloadKind,
-    make_signed_fixture,
-};
+pub use workload::{DEFAULT_WORKLOAD_TRANSFER_AMOUNT, WorkloadConfig, WorkloadKind};
 
 pub type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;

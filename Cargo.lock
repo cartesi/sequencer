@@ -1109,11 +1109,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "benchmarks"
 version = "0.1.0"
 dependencies = [
- "alloy",
  "alloy-primitives",
  "alloy-sol-types",
  "app-core",
- "cartesi-rollups-contracts",
  "clap",
  "ethereum_ssz",
  "futures-util",
@@ -3559,21 +3557,16 @@ dependencies = [
 name = "rollups-e2e"
 version = "0.1.0"
 dependencies = [
- "alloy",
  "alloy-primitives",
  "alloy-sol-types",
  "app-core",
- "cartesi-rollups-contracts",
  "ethereum_ssz",
- "futures-util",
- "k256",
+ "futures",
  "libtest-mimic",
  "rollups-harness",
  "sequencer-core",
  "sequencer-rust-client",
- "serde_json",
  "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]
@@ -3592,6 +3585,7 @@ dependencies = [
  "sequencer-rust-client",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -3908,6 +3902,7 @@ dependencies = [
 name = "sequencer-rust-client"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "sequencer-core",
  "serde_json",
  "thiserror 1.0.69",

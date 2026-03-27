@@ -56,8 +56,10 @@ pub fn default_json_output_path(prefix: &str) -> String {
 
 pub fn print_ack_report(report: &AckRunReport) {
     println!(
-        "ack benchmark completed: count={}, endpoint={}, concurrency={}",
-        report.count, report.endpoint, report.concurrency
+        "ack benchmark completed: duration={:.1}s, endpoint={}, concurrency={}",
+        report.total_wall.as_secs_f64(),
+        report.endpoint,
+        report.concurrency
     );
     println!("  accepted: {}", report.accepted);
     println!("  rejected: {}", report.rejected);
@@ -89,8 +91,11 @@ pub fn print_ack_report(report: &AckRunReport) {
 
 pub fn print_round_trip_report(report: &RoundTripRunReport) {
     println!(
-        "round-trip benchmark completed: count={}, endpoint={}, ws={}, concurrency={}",
-        report.count, report.endpoint, report.ws_subscribe_url, report.concurrency
+        "round-trip benchmark completed: duration={:.1}s, endpoint={}, ws={}, concurrency={}",
+        report.total_wall.as_secs_f64(),
+        report.endpoint,
+        report.ws_subscribe_url,
+        report.concurrency
     );
     println!("  accepted: {}", report.accepted);
     println!("  rejected: {}", report.rejected);

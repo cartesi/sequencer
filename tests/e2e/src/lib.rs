@@ -18,11 +18,6 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ScenarioResult<()>>,
 {
-    rollups_harness::teardown_sqlite_artifacts(std::path::Path::new(
-        rollups_harness::DEFAULT_TEST_LOGS_DIR,
-    ))
-    .map_err(failed)?;
-
     let outcome = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -30,19 +25,7 @@ where
         .map_err(failed)?
         .block_on(scenario());
 
-    let teardown_result = rollups_harness::teardown_sqlite_artifacts(std::path::Path::new(
-        rollups_harness::DEFAULT_TEST_LOGS_DIR,
-    ));
-
-    match (outcome, teardown_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(err), _) => Err(libtest_mimic::Failed::from(format!(
-            "{scenario_name}: {err}"
-        ))),
-        (Ok(()), Err(err)) => Err(libtest_mimic::Failed::from(format!(
-            "{scenario_name} teardown failed: {err}"
-        ))),
-    }
+    outcome.map_err(|err| libtest_mimic::Failed::from(format!("{scenario_name}: {err}")))
 }
 
 fn failed(err: impl std::fmt::Display) -> libtest_mimic::Failed {

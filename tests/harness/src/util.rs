@@ -27,6 +27,9 @@ pub(crate) fn path_as_str(path: &Path) -> HarnessResult<&str> {
         .ok_or_else(|| io_other(format!("path is not valid UTF-8: {}", path.display())).into())
 }
 
+// NOTE: There is a small TOCTOU race between releasing this port and the spawned
+// process binding to it. Fixing properly would require the sequencer binary to
+// support `--http-port 0` and report its actual port, which is out of scope.
 pub(crate) fn build_local_endpoint() -> HarnessResult<(String, String)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;

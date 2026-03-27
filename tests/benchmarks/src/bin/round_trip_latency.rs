@@ -5,8 +5,8 @@ use alloy_primitives::Address;
 use benchmarks::{
     BenchResult, DEFAULT_ENDPOINT, DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME, DOMAIN_VERSION,
     NetworkProfile, RoundTripRunConfig, WorkloadConfig, WorkloadKind, default_json_output_path,
-    default_seed_offset, evaluate_soft_confirm_target, parse_address, print_round_trip_report,
-    print_target_evaluation, resolve_external_benchmark_domain, run_round_trip_benchmark,
+    evaluate_soft_confirm_target, parse_address, print_round_trip_report, print_target_evaluation,
+    resolve_external_benchmark_domain, run_round_trip_benchmark,
     runtime::{
         DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_SEQUENCER_BIN, MemorySampler, benchmark_domain,
         bootstrap_funded_workload, managed_sequencer_config,
@@ -18,12 +18,16 @@ use serde_json::json;
 use std::path::Path;
 use std::time::Duration;
 
+/// Conservative upper bound on how many txs a single worker might send during
+/// a benchmark run. Used to pre-fund accounts generously.
+const FUNDING_ESTIMATE_TXS_PER_WORKER: u64 = 100_000;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "round_trip_latency",
     about = "round-trip latency benchmark",
     version,
-    after_help = "Examples:\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --count 1000 --concurrency 16 --max-fee 0 --from-offset 0\n  cargo run -p benchmarks --bin round_trip_latency -- --endpoint http://127.0.0.1:3000 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --count 1000 --concurrency 16 --max-fee 0 --from-offset 0\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --count 5000 --concurrency 16 --evaluate"
+    after_help = "Examples:\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 30 --concurrency 16 --max-fee 0 --from-offset 0\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 60 --concurrency 16 --evaluate"
 )]
 struct Args {
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
@@ -44,20 +48,19 @@ struct Args {
     transfer_amount: u64,
     #[arg(long, default_value_t = 0_u64)]
     from_offset: u64,
-    #[arg(long, default_value_t = 100_u64)]
-    count: u64,
+    #[arg(long, default_value_t = 45_u64)]
+    duration_secs: u64,
+    /// Number of concurrent workers (one wallet per worker).
     #[arg(long, default_value_t = 1_usize)]
     concurrency: usize,
-    #[arg(long)]
-    seed_offset: Option<u64>,
     #[arg(long, default_value_t = 1200_u16)]
     max_fee: u16,
     #[arg(long, default_value_t = 3_000_u64)]
     request_timeout_ms: u64,
     #[arg(long, default_value_t = 5_000_u64)]
     max_ws_wait_ms: u64,
-    #[arg(long, default_value_t = false)]
-    allow_rejections: bool,
+    #[arg(long, default_value_t = 5_u64)]
+    warmup_secs: u64,
     #[arg(long, default_value_t = false)]
     evaluate: bool,
     #[arg(long)]
@@ -90,7 +93,8 @@ async fn main() -> BenchResult<()> {
         None
     };
     if let Some(runtime) = managed.as_ref() {
-        bootstrap_funded_workload(runtime, &workload, args.count, args.max_fee).await?;
+        let per_worker_counts = vec![FUNDING_ESTIMATE_TXS_PER_WORKER; effective_concurrency];
+        bootstrap_funded_workload(runtime, &workload, &per_worker_counts, args.max_fee).await?;
     }
     let domain = if let Some(value) = managed.as_ref() {
         if args.domain_chain_id.is_some() || args.domain_verifying_contract.is_some() {
@@ -109,19 +113,15 @@ async fn main() -> BenchResult<()> {
         .unwrap_or_else(|| args.endpoint.clone());
 
     println!(
-        "round-trip config: endpoint={}, self_contained={}, domain_chain_id={}, domain_verifying_contract={}, from_offset={}, count={}, concurrency={}, max_fee={}, request_timeout_ms={}, max_ws_wait_ms={}, allow_rejections={}, evaluate={}, workload={}",
+        "round-trip config: endpoint={}, self_contained={}, domain_chain_id={}, domain_verifying_contract={}, from_offset={}, duration={}s, concurrency={}, max_fee={}, workload={}",
         endpoint,
         args.self_contained,
         domain.chain_id,
         domain.verifying_contract,
         args.from_offset,
-        args.count,
+        args.duration_secs,
         effective_concurrency,
         args.max_fee,
-        args.request_timeout_ms,
-        args.max_ws_wait_ms,
-        args.allow_rejections,
-        args.evaluate,
         args.workload.as_str(),
     );
 
@@ -132,17 +132,48 @@ async fn main() -> BenchResult<()> {
         )
     });
 
+    let mut ws_from_offset = args.from_offset;
+    let mut nonce_offsets = vec![0_u64; effective_concurrency];
+
+    if args.warmup_secs > 0 {
+        println!(
+            "running warmup: {}s ({} workers)",
+            args.warmup_secs, effective_concurrency
+        );
+        let warmup_config = RoundTripRunConfig {
+            endpoint: endpoint.clone(),
+            domain,
+            from_offset: ws_from_offset,
+            duration: Duration::from_secs(args.warmup_secs),
+            concurrency: effective_concurrency,
+            nonce_offsets: nonce_offsets.clone(),
+            max_fee: args.max_fee,
+            request_timeout_ms: args.request_timeout_ms,
+            max_ws_wait_ms: args.max_ws_wait_ms,
+            workload: workload.clone(),
+        };
+        let warmup_report = run_round_trip_benchmark(warmup_config).await?;
+        // Advance nonce offsets by actual accepted counts from warmup.
+        for (i, advance) in warmup_report.nonce_advances.iter().enumerate() {
+            nonce_offsets[i] += advance;
+        }
+        ws_from_offset = ws_from_offset.saturating_add(warmup_report.consumed_ws_events_total);
+        println!(
+            "warmup complete: accepted={}, rejected={}",
+            warmup_report.accepted, warmup_report.rejected
+        );
+    }
+
     let config = RoundTripRunConfig {
         endpoint,
         domain,
-        from_offset: args.from_offset,
-        count: args.count,
+        from_offset: ws_from_offset,
+        duration: Duration::from_secs(args.duration_secs),
         concurrency: effective_concurrency,
-        seed_offset: args.seed_offset.unwrap_or_else(default_seed_offset),
+        nonce_offsets,
         max_fee: args.max_fee,
         request_timeout_ms: args.request_timeout_ms,
         max_ws_wait_ms: args.max_ws_wait_ms,
-        fail_on_rejection: !args.allow_rejections,
         workload: workload.clone(),
     };
 
@@ -190,12 +221,12 @@ async fn main() -> BenchResult<()> {
             "domain_chain_id": domain.chain_id,
             "domain_verifying_contract": domain.verifying_contract.to_string(),
             "from_offset": args.from_offset,
-            "count": args.count,
+            "duration_secs": args.duration_secs,
+            "warmup_secs": args.warmup_secs,
             "concurrency": effective_concurrency,
             "max_fee": args.max_fee,
             "round_trip_request_timeout_ms": args.request_timeout_ms,
             "round_trip_max_ws_wait_ms": args.max_ws_wait_ms,
-            "allow_rejections": args.allow_rejections,
             "evaluation_requested": args.evaluate,
             "network_profile": network_profile,
             "workload": args.workload.as_str(),

@@ -15,7 +15,9 @@ pub use replay::ReplayWalletApp;
 pub use rollups::{DEVNET_CHAIN_ID, DevnetRollupsStack};
 pub use sequencer::{
     DEFAULT_DEVNET_SEQUENCER_BIN, DEFAULT_TEST_LOGS_DIR, ManagedSequencer, ManagedSequencerConfig,
-    default_devnet_sequencer_config, teardown_sqlite_artifacts,
+    default_devnet_sequencer_config,
 };
-pub use wallet::{TestSigner, WalletL1Client, WalletL2Client};
+pub use wallet::{
+    TestSigner, WalletL1Client, WalletL2Client, address_from_signing_key, sign_user_op_hex,
+};
 pub use ws::WsClient;

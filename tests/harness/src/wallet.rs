@@ -62,6 +62,10 @@ impl TestSigner {
         self.address
     }
 
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
     pub(crate) fn signed_request(
         &self,
         domain: &Eip712Domain,
@@ -85,25 +89,7 @@ impl TestSigner {
     }
 
     fn sign_user_op_hex(&self, domain: &Eip712Domain, user_op: &UserOp) -> HarnessResult<String> {
-        let hash = user_op.eip712_signing_hash(domain);
-        let k256_sig = self
-            .signing_key
-            .sign_prehash(hash.as_slice())
-            .map_err(|err| io_other(format!("failed to sign user op hash: {err}")))?;
-
-        let signature = [false, true]
-            .into_iter()
-            .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-            .find(|candidate| {
-                candidate
-                    .recover_address_from_prehash(&hash)
-                    .ok()
-                    .map(|value| value == self.address)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| io_other("failed to derive recoverable signature parity"))?;
-
-        Ok(alloy_primitives::hex::encode_prefixed(signature.as_bytes()))
+        sign_user_op_hex(&self.signing_key, domain, user_op)
     }
 }
 
@@ -318,6 +304,32 @@ impl WalletL2Client {
     }
 }
 
+pub fn sign_user_op_hex(
+    signing_key: &SigningKey,
+    domain: &Eip712Domain,
+    user_op: &UserOp,
+) -> HarnessResult<String> {
+    let hash = user_op.eip712_signing_hash(domain);
+    let k256_sig = signing_key
+        .sign_prehash(hash.as_slice())
+        .map_err(|err| io_other(format!("failed to sign user op hash: {err}")))?;
+
+    let expected_sender = address_from_signing_key(signing_key);
+    let signature = [false, true]
+        .into_iter()
+        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
+        .find(|candidate| {
+            candidate
+                .recover_address_from_prehash(&hash)
+                .ok()
+                .map(|value| value == expected_sender)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| io_other("failed to derive recoverable signature parity"))?;
+
+    Ok(alloy_primitives::hex::encode_prefixed(signature.as_bytes()))
+}
+
 fn decode_signing_key(private_key_hex: &str) -> HarnessResult<SigningKey> {
     let private_key_bytes = alloy_primitives::hex::decode(
         private_key_hex
@@ -327,7 +339,7 @@ fn decode_signing_key(private_key_hex: &str) -> HarnessResult<SigningKey> {
     Ok(SigningKey::from_bytes(private_key_bytes.as_slice().into())?)
 }
 
-fn address_from_signing_key(signing_key: &SigningKey) -> Address {
+pub fn address_from_signing_key(signing_key: &SigningKey) -> Address {
     let verifying = signing_key.verifying_key().to_encoded_point(false);
     Address::from_raw_public_key(&verifying.as_bytes()[1..])
 }

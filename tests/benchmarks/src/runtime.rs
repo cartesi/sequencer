@@ -42,10 +42,10 @@ pub fn benchmark_domain(runtime: &ManagedSequencer) -> BenchmarkDomain {
 pub async fn bootstrap_funded_workload(
     runtime: &ManagedSequencer,
     workload: &WorkloadConfig,
-    total_count: u64,
+    per_worker_counts: &[u64],
     max_fee: u16,
 ) -> BenchResult<()> {
-    let plans = funded_account_plans(workload, total_count, max_fee)?;
+    let plans = funded_account_plans(workload, per_worker_counts, max_fee)?;
     if plans.is_empty() {
         return Ok(());
     }
@@ -182,8 +182,10 @@ async fn sample_memory_until_stop(
         (Some(start), Some(end)) => Some(end - start),
         _ => None,
     };
+    // Only compute per-1k metric when accepted_count >= 1000; below that threshold
+    // the value is dominated by one-time startup allocations and is misleading.
     let rss_growth_per_1k_accepted_tx_mb = match (rss_growth_mb, accepted_count) {
-        (Some(growth), value) if value > 0 => Some(growth / (value as f64 / 1000.0)),
+        (Some(growth), value) if value >= 1000 => Some(growth / (value as f64 / 1000.0)),
         _ => None,
     };
 
