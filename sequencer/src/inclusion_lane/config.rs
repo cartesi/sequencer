@@ -8,7 +8,7 @@ use alloy_primitives::Address;
 const DEFAULT_MAX_USER_OPS_PER_CHUNK: usize = 64;
 const DEFAULT_SAFE_INPUT_BUFFER_CAPACITY: usize = 2048;
 const DEFAULT_MAX_BATCH_OPEN: Duration = Duration::from_secs(2 * 60 * 60);
-const DEFAULT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const DEFAULT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy)]
 pub struct InclusionLaneConfig {
