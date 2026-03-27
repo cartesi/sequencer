@@ -1,30 +1,21 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use alloy_primitives::{Address, Signature, U256};
-use alloy_sol_types::{Eip712Domain, SolStruct};
-use app_core::application::{
-    MAX_METHOD_PAYLOAD_BYTES, Method, Transfer, Withdrawal, default_private_keys,
-};
+use alloy_primitives::{Address, U256};
+use alloy_sol_types::Eip712Domain;
+use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, Method, Transfer, default_private_keys};
 use clap::ValueEnum;
 use k256::ecdsa::SigningKey;
-use k256::ecdsa::signature::hazmat::PrehashSigner;
+use rollups_harness::{address_from_signing_key, sign_user_op_hex};
 use sequencer_core::api::TxRequest;
 use sequencer_core::fee::fee_to_linear;
 use sequencer_core::user_op::UserOp;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-use crate::{BenchResult, support::err};
+use crate::{BenchResult, support::io_err};
 
 pub const DEFAULT_WORKLOAD_TRANSFER_AMOUNT: u64 = 1;
-
-#[derive(Debug, Clone)]
-pub struct SignedTxFixture {
-    pub request: TxRequest,
-    pub expected_sender: String,
-    pub expected_data_hex: String,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct FundedAccountPlan {
@@ -35,14 +26,12 @@ pub(crate) struct FundedAccountPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadKind {
-    Synthetic,
     FundedTransfer,
 }
 
 impl WorkloadKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Synthetic => "synthetic",
             Self::FundedTransfer => "funded-transfer",
         }
     }
@@ -65,44 +54,29 @@ impl Default for WorkloadConfig {
     }
 }
 
-pub(crate) struct WorkloadState {
-    inner: WorkloadStateInner,
-}
-
-enum WorkloadStateInner {
-    Synthetic {
-        next_seed: u64,
-    },
-    FundedTransfer {
-        accounts: Vec<FundedAccount>,
-        round_robin_index: usize,
-        transfer_amount: u64,
-    },
-}
-
+/// Build funding plans for the worker-per-wallet model.
+///
+/// `per_worker_counts[i]` is the number of transactions worker `i` will send.
+/// Only the first `per_worker_counts.len()` accounts are funded; the rest get
+/// zero balance requirements (but are still listed so the harness can iterate).
 pub(crate) fn funded_account_plans(
     config: &WorkloadConfig,
-    total_count: u64,
+    per_worker_counts: &[u64],
     max_fee: u16,
 ) -> BenchResult<Vec<FundedAccountPlan>> {
-    if config.kind != WorkloadKind::FundedTransfer {
-        return Ok(Vec::new());
-    }
-
     let keys = match config.accounts_file.as_deref() {
         Some(path) => load_private_keys_from_file(path)?,
         None => default_private_keys().to_vec(),
     };
     if keys.is_empty() {
-        return Err(err("no private keys available for funded workload"));
+        return Err(io_err("no private keys available for funded workload"));
     }
 
-    let account_count = keys.len() as u64;
     let mut plans = Vec::with_capacity(keys.len());
     for (index, private_key) in keys.into_iter().enumerate() {
         let signing_key = signing_key_from_hex(private_key.as_str())?;
         let address = address_from_signing_key(&signing_key);
-        let send_count = round_robin_send_count(total_count, account_count, index as u64);
+        let send_count = per_worker_counts.get(index).copied().unwrap_or(0);
         let required_balance =
             required_funded_transfer_balance(send_count, config.transfer_amount, max_fee);
         plans.push(FundedAccountPlan {
@@ -118,120 +92,93 @@ pub(crate) fn funded_account_plans(
 struct FundedAccount {
     signing_key: SigningKey,
     sender: Address,
-    next_nonce: u32,
 }
 
-impl WorkloadState {
-    pub(crate) fn initialize(config: &WorkloadConfig, seed_offset: u64) -> BenchResult<Self> {
-        match config.kind {
-            WorkloadKind::Synthetic => Ok(Self {
-                inner: WorkloadStateInner::Synthetic {
-                    next_seed: seed_offset,
-                },
-            }),
-            WorkloadKind::FundedTransfer => {
-                let accounts = load_funded_accounts(config.accounts_file.as_deref())?;
-                Ok(Self {
-                    inner: WorkloadStateInner::FundedTransfer {
-                        accounts,
-                        round_robin_index: 0,
-                        transfer_amount: config.transfer_amount,
-                    },
-                })
-            }
+/// Lightweight per-worker context for just-in-time signing.
+///
+/// Instead of pre-generating all signed fixtures, each worker holds a
+/// `WorkerContext` and derives + signs each `UserOp` on the fly from its
+/// loop index. This keeps memory usage constant per worker regardless of
+/// how many transactions it sends.
+#[derive(Clone)]
+pub(crate) struct WorkerContext {
+    pub signing_key: SigningKey,
+    pub sender: Address,
+    pub recipient: Address,
+    pub start_nonce: u32,
+    pub max_fee: u16,
+    pub transfer_amount: u64,
+    pub domain: Eip712Domain,
+}
+
+impl WorkerContext {
+    /// Build and sign a single `TxRequest` for the given loop index.
+    pub fn build_request(&self, index: u64) -> BenchResult<TxRequest> {
+        let nonce = self.start_nonce + index as u32;
+        let amount = U256::from(self.transfer_amount.saturating_add(u64::from(nonce)));
+        let method = Method::Transfer(Transfer {
+            amount,
+            to: self.recipient,
+        });
+        let data = ssz::Encode::as_ssz_bytes(&method);
+        if data.len() > MAX_METHOD_PAYLOAD_BYTES {
+            return Err(io_err(format!(
+                "funded transfer payload too large: {} > {}",
+                data.len(),
+                MAX_METHOD_PAYLOAD_BYTES
+            )));
         }
-    }
-
-    pub(crate) fn next_fixture(
-        &mut self,
-        max_fee: u16,
-        domain: &Eip712Domain,
-    ) -> BenchResult<SignedTxFixture> {
-        match &mut self.inner {
-            WorkloadStateInner::Synthetic { next_seed } => {
-                let fixture = make_signed_fixture(*next_seed, max_fee, domain)?;
-                *next_seed = next_seed.wrapping_add(1);
-                Ok(fixture)
-            }
-            WorkloadStateInner::FundedTransfer {
-                accounts,
-                round_robin_index,
-                transfer_amount,
-            } => {
-                if accounts.is_empty() {
-                    return Err(err("funded workload has zero accounts"));
-                }
-                let sender_index = *round_robin_index % accounts.len();
-                let recipient_index = (sender_index + 1) % accounts.len();
-                let recipient = accounts[recipient_index].sender;
-                let sender = &mut accounts[sender_index];
-
-                let amount =
-                    U256::from((*transfer_amount).saturating_add(u64::from(sender.next_nonce)));
-                let method = Method::Transfer(Transfer {
-                    amount,
-                    to: recipient,
-                });
-                let data = ssz::Encode::as_ssz_bytes(&method);
-                if data.len() > MAX_METHOD_PAYLOAD_BYTES {
-                    return Err(err(format!(
-                        "funded transfer payload too large: {} > {}",
-                        data.len(),
-                        MAX_METHOD_PAYLOAD_BYTES
-                    )));
-                }
-
-                let user_op = UserOp {
-                    nonce: sender.next_nonce,
-                    max_fee,
-                    data: data.into(),
-                };
-                let fixture =
-                    make_signed_fixture_from_signing_key(&sender.signing_key, user_op, domain)?;
-                sender.next_nonce = sender.next_nonce.wrapping_add(1);
-                *round_robin_index = (*round_robin_index + 1) % accounts.len();
-                Ok(fixture)
-            }
-        }
-    }
-
-    pub(crate) fn concurrency_cap(&self) -> Option<usize> {
-        match &self.inner {
-            WorkloadStateInner::Synthetic { .. } => None,
-            WorkloadStateInner::FundedTransfer { accounts, .. } => Some(accounts.len().max(1)),
-        }
+        let user_op = UserOp {
+            nonce,
+            max_fee: self.max_fee,
+            data: data.into(),
+        };
+        let signature = sign_user_op_hex(&self.signing_key, &self.domain, &user_op)?;
+        Ok(TxRequest {
+            message: user_op,
+            signature,
+            sender: self.sender.to_string(),
+        })
     }
 }
 
-pub fn make_signed_fixture(
-    seed: u64,
+/// Build lightweight worker contexts for just-in-time signing.
+///
+/// Worker `i` gets a context with account `i`'s signing key, a recipient
+/// (account `(i+1) % len`), and the nonce offset for that worker.
+pub(crate) fn build_worker_contexts(
+    config: &WorkloadConfig,
+    workers: usize,
     max_fee: u16,
     domain: &Eip712Domain,
-) -> BenchResult<SignedTxFixture> {
-    let signing_key = signing_key_for_seed(seed)?;
-    let sender = address_from_signing_key(&signing_key);
-    let method = Method::Withdrawal(Withdrawal {
-        amount: U256::from(seed.saturating_add(1)),
-    });
-    let data = ssz::Encode::as_ssz_bytes(&method);
-    if data.len() > MAX_METHOD_PAYLOAD_BYTES {
-        return Err(err(format!(
-            "benchmark payload too large: {} > {}",
-            data.len(),
-            MAX_METHOD_PAYLOAD_BYTES
+    nonce_offsets: &[u64],
+) -> BenchResult<Vec<WorkerContext>> {
+    let accounts = load_funded_accounts(config.accounts_file.as_deref())?;
+    if workers > accounts.len() {
+        return Err(io_err(format!(
+            "requested {} workers but only {} funded accounts available",
+            workers,
+            accounts.len()
         )));
     }
-    let message = UserOp {
-        nonce: 0,
-        max_fee,
-        data: data.clone().into(),
-    };
 
-    let fixture = make_signed_fixture_from_signing_key(&signing_key, message, domain)?;
-    if fixture.expected_sender != sender.to_string() {
-        return Err(err("unexpected synthetic sender mismatch"));
+    let mut contexts = Vec::with_capacity(workers);
+    for worker_idx in 0..workers {
+        let account = &accounts[worker_idx];
+        let recipient = &accounts[(worker_idx + 1) % accounts.len()];
+        let offset = nonce_offsets.get(worker_idx).copied().unwrap_or(0);
+        contexts.push(WorkerContext {
+            signing_key: account.signing_key.clone(),
+            sender: account.sender,
+            recipient: recipient.sender,
+            start_nonce: offset as u32,
+            max_fee,
+            transfer_amount: config.transfer_amount,
+            domain: domain.clone(),
+        });
     }
-    Ok(fixture)
+
+    Ok(contexts)
 }
 
 fn load_funded_accounts(accounts_file: Option<&str>) -> BenchResult<Vec<FundedAccount>> {
@@ -240,7 +187,7 @@ fn load_funded_accounts(accounts_file: Option<&str>) -> BenchResult<Vec<FundedAc
         None => default_private_keys().to_vec(),
     };
     if keys.is_empty() {
-        return Err(err("no private keys available for funded workload"));
+        return Err(io_err("no private keys available for funded workload"));
     }
 
     let mut accounts = Vec::with_capacity(keys.len());
@@ -250,17 +197,9 @@ fn load_funded_accounts(accounts_file: Option<&str>) -> BenchResult<Vec<FundedAc
         accounts.push(FundedAccount {
             signing_key,
             sender,
-            next_nonce: 0,
         });
     }
     Ok(accounts)
-}
-
-fn round_robin_send_count(total_count: u64, account_count: u64, account_index: u64) -> u64 {
-    if account_index >= total_count {
-        return 0;
-    }
-    1 + (total_count - 1 - account_index) / account_count
 }
 
 fn required_funded_transfer_balance(send_count: u64, transfer_amount: u64, max_fee: u16) -> U256 {
@@ -279,7 +218,7 @@ fn required_funded_transfer_balance(send_count: u64, transfer_amount: u64, max_f
 
 fn load_private_keys_from_file(path: &str) -> BenchResult<Vec<String>> {
     let contents = fs::read_to_string(path)
-        .map_err(|e| err(format!("failed reading accounts file '{path}': {e}")))?;
+        .map_err(|e| io_err(format!("failed reading accounts file '{path}': {e}")))?;
     let mut keys = Vec::new();
     for (line_no, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
@@ -289,19 +228,19 @@ fn load_private_keys_from_file(path: &str) -> BenchResult<Vec<String>> {
 
         let mut parts = trimmed.split_whitespace();
         let address = parts.next().ok_or_else(|| {
-            err(format!(
+            io_err(format!(
                 "accounts file '{path}' line {}: missing address",
                 line_no + 1
             ))
         })?;
         let private_key = parts.next().ok_or_else(|| {
-            err(format!(
+            io_err(format!(
                 "accounts file '{path}' line {}: missing private key",
                 line_no + 1
             ))
         })?;
         if parts.next().is_some() {
-            return Err(err(format!(
+            return Err(io_err(format!(
                 "accounts file '{path}' line {}: expected exactly two fields: <address> <private_key>",
                 line_no + 1
             )));
@@ -312,7 +251,7 @@ fn load_private_keys_from_file(path: &str) -> BenchResult<Vec<String>> {
         keys.push(private_key.to_string());
     }
     if keys.is_empty() {
-        return Err(err(format!(
+        return Err(io_err(format!(
             "accounts file '{path}' did not contain any account records"
         )));
     }
@@ -327,7 +266,7 @@ fn validate_hex_token(
     expected_len: usize,
 ) -> BenchResult<()> {
     if value.len() != expected_len {
-        return Err(err(format!(
+        return Err(io_err(format!(
             "accounts file '{path}' line {}: invalid {field} length: expected {}, got {}",
             line_no,
             expected_len,
@@ -335,13 +274,13 @@ fn validate_hex_token(
         )));
     }
     if !value.starts_with("0x") {
-        return Err(err(format!(
+        return Err(io_err(format!(
             "accounts file '{path}' line {}: {field} must start with 0x",
             line_no
         )));
     }
     if !value.as_bytes().iter().skip(2).all(u8::is_ascii_hexdigit) {
-        return Err(err(format!(
+        return Err(io_err(format!(
             "accounts file '{path}' line {}: {field} must be hex",
             line_no
         )));
@@ -351,9 +290,9 @@ fn validate_hex_token(
 
 fn signing_key_from_hex(hex: &str) -> BenchResult<SigningKey> {
     let bytes = alloy_primitives::hex::decode(hex)
-        .map_err(|e| err(format!("invalid private key hex '{hex}': {e}")))?;
+        .map_err(|e| io_err(format!("invalid private key hex '{hex}': {e}")))?;
     if bytes.len() != 32 {
-        return Err(err(format!(
+        return Err(io_err(format!(
             "invalid private key length: expected 32 bytes, got {}",
             bytes.len()
         )));
@@ -361,64 +300,7 @@ fn signing_key_from_hex(hex: &str) -> BenchResult<SigningKey> {
     let mut key_bytes = [0_u8; 32];
     key_bytes.copy_from_slice(&bytes);
     SigningKey::from_bytes((&key_bytes).into())
-        .map_err(|e| err(format!("invalid private key material: {e}")))
-}
-
-fn make_signed_fixture_from_signing_key(
-    signing_key: &SigningKey,
-    user_op: UserOp,
-    domain: &Eip712Domain,
-) -> BenchResult<SignedTxFixture> {
-    let sender = address_from_signing_key(signing_key);
-    let signature = sign_user_op(domain, &user_op, signing_key)?;
-    let data = user_op.data.to_vec();
-    Ok(SignedTxFixture {
-        request: TxRequest {
-            message: user_op,
-            signature,
-            sender: sender.to_string(),
-        },
-        expected_sender: sender.to_string(),
-        expected_data_hex: alloy_primitives::hex::encode_prefixed(data),
-    })
-}
-
-fn signing_key_for_seed(seed: u64) -> BenchResult<SigningKey> {
-    let mut bytes = [0_u8; 32];
-    bytes[24..32].copy_from_slice(&seed.saturating_add(1).to_be_bytes());
-    SigningKey::from_bytes((&bytes).into())
-        .map_err(|e| err(format!("build signing key failed: {e}")))
-}
-
-fn sign_user_op(
-    domain: &Eip712Domain,
-    user_op: &UserOp,
-    signing_key: &SigningKey,
-) -> BenchResult<String> {
-    let hash = user_op.eip712_signing_hash(domain);
-    let k256_sig = signing_key
-        .sign_prehash(hash.as_slice())
-        .map_err(|e| err(format!("sign user op prehash failed: {e}")))?;
-
-    let expected_sender = address_from_signing_key(signing_key);
-    let signature = [false, true]
-        .into_iter()
-        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-        .find(|candidate| {
-            candidate
-                .recover_address_from_prehash(&hash)
-                .ok()
-                .map(|sender| sender == expected_sender)
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| err("could not recover parity for signature"))?;
-
-    Ok(alloy_primitives::hex::encode_prefixed(signature.as_bytes()))
-}
-
-fn address_from_signing_key(signing_key: &SigningKey) -> Address {
-    let verifying = signing_key.verifying_key().to_encoded_point(false);
-    Address::from_raw_public_key(&verifying.as_bytes()[1..])
+        .map_err(|e| io_err(format!("invalid private key material: {e}")))
 }
 
 #[cfg(test)]
@@ -426,47 +308,61 @@ mod tests {
     use std::fs;
 
     use super::{
-        FundedAccount, WorkloadConfig, WorkloadKind, WorkloadState, WorkloadStateInner,
-        address_from_signing_key, default_private_keys, funded_account_plans,
-        required_funded_transfer_balance, round_robin_send_count, signing_key_from_hex,
+        WorkloadConfig, WorkloadKind, build_worker_contexts, default_private_keys,
+        funded_account_plans, required_funded_transfer_balance, signing_key_from_hex,
     };
-    use crate::self_contained_domain;
     use alloy_primitives::U256;
+    use alloy_sol_types::Eip712Domain;
+    use rollups_harness::address_from_signing_key;
 
     #[test]
-    fn funded_transfer_round_robin_nonce_progression() {
-        let mut accounts = Vec::new();
-        for key in default_private_keys().iter().take(2) {
-            let signing_key = signing_key_from_hex(key.as_str()).expect("signing key");
-            accounts.push(FundedAccount {
-                sender: address_from_signing_key(&signing_key),
-                signing_key,
-                next_nonce: 1,
-            });
-        }
-
-        let domain = self_contained_domain().eip712_domain();
-        let mut state = WorkloadState {
-            inner: WorkloadStateInner::FundedTransfer {
-                accounts,
-                round_robin_index: 0,
-                transfer_amount: 1,
-            },
+    fn worker_context_build_request_nonce_progression() {
+        let domain = Eip712Domain {
+            name: Some("CartesiAppSequencer".to_string().into()),
+            version: Some("1".to_string().into()),
+            chain_id: Some(U256::from(31_337_u64)),
+            verifying_contract: None,
+            salt: None,
+        };
+        let config = WorkloadConfig {
+            kind: WorkloadKind::FundedTransfer,
+            accounts_file: None,
+            transfer_amount: 1,
         };
 
-        let one = state.next_fixture(0, &domain).expect("fixture 1");
-        let two = state.next_fixture(0, &domain).expect("fixture 2");
-        let three = state.next_fixture(0, &domain).expect("fixture 3");
+        // With empty nonce_offsets, nonces start at 0.
+        let contexts = build_worker_contexts(&config, 2, 0, &domain, &[]).expect("contexts");
+        assert_eq!(contexts.len(), 2);
 
-        assert_ne!(one.expected_sender, two.expected_sender);
-        assert_eq!(one.expected_sender, three.expected_sender);
-        assert_eq!(one.request.message.nonce, 1);
-        assert_eq!(two.request.message.nonce, 1);
-        assert_eq!(three.request.message.nonce, 2);
+        // Worker 0: nonces 0, 1, 2
+        let r0 = contexts[0].build_request(0).unwrap();
+        let r1 = contexts[0].build_request(1).unwrap();
+        let r2 = contexts[0].build_request(2).unwrap();
+        assert_eq!(r0.message.nonce, 0);
+        assert_eq!(r1.message.nonce, 1);
+        assert_eq!(r2.message.nonce, 2);
+
+        // Worker 1: nonces 0, 1, 2
+        let s0 = contexts[1].build_request(0).unwrap();
+        let s1 = contexts[1].build_request(1).unwrap();
+        let s2 = contexts[1].build_request(2).unwrap();
+        assert_eq!(s0.message.nonce, 0);
+        assert_eq!(s1.message.nonce, 1);
+        assert_eq!(s2.message.nonce, 2);
+
+        // Different senders
+        assert_ne!(r0.sender, s0.sender);
+
+        // With per-worker offsets, each worker starts at its own nonce.
+        let contexts2 = build_worker_contexts(&config, 2, 0, &domain, &[5, 10]).expect("contexts");
+        assert_eq!(contexts2[0].build_request(0).unwrap().message.nonce, 5);
+        assert_eq!(contexts2[0].build_request(1).unwrap().message.nonce, 6);
+        assert_eq!(contexts2[1].build_request(0).unwrap().message.nonce, 10);
+        assert_eq!(contexts2[1].build_request(1).unwrap().message.nonce, 11);
     }
 
     #[test]
-    fn funding_plan_matches_round_robin_workload() {
+    fn funding_plan_matches_per_worker_counts() {
         let temp_path =
             std::env::temp_dir().join(format!("funded-account-plans-{}.txt", std::process::id()));
         let mut contents = String::new();
@@ -487,23 +383,20 @@ mod tests {
         };
 
         // Use max_fee=0 so fee_to_linear(0)=1, adding 1 gas per send.
-        let plans = funded_account_plans(&config, 5, 0).expect("funding plan");
+        // Worker 0 sends 3 txs, worker 1 sends 2 txs, worker 2 sends 0.
+        let plans = funded_account_plans(&config, &[3, 2], 0).expect("funding plan");
         let _ = fs::remove_file(&temp_path);
         assert!(plans.len() >= 3);
-        // Account 0: send_count=2 → 2*5 + 2*1/2 + 2*1 = 13
-        assert_eq!(plans[0].required_balance, U256::from(13_u64));
-        // Account 1: send_count=2 → same
+        // Account 0: send_count=3 → 3*5 + 3*2/2 + 3*1 = 15 + 3 + 3 = 21
+        assert_eq!(plans[0].required_balance, U256::from(21_u64));
+        // Account 1: send_count=2 → 2*5 + 2*1/2 + 2*1 = 10 + 1 + 2 = 13
         assert_eq!(plans[1].required_balance, U256::from(13_u64));
-        // Account 2: send_count=1 → 1*5 + 0 + 1*1 = 6
-        assert_eq!(plans[2].required_balance, U256::from(6_u64));
+        // Account 2: send_count=0 (not in per_worker_counts) → 0
+        assert_eq!(plans[2].required_balance, U256::ZERO);
     }
 
     #[test]
-    fn round_robin_count_and_required_balance_helpers_work() {
-        assert_eq!(round_robin_send_count(0, 3, 0), 0);
-        assert_eq!(round_robin_send_count(5, 3, 0), 2);
-        assert_eq!(round_robin_send_count(5, 3, 1), 2);
-        assert_eq!(round_robin_send_count(5, 3, 2), 1);
+    fn required_balance_helpers_work() {
         // max_fee=0 → fee_to_linear(0)=1, so gas adds send_count to the total.
         assert_eq!(required_funded_transfer_balance(0, 5, 0), U256::ZERO);
         // 3*5 + 3*2/2 + 3*1 = 15 + 3 + 3 = 21

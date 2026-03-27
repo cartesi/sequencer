@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::fs::{self, OpenOptions};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use app_core::application::default_private_keys;
 use sequencer_rust_client::SequencerClient;
+use tempfile::TempDir;
 use tokio::process::{Child, Command};
 
 use crate::HarnessResult;
@@ -41,7 +41,8 @@ pub struct ManagedSequencer {
     sequencer_bin: PathBuf,
     log_prefix: String,
     logs_dir: PathBuf,
-    data_dir: PathBuf,
+    _data_dir: TempDir,
+    data_dir_path: PathBuf,
     endpoint: String,
     log_path: PathBuf,
 }
@@ -54,40 +55,6 @@ pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> Managed
     }
 }
 
-pub fn teardown_sqlite_artifacts(logs_dir: &Path) -> HarnessResult<()> {
-    if !logs_dir.exists() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(logs_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        // Remove sequencer data directories (contain sequencer.db).
-        if path.is_dir() && path.join("sequencer.db").exists() {
-            match fs::remove_dir_all(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-            continue;
-        }
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        if !matches_sqlite_artifact(file_name) {
-            continue;
-        }
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    Ok(())
-}
-
 impl ManagedSequencer {
     pub async fn spawn(config: ManagedSequencerConfig) -> HarnessResult<Self> {
         let logs_dir = paths::resolve_from_workspace(&config.logs_dir);
@@ -96,7 +63,9 @@ impl ManagedSequencer {
         let rollups = DevnetRollupsStack::spawn(log_prefix.as_str(), logs_dir.as_path()).await?;
 
         fs::create_dir_all(logs_dir.as_path())?;
-        let data_dir = timestamped_log_path(logs_dir.as_path(), &format!("{log_prefix}-data"));
+        let data_dir = TempDir::new()
+            .map_err(|err| io_other(format!("failed to create temp data dir: {err}")))?;
+        let data_dir_path = data_dir.path().to_path_buf();
         let SpawnedSequencerProcess {
             child,
             endpoint,
@@ -105,7 +74,7 @@ impl ManagedSequencer {
             sequencer_bin.as_path(),
             log_prefix.as_str(),
             logs_dir.as_path(),
-            data_dir.as_path(),
+            data_dir_path.as_path(),
             &rollups,
         )
         .await?;
@@ -117,7 +86,8 @@ impl ManagedSequencer {
             sequencer_bin,
             log_prefix,
             logs_dir,
-            data_dir,
+            _data_dir: data_dir,
+            data_dir_path,
             endpoint,
             log_path,
         })
@@ -136,7 +106,7 @@ impl ManagedSequencer {
     }
 
     pub fn data_dir(&self) -> &Path {
-        self.data_dir.as_path()
+        self.data_dir_path.as_path()
     }
 
     pub fn domain_chain_id(&self) -> u64 {
@@ -181,7 +151,7 @@ impl ManagedSequencer {
             self.sequencer_bin.as_path(),
             self.log_prefix.as_str(),
             self.logs_dir.as_path(),
-            self.data_dir.as_path(),
+            self.data_dir_path.as_path(),
             &self.rollups,
         )
         .await?;
@@ -307,10 +277,4 @@ async fn spawn_sequencer_process(
         endpoint,
         log_path,
     })
-}
-
-fn matches_sqlite_artifact(file_name: &str) -> bool {
-    file_name.ends_with(".sqlite")
-        || file_name.ends_with(".sqlite-shm")
-        || file_name.ends_with(".sqlite-wal")
 }

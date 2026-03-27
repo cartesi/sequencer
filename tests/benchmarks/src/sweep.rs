@@ -26,6 +26,7 @@ pub struct SweepRow {
     pub http_429_count: u64,
     pub client_failure_count: u64,
     pub rejection_rate: f64,
+    pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,
     pub p999_ms: f64,
@@ -37,6 +38,7 @@ pub struct SweepMeasurements {
     pub accepted_count: u64,
     pub rejected_count: u64,
     pub rejection_rate: f64,
+    pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,
     pub p999_ms: f64,
@@ -49,6 +51,7 @@ impl SweepRow {
             accepted_count,
             rejected_count,
             rejection_rate,
+            p50_ms,
             p95_ms,
             p99_ms,
             p999_ms,
@@ -66,6 +69,7 @@ impl SweepRow {
             http_429_count,
             client_failure_count,
             rejection_rate,
+            p50_ms,
             p95_ms,
             p99_ms,
             p999_ms,
@@ -141,12 +145,12 @@ pub fn compute_capacity_summary(rows: &[SweepRow]) -> SweepSummary {
 
 pub fn write_csv(path: &Path, rows: &[SweepRow]) -> BenchResult<()> {
     let mut out = String::from(
-        "concurrency,accepted_tps,accepted_count,rejected_count,http_rejected_count,http_429_count,client_failure_count,rejection_rate,p95_ms,p99_ms,p999_ms\n",
+        "concurrency,accepted_tps,accepted_count,rejected_count,http_rejected_count,http_429_count,client_failure_count,rejection_rate,p50_ms,p95_ms,p99_ms,p999_ms\n",
     );
     for row in rows {
         out.push_str(
             format!(
-                "{},{:.6},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6}\n",
+                "{},{:.6},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
                 row.concurrency,
                 row.accepted_tps,
                 row.accepted_count,
@@ -155,6 +159,7 @@ pub fn write_csv(path: &Path, rows: &[SweepRow]) -> BenchResult<()> {
                 row.http_429_count,
                 row.client_failure_count,
                 row.rejection_rate,
+                row.p50_ms,
                 row.p95_ms,
                 row.p99_ms,
                 row.p999_ms,
@@ -217,6 +222,7 @@ mod tests {
                     accepted_count: 100,
                     rejected_count: 0,
                     rejection_rate: 0.0,
+                    p50_ms: 0.5,
                     p95_ms: 1.0,
                     p99_ms: 1.0,
                     p999_ms: 1.0,
@@ -230,6 +236,7 @@ mod tests {
                     accepted_count: 100,
                     rejected_count: 1,
                     rejection_rate: 1.0,
+                    p50_ms: 1.0,
                     p95_ms: 2.0,
                     p99_ms: 2.0,
                     p999_ms: 2.0,
@@ -243,6 +250,7 @@ mod tests {
                     accepted_count: 100,
                     rejected_count: 1,
                     rejection_rate: 1.0,
+                    p50_ms: 1.5,
                     p95_ms: 3.0,
                     p99_ms: 3.0,
                     p999_ms: 3.0,

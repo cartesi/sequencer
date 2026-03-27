@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use benchmarks::{
-    AckRunReport, BenchResult, BenchmarkJsonOutput, RoundTripRunReport,
+    BenchResult, BenchmarkJsonOutput, RoundTripRunReport, SweepRunReport, format_optional_f64,
     runtime::{DEFAULT_RESULTS_DIR, MemoryReport},
+    throughput_tx_per_s, trailing_number,
 };
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
@@ -16,30 +17,9 @@ use std::time::Duration;
 enum CompareKind {
     Ack,
     RoundTrip,
+    RtSweep,
     Sweep,
     All,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum SweepMode {
-    Ack,
-    RoundTrip,
-}
-
-impl SweepMode {
-    fn file_prefix(self) -> &'static str {
-        match self {
-            Self::Ack => "ack-sweep-",
-            Self::RoundTrip => "round-trip-sweep-",
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Ack => "ack",
-            Self::RoundTrip => "round-trip",
-        }
-    }
 }
 
 #[derive(Debug, Parser)]
@@ -50,8 +30,6 @@ struct Cli {
     results_dir: PathBuf,
     #[arg(long, value_enum, default_value_t = CompareKind::All)]
     kind: CompareKind,
-    #[arg(long, value_enum, default_value_t = SweepMode::RoundTrip)]
-    sweep_mode: SweepMode,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +38,7 @@ struct SweepCsvRow {
     accepted_tps: f64,
     rejected_count: u64,
     http_rejected_count: u64,
+    p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
     p999_ms: f64,
@@ -81,52 +60,91 @@ fn main() -> BenchResult<()> {
     match cli.kind {
         CompareKind::Ack => compare_ack(&cli.results_dir)?,
         CompareKind::RoundTrip => compare_round_trip(&cli.results_dir)?,
-        CompareKind::Sweep => compare_sweep(&cli.results_dir, cli.sweep_mode)?,
+        CompareKind::RtSweep => compare_rt_sweep(&cli.results_dir)?,
+        CompareKind::Sweep => compare_sweep(&cli.results_dir)?,
         CompareKind::All => {
             compare_ack(&cli.results_dir)?;
             println!();
             compare_round_trip(&cli.results_dir)?;
             println!();
-            compare_sweep(&cli.results_dir, cli.sweep_mode)?;
+            compare_rt_sweep(&cli.results_dir)?;
+            println!();
+            compare_sweep(&cli.results_dir)?;
         }
     }
     Ok(())
 }
 
 fn compare_ack(results_dir: &Path) -> BenchResult<()> {
-    let (old_path, new_path) = latest_two_files(results_dir, "ack-latency-", ".json")?;
-    let old = read_json::<BenchmarkJsonOutput<AckRunReport, Value>>(&old_path)?;
-    let new = read_json::<BenchmarkJsonOutput<AckRunReport, Value>>(&new_path)?;
+    // bench-ack-self now produces ack-sweep-*.json (single-concurrency sweep).
+    let result = latest_two_files(results_dir, "ack-sweep-", ".json");
+    let (old_path, new_path) = match result {
+        Ok(paths) => paths,
+        Err(_) => {
+            println!("ACK: n/a (need at least 2 ack-sweep-*.json files)");
+            return Ok(());
+        }
+    };
+    let old = read_json::<BenchmarkJsonOutput<SweepRunReport, Value>>(&old_path)?;
+    let new = read_json::<BenchmarkJsonOutput<SweepRunReport, Value>>(&new_path)?;
 
     println!(
         "ACK latest two:\n  old: {}\n  new: {}",
         old_path.display(),
         new_path.display()
     );
-    print_common(
-        old.report.accepted,
-        old.report.rejected,
-        old.report.total_wall,
-    );
-    print_common_delta(
-        old.report.accepted,
-        old.report.rejected,
-        old.report.total_wall,
-        new.report.accepted,
-        new.report.rejected,
-        new.report.total_wall,
-    );
-    print_stats_delta(
-        "ack latency",
-        &old.report.ack_latency_accepted,
-        &new.report.ack_latency_accepted,
-    );
+
+    // Extract c=1 rows for comparison.
+    let old_row = old.report.rows.first();
+    let new_row = new.report.rows.first();
+
+    if let (Some(old_row), Some(new_row)) = (old_row, new_row) {
+        println!(
+            "  old: c={}, {:.2} tx/s, {} accepted, {} rejected, p50={:.3}ms, p99={:.3}ms, p999={:.3}ms",
+            old_row.concurrency,
+            old_row.accepted_tps,
+            old_row.accepted_count,
+            old_row.rejected_count,
+            old_row.p50_ms,
+            old_row.p99_ms,
+            old_row.p999_ms
+        );
+        println!(
+            "  new: c={}, {:.2} tx/s, {} accepted, {} rejected, p50={:.3}ms, p99={:.3}ms, p999={:.3}ms",
+            new_row.concurrency,
+            new_row.accepted_tps,
+            new_row.accepted_count,
+            new_row.rejected_count,
+            new_row.p50_ms,
+            new_row.p99_ms,
+            new_row.p999_ms
+        );
+        println!("  delta:");
+        println!(
+            "    tps: {:+.3} ({:+.2}%)",
+            new_row.accepted_tps - old_row.accepted_tps,
+            pct(new_row.accepted_tps, old_row.accepted_tps)
+        );
+        print_metric_delta("p50", old_row.p50_ms, new_row.p50_ms);
+        print_metric_delta("p99", old_row.p99_ms, new_row.p99_ms);
+        print_metric_delta("p99.9", old_row.p999_ms, new_row.p999_ms);
+    } else {
+        println!("  (empty sweep rows)");
+    }
+
     print_memory_delta(old.report.memory.as_ref(), new.report.memory.as_ref());
     Ok(())
 }
 
 fn compare_round_trip(results_dir: &Path) -> BenchResult<()> {
-    let (old_path, new_path) = latest_two_files(results_dir, "round-trip-latency-", ".json")?;
+    let result = latest_two_files(results_dir, "round-trip-latency-", ".json");
+    let (old_path, new_path) = match result {
+        Ok(paths) => paths,
+        Err(_) => {
+            println!("ROUND-TRIP: n/a (need at least 2 round-trip-latency-*.json files)");
+            return Ok(());
+        }
+    };
     let old = read_json::<BenchmarkJsonOutput<RoundTripRunReport, Value>>(&old_path)?;
     let new = read_json::<BenchmarkJsonOutput<RoundTripRunReport, Value>>(&new_path)?;
 
@@ -162,14 +180,23 @@ fn compare_round_trip(results_dir: &Path) -> BenchResult<()> {
     Ok(())
 }
 
-fn compare_sweep(results_dir: &Path, sweep_mode: SweepMode) -> BenchResult<()> {
-    let (old_path, new_path) = latest_two_files(results_dir, sweep_mode.file_prefix(), ".csv")?;
+fn compare_sweep(results_dir: &Path) -> BenchResult<()> {
+    let sweep_result = latest_two_files(results_dir, "ack-sweep-", ".csv");
+    let (old_path, new_path) = match sweep_result {
+        Ok(paths) => paths,
+        Err(_) => match latest_two_files(results_dir, "capacity-sweep-self", ".csv") {
+            Ok(paths) => paths,
+            Err(_) => {
+                println!("ACK SWEEP: n/a (need at least 2 sweep CSV files)");
+                return Ok(());
+            }
+        },
+    };
     let old_rows = read_sweep_rows(&old_path)?;
     let new_rows = read_sweep_rows(&new_path)?;
 
     println!(
-        "{} SWEEP latest two:\n  old: {}\n  new: {}",
-        sweep_mode.as_str().to_uppercase(),
+        "ACK SWEEP latest two:\n  old: {}\n  new: {}",
         old_path.display(),
         new_path.display()
     );
@@ -179,7 +206,7 @@ fn compare_sweep(results_dir: &Path, sweep_mode: SweepMode) -> BenchResult<()> {
 
     println!("  deltas by concurrency:");
     println!(
-        "  c,accepted_tps_delta,p95_ms_delta,p99_ms_delta,p999_ms_delta,rejected_delta,client_failure_delta,http_429_delta"
+        "  c,accepted_tps_delta,p50_ms_delta,p95_ms_delta,p99_ms_delta,p999_ms_delta,rejected_delta,client_failure_delta,http_429_delta"
     );
 
     let mut all_concurrency: Vec<u64> = old_by_concurrency
@@ -195,9 +222,10 @@ fn compare_sweep(results_dir: &Path, sweep_mode: SweepMode) -> BenchResult<()> {
         let new = new_by_concurrency.get(&concurrency);
         if let (Some(old), Some(new)) = (old, new) {
             println!(
-                "  {},{:+.3},{:+.3},{:+.3},{:+.3},{:+},{:+},{:+}",
+                "  {},{:+.3},{:+.3},{:+.3},{:+.3},{:+.3},{:+},{:+},{:+}",
                 concurrency,
                 new.accepted_tps - old.accepted_tps,
+                new.p50_ms - old.p50_ms,
                 new.p95_ms - old.p95_ms,
                 new.p99_ms - old.p99_ms,
                 new.p999_ms - old.p999_ms,
@@ -206,7 +234,7 @@ fn compare_sweep(results_dir: &Path, sweep_mode: SweepMode) -> BenchResult<()> {
                 i128::from(new.http_429_count) - i128::from(old.http_429_count),
             );
         } else {
-            println!("  {concurrency},n/a,n/a,n/a,n/a,n/a,n/a,n/a");
+            println!("  {concurrency},n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a");
         }
     }
 
@@ -231,25 +259,133 @@ fn compare_sweep(results_dir: &Path, sweep_mode: SweepMode) -> BenchResult<()> {
     );
     println!(
         "    tps_at_first_any_rejection: old={}, new={}",
-        fmt_opt(old_summary.tps_at_first_any_rejection),
-        fmt_opt(new_summary.tps_at_first_any_rejection),
+        format_optional_f64(old_summary.tps_at_first_any_rejection),
+        format_optional_f64(new_summary.tps_at_first_any_rejection),
     );
     println!(
         "    tps_at_first_non_200: old={}, new={}",
-        fmt_opt(old_summary.tps_at_first_non_200),
-        fmt_opt(new_summary.tps_at_first_non_200),
+        format_optional_f64(old_summary.tps_at_first_non_200),
+        format_optional_f64(new_summary.tps_at_first_non_200),
     );
     println!(
         "    tps_at_first_429: old={}, new={}",
-        fmt_opt(old_summary.tps_at_first_429),
-        fmt_opt(new_summary.tps_at_first_429),
+        format_optional_f64(old_summary.tps_at_first_429),
+        format_optional_f64(new_summary.tps_at_first_429),
     );
     println!(
         "    tps_at_first_client_failure: old={}, new={}",
-        fmt_opt(old_summary.tps_at_first_client_failure),
-        fmt_opt(new_summary.tps_at_first_client_failure),
+        format_optional_f64(old_summary.tps_at_first_client_failure),
+        format_optional_f64(new_summary.tps_at_first_client_failure),
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RtSweepCsvRow {
+    concurrency: u64,
+    accepted_tps: f64,
+    rejected_count: u64,
+    ack_p50_ms: f64,
+    ack_p99_ms: f64,
+    rt_p50_ms: f64,
+    rt_p99_ms: f64,
+    rt_p999_ms: f64,
+}
+
+fn compare_rt_sweep(results_dir: &Path) -> BenchResult<()> {
+    let result = latest_two_files(results_dir, "rt-sweep-", ".csv");
+    let (old_path, new_path) = match result {
+        Ok(paths) => paths,
+        Err(_) => {
+            println!("RT SWEEP: n/a (need at least 2 rt-sweep-*.csv files)");
+            return Ok(());
+        }
+    };
+    let old_rows = read_rt_sweep_rows(&old_path)?;
+    let new_rows = read_rt_sweep_rows(&new_path)?;
+
+    println!(
+        "RT SWEEP latest two:\n  old: {}\n  new: {}",
+        old_path.display(),
+        new_path.display()
+    );
+
+    let old_by_concurrency = map_rt_sweep_rows(&old_rows);
+    let new_by_concurrency = map_rt_sweep_rows(&new_rows);
+
+    println!("  deltas by concurrency:");
+    println!(
+        "  c,tps_delta,ack_p50_delta,ack_p99_delta,rt_p50_delta,rt_p99_delta,rt_p999_delta,rejected_delta"
+    );
+
+    let mut all_concurrency: Vec<u64> = old_by_concurrency
+        .keys()
+        .chain(new_by_concurrency.keys())
+        .copied()
+        .collect();
+    all_concurrency.sort_unstable();
+    all_concurrency.dedup();
+
+    for concurrency in all_concurrency {
+        let old = old_by_concurrency.get(&concurrency);
+        let new = new_by_concurrency.get(&concurrency);
+        if let (Some(old), Some(new)) = (old, new) {
+            println!(
+                "  {},{:+.3},{:+.3},{:+.3},{:+.3},{:+.3},{:+.3},{:+}",
+                concurrency,
+                new.accepted_tps - old.accepted_tps,
+                new.ack_p50_ms - old.ack_p50_ms,
+                new.ack_p99_ms - old.ack_p99_ms,
+                new.rt_p50_ms - old.rt_p50_ms,
+                new.rt_p99_ms - old.rt_p99_ms,
+                new.rt_p999_ms - old.rt_p999_ms,
+                i128::from(new.rejected_count) - i128::from(old.rejected_count),
+            );
+        } else {
+            println!("  {concurrency},n/a,n/a,n/a,n/a,n/a,n/a,n/a");
+        }
+    }
+    Ok(())
+}
+
+fn read_rt_sweep_rows(path: &Path) -> BenchResult<Vec<RtSweepCsvRow>> {
+    let content = fs::read_to_string(path)?;
+    let mut lines = content.lines();
+    let Some(header_line) = lines.next() else {
+        return Err(std::io::Error::other(format!("empty CSV file: {}", path.display())).into());
+    };
+    let headers: Vec<&str> = header_line.split(',').collect();
+    let mut header_idx = BTreeMap::new();
+    for (idx, header) in headers.iter().enumerate() {
+        header_idx.insert(*header, idx);
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        rows.push(RtSweepCsvRow {
+            concurrency: parse_csv_u64(&cols, &header_idx, "concurrency")?,
+            accepted_tps: parse_csv_f64(&cols, &header_idx, "accepted_tps")?,
+            rejected_count: parse_csv_u64(&cols, &header_idx, "rejected_count")?,
+            ack_p50_ms: parse_csv_f64(&cols, &header_idx, "ack_p50_ms")?,
+            ack_p99_ms: parse_csv_f64(&cols, &header_idx, "ack_p99_ms")?,
+            rt_p50_ms: parse_csv_f64(&cols, &header_idx, "rt_p50_ms")?,
+            rt_p99_ms: parse_csv_f64(&cols, &header_idx, "rt_p99_ms")?,
+            rt_p999_ms: parse_csv_f64(&cols, &header_idx, "rt_p999_ms")?,
+        });
+    }
+    Ok(rows)
+}
+
+fn map_rt_sweep_rows(rows: &[RtSweepCsvRow]) -> BTreeMap<u64, RtSweepCsvRow> {
+    let mut out = BTreeMap::new();
+    for row in rows {
+        out.insert(row.concurrency, row.clone());
+    }
+    out
 }
 
 fn latest_two_files(
@@ -286,23 +422,6 @@ fn latest_two_files(
     Ok((old, new))
 }
 
-fn trailing_number(file_name: &str) -> Option<u64> {
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(left, _)| left)
-        .unwrap_or(file_name);
-    let reversed_digits: String = stem
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    if reversed_digits.is_empty() {
-        return None;
-    }
-    let digits: String = reversed_digits.chars().rev().collect();
-    digits.parse::<u64>().ok()
-}
-
 fn read_json<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> BenchResult<T> {
     let raw = fs::read_to_string(path)?;
     let parsed = serde_json::from_str::<T>(&raw)?;
@@ -331,6 +450,7 @@ fn read_sweep_rows(path: &Path) -> BenchResult<Vec<SweepCsvRow>> {
         let accepted_tps = parse_csv_f64(&cols, &header_idx, "accepted_tps")?;
         let rejected_count = parse_csv_u64(&cols, &header_idx, "rejected_count")?;
         let http_rejected_count = parse_csv_u64(&cols, &header_idx, "http_rejected_count")?;
+        let p50_ms = parse_csv_f64(&cols, &header_idx, "p50_ms")?;
         let p95_ms = parse_csv_f64(&cols, &header_idx, "p95_ms")?;
         let p99_ms = parse_csv_f64(&cols, &header_idx, "p99_ms")?;
         let p999_ms = parse_csv_f64(&cols, &header_idx, "p999_ms")?;
@@ -341,6 +461,7 @@ fn read_sweep_rows(path: &Path) -> BenchResult<Vec<SweepCsvRow>> {
             accepted_tps,
             rejected_count,
             http_rejected_count,
+            p50_ms,
             p95_ms,
             p99_ms,
             p999_ms,
@@ -412,7 +533,7 @@ fn compute_sweep_summary(rows: &[SweepCsvRow]) -> SweepSummaryView {
 }
 
 fn print_common(accepted: u64, rejected: u64, total_wall: Duration) {
-    let throughput = throughput(accepted, total_wall);
+    let throughput = throughput_tx_per_s(accepted as usize, total_wall);
     println!("  old summary:");
     println!("    accepted: {accepted}");
     println!("    rejected: {rejected}");
@@ -427,8 +548,8 @@ fn print_common_delta(
     new_rejected: u64,
     new_total_wall: Duration,
 ) {
-    let old_tps = throughput(old_accepted, old_total_wall);
-    let new_tps = throughput(new_accepted, new_total_wall);
+    let old_tps = throughput_tx_per_s(old_accepted as usize, old_total_wall);
+    let new_tps = throughput_tx_per_s(new_accepted as usize, new_total_wall);
     println!("  new summary:");
     println!(
         "    accepted: {new_accepted} (delta {:+})",
@@ -483,14 +604,6 @@ fn print_optional_metric_delta(label: &str, old_value: Option<f64>, new_value: O
     print_metric_delta(label, old_value, new_value);
 }
 
-fn throughput(accepted: u64, total_wall: Duration) -> f64 {
-    let secs = total_wall.as_secs_f64();
-    if secs == 0.0 {
-        return 0.0;
-    }
-    accepted as f64 / secs
-}
-
 fn duration_ms(value: Duration) -> f64 {
     value.as_secs_f64() * 1000.0
 }
@@ -500,12 +613,5 @@ fn pct(new_value: f64, old_value: f64) -> f64 {
         0.0
     } else {
         ((new_value / old_value) - 1.0) * 100.0
-    }
-}
-
-fn fmt_opt(value: Option<f64>) -> String {
-    match value {
-        Some(v) => format!("{v:.3}"),
-        None => "n/a".to_string(),
     }
 }
