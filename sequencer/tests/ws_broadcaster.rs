@@ -44,19 +44,21 @@ async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
 
     shutdown_runtime(runtime).await;
 
-    assert_ws_message_matches_tx(first, &expected[0], 0);
-    assert_ws_message_matches_tx(second, &expected[1], 1);
+    // DB offsets (SQLite rowid) start at 1.
+    assert_ws_message_matches_tx(first, &expected[0], 1);
+    assert_ws_message_matches_tx(second, &expected[1], 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_subscribe_resumes_from_given_offset() {
     let db = temp_db("ws-subscribe-resume");
     seed_ordered_txs(db.path.as_str());
+    // Resume from DB offset 1 — should get items with offset > 1.
     let expected = load_ordered_l2_txs_page(db.path.as_str(), 1, 1);
     assert_eq!(
         expected.len(),
         1,
-        "resume snapshot must contain one event at offset 1"
+        "resume snapshot must contain one event at offset 2"
     );
 
     let Some(runtime) = start_test_server(db.path.as_str()).await else {
@@ -73,7 +75,7 @@ async fn ws_subscribe_resumes_from_given_offset() {
 
     shutdown_runtime(runtime).await;
 
-    assert_ws_message_matches_tx(first, &expected[0], 1);
+    assert_ws_message_matches_tx(first, &expected[0], 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -105,7 +107,7 @@ async fn ws_subscribe_receives_live_events_after_subscribing() {
 
     shutdown_runtime(runtime).await;
 
-    assert_ws_message_matches_tx(live, &expected[0], base_offset);
+    assert_ws_message_matches_tx(live, &expected[0], base_offset + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -143,8 +145,8 @@ async fn ws_subscribe_fanout_delivers_live_event_to_multiple_subscribers() {
 
     shutdown_runtime(runtime).await;
 
-    assert_ws_message_matches_tx(event_a, &expected[0], base_offset);
-    assert_ws_message_matches_tx(event_b, &expected[0], base_offset);
+    assert_ws_message_matches_tx(event_a, &expected[0], base_offset + 1);
+    assert_ws_message_matches_tx(event_b, &expected[0], base_offset + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -265,8 +267,8 @@ async fn ws_subscribe_allows_catchup_exactly_at_limit() {
 
     shutdown_runtime(runtime).await;
 
-    assert_ws_message_matches_tx(first, &expected[0], 0);
-    assert_ws_message_matches_tx(second, &expected[1], 1);
+    assert_ws_message_matches_tx(first, &expected[0], 1);
+    assert_ws_message_matches_tx(second, &expected[1], 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -507,8 +509,8 @@ fn ws_subscribe_url(addr: std::net::SocketAddr, from_offset: u64) -> String {
 fn ordered_l2_tx_count(db_path: &str) -> u64 {
     let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
     storage
-        .ordered_l2_tx_count()
-        .expect("query ordered l2 count")
+        .ordered_l2_tx_head_offset()
+        .expect("query ordered l2 head offset")
 }
 
 fn load_ordered_l2_txs_page(db_path: &str, from_offset: u64, limit: usize) -> Vec<SequencedL2Tx> {
@@ -516,6 +518,9 @@ fn load_ordered_l2_txs_page(db_path: &str, from_offset: u64, limit: usize) -> Ve
     storage
         .load_ordered_l2_txs_page_from(from_offset, limit)
         .expect("load ordered l2 tx page")
+        .into_iter()
+        .map(|(_offset, tx)| tx)
+        .collect()
 }
 
 fn assert_ws_message_matches_tx(

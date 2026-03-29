@@ -141,8 +141,13 @@ impl ManagedSequencer {
         self.rollups.mine_l1_blocks(block_count).await
     }
 
-    pub async fn restart(&mut self) -> HarnessResult<()> {
-        self.shutdown_child().await?;
+    /// Kill the sequencer process. Anvil stays running, so `mine_l1_blocks()` still works.
+    pub async fn stop(&mut self) -> HarnessResult<()> {
+        self.shutdown_child().await
+    }
+
+    /// Respawn the sequencer process using the same data directory and Anvil instance.
+    pub async fn respawn(&mut self) -> HarnessResult<()> {
         let SpawnedSequencerProcess {
             child,
             endpoint,
@@ -159,6 +164,16 @@ impl ManagedSequencer {
         self.endpoint = endpoint;
         self.log_path = log_path;
         Ok(())
+    }
+
+    pub async fn restart(&mut self) -> HarnessResult<()> {
+        self.stop().await?;
+        self.respawn().await
+    }
+
+    /// Read the current sequencer log file contents.
+    pub fn read_log_contents(&self) -> HarnessResult<String> {
+        std::fs::read_to_string(&self.log_path).map_err(Into::into)
     }
 
     pub async fn ws(&self, from_offset: u64) -> HarnessResult<WsClient> {

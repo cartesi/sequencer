@@ -3,9 +3,9 @@
 
 //! Batch submitter: posts closed batches to L1 with at-least-once semantics.
 //!
-//! The batch index is used as the batch nonce (id). The scheduler checks that nonces are
-//! strictly increasing and invalidates otherwise, so duplicates are deduplicated at the
-//! scheduler level. See `worker` for the wake → read S → compare → submit → sleep loop.
+//! Each valid closed batch is assigned a contiguous nonce (via `batch_nonces`). The scheduler
+//! checks that nonces are strictly increasing and skips otherwise, so duplicates are
+//! deduplicated at the scheduler level. See `worker` for the tick loop.
 
 mod batch_poster;
 mod config;

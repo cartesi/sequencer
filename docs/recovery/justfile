@@ -1,0 +1,12 @@
+tlc := env("TLC", "tlc")
+
+# Check the preemptive recovery spec (~90s)
+check-preemptive:
+    {{tlc}} -workers auto -deadlock preemptive.tla
+
+# Check the optimistic recovery spec (~3min)
+check-optimistic:
+    {{tlc}} -workers auto -deadlock history/optimistic.tla
+
+# Check all specs
+check-all: check-preemptive check-optimistic

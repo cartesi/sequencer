@@ -49,20 +49,23 @@ pub fn scheduler_rejected_batch_does_not_consume_nonce() -> TestResult {
 }
 
 #[testsi::test_dapp(kind("scheduler"))]
-pub fn scheduler_stale_batch_consumes_nonce_without_report() -> TestResult {
+pub fn scheduler_stale_batch_is_skipped_without_consuming_nonce() -> TestResult {
     let mut machine = devnet_machine()?;
     let stale_trigger_block = SchedulerConfig::devnet().max_wait_blocks as usize + 1;
 
+    // Stale batch (nonce 0, safe_block 1, inclusion block > max_wait_blocks) → skipped silently.
     let (outputs, reports) = machine.advance_state(batch_input(
         stale_trigger_block,
         batch_with_safe_blocks(0, &[1]),
     ))?;
     assert_no_outputs_or_reports(&outputs, &reports);
 
+    // Fresh batch with nonce 0 succeeds — stale batch did NOT consume the nonce.
     let (outputs, reports) =
         machine.advance_state(batch_input(stale_trigger_block + 1, empty_batch(0)))?;
-    assert_invalid_batch_step(&outputs, &reports);
+    assert_no_outputs_or_reports(&outputs, &reports);
 
+    // Next batch with nonce 1 also succeeds.
     let (outputs, reports) =
         machine.advance_state(batch_input(stale_trigger_block + 2, empty_batch(1)))?;
     assert_no_outputs_or_reports(&outputs, &reports);

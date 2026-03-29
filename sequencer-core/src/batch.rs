@@ -86,13 +86,23 @@ pub struct BatchForSubmission {
 impl BatchForSubmission {
     /// Encode the batch for the scheduler as a single SSZ payload.
     ///
-    /// Payload is `ssz(Batch { nonce: batch_index, frames })`. The scheduler decodes this
+    /// Payload is `ssz(Batch { nonce, frames })`. The scheduler decodes this
     /// and uses `batch.nonce` for deduplication; classification at the rollup is by msg_sender.
-    pub fn encode_for_scheduler(&self) -> Vec<u8> {
+    ///
+    /// The `nonce` parameter is the contiguous L1 nonce (which may differ from `batch_index`
+    /// when invalid batches have been skipped).
+    pub fn encode_for_scheduler_with_nonce(&self, nonce: u64) -> Vec<u8> {
         let batch = Batch {
-            nonce: self.batch_index,
+            nonce,
             frames: self.batch.frames.clone(),
         };
         ssz::Encode::as_ssz_bytes(&batch)
+    }
+
+    /// Encode the batch for the scheduler using `batch_index` as the nonce.
+    ///
+    /// This is a convenience wrapper for the common case where batch_index == nonce.
+    pub fn encode_for_scheduler(&self) -> Vec<u8> {
+        self.encode_for_scheduler_with_nonce(self.batch_index)
     }
 }

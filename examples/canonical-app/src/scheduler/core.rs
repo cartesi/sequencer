@@ -13,7 +13,7 @@ pub const DEVNET_SEQUENCER_ADDRESS: Address =
     address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 pub const SEPOLIA_SEQUENCER_ADDRESS: Address =
     address!("0x16d5FF3Fdd14e2a86FBA77cbcE6B3Cd9C32b8Ff3");
-pub const MAX_WAIT_BLOCKS: u64 = 1200;
+pub const MAX_WAIT_BLOCKS: u64 = sequencer_core::MAX_WAIT_BLOCKS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerConfig {
@@ -187,7 +187,6 @@ impl<A: Application> Scheduler<A> {
             self.config.max_wait_blocks,
             inclusion_block,
         ) {
-            self.advance_expected_batch_nonce();
             return ProcessResult::without_outputs(ProcessOutcome::BatchSkippedStale);
         }
 
@@ -619,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_batch_is_skipped_and_consumes_nonce() {
+    fn stale_batch_is_skipped_without_consuming_nonce() {
         let mut scheduler = Scheduler::new(
             RecordingApp::default(),
             SchedulerConfig {
@@ -648,14 +647,16 @@ mod tests {
         let outcome = scheduler.process_input(batch_input(10, stale_batch));
         assert_eq!(outcome, ProcessOutcome::BatchSkippedStale);
         assert_eq!(scheduler.app.events(), [RecordedTx::Direct(9)]);
-        assert_eq!(scheduler.next_expected_batch_nonce(), 1);
+        // Stale batches do NOT consume the nonce — they are true no-ops in nonce space.
+        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
 
+        // The next valid batch reuses nonce 0.
         let fresh_signing_key =
             SigningKey::from_bytes((&[13_u8; 32]).into()).expect("fresh signing key");
         let fresh_sender = address_from_signing_key(&fresh_signing_key);
         scheduler.app.credit(fresh_sender, 1);
         let fresh_batch = Batch {
-            nonce: 1,
+            nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![sign_wire_user_op(
                     &test_domain(),

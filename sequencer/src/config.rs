@@ -92,13 +92,24 @@ pub struct RunConfig {
     )]
     pub batch_submitter_idle_poll_interval_ms: u64,
 
-    /// Number of blocks behind Latest that the batch submitter treats as confirmed.
+    /// Additional confirmations to wait for after a batch-submission tx is included on L1.
     #[arg(
         long,
         env = "SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH",
-        default_value = "0"
+        default_value = "2"
     )]
     pub batch_submitter_confirmation_depth: u64,
+
+    /// Blocks before MAX_WAIT_BLOCKS to trigger preemptive recovery.
+    /// The danger threshold is MAX_WAIT_BLOCKS minus this margin.
+    /// Must be less than MAX_WAIT_BLOCKS (validated at startup).
+    #[arg(long, env = "SEQ_PREEMPTIVE_MARGIN_BLOCKS", default_value = "75")]
+    pub preemptive_margin_blocks: u64,
+
+    /// Assumed L1 block time in seconds. Used to estimate block progression from
+    /// wall-clock time when the L1 provider is unreachable.
+    #[arg(long, env = "SEQ_SECONDS_PER_BLOCK", default_value = "12")]
+    pub seconds_per_block: u64,
 }
 
 impl RunConfig {
@@ -201,6 +212,13 @@ mod tests {
                 "-32616".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn run_config_defaults_batch_submitter_confirmation_depth_to_two() {
+        let config = RunConfig::try_parse_from(TEST_ARGS).expect("parse run config");
+
+        assert_eq!(config.batch_submitter_confirmation_depth, 2);
     }
 
     #[test]

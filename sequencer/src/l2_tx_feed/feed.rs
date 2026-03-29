@@ -66,8 +66,12 @@ impl L2TxFeed {
         from_offset: u64,
         max_catchup_events: u64,
     ) -> Result<Subscription, SubscribeError> {
-        let head_offset = load_head_offset(self.db_path.as_str())?;
-        let catchup_events = head_offset.saturating_sub(from_offset);
+        let (head_offset, catchup_events) = load_catchup_info(
+            self.db_path.as_str(),
+            from_offset,
+            max_catchup_events,
+            self.batch_submitter_address,
+        )?;
         if catchup_events > max_catchup_events {
             return Err(SubscribeError::CatchUpWindowExceeded {
                 requested_offset: from_offset,
@@ -126,12 +130,29 @@ impl Subscription {
     }
 }
 
-fn load_head_offset(db_path: &str) -> Result<u64, SubscribeError> {
+/// Returns `(head_offset, broadcastable_event_count_after_from_offset)`.
+///
+/// Counts events the client will actually receive — excludes invalidated batches
+/// and batch-submitter direct inputs (which are filtered before WS delivery).
+fn load_catchup_info(
+    db_path: &str,
+    from_offset: u64,
+    max_catchup_events: u64,
+    batch_submitter_address: Option<Address>,
+) -> Result<(u64, u64), SubscribeError> {
     let mut storage = Storage::open_read_only(db_path)
         .map_err(|source| SubscribeError::OpenStorage { source })?;
-    storage
-        .ordered_l2_tx_count()
-        .map_err(|source| SubscribeError::LoadHeadOffset { source })
+    let head_offset = storage
+        .ordered_l2_tx_head_offset()
+        .map_err(|source| SubscribeError::LoadHeadOffset { source })?;
+    let catchup_count = storage
+        .count_broadcastable_events_after(
+            from_offset,
+            max_catchup_events.saturating_add(1),
+            batch_submitter_address,
+        )
+        .map_err(|source| SubscribeError::LoadHeadOffset { source })?;
+    Ok((head_offset, catchup_count))
 }
 
 fn run_subscription(
@@ -164,18 +185,18 @@ fn run_subscription(
             continue;
         }
 
-        for tx in txs {
+        for (db_offset, tx) in txs {
             if shutdown.is_shutdown_requested() || events_tx.is_closed() {
                 return Ok(());
             }
 
+            next_offset = db_offset;
+
             if should_filter_from_broadcast(&tx, batch_submitter_address) {
-                next_offset = next_offset.saturating_add(1);
                 continue;
             }
 
-            let event = BroadcastTxMessage::from_offset_and_tx(next_offset, tx);
-            next_offset = next_offset.saturating_add(1);
+            let event = BroadcastTxMessage::from_offset_and_tx(db_offset, tx);
             if events_tx.blocking_send(event).is_err() {
                 return Ok(());
             }

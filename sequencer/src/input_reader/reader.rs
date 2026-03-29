@@ -13,7 +13,7 @@ use cartesi_rollups_contracts::data_availability::DataAvailability::{
 };
 use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::partition::{decode_evm_advance_input, get_input_added_events};
 use crate::shutdown::ShutdownSignal;
@@ -34,6 +34,8 @@ pub struct InputReaderConfig {
 pub enum InputReaderError {
     #[error("provider/transport: {0}")]
     Provider(String),
+    #[error("bootstrap: {0}")]
+    Bootstrap(String),
     #[error(transparent)]
     OpenStorage(#[from] StorageOpenError),
     #[error(transparent)]
@@ -57,13 +59,13 @@ impl InputReader {
         config: InputReaderConfig,
     ) -> Result<Self, InputReaderError> {
         let provider = crate::provider::create_provider(&config.rpc_url)
-            .map_err(InputReaderError::Provider)?;
+            .map_err(InputReaderError::Bootstrap)?;
         let application = Application::new(config.app_address, &provider);
         let data_availability = application
             .getDataAvailability()
             .call()
             .await
-            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+            .map_err(map_contract_bootstrap_error)?;
         let input_box_address = decode_input_box_address(&data_availability)?;
 
         let input_box = InputBox::new(input_box_address, &provider);
@@ -71,10 +73,10 @@ impl InputReader {
             .getDeploymentBlockNumber()
             .call()
             .await
-            .map_err(|e| InputReaderError::Provider(e.to_string()))?
+            .map_err(map_contract_bootstrap_error)?
             .try_into()
             .map_err(|_| {
-                InputReaderError::Provider(
+                InputReaderError::Bootstrap(
                     "input box deployment block number did not fit into u64".to_string(),
                 )
             })?;
@@ -88,7 +90,7 @@ impl InputReader {
         ))
     }
 
-    fn from_parts(
+    pub fn from_parts(
         config: InputReaderConfig,
         input_box_address: Address,
         genesis_block: u64,
@@ -121,7 +123,7 @@ impl InputReader {
         self.bootstrap_safe_head().await?;
 
         let provider = crate::provider::create_provider(&self.config.rpc_url)
-            .map_err(InputReaderError::Provider)?;
+            .map_err(InputReaderError::Bootstrap)?;
         self.advance_once(&provider).await
     }
 
@@ -129,7 +131,7 @@ impl InputReader {
         self.bootstrap_safe_head().await?;
 
         let provider = crate::provider::create_provider(&self.config.rpc_url)
-            .map_err(InputReaderError::Provider)?;
+            .map_err(InputReaderError::Bootstrap)?;
 
         loop {
             if self.shutdown.is_shutdown_requested() {
@@ -139,7 +141,7 @@ impl InputReader {
             match self.advance_once(&provider).await {
                 Ok(()) => {}
                 Err(InputReaderError::Provider(error)) => {
-                    warn!(error, "input reader advance failed, will retry");
+                    tracing::error!(error, "L1 provider error in input reader — will retry");
                 }
                 Err(err) => return Err(err),
             }
@@ -159,8 +161,9 @@ impl InputReader {
         let previous_safe_block = self.current_safe_block().await?;
 
         // If our persisted safe head is already at the current safe frontier,
-        // there is nothing new to scan.
+        // there is nothing new to scan, but we still record that L1 was reachable.
         if current_safe_block <= previous_safe_block {
+            self.touch_l1_sync().await?;
             return Ok(());
         }
 
@@ -237,6 +240,16 @@ impl InputReader {
         .map_err(|err| InputReaderError::Join(err.to_string()))?
     }
 
+    async fn touch_l1_sync(&self) -> Result<(), InputReaderError> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            storage.touch_l1_sync().map_err(InputReaderError::from)
+        })
+        .await
+        .map_err(|err| InputReaderError::Join(err.to_string()))?
+    }
+
     async fn append_safe_inputs(
         &self,
         current_safe_block: u64,
@@ -256,7 +269,7 @@ impl InputReader {
 
 fn decode_input_box_address(data_availability: &[u8]) -> Result<Address, InputReaderError> {
     let call = DataAvailabilityCalls::abi_decode(data_availability).map_err(|err| {
-        InputReaderError::Provider(format!(
+        InputReaderError::Bootstrap(format!(
             "application getDataAvailability returned invalid DataAvailability calldata: {err}"
         ))
     })?;
@@ -267,9 +280,16 @@ fn decode_input_box_address(data_availability: &[u8]) -> Result<Address, InputRe
             inputBox,
             fromBlock,
             namespaceId,
-        }) => Err(InputReaderError::Provider(format!(
+        }) => Err(InputReaderError::Bootstrap(format!(
             "application getDataAvailability returned unsupported DataAvailability.InputBoxAndEspresso(inputBox={inputBox}, fromBlock={fromBlock}, namespaceId={namespaceId})"
         ))),
+    }
+}
+
+fn map_contract_bootstrap_error(err: alloy::contract::Error) -> InputReaderError {
+    match err {
+        alloy::contract::Error::TransportError(_) => InputReaderError::Provider(err.to_string()),
+        _ => InputReaderError::Bootstrap(err.to_string()),
     }
 }
 
@@ -310,8 +330,17 @@ mod tests {
         )
     }
 
-    fn require_anvil_tests() -> bool {
-        std::env::var_os("RUN_ANVIL_TESTS").is_some()
+    /// Verify that `anvil` is available. Panics with a clear message if not found.
+    fn require_anvil() {
+        assert!(
+            std::process::Command::new("anvil")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok(),
+            "anvil not found on PATH — install Foundry (https://getfoundry.sh)"
+        );
     }
 
     #[tokio::test]
@@ -339,9 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_with_anvil_request_shutdown_then_join_returns_ok() {
-        if !require_anvil_tests() {
-            return;
-        }
+        require_anvil();
 
         let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
         let shutdown = ShutdownSignal::default();
@@ -369,9 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn advance_once_with_anvil_updates_safe_head_when_block_available() {
-        if !require_anvil_tests() {
-            return;
-        }
+        require_anvil();
 
         let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
         let db_file = NamedTempFile::new().expect("temp file");
@@ -450,10 +475,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_once_when_safe_head_ahead_of_chain_is_no_op() {
-        if !require_anvil_tests() {
-            return;
+    async fn new_with_invalid_rpc_url_returns_bootstrap_error() {
+        let db_file = NamedTempFile::new().expect("temp file");
+
+        let result = InputReader::new(
+            db_file.path().to_string_lossy().into_owned(),
+            ShutdownSignal::default(),
+            InputReaderConfig {
+                rpc_url: "not-a-valid-url".to_string(),
+                app_address: Address::ZERO,
+                poll_interval: Duration::from_secs(1),
+                long_block_range_error_codes: Vec::new(),
+            },
+        )
+        .await;
+
+        match result {
+            Err(InputReaderError::Bootstrap(_)) => {}
+            Err(other) => panic!("expected bootstrap error, got {other:?}"),
+            Ok(_) => panic!("invalid RPC URL should fail during bootstrap"),
         }
+    }
+
+    #[tokio::test]
+    async fn advance_once_when_safe_head_ahead_of_chain_is_no_op() {
+        require_anvil();
 
         let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
         let db_file = NamedTempFile::new().expect("temp file");

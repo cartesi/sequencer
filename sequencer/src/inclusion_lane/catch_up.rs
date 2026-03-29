@@ -30,7 +30,9 @@ pub(super) fn catch_up_application_paged(
     batch_submitter_address: Address,
     page_size: usize,
 ) -> Result<(), CatchUpError> {
-    let mut next_offset = 0;
+    // Cursor tracks the DB offset of the last processed item.
+    // SQLite rowids start at 1, so 0 means "before all items".
+    let mut next_offset: u64 = 0;
     let page_size = page_size.max(1);
 
     loop {
@@ -45,9 +47,9 @@ pub(super) fn catch_up_application_paged(
             return Ok(());
         }
 
-        for item in replay {
+        for (db_offset, item) in replay {
             replay_sequenced_l2_tx(app, batch_submitter_address, item)?;
-            next_offset = next_offset.saturating_add(1);
+            next_offset = db_offset;
         }
     }
 }

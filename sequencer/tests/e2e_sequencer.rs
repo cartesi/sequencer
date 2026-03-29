@@ -54,7 +54,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
     // The deposit is broadcast first.
     let deposit_message = recv_ws_message(&mut ws).await;
     match deposit_message {
-        WsTxMessage::DirectInput { offset, .. } => assert_eq!(offset, 0),
+        WsTxMessage::DirectInput { offset, .. } => assert_eq!(offset, 1),
         other => panic!("expected deposit direct input as first WS message, got {other:?}"),
     }
     let method = Method::Withdrawal(Withdrawal {
@@ -96,7 +96,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
             fee,
             data,
         } => {
-            assert_eq!(offset, 1);
+            assert_eq!(offset, 2);
             assert_eq!(ws_sender, sender.to_string());
             // Frame fee is the default log_recommended_fee = 1060.
             assert_eq!(fee, 1060);
@@ -363,9 +363,10 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
         3,
         "expected deposit, direct input, and user op"
     );
-    assert_ws_message_matches_tx(deposit_live, &expected[0], 0);
-    assert_ws_message_matches_tx(first_live, &expected[1], 1);
-    assert_ws_message_matches_tx(second_live, &expected[2], 2);
+    // DB offsets (SQLite rowid) start at 1.
+    assert_ws_message_matches_tx(deposit_live, &expected[0], 1);
+    assert_ws_message_matches_tx(first_live, &expected[1], 2);
+    assert_ws_message_matches_tx(second_live, &expected[2], 3);
 
     shutdown_runtime(runtime).await;
 
@@ -384,9 +385,10 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
             .expect("timeout connecting websocket after restart")
             .expect("connect websocket after restart");
 
-    for (offset, expected_tx) in expected.iter().enumerate() {
+    for (i, expected_tx) in expected.iter().enumerate() {
         let replayed = recv_ws_message(&mut restarted_ws).await;
-        assert_ws_message_matches_tx(replayed, expected_tx, offset as u64);
+        // DB offsets start at 1.
+        assert_ws_message_matches_tx(replayed, expected_tx, (i + 1) as u64);
     }
     drop(restarted_ws);
 
@@ -643,6 +645,9 @@ fn load_all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
     storage
         .load_ordered_l2_txs_page_from(0, total as usize)
         .expect("load ordered l2 txs")
+        .into_iter()
+        .map(|(_offset, tx)| tx)
+        .collect()
 }
 
 fn assert_ws_message_matches_tx(

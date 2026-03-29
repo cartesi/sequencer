@@ -35,15 +35,22 @@ impl TestMock {
 
 #[async_trait]
 impl BatchPoster for TestMock {
-    async fn submit_batch(&self, payload: Vec<u8>) -> Result<TxHash, BatchPosterError> {
-        let batch_index = ssz::Decode::from_ssz_bytes(payload.as_slice())
-            .map(|b: Batch| b.nonce)
-            .unwrap_or(0);
-        self.submissions
-            .lock()
-            .expect("lock")
-            .push((batch_index, payload.len()));
-        Ok(TxHash::ZERO)
+    async fn submit_batches(
+        &self,
+        payloads: Vec<Vec<u8>>,
+    ) -> Result<Vec<TxHash>, BatchPosterError> {
+        let mut tx_hashes = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let batch_index = ssz::Decode::from_ssz_bytes(payload.as_slice())
+                .map(|b: Batch| b.nonce)
+                .unwrap_or(0);
+            self.submissions
+                .lock()
+                .expect("lock")
+                .push((batch_index, payload.len()));
+            tx_hashes.push(TxHash::ZERO);
+        }
+        Ok(tx_hashes)
     }
 
     async fn observed_submitted_batch_nonces(
@@ -98,6 +105,9 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
     let shutdown = ShutdownSignal::default();
     let config = BatchSubmitterConfig {
         idle_poll_interval_ms: 5000,
+        max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+        preemptive_margin_blocks: 75,
+        seconds_per_block: 12,
     };
     let submitter = BatchSubmitter::new(
         path,

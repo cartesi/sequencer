@@ -53,7 +53,7 @@ jobs:
 
       - name: Test
         timeout-minutes: 15
-        run: RUN_ANVIL_TESTS=1 cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --all-targets --all-features --locked
 
   canonical-guest:
     runs-on: ubuntu-latest

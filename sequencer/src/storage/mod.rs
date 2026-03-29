@@ -62,6 +62,14 @@ pub struct FrameHeader {
     pub safe_block: u64,
 }
 
+/// A batch ready for L1 submission: its local index, assigned nonce, and SSZ-encoded payload.
+#[derive(Debug)]
+pub struct PendingBatch {
+    pub batch_index: u64,
+    pub nonce: u64,
+    pub encoded: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageOpenError {
     #[error(transparent)]
