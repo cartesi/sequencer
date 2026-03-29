@@ -1,0 +1,6 @@
+set dotenv-load
+
+# Submit self-transfer user ops to a live Sepolia sequencer.
+# Nonce is auto-discovered if omitted.
+demo count="20":
+    python3 demo_sepolia.py --count {{count}}
