@@ -1,22 +1,26 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Batch submitter worker: at-least-once submission to L1, deduplicated by the scheduler.
+//! Batch submitter worker: stateless, at-least-once submission to L1.
 //!
-//! The worker is intentionally stateless with respect to submitted-batch progress.
-//! On each tick it derives the highest submitted batch nonce from L1, compares that
-//! with locally closed batches, submits the first missing batch if any, then loops.
+//! On each tick the worker:
+//! 1. Assigns nonces to any un-nonced valid batches (via `batch_nonces` table).
+//! 2. Checks if any valid batch is in the danger zone — triggers shutdown if found.
+//! 3. Queries L1 for the next expected batch nonce.
+//! 4. Loads the valid unresolved suffix with nonce >= next expected.
+//! 5. Submits the pending suffix to L1 with incrementing wallet nonces.
+//! 6. Waits for confirmations or timeout, then loops.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::Address;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, error};
 
-use crate::batch_submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig, TxHash};
+use crate::batch_submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig};
 use crate::shutdown::ShutdownSignal;
-use crate::storage::{Storage, StorageOpenError};
+use crate::storage::{PendingBatch, Storage, StorageOpenError};
 
 #[derive(Debug, Error)]
 pub enum BatchSubmitterError {
@@ -28,12 +32,16 @@ pub enum BatchSubmitterError {
     Join(String),
     #[error(transparent)]
     Poster(#[from] BatchPosterError),
+    #[error(
+        "danger zone: batch {batch_index} approaching staleness — sequencer must flush and recover"
+    )]
+    DangerZone { batch_index: u64 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TickOutcome {
     Idle,
-    Submitted { batch_index: u64, tx_hash: TxHash },
+    Submitted { count: usize },
 }
 
 pub struct BatchSubmitter<P: BatchPoster> {
@@ -41,6 +49,9 @@ pub struct BatchSubmitter<P: BatchPoster> {
     batch_submitter_address: Address,
     poster: Arc<P>,
     idle_poll_interval: Duration,
+    max_wait_blocks: u64,
+    danger_threshold: u64,
+    seconds_per_block: u64,
     shutdown: ShutdownSignal,
 }
 
@@ -57,6 +68,9 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             batch_submitter_address,
             poster,
             idle_poll_interval: config.idle_poll_interval(),
+            max_wait_blocks: config.max_wait_blocks,
+            danger_threshold: config.danger_threshold(),
+            seconds_per_block: config.seconds_per_block,
             shutdown,
         }
     }
@@ -78,7 +92,27 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
                 Ok(TickOutcome::Submitted { .. }) => continue,
                 Ok(TickOutcome::Idle) => {}
                 Err(BatchSubmitterError::Poster(source)) => {
-                    warn!(error = %source, "batch submitter tick failed, will retry");
+                    error!(error = %source, "L1 provider error — will retry");
+
+                    // Wall-clock danger check: read last_l1_sync_ms from DB and
+                    // estimate how many blocks have passed since. Same logic as
+                    // the startup check — stateless, reads from DB each time.
+                    let in_danger = crate::recovery::wall_clock_danger_estimate(
+                        &self.db_path,
+                        self.batch_submitter_address,
+                        self.max_wait_blocks,
+                        self.danger_threshold,
+                        self.seconds_per_block,
+                    );
+                    match in_danger {
+                        Ok(Some(batch_index)) => {
+                            return Err(BatchSubmitterError::DangerZone { batch_index });
+                        }
+                        Ok(None) => {} // safe to retry
+                        Err(e) => {
+                            error!(error = %e, "wall-clock danger check failed");
+                        }
+                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -91,17 +125,16 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 
     pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
-        let latest_batch_opt = self.load_latest_batch_index().await?;
-        let Some(latest_batch_index) = latest_batch_opt else {
-            return Ok(TickOutcome::Idle);
-        };
+        // Step 1: Populate safe_accepted_batches and assign nonces.
+        self.assign_nonces_and_populate_safe_batches().await?;
 
-        if latest_batch_index == 0 {
-            return Ok(TickOutcome::Idle);
-        }
+        // Step 2: Check if any valid batch is in the danger zone (approaching staleness).
+        // Triggers shutdown so the startup sequence can flush the mempool and recover.
+        self.check_danger_zone().await?;
 
-        let last_closed = latest_batch_index - 1;
-        let next_expected = {
+        // Step 3: Derive the next unresolved batch nonce from the safe frontier plus
+        // latest-chain mined submissions beyond that safe prefix.
+        let next_nonce = {
             let (safe_block, safe_next_expected) =
                 self.load_safe_next_expected_batch_nonce().await?;
 
@@ -111,72 +144,97 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
                 .await?;
             advance_expected_batch_nonce(safe_next_expected, recent_observed_nonces)
         };
-        let latest_submitted = next_expected.checked_sub(1);
-        let first_to_submit = latest_submitted.map(|s| s + 1).unwrap_or(0);
-        if first_to_submit > last_closed {
+
+        // Step 4: Load the unresolved suffix (all valid batches with nonce >= next_nonce).
+        let pending = self.load_pending_batches(next_nonce).await?;
+        if pending.is_empty() {
             return Ok(TickOutcome::Idle);
         }
-        if first_to_submit < last_closed {
-            let pending_batches = last_closed - first_to_submit + 1;
-            warn!(
-                first_to_submit,
-                last_closed, pending_batches, "multiple closed batches are pending submission"
+
+        // Step 5: Submit the whole suffix in one shot, then let the poster wait for
+        // confirmations serially. Using latest mined submissions plus the latest L1
+        // account nonce makes the next tick naturally replace unresolved txs at the
+        // same wallet nonces after a timeout.
+        for batch in &pending {
+            debug!(
+                batch_index = batch.batch_index,
+                nonce = batch.nonce,
+                "queueing batch for L1 submission"
             );
         }
-
-        let batch = self.load_batch_for_submission(first_to_submit).await?;
-        debug!(batch_index = first_to_submit, "submitting batch to L1");
-        let tx_hash = self
-            .poster
-            .submit_batch(batch.encode_for_scheduler())
-            .await?;
-        info!(batch_index = first_to_submit, %tx_hash, "batch submitted to L1");
+        let submitted_batches: Vec<(u64, u64)> =
+            pending.iter().map(|b| (b.batch_index, b.nonce)).collect();
+        let payloads: Vec<Vec<u8>> = pending.into_iter().map(|b| b.encoded).collect();
+        let tx_hashes = self.poster.submit_batches(payloads).await?;
+        if tx_hashes.len() != submitted_batches.len() {
+            return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
+                format!(
+                    "poster returned {} tx hashes for {} submitted batches",
+                    tx_hashes.len(),
+                    submitted_batches.len()
+                ),
+            )));
+        }
 
         Ok(TickOutcome::Submitted {
-            batch_index: first_to_submit,
-            tx_hash,
+            count: submitted_batches.len(),
         })
     }
-
-    async fn load_latest_batch_index(&self) -> Result<Option<u64>, BatchSubmitterError> {
-        let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open_read_only(&db_path)?;
-            storage
-                .latest_batch_index()
-                .map_err(BatchSubmitterError::from)
-        })
-        .await
-        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
-    }
-
-    const SAFE_NONCE_PAGE_SIZE: u64 = 256;
 
     async fn load_safe_next_expected_batch_nonce(&self) -> Result<(u64, u64), BatchSubmitterError> {
         let db_path = self.db_path.clone();
-        let batch_submitter_address = self.batch_submitter_address;
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open_read_only(&db_path)?;
             storage
-                .advance_safe_batch_nonce_for_sender(
-                    batch_submitter_address,
-                    Self::SAFE_NONCE_PAGE_SIZE,
-                )
+                .load_safe_accepted_frontier()
                 .map_err(BatchSubmitterError::from)
         })
         .await
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
 
-    async fn load_batch_for_submission(
+    async fn assign_nonces_and_populate_safe_batches(&self) -> Result<(), BatchSubmitterError> {
+        let db_path = self.db_path.clone();
+        let batch_submitter_address = self.batch_submitter_address;
+        let max_wait_blocks = self.max_wait_blocks;
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&db_path, "NORMAL")?;
+            storage.populate_safe_accepted_batches(batch_submitter_address, max_wait_blocks)?;
+            storage.assign_batch_nonces()?;
+            Ok(())
+        })
+        .await
+        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
+    }
+
+    async fn check_danger_zone(&self) -> Result<(), BatchSubmitterError> {
+        let db_path = self.db_path.clone();
+        let danger_threshold = self.danger_threshold;
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open_read_only(&db_path)?;
+            if let Some(batch_index) = storage.check_danger_zone(danger_threshold)? {
+                tracing::error!(
+                    batch_index,
+                    danger_threshold,
+                    "danger zone detected — triggering shutdown for flush and recovery"
+                );
+                return Err(BatchSubmitterError::DangerZone { batch_index });
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
+    }
+
+    async fn load_pending_batches(
         &self,
-        batch_index: u64,
-    ) -> Result<sequencer_core::batch::BatchForSubmission, BatchSubmitterError> {
+        min_nonce: u64,
+    ) -> Result<Vec<PendingBatch>, BatchSubmitterError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open_read_only(&db_path)?;
             storage
-                .load_batch_for_submission(batch_index)
+                .load_pending_batches(min_nonce)
                 .map_err(BatchSubmitterError::from)
         })
         .await
@@ -184,6 +242,9 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 }
 
+/// Advance `expected` past any contiguous run of matching nonces in the input.
+/// Assumes `observed_nonces` are in chronological (L1 event) order — out-of-order
+/// inputs cause early termination, which is correct (the gap means a nonce is missing).
 fn advance_expected_batch_nonce(
     mut expected: u64,
     observed_nonces: impl IntoIterator<Item = u64>,
@@ -264,6 +325,9 @@ mod tests {
         let mock = Arc::new(MockBatchPoster::new());
         let config = BatchSubmitterConfig {
             idle_poll_interval_ms: 1000,
+            max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+            preemptive_margin_blocks: 75,
+            seconds_per_block: 12,
         };
         let submitter = super::BatchSubmitter::new(
             path.clone(),
@@ -274,17 +338,14 @@ mod tests {
         );
 
         let outcome = submitter.tick_once().await.expect("tick once");
-        assert_eq!(
-            outcome,
-            TickOutcome::Submitted {
-                batch_index: 0,
-                tx_hash: alloy_primitives::B256::ZERO
-            }
-        );
+        // seed_two_closed_batches creates 3 closed batches (0, 1, 2) + open batch 3.
+        assert_eq!(outcome, TickOutcome::Submitted { count: 3 });
 
         let submissions = mock.submissions();
-        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions.len(), 3);
         assert_eq!(submissions[0].0, 0);
+        assert_eq!(submissions[1].0, 1);
+        assert_eq!(submissions[2].0, 2);
     }
 
     #[tokio::test]
@@ -297,6 +358,9 @@ mod tests {
         mock.set_observed_submitted_nonces(vec![2]);
         let config = BatchSubmitterConfig {
             idle_poll_interval_ms: 1000,
+            max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+            preemptive_margin_blocks: 75,
+            seconds_per_block: 12,
         };
         let submitter = super::BatchSubmitter::new(
             path.clone(),
@@ -313,8 +377,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_once_combines_safe_prefix_with_recent_chain_suffix() {
+    async fn tick_once_skips_already_submitted() {
         let (_dir, path) = temp_db("tick-combines-prefix-and-suffix");
+        seed_two_closed_batches(&path);
+        // Seed safe_inputs for all 3 closed batches (nonces 0, 1, 2).
+        seed_safe_submitted_batches(&path, 10, &[0, 1, 2]);
+
+        let mock = Arc::new(MockBatchPoster::new());
+        let submitter = super::BatchSubmitter::new(
+            path.clone(),
+            BATCH_SUBMITTER_ADDRESS,
+            mock.clone(),
+            ShutdownSignal::default(),
+            BatchSubmitterConfig {
+                idle_poll_interval_ms: 1000,
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                seconds_per_block: 12,
+            },
+        );
+
+        let outcome = submitter.tick_once().await.expect("tick once");
+        // All 3 closed batches already submitted (nonces 0, 1, 2 in safe_inputs).
+        assert_eq!(outcome, TickOutcome::Idle);
+    }
+
+    #[tokio::test]
+    async fn tick_once_submits_only_missing_suffix_from_safe_frontier() {
+        let (_dir, path) = temp_db("tick-safe-frontier-suffix");
+        seed_two_closed_batches(&path);
+        seed_safe_submitted_batches(&path, 10, &[0, 1]);
+
+        let mock = Arc::new(MockBatchPoster::new());
+        let submitter = super::BatchSubmitter::new(
+            path.clone(),
+            BATCH_SUBMITTER_ADDRESS,
+            mock.clone(),
+            ShutdownSignal::default(),
+            BatchSubmitterConfig {
+                idle_poll_interval_ms: 1000,
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                seconds_per_block: 12,
+            },
+        );
+
+        let outcome = submitter.tick_once().await.expect("tick once");
+        assert_eq!(outcome, TickOutcome::Submitted { count: 1 });
+        assert_eq!(mock.last_from_block(), Some(11));
+
+        let submissions = mock.submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].0, 2);
+    }
+
+    #[tokio::test]
+    async fn tick_once_replaces_from_latest_mined_prefix_not_safe_prefix() {
+        let (_dir, path) = temp_db("tick-latest-mined-prefix");
         seed_two_closed_batches(&path);
         seed_safe_submitted_batches(&path, 10, &[0]);
 
@@ -327,18 +446,19 @@ mod tests {
             ShutdownSignal::default(),
             BatchSubmitterConfig {
                 idle_poll_interval_ms: 1000,
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                seconds_per_block: 12,
             },
         );
 
         let outcome = submitter.tick_once().await.expect("tick once");
-        assert_eq!(
-            outcome,
-            TickOutcome::Submitted {
-                batch_index: 2,
-                tx_hash: alloy_primitives::B256::ZERO
-            }
-        );
+        assert_eq!(outcome, TickOutcome::Submitted { count: 1 });
         assert_eq!(mock.last_from_block(), Some(11));
+
+        let submissions = mock.submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].0, 2);
     }
 
     #[tokio::test]
@@ -355,6 +475,9 @@ mod tests {
             ShutdownSignal::default(),
             BatchSubmitterConfig {
                 idle_poll_interval_ms: 1000,
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                seconds_per_block: 12,
             },
         );
 
@@ -363,6 +486,96 @@ mod tests {
             .await
             .expect_err("poster error should propagate");
         assert!(matches!(err, BatchSubmitterError::Poster(_)));
+    }
+
+    #[tokio::test]
+    async fn check_danger_zone_detects_reused_nonce_after_recovery() {
+        let (_dir, path) = temp_db("tick-stale-reused-nonce");
+        let batch_submitter = BATCH_SUBMITTER_ADDRESS;
+
+        let mut storage = Storage::open(&path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+        storage.assign_batch_nonces().expect("assign nonces gen1");
+
+        let gen1_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+            nonce: 0,
+            frames: vec![sequencer_core::batch::Frame {
+                safe_block: 10,
+                fee_price: 0,
+                user_ops: vec![],
+            }],
+        });
+        storage
+            .append_safe_inputs(
+                1210,
+                &[StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: gen1_payload,
+                    block_number: 1210,
+                }],
+            )
+            .expect("append gen1 stale submission");
+        storage
+            .populate_safe_accepted_batches(batch_submitter, 1200)
+            .expect("populate gen1 frontier");
+        let invalidated = storage.detect_and_recover(1200).expect("recover gen1");
+        assert_eq!(invalidated, vec![0, 1]);
+
+        let mut head = storage
+            .load_open_state()
+            .expect("load open state")
+            .expect("recovery batch");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close gen2 batch");
+        storage.assign_batch_nonces().expect("assign nonces gen2");
+
+        let gen2_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+            nonce: 0,
+            frames: vec![sequencer_core::batch::Frame {
+                safe_block: 100,
+                fee_price: 0,
+                user_ops: vec![],
+            }],
+        });
+        storage
+            .append_safe_inputs(
+                2410,
+                &[StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: gen2_payload,
+                    block_number: 2410,
+                }],
+            )
+            .expect("append gen2 stale submission");
+        storage
+            .populate_safe_accepted_batches(batch_submitter, 1200)
+            .expect("populate gen2 frontier");
+        drop(storage);
+
+        let submitter = super::BatchSubmitter::new(
+            path,
+            batch_submitter,
+            Arc::new(MockBatchPoster::new()),
+            ShutdownSignal::default(),
+            BatchSubmitterConfig {
+                idle_poll_interval_ms: 1000,
+                max_wait_blocks: 1200,
+                preemptive_margin_blocks: 75,
+                seconds_per_block: 12,
+            },
+        );
+
+        let err = submitter
+            .check_danger_zone()
+            .await
+            .expect_err("reused frontier nonce should still be detected as in danger zone");
+        assert!(matches!(err, BatchSubmitterError::DangerZone { .. }));
     }
 
     #[test]

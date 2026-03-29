@@ -62,6 +62,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ("shutdown_during_inflight_test", |runtime| {
             Box::pin(run_shutdown_during_inflight_test(runtime))
         }),
+        ("recovery_after_stale_batches_test", |runtime| {
+            Box::pin(run_recovery_after_stale_batches_test(runtime))
+        }),
     ]
 }
 
@@ -241,7 +244,9 @@ async fn run_reconnect_from_offset_test(runtime: &mut ManagedSequencer) -> Scena
     let deposit_message =
         apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
             .await?;
-    let reconnect_offset = deposit_message.offset().saturating_add(1);
+    // WS replay is cursor-based and exclusive: `from_offset` means
+    // "start after this already-consumed DB offset".
+    let reconnect_offset = deposit_message.offset();
     drop(ws);
 
     alice_l2.transfer(bob_address, transfer_amount).await?;
@@ -625,6 +630,109 @@ async fn run_shutdown_during_inflight_test(runtime: &mut ManagedSequencer) -> Sc
     );
     assert_eq!(replay.current_user_nonce(alice_address), 1);
     assert_eq!(replay_after.current_user_nonce(alice_address), 1);
+    Ok(())
+}
+
+async fn run_recovery_after_stale_batches_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
+    let mut replay_before = ReplayWalletApp::devnet();
+
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(100_000_u64);
+    let post_recovery_transfer = U256::from(200_000_u64);
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
+
+    // Step 1: Fund Alice via L1 deposit.
+    apply_safe_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay_before,
+        &alice_l1,
+        deposit_amount,
+    )
+    .await?;
+
+    // Step 2: Alice transfers to Bob (this will be lost after recovery).
+    alice_l2.transfer(bob_address, transfer_amount).await?;
+    replay_before.apply(ws.expect_user_op_from(alice_address).await?)?;
+
+    // Verify pre-recovery state.
+    assert_eq!(
+        replay_before.current_user_balance(alice_address),
+        deposit_amount - transfer_amount - gas,
+    );
+    assert_eq!(
+        replay_before.current_user_balance(bob_address),
+        transfer_amount,
+    );
+
+    // Step 3: Kill the sequencer (Anvil stays up).
+    drop(ws);
+    runtime.stop().await?;
+
+    // Step 4: Mine 1200 blocks to make all existing batches stale.
+    // The sequencer is down, so batches are never submitted. When the sequencer
+    // restarts, l1_safe_head will be >1200 blocks past the frames' safe_block.
+    runtime.mine_l1_blocks(1200).await?;
+
+    // Step 5: Respawn the sequencer. Startup recovery should detect staleness.
+    runtime.respawn().await?;
+
+    // Step 6: Replay from offset 0 after recovery.
+    // The deposit should be re-drained into the recovery batch.
+    // The transfer should be GONE (it was in an invalidated batch).
+    let mut ws_after = runtime.ws(0).await?;
+    let mut replay_after = ReplayWalletApp::devnet();
+
+    // Expect the re-drained deposit.
+    replay_after.apply(
+        ws_after
+            .expect_direct_input_from(runtime.erc20_portal_address())
+            .await?,
+    )?;
+
+    // No more messages — the transfer was invalidated.
+    ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
+
+    // Alice should have her full deposit back (no transfer deducted).
+    assert_eq!(
+        replay_after.current_user_balance(alice_address),
+        deposit_amount,
+        "after recovery, Alice should have full deposit (transfer was invalidated)"
+    );
+    assert_eq!(
+        replay_after.current_user_balance(bob_address),
+        U256::ZERO,
+        "after recovery, Bob should have zero (transfer was invalidated)"
+    );
+    assert_eq!(replay_after.current_user_nonce(alice_address), 0);
+
+    // Step 8: Verify new work succeeds after recovery.
+    let mut alice_l2_fresh = runtime.wallet_l2(alice)?;
+    alice_l2_fresh
+        .transfer(bob_address, post_recovery_transfer)
+        .await?;
+    replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
+
+    assert_eq!(
+        replay_after.current_user_balance(alice_address),
+        deposit_amount - post_recovery_transfer - gas,
+    );
+    assert_eq!(
+        replay_after.current_user_balance(bob_address),
+        post_recovery_transfer,
+    );
+    assert_eq!(replay_after.current_user_nonce(alice_address), 1);
+
     Ok(())
 }
 

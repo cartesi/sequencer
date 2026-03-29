@@ -99,30 +99,90 @@ where
             .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?
             .address()
     };
-    let mut input_reader = InputReader::new(
+    // Bootstrap L1 config: try L1 first, fall back to DB cache if unreachable.
+    // On first startup, L1 is required (no cache). On subsequent startups, the
+    // cache allows the sequencer to start without L1 (e.g., during provider outages).
+    let input_reader_config = InputReaderConfig {
+        rpc_url: config.eth_rpc_url.clone(),
+        app_address: config.app_address,
+        poll_interval: INPUT_READER_POLL_INTERVAL,
+        long_block_range_error_codes: config.long_block_range_error_codes.clone(),
+    };
+
+    let (mut input_reader, input_reader_genesis_block, l1_config) = match InputReader::new(
         db_path.clone(),
         shutdown.clone(),
-        InputReaderConfig {
-            rpc_url: config.eth_rpc_url.clone(),
-            app_address: config.app_address,
-            poll_interval: INPUT_READER_POLL_INTERVAL,
-            long_block_range_error_codes: config.long_block_range_error_codes.clone(),
-        },
+        input_reader_config.clone(),
     )
     .await
-    .map_err(|source| RunError::InputReader { source })?;
-    let input_reader_genesis_block = input_reader.genesis_block();
-    let l1_config = L1Config {
-        eth_rpc_url: config.eth_rpc_url.clone(),
-        input_box_address: input_reader.input_box_address(),
-        app_address: config.app_address,
-        batch_submitter_private_key,
-        batch_submitter_address,
+    {
+        Ok(reader) => {
+            let genesis = reader.genesis_block();
+            let input_box = reader.input_box_address();
+
+            // Cache for future startups when L1 might be unreachable.
+            if let Ok(mut s) = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA) {
+                let _ = s.save_l1_bootstrap_cache(input_box, genesis, config.chain_id);
+            }
+
+            let l1 = L1Config {
+                eth_rpc_url: config.eth_rpc_url.clone(),
+                input_box_address: input_box,
+                app_address: config.app_address,
+                batch_submitter_private_key,
+                batch_submitter_address,
+            };
+            (reader, genesis, l1)
+        }
+        Err(InputReaderError::Provider(e)) => {
+            // L1 unreachable. Try the DB cache.
+            tracing::error!(
+                error = %e,
+                "L1 unreachable during bootstrap — checking DB cache"
+            );
+            let cache_storage = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            let cached = cache_storage
+                .load_l1_bootstrap_cache()
+                .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
+            let Some((input_box, genesis, cached_chain_id)) = cached else {
+                return Err(RunError::Io(std::io::Error::other(
+                    "L1 unreachable and no bootstrap cache — \
+                         L1 is required for first startup",
+                )));
+            };
+            assert_eq!(
+                cached_chain_id, config.chain_id,
+                "cached chain ID {cached_chain_id} does not match --chain-id {}",
+                config.chain_id
+            );
+
+            let reader = InputReader::from_parts(
+                input_reader_config,
+                input_box,
+                genesis,
+                db_path.clone(),
+                shutdown.clone(),
+            );
+            let l1 = L1Config {
+                eth_rpc_url: config.eth_rpc_url.clone(),
+                input_box_address: input_box,
+                app_address: config.app_address,
+                batch_submitter_private_key,
+                batch_submitter_address,
+            };
+            (reader, genesis, l1)
+        }
+        Err(source) => return Err(RunError::InputReader { source }),
     };
-    input_reader
-        .sync_to_current_safe_head()
-        .await
-        .map_err(|source| RunError::InputReader { source })?;
+    // ── Startup config ──────────────────────────────────────────────
+    assert!(
+        config.preemptive_margin_blocks < sequencer_core::MAX_WAIT_BLOCKS,
+        "preemptive_margin_blocks ({}) must be less than MAX_WAIT_BLOCKS ({})",
+        config.preemptive_margin_blocks,
+        sequencer_core::MAX_WAIT_BLOCKS,
+    );
+    let danger_threshold =
+        sequencer_core::MAX_WAIT_BLOCKS.saturating_sub(config.preemptive_margin_blocks);
 
     tracing::info!(
         http_addr = %config.http_addr,
@@ -132,8 +192,27 @@ where
         input_reader_genesis_block,
         chain_id = config.chain_id,
         app_address = %l1_config.app_address,
-        "starting sequencer"
+        batch_submitter_address = %l1_config.batch_submitter_address,
+        max_wait_blocks = sequencer_core::MAX_WAIT_BLOCKS,
+        preemptive_margin_blocks = config.preemptive_margin_blocks,
+        danger_threshold,
+        "sequencer startup"
     );
+
+    // ── Preemptive recovery ────────────────────────────────────────
+    // See docs/recovery/ for the full design and TLA+ spec.
+    crate::recovery::run_preemptive_recovery(
+        &db_path,
+        &mut input_reader,
+        l1_config.batch_submitter_address,
+        &l1_config.eth_rpc_url,
+        &l1_config.batch_submitter_private_key,
+        sequencer_core::MAX_WAIT_BLOCKS,
+        danger_threshold,
+        config.seconds_per_block,
+    )
+    .await
+    .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
 
     let storage = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
     let (tx, mut inclusion_lane_handle) = InclusionLane::start(
@@ -148,6 +227,9 @@ where
     // Batch submitter uses the same L1 config (InputBox address and RPC URL) as the input reader.
     let batch_submitter_config = BatchSubmitterConfig {
         idle_poll_interval_ms: config.batch_submitter_idle_poll_interval_ms,
+        max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+        preemptive_margin_blocks: config.preemptive_margin_blocks,
+        seconds_per_block: config.seconds_per_block,
     };
     let poster_config = BatchPosterConfig {
         l1_submit_address: l1_config.input_box_address,
@@ -159,17 +241,26 @@ where
     };
     let provider = build_batch_submitter_provider(&l1_config)?;
 
-    // Validate that the RPC chain ID matches --chain-id.
-    use alloy::providers::Provider;
-    let rpc_chain_id = provider
-        .get_chain_id()
-        .await
-        .map_err(|e| std::io::Error::other(format!("failed to query RPC chain ID: {e}")))?;
-    assert_eq!(
-        rpc_chain_id, config.chain_id,
-        "RPC chain ID {rpc_chain_id} does not match --chain-id {}",
-        config.chain_id
-    );
+    // Validate that the RPC chain ID matches --chain-id (skip if L1 unreachable —
+    // the cache already validated chain_id during bootstrap fallback above).
+    {
+        use alloy::providers::Provider;
+        match provider.get_chain_id().await {
+            Ok(rpc_chain_id) => {
+                assert_eq!(
+                    rpc_chain_id, config.chain_id,
+                    "RPC chain ID {rpc_chain_id} does not match --chain-id {}",
+                    config.chain_id
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "could not validate RPC chain ID — L1 unreachable, trusting config"
+                );
+            }
+        }
+    }
 
     let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
     let submitter = BatchSubmitter::new(

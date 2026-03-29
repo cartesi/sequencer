@@ -20,4 +20,5 @@ LEFT JOIN frames f
 LEFT JOIN safe_inputs d
   ON d.safe_input_index = s.safe_input_index
 WHERE s.offset > ?1
+  AND s.batch_index NOT IN (SELECT batch_index FROM invalid_batches)
 ORDER BY s.offset ASC

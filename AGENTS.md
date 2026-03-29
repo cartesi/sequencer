@@ -41,9 +41,12 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - `sequencer/src/inclusion_lane/lane.rs`: batched execution/commit loop (single lane).
 - `sequencer/src/inclusion_lane/types.rs`: inclusion-lane queue item and pipeline error types.
 - `sequencer/src/inclusion_lane/error.rs`: inclusion-lane runtime and catch-up error types.
+- `sequencer/src/batch_submitter/worker.rs`: stateless batch submitter — assigns nonces, populates safe metadata, checks staleness, bulk-submits pending batches to L1.
 - `sequencer/src/input_reader/`: safe-input ingestion from InputBox into SQLite.
 - `sequencer/src/l2_tx_feed/mod.rs`: DB-backed ordered-L2Tx feed used by WS subscriptions.
 - `sequencer/src/storage/mod.rs`: DB open, migrations, frame persistence, and direct-input broker APIs.
+- `sequencer/src/storage/db.rs`: main storage API — batch management, recovery (cascade invalidation, nonce assignment, safe batch population), and ordered-L2Tx queries.
+- `sequencer/src/storage/sql.rs`: SQL constants and low-level query functions.
 - `sequencer/src/storage/migrations/`: DB schema/bootstrapping (`0001`).
 - `sequencer-core/src/`: shared domain types/interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, broadcast message model).
 - `examples/app-core/src/application/mod.rs`: wallet prototype implementing `Application`.
@@ -55,7 +58,7 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - API validates signature and enqueues signed `UserOp`; method decoding happens during application execution.
 - Deposits are direct-input-only (L1 -> L2) and must not be represented as user ops.
 - Rejections (`InvalidNonce`, fee cap too low, insufficient gas balance) produce no state mutation and are not persisted.
-- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`.
+- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`. Recovery metadata lives in `batch_nonces`, `safe_accepted_batches`, and `invalid_batches`.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame.
 - The next frame fee is sampled from `batch_policy_derived.recommended_fee` when rotating to a new frame (defaults follow `batch_policy` bootstrap rows; tune `gas_price` / `alpha` via SQLite if needed).
 - `/ws/subscribe` currently has internal guardrails: subscriber cap `64`, catch-up cap `50000`.
@@ -80,7 +83,8 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - `safe_inputs` contains only L1 app direct input **bodies**. InputBox payload first byte: **0x00** = direct input (tag stripped, body stored and executed), **0x01** = batch submission (for scheduler, not stored), **others** = discarded (invalid/garbage). The input reader only accepts 0x00-tagged payloads and stores `payload[1..]`.
 - Safe cursor/head values should be derived from persisted facts when possible, not duplicated as mutable fields.
 - Replay/catch-up must use persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics.
-- Included user-op identity is constrained by `UNIQUE(sender, nonce)`.
+- Cursor pagination for ordered L2 txs uses **SQLite rowid** (`s.offset`), not count-based offsets. This avoids holes in the offset space caused by invalidated batches, which would break count-based pagination.
+- Included user-op identity is tracked by application nonce logic (no DB uniqueness constraint — removed to allow resubmission after recovery).
 
 ## Type Boundaries
 
@@ -174,11 +178,7 @@ Focus tests on:
 
 If adding integration tests, prefer black-box tests around `POST /tx` and commit outcomes.
 
-Some `sequencer` tests use Anvil and are opt-in locally:
-
-```bash
-RUN_ANVIL_TESTS=1 cargo test -p sequencer --lib
-```
+Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a clear message if `anvil` is not on PATH. Install Foundry or use `nix develop` to get it.
 
 ## Definition of Done for Agent Changes
 
@@ -190,6 +190,109 @@ Before finishing, ensure:
    - what changed
    - why it changed
    - risk/compatibility notes
+
+## Sequencer / Scheduler Duality
+
+The system has two sides that must agree on transaction ordering:
+
+- **Sequencer** (off-chain, low-latency): orders user ops into frames and batches, posts them to L1 via the InputBox contract. Gives "soft confirmations" — the ordered stream visible to WebSocket subscribers.
+- **Scheduler** (on-chain, inside the rollup): replays the same ordering by reading batches from L1 safe inputs. Each frame's `safe_block` marker tells the scheduler where to splice direct inputs (deposits) between user ops.
+
+The `safe_block` in each frame is the synchronization primitive. When the scheduler processes a frame, it first drains all pending direct inputs whose block number ≤ `safe_block`, then executes the frame's user ops. This guarantees both sides produce the same execution order.
+
+## Batch Staleness and Recovery
+
+> See `docs/recovery/` for the full conceptual model: the batch tree, coloring, nonce poisoning, uncertainty intervals, Silver-only detection, and the preemptive recovery design.
+> See `docs/recovery/preemptive.tla` for the TLA+ spec (157M states verified). See `docs/recovery/history/` for the optimistic alternative and design evolution.
+
+A batch becomes **stale** when `inclusion_block - first_frame.safe_block >= max_wait_blocks` (currently 1200 blocks, ~4 hours). This means the batch sat on L1 too long before the scheduler processed it -- by the time it runs, the direct-input splice points are dangerously far behind.
+
+When the scheduler encounters a stale batch, it **skips it entirely** -- no nonce consumed, no state change, no report. It's a true no-op in nonce space.
+
+### Cascading invalidation via nonce poisoning
+
+If a batch is stale, **all subsequent batches are also invalid**. The primary mechanism is nonce poisoning: the scheduler's expected-nonce counter does not advance when a stale batch is skipped. Every subsequent batch arrives with a nonce the scheduler isn't expecting, so it's rejected regardless of its own staleness. Invalidation is therefore a suffix operation: marking batch N invalid cascades to N+1, N+2, ..., including the open batch.
+
+### Silver-only detection (critical constraint)
+
+Recovery must only be triggered when the frontier batch is **Silver** (safe on L1). Detecting staleness on Pending or Bronze batches is unsafe: TLA+ model checking found a race where wallet-nonce mutual exclusion kills the frontier zombie before the scheduler sees it, allowing non-frontier dead batches to pass the nonce check. See `docs/recovery/` "Why Recovery Must Wait for Silver" for the full counterexample.
+
+### Preemptive recovery
+
+Rather than waiting for a batch to become stale on L1, the sequencer uses a **danger threshold** (`MAX_WAIT_BLOCKS - MARGIN`). When the frontier batch's current staleness reaches this threshold:
+
+1. **Go offline** -- stop accepting user ops
+2. **Flush mempool** -- submit no-op transactions at all pending `w_nonce` slots, wait for safe finality. This resolves all mempool uncertainty: every slot is either a batch (Silver) or a no-op (dead).
+3. **Run recovery** -- on fully-finalized L1 state: populate gold frontier, detect stale Silver, cascade-invalidate, open recovery batch
+4. **Resume** -- restart batch submitter and user-op acceptance
+
+### Recovery tables
+
+Two auxiliary tables support recovery:
+
+- **`batch_nonces`** (`batch_index` PK, `nonce`): Separates nonce assignment (batch submitter's job) from batch creation (sequencer's job). Nonces are NOT unique -- after invalidation and recovery, new batches reuse nonces. Assigned by `assign_batch_nonces()` which finds un-nonced valid closed batches and assigns sequential nonces starting from `MAX(nonce) + 1` over non-invalid batches.
+
+- **`safe_accepted_batches`** (`safe_input_index` PK -> `safe_inputs`, `nonce`, `first_frame_safe_block`, `inclusion_block`): A derived log of batch submissions the scheduler would actually execute. Populated by `populate_safe_accepted_batches()`, which simulates the scheduler's acceptance logic: scans safe inputs in order, skips stale batches, and only records submissions where `nonce == expected_nonce`. Duplicates, out-of-order submissions, and old pre-recovery in-flight transactions are automatically skipped.
+
+### Recovery procedure
+
+1. **Populate accepted frontier**: `populate_safe_accepted_batches()` simulates the scheduler's acceptance logic over safe inputs, building the `safe_accepted_batches` table.
+
+2. **Assign nonces**: `assign_batch_nonces()` assigns contiguous nonces to any valid closed batches that don't have one yet.
+
+3. **Detect and recover (atomic)**: `detect_and_recover(max_wait_blocks)` runs inside a single `Immediate` SQLite transaction:
+   - Computes the accepted frontier (how many batches the scheduler has accepted).
+   - Finds the valid local batch at that nonce (the first unaccepted batch).
+   - If it exists and is stale **by inclusion** (it must be Silver at this point), cascade-invalidates ALL batches with index >= stale batch.
+   - Opens a fresh recovery batch (insert batch + frame + re-drain pending directs, including any from invalidated batches).
+   - Also handles the edge case where a previous boot invalidated the suffix but crashed before reopening -- if no valid open batch exists, one is created.
+   - Commits atomically -- either the entire recovery succeeds or nothing changes.
+
+4. **Filtering**: All storage queries that derive state from batch data (`latest_batch_index`, `ordered_l2_txs`, `drained_direct_count`, `l2_tx_count`) exclude rows from `invalid_batches`. Catch-up replay, lane state initialization, and the L2 tx feed automatically skip invalidated transactions. Direct inputs from invalidated batches are re-drained into the recovery batch.
+
+### Nonce decoupling
+
+The local `batch_index` (monotonic, includes invalid batches) is distinct from the batch `nonce` (contiguous over valid batches, stored in `batch_nonces`). After cascade invalidation and recovery, new batches reuse nonces starting from the first invalid nonce. Among valid batches, nonces are unique -- this is what makes the nonce-to-index mapping unambiguous for the recovery path (L1 works in nonce-space, the sequencer in index-space).
+
+### Stateless batch submitter
+
+The batch submitter derives everything from DB + chain state each tick:
+
+1. Assign nonces and populate safe_accepted_batches (write DB metadata).
+2. **Danger threshold check** -- compare the frontier batch's `safe_block` against `current_safe_block`. If `current_safe_block - safe_block >= DANGER_THRESHOLD`, trigger preemptive recovery (shutdown for flush + recovery).
+3. Derive next nonce from L1 (safe prefix + observed recent transactions).
+4. `load_pending_batches(next_nonce)` -- get all pending valid batches with nonce >= next.
+5. **Bulk-submit ALL pending batches** with incrementing wallet nonces. Must use `max(walletNonce, nextL1Slot)` as starting nonce. L1 tx nonce guarantees ordering.
+
+### Detection: safe-only, with wall-clock fallback
+
+Staleness is only checked against L1 **safe** state, never latest. If there are stale batches in latest that haven't reached safe yet, they will eventually become safe, and the staleness check will then trigger recovery. This avoids reacting to L1 reorgs.
+
+When L1 is unreachable, the DB-based danger check sees stale (frozen) `current_safe_block` data and may fail to trigger. The batch submitter falls back to **wall-clock estimation**: `estimated_missed_blocks = (now - last_l1_success) / seconds_per_block`. The danger threshold is adjusted downward by this estimate. At startup, a similar wall-clock check uses the oldest valid batch's `created_at_ms` to decide whether to proceed (before danger zone) or block (in danger zone). See `docs/recovery/` "L1 unreachability" for details.
+
+### Two staleness references
+
+The staleness formula is `reference_block - first_frame_safe_block >= MAX_WAIT_BLOCKS`, but the reference block differs by context:
+
+- **Inclusion staleness** (`inclusion_block`): the scheduler's check. Each batch has its own inclusion block. Not monotonic -- a promptly submitted old batch can be healthy while a late-submitted newer batch is stale. Shapes the gold frontier.
+- **Current staleness** (`current_safe_block`): the sequencer's detection check. Same reference for all batches. Monotonic within the valid path (earlier batches have smaller `first_frame_safe_block`). The frontier batch is always the most-stale, so the system only needs to check it.
+
+Cascade invalidation does not rely on staleness being monotonic. It follows from nonce poisoning: once one batch is skipped, all subsequent nonces are unreachable (see `docs/recovery/`).
+
+### Key design choices
+
+- **Silver-only detection** -- recovery is triggered only when the frontier batch is Silver (safe on L1). This is critical for correctness: it guarantees the stale batch is permanently on L1 and the scheduler is poisoned before any recovery batch is processed. TLA+ V2 proved this is necessary (see `docs/recovery/`).
+- **Preemptive flush** -- the sequencer goes offline and flushes the mempool with no-op transactions before running recovery. This eliminates mempool uncertainty and dead-batch races.
+- **No wallet nonce reset** -- `walletNonce` must NOT be reset during recovery. Recovery batches use `w_nonces` past all dead batch slots. The flush consumes dead batch slots by advancing `nextL1Slot` up to `walletNonce`.
+- **Wall-clock fallback** -- when L1 is unreachable, the batch submitter and startup recovery use `elapsed / seconds_per_block` to estimate block progression. This prevents the sequencer from silently issuing doomed soft confirmations during extended L1 outages.
+- **Cascading invalidation** -- a single stale batch invalidates the entire suffix of batch space, including the open batch.
+- **Append-only `invalid_batches` table** rather than mutating existing rows -- consistent with the storage model's append-oriented philosophy.
+- **Atomic crash-safe recovery** -- detection, cascade invalidation, and recovery batch opening all happen in one SQLite transaction. A crash at any point leaves the DB unchanged.
+- **Frontier-based stale detection** -- `safe_accepted_batches` simulates the scheduler's acceptance logic, so stale detection compares the local batch chain against the accepted frontier rather than matching individual L1 submissions.
+- **Direct input re-draining** -- when a batch is invalidated, its direct inputs (deposits) are re-drained into the recovery batch.
+- **Idempotent** -- running detection and nonce assignment multiple times is safe (`INSERT OR IGNORE`).
+- **Nonce-0 edge case** -- recovery requires at least one Gold ancestor. The TLA+ model uses a genesis sentinel (Gold at nonce 0) to close this hole. The implementation can handle it however is simplest (see `docs/recovery/` for options).
+- **`MAX_WAIT_BLOCKS`** is a shared constant in `sequencer-core` (1200), used by both the scheduler and the sequencer.
 
 ## Near-Term Roadmap Hints
 

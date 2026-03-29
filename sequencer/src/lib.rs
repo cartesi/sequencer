@@ -13,6 +13,7 @@ pub mod input_reader;
 pub mod l2_tx_feed;
 pub mod partition;
 pub mod provider;
+pub mod recovery;
 mod runtime;
 pub mod shutdown;
 pub mod storage;

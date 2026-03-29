@@ -1,0 +1,256 @@
+# Batch Recovery
+
+This document describes the recovery design for the sequencer: how the system detects that batches are failing to land on L1, and how it recovers to a consistent state. The design is verified with bounded TLA+ model checking ([`preemptive.tla`](preemptive.tla)).
+
+See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and function names.
+
+## The Batch Tree
+
+Batches form a tree where each node is a batch and edges point from child to parent. Each batch has a single parent: the preceding batch in the valid chain.
+
+Batches have two identifiers:
+
+- **Index** (`batch_index`): monotonically increasing, unique, never reused. Creation order.
+- **Nonce** (`batch_nonce`): depth of the node in the tree. Assigned by the batch submitter to valid closed batches.
+
+In normal operation the tree degenerates into a list -- index and nonce increase in lockstep. Branches appear only after recovery, when a suffix of the chain is invalidated and a new batch forks from the last valid ancestor.
+
+There is always exactly one **valid path** (root to leaf) that constitutes the current batch chain. The valid path splits into a **prefix** (safe on L1, accepted by the scheduler) and a **suffix** (pending or confirming).
+
+### Genesis sentinel (nonce-0 edge case)
+
+Recovery requires at least one Gold ancestor (the cascade invalidates a suffix and forks from the last Gold batch). If the very first batch (nonce 0) goes stale before any batch becomes Gold, there is no ancestor to fork from.
+
+The TLA+ model handles this with a **genesis sentinel**: the initial state starts with a Gold batch at nonce 0. This is a modeling technique that eliminates the nonce-0 special case, allowing Resolve to use uniform logic (the `fng > 1` guard is always satisfied). Without it, the model would need a separate Resolve action with different arithmetic for the "no Gold ancestor" case.
+
+The implementation can handle the nonce-0 case either by submitting a sentinel batch at first startup, or by special-casing the recovery code for the "no Gold ancestor" branch.
+
+## Coloring
+
+Every batch on the valid path has exactly one color. Dead branches are lead (permanently invalid).
+
+### Simplified model (three colors)
+
+| Color      | Meaning                                                        | Terminal? |
+|------------|----------------------------------------------------------------|-----------|
+| **Gold**   | Safe on L1 and accepted by the scheduler                       | Yes       |
+| **Silver** | Valid, optimistically executed, but not yet safe/accepted      | No        |
+| **Lead**   | Invalid (in `invalid_batches`)                                 | Yes       |
+
+Gold batches form a contiguous prefix of the valid path. Silver batches form a contiguous suffix (after the gold prefix up to the open batch). Lead batches hang off gold nodes as dead branches -- the first lead in any cascade always has a gold parent.
+
+### Extended model (five colors)
+
+To model the full lifecycle including L1 submission:
+
+| Color       | Meaning                                                | Has `w_nonce`? |
+|-------------|--------------------------------------------------------|----------------|
+| **Tip**     | Open batch, not yet closed                             | No             |
+| **Pending** | Closed, may or may not be submitted to mempool         | Maybe          |
+| **Bronze**  | Included in an L1 block, block not yet safe            | Yes            |
+| **Silver**  | Included, block has reached safe finality              | Yes            |
+| **Gold**    | Safe, accepted and executed by the scheduler           | Yes            |
+
+The spine ordering invariant: `Gold* Silver* Bronze* Pending* Tip`
+
+A Pending batch may have a `w_nonce` (submitted to the L1 mempool but not yet included in a block) or not (not yet submitted). The batch submitter assigns `w_nonce`s to all unsubmitted Pending batches at once, in spine-position order.
+
+## Nonce Poisoning
+
+The scheduler maintains a single counter: "I expect batch nonce N next."
+
+When a batch with nonce N arrives stale, the scheduler **skips it entirely** -- no nonce increment, no state change, no report. It is a true noop in nonce-space.
+
+This poisons the nonce counter. Every subsequent batch (nonce N+1, N+2, ...) is dead on arrival. Not because they are individually stale, but because the scheduler still expects nonce N. The only batch with nonce N was stale and skipped, so the counter will never advance past N.
+
+Cascade invalidation is therefore **exact, not conservative**. The sequencer's `WHERE batch_index >= stale_batch_index` mirrors precisely what the scheduler will do (refuse). The entire silver suffix is unreachable once any batch in it is stale.
+
+Recovery is the only way forward: create a new batch with nonce N, giving the scheduler what it needs to resume.
+
+## Two Staleness References
+
+The staleness formula is `reference_block - first_frame_safe_block >= MAX_WAIT_BLOCKS`, but the reference block differs by context:
+
+### Inclusion staleness (scheduler's perspective)
+
+```
+inclusion_block - first_frame_safe_block >= MAX_WAIT_BLOCKS
+```
+
+Used by `populate_safe_accepted_batches` to simulate what the scheduler accepts. Each batch has its own inclusion block (the L1 block where its submission landed). **Not monotonic** across batches -- a promptly submitted old batch can be healthy while a late-submitted newer batch is stale.
+
+Inclusion staleness determines the **gold frontier**: the set of batches the scheduler has accepted.
+
+### Current staleness (sequencer's detection)
+
+```
+current_safe_block - first_frame_safe_block >= MAX_WAIT_BLOCKS
+```
+
+Used by the danger threshold detector. The reference block (`current_safe_block`) is the same for all batches. **Monotonic within the valid path** -- earlier batches have smaller `first_frame_safe_block`, so larger difference. If the frontier batch is not stale by this measure, no batch is.
+
+Current staleness triggers **preemptive recovery** (see below).
+
+## Nonce Uniqueness on the Valid Path
+
+The `batch_nonces` table can have duplicate nonces across the full table -- a recovery batch reuses the nonce of the first batch it replaces. But among **valid batches** (those not in `invalid_batches`), nonces are unique.
+
+This matters because L1 works in nonce-space (the scheduler identifies batches by nonce) while the sequencer works in index-space (local `batch_index`). The recovery path needs to translate between them: "which batch indexes should we invalidate?" Nonce uniqueness on the valid path is what makes this mapping unambiguous.
+
+## The L1 Stream
+
+L1 processes transactions in `w_nonce` order. At each slot (a given `w_nonce` value), exactly one transaction is included. If multiple transactions compete for the same slot (e.g., a dead batch and a flush no-op), L1 non-deterministically picks one. The loser is discarded.
+
+This is the interface between the sequencer and the scheduler. The scheduler sees a stream of entries ordered by `w_nonce`, each with a `batch_nonce`, `inclusion_block`, and `safe_block`. It processes them in order, accepting or rejecting based on nonce match and staleness.
+
+## The Uncertainty Interval
+
+The core insight behind the recovery design is that **mempool uncertainty is bounded by a time interval**.
+
+Once a batch's `safe_block` is old enough that `current_safe_block - safe_block >= MAX_WAIT_BLOCKS`, we know it is stale no matter when it lands on L1 (because `inclusion_block >= current_safe_block`). Any batch in the mempool with that `safe_block` is dead-on-arrival. This means mempool uncertainty has a natural expiration: after `MAX_WAIT_BLOCKS`, the L1 outcome doesn't matter.
+
+This gives us three regimes:
+
+```
+|---------- safe ----------|-- danger zone --|-- past MAX_WAIT --|
+        no action             flush + recover     self-resolved
+```
+
+- **Before the danger zone**: batches are young. Nothing to do.
+- **In the danger zone**: batches might land stale, or might still make it. This is the window of uncertainty. The flush resolves it by forcing every `w_nonce` slot to finalize (batch wins or no-op wins). After the flush, the sequencer reads the scheduler's finalized state and cascades if needed.
+- **Past MAX_WAIT**: all unresolved batches are guaranteed stale by L1 monotonicity (`inclusion_block >= current_safe_block >= safe_block + MAX_WAIT`). Staleness self-resolves -- the L1 outcome doesn't matter because every possible inclusion is stale. This means the flush could in principle be skipped: just wait for all slots to be consumed (which happens naturally as L1 progresses), then read the scheduler's state. In the implementation, the flush is still recommended for all cases (it's cheap when past MAX_WAIT since all competing batches are stale anyway), but the self-resolution property is what makes the design robust to long outages.
+
+**What TLA+ proves vs external reasoning**: the TLA+ model ([`preemptive.tla`](preemptive.tla)) proves that after all `w_nonce` slots are resolved (however that happens), ZombieSafety holds. It does not model the danger threshold or the passage of time. The claim that "past MAX_WAIT, staleness self-resolves" is an external argument from L1 monotonicity (`inclusion_block >= current_safe_block`), not something TLA+ checks.
+
+Any recovery design must wait out this uncertainty. The question is how. The preemptive design (implemented here) forces resolution by going offline and flushing. An alternative optimistic design lets the uncertainty resolve naturally but keeps serving soft confirmations -- see [`history/`](history/) for that approach and why we preferred preemptive.
+
+## Silver-Only Detection
+
+Recovery must only cascade-invalidate when the frontier batch is **Silver** (safe on L1). This constraint is shared by all recovery designs and is critical for correctness.
+
+A Silver batch's L1 entry is permanent -- no mempool competition can kill it. The scheduler **will** see it, at a `w_nonce` lower than any recovery batch, and be poisoned. This ordering guarantee is what makes nonce poisoning reliable.
+
+Detecting staleness on Pending or Bronze batches is unsafe: a recovery batch can take the frontier's L1 slot via wallet-nonce mutual exclusion, preventing the scheduler from ever seeing the stale frontier, and allowing non-frontier dead batches to pass the nonce check. TLA+ model checking found this bug; see [`history/`](history/) for the counterexample.
+
+## Preemptive Recovery Design
+
+The sequencer uses a preemptive approach: detect danger early, go offline, flush the mempool, then recover on solid ground. This design was preferred over the optimistic alternative because it is simpler to reason about and produces fewer invalidated soft confirmations (the sequencer stops issuing them before the cascade).
+
+### Step 1: Danger threshold
+
+Define `DANGER_THRESHOLD = MAX_WAIT_BLOCKS - MARGIN`. When the frontier batch's current staleness (`current_safe_block - safe_block`) reaches `DANGER_THRESHOLD`, trigger preemptive recovery.
+
+The margin must cover: flush submission time + L1 safe finality wait (~15 min on Ethereum) + recovery execution time. With `MAX_WAIT_BLOCKS = 1200` (~4 hours), a margin of ~75 blocks (~15 min) is conservative.
+
+### Step 2: Go offline
+
+Stop accepting new user operations. From the outside world, the sequencer is temporarily unavailable. This eliminates concurrent batch creation during recovery.
+
+### Step 3: Flush mempool
+
+Query the latest confirmed `w_nonce` (N) and the pending `w_nonce` (M). Submit `M - N` no-op transactions (e.g., self-transfer of 0 ETH) at nonces N, N+1, ..., M-1. These compete with any batches in the mempool at the same slots.
+
+Wait for all `M - N` slots to reach L1 safe finality.
+
+### Step 4: Post-flush state
+
+Every `w_nonce` slot from N to M-1 is now resolved:
+
+- **Batch won**: the batch is on L1 and safe (Silver or Gold)
+- **No-op won**: the batch is dead forever, its slot consumed
+
+There are no more mempool entries. All uncertainty is resolved.
+
+### Step 5: Run recovery
+
+This is an atomic SQLite transaction operating on fully-finalized L1 state:
+
+1. **Populate gold frontier** (`populate_safe_accepted_batches`): scan L1 safe inputs, simulate scheduler acceptance logic. Learn `schedulerExpected` -- the next batch nonce the scheduler needs.
+2. **Assign nonces** (`assign_batch_nonces`): give contiguous nonces to un-nonced valid closed batches.
+3. **Detect staleness**: if the first unaccepted batch is stale by inclusion, cascade-invalidate it and all successors. If nothing is stale (all batches made it in time), skip to step 6.
+4. **Open recovery batch**: fresh batch with `batch_nonce = schedulerExpected`, re-drain direct inputs from invalidated batches.
+
+### Step 6: Resume
+
+Restart the batch submitter and user-op acceptance. The sequencer is back online.
+
+### Startup behavior
+
+On startup, the sequencer doesn't know whether it was a preemptive shutdown, a spurious restart, or coming online after a long outage. It runs the same detection logic:
+
+1. **Before the danger zone**: no action needed. Continue normally.
+2. **In the danger zone**: flush (step 3), wait for finality (step 4), then run recovery (step 5).
+3. **Past MAX_WAIT**: staleness has self-resolved, but `w_nonce` slots may still be unresolved (batches pending in the mempool). Flush (step 3) to resolve slots, then run recovery (step 5). The flush is cheap here -- all competing batches are stale anyway.
+
+Cases 2 and 3 differ in *why* batches are stale (danger zone: they might land stale; past MAX_WAIT: they're guaranteed stale) but follow the same procedure. The flush in case 3 is an optimization concern, not a safety concern: even without flushing, any batch that eventually lands will be stale, so ZombieSafety holds. But `populate_safe_accepted_batches` needs to see all safe L1 entries to compute `schedulerExpected` accurately, so waiting for slot resolution (via flush or naturally) is needed for correct recovery.
+
+**What TLA+ proves here**: the model does not distinguish these three cases. It proves ZombieSafety assuming all `w_nonce` slots are eventually resolved. The claim that past MAX_WAIT the flush can be replaced by waiting for natural slot resolution is external reasoning from L1 monotonicity.
+
+### L1 unreachability
+
+The danger zone check and the flush both require L1. If L1 is unreachable, the sequencer must decide whether to proceed (before danger zone) or block (in danger zone).
+
+**At startup**: the sequencer attempts to sync the safe head from L1. If this fails, it falls back to a **wall-clock danger estimate**: read the oldest valid batch's `created_at_ms` from the DB, compute `wall_clock_age = (now - created_at) / seconds_per_block`, and compare against the danger threshold. If the estimate is before the danger zone, the sequencer proceeds with stale DB data — the input reader and batch submitter will catch up when L1 returns. If the estimate is in or past the danger zone, the sequencer refuses to start (it can't safely issue soft confirmations without knowing L1 state).
+
+**At runtime**: the batch submitter retries on L1 errors (provider failures). On each retry, it runs the same wall-clock estimate: `estimated_missed_blocks = (now - last_l1_success) / seconds_per_block`. It adjusts the danger threshold downward by this estimate. If the adjusted check triggers, the batch submitter crashes for recovery. This ensures the sequencer doesn't keep issuing soft confirmations while disconnected from L1 long enough to cross the danger zone.
+
+**Other workers during L1 outages**: the inclusion lane and API are purely local (SQLite) and continue operating. The input reader retries L1 polling with error logging. All L1-dependent workers log errors at the `error` level to alert operators.
+
+The `seconds_per_block` parameter (default: 12 for Ethereum) is configurable via `SEQ_SECONDS_PER_BLOCK`. The wall-clock estimate is conservative — it may overestimate age (if blocks are slower than assumed), which causes earlier detection. This is correct: better to crash early than to issue doomed soft confirmations.
+
+## Dead Batches
+
+After cascade invalidation, submitted Pending batches (those with `w_nonce` assigned) are **dead batches**. They are still in the L1 mempool, competing with their flush no-op transactions.
+
+Two outcomes per dead batch, non-deterministic:
+
+- **Dead batch beats no-op**: lands on L1, scheduler sees it, rejects it (stale by inclusion, or nonce-poisoned by a preceding stale/missing batch)
+- **No-op beats dead batch**: dead batch killed forever, scheduler never sees it (the scheduler skips the gap)
+
+A killed batch acts as **silent nonce poison**: the scheduler never sees it, so `schedulerExpected` stays stuck at its `batch_nonce`. All subsequent batches have wrong nonces.
+
+Dead batches occupy `w_nonce` slots strictly below `walletNonce`. Recovery batches occupy `w_nonce` slots at or above `walletNonce`. **No overlap.** This is why no mutual exclusion is needed between dead batches and recovery batches -- they live in non-overlapping `w_nonce` ranges.
+
+## Implementation Constraints
+
+These constraints were discovered during TLA+ model checking and are required for correctness:
+
+1. **`walletNonce` must NOT be reset during recovery.** Recovery batches must use `w_nonces` strictly past all dead batch slots. The flush consumes dead batch slots by advancing `nextL1Slot` up to `walletNonce`. Recovery starts fresh from there.
+
+2. **`SubmitBatch` must use `max(walletNonce, nextL1Slot)`.** Prevents assigning `w_nonce` values for slots L1 has already consumed.
+
+3. **`SubmitBatch` must assign ALL pending batches at once, in spine-position order.** If batches are submitted individually, a flush-win can bump one batch's `w_nonce` past a later batch's, violating the spine ordering invariant.
+
+4. **Wall-clock fallback when L1 is unreachable.** The batch submitter must track the last successful L1 communication time. On provider errors, it must estimate block progression from wall-clock time (`elapsed / seconds_per_block`) and crash if the estimated age exceeds the danger threshold. Without this, an L1 outage can silently push batches past the danger zone while the DB-based check sees stale (frozen) data.
+
+## Formal Verification
+
+The recovery design is verified with bounded TLA+ model checking. The canonical spec is [`preemptive.tla`](preemptive.tla). An alternative optimistic design is preserved in [`history/optimistic.tla`](history/optimistic.tla).
+
+**Scope and limitations**: these are bounded safety models. They exhaustively check all reachable states within the configured bounds, but do not prove liveness (eventual progress), do not model the danger threshold trigger or timing margins, and do not model crash/restart (the implementation relies on SQLite atomic transactions for crash safety).
+
+### `preemptive.tla` -- Slot-level safety under adversarial flush
+
+Models the core slot-level mechanics of preemptive recovery. At every `w_nonce` slot, L1 non-deterministically includes the spine batch OR a flush no-op (killing the batch). This covers the case where the frontier batch itself is killed during flush.
+
+The model is a **safety over-approximation**: it allows `AdvanceTip` and `SubmitBatch` to interleave freely with recovery, which the real protocol prevents (the sequencer goes offline). This makes the proof stronger -- if `ZombieSafety` holds under more interleavings, it holds under fewer. However, the model does not verify the sequential protocol phases (cutover, flush, wait, recover, resume) described above.
+
+**Verified**: 157M states, 0 violations.
+
+| Invariant | Meaning |
+|-----------|---------|
+| ZombieSafety | `schedulerExpected = CountGold(spine)` -- scheduler accepts exactly the Gold prefix |
+| BatchNoncesContiguous | Batch nonces are 0..N-1 for non-Tip spine |
+| InvalidOnlyOnGold | Dead branches only hang off Gold nodes |
+| L1WNonceUnique | No two L1 entries share a `w_nonce` |
+| L1BeforeCursor | All L1 entries have `w_nonce < nextL1Slot` |
+| SchedulerBehindL1 | Scheduler cursor doesn't pass L1 cursor |
+| DeadNotYetIncluded | Dead batches have `w_nonce >= nextL1Slot` |
+
+### Running the spec
+
+```bash
+tlc -workers auto -deadlock docs/recovery/preemptive.tla    # ~90s
+```
+
+Bounds are in `preemptive.cfg`. The `MaxWalletNonce` bound keeps the state space finite (kill/resubmit cycles generate new `w_nonce` values). Increase bounds for higher confidence at the cost of longer runtime.

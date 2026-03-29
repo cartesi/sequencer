@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use rusqlite::{Connection, Result, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Result, Row, Transaction, params};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{SafeInputRange, StoredSafeInput};
@@ -20,10 +20,10 @@ const SQL_SELECT_USER_OP_COUNT_FOR_FRAME: &str =
     include_str!("queries/select_user_op_count_for_frame.sql");
 const SQL_SELECT_ORDERED_L2_TXS_FOR_BATCH: &str =
     include_str!("queries/select_ordered_l2_txs_for_batch.sql");
-const SQL_SELECT_LATEST_BATCH_INDEX: &str = "SELECT MAX(batch_index) FROM batches";
+const SQL_SELECT_LATEST_BATCH_INDEX: &str = "SELECT MAX(batch_index) FROM batches WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches)";
 const SQL_SELECT_USER_OPS_FOR_FRAME: &str = "SELECT nonce, max_fee, data, sig FROM user_ops WHERE batch_index = ?1 AND frame_in_batch = ?2 ORDER BY pos_in_frame ASC";
 const SQL_SELECT_MAX_SAFE_INPUT_INDEX: &str = "SELECT MAX(safe_input_index) FROM safe_inputs";
-const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_txs";
+const SQL_SELECT_ORDERED_L2_TX_COUNT: &str = "SELECT COUNT(*) FROM sequenced_l2_txs WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches)";
 const SQL_SELECT_BATCH_POLICY: &str = "SELECT log_recommended_fee, log_batch_size_target FROM batch_policy_derived WHERE singleton_id = 0 LIMIT 1";
 const SQL_SELECT_SAFE_BLOCK: &str =
     "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1";
@@ -36,9 +36,31 @@ const SQL_UPDATE_BATCH_POLICY_LOG_GAS_PRICE: &str =
 const SQL_UPDATE_BATCH_POLICY_ALPHA: &str =
     "UPDATE batch_policy SET log_alpha = ?1, log_one_plus_alpha = ?2 WHERE singleton_id = 0";
 const SQL_UPDATE_SAFE_BLOCK: &str =
+    "UPDATE l1_safe_head SET block_number = ?1, synced_at_ms = ?2 WHERE singleton_id = 0";
+const SQL_UPDATE_SAFE_BLOCK_BOOTSTRAP: &str =
     "UPDATE l1_safe_head SET block_number = ?1 WHERE singleton_id = 0";
+const SQL_TOUCH_L1_SYNC: &str = "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0";
+const SQL_INSERT_INVALID_BATCH: &str =
+    "INSERT OR IGNORE INTO invalid_batches (batch_index) VALUES (?1)";
+const SQL_SELECT_FIRST_FRAME_SAFE_BLOCK: &str =
+    "SELECT safe_block FROM frames WHERE batch_index = ?1 ORDER BY frame_in_batch ASC LIMIT 1";
+const SQL_INSERT_BATCH_NONCE: &str =
+    "INSERT OR IGNORE INTO batch_nonces (batch_index, nonce) VALUES (?1, ?2)";
+const SQL_INSERT_SAFE_ACCEPTED_BATCH: &str = "INSERT OR IGNORE INTO safe_accepted_batches (safe_input_index, nonce, first_frame_safe_block, inclusion_block) VALUES (?1, ?2, ?3, ?4)";
 #[derive(Debug, Clone)]
 pub(super) struct OrderedL2TxRow {
+    pub kind: i64,
+    pub sender: Option<Vec<u8>>,
+    pub data: Option<Vec<u8>>,
+    pub fee: Option<i64>,
+    pub payload: Option<Vec<u8>>,
+    pub block_number: Option<i64>,
+}
+
+/// Like `OrderedL2TxRow` but includes the DB offset for cursor-based pagination.
+#[derive(Debug, Clone)]
+pub(super) struct OrderedL2TxRowWithOffset {
+    pub offset: i64,
     pub kind: i64,
     pub sender: Option<Vec<u8>>,
     pub data: Option<Vec<u8>>,
@@ -71,7 +93,14 @@ pub(super) struct FrameUserOpRow {
 }
 
 pub(super) fn sql_select_total_drained_direct_inputs(conn: &Connection) -> Result<i64> {
-    const SQL: &str = "SELECT COUNT(*) FROM sequenced_l2_txs WHERE safe_input_index IS NOT NULL";
+    // Return the next safe_input_index to drain: MAX(safe_input_index) + 1 from
+    // valid (non-invalidated) batches. Using MAX+1 instead of COUNT(*) is robust
+    // against non-contiguous safe_input_index values.
+    // When a batch is invalidated, the cursor rewinds because those rows are filtered
+    // out, allowing re-draining into the recovery batch.
+    const SQL: &str = "SELECT COALESCE(MAX(safe_input_index) + 1, 0) FROM sequenced_l2_txs \
+                       WHERE safe_input_index IS NOT NULL \
+                       AND batch_index NOT IN (SELECT batch_index FROM invalid_batches)";
     conn.query_row(SQL, [], |row| row.get(0))
 }
 
@@ -123,8 +152,98 @@ pub(super) fn sql_select_safe_block(conn: &Connection) -> Result<i64> {
     conn.query_row(SQL_SELECT_SAFE_BLOCK, [], |row| row.get(0))
 }
 
-pub(super) fn sql_update_safe_block(conn: &Connection, safe_block: i64) -> Result<usize> {
-    conn.execute(SQL_UPDATE_SAFE_BLOCK, params![safe_block])
+pub(super) fn sql_update_safe_block(
+    conn: &Connection,
+    safe_block: i64,
+    synced_at_ms: i64,
+) -> Result<usize> {
+    conn.execute(SQL_UPDATE_SAFE_BLOCK, params![safe_block, synced_at_ms])
+}
+
+pub(super) fn sql_update_safe_block_bootstrap(conn: &Connection, safe_block: i64) -> Result<usize> {
+    conn.execute(SQL_UPDATE_SAFE_BLOCK_BOOTSTRAP, params![safe_block])
+}
+
+pub(super) fn sql_select_l1_sync_timestamp(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
+        [],
+        |row| row.get(0),
+    )
+}
+
+pub(super) fn sql_touch_l1_sync(conn: &Connection, synced_at_ms: i64) -> Result<usize> {
+    conn.execute(SQL_TOUCH_L1_SYNC, params![synced_at_ms])
+}
+
+/// Read cached L1 bootstrap data (input_box_address, genesis_block, chain_id).
+pub(super) fn sql_select_l1_bootstrap_cache(
+    conn: &Connection,
+) -> Result<Option<(Vec<u8>, i64, i64)>> {
+    conn.query_row(
+        "SELECT input_box_address, genesis_block, chain_id \
+         FROM l1_bootstrap_cache WHERE singleton_id = 0",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+/// Write L1 bootstrap data to cache.
+pub(super) fn sql_upsert_l1_bootstrap_cache(
+    conn: &Connection,
+    input_box_address: &[u8],
+    genesis_block: i64,
+    chain_id: i64,
+) -> Result<usize> {
+    conn.execute(
+        "INSERT OR REPLACE INTO l1_bootstrap_cache \
+         (singleton_id, input_box_address, genesis_block, chain_id) \
+         VALUES (0, ?1, ?2, ?3)",
+        params![input_box_address, genesis_block, chain_id],
+    )
+}
+
+pub(super) fn sql_insert_invalid_batch(conn: &Connection, batch_index: i64) -> Result<usize> {
+    conn.execute(SQL_INSERT_INVALID_BATCH, params![batch_index])
+}
+
+pub(super) fn sql_select_first_frame_safe_block(
+    conn: &Connection,
+    batch_index: i64,
+) -> Result<Option<i64>> {
+    conn.query_row(
+        SQL_SELECT_FIRST_FRAME_SAFE_BLOCK,
+        params![batch_index],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+pub(super) fn sql_insert_batch_nonce(
+    conn: &Connection,
+    batch_index: i64,
+    nonce: i64,
+) -> Result<usize> {
+    conn.execute(SQL_INSERT_BATCH_NONCE, params![batch_index, nonce])
+}
+
+pub(super) fn sql_insert_safe_accepted_batch(
+    conn: &Connection,
+    safe_input_index: i64,
+    nonce: i64,
+    first_frame_safe_block: i64,
+    inclusion_block: i64,
+) -> Result<usize> {
+    conn.execute(
+        SQL_INSERT_SAFE_ACCEPTED_BATCH,
+        params![
+            safe_input_index,
+            nonce,
+            first_frame_safe_block,
+            inclusion_block
+        ],
+    )
 }
 
 pub(super) fn sql_select_safe_inputs_range(
@@ -260,9 +379,12 @@ pub(super) fn sql_select_ordered_l2_txs_page_from_offset(
     conn: &Connection,
     offset: i64,
     limit: i64,
-) -> Result<Vec<OrderedL2TxRow>> {
+) -> Result<Vec<OrderedL2TxRowWithOffset>> {
     let mut stmt = conn.prepare_cached(SQL_SELECT_ORDERED_L2_TXS_PAGE_FROM_OFFSET)?;
-    let mapped = stmt.query_map(params![offset, limit], convert_row_to_ordered_l2_tx_row)?;
+    let mapped = stmt.query_map(
+        params![offset, limit],
+        convert_row_to_ordered_l2_tx_row_with_offset,
+    )?;
     mapped.collect()
 }
 
@@ -373,6 +495,18 @@ fn convert_row_to_ordered_l2_tx_row(row: &Row<'_>) -> Result<OrderedL2TxRow> {
     })
 }
 
+fn convert_row_to_ordered_l2_tx_row_with_offset(row: &Row<'_>) -> Result<OrderedL2TxRowWithOffset> {
+    Ok(OrderedL2TxRowWithOffset {
+        offset: row.get(0)?,
+        kind: row.get(1)?,
+        sender: row.get(2)?,
+        data: row.get(3)?,
+        fee: row.get(4)?,
+        payload: row.get(5)?,
+        block_number: row.get(6)?,
+    })
+}
+
 fn convert_row_to_latest_batch_with_user_op_count(row: &Row<'_>) -> Result<(i64, i64, i64)> {
     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
 }
@@ -396,13 +530,13 @@ mod tests {
         SQL_INSERT_USER_OP, sql_insert_open_batch, sql_insert_open_batch_with_index,
         sql_insert_open_frame, sql_insert_safe_inputs_batch, sql_insert_sequenced_direct_inputs,
         sql_insert_user_ops_batch, sql_select_batch_policy, sql_select_frames_for_batch,
-        sql_select_latest_batch_index, sql_select_latest_batch_with_user_op_count,
-        sql_select_max_safe_input_index, sql_select_ordered_l2_tx_count,
-        sql_select_ordered_l2_txs_from_offset, sql_select_ordered_l2_txs_page_from_offset,
-        sql_select_safe_block, sql_select_safe_inputs_range,
-        sql_select_total_drained_direct_inputs, sql_select_user_ops_for_frame,
-        sql_update_batch_policy_alpha, sql_update_batch_policy_log_gas_price,
-        sql_update_safe_block,
+        sql_select_l1_sync_timestamp, sql_select_latest_batch_index,
+        sql_select_latest_batch_with_user_op_count, sql_select_max_safe_input_index,
+        sql_select_ordered_l2_tx_count, sql_select_ordered_l2_txs_from_offset,
+        sql_select_ordered_l2_txs_page_from_offset, sql_select_safe_block,
+        sql_select_safe_inputs_range, sql_select_total_drained_direct_inputs,
+        sql_select_user_ops_for_frame, sql_update_batch_policy_alpha,
+        sql_update_batch_policy_log_gas_price, sql_update_safe_block,
     };
     use crate::inclusion_lane::PendingUserOp;
     use crate::storage::db::Storage;
@@ -717,8 +851,12 @@ mod tests {
     fn l1_safe_head_helpers_read_and_update_singleton() {
         let conn = setup_conn();
         assert_eq!(sql_select_safe_block(&conn).expect("read safe block"), 0);
-        sql_update_safe_block(&conn, 12).expect("update safe block");
+        sql_update_safe_block(&conn, 12, 1000).expect("update safe block");
         assert_eq!(sql_select_safe_block(&conn).expect("read updated"), 12);
+        assert_eq!(
+            sql_select_l1_sync_timestamp(&conn).expect("read sync ts"),
+            1000
+        );
     }
 
     #[test]
@@ -813,8 +951,8 @@ mod tests {
         )
         .expect("insert second user op with same nonce and different sender");
 
-        // Same sender + nonce should violate uniqueness.
-        let duplicate_sender_nonce = conn.execute(
+        // Same sender + nonce is now allowed (UNIQUE constraint removed for recovery).
+        conn.execute(
             SQL_INSERT_USER_OP,
             params![
                 0_i64,
@@ -827,10 +965,7 @@ mod tests {
                 vec![0x77_u8; 65],
                 0_i64
             ],
-        );
-        assert!(
-            duplicate_sender_nonce.is_err(),
-            "duplicate (sender, nonce) should fail"
-        );
+        )
+        .expect("duplicate (sender, nonce) should now succeed");
     }
 }

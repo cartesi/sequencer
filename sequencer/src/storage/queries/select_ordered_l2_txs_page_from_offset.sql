@@ -1,4 +1,5 @@
 SELECT
+    s.offset,
     CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END AS kind,
     CASE
         WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.sender
@@ -20,5 +21,6 @@ LEFT JOIN frames f
 LEFT JOIN safe_inputs d
   ON d.safe_input_index = s.safe_input_index
 WHERE s.offset > ?1
+  AND s.batch_index NOT IN (SELECT batch_index FROM invalid_batches)
 ORDER BY s.offset ASC
 LIMIT ?2
