@@ -147,7 +147,7 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let safe_block = query_current_safe_block(&tx)?;
 
-        const SQL: &str = "SELECT payload FROM safe_inputs \
+        const SQL: &str = "SELECT safe_input_index, payload FROM safe_inputs \
                            WHERE sender = ?1 AND safe_input_index >= ?2 \
                            ORDER BY safe_input_index ASC LIMIT ?3";
         let mut expected: u64 = 0;
@@ -156,20 +156,20 @@ impl Storage {
         loop {
             let mut stmt = tx.prepare_cached(SQL)?;
             let mut rows = stmt.query(rusqlite::params![sender.as_slice(), offset, limit])?;
-            let mut page_count: i64 = 0;
+            let mut fetched_rows: i64 = 0;
             while let Some(row) = rows.next()? {
-                page_count += 1;
-                let payload: Vec<u8> = row.get(0)?;
+                fetched_rows += 1;
+                offset = row.get::<_, i64>(0)?.saturating_add(1);
+                let payload: Vec<u8> = row.get(1)?;
                 if let Ok(batch) = <Batch as ssz::Decode>::from_ssz_bytes(&payload)
                     && batch.nonce == expected
                 {
                     expected = expected.saturating_add(1);
                 }
             }
-            if page_count < limit {
+            if fetched_rows < limit {
                 break;
             }
-            offset = offset.saturating_add(page_count);
         }
 
         tx.commit()?;
