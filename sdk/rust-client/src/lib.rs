@@ -29,7 +29,7 @@ impl SequencerClient {
         request_timeout: Duration,
     ) -> Result<Self, ClientBuildError> {
         let endpoint = endpoint.into();
-        // Validate URL format (must be http://)
+        // Validate URL format (must be http:// or https://)
         validate_http_url(&endpoint).map_err(ClientBuildError::InvalidEndpoint)?;
         let http_client = build_http_client(request_timeout)
             .map_err(|e| ClientBuildError::InvalidEndpoint(e.to_string()))?;
@@ -46,7 +46,8 @@ impl SequencerClient {
 
     pub fn host_port(&self) -> &str {
         self.endpoint
-            .strip_prefix("http://")
+            .strip_prefix("https://")
+            .or_else(|| self.endpoint.strip_prefix("http://"))
             .unwrap_or(&self.endpoint)
             .split('/')
             .next()
@@ -127,17 +128,30 @@ fn map_reqwest_error(err: reqwest::Error) -> SubmitTxError {
             SubmitTxError::TimeoutRead
         }
     } else if err.is_connect() {
-        SubmitTxError::IoConnect(err.to_string())
+        SubmitTxError::IoConnect(error_chain(&err))
     } else {
-        SubmitTxError::IoRead(err.to_string())
+        SubmitTxError::IoRead(error_chain(&err))
     }
 }
 
+/// Walk the full error chain via `.source()` to produce a detailed message.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    msg
+}
+
 fn validate_http_url(http_url: &str) -> Result<(), String> {
-    let stripped = http_url
-        .trim_end_matches('/')
-        .strip_prefix("http://")
-        .ok_or_else(|| "only http:// URLs are supported".to_string())?;
+    let trimmed = http_url.trim_end_matches('/');
+    let stripped = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(|| "only http:// and https:// URLs are supported".to_string())?;
     let host = stripped.split('/').next().unwrap_or("");
     if host.is_empty() {
         return Err("missing host in http URL".to_string());

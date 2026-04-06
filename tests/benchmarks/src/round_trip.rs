@@ -264,20 +264,22 @@ pub async fn run_round_trip_benchmark(
 
     let total_wall = started.elapsed();
 
-    if accepted_ack_samples.is_empty() {
-        return Err(std::io::Error::other("round-trip benchmark had no accepted txs").into());
-    }
-
     // Join submit starts with WS arrival timestamps to compute round-trip latencies.
     let ws_arrival_map = match Arc::try_unwrap(ws_arrivals) {
         Ok(mutex) => mutex.into_inner().unwrap(),
         Err(arc) => arc.lock().unwrap().clone(),
     };
-    let round_trip_samples =
-        join_round_trip_samples(expected_submit_starts, ws_arrival_map, accepted)?;
 
-    let ack_stats = summarize(accepted_ack_samples.as_slice())?;
-    let round_trip_stats = summarize(round_trip_samples.as_slice())?;
+    let (ack_stats, round_trip_stats) = if accepted_ack_samples.is_empty() {
+        (Stats::zero(), Stats::zero())
+    } else {
+        let round_trip_samples =
+            join_round_trip_samples(expected_submit_starts, ws_arrival_map, accepted)?;
+        (
+            summarize(accepted_ack_samples.as_slice())?,
+            summarize(round_trip_samples.as_slice())?,
+        )
+    };
     let rejected_stats = if rejected_ack_samples.is_empty() {
         None
     } else {

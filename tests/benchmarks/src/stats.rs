@@ -19,6 +19,19 @@ pub struct Stats {
 }
 
 impl Stats {
+    pub fn zero() -> Self {
+        Self {
+            count: 0,
+            min: Duration::ZERO,
+            max: Duration::ZERO,
+            mean: Duration::ZERO,
+            p50: Duration::ZERO,
+            p95: Duration::ZERO,
+            p99: Duration::ZERO,
+            p999: Duration::ZERO,
+        }
+    }
+
     pub fn to_ms(&self) -> StatsMs {
         StatsMs {
             count: self.count,

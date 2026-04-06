@@ -40,6 +40,8 @@ pub struct AckRunReport {
     pub rejected: u64,
     pub rejection_rate: f64,
     pub rejection_breakdown: BTreeMap<String, u64>,
+    /// First detail string observed for each breakdown key.
+    pub rejection_examples: BTreeMap<String, String>,
     pub first_rejection: Option<String>,
     pub total_wall: Duration,
     pub throughput_tps: f64,
@@ -133,6 +135,7 @@ pub async fn run_ack_benchmark(config: AckRunConfig) -> BenchResult<AckRunReport
     let mut rejected = 0_u64;
     let mut first_rejection: Option<String> = None;
     let mut rejection_breakdown = BTreeMap::<String, u64>::new();
+    let mut rejection_examples = BTreeMap::<String, String>::new();
 
     while let Some(sample) = result_rx.recv().await {
         match sample.rejection {
@@ -146,6 +149,9 @@ pub async fn run_ack_benchmark(config: AckRunConfig) -> BenchResult<AckRunReport
                 *rejection_breakdown
                     .entry(rejection.key.clone())
                     .or_insert(0) += 1;
+                rejection_examples
+                    .entry(rejection.key.clone())
+                    .or_insert_with(|| rejection.detail.clone());
                 if first_rejection.is_none() {
                     first_rejection = Some(rejection.detail);
                 }
@@ -161,11 +167,11 @@ pub async fn run_ack_benchmark(config: AckRunConfig) -> BenchResult<AckRunReport
     }
     let total_wall = started.elapsed();
 
-    if accepted_ack_samples.is_empty() {
-        return Err(std::io::Error::other("ack benchmark had no accepted txs").into());
-    }
-
-    let ack_stats = summarize(accepted_ack_samples.as_slice())?;
+    let ack_stats = if accepted_ack_samples.is_empty() {
+        Stats::zero()
+    } else {
+        summarize(accepted_ack_samples.as_slice())?
+    };
     let rejected_stats = if rejected_ack_samples.is_empty() {
         None
     } else {
@@ -179,6 +185,7 @@ pub async fn run_ack_benchmark(config: AckRunConfig) -> BenchResult<AckRunReport
         rejected,
         rejection_rate: rejection_rate(accepted, rejected),
         rejection_breakdown,
+        rejection_examples,
         first_rejection,
         total_wall,
         throughput_tps: throughput_tx_per_s(ack_stats.count, total_wall),

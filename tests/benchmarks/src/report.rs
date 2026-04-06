@@ -77,6 +77,12 @@ pub fn print_ack_report(report: &AckRunReport) {
             println!("    {key}: {count}");
         }
     }
+    if !report.rejection_examples.is_empty() {
+        println!("  rejection_examples:");
+        for (key, example) in &report.rejection_examples {
+            println!("    {key}: {example}");
+        }
+    }
     print_stats("ack_latency_accepted", &report.ack_latency_accepted);
     if let Some(stats) = report.ack_latency_rejected.as_ref() {
         print_stats("ack_latency_rejected", stats);
