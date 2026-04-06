@@ -4,3 +4,27 @@ set dotenv-load
 # Nonce is auto-discovered if omitted.
 demo count="20":
     python3 demo_sepolia.py --count {{count}}
+
+# Deposit USDC into the app via the ERC20Portal on Sepolia L1.
+deposit:
+    bash deposit_sepolia.sh
+
+# Generate N random wallets for benchmarking.
+gen-accounts count="16" output="sepolia_accounts.txt":
+    python3 gen_accounts.py --count {{count}} --output {{output}}
+
+# Fund worker accounts with L2 balance via transfers from the funded wallet.
+fund-workers accounts_file="sepolia_accounts.txt" amount_per_worker="1000000":
+    python3 fund_workers.py --accounts-file {{accounts_file}} --amount-per-worker {{amount_per_worker}}
+
+# Run a single-concurrency benchmark against the Sepolia sequencer.
+bench concurrency="1" duration="45" accounts_file="sepolia_accounts.txt" max_fee="1200" extra="":
+    cargo run -p benchmarks --bin sweep --release --manifest-path ../../Cargo.toml -- \
+        --endpoint $SEQUENCER_URL \
+        --domain-chain-id $SEPOLIA_CHAIN_ID \
+        --domain-verifying-contract $APP_ADDRESS \
+        --duration-secs {{duration}} \
+        --max-fee {{max_fee}} \
+        --concurrency-list {{concurrency}} \
+        --accounts-file {{accounts_file}} \
+        {{extra}}
