@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use alloy_primitives::Address;
 use async_trait::async_trait;
-use sequencer::batch_submitter::{BatchPoster, BatchPosterError, TxHash};
-use sequencer::batch_submitter::{BatchSubmitter, BatchSubmitterConfig};
-use sequencer::shutdown::ShutdownSignal;
+use sequencer::l1::submitter::{BatchPoster, BatchPosterError, TxHash};
+use sequencer::l1::submitter::{BatchSubmitter, BatchSubmitterConfig};
+use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
 use tempfile::TempDir;

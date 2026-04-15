@@ -18,8 +18,8 @@ use alloy_primitives::Address;
 use thiserror::Error;
 use tracing::{debug, error};
 
-use crate::batch_submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig};
-use crate::shutdown::ShutdownSignal;
+use crate::l1::submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig};
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{PendingBatch, Storage, StorageOpenError};
 
 #[derive(Debug, Error)]
@@ -265,10 +265,10 @@ mod tests {
 
     use alloy_primitives::Address;
 
-    use crate::batch_submitter::{
-        BatchSubmitterConfig, BatchSubmitterError, TickOutcome, batch_poster::mock::MockBatchPoster,
+    use crate::l1::submitter::{
+        BatchSubmitterConfig, BatchSubmitterError, TickOutcome, poster::mock::MockBatchPoster,
     };
-    use crate::shutdown::ShutdownSignal;
+    use crate::runtime::shutdown::ShutdownSignal;
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use tempfile::TempDir;
 

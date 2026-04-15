@@ -30,8 +30,8 @@ mod flusher;
 use alloy_primitives::Address;
 use thiserror::Error;
 
-use crate::config::L1Config;
-use crate::input_reader::{InputReader, InputReaderError};
+use crate::l1::reader::{InputReader, InputReaderError};
+use crate::runtime::config::L1Config;
 use crate::storage::{self, StorageOpenError};
 pub use flusher::MempoolFlusher;
 
@@ -138,7 +138,7 @@ pub async fn run_preemptive_recovery(
         );
 
         // ── Step 3: Flush mempool ──────────────────────────────────
-        let flush_provider = crate::provider::create_signer_provider(
+        let flush_provider = crate::l1::provider::create_signer_provider(
             &l1_config.eth_rpc_url,
             &l1_config.batch_submitter_private_key,
         )

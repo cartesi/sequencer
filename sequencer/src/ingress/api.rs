@@ -8,19 +8,63 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use alloy_sol_types::Eip712Domain;
+use axum::Router;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
-use tokio::sync::mpsc::error::TrySendError;
+use axum::routing::post;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
 use tracing::debug;
 
-use super::{ApiError, ApiState};
-use crate::inclusion_lane::PendingUserOp;
+use crate::http::ApiError;
+use crate::ingress::inclusion_lane::PendingUserOp;
+use crate::runtime::shutdown::ShutdownSignal;
 use sequencer_core::api::{TxRequest, TxResponse};
 use sequencer_core::user_op::SignedUserOp;
 
-pub(super) async fn submit_tx(
-    State(state): State<Arc<ApiState>>,
+/// State for the submit endpoint. Kept narrow — only what `/tx` actually needs.
+#[derive(Clone)]
+pub(crate) struct SubmitState {
+    pub tx_sender: mpsc::Sender<PendingUserOp>,
+    pub domain: Eip712Domain,
+    pub max_user_op_data_bytes: usize,
+    pub shutdown: ShutdownSignal,
+}
+
+impl SubmitState {
+    pub(crate) fn new(
+        tx_sender: mpsc::Sender<PendingUserOp>,
+        domain: Eip712Domain,
+        max_user_op_data_bytes: usize,
+        shutdown: ShutdownSignal,
+    ) -> Self {
+        Self {
+            tx_sender,
+            domain,
+            max_user_op_data_bytes,
+            shutdown,
+        }
+    }
+
+    fn reject_if_shutting_down(&self) -> Result<(), ApiError> {
+        if self.shutdown.is_shutdown_requested() {
+            Err(ApiError::unavailable("sequencer shutting down"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Build the ingress router. Caller wires it into an `axum::serve` listener.
+pub(crate) fn router(state: Arc<SubmitState>) -> Router {
+    Router::new()
+        .route("/tx", post(submit_tx))
+        .with_state(state)
+}
+
+async fn submit_tx(
+    State(state): State<Arc<SubmitState>>,
     req: Result<Json<TxRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TxResponse>, ApiError> {
     let Json(req) = req.map_err(map_json_rejection)?;
@@ -56,9 +100,10 @@ fn map_json_rejection(err: axum::extract::rejection::JsonRejection) -> ApiError 
 }
 
 fn enqueue_verified_tx(
-    state: &ApiState,
+    state: &SubmitState,
     signed: SignedUserOp,
-) -> Result<oneshot::Receiver<Result<(), crate::inclusion_lane::SequencerError>>, ApiError> {
+) -> Result<oneshot::Receiver<Result<(), crate::ingress::inclusion_lane::SequencerError>>, ApiError>
+{
     state.reject_if_shutting_down()?;
 
     let (respond_to, recv) = oneshot::channel();
@@ -97,21 +142,11 @@ mod tests {
         let db = TempDir::new().expect("create temp dir");
         let db_path = db.path().join("sequencer.db");
         let _storage = Storage::open(&db_path.to_string_lossy(), "NORMAL").expect("create db");
-        let shutdown = crate::shutdown::ShutdownSignal::default();
-        let tx_feed = crate::l2_tx_feed::L2TxFeed::new(
-            db_path.to_string_lossy().into_owned(),
-            shutdown.clone(),
-            crate::l2_tx_feed::L2TxFeedConfig {
-                idle_poll_interval: std::time::Duration::from_millis(2),
-                page_size: 64,
-                batch_submitter_address: None,
-            },
-        );
-
+        let shutdown = ShutdownSignal::default();
         shutdown.request_shutdown();
 
         let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
-        let state = Arc::new(ApiState::new(
+        let state = Arc::new(SubmitState::new(
             tx_sender,
             Eip712Domain {
                 name: None,
@@ -122,12 +157,6 @@ mod tests {
             },
             128,
             shutdown,
-            tx_feed.clone(),
-            crate::api::ApiConfig {
-                max_body_bytes: 128,
-                ws_max_subscribers: 1,
-                ws_max_catchup_events: 1,
-            },
         ));
 
         let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");

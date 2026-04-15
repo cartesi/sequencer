@@ -1,15 +1,23 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! DB-backed ordered-L2-tx feed used by WS subscriptions and catch-up replay.
+
+mod error;
+
+#[cfg(test)]
+mod tests;
+
+pub use error::{SubscribeError, SubscriptionError};
+pub use sequencer_core::broadcast::BroadcastTxMessage;
+
 use std::time::Duration;
 
 use alloy_primitives::Address;
-pub use sequencer_core::broadcast::BroadcastTxMessage;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use tokio::sync::mpsc;
 
-use super::{SubscribeError, SubscriptionError};
-use crate::shutdown::ShutdownSignal;
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::Storage;
 
 #[derive(Debug, Clone, Copy)]

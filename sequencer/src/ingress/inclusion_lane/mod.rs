@@ -13,21 +13,31 @@
 //! The lane is a single-thread `spawn_blocking` task. SQLite is the only
 //! synchronization with other components (input reader, batch submitter).
 
+mod catch_up;
+mod config;
+mod error;
+mod types;
+
+#[cfg(test)]
+mod tests;
+
+pub use config::InclusionLaneConfig;
+pub use error::InclusionLaneError;
+pub use types::{PendingUserOp, SequencerError};
+
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::shutdown::ShutdownSignal;
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::application::{AppError, Application, ExecutionOutcome};
 use sequencer_core::l2_tx::DirectInput;
 use sequencer_core::user_op::SignedUserOp;
 
-use super::catch_up::catch_up_application;
-use super::config::InclusionLaneConfig;
-use super::{InclusionLaneError, PendingUserOp, SequencerError};
+use catch_up::catch_up_application;
 
 /// Owns the application instance, the `Storage` write handle, and the user-op
 /// receiver for the lifetime of the sequencer process.

@@ -1,6 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! Reads safe InputBox events from L1 and appends them to sequencer storage.
+//! Minimal design: no epochs or consensus; flat contiguous indices only.
+
 use std::time::Duration;
 
 use alloy::eips::BlockNumberOrTag::Safe;
@@ -15,8 +18,8 @@ use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::partition::{decode_evm_advance_input, get_input_added_events};
-use crate::shutdown::ShutdownSignal;
+use crate::l1::partition::{decode_evm_advance_input, get_input_added_events};
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{Storage, StorageOpenError, StoredSafeInput};
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
@@ -58,7 +61,7 @@ impl InputReader {
         shutdown: ShutdownSignal,
         config: InputReaderConfig,
     ) -> Result<Self, InputReaderError> {
-        let provider = crate::provider::create_provider(&config.rpc_url)
+        let provider = crate::l1::provider::create_provider(&config.rpc_url)
             .map_err(InputReaderError::Bootstrap)?;
         let application = Application::new(config.app_address, &provider);
         let data_availability = application
@@ -122,7 +125,7 @@ impl InputReader {
     pub async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
         self.bootstrap_safe_head().await?;
 
-        let provider = crate::provider::create_provider(&self.config.rpc_url)
+        let provider = crate::l1::provider::create_provider(&self.config.rpc_url)
             .map_err(InputReaderError::Bootstrap)?;
         self.advance_once(&provider).await
     }
@@ -130,7 +133,7 @@ impl InputReader {
     async fn run_forever(mut self) -> Result<(), InputReaderError> {
         self.bootstrap_safe_head().await?;
 
-        let provider = crate::provider::create_provider(&self.config.rpc_url)
+        let provider = crate::l1::provider::create_provider(&self.config.rpc_url)
             .map_err(InputReaderError::Bootstrap)?;
 
         loop {

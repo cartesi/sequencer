@@ -12,12 +12,12 @@ use app_core::application::{
 use futures_util::StreamExt;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
-use sequencer::api::{self, ApiConfig};
-use sequencer::inclusion_lane::{
+use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
+use sequencer::http::{self, ApiConfig};
+use sequencer::ingress::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, InclusionLaneError, PendingUserOp,
 };
-use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
-use sequencer::shutdown::ShutdownSignal;
+use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::l2_tx::SequencedL2Tx;
@@ -398,9 +398,10 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
 struct FullServerRuntime {
     addr: std::net::SocketAddr,
     shutdown: ShutdownSignal,
-    server_task: Option<api::ApiServerTask>,
-    lane_handle:
-        Option<tokio::task::JoinHandle<Result<(), sequencer::inclusion_lane::InclusionLaneError>>>,
+    server_task: Option<http::ApiServerTask>,
+    lane_handle: Option<
+        tokio::task::JoinHandle<Result<(), sequencer::ingress::inclusion_lane::InclusionLaneError>>,
+    >,
     _parked_rx: Option<mpsc::Receiver<PendingUserOp>>,
 }
 
@@ -465,7 +466,7 @@ async fn start_full_server_with_max_body(
         },
     );
 
-    let server_task = api::start_on_listener(
+    let server_task = http::start_on_listener(
         listener,
         tx,
         domain,
@@ -515,7 +516,7 @@ async fn start_api_only_server(
             batch_submitter_address: None,
         },
     );
-    let server_task = api::start_on_listener(
+    let server_task = http::start_on_listener(
         listener,
         tx,
         domain,

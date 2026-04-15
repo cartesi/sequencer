@@ -14,20 +14,21 @@ use serde::Deserialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::warn;
 
-use crate::l2_tx_feed::{BroadcastTxMessage, L2TxFeed, SubscribeError};
+use crate::egress::l2_tx_feed::{BroadcastTxMessage, L2TxFeed, SubscribeError};
+use crate::http::WS_CATCHUP_WINDOW_EXCEEDED_REASON;
 
-use super::{ApiState, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
+use super::SubscribeState;
 
 const MAX_INBOUND_WS_MESSAGE_SIZE: usize = 8 * 1024;
 const MAX_INBOUND_WS_FRAME_SIZE: usize = 8 * 1024;
 
 #[derive(Debug, Deserialize)]
-pub(super) struct SubscribeQuery {
+pub(crate) struct SubscribeQuery {
     from_offset: Option<u64>,
 }
 
-pub(super) async fn subscribe_l2_txs(
-    State(state): State<Arc<ApiState>>,
+pub(crate) async fn subscribe_l2_txs(
+    State(state): State<Arc<SubscribeState>>,
     Query(query): Query<SubscribeQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
