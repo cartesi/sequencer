@@ -30,9 +30,22 @@ mod flusher;
 use alloy_primitives::Address;
 use thiserror::Error;
 
+use crate::config::L1Config;
 use crate::input_reader::{InputReader, InputReaderError};
 use crate::storage::{self, StorageOpenError};
 pub use flusher::MempoolFlusher;
+
+/// Recovery thresholds and timing parameters. Bundled together so callers don't
+/// have to plumb four `u64` arguments through multiple layers.
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryParams {
+    /// Stale-batch deadline (`MAX_WAIT_BLOCKS`).
+    pub max_wait_blocks: u64,
+    /// `MAX_WAIT_BLOCKS - MARGIN`. Triggering threshold for preemptive recovery.
+    pub danger_threshold: u64,
+    /// Wall-clock fallback estimate when L1 is unreachable. Default 12 (Ethereum).
+    pub seconds_per_block: u64,
+}
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 
@@ -40,8 +53,8 @@ const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 pub enum RecoveryError {
     #[error(transparent)]
     OpenStorage(#[from] StorageOpenError),
-    #[error("storage: {0}")]
-    Storage(String),
+    #[error(transparent)]
+    Storage(#[from] rusqlite::Error),
     #[error("flush: {0}")]
     Flush(#[from] flusher::FlushError),
     #[error("input reader: {0}")]
@@ -66,17 +79,19 @@ pub enum RecoveryError {
 ///    detect stale, cascade-invalidate, open recovery batch).
 ///
 /// Returns the list of invalidated batch indices (empty if no stale batches).
-#[allow(clippy::too_many_arguments)]
 pub async fn run_preemptive_recovery(
     db_path: &str,
     input_reader: &mut InputReader,
-    batch_submitter_address: Address,
-    eth_rpc_url: &str,
-    batch_submitter_private_key: &str,
-    max_wait_blocks: u64,
-    danger_threshold: u64,
-    seconds_per_block: u64,
+    l1_config: &L1Config,
+    params: RecoveryParams,
 ) -> Result<Vec<u64>, RecoveryError> {
+    let RecoveryParams {
+        max_wait_blocks,
+        danger_threshold,
+        seconds_per_block: _,
+    } = params;
+    let batch_submitter_address = l1_config.batch_submitter_address;
+
     // ── Step 1: Sync safe head (tolerate L1 failure) ───────────────
     match input_reader.sync_to_current_safe_head().await {
         Ok(()) => {
@@ -90,17 +105,9 @@ pub async fn run_preemptive_recovery(
 
             // L1 is down. Estimate whether the frontier batch has crossed the danger
             // threshold since the last successful sync.
-            let in_danger = wall_clock_danger_estimate(
-                db_path,
-                batch_submitter_address,
-                max_wait_blocks,
-                danger_threshold,
-                seconds_per_block,
-            )?;
+            let in_danger = wall_clock_danger_estimate(db_path, batch_submitter_address, params)?;
 
             if let Some(batch_index) = in_danger {
-                // Can't proceed — we might be in the danger zone and L1 is needed
-                // for flush + recovery. Return an error so the process retries.
                 tracing::error!(
                     batch_index,
                     "wall-clock estimate indicates danger zone during startup outage"
@@ -118,15 +125,8 @@ pub async fn run_preemptive_recovery(
     // ── Step 2: Populate frontier + check danger zone ───────────────
     let needs_flush = {
         let mut det_storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
-        det_storage
-            .populate_safe_accepted_batches(batch_submitter_address, max_wait_blocks)
-            .map_err(|e| RecoveryError::Storage(e.to_string()))?;
-        det_storage
-            .assign_batch_nonces()
-            .map_err(|e| RecoveryError::Storage(e.to_string()))?;
-        det_storage
-            .check_danger_zone(danger_threshold)
-            .map_err(|e| RecoveryError::Storage(e.to_string()))?
+        det_storage.refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)?;
+        det_storage.check_danger_zone(danger_threshold)?
     };
 
     if let Some(batch_index) = needs_flush {
@@ -138,9 +138,11 @@ pub async fn run_preemptive_recovery(
         );
 
         // ── Step 3: Flush mempool ──────────────────────────────────
-        let flush_provider =
-            crate::provider::create_signer_provider(eth_rpc_url, batch_submitter_private_key)
-                .map_err(|e| RecoveryError::Provider(e.to_string()))?;
+        let flush_provider = crate::provider::create_signer_provider(
+            &l1_config.eth_rpc_url,
+            &l1_config.batch_submitter_private_key,
+        )
+        .map_err(|e| RecoveryError::Provider(e.to_string()))?;
         let flusher = MempoolFlusher::new(flush_provider, batch_submitter_address);
         flusher.flush_and_wait().await?;
 
@@ -153,9 +155,7 @@ pub async fn run_preemptive_recovery(
     // ── Step 4: Atomic recovery ────────────────────────────────────
     tracing::info!("running startup recovery (populate frontier, assign nonces, detect stale)");
     let mut det_storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
-    let invalidated = det_storage
-        .run_startup_recovery(batch_submitter_address, max_wait_blocks)
-        .map_err(|e| RecoveryError::Storage(e.to_string()))?;
+    let invalidated = det_storage.run_startup_recovery(batch_submitter_address, max_wait_blocks)?;
 
     if invalidated.is_empty() {
         tracing::info!("no stale batches found — continuing normally");
@@ -184,15 +184,16 @@ pub async fn run_preemptive_recovery(
 pub(crate) fn wall_clock_danger_estimate(
     db_path: &str,
     batch_submitter_address: Address,
-    max_wait_blocks: u64,
-    danger_threshold: u64,
-    seconds_per_block: u64,
+    params: RecoveryParams,
 ) -> Result<Option<u64>, RecoveryError> {
+    let RecoveryParams {
+        max_wait_blocks,
+        danger_threshold,
+        seconds_per_block,
+    } = params;
     let mut storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
 
-    let last_sync_ms = storage
-        .last_l1_sync_ms()
-        .map_err(|e| RecoveryError::Storage(e.to_string()))?;
+    let last_sync_ms = storage.last_l1_sync_ms()?;
 
     if last_sync_ms == 0 {
         // Never synced — first startup. L1 is required.
@@ -209,15 +210,8 @@ pub(crate) fn wall_clock_danger_estimate(
     let estimated_missed_blocks = elapsed_secs / seconds_per_block;
     let adjusted_threshold = danger_threshold.saturating_sub(estimated_missed_blocks);
 
-    storage
-        .populate_safe_accepted_batches(batch_submitter_address, max_wait_blocks)
-        .map_err(|e| RecoveryError::Storage(e.to_string()))?;
-    storage
-        .assign_batch_nonces()
-        .map_err(|e| RecoveryError::Storage(e.to_string()))?;
-    let estimated_danger_batch = storage
-        .check_danger_zone(adjusted_threshold)
-        .map_err(|e| RecoveryError::Storage(e.to_string()))?;
+    storage.refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)?;
+    let estimated_danger_batch = storage.check_danger_zone(adjusted_threshold)?;
 
     if let Some(batch_index) = estimated_danger_batch {
         tracing::error!(
@@ -283,8 +277,16 @@ mod tests {
     fn wall_clock_danger_estimate_requires_previous_real_sync() {
         let (_dir, path) = temp_db("wall-clock-first-startup");
 
-        let err = wall_clock_danger_estimate(&path, BATCH_SUBMITTER, 1200, 1125, 12)
-            .expect_err("first startup without L1 sync should block");
+        let err = wall_clock_danger_estimate(
+            &path,
+            BATCH_SUBMITTER,
+            RecoveryParams {
+                max_wait_blocks: 1200,
+                danger_threshold: 1125,
+                seconds_per_block: 12,
+            },
+        )
+        .expect_err("first startup without L1 sync should block");
         assert!(matches!(err, RecoveryError::L1UnreachableInDangerZone));
     }
 
@@ -323,8 +325,16 @@ mod tests {
         let missed_blocks = 25_u64;
         set_last_l1_sync_ms(&path, now_ms.saturating_sub(missed_blocks * 12 * 1000));
 
-        let batch_index = wall_clock_danger_estimate(&path, BATCH_SUBMITTER, 1200, 1125, 12)
-            .expect("wall clock estimate should succeed");
+        let batch_index = wall_clock_danger_estimate(
+            &path,
+            BATCH_SUBMITTER,
+            RecoveryParams {
+                max_wait_blocks: 1200,
+                danger_threshold: 1125,
+                seconds_per_block: 12,
+            },
+        )
+        .expect("wall clock estimate should succeed");
         assert_eq!(
             batch_index,
             Some(1),

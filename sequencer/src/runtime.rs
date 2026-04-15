@@ -204,12 +204,12 @@ where
     crate::recovery::run_preemptive_recovery(
         &db_path,
         &mut input_reader,
-        l1_config.batch_submitter_address,
-        &l1_config.eth_rpc_url,
-        &l1_config.batch_submitter_private_key,
-        sequencer_core::MAX_WAIT_BLOCKS,
-        danger_threshold,
-        config.seconds_per_block,
+        &l1_config,
+        crate::recovery::RecoveryParams {
+            max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+            danger_threshold,
+            seconds_per_block: config.seconds_per_block,
+        },
     )
     .await
     .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
