@@ -1,6 +1,11 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! Shared axum state. Fields are partitioned by endpoint (tx-only, ws-only,
+//! shared) — this partition is what makes the future tx/ws split mechanical.
+//! Adding a new field that's used by both endpoints is fine; adding one that
+//! couples them is the bit to think twice about.
+
 use std::sync::Arc;
 
 use alloy_sol_types::Eip712Domain;
@@ -13,10 +18,15 @@ use crate::shutdown::ShutdownSignal;
 
 #[derive(Clone)]
 pub(super) struct ApiState {
+    // ── tx-only ────────────────────────────────────────────────────────
     pub tx_sender: mpsc::Sender<PendingUserOp>,
     pub domain: Eip712Domain,
     pub max_user_op_data_bytes: usize,
+
+    // ── shared ─────────────────────────────────────────────────────────
     pub shutdown: ShutdownSignal,
+
+    // ── ws-only ────────────────────────────────────────────────────────
     pub ws_subscriber_limit: Arc<Semaphore>,
     pub ws_max_catchup_events: u64,
     pub tx_feed: L2TxFeed,

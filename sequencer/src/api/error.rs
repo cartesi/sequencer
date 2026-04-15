@@ -1,6 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! HTTP-level error type shared across endpoints. Each variant maps to a
+//! status + machine-readable code; `IntoResponse` produces the standard
+//! `{ ok, code, message }` JSON body.
+
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

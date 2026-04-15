@@ -1,10 +1,15 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! `POST /tx` — validate a signed user op, enqueue it for the inclusion lane,
+//! and wait for the lane's commit ack before responding. Synchronous from the
+//! client's perspective: 200 means included.
+
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::extract::{Json, State};
+use axum::http::StatusCode;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
 use tracing::debug;
@@ -18,7 +23,7 @@ pub(super) async fn submit_tx(
     State(state): State<Arc<ApiState>>,
     req: Result<Json<TxRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TxResponse>, ApiError> {
-    let Json(req) = req.map_err(super::map_json_rejection)?;
+    let Json(req) = req.map_err(map_json_rejection)?;
 
     let signed = req
         .into_signed_user_op(&state.domain, state.max_user_op_data_bytes)
@@ -38,6 +43,16 @@ pub(super) async fn submit_tx(
         sender: sender.to_string(),
         nonce,
     }))
+}
+
+/// Normalize JSON-extractor failures: 413 stays 413, everything else becomes
+/// 400. Keeps the public API contract stable across axum upgrades.
+fn map_json_rejection(err: axum::extract::rejection::JsonRejection) -> ApiError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::payload_too_large(format!("request body too large: {err}"))
+    } else {
+        ApiError::bad_request(format!("invalid JSON: {err}"))
+    }
 }
 
 fn enqueue_verified_tx(
