@@ -179,7 +179,7 @@ fn insert_safe_inputs_batch(
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{Storage, StoredSafeInput, test_helpers::temp_db};
+    use crate::storage::{SafeInputRange, Storage, StoredSafeInput, test_helpers::temp_db};
     use alloy_primitives::Address;
 
     #[test]
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 0);
         let mut out = Vec::new();
         storage
-            .fill_safe_inputs(0, 0, &mut out)
+            .fill_safe_inputs(SafeInputRange::new(0, 0), &mut out)
             .expect("query empty interval");
         assert!(out.is_empty());
 
@@ -213,13 +213,12 @@ mod tests {
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 2);
 
         storage
-            .fill_safe_inputs(0, 2, &mut out)
+            .fill_safe_inputs(SafeInputRange::new(0, 2), &mut out)
             .expect("query full interval");
         assert_eq!(out, inserted);
 
-        out.clear();
         storage
-            .fill_safe_inputs(1, 1, &mut out)
+            .fill_safe_inputs(SafeInputRange::new(1, 1), &mut out)
             .expect("query empty half-open interval");
         assert!(out.is_empty());
     }

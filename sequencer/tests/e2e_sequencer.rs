@@ -451,6 +451,7 @@ async fn start_full_server_with_max_body(
             safe_input_buffer_capacity: 32,
             max_batch_open: Duration::from_secs(60 * 60),
             idle_poll_interval: Duration::from_millis(2),
+            frontier_min_interval: Duration::ZERO,
         },
     );
 

@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::shutdown::ShutdownSignal;
-use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+use crate::storage::{SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
@@ -201,6 +201,9 @@ fn default_test_config() -> InclusionLaneConfig {
         safe_input_buffer_capacity: 16,
         max_batch_open: Duration::MAX,
         idle_poll_interval: Duration::from_millis(2),
+        // Tests should observe frontier changes immediately rather than wait
+        // for the production gate.
+        frontier_min_interval: Duration::ZERO,
     }
 }
 
@@ -663,15 +666,32 @@ async fn batch_closes_when_max_user_op_bytes_is_reached() {
     assert_eq!(drain, 0);
 }
 
+/// Test fixture: a `WriteHead` whose size budget is unbounded, so the early-stop
+/// in `dequeue_and_execute_user_op_chunk` never triggers from the size check
+/// alone. Tests that want to exercise the size check construct their own.
+fn unbounded_head() -> WriteHead {
+    WriteHead {
+        batch_index: 0,
+        batch_created_at: SystemTime::now(),
+        frame_fee: 0,
+        safe_block: 0,
+        batch_user_op_count: 0,
+        open_frame_user_op_count: 0,
+        frame_in_batch: 0,
+        max_batch_user_op_bytes: u64::MAX,
+    }
+}
+
 #[test]
 fn dequeue_returns_channel_closed_when_disconnected() {
     let (tx, mut rx) = mpsc::channel::<PendingUserOp>(1);
     drop(tx);
     let mut app = TestApp::default();
     let mut included = Vec::new();
+    let head = unbounded_head();
 
-    let err =
-        dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, 1, &mut included).unwrap_err();
+    let err = dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, 1, &head, &mut included)
+        .unwrap_err();
     assert!(matches!(err, InclusionLaneError::ChannelClosed));
 }
 
@@ -684,7 +704,8 @@ fn dequeue_flushes_executed_ops_before_observing_disconnect() {
 
     let mut app = TestApp::default();
     let mut included = Vec::new();
-    dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, 16, &mut included)
+    let head = unbounded_head();
+    dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, 16, &head, &mut included)
         .expect("should flush processed user ops before disconnect");
     assert_eq!(included.len(), 1);
 }

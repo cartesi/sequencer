@@ -44,12 +44,16 @@ pub struct StoredSafeInput {
     pub block_number: u64,
 }
 
-/// Half-open range `[start_inclusive, end_exclusive)` over `safe_input_index`
-/// values. Used to describe which safe inputs a frame drained.
+/// Half-open range `[start, end)` over `safe_input_index` values. Used to
+/// describe which safe inputs a frame drained.
+///
+/// Fields are private so the `new`-time invariant (`end >= start`) can't be
+/// broken by direct mutation. Read via [`start`](Self::start) /
+/// [`end`](Self::end); construct via [`new`](Self::new) / [`empty_at`](Self::empty_at).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SafeInputRange {
-    pub start_inclusive: u64,
-    pub end_exclusive: u64,
+    start_inclusive: u64,
+    end_exclusive: u64,
 }
 
 impl SafeInputRange {
@@ -68,12 +72,54 @@ impl SafeInputRange {
         Self::new(index, index)
     }
 
+    /// Extend the range forward, producing `[self.end, new_end)`. Panics if
+    /// `new_end < self.end` — this is the "advance" direction only.
     pub fn advance_to(self, end_exclusive: u64) -> Self {
         Self::new(self.end_exclusive, end_exclusive)
     }
 
+    pub fn start(self) -> u64 {
+        self.start_inclusive
+    }
+
+    pub fn end(self) -> u64 {
+        self.end_exclusive
+    }
+
     pub fn is_empty(self) -> bool {
         self.start_inclusive == self.end_exclusive
+    }
+
+    /// Split the range into consecutive sub-ranges of at most `max_len`
+    /// elements. The last chunk may be shorter. Yields nothing if empty.
+    pub fn chunks(self, max_len: u64) -> SafeInputRangeChunks {
+        assert!(max_len > 0, "chunk size must be positive");
+        SafeInputRangeChunks {
+            cursor: self.start_inclusive,
+            end: self.end_exclusive,
+            max_len,
+        }
+    }
+}
+
+/// Iterator returned by [`SafeInputRange::chunks`].
+pub struct SafeInputRangeChunks {
+    cursor: u64,
+    end: u64,
+    max_len: u64,
+}
+
+impl Iterator for SafeInputRangeChunks {
+    type Item = SafeInputRange;
+
+    fn next(&mut self) -> Option<SafeInputRange> {
+        if self.cursor >= self.end {
+            return None;
+        }
+        let chunk_end = self.end.min(self.cursor.saturating_add(self.max_len));
+        let chunk = SafeInputRange::new(self.cursor, chunk_end);
+        self.cursor = chunk_end;
+        Some(chunk)
     }
 }
 

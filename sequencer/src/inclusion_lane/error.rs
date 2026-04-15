@@ -1,6 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! Lane-level error types. Returned from the lane's join handle; the runtime
+//! logs them and may shut down depending on severity.
+
 use sequencer_core::application::AppError;
 use thiserror::Error;
 
@@ -13,35 +16,12 @@ pub enum InclusionLaneError {
         #[source]
         source: CatchUpError,
     },
-    #[error("cannot load next undrained safe-input index")]
-    LoadNextUndrainedDirectInputIndex {
-        #[source]
-        source: rusqlite::Error,
-    },
-    #[error("cannot load safe inputs")]
-    LoadSafeInputs {
-        #[source]
-        source: rusqlite::Error,
-    },
-    #[error("cannot load/create open batch/frame")]
-    LoadOpenState {
-        #[source]
-        source: rusqlite::Error,
-    },
-    #[error("append user ops failed")]
-    AppendUserOps {
-        #[source]
-        source: rusqlite::Error,
-    },
+    #[error(transparent)]
+    Storage(#[from] rusqlite::Error),
     #[error("direct input execution failed")]
     ExecuteDirectInput {
         #[source]
         source: AppError,
-    },
-    #[error("failed to close/rotate frame")]
-    CloseFrameRotate {
-        #[source]
-        source: rusqlite::Error,
     },
 }
 

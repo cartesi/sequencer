@@ -87,43 +87,6 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
     }))
 }
 
-pub(super) fn assert_write_head_matches_open_state(
-    tx: &Transaction<'_>,
-    expected: &WriteHead,
-) -> Result<()> {
-    let actual = load_current_write_head(tx)?.expect("stale WriteHead: storage has no open state");
-    assert_eq!(
-        expected.batch_index, actual.batch_index,
-        "stale WriteHead: batch_index mismatch"
-    );
-    assert_eq!(
-        expected.frame_in_batch, actual.frame_in_batch,
-        "stale WriteHead: frame_in_batch mismatch"
-    );
-    assert_eq!(
-        expected.batch_user_op_count, actual.batch_user_op_count,
-        "stale WriteHead: batch_user_op_count mismatch"
-    );
-    assert_eq!(
-        expected.open_frame_user_op_count, actual.open_frame_user_op_count,
-        "stale WriteHead: open_frame_user_op_count mismatch"
-    );
-    assert_eq!(
-        expected.frame_fee, actual.frame_fee,
-        "stale WriteHead: frame_fee mismatch"
-    );
-    assert_eq!(
-        expected.safe_block, actual.safe_block,
-        "stale WriteHead: safe_block mismatch"
-    );
-    assert_eq!(
-        to_unix_ms(expected.batch_created_at),
-        to_unix_ms(actual.batch_created_at),
-        "stale WriteHead: batch_created_at mismatch"
-    );
-    Ok(())
-}
-
 // ── Cross-writer reads (no `&mut self` needed) ───────────────────────────
 
 pub(super) fn query_latest_safe_input_index_exclusive(conn: &Connection) -> Result<u64> {
@@ -221,7 +184,7 @@ pub(super) fn persist_frame_direct_sequence(
         "INSERT INTO sequenced_l2_txs (batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
          VALUES (?1, ?2, NULL, ?3)",
     )?;
-    for safe_input_index in range.start_inclusive..range.end_exclusive {
+    for safe_input_index in range.start()..range.end() {
         stmt.execute(params![
             u64_to_i64(batch_index),
             i64::from(frame_in_batch),

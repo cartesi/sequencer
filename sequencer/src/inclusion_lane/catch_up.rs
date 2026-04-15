@@ -1,6 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! Startup-only replay: walk the persisted ordered-L2-tx stream and feed it
+//! to the application so its in-memory state matches the DB before the lane
+//! starts taking new work. Runs once, before the hot loop.
+
 use alloy_primitives::Address;
 
 use crate::storage::Storage;
