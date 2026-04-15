@@ -1,6 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! `GET /ws/subscribe` — replay-then-live stream of ordered L2 txs.
+//! Acquires a subscriber permit before upgrading; permit is held for the
+//! lifetime of the session and released on disconnect via `Drop`.
+
 use std::sync::Arc;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
@@ -67,32 +71,22 @@ async fn run_ws_session(
                 max_catchup_events,
                 "ws catch-up window exceeded; closing subscriber"
             );
-            let _ = socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: close_code::POLICY,
-                    reason: WS_CATCHUP_WINDOW_EXCEEDED_REASON.into(),
-                })))
-                .await;
+            close_with_frame(
+                &mut socket,
+                close_code::POLICY,
+                WS_CATCHUP_WINDOW_EXCEEDED_REASON,
+            )
+            .await;
             return;
         }
         Err(SubscribeError::OpenStorage { source }) => {
             warn!(error = %source, "ws subscription failed to open replay storage");
-            let _ = socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: close_code::ERROR,
-                    reason: "subscription unavailable".into(),
-                })))
-                .await;
+            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
             return;
         }
         Err(SubscribeError::LoadHeadOffset { source }) => {
             warn!(error = %source, "ws subscription failed to read replay head");
-            let _ = socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: close_code::ERROR,
-                    reason: "subscription unavailable".into(),
-                })))
-                .await;
+            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
             return;
         }
     };
@@ -125,6 +119,15 @@ async fn run_ws_session(
     if let Err(err) = subscription.finish().await {
         warn!(error = %err, "tx feed subscription cleanup failed");
     }
+}
+
+async fn close_with_frame(socket: &mut WebSocket, code: u16, reason: &str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
 }
 
 async fn send_ws_event(socket: &mut WebSocket, event: &BroadcastTxMessage) -> Result<(), ()> {

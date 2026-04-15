@@ -1,6 +1,18 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! HTTP / WebSocket surface. Two endpoints today:
+//!
+//! - `POST /tx` — submit a signed user op (validated, enqueued for the
+//!   inclusion lane). See `tx`.
+//! - `GET /ws/subscribe` — replay + live stream of the ordered L2 tx feed.
+//!   See `ws`.
+//!
+//! Both endpoints share an [`ApiState`] and an [`ApiError`] today. The two
+//! halves are otherwise independent and are intended to split into separate
+//! processes/binaries — keep that in mind when adding cross-endpoint coupling
+//! to `state.rs` or `error.rs`.
+
 mod error;
 mod state;
 mod tx;
@@ -12,7 +24,6 @@ use std::sync::Arc;
 use alloy_sol_types::Eip712Domain;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::http::StatusCode;
 use axum::routing::{get, post};
 use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
@@ -106,13 +117,4 @@ fn router(state: Arc<ApiState>, max_body_bytes: usize) -> Router {
         // Enforces a raw request-body cap before JSON deserialization, including whitespace.
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(TraceLayer::new_for_http())
-}
-
-// Keep non-413 JSON extractor failures normalized to 400 for a stable API contract.
-fn map_json_rejection(err: axum::extract::rejection::JsonRejection) -> ApiError {
-    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        ApiError::payload_too_large(format!("request body too large: {err}"))
-    } else {
-        ApiError::bad_request(format!("invalid JSON: {err}"))
-    }
 }
