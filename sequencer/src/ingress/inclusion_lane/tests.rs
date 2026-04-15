@@ -12,15 +12,15 @@ use rusqlite::params;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::shutdown::ShutdownSignal;
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 
 use super::catch_up::catch_up_application_paged;
+use super::dequeue_and_execute_user_op_chunk;
 use super::error::CatchUpError;
-use super::lane::dequeue_and_execute_user_op_chunk;
 use super::{InclusionLane, InclusionLaneConfig, InclusionLaneError, PendingUserOp};
 
 #[derive(Default)]

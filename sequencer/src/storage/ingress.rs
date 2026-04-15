@@ -20,7 +20,7 @@ use super::{
     BatchPolicy, SafeFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
     batch_size_target_bytes,
 };
-use crate::inclusion_lane::PendingUserOp;
+use crate::ingress::inclusion_lane::PendingUserOp;
 
 impl Storage {
     /// Cursor for the next safe input to drain into a frame. Reads the highest

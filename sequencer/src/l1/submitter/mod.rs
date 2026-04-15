@@ -7,12 +7,10 @@
 //! checks that nonces are strictly increasing and skips otherwise, so duplicates are
 //! deduplicated at the scheduler level. See `worker` for the tick loop.
 
-mod batch_poster;
 mod config;
+mod poster;
 mod worker;
 
-pub use batch_poster::{
-    BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster, TxHash,
-};
 pub use config::BatchSubmitterConfig;
+pub use poster::{BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster, TxHash};
 pub use worker::{BatchSubmitter, BatchSubmitterError, TickOutcome};

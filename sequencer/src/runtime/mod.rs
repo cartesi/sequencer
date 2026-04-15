@@ -1,19 +1,26 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! Process orchestration: bootstraps L1 state, opens storage, runs preemptive
+//! recovery, then spawns the lane / input reader / batch submitter / feed /
+//! HTTP servers and awaits their completion.
+
+pub mod config;
+pub mod shutdown;
+
 use thiserror::Error;
 use tracing::warn;
 
-use crate::api::{self, ApiConfig};
-use crate::batch_submitter::{BatchPosterConfig, EthereumBatchPoster};
-use crate::batch_submitter::{BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError};
-use crate::config::{L1Config, RunConfig};
-use crate::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
-use crate::input_reader::{InputReader, InputReaderConfig, InputReaderError};
-use crate::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
-use crate::shutdown::ShutdownSignal;
+use crate::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
+use crate::http::{self, ApiConfig};
+use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
+use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
+use crate::l1::submitter::{BatchPosterConfig, EthereumBatchPoster};
+use crate::l1::submitter::{BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError};
 use crate::storage::{self, StorageOpenError};
+use config::{L1Config, RunConfig};
 use sequencer_core::application::Application;
+use shutdown::ShutdownSignal;
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 const QUEUE_CAPACITY: usize = 8192;
@@ -281,7 +288,7 @@ where
         },
     );
 
-    let mut server_task = api::start(
+    let mut server_task = http::start(
         &config.http_addr,
         tx,
         domain,
@@ -506,6 +513,6 @@ fn log_cleanup_result(component: &str, result: Result<(), RunError>) {
 fn build_batch_submitter_provider(
     l1: &L1Config,
 ) -> Result<alloy::providers::DynProvider, std::io::Error> {
-    crate::provider::create_signer_provider(&l1.eth_rpc_url, &l1.batch_submitter_private_key)
+    crate::l1::provider::create_signer_provider(&l1.eth_rpc_url, &l1.batch_submitter_private_key)
         .map_err(std::io::Error::other)
 }

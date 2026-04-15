@@ -3,20 +3,27 @@
 
 //! Sequencer prototype focused on deterministic inclusion and replay.
 //!
-//! Flow: API -> inclusion lane -> SQLite -> catch-up replay.
-//! The inclusion lane is the single writer that defines execution order.
-pub mod api;
-pub mod batch_submitter;
-pub mod config;
-pub mod inclusion_lane;
-pub mod input_reader;
-pub mod l2_tx_feed;
-pub mod partition;
-pub mod provider;
+//! Top-level layout follows the system's data flow:
+//!
+//! - `ingress` — submit API + inclusion lane (write path from external clients)
+//! - `egress` — subscribe API + L2-tx feed (read path to internal indexers)
+//! - `l1` — input reader, batch submitter, L1 helpers
+//! - `storage` — SQLite-backed persistence (organized by writer role)
+//! - `recovery` — cascade invalidation + recovery batch
+//! - `runtime` — orchestration, config, shutdown
+//! - `http` — shared HTTP error type + axum::serve orchestration
+//!
+//! The inclusion lane is the single writer of open-batch state; this is the
+//! invariant the storage layer relies on.
+
+pub mod egress;
+pub mod http;
+pub mod ingress;
+pub mod l1;
 pub mod recovery;
-mod runtime;
-pub mod shutdown;
+pub mod runtime;
 pub mod storage;
 
-pub use config::RunConfig;
+pub use http::{ApiConfig, ApiError, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
+pub use runtime::config::RunConfig;
 pub use runtime::{RunError, run};

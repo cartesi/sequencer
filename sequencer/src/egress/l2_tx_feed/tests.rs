@@ -8,8 +8,8 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 
 use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError};
-use crate::inclusion_lane::{PendingUserOp, SequencerError};
-use crate::shutdown::ShutdownSignal;
+use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 use sequencer_core::user_op::UserOp;

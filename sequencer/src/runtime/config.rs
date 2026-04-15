@@ -61,7 +61,7 @@ pub struct RunConfig {
     #[arg(long, env = "SEQ_ETH_RPC_URL", value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
-    #[arg(long, env = "SEQ_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
+    #[arg(long, env = "SEQ_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::l1::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
     pub long_block_range_error_codes: Vec<String>,
     /// Expected chain ID. Validated against the RPC at startup.
     #[arg(long, env = "SEQ_CHAIN_ID")]

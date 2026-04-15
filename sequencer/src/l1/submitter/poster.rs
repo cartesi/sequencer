@@ -12,7 +12,7 @@ use sequencer_core::batch::Batch;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::partition::{decode_evm_advance_input, get_input_added_events};
+use crate::l1::partition::{decode_evm_advance_input, get_input_added_events};
 
 pub type TxHash = alloy_primitives::B256;
 

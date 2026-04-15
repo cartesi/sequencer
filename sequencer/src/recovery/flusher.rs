@@ -249,7 +249,7 @@ mod tests {
     /// Create a signer provider from an Anvil private key.
     fn signer_provider(anvil: &alloy::node_bindings::AnvilInstance) -> DynProvider {
         let key_hex = alloy_primitives::hex::encode(anvil.first_key().to_bytes());
-        crate::provider::create_signer_provider(
+        crate::l1::provider::create_signer_provider(
             anvil.endpoint_url().as_str(),
             &format!("0x{key_hex}"),
         )

@@ -8,10 +8,10 @@ use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
 use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
 use futures_util::{SinkExt, StreamExt};
-use sequencer::api::{self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
-use sequencer::inclusion_lane::{PendingUserOp, SequencerError};
-use sequencer::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
-use sequencer::shutdown::ShutdownSignal;
+use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
+use sequencer::http::{self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
+use sequencer::ingress::inclusion_lane::{PendingUserOp, SequencerError};
+use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::WsTxMessage;
 use sequencer_core::l2_tx::SequencedL2Tx;
@@ -379,7 +379,7 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
 struct WsServerRuntime {
     addr: std::net::SocketAddr,
     shutdown: ShutdownSignal,
-    server_task: Option<api::ApiServerTask>,
+    server_task: Option<http::ApiServerTask>,
 }
 
 impl Drop for WsServerRuntime {
@@ -423,7 +423,7 @@ async fn start_test_server_with_limits(
             batch_submitter_address: None,
         },
     );
-    let task = api::start_on_listener(
+    let task = http::start_on_listener(
         listener,
         tx_sender,
         Eip712Domain {
