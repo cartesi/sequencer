@@ -198,6 +198,10 @@ pub fn start_on_listener(
     tx_feed: L2TxFeed,
     config: ApiConfig,
 ) -> ApiServerTask {
+    let health_state = Arc::new(crate::egress::api::HealthState {
+        tx_sender: tx_sender.clone(),
+        shutdown: shutdown.clone(),
+    });
     let submit_state = Arc::new(SubmitState::new(
         tx_sender,
         domain,
@@ -212,7 +216,7 @@ pub fn start_on_listener(
     ));
 
     let app: Router = crate::ingress::api::router(submit_state)
-        .merge(crate::egress::api::router(subscribe_state))
+        .merge(crate::egress::api::router(subscribe_state, health_state))
         // Enforces a raw request-body cap before JSON deserialization, including whitespace.
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
         .layer(TraceLayer::new_for_http());

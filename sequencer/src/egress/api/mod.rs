@@ -1,9 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Egress HTTP API routes. Today: just `/ws/subscribe`. Health checks (`/livez`,
-//! `/readyz`, `/healthz`) and additional read endpoints will land here.
+//! Egress HTTP API routes: WebSocket subscribe + k8s-style health probes.
+//! Additional read endpoints will land here.
 
+mod health;
 mod state;
 mod subscribe;
 
@@ -12,12 +13,24 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::get;
 
+pub(crate) use health::HealthState;
 pub(crate) use state::SubscribeState;
-pub(crate) use subscribe::subscribe_l2_txs;
 
-/// Build the egress router. Caller wires it into an `axum::serve` listener.
-pub(crate) fn router(state: Arc<SubscribeState>) -> Router {
-    Router::new()
-        .route("/ws/subscribe", get(subscribe_l2_txs))
-        .with_state(state)
+/// Build the egress router. Each subrouter has its own state; the merge is
+/// transparent to axum's routing.
+pub(crate) fn router(
+    subscribe_state: Arc<SubscribeState>,
+    health_state: Arc<HealthState>,
+) -> Router {
+    let subscribe_router = Router::new()
+        .route("/ws/subscribe", get(subscribe::subscribe_l2_txs))
+        .with_state(subscribe_state);
+
+    let health_router = Router::new()
+        .route("/livez", get(health::livez))
+        .route("/readyz", get(health::readyz))
+        .route("/healthz", get(health::healthz))
+        .with_state(health_state);
+
+    subscribe_router.merge(health_router)
 }

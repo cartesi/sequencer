@@ -40,14 +40,27 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 - `tests/e2e/` - end-to-end test infrastructure
 - `tests/harness/` - shared test harness utilities
 
+## Sequencer Module Layout
+
+`sequencer/src/` is organized by writer role — same naming used inside `storage/`:
+
+- `runtime/` - process orchestration, config, shutdown
+- `storage/` - SQLite persistence, split per writer role (ingress, egress, l1_inputs, l1_submission, recovery, admin)
+- `recovery/` - preemptive recovery procedure + mempool flusher
+- `l1/` - L1 client surface: `reader`, `submitter/`, `provider`, `partition`
+- `ingress/` - write path: `api.rs` (POST /tx) + `inclusion_lane/` (the hot path)
+- `egress/` - read path: `api/` (WS subscribe + health probes) + `l2_tx_feed/`
+- `http.rs` - shared HTTP error type + `axum::serve` orchestration
+
 ## Key Concepts
 
 - **Chunk**: bounded list of user ops processed together to amortize SQLite cost
 - **Frame**: ordering boundary committing a `safe_block` + user ops; scheduler drains direct inputs up to `safe_block` before executing the frame's ops
 - **Batch**: list of frames posted on-chain as one L1 transaction
-- **Inclusion lane**: single-lane hot-path loop that dequeues, executes, persists, and rotates frame/batch boundaries
-- **Batch submitter**: stateless worker that assigns nonces, bulk-submits all pending batches to L1 each tick
-- **Input reader**: ingests safe inputs from L1 InputBox into SQLite
+- **Inclusion lane** (`ingress/inclusion_lane/`): single-lane hot-path loop that dequeues, executes, persists, and rotates frame/batch boundaries
+- **Batch submitter** (`l1/submitter/`): stateless worker that assigns nonces, bulk-submits all pending batches to L1 each tick
+- **Input reader** (`l1/reader.rs`): ingests safe inputs from L1 InputBox into SQLite
+- **L2 tx feed** (`egress/l2_tx_feed/`): DB-backed ordered-tx stream used by WS subscribers
 
 ## Storage Tables (Key Ones)
 
@@ -58,6 +71,10 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 - `safe_accepted_batches` - derived log of batch submissions the scheduler would execute (frontier-based)
 - `invalid_batches` - append-only table of invalidated batch indices (cascade semantics)
 - `batch_policy` / `batch_policy_derived` - fee and sizing parameters
+
+### Valid-row views
+
+`valid_batches`, `valid_batch_nonces`, `valid_sequenced_l2_txs` — same shape as the underlying tables, with rows whose `batch_index` is in `invalid_batches` filtered out. Reads go through these views; writers go to the base tables. Adding a new read query? Use the view, not the table.
 
 ## Recovery Design
 
@@ -74,7 +91,15 @@ The sequencer (off-chain) and scheduler (on-chain) must agree on transaction ord
 - Cursor pagination uses SQLite rowid, not count-based offsets
 - `batch_index` (local, monotonic) is distinct from batch `nonce` (contiguous over valid batches)
 - `MAX_WAIT_BLOCKS` (1200, ~4h) is shared between sequencer and scheduler in `sequencer-core`
-- All queries over batch data filter out `invalid_batches`
+- Reads over batch data go through `valid_*` views (which filter out `invalid_batches`); writers go to the base tables
+- The inclusion lane is the only writer of open batch/frame state — storage trusts the in-memory `WriteHead` without per-write sanity checks; FK + PK constraints catch the dangerous failure modes
+
+## HTTP Endpoints
+
+- **Ingress** (public-facing): `POST /tx`
+- **Egress** (internal indexers): `GET /ws/subscribe`, `GET /livez`, `GET /readyz`, `GET /healthz`
+
+Today both sides serve from one listener; the planned api split puts each side on its own port (same binary) so internal probes/subscribers can be firewalled from public submit traffic.
 
 ## Environment Variables
 
