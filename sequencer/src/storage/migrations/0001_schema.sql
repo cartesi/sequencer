@@ -22,6 +22,25 @@ CREATE TABLE IF NOT EXISTS batch_nonces (
 CREATE INDEX IF NOT EXISTS idx_batch_nonces_nonce_batch
     ON batch_nonces(nonce, batch_index);
 
+-- ---------------------------------------------------------------------------
+-- Valid-row views
+--
+-- Application-level reads almost always exclude rows from invalidated batches.
+-- These views encapsulate that filter so individual queries don't have to
+-- repeat `WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches)`.
+--
+-- Writers go to the base tables. Readers go through the views unless they
+-- explicitly need to see invalid rows (e.g., the cascade-collection query
+-- inside `recovery::detect_stale_and_collect_cascade`).
+-- ---------------------------------------------------------------------------
+CREATE VIEW IF NOT EXISTS valid_batches AS
+SELECT * FROM batches
+WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches);
+
+CREATE VIEW IF NOT EXISTS valid_batch_nonces AS
+SELECT * FROM batch_nonces
+WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches);
+
 -- Derived log of batch submissions the scheduler would actually execute.
 -- Unlike a raw log of all safe submissions, this only contains the accepted
 -- prefix: batches whose nonce matched the expected sequence and were not stale.
@@ -124,6 +143,11 @@ CREATE INDEX IF NOT EXISTS idx_sequenced_l2_txs_frame
 -- the next undrained direct-input cursor at frame-close time.
 CREATE INDEX IF NOT EXISTS idx_sequenced_l2_txs_safe_input
     ON sequenced_l2_txs(safe_input_index) WHERE safe_input_index IS NOT NULL;
+
+-- See the "Valid-row views" comment above invalid_batches for the rationale.
+CREATE VIEW IF NOT EXISTS valid_sequenced_l2_txs AS
+SELECT * FROM sequenced_l2_txs
+WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches);
 
 CREATE TABLE IF NOT EXISTS l1_safe_head (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),

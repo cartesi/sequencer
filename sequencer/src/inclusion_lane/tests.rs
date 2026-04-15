@@ -564,11 +564,14 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
         .expect("wait for ack")
         .expect("ack channel open");
 
-    let replay = {
+    let replay: Vec<SequencedL2Tx> = {
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
         storage
-            .load_ordered_l2_txs_from(0)
+            .load_ordered_l2_txs_page_from(0, 1_000_000)
             .expect("load ordered replay")
+            .into_iter()
+            .map(|(_offset, tx)| tx)
+            .collect()
     };
     shutdown_lane(&shutdown, lane_handle).await;
 

@@ -1,14 +1,41 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-mod db;
-mod sql;
+//! SQLite-backed storage for the sequencer.
+//!
+//! [`Storage`] is the single entry point. Methods are clustered by writer role
+//! across sibling files:
+//!
+//! - `ingress` — inclusion lane: user-op append, frame/batch close
+//! - `egress` — WS feed and catch-up replay (read-only)
+//! - `l1_inputs` — input reader: safe-input ingestion, L1 head, bootstrap cache
+//! - `l1_submission` — batch submitter: nonces, frontier, pending batches
+//! - `recovery` — cascade invalidation, recovery-batch open
+//! - `admin` — operator policy tunables (gas price, alpha)
+//!
+//! Cross-writer helpers live in `internals`. The schema and `valid_*` views
+//! live in `migrations/0001_schema.sql`. See `docs/recovery/README.md` for the
+//! recovery design and TLA+ specs.
+
+mod admin;
+mod egress;
+mod ingress;
+mod internals;
+mod l1_inputs;
+mod l1_submission;
+mod open;
+mod recovery;
+
+#[cfg(test)]
+mod test_helpers;
 
 use std::time::SystemTime;
 use thiserror::Error;
 
-pub use db::Storage;
+pub use open::Storage;
 
+/// One safe input as stored on the L1 InputBox: sender, opaque payload, and
+/// the L1 block where it was included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSafeInput {
     pub sender: alloy_primitives::Address,
@@ -17,6 +44,8 @@ pub struct StoredSafeInput {
     pub block_number: u64,
 }
 
+/// Half-open range `[start_inclusive, end_exclusive)` over `safe_input_index`
+/// values. Used to describe which safe inputs a frame drained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SafeInputRange {
     pub start_inclusive: u64,
@@ -48,12 +77,16 @@ impl SafeInputRange {
     }
 }
 
+/// Snapshot of the L1 view: current safe block, plus the exclusive cursor
+/// into `safe_inputs`. Read by the inclusion lane to decide when to advance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SafeFrontier {
     pub safe_block: u64,
     pub end_exclusive: u64,
 }
 
+/// Per-frame metadata: position within batch, committed fee, and the
+/// safe-block boundary the frame draws against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     pub frame_in_batch: u32,
@@ -70,6 +103,8 @@ pub struct PendingBatch {
     pub encoded: Vec<u8>,
 }
 
+/// Returned by [`Storage::open`] and friends; either the SQLite handle failed
+/// to open or migrations refused to apply.
 #[derive(Debug, Error)]
 pub enum StorageOpenError {
     #[error(transparent)]
@@ -88,6 +123,9 @@ pub struct BatchPolicy {
     pub batch_size_target: u16,
 }
 
+/// In-memory mirror of the latest open batch + frame. Mutated by `Storage`
+/// methods that change the open state (`append_user_ops_chunk`, `close_*`).
+/// The lane keeps one `WriteHead` and threads it through every call.
 #[derive(Debug, Clone, Copy)]
 pub struct WriteHead {
     pub batch_index: u64,

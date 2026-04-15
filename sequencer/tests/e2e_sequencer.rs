@@ -639,11 +639,8 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
 
 fn load_all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
     let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
-    let total = storage
-        .ordered_l2_tx_count()
-        .expect("query ordered l2 tx count");
     storage
-        .load_ordered_l2_txs_page_from(0, total as usize)
+        .load_ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load ordered l2 txs")
         .into_iter()
         .map(|(_offset, tx)| tx)

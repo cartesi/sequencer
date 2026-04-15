@@ -100,9 +100,11 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
                     let in_danger = crate::recovery::wall_clock_danger_estimate(
                         &self.db_path,
                         self.batch_submitter_address,
-                        self.max_wait_blocks,
-                        self.danger_threshold,
-                        self.seconds_per_block,
+                        crate::recovery::RecoveryParams {
+                            max_wait_blocks: self.max_wait_blocks,
+                            danger_threshold: self.danger_threshold,
+                            seconds_per_block: self.seconds_per_block,
+                        },
                     );
                     match in_danger {
                         Ok(Some(batch_index)) => {
@@ -125,11 +127,11 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 
     pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
-        // Step 1: Populate safe_accepted_batches and assign nonces.
-        self.assign_nonces_and_populate_safe_batches().await?;
+        // Refresh `safe_accepted_batches` + `batch_nonces` so the danger check and
+        // pending-batch query observe the latest L1 frontier.
+        self.refresh_recovery_metadata().await?;
 
-        // Step 2: Check if any valid batch is in the danger zone (approaching staleness).
-        // Triggers shutdown so the startup sequence can flush the mempool and recover.
+        // Crash on danger zone so the startup sequence can flush the mempool and recover.
         self.check_danger_zone().await?;
 
         // Step 3: Derive the next unresolved batch nonce from the safe frontier plus
@@ -193,15 +195,15 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
 
-    async fn assign_nonces_and_populate_safe_batches(&self) -> Result<(), BatchSubmitterError> {
+    async fn refresh_recovery_metadata(&self) -> Result<(), BatchSubmitterError> {
         let db_path = self.db_path.clone();
         let batch_submitter_address = self.batch_submitter_address;
         let max_wait_blocks = self.max_wait_blocks;
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path, "NORMAL")?;
-            storage.populate_safe_accepted_batches(batch_submitter_address, max_wait_blocks)?;
-            storage.assign_batch_nonces()?;
-            Ok(())
+            storage
+                .refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)
+                .map_err(BatchSubmitterError::from)
         })
         .await
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
