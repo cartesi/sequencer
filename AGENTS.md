@@ -31,23 +31,41 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 
 ## Architecture Map
 
+Top-level layout follows the system's data flow. Each module corresponds to a
+writer role; see also the matching `storage/<role>.rs` for the storage half.
+
 - `sequencer/src/main.rs`: thin binary entrypoint.
 - `sequencer/src/lib.rs`: public sequencer API (`run`, `RunConfig`).
-- `sequencer/src/config.rs`: runtime input parsing and EIP-712 domain construction.
-- `sequencer/src/runtime.rs`: bootstrap and runtime wiring.
-- `sequencer/src/api/mod.rs`: `POST /tx` and `GET /ws/subscribe` endpoints (tx ingress + replay feed).
-- `sequencer/src/api/error.rs`: API error model + HTTP mapping.
-- `sequencer/src/inclusion_lane/mod.rs`: inclusion-lane exports and public surface.
-- `sequencer/src/inclusion_lane/lane.rs`: batched execution/commit loop (single lane).
-- `sequencer/src/inclusion_lane/types.rs`: inclusion-lane queue item and pipeline error types.
-- `sequencer/src/inclusion_lane/error.rs`: inclusion-lane runtime and catch-up error types.
-- `sequencer/src/batch_submitter/worker.rs`: stateless batch submitter — assigns nonces, populates safe metadata, checks staleness, bulk-submits pending batches to L1.
-- `sequencer/src/input_reader/`: safe-input ingestion from InputBox into SQLite.
-- `sequencer/src/l2_tx_feed/mod.rs`: DB-backed ordered-L2Tx feed used by WS subscriptions.
-- `sequencer/src/storage/mod.rs`: DB open, migrations, frame persistence, and direct-input broker APIs.
-- `sequencer/src/storage/db.rs`: main storage API — batch management, recovery (cascade invalidation, nonce assignment, safe batch population), and ordered-L2Tx queries.
-- `sequencer/src/storage/sql.rs`: SQL constants and low-level query functions.
-- `sequencer/src/storage/migrations/`: DB schema/bootstrapping (`0001`).
+- `sequencer/src/http.rs`: shared HTTP error type, JSON `ErrorResponse` shape, `ApiConfig`, and the `axum::serve` orchestration that today merges ingress + egress routers onto one listener.
+- `sequencer/src/runtime/`: process orchestration.
+  - `mod.rs`: bootstrap (`run`), wiring, error type.
+  - `config.rs`: CLI / env input parsing, `L1Config`, `RunConfig`, EIP-712 domain.
+  - `shutdown.rs`: `ShutdownSignal` shared across components.
+- `sequencer/src/ingress/`: write path from external clients.
+  - `api.rs`: `POST /tx` handler, `SubmitState`, JSON-rejection mapping.
+  - `inclusion_lane/`: hot-path single-lane loop (`mod.rs`), catch-up replay (`catch_up.rs`), `InclusionLaneConfig`, error/types.
+- `sequencer/src/egress/`: read path to internal indexers.
+  - `api/`: subscribe handler (`subscribe.rs`), `SubscribeState`, health probes (`health.rs`), router merge (`mod.rs`).
+  - `l2_tx_feed/`: DB-backed ordered-L2-tx feed used by WS subscriptions.
+- `sequencer/src/l1/`: L1 client surface.
+  - `reader.rs`: safe-input ingestion from InputBox into SQLite.
+  - `submitter/`: stateless batch submitter (`worker.rs`) + L1 poster (`poster.rs`) + config.
+  - `provider.rs`: alloy provider construction.
+  - `partition.rs`: long-block-range retry helper (shared by reader + submitter).
+- `sequencer/src/recovery/`: preemptive recovery startup procedure.
+  - `mod.rs`: `run_preemptive_recovery`, wall-clock danger estimate.
+  - `flusher.rs`: mempool flusher (no-op transactions to resolve pending nonce slots).
+- `sequencer/src/storage/`: SQLite-backed persistence, split by writer role.
+  - `mod.rs`: shared types (`SafeInputRange`, `WriteHead`, etc.).
+  - `open.rs`: `Storage` struct + open / migrations.
+  - `ingress.rs`: inclusion-lane writes (batches, frames, user_ops; close/rotate).
+  - `egress.rs`: WS feed / catch-up reads (paginated ordered txs).
+  - `l1_inputs.rs`: input-reader writes (`safe_inputs`, `l1_safe_head`, bootstrap cache).
+  - `l1_submission.rs`: batch-submitter writes (`batch_nonces`, `safe_accepted_batches`) + pending-batch reads.
+  - `recovery.rs`: cascade invalidation, recovery-batch open; free fns shared with the submitter.
+  - `admin.rs`: operator policy tunables (`set_alpha`, `set_log_gas_price`).
+  - `internals.rs`: cross-writer helpers (i64↔u64, time, decode, write-head loaders).
+  - `migrations/0001_schema.sql`: schema + `valid_*` views.
 - `sequencer-core/src/`: shared domain types/interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, broadcast message model).
 - `examples/app-core/src/application/mod.rs`: wallet prototype implementing `Application`.
 - `tests/benchmarks/src/`: benchmark harnesses and self-contained benchmark runtime.
@@ -63,6 +81,8 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - The next frame fee is sampled from `batch_policy_derived.recommended_fee` when rotating to a new frame (defaults follow `batch_policy` bootstrap rows; tune `gas_price` / `alpha` via SQLite if needed).
 - `/ws/subscribe` currently has internal guardrails: subscriber cap `64`, catch-up cap `50000`.
 - When that catch-up window is exceeded, `/ws/subscribe` upgrades and then closes with websocket close code `1008` (`POLICY`) and reason `catch-up window exceeded`.
+- Health endpoints (egress side): `GET /livez` (always 200 if process is alive), `GET /readyz` (200 if shutdown not requested AND inclusion lane channel still open, else 503), `GET /healthz` (JSON `{ status, inclusion_lane }` with same 200/503 mirror).
+- The api today serves `/tx` (ingress) and `/ws/subscribe` + `/livez` + `/readyz` + `/healthz` (egress) on the **same listener**. The planned api split puts each side on its own port (same binary) so internal probes / subscribers can be firewalled separately from public submit traffic.
 - Wallet state (balances/nonces) is in-memory right now (not persisted).
 - EIP-712 domain name/version are fixed in code; chain ID and verifying contract come from `SEQ_CHAIN_ID` and `SEQ_APP_ADDRESS` (validated against the RPC chain id at startup).
 
@@ -85,6 +105,8 @@ Primary objective in this phase: make sequencer behavior, safety checks, and per
 - Replay/catch-up must use persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics.
 - Cursor pagination for ordered L2 txs uses **SQLite rowid** (`s.offset`), not count-based offsets. This avoids holes in the offset space caused by invalidated batches, which would break count-based pagination.
 - Included user-op identity is tracked by application nonce logic (no DB uniqueness constraint — removed to allow resubmission after recovery).
+- Reads over batch data go through `valid_batches`, `valid_batch_nonces`, and `valid_sequenced_l2_txs` views (defined in `0001_schema.sql`). The views encapsulate the "exclude `invalid_batches`" filter so individual queries don't repeat it.
+- The inclusion lane is the **only writer** of open batch/frame state. `Storage::append_user_ops_chunk` and the `close_*` methods trust the in-memory `WriteHead` without per-write sanity checks; FK + PK constraints catch the dangerous failure modes (write to non-existent frame, duplicate `pos_in_frame`).
 
 ## Type Boundaries
 
@@ -162,10 +184,11 @@ Required env vars:
 
 ## Coding Conventions for This Repo
 
-- Prefer small, composable functions at module boundaries (`api` -> `application` -> `storage`).
+- Prefer small, composable functions at module boundaries (`ingress::api` → `ingress::inclusion_lane` → `storage::ingress`; `egress::l2_tx_feed` ← `storage::egress`).
 - Keep application validation/execution deterministic for a given input/state.
-- Surface user-facing errors via `ApiError`; keep internal failures descriptive but safe.
+- Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe.
 - Avoid introducing heavy dependencies without strong reason.
+- Documentation style: lean. Module headers (1–4 lines) + docs on public methods only when the contract isn't obvious from name+signature. Use inline comments for **why**, never for **what**.
 
 ## Testing Guidance
 
