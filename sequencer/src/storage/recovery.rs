@@ -412,10 +412,7 @@ fn open_recovery_batch_in_tx(tx: &Transaction<'_>) -> Result<()> {
         i64_to_u64(value)
     };
     let safe_input_end = query_latest_safe_input_index_exclusive(tx)?;
-    let leading_range = super::SafeInputRange {
-        start_inclusive: next_undrained,
-        end_exclusive: safe_input_end,
-    };
+    let leading_range = super::SafeInputRange::new(next_undrained, safe_input_end);
     persist_frame_direct_sequence(tx, next_bi, 0, leading_range)?;
     Ok(())
 }

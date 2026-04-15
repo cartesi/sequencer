@@ -12,9 +12,9 @@ use alloy_primitives::Address;
 use rusqlite::{Result, Transaction, TransactionBehavior, params};
 
 use super::internals::{
-    assert_write_head_matches_open_state, from_unix_ms, i64_to_u64, insert_open_batch,
-    insert_open_batch_with_index, insert_open_frame, load_current_write_head, now_unix_ms,
-    persist_frame_direct_sequence, query_batch_policy, to_unix_ms, u64_to_i64,
+    from_unix_ms, i64_to_u64, insert_open_batch, insert_open_batch_with_index, insert_open_frame,
+    load_current_write_head, now_unix_ms, persist_frame_direct_sequence, query_batch_policy,
+    to_unix_ms, u64_to_i64,
 };
 use super::{
     BatchPolicy, SafeFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
@@ -100,21 +100,16 @@ impl Storage {
         })
     }
 
-    /// Append safe-input rows in `[from_inclusive, to_exclusive)` to `out`.
-    /// Asserts contiguity — gaps in `safe_input_index` are a bug, not a
-    /// runtime condition. Caller pre-allocates `out`.
+    /// Replace `out`'s contents with the safe-input rows in `range`. Asserts
+    /// contiguity — gaps in `safe_input_index` are a bug, not a runtime
+    /// condition.
     pub fn fill_safe_inputs(
         &mut self,
-        from_inclusive: u64,
-        to_exclusive: u64,
+        range: SafeInputRange,
         out: &mut Vec<StoredSafeInput>,
     ) -> Result<()> {
-        assert!(
-            from_inclusive <= to_exclusive,
-            "invalid safe-input interval [{from_inclusive}, {to_exclusive})"
-        );
-
-        if from_inclusive == to_exclusive {
+        out.clear();
+        if range.is_empty() {
             return Ok(());
         }
 
@@ -126,7 +121,7 @@ impl Storage {
         ";
         let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(
-            params![u64_to_i64(from_inclusive), u64_to_i64(to_exclusive)],
+            params![u64_to_i64(range.start()), u64_to_i64(range.end())],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -141,7 +136,7 @@ impl Storage {
         for (offset, row) in rows.enumerate() {
             let (index_i64, sender, payload, block_number_i64) = row?;
             let index = i64_to_u64(index_i64);
-            let expected = from_inclusive.saturating_add(offset as u64);
+            let expected = range.start().saturating_add(offset as u64);
 
             assert_eq!(
                 index, expected,
@@ -157,17 +152,22 @@ impl Storage {
         }
 
         assert_eq!(
-            from_inclusive.saturating_add(fetched_count),
-            to_exclusive,
-            "safe-input interval [{from_inclusive}, {to_exclusive}) not fully populated"
+            range.start().saturating_add(fetched_count),
+            range.end(),
+            "safe-input range {range:?} not fully populated"
         );
 
         Ok(())
     }
 
     /// Persist a chunk of user ops into the open frame and bump `head`'s
-    /// counters. Asserts `head` matches the persisted open state — passing a
-    /// stale `WriteHead` panics rather than silently corrupting ordering.
+    /// counters.
+    ///
+    /// `head` is treated as authoritative: the lane is the only writer of
+    /// open-frame state, so a stale `WriteHead` indicates a bug in the lane,
+    /// not a runtime condition. The schema's FK + PK constraints catch the
+    /// dangerous failure modes (write to a non-existent frame, duplicate
+    /// `pos_in_frame`) by failing the INSERT.
     pub fn append_user_ops_chunk(
         &mut self,
         head: &mut WriteHead,
@@ -180,10 +180,6 @@ impl Storage {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Keep the invariant check inside the write transaction so validation
-        // and writes observe the same database snapshot.
-        assert_write_head_matches_open_state(&tx, head)?;
-
         insert_user_ops_batch(
             &tx,
             head.batch_index,
@@ -209,7 +205,6 @@ impl Storage {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_write_head_matches_open_state(&tx, head)?;
         let now_ms = now_unix_ms();
         let policy = query_batch_policy(&tx)?;
         let next_frame_in_batch = head.frame_in_batch.saturating_add(1);
@@ -242,7 +237,6 @@ impl Storage {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_write_head_matches_open_state(&tx, head)?;
         let now_ms = now_unix_ms();
         // Batch policy is sampled here: the derived fee is committed to the newly
         // opened frame, and the batch size target is stored on the write head.
