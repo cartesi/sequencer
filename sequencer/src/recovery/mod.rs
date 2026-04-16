@@ -88,7 +88,7 @@ pub async fn run_preemptive_recovery(
     let RecoveryParams {
         max_wait_blocks,
         danger_threshold,
-        seconds_per_block: _,
+        seconds_per_block,
     } = params;
     let batch_submitter_address = l1_config.batch_submitter_address;
 
@@ -143,7 +143,8 @@ pub async fn run_preemptive_recovery(
             &l1_config.batch_submitter_private_key,
         )
         .map_err(|e| RecoveryError::Provider(e.to_string()))?;
-        let flusher = MempoolFlusher::new(flush_provider, batch_submitter_address);
+        let flusher =
+            MempoolFlusher::new(flush_provider, batch_submitter_address, seconds_per_block);
         flusher.flush_and_wait().await?;
 
         tracing::info!("re-syncing L1 safe head after flush");

@@ -1,12 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use alloy_sol_types::Eip712Domain;
 use clap::{ArgGroup, Parser};
-
-pub const DOMAIN_NAME: &str = "CartesiAppSequencer";
-pub const DOMAIN_VERSION: &str = "1";
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_DATA_DIR: &str = "sequencer-data";
@@ -108,19 +105,13 @@ pub struct RunConfig {
 
     /// Assumed L1 block time in seconds. Used to estimate block progression from
     /// wall-clock time when the L1 provider is unreachable.
-    #[arg(long, env = "SEQ_SECONDS_PER_BLOCK", default_value = "12")]
+    #[arg(long, env = "SEQ_SECONDS_PER_BLOCK", default_value = "12", value_parser = clap::value_parser!(u64).range(1..))]
     pub seconds_per_block: u64,
 }
 
 impl RunConfig {
     pub fn build_domain(&self) -> Eip712Domain {
-        Eip712Domain {
-            name: Some(DOMAIN_NAME.into()),
-            version: Some(DOMAIN_VERSION.into()),
-            chain_id: Some(U256::from(self.chain_id)),
-            verifying_contract: Some(self.app_address),
-            salt: None,
-        }
+        sequencer_core::build_input_domain(self.chain_id, self.app_address)
     }
 
     /// Full path to the SQLite database file inside `data_dir`.
@@ -168,9 +159,10 @@ fn parse_address(raw: &str) -> Result<Address, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DOMAIN_NAME, DOMAIN_VERSION, RunConfig};
+    use super::RunConfig;
     use alloy_primitives::{Address, U256};
     use clap::Parser;
+    use sequencer_core::{DOMAIN_NAME, DOMAIN_VERSION};
 
     const TEST_ARGS: [&str; 9] = [
         "sequencer",

@@ -89,13 +89,23 @@ async fn submit_tx(
     }))
 }
 
-/// Normalize JSON-extractor failures: 413 stays 413, everything else becomes
-/// 400. Keeps the public API contract stable across axum upgrades.
+/// Normalize JSON-extractor failures into fixed client-facing messages.
+/// Keeps the public API contract stable across axum upgrades and avoids
+/// reflecting parser internals (serde line/column, token excerpts) to callers.
 fn map_json_rejection(err: axum::extract::rejection::JsonRejection) -> ApiError {
+    use axum::extract::rejection::JsonRejection;
+
+    tracing::debug!(error = %err, "JSON extraction failed");
+
     if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        ApiError::payload_too_large(format!("request body too large: {err}"))
+        ApiError::payload_too_large("request body too large")
     } else {
-        ApiError::bad_request(format!("invalid JSON: {err}"))
+        match err {
+            JsonRejection::MissingJsonContentType(_) => {
+                ApiError::bad_request("missing content type")
+            }
+            _ => ApiError::bad_request("invalid JSON"),
+        }
     }
 }
 

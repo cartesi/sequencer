@@ -244,6 +244,8 @@ impl<A: Application> Scheduler<A> {
         for user_op in &frame.user_ops {
             if let Some(sender) = self.recover_sender(domain, user_op) {
                 let plain = user_op.to_user_op();
+                // Defense-in-depth: the trait default in validate_and_execute_user_op
+                // now centralizes this check, but we keep it here as an extra guard.
                 if plain.max_fee < frame.fee_price {
                     eprintln!("scheduler skipped frame user-op due to max_fee < fee_price");
                     continue;
@@ -326,13 +328,7 @@ fn has_elapsed_since(start_block: u64, wait_blocks: u64, current_block: u64) -> 
 }
 
 pub(super) fn input_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
-    Eip712Domain {
-        name: None,
-        version: None,
-        chain_id: Some(U256::from(chain_id)),
-        verifying_contract: Some(verifying_contract),
-        salt: None,
-    }
+    sequencer_core::build_input_domain(chain_id, verifying_contract)
 }
 
 pub(super) fn block_to_u64(block: U256) -> u64 {

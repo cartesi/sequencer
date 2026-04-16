@@ -270,7 +270,18 @@ pub(super) fn assign_batch_nonces_inner(conn: &Connection) -> Result<u64> {
 /// Detect stale batches, cascade-invalidate, and restore the open-batch invariant.
 /// See `Storage::detect_and_recover` for full doc.
 fn detect_and_recover_inner(tx: &Transaction<'_>, max_wait_blocks: u64) -> Result<Vec<u64>> {
-    let invalidated = detect_stale_and_cascade(tx, max_wait_blocks)?;
+    let mut invalidated = detect_stale_and_cascade(tx, max_wait_blocks)?;
+
+    // Also check the open batch: if it was never closed (and therefore never
+    // assigned a nonce), `detect_stale_and_cascade` won't see it. This happens
+    // when the sequencer stopped before batch closure and enough L1 blocks
+    // elapsed to make the open batch's frames stale.
+    if invalidated.is_empty()
+        && let Some(stale_open) = check_open_batch_staleness(tx, max_wait_blocks)?
+    {
+        invalidated = cascade_invalidate_from(tx, stale_open)?;
+    }
+
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
         open_recovery_batch_in_tx(tx)?;
     }
@@ -330,24 +341,20 @@ pub(super) fn find_frontier_batch_exceeding_threshold(
     }
 }
 
-/// Detect the first stale batch and atomically invalidate the cascade suffix.
+/// Cascade-invalidate all valid batches with `batch_index >= from_batch_index`.
 ///
-/// Reads the cascade list out of `valid_batches` BEFORE inserting into
-/// `invalid_batches` — the SELECT must see the rows the INSERT will then mark
-/// invalid (the view re-evaluates per statement).
-fn detect_stale_and_cascade(tx: &Transaction<'_>, max_wait_blocks: u64) -> Result<Vec<u64>> {
-    let Some(stale_batch_index) = find_frontier_batch_exceeding_threshold(tx, max_wait_blocks)?
-    else {
-        return Ok(Vec::new());
-    };
-    let stale_i64 = u64_to_i64(stale_batch_index);
+/// Reads the cascade list BEFORE inserting into `invalid_batches` — the SELECT
+/// must see the rows the INSERT will then mark invalid (the view re-evaluates
+/// per statement).
+fn cascade_invalidate_from(tx: &Transaction<'_>, from_batch_index: u64) -> Result<Vec<u64>> {
+    let from_i64 = u64_to_i64(from_batch_index);
 
     let invalidated: Vec<u64> = {
         let mut stmt = tx.prepare(
             "SELECT batch_index FROM valid_batches \
              WHERE batch_index >= ?1 ORDER BY batch_index ASC",
         )?;
-        stmt.query_map(params![stale_i64], |row| {
+        stmt.query_map(params![from_i64], |row| {
             row.get::<_, i64>(0).map(i64_to_u64)
         })?
         .collect::<Result<_>>()?
@@ -357,11 +364,62 @@ fn detect_stale_and_cascade(tx: &Transaction<'_>, max_wait_blocks: u64) -> Resul
         tx.execute(
             "INSERT INTO invalid_batches (batch_index) \
              SELECT batch_index FROM valid_batches WHERE batch_index >= ?1",
-            params![stale_i64],
+            params![from_i64],
         )?;
     }
 
     Ok(invalidated)
+}
+
+/// Detect the first stale nonce-bearing batch and cascade-invalidate.
+fn detect_stale_and_cascade(tx: &Transaction<'_>, max_wait_blocks: u64) -> Result<Vec<u64>> {
+    let Some(stale_batch_index) = find_frontier_batch_exceeding_threshold(tx, max_wait_blocks)?
+    else {
+        return Ok(Vec::new());
+    };
+    cascade_invalidate_from(tx, stale_batch_index)
+}
+
+/// Check whether the open batch (MAX batch_index) is stale by current staleness.
+///
+/// This catches the case where the sequencer stopped before the batch was closed
+/// and submitted to L1, and enough blocks elapsed to make its frames stale.
+/// `assign_batch_nonces` skips the open batch, so `detect_stale_and_cascade`
+/// would miss it.
+fn check_open_batch_staleness(tx: &Transaction<'_>, max_wait_blocks: u64) -> Result<Option<u64>> {
+    let max_bi: Option<i64> =
+        tx.query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
+    let Some(max_bi) = max_bi else {
+        return Ok(None);
+    };
+    // Only consider it if it's still valid (not already invalidated).
+    let is_invalid: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM invalid_batches WHERE batch_index = ?1)",
+        rusqlite::params![max_bi],
+        |row| row.get(0),
+    )?;
+    if is_invalid {
+        return Ok(None);
+    }
+
+    // Check the open batch's first frame safe_block against current safe block.
+    let first_frame_safe_block: u64 = {
+        let value: Option<i64> = tx
+            .query_row(
+                "SELECT safe_block FROM frames \
+                 WHERE batch_index = ?1 ORDER BY frame_in_batch ASC LIMIT 1",
+                params![max_bi],
+                |row| row.get(0),
+            )
+            .optional()?;
+        i64_to_u64(value.unwrap_or(0))
+    };
+    let safe_block = query_current_safe_block(tx)?;
+    if batch_age_is_stale(safe_block, first_frame_safe_block, max_wait_blocks) {
+        Ok(Some(i64_to_u64(max_bi)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Check whether the DB has a valid (non-invalidated) open batch.
@@ -385,7 +443,7 @@ fn has_valid_open_batch(tx: &Connection) -> Result<bool> {
 /// Open a fresh recovery batch inside an existing transaction.
 fn open_recovery_batch_in_tx(tx: &Transaction<'_>) -> Result<()> {
     let now_ms = now_unix_ms();
-    let safe_block = query_current_safe_block(tx).unwrap_or(0);
+    let safe_block = query_current_safe_block(tx)?;
 
     let max_bi: Option<i64> =
         tx.query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;

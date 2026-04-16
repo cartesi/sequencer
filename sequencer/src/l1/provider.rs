@@ -20,6 +20,15 @@ const COMPUTE_UNITS_PER_SEC: u64 = 500;
 fn create_client(url: &str) -> Result<RpcClient, String> {
     let url = Url::parse(url).map_err(|e| format!("invalid RPC URL: {e}"))?;
 
+    // Reject non-HTTPS for remote hosts to prevent accidental plaintext RPC.
+    let host = url.host_str().unwrap_or("");
+    if url.scheme() != "https" && !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return Err(format!(
+            "remote RPC must use https, got {}://",
+            url.scheme()
+        ));
+    }
+
     let http_client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -50,7 +59,7 @@ pub fn create_provider(url: &str) -> Result<DynProvider, String> {
 pub fn create_signer_provider(url: &str, private_key: &str) -> Result<DynProvider, String> {
     let client = create_client(url)?;
     let signer =
-        PrivateKeySigner::from_str(private_key).map_err(|e| format!("invalid private key: {e}"))?;
+        PrivateKeySigner::from_str(private_key).map_err(|_| "invalid private key".to_string())?;
     let provider = ProviderBuilder::new().wallet(signer).connect_client(client);
     Ok(provider.erased())
 }

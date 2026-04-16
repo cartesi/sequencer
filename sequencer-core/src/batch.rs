@@ -4,10 +4,6 @@
 use crate::user_op::UserOp;
 use ssz_derive::{Decode, Encode};
 
-/// Tag byte for InputBox payloads that are L1 app direct inputs (e.g. deposits).
-/// L1/app must post such inputs as `0x00 || body`. Only these are stored (body only) and executed.
-pub const INPUT_TAG_DIRECT_INPUT: u8 = 0x00;
-
 // ---------------------------------------------------------------------------
 // Gas-economics-derived batch sizing
 //

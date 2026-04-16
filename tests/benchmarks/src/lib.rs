@@ -16,8 +16,7 @@ mod workload;
 
 pub use ack::{AckRunConfig, AckRunReport, run_ack_benchmark};
 pub use domain::{
-    BenchmarkDomain, DEFAULT_ENDPOINT, DOMAIN_NAME, DOMAIN_VERSION, parse_address,
-    resolve_external_benchmark_domain,
+    BenchmarkDomain, DEFAULT_ENDPOINT, parse_address, resolve_external_benchmark_domain,
 };
 pub use evaluation::{
     ACK_P99_TARGET_MS, DIAGNOSTIC_P999_MIN_ACCEPTED_COUNT, NetworkProfile, NetworkProfileKind,
@@ -34,6 +33,7 @@ pub use rt_sweep::{
     RtSweepMeasurements, RtSweepRow, RtSweepRunReport, RtSweepSummary, compute_rt_sweep_summary,
     print_rt_sweep_report, write_csv as write_rt_sweep_csv,
 };
+pub use sequencer_core::{DOMAIN_NAME, DOMAIN_VERSION};
 pub use stats::{
     Stats, StatsMs, format_optional_f64, print_stats, rejection_rate, summarize,
     throughput_tx_per_s,

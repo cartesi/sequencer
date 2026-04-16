@@ -242,7 +242,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         self.storage
             .append_user_ops_chunk(head, included.as_slice())
             .map_err(|err| {
-                Self::respond_internal_to_all(included, format!("db error: {err}"));
+                Self::respond_internal_to_all(included, "internal storage error".to_string());
                 InclusionLaneError::Storage(err)
             })
     }

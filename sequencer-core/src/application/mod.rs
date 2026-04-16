@@ -102,6 +102,15 @@ pub trait Application: Send {
         user_op: &UserOp,
         current_fee: u16,
     ) -> Result<ExecutionOutcome, AppError> {
+        // Protocol invariant: max_fee must cover the current frame fee.
+        // Enforced here so every Application impl inherits it.
+        if user_op.max_fee < current_fee {
+            return Ok(ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
+                max_fee: user_op.max_fee,
+                base_fee: current_fee,
+            }));
+        }
+
         if let Err(reason) = self.validate_user_op(sender, user_op, current_fee) {
             return Ok(ExecutionOutcome::Invalid(reason));
         }
