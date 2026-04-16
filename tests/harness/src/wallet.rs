@@ -234,13 +234,7 @@ impl WalletL2Client {
             endpoint.to_string(),
             DEFAULT_SEQUENCER_CLIENT_TIMEOUT,
         )?;
-        let domain = Eip712Domain {
-            name: Some("CartesiAppSequencer".to_string().into()),
-            version: Some("1".to_string().into()),
-            chain_id: Some(U256::from(chain_id)),
-            verifying_contract: Some(verifying_contract),
-            salt: None,
-        };
+        let domain = sequencer_core::build_input_domain(chain_id, verifying_contract);
         Ok(Self {
             signer,
             client,

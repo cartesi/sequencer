@@ -145,14 +145,8 @@ impl Application for WalletApp {
             });
         }
 
-        let max_fee = user_op.max_fee;
-        // Users sign a cap (log-space exponent); sequencer executes against the committed frame fee.
-        if max_fee < current_fee {
-            return Err(InvalidReason::InvalidMaxFee {
-                max_fee,
-                base_fee: current_fee,
-            });
-        }
+        // max_fee < current_fee is already checked by the trait default in
+        // validate_and_execute_user_op. No need to repeat here.
 
         let gas_cost = sequencer_core::fee::fee_to_linear(current_fee);
         let balance = self.balance_of(&sender);
@@ -279,6 +273,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_when_max_fee_below_current_fee() {
+        use sequencer_core::application::{Application, ExecutionOutcome};
+
         let mut app = WalletApp::new(WalletConfig::default());
         let sender = Address::from_slice(&[0x11; 20]);
         app.balances.insert(sender, U256::from(10_u64));
@@ -289,15 +285,17 @@ mod tests {
             data: Vec::<u8>::new().into(),
         };
 
-        let err = app
-            .validate_user_op(sender, &user_op, 2)
-            .expect_err("max_fee < current_fee should be invalid");
+        // The max_fee < current_fee check now lives in the trait default
+        // (validate_and_execute_user_op), not in validate_user_op directly.
+        let result = app
+            .validate_and_execute_user_op(sender, &user_op, 2)
+            .expect("should return Ok(Invalid), not Err");
         assert_eq!(
-            err,
-            InvalidReason::InvalidMaxFee {
+            result,
+            ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
                 max_fee: 1,
                 base_fee: 2
-            }
+            })
         );
     }
 

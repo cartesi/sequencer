@@ -1,16 +1,13 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use alloy_sol_types::Eip712Domain;
 use serde::{Deserialize, Serialize};
 
 use crate::{BenchResult, support::io_err};
 
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:3000";
-pub const DOMAIN_NAME: &str = "CartesiAppSequencer";
-pub const DOMAIN_VERSION: &str = "1";
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BenchmarkDomain {
     pub chain_id: u64,
@@ -19,13 +16,7 @@ pub struct BenchmarkDomain {
 
 impl BenchmarkDomain {
     pub fn eip712_domain(self) -> Eip712Domain {
-        Eip712Domain {
-            name: Some(DOMAIN_NAME.to_string().into()),
-            version: Some(DOMAIN_VERSION.to_string().into()),
-            chain_id: Some(U256::from(self.chain_id)),
-            verifying_contract: Some(self.verifying_contract),
-            salt: None,
-        }
+        sequencer_core::build_input_domain(self.chain_id, self.verifying_contract)
     }
 }
 

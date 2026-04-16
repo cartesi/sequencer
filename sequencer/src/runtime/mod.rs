@@ -75,6 +75,8 @@ pub enum RunError {
         #[source]
         source: tokio::task::JoinError,
     },
+    #[error("RPC chain ID {rpc} does not match --chain-id {config}")]
+    ChainIdMismatch { rpc: u64, config: u64 },
 }
 
 enum FirstExit {
@@ -127,6 +129,28 @@ where
             let genesis = reader.genesis_block();
             let input_box = reader.input_box_address();
 
+            // Validate chain ID early — before any DB writes.
+            {
+                use alloy::providers::Provider;
+                let check_provider = crate::l1::provider::create_provider(&config.eth_rpc_url)
+                    .map_err(|e| RunError::Io(std::io::Error::other(e)))?;
+                match check_provider.get_chain_id().await {
+                    Ok(rpc_chain_id) if rpc_chain_id != config.chain_id => {
+                        return Err(RunError::ChainIdMismatch {
+                            rpc: rpc_chain_id,
+                            config: config.chain_id,
+                        });
+                    }
+                    Ok(_) => {} // verified
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "could not validate RPC chain ID at bootstrap"
+                        );
+                    }
+                }
+            }
+
             // Cache for future startups when L1 might be unreachable.
             if let Ok(mut s) = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA) {
                 let _ = s.save_l1_bootstrap_cache(input_box, genesis, config.chain_id);
@@ -157,11 +181,12 @@ where
                          L1 is required for first startup",
                 )));
             };
-            assert_eq!(
-                cached_chain_id, config.chain_id,
-                "cached chain ID {cached_chain_id} does not match --chain-id {}",
-                config.chain_id
-            );
+            if cached_chain_id != config.chain_id {
+                return Err(RunError::ChainIdMismatch {
+                    rpc: cached_chain_id,
+                    config: config.chain_id,
+                });
+            }
 
             let reader = InputReader::from_parts(
                 input_reader_config,
@@ -247,27 +272,6 @@ where
         long_block_range_error_codes: config.long_block_range_error_codes,
     };
     let provider = build_batch_submitter_provider(&l1_config)?;
-
-    // Validate that the RPC chain ID matches --chain-id (skip if L1 unreachable —
-    // the cache already validated chain_id during bootstrap fallback above).
-    {
-        use alloy::providers::Provider;
-        match provider.get_chain_id().await {
-            Ok(rpc_chain_id) => {
-                assert_eq!(
-                    rpc_chain_id, config.chain_id,
-                    "RPC chain ID {rpc_chain_id} does not match --chain-id {}",
-                    config.chain_id
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "could not validate RPC chain ID — L1 unreachable, trusting config"
-                );
-            }
-        }
-    }
 
     let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
     let submitter = BatchSubmitter::new(

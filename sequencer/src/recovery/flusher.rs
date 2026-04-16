@@ -17,13 +17,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
-/// Conservative timeout for waiting on tx inclusion.
-/// Uses Ethereum's 12s block time as a worst-case heuristic.
-const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10 * 12);
-
-/// Sleep between outer-loop iterations to let the safe head advance.
-const SAFE_HEAD_POLL_INTERVAL: Duration = Duration::from_secs(12);
-
 #[derive(Debug, Error)]
 pub enum FlushError {
     #[error("provider/transport: {0}")]
@@ -38,12 +31,12 @@ pub struct MempoolFlusher {
 }
 
 impl MempoolFlusher {
-    pub fn new(provider: DynProvider, address: Address) -> Self {
+    pub fn new(provider: DynProvider, address: Address, seconds_per_block: u64) -> Self {
         Self {
             provider,
             address,
-            confirmation_timeout: CONFIRMATION_TIMEOUT,
-            safe_poll_interval: SAFE_HEAD_POLL_INTERVAL,
+            confirmation_timeout: Duration::from_secs(10 * seconds_per_block),
+            safe_poll_interval: Duration::from_secs(seconds_per_block),
         }
     }
 
@@ -148,8 +141,9 @@ impl MempoolFlusher {
                 .with_to(self.address)
                 .with_value(U256::ZERO)
                 .with_nonce(nonce)
-                .with_max_fee_per_gas(fees.max_fee_per_gas)
-                // Elevated tip to compete with batch txs in the mempool.
+                // Bump both fee fields by ≥10% to satisfy Ethereum's replacement rule
+                // when a batch tx at this nonce is still in our node's mempool.
+                .with_max_fee_per_gas(fees.max_fee_per_gas.saturating_mul(11) / 10 + 1)
                 .with_max_priority_fee_per_gas(
                     fees.max_priority_fee_per_gas.saturating_mul(2).max(1),
                 );
@@ -304,7 +298,7 @@ mod tests {
                 .expect("mine");
         }
 
-        let flusher = MempoolFlusher::new(provider, addr);
+        let flusher = MempoolFlusher::new(provider, addr, 12);
         // No pending txs — should return immediately.
         flusher.flush_and_wait().await.expect("flush");
     }
@@ -341,7 +335,7 @@ mod tests {
         let _miner = start_miner(provider.clone(), Duration::from_millis(100));
 
         // Run the flusher — it should resolve all 3 nonces to safe.
-        let flusher = MempoolFlusher::new(provider.clone(), addr)
+        let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
         tokio::time::timeout(Duration::from_secs(10), flusher.flush_and_wait())
             .await
@@ -395,7 +389,7 @@ mod tests {
         let _miner = start_miner(provider.clone(), Duration::from_millis(100));
 
         // Flusher should wait for safe finality (no new txs to submit).
-        let flusher = MempoolFlusher::new(provider.clone(), addr)
+        let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
         tokio::time::timeout(Duration::from_secs(10), flusher.flush_and_wait())
             .await

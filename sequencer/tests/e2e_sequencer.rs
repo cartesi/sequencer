@@ -789,13 +789,7 @@ fn decode_hex_prefixed(value: &str) -> Vec<u8> {
 }
 
 fn test_domain() -> Eip712Domain {
-    Eip712Domain {
-        name: Some("CartesiAppSequencer".to_string().into()),
-        version: Some("1".to_string().into()),
-        chain_id: Some(U256::from(1_u64)),
-        verifying_contract: Some(Address::from_slice(&[0_u8; 20])),
-        salt: None,
-    }
+    sequencer_core::build_input_domain(1, Address::from_slice(&[0_u8; 20]))
 }
 
 struct TestDb {

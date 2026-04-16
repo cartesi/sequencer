@@ -737,13 +737,7 @@ async fn run_recovery_after_stale_batches_test(
 }
 
 fn eip712_domain(runtime: &ManagedSequencer) -> alloy_sol_types::Eip712Domain {
-    alloy_sol_types::Eip712Domain {
-        name: Some("CartesiAppSequencer".to_string().into()),
-        version: Some("1".to_string().into()),
-        chain_id: Some(U256::from(runtime.domain_chain_id())),
-        verifying_contract: Some(runtime.verifying_contract()),
-        salt: None,
-    }
+    sequencer_core::build_input_domain(runtime.domain_chain_id(), runtime.verifying_contract())
 }
 
 fn ssz_encode_transfer(to: Address, amount: U256) -> Vec<u8> {

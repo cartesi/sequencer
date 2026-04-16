@@ -231,13 +231,7 @@ fn devnet_machine() -> Result<Machine, Box<dyn std::error::Error + Send + Sync>>
 }
 
 fn input_domain() -> Eip712Domain {
-    Eip712Domain {
-        name: None,
-        version: None,
-        chain_id: Some(U256::from(TEST_CHAIN_ID)),
-        verifying_contract: Some(TEST_DAPP_ADDRESS),
-        salt: None,
-    }
+    sequencer_core::build_input_domain(TEST_CHAIN_ID, TEST_DAPP_ADDRESS)
 }
 
 fn signing_key(byte: u8) -> SigningKey {
