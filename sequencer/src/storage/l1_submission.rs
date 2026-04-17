@@ -17,7 +17,7 @@ use super::internals::{
     decode_l2_tx_row, i64_to_u16, i64_to_u32, i64_to_u64, query_current_safe_block, u64_to_i64,
 };
 use super::recovery::{
-    assign_batch_nonces_inner, find_closed_frontier_batch_in_danger, find_first_batch_in_danger,
+    find_closed_frontier_batch_in_danger, find_first_batch_in_danger,
     populate_safe_accepted_batches_inner, query_latest_safe_accepted_batch,
 };
 use super::{FrameHeader, PendingBatch};
@@ -57,36 +57,27 @@ impl Storage {
         Ok(())
     }
 
-    /// Assign nonces to all valid batches that don't yet have a nonce in `batch_nonces`.
-    /// Nonces are derived from the latest valid assigned batch in batch order.
-    ///
-    /// Returns the number of newly assigned nonces.
-    pub fn assign_batch_nonces(&mut self) -> Result<u64> {
-        assign_batch_nonces_inner(&self.conn)
-    }
-
     /// Check if the first unresolved batch (past the accepted frontier) is in the
     /// danger zone (approaching staleness).
     ///
-    /// Returns the `batch_index` of the first **closed and nonced** batch past
-    /// the accepted frontier whose age (`current_safe_block -
-    /// first_frame_safe_block`) meets or exceeds `danger_threshold`.
+    /// Returns the `batch_index` of the first **valid closed** batch past the
+    /// accepted frontier whose age (`current_safe_block - first_frame_safe_block`)
+    /// meets or exceeds `danger_threshold`.
     ///
     /// Scope: closed batches only. This is the **zombie-detection** check —
     /// an answer of `Some(_)` means "there is a batch submitted (or about to
     /// be submitted) to L1 that may become stale before landing safely;
     /// flush pending wallet-nonce slots and trigger recovery."
     ///
-    /// Does NOT consider the open (tip) batch. An aging open batch is not a
-    /// zombie risk (nothing submitted to L1 yet), so flushing it would be a
-    /// no-op and triggering recovery just for it would produce a restart
-    /// loop. The open batch's staleness is handled at `MAX_WAIT_BLOCKS` by
-    /// `detect_and_recover` and (for L1-unreachable boots) by
-    /// [`Self::check_any_unresolved_batch_in_danger`].
+    /// Does NOT consider the Tip. An aging Tip is not a zombie risk (nothing
+    /// submitted to L1 yet), so flushing it would be a no-op and triggering
+    /// recovery just for it would produce a restart loop. The Tip's staleness
+    /// is handled at `MAX_WAIT_BLOCKS` by `detect_and_recover` and (for
+    /// L1-unreachable boots) by [`Self::check_any_unresolved_batch_in_danger`].
     ///
-    /// Requires `safe_accepted_batches` and `batch_nonces` to be populated
-    /// first (call `populate_safe_accepted_batches` + `assign_batch_nonces`,
-    /// or `refresh_recovery_metadata`, before this).
+    /// Requires `safe_accepted_batches` to be populated first (call
+    /// `populate_safe_accepted_batches` or `refresh_recovery_metadata` before
+    /// this).
     pub fn check_danger_zone(&mut self, danger_threshold: u64) -> Result<Option<u64>> {
         find_closed_frontier_batch_in_danger(&self.conn, danger_threshold)
     }
@@ -234,7 +225,7 @@ impl Storage {
 
     /// Load the next valid closed batch that needs to be submitted.
     pub fn load_next_batch_to_submit(&mut self, min_nonce: u64) -> Result<Option<PendingBatch>> {
-        const SQL: &str = "SELECT batch_index, nonce FROM valid_batch_nonces \
+        const SQL: &str = "SELECT batch_index, nonce FROM valid_closed_batches \
                            WHERE nonce >= ?1 ORDER BY nonce ASC LIMIT 1";
         let batch_ref: Option<(i64, i64)> = self
             .conn
@@ -258,12 +249,8 @@ impl Storage {
     }
 
     /// Load all valid closed batches with nonce >= `min_nonce`, in nonce order.
-    ///
-    /// Issues one query against `batch_nonces` to pull every `(batch_index, nonce)` pair
-    /// in the unresolved suffix, then loads each batch's frames/user_ops in turn. Avoids
-    /// the previous N+1 pattern of one `batch_nonces` query per batch.
     pub fn load_pending_batches(&mut self, min_nonce: u64) -> Result<Vec<PendingBatch>> {
-        const SQL: &str = "SELECT batch_index, nonce FROM valid_batch_nonces \
+        const SQL: &str = "SELECT batch_index, nonce FROM valid_closed_batches \
                            WHERE nonce >= ?1 ORDER BY nonce ASC";
         let pending_refs: Vec<(u64, u64)> = {
             let mut stmt = self.conn.prepare_cached(SQL)?;
@@ -581,7 +568,6 @@ mod tests {
         let db = temp_db("load-next-batch-to-submit");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
         seed_closed_batches(&mut storage, 3);
-        storage.assign_batch_nonces().expect("assign nonces");
         storage.insert_invalid_batch(1).expect("invalidate batch 1");
 
         let first = storage
@@ -605,8 +591,13 @@ mod tests {
     }
 
     #[test]
-    fn assign_batch_nonces_reuses_frontier_nonce_after_invalid_suffix() {
-        let db = temp_db("assign-nonces-after-invalid-suffix");
+    fn nonce_is_reused_after_torn_cascade() {
+        // After a torn cascade invalidates every batch (including genesis),
+        // the recovery batch has no valid ancestor. Its parent is NULL,
+        // so its nonce resets to 0 — effectively reusing the nonce of the
+        // original genesis. The scheduler's "expected next nonce" also
+        // resets to 0, since no accepted batches were ever submitted.
+        let db = temp_db("nonce-reuse-after-torn-cascade");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
 
         let mut head = storage
@@ -615,7 +606,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0");
-        storage.assign_batch_nonces().expect("assign generation 1");
 
         storage.insert_invalid_batch(0).expect("invalidate batch 0");
         storage.insert_invalid_batch(1).expect("invalidate batch 1");
@@ -623,27 +613,22 @@ mod tests {
             .detect_and_recover(1200)
             .expect("open recovery batch after torn invalidation");
 
-        let mut head = storage
+        let head = storage
             .load_open_state()
             .expect("load open state")
             .expect("recovery batch");
         assert_eq!(head.batch_index, 2);
-        storage
-            .close_frame_and_batch(&mut head, 100)
-            .expect("close recovery batch");
 
-        let assigned = storage.assign_batch_nonces().expect("assign generation 2");
-        assert_eq!(assigned, 1);
-
-        let batch_two_nonce: i64 = storage
+        // Recovery Tip has no valid ancestor → parent NULL → nonce 0.
+        let recovery_nonce: i64 = storage
             .conn
             .query_row(
-                "SELECT nonce FROM batch_nonces WHERE batch_index = 2",
+                "SELECT nonce FROM batches WHERE batch_index = 2",
                 [],
                 |row| row.get(0),
             )
-            .expect("query reused nonce");
-        assert_eq!(batch_two_nonce, 0);
+            .expect("query recovery nonce");
+        assert_eq!(recovery_nonce, 0, "recovery Tip reuses nonce 0");
     }
 
     #[test]
@@ -655,7 +640,6 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("init");
         storage.close_frame_and_batch(&mut head, 10).expect("close");
-        storage.assign_batch_nonces().expect("nonces");
 
         storage
             .append_safe_inputs(
@@ -693,7 +677,6 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("init");
         storage.close_frame_and_batch(&mut head, 10).expect("close");
-        storage.assign_batch_nonces().expect("nonces");
 
         storage
             .append_safe_inputs(
@@ -727,7 +710,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 10)
             .expect("close 2");
-        storage.assign_batch_nonces().expect("nonces");
 
         storage
             .append_safe_inputs(

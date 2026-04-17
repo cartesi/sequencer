@@ -26,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBe
 
 use super::Storage;
 use super::internals::{
-    batch_age_is_stale, i64_to_u64, insert_open_batch_with_index, insert_open_frame, now_unix_ms,
+    batch_age_is_stale, i64_to_u64, insert_new_batch, insert_open_frame, now_unix_ms,
     persist_frame_direct_sequence, query_batch_policy, query_current_safe_block,
     query_latest_safe_input_index_exclusive, u64_to_i64,
 };
@@ -36,9 +36,13 @@ impl Storage {
     /// through [`Storage::detect_and_recover`] / [`Storage::run_startup_recovery`].
     #[cfg(test)]
     pub(crate) fn insert_invalid_batch(&mut self, batch_index: u64) -> Result<()> {
+        let now_ms = now_unix_ms();
+        // Only set if currently NULL — leaves already-invalid rows alone so this
+        // remains idempotent (matching the previous `INSERT OR IGNORE` semantic).
         self.conn.execute(
-            "INSERT OR IGNORE INTO invalid_batches (batch_index) VALUES (?1)",
-            params![u64_to_i64(batch_index)],
+            "UPDATE batches SET invalidated_at_ms = ?1 \
+             WHERE batch_index = ?2 AND invalidated_at_ms IS NULL",
+            params![now_ms, u64_to_i64(batch_index)],
         )?;
         Ok(())
     }
@@ -63,12 +67,14 @@ impl Storage {
     }
 
     /// Refresh the recovery-side metadata in one atomic transaction:
-    /// 1. Populate `safe_accepted_batches` from L1 safe inputs (the gold frontier).
-    /// 2. Assign nonces to any un-nonced valid batches.
+    /// Populate `safe_accepted_batches` from L1 safe inputs (the gold frontier).
     ///
     /// Called by the batch submitter each tick and by the recovery startup sequence
-    /// before checking the danger zone. Both `populate` and `assign` are idempotent,
+    /// before checking the danger zone. `populate` is idempotent (cursor-tracked),
     /// so re-running this is safe.
+    ///
+    /// Note: nonce assignment is no longer part of this step — nonces are now
+    /// structural (assigned at batch creation by `insert_new_batch`).
     pub fn refresh_recovery_metadata(
         &mut self,
         batch_submitter_address: Address,
@@ -78,7 +84,6 @@ impl Storage {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         populate_safe_accepted_batches_inner(&tx, batch_submitter_address, max_wait_blocks)?;
-        assign_batch_nonces_inner(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -94,7 +99,6 @@ impl Storage {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         populate_safe_accepted_batches_inner(&tx, batch_submitter_address, max_wait_blocks)?;
-        assign_batch_nonces_inner(&tx)?;
         let invalidated = detect_and_recover_inner(&tx, max_wait_blocks)?;
         tx.commit()?;
         Ok(invalidated)
@@ -219,54 +223,6 @@ pub(super) fn populate_safe_accepted_batches_inner(
     Ok(())
 }
 
-/// Assign nonces to all valid batches that don't yet have a nonce in `batch_nonces`.
-/// See `Storage::assign_batch_nonces` for full doc.
-pub(super) fn assign_batch_nonces_inner(conn: &Connection) -> Result<u64> {
-    const SQL_LATEST_VALID_NONCE: &str = "SELECT nonce FROM valid_batch_nonces \
-                                          ORDER BY batch_index DESC LIMIT 1";
-    let latest_valid_nonce: Option<i64> = conn
-        .query_row(SQL_LATEST_VALID_NONCE, [], |row| row.get(0))
-        .optional()?;
-    let mut next_nonce = latest_valid_nonce
-        .map(|nonce| i64_to_u64(nonce).saturating_add(1))
-        .unwrap_or(0);
-
-    // The open batch (MAX(batch_index)) reads from `batches` directly because we
-    // explicitly want to skip whichever row is currently the open one — including
-    // it when it's invalid would be a no-op; including it when it's valid is wrong
-    // because we don't assign nonces to open batches.
-    let open_batch_index: Option<i64> =
-        conn.query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
-    let Some(open_batch_index) = open_batch_index else {
-        return Ok(0);
-    };
-
-    const SQL_UNNONCED: &str = "SELECT batch_index FROM valid_batches \
-                                WHERE batch_index NOT IN (SELECT batch_index FROM batch_nonces) \
-                                  AND batch_index < ?1 \
-                                ORDER BY batch_index ASC";
-    let mut stmt = conn.prepare(SQL_UNNONCED)?;
-    let mut rows = stmt.query(rusqlite::params![open_batch_index])?;
-    let mut to_assign = Vec::new();
-    while let Some(row) = rows.next()? {
-        let bi: i64 = row.get(0)?;
-        to_assign.push(i64_to_u64(bi));
-    }
-    drop(rows);
-    drop(stmt);
-
-    let count = to_assign.len() as u64;
-    for bi in to_assign {
-        conn.execute(
-            "INSERT OR IGNORE INTO batch_nonces (batch_index, nonce) VALUES (?1, ?2)",
-            params![u64_to_i64(bi), u64_to_i64(next_nonce)],
-        )?;
-        next_nonce = next_nonce.saturating_add(1);
-    }
-
-    Ok(count)
-}
-
 /// Detect stale batches, cascade-invalidate, and restore the open-batch invariant.
 /// See `Storage::detect_and_recover` for full doc.
 fn detect_and_recover_inner(tx: &Transaction<'_>, max_wait_blocks: u64) -> Result<Vec<u64>> {
@@ -285,15 +241,13 @@ fn detect_and_recover_inner(tx: &Transaction<'_>, max_wait_blocks: u64) -> Resul
 /// older than `current_safe_block - threshold`, or `None` if no such batch.
 ///
 /// "Unresolved" means either:
-///   (a) a closed batch past the accepted frontier (visible via
-///       `valid_batch_nonces`), or
-///   (b) the currently-open batch (has no nonce, so invisible to (a) but
-///       still at risk of aging into danger).
+///   (a) a closed batch past the accepted frontier, or
+///   (b) the current Tip (still at risk of aging into danger).
 ///
-/// Closed-unaccepted batches are strictly older than the open batch (the
-/// sequencer opens new batches at monotonically non-decreasing `safe_block`),
-/// so the closed-frontier check takes precedence. Cascading from that batch
-/// covers the open batch automatically via `batch_index >= N`.
+/// Closed-unaccepted batches are strictly older than the Tip (the sequencer
+/// opens new batches at monotonically non-decreasing `safe_block`), so the
+/// closed-frontier check takes precedence. Cascading from that batch covers
+/// the Tip automatically via `batch_index >= N`.
 ///
 /// Used by:
 ///   - `Storage::check_danger_zone` — preemptive danger check (submitter
@@ -304,27 +258,23 @@ fn detect_and_recover_inner(tx: &Transaction<'_>, max_wait_blocks: u64) -> Resul
 /// the preemptive and reactive paths can never diverge on what counts as "in
 /// danger."
 ///
-/// Requires `safe_accepted_batches` and `batch_nonces` to be populated (via
+/// Requires `safe_accepted_batches` to be populated (via
 /// `refresh_recovery_metadata`) for the closed-frontier arm to function.
 pub(super) fn find_first_batch_in_danger(conn: &Connection, threshold: u64) -> Result<Option<u64>> {
     if let Some(bi) = find_closed_frontier_batch_in_danger(conn, threshold)? {
         return Ok(Some(bi));
     }
-    find_open_batch_in_danger(conn, threshold)
+    find_tip_batch_in_danger(conn, threshold)
 }
 
-/// First closed batch past the accepted frontier whose `first_frame_safe_block`
-/// is older than `current_safe_block - threshold`. Returns `None` if no closed
-/// batch at the frontier matches.
+/// First valid closed batch past the accepted frontier whose `first_frame_safe_block`
+/// is older than `current_safe_block - threshold`. Returns `None` if no such
+/// batch matches.
 ///
-/// Does not consider the open batch — `assign_batch_nonces` never nonces
-/// `MAX(batch_index)`, so open batches are invisible to `valid_batch_nonces`.
-/// The unified entrypoint `find_first_batch_in_danger` falls through to
-/// `find_open_batch_in_danger` for that case.
-///
-/// Exposed to `l1_submission` so `Storage::check_danger_zone` can use this
-/// directly — the submitter's zombie-detection check must NOT flag open
-/// batches (they have no L1 tx to become a zombie).
+/// Does not consider the Tip — the submitter's zombie-detection check must
+/// NOT flag the Tip (it has no L1 tx to become a zombie). The unified
+/// entrypoint `find_first_batch_in_danger` falls through to
+/// `find_tip_batch_in_danger` for that case.
 pub(super) fn find_closed_frontier_batch_in_danger(
     conn: &Connection,
     threshold: u64,
@@ -335,7 +285,7 @@ pub(super) fn find_closed_frontier_batch_in_danger(
 
     let batch_ref: Option<(i64, i64)> = conn
         .query_row(
-            "SELECT batch_index, nonce FROM valid_batch_nonces \
+            "SELECT batch_index, nonce FROM valid_closed_batches \
              WHERE nonce >= ?1 ORDER BY nonce ASC LIMIT 1",
             rusqlite::params![u64_to_i64(frontier_nonce)],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -357,37 +307,23 @@ pub(super) fn find_closed_frontier_batch_in_danger(
     }
 }
 
-/// Open batch (MAX `batch_index`, if valid) whose `first_frame_safe_block` is
-/// older than `current_safe_block - threshold`. Returns `None` if no valid
-/// open batch exists or it is not yet in danger.
-///
-/// The open batch has no `batch_nonces` row because `assign_batch_nonces`
-/// explicitly skips `MAX(batch_index)`. It's therefore invisible to
-/// `find_closed_frontier_batch_in_danger` and must be checked separately.
-fn find_open_batch_in_danger(conn: &Connection, threshold: u64) -> Result<Option<u64>> {
-    let max_bi: Option<i64> =
-        conn.query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
-    let Some(max_bi) = max_bi else {
+/// The Tip (if any) whose `first_frame_safe_block` is older than
+/// `current_safe_block - threshold`. Returns `None` if no Tip exists or it's
+/// not yet in danger.
+fn find_tip_batch_in_danger(conn: &Connection, threshold: u64) -> Result<Option<u64>> {
+    let tip_bi: Option<i64> = conn
+        .query_row("SELECT batch_index FROM valid_open_batch", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let Some(tip_bi) = tip_bi else {
         return Ok(None);
     };
 
-    // A previous cascade may have invalidated everything up to and including
-    // the latest batch (torn-invalidation case, handled by the caller re-
-    // opening a fresh batch). In that state, there's no valid open batch —
-    // don't double-invalidate.
-    let is_invalid: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM invalid_batches WHERE batch_index = ?1)",
-        rusqlite::params![max_bi],
-        |row| row.get(0),
-    )?;
-    if is_invalid {
-        return Ok(None);
-    }
-
-    let first_frame_safe_block = first_frame_safe_block_of(conn, max_bi)?;
+    let first_frame_safe_block = first_frame_safe_block_of(conn, tip_bi)?;
     let safe_block = query_current_safe_block(conn)?;
     if batch_age_is_stale(safe_block, first_frame_safe_block, threshold) {
-        Ok(Some(i64_to_u64(max_bi)))
+        Ok(Some(i64_to_u64(tip_bi)))
     } else {
         Ok(None)
     }
@@ -409,9 +345,9 @@ fn first_frame_safe_block_of(conn: &Connection, batch_index: i64) -> Result<u64>
 
 /// Cascade-invalidate all valid batches with `batch_index >= from_batch_index`.
 ///
-/// Reads the cascade list BEFORE inserting into `invalid_batches` — the SELECT
-/// must see the rows the INSERT will then mark invalid (the view re-evaluates
-/// per statement).
+/// Reads the list BEFORE mutating — the SELECT must see the rows the UPDATE
+/// will then mark invalid. The `invalidated_at_ms IS NULL` guard on the UPDATE
+/// keeps this idempotent: rows already invalid are untouched.
 fn cascade_invalidate_from(tx: &Transaction<'_>, from_batch_index: u64) -> Result<Vec<u64>> {
     let from_i64 = u64_to_i64(from_batch_index);
 
@@ -427,46 +363,44 @@ fn cascade_invalidate_from(tx: &Transaction<'_>, from_batch_index: u64) -> Resul
     };
 
     if !invalidated.is_empty() {
+        let now_ms = now_unix_ms();
         tx.execute(
-            "INSERT INTO invalid_batches (batch_index) \
-             SELECT batch_index FROM valid_batches WHERE batch_index >= ?1",
-            params![from_i64],
+            "UPDATE batches SET invalidated_at_ms = ?1 \
+             WHERE batch_index >= ?2 AND invalidated_at_ms IS NULL",
+            params![now_ms, from_i64],
         )?;
     }
 
     Ok(invalidated)
 }
 
-/// Check whether the DB has a valid (non-invalidated) open batch.
-///
-/// The open batch is always the absolute latest batch (MAX batch_index).
-/// If the latest batch is in `invalid_batches`, there is no valid open batch.
+/// Check whether the DB has a valid Tip (`sealed_at_ms IS NULL AND
+/// `invalidated_at_ms IS NULL`).
 fn has_valid_open_batch(tx: &Connection) -> Result<bool> {
-    let max_bi: Option<i64> =
-        tx.query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
-    let Some(max_bi) = max_bi else {
-        return Ok(false);
-    };
-    let is_invalid: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM invalid_batches WHERE batch_index = ?1)",
-        rusqlite::params![max_bi],
-        |row| row.get(0),
-    )?;
-    Ok(!is_invalid)
+    let count: i64 = tx.query_row("SELECT COUNT(*) FROM valid_open_batch", [], |row| {
+        row.get(0)
+    })?;
+    Ok(count > 0)
 }
 
 /// Open a fresh recovery batch inside an existing transaction.
+///
+/// The new Tip's parent is the highest-indexed valid batch (the last valid
+/// ancestor after the cascade). If none exists — the torn-state case where
+/// every batch has been invalidated — the new Tip has no parent (nonce 0,
+/// like a fresh genesis).
 fn open_recovery_batch_in_tx(tx: &Transaction<'_>) -> Result<()> {
     let now_ms = now_unix_ms();
     let safe_block = query_current_safe_block(tx)?;
 
-    let max_bi: Option<i64> =
-        tx.query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
-    let next_bi = i64_to_u64(max_bi.map(|b| b.saturating_add(1)).unwrap_or(0));
+    let parent_batch_index: Option<u64> = tx
+        .query_row("SELECT MAX(batch_index) FROM valid_batches", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+        .map(i64_to_u64);
 
     let policy = query_batch_policy(tx)?;
-
-    insert_open_batch_with_index(tx, next_bi, now_ms)?;
+    let next_bi = insert_new_batch(tx, None, parent_batch_index, now_ms)?;
     insert_open_frame(tx, next_bi, 0, now_ms, policy.recommended_fee, safe_block)?;
 
     // Drain leading directs into the new batch's first frame.
@@ -660,8 +594,6 @@ mod tests {
                 .expect("close batch");
         }
 
-        storage.assign_batch_nonces().expect("assign nonces");
-
         let batch_submitter = Address::repeat_byte(0xAA);
         storage
             .append_safe_inputs(
@@ -699,7 +631,6 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch");
 
-        storage.assign_batch_nonces().expect("assign nonces");
         let batch_submitter = Address::repeat_byte(0xAA);
         storage
             .append_safe_inputs(
@@ -734,8 +665,6 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0");
 
-        storage.assign_batch_nonces().expect("assign nonces gen1");
-
         let batch_submitter = Address::repeat_byte(0xAA);
         storage
             .append_safe_inputs(
@@ -759,8 +688,6 @@ mod tests {
             .close_frame_and_batch(&mut head, 100)
             .expect("close recovery batch");
 
-        storage.assign_batch_nonces().expect("assign nonces gen2");
-
         let second = storage.detect_and_recover(1200).expect("second recovery");
         assert!(
             second.is_empty(),
@@ -779,7 +706,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0");
-        storage.assign_batch_nonces().expect("assign nonces gen1");
 
         let batch_submitter = Address::repeat_byte(0xAA);
         storage
@@ -803,7 +729,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 100)
             .expect("close gen2 batch");
-        storage.assign_batch_nonces().expect("assign nonces gen2");
 
         storage
             .append_safe_inputs(
@@ -827,25 +752,22 @@ mod tests {
         );
     }
 
-    // ── §7.3 — open-batch staleness regression (post-unification) ──────────
+    // ── §7.3 — Tip staleness regression ───────────────────────────────────
     //
-    // Original bug: an open (unclosed, not-yet-nonced) batch whose first
-    // frame was pinned to an old safe_block escaped detection, because the
-    // frontier lookup only queries `valid_batch_nonces` (which `assign_batch_nonces`
-    // never populates for the max batch_index).
+    // Original bug: a Tip (unsealed) whose first frame was pinned to an old
+    // safe_block escaped detection. The frontier lookup only considered
+    // closed batches, leaving the Tip out of scope.
     //
-    // After the unification refactor, both the preemptive danger check and
-    // the reactive cascade path go through `find_first_batch_in_danger`,
-    // which falls through to `find_open_batch_in_danger` when no closed
-    // frontier batch matches. These tests verify the reactive path
-    // (`detect_and_recover`); parallel tests for the preemptive path
-    // (`check_danger_zone`) live under the `check_danger_zone` header below.
+    // Fix: `find_first_batch_in_danger` first tries the closed-frontier
+    // check, then falls through to `find_tip_batch_in_danger`. Both the
+    // preemptive danger check and the reactive cascade path go through this
+    // helper, so they can never diverge on what counts as "in danger".
     //
     // Below covers four cases:
-    //   - positive: open batch IS stale → invalidated
-    //   - negative: open batch is fresh → NOT invalidated (no false positives)
-    //   - combined: closed+stale AND open+stale → both invalidated in one cascade
-    //   - no-batch: empty DB with no open batch → no-op, no panic
+    //   - positive: Tip IS stale → invalidated
+    //   - negative: Tip is fresh → NOT invalidated (no false positives)
+    //   - combined: closed+stale AND tip+stale → both invalidated in one cascade
+    //   - no-batch: empty DB with no Tip → no-op, no panic
 
     #[test]
     fn open_batch_stale_by_current_safe_block_is_invalidated() {
@@ -967,7 +889,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0");
-        storage.assign_batch_nonces().expect("assign nonces");
 
         // Advance safe head so batch 0's first frame (safe_block=10) is stale.
         storage
@@ -1040,7 +961,6 @@ mod tests {
         let before = load_all_ordered_l2_txs(&mut storage);
         assert_eq!(before.len(), 2, "both deposits should be visible");
 
-        storage.assign_batch_nonces().expect("assign nonces");
         let batch_submitter = Address::repeat_byte(0xAA);
         storage
             .append_safe_inputs(
@@ -1113,7 +1033,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 0");
-        storage.assign_batch_nonces().expect("assign nonces");
 
         storage
             .append_safe_inputs(
@@ -1240,7 +1159,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 1");
-        storage.assign_batch_nonces().expect("assign nonces");
 
         storage
             .append_safe_inputs(
@@ -1279,7 +1197,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 1");
-        storage.assign_batch_nonces().expect("assign nonces");
 
         storage
             .append_safe_inputs(
@@ -1320,7 +1237,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch");
-        storage.assign_batch_nonces().expect("assign nonces");
 
         storage
             .append_safe_inputs(
@@ -1360,7 +1276,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch");
-        storage.assign_batch_nonces().expect("assign nonces");
 
         storage
             .append_safe_inputs(
@@ -1395,7 +1310,6 @@ mod tests {
         for _ in 0..3 {
             storage.close_frame_and_batch(&mut head, 10).expect("close");
         }
-        storage.assign_batch_nonces().expect("assign nonces");
 
         storage
             .append_safe_inputs(
@@ -1426,7 +1340,6 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage.close_frame_and_batch(&mut head, 10).expect("close");
-        storage.assign_batch_nonces().expect("nonces gen1");
 
         storage
             .append_safe_inputs(
@@ -1448,7 +1361,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head2, 1210)
             .expect("close gen2");
-        storage.assign_batch_nonces().expect("nonces gen2");
 
         storage
             .append_safe_inputs(
@@ -1478,7 +1390,6 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("init");
         storage.close_frame_and_batch(&mut head, 10).expect("close");
-        storage.assign_batch_nonces().expect("nonces");
         storage
             .append_safe_inputs(
                 1210,
@@ -1498,7 +1409,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head2, 1210)
             .expect("close gen2");
-        storage.assign_batch_nonces().expect("nonces gen2");
         storage
             .append_safe_inputs(
                 2410,
@@ -1518,7 +1428,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head3, 2410)
             .expect("close gen3");
-        storage.assign_batch_nonces().expect("nonces gen3");
         storage
             .append_safe_inputs(
                 2420,
@@ -1548,7 +1457,6 @@ mod tests {
         for _ in 0..50 {
             storage.close_frame_and_batch(&mut head, 10).expect("close");
         }
-        storage.assign_batch_nonces().expect("assign nonces");
 
         storage
             .append_safe_inputs(
@@ -1566,5 +1474,256 @@ mod tests {
 
         let inv = storage.detect_and_recover(max_wait).expect("detect");
         assert_eq!(inv.len(), 51);
+    }
+
+    // ── Schema-invariant regression tests ─────────────────────────────────
+    //
+    // These exercise the triggers + partial unique index in the schema
+    // directly. Each one checks a specific invariant that previously lived
+    // in writer discipline and now has a schema-level tripwire.
+    //
+    // They're here (rather than in a dedicated file) because they share the
+    // recovery tests' setup: same helpers, same fixture. Failures here mean
+    // the schema guard regressed, which is the whole point of making the
+    // invariants declarative.
+
+    #[test]
+    fn schema_rejects_second_valid_tip() {
+        // The partial unique index `ux_single_valid_tip` catches a writer that
+        // opens a new Tip without sealing the old one first.
+        let db = temp_db("schema-second-tip");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+
+        // Try to bypass the lane and insert a second valid Tip directly.
+        let err = storage.conn.execute(
+            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
+             VALUES (99, 0, 1, 1000)",
+            [],
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("UNIQUE constraint failed") && msg.contains("ux_single_valid_tip"),
+            "expected ux_single_valid_tip violation, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_bad_nonce_contiguity() {
+        // Nonce must equal parent.nonce + 1 — trigger enforces it.
+        // Insert the bad-nonce batch as already-sealed so it doesn't collide
+        // with the existing Tip on `ux_single_valid_tip`.
+        let db = temp_db("schema-bad-nonce");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 0)
+            .expect("close batch 0; batch 1 is now Tip");
+        // Batch 1 has nonce 1 (0 + 1). Insert child with nonce 99 (should be 2).
+        let err = storage.conn.execute(
+            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
+             VALUES (999, 1, 99, \
+                     (SELECT created_at_ms FROM batches WHERE batch_index = 1), \
+                     (SELECT created_at_ms FROM batches WHERE batch_index = 1))",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("batch nonce must equal parent.nonce + 1"),
+            "expected nonce trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_genesis_with_nonzero_nonce() {
+        let db = temp_db("schema-genesis-nonzero");
+        let storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let err = storage.conn.execute(
+            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
+             VALUES (0, NULL, 7, 100)",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("genesis batch must have nonce 0"),
+            "expected genesis-nonce trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_re_seal() {
+        let db = temp_db("schema-re-seal");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 0)
+            .expect("close batch 0 (seals it)");
+        // Batch 0 is sealed. Attempt to re-seal with a different timestamp.
+        let err = storage.conn.execute(
+            "UPDATE batches SET sealed_at_ms = sealed_at_ms + 1 WHERE batch_index = 0",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("sealed_at_ms is write-once"),
+            "expected write-once trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_re_invalidate() {
+        let db = temp_db("schema-re-invalidate");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        // Seed via test helper (uses now_unix_ms internally).
+        storage.insert_invalid_batch(0).expect("first invalidate");
+        let err = storage.conn.execute(
+            "UPDATE batches SET invalidated_at_ms = invalidated_at_ms + 1 \
+             WHERE batch_index = 0",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("invalidated_at_ms is write-once"),
+            "expected write-once trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_frame_insert_into_sealed_batch() {
+        // This is the bug class we've been fighting: writer holds a stale
+        // WriteHead and writes to a batch that's no longer the Tip.
+        let db = temp_db("schema-frame-into-sealed");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 0)
+            .expect("close batch 0; batch 0 is now sealed");
+        // Batch 0 is sealed. Any direct insert into its frames must fail.
+        let err = storage.conn.execute(
+            "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
+             VALUES (0, 1, 100, 1060, 0)",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("frames can only be inserted into the current Tip"),
+            "expected tip-only-frames trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_frame_insert_into_invalidated_batch() {
+        let db = temp_db("schema-frame-into-invalid");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        // Invalidate (without sealing) — Tip that never closed, now dead.
+        storage.insert_invalid_batch(0).expect("invalidate tip");
+        let err = storage.conn.execute(
+            "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
+             VALUES (0, 1, 100, 1060, 0)",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("frames can only be inserted into the current Tip"),
+            "expected tip-only-frames trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_parent_batch_index_mutation() {
+        let db = temp_db("schema-parent-immutable");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 0)
+            .expect("close batch 0");
+        // Try to change parent of batch 1 — should be rejected.
+        let err = storage.conn.execute(
+            "UPDATE batches SET parent_batch_index = NULL WHERE batch_index = 1",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("parent_batch_index is immutable"),
+            "expected parent-immutable trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn nonce_reuse_after_cascade_with_valid_ancestor() {
+        // Beautiful part of parent-pointer + structural nonce: after a cascade
+        // that invalidates only the suffix (keeping an ancestor valid), the
+        // new Tip's parent is the last valid ancestor, so its nonce is
+        // `ancestor.nonce + 1` — the same nonce the invalidated suffix's
+        // first batch had. Nonce reuse is automatic.
+        //
+        // Scenario: batch 0 is accepted (safe_accepted_batches advances past
+        // nonce 0). Batch 1 is stale and triggers cascade. Batches 1, 2, 3
+        // invalidated; batch 0 remains valid.
+        let db = temp_db("nonce-reuse-with-ancestor");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let batch_submitter = SENDER_A;
+
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize at safe_block=10");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 0 (nonce 0)");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 1 (nonce 1)");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 2 (nonce 2)");
+        // Head is now batch 3 (nonce 3, first_frame_safe_block=100).
+
+        // Batch 0 lands on L1 (accepted): safe_input at block 20 with nonce 0.
+        storage
+            .append_safe_inputs(
+                20,
+                &[StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: make_stale_batch_payload(0, 10),
+                    block_number: 20,
+                }],
+            )
+            .expect("append batch 0 submission");
+        storage
+            .populate_safe_accepted_batches(batch_submitter, 1200)
+            .expect("populate accepted frontier");
+
+        // Advance safe head so batches 1, 2, 3 (first_frame=100) are stale.
+        // current_safe=1400 → 1400-100=1300 >= 1200.
+        storage
+            .append_safe_inputs(1400, &[])
+            .expect("advance past threshold");
+
+        let inv = storage.detect_and_recover(1200).expect("recover");
+        // Batches 1, 2, 3 invalidated; batch 0 (accepted) stays valid.
+        assert_eq!(inv, vec![1, 2, 3], "only the suffix cascades, got {inv:?}");
+
+        // The NEW Tip has parent=0 (the last valid ancestor), nonce=1.
+        // This is what nonce reuse looks like: the invalidated batch 1 had
+        // nonce 1; the recovery batch gets the same nonce via +1-from-parent.
+        let (tip_nonce, tip_parent): (i64, i64) = storage
+            .conn
+            .query_row(
+                "SELECT nonce, parent_batch_index FROM valid_open_batch",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query recovery tip");
+        assert_eq!(tip_nonce, 1, "recovery Tip reuses nonce 1");
+        assert_eq!(tip_parent, 0, "recovery Tip's parent is batch 0");
     }
 }

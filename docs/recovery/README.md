@@ -35,7 +35,7 @@ Every batch on the valid path has exactly one color. Dead branches are lead (per
 |------------|----------------------------------------------------------------|-----------|
 | **Gold**   | Safe on L1 and accepted by the scheduler                       | Yes       |
 | **Silver** | Valid, optimistically executed, but not yet safe/accepted      | No        |
-| **Lead**   | Invalid (in `invalid_batches`)                                 | Yes       |
+| **Lead**   | Invalid (has `batches.invalidated_at_ms` set)                  | Yes       |
 
 Gold batches form a contiguous prefix of the valid path. Silver batches form a contiguous suffix (after the gold prefix up to the open batch). Lead batches hang off gold nodes as dead branches -- the first lead in any cascade always has a gold parent.
 
@@ -93,7 +93,7 @@ Current staleness triggers **preemptive recovery** (see below).
 
 ## Nonce Uniqueness on the Valid Path
 
-The `batch_nonces` table can have duplicate nonces across the full table -- a recovery batch reuses the nonce of the first batch it replaces. But among **valid batches** (those not in `invalid_batches`), nonces are unique.
+`batches.nonce` can repeat across the full table -- a recovery batch inherits `parent.nonce + 1` from the last valid ancestor, which is the same nonce the first invalidated suffix batch had. Among **valid batches** (those with `invalidated_at_ms IS NULL`), nonces are unique because the valid path is a strict chain via `parent_batch_index`.
 
 This matters because L1 works in nonce-space (the scheduler identifies batches by nonce) while the sequencer works in index-space (local `batch_index`). The recovery path needs to translate between them: "which batch indexes should we invalidate?" Nonce uniqueness on the valid path is what makes this mapping unambiguous.
 
@@ -166,9 +166,8 @@ There are no more mempool entries. All uncertainty is resolved.
 This is an atomic SQLite transaction operating on fully-finalized L1 state:
 
 1. **Populate gold frontier** (`populate_safe_accepted_batches`): scan L1 safe inputs, simulate scheduler acceptance logic. Learn `schedulerExpected` -- the next batch nonce the scheduler needs.
-2. **Assign nonces** (`assign_batch_nonces`): give contiguous nonces to un-nonced valid closed batches.
-3. **Detect staleness**: if the first unaccepted batch is stale by inclusion, cascade-invalidate it and all successors. If nothing is stale (all batches made it in time), skip to step 6.
-4. **Open recovery batch**: fresh batch with `batch_nonce = schedulerExpected`, re-drain direct inputs from invalidated batches.
+2. **Detect staleness**: if the first unaccepted batch is stale by inclusion, cascade-invalidate it and all successors (set `invalidated_at_ms` on each). If nothing is stale, skip to step 6 (Resume).
+3. **Open recovery batch**: fresh batch whose `parent_batch_index` is the last valid ancestor. Its `nonce` is structurally `parent.nonce + 1`, which equals `schedulerExpected`. Re-drain direct inputs from invalidated batches.
 
 ### Step 6: Resume
 

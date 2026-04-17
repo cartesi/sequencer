@@ -39,13 +39,15 @@ pub(super) fn batch_age_is_stale(
 // batch/frame and must always match what's persisted in `batches` and `frames`.
 
 pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
+    // The Tip is the single row in `valid_open_batch` (enforced by
+    // `ux_single_valid_tip`). Returns None if there's no Tip (fresh DB,
+    // or torn state between cascade and recovery-batch open).
     let latest_batch = match tx.query_row(
         "SELECT
             b.batch_index,
             b.created_at_ms,
             (SELECT COUNT(*) FROM user_ops u WHERE u.batch_index = b.batch_index) AS user_op_count
-         FROM valid_batches b
-         ORDER BY b.batch_index DESC LIMIT 1",
+         FROM valid_open_batch b",
         [],
         |row| {
             Ok((
@@ -126,23 +128,76 @@ pub(super) fn query_batch_policy(conn: &Connection) -> Result<BatchPolicy> {
 
 // ── Batch / frame insert helpers (used by ingress and recovery) ───────────
 
-pub(super) fn insert_open_batch(tx: &Transaction<'_>, created_at_ms: i64) -> Result<u64> {
-    tx.execute(
-        "INSERT INTO batches (created_at_ms) VALUES (?1)",
-        params![created_at_ms],
-    )?;
-    Ok(i64_to_u64(tx.last_insert_rowid()))
+/// Insert a new batch. Nonce is derived from `parent_batch_index`:
+/// `parent.nonce + 1`, or 0 if `parent_batch_index` is None (genesis or
+/// post-cascade torn-state new Tip).
+///
+/// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
+/// The explicit form is used only by `initialize_open_state` to pin the
+/// very first genesis batch at `batch_index = 0`.
+///
+/// The `trg_enforce_nonce_contiguity` trigger verifies the nonce matches
+/// `parent.nonce + 1`, so caller and schema agree.
+pub(super) fn insert_new_batch(
+    tx: &Transaction<'_>,
+    batch_index_opt: Option<u64>,
+    parent_batch_index: Option<u64>,
+    created_at_ms: i64,
+) -> Result<u64> {
+    let nonce = compute_next_nonce(tx, parent_batch_index)?;
+    match batch_index_opt {
+        Some(bi) => {
+            tx.execute(
+                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    u64_to_i64(bi),
+                    parent_batch_index.map(u64_to_i64),
+                    u64_to_i64(nonce),
+                    created_at_ms
+                ],
+            )?;
+            Ok(bi)
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO batches (parent_batch_index, nonce, created_at_ms) \
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    parent_batch_index.map(u64_to_i64),
+                    u64_to_i64(nonce),
+                    created_at_ms
+                ],
+            )?;
+            Ok(i64_to_u64(tx.last_insert_rowid()))
+        }
+    }
 }
 
-pub(super) fn insert_open_batch_with_index(
-    tx: &Transaction<'_>,
-    batch_index: u64,
-    created_at_ms: i64,
-) -> Result<()> {
-    tx.execute(
-        "INSERT INTO batches (batch_index, created_at_ms) VALUES (?1, ?2)",
-        params![u64_to_i64(batch_index), created_at_ms],
+fn compute_next_nonce(tx: &Transaction<'_>, parent_batch_index: Option<u64>) -> Result<u64> {
+    match parent_batch_index {
+        None => Ok(0),
+        Some(parent_bi) => {
+            let parent_nonce: i64 = tx.query_row(
+                "SELECT nonce FROM batches WHERE batch_index = ?1",
+                params![u64_to_i64(parent_bi)],
+                |row| row.get(0),
+            )?;
+            Ok(i64_to_u64(parent_nonce).saturating_add(1))
+        }
+    }
+}
+
+/// Mark a batch as sealed (inclusion lane closed it). Write-once per the
+/// `trg_sealed_at_ms_write_once` trigger.
+pub(super) fn seal_batch(tx: &Transaction<'_>, batch_index: u64, sealed_at_ms: i64) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE batches SET sealed_at_ms = ?1 WHERE batch_index = ?2",
+        params![sealed_at_ms, u64_to_i64(batch_index)],
     )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::StatementChangedRows(changed));
+    }
     Ok(())
 }
 

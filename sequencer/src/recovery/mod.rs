@@ -311,7 +311,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 1");
-        storage.assign_batch_nonces().expect("assign nonces");
 
         storage
             .append_safe_inputs(
