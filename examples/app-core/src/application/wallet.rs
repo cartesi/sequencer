@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use alloy_primitives::{Address, U256, address};
-use ssz::Decode;
+use ssz::{Decode, Encode};
+use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
+use thiserror::Error;
 use tracing::{error, warn};
 use types::alloy_sol_types::SolCall;
 use types::{Erc20Deposit, Erc20Transfer};
@@ -53,6 +56,42 @@ pub struct WalletApp {
     config: WalletConfig,
     balances: HashMap<Address, U256>,
     nonces: HashMap<Address, u32>,
+    executed_input_count: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum WalletSnapshotError {
+    #[error("snapshot decode failed: {0}")]
+    Decode(String),
+    #[error("snapshot I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<ssz::DecodeError> for WalletSnapshotError {
+    fn from(value: ssz::DecodeError) -> Self {
+        Self::Decode(format!("{value:?}"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+struct SnapshotBalance {
+    address: [u8; 20],
+    balance_be: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+struct SnapshotNonce {
+    address: [u8; 20],
+    nonce: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+struct WalletSnapshotV1 {
+    erc20_portal_address: [u8; 20],
+    supported_erc20_token: [u8; 20],
+    sequencer_address: [u8; 20],
+    balances: Vec<SnapshotBalance>,
+    nonces: Vec<SnapshotNonce>,
     executed_input_count: u64,
 }
 
@@ -111,6 +150,77 @@ impl WalletApp {
         }
 
         Erc20Deposit::decode(&input.payload).map(Some)
+    }
+
+    pub fn snapshot_bytes(&self) -> Vec<u8> {
+        let mut balances: Vec<_> = self
+            .balances
+            .iter()
+            .map(|(address, balance)| SnapshotBalance {
+                address: address.into_array(),
+                balance_be: balance.to_be_bytes(),
+            })
+            .collect();
+        balances.sort_unstable_by_key(|entry| entry.address);
+
+        let mut nonces: Vec<_> = self
+            .nonces
+            .iter()
+            .map(|(address, nonce)| SnapshotNonce {
+                address: address.into_array(),
+                nonce: *nonce,
+            })
+            .collect();
+        nonces.sort_unstable_by_key(|entry| entry.address);
+
+        WalletSnapshotV1 {
+            erc20_portal_address: self.config.erc20_portal_address.into_array(),
+            supported_erc20_token: self.config.supported_erc20_token.into_array(),
+            sequencer_address: self.config.sequencer_address.into_array(),
+            balances,
+            nonces,
+            executed_input_count: self.executed_input_count,
+        }
+        .as_ssz_bytes()
+    }
+
+    pub fn restore_from_snapshot_bytes(
+        &mut self,
+        snapshot: &[u8],
+    ) -> Result<(), WalletSnapshotError> {
+        let decoded = WalletSnapshotV1::from_ssz_bytes(snapshot)?;
+        self.config = WalletConfig {
+            erc20_portal_address: Address::from(decoded.erc20_portal_address),
+            supported_erc20_token: Address::from(decoded.supported_erc20_token),
+            sequencer_address: Address::from(decoded.sequencer_address),
+        };
+        self.balances = decoded
+            .balances
+            .into_iter()
+            .map(|entry| {
+                (
+                    Address::from(entry.address),
+                    U256::from_be_bytes(entry.balance_be),
+                )
+            })
+            .collect();
+        self.nonces = decoded
+            .nonces
+            .into_iter()
+            .map(|entry| (Address::from(entry.address), entry.nonce))
+            .collect();
+        self.executed_input_count = decoded.executed_input_count;
+        Ok(())
+    }
+
+    pub fn save_snapshot<P: AsRef<Path>>(&self, path: P) -> Result<(), WalletSnapshotError> {
+        std::fs::write(path, self.snapshot_bytes())?;
+        Ok(())
+    }
+
+    pub fn load_snapshot<P: AsRef<Path>>(&mut self, path: P) -> Result<(), WalletSnapshotError> {
+        let bytes = std::fs::read(path)?;
+        self.restore_from_snapshot_bytes(&bytes)
     }
 }
 
@@ -257,6 +367,9 @@ impl Application for WalletApp {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use alloy_primitives::{Address, U256, address};
     use ssz_derive::{Decode, Encode};
     use types::ERC20_DEPOSIT_PREFIX_BYTES;
@@ -644,5 +757,82 @@ mod tests {
         );
         // Fee goes to address zero — effectively burned.
         assert_eq!(app.current_user_balance(Address::ZERO), gas_cost);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_restores_full_state() {
+        let mut app = WalletApp::new(WalletConfig {
+            erc20_portal_address: address!("0x1212121212121212121212121212121212121212"),
+            supported_erc20_token: address!("0x3434343434343434343434343434343434343434"),
+            sequencer_address: address!("0x5656565656565656565656565656565656565656"),
+        });
+        let alice = address!("0x1111111111111111111111111111111111111111");
+        let bob = address!("0x2222222222222222222222222222222222222222");
+        app.balances.insert(alice, U256::from(1234_u64));
+        app.balances.insert(bob, U256::from(5678_u64));
+        app.nonces.insert(alice, 4);
+        app.nonces.insert(bob, 9);
+        app.executed_input_count = 42;
+
+        let snapshot = app.snapshot_bytes();
+        let mut restored = WalletApp::default();
+        restored
+            .restore_from_snapshot_bytes(&snapshot)
+            .expect("snapshot should decode");
+
+        assert_eq!(
+            restored.config.erc20_portal_address,
+            app.config.erc20_portal_address
+        );
+        assert_eq!(
+            restored.config.supported_erc20_token,
+            app.config.supported_erc20_token
+        );
+        assert_eq!(
+            restored.config.sequencer_address,
+            app.config.sequencer_address
+        );
+        assert_eq!(restored.balances, app.balances);
+        assert_eq!(restored.nonces, app.nonces);
+        assert_eq!(restored.executed_input_count, app.executed_input_count);
+    }
+
+    #[test]
+    fn save_then_load_snapshot_persists_state_to_disk() {
+        let mut app = WalletApp::new(WalletConfig::default());
+        let user = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        app.balances.insert(user, U256::from(999_u64));
+        app.nonces.insert(user, 3);
+        app.executed_input_count = 11;
+
+        let path = temp_snapshot_file_path("wallet-snapshot");
+        app.save_snapshot(&path).expect("save snapshot");
+
+        let mut loaded = WalletApp::default();
+        loaded.load_snapshot(&path).expect("load snapshot");
+        std::fs::remove_file(&path).expect("cleanup snapshot file");
+
+        assert_eq!(loaded.balances, app.balances);
+        assert_eq!(loaded.nonces, app.nonces);
+        assert_eq!(loaded.executed_input_count, app.executed_input_count);
+    }
+
+    #[test]
+    fn restore_rejects_malformed_snapshot() {
+        let mut app = WalletApp::default();
+        let err = app
+            .restore_from_snapshot_bytes(&[0x01, 0x02, 0x03])
+            .expect_err("invalid bytes should fail");
+        assert!(matches!(err, super::WalletSnapshotError::Decode(_)));
+    }
+
+    fn temp_snapshot_file_path(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        path.push(format!("{prefix}-{}-{nanos}.bin", std::process::id()));
+        path
     }
 }
