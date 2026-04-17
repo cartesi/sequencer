@@ -6,7 +6,8 @@ use std::time::Duration;
 use crate::{ScenarioFn, ScenarioResult};
 use alloy_primitives::{Address, U256};
 use rollups_harness::{
-    ManagedSequencer, ReplayWalletApp, TestSigner, WalletL1Client, WsClient, sign_user_op_hex,
+    ManagedSequencer, ReplayWalletApp, TcpProxy, TestSigner, WalletL1Client, WsClient,
+    sign_user_op_hex,
 };
 use sequencer_core::api::{TxRequest, WsTxMessage};
 use sequencer_core::fee::fee_to_linear;
@@ -64,6 +65,18 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         }),
         ("recovery_after_stale_batches_test", |runtime| {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
+        }),
+        ("sequencer_outage_pre_danger_no_recovery_test", |runtime| {
+            Box::pin(run_sequencer_outage_pre_danger_no_recovery_test(runtime))
+        }),
+        ("sequencer_outage_danger_zone_no_cascade_test", |runtime| {
+            Box::pin(run_sequencer_outage_danger_zone_no_cascade_test(runtime))
+        }),
+        ("provider_outage_past_stale_cascades_test", |runtime| {
+            Box::pin(run_provider_outage_past_stale_cascades_test(runtime))
+        }),
+        ("provider_outage_wall_clock_refuses_boot_test", |runtime| {
+            Box::pin(run_provider_outage_wall_clock_refuses_boot_test(runtime))
         }),
     ]
 }
@@ -733,6 +746,405 @@ async fn run_recovery_after_stale_batches_test(
     );
     assert_eq!(replay_after.current_user_nonce(alice_address), 1);
 
+    Ok(())
+}
+
+// ── §11.1.1 — Sequencer outage, pre-danger zone ────────────────────────────
+//
+// Sequencer stops with an open batch (deposit + transfer); L1 advances 500
+// blocks (well below the danger threshold of ~1125). On restart:
+//   - Startup recovery runs but finds no danger zone → no flush.
+//   - No batches are stale → no cascade invalidation.
+//   - The deposit and transfer persist across the restart.
+//   - New txs succeed against the unchanged state.
+//
+// This is the positive control for the recovery procedure: it must NOT fire
+// (or over-fire) when L1 hasn't drifted enough to cause trouble.
+
+async fn run_sequencer_outage_pre_danger_no_recovery_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    // Pick an advance that's safely below the 1125-block danger threshold
+    // (MAX_WAIT_BLOCKS 1200 - default margin 75 = 1125).
+    const PRE_DANGER_BLOCKS: u64 = 500;
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
+    let mut replay_before = ReplayWalletApp::devnet();
+
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(100_000_u64);
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
+
+    // Step 1: Fund Alice and record a transfer.
+    apply_safe_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay_before,
+        &alice_l1,
+        deposit_amount,
+    )
+    .await?;
+    alice_l2.transfer(bob_address, transfer_amount).await?;
+    replay_before.apply(ws.expect_user_op_from(alice_address).await?)?;
+
+    let expected_alice_balance = deposit_amount - transfer_amount - gas;
+    let expected_bob_balance = transfer_amount;
+
+    // Step 2: Stop the sequencer. Leave Anvil running.
+    drop(ws);
+    runtime.stop().await?;
+
+    // Step 3: Advance L1 a pre-danger amount (500 < 1125 danger threshold).
+    runtime.mine_l1_blocks(PRE_DANGER_BLOCKS).await?;
+
+    // Step 4: Restart. No recovery should fire.
+    runtime.respawn().await?;
+
+    // Step 5: Replay via WS from offset 0. Both the deposit and transfer must
+    // still be present (no invalidation).
+    let mut ws_after = runtime.ws(0).await?;
+    let mut replay_after = ReplayWalletApp::devnet();
+    replay_after.apply(
+        ws_after
+            .expect_direct_input_from(runtime.erc20_portal_address())
+            .await?,
+    )?;
+    replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
+
+    assert_eq!(
+        replay_after.current_user_balance(alice_address),
+        expected_alice_balance,
+        "pre-danger restart must preserve Alice's balance",
+    );
+    assert_eq!(
+        replay_after.current_user_balance(bob_address),
+        expected_bob_balance,
+        "pre-danger restart must preserve Bob's balance",
+    );
+    assert_eq!(
+        replay_after.current_user_nonce(alice_address),
+        1,
+        "Alice's nonce must NOT be reset",
+    );
+
+    // Step 6: No further messages queued. Confirm nothing else comes through.
+    // (A follow-up "new work succeeds" step is omitted here because the
+    // harness's `wallet_l2` initializes its local nonce counter at 0, and
+    // this scenario explicitly does NOT reset the on-chain nonce — the
+    // post-restart nonce is 1. Adding a "submit at nonce 1" check would
+    // require harness plumbing beyond the scope of this regression test.)
+    ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
+
+    Ok(())
+}
+
+// ── §11.1.2 — Sequencer outage, danger zone (not yet stale) ────────────────
+//
+// Sequencer stops; L1 advances into the danger zone (past 1125 blocks) but
+// strictly below the staleness threshold (1200). On restart:
+//   - `check_danger_zone` returns Some(_) — flush runs (no-op: nothing was
+//     submitted and no w_nonce is pending).
+//   - `detect_and_recover` finds nothing stale — no cascade.
+//   - Pre-outage state is preserved (same positive invariant as §11.1.1).
+//
+// This exercises the flush-runs-but-cascade-doesn't path specifically.
+
+async fn run_sequencer_outage_danger_zone_no_cascade_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    // Pick advance in the danger zone: > danger_threshold (1125) but < MAX_WAIT (1200).
+    const DANGER_ZONE_BLOCKS: u64 = 1150;
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
+    let mut replay_before = ReplayWalletApp::devnet();
+
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(100_000_u64);
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
+
+    apply_safe_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay_before,
+        &alice_l1,
+        deposit_amount,
+    )
+    .await?;
+    alice_l2.transfer(bob_address, transfer_amount).await?;
+    replay_before.apply(ws.expect_user_op_from(alice_address).await?)?;
+
+    let expected_alice_balance = deposit_amount - transfer_amount - gas;
+    let expected_bob_balance = transfer_amount;
+
+    drop(ws);
+    runtime.stop().await?;
+
+    // L1 advances into the danger zone but strictly below the staleness
+    // threshold. The danger-zone path should fire (flush is a no-op here
+    // because no batch was ever submitted to L1), and the recovery procedure
+    // should find no stale batches.
+    runtime.mine_l1_blocks(DANGER_ZONE_BLOCKS).await?;
+
+    runtime.respawn().await?;
+
+    // Same positive invariant as §11.1.1: pre-outage state preserved, nonces
+    // not reset, feed replay produces identical history.
+    let mut ws_after = runtime.ws(0).await?;
+    let mut replay_after = ReplayWalletApp::devnet();
+    replay_after.apply(
+        ws_after
+            .expect_direct_input_from(runtime.erc20_portal_address())
+            .await?,
+    )?;
+    replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
+
+    assert_eq!(
+        replay_after.current_user_balance(alice_address),
+        expected_alice_balance,
+        "danger-zone restart must preserve Alice's balance \
+         (flush runs but no cascade)",
+    );
+    assert_eq!(
+        replay_after.current_user_balance(bob_address),
+        expected_bob_balance,
+    );
+    assert_eq!(
+        replay_after.current_user_nonce(alice_address),
+        1,
+        "nonce must not be reset when no cascade happens",
+    );
+
+    ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
+
+    Ok(())
+}
+
+// ── §11.2.3 — Provider outage, past-stale (recovery through proxy) ──────────
+//
+// Scenario: the sequencer is routed through a `TcpProxy`, simulating a
+// gateway in front of the real L1 node. While the sequencer is stopped,
+// a temporary outage happens (proxy disconnected), L1 advances past the
+// staleness threshold, and the outage ends (proxy reconnected). The next
+// sequencer restart connects via the proxy, sees the advanced safe head,
+// and cascade-invalidates the stale open batch.
+//
+// What this locks down that the sequencer-outage tests don't:
+//   - The proxy is actually wired into the RPC path. Subsequent RPC calls
+//     from the sequencer (safe-head sync, batch submission) route through
+//     it. If `set_l1_endpoint_override` ever regressed (e.g., respawn
+//     ignored the override), this test would fail.
+//   - Recovery over a non-direct connection works end-to-end.
+//
+// Note on wall-clock fallback: in principle this scenario would also test
+// the fallback refusing to boot when L1 is unreachable AND real time has
+// elapsed past the danger threshold. In practice, `anvil_mine(N)` takes
+// milliseconds of real wall-clock time, so the fallback correctly reports
+// "not yet in danger by wall-clock" and lets the sequencer boot with stale
+// data. Exercising the wall-clock-refuses-to-boot path requires either
+// direct `synced_at_ms` DB manipulation or a time-skew tool — deferred.
+
+async fn run_provider_outage_past_stale_cascades_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    // Advance comfortably past staleness so the test is robust to small
+    // scheduling drifts.
+    const PAST_STALE_BLOCKS: u64 = 1250;
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+
+    // Step 1: Normal setup — deposit + transfer (the transfer will be lost).
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
+    let mut replay_before = ReplayWalletApp::devnet();
+
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(100_000_u64);
+
+    apply_safe_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay_before,
+        &alice_l1,
+        deposit_amount,
+    )
+    .await?;
+    alice_l2.transfer(bob_address, transfer_amount).await?;
+    replay_before.apply(ws.expect_user_op_from(alice_address).await?)?;
+
+    // Step 2: Stop the sequencer and insert a proxy into the L1 path.
+    drop(ws);
+    runtime.stop().await?;
+
+    let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
+    runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
+
+    // Step 3: Simulate a gateway outage that spans the staleness window.
+    //   - Disconnect the proxy (gateway is down).
+    //   - Mine 1250 blocks directly on Anvil (bypasses the proxy).
+    //   - Reconnect the proxy (gateway is back).
+    // During the outage the sequencer is stopped; when it comes back up,
+    // it will see the advanced safe head through the proxy.
+    proxy.disconnect();
+    runtime.mine_l1_blocks(PAST_STALE_BLOCKS).await?;
+    proxy.reconnect();
+
+    // Step 4: Respawn. The sequencer dials the proxy, the proxy forwards
+    // to Anvil, `sync_to_current_safe_head` returns 1250+ blocks past the
+    // open batch's first frame. `check_open_batch_staleness` fires, cascade
+    // invalidates, recovery batch opens.
+    runtime.respawn().await?;
+
+    // Step 5: Verify via WS replay.
+    let mut ws_after = runtime.ws(0).await?;
+    let mut replay_after = ReplayWalletApp::devnet();
+    replay_after.apply(
+        ws_after
+            .expect_direct_input_from(runtime.erc20_portal_address())
+            .await?,
+    )?;
+    ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
+
+    assert_eq!(
+        replay_after.current_user_balance(alice_address),
+        deposit_amount,
+        "transfer must be invalidated after past-stale outage routed through proxy",
+    );
+    assert_eq!(
+        replay_after.current_user_balance(bob_address),
+        U256::ZERO,
+        "Bob's receiving balance must be rolled back",
+    );
+    assert_eq!(replay_after.current_user_nonce(alice_address), 0);
+
+    // Step 6: Tear down the proxy cleanly.
+    proxy.shutdown().await?;
+
+    Ok(())
+}
+
+// ── §7.8.1 — Wall-clock fallback refuses to boot past danger threshold ─────
+//
+// Scenario: L1 is unreachable AND wall-clock time has elapsed past the
+// danger threshold since the last successful L1 sync. The sequencer must
+// refuse to boot — proceeding would mean issuing soft confirmations against
+// stale L1 state, potentially missing that batches are already doomed.
+//
+// This test only became possible after the `find_first_batch_in_danger`
+// unification. Prior to that fix, an open batch was invisible to
+// `check_danger_zone`, so the wall-clock fallback could "miss" an open
+// batch aging into danger while L1 was unreachable and boot anyway.
+//
+// The wall-clock illusion is created without OS tooling: `rewind_synced_at_ms`
+// rewrites `l1_safe_head.synced_at_ms` to an older timestamp, equivalent
+// to advancing the wall clock from the sequencer's perspective. We mine
+// an equivalent number of blocks on Anvil to keep the block-time coupling
+// documented in `docs/threat-model/README.md`.
+
+async fn run_provider_outage_wall_clock_refuses_boot_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    // Pick an elapsed time comfortably past the danger threshold. Defaults:
+    // seconds_per_block=12, danger_threshold=MAX_WAIT_BLOCKS(1200)-margin(75)=1125.
+    // We need elapsed_secs / 12 > 1125 → elapsed_secs > 13500. Use 5h.
+    const WALL_CLOCK_MS_AGO: u64 = 5 * 60 * 60 * 1000;
+    // Coupled block advance so the post-reconnect recovery has a fresh
+    // safe head to compare against.
+    const COUPLED_BLOCKS: u64 = WALL_CLOCK_MS_AGO / 1000 / 12;
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+
+    // Step 1: Normal setup — deposit + transfer (transfer will be lost).
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
+    let mut replay_before = ReplayWalletApp::devnet();
+
+    apply_safe_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay_before,
+        &alice_l1,
+        U256::from(600_000_u64),
+    )
+    .await?;
+    alice_l2
+        .transfer(bob_address, U256::from(100_000_u64))
+        .await?;
+    replay_before.apply(ws.expect_user_op_from(alice_address).await?)?;
+
+    // Step 2: Stop the sequencer, insert proxy, disconnect it, advance L1.
+    drop(ws);
+    runtime.stop().await?;
+
+    let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
+    runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
+    proxy.disconnect();
+    runtime.mine_l1_blocks(COUPLED_BLOCKS).await?;
+
+    // Step 3: Rewind the DB's synced_at_ms to simulate 5h of wall-clock gap.
+    // Combined with the block advance in step 2, this maintains the
+    // L1-block-time coupling: from the sequencer's view, 5h of time passed
+    // and ~1500 blocks were missed.
+    runtime.rewind_synced_at_ms(WALL_CLOCK_MS_AGO)?;
+
+    // Step 4: Attempt respawn with proxy disconnected. The sequencer:
+    //   - dials the proxy → sync_to_current_safe_head fails (L1 unreachable).
+    //   - falls back to wall-clock estimation.
+    //   - computes missed_blocks = 18000s / 12 = 1500 > danger_threshold 1125.
+    //   - `find_first_batch_in_danger(adjusted_threshold=0)` flags the open
+    //     batch (first_frame_safe_block << current_safe_block - 0).
+    //   - returns L1UnreachableInDangerZone → process exits with failure.
+    let respawn_result = runtime.respawn().await;
+    assert!(
+        respawn_result.is_err(),
+        "respawn must fail: wall-clock says past-danger AND open batch is in danger",
+    );
+
+    // Step 5: Reconnect the proxy and respawn normally. Sync now succeeds,
+    // the stale open batch is cascade-invalidated, recovery batch opens.
+    proxy.reconnect();
+    runtime.respawn().await?;
+
+    // Step 6: Verify the invalidation: only the re-drained deposit appears.
+    let mut ws_after = runtime.ws(0).await?;
+    let mut replay_after = ReplayWalletApp::devnet();
+    replay_after.apply(
+        ws_after
+            .expect_direct_input_from(runtime.erc20_portal_address())
+            .await?,
+    )?;
+    ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
+
+    assert_eq!(
+        replay_after.current_user_balance(alice_address),
+        U256::from(600_000_u64),
+        "transfer must be invalidated after wall-clock-triggered recovery",
+    );
+    assert_eq!(replay_after.current_user_balance(bob_address), U256::ZERO,);
+    assert_eq!(replay_after.current_user_nonce(alice_address), 0);
+
+    proxy.shutdown().await?;
     Ok(())
 }
 

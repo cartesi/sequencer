@@ -3581,6 +3581,7 @@ dependencies = [
  "ethereum_ssz",
  "futures-util",
  "k256",
+ "rusqlite",
  "sequencer-core",
  "sequencer-rust-client",
  "serde",

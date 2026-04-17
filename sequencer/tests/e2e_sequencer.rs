@@ -29,6 +29,167 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+// ── §1.1 — V1 regression: cross-boundary signature domain consistency ────────
+//
+// The sequencer signs user-ops with `sequencer_core::build_input_domain`. The
+// scheduler (canonical-app) recovers senders with the same function. If the
+// two sides ever drift (the V1 bug: scheduler had `name: None`, sequencer had
+// `name: Some("CartesiAppSequencer")`), every signature recovers a different
+// address on each side, structurally breaking the rollup.
+//
+// These tests lock the invariant at two levels:
+//   1. A signature built via the shared constructor recovers the signer's
+//      address (positive).
+//   2. A signature built with ANY domain that differs from the shared
+//      constructor recovers a DIFFERENT address (negative — proves the domain
+//      actually affects recovery).
+
+#[test]
+fn v1_regression_shared_domain_recovers_signer() {
+    use alloy_sol_types::SolStruct;
+
+    let signing_key = SigningKey::from_bytes((&[42_u8; 32]).into()).expect("signing key");
+    let signer_address = address_from_signing_key(&signing_key);
+
+    let chain_id = 31_337_u64;
+    let app = Address::from_slice(&[0xaa; 20]);
+    let domain = sequencer_core::build_input_domain(chain_id, app);
+
+    let user_op = UserOp {
+        nonce: 0,
+        max_fee: 1_200,
+        data: vec![0x01, 0x02, 0x03].into(),
+    };
+
+    // Sign with the shared domain.
+    let hash = user_op.eip712_signing_hash(&domain);
+    let k256_sig = signing_key.sign_prehash(hash.as_slice()).expect("sign");
+    let signature = [false, true]
+        .into_iter()
+        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
+        .find(|s| {
+            s.recover_address_from_prehash(&hash)
+                .ok()
+                .is_some_and(|r| r == signer_address)
+        })
+        .expect("recoverable parity");
+
+    // Recover with the shared domain — must equal signer.
+    let hash_again = user_op.eip712_signing_hash(&domain);
+    let recovered = signature
+        .recover_address_from_prehash(&hash_again)
+        .expect("recover");
+    assert_eq!(
+        recovered, signer_address,
+        "shared domain must recover signer"
+    );
+}
+
+#[test]
+fn v1_regression_name_none_domain_recovers_different_address() {
+    use alloy_sol_types::{Eip712Domain, SolStruct};
+
+    let signing_key = SigningKey::from_bytes((&[42_u8; 32]).into()).expect("signing key");
+    let signer_address = address_from_signing_key(&signing_key);
+
+    let chain_id = 31_337_u64;
+    let app = Address::from_slice(&[0xaa; 20]);
+    let correct_domain = sequencer_core::build_input_domain(chain_id, app);
+
+    // The exact buggy domain the scheduler used pre-V1 fix.
+    let buggy_domain = Eip712Domain {
+        name: None,
+        version: None,
+        chain_id: Some(U256::from(chain_id)),
+        verifying_contract: Some(app),
+        salt: None,
+    };
+
+    let user_op = UserOp {
+        nonce: 0,
+        max_fee: 1_200,
+        data: vec![0x01, 0x02, 0x03].into(),
+    };
+
+    // Sign with the correct (shared) domain.
+    let hash = user_op.eip712_signing_hash(&correct_domain);
+    let k256_sig = signing_key.sign_prehash(hash.as_slice()).expect("sign");
+    let signature = [false, true]
+        .into_iter()
+        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
+        .find(|s| {
+            s.recover_address_from_prehash(&hash)
+                .ok()
+                .is_some_and(|r| r == signer_address)
+        })
+        .expect("recoverable parity");
+
+    // Recover with the buggy domain — must NOT recover the signer.
+    // (This is what would silently fail at the scheduler under the V1 bug.)
+    let buggy_hash = user_op.eip712_signing_hash(&buggy_domain);
+    let recovered_under_buggy = signature
+        .recover_address_from_prehash(&buggy_hash)
+        .expect("recovery succeeds but returns the wrong address");
+    assert_ne!(
+        recovered_under_buggy, signer_address,
+        "a name:None domain must not recover the signer — if this fails, \
+         the shared domain constructor is bit-identical to the buggy one, \
+         meaning the V1 fix regressed"
+    );
+}
+
+#[test]
+fn v1_regression_domain_fields_all_affect_recovery() {
+    use alloy_sol_types::SolStruct;
+
+    let signing_key = SigningKey::from_bytes((&[42_u8; 32]).into()).expect("signing key");
+    let signer_address = address_from_signing_key(&signing_key);
+
+    let app = Address::from_slice(&[0xaa; 20]);
+    let user_op = UserOp {
+        nonce: 0,
+        max_fee: 1_200,
+        data: vec![0x01].into(),
+    };
+
+    // Sign with chain_id = 1.
+    let chain_a = sequencer_core::build_input_domain(1, app);
+    let hash_a = user_op.eip712_signing_hash(&chain_a);
+    let k256_sig = signing_key.sign_prehash(hash_a.as_slice()).expect("sign");
+    let signature = [false, true]
+        .into_iter()
+        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
+        .find(|s| {
+            s.recover_address_from_prehash(&hash_a)
+                .ok()
+                .is_some_and(|r| r == signer_address)
+        })
+        .expect("recoverable parity");
+
+    // Cross-chain replay must fail: recover under chain_id=2 with the same app.
+    let chain_b = sequencer_core::build_input_domain(2, app);
+    let hash_b = user_op.eip712_signing_hash(&chain_b);
+    let recovered_b = signature
+        .recover_address_from_prehash(&hash_b)
+        .expect("recovery returns some address");
+    assert_ne!(
+        recovered_b, signer_address,
+        "cross-chain replay must not recover signer"
+    );
+
+    // Cross-app replay must fail: recover under same chain but different app.
+    let other_app = Address::from_slice(&[0xbb; 20]);
+    let chain_a_app_other = sequencer_core::build_input_domain(1, other_app);
+    let hash_app_other = user_op.eip712_signing_hash(&chain_a_app_other);
+    let recovered_app_other = signature
+        .recover_address_from_prehash(&hash_app_other)
+        .expect("recovery returns some address");
+    assert_ne!(
+        recovered_app_other, signer_address,
+        "cross-app replay must not recover signer"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_submit_tx_ack_and_broadcast() {
     let db = temp_db("full-e2e");
@@ -226,6 +387,43 @@ async fn api_rejects_malformed_json_as_bad_request() {
     assert!(
         body.contains("BAD_REQUEST"),
         "expected bad-request error code, got: {body}"
+    );
+
+    // §2.10 / H2 regression: the message must come from the fixed taxonomy
+    // ("invalid JSON"), NOT reflect serde's line/column/token excerpt. The
+    // malformed input contains the token `0x1234` — assert it doesn't appear
+    // in the response body so no attacker-submitted bytes are echoed.
+    assert!(
+        body.contains("\"message\":\"invalid JSON\""),
+        "expected fixed message 'invalid JSON' in body, got: {body}"
+    );
+    assert!(
+        !body.contains("0x1234"),
+        "body must not reflect attacker-submitted input bytes, got: {body}"
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_rejects_missing_content_type_with_fixed_message() {
+    // §2.10 / H2 regression: missing Content-Type must produce a fixed
+    // `"missing content type"` message, not reflect any part of the request.
+    let db = temp_db("missing-content-type");
+    let domain = test_domain();
+    bootstrap_open_frame(db.path.as_str());
+
+    let Some(runtime) = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await
+    else {
+        return;
+    };
+
+    // Valid JSON body, but sent without Content-Type: application/json.
+    let (status, body) = post_raw_body_no_content_type(runtime.addr, "{}").await;
+    assert_eq!(status, 400, "missing content-type: {body}");
+    assert!(
+        body.contains("\"message\":\"missing content type\""),
+        "expected fixed 'missing content type' message, got: {body}"
     );
 
     shutdown_runtime(runtime).await;
@@ -698,6 +896,30 @@ fn assert_ws_message_matches_tx(
             );
         }
     }
+}
+
+async fn post_raw_body_no_content_type(addr: std::net::SocketAddr, body: &str) -> (u16, String) {
+    let host_port = addr.to_string();
+    let mut stream = tokio::net::TcpStream::connect(host_port.as_str())
+        .await
+        .expect("connect test http socket");
+    // Deliberately omit Content-Type header.
+    let request = format!(
+        "POST /tx HTTP/1.1\r\nHost: {host_port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw request");
+    stream.flush().await.expect("flush raw request");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read raw response");
+    parse_http_response(response.as_slice())
 }
 
 async fn post_raw_json(addr: std::net::SocketAddr, body: &str) -> (u16, String) {
