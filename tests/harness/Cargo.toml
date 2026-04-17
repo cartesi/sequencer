@@ -17,6 +17,7 @@ alloy-sol-types = "1.4.1"
 cartesi-rollups-contracts = "=2.2.0"
 futures-util = "0.3"
 k256 = "0.13.4"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 sequencer-core = { path = "../../sequencer-core" }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
 serde = { version = "1", features = ["derive"] }

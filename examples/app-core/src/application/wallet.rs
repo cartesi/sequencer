@@ -177,33 +177,31 @@ impl Application for WalletApp {
 
         let method = Method::from_ssz_bytes(user_op.data.as_slice()).ok();
         match method.as_ref() {
-            Some(Method::Transfer(transfer)) => {
-                if self.debit_if_possible(sender, transfer.amount) {
-                    self.credit(transfer.to, transfer.amount);
-                    outputs.push(AppOutput::Notice(
-                        TransferNotice {
-                            sender,
-                            recipient: transfer.to,
-                            amount: transfer.amount,
-                        }
-                        .abi_encode(),
-                    ));
-                }
+            Some(Method::Transfer(transfer)) if self.debit_if_possible(sender, transfer.amount) => {
+                self.credit(transfer.to, transfer.amount);
+                outputs.push(AppOutput::Notice(
+                    TransferNotice {
+                        sender,
+                        recipient: transfer.to,
+                        amount: transfer.amount,
+                    }
+                    .abi_encode(),
+                ));
             }
-            Some(Method::Withdrawal(withdrawal)) => {
-                if self.debit_if_possible(sender, withdrawal.amount) {
-                    outputs.push(AppOutput::Voucher {
-                        destination: self.config.supported_erc20_token,
-                        value: U256::ZERO,
-                        payload: Erc20Transfer {
-                            recipient: sender,
-                            amount: withdrawal.amount,
-                        }
-                        .abi_encode(),
-                    });
-                }
+            Some(Method::Withdrawal(withdrawal))
+                if self.debit_if_possible(sender, withdrawal.amount) =>
+            {
+                outputs.push(AppOutput::Voucher {
+                    destination: self.config.supported_erc20_token,
+                    value: U256::ZERO,
+                    payload: Erc20Transfer {
+                        recipient: sender,
+                        amount: withdrawal.amount,
+                    }
+                    .abi_encode(),
+                });
             }
-            None => {}
+            _ => {}
         }
 
         self.executed_input_count = self.executed_input_count.saturating_add(1);

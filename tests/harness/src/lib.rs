@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 pub mod paths;
+pub mod proxy;
 pub mod replay;
 pub mod rollups;
 pub mod sequencer;
@@ -11,6 +12,7 @@ pub mod ws;
 
 pub type HarnessResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+pub use proxy::TcpProxy;
 pub use replay::ReplayWalletApp;
 pub use rollups::{DEVNET_CHAIN_ID, DevnetRollupsStack};
 pub use sequencer::{

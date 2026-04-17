@@ -45,6 +45,11 @@ pub struct ManagedSequencer {
     data_dir_path: PathBuf,
     endpoint: String,
     log_path: PathBuf,
+    /// Overrides the `--eth-rpc-url` the sequencer uses. When `None`, the
+    /// sequencer dials Anvil directly. When `Some(url)`, it dials the
+    /// override (e.g., a `TcpProxy` in front of Anvil for outage tests).
+    /// Persists across `respawn()` so post-restart behavior is consistent.
+    l1_endpoint_override: Option<String>,
 }
 
 pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> ManagedSequencerConfig {
@@ -76,6 +81,7 @@ impl ManagedSequencer {
             logs_dir.as_path(),
             data_dir_path.as_path(),
             &rollups,
+            None,
         )
         .await?;
 
@@ -90,7 +96,68 @@ impl ManagedSequencer {
             data_dir_path,
             endpoint,
             log_path,
+            l1_endpoint_override: None,
         })
+    }
+
+    /// Configure the sequencer to dial `l1_endpoint` instead of Anvil directly.
+    /// The override applies to the *next* `respawn()` and persists until cleared.
+    /// Intended for tests that route through a [`crate::TcpProxy`].
+    ///
+    /// Does not affect the currently-running sequencer process.
+    pub fn set_l1_endpoint_override(&mut self, l1_endpoint: Option<String>) {
+        self.l1_endpoint_override = l1_endpoint;
+    }
+
+    /// Rewind the `l1_safe_head.synced_at_ms` timestamp in the DB to `ms_ago`
+    /// milliseconds before now (i.e., simulate a wall-clock gap since the
+    /// last successful L1 sync).
+    ///
+    /// **The sequencer must be stopped** before calling this — SQLite file
+    /// locking prevents concurrent writes. The typical flow is:
+    /// `stop() → rewind_synced_at_ms(ms_ago) → respawn()`.
+    ///
+    /// Semantically equivalent to advancing the wall clock by `ms_ago` from
+    /// the sequencer's perspective: the wall-clock fallback's
+    /// `(now - last_sync_ms)` computation yields `ms_ago`. Used to
+    /// deterministically exercise the `L1UnreachableInDangerZone` path
+    /// without needing `libfaketime` or similar OS tooling. See
+    /// `docs/threat-model/README.md` "L1 block-time coupling" for the
+    /// invariant this helper operationalizes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DB file does not exist (sequencer has never been
+    /// started with this data dir) or if `ms_ago` is larger than the
+    /// current wall-clock Unix ms value (underflow).
+    pub fn rewind_synced_at_ms(&self, ms_ago: u64) -> HarnessResult<()> {
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|err| io_other(format!("system time before UNIX epoch: {err}")))?
+            .as_millis() as u64;
+        let new_synced_at_ms = now_ms.checked_sub(ms_ago).ok_or_else(|| {
+            io_other(format!(
+                "rewind_synced_at_ms: ms_ago {ms_ago} exceeds current Unix ms {now_ms}",
+            ))
+        })?;
+
+        let conn = rusqlite::Connection::open(db_path.as_path())
+            .map_err(|err| io_other(format!("open DB for rewind: {err}")))?;
+        let updated = conn
+            .execute(
+                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+                [new_synced_at_ms as i64],
+            )
+            .map_err(|err| io_other(format!("update synced_at_ms: {err}")))?;
+        if updated != 1 {
+            return Err(io_other(format!(
+                "rewind_synced_at_ms: expected to update 1 row, updated {updated}. \
+                 Has the sequencer ever successfully booted against this data dir?",
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     pub fn endpoint(&self) -> &str {
@@ -147,6 +214,8 @@ impl ManagedSequencer {
     }
 
     /// Respawn the sequencer process using the same data directory and Anvil instance.
+    ///
+    /// Honors any `l1_endpoint_override` set via [`Self::set_l1_endpoint_override`].
     pub async fn respawn(&mut self) -> HarnessResult<()> {
         let SpawnedSequencerProcess {
             child,
@@ -158,6 +227,7 @@ impl ManagedSequencer {
             self.logs_dir.as_path(),
             self.data_dir_path.as_path(),
             &self.rollups,
+            self.l1_endpoint_override.as_deref(),
         )
         .await?;
         self.child = child;
@@ -243,6 +313,7 @@ async fn spawn_sequencer_process(
     logs_dir: &Path,
     data_dir: &Path,
     rollups: &DevnetRollupsStack,
+    l1_endpoint_override: Option<&str>,
 ) -> HarnessResult<SpawnedSequencerProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;
     let log_path = timestamped_log_path(logs_dir, log_prefix);
@@ -256,13 +327,14 @@ async fn spawn_sequencer_process(
     let batch_submitter_key = default_private_keys().first().cloned().unwrap_or_else(|| {
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()
     });
+    let eth_rpc_url = l1_endpoint_override.unwrap_or_else(|| rollups.l1_endpoint());
     let mut child = Command::new(path_as_str(sequencer_bin)?)
         .arg("--http-addr")
         .arg(http_addr)
         .arg("--data-dir")
         .arg(path_as_str(data_dir)?)
         .arg("--eth-rpc-url")
-        .arg(rollups.l1_endpoint())
+        .arg(eth_rpc_url)
         .arg("--chain-id")
         .arg(DEVNET_CHAIN_ID.to_string())
         .arg("--app-address")
