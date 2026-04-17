@@ -270,17 +270,10 @@ pub(super) fn assign_batch_nonces_inner(conn: &Connection) -> Result<u64> {
 /// Detect stale batches, cascade-invalidate, and restore the open-batch invariant.
 /// See `Storage::detect_and_recover` for full doc.
 fn detect_and_recover_inner(tx: &Transaction<'_>, max_wait_blocks: u64) -> Result<Vec<u64>> {
-    let mut invalidated = detect_stale_and_cascade(tx, max_wait_blocks)?;
-
-    // Also check the open batch: if it was never closed (and therefore never
-    // assigned a nonce), `detect_stale_and_cascade` won't see it. This happens
-    // when the sequencer stopped before batch closure and enough L1 blocks
-    // elapsed to make the open batch's frames stale.
-    if invalidated.is_empty()
-        && let Some(stale_open) = check_open_batch_staleness(tx, max_wait_blocks)?
-    {
-        invalidated = cascade_invalidate_from(tx, stale_open)?;
-    }
+    let invalidated = match find_first_batch_in_danger(tx, max_wait_blocks)? {
+        Some(bi) => cascade_invalidate_from(tx, bi)?,
+        None => Vec::new(),
+    };
 
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
         open_recovery_batch_in_tx(tx)?;
@@ -288,18 +281,51 @@ fn detect_and_recover_inner(tx: &Transaction<'_>, max_wait_blocks: u64) -> Resul
     Ok(invalidated)
 }
 
-/// Find the first unresolved batch past the accepted frontier whose age exceeds `threshold`.
+/// The oldest unresolved batch (closed-unaccepted OR open) whose first frame is
+/// older than `current_safe_block - threshold`, or `None` if no such batch.
 ///
-/// The accepted frontier (latest accepted nonce + 1 from `safe_accepted_batches`) tells us
-/// how many batches the scheduler has accepted. The local batch with that nonce is the first
-/// unaccepted one. If it exists and its `first_frame_safe_block` is old enough
-/// (`current_safe_block - first_frame_safe_block >= threshold`), it's returned.
+/// "Unresolved" means either:
+///   (a) a closed batch past the accepted frontier (visible via
+///       `valid_batch_nonces`), or
+///   (b) the currently-open batch (has no nonce, so invisible to (a) but
+///       still at risk of aging into danger).
 ///
-/// Used with `threshold = max_wait_blocks` for staleness detection, and with
-/// `threshold = danger_threshold` for preemptive danger-zone detection.
+/// Closed-unaccepted batches are strictly older than the open batch (the
+/// sequencer opens new batches at monotonically non-decreasing `safe_block`),
+/// so the closed-frontier check takes precedence. Cascading from that batch
+/// covers the open batch automatically via `batch_index >= N`.
 ///
-/// Requires `safe_accepted_batches` and `batch_nonces` to be populated.
-pub(super) fn find_frontier_batch_exceeding_threshold(
+/// Used by:
+///   - `Storage::check_danger_zone` — preemptive danger check (submitter
+///     worker tick + startup wall-clock fallback).
+///   - `detect_and_recover_inner` — atomic cascade-invalidation path.
+///
+/// Keeping both call sites behind this single helper keeps them symmetric:
+/// the preemptive and reactive paths can never diverge on what counts as "in
+/// danger."
+///
+/// Requires `safe_accepted_batches` and `batch_nonces` to be populated (via
+/// `refresh_recovery_metadata`) for the closed-frontier arm to function.
+pub(super) fn find_first_batch_in_danger(conn: &Connection, threshold: u64) -> Result<Option<u64>> {
+    if let Some(bi) = find_closed_frontier_batch_in_danger(conn, threshold)? {
+        return Ok(Some(bi));
+    }
+    find_open_batch_in_danger(conn, threshold)
+}
+
+/// First closed batch past the accepted frontier whose `first_frame_safe_block`
+/// is older than `current_safe_block - threshold`. Returns `None` if no closed
+/// batch at the frontier matches.
+///
+/// Does not consider the open batch — `assign_batch_nonces` never nonces
+/// `MAX(batch_index)`, so open batches are invisible to `valid_batch_nonces`.
+/// The unified entrypoint `find_first_batch_in_danger` falls through to
+/// `find_open_batch_in_danger` for that case.
+///
+/// Exposed to `l1_submission` so `Storage::check_danger_zone` can use this
+/// directly — the submitter's zombie-detection check must NOT flag open
+/// batches (they have no L1 tx to become a zombie).
+pub(super) fn find_closed_frontier_batch_in_danger(
     conn: &Connection,
     threshold: u64,
 ) -> Result<Option<u64>> {
@@ -322,23 +348,63 @@ pub(super) fn find_frontier_batch_exceeding_threshold(
         return Ok(None);
     }
 
-    let first_frame_safe_block: u64 = {
-        let value: Option<i64> = conn
-            .query_row(
-                "SELECT safe_block FROM frames \
-                 WHERE batch_index = ?1 ORDER BY frame_in_batch ASC LIMIT 1",
-                params![batch_index],
-                |row| row.get(0),
-            )
-            .optional()?;
-        i64_to_u64(value.unwrap_or(0))
-    };
+    let first_frame_safe_block = first_frame_safe_block_of(conn, batch_index)?;
     let safe_block = query_current_safe_block(conn)?;
     if batch_age_is_stale(safe_block, first_frame_safe_block, threshold) {
         Ok(Some(i64_to_u64(batch_index)))
     } else {
         Ok(None)
     }
+}
+
+/// Open batch (MAX `batch_index`, if valid) whose `first_frame_safe_block` is
+/// older than `current_safe_block - threshold`. Returns `None` if no valid
+/// open batch exists or it is not yet in danger.
+///
+/// The open batch has no `batch_nonces` row because `assign_batch_nonces`
+/// explicitly skips `MAX(batch_index)`. It's therefore invisible to
+/// `find_closed_frontier_batch_in_danger` and must be checked separately.
+fn find_open_batch_in_danger(conn: &Connection, threshold: u64) -> Result<Option<u64>> {
+    let max_bi: Option<i64> =
+        conn.query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
+    let Some(max_bi) = max_bi else {
+        return Ok(None);
+    };
+
+    // A previous cascade may have invalidated everything up to and including
+    // the latest batch (torn-invalidation case, handled by the caller re-
+    // opening a fresh batch). In that state, there's no valid open batch —
+    // don't double-invalidate.
+    let is_invalid: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM invalid_batches WHERE batch_index = ?1)",
+        rusqlite::params![max_bi],
+        |row| row.get(0),
+    )?;
+    if is_invalid {
+        return Ok(None);
+    }
+
+    let first_frame_safe_block = first_frame_safe_block_of(conn, max_bi)?;
+    let safe_block = query_current_safe_block(conn)?;
+    if batch_age_is_stale(safe_block, first_frame_safe_block, threshold) {
+        Ok(Some(i64_to_u64(max_bi)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// `frames.safe_block` of the lowest `frame_in_batch` in `batch_index`.
+/// Returns 0 if the batch has no frames yet.
+fn first_frame_safe_block_of(conn: &Connection, batch_index: i64) -> Result<u64> {
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT safe_block FROM frames \
+             WHERE batch_index = ?1 ORDER BY frame_in_batch ASC LIMIT 1",
+            params![batch_index],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(i64_to_u64(value.unwrap_or(0)))
 }
 
 /// Cascade-invalidate all valid batches with `batch_index >= from_batch_index`.
@@ -369,57 +435,6 @@ fn cascade_invalidate_from(tx: &Transaction<'_>, from_batch_index: u64) -> Resul
     }
 
     Ok(invalidated)
-}
-
-/// Detect the first stale nonce-bearing batch and cascade-invalidate.
-fn detect_stale_and_cascade(tx: &Transaction<'_>, max_wait_blocks: u64) -> Result<Vec<u64>> {
-    let Some(stale_batch_index) = find_frontier_batch_exceeding_threshold(tx, max_wait_blocks)?
-    else {
-        return Ok(Vec::new());
-    };
-    cascade_invalidate_from(tx, stale_batch_index)
-}
-
-/// Check whether the open batch (MAX batch_index) is stale by current staleness.
-///
-/// This catches the case where the sequencer stopped before the batch was closed
-/// and submitted to L1, and enough blocks elapsed to make its frames stale.
-/// `assign_batch_nonces` skips the open batch, so `detect_stale_and_cascade`
-/// would miss it.
-fn check_open_batch_staleness(tx: &Transaction<'_>, max_wait_blocks: u64) -> Result<Option<u64>> {
-    let max_bi: Option<i64> =
-        tx.query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
-    let Some(max_bi) = max_bi else {
-        return Ok(None);
-    };
-    // Only consider it if it's still valid (not already invalidated).
-    let is_invalid: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM invalid_batches WHERE batch_index = ?1)",
-        rusqlite::params![max_bi],
-        |row| row.get(0),
-    )?;
-    if is_invalid {
-        return Ok(None);
-    }
-
-    // Check the open batch's first frame safe_block against current safe block.
-    let first_frame_safe_block: u64 = {
-        let value: Option<i64> = tx
-            .query_row(
-                "SELECT safe_block FROM frames \
-                 WHERE batch_index = ?1 ORDER BY frame_in_batch ASC LIMIT 1",
-                params![max_bi],
-                |row| row.get(0),
-            )
-            .optional()?;
-        i64_to_u64(value.unwrap_or(0))
-    };
-    let safe_block = query_current_safe_block(tx)?;
-    if batch_age_is_stale(safe_block, first_frame_safe_block, max_wait_blocks) {
-        Ok(Some(i64_to_u64(max_bi)))
-    } else {
-        Ok(None)
-    }
 }
 
 /// Check whether the DB has a valid (non-invalidated) open batch.
@@ -812,6 +827,161 @@ mod tests {
         );
     }
 
+    // ── §7.3 — open-batch staleness regression (post-unification) ──────────
+    //
+    // Original bug: an open (unclosed, not-yet-nonced) batch whose first
+    // frame was pinned to an old safe_block escaped detection, because the
+    // frontier lookup only queries `valid_batch_nonces` (which `assign_batch_nonces`
+    // never populates for the max batch_index).
+    //
+    // After the unification refactor, both the preemptive danger check and
+    // the reactive cascade path go through `find_first_batch_in_danger`,
+    // which falls through to `find_open_batch_in_danger` when no closed
+    // frontier batch matches. These tests verify the reactive path
+    // (`detect_and_recover`); parallel tests for the preemptive path
+    // (`check_danger_zone`) live under the `check_danger_zone` header below.
+    //
+    // Below covers four cases:
+    //   - positive: open batch IS stale → invalidated
+    //   - negative: open batch is fresh → NOT invalidated (no false positives)
+    //   - combined: closed+stale AND open+stale → both invalidated in one cascade
+    //   - no-batch: empty DB with no open batch → no-op, no panic
+
+    #[test]
+    fn open_batch_stale_by_current_safe_block_is_invalidated() {
+        // Scenario: sequencer opened batch 0 at safe_block=10, never closed it,
+        // then stayed down until safe advanced to 1500 (>1200 past safe_block).
+        // Recovery must invalidate the open batch.
+        let db = temp_db("open-batch-stale");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize open state at safe_block=10");
+
+        // Advance the safe head so the open batch's first frame (safe_block=10)
+        // is now stale: 1500 - 10 >= 1200.
+        storage
+            .append_safe_inputs(1500, &[])
+            .expect("advance safe head past MAX_WAIT_BLOCKS");
+
+        let invalidated = storage
+            .detect_and_recover(1200)
+            .expect("recover from stale open batch");
+        assert_eq!(
+            invalidated,
+            vec![0],
+            "open batch 0 should be invalidated by current staleness"
+        );
+
+        // A fresh recovery batch must be opened at batch_index=1.
+        let head = storage.load_open_state().expect("load").expect("head");
+        assert_eq!(head.batch_index, 1, "recovery batch is the next index");
+    }
+
+    #[test]
+    fn open_batch_not_yet_stale_is_not_invalidated() {
+        // Negative: open batch's first frame safe_block=10 with current safe=1100.
+        // 1100 - 10 = 1090 < 1200. Must NOT cascade.
+        // Catches false-positive regressions in the open-batch arm of
+        // `find_first_batch_in_danger`.
+        let db = temp_db("open-batch-fresh");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize open state at safe_block=10");
+
+        storage
+            .append_safe_inputs(1100, &[])
+            .expect("advance safe head below threshold");
+
+        let invalidated = storage
+            .detect_and_recover(1200)
+            .expect("recover with non-stale open batch");
+        assert!(
+            invalidated.is_empty(),
+            "fresh open batch must not be cascade-invalidated, got: {invalidated:?}"
+        );
+
+        // The open batch must still be the live one (no recovery batch opened).
+        let head = storage.load_open_state().expect("load").expect("head");
+        assert_eq!(
+            head.batch_index, 0,
+            "original open batch 0 must still be the head"
+        );
+    }
+
+    #[test]
+    fn open_batch_exactly_at_threshold_is_invalidated() {
+        // Boundary: 1210 - 10 = 1200, which is >= MAX_WAIT_BLOCKS.
+        // The staleness comparison is `>=`, so this must invalidate.
+        let db = temp_db("open-batch-boundary");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+
+        storage
+            .append_safe_inputs(1210, &[])
+            .expect("advance safe head to exact threshold");
+
+        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        assert_eq!(invalidated, vec![0], "boundary (>= threshold) invalidates");
+    }
+
+    #[test]
+    fn open_batch_one_block_below_threshold_is_not_invalidated() {
+        // Boundary: 1209 - 10 = 1199 < 1200. One-block margin must NOT invalidate.
+        let db = temp_db("open-batch-below-boundary");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+
+        storage
+            .append_safe_inputs(1209, &[])
+            .expect("advance safe head to one block below threshold");
+
+        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        assert!(
+            invalidated.is_empty(),
+            "one-block-below-threshold must not invalidate, got: {invalidated:?}"
+        );
+    }
+
+    #[test]
+    fn closed_unsubmitted_stale_and_open_stale_both_cascade() {
+        // Scenario: batch 0 is closed and nonced but never submitted to L1
+        // (safe_accepted_batches is empty). Batch 1 is open and also stale.
+        // `find_first_batch_in_danger` should return closed batch 0 at the
+        // frontier (nonce 0, no acceptance yet) and cascade through batch 1.
+        let db = temp_db("closed-unsubmitted-and-open-stale");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize at safe_block=10");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+        storage.assign_batch_nonces().expect("assign nonces");
+
+        // Advance safe head so batch 0's first frame (safe_block=10) is stale.
+        storage
+            .append_safe_inputs(1500, &[])
+            .expect("advance safe head past staleness");
+
+        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        assert_eq!(
+            invalidated,
+            vec![0, 1],
+            "closed unsubmitted batch 0 and subsequent open batch 1 cascade together"
+        );
+    }
+
     #[test]
     fn detect_and_recover_opens_batch_after_torn_invalidation() {
         let db = temp_db("detect-torn");
@@ -925,6 +1095,14 @@ mod tests {
 
     #[test]
     fn check_danger_zone_ignores_old_gold_batches() {
+        // Batch 0 is Gold (accepted, first_frame_safe_block=10). Batch 1 is
+        // the open tip at first_frame_safe_block=100. Advance safe head to
+        // 1200 so batch 0 is age=1190 > 1125 (past threshold, but it's Gold
+        // and therefore excluded) while batch 1 is age=1100 < 1125 (fresh).
+        //
+        // `check_danger_zone` must return None: no unresolved batch is in
+        // danger. Gold batches (accepted past the frontier) never participate,
+        // and the open tip isn't old enough to trip the threshold.
         let db = temp_db("danger-zone-gold");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
         let batch_submitter = Address::repeat_byte(0xAA);
@@ -951,14 +1129,99 @@ mod tests {
             .populate_safe_accepted_batches(batch_submitter, 1200)
             .expect("populate sab");
 
+        // Advance to a current safe block where batch 0 (safe_block=10) is
+        // past threshold (1200-10=1190>=1125) but batch 1 (safe_block=100)
+        // is still fresh (1200-100=1100<1125).
         storage
-            .append_safe_inputs(5000, &[])
+            .append_safe_inputs(1200, &[])
             .expect("advance safe block");
 
         let result = storage.check_danger_zone(1125).expect("check danger zone");
         assert!(
             result.is_none(),
             "old Gold batches should not trigger danger zone; got batch_index={result:?}"
+        );
+    }
+
+    #[test]
+    fn check_danger_zone_does_not_flag_open_batch_zombie() {
+        // `check_danger_zone` is for zombie detection: it must NOT flag the
+        // open batch (which has no L1 tx to become a zombie). Flagging open
+        // batches here would put the live submitter into a shutdown/restart
+        // loop when an open batch ages into the danger zone without any
+        // pending wallet-nonce slots to flush.
+        //
+        // Scenario: only an open batch exists, aged past the danger
+        // threshold. `check_danger_zone` returns None.
+        let db = temp_db("danger-zone-open-no-zombie");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize open batch at safe_block=10");
+
+        storage
+            .append_safe_inputs(1200, &[])
+            .expect("advance safe head past danger threshold");
+
+        let result = storage.check_danger_zone(1125).expect("check danger zone");
+        assert!(
+            result.is_none(),
+            "open batch (no zombie) must not trigger check_danger_zone; got batch_index={result:?}"
+        );
+    }
+
+    // ── check_any_unresolved_batch_in_danger ───────────────────────────────
+
+    #[test]
+    fn check_any_unresolved_flags_stale_open_batch() {
+        // Wall-clock fallback regression: `check_any_unresolved_batch_in_danger`
+        // MUST flag a stale open batch. This is the semantic the wall-clock
+        // fallback relies on — if L1 is unreachable and an open batch may be
+        // past the threshold, refuse to boot rather than accept user ops
+        // into a batch that can't land.
+        let db = temp_db("any-unresolved-open-stale");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize open batch at safe_block=10");
+
+        storage
+            .append_safe_inputs(1200, &[])
+            .expect("advance safe head past threshold");
+
+        let result = storage
+            .check_any_unresolved_batch_in_danger(1125)
+            .expect("check any unresolved in danger");
+        assert_eq!(
+            result,
+            Some(0),
+            "stale open batch (batch 0) must be flagged by the unified check"
+        );
+    }
+
+    #[test]
+    fn check_any_unresolved_does_not_flag_fresh_open_batch() {
+        // Negative counterpart. Fresh open batch below threshold must not
+        // trigger false positives in the unified check.
+        let db = temp_db("any-unresolved-open-fresh");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize open batch at safe_block=10");
+
+        storage
+            .append_safe_inputs(1100, &[])
+            .expect("advance safe head below threshold");
+
+        let result = storage
+            .check_any_unresolved_batch_in_danger(1125)
+            .expect("check any unresolved in danger");
+        assert!(
+            result.is_none(),
+            "fresh open batch must not trigger the unified check; got batch_index={result:?}"
         );
     }
 

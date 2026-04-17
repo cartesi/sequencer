@@ -226,4 +226,49 @@ mod tests {
             Some(Address::from_slice(&[0x11; 20]))
         );
     }
+
+    // ── §8.4.2 — H8 regression: SEQ_SECONDS_PER_BLOCK=0 is rejected by clap ──
+    //
+    // The H8 hardening added `value_parser = clap::value_parser!(u64).range(1..)`
+    // on `seconds_per_block` to prevent a divide-by-zero panic in the
+    // wall-clock fallback (`elapsed_secs / seconds_per_block`). Without the
+    // value parser, an operator typo would panic the process during the worst
+    // possible moment — an L1 outage. These tests lock the clap-level guard.
+
+    fn args_with_seconds_per_block(value: &str) -> Vec<&str> {
+        let mut args: Vec<&str> = TEST_ARGS.to_vec();
+        args.push("--seconds-per-block");
+        args.push(value);
+        args
+    }
+
+    #[test]
+    fn run_config_rejects_seconds_per_block_zero() {
+        let err = RunConfig::try_parse_from(args_with_seconds_per_block("0"))
+            .expect_err("seconds_per_block=0 must be rejected");
+        let message = err.to_string();
+        // The exact clap wording depends on the version; the specific field is
+        // what we want to pin.
+        assert!(
+            message.contains("--seconds-per-block") || message.contains("seconds_per_block"),
+            "error must name the offending field, got: {message}"
+        );
+    }
+
+    #[test]
+    fn run_config_accepts_seconds_per_block_one() {
+        // One is the minimum allowed (1..).
+        let config =
+            RunConfig::try_parse_from(args_with_seconds_per_block("1")).expect("parse succeeds");
+        assert_eq!(config.seconds_per_block, 1);
+    }
+
+    #[test]
+    fn run_config_default_seconds_per_block_is_12() {
+        let config = RunConfig::try_parse_from(TEST_ARGS).expect("parse run config");
+        assert_eq!(
+            config.seconds_per_block, 12,
+            "default should reflect Ethereum block time"
+        );
+    }
 }

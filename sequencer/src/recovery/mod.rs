@@ -212,7 +212,13 @@ pub(crate) fn wall_clock_danger_estimate(
     let adjusted_threshold = danger_threshold.saturating_sub(estimated_missed_blocks);
 
     storage.refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)?;
-    let estimated_danger_batch = storage.check_danger_zone(adjusted_threshold)?;
+    // Use the unified check here (not `check_danger_zone`): if L1 is
+    // unreachable, we want to refuse to boot whenever *any* unresolved batch
+    // may be past the threshold, including the open batch. `check_danger_zone`
+    // is narrower (closed batches only, for zombie detection by the live
+    // submitter) and would miss an aging open batch.
+    let estimated_danger_batch =
+        storage.check_any_unresolved_batch_in_danger(adjusted_threshold)?;
 
     if let Some(batch_index) = estimated_danger_batch {
         tracing::error!(

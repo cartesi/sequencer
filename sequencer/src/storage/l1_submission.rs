@@ -17,7 +17,7 @@ use super::internals::{
     decode_l2_tx_row, i64_to_u16, i64_to_u32, i64_to_u64, query_current_safe_block, u64_to_i64,
 };
 use super::recovery::{
-    assign_batch_nonces_inner, find_frontier_batch_exceeding_threshold,
+    assign_batch_nonces_inner, find_closed_frontier_batch_in_danger, find_first_batch_in_danger,
     populate_safe_accepted_batches_inner, query_latest_safe_accepted_batch,
 };
 use super::{FrameHeader, PendingBatch};
@@ -68,13 +68,44 @@ impl Storage {
     /// Check if the first unresolved batch (past the accepted frontier) is in the
     /// danger zone (approaching staleness).
     ///
-    /// Returns the batch_index of the frontier batch if its age
-    /// (`current_safe_block - first_frame_safe_block`) meets or exceeds `danger_threshold`.
+    /// Returns the `batch_index` of the first **closed and nonced** batch past
+    /// the accepted frontier whose age (`current_safe_block -
+    /// first_frame_safe_block`) meets or exceeds `danger_threshold`.
     ///
-    /// Requires `safe_accepted_batches` and `batch_nonces` to be populated first
-    /// (call `populate_safe_accepted_batches` + `assign_batch_nonces` before this).
+    /// Scope: closed batches only. This is the **zombie-detection** check —
+    /// an answer of `Some(_)` means "there is a batch submitted (or about to
+    /// be submitted) to L1 that may become stale before landing safely;
+    /// flush pending wallet-nonce slots and trigger recovery."
+    ///
+    /// Does NOT consider the open (tip) batch. An aging open batch is not a
+    /// zombie risk (nothing submitted to L1 yet), so flushing it would be a
+    /// no-op and triggering recovery just for it would produce a restart
+    /// loop. The open batch's staleness is handled at `MAX_WAIT_BLOCKS` by
+    /// `detect_and_recover` and (for L1-unreachable boots) by
+    /// [`Self::check_any_unresolved_batch_in_danger`].
+    ///
+    /// Requires `safe_accepted_batches` and `batch_nonces` to be populated
+    /// first (call `populate_safe_accepted_batches` + `assign_batch_nonces`,
+    /// or `refresh_recovery_metadata`, before this).
     pub fn check_danger_zone(&mut self, danger_threshold: u64) -> Result<Option<u64>> {
-        find_frontier_batch_exceeding_threshold(&self.conn, danger_threshold)
+        find_closed_frontier_batch_in_danger(&self.conn, danger_threshold)
+    }
+
+    /// Returns the `batch_index` of the first **unresolved** batch (closed-
+    /// unaccepted OR open) whose age meets or exceeds `threshold`.
+    ///
+    /// Scope: the full zombie-or-aging check. Used when the caller cannot
+    /// distinguish between pending-closed-batch danger and open-batch
+    /// aging — specifically, the wall-clock fallback at startup, where L1
+    /// is unreachable and we want to refuse to boot if *any* unresolved
+    /// batch might be past the threshold.
+    ///
+    /// Distinct from [`Self::check_danger_zone`] because the responses to
+    /// "closed batch in danger" and "open batch in danger" are different:
+    /// the former triggers flush + shutdown, the latter should be handled
+    /// by closing/submitting the batch or waiting for its natural close.
+    pub fn check_any_unresolved_batch_in_danger(&mut self, threshold: u64) -> Result<Option<u64>> {
+        find_first_batch_in_danger(&self.conn, threshold)
     }
 
     /// Highest valid (non-invalidated) `batch_index`, or `None` if no valid
