@@ -7,6 +7,7 @@ use benchmarks::{
 };
 use clap::Parser;
 use serde_json::Value;
+use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;

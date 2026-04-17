@@ -17,3 +17,4 @@ ssz = { package = "ethereum_ssz", version = "0.10" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
 tracing = "0.1"
 types = { workspace = true }
+thiserror = "1"
