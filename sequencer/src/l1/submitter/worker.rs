@@ -4,7 +4,7 @@
 //! Batch submitter worker: stateless, at-least-once submission to L1.
 //!
 //! On each tick the worker:
-//! 1. Assigns nonces to any un-nonced valid batches (via `batch_nonces` table).
+//! 1. Refreshes the scheduler-accepted frontier (`safe_accepted_batches`).
 //! 2. Checks if any valid batch is in the danger zone — triggers shutdown if found.
 //! 3. Queries L1 for the next expected batch nonce.
 //! 4. Loads the valid unresolved suffix with nonce >= next expected.
@@ -127,8 +127,8 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 
     pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
-        // Refresh `safe_accepted_batches` + `batch_nonces` so the danger check and
-        // pending-batch query observe the latest L1 frontier.
+        // Refresh `safe_accepted_batches` so the danger check and pending-batch
+        // query observe the latest L1 frontier.
         self.refresh_recovery_metadata().await?;
 
         // Crash on danger zone so the startup sequence can flush the mempool and recover.
@@ -502,7 +502,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0");
-        storage.assign_batch_nonces().expect("assign nonces gen1");
 
         let gen1_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
             nonce: 0,
@@ -535,7 +534,6 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 100)
             .expect("close gen2 batch");
-        storage.assign_batch_nonces().expect("assign nonces gen2");
 
         let gen2_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
             nonce: 0,

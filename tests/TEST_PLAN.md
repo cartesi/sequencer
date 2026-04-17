@@ -351,7 +351,7 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 | 7.2.1 | Stale batch N cascades to all batches with `batch_index >= N` | `[x]` | `storage/recovery.rs` unit tests |
 | 7.2.2 | Cascade is a single atomic SQL transaction; crash mid-cascade leaves DB unchanged | `[ ]` | Needs failpoint injection |
 | 7.2.3 | `valid_*` views hide invalidated batches immediately after cascade | `[x]` | Covered by inline tests |
-| 7.2.4 | `batch_nonces` rows for invalidated batches are NOT deleted (nonces can be reused) | `[x]` | Covered by `detect_and_recover_does_not_false_match_after_nonce_reuse` |
+| 7.2.4 | Nonce reuse works automatically via parent-pointer (new Tip's `parent.nonce + 1` equals the invalidated suffix's first nonce) | `[x]` | Covered by `detect_and_recover_does_not_false_match_after_nonce_reuse`, `nonce_reuse_after_cascade_with_valid_ancestor`, `nonce_is_reused_after_torn_cascade` |
 
 ### 7.3 Open-batch-only case (NEW regression zone — V4 + open-batch fix)
 
@@ -385,9 +385,9 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 | 7.6.1 | Run `detect_and_recover` twice on the same state → second run is no-op | `[x]` | `detect_and_recover_is_idempotent` |
 | 7.6.2 | Crash AFTER cascade INSERT but BEFORE `open_recovery_batch_in_tx` → on restart, a recovery batch is opened (torn state) | `[x]` | `detect_and_recover_opens_batch_after_torn_invalidation` |
 | 7.6.3 | Crash AFTER open_recovery_batch → restart finds valid open batch, does nothing | `[ ]` | |
-| 7.6.4 | The entire recovery procedure (populate + assign + detect + open) runs in a single `Immediate` transaction | `[x]` | Structural, verified by reading |
+| 7.6.4 | The entire recovery procedure (populate + detect + open) runs in a single `Immediate` transaction | `[x]` | Structural, verified by reading |
 | 7.6.5 | `populate_safe_accepted_batches` is resumable (cursor-tracked, `INSERT OR IGNORE`) | `[x]` | |
-| 7.6.6 | `assign_batch_nonces` is idempotent (`INSERT OR IGNORE`) | `[x]` | |
+| 7.6.6 | Nonce assignment is structural (not a discrete step); `insert_new_batch` derives nonce from `parent.nonce + 1` at creation time | `[x]` | `trg_enforce_nonce_contiguity` verifies; `schema_rejects_bad_nonce_contiguity` covers the trigger path |
 
 ### 7.7 Mempool flusher
 
@@ -497,9 +497,11 @@ For deterministic tests, pick margins well inside each zone (e.g., 500 / 1150 / 
 |---|----------|--------|-------|
 | 12.1.1 | Schema CHECK constraints enforced: `safe_inputs.sender` length 20, `frames.fee >= 0`, XOR on `sequenced_l2_txs`, etc. | `[ ]` | One test per CHECK |
 | 12.1.2 | FK cascade: deleting a `batches` row (should be impossible via PK) doesn't orphan children | `[-]` | Structural; writes are append-only |
-| 12.2.1 | `valid_batches` correctly filters by `invalid_batches` | `[x]` | Implicit in recovery tests |
-| 12.2.2 | `valid_batch_nonces` correctly filters | `[x]` | |
+| 12.2.1 | `valid_batches` correctly filters by `invalidated_at_ms IS NULL` | `[x]` | Implicit in recovery tests |
+| 12.2.2 | `valid_closed_batches` correctly filters (sealed + valid) | `[x]` | Submitter pending-batch load covers it |
 | 12.2.3 | `valid_sequenced_l2_txs` correctly filters | `[x]` | |
+| 12.2.4 | `valid_open_batch` has at most one row (partial unique index `ux_single_valid_tip`) | `[x]` | `schema_rejects_second_valid_tip` |
+| 12.2.5 | Schema triggers reject: bad nonce, re-seal, re-invalidate, writes to non-Tip, parent mutation | `[x]` | `schema_rejects_*` test group |
 | 12.3.1 | Multi-statement writers wrap in `Immediate` transaction; partial failure leaves DB unchanged | `[?]` | |
 | 12.3.2 | `trg_sequence_user_op` does not fire if outer user_ops INSERT rolls back | `[?]` | |
 | 12.4.1 | Rowid pagination correctly skips invalidated rows via `valid_sequenced_l2_txs` view | `[x]` | Implicit in WS catch-up after recovery |

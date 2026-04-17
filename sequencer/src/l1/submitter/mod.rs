@@ -3,9 +3,10 @@
 
 //! Batch submitter: posts closed batches to L1 with at-least-once semantics.
 //!
-//! Each valid closed batch is assigned a contiguous nonce (via `batch_nonces`). The scheduler
-//! checks that nonces are strictly increasing and skips otherwise, so duplicates are
-//! deduplicated at the scheduler level. See `worker` for the tick loop.
+//! Each valid closed batch has a structural nonce (`batches.nonce`, set at
+//! creation time as `parent.nonce + 1`). The scheduler checks that nonces are
+//! strictly increasing and skips otherwise, so duplicates are deduplicated at
+//! the scheduler level. See `worker` for the tick loop.
 
 mod config;
 mod poster;

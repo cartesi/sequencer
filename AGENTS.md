@@ -151,7 +151,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - API validates the EIP-712 signature and enqueues a `SignedUserOp`. Method payload decoding happens during application execution, not at ingress.
 - **Deposits are direct-input-only** (L1 → L2) and must not be represented as user ops.
 - Rejections (`InvalidNonce`, `InvalidMaxFee`, `InsufficientGasBalance`) produce no state mutation and are not persisted.
-- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`. Recovery metadata lives in `batch_nonces`, `safe_accepted_batches`, and `invalid_batches`.
+- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is sampled from `batch_policy_derived.recommended_fee` at rotation.
 - Wallet state (balances, nonces) is in-memory today — not persisted.
 - **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`. `chainId` and `verifyingContract` come from `SEQ_CHAIN_ID` and `SEQ_APP_ADDRESS` (validated against the RPC chain id at startup). All four fields must be present on both sides — see [`SECURITY_TODO.md`](SECURITY_TODO.md) for the open divergence finding.
@@ -198,7 +198,8 @@ Application state changes must flow exclusively through `execute_valid_user_op` 
 - Replay/catch-up uses persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics exactly.
 - Cursor pagination for ordered L2 txs uses **SQLite rowid**, not count-based offsets. Holes from invalidated batches would break count-based pagination.
 - Included user-op identity is tracked by application nonce logic; no DB uniqueness constraint (removed to allow resubmission after recovery).
-- **Reads over batch data go through `valid_batches`, `valid_batch_nonces`, and `valid_sequenced_l2_txs` views.** These encapsulate the "exclude `invalid_batches`" filter so individual queries don't repeat it. Writers go to the base tables.
+- **Reads over batch data go through `valid_batches`, `valid_closed_batches`, `valid_open_batch`, and `valid_sequenced_l2_txs` views.** These encapsulate the "exclude invalidated rows" filter so individual queries don't repeat it. Writers go to the base tables.
+- **`batches` row columns partition cleanly by writer.** `sealed_at_ms` is owned by the inclusion lane (set when closing a batch); `invalidated_at_ms` is owned by recovery (set during cascade). Each is write-once (NULL → non-NULL, never back) and enforced by triggers. The partial unique index `ux_single_valid_tip` guarantees at most one row has both NULL — the Tip.
 - The inclusion lane is the **only writer** of open batch/frame state. `Storage::append_user_ops_chunk` and the `close_*` methods trust the in-memory `WriteHead`; FK + PK constraints catch the dangerous failure modes.
 
 ## Type Boundaries

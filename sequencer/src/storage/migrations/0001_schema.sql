@@ -1,61 +1,133 @@
+-- ---------------------------------------------------------------------------
+-- Batch lifecycle
+--
+-- A batch has two monotonic events in its lifetime, each stored as a nullable
+-- write-once timestamp on the row:
+--
+--   * `sealed_at_ms`      — inclusion lane closed the batch (no more ops).
+--   * `invalidated_at_ms` — recovery cascade-invalidated the batch.
+--
+-- NULL means the event hasn't happened. Once set, triggers below make the
+-- column write-once. The only "mutable" state on the row is these two NULL→value
+-- transitions, each owned by exactly one writer (inclusion lane vs recovery).
+--
+-- The **Tip** is the one batch currently accepting ops: sealed_at_ms IS NULL
+-- AND invalidated_at_ms IS NULL. A partial unique index enforces at-most-one.
+--
+-- `nonce` is structural: equal to `parent.nonce + 1`, or 0 for genesis (parent
+-- NULL). Enforced by trigger on INSERT. The scheduler's view of a batch's
+-- identity; reused across recovery cascades (new Tip forks from last valid
+-- ancestor, inheriting nonce via the +1 rule).
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS batches (
-    batch_index    INTEGER PRIMARY KEY,
-    created_at_ms  INTEGER NOT NULL
+    batch_index        INTEGER PRIMARY KEY,
+    parent_batch_index INTEGER REFERENCES batches(batch_index),  -- NULL only for genesis
+    nonce              INTEGER NOT NULL CHECK (nonce >= 0),
+    created_at_ms      INTEGER NOT NULL,
+    sealed_at_ms       INTEGER
+        CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= created_at_ms),
+    invalidated_at_ms  INTEGER
+        CHECK (invalidated_at_ms IS NULL OR invalidated_at_ms >= created_at_ms)
 );
 
--- Batches that missed their submission deadline and will never be executed
--- by the scheduler. Append-only: once a batch is marked invalid it stays invalid.
--- The sequencer recovery procedure populates this table at startup.
--- Cascading: if batch B is invalid, all batches with batch_index > B are also invalid.
-CREATE TABLE IF NOT EXISTS invalid_batches (
-    batch_index INTEGER PRIMARY KEY REFERENCES batches(batch_index)
-);
-
--- Nonce assignments for batches. Populated by the batch submitter.
--- Nonces are assigned to valid batches in order. After cascading invalidation,
--- new batches reuse nonces (nonces are NOT unique across the table).
-CREATE TABLE IF NOT EXISTS batch_nonces (
-    batch_index INTEGER PRIMARY KEY REFERENCES batches(batch_index),
-    nonce       INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_batch_nonces_nonce_batch
-    ON batch_nonces(nonce, batch_index);
-
--- ---------------------------------------------------------------------------
--- Valid-row views
+-- "At most one valid Tip" — structural via partial unique index. The predicate
+-- references only local columns of `batches`, so SQLite accepts it.
 --
--- Application-level reads almost always exclude rows from invalidated batches.
--- These views encapsulate that filter so individual queries don't have to
--- repeat `WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches)`.
---
--- Writers go to the base tables. Readers go through the views unless they
--- explicitly need to see invalid rows (e.g., the cascade-collection query
--- inside `recovery::detect_stale_and_collect_cascade`).
--- ---------------------------------------------------------------------------
+-- We index on COALESCE(sealed_at_ms, 0) instead of sealed_at_ms directly
+-- because SQLite UNIQUE indexes treat NULLs as distinct — so indexing directly
+-- on `sealed_at_ms` would allow many NULL rows. COALESCE maps all matching
+-- rows to the same non-NULL value (0), forcing real uniqueness.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_single_valid_tip
+    ON batches(COALESCE(sealed_at_ms, 0))
+    WHERE sealed_at_ms IS NULL AND invalidated_at_ms IS NULL;
+
+-- Submitter hot path: "give me valid closed batches with nonce >= N", ordered.
+CREATE INDEX IF NOT EXISTS idx_batches_valid_closed_by_nonce
+    ON batches(nonce)
+    WHERE invalidated_at_ms IS NULL AND sealed_at_ms IS NOT NULL;
+
+-- ── Views ──────────────────────────────────────────────────────────────────
 CREATE VIEW IF NOT EXISTS valid_batches AS
-SELECT * FROM batches
-WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches);
+    SELECT * FROM batches WHERE invalidated_at_ms IS NULL;
 
-CREATE VIEW IF NOT EXISTS valid_batch_nonces AS
-SELECT * FROM batch_nonces
-WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches);
+CREATE VIEW IF NOT EXISTS valid_closed_batches AS
+    SELECT * FROM valid_batches WHERE sealed_at_ms IS NOT NULL;
 
--- Derived log of batch submissions the scheduler would actually execute.
--- Unlike a raw log of all safe submissions, this only contains the accepted
--- prefix: batches whose nonce matched the expected sequence and were not stale.
--- Populated by populate_safe_accepted_batches() which simulates the scheduler's
--- acceptance logic over safe_inputs.
-CREATE TABLE IF NOT EXISTS safe_accepted_batches (
-    safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),
-    nonce                INTEGER NOT NULL,
-    first_frame_safe_block INTEGER NOT NULL,
-    inclusion_block      INTEGER NOT NULL
-);
+-- At most one row by the partial unique index above.
+CREATE VIEW IF NOT EXISTS valid_open_batch AS
+    SELECT * FROM valid_batches WHERE sealed_at_ms IS NULL;
+
+-- ── Triggers ───────────────────────────────────────────────────────────────
+--
+-- These enforce invariants the writer could otherwise violate with a bug.
+-- Keep them declarative: each one names an invariant and refuses writes that
+-- would break it. The Rust writer is still the source of truth for the
+-- transition sequence — triggers just ensure the DB never reaches an
+-- inconsistent state if the writer misbehaves.
+
+-- Nonce contiguity: `nonce = parent.nonce + 1`, or 0 for genesis.
+CREATE TRIGGER IF NOT EXISTS trg_enforce_nonce_contiguity
+AFTER INSERT ON batches
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.parent_batch_index IS NULL AND NEW.nonce != 0
+            THEN RAISE(ABORT, 'genesis batch must have nonce 0')
+        WHEN NEW.parent_batch_index IS NOT NULL
+         AND NEW.nonce != (SELECT nonce + 1 FROM batches WHERE batch_index = NEW.parent_batch_index)
+            THEN RAISE(ABORT, 'batch nonce must equal parent.nonce + 1')
+    END;
+END;
+
+-- Write-once: sealed_at_ms transitions only NULL → non-NULL.
+CREATE TRIGGER IF NOT EXISTS trg_sealed_at_ms_write_once
+BEFORE UPDATE OF sealed_at_ms ON batches
+FOR EACH ROW
+WHEN OLD.sealed_at_ms IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'sealed_at_ms is write-once');
+END;
+
+-- Write-once: invalidated_at_ms transitions only NULL → non-NULL.
+CREATE TRIGGER IF NOT EXISTS trg_invalidated_at_ms_write_once
+BEFORE UPDATE OF invalidated_at_ms ON batches
+FOR EACH ROW
+WHEN OLD.invalidated_at_ms IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'invalidated_at_ms is write-once');
+END;
+
+-- parent_batch_index is immutable after insert.
+CREATE TRIGGER IF NOT EXISTS trg_parent_batch_index_immutable
+BEFORE UPDATE OF parent_batch_index ON batches
+FOR EACH ROW
+WHEN (OLD.parent_batch_index IS NULL) != (NEW.parent_batch_index IS NULL)
+   OR OLD.parent_batch_index IS NOT NULL AND NEW.parent_batch_index IS NOT NULL
+      AND OLD.parent_batch_index != NEW.parent_batch_index
+BEGIN
+    SELECT RAISE(ABORT, 'parent_batch_index is immutable');
+END;
+
+-- nonce is immutable after insert.
+CREATE TRIGGER IF NOT EXISTS trg_nonce_immutable
+BEFORE UPDATE OF nonce ON batches
+FOR EACH ROW
+WHEN OLD.nonce != NEW.nonce
+BEGIN
+    SELECT RAISE(ABORT, 'nonce is immutable');
+END;
+
+-- ---------------------------------------------------------------------------
+-- Frames and user ops: must target the current Tip.
+--
+-- These catch "stale WriteHead" bugs — where a writer holds an in-memory
+-- batch_index that's no longer the Tip (sealed or invalidated between reads).
+-- A PK lookup per row: microseconds, negligible overhead even on hot paths.
+-- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS frames (
     batch_index          INTEGER NOT NULL REFERENCES batches(batch_index),
-    frame_in_batch       INTEGER NOT NULL,
+    frame_in_batch       INTEGER NOT NULL CHECK (frame_in_batch >= 0),
     created_at_ms        INTEGER NOT NULL,
     -- Fee committed by the sequencer for this whole frame.
     fee                  INTEGER NOT NULL CHECK (fee >= 0),
@@ -64,19 +136,45 @@ CREATE TABLE IF NOT EXISTS frames (
     PRIMARY KEY(batch_index, frame_in_batch)
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_frames_target_must_be_tip
+BEFORE INSERT ON frames
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM batches
+    WHERE batch_index = NEW.batch_index
+      AND sealed_at_ms IS NULL
+      AND invalidated_at_ms IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'frames can only be inserted into the current Tip');
+END;
+
 CREATE TABLE IF NOT EXISTS user_ops (
     batch_index      INTEGER NOT NULL,
     frame_in_batch   INTEGER NOT NULL,
-    pos_in_frame     INTEGER NOT NULL,
-    sender           BLOB NOT NULL,
-    nonce            INTEGER NOT NULL,
-    max_fee          INTEGER NOT NULL,
+    pos_in_frame     INTEGER NOT NULL CHECK (pos_in_frame >= 0),
+    sender           BLOB NOT NULL CHECK (length(sender) = 20),
+    nonce            INTEGER NOT NULL CHECK (nonce >= 0),
+    max_fee          INTEGER NOT NULL CHECK (max_fee >= 0),
     data             BLOB NOT NULL,
-    sig              BLOB NOT NULL,
+    sig              BLOB NOT NULL CHECK (length(sig) = 65),
     received_at_ms   INTEGER NOT NULL,
     PRIMARY KEY(batch_index, frame_in_batch, pos_in_frame),
     FOREIGN KEY(batch_index, frame_in_batch) REFERENCES frames(batch_index, frame_in_batch)
 );
+
+CREATE TRIGGER IF NOT EXISTS trg_user_ops_target_must_be_tip
+BEFORE INSERT ON user_ops
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM batches
+    WHERE batch_index = NEW.batch_index
+      AND sealed_at_ms IS NULL
+      AND invalidated_at_ms IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'user_ops can only be inserted into the current Tip');
+END;
 
 -- Automatically sequence every user-op into the global replay order on insert.
 -- Note: safe_inputs do NOT have an analogous trigger because their
@@ -136,6 +234,19 @@ CREATE TABLE IF NOT EXISTS sequenced_l2_txs (
     -- (No UNIQUE constraint on safe_input_index.)
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_sequenced_l2_txs_target_must_be_tip
+BEFORE INSERT ON sequenced_l2_txs
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM batches
+    WHERE batch_index = NEW.batch_index
+      AND sealed_at_ms IS NULL
+      AND invalidated_at_ms IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sequenced_l2_txs can only target the current Tip');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_sequenced_l2_txs_frame
     ON sequenced_l2_txs(batch_index, frame_in_batch);
 
@@ -144,10 +255,21 @@ CREATE INDEX IF NOT EXISTS idx_sequenced_l2_txs_frame
 CREATE INDEX IF NOT EXISTS idx_sequenced_l2_txs_safe_input
     ON sequenced_l2_txs(safe_input_index) WHERE safe_input_index IS NOT NULL;
 
--- See the "Valid-row views" comment above invalid_batches for the rationale.
 CREATE VIEW IF NOT EXISTS valid_sequenced_l2_txs AS
 SELECT * FROM sequenced_l2_txs
-WHERE batch_index NOT IN (SELECT batch_index FROM invalid_batches);
+WHERE batch_index NOT IN (SELECT batch_index FROM batches WHERE invalidated_at_ms IS NOT NULL);
+
+-- Derived log of batch submissions the scheduler would actually execute.
+-- Unlike a raw log of all safe submissions, this only contains the accepted
+-- prefix: batches whose nonce matched the expected sequence and were not stale.
+-- Populated by populate_safe_accepted_batches() which simulates the scheduler's
+-- acceptance logic over safe_inputs.
+CREATE TABLE IF NOT EXISTS safe_accepted_batches (
+    safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),
+    nonce                INTEGER NOT NULL,
+    first_frame_safe_block INTEGER NOT NULL,
+    inclusion_block      INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS l1_safe_head (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
@@ -165,9 +287,9 @@ VALUES (0, 0, 0);
 -- Allows the sequencer to start without L1 if it has run before.
 CREATE TABLE IF NOT EXISTS l1_bootstrap_cache (
     singleton_id       INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    input_box_address  BLOB    NOT NULL,
-    genesis_block      INTEGER NOT NULL,
-    chain_id           INTEGER NOT NULL
+    input_box_address  BLOB    NOT NULL CHECK (length(input_box_address) = 20),
+    genesis_block      INTEGER NOT NULL CHECK (genesis_block >= 0),
+    chain_id           INTEGER NOT NULL CHECK (chain_id > 0)
 );
 
 

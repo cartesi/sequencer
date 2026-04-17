@@ -12,9 +12,9 @@ use alloy_primitives::Address;
 use rusqlite::{Result, Transaction, TransactionBehavior, params};
 
 use super::internals::{
-    from_unix_ms, i64_to_u64, insert_open_batch, insert_open_batch_with_index, insert_open_frame,
-    load_current_write_head, now_unix_ms, persist_frame_direct_sequence, query_batch_policy,
-    to_unix_ms, u64_to_i64,
+    from_unix_ms, i64_to_u64, insert_new_batch, insert_open_frame, load_current_write_head,
+    now_unix_ms, persist_frame_direct_sequence, query_batch_policy, seal_batch, to_unix_ms,
+    u64_to_i64,
 };
 use super::{
     BatchPolicy, SafeFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
@@ -68,7 +68,8 @@ impl Storage {
 
         let now_ms = now_unix_ms();
         let policy = query_batch_policy(&tx)?;
-        insert_open_batch_with_index(&tx, 0, now_ms)?;
+        // Genesis: explicit batch_index = 0, parent = None, nonce = 0.
+        insert_new_batch(&tx, Some(0), None, now_ms)?;
         insert_open_frame(&tx, 0, 0, now_ms, policy.recommended_fee, safe_block)?;
         persist_frame_direct_sequence(&tx, 0, 0, leading_direct_range)?;
         tx.commit()?;
@@ -229,6 +230,11 @@ impl Storage {
 
     /// Close the current batch and open a fresh one with its first frame.
     /// Used when batch policy (size/deadline) triggers a batch close.
+    ///
+    /// Atomically: seal the current Tip (sets `sealed_at_ms`), insert the new
+    /// Tip with `parent_batch_index = head.batch_index`, open its first frame.
+    /// Order matters: sealing first removes the old row from the
+    /// `ux_single_valid_tip` partial index, making room for the new Tip.
     pub fn close_frame_and_batch(
         &mut self,
         head: &mut WriteHead,
@@ -241,7 +247,8 @@ impl Storage {
         // Batch policy is sampled here: the derived fee is committed to the newly
         // opened frame, and the batch size target is stored on the write head.
         let policy = query_batch_policy(&tx)?;
-        let next_batch_index = insert_open_batch(&tx, now_ms)?;
+        seal_batch(&tx, head.batch_index, now_ms)?;
+        let next_batch_index = insert_new_batch(&tx, None, Some(head.batch_index), now_ms)?;
         insert_open_frame(
             &tx,
             next_batch_index,
