@@ -356,6 +356,58 @@ mod tests {
     }
 
     #[test]
+    fn closed_batch_becomes_eligible_for_submission_with_assigned_nonce() {
+        // §3.3.3: closing a batch transitions it from "open Tip" to "eligible
+        // for L1 submission" — it appears in `valid_closed_batches` with a
+        // nonce derived from its parent pointer. Pins the submitter's
+        // contract: open batches are NOT pulled into the submission pipeline,
+        // and closed batches ARE, at the schema-guaranteed nonce.
+        let db = temp_db("closed-batch-eligible");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize open state");
+
+        // Before close: the open batch must not appear in pending-batches.
+        let pending_before = storage
+            .load_pending_batches(0)
+            .expect("load pending batches (pre-close)");
+        assert!(
+            pending_before.is_empty(),
+            "open batch must not be eligible for submission: {pending_before:?}",
+        );
+
+        // Close batch 0 — this rotates the Tip to batch 1 and seals batch 0.
+        let safe_block = head.safe_block;
+        storage
+            .close_frame_and_batch(&mut head, safe_block)
+            .expect("close batch 0");
+
+        // After close: batch 0 is eligible with nonce 0 (genesis, parent
+        // NULL → trigger assigns nonce 0).
+        let pending_after = storage
+            .load_pending_batches(0)
+            .expect("load pending batches (post-close)");
+        assert_eq!(
+            pending_after.len(),
+            1,
+            "exactly one batch should be eligible after the first close",
+        );
+        assert_eq!(pending_after[0].batch_index, 0);
+        assert_eq!(
+            pending_after[0].nonce, 0,
+            "closed batch 0 must carry nonce 0 (genesis, no parent)",
+        );
+        // The new open Tip (batch 1) must NOT be eligible even though it
+        // exists — eligibility requires sealed_at_ms NOT NULL.
+        assert!(
+            pending_after.iter().all(|b| b.batch_index != 1),
+            "open batch 1 (the new Tip) must not be eligible: {pending_after:?}",
+        );
+    }
+
+    #[test]
     fn load_safe_accepted_frontier_returns_zero_when_no_batches_were_accepted() {
         let db = temp_db("safe-accepted-frontier-empty");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");

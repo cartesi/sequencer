@@ -3871,6 +3871,7 @@ dependencies = [
  "ethereum_ssz_derive",
  "futures-util",
  "k256",
+ "rollups-harness",
  "rusqlite",
  "rusqlite_migration",
  "sequencer-core",

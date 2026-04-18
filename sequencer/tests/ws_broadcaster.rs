@@ -17,10 +17,12 @@ use sequencer_core::api::WsTxMessage;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 use sequencer_rust_client::SequencerClient;
-use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+mod common;
+use common::temp_db;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
@@ -569,22 +571,5 @@ fn assert_ws_message_matches_tx(
         (actual, expected) => {
             panic!("ws message type mismatch; actual={actual:?}, expected={expected:?}")
         }
-    }
-}
-
-struct TestDb {
-    _dir: TempDir,
-    path: String,
-}
-
-fn temp_db(name: &str) -> TestDb {
-    let dir = tempfile::Builder::new()
-        .prefix(format!("sequencer-ws-feed-{name}-").as_str())
-        .tempdir()
-        .expect("create temporary test directory");
-    let path = dir.path().join("sequencer.sqlite");
-    TestDb {
-        _dir: dir,
-        path: path.to_string_lossy().into_owned(),
     }
 }

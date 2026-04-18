@@ -40,3 +40,7 @@ tokio-tungstenite = "0.28"
 k256 = "0.13.4"
 tempfile = "3"
 sequencer-rust-client = { path = "../sdk/rust-client" }
+# Used for `TcpProxy` in inline tests that need to simulate provider disconnect
+# (e.g., flusher survives extended outage). The sequencer crate doesn't depend
+# on `rollups-harness` in production; only the test profile pulls it in.
+rollups-harness = { path = "../tests/harness" }

@@ -269,20 +269,11 @@ mod tests {
         BatchSubmitterConfig, BatchSubmitterError, TickOutcome, poster::mock::MockBatchPoster,
     };
     use crate::runtime::shutdown::ShutdownSignal;
+    use crate::storage::test_helpers::{TestDb, temp_db};
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
-    use tempfile::TempDir;
 
     const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
     const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
-
-    fn temp_db(name: &str) -> (TempDir, String) {
-        let dir = tempfile::Builder::new()
-            .prefix(format!("sequencer-batch-submitter-{name}-").as_str())
-            .tempdir()
-            .expect("create temporary test directory");
-        let path = dir.path().join("sequencer.sqlite");
-        (dir, path.to_string_lossy().into_owned())
-    }
 
     fn seed_two_closed_batches(db_path: &str) {
         let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
@@ -321,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_once_submits_first_missing_closed_batch() {
-        let (_dir, path) = temp_db("tick-submits");
+        let TestDb { _dir, path } = temp_db("tick-submits");
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
@@ -352,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_once_submits_nothing_when_already_caught_up() {
-        let (_dir, path) = temp_db("tick-caught-up");
+        let TestDb { _dir, path } = temp_db("tick-caught-up");
         seed_two_closed_batches(&path);
         seed_safe_submitted_batches(&path, 10, &[0, 1]);
 
@@ -380,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_once_skips_already_submitted() {
-        let (_dir, path) = temp_db("tick-combines-prefix-and-suffix");
+        let TestDb { _dir, path } = temp_db("tick-combines-prefix-and-suffix");
         seed_two_closed_batches(&path);
         // Seed safe_inputs for all 3 closed batches (nonces 0, 1, 2).
         seed_safe_submitted_batches(&path, 10, &[0, 1, 2]);
@@ -406,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_once_submits_only_missing_suffix_from_safe_frontier() {
-        let (_dir, path) = temp_db("tick-safe-frontier-suffix");
+        let TestDb { _dir, path } = temp_db("tick-safe-frontier-suffix");
         seed_two_closed_batches(&path);
         seed_safe_submitted_batches(&path, 10, &[0, 1]);
 
@@ -435,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_once_replaces_from_latest_mined_prefix_not_safe_prefix() {
-        let (_dir, path) = temp_db("tick-latest-mined-prefix");
+        let TestDb { _dir, path } = temp_db("tick-latest-mined-prefix");
         seed_two_closed_batches(&path);
         seed_safe_submitted_batches(&path, 10, &[0]);
 
@@ -465,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_once_propagates_poster_errors() {
-        let (_dir, path) = temp_db("tick-poster-error");
+        let TestDb { _dir, path } = temp_db("tick-poster-error");
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
@@ -492,7 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_danger_zone_detects_reused_nonce_after_recovery() {
-        let (_dir, path) = temp_db("tick-stale-reused-nonce");
+        let TestDb { _dir, path } = temp_db("tick-stale-reused-nonce");
         let batch_submitter = BATCH_SUBMITTER_ADDRESS;
 
         let mut storage = Storage::open(&path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");

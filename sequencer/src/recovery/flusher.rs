@@ -30,13 +30,44 @@ pub struct MempoolFlusher {
     safe_poll_interval: Duration,
 }
 
+/// Derive the flusher's watch/poll durations from the configured block time.
+///
+/// `confirmation_timeout` is 10 blocks — long enough to survive one-off L1
+/// stalls but short enough to retry within a reasonable window.
+/// `safe_poll_interval` is one block — matches the natural cadence for
+/// `get_transaction_count(Safe)` to advance.
+///
+/// H6 regression: both values must scale with `SEQ_SECONDS_PER_BLOCK`; a fixed
+/// 12s assumption would mis-pace on non-mainnet chains.
+fn derive_timeouts(seconds_per_block: u64) -> (Duration, Duration) {
+    (
+        Duration::from_secs(10 * seconds_per_block),
+        Duration::from_secs(seconds_per_block),
+    )
+}
+
+/// Bump base 1559 fees to satisfy Ethereum's transaction replacement rule
+/// (EIP-1559 §Replacement, ≥10% bump on both `max_fee_per_gas` and
+/// `max_priority_fee_per_gas`).
+///
+/// H5 regression: a replacement no-op must out-bid any pending batch tx at the
+/// same nonce to guarantee slot consumption. The `+ 1` on `max_fee` handles the
+/// edge case where `base * 11 / 10` equals `base * 11 / 10` after integer
+/// rounding; the priority doubling is generous but preserves the invariant.
+fn bumped_replacement_fees(base_max_fee: u128, base_priority_fee: u128) -> (u128, u128) {
+    let new_max_fee = base_max_fee.saturating_mul(11) / 10 + 1;
+    let new_priority_fee = base_priority_fee.saturating_mul(2).max(1);
+    (new_max_fee, new_priority_fee)
+}
+
 impl MempoolFlusher {
     pub fn new(provider: DynProvider, address: Address, seconds_per_block: u64) -> Self {
+        let (confirmation_timeout, safe_poll_interval) = derive_timeouts(seconds_per_block);
         Self {
             provider,
             address,
-            confirmation_timeout: Duration::from_secs(10 * seconds_per_block),
-            safe_poll_interval: Duration::from_secs(seconds_per_block),
+            confirmation_timeout,
+            safe_poll_interval,
         }
     }
 
@@ -126,12 +157,15 @@ impl MempoolFlusher {
             .await
             .map_err(|e| FlushError::Provider(e.to_string()))?;
 
+        let (bumped_max_fee, bumped_priority_fee) =
+            bumped_replacement_fees(fees.max_fee_per_gas, fees.max_priority_fee_per_gas);
+
         debug!(
             from_nonce,
             to_nonce,
             count = to_nonce - from_nonce,
-            max_fee_per_gas = fees.max_fee_per_gas,
-            max_priority_fee = fees.max_priority_fee_per_gas.saturating_mul(2).max(1),
+            max_fee_per_gas = bumped_max_fee,
+            max_priority_fee = bumped_priority_fee,
             "submitting flush no-ops"
         );
 
@@ -141,12 +175,8 @@ impl MempoolFlusher {
                 .with_to(self.address)
                 .with_value(U256::ZERO)
                 .with_nonce(nonce)
-                // Bump both fee fields by ≥10% to satisfy Ethereum's replacement rule
-                // when a batch tx at this nonce is still in our node's mempool.
-                .with_max_fee_per_gas(fees.max_fee_per_gas.saturating_mul(11) / 10 + 1)
-                .with_max_priority_fee_per_gas(
-                    fees.max_priority_fee_per_gas.saturating_mul(2).max(1),
-                );
+                .with_max_fee_per_gas(bumped_max_fee)
+                .with_max_priority_fee_per_gas(bumped_priority_fee);
 
             match self.provider.send_transaction(tx).await {
                 Ok(pending) => {
@@ -216,6 +246,80 @@ mod tests {
     use alloy::network::TransactionBuilder;
     use alloy::node_bindings::Anvil;
     use alloy::providers::Provider;
+
+    // ── §7.7.4 H5: replacement-fee bump satisfies EIP-1559 rules ─────────
+
+    #[test]
+    fn replacement_fee_bump_exceeds_ten_percent_for_max_fee() {
+        // `max_fee_per_gas` must strictly exceed base by ≥10% for any positive base.
+        for base in [1_u128, 10, 100, 1_000, 1_000_000, 1_000_000_000_000] {
+            let (new_max, _) = bumped_replacement_fees(base, 0);
+            assert!(
+                new_max.saturating_mul(10) >= base.saturating_mul(11),
+                "max_fee bump violates ≥10% rule: base={base}, new={new_max}",
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_fee_bump_doubles_priority_fee() {
+        // `priority_fee` doubles (200%), easily clearing the 10% replacement threshold.
+        for base in [1_u128, 10, 1_000, 1_000_000_000] {
+            let (_, new_prio) = bumped_replacement_fees(0, base);
+            assert_eq!(new_prio, base.saturating_mul(2));
+            assert!(
+                new_prio.saturating_mul(10) >= base.saturating_mul(11),
+                "priority bump violates ≥10% rule: base={base}, new={new_prio}",
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_fee_floor_is_positive_even_when_base_is_zero() {
+        // If the estimator returns zero, bumped values are still positive so the
+        // tx is actually broadcast rather than rejected by the node.
+        let (new_max, new_prio) = bumped_replacement_fees(0, 0);
+        assert!(new_max >= 1);
+        assert!(new_prio >= 1);
+    }
+
+    #[test]
+    fn replacement_fee_bump_saturates_at_u128_max() {
+        // Overflow safety: astronomical base fees must not wrap around.
+        let (new_max, new_prio) = bumped_replacement_fees(u128::MAX, u128::MAX);
+        assert_eq!(new_max, u128::MAX / 10 + 1);
+        assert_eq!(new_prio, u128::MAX);
+    }
+
+    // ── §7.7.5 H6: timeouts derive from seconds_per_block ────────────────
+
+    #[test]
+    fn timeouts_derive_from_seconds_per_block() {
+        assert_eq!(
+            derive_timeouts(12),
+            (Duration::from_secs(120), Duration::from_secs(12)),
+            "mainnet 12s block: 120s confirmation, 12s poll",
+        );
+        assert_eq!(
+            derive_timeouts(2),
+            (Duration::from_secs(20), Duration::from_secs(2)),
+            "fast L2 2s block: scaled proportionally",
+        );
+        assert_eq!(
+            derive_timeouts(1),
+            (Duration::from_secs(10), Duration::from_secs(1)),
+            "minimum accepted block time (H8: SEQ_SECONDS_PER_BLOCK >= 1)",
+        );
+    }
+
+    #[test]
+    fn confirmation_timeout_is_ten_times_safe_poll_interval() {
+        // Structural invariant: confirmation window == 10 × poll interval.
+        for spb in [1_u64, 2, 5, 12, 30] {
+            let (conf, poll) = derive_timeouts(spb);
+            assert_eq!(conf, poll * 10);
+        }
+    }
 
     /// Verify that `anvil` is available. Panics with a clear message if not found.
     fn require_anvil() {
@@ -405,5 +509,109 @@ mod tests {
             safe_after >= 2,
             "safe nonce should be >= 2 after flush, got {safe_after}"
         );
+    }
+
+    // ── §7.7.7 flusher under extended provider outage ────────────────────
+    //
+    // Implementation note (matters for what this test pins): `flush_and_wait`
+    // does NOT retry internally on `Provider` errors — a failed `nonce_at`
+    // call propagates via `?` and the function returns. The "retry forever"
+    // language in TEST_PLAN §7.7.7 is really about the orchestrator restart
+    // loop: on each respawn a fresh flusher is constructed and tried, and
+    // this repeats until the provider becomes reachable again (covered at
+    // e2e by §11.2.2-followup / §11.1.5's `respawn_until_stable`).
+    //
+    // This test pins the two ends of that contract: (a) a mid-flush
+    // disconnect surfaces as `FlushError::Provider` fast (no hang, no
+    // internal retry), and (b) a fresh flusher call after reconnect
+    // completes and consumes the pending wallet-nonce slot.
+
+    #[tokio::test]
+    async fn flush_surfaces_provider_error_under_disconnect_and_completes_on_reconnect() {
+        use rollups_harness::TcpProxy;
+
+        require_anvil();
+
+        let anvil = spawn_anvil();
+        // Direct-to-Anvil provider: the test uses this to seed pending
+        // mempool state and inspect the chain. Bypasses the proxy so the
+        // seeding itself isn't affected by disconnect.
+        let direct_provider = signer_provider(&anvil);
+        let addr = anvil.addresses()[0];
+
+        // Proxy in front of Anvil — this is what the flusher dials. Anvil's
+        // endpoint uses `localhost` which the proxy's upstream parser rejects
+        // (it expects a literal IP). Swap for `127.0.0.1` so `parse` accepts.
+        let anvil_upstream = anvil.endpoint().replace("localhost", "127.0.0.1");
+        let proxy = TcpProxy::spawn(anvil_upstream.as_str())
+            .await
+            .expect("spawn proxy");
+
+        let key_hex = alloy_primitives::hex::encode(anvil.first_key().to_bytes());
+        let proxied_provider = crate::l1::provider::create_signer_provider(
+            proxy.endpoint().as_str(),
+            &format!("0x{key_hex}"),
+        )
+        .expect("create signer provider through proxy");
+
+        // Seed: submit a tx at wallet-nonce 0 into Anvil's mempool (auto-
+        // mining is off, so it stays pending). The flusher now has work.
+        send_tx_at_nonce(&direct_provider, addr, 0).await;
+        let pending = direct_provider
+            .get_transaction_count(addr)
+            .block_id(BlockNumberOrTag::Pending.into())
+            .await
+            .expect("pending nonce");
+        assert_eq!(pending, 1, "seed tx should be pending");
+
+        // Disconnect the proxy. The flusher's provider can no longer reach
+        // Anvil — any RPC call sees a torn-down TCP connection.
+        proxy.disconnect();
+        let flusher = MempoolFlusher::new(proxied_provider.clone(), addr, 12)
+            .with_timeouts(Duration::from_secs(2), Duration::from_millis(200));
+
+        // `flush_and_wait` must fail fast (no internal retry loop). Wrap in
+        // a generous outer timeout just to bound test flakiness if alloy's
+        // HTTP client has small internal retries.
+        let err = tokio::time::timeout(Duration::from_secs(5), flusher.flush_and_wait())
+            .await
+            .expect("flush_and_wait must not hang under disconnect")
+            .expect_err("flush_and_wait must surface a Provider error under disconnect");
+        assert!(
+            matches!(err, FlushError::Provider(_)),
+            "expected FlushError::Provider, got: {err:?}",
+        );
+
+        // Reconnect the proxy + start mining so the flusher can make forward
+        // progress. This models the orchestrator's next respawn succeeding
+        // after the provider returns.
+        proxy.reconnect();
+        let _miner = start_miner(direct_provider.clone(), Duration::from_millis(100));
+
+        // A fresh flusher (a respawn would build a new one from scratch).
+        // It should now read nonces, replace the pending tx with a bumped-
+        // fee no-op (or let the original land), wait for safe, and return.
+        let flusher_after = MempoolFlusher::new(proxied_provider, addr, 12)
+            .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
+        tokio::time::timeout(Duration::from_secs(15), flusher_after.flush_and_wait())
+            .await
+            .expect("flush_and_wait should complete after reconnect")
+            .expect("flush should succeed once the provider is reachable");
+
+        // Forward progress: the nonce-0 slot was consumed (either by the
+        // flusher's no-op or by the original tx landing). `safe_nonce` is
+        // >= 1 only if something at nonce 0 reached safe finality — proof
+        // the flusher completed its job end-to-end.
+        let safe_after = direct_provider
+            .get_transaction_count(addr)
+            .block_id(BlockNumberOrTag::Safe.into())
+            .await
+            .expect("safe nonce after flush");
+        assert!(
+            safe_after >= 1,
+            "nonce-0 slot must be consumed and safe after flush, got {safe_after}",
+        );
+
+        proxy.shutdown().await.expect("proxy shutdown");
     }
 }

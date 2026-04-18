@@ -23,11 +23,13 @@ use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
-use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+mod common;
+use common::temp_db;
 
 // ── §1.1 — V1 regression: cross-boundary signature domain consistency ────────
 //
@@ -508,6 +510,449 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
     assert!(
         body.contains(&MAX_METHOD_PAYLOAD_BYTES.to_string()),
         "expected max payload size in error body, got: {body}"
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
+    // §2.3.3 / H2 regression: a body that is valid JSON but missing required
+    // fields must respond with the fixed `"invalid JSON"` envelope. The
+    // response must not echo serde's deserialization error text — that would
+    // leak our internal field names and parser internals to callers.
+    let db = temp_db("missing-fields-json");
+    let domain = test_domain();
+    bootstrap_open_frame(db.path.as_str());
+
+    let Some(runtime) = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await
+    else {
+        return;
+    };
+
+    // Empty object — valid JSON, missing every required field.
+    let (status, body) = post_raw_json(runtime.addr, "{}").await;
+    assert_eq!(status, 400, "missing fields: {body}");
+
+    // Parse the response envelope and assert the message is exactly the fixed
+    // taxonomy string. Anything else implies serde leaked internals into the
+    // body — that's the regression this test pins.
+    let envelope: serde_json::Value = serde_json::from_str(&body).expect("response is JSON");
+    let message = envelope
+        .get("message")
+        .and_then(|m| m.as_str())
+        .expect("envelope has string `message` field");
+    assert_eq!(
+        message, "invalid JSON",
+        "response message must be the fixed taxonomy string, got: {message:?} (full body: {body})",
+    );
+    let code = envelope
+        .get("code")
+        .and_then(|c| c.as_str())
+        .expect("envelope has string `code` field");
+    assert_eq!(code, "BAD_REQUEST", "unexpected error code: {body}");
+
+    // Sanity: serde's typical leak vocabulary must not appear anywhere.
+    for needle in ["missing field", "expected", "deserializ", "line ", "column "] {
+        assert!(
+            !body.contains(needle),
+            "potential serde leak — body contains {needle:?}: {body}",
+        );
+    }
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_payload_size_check_fires_before_signature_recovery() {
+    // §2.3.5 sharpening: oversized `data` must be rejected by
+    // `validate_payload_size` BEFORE any cryptographic work. We submit an
+    // oversized payload paired with a garbage-but-correctly-shaped signature:
+    // if the size check is enforced first, the response says "user op payload
+    // too large"; if signature recovery ran first the response would mention a
+    // signature/sender mismatch instead. Catches a regression that re-orders
+    // signature verification ahead of size validation, which would open a DoS
+    // vector (huge body × secp256k1 recovery cost).
+    let db = temp_db("size-before-sig");
+    let domain = test_domain();
+    bootstrap_open_frame(db.path.as_str());
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain).await else {
+        return;
+    };
+
+    // Hand-craft a request: oversized data + correctly-shaped but garbage
+    // signature. The 65-byte signature passes `validate_hex_lengths`, so the
+    // next gate is `validate_payload_size`. If anyone moves signature recovery
+    // ahead of it, the response message changes and this assertion fails.
+    let oversized_data_hex = "00".repeat(MAX_METHOD_PAYLOAD_BYTES + 1);
+    let bogus_sig_hex = format!("0x{}", "00".repeat(65));
+    let body = format!(
+        "{{\"message\":{{\"nonce\":0,\"max_fee\":0,\"data\":\"0x{oversized_data_hex}\"}},\
+         \"signature\":\"{bogus_sig_hex}\",\
+         \"sender\":\"0x0000000000000000000000000000000000000001\"}}",
+    );
+    // Confirm the body fits under the default 4 KB body limit so we exercise
+    // the payload-size gate, not the upstream body-too-large gate.
+    assert!(
+        body.len() < 4 * 1024,
+        "test body must stay under default max_body_bytes (got {} bytes)",
+        body.len(),
+    );
+
+    let (status, response_body) = post_raw_json(runtime.addr, body.as_str()).await;
+    assert_eq!(status, 400, "oversized + bogus sig: {response_body}");
+    assert!(
+        response_body.contains("user op payload too large"),
+        "size check must fire before signature verification — \
+         expected 'user op payload too large' message, got: {response_body}",
+    );
+    // Defensive: ensure the rejection is NOT a signature-class error. Any of
+    // these would mean signature recovery ran on the oversized payload.
+    for sig_marker in ["signature", "sender mismatch", "recover", "INVALID_SIGNATURE"] {
+        assert!(
+            !response_body.contains(sig_marker),
+            "response mentions {sig_marker:?} — signature recovery may have run \
+             before the size check: {response_body}",
+        );
+    }
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_rejects_signature_with_invalid_parity_byte() {
+    // §2.2.3: signature with correct length (65 bytes) but a parity byte
+    // outside the valid set (0/1 or 27/28) must be rejected at the crypto
+    // boundary with 422. Catches regressions where a new signature codec
+    // accepts arbitrary parity values and silently drifts recovery.
+    let db = temp_db("bad-parity-byte");
+    let domain = test_domain();
+    bootstrap_open_frame(db.path.as_str());
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
+        .expect("build sequencer client");
+
+    // Correct-length signature (65 bytes) with a non-recoverable parity byte.
+    let mut bogus_sig = [0_u8; 65];
+    bogus_sig[64] = 0xFF;
+    let bogus_sig_hex = format!("0x{}", alloy_primitives::hex::encode(bogus_sig));
+
+    let mut request = make_valid_request(&domain);
+    request.signature = bogus_sig_hex;
+
+    let (status, body) = client
+        .submit_tx_with_status(&request)
+        .await
+        .expect("submit tx");
+    // Observed: 400 with `INVALID_SIGNATURE` code. (TEST_PLAN originally said
+    // 422; the code returns 400 for all signature-class rejections, same as
+    // §2.2.1 `forged_signature_rejected_test`. This test pins the actual
+    // contract.)
+    assert_eq!(
+        status, 400,
+        "invalid parity byte must produce 400 (signature-class error), got {status}: {body}",
+    );
+    assert!(
+        body.contains("INVALID_SIGNATURE"),
+        "expected INVALID_SIGNATURE code, got: {body}",
+    );
+    // Defensive: make sure the rejection is from the signature layer, not the
+    // hex-length gate (§2.2.2 covers that) and not the payload-size gate.
+    assert!(
+        !body.contains("signature must be") && !body.contains("payload too large"),
+        "expected sig-recovery class error, not hex-length or size: {body}",
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
+    // §2.2.4: `sender` field in the request must equal the address recovered
+    // from the signature. A valid signature over a user-op paired with a
+    // different claimed `sender` must be rejected — can't accept someone
+    // else's signed op as if it came from ourselves. Complements the
+    // integration-level forged_signature_rejected_test (which asserts the
+    // end-to-end shape); this one pins the direct API response.
+    let db = temp_db("sender-mismatch-explicit");
+    let domain = test_domain();
+    bootstrap_open_frame(db.path.as_str());
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
+        .expect("build sequencer client");
+
+    // Key A signs the user op; we claim the sender is address B.
+    let signing_key_a =
+        SigningKey::from_bytes((&[1_u8; 32]).into()).expect("create signing key a");
+    let signing_key_b =
+        SigningKey::from_bytes((&[2_u8; 32]).into()).expect("create signing key b");
+    let address_a = address_from_signing_key(&signing_key_a);
+    let address_b = address_from_signing_key(&signing_key_b);
+    assert_ne!(address_a, address_b, "test setup: A and B must differ");
+
+    let user_op = UserOp {
+        nonce: 0,
+        max_fee: TEST_MAX_FEE,
+        data: Vec::new().into(),
+    };
+    let request = TxRequest {
+        signature: sign_user_op_hex(&domain, &user_op, &signing_key_a),
+        sender: address_b.to_string(),
+        message: user_op,
+    };
+
+    let (status, body) = client
+        .submit_tx_with_status(&request)
+        .await
+        .expect("submit tx");
+    // Observed: 400 `INVALID_SIGNATURE` `"sender mismatch"`. See parity-byte
+    // test above for the TEST_PLAN-vs-reality note on the status code.
+    assert_eq!(
+        status, 400,
+        "sender-mismatch must produce 400 (signature-class error), got {status}: {body}",
+    );
+    assert!(
+        body.contains("sender mismatch"),
+        "expected `sender mismatch` message, got: {body}",
+    );
+    assert!(
+        body.contains("INVALID_SIGNATURE"),
+        "expected INVALID_SIGNATURE code, got: {body}",
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_rejects_user_op_with_nonce_gap() {
+    // §2.4.3: submitting a user-op with a nonce above the next expected one
+    // (i.e., a gap) must return 422 `InvalidNonce` and leave state
+    // unchanged. Complement to §2.4.2 (nonce too low / replay) — together
+    // they pin the strict-equality requirement on `current_user_nonce`.
+    let db = temp_db("nonce-gap-too-high");
+    let domain = test_domain();
+    let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
+        .expect("build sequencer client");
+
+    // Current user nonce is 0 — a fresh sender has never submitted. Nonce 7
+    // leaves a six-slot gap.
+    let user_op = UserOp {
+        nonce: 7,
+        max_fee: TEST_MAX_FEE,
+        data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
+            amount: U256::from(0_u64),
+        }))
+        .into(),
+    };
+    let request = TxRequest {
+        signature: sign_user_op_hex(&domain, &user_op, &signing_key),
+        sender: sender.to_string(),
+        message: user_op,
+    };
+
+    let (status, body) = client
+        .submit_tx_with_status(&request)
+        .await
+        .expect("submit tx");
+    assert_eq!(
+        status, 422,
+        "nonce gap must produce 422, got {status}: {body}",
+    );
+    assert!(
+        body.contains("nonce") || body.contains("NONCE"),
+        "expected nonce-class error, got: {body}",
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
+    // §2.5.2 boundary: the check is `max_fee >= current_frame_fee` (strict
+    // less-than rejects). An op with `max_fee == current_frame_fee` must be
+    // accepted. Pairs with §2.5.1 (`fee_below_minimum_rejected_test`) — the
+    // two together pin the comparator.
+    let db = temp_db("fee-boundary-equal");
+    let domain = test_domain();
+    let signing_key = SigningKey::from_bytes((&[9_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    // Fund with enough to cover gas at the frame fee.
+    bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
+
+    // `bootstrap_open_frame` asserts frame_fee == 1060; use that exact value
+    // for the boundary case.
+    const FRAME_FEE_BOUNDARY: u16 = 1060;
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
+        .expect("build sequencer client");
+
+    let user_op = UserOp {
+        nonce: 0,
+        max_fee: FRAME_FEE_BOUNDARY,
+        data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
+            amount: U256::from(0_u64),
+        }))
+        .into(),
+    };
+    let request = TxRequest {
+        signature: sign_user_op_hex(&domain, &user_op, &signing_key),
+        sender: sender.to_string(),
+        message: user_op,
+    };
+
+    let (status, body) = client
+        .submit_tx_with_status(&request)
+        .await
+        .expect("submit tx");
+    assert_eq!(
+        status, 200,
+        "max_fee == current_frame_fee boundary must be accepted (comparator is `<`, not `<=`), got {status}: {body}",
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_rejects_user_op_when_balance_below_gas_cost() {
+    // §2.6.1: if sender's balance < `fee_to_linear(current_frame_fee)` the
+    // user op must be rejected with 422 `InsufficientGasBalance` and leave
+    // state unchanged. Exercises the balance check in
+    // `WalletApp::validate_user_op` (app-core). A fresh sender with no
+    // deposits has balance 0, well below `fee_to_linear(1060)` (the
+    // bootstrapped frame fee).
+    let db = temp_db("insufficient-gas-balance");
+    let domain = test_domain();
+    let signing_key =
+        SigningKey::from_bytes((&[11_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    // No deposit for `sender` → balance = 0.
+    bootstrap_open_frame(db.path.as_str());
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
+        .expect("build sequencer client");
+
+    let user_op = UserOp {
+        nonce: 0,
+        max_fee: TEST_MAX_FEE,
+        data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
+            amount: U256::from(0_u64),
+        }))
+        .into(),
+    };
+    let request = TxRequest {
+        signature: sign_user_op_hex(&domain, &user_op, &signing_key),
+        sender: sender.to_string(),
+        message: user_op,
+    };
+
+    let (status, body) = client
+        .submit_tx_with_status(&request)
+        .await
+        .expect("submit tx");
+    assert_eq!(
+        status, 422,
+        "insufficient-balance must produce 422, got {status}: {body}",
+    );
+    assert!(
+        body.contains("insufficient balance for gas"),
+        "expected InsufficientGasBalance message, got: {body}",
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_concurrent_same_nonce_leaves_exactly_one_committed() {
+    // §2.8.2: two concurrent POSTs for the same (sender, nonce) — one
+    // succeeds, one is rejected with a nonce-class error. Pins the invariant
+    // that the rejected half does NOT leave any state artifact: the final
+    // balance/nonce must match the single-commit path.
+    let db = temp_db("concurrent-same-nonce");
+    let domain = test_domain();
+    let signing_key =
+        SigningKey::from_bytes((&[13_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    bootstrap_open_frame_with_deposits(
+        db.path.as_str(),
+        &[(sender, U256::from(10_000_000_u64))],
+    );
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+
+    let user_op = UserOp {
+        nonce: 0,
+        max_fee: TEST_MAX_FEE,
+        data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
+            amount: U256::from(0_u64),
+        }))
+        .into(),
+    };
+    let request = TxRequest {
+        signature: sign_user_op_hex(&domain, &user_op, &signing_key),
+        sender: sender.to_string(),
+        message: user_op,
+    };
+    let request_json = serde_json::to_string(&request).expect("serialize request");
+
+    // Two concurrent POSTs with byte-identical bodies.
+    let addr = runtime.addr;
+    let body_a = request_json.clone();
+    let body_b = request_json;
+    let a = tokio::spawn(async move { post_raw_json(addr, body_a.as_str()).await });
+    let b = tokio::spawn(async move { post_raw_json(addr, body_b.as_str()).await });
+    let (res_a, res_b) = tokio::try_join!(a, b).expect("join concurrent posts");
+
+    let outcomes = [res_a, res_b];
+    let accepted = outcomes.iter().filter(|(s, _)| *s == 200).count();
+    let rejected_bodies: Vec<&String> = outcomes
+        .iter()
+        .filter_map(|(s, b)| (*s == 422).then_some(b))
+        .collect();
+    assert_eq!(
+        accepted, 1,
+        "exactly one concurrent submission must be accepted, outcomes: {outcomes:?}",
+    );
+    assert_eq!(
+        rejected_bodies.len(),
+        1,
+        "exactly one concurrent submission must be rejected with 422, outcomes: {outcomes:?}",
+    );
+    let rejected_body = rejected_bodies[0];
+    assert!(
+        rejected_body.contains("bad nonce") || rejected_body.contains("INVALID_NONCE"),
+        "rejected concurrent op should be nonce-class, got: {rejected_body}",
     );
 
     shutdown_runtime(runtime).await;
@@ -1012,21 +1457,4 @@ fn decode_hex_prefixed(value: &str) -> Vec<u8> {
 
 fn test_domain() -> Eip712Domain {
     sequencer_core::build_input_domain(1, Address::from_slice(&[0_u8; 20]))
-}
-
-struct TestDb {
-    _dir: TempDir,
-    path: String,
-}
-
-fn temp_db(name: &str) -> TestDb {
-    let dir = tempfile::Builder::new()
-        .prefix(format!("sequencer-full-e2e-{name}-").as_str())
-        .tempdir()
-        .expect("create temporary test directory");
-    let path = dir.path().join("sequencer.sqlite");
-    TestDb {
-        _dir: dir,
-        path: path.to_string_lossy().into_owned(),
-    }
 }

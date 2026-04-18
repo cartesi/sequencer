@@ -27,7 +27,7 @@ mod open;
 mod recovery;
 
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 use std::time::SystemTime;
 use thiserror::Error;

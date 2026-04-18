@@ -219,4 +219,70 @@ mod tests {
         let verifying = signing_key.verifying_key().to_encoded_point(false);
         Address::from_raw_public_key(&verifying.as_bytes()[1..])
     }
+
+    // ── §1.7 S-malleability — no alternate signature can recover a different
+    // address at our boundary. Structurally guaranteed by alloy+k256; this is
+    // a regression lock.
+
+    #[test]
+    fn s_malleable_signature_cannot_recover_a_different_address() {
+        use alloy_primitives::{B256, U256};
+
+        // secp256k1 curve order `n`. s' = n - s is the canonical malleable
+        // transform that pairs with flipped parity to produce an alternate
+        // signature recovering the same public key.
+        const SECP256K1_N: U256 = U256::from_be_slice(&[
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C,
+            0xD0, 0x36, 0x41, 0x41,
+        ]);
+
+        let signing_key = SigningKey::from_bytes((&[0x42_u8; 32]).into()).expect("key");
+        let expected_sender = address_from_signing_key(&signing_key);
+
+        let msg_hash = B256::from([0xfe_u8; 32]);
+        let k256_sig = signing_key
+            .sign_prehash(msg_hash.as_slice())
+            .expect("sign prehash");
+
+        // k256's `sign_prehash` returns a low-s signature by default. Find the
+        // parity that pairs with it to recover the expected signer.
+        let valid_sig = [false, true]
+            .into_iter()
+            .map(|p| Signature::from_signature_and_parity(k256_sig, p))
+            .find(|s| {
+                s.recover_address_from_prehash(&msg_hash)
+                    .ok()
+                    .is_some_and(|a| a == expected_sender)
+            })
+            .expect("low-s signature must recover the signer with one parity");
+
+        // Construct the S-malleable variant: same r, s' = n - s, flipped parity.
+        let malleable_sig = Signature::new(
+            valid_sig.r(),
+            SECP256K1_N - valid_sig.s(),
+            !valid_sig.v(),
+        );
+        assert_ne!(
+            malleable_sig.s(),
+            valid_sig.s(),
+            "malleable transform must actually change the signature",
+        );
+
+        match malleable_sig.recover_address_from_prehash(&msg_hash) {
+            Err(_) => {
+                // alloy rejected the high-s form (EIP-2 style). Impersonation
+                // via malleability is structurally impossible at recovery.
+            }
+            Ok(addr) => {
+                // alloy accepted high-s; it MUST return the same signer.
+                // Any other outcome would let an attacker grind a distinct
+                // signature that recovers a different address.
+                assert_eq!(
+                    addr, expected_sender,
+                    "malleable signature recovered a DIFFERENT address — impersonation possible",
+                );
+            }
+        }
+    }
 }
