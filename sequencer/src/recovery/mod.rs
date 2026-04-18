@@ -244,20 +244,11 @@ pub(crate) fn wall_clock_danger_estimate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::test_helpers::temp_db;
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
-    use tempfile::TempDir;
 
     const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
     const BATCH_SUBMITTER: Address = Address::repeat_byte(0xAA);
-
-    fn temp_db(name: &str) -> (TempDir, String) {
-        let dir = tempfile::Builder::new()
-            .prefix(format!("sequencer-recovery-{name}-").as_str())
-            .tempdir()
-            .expect("create temporary test directory");
-        let path = dir.path().join("sequencer.sqlite");
-        (dir, path.to_string_lossy().into_owned())
-    }
 
     fn set_last_l1_sync_ms(db_path: &str, synced_at_ms: u64) {
         let conn = Storage::open_connection(db_path, SQLITE_SYNCHRONOUS_PRAGMA)
@@ -282,10 +273,10 @@ mod tests {
 
     #[test]
     fn wall_clock_danger_estimate_requires_previous_real_sync() {
-        let (_dir, path) = temp_db("wall-clock-first-startup");
+        let db = temp_db("wall-clock-first-startup");
 
         let err = wall_clock_danger_estimate(
-            &path,
+            &db.path,
             BATCH_SUBMITTER,
             RecoveryParams {
                 max_wait_blocks: 1200,
@@ -299,8 +290,8 @@ mod tests {
 
     #[test]
     fn wall_clock_danger_estimate_accounts_for_frontier_age_at_last_sync() {
-        let (_dir, path) = temp_db("wall-clock-frontier-age");
-        let mut storage = Storage::open(&path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let db = temp_db("wall-clock-frontier-age");
+        let mut storage = Storage::open(&db.path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
 
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
@@ -329,10 +320,10 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         let missed_blocks = 25_u64;
-        set_last_l1_sync_ms(&path, now_ms.saturating_sub(missed_blocks * 12 * 1000));
+        set_last_l1_sync_ms(&db.path, now_ms.saturating_sub(missed_blocks * 12 * 1000));
 
         let batch_index = wall_clock_danger_estimate(
-            &path,
+            &db.path,
             BATCH_SUBMITTER,
             RecoveryParams {
                 max_wait_blocks: 1200,

@@ -102,3 +102,171 @@ impl BatchForSubmission {
         self.encode_for_scheduler_with_nonce(self.batch_index)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssz::{Decode, Encode};
+
+    fn sample_user_op(nonce: u32) -> WireUserOp {
+        WireUserOp {
+            nonce,
+            max_fee: 100,
+            data: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            signature: vec![0xee; WireUserOp::SIGNATURE_BYTES],
+        }
+    }
+
+    fn sample_frame(safe_block: u64, user_op_count: u32) -> Frame {
+        Frame {
+            user_ops: (0..user_op_count).map(sample_user_op).collect(),
+            safe_block,
+            fee_price: 42,
+        }
+    }
+
+    fn sample_batch(nonce: u64, frame_count: u64) -> Batch {
+        Batch {
+            nonce,
+            frames: (0..frame_count)
+                .map(|i| sample_frame(100 + i, 2))
+                .collect(),
+        }
+    }
+
+    // ── §1.4 SSZ round-trip determinism ──────────────────────────────────
+
+    #[test]
+    fn ssz_roundtrip_empty_batch_is_identity() {
+        let batch = Batch {
+            nonce: 0,
+            frames: vec![],
+        };
+        let encoded = batch.as_ssz_bytes();
+        let decoded = Batch::from_ssz_bytes(&encoded).expect("decode empty batch");
+        assert_eq!(decoded, batch);
+        assert_eq!(decoded.as_ssz_bytes(), encoded);
+    }
+
+    #[test]
+    fn ssz_roundtrip_populated_batch_is_identity() {
+        let batch = sample_batch(42, 3);
+        let encoded = batch.as_ssz_bytes();
+        let decoded = Batch::from_ssz_bytes(&encoded).expect("decode populated batch");
+        assert_eq!(decoded, batch);
+        assert_eq!(decoded.as_ssz_bytes(), encoded);
+    }
+
+    #[test]
+    fn ssz_roundtrip_frame_with_empty_user_ops_is_identity() {
+        // Closed-empty frames (direct-input-only) are a real on-wire shape.
+        let frame = Frame {
+            user_ops: vec![],
+            safe_block: 7,
+            fee_price: 0,
+        };
+        let encoded = frame.as_ssz_bytes();
+        let decoded = Frame::from_ssz_bytes(&encoded).expect("decode");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn ssz_roundtrip_wire_user_op_is_identity() {
+        let uop = sample_user_op(99);
+        let encoded = uop.as_ssz_bytes();
+        let decoded = WireUserOp::from_ssz_bytes(&encoded).expect("decode wire user op");
+        assert_eq!(decoded, uop);
+    }
+
+    #[test]
+    fn ssz_encoding_is_deterministic_across_calls() {
+        // Determinism under the same input is a consensus requirement; encoding
+        // the same batch twice must produce byte-identical output.
+        let batch = sample_batch(7, 2);
+        assert_eq!(batch.as_ssz_bytes(), batch.as_ssz_bytes());
+    }
+
+    // ── §1.5 Decode robustness (no panics on adversarial bytes) ──────────
+
+    #[test]
+    fn ssz_decode_empty_payload_returns_error() {
+        assert!(Batch::from_ssz_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn ssz_decode_below_fixed_header_returns_error() {
+        // Batch's fixed portion is 8 (nonce) + 4 (frames offset) = 12 bytes.
+        for len in 0..12 {
+            let buf = vec![0u8; len];
+            assert!(
+                Batch::from_ssz_bytes(&buf).is_err(),
+                "decoding {len} bytes below fixed header must fail",
+            );
+        }
+    }
+
+    #[test]
+    fn ssz_decode_truncated_valid_batch_returns_error() {
+        let batch = sample_batch(1, 2);
+        let full = batch.as_ssz_bytes();
+        // Truncating anywhere before the full length must not round-trip.
+        for cut in 0..full.len() {
+            let truncated = &full[..cut];
+            match Batch::from_ssz_bytes(truncated) {
+                Err(_) => {}
+                Ok(decoded) => assert_ne!(
+                    decoded, batch,
+                    "truncation at {cut} silently decoded to the original batch",
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn ssz_decode_invalid_offset_returns_error() {
+        // Well-formed nonce (8 zero bytes), frames offset points far past the
+        // buffer end. SSZ must reject rather than read out of bounds.
+        let mut buf = vec![0u8; 12];
+        buf[8..12].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
+        assert!(Batch::from_ssz_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn ssz_decode_garbage_bytes_never_panics() {
+        // Adversarial fixed patterns. Decoding may Err or Ok; the invariant we
+        // care about is "no panic" — the test passing proves it.
+        for pattern in [0x00, 0x01, 0x42, 0x7f, 0x80, 0xff] {
+            for len in [1, 12, 64, 256, 1024] {
+                let _ = Batch::from_ssz_bytes(&vec![pattern; len]);
+            }
+        }
+    }
+
+    // ── encode_for_scheduler semantics ───────────────────────────────────
+
+    #[test]
+    fn encode_for_scheduler_uses_batch_index_as_wire_nonce() {
+        let batch = sample_batch(3, 1);
+        let submission = BatchForSubmission {
+            batch_index: 7,
+            created_at_ms: 0,
+            batch: batch.clone(),
+        };
+        let encoded = submission.encode_for_scheduler();
+        let decoded = Batch::from_ssz_bytes(&encoded).expect("decode");
+        assert_eq!(decoded.nonce, 7);
+        assert_eq!(decoded.frames, batch.frames);
+    }
+
+    #[test]
+    fn encode_for_scheduler_with_nonce_overrides_batch_index() {
+        let submission = BatchForSubmission {
+            batch_index: 7,
+            created_at_ms: 0,
+            batch: sample_batch(3, 1),
+        };
+        let encoded = submission.encode_for_scheduler_with_nonce(42);
+        let decoded = Batch::from_ssz_bytes(&encoded).expect("decode");
+        assert_eq!(decoded.nonce, 42);
+    }
+}

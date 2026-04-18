@@ -207,14 +207,7 @@ where
         Err(source) => return Err(RunError::InputReader { source }),
     };
     // ── Startup config ──────────────────────────────────────────────
-    assert!(
-        config.preemptive_margin_blocks < sequencer_core::MAX_WAIT_BLOCKS,
-        "preemptive_margin_blocks ({}) must be less than MAX_WAIT_BLOCKS ({})",
-        config.preemptive_margin_blocks,
-        sequencer_core::MAX_WAIT_BLOCKS,
-    );
-    let danger_threshold =
-        sequencer_core::MAX_WAIT_BLOCKS.saturating_sub(config.preemptive_margin_blocks);
+    let danger_threshold = compute_danger_threshold(config.preemptive_margin_blocks);
 
     tracing::info!(
         http_addr = %config.http_addr,
@@ -519,4 +512,56 @@ fn build_batch_submitter_provider(
 ) -> Result<alloy::providers::DynProvider, std::io::Error> {
     crate::l1::provider::create_signer_provider(&l1.eth_rpc_url, &l1.batch_submitter_private_key)
         .map_err(std::io::Error::other)
+}
+
+/// Resolve the preemptive danger threshold from the configured margin.
+///
+/// Panics if `preemptive_margin_blocks >= MAX_WAIT_BLOCKS` — the danger
+/// threshold would be zero or underflow, making preemptive recovery
+/// indistinguishable from hard staleness. Caught at startup so the process
+/// never runs in that configuration.
+fn compute_danger_threshold(preemptive_margin_blocks: u64) -> u64 {
+    assert!(
+        preemptive_margin_blocks < sequencer_core::MAX_WAIT_BLOCKS,
+        "preemptive_margin_blocks ({}) must be less than MAX_WAIT_BLOCKS ({})",
+        preemptive_margin_blocks,
+        sequencer_core::MAX_WAIT_BLOCKS,
+    );
+    sequencer_core::MAX_WAIT_BLOCKS - preemptive_margin_blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_danger_threshold;
+    use sequencer_core::MAX_WAIT_BLOCKS;
+
+    // ── §8.4.1 preemptive_margin_blocks validation ────────────────────
+
+    #[test]
+    #[should_panic(expected = "preemptive_margin_blocks")]
+    fn margin_equal_to_max_wait_panics() {
+        compute_danger_threshold(MAX_WAIT_BLOCKS);
+    }
+
+    #[test]
+    #[should_panic(expected = "preemptive_margin_blocks")]
+    fn margin_greater_than_max_wait_panics() {
+        compute_danger_threshold(MAX_WAIT_BLOCKS + 1);
+    }
+
+    #[test]
+    fn margin_one_below_max_wait_yields_threshold_one() {
+        assert_eq!(compute_danger_threshold(MAX_WAIT_BLOCKS - 1), 1);
+    }
+
+    #[test]
+    fn zero_margin_yields_full_wait_window() {
+        assert_eq!(compute_danger_threshold(0), MAX_WAIT_BLOCKS);
+    }
+
+    #[test]
+    fn default_margin_matches_production_setting() {
+        // Default is 75 per `SEQ_PREEMPTIVE_MARGIN_BLOCKS`; threshold = MAX - 75.
+        assert_eq!(compute_danger_threshold(75), MAX_WAIT_BLOCKS - 75);
+    }
 }

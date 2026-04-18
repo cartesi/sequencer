@@ -25,6 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            faketime \
             lua5.4 \
             liblua5.4-dev \
             libslirp-dev
@@ -99,6 +100,11 @@ jobs:
           cartesi-machine-sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
           cartesi-machine-sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
           install-foundry: "true"
+
+      - name: Install faketime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y faketime
 
       - name: Run rollups E2E tests
         run: just test-rollups-e2e

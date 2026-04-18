@@ -387,6 +387,76 @@ mod tests {
     }
 
     #[test]
+    fn frame_fee_is_immutable_for_the_lifetime_of_the_frame() {
+        // §3.2.3: once a frame is opened at fee F, a policy update mid-frame
+        // must NOT change the open frame's committed fee. Only the *next*
+        // frame (after close) sees the new policy. This pins the write-once
+        // contract `frames.fee` relies on — users submitting against the open
+        // frame know the fee they're paying, regardless of upstream policy
+        // drift during their round-trip.
+        let db = temp_db("frame-fee-immutable");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize open state");
+        let original_batch_index = head.batch_index;
+        let original_frame_in_batch = head.frame_in_batch;
+        // Default: log_gas_price=0 → log_recommended_fee = 0+20+419+621 = 1060
+        assert_eq!(head.frame_fee, 1060);
+
+        // Simulate an operator policy update mid-frame: fee oracle reports a
+        // higher gas price. The derived view reflects the new fee immediately.
+        storage
+            .set_log_gas_price(100)
+            .expect("set higher log gas price");
+        let new_policy = storage.batch_policy().expect("read updated policy");
+        assert_eq!(
+            new_policy.recommended_fee, 1160,
+            "policy-derived fee should reflect the new gas price",
+        );
+
+        // Invariant: the already-open frame's persisted fee stays at 1060.
+        let persisted_frame_fee: i64 = storage
+            .conn
+            .query_row(
+                "SELECT fee FROM frames WHERE batch_index = ?1 AND frame_in_batch = ?2",
+                rusqlite::params![
+                    original_batch_index as i64,
+                    original_frame_in_batch as i64,
+                ],
+                |row| row.get(0),
+            )
+            .expect("query open frame fee");
+        assert_eq!(
+            persisted_frame_fee, 1060,
+            "open frame's committed fee must not change across policy updates",
+        );
+
+        // And the in-memory WriteHead mirror must also be stable — the lane
+        // submitting against this head should see a consistent fee.
+        assert_eq!(
+            head.frame_fee, 1060,
+            "WriteHead.frame_fee must stay stable until advance_frame runs",
+        );
+
+        // Closing the frame picks up the new policy — the *next* frame opens
+        // at 1160. This is the expected policy-flow boundary.
+        let next_safe_block = head.safe_block;
+        storage
+            .close_frame_only(
+                &mut head,
+                next_safe_block,
+                SafeInputRange::empty_at(0),
+            )
+            .expect("rotate within same batch");
+        assert_eq!(
+            head.frame_fee, 1160,
+            "the next frame must use the updated policy's fee (policy flows in at close)",
+        );
+    }
+
+    #[test]
     fn next_undrained_safe_input_index_is_derived_from_sequenced_directs() {
         let db = temp_db("safe-cursor");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");

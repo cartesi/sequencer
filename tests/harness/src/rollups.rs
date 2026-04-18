@@ -91,6 +91,18 @@ impl DevnetRollupsStack {
         self.anvil.mine_blocks(block_count).await
     }
 
+    /// Toggle Anvil's auto-mining mode. When disabled, txs accumulate in
+    /// the mempool until an explicit `anvil_mine` call (or re-enable).
+    pub async fn set_automine(&self, enabled: bool) -> HarnessResult<()> {
+        self.anvil.set_automine(enabled).await
+    }
+
+    /// Drop every pending tx from Anvil's mempool. Useful for simulating
+    /// mempool eviction or gateway packet loss.
+    pub async fn drop_all_pending_txs(&self) -> HarnessResult<()> {
+        self.anvil.drop_all_pending_txs().await
+    }
+
     pub async fn shutdown(self) -> HarnessResult<()> {
         self.anvil.shutdown().await
     }
@@ -212,6 +224,30 @@ impl ManagedAnvil {
                     "failed to mine {block_count} Anvil block(s): {err}"
                 ))
             })?;
+        Ok(())
+    }
+
+    async fn set_automine(&self, enabled: bool) -> HarnessResult<()> {
+        let provider = ProviderBuilder::new()
+            .connect(self.endpoint.as_str())
+            .await
+            .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
+        provider
+            .anvil_set_auto_mine(enabled)
+            .await
+            .map_err(|err| io_other(format!("failed to set auto_mine={enabled}: {err}")))?;
+        Ok(())
+    }
+
+    async fn drop_all_pending_txs(&self) -> HarnessResult<()> {
+        let provider = ProviderBuilder::new()
+            .connect(self.endpoint.as_str())
+            .await
+            .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
+        provider
+            .anvil_drop_all_transactions()
+            .await
+            .map_err(|err| io_other(format!("failed to drop all pending txs: {err}")))?;
         Ok(())
     }
 }

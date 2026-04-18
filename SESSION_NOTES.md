@@ -1,189 +1,286 @@
-# Session Handoff — 2026-04-16
+# Session Handoff — 2026-04-18 / 2026-04-19
 
-A short note for the next agent (or your future self) picking up work in this
-worktree. Ephemeral: delete after absorbing.
+Ephemeral note for the next agent. Delete after absorbing.
 
 ## TL;DR
 
-The branch is clean, green, and ready to commit. The staged security review
-(Parts 1-8) found 4 vulnerabilities + 8 hardening items; all were fixed and
-locked in with regression tests. The test harness gained a programmable
-TCP proxy and a DB-level wall-clock rewind helper. The zone × outage matrix
-has 4 of 7 cells covered end-to-end. A real structural bug in the
-danger-check path was caught while writing the wall-clock e2e test and
-fixed by splitting zombie-detection from any-unresolved-batch detection.
+This session landed **seventeen new e2e tests** (19 → 36 passing) across
+four batches:
+
+1. §11 outage matrix + recovery critical path (8 tests).
+2. Tier A e2e follow-up — WS cursor edges, direct-input drain corners,
+   replay determinism, input reader retry (6 tests).
+3. Tier A bootstrap edges — first-boot-no-cache, chain-id mismatch via
+   live RPC, nonce-0 first-batch recovery (3 tests).
+
+Plus the harness primitives that unlocked them. All work under `tests/`.
+
+- **T7 (libfaketime dynamic)** was already in place from the prior session.
+- **T8 (orchestrator-restart)** added: `RespawnAttemptOutcome` /
+  `RespawnPolicy` / `respawn_and_watch` / `respawn_until_stable`.
+- **T2 (Anvil runtime toggle)** added: `set_automine(bool)` +
+  `drop_all_pending_txs` (via `anvil_setAutomine` / `anvil_dropAllTransactions`).
+- **`reset_l1_safe_head_synced_at_ms`** added for §7.8.2.
+- **`observe_for(Duration)`** added for §7.3.5-style negative controls.
+
+**§7.1.1 deliberately left `[-]` (out of scope).** See "Decisions"
+below.
 
 ## State of the tree
 
-- `cargo check` / `cargo fmt --all --check` / `cargo clippy --all-targets --all-features -- -D warnings` — all clean.
-- `cargo test --workspace --exclude canonical-test` — all passing (~200 tests).
-- `just test-rollups-e2e` — 16/16 passing (~53s).
-- Uncommitted changes: `git status --short` shows 13 modified files (the
-  refactor + tests) and 2 untracked files (`SECURITY_TODO.md` and
-  `feature-recovery-old-origin-markdown-recovery-2026-04-15.md`). Commit when
-  ready.
-- Untracked files worth reviewing before commit:
-  - [`SECURITY_TODO.md`](SECURITY_TODO.md) — **keep**. All findings now have
-    action items checked off; the file is living documentation for the
-    review.
-  - [`feature-recovery-old-origin-markdown-recovery-2026-04-15.md`](feature-recovery-old-origin-markdown-recovery-2026-04-15.md) —
-    **safe to delete.** Its content was absorbed into
-    [`AGENTS.md`](AGENTS.md) during the docs rewrite.
+- **New/modified files** (uncommitted; user plans a squash-later strategy):
+  - `tests/harness/src/sequencer.rs`
+  - `tests/harness/src/rollups.rs`
+  - `tests/harness/src/lib.rs`
+  - `tests/e2e/src/test_cases.rs` — 17 new scenarios.
+  - `tests/TEST_PLAN.md` — rows flipped; new T2 + T8 tooling rows.
+- **Tests**: 36 e2e passing (`just test-rollups-e2e`). Unit/integration
+  suite not re-run this session (no sequencer code changed).
+- **Lint**: `cargo fmt --all --check` + `cargo clippy --all-targets
+  --all-features -- -D warnings` clean.
 
-## What this session did
+## Tests landed (this session, both iterations combined)
 
-High level, in order:
+Outage matrix / recovery critical path:
 
-1. **Staged security review** (Parts 1-8) — scheduler, sequencer-core, fee
-   model, ingress, L1, recovery, storage, egress/runtime/config. Findings
-   collected in [`SECURITY_TODO.md`](SECURITY_TODO.md). Threat model
-   formalized in [`docs/threat-model/README.md`](docs/threat-model/README.md).
-2. **Docs rewrite** — [`AGENTS.md`](AGENTS.md), [`CLAUDE.md`](CLAUDE.md),
-   [`README.md`](README.md). Absorbed content from the recovered
-   `feature-recovery-...md`. Added the L1 block-time coupling assumption to
-   the threat-model doc.
-3. **All 12 security findings fixed.** One finding (wall-clock
-   `unwrap_or(0)` masking `l1_safe_head` corruption, §7.3 equivalent) led to
-   the open-batch staleness gap discovery — another real bug.
-4. **Phase 1 regression tests** — 19 new unit/integration tests locking in
-   the security fixes. See [`tests/TEST_PLAN.md`](tests/TEST_PLAN.md) for
-   the full matrix. One of the H4 tests caught a real latent bug in the
-   H4 fix itself (bracket-wrapped IPv6 literal in `host_str()`).
-5. **Phase 2 tooling + zone matrix** — built `tests/harness/src/proxy.rs`
-   (TCP proxy with `disconnect`/`reconnect`) and
-   `ManagedSequencer::rewind_synced_at_ms` (DB-level wall-clock rewind).
-   Covered §11.1.1 / §11.1.2 / §11.1.3 / §11.2.3 — 4 of 7 zone × outage
-   cells.
-6. **Danger-check unification bug** — while writing the wall-clock e2e
-   test, discovered that `check_danger_zone` and `detect_and_recover` were
-   asymmetric (closed-only vs closed+open). The first unification attempt
-   broke the live submitter (restart loop on aging open batches). The
-   landed fix splits the public API into two explicit semantics:
-   `check_danger_zone` (zombie-only) and `check_any_unresolved_batch_in_danger`
-   (unified). See the refactor notes in
-   [`tests/TEST_PLAN.md`](tests/TEST_PLAN.md) Phase 2 lessons.
+| Row | Test | Shape |
+|-----|------|-------|
+| §11.4.1 | `provider_outage_short_hiccup_no_recovery_test` | Brief proxy disconnect, no L1/wall-clock advance; POST /tx keeps working, zero invalidation |
+| §11.3.2 | `both_down_danger_zone_sequencer_first_refuses_boot_test` | Both stopped, advance into danger zone, sequencer respawn refuses while L1 still unreachable |
+| §11.3.3 | `both_down_danger_zone_proxy_first_restart_cycle_recovers_test` | Both stopped, advance into danger zone, proxy reconnects first; `respawn_until_stable` drives to convergence with cascade |
+| §11.1.5 | `sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test` | Coupled wall+L1 advance into danger; orchestrator loop converges |
+| §11.2.2-followup | `provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recovers_test` | Mid-run DangerZone exit + reconnect + restart cycle → cascade |
+| §7.8.2 | `first_boot_l1_unreachable_never_synced_refuses_boot_test` | `synced_at_ms == 0` branch of wall-clock fallback refuses to boot |
+| §11.1.4 | `delayed_inclusion_cascades_on_restart_test` | Mempool-held submission, dropped, advance past MAX_WAIT, respawn cascades |
+| §7.3.5 | `aging_open_tip_tolerated_by_zombie_check_test` | Submitter's closed-only zombie check tolerates aging open Tip; fires on subsequent auto-close |
 
-## Where the work stopped
+Tier A e2e follow-up (WS / drain / replay / input reader):
 
-Everything in-scope is documented. Specifically:
+| Row | Test | Shape |
+|-----|------|-------|
+| §4.4.2 | `ws_reconnect_at_invalidated_offset_skips_cleanly_test` | Reconnect at a previously-observed offset that got invalidated; cursor skips cleanly and delivers only post-recovery events |
+| §4.1.3 | `ws_subscribe_from_future_offset_waits_silently_test` | Pin the "subscribe beyond head waits silently" contract (consistent with `from_offset=0` on an empty head) |
+| §7.4.2 | `recovery_drains_safe_but_undrained_direct_input_test` | Deposit that was safe but never-drained before the sequencer stopped lands in the recovery batch's first frame on respawn |
+| §7.4.3 | `recovery_batch_opens_empty_when_no_direct_inputs_pending_test` | Negative control: no deposits → recovery batch opens empty, cascade still fires on aged empty initial Tip |
+| §10.1.1 | `replay_matches_live_for_mixed_workload_test` | 3-user mixed workload; post-restart WS catch-up produces per-user state identical to the live replay |
+| §5.4.1 / §5.4.2 | `provider_outage_input_reader_retries_after_reconnect_test` | T1 proxy disconnect + L1 deposit (bypassing proxy) + reconnect → reader's retry loop catches up without crashing |
 
-- [`tests/TEST_PLAN.md`](tests/TEST_PLAN.md) lists every remaining scenario
-  with `[ ]`, `[!]`, `[?]`, or `[-]` status. Phase 1 and Phase 2 open items
-  are called out at the top under "Recent regression work."
-- [`SECURITY_TODO.md`](SECURITY_TODO.md) has all fixes checked off. No
-  outstanding vulnerability work.
-- One deferred design review recorded in TEST_PLAN: TLA+ spec alignment
-  with the danger-check split — does `preemptive.tla` model the
-  zombie-vs-aging distinction, or is it the same unification flaw we just
-  fixed in code?
+Tier A bootstrap edges (the final batch this session):
 
-## The one design question worth tackling next
+| Row | Test | Shape |
+|-----|------|-------|
+| §8.1.2 | `first_boot_no_cache_l1_unreachable_refuses_boot_test` | `clear_l1_bootstrap_cache` after a normal boot, then respawn through a disconnected proxy. Bootstrap discovery has nothing to fall back to → refuses boot. Distinct from §7.8.2 (wall-clock fallback): hits the *earlier* `InputReader::new` discovery step. |
+| §8.2.1 / §8.3.1 / §6.5.1 | `chain_id_mismatch_via_live_rpc_refuses_boot_test` | H7 RPC-path regression. Spawns the full sequencer binary against real Anvil with a mismatched `--chain-id` (override via new `set_chain_id_override` harness method); bootstrap-time RPC check returns `RunError::ChainIdMismatch`. Reset-and-respawn proves the failed attempt didn't poison the cache. The previous integration-level scaffolding in `sequencer/tests/chain_id_validation.rs` (cache path) stays — these complement each other. |
+| §7.5.1 / §7.5.2 | `nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test` | Nonce-0 first-batch recovery edge. Uses T2 to ensure the first-ever batch's L1 submission is dropped before reaching the chain. Cascade fires; recovery batch reuses nonce 0 (parent NULL — no genesis sentinel). Then drives 150 transfers + 2 explicit L1 confirmations to land the recovery batch in `safe_accepted_batches` at the reused nonce, proving §7.5.2 (`populate_safe_accepted_batches_inner` cursor handles reuse). |
 
-**Aging open batch in the danger zone, during *live* operation (L1
-reachable). NOT the same as the wall-clock fallback gap — that one is
-fixed.**
+## Harness primitives added
 
-What the refactor DID fix:
-- `check_any_unresolved_batch_in_danger` (wall-clock fallback) now sees
-  open batches. ✓
-- `detect_and_recover` at startup cascades open batches that are past
-  `MAX_WAIT_BLOCKS`. ✓ (this was the §7.3 security-review fix, now
-  subsumed by the unified helper)
-- The asymmetry between preemptive-check and cascade-check is gone. ✓
+Inline-documented in `tests/harness/src/sequencer.rs`:
 
-What the refactor did NOT fix — the scenario still open:
+- `respawn_and_watch(stabilization) -> RespawnAttemptOutcome` — classifies a
+  single respawn attempt as `Stable` / `RespawnFailed(String)` /
+  `ExitedPostRespawn(ExitStatus)`.
+- `respawn_until_stable(policy) -> Vec<RespawnAttemptOutcome>` — loops
+  `respawn_and_watch`, advancing L1+wall by `policy.advance_per_retry`
+  between failed attempts. Required for the danger-zone-to-cascade
+  convergence path (closed batch only cascades once it ages past
+  `MAX_WAIT_BLOCKS`, so each retry needs L1 + wall-clock drift).
+- `set_automine(bool)` + `drop_all_pending_txs()` — T2. Toggle Anvil's
+  auto-mining and flush its mempool without respawning Anvil or affecting
+  other tests. Chosen over `--no-mining` spawn flag precisely because
+  it's runtime-toggleable.
+- `reset_l1_safe_head_synced_at_ms()` — zeros the DB's
+  `l1_safe_head.synced_at_ms` while the sequencer is stopped, to simulate
+  "never synced L1" without reconstructing a truly-blank DB.
+- `observe_for(grace) -> Option<ExitStatus>` — watches the child for
+  `grace` without consuming its exit handle. Returns `None` if still
+  alive (safe to continue), `Some(status)` if the child exited within
+  the window. Used by §7.3.5 as a negative-control "stayed up" check.
+- `clear_l1_bootstrap_cache()` — DELETE on `l1_bootstrap_cache`. Used
+  by §8.1.2 to mimic a never-bootstrapped DB, and by §8.2.1 to force
+  the live-RPC chain-id check (bypasses the cache-path that would
+  catch the mismatch first).
+- `set_chain_id_override(Option<u64>)` — overrides the `--chain-id`
+  argument the sequencer is spawned with on the next respawn. Used
+  by §8.2.1 / §8.3.1 to inject a deliberately wrong chain id and
+  exercise the bootstrap-time RPC mismatch path.
+- `count_safe_accepted_batches() -> (count, min_nonce)` — read-only
+  snapshot of `safe_accepted_batches`. Used by §7.5.2 to verify that
+  the recovery batch's L1 submission lands and gets accepted at its
+  expected (reused-zero) nonce.
 
-- L1 is reachable (so the wall-clock fallback doesn't run).
-- Open batch ages past `danger_threshold` (default 1125 blocks).
-- Open batch is NOT yet past `MAX_WAIT_BLOCKS` (default 1200).
+## Decisions worth remembering
 
-In that ~75-block window (≈15 min at 12s/block):
+### §7.1.1 — skipped, marked `[-]`
 
-- `check_danger_zone` (submitter tick, closed-only by design) returns
-  None → no flush, no shutdown.
-- `detect_and_recover` only runs at startup, and uses `MAX_WAIT_BLOCKS`
-  as the threshold — wouldn't cascade even if it did run.
-- The batch continues accepting user ops and issuing soft confirmations
-  for a batch that's 15 minutes away from being auto-skipped by the
-  scheduler if it doesn't land in time.
+Originally on the Tier A list. After investigating:
 
-When the batch finally closes (via policy) and gets nonced, the next
-submitter tick sees closed-batch-in-danger → flush + shutdown → restart →
-`detect_and_recover` at `MAX_WAIT_BLOCKS` cascades. By then some of those
-window soft confirmations may be doomed.
+- **Unique submitter-side code path it would exercise** (live
+  `check_danger_zone` firing on closed-in-danger batch): **already
+  covered** by §7.3.5. Both tests reach the same submitter state
+  (closed batch in `batches`, not in `safe_accepted_batches`); the
+  setup story differs (§7.3.5 = aged Tip auto-closes; §7.1.1 = mempool
+  lost submission), but the code path through
+  `BatchSubmitterError::DangerZone` is identical.
+- **Other unique path**
+  (`populate_safe_accepted_batches_inner`'s `batch_age_is_stale`
+  continue, i.e., the scheduler's "skip past-stale inclusion" logic):
+  has a unit test. Hard to exercise e2e because Anvil's `anvil_mine(N)`
+  mines any pending tx into the first mined block — you can't hold a
+  tx in the mempool while L1 advances.
+- **Bonus obstacle**: the submitter's
+  `wait_for_confirmations` timeout is `(confirmation_depth + 1) × 2 ×
+  ETHEREUM_BLOCK_TIME_SECS`, hard-coded against
+  `ETHEREUM_BLOCK_TIME_SECS = 12s`. Minimum 24 s at depth 0. Tokio's
+  `Instant`-based timers aren't intercepted by libfaketime on macOS, so
+  we can't fast-forward through that wait.
 
-In practice this window is short or empty under normal batch policy
-(`max_open_time ≪ danger_margin`). But it's a real latent issue.
+Verdict: the effort-to-value ratio doesn't justify adding the test. If
+T3 ever lands (sub-second poll interval + config-tunable
+`ETHEREUM_BLOCK_TIME_SECS`), §7.1.1 becomes a small marginal win; until
+then, treat §7.3.5 + §11.1.4 as covering the delayed-inclusion space.
 
-**Three candidate design responses, in increasing invasiveness:**
+### `set_faketime_offset` wants `"+Ns"`, not `"+2h5m"`
 
-1. **Accept it.** Under normal batch policy
-   (`max_open_time ≪ MAX_WAIT_BLOCKS`) this shouldn't happen; document the
-   invariant and rely on it. Simplest, but leaves the latent gap.
+I initially wrote §7.3.5 using `"+2h5m"` for the wall-clock jump past
+`max_batch_open`. The test hung in `wait_for_exit`; libfaketime
+doesn't parse combined unit forms reliably. Fix: use `"+7500s"` (same
+format `advance_wall_and_mine` writes). Safer default going forward.
 
-2. **Proactively invalidate aging open batches at recovery.** Change
-   `detect_and_recover` to invalidate the open batch if it's past
-   `danger_threshold` (not just `MAX_WAIT_BLOCKS`). Safe because the open
-   batch was never submitted — no zombie risk. Trades off: we invalidate
-   soft confirmations earlier than strictly necessary.
+### `§7.3.5`'s `observe_for` invariant
 
-3. **Force-close the open batch from the submitter.** When the submitter
-   detects open-batch-in-danger, signal the inclusion lane to force-close
-   the current batch so it can be submitted. Prevents the gap cleanly
-   but needs new cross-component communication.
+The 8 s observation window isn't arbitrary — it must span at least one
+full `batch_submitter_idle_poll_interval_ms` (default 5 s) + input
+reader poll (~2 s). If someone lowers those defaults in the future,
+consider whether §7.3.5's window is still large enough (it currently
+has ~1 s of headroom).
 
-My instinct is (2) — it's the smallest change that closes the gap and
-matches the existing "cascade on restart" pattern. (3) is arguably cleaner
-architecturally but much bigger scope.
+### `§11.1.5`'s `outcomes.len() >= 2` assertion
 
-Before implementing any of them, **read `docs/recovery/preemptive.tla`
-with this lens**: does the spec model "open batch aging while L1 is
-reachable"? If so, what's the prescribed response? The answer informs
-which option to pick.
+Load-bearing: without it, a future change that made the first respawn
+converge (e.g., startup recovery cascading at `danger_threshold`
+instead of `MAX_WAIT_BLOCKS`) would silently turn this test into a
+trivial single-respawn test, losing the flush/shutdown-path coverage.
 
-## Recommended priority order for the next session
+### §11.1.4's re-enable-auto-mining-before-respawn step
 
-1. **TLA+ spec review** — read the spec with the zombie/aging split in
-   mind. Confirm or refute the alignment. ~1h. Unlocks the design
-   decision for #2.
-2. **Aging-open-batch design fix** — pick (1), (2), or (3) above based on
-   the spec review, implement, add e2e coverage. Medium scope.
-3. **§11.1.4 — closed+submitted batch past-stale** — needs `--no-mining`
-   support in the harness (T2). Medium scope. Covers a code path none of
-   the current tests exercise (closed-batch zombie + recovery).
-4. **§11.2.1 / §11.2.2 — provider outage in pre-danger and danger zones** —
-   needs the proxy (already built) plus `--no-mining`. Small scope once
-   T2 is in.
-5. **§7.8.2 first-boot-with-L1-down** — small harness extension (pre-spawn
-   L1 override) + one e2e test.
-6. **H1 failpoint** — the one outstanding hardening regression (rusqlite
-   error leak). Needs failpoint injection tool. Small scope once the
-   mechanism exists.
+Also load-bearing: the startup flusher submits a no-op at the stuck
+wallet-nonce slot and needs auto-mining on to see it confirm.
+Otherwise the flush hangs. Don't reorder the setup.
 
-Everything else in TEST_PLAN is lower-value or already `[x]`/`[!]`/`[?]`
-with adequate notes.
+### §4.4.2's "reconnect across invalidation" reframing
+
+The original TEST_PLAN phrasing ("live subscriber at the time of
+invalidation") is structurally impossible — invalidation fires inside
+`run_preemptive_recovery`, after the sequencer exits (DangerZone or
+stop), so the WS socket always dies before the cascade. The
+meaningful test is the reconnect arc: captured offset → kill →
+cascade → reconnect at captured offset → cursor skips cleanly. Row
+in TEST_PLAN is updated to match.
+
+### §10.1.1 complements, doesn't replace, `restart_and_replay_test`
+
+The existing `restart_and_replay_test` already does a restart + WS
+catch-up + assert-replay-state for a single-user workload, and it
+pins the specific balances. §10.1.1 adds a distinct test because the
+property being asserted is *general* (any live workload must replay
+deterministically), not the particular expected values, and because
+it sweeps a wider multi-sender / multi-op workload. Keep both — the
+single-sender test catches value regressions; the mixed-workload
+test catches replay-divergence regressions.
+
+### Wallet endpoints don't survive respawn
+
+`runtime.endpoint()` rebinds to a fresh local port on every respawn
+(see `build_local_endpoint`). Any `WalletL2Client` / `WsClient`
+created BEFORE a respawn still holds the old endpoint string and
+will fail with "tcp connect failed" on the next call.
+
+Idiom: re-create both via `runtime.wallet_l2(...)` and `runtime.ws(...)`
+after every respawn. Caught this in §7.5.x during development; the
+post-recovery transfer phase failed until the wallet was recreated.
+
+### §7.5.2's confirmation timing
+
+The submitter's `wait_for_confirmations` is hard-coded against
+`ETHEREUM_BLOCK_TIME_SECS = 12` and waits for `confirmation_depth +
+1 = 3` confirmations. With Anvil's instamine, the submission lands
+at 1 confirmation (the block carrying it). To unblock the wait
+without sitting through the 72 s timeout, §7.5.2 explicitly mines 2
+extra blocks via `mine_l1_blocks(2)` after the submission. If T3
+ever lands and `confirmation_depth` becomes test-tunable, this
+manual mining can go away.
+
+## Open items
+
+### Tier A — remaining recovery-critical-path work
+
+Nothing. §7.1.1 closed as `[-]`; the critical path is fully covered.
+
+### Tier B — tooling quality-of-life
+
+- **T3** — plumb `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS` through
+  `ManagedSequencerConfig`. Would shorten §11.1.4's 7 s sleep and
+  §7.3.5's 8 s observation window, and open up §7.1.1 as a cheap test
+  (if combined with a config-tunable `ETHEREUM_BLOCK_TIME_SECS` at the
+  poster layer). Medium work.
+
+### Tier C — broader e2e coverage (mostly done)
+
+The remaining `tests/e2e` gaps are very small after this session:
+
+- **§4.3.1** — 65th WS subscriber rejected. Already covered at
+  integration level (`ws_subscribe_rejects_when_subscriber_limit_is_reached`
+  in `sequencer/tests/ws_broadcaster.rs`); duplicating at e2e is
+  marginal and CI fd-limit-prone.
+- **§9.1.3 / §9.1.4** — shutdown during batch submission / input
+  reader poll. Timing-sensitive; would need T2 + careful mid-flight
+  signaling. Lower priority than what's left in other layers.
+- **§2.1.2** — soft-confirmation latency budget (POST → WS within 500
+  ms). Useful as a regression guard but flaky on slow CI; probably
+  needs a generous bound.
+
+Everything else of value at the e2e layer has landed.
+
+### Tier D — better at other layers
+
+- **§2.3.1–5** (API body hardening) — better in
+  `sequencer/tests/e2e_sequencer.rs`. Spinning up the full e2e stack
+  for a 400/413 check is wasteful.
+- **§12.1.1** (schema CHECKs) — unit tests in `storage/`.
+- **§7.7.4/5** (flusher H5/H6) — better in
+  `batch_submitter_integration.rs`; assertions are on tx field
+  values, not end-to-end flows.
+
+### Tier E — needs sequencer-side work (out of scope here)
+
+- **T5 failpoints** — gates §2.10.1 / §5.3.1 / §7.2.2 / §7.6.3.
+- **TLA+ alignment** — docs/spec sync with the parent-pointer schema
+  refactor.
+
+## Commit hygiene
+
+The user has opted for a squash-later strategy on this branch. As of
+handoff, all work is uncommitted. Natural squash boundaries if the
+user changes their mind:
+
+1. **T8 + five §11.x tests** (orchestrator-restart + matrix closure)
+2. **T2 + §11.1.4** (delayed-inclusion)
+3. **§7.8.2** (first-boot L1 down)
+4. **§7.3.5** (aging Tip negative control)
+5. **TEST_PLAN + SESSION_NOTES updates** bundled through each above
 
 ## Context a new agent will need
 
-Must-reads before touching anything:
+All doc pointers from prior handoffs remain accurate. Specific to this
+session:
 
-- [`AGENTS.md`](AGENTS.md) — architecture, duality, recovery, invariants.
-  Start here if you're unfamiliar.
-- [`docs/threat-model/README.md`](docs/threat-model/README.md) — what's in
-  and out of scope for security-adjacent work.
-- [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design;
-  the TLA+ spec lives next to it.
-- [`tests/TEST_PLAN.md`](tests/TEST_PLAN.md) — 14-section scenario matrix
-  with status markers. Canonical source for "what's tested and what isn't."
-- [`SECURITY_TODO.md`](SECURITY_TODO.md) — closed findings; useful as
-  reference for the fix patterns.
-
-## Things I'd do differently
-
-- **Run `just test-rollups-e2e` earlier and more often.** Two of my tests
-  had bugs that only surfaced at e2e level (nonce-state assumption and
-  wall-clock semantic). Desk-checking is a weaker signal than green tests.
-- **Surface design questions before implementing fixes.** The danger-check
-  unification should have been discussed before the first attempt; the
-  naive "just unify" was wrong because the two callers wanted different
-  semantics. Would have saved one bad refactor + rework cycle.
+- New harness primitives are documented inline in
+  `tests/harness/src/sequencer.rs` (`respawn_and_watch`,
+  `respawn_until_stable`, `set_automine`, `drop_all_pending_txs`,
+  `reset_l1_safe_head_synced_at_ms`, `observe_for`).
+- `cargo run -p rollups-e2e -- <test_name>` runs a single scenario;
+  `just test-rollups-e2e` runs all 27 (~145 s).
+- Before running tests fresh in a clean worktree: `just setup` +
+  `just canonical-build-machine-image`. Both were run earlier in this
+  session.

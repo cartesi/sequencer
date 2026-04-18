@@ -9,15 +9,15 @@ use tempfile::TempDir;
 
 use super::{SafeInputRange, Storage, StoredSafeInput};
 
-pub(super) const SENDER_A: Address = Address::repeat_byte(0xAA);
-pub(super) const SENDER_B: Address = Address::repeat_byte(0xBB);
+pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
+pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
 
-pub(super) struct TestDb {
+pub(crate) struct TestDb {
     pub _dir: TempDir,
     pub path: String,
 }
 
-pub(super) fn temp_db(name: &str) -> TestDb {
+pub(crate) fn temp_db(name: &str) -> TestDb {
     let dir = tempfile::Builder::new()
         .prefix(format!("sequencer-{name}-").as_str())
         .tempdir()
@@ -31,7 +31,7 @@ pub(super) fn temp_db(name: &str) -> TestDb {
 
 /// Insert safe inputs whose payloads are SSZ-encoded batches with the given nonces,
 /// all attributed to `sender`.
-pub(super) fn seed_safe_inputs_with_batch_nonces(
+pub(crate) fn seed_safe_inputs_with_batch_nonces(
     storage: &mut Storage,
     sender: Address,
     safe_block: u64,
@@ -54,7 +54,7 @@ pub(super) fn seed_safe_inputs_with_batch_nonces(
 }
 
 /// Create N closed batches (batch indices `0..count-1`) plus one open batch (index `count`).
-pub(super) fn seed_closed_batches(storage: &mut Storage, count: u64) {
+pub(crate) fn seed_closed_batches(storage: &mut Storage, count: u64) {
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -68,7 +68,7 @@ pub(super) fn seed_closed_batches(storage: &mut Storage, count: u64) {
 
 /// Pull every valid sequenced L2 tx out of storage, dropping the offset.
 /// Test-only convenience around `load_ordered_l2_txs_page_from`.
-pub(super) fn load_all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
+pub(crate) fn load_all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
     storage
         .load_ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load all ordered l2 txs")
@@ -78,7 +78,7 @@ pub(super) fn load_all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2T
 }
 
 /// SSZ-encoded single-frame batch payload at the given (nonce, safe_block).
-pub(super) fn make_stale_batch_payload(nonce: u64, safe_block: u64) -> Vec<u8> {
+pub(crate) fn make_stale_batch_payload(nonce: u64, safe_block: u64) -> Vec<u8> {
     ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
         nonce,
         frames: vec![sequencer_core::batch::Frame {

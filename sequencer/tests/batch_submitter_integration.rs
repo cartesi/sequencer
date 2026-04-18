@@ -13,7 +13,9 @@ use sequencer::l1::submitter::{BatchSubmitter, BatchSubmitterConfig};
 use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
-use tempfile::TempDir;
+
+mod common;
+use common::{TestDb, temp_db};
 
 const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
 
@@ -69,15 +71,6 @@ impl BatchPoster for TestMock {
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 
-fn temp_db(name: &str) -> (TempDir, String) {
-    let dir = tempfile::Builder::new()
-        .prefix(format!("sequencer-batch-submitter-it-{name}-").as_str())
-        .tempdir()
-        .expect("create temporary test directory");
-    let path = dir.path().join("sequencer.sqlite");
-    (dir, path.to_string_lossy().into_owned())
-}
-
 /// Seeds storage so batches 1 and 2 are closed and batch 3 is open.
 fn seed_two_closed_batches(db_path: &str) {
     let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
@@ -98,7 +91,7 @@ fn seed_two_closed_batches(db_path: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
-    let (_dir, path) = temp_db("loop-submits");
+    let TestDb { _dir, path } = temp_db("loop-submits");
     seed_two_closed_batches(&path);
 
     let mock = TestMock::new();

@@ -19,8 +19,20 @@ fn main() {
                         ManagedSequencer::spawn(default_devnet_sequencer_config(log_prefix))
                             .await?;
                     let scenario_result = scenario(&mut runtime).await;
+                    // Post-test schema invariants (TEST_PLAN §12.5.3):
+                    // assert the DB's structural invariants only if the
+                    // scenario succeeded — otherwise we'd mask the original
+                    // failure with downstream weirdness. Checks the partial
+                    // unique index, nonce contiguity, and FK validity
+                    // directly against the DB file.
+                    let invariant_result = if scenario_result.is_ok() {
+                        runtime.assert_schema_invariants()
+                    } else {
+                        Ok(())
+                    };
                     let shutdown_result = runtime.shutdown().await;
                     shutdown_result?;
+                    invariant_result?;
                     scenario_result
                 })
             })

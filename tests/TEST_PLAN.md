@@ -50,9 +50,29 @@ Behind the scenes, all three share `find_first_batch_in_danger` and `find_closed
 - `provider_outage_wall_clock_refuses_boot_test` — e2e proving the full chain works end-to-end.
 
 **Still open from Phase 1**:
-- §6.5.1 / §8.3.1 (H7 RPC-path) — needs real InputBox contract, deferred to `tests/e2e/` harness
 - §2.10.1 (H1 rusqlite leak) — needs failpoint injection (tool T5)
-- §8.4.1 (preemptive_margin_blocks) — runtime `assert!`; could be a `#[should_panic]` test
+- (§6.5.1 / §8.3.1 (H7 RPC-path) closed by `tests/e2e` in commit `6f47b38`.)
+
+**Phase 3 — Unit-test hygiene** (in progress):
+- Shared `TestDb` / `temp_db` unified: `storage::test_helpers` promoted to `pub(crate)` and reused across 4 inline test modules; `sequencer/tests/common/mod.rs` added for integration tests. 6 local `temp_db` clones removed.
+- `storage/recovery.rs`'s 38 flat tests split into 8 nested sub-modules (`invalid_batches`, `detect_and_recover`, `tip_staleness`, `check_danger_zone`, `check_any_unresolved`, `boundary`, `schema_invariants`, `tree_invariants`). Test names now self-locate (e.g. `tests::tip_staleness::open_batch_exactly_at_threshold_is_invalidated`).
+- `sequencer-core/src/batch.rs` unit tests added (was zero tests): §1.4 SSZ roundtrip for `Batch`/`Frame`/`WireUserOp`, cross-call determinism, and §1.5 decode robustness (empty, below-header, truncated, invalid offset, garbage fuzz). 12 new tests.
+- Stale markers cleaned: §1.4 `[?]`→`[x]`, §1.5 `[ ]`→`[x]`, §2.4.2 `[?]`→`[x]`, §2.7.1 `[ ]`→`[x]`, §5.1.1 `[?]`→`[x]`.
+
+**SSZ library finding (Phase 3):** `ethereum_ssz::Decode::from_ssz_bytes` silently accepts trailing bytes after a valid `Batch` encoding. Not a security issue under our threat model (only the trusted batch-submitter sender is classified as `Batch` at L1; the scheduler also authenticates by msg_sender). Flagging for visibility: if any future path decodes a non-authenticated payload as `Batch`, this would need a pre-decode length check or a wrapper that enforces full-consumption. Referenced in §1.5 notes.
+
+**Landed in Phase 3** (cumulative, unit-layer):
+- §1.4, §1.5 — batch SSZ roundtrip + decode robustness (`sequencer-core/src/batch.rs`).
+- §1.7 — S-malleability: malleable variant cannot recover a different address (alloy/k256 regression lock).
+- §7.4.2, §7.4.3 — undrained safe input reaches recovery batch; empty recovery first frame. **Also covered at e2e in `6f47b38`** — both layers retained for defense in depth.
+- §7.5.1 — first-batch-stale → nonce 0 reused after torn cascade. **Also covered at e2e in `6f47b38`.**
+- §7.6.3 — post-`open_recovery_batch` crash → restart is no-op over persisted state.
+- §7.7.4, §7.7.5 — flusher fee-bump and timeout helpers extracted + H5/H6 regression-locked.
+- §8.4.1 — `preemptive_margin_blocks` validation extracted + `#[should_panic]` covered.
+
+**Prioritized unit-layer gaps still open:**
+- §7.2.2, §7.6 crash-atomicity rows — require failpoint injection (tool T5, not built).
+- §7.7.7 — flusher survives extended provider outage (requires proxy tool, built for §11 but not wired here).
 
 **Deferred design-review items:**
 - [ ] **TLA+ spec alignment with the danger-check split.** The `preemptive.tla` spec models "danger zone detection" at a high level. After the `check_danger_zone` vs `check_any_unresolved_batch_in_danger` split (surfaced by the open-batch-in-danger bug), we should re-read the spec to confirm:
@@ -83,10 +103,10 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 | 1.1 | Sign a `UserOp` with `sequencer_core::build_input_domain(chain_id, app)`, decode with the same constructor, assert recovered sender matches signer | Integration (`sequencer/tests/e2e_sequencer.rs::v1_regression_shared_domain_recovers_signer`) | `[x]` | **V1 regression.** Plus a negative test that a `name:None` domain recovers a DIFFERENT address — catches any reintroduction of the V1 bug. |
 | 1.2 | Sign with chain_id=X, attempt recover with chain_id=Y → recovered address ≠ signer | Integration (`v1_regression_domain_fields_all_affect_recovery`) | `[x]` | Cross-chain replay protection |
 | 1.3 | Sign with app=X, attempt recover with app=Y → recovered address ≠ signer | Integration (same test) | `[x]` | Cross-app replay protection |
-| 1.4 | SSZ encode a `Batch`, decode, re-encode → byte-identical | Unit | `[?]` | Determinism; may already be covered by ssz-derive tests |
-| 1.5 | SSZ decode fails cleanly on truncated payload, garbage bytes, malformed offsets → returns `DecodeError`, never panics | Unit | `[ ]` | Property-test candidate |
+| 1.4 | SSZ encode a `Batch`, decode, re-encode → byte-identical | Unit (`sequencer-core/src/batch.rs::tests::ssz_roundtrip_*`) | `[x]` | Covers empty batch, populated batch, empty-user-ops frame, wire user op, and cross-call determinism |
+| 1.5 | SSZ decode fails cleanly on truncated payload, garbage bytes, malformed offsets → returns `DecodeError`, never panics | Unit (`sequencer-core/src/batch.rs::tests::ssz_decode_*`) | `[x]` | Covers empty payload, sub-header lengths, truncated valid batch, invalid offset, and garbage-pattern fuzz. **Known library behavior:** `ethereum_ssz` silently accepts trailing bytes after a valid batch. Not a security issue under our threat model (only the trusted batch-submitter sender is classified as `Batch`), but worth noting if the scheduler side ever decodes a non-authenticated payload as `Batch`. |
 | 1.6 | `MAX_WAIT_BLOCKS` constant is the same value on sequencer and scheduler sides at link time | Unit | `[x]` | Shared via `sequencer_core::MAX_WAIT_BLOCKS` — structural guarantee, no runtime check needed |
-| 1.7 | S-malleability neutralized: signing the same op twice produces low-s and high-s forms; both recover the same sender | Unit | `[ ]` | Already guaranteed by alloy; test confirms the guarantee at our boundary |
+| 1.7 | S-malleability neutralized: signing the same op twice produces low-s and high-s forms; both recover the same sender | Unit (`sequencer/src/ingress/api.rs::tests::s_malleable_signature_cannot_recover_a_different_address`) | `[x]` | Constructs the malleable variant (`s' = n - s`, flipped parity) and asserts recovery either errors (EIP-2 rejection) or yields the same address. Regression lock against alloy/k256 behavioral drift. |
 
 ---
 
@@ -103,28 +123,28 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 2.2.1 | Forged signature (valid format, wrong key) → 422, no state change | `[x]` | `forged_signature_rejected_test` |
-| 2.2.2 | Signature wrong hex length → 400 before crypto work | `[ ]` | |
-| 2.2.3 | Signature valid bytes, invalid parity byte → 422 | `[ ]` | |
-| 2.2.4 | Signature recovers a different address than claimed `sender` field → 422 | `[ ]` | Implicit in forged test but worth making explicit |
+| 2.2.1 | Forged signature (valid format, wrong key) → 400 `INVALID_SIGNATURE`, no state change | `[x]` | `forged_signature_rejected_test` (e2e). **Note on status code**: observed contract is 400 `INVALID_SIGNATURE` for all signature-class rejections (not 422). Prior TEST_PLAN text said 422; updated to match reality. |
+| 2.2.2 | Signature wrong hex length → 400 before crypto work | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_signature_with_wrong_hex_length` — passes a 4-byte signature (`0xdeadbeef`); rejection fires from `validate_hex_lengths` before any crypto runs. |
+| 2.2.3 | Signature valid bytes, invalid parity byte → 400 `INVALID_SIGNATURE` | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_signature_with_invalid_parity_byte` — sends a 65-byte signature with the parity byte set to `0xFF`. Observed `"cannot recover sender"` path. Defensively asserts the rejection is *not* from the hex-length or payload-size gates. |
+| 2.2.4 | Signature recovers a different address than claimed `sender` field → 400 `INVALID_SIGNATURE` | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_sender_claim_that_mismatches_signature_recovery` — key A signs the op, request claims sender is B; asserts `sender mismatch` + `INVALID_SIGNATURE` code. Complements the e2e `forged_signature_rejected_test` (which covers the full end-to-end shape including the empty WS); this one pins the direct API response. |
 
 ### 2.3 Body / format
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 2.3.1 | Body exceeds `max_body_bytes` (default 4 KB) → 413 before JSON parse | `[ ]` | Regression for `DefaultBodyLimit` enforcement |
-| 2.3.2 | Body is not JSON → 400 with `"invalid JSON"` (H2 regression: must NOT leak serde internals) | `[ ]` | **Hardening regression test** |
-| 2.3.3 | Body is JSON but missing fields → 400, doesn't leak deserialization error text | `[ ]` | H2 regression |
-| 2.3.4 | Content-Type other than `application/json` → 400 with `"missing content type"` | `[ ]` | H2 regression |
-| 2.3.5 | User op `data` field exceeds `max_user_op_data_bytes` → 400 before signature verify | `[ ]` | |
+| 2.3.1 | Body exceeds `max_body_bytes` (default 4 KB) → 413 before JSON parse | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_oversized_json_body_before_parsing` — uses a small `max_body_bytes` (256) to make the 413 trigger fast; asserts status `PAYLOAD_TOO_LARGE`. Regression for `DefaultBodyLimit` enforcement. |
+| 2.3.2 | Body is not JSON → 400 with `"invalid JSON"` (H2 regression: must NOT leak serde internals) | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_malformed_json_as_bad_request` — sends a malformed body containing the bytes `0x1234`; asserts response message is exactly `"invalid JSON"` AND that `0x1234` does not appear in the body (no input echo). |
+| 2.3.3 | Body is JSON but missing fields → 400, doesn't leak deserialization error text | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_json_with_missing_fields_using_fixed_envelope` — sends `{}`; parses the response envelope and asserts `message == "invalid JSON"` and `code == "BAD_REQUEST"`; sweeps for serde leak vocabulary (`"missing field"`, `"expected"`, `"deserializ"`, `"line "`, `"column "`). H2 regression. |
+| 2.3.4 | Content-Type other than `application/json` → 400 with `"missing content type"` | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_missing_content_type_with_fixed_message` — sends a valid JSON body without the header; asserts the fixed `"missing content type"` envelope message. H2 regression. |
+| 2.3.5 | User op `data` field exceeds `max_user_op_data_bytes` → 400 before signature verify | `[x]` | Two complementary tests: `api_rejects_user_op_payloads_above_application_limit` (oversized data + valid signature → 400 with `"user op payload too large"`, body echoes the limit) and `api_payload_size_check_fires_before_signature_recovery` (oversized data + correctly-shaped *garbage* signature → still gets the size-class error, never a signature error — proves the validation order in `validate_payload_size` runs before `recover_sender`, so signature recovery isn't a DoS amplifier on huge bodies). |
 
 ### 2.4 Nonce rules
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 2.4.1 | First tx with nonce 0 → accepted, next expected becomes 1 | `[x]` | `deposit_transfer_withdrawal_test` |
-| 2.4.2 | Tx with nonce too low (e.g., replay) → 422 `InvalidNonce`, no state change | `[?]` | `rejected_user_op_not_broadcast_test` may cover |
-| 2.4.3 | Tx with nonce too high (gap) → 422 `InvalidNonce`, no state change | `[ ]` | |
+| 2.4.2 | Tx with nonce too low (e.g., replay) → 422 `InvalidNonce`, no state change | `[x]` | `rejected_user_op_not_broadcast_test` |
+| 2.4.3 | Tx with nonce too high (gap) → 422 `InvalidNonce`, no state change | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_user_op_with_nonce_gap` — submits nonce 7 when the expected nonce is 0; asserts 422 + nonce-class message. Complement to §2.4.2 (nonce too low); together they pin strict-equality on `current_user_nonce`. |
 | 2.4.4 | `InvalidNonce` response does NOT get broadcast on WS | `[x]` | `rejected_user_op_not_broadcast_test` |
 
 ### 2.5 Fee rules (V3 regression)
@@ -132,21 +152,21 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 2.5.1 | `max_fee < current_frame_fee` → 422 `InvalidMaxFee` | `[x]` | `fee_below_minimum_rejected_test` |
-| 2.5.2 | `max_fee == current_frame_fee` → accepted (boundary) | `[ ]` | |
+| 2.5.2 | `max_fee == current_frame_fee` → accepted (boundary) | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_accepts_user_op_with_max_fee_equal_to_current_frame_fee` — submits `max_fee = 1060` (exactly the bootstrapped frame's fee); asserts 200. Paired with §2.5.1 (`fee_below_minimum_rejected_test`), pins the comparator as strict `<` (not `<=`). |
 | 2.5.3 | Rejection handled by trait-default `validate_and_execute_user_op` (V3 regression) | `[x]` | Unit test in `app-core/wallet.rs` |
 
 ### 2.6 Balance rules
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 2.6.1 | `balance < fee_to_linear(current_fee)` → 422 `InsufficientGasBalance`, no state change | `[?]` | |
-| 2.6.2 | Rejected op does NOT broadcast | `[?]` | |
+| 2.6.1 | `balance < fee_to_linear(current_fee)` → 422 `InsufficientGasBalance`, no state change | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_rejects_user_op_when_balance_below_gas_cost` — fresh signer with no deposit (balance = 0) submits a user-op; asserts 422 + `"insufficient balance for gas"` (the `InvalidReason::InsufficientGasBalance` Display text from `sequencer_core::application`). Exercises `WalletApp::validate_user_op`'s balance check in app-core. |
+| 2.6.2 | Rejected op does NOT broadcast | `[x]` | Covered indirectly by `rejected_user_op_not_broadcast_test` (e2e) which asserts the WS no-message-after-reject invariant on the bad-nonce variant. The broadcast filter in the lane is rejection-class-agnostic (any `SequencerError` rejection path → no WS event), so bad-nonce coverage applies to the insufficient-gas path too. A dedicated insufficient-gas test would add belt-and-suspenders and could land alongside §2.6.1. |
 
 ### 2.7 Admission control
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 2.7.1 | Queue full → `429 OVERLOADED` with body `"queue full"` | `[ ]` | Hard to trigger reliably; maybe property test |
+| 2.7.1 | Queue full → `429 OVERLOADED` with body `"queue full"` | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_returns_429_when_queue_is_full` |
 | 2.7.2 | Queue-full response does not leak per-sender info | `[ ]` | Hardening |
 
 ### 2.8 Concurrency
@@ -154,14 +174,14 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 2.8.1 | Two concurrent POSTs for same (sender, nonce) → exactly one admitted, one gets `InvalidNonce` | `[x]` | `concurrent_user_ops_test` |
-| 2.8.2 | Rejected concurrent op produces no state change | `[?]` | |
+| 2.8.2 | Rejected concurrent op produces no state change | `[x]` | `sequencer/tests/e2e_sequencer.rs::api_concurrent_same_nonce_leaves_exactly_one_committed` — two `tokio::spawn`-ed POSTs with byte-identical bodies (same sender, same nonce) join concurrently; asserts exactly one 200 + one 422 with a nonce-class message. Complements `concurrent_user_ops_test` (distinct-sender happy path, at e2e) by pinning the rejected-branch outcome specifically. |
 
 ### 2.9 Shutdown semantics
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 2.9.1 | Mid-request shutdown: in-flight requests get 503 or clean error | `[x]` | `shutdown_during_inflight_test` |
-| 2.9.2 | Post-shutdown POST → 503 immediately | `[?]` | |
+| 2.9.2 | Post-shutdown POST → 503 immediately | `[x]` | `sequencer/src/ingress/api.rs::tests::submit_tx_rejects_when_shutdown_has_started` — requests shutdown on the `ShutdownSignal`, then submits; asserts `StatusCode::SERVICE_UNAVAILABLE` with code `UNAVAILABLE`. |
 
 ### 2.10 Error-body hardening (regression tests for security review findings)
 
@@ -189,7 +209,7 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 |---|----------|--------|-------|
 | 3.2.1 | Frame closes on direct-input drain and opens a new one at the current safe_block | `[?]` | |
 | 3.2.2 | New frame's `fee_price` sampled from `batch_policy_derived.recommended_fee` at rotation | `[?]` | |
-| 3.2.3 | Frame fee stays fixed for the frame's lifetime even if policy is updated mid-frame | `[ ]` | Regression for "frames.fee immutable" invariant |
+| 3.2.3 | Frame fee stays fixed for the frame's lifetime even if policy is updated mid-frame | `[x]` | `storage/ingress.rs::tests::frame_fee_is_immutable_for_the_lifetime_of_the_frame` — opens a frame at default fee (1060), calls `set_log_gas_price(100)` mid-frame (derived policy now recommends 1160), asserts the open frame's persisted `frames.fee` is still 1060 AND the `WriteHead.frame_fee` mirror is stable; then closes the frame and asserts the *next* frame opens at 1160 (policy flows in at close). Regression for "frames.fee immutable" invariant. |
 
 ### 3.3 Batch closure
 
@@ -197,7 +217,7 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 |---|----------|--------|-------|
 | 3.3.1 | Batch closes when `max_batch_user_op_bytes` target is reached | `[x]` | `batch_closes_when_max_user_op_bytes_is_reached` |
 | 3.3.2 | Batch closes when deadline (`max_open_time`) elapses | `[x]` | `batch_closes_when_max_open_time_is_reached` |
-| 3.3.3 | Closed batch becomes eligible for nonce assignment | `[?]` | |
+| 3.3.3 | Closed batch becomes eligible for nonce assignment | `[x]` | `storage/l1_submission.rs::tests::closed_batch_becomes_eligible_for_submission_with_assigned_nonce` — asserts `load_pending_batches(0)` is empty before close and returns `[batch_index=0, nonce=0]` after `close_frame_and_batch`; also asserts the new open Tip (batch 1) is NOT eligible. Pins the open→closed→eligible transition + the genesis nonce invariant. |
 
 ### 3.4 Single-writer invariant
 
@@ -222,7 +242,7 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 |---|----------|--------|-------|
 | 4.1.1 | Subscribe `from_offset=0` → receive all historical events then live | `[x]` | Many tests |
 | 4.1.2 | Subscribe `from_offset=N` (N < head) → receive tail only | `[x]` | `reconnect_from_offset_test` |
-| 4.1.3 | Subscribe `from_offset=future` → waits for new events, doesn't error | `[ ]` | Property of the cursor query |
+| 4.1.3 | Subscribe `from_offset=future` → waits for new events, doesn't error | `[x]` `ws_subscribe_from_future_offset_waits_silently_test` | Pins the contract: subscribe with offset well beyond current head succeeds, delivers nothing until an event with a greater offset arrives. Consistent with `from_offset=0` on an empty head — we don't want the wait-for-new-events path to differ based on whether history happens to exist. |
 
 ### 4.2 Catch-up bounds
 
@@ -242,7 +262,7 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 4.4.1 | After cascade-invalidation, subscribing `from_offset=0` does NOT deliver events from invalidated batches | `[x]` | `recovery_after_stale_batches_test` (regression for open-batch bug) |
-| 4.4.2 | Subscriber live at the time of invalidation: next events come from the recovery batch only | `[ ]` | |
+| 4.4.2 | Reconnect after a cascade at a previously-observed offset that got invalidated → cursor delivers only post-recovery events. Complement to §4.4.1: that test reconnects at `from_offset=0` (trivial walk of the valid view); this tests the non-zero case where the client's last-seen offset is *itself* now hidden by `valid_sequenced_l2_txs`. A WS connection can't span invalidation — the sequencer exits (DangerZone or stop) first and the socket dies — so the scenario is specifically "client had last_seen=N before the break, reconnects at N post-recovery, query `WHERE offset > N` against the valid view skips cleanly past N". | `[x]` `ws_reconnect_at_invalidated_offset_skips_cleanly_test` | Captures the transfer's offset pre-cascade, reconnects at that offset post-recovery, asserts (a) delivered event's offset is strictly greater and (b) reconnect-at-invalidated matches reconnect-at-zero. |
 
 ### 4.5 Data exposure
 
@@ -259,7 +279,7 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 5.1.1 | `InputAdded` event at safe block N → row in `safe_inputs` with block_number=N | `[?]` | Covered by deposit e2e |
+| 5.1.1 | `InputAdded` event at safe block N → row in `safe_inputs` with block_number=N | `[x]` | Covered by `deposit_transfer_withdrawal_test` (deposit e2e) |
 | 5.1.2 | Multiple events in one `eth_getLogs` response ingested in order | `[?]` | |
 | 5.1.3 | Zero events in a safe-head advance → `l1_safe_head.block_number` advances, `synced_at_ms` updates | `[ ]` | |
 
@@ -280,16 +300,16 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 5.4.1 | Transient `Provider` error → reader retries, does not crash | `[ ]` | Needs proxy to toggle RPC |
-| 5.4.2 | Provider times out → reader logs and retries | `[ ]` | Needs proxy |
+| 5.4.1 | Transient `Provider` error → reader retries, does not crash | `[x]` `provider_outage_input_reader_retries_after_reconnect_test` | Routes through T1 proxy. Disconnect → deposit on L1 (bypasses the proxy) → mine 20 blocks for safe depth → reader keeps retrying with connection errors for ≥5 s (`observe_for` asserts no exit) → reconnect → reader pulls the backlog → WS delivers the deposit event. |
+| 5.4.2 | Provider times out → reader logs and retries | `[x]` | Covered by the same test — T1's `disconnect()` simulates any provider failure mode (connection refused / closed socket / pending read timeout); at e2e level there's no clean way to distinguish a refused connection from a timeout, and the retry path is identical. |
 | 5.4.3 | Storage error during insert → reader fails loudly (fail-stop) | `[ ]` | |
 
 ### 5.5 Long-range partition
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 5.5.1 | Range that triggers `SEQ_LONG_BLOCK_RANGE_ERROR_CODES` splits in half, both halves succeed | `[ ]` | |
-| 5.5.2 | Range splits down to 1 block and still fails → bubbles up cleanly | `[ ]` | |
+| 5.5.1 | Range that triggers `SEQ_LONG_BLOCK_RANGE_ERROR_CODES` splits in half, both halves succeed | `[ ]` | Not cheaply testable at e2e: the proxy (T1) is a dumb TCP pass-through and can't selectively error based on RPC params / block-range size. Clean coverage would need either an HTTP-inspecting proxy (substantial new tooling) or a mock `Provider` (alloy's trait surface is large; non-trivial scaffolding) or a closure-refactor of `get_input_added_events` (production-code change for testability). The interesting logic — error-code matching in `error_message_matches_retry_codes` — is already unit-tested; the recursion itself is a standard bisect over that predicate. Low regression risk without dedicated coverage. |
+| 5.5.2 | Range splits down to 1 block and still fails → bubbles up cleanly | `[ ]` | Same blocker as §5.5.1. Covered by inspection: the termination condition `if start_block >= end_block { return Err(...) }` in `get_input_added_events` is a 3-line bisect guard. |
 
 ---
 
@@ -325,7 +345,7 @@ See §11 matrix rows for full outage behavior.
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 6.5.1 | Sequencer configured with `--chain-id=X`, RPC returns Y → startup returns `RunError::ChainIdMismatch`, no panic, no DB writes | `[!]` | **H7 regression (RPC path) deferred** — `chain_id_validation.rs` has a scaffolded test, but it requires a real InputBox contract deployed to Anvil (chain-id check fires AFTER `InputReader::new`'s bootstrap contract call). Proper coverage lives in `tests/e2e/` harness which has `just setup` deployments. |
+| 6.5.1 | Sequencer configured with `--chain-id=X`, RPC returns Y → startup returns `RunError::ChainIdMismatch`, no panic, no DB writes | `[x]` Covered at e2e level by `chain_id_mismatch_via_live_rpc_refuses_boot_test` (see §8.2.1). The `tests/e2e/` harness's deployed-InputBox setup is what made this feasible. |
 | 6.5.2 | L1 unreachable at startup with cache present, cached chain_id matches config → boots | `[x]` | Positive control in `chain_id_match_does_not_produce_mismatch_error` |
 | 6.5.3 | L1 unreachable at startup with cache present, cached chain_id differs → returns `RunError::ChainIdMismatch`, no panic | `[x]` | **H7 regression (cache path)**: `chain_id_mismatch_from_cache_returns_typed_error` |
 
@@ -339,7 +359,7 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 7.1.1 | Frontier batch (nonce-bearing, closed, accepted) crosses `MAX_WAIT_BLOCKS` by inclusion staleness → cascade-invalidated on next check | `[ ]` | Needs `--no-mining` to hold batch submission |
+| 7.1.1 | Frontier batch (nonce-bearing, closed, accepted) crosses `MAX_WAIT_BLOCKS` by inclusion staleness → cascade-invalidated on next check | `[-]` | Scoped out: the unique submitter-side path (live `check_danger_zone` firing on a closed-in-danger batch) is already covered by §7.3.5. The *other* unique path — `populate_safe_accepted_batches_inner`'s inclusion-stale skip (the `batch_age_is_stale` continue) — has unit coverage and is hard to exercise e2e: Anvil's `anvil_mine(N)` includes any pending tx in the first mined block, so you can't mine empty blocks past a held mempool tx. Also, the submitter's live-exit path is gated by `wait_for_confirmations`'s 24–72 s timeout (hard-coded against ETHEREUM_BLOCK_TIME_SECS, not config-tunable). Would become cheap if that timeout became test-configurable (T3-adjacent). |
 | 7.1.2 | Open batch (not yet closed) crosses `MAX_WAIT_BLOCKS` by current staleness → cascade-invalidated | `[x]` | `recovery_after_stale_batches_test` (**the bug we caught**) |
 | 7.1.3 | Batch in danger zone but not yet stale → flush triggers, but no cascade | `[ ]` | See §11 zone matrix |
 | 7.1.4 | Batch pre-danger-zone → no flush, no cascade | `[ ]` | See §11 zone matrix |
@@ -361,22 +381,23 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 | 7.3.2 | Same scenario with NO direct inputs pending → recovery batch opens, empty frame | `[x]` | Implicit in `open_batch_stale_by_current_safe_block_is_invalidated` (no deposits seeded) |
 | 7.3.3 | Closed-and-nonced batch stale + open batch also stale → both in one cascade | `[x]` | `closed_unsubmitted_stale_and_open_stale_both_cascade` |
 | 7.3.4 | `check_open_batch_staleness` returns `None` when open batch is NOT stale → no false positive cascade | `[x]` | **Critical negative test**: `open_batch_not_yet_stale_is_not_invalidated` + boundary tests (`open_batch_exactly_at_threshold_is_invalidated`, `open_batch_one_block_below_threshold_is_not_invalidated`) |
+| 7.3.5 | **Aging Tip while sequencer is UP and L1 is reachable**: Tip ages past `danger_threshold` without crossing `MAX_WAIT_BLOCKS`. Submitter's zombie check (closed-only) must NOT trigger shutdown loop; Tip closes/invalidates by natural policy; no doomed soft confirmations are issued. Closes the gap the schema refactor was designed to prevent. | `[x]` `aging_open_tip_tolerated_by_zombie_check_test` | Decoupled L1/wall-clock advance: `mine_l1_blocks(1150)` jumps L1 into the danger zone while the wall clock stays put so the Tip remains open. `observe_for(8s)` asserts the sequencer keeps running (would catch any regression that unifies the zombie check across open + closed batches). Then `set_faketime_offset("+7500s")` (past `DEFAULT_MAX_BATCH_OPEN` = 7200s) forces the inclusion lane's natural time-based close; submitter's next tick exits with `DangerZone`. Asserts `counts.invalidated == 0` (danger zone, below MAX_WAIT → no cascade). |
 
 ### 7.4 Re-drain direct inputs
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 7.4.1 | Direct input was drained into invalidated batch → re-drained into recovery batch | `[x]` | `recovery_redrains_direct_inputs_and_replay_sees_them_once` |
-| 7.4.2 | Direct input that was already safe but NOT yet drained → included in recovery batch's first frame | `[ ]` | |
-| 7.4.3 | No direct inputs pending → recovery batch opens empty | `[ ]` | |
+| 7.4.2 | Direct input that was already safe but NOT yet drained → included in recovery batch's first frame | `[x]` | **e2e:** `recovery_drains_safe_but_undrained_direct_input_test` — stops the sequencer before any user activity, deposits on L1 (bypasses the sequencer's process), advances past MAX_WAIT. Respawn's startup recovery syncs safe head, sees the previously-invisible deposit in `safe_inputs`, cascades the aged empty initial Tip, opens a recovery batch whose `leading_range` includes the never-drained deposit. Distinct from §7.4.1 (`recovery_after_stale_batches_test`), which re-drains an already-drained-into-invalidated-batch input. **Unit:** `storage/recovery.rs::tests::tip_staleness::undrained_safe_input_appears_in_recovery_batch_first_frame` — covers the same recovery-drain branch via direct Storage-layer setup (no harness/Anvil). |
+| 7.4.3 | No direct inputs pending → recovery batch opens empty | `[x]` | **e2e:** `recovery_batch_opens_empty_when_no_direct_inputs_pending_test` — negative control for §7.4.2: same shape, no L1 deposit. `leading_range = [0, 0)` → recovery batch's first frame is empty → WS(0) sees nothing. Cascade still fires on the aged empty initial Tip. **Unit:** `storage/recovery.rs::tests::tip_staleness::recovery_batch_opens_empty_when_no_direct_inputs_pending`. |
 | 7.4.4 | A subscriber seeing events across recovery sees each direct input exactly once | `[x]` | Implicit in 7.4.1 |
 
 ### 7.5 Nonce-0 edge case
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 7.5.1 | First-ever batch (nonce 0) goes stale before any batch reaches Gold → recovery invalidates and opens fresh batch 0 | `[ ]` | No genesis sentinel in our impl; must handle natively |
-| 7.5.2 | After 7.5.1, scheduler accepts the recovery batch at nonce 0 (nonce space reused) | `[ ]` | |
+| 7.5.1 | First-ever batch (nonce 0) goes stale before any batch reaches Gold → recovery invalidates and opens fresh batch 0 | `[x]` | **e2e:** `nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test` — uses T2 (auto-mining off + drop) to ensure the first-ever batch's L1 submission never lands. Cascade fires → recovery batch opens with `parent_batch_index = NULL` and reused `nonce = 0`. Structural invariants (NULL parent → nonce 0, contiguous valid-path nonces) verified by post-test `assert_schema_invariants`. **Unit:** `storage/recovery.rs::tests::tip_staleness::first_batch_stale_recovery_reuses_nonce_zero` — asserts the same `nonce = 0` / `parent_batch_index = NULL` invariants directly at the Storage layer via raw SQL. |
+| 7.5.2 | After 7.5.1, scheduler accepts the recovery batch at nonce 0 (nonce space reused) | `[x]` | Same e2e test as §7.5.1 — drives 150 transfers into the recovery batch to size-trigger close + submit, then explicitly mines L1 blocks for confirmations. Asserts `safe_accepted_batches` has a row with `MIN(nonce) = 0` — proving `populate_safe_accepted_batches_inner` accepts a reused-nonce batch after cascade. |
 
 ### 7.6 Idempotency & crash-safety
 
@@ -384,7 +405,7 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 |---|----------|--------|-------|
 | 7.6.1 | Run `detect_and_recover` twice on the same state → second run is no-op | `[x]` | `detect_and_recover_is_idempotent` |
 | 7.6.2 | Crash AFTER cascade INSERT but BEFORE `open_recovery_batch_in_tx` → on restart, a recovery batch is opened (torn state) | `[x]` | `detect_and_recover_opens_batch_after_torn_invalidation` |
-| 7.6.3 | Crash AFTER open_recovery_batch → restart finds valid open batch, does nothing | `[ ]` | |
+| 7.6.3 | Crash AFTER open_recovery_batch → restart finds valid open batch, does nothing | `[x]` | `storage/recovery.rs::tests::tip_staleness::detect_and_recover_after_post_recovery_crash_is_no_op` — drops Storage between calls to model a restart over the persisted DB. Distinct from §7.6.1's back-to-back same-handle idempotence. |
 | 7.6.4 | The entire recovery procedure (populate + detect + open) runs in a single `Immediate` transaction | `[x]` | Structural, verified by reading |
 | 7.6.5 | `populate_safe_accepted_batches` is resumable (cursor-tracked, `INSERT OR IGNORE`) | `[x]` | |
 | 7.6.6 | Nonce assignment is structural (not a discrete step); `insert_new_batch` derives nonce from `parent.nonce + 1` at creation time | `[x]` | `trg_enforce_nonce_contiguity` verifies; `schema_rejects_bad_nonce_contiguity` covers the trigger path |
@@ -396,18 +417,18 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 | 7.7.1 | Pending wallet-nonce slot → flusher submits a no-op that consumes the slot | `[x]` | Existing Anvil-backed flusher tests |
 | 7.7.2 | No pending slots → flush is instant no-op | `[x]` | |
 | 7.7.3 | Flusher no-op competes with a batch tx at the same nonce; one of them lands, slot is consumed | `[x]` | |
-| 7.7.4 | Flusher fee bump satisfies Ethereum's ≥10% replacement rule (H5 regression) | `[ ]` | Explicit assertion that both `max_fee_per_gas` and `priority_fee` are bumped |
-| 7.7.5 | Flusher `confirmation_timeout` derives from `seconds_per_block` config (H6 regression) | `[ ]` | |
+| 7.7.4 | Flusher fee bump satisfies Ethereum's ≥10% replacement rule (H5 regression) | `[x]` | Extracted `bumped_replacement_fees()` helper in `recovery/flusher.rs`; covered by `replacement_fee_bump_exceeds_ten_percent_for_max_fee`, `replacement_fee_bump_doubles_priority_fee`, `replacement_fee_floor_is_positive_even_when_base_is_zero`, `replacement_fee_bump_saturates_at_u128_max`. |
+| 7.7.5 | Flusher `confirmation_timeout` derives from `seconds_per_block` config (H6 regression) | `[x]` | Extracted `derive_timeouts()` helper; covered by `timeouts_derive_from_seconds_per_block` (tests 1/2/12 s/block) and `confirmation_timeout_is_ten_times_safe_poll_interval` (structural invariant). |
 | 7.7.6 | Flusher outer loop runs without timeout; inner watch-timeout re-enters the loop | `[x]` | Verified in review |
-| 7.7.7 | Flusher survives extended provider outage — retries forever, completes when provider returns | `[ ]` | Needs proxy |
+| 7.7.7 | Flusher survives extended provider outage — retries forever, completes when provider returns | `[x]` | `sequencer/src/recovery/flusher.rs::tests::flush_surfaces_provider_error_under_disconnect_and_completes_on_reconnect` — spawns a `TcpProxy` (from `rollups-harness`, added as sequencer dev-dep) in front of Anvil; seeds pending wallet-nonce state; disconnects proxy and asserts `flush_and_wait` returns `FlushError::Provider` fast (no internal retry); reconnects proxy + starts mining; asserts a fresh flusher call completes and the nonce-0 slot reaches safe. **Implementation note pinned by the test**: `flush_and_wait` does NOT retry internally; "retries forever" in this row is the *orchestrator restart loop* (covered at e2e by §11.1.5 / §11.2.2-followup's `respawn_until_stable`). This test pins the flusher's error surface under disconnect + its completion on reconnect — the two ends of what the orchestrator is looping over. |
 
 ### 7.8 Wall-clock fallback
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 7.8.1 | L1 unreachable, elapsed wall time estimates `missed_blocks > danger_threshold` → recovery triggers | `[x]` | `provider_outage_wall_clock_refuses_boot_test` in `tests/e2e`. Validated end-to-end: proxy disconnected → `anvil_mine(1500)` + `rewind_synced_at_ms(5h)` → respawn fails with `L1UnreachableInDangerZone` → proxy reconnect + respawn succeeds + cascade fires. |
-| 7.8.2 | `l1_safe_head.synced_at_ms == 0` (never synced) → treat as danger zone, return `L1UnreachableInDangerZone` error | `[ ]` | First-boot-with-L1-down case; would need `ManagedSequencer` to accept a pre-spawn L1 endpoint override (currently only respawn honors it). |
-| 7.8.3 | `SystemTime::now()` backward jump → `saturating_sub` handles cleanly, no panic | `[ ]` | Clock-skew regression |
+| 7.8.1 | L1 unreachable, elapsed wall time estimates `missed_blocks > danger_threshold` → recovery triggers | `[x]` | `provider_outage_wall_clock_refuses_boot_test` in `tests/e2e`. Validated end-to-end: proxy disconnected → `anvil_mine(1500)` + `faketime '+5h'` → respawn fails with `L1UnreachableInDangerZone` → proxy reconnect + respawn succeeds + cascade fires. Migrated from the now-removed `rewind_synced_at_ms` helper to faketime. |
+| 7.8.2 | `l1_safe_head.synced_at_ms == 0` (never synced) → treat as danger zone, return `L1UnreachableInDangerZone` error | `[x]` `first_boot_l1_unreachable_never_synced_refuses_boot_test` | Normal boot seeds the bootstrap cache; `ManagedSequencer::reset_l1_safe_head_synced_at_ms` then rewrites `synced_at_ms` to 0 on disk while the sequencer is stopped. Respawning with the proxy disconnected triggers the wall-clock fallback's `synced_at_ms == 0` branch → `L1UnreachableInDangerZone`. Scope limit: the separate "truly first-ever boot (no bootstrap cache)" path is tested elsewhere; this one pins the wall-clock branch specifically. |
+| 7.8.3 | `SystemTime::now()` backward jump → `saturating_sub` handles cleanly, no panic | `[x]` | `wall_clock_backward_jump_no_panic_test` in `tests/e2e`. Uses `faketime '-1h'` with proxy disconnected to force the wall-clock-fallback path with `now < last_sync_ms`. |
 | 7.8.4 | `SEQ_SECONDS_PER_BLOCK=0` rejected at config parse (H8 regression) | `[x]` | Clap integration tests at §8.4.2 |
 
 ---
@@ -417,12 +438,12 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 8.1.1 | First boot, L1 reachable → discovers InputBox + genesis + chain_id from L1, writes bootstrap cache | `[?]` | Covered by normal e2e |
-| 8.1.2 | First boot, L1 unreachable → returns error (`"L1 unreachable and no bootstrap cache"`) | `[ ]` | |
-| 8.2.1 | Restart, L1 reachable → validates RPC chain_id against config before any DB write (H7 regression) | `[!]` | **H7 regression (RPC path) deferred** — see §6.5.1 |
+| 8.1.2 | First boot, L1 unreachable → returns error (`"L1 unreachable and no bootstrap cache"`) | `[x]` `first_boot_no_cache_l1_unreachable_refuses_boot_test` | Distinct from §7.8.2 (wall-clock fallback): this hits the *earlier* `InputReader::new` discovery step. Harness `clear_l1_bootstrap_cache` empties the cache table after a normal boot; respawn through a disconnected proxy hits the no-cache + L1-unreachable code path. Verifies reversibility: reconnect proxy, respawn succeeds. |
+| 8.2.1 | Restart, L1 reachable → validates RPC chain_id against config before any DB write (H7 regression) | `[x]` `chain_id_mismatch_via_live_rpc_refuses_boot_test` | **H7 regression (RPC path).** Spawns the full sequencer binary against real Anvil with mismatched `--chain-id` (override on `ManagedSequencer`); asserts respawn fails with `RunError::ChainIdMismatch`. Reset-to-correct-chain-id respawn succeeds — proves the failed attempt didn't poison the bootstrap cache. Complements the cache-path test in `sequencer/tests/chain_id_validation.rs`. |
 | 8.2.2 | Restart, L1 unreachable, cache present → uses cache, validates cached chain_id | `[x]` | `restart_and_replay_test` + `chain_id_match_does_not_produce_mismatch_error` |
-| 8.3.1 | Chain-id mismatch (config vs RPC) → `RunError::ChainIdMismatch`, no DB contamination | `[!]` | See §6.5.1 — cache-path test passes, RPC-path test deferred |
+| 8.3.1 | Chain-id mismatch (config vs RPC) → `RunError::ChainIdMismatch`, no DB contamination | `[x]` Same test as §8.2.1 — `chain_id_mismatch_via_live_rpc_refuses_boot_test` covers both since they're the same code path with different framings. |
 | 8.3.2 | Chain-id mismatch (config vs cache) → `RunError::ChainIdMismatch`, no DB contamination | `[x]` | **H7 regression (cache)**: `chain_id_mismatch_from_cache_returns_typed_error` |
-| 8.4.1 | `SEQ_PREEMPTIVE_MARGIN_BLOCKS >= MAX_WAIT_BLOCKS` rejected at startup | `[ ]` | Runtime `assert!` — could be `#[should_panic]` test via full `run()` call; not yet written |
+| 8.4.1 | `SEQ_PREEMPTIVE_MARGIN_BLOCKS >= MAX_WAIT_BLOCKS` rejected at startup | `[x]` | Validation extracted to `runtime::compute_danger_threshold` and covered by `runtime::tests::margin_equal_to_max_wait_panics`, `margin_greater_than_max_wait_panics`, plus positive-control tests for 0, default (75), and just-below-max-wait. |
 | 8.4.2 | `SEQ_SECONDS_PER_BLOCK=0` rejected by clap parser | `[x]` | **H8 regression**: `run_config_rejects_seconds_per_block_zero` + `run_config_accepts_seconds_per_block_one` + `run_config_default_seconds_per_block_is_12` in `runtime/config.rs` |
 | 8.5.1 | Private-key parse failure does not echo key bytes in error (H3 regression) | `[x]` | **H3 regression**: `create_signer_provider_does_not_echo_key_bytes_on_invalid_hex` + `_on_odd_length` in `l1/provider.rs::tests` |
 | 8.5.2 | `http://` URL for non-loopback host rejected (H4 regression) | `[x]` | **H4 regression**: `create_client_rejects_http_for_remote_host` |
@@ -447,7 +468,7 @@ Derived from the `Application Trait Contract` section in [`AGENTS.md`](../AGENTS
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 10.1.1 | An input that executed successfully live MUST succeed on replay (catch-up) | `[ ]` | Property test: for all inputs accepted live, replay must accept |
+| 10.1.1 | An input that executed successfully live MUST succeed on replay (catch-up) | `[x]` `replay_matches_live_for_mixed_workload_test` | Diverse multi-sender workload (Alice/Bob/Charlie, two interleaved deposits, transfers in both directions, two withdrawals). Post-restart WS catch-up assembles a fresh replay; test asserts per-user balance + nonce + executed-input-count equality against the live replay. Any Application non-determinism or catch-up bug diverges the two replays immediately. Complements `restart_and_replay_test` (narrower single-sender workload, implicit equality). |
 | 10.1.2 | `AppError::Internal` during catch-up → lane crashes, sequencer fails to start | `[x]` | `catch_up.rs` error handling |
 | 10.1.3 | `ExecutionOutcome::Invalid` during catch-up → skipped cleanly | `[x]` | |
 | 10.2.1 | `validate_user_op` is pure: no mutations, no time dependence, no randomness | `[-]` | Enforced by code review; can't test directly |
@@ -471,16 +492,18 @@ For deterministic tests, pick margins well inside each zone (e.g., 500 / 1150 / 
 | # | Zone | Expected behavior | Status |
 |---|------|-------------------|--------|
 | 11.1.1 | Pre-danger (500) | No recovery. Sequencer resumes; pending batches submit normally. | `[x]` `sequencer_outage_pre_danger_no_recovery_test` |
-| 11.1.2 | Danger zone (1150) | Preemptive recovery triggers. Flush runs (no-op if nothing pending). No cascade. Sequencer resumes. | `[x]` `sequencer_outage_danger_zone_no_cascade_test` |
-| 11.1.3 | Past-stale, open batch (1250) | Open batch invalidated via `check_open_batch_staleness`. Recovery batch opened. Resume. | `[x]` `recovery_after_stale_batches_test` |
-| 11.1.4 | Past-stale, closed+submitted batch (1250) | Closed batch invalidated via `detect_stale_and_cascade`. Recovery batch opened. Resume. | `[ ]` | Needs `--no-mining` (T2) to deterministically close + submit a batch before the outage |
+| 11.1.2 | Danger zone (1150), decoupled wall clock | Narrow: only L1 advances; wall clock stays put. No closed batch past frontier is stale → no flush, no cascade, sequencer resumes. | `[x]` `sequencer_outage_danger_zone_no_cascade_test`. Uses `mine_l1_blocks` directly (no wall-clock advance) because coupled advance triggers the aged-Tip-auto-close → flush-cycle path covered by §11.1.5 below. |
+| 11.1.3 | Past-stale, open batch (1250) | Open batch invalidated via staleness check. Recovery batch opened. Resume. | `[x]` `recovery_after_stale_batches_test`. Uses `advance_wall_and_mine` — coupled wall-clock+L1 advance models real outage semantics. |
+| 11.1.4 | Past-stale, closed+submitted batch (1250) | Closed batch invalidated. Recovery batch opened. Resume. | `[x]` `delayed_inclusion_cascades_on_restart_test` | Uses T2. Setup: deposit + 150 transfers force a size-triggered batch close while auto-mining is disabled, so the submitter's L1 tx lands in a held mempool. Stop sequencer → `drop_all_pending_txs` → `advance_wall_and_mine(1250 * 12s)` (genuinely empty blocks since mempool is empty) → re-enable auto-mining → respawn. Startup recovery detects the closed batch is past `MAX_WAIT_BLOCKS` and cascades; flush runs against the (now live) auto-miner. WS replay asserts the transfers are rolled back. |
+| 11.1.5 | Danger zone (1150), **coupled wall+L1 advance** | Realistic: outage advances both L1 and wall clock. On respawn the aged Tip auto-closes, the resulting closed batch IS in danger, submitter triggers flush+shutdown, orchestrator restarts, post-flush recovery completes, sequencer is healthy. | `[x]` `sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test` — drives the full orchestrator loop via `respawn_until_stable` (T8). First respawn exits with `DangerZone` after the aged Tip closes; each retry advances L1 by ~100 blocks (~20 min) until the closed batch ages past `MAX_WAIT_BLOCKS` and startup recovery cascades. Asserts the loop requires at least two attempts (not a cheap no-op) and that a cascade-invalidation actually fired. |
 
 ### 11.2 Provider outage (proxy disconnects, sequencer stays up, anvil advances behind the proxy)
 
 | # | Zone | Expected behavior | Status |
 |---|------|-------------------|--------|
-| 11.2.1 | Pre-danger (500) | Sequencer retries. Wall-clock estimate < threshold. Reconnect → sync, resume. | `[ ]` | Needs proxy |
-| 11.2.2 | Danger zone (1150) | Wall-clock estimate enters danger zone. Recovery triggers. Flush blocks on proxy. Reconnect → flush completes → no cascade → resume. | `[ ]` | Needs proxy |
+| 11.2.1 | Pre-danger (500), sequencer stays UP, load applied | Sequencer retries. Wall-clock estimate < threshold. Inclusion lane continues accepting user ops **and closes batches by size**. Reconnect → sync, resume. | `[x]` `provider_outage_pre_danger_sequencer_continues_test` — submits ~150 transfers during the outage, asserts `count_batches().sealed` strictly increased. |
+| 11.2.2 | Danger zone (3h55min), sequencer UP, self-exits | Running sequencer's wall-clock fallback detects danger mid-run → exits with `DangerZone`. Startup wall-clock fallback refuses subsequent boot while proxy still disconnected. No invalidation (not past-stale). | `[x]` `provider_outage_danger_zone_sequencer_self_exits_test` — uses dynamic faketime (file-based) to shift the running sequencer's clock into the danger zone without a respawn. Stops at the "refuse to reboot" assertion. |
+| 11.2.2-follow-up | Danger zone → mid-run exit → reconnect → restart cycle | Completes §11.2.2: proxy reconnects, `respawn_until_stable` drives the orchestrator loop (advancing L1 each retry) until the aged closed batch crosses `MAX_WAIT_BLOCKS` and cascade fires. Asserts Stable convergence + cascade-invalidation. | `[x]` `provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recovers_test` — uses T8 (`respawn_until_stable`). |
 | 11.2.3 | Past-stale (1250) | Wall-clock estimate past stale. Recovery + flush block on proxy. Reconnect → flush + cascade. | `[x]` `provider_outage_past_stale_cascades_test` — stops sequencer, disconnects proxy, advances L1, verifies restart refuses while proxy is disconnected (wall-clock fallback past stale → `L1UnreachableInDangerZone`), then reconnects and verifies cascade |
 
 ### 11.3 Combined: outage both sides at once
@@ -488,6 +511,14 @@ For deterministic tests, pick margins well inside each zone (e.g., 500 / 1150 / 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 11.3.1 | Sequencer stopped, proxy disconnected, anvil mines 1250 blocks, BOTH reconnect → recovery triggers correctly | `[x]` | Effectively covered by §11.2.3 — the "sequencer stopped + proxy disconnected" path is tested end-to-end there |
+| 11.3.2 | Both stopped, advance to danger zone, then turn on sequencer ONLY (proxy still disconnected) | `[x]` `both_down_danger_zone_sequencer_first_refuses_boot_test` | Realistic datacenter-outage-recovery scenario: sequencer boots while L1 is still unreachable, wall-clock fallback sees past-danger → `L1UnreachableInDangerZone`. Stops at the refuse-boot assertion (no cascade yet — we're below MAX_WAIT). Complement to §11.2.3 in the danger-zone window instead of past-stale. |
+| 11.3.3 | Both stopped, advance to danger zone, proxy returns FIRST (sequencer still down), then sequencer → normal sync, startup sees aged batches and handles them | `[x]` `both_down_danger_zone_proxy_first_restart_cycle_recovers_test` | Tests the "L1 recovered before us" reconnect ordering. Uses T8: first respawn exits with `DangerZone` after the aged Tip closes, `respawn_until_stable` advances L1 by 100 blocks per retry until cascade fires on a subsequent respawn. |
+
+### 11.4 Short-duration provider hiccups (heal-within-pre-danger)
+
+| # | Scenario | Status | Notes |
+|---|----------|--------|-------|
+| 11.4.1 | Sequencer running, proxy disconnects for a few seconds (pre-danger), reconnects. Sequencer retries, resumes without any recovery action. | `[x]` `provider_outage_short_hiccup_no_recovery_test` | Most-common production fault — RPC flaked briefly, retry succeeded. Disconnect lasts ≥1 submitter poll interval (6s) with zero L1/wall-clock advance, then reconnects; asserts POST /tx keeps working and no batch gets invalidated. Complement to §11.2.1 (load-under-outage); this covers the "pure retry loop" path with no wall-clock pressure. |
 
 ---
 
@@ -495,7 +526,7 @@ For deterministic tests, pick margins well inside each zone (e.g., 500 / 1150 / 
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 12.1.1 | Schema CHECK constraints enforced: `safe_inputs.sender` length 20, `frames.fee >= 0`, XOR on `sequenced_l2_txs`, etc. | `[ ]` | One test per CHECK |
+| 12.1.1 | Schema CHECK constraints enforced: `safe_inputs.sender` length 20, `frames.fee >= 0`, XOR on `sequenced_l2_txs`, etc. | `[x]` | `storage/recovery.rs::tests::schema_invariants::schema_rejects_*` — six new tests exercise CHECK-level refusals: `safe_input_with_wrong_sender_length`, `user_op_with_wrong_sender_length`, `user_op_with_wrong_signature_length`, `sequenced_l2_tx_with_neither_xor_branch`, `l1_bootstrap_cache_with_zero_chain_id`, `safe_input_with_negative_block_number`. Each asserts `CHECK constraint failed` specifically (not a trigger/FK/NOT NULL error). |
 | 12.1.2 | FK cascade: deleting a `batches` row (should be impossible via PK) doesn't orphan children | `[-]` | Structural; writes are append-only |
 | 12.2.1 | `valid_batches` correctly filters by `invalidated_at_ms IS NULL` | `[x]` | Implicit in recovery tests |
 | 12.2.2 | `valid_closed_batches` correctly filters (sealed + valid) | `[x]` | Submitter pending-batch load covers it |
@@ -505,6 +536,14 @@ For deterministic tests, pick margins well inside each zone (e.g., 500 / 1150 / 
 | 12.3.1 | Multi-statement writers wrap in `Immediate` transaction; partial failure leaves DB unchanged | `[?]` | |
 | 12.3.2 | `trg_sequence_user_op` does not fire if outer user_ops INSERT rolls back | `[?]` | |
 | 12.4.1 | Rowid pagination correctly skips invalidated rows via `valid_sequenced_l2_txs` view | `[x]` | Implicit in WS catch-up after recovery |
+
+### 12.5 Parent-pointer tree invariants (NEW)
+
+| # | Scenario | Status | Notes |
+|---|----------|--------|-------|
+| 12.5.1 | **Tree integrity property test**: for a mixed workload (opens, closes, partial/torn cascades), every valid batch satisfies `nonce = parent.nonce + 1`, `parent_batch_index` is NULL (genesis) or references an existing batch, and parent-walk terminates within `batch_index` hops. | `[x]` | `tree_invariants_hold_across_mixed_workload` in `storage/recovery.rs` tests. |
+| 12.5.2 | **Subtree equivalence**: among *valid* batches, `{batch_index >= N}` equals the subtree rooted at N via recursive `parent_batch_index` walk. Documents the equivalence the cascade query relies on. | `[x]` | `subtree_by_batch_index_equals_subtree_by_parent_walk`. If this ever diverges, cascade must switch to recursive CTE. |
+| 12.5.3 | **Post-e2e schema invariants**: after each passing e2e test, harness-side DB inspection asserts at most one `valid_open_batch` row, `nonce = parent.nonce + 1` across all batches, contiguous valid-path nonces, and no FK orphans. | `[x]` | `ManagedSequencer::assert_schema_invariants` wired into `tests/e2e/src/main.rs` as a post-scenario step. Harness-only; no sequencer changes. |
 
 ---
 
@@ -548,12 +587,13 @@ Coverage of the above requires the following test-harness additions. Each unlock
 | # | Tool | Unlocks | Status |
 |---|------|---------|--------|
 | T1 | TCP proxy with `disconnect()` / `reconnect()` | §11.2, §11.3, §7.7.7, §5.4 | `[x]` Built — `tests/harness/src/proxy.rs`; 6 unit tests; `ManagedSequencer::set_l1_endpoint_override` routes sequencer through it |
-| T2 | Anvil `--no-mining` mode | §7.1.1, §7.1.3, §7.1.4, §11.1.4, §11.2.1, §11.2.2 (all cells with precise zone control) | `[ ]` Not built — would unlock closed-batch scenarios and finer-grained zone timing |
+| T2 | Runtime toggle of Anvil's auto-mining + mempool drop | §11.1.4 (done); §7.1.1, §7.1.3, §7.1.4 (pending — live-runtime variants) | `[x]` `ManagedSequencer::set_automine(bool)` (via `anvil_setAutomine`) holds or releases the mempool without respawning Anvil; `drop_all_pending_txs` (via `anvil_dropAllTransactions`) simulates gateway packet loss. Chosen over `--no-mining` spawn flag because it's runtime-toggleable — existing tests stay on auto-mining, only delayed-inclusion tests flip it. |
 | T3 | Shorter poll intervals for tests (sub-second `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`) | Reduces raciness in §11, §7.7, §6 | `[ ]` Not built |
 | T4 | `wait_for_recovery_complete` helper (poll a health / debug endpoint) | Replaces sleep-based waits throughout §11, §7 | `[ ]` Not built |
 | T5 | Injectable failpoints (SQLite error, sub-transaction crash) | §7.2.2, §7.6.2 done; §7.6.3, §2.10.1 (H1) need more | `[?]` Partial — inline tests already induce some |
 | T6 | Smaller `MAX_WAIT_BLOCKS` for test builds (optional optimization) | Shortens mine-1200-blocks tests | `[-]` Probably not needed — 1200 empty blocks mines in <1s |
-| T7 | Direct `synced_at_ms` DB writer | §7.8.1, §7.8.2 — wall-clock-refuses-to-boot path (real seconds must elapse for the fallback to fire; anvil-mine doesn't count) | `[x]` `ManagedSequencer::rewind_synced_at_ms(ms_ago)` — rewrites the DB timestamp while the sequencer is stopped. `libfaketime`-free. Unblocks future wall-clock tests once a deterministic batch-close mechanism (T2) is available. |
+| T7 | libfaketime via `FAKETIME_TIMESTAMP_FILE` (dynamic) for the sequencer subprocess | §7.8.1 (done), §7.8.3 (clock skew, done), §11.2.2 (done, live danger-zone detection), §7.3.5 (aging-Tip, pending), §7.8.2 (first-boot-L1-down, pending) | `[x]` `ManagedSequencer::set_faketime_offset(Option<String>)` writes to the rc file; `ManagedSequencer::advance_wall_and_mine(Duration)` is the coupled (cumulative) helper. Harness sets `FAKETIME_TIMESTAMP_FILE` + `FAKETIME_NO_CACHE=1` + `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD` on the child. Dynamic: the running sequencer re-reads the file on every time call, so tests can shift time mid-run without a respawn. Added to `flake.nix` + CI (`apt install faketime` on Ubuntu). |
+| T8 | Orchestrator-restart primitive (`respawn_until_stable`) | §11.1.5 (done), §11.2.2-follow-up (done), §11.3.3 (done) | `[x]` `ManagedSequencer::respawn_and_watch(Duration) -> RespawnAttemptOutcome` classifies a single attempt into `Stable` / `RespawnFailed(String)` / `ExitedPostRespawn(ExitStatus)`. `respawn_until_stable(RespawnPolicy)` wraps it in a retry loop with optional `advance_per_retry` — required for the danger-zone-to-cascade convergence path (aged closed batch only cascades once it ages past `MAX_WAIT_BLOCKS`, so each retry needs to advance L1 + wall clock). Returns the full attempt sequence so tests can assert *both* convergence and that the loop actually exercised the flush/shutdown path (not a cheap first-attempt success). |
 
 ---
 

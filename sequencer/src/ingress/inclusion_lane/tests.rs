@@ -9,10 +9,10 @@ use std::time::{Duration, SystemTime};
 use alloy_primitives::{Address, Signature, U256};
 use app_core::application::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
 use rusqlite::params;
-use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::ShutdownSignal;
+use crate::storage::test_helpers::temp_db;
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
@@ -64,11 +64,6 @@ impl Application for TestApp {
     fn executed_input_count(&self) -> u64 {
         self.executed_input_count
     }
-}
-
-struct TestDb {
-    _dir: TempDir,
-    path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,18 +174,6 @@ impl Application for ReplayRecordingApp {
 
     fn executed_input_count(&self) -> u64 {
         self.executed_input_count
-    }
-}
-
-fn temp_db(name: &str) -> TestDb {
-    let dir = tempfile::Builder::new()
-        .prefix(format!("sequencer-inclusion-lane-{name}-").as_str())
-        .tempdir()
-        .expect("create temporary test directory");
-    let path = dir.path().join("sequencer.sqlite");
-    TestDb {
-        _dir: dir,
-        path: path.to_string_lossy().into_owned(),
     }
 }
 
