@@ -50,6 +50,16 @@ Current wallet snapshot API:
 - `save_snapshot<P: AsRef<Path>>(&self, path: P) -> Result<(), WalletSnapshotError>`
 - `load_snapshot<P: AsRef<Path>>(&mut self, path: P) -> Result<(), WalletSnapshotError>`
 
+## Disk Write Semantics
+
+`save_snapshot` uses an atomic replacement pattern:
+
+- write bytes to a temporary file in the same directory as the target
+- `sync_all` the temp file
+- rename temp file to the final path
+
+This avoids exposing partially written snapshot bytes at the target path.
+
 ## Out of Scope
 
 This document intentionally does not define:
