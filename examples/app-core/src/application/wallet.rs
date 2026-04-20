@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 use alloy_primitives::{Address, U256, address};
@@ -214,7 +215,25 @@ impl WalletApp {
     }
 
     pub fn save_snapshot<P: AsRef<Path>>(&self, path: P) -> Result<(), WalletSnapshotError> {
-        std::fs::write(path, self.snapshot_bytes())?;
+        let path = path.as_ref();
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("wallet-snapshot");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_path = parent.join(format!(".{file_name}.tmp-{}-{}", std::process::id(), nanos));
+
+        let bytes = self.snapshot_bytes();
+        let mut temp_file = std::fs::File::create(&temp_path)?;
+        temp_file.write_all(&bytes)?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+
+        std::fs::rename(&temp_path, path)?;
         Ok(())
     }
 
