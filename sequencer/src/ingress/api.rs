@@ -258,11 +258,8 @@ mod tests {
             .expect("low-s signature must recover the signer with one parity");
 
         // Construct the S-malleable variant: same r, s' = n - s, flipped parity.
-        let malleable_sig = Signature::new(
-            valid_sig.r(),
-            SECP256K1_N - valid_sig.s(),
-            !valid_sig.v(),
-        );
+        let malleable_sig =
+            Signature::new(valid_sig.r(), SECP256K1_N - valid_sig.s(), !valid_sig.v());
         assert_ne!(
             malleable_sig.s(),
             valid_sig.s(),

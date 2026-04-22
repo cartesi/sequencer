@@ -149,9 +149,10 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ("multi_deposit_same_block_test", |runtime| {
             Box::pin(run_multi_deposit_same_block_test(runtime))
         }),
-        ("shutdown_during_inflight_test", |runtime| {
-            Box::pin(run_shutdown_during_inflight_test(runtime))
-        }),
+        (
+            "restart_after_committed_tx_replays_cleanly_test",
+            |runtime| Box::pin(run_restart_after_committed_tx_replays_cleanly_test(runtime)),
+        ),
         ("recovery_after_stale_batches_test", |runtime| {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
         }),
@@ -169,6 +170,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         }),
         ("wall_clock_backward_jump_no_panic_test", |runtime| {
             Box::pin(run_wall_clock_backward_jump_no_panic_test(runtime))
+        }),
+        ("stalled_safe_head_startup_refuses_boot_test", |runtime| {
+            Box::pin(run_stalled_safe_head_startup_refuses_boot_test(runtime))
         }),
         (
             "provider_outage_pre_danger_sequencer_continues_test",
@@ -232,6 +236,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         }),
         ("aging_open_tip_tolerated_by_zombie_check_test", |runtime| {
             Box::pin(run_aging_open_tip_tolerated_by_zombie_check_test(runtime))
+        }),
+        ("stalled_safe_head_live_exit_test", |runtime| {
+            Box::pin(run_stalled_safe_head_live_exit_test(runtime))
         }),
         (
             "ws_reconnect_at_invalidated_offset_skips_cleanly_test",
@@ -819,7 +826,15 @@ async fn run_multi_deposit_same_block_test(runtime: &mut ManagedSequencer) -> Sc
     Ok(())
 }
 
-async fn run_shutdown_during_inflight_test(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
+// Restart after a committed tx and verify replay stays consistent.
+//
+// This is intentionally not an "in-flight request during shutdown" test:
+// `WalletL2Client::transfer()` awaits the HTTP ack, so by the time restart
+// happens the user-op is already durable. What this locks down is the
+// committed-tx replay path across restart.
+async fn run_restart_after_committed_tx_replays_cleanly_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
     let alice = TestSigner::from_default(1)?;
     let alice_address = alice.address();
 
@@ -1335,7 +1350,7 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     //   - computes missed_blocks = 18000s / 12 = 1500 > danger_threshold 1125.
     //   - `find_first_batch_in_danger(adjusted_threshold=0)` flags the open
     //     batch (first_frame_safe_block << current_safe_block - 0).
-    //   - returns L1UnreachableInDangerZone → process exits with failure.
+    //   - returns StartupDangerZoneEstimate → process exits with failure.
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -1417,6 +1432,84 @@ async fn run_wall_clock_backward_jump_no_panic_test(
     runtime.set_faketime_offset(None)?;
 
     proxy.shutdown().await?;
+    Ok(())
+}
+
+// §7.8.5 — Provider reachable, safe head frozen, startup refuses to boot.
+//
+// Scenario:
+//   1. Create an open Tip and age it into the danger window while L1 is
+//      still reachable.
+//   2. Stop the sequencer without mining any more L1 blocks, so the next
+//      startup sees the same safe head again.
+//   3. Jump only the sequencer's wall clock forward by >1 block interval.
+//      Startup sync succeeds, but because the safe head did not advance, the
+//      reader preserves the old safe-progress timestamp.
+//   4. `stalled_safe_head_danger_estimate` treats that as a reachable-but-
+//      frozen safe head and refuses boot.
+//   5. Mine one more L1 block and respawn again; safe-head progress resumes,
+//      the timestamp refreshes, and the sequencer stays up.
+async fn run_stalled_safe_head_startup_refuses_boot_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    const STALLED_SAFE_HEAD_OFFSET: &str = "+30s";
+    const SAFE_HEAD_SYNC_WINDOW: Duration = Duration::from_secs(8);
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice)?;
+    let mut replay = ReplayWalletApp::devnet();
+    {
+        let mut ws = runtime.ws(0).await?;
+        apply_safe_supported_deposit(
+            runtime,
+            &mut ws,
+            &mut replay,
+            &alice_l1,
+            U256::from(600_000_u64),
+        )
+        .await?;
+        alice_l2.transfer(bob_address, U256::from(1_u64)).await?;
+        replay.apply(ws.expect_user_op_from(alice_address).await?)?;
+    }
+
+    runtime.mine_l1_blocks(DANGER_ZONE_BLOCKS).await?;
+
+    let early_exit = runtime.observe_for(SAFE_HEAD_SYNC_WINDOW).await?;
+    assert!(
+        early_exit.is_none(),
+        "aging open Tip alone must not crash while the safe head is still progressing: \
+         got unexpected exit {early_exit:?}",
+    );
+
+    runtime.stop().await?;
+    runtime.set_faketime_offset(Some(STALLED_SAFE_HEAD_OFFSET.to_string()))?;
+
+    let respawn_result = runtime.respawn().await;
+    assert!(
+        respawn_result.is_err(),
+        "startup must refuse when L1 is reachable but the safe head stayed frozen long enough to estimate danger",
+    );
+
+    let counts = runtime.count_batches()?;
+    assert_eq!(
+        counts.invalidated, 0,
+        "startup refusal on a reachable-but-stalled safe head must not cascade batches: {counts:?}",
+    );
+
+    runtime.mine_l1_blocks(1).await?;
+    runtime.respawn().await?;
+
+    let stable_after_progress = runtime.observe_for(SAFE_HEAD_SYNC_WINDOW).await?;
+    assert!(
+        stable_after_progress.is_none(),
+        "once safe-head progress resumes, the sequencer should boot and remain stable; got {stable_after_progress:?}",
+    );
+
     Ok(())
 }
 
@@ -1618,7 +1711,7 @@ async fn run_provider_outage_danger_zone_sequencer_self_exits_test(
 
     // Step 5: Try to respawn while proxy is still disconnected. Startup
     // runs the same wall-clock fallback via `run_preemptive_recovery` and
-    // should refuse to boot (`L1UnreachableInDangerZone`).
+    // should refuse to boot (`StartupDangerZoneEstimate`).
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -2152,7 +2245,7 @@ async fn run_provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recover
 // to 0 directly, then respawn with the proxy disconnected. The bootstrap
 // cache is still populated — so the sequencer gets past the
 // contract-discovery phase — but the wall-clock fallback sees the zeroed
-// timestamp and returns `L1UnreachableInDangerZone`.
+// timestamp and returns `StartupDangerZoneEstimate`.
 //
 // Scope note: a "truly" first-ever boot would fail even earlier (no
 // bootstrap cache, can't discover contracts). That's a separate test; this
@@ -2444,6 +2537,69 @@ async fn run_aging_open_tip_tolerated_by_zombie_check_test(
     assert_eq!(
         counts.invalidated, 0,
         "danger-zone self-exit must not invalidate batches: {counts:?}",
+    );
+
+    Ok(())
+}
+
+// §7.8.6 — Provider reachable, safe head frozen, live submitter self-exits.
+//
+// This is the runtime twin of §7.8.5. We first reproduce the existing
+// "aging open Tip under reachable L1" negative control: the reader catches up
+// to a danger-window safe head and the sequencer stays alive because the
+// closed-batch zombie check intentionally ignores the open Tip. We then freeze
+// safe-head progress (no more L1 blocks) and jump only the sequencer's wall
+// clock forward. The live submitter should notice the missing safe-progress
+// timestamp advance and exit with `DangerZone` before the provider itself
+// fails.
+async fn run_stalled_safe_head_live_exit_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    const STALLED_SAFE_HEAD_OFFSET: &str = "+30s";
+    const SAFE_HEAD_SYNC_WINDOW: Duration = Duration::from_secs(8);
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice)?;
+    let mut replay = ReplayWalletApp::devnet();
+    {
+        let mut ws = runtime.ws(0).await?;
+        apply_safe_supported_deposit(
+            runtime,
+            &mut ws,
+            &mut replay,
+            &alice_l1,
+            U256::from(600_000_u64),
+        )
+        .await?;
+        alice_l2.transfer(bob_address, U256::from(1_u64)).await?;
+        replay.apply(ws.expect_user_op_from(alice_address).await?)?;
+    }
+
+    runtime.mine_l1_blocks(DANGER_ZONE_BLOCKS).await?;
+
+    let early_exit = runtime.observe_for(SAFE_HEAD_SYNC_WINDOW).await?;
+    assert!(
+        early_exit.is_none(),
+        "the closed-only zombie check must keep tolerating an aging open Tip before the safe head stalls; got unexpected exit {early_exit:?}",
+    );
+
+    runtime.set_faketime_offset(Some(STALLED_SAFE_HEAD_OFFSET.to_string()))?;
+
+    let exit = runtime.wait_for_exit(Duration::from_secs(15)).await?;
+    assert!(
+        !exit.success(),
+        "reachable-but-stalled safe head must force a non-zero self-exit before the provider fails, got {exit:?}",
+    );
+
+    let counts = runtime.count_batches()?;
+    assert_eq!(
+        counts.invalidated, 0,
+        "live stalled-safe-head shutdown must not cascade batches on its own: {counts:?}",
     );
 
     Ok(())

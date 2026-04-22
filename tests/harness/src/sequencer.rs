@@ -51,7 +51,7 @@ pub enum RespawnAttemptOutcome {
     Stable,
     /// `respawn()` itself returned `Err` — the child exited during bootstrap
     /// before HTTP became ready. Typically surfaces
-    /// `RecoveryError::L1UnreachableInDangerZone` from the wall-clock
+    /// `RecoveryError::StartupDangerZoneEstimate` from the startup
     /// fallback.
     RespawnFailed(String),
     /// `respawn()` returned `Ok` but the child exited within the
@@ -403,16 +403,23 @@ impl ManagedSequencer {
             }
         }
 
-        // 3. Valid-path nonce contiguity.
+        // 3. Valid-path nonce uniqueness and contiguity.
         let mut stmt = conn
             .prepare("SELECT nonce FROM valid_batches ORDER BY nonce ASC")
             .map_err(|err| io_other(format!("prepare valid-nonces: {err}")))?;
-        let mut valid_nonces: Vec<i64> = stmt
+        let valid_nonces: Vec<i64> = stmt
             .query_map([], |row| row.get::<_, i64>(0))
             .map_err(|err| io_other(format!("query valid-nonces: {err}")))?
             .collect::<rusqlite::Result<_>>()
             .map_err(|err| io_other(format!("collect valid-nonces: {err}")))?;
-        valid_nonces.dedup();
+        for pair in valid_nonces.windows(2) {
+            if pair[0] == pair[1] {
+                panic!(
+                    "schema invariant: duplicate valid nonce {} in {valid_nonces:?}",
+                    pair[0]
+                );
+            }
+        }
         for (i, &n) in valid_nonces.iter().enumerate() {
             if n != i as i64 {
                 panic!("schema invariant: valid nonces not contiguous: {valid_nonces:?}");
@@ -580,7 +587,7 @@ impl ManagedSequencer {
     /// There are two distinct "unstable" shapes the sequencer can take:
     ///   - The child dies during bootstrap (before HTTP readiness), which
     ///     makes `respawn()` itself return `Err`. Canonical cause:
-    ///     `RecoveryError::L1UnreachableInDangerZone` from the wall-clock
+    ///     `RecoveryError::StartupDangerZoneEstimate` from the startup
     ///     fallback when L1 is unreachable.
     ///   - The child comes up (HTTP ready, bootstrap passed), then one of
     ///     the internal tasks returns a fatal error and the process exits.

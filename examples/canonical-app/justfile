@@ -2,7 +2,13 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 out_dir := "out"
 source_date_epoch := "0"
+cartesi_machine_version := "0.20.0"
+linux_image_release := "v0.20.0"
+linux_kernel_filename := "linux-6.5.13-ctsi-1-v0.20.0.bin"
 linux_kernel := out_dir + "/linux.bin"
+linux_kernel_sha512 := linux_kernel + ".sha512"
+linux_kernel_url := "https://github.com/cartesi/machine-linux-image/releases/download/" + linux_image_release + "/" + linux_kernel_filename
+linux_kernel_sha512_url := linux_kernel_url + ".sha512"
 rootfs_tar := out_dir + "/canonical-rootfs.tar"
 rootfs_ext2 := out_dir + "/canonical-rootfs.ext2"
 machine_image := out_dir + "/canonical-machine-image"
@@ -13,7 +19,17 @@ machine_image_sepolia := out_dir + "/canonical-machine-image-sepolia"
 
 download-deps:
     @mkdir -p {{out_dir}}
-    @if [[ ! -f {{linux_kernel}} ]]; then wget https://github.com/cartesi/image-kernel/releases/download/v0.20.0/linux-6.5.13-ctsi-1-v0.20.0.bin -O {{linux_kernel}}; fi
+    @kernel_tmp="{{linux_kernel}}.tmp"; checksum_tmp="{{linux_kernel_sha512}}.tmp"; \
+      verify_kernel() { (cd {{out_dir}} && shasum -a 512 -c "$(basename {{linux_kernel_sha512}})" >/dev/null); }; \
+      if [[ ! -s {{linux_kernel}} || ! -s {{linux_kernel_sha512}} ]] || ! verify_kernel; then \
+        rm -f "{{linux_kernel}}" "{{linux_kernel_sha512}}" "$kernel_tmp" "$checksum_tmp"; \
+        wget "{{linux_kernel_url}}" -O "$kernel_tmp"; \
+        wget "{{linux_kernel_sha512_url}}" -O "$checksum_tmp"; \
+        mv "$kernel_tmp" "{{linux_kernel}}"; \
+        sed "s#  artifacts/[^ ]*\$#  $(basename {{linux_kernel}})#" "$checksum_tmp" > "{{linux_kernel_sha512}}"; \
+        rm -f "$checksum_tmp"; \
+        verify_kernel; \
+      fi
 
 build-dapp: build-dapp-devnet
 
@@ -59,8 +75,9 @@ clean:
     rm -rf {{out_dir}}
 
 build-machine-image: clean-machine-image build-rootfs-devnet
-    test -f {{linux_kernel}} || { echo "missing {{linux_kernel}}; run 'just setup' first"; exit 1; }
+    test -s {{linux_kernel}} || { echo "missing or empty {{linux_kernel}}; run 'just setup' first"; exit 1; }
     cartesi-machine \
+      --assert-version={{cartesi_machine_version}} \
       --ram-length=128Mi \
       --ram-image={{linux_kernel}} \
       --flash-drive=label:root,data_filename:{{rootfs_ext2}} \
@@ -70,8 +87,9 @@ build-machine-image: clean-machine-image build-rootfs-devnet
       --store={{machine_image}}
 
 build-machine-image-sepolia: clean-machine-image-sepolia build-rootfs-sepolia
-    test -f {{linux_kernel}} || { echo "missing {{linux_kernel}}; run 'just setup' first"; exit 1; }
+    test -s {{linux_kernel}} || { echo "missing or empty {{linux_kernel}}; run 'just setup' first"; exit 1; }
     cartesi-machine \
+      --assert-version={{cartesi_machine_version}} \
       --ram-length=128Mi \
       --ram-image={{linux_kernel}} \
       --flash-drive=label:root,data_filename:{{rootfs_ext2}} \

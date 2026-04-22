@@ -20,7 +20,7 @@ use tracing::{debug, error};
 
 use crate::l1::submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig};
 use crate::runtime::shutdown::ShutdownSignal;
-use crate::storage::{PendingBatch, Storage, StorageOpenError};
+use crate::storage::{PendingBatch, Storage, StorageOpenError, SubmitterTickSnapshot};
 
 #[derive(Debug, Error)]
 pub enum BatchSubmitterError {
@@ -33,7 +33,7 @@ pub enum BatchSubmitterError {
     #[error(transparent)]
     Poster(#[from] BatchPosterError),
     #[error(
-        "danger zone: batch {batch_index} approaching staleness — sequencer must flush and recover"
+        "danger zone: batch {batch_index} approaching staleness — sequencer must stop for recovery"
     )]
     DangerZone { batch_index: u64 },
 }
@@ -94,9 +94,10 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
                 Err(BatchSubmitterError::Poster(source)) => {
                     error!(error = %source, "L1 provider error — will retry");
 
-                    // Wall-clock danger check: read last_l1_sync_ms from DB and
-                    // estimate how many blocks have passed since. Same logic as
-                    // the startup check — stateless, reads from DB each time.
+                    // Wall-clock danger check: read the persisted safe-progress
+                    // marker from DB and estimate how many blocks have passed
+                    // since then. Same logic as the startup outage check —
+                    // stateless, reads from DB each time.
                     let in_danger = crate::recovery::wall_clock_danger_estimate(
                         &self.db_path,
                         self.batch_submitter_address,
@@ -127,24 +128,39 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 
     pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
-        // Refresh `safe_accepted_batches` so the danger check and pending-batch
-        // query observe the latest L1 frontier.
-        self.refresh_recovery_metadata().await?;
+        let snapshot = self.load_tick_snapshot().await?;
 
         // Crash on danger zone so the startup sequence can flush the mempool and recover.
-        self.check_danger_zone().await?;
+        if let Some(batch_index) = snapshot.danger_batch_index {
+            tracing::error!(
+                batch_index,
+                danger_threshold = self.danger_threshold,
+                "danger zone detected — triggering shutdown for flush and recovery"
+            );
+            return Err(BatchSubmitterError::DangerZone { batch_index });
+        }
+
+        if safe_progress_has_stalled(snapshot.last_safe_progress_ms, self.seconds_per_block) {
+            if let Some(batch_index) = self.check_stalled_safe_head_danger().await? {
+                return Err(BatchSubmitterError::DangerZone { batch_index });
+            }
+        }
 
         // Step 3: Derive the next unresolved batch nonce from the safe frontier plus
         // latest-chain mined submissions beyond that safe prefix.
+        //
+        // This must start at `safe_block + 1`: after a danger-zone shutdown, the
+        // flusher only returns once `Pending <= Safe`, so any wallet-nonce slots
+        // backed by blocks at or below the safe head are already resolved and
+        // folded into `safe_next_expected_nonce`. Re-scanning those blocks here
+        // would double-count the finalized prefix and can skew post-recovery
+        // resubmission.
         let next_nonce = {
-            let (safe_block, safe_next_expected) =
-                self.load_safe_next_expected_batch_nonce().await?;
-
             let recent_observed_nonces = self
                 .poster
-                .observed_submitted_batch_nonces(safe_block.saturating_add(1))
+                .observed_submitted_batch_nonces(snapshot.safe_block.saturating_add(1))
                 .await?;
-            advance_expected_batch_nonce(safe_next_expected, recent_observed_nonces)
+            advance_expected_batch_nonce(snapshot.safe_next_expected_nonce, recent_observed_nonces)
         };
 
         // Step 4: Load the unresolved suffix (all valid batches with nonce >= next_nonce).
@@ -183,46 +199,46 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         })
     }
 
-    async fn load_safe_next_expected_batch_nonce(&self) -> Result<(u64, u64), BatchSubmitterError> {
-        let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open_read_only(&db_path)?;
-            storage
-                .load_safe_accepted_frontier()
-                .map_err(BatchSubmitterError::from)
-        })
-        .await
-        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
-    }
-
-    async fn refresh_recovery_metadata(&self) -> Result<(), BatchSubmitterError> {
+    async fn load_tick_snapshot(&self) -> Result<SubmitterTickSnapshot, BatchSubmitterError> {
         let db_path = self.db_path.clone();
         let batch_submitter_address = self.batch_submitter_address;
         let max_wait_blocks = self.max_wait_blocks;
+        let danger_threshold = self.danger_threshold;
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path, "NORMAL")?;
             storage
-                .refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)
+                .prepare_submitter_tick_snapshot(
+                    batch_submitter_address,
+                    max_wait_blocks,
+                    danger_threshold,
+                )
                 .map_err(BatchSubmitterError::from)
         })
         .await
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
 
-    async fn check_danger_zone(&self) -> Result<(), BatchSubmitterError> {
+    async fn check_stalled_safe_head_danger(&self) -> Result<Option<u64>, BatchSubmitterError> {
         let db_path = self.db_path.clone();
-        let danger_threshold = self.danger_threshold;
+        let batch_submitter_address = self.batch_submitter_address;
+        let params = crate::recovery::RecoveryParams {
+            max_wait_blocks: self.max_wait_blocks,
+            danger_threshold: self.danger_threshold,
+            seconds_per_block: self.seconds_per_block,
+        };
         tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open_read_only(&db_path)?;
-            if let Some(batch_index) = storage.check_danger_zone(danger_threshold)? {
-                tracing::error!(
-                    batch_index,
-                    danger_threshold,
-                    "danger zone detected — triggering shutdown for flush and recovery"
-                );
-                return Err(BatchSubmitterError::DangerZone { batch_index });
-            }
-            Ok(())
+            crate::recovery::stalled_safe_head_danger_estimate(
+                &db_path,
+                batch_submitter_address,
+                params,
+            )
+            .map_err(|err| match err {
+                crate::recovery::RecoveryError::OpenStorage(err) => {
+                    BatchSubmitterError::OpenStorage(err)
+                }
+                crate::recovery::RecoveryError::Storage(err) => BatchSubmitterError::Storage(err),
+                other => BatchSubmitterError::Poster(BatchPosterError::Provider(other.to_string())),
+            })
         })
         .await
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
@@ -244,9 +260,12 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 }
 
-/// Advance `expected` past any contiguous run of matching nonces in the input.
-/// Assumes `observed_nonces` are in chronological (L1 event) order — out-of-order
-/// inputs cause early termination, which is correct (the gap means a nonce is missing).
+/// Advance `expected` by greedily consuming any matching observed nonce.
+///
+/// Assumes `observed_nonces` are in chronological (L1 event) order. Under that
+/// ordering, once a nonce is missing from the stream the expected frontier will
+/// naturally stop advancing; later mismatches are ignored rather than causing an
+/// explicit early return.
 fn advance_expected_batch_nonce(
     mut expected: u64,
     observed_nonces: impl IntoIterator<Item = u64>,
@@ -257,6 +276,19 @@ fn advance_expected_batch_nonce(
         }
     }
     expected
+}
+
+fn safe_progress_has_stalled(last_safe_progress_ms: u64, seconds_per_block: u64) -> bool {
+    if last_safe_progress_ms == 0 {
+        return false;
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let min_stall_ms = seconds_per_block.saturating_mul(1000);
+    now_ms.saturating_sub(last_safe_progress_ms) >= min_stall_ms
 }
 
 #[cfg(test)]
@@ -274,6 +306,16 @@ mod tests {
 
     const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
     const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
+
+    fn set_last_safe_progress_ms(db_path: &str, synced_at_ms: u64) {
+        let conn = Storage::open_connection(db_path, SQLITE_SYNCHRONOUS_PRAGMA)
+            .expect("open raw sqlite connection");
+        conn.execute(
+            "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+            [i64::try_from(synced_at_ms).unwrap_or(i64::MAX)],
+        )
+        .expect("update sync timestamp");
+    }
 
     fn seed_two_closed_batches(db_path: &str) {
         let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
@@ -482,6 +524,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tick_once_detects_stalled_safe_head_before_poster_error() {
+        let TestDb { _dir, path } = temp_db("tick-stalled-safe-head");
+        let mut storage = Storage::open(&path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(100, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 0");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 1");
+        storage
+            .append_safe_inputs(
+                1200,
+                &[StoredSafeInput {
+                    sender: BATCH_SUBMITTER_ADDRESS,
+                    payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+                        nonce: 0,
+                        frames: vec![sequencer_core::batch::Frame {
+                            safe_block: 100,
+                            fee_price: 0,
+                            user_ops: vec![],
+                        }],
+                    }),
+                    block_number: 200,
+                }],
+            )
+            .expect("append accepted batch 0");
+        drop(storage);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        set_last_safe_progress_ms(&path, now_ms.saturating_sub(25 * 12 * 1000));
+
+        let mock = Arc::new(MockBatchPoster::new());
+        let submitter = super::BatchSubmitter::new(
+            path,
+            BATCH_SUBMITTER_ADDRESS,
+            mock,
+            ShutdownSignal::default(),
+            BatchSubmitterConfig {
+                idle_poll_interval_ms: 1000,
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                seconds_per_block: 12,
+            },
+        );
+
+        let err = submitter
+            .tick_once()
+            .await
+            .expect_err("stalled safe head should trip the danger-zone estimate");
+        assert!(matches!(
+            err,
+            BatchSubmitterError::DangerZone { batch_index: 1 }
+        ));
+    }
+
+    #[tokio::test]
     async fn check_danger_zone_detects_reused_nonce_after_recovery() {
         let TestDb { _dir, path } = temp_db("tick-stale-reused-nonce");
         let batch_submitter = BATCH_SUBMITTER_ADDRESS;
@@ -562,11 +666,14 @@ mod tests {
             },
         );
 
-        let err = submitter
-            .check_danger_zone()
+        let snapshot = submitter
+            .load_tick_snapshot()
             .await
-            .expect_err("reused frontier nonce should still be detected as in danger zone");
-        assert!(matches!(err, BatchSubmitterError::DangerZone { .. }));
+            .expect("load coherent submitter snapshot");
+        assert!(
+            snapshot.danger_batch_index.is_some(),
+            "reused frontier nonce should still be detected as in danger zone"
+        );
     }
 
     #[test]
@@ -582,5 +689,18 @@ mod tests {
         );
         assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 2, 1]), 2);
         assert_eq!(super::advance_expected_batch_nonce(2, vec![2, 3]), 4);
+    }
+
+    #[test]
+    fn safe_progress_has_stalled_requires_at_least_one_estimated_block() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        assert!(!super::safe_progress_has_stalled(now_ms, 12));
+        assert!(super::safe_progress_has_stalled(
+            now_ms.saturating_sub(12_000),
+            12
+        ));
     }
 }

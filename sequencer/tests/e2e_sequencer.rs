@@ -553,7 +553,13 @@ async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
     assert_eq!(code, "BAD_REQUEST", "unexpected error code: {body}");
 
     // Sanity: serde's typical leak vocabulary must not appear anywhere.
-    for needle in ["missing field", "expected", "deserializ", "line ", "column "] {
+    for needle in [
+        "missing field",
+        "expected",
+        "deserializ",
+        "line ",
+        "column ",
+    ] {
         assert!(
             !body.contains(needle),
             "potential serde leak — body contains {needle:?}: {body}",
@@ -609,7 +615,12 @@ async fn api_payload_size_check_fires_before_signature_recovery() {
     );
     // Defensive: ensure the rejection is NOT a signature-class error. Any of
     // these would mean signature recovery ran on the oversized payload.
-    for sig_marker in ["signature", "sender mismatch", "recover", "INVALID_SIGNATURE"] {
+    for sig_marker in [
+        "signature",
+        "sender mismatch",
+        "recover",
+        "INVALID_SIGNATURE",
+    ] {
         assert!(
             !response_body.contains(sig_marker),
             "response mentions {sig_marker:?} — signature recovery may have run \
@@ -693,10 +704,8 @@ async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
         .expect("build sequencer client");
 
     // Key A signs the user op; we claim the sender is address B.
-    let signing_key_a =
-        SigningKey::from_bytes((&[1_u8; 32]).into()).expect("create signing key a");
-    let signing_key_b =
-        SigningKey::from_bytes((&[2_u8; 32]).into()).expect("create signing key b");
+    let signing_key_a = SigningKey::from_bytes((&[1_u8; 32]).into()).expect("create signing key a");
+    let signing_key_b = SigningKey::from_bytes((&[2_u8; 32]).into()).expect("create signing key b");
     let address_a = address_from_signing_key(&signing_key_a);
     let address_b = address_from_signing_key(&signing_key_b);
     assert_ne!(address_a, address_b, "test setup: A and B must differ");
@@ -847,8 +856,7 @@ async fn api_rejects_user_op_when_balance_below_gas_cost() {
     // bootstrapped frame fee).
     let db = temp_db("insufficient-gas-balance");
     let domain = test_domain();
-    let signing_key =
-        SigningKey::from_bytes((&[11_u8; 32]).into()).expect("create signing key");
+    let signing_key = SigningKey::from_bytes((&[11_u8; 32]).into()).expect("create signing key");
     let sender = address_from_signing_key(&signing_key);
     // No deposit for `sender` → balance = 0.
     bootstrap_open_frame(db.path.as_str());
@@ -899,13 +907,9 @@ async fn api_concurrent_same_nonce_leaves_exactly_one_committed() {
     // balance/nonce must match the single-commit path.
     let db = temp_db("concurrent-same-nonce");
     let domain = test_domain();
-    let signing_key =
-        SigningKey::from_bytes((&[13_u8; 32]).into()).expect("create signing key");
+    let signing_key = SigningKey::from_bytes((&[13_u8; 32]).into()).expect("create signing key");
     let sender = address_from_signing_key(&signing_key);
-    bootstrap_open_frame_with_deposits(
-        db.path.as_str(),
-        &[(sender, U256::from(10_000_000_u64))],
-    );
+    bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(10_000_000_u64))]);
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;

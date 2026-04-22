@@ -149,6 +149,16 @@ pub struct PendingBatch {
     pub encoded: Vec<u8>,
 }
 
+/// Coherent DB snapshot for one batch-submitter tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitterTickSnapshot {
+    pub safe_block: u64,
+    pub safe_next_expected_nonce: u64,
+    pub danger_batch_index: Option<u64>,
+    /// Wall-clock time when we last observed the safe frontier advance.
+    pub last_safe_progress_ms: u64,
+}
+
 /// Returned by [`Storage::open`] and friends; either the SQLite handle failed
 /// to open or migrations refused to apply.
 #[derive(Debug, Error)]

@@ -117,20 +117,22 @@ This gives us three regimes:
 ```
 
 - **Before the danger zone**: batches are young. Nothing to do.
-- **In the danger zone**: batches might land stale, or might still make it. This is the window of uncertainty. The flush resolves it by forcing every `w_nonce` slot to finalize (batch wins or no-op wins). After the flush, the sequencer reads the scheduler's finalized state and cascades if needed.
-- **Past MAX_WAIT**: all unresolved batches are guaranteed stale by L1 monotonicity (`inclusion_block >= current_safe_block >= safe_block + MAX_WAIT`). Staleness self-resolves -- the L1 outcome doesn't matter because every possible inclusion is stale. This means the flush could in principle be skipped: just wait for all slots to be consumed (which happens naturally as L1 progresses), then read the scheduler's state. In the implementation, the flush is still recommended for all cases (it's cheap when past MAX_WAIT since all competing batches are stale anyway), but the self-resolution property is what makes the design robust to long outages.
+- **In the danger zone**: batches might land stale, or might still make it. This is the window of uncertainty. For **closed unresolved batches**, the flush resolves it by forcing every `w_nonce` slot to finalize (batch wins or no-op wins). After the flush, the sequencer reads the scheduler's finalized state and cascades if needed. An **open Tip** has no `w_nonce` slot yet, so it is not part of this uncertainty set.
+- **Past MAX_WAIT**: all unresolved batches are guaranteed stale by L1 monotonicity (`inclusion_block >= current_safe_block >= safe_block + MAX_WAIT`). For closed unresolved batches, the L1 outcome no longer matters because every eventual inclusion is stale, but wallet-nonce slots may still need to be flushed (or naturally consumed) before recovery can reconstruct the scheduler frontier. For an aging open Tip, there is no L1-slot uncertainty at all, so startup recovery can invalidate it directly.
 
 **What TLA+ proves vs external reasoning**: the TLA+ model ([`preemptive.tla`](preemptive.tla)) proves that after all `w_nonce` slots are resolved (however that happens), ZombieSafety holds. It does not model the danger threshold or the passage of time. The claim that "past MAX_WAIT, staleness self-resolves" is an external argument from L1 monotonicity (`inclusion_block >= current_safe_block`), not something TLA+ checks.
 
 Any recovery design must wait out this uncertainty. The question is how. The preemptive design (implemented here) forces resolution by going offline and flushing. An alternative optimistic design lets the uncertainty resolve naturally but keeps serving soft confirmations -- see [`history/`](history/) for that approach and why we preferred preemptive.
 
-## Silver-Only Detection
+## Silver-Only for Submitted Batches
 
-Recovery must only cascade-invalidate when the frontier batch is **Silver** (safe on L1). This constraint is shared by all recovery designs and is critical for correctness.
+The Silver-only constraint applies to **submitted batches whose L1 slot outcome is still relevant**. This is the zombie path, and it is where the optimistic-design counterexample from [`history/`](history/) still matters.
 
 A Silver batch's L1 entry is permanent -- no mempool competition can kill it. The scheduler **will** see it, at a `w_nonce` lower than any recovery batch, and be poisoned. This ordering guarantee is what makes nonce poisoning reliable.
 
-Detecting staleness on Pending or Bronze batches is unsafe: a recovery batch can take the frontier's L1 slot via wallet-nonce mutual exclusion, preventing the scheduler from ever seeing the stale frontier, and allowing non-frontier dead batches to pass the nonce check. TLA+ model checking found this bug; see [`history/`](history/) for the counterexample.
+Detecting staleness on Pending or Bronze submitted batches *before wallet-nonce uncertainty is resolved* is unsafe: a recovery batch can take the frontier's L1 slot via wallet-nonce mutual exclusion, preventing the scheduler from ever seeing the stale frontier, and allowing non-frontier dead batches to pass the nonce check. TLA+ model checking found this bug; see [`history/`](history/) for the counterexample.
+
+The open Tip is different. It has no L1 transaction yet, so there is no `w_nonce` competition and no zombie risk. Once `current_safe_block - first_frame_safe_block >= MAX_WAIT_BLOCKS`, startup recovery can invalidate the stale Tip directly and open a fresh one. Likewise, after a preemptive flush has resolved all competing `w_nonce` slots for closed batches, the atomic recovery transaction can safely use **current staleness** on the oldest unresolved batch (closed or open).
 
 ## Preemptive Recovery Design
 
@@ -166,7 +168,7 @@ There are no more mempool entries. All uncertainty is resolved.
 This is an atomic SQLite transaction operating on fully-finalized L1 state:
 
 1. **Populate gold frontier** (`populate_safe_accepted_batches`): scan L1 safe inputs, simulate scheduler acceptance logic. Learn `schedulerExpected` -- the next batch nonce the scheduler needs.
-2. **Detect staleness**: if the first unaccepted batch is stale by inclusion, cascade-invalidate it and all successors (set `invalidated_at_ms` on each). If nothing is stale, skip to step 6 (Resume).
+2. **Detect staleness**: find the oldest unresolved batch (first closed batch past the accepted frontier, otherwise the open Tip). If its **current staleness** (`current_safe_block - first_frame_safe_block`) has reached `MAX_WAIT_BLOCKS`, cascade-invalidate it and all successors (set `invalidated_at_ms` on each). Closed-batch cascades rely on the preceding flush/safe-head sync to remove wallet-nonce uncertainty; Tip cascades need no flush because the Tip has no L1 slot yet. If nothing is stale, skip to step 6 (Resume).
 3. **Open recovery batch**: fresh batch whose `parent_batch_index` is the last valid ancestor. Its `nonce` is structurally `parent.nonce + 1`, which equals `schedulerExpected`. Re-drain direct inputs from invalidated batches.
 
 ### Step 6: Resume
@@ -175,23 +177,26 @@ Restart the batch submitter and user-op acceptance. The sequencer is back online
 
 ### Startup behavior
 
-On startup, the sequencer doesn't know whether it was a preemptive shutdown, a spurious restart, or coming online after a long outage. It runs the same detection logic:
+On startup, the sequencer doesn't know whether it was a preemptive shutdown, a spurious restart, or coming online after a long outage. It therefore splits the check in two:
 
-1. **Before the danger zone**: no action needed. Continue normally.
-2. **In the danger zone**: flush (step 3), wait for finality (step 4), then run recovery (step 5).
-3. **Past MAX_WAIT**: staleness has self-resolved, but `w_nonce` slots may still be unresolved (batches pending in the mempool). Flush (step 3) to resolve slots, then run recovery (step 5). The flush is cheap here -- all competing batches are stale anyway.
+1. **Closed unresolved frontier batch in danger**: run the zombie-path check (`check_danger_zone`). If the first closed batch past the accepted frontier has entered the danger zone, flush (step 3), wait for finality (step 4), then run recovery (step 5).
+2. **No closed batch in danger**: skip the flush and run the atomic recovery transaction directly. This is the normal path on a clean restart, and it is also how startup handles an open Tip that has already crossed `MAX_WAIT_BLOCKS`.
 
-Cases 2 and 3 differ in *why* batches are stale (danger zone: they might land stale; past MAX_WAIT: they're guaranteed stale) but follow the same procedure. The flush in case 3 is an optimization concern, not a safety concern: even without flushing, any batch that eventually lands will be stale, so ZombieSafety holds. But `populate_safe_accepted_batches` needs to see all safe L1 entries to compute `schedulerExpected` accurately, so waiting for slot resolution (via flush or naturally) is needed for correct recovery.
+This means "danger at startup" is not one unified flow:
 
-**What TLA+ proves here**: the model does not distinguish these three cases. It proves ZombieSafety assuming all `w_nonce` slots are eventually resolved. The claim that past MAX_WAIT the flush can be replaced by waiting for natural slot resolution is external reasoning from L1 monotonicity.
+- **Closed unresolved batches** still need the flush because their `w_nonce` slots may contain zombie uncertainty.
+- **An aging open Tip** can be recovered directly because there is no L1 slot to resolve.
+- **Closed unresolved batches already past `MAX_WAIT_BLOCKS`** are guaranteed stale by monotonicity, but the sequencer still flushes before recovery so `populate_safe_accepted_batches` can reconstruct the scheduler frontier from fully resolved safe inputs.
+
+**What TLA+ proves here**: the model still abstracts away the full startup cutover/flush decision. It proves ZombieSafety once wallet-nonce slots resolve, and separately models direct recovery of an aging open Tip. The claim that past `MAX_WAIT`, closed-batch staleness self-resolves is external reasoning from L1 monotonicity.
 
 ### L1 unreachability
 
 The danger zone check and the flush both require L1. If L1 is unreachable, the sequencer must decide whether to proceed (before danger zone) or block (in danger zone).
 
-**At startup**: the sequencer attempts to sync the safe head from L1. If this fails, it falls back to a **wall-clock danger estimate**: read the oldest valid batch's `created_at_ms` from the DB, compute `wall_clock_age = (now - created_at) / seconds_per_block`, and compare against the danger threshold. If the estimate is before the danger zone, the sequencer proceeds with stale DB data — the input reader and batch submitter will catch up when L1 returns. If the estimate is in or past the danger zone, the sequencer refuses to start (it can't safely issue soft confirmations without knowing L1 state).
+**At startup**: the sequencer attempts to sync the safe head from L1. If this fails, it falls back to a **wall-clock danger estimate** based on the persisted last-L1-sync marker: compute `estimated_missed_blocks = (now - last_l1_sync_ms) / seconds_per_block`, adjust the danger threshold downward by that estimate, and run the unresolved-batch danger check against the stale DB view. If the estimate is before the danger zone, the sequencer proceeds with stale DB data — the input reader and batch submitter will catch up when L1 returns. If the estimate is in or past the danger zone, the sequencer refuses to start (it can't safely issue soft confirmations without knowing L1 state).
 
-**At runtime**: the batch submitter retries on L1 errors (provider failures). On each retry, it runs the same wall-clock estimate: `estimated_missed_blocks = (now - last_l1_success) / seconds_per_block`. It adjusts the danger threshold downward by this estimate. If the adjusted check triggers, the batch submitter crashes for recovery. This ensures the sequencer doesn't keep issuing soft confirmations while disconnected from L1 long enough to cross the danger zone.
+**At runtime**: the batch submitter retries on L1 errors (provider failures). On each retry, it runs the same wall-clock estimate: `estimated_missed_blocks = (now - last_l1_sync_ms) / seconds_per_block`. It adjusts the danger threshold downward by this estimate. If the adjusted check triggers, the batch submitter crashes for recovery. This ensures the sequencer doesn't keep issuing soft confirmations while disconnected from L1 long enough to cross the danger zone.
 
 **Other workers during L1 outages**: the inclusion lane and API are purely local (SQLite) and continue operating. The input reader retries L1 polling with error logging. All L1-dependent workers log errors at the `error` level to alert operators.
 
@@ -230,9 +235,9 @@ The recovery design is verified with bounded TLA+ model checking. The canonical 
 
 ### `preemptive.tla` -- Slot-level safety under adversarial flush
 
-Models the core slot-level mechanics of preemptive recovery. At every `w_nonce` slot, L1 non-deterministically includes the spine batch OR a flush no-op (killing the batch). This covers the case where the frontier batch itself is killed during flush.
+Models the core slot-level mechanics of preemptive recovery. At every `w_nonce` slot, L1 non-deterministically includes the spine batch OR a flush no-op (killing the batch). This covers the case where the frontier batch itself is killed during flush. The model also treats the open Tip's `safe_block` as meaningful, so it can explicitly recover an aging Tip that has no L1 footprint yet.
 
-The model is a **safety over-approximation**: it allows `AdvanceTip` and `SubmitBatch` to interleave freely with recovery, which the real protocol prevents (the sequencer goes offline). This makes the proof stronger -- if `ZombieSafety` holds under more interleavings, it holds under fewer. However, the model does not verify the sequential protocol phases (cutover, flush, wait, recover, resume) described above.
+The model is a **safety over-approximation**: it allows `AdvanceTip` and `SubmitBatch` to interleave freely with recovery, which the real protocol prevents (the sequencer goes offline). This makes the proof stronger -- if `ZombieSafety` holds under more interleavings, it holds under fewer. However, the model does not verify the full sequential protocol phases (cutover, flush, wait, recover, resume) described above; in particular, the startup decision of whether a closed unresolved batch must flush before recovery remains an external argument layered on top of the slot-level proof.
 
 **Verified**: 157M states, 0 violations.
 

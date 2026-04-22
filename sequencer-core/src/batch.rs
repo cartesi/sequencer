@@ -128,9 +128,7 @@ mod tests {
     fn sample_batch(nonce: u64, frame_count: u64) -> Batch {
         Batch {
             nonce,
-            frames: (0..frame_count)
-                .map(|i| sample_frame(100 + i, 2))
-                .collect(),
+            frames: (0..frame_count).map(|i| sample_frame(100 + i, 2)).collect(),
         }
     }
 

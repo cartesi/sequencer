@@ -61,16 +61,14 @@ pub enum RecoveryError {
     InputReader(#[from] InputReaderError),
     #[error("provider: {0}")]
     Provider(String),
-    #[error(
-        "L1 unreachable at startup and wall-clock estimate indicates danger zone — \
-         cannot proceed safely"
-    )]
-    L1UnreachableInDangerZone,
+    #[error("startup safe-progress estimate indicates danger zone — cannot proceed safely")]
+    StartupDangerZoneEstimate,
 }
 
 /// Run the full preemptive recovery procedure at startup.
 ///
-/// 1. Try to sync the safe head from L1. If L1 is unreachable, use wall-clock
+/// 1. Try to sync the safe head from L1. If L1 is unreachable, or if the safe
+///    head is reachable but appears stalled for too long, use wall-clock
 ///    estimation to decide whether it's safe to proceed (before danger zone)
 ///    or we must block (in or past danger zone).
 /// 2. Check if any batch is in the danger zone (approaching staleness).
@@ -112,7 +110,7 @@ pub async fn run_preemptive_recovery(
                     batch_index,
                     "wall-clock estimate indicates danger zone during startup outage"
                 );
-                return Err(RecoveryError::L1UnreachableInDangerZone);
+                return Err(RecoveryError::StartupDangerZoneEstimate);
             }
 
             tracing::info!(
@@ -120,6 +118,16 @@ pub async fn run_preemptive_recovery(
                  proceeding with stale safe head"
             );
         }
+    }
+
+    if let Some(batch_index) =
+        stalled_safe_head_danger_estimate(db_path, batch_submitter_address, params)?
+    {
+        tracing::error!(
+            batch_index,
+            "safe head has not progressed and the estimated frontier is in danger zone at startup"
+        );
+        return Err(RecoveryError::StartupDangerZoneEstimate);
     }
 
     // ── Step 2: Populate frontier + check danger zone ───────────────
@@ -173,14 +181,13 @@ pub async fn run_preemptive_recovery(
 
 /// Estimate whether we're in the danger zone using wall-clock time.
 ///
-/// Reads `last_l1_sync_ms` from the DB — the wall-clock timestamp of the last
-/// successful L1 sync. Estimates how many blocks have elapsed since then using
-/// `seconds_per_block`, then adjusts the frontier-based danger check by that
-/// many missed blocks. Returns the frontier batch index if it is estimated to
-/// have crossed the danger threshold.
+/// Reads the persisted safe-progress timestamp from the DB. Estimates how many
+/// blocks have elapsed since then using `seconds_per_block`, then adjusts the
+/// frontier-based danger check by that many missed blocks. Returns the frontier
+/// batch index if it is estimated to have crossed the danger threshold.
 ///
 /// This is the same check the batch submitter uses at runtime. Both ask:
-/// "given the frontier age at our last successful sync, how much additional
+/// "given the frontier age at our last safe-head progress, how much additional
 /// age should we attribute to the outage?"
 pub(crate) fn wall_clock_danger_estimate(
     db_path: &str,
@@ -194,21 +201,18 @@ pub(crate) fn wall_clock_danger_estimate(
     } = params;
     let mut storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
 
-    let last_sync_ms = storage.last_l1_sync_ms()?;
+    let last_sync_ms = storage.last_safe_progress_ms()?;
 
     if last_sync_ms == 0 {
         // Never synced — first startup. L1 is required.
-        tracing::error!("no previous L1 sync recorded — L1 is required for first startup");
-        return Err(RecoveryError::L1UnreachableInDangerZone);
+        tracing::error!(
+            "no previous safe-head observation recorded — L1 is required for first startup"
+        );
+        return Err(RecoveryError::StartupDangerZoneEstimate);
     }
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let elapsed_secs = now_ms.saturating_sub(last_sync_ms) / 1000;
-    let estimated_missed_blocks = elapsed_secs / seconds_per_block;
+    let (elapsed_secs, estimated_missed_blocks) =
+        estimate_missed_blocks_since(last_sync_ms, seconds_per_block);
     let adjusted_threshold = danger_threshold.saturating_sub(estimated_missed_blocks);
 
     storage.refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)?;
@@ -241,6 +245,68 @@ pub(crate) fn wall_clock_danger_estimate(
     }
 }
 
+/// Estimate danger when L1 remains reachable but the safe frontier has failed
+/// to advance for at least one expected block interval.
+pub(crate) fn stalled_safe_head_danger_estimate(
+    db_path: &str,
+    batch_submitter_address: Address,
+    params: RecoveryParams,
+) -> Result<Option<u64>, RecoveryError> {
+    let RecoveryParams {
+        max_wait_blocks,
+        danger_threshold,
+        seconds_per_block,
+    } = params;
+    let mut storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+
+    let last_sync_ms = storage.last_safe_progress_ms()?;
+    if last_sync_ms == 0 {
+        return Ok(None);
+    }
+
+    let (elapsed_secs, estimated_missed_blocks) =
+        estimate_missed_blocks_since(last_sync_ms, seconds_per_block);
+    if estimated_missed_blocks == 0 {
+        return Ok(None);
+    }
+
+    let adjusted_threshold = danger_threshold.saturating_sub(estimated_missed_blocks);
+    storage.refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)?;
+    let estimated_danger_batch =
+        storage.check_any_unresolved_batch_in_danger(adjusted_threshold)?;
+
+    if let Some(batch_index) = estimated_danger_batch {
+        tracing::error!(
+            batch_index,
+            estimated_missed_blocks,
+            elapsed_secs,
+            danger_threshold,
+            adjusted_threshold,
+            "safe-head stall estimate: frontier is estimated to be in danger zone"
+        );
+        Ok(Some(batch_index))
+    } else {
+        tracing::info!(
+            estimated_missed_blocks,
+            danger_threshold,
+            adjusted_threshold,
+            "safe-head stall estimate: before danger zone"
+        );
+        Ok(None)
+    }
+}
+
+fn estimate_missed_blocks_since(last_sync_ms: u64, seconds_per_block: u64) -> (u64, u64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let elapsed_secs = now_ms.saturating_sub(last_sync_ms) / 1000;
+    let estimated_missed_blocks = elapsed_secs / seconds_per_block;
+    (elapsed_secs, estimated_missed_blocks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,7 +316,7 @@ mod tests {
     const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
     const BATCH_SUBMITTER: Address = Address::repeat_byte(0xAA);
 
-    fn set_last_l1_sync_ms(db_path: &str, synced_at_ms: u64) {
+    fn set_last_safe_progress_ms(db_path: &str, synced_at_ms: u64) {
         let conn = Storage::open_connection(db_path, SQLITE_SYNCHRONOUS_PRAGMA)
             .expect("open raw sqlite connection");
         conn.execute(
@@ -285,7 +351,7 @@ mod tests {
             },
         )
         .expect_err("first startup without L1 sync should block");
-        assert!(matches!(err, RecoveryError::L1UnreachableInDangerZone));
+        assert!(matches!(err, RecoveryError::StartupDangerZoneEstimate));
     }
 
     #[test]
@@ -320,7 +386,7 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         let missed_blocks = 25_u64;
-        set_last_l1_sync_ms(&db.path, now_ms.saturating_sub(missed_blocks * 12 * 1000));
+        set_last_safe_progress_ms(&db.path, now_ms.saturating_sub(missed_blocks * 12 * 1000));
 
         let batch_index = wall_clock_danger_estimate(
             &db.path,
@@ -337,5 +403,73 @@ mod tests {
             Some(1),
             "frontier already 1100 blocks old should trip after 25 missed blocks"
         );
+    }
+
+    #[test]
+    fn stalled_safe_head_danger_estimate_requires_elapsed_progress_gap() {
+        let db = temp_db("stall-estimate-needs-gap");
+        let mut storage = Storage::open(&db.path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        storage
+            .append_safe_inputs(1200, &[])
+            .expect("record current safe progress");
+        drop(storage);
+
+        let batch_index = stalled_safe_head_danger_estimate(
+            &db.path,
+            BATCH_SUBMITTER,
+            RecoveryParams {
+                max_wait_blocks: 1200,
+                danger_threshold: 1125,
+                seconds_per_block: 12,
+            },
+        )
+        .expect("stalled safe-head estimate should succeed");
+        assert_eq!(batch_index, None);
+    }
+
+    #[test]
+    fn stalled_safe_head_danger_estimate_uses_safe_progress_timestamp() {
+        let db = temp_db("stall-estimate-frontier-age");
+        let mut storage = Storage::open(&db.path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(100, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 0");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 1");
+
+        storage
+            .append_safe_inputs(
+                1200,
+                &[StoredSafeInput {
+                    sender: BATCH_SUBMITTER,
+                    payload: batch_payload(0, 100),
+                    block_number: 200,
+                }],
+            )
+            .expect("append accepted batch");
+        drop(storage);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        set_last_safe_progress_ms(&db.path, now_ms.saturating_sub(25 * 12 * 1000));
+
+        let batch_index = stalled_safe_head_danger_estimate(
+            &db.path,
+            BATCH_SUBMITTER,
+            RecoveryParams {
+                max_wait_blocks: 1200,
+                danger_threshold: 1125,
+                seconds_per_block: 12,
+            },
+        )
+        .expect("stalled safe-head estimate should succeed");
+        assert_eq!(batch_index, Some(1));
     }
 }

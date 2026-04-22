@@ -250,13 +250,13 @@ fn detect_and_recover_inner(tx: &Transaction<'_>, max_wait_blocks: u64) -> Resul
 /// the Tip automatically via `batch_index >= N`.
 ///
 /// Used by:
-///   - `Storage::check_danger_zone` — preemptive danger check (submitter
-///     worker tick + startup wall-clock fallback).
+///   - `Storage::check_any_unresolved_batch_in_danger` — startup wall-clock
+///     fallback when L1 is unreachable.
 ///   - `detect_and_recover_inner` — atomic cascade-invalidation path.
 ///
-/// Keeping both call sites behind this single helper keeps them symmetric:
-/// the preemptive and reactive paths can never diverge on what counts as "in
-/// danger."
+/// Keeping both call sites behind this single helper keeps the "any unresolved
+/// batch may already be too old" logic symmetric between the startup fallback
+/// and the recovery transaction.
 ///
 /// Requires `safe_accepted_batches` to be populated (via
 /// `refresh_recovery_metadata`) for the closed-frontier arm to function.
@@ -940,6 +940,78 @@ mod tests {
         }
 
         #[test]
+        fn detect_and_recover_rolls_back_when_cascade_update_aborts() {
+            let db = temp_db("detect-cascade-abort");
+            let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+
+            let mut head = storage
+                .initialize_open_state(10, SafeInputRange::empty_at(0))
+                .expect("initialize");
+            storage
+                .close_frame_and_batch(&mut head, 10)
+                .expect("close batch 0");
+
+            // Advance safe head so batch 0's first frame (safe_block=10) is stale.
+            storage
+                .append_safe_inputs(1500, &[])
+                .expect("advance safe head past staleness");
+
+            storage
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER fail_cascade_invalidation
+                     AFTER UPDATE OF invalidated_at_ms ON batches
+                     WHEN NEW.invalidated_at_ms IS NOT NULL
+                      AND OLD.invalidated_at_ms IS NULL
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected cascade failure');
+                     END;",
+                )
+                .expect("install failure trigger");
+
+            let err = storage
+                .detect_and_recover(1200)
+                .expect_err("trigger should abort recovery transaction");
+            assert!(
+                err.to_string().contains("injected cascade failure"),
+                "unexpected error: {err:?}"
+            );
+            drop(storage);
+
+            let conn =
+                Storage::open_connection(db.path.as_str(), "NORMAL").expect("open read conn");
+            let invalidated_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM batches WHERE invalidated_at_ms IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count invalidated");
+            assert_eq!(
+                invalidated_count, 0,
+                "failed cascade must not persist torn invalidation state"
+            );
+
+            let batch_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM batches", [], |row| row.get(0))
+                .expect("count batches");
+            assert_eq!(
+                batch_count, 2,
+                "failed recovery must not open an extra batch"
+            );
+
+            let open_batch_index: i64 = conn
+                .query_row("SELECT batch_index FROM valid_open_batch", [], |row| {
+                    row.get(0)
+                })
+                .expect("query valid open batch");
+            assert_eq!(
+                open_batch_index, 1,
+                "failed recovery must leave the original Tip in place"
+            );
+        }
+
+        #[test]
         fn recovery_redrains_direct_inputs_and_replay_sees_them_once() {
             let db = temp_db("recovery-redrain-e2e");
             let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
@@ -1029,8 +1101,7 @@ mod tests {
             // frame after cascade. Complements §7.4.1 (re-drain from
             // invalidated) with the never-drained case.
             let db = temp_db("recovery-includes-undrained");
-            let mut storage =
-                Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+            let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
 
             let mut head = storage
                 .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1104,8 +1175,7 @@ mod tests {
             // from the batch-submitter's own self-submission, which is drained
             // but carries no user-visible payload).
             let db = temp_db("recovery-empty-first-frame");
-            let mut storage =
-                Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+            let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
 
             let mut head = storage
                 .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1155,8 +1225,7 @@ mod tests {
             // Gold. Cascade invalidates it; recovery opens a fresh batch that
             // reuses nonce 0 (no valid ancestor exists to advance the nonce).
             let db = temp_db("first-batch-stale-nonce-zero");
-            let mut storage =
-                Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+            let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
 
             let mut head = storage
                 .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1193,8 +1262,8 @@ mod tests {
 
             // Read the new Tip's nonce and parent pointer via raw SQL — no
             // public accessor surfaces them.
-            let conn = Storage::open_connection(db.path.as_str(), "NORMAL")
-                .expect("open read conn");
+            let conn =
+                Storage::open_connection(db.path.as_str(), "NORMAL").expect("open read conn");
             let recovery_i64 = recovery.batch_index as i64;
             let nonce: i64 = conn
                 .query_row(
@@ -1231,8 +1300,7 @@ mod tests {
             // Storage handle) — this test drops and reopens Storage to model a
             // full restart over the persisted DB.
             let db = temp_db("post-recovery-crash-idempotent");
-            let mut storage =
-                Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+            let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
 
             let mut head = storage
                 .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1269,8 +1337,7 @@ mod tests {
             // dropping Storage (mimics process exit) and reopening against the
             // same on-disk DB.
             drop(storage);
-            let mut storage =
-                Storage::open(db.path.as_str(), "NORMAL").expect("reopen storage");
+            let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("reopen storage");
 
             let second = storage.detect_and_recover(1200).expect("second detect");
             assert!(
