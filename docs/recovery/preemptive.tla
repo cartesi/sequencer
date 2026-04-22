@@ -11,7 +11,9 @@
  * so schedulerExpected stays stuck at its batch_nonce.  All subsequent
  * batches — whether alive on L1 or dead — have wrong nonces.
  * Recovery resubmits the killed batch; if stale by inclusion, Resolve
- * cascades; if fresh, the scheduler accepts it.
+ * cascades; if fresh, the scheduler accepts it.  Resolve can also
+ * discard an aging open Tip whose current-safe-block age has reached
+ * MAX_WAIT_BLOCKS.
  *
  * Colors on the spine: Gold* Silver* Bronze* Pending* Tip
  * During flush, SpineOrdering can be temporarily violated (a killed
@@ -31,7 +33,7 @@
  *   AdvanceSafeBlock -- L1 safe block advances, Bronze -> Silver
  *   SchedulerStep    -- scheduler processes next safe entry -> Gold
  *   SchedulerSkip    -- scheduler skips gap (no-op slot)
- *   Resolve          -- Silver frontier stale -> cascade, recover
+ *   Resolve          -- stale unresolved frontier -> cascade, recover
  *)
 
 EXTENDS Integers, Sequences, FiniteSets
@@ -107,6 +109,8 @@ SilverAtBN(s, bn) ==
 
 IsStaleByInclusion(b) == b.inclusion_block - b.safe_block >= MAX_WAIT_BLOCKS
 
+IsStaleByCurrent(b) == currentSafeBlock - b.safe_block >= MAX_WAIT_BLOCKS
+
 ---------------------------------------------------------------------------
 (* Invariants *)
 
@@ -163,6 +167,10 @@ Inv ==
  * This is a modeling technique that eliminates the nonce-0 edge
  * case, allowing Resolve to use uniform logic.  The implementation
  * can handle nonce-0 however is simplest (see README.md).
+ *
+ * Tip.safe_block models the first frame's safe_block of the open batch.
+ * Keeping it meaningful lets the spec represent a Tip that ages past
+ * MAX_WAIT_BLOCKS before ever getting an L1 transaction.
  *)
 Init ==
     /\ spine = <<[index |-> 0, color |-> Gold, safe_block |-> 0,
@@ -188,26 +196,26 @@ AdvanceTip ==
     /\ nextIndex <= MaxBatchIndex
     /\ LET tipPos == Len(spine) IN
        /\ spine[tipPos].color = Tip
-       /\ \E sb \in 0..currentSafeBlock :
-            /\ (tipPos > 1 => sb >= spine[tipPos - 1].safe_block)
-            /\ spine' = [i \in 1..Len(spine) + 1 |->
-                IF i < tipPos THEN spine[i]
-                ELSE IF i = tipPos
-                     THEN [index          |-> spine[tipPos].index,
-                           color          |-> Pending,
-                           safe_block     |-> sb,
-                           inclusion_block |-> 0,
-                           w_nonce        |-> NONE,
-                           batch_nonce    |-> tipPos - 1]
-                     ELSE [index          |-> nextIndex,
-                           color          |-> Tip,
-                           safe_block     |-> 0,
-                           inclusion_block |-> 0,
-                           w_nonce        |-> NONE,
-                           batch_nonce    |-> 0]]
-            /\ invalid' = [i \in 1..Len(spine) + 1 |->
-                              IF i <= Len(spine) THEN invalid[i] ELSE 0]
-            /\ nextIndex' = nextIndex + 1
+       /\ spine[tipPos].safe_block <= currentSafeBlock
+       /\ (tipPos > 1 => spine[tipPos].safe_block >= spine[tipPos - 1].safe_block)
+       /\ spine' = [i \in 1..Len(spine) + 1 |->
+            IF i < tipPos THEN spine[i]
+            ELSE IF i = tipPos
+                 THEN [index          |-> spine[tipPos].index,
+                       color          |-> Pending,
+                       safe_block     |-> spine[tipPos].safe_block,
+                       inclusion_block |-> 0,
+                       w_nonce        |-> NONE,
+                       batch_nonce    |-> tipPos - 1]
+                 ELSE [index          |-> nextIndex,
+                       color          |-> Tip,
+                       safe_block     |-> currentSafeBlock,
+                       inclusion_block |-> 0,
+                       w_nonce        |-> NONE,
+                       batch_nonce    |-> 0]]
+       /\ invalid' = [i \in 1..Len(spine) + 1 |->
+                          IF i <= Len(spine) THEN invalid[i] ELSE 0]
+       /\ nextIndex' = nextIndex + 1
        /\ UNCHANGED <<currentSafeBlock, walletNonce, nextL1Slot,
                       l1Included, schedulerCursor, schedulerExpected,
                       deadBatches>>
@@ -369,12 +377,14 @@ SchedulerSkip ==
 
 ---------------------------------------------------------------------------
 (*
- * Resolve: the frontier Silver is stale -> cascade-invalidate.
+ * Resolve: the oldest unresolved batch is definitely stale ->
+ * cascade-invalidate.
  *
- * The frontier must be Silver (safe on L1).  After the flush, this
- * is either the first unaccepted batch (it survived the flush but
- * is stale by inclusion), or a resubmitted batch that was killed
- * during flush and resubmitted.
+ * Two cases are modeled:
+ *   1. the frontier unresolved batch is Silver and stale by inclusion
+ *      (the submitted-batch zombie path), or
+ *   2. the frontier unresolved batch is Tip and stale by currentSafeBlock
+ *      (the aging open-batch path).
  *
  * Cascade-invalidated batches already on L1 (Silver/Bronze) remain
  * in l1Included.  Submitted Pendings become dead batches.
@@ -390,8 +400,8 @@ Resolve ==
     /\ nextIndex <= MaxBatchIndex
     /\ LET fng == FirstNonGold(spine) IN
        /\ fng > 1
-       /\ spine[fng].color = Silver
-       /\ IsStaleByInclusion(spine[fng])
+       /\ ((spine[fng].color = Silver /\ IsStaleByInclusion(spine[fng]))
+           \/ (spine[fng].color = Tip /\ IsStaleByCurrent(spine[fng])))
        /\ LET newLen == fng
               newDead ==
                   {[batch_nonce |-> spine[i].batch_nonce,
@@ -404,7 +414,7 @@ Resolve ==
                           IF i < fng THEN spine[i]
                           ELSE [index          |-> nextIndex,
                                 color          |-> Tip,
-                                safe_block     |-> 0,
+                                safe_block     |-> currentSafeBlock,
                                 inclusion_block |-> 0,
                                 w_nonce        |-> NONE,
                                 batch_nonce    |-> 0]]

@@ -71,15 +71,10 @@ Behind the scenes, all three share `find_first_batch_in_danger` and `find_closed
 - §8.4.1 — `preemptive_margin_blocks` validation extracted + `#[should_panic]` covered.
 
 **Prioritized unit-layer gaps still open:**
-- §7.2.2, §7.6 crash-atomicity rows — require failpoint injection (tool T5, not built).
-- §7.7.7 — flusher survives extended provider outage (requires proxy tool, built for §11 but not wired here).
+- §2.10.1 (H1 rusqlite leak) — needs failpoint injection (tool T5).
 
-**Deferred design-review items:**
-- [ ] **TLA+ spec alignment with the danger-check split.** The `preemptive.tla` spec models "danger zone detection" at a high level. After the `check_danger_zone` vs `check_any_unresolved_batch_in_danger` split (surfaced by the open-batch-in-danger bug), we should re-read the spec to confirm:
-  - Whether the spec makes the zombie-vs-aging distinction explicit, or whether both callers are modeled as one "DangerFired" action.
-  - If the spec has the same unification flaw as the pre-fix code (i.e., treats any batch-in-danger as triggering flush + shutdown), whether that is a gap in the spec or a gap in the implementation.
-  - Whether the open-batch case is covered by a dedicated action or elided as part of the Tip→Pending→Silver lifecycle.
-  - Update the spec if needed; leave a short note in `docs/recovery/` if the implementation is strictly more cautious than the spec.
+**Completed design-review items:**
+- [x] **TLA+ spec alignment with the danger-check split.** `docs/recovery/preemptive.tla` now distinguishes the zombie path (stale Silver frontier) from the aging-open-Tip path, `docs/recovery/README.md` documents the same split explicitly, and TLC was re-run against the updated model.
 
 ## Test layers
 
@@ -180,7 +175,7 @@ These are the **cross-boundary** invariants. Any divergence here is catastrophic
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 2.9.1 | Mid-request shutdown: in-flight requests get 503 or clean error | `[x]` | `shutdown_during_inflight_test` |
+| 2.9.1 | Mid-request shutdown: in-flight requests get 503 or clean error | `[ ]` | Not currently covered. The old `shutdown_during_inflight_test` was renamed to `restart_after_committed_tx_replays_cleanly_test` because it only proves replay-after-restart for an already-committed tx. A deterministic hook would be needed for a real in-flight shutdown test. |
 | 2.9.2 | Post-shutdown POST → 503 immediately | `[x]` | `sequencer/src/ingress/api.rs::tests::submit_tx_rejects_when_shutdown_has_started` — requests shutdown on the `ShutdownSignal`, then submits; asserts `StatusCode::SERVICE_UNAVAILABLE` with code `UNAVAILABLE`. |
 
 ### 2.10 Error-body hardening (regression tests for security review findings)
@@ -369,7 +364,7 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 7.2.1 | Stale batch N cascades to all batches with `batch_index >= N` | `[x]` | `storage/recovery.rs` unit tests |
-| 7.2.2 | Cascade is a single atomic SQL transaction; crash mid-cascade leaves DB unchanged | `[ ]` | Needs failpoint injection |
+| 7.2.2 | Cascade is a single atomic SQL transaction; crash mid-cascade leaves DB unchanged | `[x]` | `detect_and_recover_rolls_back_when_cascade_update_aborts` injects a SQLite trigger abort during the cascade UPDATE and proves the DB rolls back cleanly |
 | 7.2.3 | `valid_*` views hide invalidated batches immediately after cascade | `[x]` | Covered by inline tests |
 | 7.2.4 | Nonce reuse works automatically via parent-pointer (new Tip's `parent.nonce + 1` equals the invalidated suffix's first nonce) | `[x]` | Covered by `detect_and_recover_does_not_false_match_after_nonce_reuse`, `nonce_reuse_after_cascade_with_valid_ancestor`, `nonce_is_reused_after_torn_cascade` |
 
@@ -426,10 +421,12 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 7.8.1 | L1 unreachable, elapsed wall time estimates `missed_blocks > danger_threshold` → recovery triggers | `[x]` | `provider_outage_wall_clock_refuses_boot_test` in `tests/e2e`. Validated end-to-end: proxy disconnected → `anvil_mine(1500)` + `faketime '+5h'` → respawn fails with `L1UnreachableInDangerZone` → proxy reconnect + respawn succeeds + cascade fires. Migrated from the now-removed `rewind_synced_at_ms` helper to faketime. |
-| 7.8.2 | `l1_safe_head.synced_at_ms == 0` (never synced) → treat as danger zone, return `L1UnreachableInDangerZone` error | `[x]` `first_boot_l1_unreachable_never_synced_refuses_boot_test` | Normal boot seeds the bootstrap cache; `ManagedSequencer::reset_l1_safe_head_synced_at_ms` then rewrites `synced_at_ms` to 0 on disk while the sequencer is stopped. Respawning with the proxy disconnected triggers the wall-clock fallback's `synced_at_ms == 0` branch → `L1UnreachableInDangerZone`. Scope limit: the separate "truly first-ever boot (no bootstrap cache)" path is tested elsewhere; this one pins the wall-clock branch specifically. |
+| 7.8.1 | L1 unreachable, elapsed wall time estimates `missed_blocks > danger_threshold` → recovery triggers | `[x]` | `provider_outage_wall_clock_refuses_boot_test` in `tests/e2e`. Validated end-to-end: proxy disconnected → `anvil_mine(1500)` + `faketime '+5h'` → respawn fails with `StartupDangerZoneEstimate` → proxy reconnect + respawn succeeds + cascade fires. Migrated from the now-removed `rewind_synced_at_ms` helper to faketime. |
+| 7.8.2 | `l1_safe_head.synced_at_ms == 0` (never synced) → treat as danger zone, return `StartupDangerZoneEstimate` error | `[x]` `first_boot_l1_unreachable_never_synced_refuses_boot_test` | Normal boot seeds the bootstrap cache; `ManagedSequencer::reset_l1_safe_head_synced_at_ms` then rewrites `synced_at_ms` to 0 on disk while the sequencer is stopped. Respawning with the proxy disconnected triggers the wall-clock fallback's `synced_at_ms == 0` branch → `StartupDangerZoneEstimate`. Scope limit: the separate "truly first-ever boot (no bootstrap cache)" path is tested elsewhere; this one pins the wall-clock branch specifically. |
 | 7.8.3 | `SystemTime::now()` backward jump → `saturating_sub` handles cleanly, no panic | `[x]` | `wall_clock_backward_jump_no_panic_test` in `tests/e2e`. Uses `faketime '-1h'` with proxy disconnected to force the wall-clock-fallback path with `now < last_sync_ms`. |
 | 7.8.4 | `SEQ_SECONDS_PER_BLOCK=0` rejected at config parse (H8 regression) | `[x]` | Clap integration tests at §8.4.2 |
+| 7.8.5 | L1 reachable, safe head frozen, startup estimates danger from stale safe-progress timestamp and refuses boot | `[x]` | `stalled_safe_head_startup_refuses_boot_test` — ages an open Tip into the danger window while L1 is healthy, stops the sequencer, advances only `faketime`, and verifies startup sync succeeds but still refuses because the safe head did not advance. Mining one new block makes the next respawn stable again. |
+| 7.8.6 | L1 reachable, safe head frozen, running submitter self-exits before provider failure | `[x]` | `stalled_safe_head_live_exit_test` — starts from the same aging-open-Tip shape as §7.3.5, then advances only `faketime` so the live stalled-safe-head estimate trips `DangerZone` while the provider remains reachable. |
 
 ---
 
@@ -455,7 +452,7 @@ The largest and most sensitive section. The open-batch bug demonstrates that des
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
-| 9.1.1 | `runtime.stop()` drains pending user ops with explicit `Err(Unavailable)`; no silent drops | `[x]` | `shutdown_during_inflight_test` |
+| 9.1.1 | `runtime.stop()` drains pending user ops with explicit `Err(Unavailable)`; no silent drops | `[ ]` | Not currently covered. `restart_after_committed_tx_replays_cleanly_test` exercises replay consistency after restart, not shutdown with a tx still pending. |
 | 9.1.2 | Post-shutdown POST → 503 immediately (before consuming channel slot) | `[?]` | |
 | 9.1.3 | Shutdown during batch submission: in-flight tx either completes or is abandoned cleanly | `[ ]` | Needs proxy or controlled timing |
 | 9.1.4 | Shutdown during L1 input reader poll: reader exits cleanly, no corrupt safe-head state | `[ ]` | |
@@ -504,14 +501,14 @@ For deterministic tests, pick margins well inside each zone (e.g., 500 / 1150 / 
 | 11.2.1 | Pre-danger (500), sequencer stays UP, load applied | Sequencer retries. Wall-clock estimate < threshold. Inclusion lane continues accepting user ops **and closes batches by size**. Reconnect → sync, resume. | `[x]` `provider_outage_pre_danger_sequencer_continues_test` — submits ~150 transfers during the outage, asserts `count_batches().sealed` strictly increased. |
 | 11.2.2 | Danger zone (3h55min), sequencer UP, self-exits | Running sequencer's wall-clock fallback detects danger mid-run → exits with `DangerZone`. Startup wall-clock fallback refuses subsequent boot while proxy still disconnected. No invalidation (not past-stale). | `[x]` `provider_outage_danger_zone_sequencer_self_exits_test` — uses dynamic faketime (file-based) to shift the running sequencer's clock into the danger zone without a respawn. Stops at the "refuse to reboot" assertion. |
 | 11.2.2-follow-up | Danger zone → mid-run exit → reconnect → restart cycle | Completes §11.2.2: proxy reconnects, `respawn_until_stable` drives the orchestrator loop (advancing L1 each retry) until the aged closed batch crosses `MAX_WAIT_BLOCKS` and cascade fires. Asserts Stable convergence + cascade-invalidation. | `[x]` `provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recovers_test` — uses T8 (`respawn_until_stable`). |
-| 11.2.3 | Past-stale (1250) | Wall-clock estimate past stale. Recovery + flush block on proxy. Reconnect → flush + cascade. | `[x]` `provider_outage_past_stale_cascades_test` — stops sequencer, disconnects proxy, advances L1, verifies restart refuses while proxy is disconnected (wall-clock fallback past stale → `L1UnreachableInDangerZone`), then reconnects and verifies cascade |
+| 11.2.3 | Past-stale (1250) | Wall-clock estimate past stale. Recovery + flush block on proxy. Reconnect → flush + cascade. | `[x]` `provider_outage_past_stale_cascades_test` — stops sequencer, disconnects proxy, advances L1, verifies restart refuses while proxy is disconnected (wall-clock fallback past stale → `StartupDangerZoneEstimate`), then reconnects and verifies cascade |
 
 ### 11.3 Combined: outage both sides at once
 
 | # | Scenario | Status | Notes |
 |---|----------|--------|-------|
 | 11.3.1 | Sequencer stopped, proxy disconnected, anvil mines 1250 blocks, BOTH reconnect → recovery triggers correctly | `[x]` | Effectively covered by §11.2.3 — the "sequencer stopped + proxy disconnected" path is tested end-to-end there |
-| 11.3.2 | Both stopped, advance to danger zone, then turn on sequencer ONLY (proxy still disconnected) | `[x]` `both_down_danger_zone_sequencer_first_refuses_boot_test` | Realistic datacenter-outage-recovery scenario: sequencer boots while L1 is still unreachable, wall-clock fallback sees past-danger → `L1UnreachableInDangerZone`. Stops at the refuse-boot assertion (no cascade yet — we're below MAX_WAIT). Complement to §11.2.3 in the danger-zone window instead of past-stale. |
+| 11.3.2 | Both stopped, advance to danger zone, then turn on sequencer ONLY (proxy still disconnected) | `[x]` `both_down_danger_zone_sequencer_first_refuses_boot_test` | Realistic datacenter-outage-recovery scenario: sequencer boots while L1 is still unreachable, wall-clock fallback sees past-danger → `StartupDangerZoneEstimate`. Stops at the refuse-boot assertion (no cascade yet — we're below MAX_WAIT). Complement to §11.2.3 in the danger-zone window instead of past-stale. |
 | 11.3.3 | Both stopped, advance to danger zone, proxy returns FIRST (sequencer still down), then sequencer → normal sync, startup sees aged batches and handles them | `[x]` `both_down_danger_zone_proxy_first_restart_cycle_recovers_test` | Tests the "L1 recovered before us" reconnect ordering. Uses T8: first respawn exits with `DangerZone` after the aged Tip closes, `respawn_until_stable` advances L1 by 100 blocks per retry until cascade fires on a subsequent respawn. |
 
 ### 11.4 Short-duration provider hiccups (heal-within-pre-danger)
@@ -590,7 +587,7 @@ Coverage of the above requires the following test-harness additions. Each unlock
 | T2 | Runtime toggle of Anvil's auto-mining + mempool drop | §11.1.4 (done); §7.1.1, §7.1.3, §7.1.4 (pending — live-runtime variants) | `[x]` `ManagedSequencer::set_automine(bool)` (via `anvil_setAutomine`) holds or releases the mempool without respawning Anvil; `drop_all_pending_txs` (via `anvil_dropAllTransactions`) simulates gateway packet loss. Chosen over `--no-mining` spawn flag because it's runtime-toggleable — existing tests stay on auto-mining, only delayed-inclusion tests flip it. |
 | T3 | Shorter poll intervals for tests (sub-second `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`) | Reduces raciness in §11, §7.7, §6 | `[ ]` Not built |
 | T4 | `wait_for_recovery_complete` helper (poll a health / debug endpoint) | Replaces sleep-based waits throughout §11, §7 | `[ ]` Not built |
-| T5 | Injectable failpoints (SQLite error, sub-transaction crash) | §7.2.2, §7.6.2 done; §7.6.3, §2.10.1 (H1) need more | `[?]` Partial — inline tests already induce some |
+| T5 | Injectable failpoints (SQLite error, sub-transaction crash) | §2.10.1 (H1) | `[?]` Partial — inline SQLite-trigger tests now cover recovery crash-atomicity; a broader framework is still only needed for the API error-body leak case |
 | T6 | Smaller `MAX_WAIT_BLOCKS` for test builds (optional optimization) | Shortens mine-1200-blocks tests | `[-]` Probably not needed — 1200 empty blocks mines in <1s |
 | T7 | libfaketime via `FAKETIME_TIMESTAMP_FILE` (dynamic) for the sequencer subprocess | §7.8.1 (done), §7.8.3 (clock skew, done), §11.2.2 (done, live danger-zone detection), §7.3.5 (aging-Tip, pending), §7.8.2 (first-boot-L1-down, pending) | `[x]` `ManagedSequencer::set_faketime_offset(Option<String>)` writes to the rc file; `ManagedSequencer::advance_wall_and_mine(Duration)` is the coupled (cumulative) helper. Harness sets `FAKETIME_TIMESTAMP_FILE` + `FAKETIME_NO_CACHE=1` + `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD` on the child. Dynamic: the running sequencer re-reads the file on every time call, so tests can shift time mid-run without a respawn. Added to `flake.nix` + CI (`apt install faketime` on Ubuntu). |
 | T8 | Orchestrator-restart primitive (`respawn_until_stable`) | §11.1.5 (done), §11.2.2-follow-up (done), §11.3.3 (done) | `[x]` `ManagedSequencer::respawn_and_watch(Duration) -> RespawnAttemptOutcome` classifies a single attempt into `Stable` / `RespawnFailed(String)` / `ExitedPostRespawn(ExitStatus)`. `respawn_until_stable(RespawnPolicy)` wraps it in a retry loop with optional `advance_per_retry` — required for the danger-zone-to-cascade convergence path (aged closed batch only cascades once it ages past `MAX_WAIT_BLOCKS`, so each retry needs to advance L1 + wall clock). Returns the full attempt sequence so tests can assert *both* convergence and that the loop actually exercised the flush/shutdown path (not a cheap first-attempt success). |

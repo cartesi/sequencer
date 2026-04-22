@@ -23,6 +23,9 @@ pub struct BatchPosterConfig {
     pub batch_submitter_address: alloy_primitives::Address,
     pub start_block: u64,
     pub confirmation_depth: u64,
+    /// Assumed L1 block time in seconds, used to derive a conservative
+    /// confirmation timeout for watched batch-submission txs.
+    pub seconds_per_block: u64,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
     pub long_block_range_error_codes: Vec<String>,
 }
@@ -55,18 +58,14 @@ impl EthereumBatchPoster {
         Self { provider, config }
     }
 
-    /// Conservative upper-bound timeout for waiting on confirmations.
-    /// Uses Ethereum's 12s block time as a worst-case heuristic — shorter block
-    /// times on other chains just mean the timeout fires later than necessary,
-    /// which is safe (the next tick retries under fresher state).
+    /// Conservative upper-bound timeout for waiting on confirmations, derived
+    /// from the configured block time. Shorter block times on other chains just
+    /// make the watch complete sooner.
     fn confirmation_timeout(&self) -> std::time::Duration {
-        const ETHEREUM_BLOCK_TIME_SECS: u64 = 12;
-        let blocks_to_wait = self
-            .config
-            .confirmation_depth
-            .saturating_add(1)
-            .saturating_mul(2);
-        std::time::Duration::from_secs(blocks_to_wait.saturating_mul(ETHEREUM_BLOCK_TIME_SECS))
+        derive_confirmation_timeout(
+            self.config.confirmation_depth,
+            self.config.seconds_per_block,
+        )
     }
 
     async fn latest_account_nonce(&self) -> Result<u64, BatchPosterError> {
@@ -127,6 +126,14 @@ impl EthereumBatchPoster {
 
         Ok(())
     }
+}
+
+fn derive_confirmation_timeout(
+    confirmation_depth: u64,
+    seconds_per_block: u64,
+) -> std::time::Duration {
+    let blocks_to_wait = confirmation_depth.saturating_add(1).saturating_mul(2);
+    std::time::Duration::from_secs(blocks_to_wait.saturating_mul(seconds_per_block))
 }
 
 #[async_trait]
@@ -303,7 +310,9 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchPoster, mock::MockBatchPoster};
+    use std::time::Duration;
+
+    use super::{BatchPoster, derive_confirmation_timeout, mock::MockBatchPoster};
 
     #[tokio::test]
     async fn mock_poster_tracks_requested_suffix_start_block() {
@@ -315,5 +324,12 @@ mod tests {
 
         assert!(observed.is_empty());
         assert_eq!(poster.last_from_block(), Some(42));
+    }
+
+    #[test]
+    fn confirmation_timeout_derives_from_seconds_per_block() {
+        assert_eq!(derive_confirmation_timeout(2, 12), Duration::from_secs(72));
+        assert_eq!(derive_confirmation_timeout(2, 1), Duration::from_secs(6));
+        assert_eq!(derive_confirmation_timeout(5, 3), Duration::from_secs(36));
     }
 }

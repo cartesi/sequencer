@@ -164,9 +164,10 @@ impl InputReader {
         let previous_safe_block = self.current_safe_block().await?;
 
         // If our persisted safe head is already at the current safe frontier,
-        // there is nothing new to scan, but we still record that L1 was reachable.
+        // there is nothing new to scan. We only seed the progress marker on the
+        // first real observation; subsequent same-head polls must not refresh it.
         if current_safe_block <= previous_safe_block {
-            self.touch_l1_sync().await?;
+            self.initialize_safe_progress_if_unset().await?;
             return Ok(());
         }
 
@@ -243,11 +244,13 @@ impl InputReader {
         .map_err(|err| InputReaderError::Join(err.to_string()))?
     }
 
-    async fn touch_l1_sync(&self) -> Result<(), InputReaderError> {
+    async fn initialize_safe_progress_if_unset(&self) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
-            storage.touch_l1_sync().map_err(InputReaderError::from)
+            storage
+                .initialize_safe_progress_if_unset()
+                .map_err(InputReaderError::from)
         })
         .await
         .map_err(|err| InputReaderError::Join(err.to_string()))?
@@ -511,6 +514,14 @@ mod tests {
         storage
             .append_safe_inputs(1000, &[])
             .expect("set safe head ahead of chain");
+        let recorded_sync = storage
+            .last_safe_progress_ms()
+            .expect("read safe-progress timestamp");
+        assert!(
+            recorded_sync > 0,
+            "append_safe_inputs should stamp safe progress"
+        );
+        drop(storage);
 
         let mut reader = test_reader(
             db_path,
@@ -529,6 +540,19 @@ mod tests {
             reader.current_safe_block().await.expect("read"),
             1000,
             "safe head should remain unchanged when already ahead of chain"
+        );
+
+        let storage = Storage::open(
+            db_file.path().to_string_lossy().as_ref(),
+            SQLITE_SYNCHRONOUS_PRAGMA,
+        )
+        .expect("re-open storage");
+        assert_eq!(
+            storage
+                .last_safe_progress_ms()
+                .expect("read unchanged safe-progress timestamp"),
+            recorded_sync,
+            "same-head polls must not refresh the safe-progress marker"
         );
     }
 

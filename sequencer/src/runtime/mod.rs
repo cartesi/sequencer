@@ -262,6 +262,7 @@ where
         batch_submitter_address: l1_config.batch_submitter_address,
         start_block: input_reader_genesis_block,
         confirmation_depth: config.batch_submitter_confirmation_depth,
+        seconds_per_block: config.seconds_per_block,
         long_block_range_error_codes: config.long_block_range_error_codes,
     };
     let provider = build_batch_submitter_provider(&l1_config)?;

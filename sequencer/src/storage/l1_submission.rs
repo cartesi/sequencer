@@ -20,11 +20,44 @@ use super::recovery::{
     find_closed_frontier_batch_in_danger, find_first_batch_in_danger,
     populate_safe_accepted_batches_inner, query_latest_safe_accepted_batch,
 };
-use super::{FrameHeader, PendingBatch};
+use super::{FrameHeader, PendingBatch, SubmitterTickSnapshot};
 use sequencer_core::batch::{Batch, BatchForSubmission, Frame as BatchFrame, WireUserOp};
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
+    /// Refresh recovery metadata and load the coherent DB snapshot the live
+    /// submitter uses for one tick.
+    pub fn prepare_submitter_tick_snapshot(
+        &mut self,
+        batch_submitter_address: Address,
+        max_wait_blocks: u64,
+        danger_threshold: u64,
+    ) -> Result<SubmitterTickSnapshot> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        populate_safe_accepted_batches_inner(&tx, batch_submitter_address, max_wait_blocks)?;
+
+        let safe_block = query_current_safe_block(&tx)?;
+        let safe_next_expected_nonce = query_latest_safe_accepted_batch(&tx)?
+            .map(|row| i64_to_u64(row.nonce).saturating_add(1))
+            .unwrap_or(0);
+        let danger_batch_index = find_closed_frontier_batch_in_danger(&tx, danger_threshold)?;
+        let last_safe_progress_ms: i64 = tx.query_row(
+            "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        tx.commit()?;
+        Ok(SubmitterTickSnapshot {
+            safe_block,
+            safe_next_expected_nonce,
+            danger_batch_index,
+            last_safe_progress_ms: i64_to_u64(last_safe_progress_ms),
+        })
+    }
+
     /// Load the scheduler-accepted safe frontier persisted in `safe_accepted_batches`.
     ///
     /// Returns `(current_safe_block, next_expected_nonce)`.
@@ -283,6 +316,7 @@ mod tests {
     };
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use alloy_primitives::Address;
+    use sequencer_core::batch::{Batch, Frame as BatchFrame};
 
     #[test]
     fn batch_for_submission_builds_from_storage() {
@@ -432,6 +466,66 @@ mod tests {
             .expect("load safe accepted frontier");
         assert_eq!(safe_block, 10);
         assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn prepare_submitter_tick_snapshot_returns_coherent_frontier_view() {
+        let db = temp_db("submitter-tick-snapshot-frontier");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4]);
+
+        let snapshot = storage
+            .prepare_submitter_tick_snapshot(SENDER_A, u64::MAX, 1125)
+            .expect("prepare submitter tick snapshot");
+
+        assert_eq!(snapshot.safe_block, 10);
+        assert_eq!(snapshot.safe_next_expected_nonce, 2);
+        assert_eq!(snapshot.danger_batch_index, None);
+        assert!(
+            snapshot.last_safe_progress_ms > 0,
+            "safe-input append should stamp safe progress"
+        );
+    }
+
+    #[test]
+    fn prepare_submitter_tick_snapshot_reports_closed_frontier_danger() {
+        let db = temp_db("submitter-tick-snapshot-danger");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 1");
+
+        storage
+            .append_safe_inputs(
+                1135,
+                &[StoredSafeInput {
+                    sender: SENDER_A,
+                    payload: ssz::Encode::as_ssz_bytes(&Batch {
+                        nonce: 0,
+                        frames: vec![BatchFrame {
+                            user_ops: vec![],
+                            safe_block: 10,
+                            fee_price: 0,
+                        }],
+                    }),
+                    block_number: 20,
+                }],
+            )
+            .expect("append accepted batch 0");
+
+        let snapshot = storage
+            .prepare_submitter_tick_snapshot(SENDER_A, 1200, 1125)
+            .expect("prepare submitter tick snapshot");
+
+        assert_eq!(snapshot.safe_block, 1135);
+        assert_eq!(snapshot.safe_next_expected_nonce, 1);
+        assert_eq!(snapshot.danger_batch_index, Some(1));
     }
 
     #[test]

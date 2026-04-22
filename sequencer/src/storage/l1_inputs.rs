@@ -5,7 +5,7 @@
 //! advances `l1_safe_head`, and maintains the L1 bootstrap cache.
 //!
 //! Also exposes the read-side queries the input reader and other callers need
-//! (current safe block, safe-input bounds, last-sync timestamp).
+//! (current safe block, safe-input bounds, last safe-progress timestamp).
 
 use alloy_primitives::Address;
 use rusqlite::{OptionalExtension, Result, Transaction, TransactionBehavior, params};
@@ -53,23 +53,29 @@ impl Storage {
         Ok(())
     }
 
-    /// Record that L1 was successfully queried at the current wall-clock time.
-    pub fn touch_l1_sync(&mut self) -> Result<()> {
+    /// Record the first real safe-head observation if no prior observation was
+    /// persisted yet.
+    ///
+    /// Used when the input reader successfully contacts L1 but the observed
+    /// safe block matches the bootstrap floor (for example, first startup on a
+    /// chain that has not advanced past genesis). This seeds the wall-clock
+    /// estimator once without repeatedly refreshing it while the safe head is
+    /// frozen.
+    pub fn initialize_safe_progress_if_unset(&mut self) -> Result<()> {
         let now_ms = now_unix_ms();
-        let changed = self.conn.execute(
-            "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+        self.conn.execute(
+            "UPDATE l1_safe_head SET synced_at_ms = ?1 \
+             WHERE singleton_id = 0 AND synced_at_ms = 0",
             params![now_ms],
         )?;
-        if changed != 1 {
-            return Err(rusqlite::Error::StatementChangedRows(changed));
-        }
         Ok(())
     }
 
     /// Atomically: insert `inputs` (assigned contiguous indexes starting from
     /// the current MAX+1), advance `l1_safe_head.block_number` to `safe_block`,
-    /// and stamp `synced_at_ms`. Asserts `safe_block` is monotonic and that it
-    /// strictly advances when `inputs` is non-empty.
+    /// and stamp `synced_at_ms` as the wall-clock time when the safe frontier
+    /// advanced. Asserts `safe_block` is monotonic and that it strictly
+    /// advances when `inputs` is non-empty.
     pub fn append_safe_inputs(
         &mut self,
         safe_block: u64,
@@ -104,9 +110,9 @@ impl Storage {
         Ok(())
     }
 
-    /// Wall-clock timestamp (Unix ms) of the last successful L1 sync. Returns 0
-    /// if no sync has occurred. Read by the recovery wall-clock danger estimate.
-    pub fn last_l1_sync_ms(&self) -> Result<u64> {
+    /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance.
+    /// Returns 0 if no real safe-head observation has occurred yet.
+    pub fn last_safe_progress_ms(&self) -> Result<u64> {
         let value: i64 = self.conn.query_row(
             "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
             [],
@@ -179,6 +185,8 @@ fn insert_safe_inputs_batch(
 
 #[cfg(test)]
 mod tests {
+    use std::{thread, time::Duration};
+
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput, test_helpers::temp_db};
     use alloy_primitives::Address;
 
@@ -240,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_minimum_safe_block_does_not_record_l1_sync() {
+    fn ensure_minimum_safe_block_does_not_record_safe_progress() {
         let db = temp_db("ensure-min-safe-block-no-sync");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
 
@@ -248,25 +256,45 @@ mod tests {
             .ensure_minimum_safe_block(7)
             .expect("advance bootstrap safe head");
         assert_eq!(
-            storage.last_l1_sync_ms().expect("read sync timestamp"),
+            storage
+                .last_safe_progress_ms()
+                .expect("read sync timestamp"),
             0,
-            "bootstrap safe-head initialization must not count as a real L1 sync"
+            "bootstrap safe-head initialization must not count as safe progress"
         );
 
-        storage.touch_l1_sync().expect("record real L1 sync");
-        let recorded_sync = storage.last_l1_sync_ms().expect("read sync timestamp");
+        storage
+            .initialize_safe_progress_if_unset()
+            .expect("record first real safe-head observation");
+        let recorded_sync = storage
+            .last_safe_progress_ms()
+            .expect("read sync timestamp");
         assert!(
             recorded_sync > 0,
-            "touch_l1_sync should record wall-clock time"
+            "initial observation should record wall-clock time"
+        );
+
+        thread::sleep(Duration::from_millis(5));
+        storage
+            .initialize_safe_progress_if_unset()
+            .expect("do not refresh unchanged safe head");
+        assert_eq!(
+            storage
+                .last_safe_progress_ms()
+                .expect("read unchanged sync timestamp"),
+            recorded_sync,
+            "repeat observations of the same safe head must not refresh the marker"
         );
 
         storage
             .ensure_minimum_safe_block(9)
             .expect("advance bootstrap safe head again");
         assert_eq!(
-            storage.last_l1_sync_ms().expect("read sync timestamp"),
+            storage
+                .last_safe_progress_ms()
+                .expect("read sync timestamp"),
             recorded_sync,
-            "bootstrap safe-head updates must preserve the last real L1 sync timestamp"
+            "bootstrap safe-head updates must preserve the last real safe-progress timestamp"
         );
     }
 }

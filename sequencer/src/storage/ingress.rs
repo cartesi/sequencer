@@ -421,10 +421,7 @@ mod tests {
             .conn
             .query_row(
                 "SELECT fee FROM frames WHERE batch_index = ?1 AND frame_in_batch = ?2",
-                rusqlite::params![
-                    original_batch_index as i64,
-                    original_frame_in_batch as i64,
-                ],
+                rusqlite::params![original_batch_index as i64, original_frame_in_batch as i64,],
                 |row| row.get(0),
             )
             .expect("query open frame fee");
@@ -444,11 +441,7 @@ mod tests {
         // at 1160. This is the expected policy-flow boundary.
         let next_safe_block = head.safe_block;
         storage
-            .close_frame_only(
-                &mut head,
-                next_safe_block,
-                SafeInputRange::empty_at(0),
-            )
+            .close_frame_only(&mut head, next_safe_block, SafeInputRange::empty_at(0))
             .expect("rotate within same batch");
         assert_eq!(
             head.frame_fee, 1160,
