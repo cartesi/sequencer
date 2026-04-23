@@ -159,7 +159,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             .await?;
 
         let from_nonce = decide_submit_start(frontier, &recent_observed);
-        let pending = self.load_pending_batches(from_nonce).await?;
+        let pending = self.pending_batches(from_nonce).await?;
         if pending.is_empty() {
             return Ok(TickOutcome::Idle);
         }
@@ -198,7 +198,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
 
-    async fn load_pending_batches(
+    async fn pending_batches(
         &self,
         min_nonce: u64,
     ) -> Result<Vec<PendingBatch>, BatchSubmitterError> {
@@ -206,7 +206,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open_read_only(&db_path)?;
             storage
-                .load_pending_batches(min_nonce)
+                .pending_batches(min_nonce)
                 .map_err(BatchSubmitterError::from)
         })
         .await
@@ -259,7 +259,6 @@ mod tests {
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput, SubmitterFrontier};
     use sequencer_core::protocol::ProtocolConfig;
 
-    const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
     const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
 
     /// Protocol pinned to `BATCH_SUBMITTER_ADDRESS` — worker tests use that as
@@ -280,7 +279,7 @@ mod tests {
     }
 
     fn seed_two_closed_batches(db_path: &str) {
-        let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let mut storage = Storage::open(db_path).expect("open storage");
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -297,7 +296,7 @@ mod tests {
     }
 
     fn seed_safe_submitted_batches(db_path: &str, safe_block: u64, nonces: &[u64]) {
-        let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let mut storage = Storage::open(db_path).expect("open storage");
         let inputs: Vec<_> = nonces
             .iter()
             .map(|nonce| StoredSafeInput {

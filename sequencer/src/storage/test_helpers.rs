@@ -88,10 +88,10 @@ pub(crate) fn seed_closed_batches(storage: &mut Storage, count: u64) {
 }
 
 /// Pull every valid sequenced L2 tx out of storage, dropping the offset.
-/// Test-only convenience around `load_ordered_l2_txs_page_from`.
-pub(crate) fn load_all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
+/// Test-only convenience around `ordered_l2_txs_page_from`.
+pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
     storage
-        .load_ordered_l2_txs_page_from(0, 1_000_000)
+        .ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load all ordered l2 txs")
         .into_iter()
         .map(|(_offset, tx)| tx)

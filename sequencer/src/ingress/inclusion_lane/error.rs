@@ -18,6 +18,11 @@ pub enum InclusionLaneError {
     },
     #[error(transparent)]
     Storage(#[from] rusqlite::Error),
+    #[error("user op execution failed")]
+    ExecuteUserOp {
+        #[source]
+        source: AppError,
+    },
     #[error("direct input execution failed")]
     ExecuteDirectInput {
         #[source]

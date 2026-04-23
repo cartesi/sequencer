@@ -9,12 +9,15 @@
 //! by the lane's flow, not by an L1 ingress event.
 
 use alloy_primitives::Address;
-use rusqlite::{Result, Transaction, TransactionBehavior, params};
+use rusqlite::{Result, Transaction, params};
 
-use super::internals::{
-    from_unix_ms, i64_to_u64, insert_new_batch, insert_open_frame, load_current_write_head,
-    now_unix_ms, persist_frame_direct_sequence, query_batch_policy, seal_batch, to_unix_ms,
-    u64_to_i64,
+use super::convert::{from_unix_ms, i64_to_u64, now_unix_ms, to_unix_ms, u64_to_i64};
+use super::mutations::{
+    insert_new_batch, insert_open_frame, persist_frame_direct_sequence, seal_batch,
+};
+use super::queries::{
+    load_current_write_head, query_batch_policy, query_current_safe_block,
+    query_latest_safe_input_index_exclusive,
 };
 use super::{
     BatchPolicy, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
@@ -30,7 +33,7 @@ impl Storage {
     /// Using `MAX + 1` instead of `COUNT(*)` makes this robust against gaps:
     /// when a batch is invalidated, those rows drop out of the view and the
     /// cursor naturally rewinds, allowing the recovery batch to re-drain.
-    pub fn load_next_undrained_safe_input_index(&mut self) -> Result<u64> {
+    pub fn next_undrained_safe_input_index(&mut self) -> Result<u64> {
         const SQL: &str = "
             SELECT COALESCE(MAX(safe_input_index) + 1, 0)
             FROM valid_sequenced_l2_txs
@@ -42,62 +45,51 @@ impl Storage {
 
     /// Resume the lane on startup. Returns `None` if storage is empty (caller
     /// should follow up with [`Storage::initialize_open_state`]).
-    pub fn load_open_state(&mut self) -> Result<Option<WriteHead>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let head = load_current_write_head(&tx)?;
-        tx.commit()?;
-        Ok(head)
+    pub fn open_state(&mut self) -> Result<Option<WriteHead>> {
+        self.read(load_current_write_head)
     }
 
     /// Bootstrap the very first batch + frame. Asserts that no open state
-    /// exists; call only when [`Storage::load_open_state`] returns `None`.
+    /// exists; call only when [`Storage::open_state`] returns `None`.
     pub fn initialize_open_state(
         &mut self,
         safe_block: u64,
         leading_direct_range: SafeInputRange,
     ) -> Result<WriteHead> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert!(
-            load_current_write_head(&tx)?.is_none(),
-            "open state already exists"
-        );
+        self.write(|tx| {
+            assert!(
+                load_current_write_head(tx)?.is_none(),
+                "open state already exists"
+            );
 
-        let now_ms = now_unix_ms();
-        let policy = query_batch_policy(&tx)?;
-        // Genesis: explicit batch_index = 0, parent = None, nonce = 0.
-        insert_new_batch(&tx, Some(0), None, now_ms)?;
-        insert_open_frame(&tx, 0, 0, now_ms, policy.recommended_fee, safe_block)?;
-        persist_frame_direct_sequence(&tx, 0, 0, leading_direct_range)?;
-        tx.commit()?;
+            let now_ms = now_unix_ms();
+            let policy = query_batch_policy(tx)?;
+            // Genesis: explicit batch_index = 0, parent = None, nonce = 0.
+            insert_new_batch(tx, Some(0), None, now_ms)?;
+            insert_open_frame(tx, 0, 0, now_ms, policy.recommended_fee, safe_block)?;
+            persist_frame_direct_sequence(tx, 0, 0, leading_direct_range)?;
 
-        Ok(WriteHead {
-            batch_index: 0,
-            batch_created_at: from_unix_ms(now_ms),
-            frame_fee: policy.recommended_fee,
-            safe_block,
-            batch_user_op_count: 0,
-            open_frame_user_op_count: 0,
-            frame_in_batch: 0,
-            max_batch_user_op_bytes: batch_size_target_bytes(policy),
+            Ok(WriteHead {
+                batch_index: 0,
+                batch_created_at: from_unix_ms(now_ms),
+                frame_fee: policy.recommended_fee,
+                safe_block,
+                batch_user_op_count: 0,
+                open_frame_user_op_count: 0,
+                frame_in_batch: 0,
+                max_batch_user_op_bytes: batch_size_target_bytes(policy),
+            })
         })
     }
 
     /// Snapshot the current L1 view: safe block + exclusive safe-input cursor.
     /// The lane uses this to decide whether to advance.
-    pub fn load_safe_input_frontier(&mut self) -> Result<SafeInputFrontier> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let safe_block = super::internals::query_current_safe_block(&tx)?;
-        let end_exclusive = super::internals::query_latest_safe_input_index_exclusive(&tx)?;
-        tx.commit()?;
-        Ok(SafeInputFrontier {
-            safe_block,
-            end_exclusive,
+    pub fn safe_input_frontier(&mut self) -> Result<SafeInputFrontier> {
+        self.read(|tx| {
+            Ok(SafeInputFrontier {
+                safe_block: query_current_safe_block(tx)?,
+                end_exclusive: query_latest_safe_input_index_exclusive(tx)?,
+            })
         })
     }
 
@@ -177,19 +169,15 @@ impl Storage {
         if user_ops.is_empty() {
             return Ok(());
         }
-
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_user_ops_batch(
-            &tx,
-            head.batch_index,
-            head.frame_in_batch,
-            head.open_frame_user_op_count,
-            user_ops,
-        )?;
-
-        tx.commit()?;
+        self.write(|tx| {
+            insert_user_ops_batch(
+                tx,
+                head.batch_index,
+                head.frame_in_batch,
+                head.open_frame_user_op_count,
+                user_ops,
+            )
+        })?;
         head.increment_batch_user_op_count(user_ops.len());
         Ok(())
     }
@@ -203,27 +191,26 @@ impl Storage {
         next_safe_block: u64,
         leading_direct_range: SafeInputRange,
     ) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = now_unix_ms();
-        let policy = query_batch_policy(&tx)?;
-        let next_frame_in_batch = head.frame_in_batch.saturating_add(1);
-        insert_open_frame(
-            &tx,
-            head.batch_index,
-            next_frame_in_batch,
-            now_ms,
-            policy.recommended_fee,
-            next_safe_block,
-        )?;
-        persist_frame_direct_sequence(
-            &tx,
-            head.batch_index,
-            next_frame_in_batch,
-            leading_direct_range,
-        )?;
-        tx.commit()?;
+        let policy = self.write(|tx| {
+            let now_ms = now_unix_ms();
+            let policy = query_batch_policy(tx)?;
+            let next_frame_in_batch = head.frame_in_batch.saturating_add(1);
+            insert_open_frame(
+                tx,
+                head.batch_index,
+                next_frame_in_batch,
+                now_ms,
+                policy.recommended_fee,
+                next_safe_block,
+            )?;
+            persist_frame_direct_sequence(
+                tx,
+                head.batch_index,
+                next_frame_in_batch,
+                leading_direct_range,
+            )?;
+            Ok(policy)
+        })?;
         head.advance_frame(policy, next_safe_block);
         Ok(())
     }
@@ -240,24 +227,23 @@ impl Storage {
         head: &mut WriteHead,
         next_safe_block: u64,
     ) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = now_unix_ms();
-        // Batch policy is sampled here: the derived fee is committed to the newly
-        // opened frame, and the batch size target is stored on the write head.
-        let policy = query_batch_policy(&tx)?;
-        seal_batch(&tx, head.batch_index, now_ms)?;
-        let next_batch_index = insert_new_batch(&tx, None, Some(head.batch_index), now_ms)?;
-        insert_open_frame(
-            &tx,
-            next_batch_index,
-            0,
-            now_ms,
-            policy.recommended_fee,
-            next_safe_block,
-        )?;
-        tx.commit()?;
+        let (next_batch_index, now_ms, policy) = self.write(|tx| {
+            let now_ms = now_unix_ms();
+            // Batch policy is sampled here: the derived fee is committed to the newly
+            // opened frame, and the batch size target is stored on the write head.
+            let policy = query_batch_policy(tx)?;
+            seal_batch(tx, head.batch_index, now_ms)?;
+            let next_batch_index = insert_new_batch(tx, None, Some(head.batch_index), now_ms)?;
+            insert_open_frame(
+                tx,
+                next_batch_index,
+                0,
+                now_ms,
+                policy.recommended_fee,
+                next_safe_block,
+            )?;
+            Ok((next_batch_index, now_ms, policy))
+        })?;
         head.move_to_next_batch(
             next_batch_index,
             from_unix_ms(now_ms),
@@ -320,13 +306,10 @@ mod tests {
     #[test]
     fn open_state_is_idempotent_and_rotation_is_atomic() {
         let db = temp_db("open-state");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         assert!(
-            storage
-                .load_open_state()
-                .expect("load open state")
-                .is_none(),
+            storage.open_state().expect("load open state").is_none(),
             "fresh storage should not have an open frame yet"
         );
 
@@ -334,7 +317,7 @@ mod tests {
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
         let head_b = storage
-            .load_open_state()
+            .open_state()
             .expect("load existing open state")
             .expect("open state should now exist");
 
@@ -364,7 +347,7 @@ mod tests {
     #[test]
     fn next_frame_fee_comes_from_batch_policy() {
         let db = temp_db("batch-policy-fee");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let policy = storage.batch_policy().expect("default policy");
         // Default: log_gas_price=0, log_recommended_fee = 0+20+419+621 = 1060
         assert_eq!(policy.recommended_fee, 1060);
@@ -398,7 +381,7 @@ mod tests {
         // frame know the fee they're paying, regardless of upstream policy
         // drift during their round-trip.
         let db = temp_db("frame-fee-immutable");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -455,10 +438,10 @@ mod tests {
     #[test]
     fn next_undrained_safe_input_index_is_derived_from_sequenced_directs() {
         let db = temp_db("safe-cursor");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         assert_eq!(
             storage
-                .load_next_undrained_safe_input_index()
+                .next_undrained_safe_input_index()
                 .expect("empty cursor"),
             0
         );
@@ -488,7 +471,7 @@ mod tests {
 
         assert_eq!(
             storage
-                .load_next_undrained_safe_input_index()
+                .next_undrained_safe_input_index()
                 .expect("derived cursor"),
             2
         );
@@ -497,7 +480,7 @@ mod tests {
     #[test]
     fn initialize_open_state_creates_first_real_batch_and_frame() {
         let db = temp_db("initialize-open-state");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         let head = storage
             .initialize_open_state(12, SafeInputRange::empty_at(0))
@@ -508,7 +491,7 @@ mod tests {
         assert_eq!(head.safe_block, 12);
 
         let loaded = storage
-            .load_open_state()
+            .open_state()
             .expect("load open state")
             .expect("open state should exist");
         assert_eq!(loaded.batch_index, 0);
@@ -519,7 +502,7 @@ mod tests {
     #[test]
     fn replay_returns_direct_inputs_in_drain_order() {
         let db = temp_db("replay-order");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -545,7 +528,7 @@ mod tests {
             .expect("close frame with directs");
 
         let replay = storage
-            .load_ordered_l2_txs_page_from(0, 100)
+            .ordered_l2_txs_page_from(0, 100)
             .expect("load replay");
         assert_eq!(replay.len(), 2);
         match &replay[0].1 {

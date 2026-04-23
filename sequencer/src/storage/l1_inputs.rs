@@ -8,14 +8,12 @@
 //! (current safe block, safe-input bounds, last safe-progress timestamp).
 
 use alloy_primitives::Address;
-use rusqlite::{OptionalExtension, Result, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Result, Transaction, params};
 
 use super::Storage;
 use super::StoredSafeInput;
-use super::internals::{
-    i64_to_u64, now_unix_ms, query_current_safe_block, query_latest_safe_input_index_exclusive,
-    u64_to_i64,
-};
+use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
+use super::queries::{query_current_safe_block, query_latest_safe_input_index_exclusive};
 use super::safe_accepted_batches::populate_safe_accepted_batches;
 use sequencer_core::protocol::ProtocolConfig;
 
@@ -35,24 +33,23 @@ impl Storage {
     /// it doesn't masquerade as a real L1 sync to the wall-clock danger
     /// estimator.
     pub fn ensure_minimum_safe_block(&mut self, minimum_safe_block: u64) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = query_current_safe_block(&tx)?;
-        if current < minimum_safe_block {
-            // `synced_at_ms` is intentionally NOT touched here: this is a bootstrap
-            // setup (genesis-block sync), not a real L1 read. Leaving it preserves
-            // the wall-clock danger estimate's "time since last real sync" semantics.
-            let changed = tx.execute(
-                "UPDATE l1_safe_head SET block_number = ?1 WHERE singleton_id = 0",
-                params![u64_to_i64(minimum_safe_block)],
-            )?;
-            if changed != 1 {
-                return Err(rusqlite::Error::StatementChangedRows(changed));
+        self.write(|tx| {
+            let current = query_current_safe_block(tx)?;
+            if current < minimum_safe_block {
+                // `synced_at_ms` is intentionally NOT touched here: this is a
+                // bootstrap setup (genesis-block sync), not a real L1 read.
+                // Leaving it preserves the wall-clock danger estimate's "time
+                // since last real sync" semantics.
+                let changed = tx.execute(
+                    "UPDATE l1_safe_head SET block_number = ?1 WHERE singleton_id = 0",
+                    params![u64_to_i64(minimum_safe_block)],
+                )?;
+                if changed != 1 {
+                    return Err(rusqlite::Error::StatementChangedRows(changed));
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Record the first real safe-head observation if no prior observation was
@@ -93,35 +90,30 @@ impl Storage {
         inputs: &[StoredSafeInput],
         protocol: &ProtocolConfig,
     ) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.write(|tx| {
+            let current = query_current_safe_block(tx)?;
+            assert!(
+                safe_block >= current,
+                "safe block regressed: current={current}, next={safe_block}"
+            );
+            assert!(
+                safe_block > current || inputs.is_empty(),
+                "safe block must advance when appending new safe inputs"
+            );
 
-        let current = query_current_safe_block(&tx)?;
-        assert!(
-            safe_block >= current,
-            "safe block regressed: current={current}, next={safe_block}"
-        );
-        assert!(
-            safe_block > current || inputs.is_empty(),
-            "safe block must advance when appending new safe inputs"
-        );
+            let next_index = query_latest_safe_input_index_exclusive(tx)?;
+            insert_safe_inputs_batch(tx, next_index, inputs)?;
 
-        let next_index = query_latest_safe_input_index_exclusive(&tx)?;
-        insert_safe_inputs_batch(&tx, next_index, inputs)?;
+            let changed = tx.execute(
+                "UPDATE l1_safe_head SET block_number = ?1, synced_at_ms = ?2 WHERE singleton_id = 0",
+                params![u64_to_i64(safe_block), now_unix_ms()],
+            )?;
+            if changed != 1 {
+                return Err(rusqlite::Error::StatementChangedRows(changed));
+            }
 
-        let changed = tx.execute(
-            "UPDATE l1_safe_head SET block_number = ?1, synced_at_ms = ?2 WHERE singleton_id = 0",
-            params![u64_to_i64(safe_block), now_unix_ms()],
-        )?;
-        if changed != 1 {
-            return Err(rusqlite::Error::StatementChangedRows(changed));
-        }
-
-        populate_safe_accepted_batches(&tx, protocol)?;
-
-        tx.commit()?;
-        Ok(())
+            populate_safe_accepted_batches(tx, protocol)
+        })
     }
 
     /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance.
@@ -137,7 +129,7 @@ impl Storage {
 
     /// Read cached L1 bootstrap data (input_box_address, genesis_block, chain_id).
     /// Returns `None` on first startup.
-    pub fn load_l1_bootstrap_cache(&self) -> Result<Option<(Address, u64, u64)>> {
+    pub fn l1_bootstrap_cache(&self) -> Result<Option<(Address, u64, u64)>> {
         let row: Option<(Vec<u8>, i64, i64)> = self
             .conn
             .query_row(
@@ -210,7 +202,7 @@ mod tests {
     #[test]
     fn safe_input_api_uses_half_open_intervals() {
         let db = temp_db("safe-input-api");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_protocol_config();
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 0);
@@ -252,7 +244,7 @@ mod tests {
     #[test]
     fn ensure_minimum_safe_block_only_moves_forward() {
         let db = temp_db("ensure-min-safe-block");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         storage
             .ensure_minimum_safe_block(7)
@@ -268,7 +260,7 @@ mod tests {
     #[test]
     fn ensure_minimum_safe_block_does_not_record_safe_progress() {
         let db = temp_db("ensure-min-safe-block-no-sync");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         storage
             .ensure_minimum_safe_block(7)

@@ -54,7 +54,7 @@ mod tests {
     #[test]
     fn high_gas_price_clamps_recommended_fee_to_max_exponent() {
         let db = temp_db("clamp-fee");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         // Set gas price high enough that log_recommended_fee > MAX_EXPONENT (17101).
         // Default: log_recommended_fee = gas_price + 20 + 419 + 621.
@@ -78,7 +78,7 @@ mod tests {
     #[should_panic(expected = "num + denom overflows u64")]
     fn set_alpha_rejects_overflow() {
         let db = temp_db("alpha-overflow");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage.set_alpha(u64::MAX, 1).unwrap();
     }
 
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn batch_policy_check_rejects_unsafe_alpha() {
         let db = temp_db("unsafe-alpha");
-        let storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
         // log_alpha=-350 → log_batch_size_target = 1403-(-350)-419 = 1334 >= log_max_batch_bytes=1333
         let err = storage.conn.execute(
             "UPDATE batch_policy SET log_alpha = ?1, log_one_plus_alpha = ?2 WHERE singleton_id = 0",

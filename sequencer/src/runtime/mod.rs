@@ -24,12 +24,12 @@ use crate::l1::submitter::{
 };
 use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit};
 use crate::storage::{self, StorageOpenError};
+use alloy_primitives::Address;
 use config::{L1Config, RunConfig};
 use sequencer_core::application::Application;
 use sequencer_core::protocol::ProtocolConfig;
 use shutdown::ShutdownSignal;
 
-const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 const QUEUE_CAPACITY: usize = 8192;
 const INPUT_READER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Danger detector cadence. Cheap DB-only check; re-running quickly bounds the
@@ -95,6 +95,8 @@ pub enum RunError {
         #[source]
         source: tokio::task::JoinError,
     },
+    #[error("danger detector stopped unexpectedly")]
+    DangerDetectorStoppedUnexpectedly,
     /// Deliberate shutdown triggered by the danger detector. Not an error in
     /// the usual sense — the orchestrator is expected to respawn, at which
     /// point `run_preemptive_recovery` handles it.
@@ -126,13 +128,8 @@ where
 
     let batch_submitter_private_key = config.resolve_private_key()?;
 
-    let batch_submitter_address = {
-        use alloy::signers::local::PrivateKeySigner;
-        use std::str::FromStr;
-        PrivateKeySigner::from_str(&batch_submitter_private_key)
-            .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?
-            .address()
-    };
+    let batch_submitter_address =
+        batch_submitter_address_from_private_key(batch_submitter_private_key.as_str())?;
 
     // One ProtocolConfig shared across the whole process: the input reader,
     // the danger detector, and startup recovery all mirror the same
@@ -189,7 +186,7 @@ where
             }
 
             // Cache for future startups when L1 might be unreachable.
-            if let Ok(mut s) = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA) {
+            if let Ok(mut s) = storage::Storage::open(&db_path) {
                 let _ = s.save_l1_bootstrap_cache(input_box, genesis, config.chain_id);
             }
 
@@ -208,9 +205,9 @@ where
                 error = %e,
                 "L1 unreachable during bootstrap — checking DB cache"
             );
-            let cache_storage = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            let cache_storage = storage::Storage::open(&db_path)?;
             let cached = cache_storage
-                .load_l1_bootstrap_cache()
+                .l1_bootstrap_cache()
                 .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
             let Some((input_box, genesis, cached_chain_id)) = cached else {
                 return Err(RunError::Io(std::io::Error::other(
@@ -266,7 +263,7 @@ where
         .await
         .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
 
-    let storage = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+    let storage = storage::Storage::open(&db_path)?;
     let (tx, mut inclusion_lane_handle) = InclusionLane::start(
         QUEUE_CAPACITY,
         shutdown.clone(),
@@ -363,6 +360,15 @@ where
         danger_detector_handle,
     )
     .await
+}
+
+fn batch_submitter_address_from_private_key(private_key: &str) -> Result<Address, RunError> {
+    use alloy::signers::local::PrivateKeySigner;
+    use std::str::FromStr;
+
+    Ok(PrivateKeySigner::from_str(private_key)
+        .map_err(|_| RunError::Io(std::io::Error::other("invalid private key")))?
+        .address())
 }
 
 fn begin_runtime_shutdown(shutdown: &ShutdownSignal) {
@@ -594,7 +600,7 @@ fn map_danger_detector_exit(
             // fired, which only happens after someone else triggered
             // runtime-wide shutdown. Treat this as a real exit only if nothing
             // else did first.
-            RunError::BatchSubmitterStoppedUnexpectedly
+            RunError::DangerDetectorStoppedUnexpectedly
         }
         Ok(Ok(DetectorExit::DangerZone { batch_index })) => {
             RunError::DangerZoneDetected { batch_index }
@@ -619,6 +625,8 @@ fn build_batch_submitter_provider(
 
 #[cfg(test)]
 mod tests {
+    use super::{RunError, batch_submitter_address_from_private_key, map_danger_detector_exit};
+    use crate::recovery::{DangerDetectorError, DetectorExit};
     use sequencer_core::MAX_WAIT_BLOCKS;
     use sequencer_core::protocol::ProtocolConfig;
 
@@ -665,5 +673,40 @@ mod tests {
             protocol_with_margin(75).danger_threshold(),
             MAX_WAIT_BLOCKS - 75
         );
+    }
+
+    #[test]
+    fn invalid_private_key_error_does_not_echo_key_material() {
+        let secret = "0xabc123SECRET";
+        let err = batch_submitter_address_from_private_key(secret)
+            .expect_err("invalid private key should be rejected");
+        let message = err.to_string();
+
+        assert_eq!(message, "invalid private key");
+        assert!(
+            !message.contains(secret),
+            "private key material must not be reflected in startup errors"
+        );
+    }
+
+    #[test]
+    fn danger_detector_shutdown_maps_to_detector_specific_unexpected_exit() {
+        let err = map_danger_detector_exit(Ok(Ok(DetectorExit::Shutdown)));
+        assert!(matches!(err, RunError::DangerDetectorStoppedUnexpectedly));
+    }
+
+    #[test]
+    fn danger_detector_danger_zone_maps_to_deliberate_runtime_exit() {
+        let err = map_danger_detector_exit(Ok(Ok(DetectorExit::DangerZone { batch_index: 7 })));
+        assert!(matches!(
+            err,
+            RunError::DangerZoneDetected { batch_index: 7 }
+        ));
+    }
+
+    #[test]
+    fn danger_detector_errors_preserve_source_category() {
+        let err = map_danger_detector_exit(Ok(Err(DangerDetectorError::Join("boom".into()))));
+        assert!(matches!(err, RunError::DangerDetector { .. }));
     }
 }

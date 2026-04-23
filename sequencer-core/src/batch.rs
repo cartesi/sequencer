@@ -72,37 +72,6 @@ impl WireUserOp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BatchForSubmission {
-    pub batch_index: u64,
-    pub created_at_ms: u64,
-    pub batch: Batch,
-}
-
-impl BatchForSubmission {
-    /// Encode the batch for the scheduler as a single SSZ payload.
-    ///
-    /// Payload is `ssz(Batch { nonce, frames })`. The scheduler decodes this
-    /// and uses `batch.nonce` for deduplication; classification at the rollup is by msg_sender.
-    ///
-    /// The `nonce` parameter is the contiguous L1 nonce (which may differ from `batch_index`
-    /// when invalid batches have been skipped).
-    pub fn encode_for_scheduler_with_nonce(&self, nonce: u64) -> Vec<u8> {
-        let batch = Batch {
-            nonce,
-            frames: self.batch.frames.clone(),
-        };
-        ssz::Encode::as_ssz_bytes(&batch)
-    }
-
-    /// Encode the batch for the scheduler using `batch_index` as the nonce.
-    ///
-    /// This is a convenience wrapper for the common case where batch_index == nonce.
-    pub fn encode_for_scheduler(&self) -> Vec<u8> {
-        self.encode_for_scheduler_with_nonce(self.batch_index)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,33 +207,5 @@ mod tests {
                 let _ = Batch::from_ssz_bytes(&vec![pattern; len]);
             }
         }
-    }
-
-    // ── encode_for_scheduler semantics ───────────────────────────────────
-
-    #[test]
-    fn encode_for_scheduler_uses_batch_index_as_wire_nonce() {
-        let batch = sample_batch(3, 1);
-        let submission = BatchForSubmission {
-            batch_index: 7,
-            created_at_ms: 0,
-            batch: batch.clone(),
-        };
-        let encoded = submission.encode_for_scheduler();
-        let decoded = Batch::from_ssz_bytes(&encoded).expect("decode");
-        assert_eq!(decoded.nonce, 7);
-        assert_eq!(decoded.frames, batch.frames);
-    }
-
-    #[test]
-    fn encode_for_scheduler_with_nonce_overrides_batch_index() {
-        let submission = BatchForSubmission {
-            batch_index: 7,
-            created_at_ms: 0,
-            batch: sample_batch(3, 1),
-        };
-        let encoded = submission.encode_for_scheduler_with_nonce(42);
-        let decoded = Batch::from_ssz_bytes(&encoded).expect("decode");
-        assert_eq!(decoded.nonce, 42);
     }
 }

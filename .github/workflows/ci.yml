@@ -27,6 +27,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             faketime \
+            libfaketime \
             lua5.4 \
             liblua5.4-dev \
             libslirp-dev
@@ -108,7 +109,7 @@ jobs:
       - name: Install faketime
         run: |
           sudo apt-get update
-          sudo apt-get install -y faketime
+          sudo apt-get install -y faketime libfaketime
 
       - name: Run rollups E2E tests
         run: just test-rollups-e2e

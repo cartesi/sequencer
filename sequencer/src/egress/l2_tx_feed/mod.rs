@@ -182,7 +182,7 @@ fn run_subscription(
         }
 
         let txs = storage
-            .load_ordered_l2_txs_page_from(next_offset, page_size)
+            .ordered_l2_txs_page_from(next_offset, page_size)
             .map_err(|source| SubscriptionError::LoadReplay {
                 offset: next_offset,
                 source,

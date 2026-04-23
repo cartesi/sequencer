@@ -133,8 +133,6 @@ mod tests {
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use std::time::Duration;
 
-    const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
-
     fn test_protocol() -> ProtocolConfig {
         ProtocolConfig {
             batch_submitter: SENDER_A,
@@ -158,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn exits_on_shutdown_when_safe() {
         let db = temp_db("detector-shutdown");
-        let mut storage = Storage::open(&db.path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let mut storage = Storage::open(&db.path).expect("open storage");
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -188,7 +186,7 @@ mod tests {
         // Closed frontier batch is aged past `danger_threshold` against the
         // observed safe block — the strict arm of `check_danger` trips.
         let db = temp_db("detector-strict-danger");
-        let mut storage = Storage::open(&db.path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let mut storage = Storage::open(&db.path).expect("open storage");
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -246,7 +244,7 @@ mod tests {
         // DangerZone), but the Stalled path goes through `wall_clock_adjusted_threshold`
         // — a completely separate code path that deserves its own test.
         let db = temp_db("detector-stalled-danger");
-        let mut storage = Storage::open(&db.path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let mut storage = Storage::open(&db.path).expect("open storage");
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -278,8 +276,8 @@ mod tests {
         // batch 1's age = 1100 trips `>=`. Stalled fires.
         let now_ms = crate::runtime::clock::unix_now_ms();
         drop(storage);
-        let rewind_conn = Storage::open_connection(&db.path, SQLITE_SYNCHRONOUS_PRAGMA)
-            .expect("open raw connection to rewind synced_at_ms");
+        let rewind_conn =
+            Storage::open_connection(&db.path).expect("open raw connection to rewind synced_at_ms");
         rewind_conn
             .execute(
                 "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",

@@ -3,27 +3,36 @@
 
 //! SQLite-backed storage for the sequencer.
 //!
-//! [`Storage`] is the single entry point. Methods are clustered by writer role
-//! across sibling files:
+//! [`Storage`] is the single entry point. Methods are clustered by caller role
+//! across sibling files — mostly "one file per writer", plus one read-only
+//! batch-aggregate file that two roles share:
 //!
 //! - `ingress` — inclusion lane: user-op append, frame/batch close
 //! - `egress` — WS feed and catch-up replay (read-only)
 //! - `l1_inputs` — input reader: safe-input ingestion, L1 head, bootstrap cache
-//! - `l1_submission` — batch submitter: nonces, frontier, pending batches
-//! - `recovery` — cascade invalidation, recovery-batch open
+//! - `l1_submission` — batch-aggregate reads (submitter frontier, pending
+//!   batches, per-batch replay) shared between the submitter and egress
+//! - `recovery` — cascade invalidation, recovery-batch open, danger checks
 //! - `admin` — operator policy tunables (gas price, alpha)
 //!
-//! Cross-writer helpers live in `internals`. The schema and `valid_*` views
-//! live in `migrations/0001_schema.sql`. See `docs/recovery/README.md` for the
-//! recovery design and TLA+ specs.
+//! Cross-writer helpers are split by concern:
+//!
+//! - `convert` — int width + time conversions
+//! - `queries` — shared read helpers (`query_*`, `load_current_write_head`)
+//! - `mutations` — shared write helpers (`insert_new_batch`, `seal_batch`, …)
+//!
+//! The schema and `valid_*` views live in `migrations/0001_schema.sql`. See
+//! `docs/recovery/README.md` for the recovery design and TLA+ specs.
 
 mod admin;
+mod convert;
 mod egress;
 mod ingress;
-mod internals;
 mod l1_inputs;
 mod l1_submission;
+mod mutations;
 mod open;
+mod queries;
 mod recovery;
 mod safe_accepted_batches;
 

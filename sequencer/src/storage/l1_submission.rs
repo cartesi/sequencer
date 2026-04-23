@@ -1,23 +1,25 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Batch submitter writer: assigns nonces, populates the scheduler-accepted
-//! frontier, and exposes the read-only queries that drive each tick (frontier
-//! lookup, pending-batch loading).
+//! Batch-aggregate reads: frontier lookup, per-batch frames + user ops, the
+//! catch-up / per-batch replay reader, and the SSZ-encoded pending-batch list
+//! the submitter pulls each tick.
 //!
-//! Recovery shares all of these — `Storage::detect_and_recover` calls the
-//! same helpers under one transaction. The split is by *frequency*: this file
-//! is what runs every tick; recovery is the once-per-startup composer.
+//! Despite the historical name, nothing in this file does writes — structural
+//! nonces are assigned by the `batches.nonce` trigger at close time (see
+//! `ingress`), and `safe_accepted_batches` is maintained by `append_safe_inputs`
+//! (see `l1_inputs`). The reads here are shared between the batch submitter
+//! (hot-path tick) and the egress replay path (catch-up reader); they live
+//! together because they all aggregate at the batch level.
 
-use rusqlite::{OptionalExtension, Result, TransactionBehavior, params};
+use rusqlite::{Result, params};
 
 use super::Storage;
-use super::internals::{
-    decode_l2_tx_row, i64_to_u16, i64_to_u32, i64_to_u64, query_current_safe_block, u64_to_i64,
-};
+use super::convert::{i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
+use super::queries::{decode_l2_tx_row, query_current_safe_block};
 use super::safe_accepted_batches::query_latest_safe_accepted_batch;
 use super::{FrameHeader, PendingBatch, SubmitterFrontier};
-use sequencer_core::batch::{Batch, BatchForSubmission, Frame as BatchFrame, WireUserOp};
+use sequencer_core::batch::{Batch, Frame as BatchFrame, WireUserOp};
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
@@ -28,17 +30,13 @@ impl Storage {
     /// The scheduler-accepted frontier is maintained by
     /// [`Storage::append_safe_inputs`], so this is a pure read.
     pub fn submitter_frontier(&mut self) -> Result<SubmitterFrontier> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let safe_block = query_current_safe_block(&tx)?;
-        let accepted_next_nonce = query_latest_safe_accepted_batch(&tx)?
-            .map(|row| i64_to_u64(row.nonce).saturating_add(1))
-            .unwrap_or(0);
-        tx.commit()?;
-        Ok(SubmitterFrontier {
-            safe_block,
-            accepted_next_nonce,
+        self.read(|tx| {
+            Ok(SubmitterFrontier {
+                safe_block: query_current_safe_block(tx)?,
+                accepted_next_nonce: query_latest_safe_accepted_batch(tx)?
+                    .map(|row| i64_to_u64(row.nonce).saturating_add(1))
+                    .unwrap_or(0),
+            })
         })
     }
 
@@ -56,7 +54,7 @@ impl Storage {
     /// Frame headers for `batch_index` in `frame_in_batch` order. Reads the
     /// raw `frames` table — does NOT filter on validity, since callers only
     /// reach this method after they already know the batch is valid.
-    pub fn load_frames_for_batch(&mut self, batch_index: u64) -> Result<Vec<FrameHeader>> {
+    pub fn frames_for_batch(&mut self, batch_index: u64) -> Result<Vec<FrameHeader>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT frame_in_batch, fee, safe_block FROM frames \
              WHERE batch_index = ?1 ORDER BY frame_in_batch ASC",
@@ -73,10 +71,7 @@ impl Storage {
 
     /// Materialize all sequenced L2 txs in one batch (used by the catch-up /
     /// per-batch replay paths). Returns `[]` for invalidated batches.
-    pub fn load_ordered_l2_txs_for_batch(
-        &mut self,
-        batch_index: u64,
-    ) -> Result<Vec<SequencedL2Tx>> {
+    pub fn ordered_l2_txs_for_batch(&mut self, batch_index: u64) -> Result<Vec<SequencedL2Tx>> {
         const SQL: &str = "
             SELECT
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END AS kind,
@@ -116,19 +111,46 @@ impl Storage {
         rows.collect::<Result<Vec<_>>>()
     }
 
-    /// Assemble a batch (header + frames + user ops) for SSZ encoding and L1
-    /// submission. The returned [`BatchForSubmission`] carries a placeholder
-    /// nonce of 0; callers stamp the real nonce via `encode_for_scheduler_with_nonce`.
-    pub fn load_batch_for_submission(&mut self, batch_index: u64) -> Result<BatchForSubmission> {
-        let created_at_ms: i64 = self.conn.query_row(
-            "SELECT created_at_ms FROM batches WHERE batch_index = ?1 LIMIT 1",
-            [u64_to_i64(batch_index)],
-            |row| row.get(0),
-        )?;
+    /// Load all valid closed batches with nonce >= `min_nonce`, in nonce order,
+    /// each one fully assembled and SSZ-encoded with its authoritative nonce.
+    ///
+    /// Authoritative because the nonce stamped into the wire payload is the
+    /// one the DB persists on the batch row (via the `parent.nonce + 1`
+    /// structural invariant). The caller never sees an unstamped batch —
+    /// there is no way to accidentally encode with the wrong nonce.
+    pub fn pending_batches(&mut self, min_nonce: u64) -> Result<Vec<PendingBatch>> {
+        const SQL: &str = "SELECT batch_index, nonce FROM valid_closed_batches \
+                           WHERE nonce >= ?1 ORDER BY nonce ASC";
+        let pending_refs: Vec<(u64, u64)> = {
+            let mut stmt = self.conn.prepare_cached(SQL)?;
+            let rows = stmt.query_map(params![u64_to_i64(min_nonce)], |row| {
+                let bi: i64 = row.get(0)?;
+                let nonce: i64 = row.get(1)?;
+                Ok((i64_to_u64(bi), i64_to_u64(nonce)))
+            })?;
+            rows.collect::<Result<Vec<_>>>()?
+        };
 
-        let frame_headers = self.load_frames_for_batch(batch_index)?;
+        let mut batches = Vec::with_capacity(pending_refs.len());
+        for (batch_index, nonce) in pending_refs {
+            let frames = self.load_batch_frames(batch_index)?;
+            let batch = Batch { nonce, frames };
+            let encoded = ssz::Encode::as_ssz_bytes(&batch);
+            batches.push(PendingBatch {
+                batch_index,
+                nonce,
+                encoded,
+            });
+        }
+        Ok(batches)
+    }
+
+    /// Load every frame (header + user ops) of `batch_index` in frame order.
+    /// Internal helper for [`Self::pending_batches`]; does NOT filter on
+    /// validity — callers only reach this after they know the batch is valid.
+    fn load_batch_frames(&mut self, batch_index: u64) -> Result<Vec<BatchFrame>> {
+        let frame_headers = self.frames_for_batch(batch_index)?;
         let mut frames = Vec::with_capacity(frame_headers.len());
-
         for header in frame_headers {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT nonce, max_fee, data, sig FROM user_ops \
@@ -147,75 +169,13 @@ impl Storage {
                 },
             )?;
             let user_ops: Vec<WireUserOp> = rows.collect::<Result<_>>()?;
-
             frames.push(BatchFrame {
                 user_ops,
                 safe_block: header.safe_block,
                 fee_price: header.fee,
             });
         }
-
-        // Nonce is a placeholder — callers use encode_for_scheduler_with_nonce() to set the real one.
-        let batch = Batch { nonce: 0, frames };
-        let created_at_ms_u64 = created_at_ms.max(0) as u64;
-
-        Ok(BatchForSubmission {
-            batch_index,
-            created_at_ms: created_at_ms_u64,
-            batch,
-        })
-    }
-
-    /// Load the next valid closed batch that needs to be submitted.
-    pub fn load_next_batch_to_submit(&mut self, min_nonce: u64) -> Result<Option<PendingBatch>> {
-        const SQL: &str = "SELECT batch_index, nonce FROM valid_closed_batches \
-                           WHERE nonce >= ?1 ORDER BY nonce ASC LIMIT 1";
-        let batch_ref: Option<(i64, i64)> = self
-            .conn
-            .query_row(SQL, params![u64_to_i64(min_nonce)], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()?;
-        let Some((batch_index, nonce)) = batch_ref else {
-            return Ok(None);
-        };
-
-        let batch_index = i64_to_u64(batch_index);
-        let nonce = i64_to_u64(nonce);
-        let batch = self.load_batch_for_submission(batch_index)?;
-        let encoded = batch.encode_for_scheduler_with_nonce(nonce);
-        Ok(Some(PendingBatch {
-            batch_index,
-            nonce,
-            encoded,
-        }))
-    }
-
-    /// Load all valid closed batches with nonce >= `min_nonce`, in nonce order.
-    pub fn load_pending_batches(&mut self, min_nonce: u64) -> Result<Vec<PendingBatch>> {
-        const SQL: &str = "SELECT batch_index, nonce FROM valid_closed_batches \
-                           WHERE nonce >= ?1 ORDER BY nonce ASC";
-        let pending_refs: Vec<(u64, u64)> = {
-            let mut stmt = self.conn.prepare_cached(SQL)?;
-            let rows = stmt.query_map(params![u64_to_i64(min_nonce)], |row| {
-                let bi: i64 = row.get(0)?;
-                let nonce: i64 = row.get(1)?;
-                Ok((i64_to_u64(bi), i64_to_u64(nonce)))
-            })?;
-            rows.collect::<Result<Vec<_>>>()?
-        };
-
-        let mut batches = Vec::with_capacity(pending_refs.len());
-        for (batch_index, nonce) in pending_refs {
-            let batch = self.load_batch_for_submission(batch_index)?;
-            let encoded = batch.encode_for_scheduler_with_nonce(nonce);
-            batches.push(PendingBatch {
-                batch_index,
-                nonce,
-                encoded,
-            });
-        }
-        Ok(batches)
+        Ok(frames)
     }
 }
 
@@ -231,33 +191,48 @@ mod tests {
     use sequencer_core::protocol::ProtocolConfig;
 
     #[test]
-    fn batch_for_submission_builds_from_storage() {
-        let db = temp_db("batch-for-submission");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    fn pending_batches_stamps_authoritative_nonce_into_wire_bytes() {
+        // The landmine we removed: an earlier `batch_for_submission` returned a
+        // `Batch { nonce: 0, … }` placeholder, and callers had to remember to
+        // stamp the real nonce via `encode_for_scheduler_with_nonce`. The new
+        // `pending_batches` reads the DB-authoritative nonce from
+        // `valid_closed_batches` and bakes it straight into the SSZ bytes — so
+        // decoding the payload must round-trip back to that nonce, and the
+        // frame body must match what storage persisted.
+        let db = temp_db("pending-batches-nonce-baked-in");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
-        let head = storage
+        let mut head = storage
             .initialize_open_state(12, SafeInputRange::empty_at(0))
             .expect("initialize open state");
-        assert_eq!(head.batch_index, 0);
+        // Close batch 0 so it becomes eligible for submission.
+        storage
+            .close_frame_and_batch(&mut head, 12)
+            .expect("close batch 0");
 
-        let batch = storage
-            .load_batch_for_submission(0)
-            .expect("load batch for submission");
+        let pending = storage.pending_batches(0).expect("load pending batches");
+        assert_eq!(pending.len(), 1);
+        let entry = &pending[0];
+        assert_eq!(entry.batch_index, 0);
+        assert_eq!(entry.nonce, 0, "genesis batch has nonce 0");
 
-        assert_eq!(batch.batch_index, 0);
-        assert_eq!(batch.batch.frames.len(), 1);
-        let frame = &batch.batch.frames[0];
+        // The wire bytes must decode back to the authoritative nonce AND the
+        // frame body storage persisted.
+        let decoded: Batch =
+            ssz::Decode::from_ssz_bytes(&entry.encoded).expect("decode pending wire bytes");
+        assert_eq!(decoded.nonce, entry.nonce);
+        assert_eq!(decoded.frames.len(), 1);
+        let frame = &decoded.frames[0];
         assert!(frame.user_ops.is_empty());
         assert_eq!(frame.safe_block, 12);
-        // Default log_recommended_fee = 0+20+419+621 = 1060
+        // Default log_recommended_fee = 0+20+419+621 = 1060.
         assert_eq!(frame.fee_price, 1060);
-        assert!(batch.created_at_ms > 0);
     }
 
     #[test]
     fn batch_level_helpers_expose_latest_index_frames_and_txs() {
         let db = temp_db("batch-level-helpers");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         // Before initialization there should be no batches.
         assert!(
@@ -287,13 +262,13 @@ mod tests {
 
         // Batch 0 should still have at least one frame header.
         let frames = storage
-            .load_frames_for_batch(0)
+            .frames_for_batch(0)
             .expect("load frames for batch 0");
         assert!(!frames.is_empty());
 
         // Ordered L2 txs for batch 0 should be queryable (even if empty).
         let txs = storage
-            .load_ordered_l2_txs_for_batch(0)
+            .ordered_l2_txs_for_batch(0)
             .expect("load l2 txs for batch 0");
         assert!(
             txs.is_empty(),
@@ -309,7 +284,7 @@ mod tests {
         // contract: open batches are NOT pulled into the submission pipeline,
         // and closed batches ARE, at the schema-guaranteed nonce.
         let db = temp_db("closed-batch-eligible");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -317,7 +292,7 @@ mod tests {
 
         // Before close: the open batch must not appear in pending-batches.
         let pending_before = storage
-            .load_pending_batches(0)
+            .pending_batches(0)
             .expect("load pending batches (pre-close)");
         assert!(
             pending_before.is_empty(),
@@ -333,7 +308,7 @@ mod tests {
         // After close: batch 0 is eligible with nonce 0 (genesis, parent
         // NULL → trigger assigns nonce 0).
         let pending_after = storage
-            .load_pending_batches(0)
+            .pending_batches(0)
             .expect("load pending batches (post-close)");
         assert_eq!(
             pending_after.len(),
@@ -356,7 +331,7 @@ mod tests {
     #[test]
     fn submitter_frontier_returns_zero_when_no_batches_were_accepted() {
         let db = temp_db("submitter-frontier-empty");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let frontier = storage.submitter_frontier().expect("submitter frontier");
         assert_eq!(frontier.safe_block, 0);
         assert_eq!(frontier.accepted_next_nonce, 0);
@@ -365,7 +340,7 @@ mod tests {
     #[test]
     fn submitter_frontier_tracks_accepted_prefix() {
         let db = temp_db("submitter-frontier-prefix");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         // seed_safe_inputs_with_batch_nonces already calls append_safe_inputs,
         // which auto-populates safe_accepted_batches.
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4, 5]);
@@ -394,7 +369,7 @@ mod tests {
     #[test]
     fn check_danger_reports_strict_on_closed_frontier() {
         let db = temp_db("check-danger-strict");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -438,7 +413,7 @@ mod tests {
         // safe head hasn't advanced in ~25 blocks — effective threshold drops to
         // 1100, batch 1's age jumps past it via the wall-clock correction.
         let db = temp_db("check-danger-stalled");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -491,7 +466,7 @@ mod tests {
         // Safe — never-synced is benign at this layer; callers that need
         // "refuse on never-synced" (startup L1-unreachable) check explicitly.
         let db = temp_db("check-danger-never-synced");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let status = storage
             .check_danger(&default_test_protocol(), unix_now_ms())
             .expect("check_danger");
@@ -501,7 +476,7 @@ mod tests {
     #[test]
     fn populate_safe_accepted_batches_resumes_from_latest_row() {
         let db = temp_db("safe-accepted-frontier-resume");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = protocol_config_for(SENDER_A);
 
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1]);
@@ -554,7 +529,7 @@ mod tests {
     #[test]
     fn safe_accepted_frontier_skips_stale_payloads() {
         let db = temp_db("safe-accepted-frontier-skip-stale");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_test_protocol();
 
         // Seed a non-stale batch with nonce 0 (safe_block=100, block_number=200, max_wait=1200 → not stale)
@@ -618,7 +593,7 @@ mod tests {
         // choice: populate_safe_accepted_batches accepts such batches because
         // the sequencer would never produce them.
         let db = temp_db("frontier-future-safe-block");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         let future_safe_block_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
             nonce: 0,
@@ -675,30 +650,34 @@ mod tests {
     }
 
     #[test]
-    fn load_next_batch_to_submit_returns_nonce_ordered_valid_suffix() {
-        let db = temp_db("load-next-batch-to-submit");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    fn pending_batches_skips_invalidated_and_respects_min_nonce() {
+        let db = temp_db("load-pending-batches-filter");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         seed_closed_batches(&mut storage, 3);
         storage.insert_invalid_batch(1).expect("invalidate batch 1");
 
-        let first = storage
-            .load_next_batch_to_submit(0)
-            .expect("load first pending batch")
-            .expect("batch 0 should be pending");
-        assert_eq!(first.batch_index, 0);
-        assert_eq!(first.nonce, 0);
+        // From nonce 0: batches 0 and 2 remain valid.
+        let from_zero = storage
+            .pending_batches(0)
+            .expect("load pending batches from 0");
+        let nonces: Vec<u64> = from_zero.iter().map(|b| b.nonce).collect();
+        assert_eq!(nonces, vec![0, 2], "batch 1 must be filtered out");
 
-        let second = storage
-            .load_next_batch_to_submit(1)
-            .expect("load next pending batch")
-            .expect("batch 2 should be pending");
-        assert_eq!(second.batch_index, 2);
-        assert_eq!(second.nonce, 2);
+        // From nonce 1: only batch 2 remains (batch 0 is below min_nonce).
+        let from_one = storage
+            .pending_batches(1)
+            .expect("load pending batches from 1");
+        let nonces: Vec<u64> = from_one.iter().map(|b| b.nonce).collect();
+        assert_eq!(nonces, vec![2]);
 
-        let none = storage
-            .load_next_batch_to_submit(3)
-            .expect("load after suffix");
-        assert!(none.is_none(), "no batch should remain at nonce >= 3");
+        // Past the suffix: empty.
+        let from_three = storage
+            .pending_batches(3)
+            .expect("load pending batches from 3");
+        assert!(
+            from_three.is_empty(),
+            "no batch should remain at nonce >= 3"
+        );
     }
 
     #[test]
@@ -709,7 +688,7 @@ mod tests {
         // original genesis. The scheduler's "expected next nonce" also
         // resets to 0, since no accepted batches were ever submitted.
         let db = temp_db("nonce-reuse-after-torn-cascade");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -725,7 +704,7 @@ mod tests {
             .expect("open recovery batch after torn invalidation");
 
         let head = storage
-            .load_open_state()
+            .open_state()
             .expect("load open state")
             .expect("recovery batch");
         assert_eq!(head.batch_index, 2);
@@ -745,7 +724,7 @@ mod tests {
     #[test]
     fn populate_safe_accepted_batches_skips_duplicate_nonces() {
         let db = temp_db("populate-dup-nonces");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_test_protocol();
 
         let mut head = storage
@@ -782,7 +761,7 @@ mod tests {
     #[test]
     fn populate_safe_accepted_batches_handles_large_nonce_gap() {
         let db = temp_db("populate-nonce-gap");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_test_protocol();
 
         let mut head = storage
@@ -809,7 +788,7 @@ mod tests {
     #[test]
     fn populate_safe_accepted_batches_out_of_order_arrivals_stalls_frontier() {
         let db = temp_db("populate-out-of-order");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_test_protocol();
 
         let mut head = storage

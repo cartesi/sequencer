@@ -66,6 +66,35 @@ impl Application for TestApp {
     }
 }
 
+struct InternalUserOpApp;
+
+impl Application for InternalUserOpApp {
+    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+
+    fn current_user_nonce(&self, _sender: Address) -> u32 {
+        0
+    }
+
+    fn current_user_balance(&self, _sender: Address) -> U256 {
+        U256::MAX
+    }
+
+    fn validate_user_op(
+        &self,
+        _sender: Address,
+        _user_op: &UserOp,
+        _current_fee: u16,
+    ) -> Result<(), InvalidReason> {
+        Ok(())
+    }
+
+    fn execute_valid_user_op(&mut self, _user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
+        Err(AppError::Internal {
+            reason: "app invariant failed".to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplayEvent {
     UserOp {
@@ -198,16 +227,13 @@ async fn start_lane(
     ShutdownSignal,
     tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
 ) {
-    let storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let storage = Storage::open(db_path).expect("open storage");
     let shutdown = ShutdownSignal::default();
     let (tx, handle) =
         InclusionLane::start(128, shutdown.clone(), TestApp::default(), storage, config);
     let initialized = wait_until(Duration::from_secs(2), || {
-        let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
-        storage
-            .load_open_state()
-            .expect("load open state")
-            .is_some()
+        let mut storage = Storage::open(db_path).expect("open storage");
+        storage.open_state().expect("load open state").is_some()
     })
     .await;
     assert!(initialized, "lane should initialize its first open state");
@@ -244,7 +270,7 @@ fn make_pending_user_op(
 }
 
 fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
-    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -335,14 +361,14 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
 }
 
 fn read_count(db_path: &str, table: &str) -> i64 {
-    let conn = Storage::open_connection(db_path, "NORMAL").expect("open sqlite reader");
+    let conn = Storage::open_connection(db_path).expect("open sqlite reader");
     let sql = format!("SELECT COUNT(*) FROM {table}");
     conn.query_row(sql.as_str(), [], |row| row.get(0))
         .expect("count rows")
 }
 
 fn read_frame_direct_count(db_path: &str, batch_index: i64, frame_in_batch: i64) -> i64 {
-    let conn = Storage::open_connection(db_path, "NORMAL").expect("open sqlite reader");
+    let conn = Storage::open_connection(db_path).expect("open sqlite reader");
     conn.query_row(
         "SELECT COUNT(*) FROM sequenced_l2_txs
          WHERE batch_index = ?1
@@ -404,8 +430,7 @@ async fn ack_happens_after_chunk_commit_without_closing_frame() {
 async fn direct_inputs_close_frame_and_persist_drain() {
     let db = temp_db("directs-close-frame");
     let (_tx, shutdown, lane_handle) = start_lane(db.path.as_str(), default_test_config()).await;
-    let mut feeder_storage =
-        Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
+    let mut feeder_storage = Storage::open(db.path.as_str()).expect("open feeder storage");
 
     feeder_storage
         .append_safe_inputs(
@@ -435,9 +460,9 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     let db = temp_db("sequenced-safe-inputs-skip");
     let batch_submitter_address = Address::from([0xfe; 20]);
     let executed_direct_inputs = Arc::new(AtomicU64::new(0));
-    let storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    let storage = Storage::open(db.path.as_str()).expect("open storage");
     let shutdown = ShutdownSignal::default();
-    let (tx, lane_handle) = InclusionLane::start(
+    let (_tx, lane_handle) = InclusionLane::start(
         128,
         shutdown.clone(),
         SharedCountingApp {
@@ -450,17 +475,13 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
         },
     );
     let initialized = wait_until(Duration::from_secs(2), || {
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        storage
-            .load_open_state()
-            .expect("load open state")
-            .is_some()
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage.open_state().expect("load open state").is_some()
     })
     .await;
     assert!(initialized, "lane should initialize open state");
 
-    let mut feeder_storage =
-        Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
+    let mut feeder_storage = Storage::open(db.path.as_str()).expect("open feeder storage");
     feeder_storage
         .append_safe_inputs(
             10,
@@ -477,7 +498,6 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
         read_frame_direct_count(db.path.as_str(), 0, 1) == 1
     })
     .await;
-    drop(tx);
     shutdown_lane(&shutdown, lane_handle).await;
 
     assert!(
@@ -497,8 +517,7 @@ async fn direct_inputs_are_paginated_by_buffer_capacity() {
     let mut config = default_test_config();
     config.safe_input_buffer_capacity = 2;
     let (_tx, shutdown, lane_handle) = start_lane(db.path.as_str(), config).await;
-    let mut feeder_storage =
-        Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
+    let mut feeder_storage = Storage::open(db.path.as_str()).expect("open feeder storage");
 
     let mut directs = Vec::new();
     for index in 0..5_u64 {
@@ -527,8 +546,7 @@ async fn direct_inputs_are_paginated_by_buffer_capacity() {
 async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
     let db = temp_db("directs-before-later-userops");
     let (tx, shutdown, lane_handle) = start_lane(db.path.as_str(), default_test_config()).await;
-    let mut feeder_storage =
-        Storage::open(db.path.as_str(), "NORMAL").expect("open feeder storage");
+    let mut feeder_storage = Storage::open(db.path.as_str()).expect("open feeder storage");
 
     feeder_storage
         .append_safe_inputs(
@@ -559,9 +577,9 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
         .expect("ack channel open");
 
     let replay: Vec<SequencedL2Tx> = {
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage
-            .load_ordered_l2_txs_page_from(0, 1_000_000)
+            .ordered_l2_txs_page_from(0, 1_000_000)
             .expect("load ordered replay")
             .into_iter()
             .map(|(_offset, tx)| tx)
@@ -633,7 +651,7 @@ async fn batch_closes_when_max_user_op_bytes_is_reached() {
     // Set alpha high enough that batch_size_target ≤ one user op (126 bytes).
     // 55000*1000/(17000*26) = 124 bytes < 126.
     {
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage.set_alpha(17000, 1000).expect("set alpha");
     }
     let config = default_test_config();
@@ -702,10 +720,37 @@ fn dequeue_flushes_executed_ops_before_observing_disconnect() {
 }
 
 #[test]
+fn dequeue_returns_lane_error_when_app_reports_internal() {
+    let (tx, mut rx) = mpsc::channel::<PendingUserOp>(1);
+    let (pending, recv) = make_pending_user_op(0x45);
+    tx.blocking_send(pending).expect("enqueue pending user op");
+
+    let mut app = InternalUserOpApp;
+    let mut included = Vec::new();
+    let head = unbounded_head();
+    let err = dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, 16, &head, &mut included)
+        .expect_err("internal application error should stop the lane");
+
+    assert!(matches!(err, InclusionLaneError::ExecuteUserOp { .. }));
+    assert!(
+        included.is_empty(),
+        "internal errors must not leave an op ready to persist"
+    );
+    let response = recv
+        .blocking_recv()
+        .expect("lane should respond to triggering op")
+        .expect_err("triggering op should receive internal error");
+    assert!(matches!(
+        response,
+        super::SequencerError::Internal(message) if message == "app invariant failed"
+    ));
+}
+
+#[test]
 fn catch_up_replays_multiple_pages() {
     let db = temp_db("catch-up-multi-page");
     let expected = seed_replay_fixture(db.path.as_str());
-    let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::default();
 
     catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
@@ -719,7 +764,7 @@ fn catch_up_replays_multiple_pages() {
 fn catch_up_replays_from_storage_even_when_app_reports_executed_inputs() {
     let db = temp_db("catch-up-offset");
     let expected = seed_replay_fixture(db.path.as_str());
-    let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::with_executed_input_count(3);
 
     catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
@@ -733,7 +778,7 @@ fn catch_up_replays_from_storage_even_when_app_reports_executed_inputs() {
 fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
     let db = temp_db("catch-up-mixed-page-boundary");
     let expected = seed_replay_fixture(db.path.as_str());
-    let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::default();
 
     catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 4)
@@ -745,8 +790,7 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
 #[test]
 fn catch_up_load_error_reports_offset() {
     let db = temp_db("catch-up-load-error");
-    let mut storage =
-        Storage::open_without_migrations(db.path.as_str(), "NORMAL").expect("open raw storage");
+    let mut storage = Storage::open_without_migrations(db.path.as_str()).expect("open raw storage");
     let mut app = ReplayRecordingApp::default();
 
     let err = catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)

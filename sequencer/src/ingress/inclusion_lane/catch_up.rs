@@ -41,7 +41,7 @@ pub(super) fn catch_up_application_paged(
 
     loop {
         let replay = storage
-            .load_ordered_l2_txs_page_from(next_offset, page_size)
+            .ordered_l2_txs_page_from(next_offset, page_size)
             .map_err(|source| CatchUpError::LoadReplay {
                 offset: next_offset,
                 source,

@@ -11,14 +11,15 @@ use alloy_primitives::Address;
 use rusqlite::{Result, params};
 
 use super::Storage;
-use super::internals::{decode_l2_tx_row, i64_to_u64, u64_to_i64, usize_to_i64};
+use super::convert::{i64_to_u64, u64_to_i64, usize_to_i64};
+use super::queries::decode_l2_tx_row;
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
     /// Load a page of ordered L2 transactions starting after the given offset.
     /// Returns `(db_offset, tx)` pairs. Callers should track `db_offset` of the
     /// last item as their cursor, not increment a counter.
-    pub fn load_ordered_l2_txs_page_from(
+    pub fn ordered_l2_txs_page_from(
         &mut self,
         offset: u64,
         limit: usize,

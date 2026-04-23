@@ -6,12 +6,18 @@
 //! Method clusters live in sibling files (`ingress`, `egress`, `l1_inputs`,
 //! `l1_submission`, `recovery`, `admin`) — each adds its own `impl Storage`.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, Result, Transaction, TransactionBehavior};
 use rusqlite_migration::{M, Migrations};
 
 use super::StorageOpenError;
 
 const MIGRATION_0001_SCHEMA: &str = include_str!("migrations/0001_schema.sql");
+
+/// SQLite `synchronous` pragma used by every production writer connection.
+/// `NORMAL` is appropriate under WAL — fsyncs at checkpoint boundaries, not
+/// per-transaction. Tests use the same value; if a future test needs
+/// `FULL`/`OFF`, add a `#[cfg(test)]` override.
+const SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 
 /// Sequencer storage backed by a single SQLite database.
 ///
@@ -23,56 +29,95 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn open(path: &str, synchronous: &str) -> Result<Self, StorageOpenError> {
-        let conn = Self::open_connection_with_migrations(path, synchronous)?;
-        Ok(Self { conn })
-    }
-
-    /// Open without running migrations. Used by tests that need to inspect or
-    /// pre-seed the schema before letting the migration runner touch it.
-    pub fn open_without_migrations(
-        path: &str,
-        synchronous: &str,
-    ) -> Result<Self, StorageOpenError> {
-        let conn = Self::open_connection(path, synchronous)?;
+    /// Production open: runs migrations, uses the canonical synchronous pragma.
+    pub fn open(path: &str) -> Result<Self, StorageOpenError> {
+        let mut conn = open_writer_connection(path)?;
+        run_migrations(&mut conn)?;
         Ok(Self { conn })
     }
 
     /// Read-only handle. Uses a 50ms `busy_timeout` (vs. 5s for writers) so
     /// readers fail fast under write pressure and don't block on hot paths.
     pub fn open_read_only(path: &str) -> Result<Self, StorageOpenError> {
-        let conn = Self::open_connection_read_only(path)?;
+        let conn = open_reader_connection(path)?;
         Ok(Self { conn })
     }
 
-    pub fn open_connection(path: &str, synchronous: &str) -> Result<Connection, StorageOpenError> {
-        let conn = Connection::open(path)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", synchronous)?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
-        Ok(conn)
+    /// Test-only: open without running migrations. Lets tests pre-seed the
+    /// schema before the migration runner touches it.
+    #[cfg(test)]
+    pub fn open_without_migrations(path: &str) -> Result<Self, StorageOpenError> {
+        let conn = open_writer_connection(path)?;
+        Ok(Self { conn })
     }
 
-    pub fn open_connection_read_only(path: &str) -> Result<Connection, StorageOpenError> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.pragma_update(None, "query_only", "ON")?;
-        // Readers should fail fast under write pressure to keep tail latency bounded.
-        conn.pragma_update(None, "busy_timeout", 50)?;
-        Ok(conn)
+    /// Test-only: return a raw `Connection` with the same pragmas as
+    /// [`Storage::open`]. Used by tests that need to reach past the typed API
+    /// (e.g., rewinding `synced_at_ms`, installing failure triggers).
+    #[cfg(test)]
+    pub fn open_connection(path: &str) -> std::result::Result<Connection, StorageOpenError> {
+        open_writer_connection(path)
     }
 
-    pub fn open_connection_with_migrations(
-        path: &str,
-        synchronous: &str,
-    ) -> Result<Connection, StorageOpenError> {
-        let mut conn = Self::open_connection(path, synchronous)?;
-        Self::run_migrations(&mut conn)?;
-        Ok(conn)
+    /// Run `f` inside a Deferred transaction, commit on success. For pure reads.
+    ///
+    /// Using Deferred rather than Immediate matches SQLite's default — readers
+    /// don't hold a write lock and don't block writers. If `f` returns `Err`
+    /// the transaction is dropped unsent (auto-rollback); on success the
+    /// commit is issued before returning `Ok`.
+    pub fn read<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<T>,
+    {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
 
-    pub fn run_migrations(conn: &mut Connection) -> Result<(), StorageOpenError> {
-        Migrations::from_slice(&[M::up(MIGRATION_0001_SCHEMA)]).to_latest(conn)?;
-        Ok(())
+    /// Run `f` inside an Immediate transaction, commit on success. For any
+    /// mutation.
+    ///
+    /// Using Immediate acquires the write lock upfront so contending writers
+    /// see `SQLITE_BUSY` immediately rather than mid-transaction — this is
+    /// the right cadence under WAL + single-writer discipline. Same commit /
+    /// auto-rollback semantics as [`Storage::read`].
+    pub fn write<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<T>,
+    {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
+}
+
+/// Open a read-write connection with WAL + `NORMAL` sync + 5s busy timeout.
+fn open_writer_connection(path: &str) -> Result<Connection, StorageOpenError> {
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", SYNCHRONOUS_PRAGMA)?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    Ok(conn)
+}
+
+/// Open a read-only connection with `query_only` + 50ms busy timeout.
+fn open_reader_connection(path: &str) -> Result<Connection, StorageOpenError> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    conn.pragma_update(None, "busy_timeout", 50)?;
+    Ok(conn)
+}
+
+/// Apply all migrations. Package-private — callers use [`Storage::open`]
+/// which runs this automatically.
+pub(super) fn run_migrations(conn: &mut Connection) -> Result<(), StorageOpenError> {
+    Migrations::from_slice(&[M::up(MIGRATION_0001_SCHEMA)]).to_latest(conn)?;
+    Ok(())
 }

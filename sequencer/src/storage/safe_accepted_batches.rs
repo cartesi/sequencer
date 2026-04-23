@@ -23,7 +23,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
-use super::internals::{i64_to_u64, u64_to_i64};
+use super::convert::{i64_to_u64, u64_to_i64};
 use sequencer_core::protocol::{ProtocolConfig, SafeInputView};
 
 /// One row of `safe_accepted_batches`, exposing just the columns the

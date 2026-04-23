@@ -860,6 +860,8 @@ fn apply_faketime_env(
 ///   1. `$LIBFAKETIME_LIB` (explicit override).
 ///   2. `lib/faketime/libfaketime.{1.dylib,so.1}` relative to the `faketime`
 ///      binary's prefix (Nix layout).
+///   3. Linux distro multiarch lib dirs such as
+///      `/usr/lib/x86_64-linux-gnu/faketime` (Debian/Ubuntu apt layout).
 fn find_libfaketime() -> HarnessResult<PathBuf> {
     if let Ok(p) = std::env::var("LIBFAKETIME_LIB") {
         let p = PathBuf::from(p);
@@ -886,20 +888,107 @@ fn find_libfaketime() -> HarnessResult<PathBuf> {
                 "faketime path has no grandparent: {faketime_bin:?}"
             ))
         })?;
-    let lib_dir = prefix.join("lib").join("faketime");
-    let candidates: &[&str] = if cfg!(target_os = "macos") {
+    let lib_dirs = candidate_libfaketime_dirs(prefix);
+    let candidates = libfaketime_file_names();
+    if let Some(path) = find_libfaketime_in_dirs(lib_dirs.as_slice(), candidates) {
+        return Ok(path);
+    }
+
+    let searched = lib_dirs
+        .iter()
+        .map(|p| format!("{p:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(io_other(format!(
+        "libfaketime not found under any searched directory [{searched}] (tried {candidates:?})"
+    ))
+    .into())
+}
+
+fn libfaketime_file_names() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
         &["libfaketime.1.dylib", "libfaketime.dylib"]
     } else {
         &["libfaketime.so.1", "libfaketime.so"]
-    };
-    for name in candidates {
-        let p = lib_dir.join(name);
-        if p.exists() {
-            return Ok(p);
+    }
+}
+
+fn candidate_libfaketime_dirs(prefix: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let lib_dir = prefix.join("lib");
+    dirs.push(lib_dir.join("faketime"));
+
+    if cfg!(target_os = "linux") {
+        if let Ok(entries) = fs::read_dir(&lib_dir) {
+            let mut multiarch_dirs = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .filter(|path| path.file_name().is_some_and(|name| name != "faketime"))
+                .map(|path| path.join("faketime"))
+                .collect::<Vec<_>>();
+            multiarch_dirs.sort();
+            dirs.extend(multiarch_dirs);
+        }
+        dirs.push(prefix.join("lib64").join("faketime"));
+    }
+
+    dirs.dedup();
+    dirs
+}
+
+fn find_libfaketime_in_dirs(lib_dirs: &[PathBuf], candidates: &[&str]) -> Option<PathBuf> {
+    for lib_dir in lib_dirs {
+        for name in candidates {
+            let path = lib_dir.join(name);
+            if path.exists() {
+                return Some(path);
+            }
         }
     }
-    Err(io_other(format!(
-        "libfaketime not found under {lib_dir:?} (tried {candidates:?})"
-    ))
-    .into())
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{candidate_libfaketime_dirs, find_libfaketime_in_dirs};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn libfaketime_lookup_finds_debian_multiarch_layout() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let prefix = temp.path();
+        let multiarch_dir = prefix.join("lib").join("x86_64-linux-gnu").join("faketime");
+        fs::create_dir_all(&multiarch_dir).expect("create multiarch faketime dir");
+        let expected = multiarch_dir.join("libfaketime.so.1");
+        fs::write(&expected, b"fake so").expect("write fake lib");
+
+        let dirs = candidate_libfaketime_dirs(prefix);
+        let found = find_libfaketime_in_dirs(dirs.as_slice(), &["libfaketime.so.1"])
+            .expect("multiarch lib should be discovered");
+
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn libfaketime_lookup_prefers_direct_prefix_layout() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let prefix = temp.path();
+        let direct_dir = prefix.join("lib").join("faketime");
+        let multiarch_dir = prefix.join("lib").join("x86_64-linux-gnu").join("faketime");
+        fs::create_dir_all(&direct_dir).expect("create direct faketime dir");
+        fs::create_dir_all(&multiarch_dir).expect("create multiarch faketime dir");
+        let expected = direct_dir.join("libfaketime.so.1");
+        let fallback = multiarch_dir.join("libfaketime.so.1");
+        fs::write(&expected, b"direct").expect("write direct lib");
+        fs::write(&fallback, b"fallback").expect("write fallback lib");
+
+        let dirs = candidate_libfaketime_dirs(prefix);
+        let found = find_libfaketime_in_dirs(dirs.as_slice(), &["libfaketime.so.1"])
+            .expect("direct lib should be discovered");
+
+        assert_eq!(found, expected);
+    }
 }

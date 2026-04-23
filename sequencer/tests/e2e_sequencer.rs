@@ -1004,7 +1004,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     let second_live = recv_ws_message(&mut ws).await;
     drop(ws);
 
-    let expected = load_all_ordered_l2_txs(db.path.as_str());
+    let expected = all_ordered_l2_txs(db.path.as_str());
     assert_eq!(
         expected.len(),
         3,
@@ -1085,7 +1085,7 @@ async fn start_full_server_with_max_body(
     };
     let addr = listener.local_addr().expect("read listener addr");
 
-    let storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let storage = Storage::open(db_path).expect("open storage");
     let shutdown = ShutdownSignal::default();
 
     let (tx, lane_handle) = InclusionLane::start(
@@ -1151,7 +1151,7 @@ async fn start_api_only_server(
     };
     let addr = listener.local_addr().expect("read listener addr");
 
-    let _storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let _storage = Storage::open(db_path).expect("open storage");
     let (tx, rx) = mpsc::channel::<PendingUserOp>(queue_capacity);
     let shutdown = ShutdownSignal::default();
     let tx_feed = L2TxFeed::new(
@@ -1218,7 +1218,7 @@ fn bootstrap_open_frame(db_path: &str) {
 /// Bootstrap open frame, optionally seeding ERC-20 deposits for the given senders.
 /// Each sender receives `amount` tokens before the frame is opened.
 fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)]) {
-    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let config = WalletConfig::default();
 
     if !deposits.is_empty() {
@@ -1282,7 +1282,7 @@ fn make_valid_request(domain: &Eip712Domain) -> TxRequest {
 }
 
 fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
-    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     storage
         .append_safe_inputs(
             safe_block,
@@ -1301,10 +1301,10 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
         .expect("append safe direct input");
 }
 
-fn load_all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
+fn all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
     let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
     storage
-        .load_ordered_l2_txs_page_from(0, 1_000_000)
+        .ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load ordered l2 txs")
         .into_iter()
         .map(|(_offset, tx)| tx)

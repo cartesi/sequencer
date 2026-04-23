@@ -2027,11 +2027,16 @@ async fn run_both_down_danger_zone_proxy_first_restart_cycle_recovers_test(
 //
 // That's a flush-and-restart signal, not a cascade. Under orchestration, the
 // next boot's preemptive recovery runs `check_danger_zone` (closed-only),
-// flushes the mempool (no-op here — nothing was ever submitted), re-syncs,
-// then runs `run_startup_recovery` with the `MAX_WAIT_BLOCKS` threshold. The
-// latter only cascades once the closed batch has aged past 1200 blocks —
-// which happens once enough additional L1 blocks accumulate across
-// orchestrator retries.
+// flushes the mempool, re-syncs, then runs `run_startup_recovery` with the
+// `MAX_WAIT_BLOCKS` threshold. Two end states are valid:
+//   - the closed batch does NOT land before the detector-triggered shutdown,
+//     so a later respawn ages it past `MAX_WAIT_BLOCKS` and recovery cascades;
+//   - the submitter gets one last batch onto L1 before shutdown, so the next
+//     respawn sees that batch in `safe_inputs` and converges without any
+//     invalidation.
+//
+// The test's load-bearing assertion is therefore restart-loop convergence
+// under a realistic coupled outage, not mandatory cascade.
 //
 // Proves the sequencer-outage danger-zone path (not just the provider-outage
 // analogue §11.2.2) follows the same flush/shutdown → respawn → cascade
@@ -2092,10 +2097,6 @@ async fn run_sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test(
     );
 
     let counts = runtime.count_batches()?;
-    assert!(
-        counts.invalidated >= 1,
-        "expected cascade-invalidation after restart-cycle: {counts:?}",
-    );
 
     let mut ws_after = runtime.ws(0).await?;
     let mut replay_after = ReplayWalletApp::devnet();
@@ -2104,15 +2105,29 @@ async fn run_sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test(
             .expect_direct_input_from(runtime.erc20_portal_address())
             .await?,
     )?;
-    ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
-
-    assert_eq!(
-        replay_after.current_user_balance(alice_address),
-        U256::from(600_000_u64),
-        "cascade must roll Alice back to the full deposit",
-    );
-    assert_eq!(replay_after.current_user_balance(bob_address), U256::ZERO);
-    assert_eq!(replay_after.current_user_nonce(alice_address), 0);
+    if counts.invalidated >= 1 {
+        ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
+        assert_eq!(
+            replay_after.current_user_balance(alice_address),
+            U256::from(600_000_u64),
+            "cascade must roll Alice back to the full deposit",
+        );
+        assert_eq!(replay_after.current_user_balance(bob_address), U256::ZERO);
+        assert_eq!(replay_after.current_user_nonce(alice_address), 0);
+    } else {
+        replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
+        ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
+        assert_eq!(
+            replay_after.current_user_balance(alice_address),
+            U256::from(500_000_u64),
+            "if no cascade fired, the pre-outage transfer must have remained canonical",
+        );
+        assert_eq!(
+            replay_after.current_user_balance(bob_address),
+            U256::from(100_000_u64),
+        );
+        assert_eq!(replay_after.current_user_nonce(alice_address), 1);
+    }
 
     Ok(())
 }

@@ -308,7 +308,7 @@ async fn ws_subscribe_closes_on_oversized_inbound_message() {
 }
 
 fn seed_ordered_txs(db_path: &str) {
-    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -353,9 +353,9 @@ fn seed_ordered_txs(db_path: &str) {
 }
 
 fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
-    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
-        .load_open_state()
+        .open_state()
         .expect("load open state")
         .expect("open state should exist");
     let safe_block = storage
@@ -530,7 +530,7 @@ fn ordered_l2_tx_count(db_path: &str) -> u64 {
 fn load_ordered_l2_txs_page(db_path: &str, from_offset: u64, limit: usize) -> Vec<SequencedL2Tx> {
     let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
     storage
-        .load_ordered_l2_txs_page_from(from_offset, limit)
+        .ordered_l2_txs_page_from(from_offset, limit)
         .expect("load ordered l2 tx page")
         .into_iter()
         .map(|(_offset, tx)| tx)
