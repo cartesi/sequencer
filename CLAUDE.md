@@ -42,11 +42,11 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 
 `sequencer/src/` is organized by writer role; `storage/<role>.rs` holds each role's storage half.
 
-- `runtime/` — bootstrap, config, shutdown.
+- `runtime/` — bootstrap, config, shutdown, shared clock.
 - `ingress/` — public write path: `api.rs` (`POST /tx`) + `inclusion_lane/` (hot path).
 - `egress/` — internal read path: `api/` (WS subscribe + health) + `l2_tx_feed/`.
 - `l1/` — reader, submitter, provider, partition helper.
-- `recovery/` — preemptive recovery procedure + mempool flusher.
+- `recovery/` — startup preemptive-recovery procedure, runtime danger detector, mempool flusher.
 - `storage/` — SQLite persistence, split per writer role.
 - `http.rs` — shared HTTP error type + `axum::serve` orchestration.
 

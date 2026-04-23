@@ -15,23 +15,6 @@ use rusqlite::{Connection, Result, Transaction, params};
 use super::{BatchPolicy, SafeInputRange, WriteHead};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 
-// ── Batch staleness predicate ─────────────────────────────────────────────
-
-/// A batch is stale when `reference_block - first_frame_safe_block >= max_wait_blocks`.
-///
-/// Used in two contexts:
-/// - **Inclusion staleness**: `reference_block` is the L1 block the batch was included in.
-///   The scheduler uses this to skip stale submissions.
-/// - **Current staleness**: `reference_block` is the current safe block. The sequencer
-///   uses this to detect batches that will be stale by the time the scheduler sees them.
-pub(super) fn batch_age_is_stale(
-    reference_block: u64,
-    first_frame_safe_block: u64,
-    max_wait_blocks: u64,
-) -> bool {
-    reference_block.saturating_sub(first_frame_safe_block) >= max_wait_blocks
-}
-
 // ── Write-head loading and validation ─────────────────────────────────────
 //
 // Used by ingress (initialize/append/close) and recovery (open recovery batch

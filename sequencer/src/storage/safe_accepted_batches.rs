@@ -5,7 +5,7 @@
 //!
 //! `safe_accepted_batches` caches the prefix of submitted batches that the
 //! on-chain scheduler would accept, based on an off-chain simulation of its
-//! acceptance rules (see [`super::scheduler_rules::SchedulerRules`]).
+//! acceptance rules (see [`sequencer_core::protocol::ProtocolConfig`]).
 //!
 //! Maintenance contract: the view is advanced atomically with each
 //! [`super::Storage::append_safe_inputs`] write, so any reader that sees
@@ -13,7 +13,7 @@
 //! caller should populate this view directly.
 //!
 //! Readers:
-//! - batch submitter frontier / danger reads (`submitter_frontier_view`,
+//! - batch submitter frontier / danger reads (`submitter_frontier`,
 //!   `check_danger`)
 //! - recovery cascade (`find_closed_frontier_batch_in_danger`)
 //! - wall-clock and stalled-safe-head danger estimates
@@ -23,8 +23,8 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
-use super::internals::i64_to_u64;
-use super::scheduler_rules::{SafeInputRef, SchedulerRules};
+use super::internals::{i64_to_u64, u64_to_i64};
+use sequencer_core::protocol::{ProtocolConfig, SafeInputView};
 
 /// One row of `safe_accepted_batches`, exposing just the columns the
 /// frontier-read code paths need.
@@ -57,9 +57,9 @@ pub(super) fn query_latest_safe_accepted_batch(
 ///
 /// Paginates through `safe_inputs` rows newer than the cursor (latest accepted
 /// row), pre-filtered at SQL to the batch-submitter's sender. For each row,
-/// delegates to [`SchedulerRules::evaluate`] with the currently-expected
+/// delegates to [`ProtocolConfig::scheduler_accepts`] with the currently-expected
 /// nonce — on `Some`, inserts the accepted row and advances expected; on
-/// `None`, moves on. The SQL sender filter is an optimization; `evaluate`
+/// `None`, moves on. The SQL sender filter is an optimization; `scheduler_accepts`
 /// re-checks defensively, so the filter is correctness-neutral.
 ///
 /// Paginated to bound memory. The cursor tracks the scan regardless of
@@ -67,7 +67,7 @@ pub(super) fn query_latest_safe_accepted_batch(
 /// makes forward progress.
 pub(super) fn populate_safe_accepted_batches(
     conn: &Connection,
-    rules: &SchedulerRules,
+    protocol: &ProtocolConfig,
 ) -> Result<()> {
     const PAGE_SIZE: i64 = 256;
     const SELECT_SQL: &str = "SELECT safe_input_index, payload, block_number \
@@ -94,11 +94,7 @@ pub(super) fn populate_safe_accepted_batches(
         let page: Vec<(i64, Vec<u8>, i64)> = {
             let mut stmt = conn.prepare_cached(SELECT_SQL)?;
             stmt.query_map(
-                params![
-                    rules.batch_submitter_address().as_slice(),
-                    cursor,
-                    PAGE_SIZE,
-                ],
+                params![protocol.batch_submitter.as_slice(), cursor, PAGE_SIZE,],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?
             .collect::<Result<_>>()?
@@ -111,22 +107,22 @@ pub(super) fn populate_safe_accepted_batches(
 
         for (safe_input_index, payload, block_number) in &page {
             cursor = *safe_input_index;
-            let input = SafeInputRef {
-                safe_input_index: *safe_input_index,
-                sender: rules.batch_submitter_address(),
+            let input = SafeInputView {
+                safe_input_index: i64_to_u64(*safe_input_index),
+                sender: protocol.batch_submitter,
                 payload: payload.as_slice(),
                 inclusion_block: i64_to_u64(*block_number),
             };
-            let Some(accepted) = rules.evaluate(input, expected) else {
+            let Some(accepted) = protocol.scheduler_accepts(input, expected) else {
                 continue;
             };
             conn.execute(
                 INSERT_SQL,
                 params![
-                    accepted.safe_input_index,
-                    i64::try_from(accepted.nonce).unwrap_or(i64::MAX),
-                    i64::try_from(accepted.first_frame_safe_block).unwrap_or(i64::MAX),
-                    i64::try_from(accepted.inclusion_block).unwrap_or(i64::MAX),
+                    u64_to_i64(accepted.safe_input_index),
+                    u64_to_i64(accepted.nonce),
+                    u64_to_i64(accepted.first_frame_safe_block),
+                    u64_to_i64(accepted.inclusion_block),
                 ],
             )?;
             expected = expected.saturating_add(1);

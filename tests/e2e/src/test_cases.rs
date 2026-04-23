@@ -1350,7 +1350,7 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     //   - computes missed_blocks = 18000s / 12 = 1500 > danger_threshold 1125.
     //   - `find_first_batch_in_danger(adjusted_threshold=0)` flags the open
     //     batch (first_frame_safe_block << current_safe_block - 0).
-    //   - returns StartupDangerZoneEstimate → process exits with failure.
+    //   - decide_startup_action returns Refuse(StalledSafeHead) → process exits with failure.
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -1711,7 +1711,7 @@ async fn run_provider_outage_danger_zone_sequencer_self_exits_test(
 
     // Step 5: Try to respawn while proxy is still disconnected. Startup
     // runs the same wall-clock fallback via `run_preemptive_recovery` and
-    // should refuse to boot (`StartupDangerZoneEstimate`).
+    // should refuse to boot (`decide_startup_action → Refuse(...)`).
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -2245,7 +2245,8 @@ async fn run_provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recover
 // to 0 directly, then respawn with the proxy disconnected. The bootstrap
 // cache is still populated — so the sequencer gets past the
 // contract-discovery phase — but the wall-clock fallback sees the zeroed
-// timestamp and returns `StartupDangerZoneEstimate`.
+// timestamp and `decide_startup_action` returns
+// `Refuse(NeverSyncedAndUnreachable)`.
 //
 // Scope note: a "truly" first-ever boot would fail even earlier (no
 // bootstrap cache, can't discover contracts). That's a separate test; this

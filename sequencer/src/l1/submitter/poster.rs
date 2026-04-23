@@ -245,7 +245,6 @@ pub(crate) mod mock {
     #[derive(Debug)]
     pub struct MockBatchPoster {
         pub submissions: Mutex<Vec<(u64, usize)>>,
-        pub fail_submit: Mutex<bool>,
         pub observed_submitted_nonces: Mutex<Vec<u64>>,
         pub observed_submitted_error: Mutex<Option<String>>,
         pub last_from_block: Mutex<Option<u64>>,
@@ -255,7 +254,6 @@ pub(crate) mod mock {
         pub fn new() -> Self {
             Self {
                 submissions: Mutex::new(Vec::new()),
-                fail_submit: Mutex::new(false),
                 observed_submitted_nonces: Mutex::new(Vec::new()),
                 observed_submitted_error: Mutex::new(None),
                 last_from_block: Mutex::new(None),
@@ -285,9 +283,6 @@ pub(crate) mod mock {
             &self,
             payloads: Vec<Vec<u8>>,
         ) -> Result<Vec<TxHash>, BatchPosterError> {
-            if *self.fail_submit.lock().expect("lock") {
-                return Err(BatchPosterError::Provider("mock submit fail".into()));
-            }
             let mut tx_hashes = Vec::with_capacity(payloads.len());
             for payload in payloads {
                 let batch_index = ssz::Decode::from_ssz_bytes(payload.as_ref())

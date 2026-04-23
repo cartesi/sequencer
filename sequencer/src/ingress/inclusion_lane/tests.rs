@@ -12,7 +12,7 @@ use rusqlite::params;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::ShutdownSignal;
-use crate::storage::test_helpers::{default_scheduler_rules, temp_db};
+use crate::storage::test_helpers::{default_protocol_config, temp_db};
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
@@ -262,7 +262,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            &default_scheduler_rules(),
+            &default_protocol_config(),
         )
         .expect("append first direct input");
     storage
@@ -281,7 +281,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 payload: vec![0xbb],
                 block_number: 20,
             }],
-            &default_scheduler_rules(),
+            &default_protocol_config(),
         )
         .expect("append second direct input");
     storage
@@ -296,7 +296,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 payload: vec![0xcc],
                 block_number: 30,
             }],
-            &default_scheduler_rules(),
+            &default_protocol_config(),
         )
         .expect("append third direct input");
     storage
@@ -415,7 +415,7 @@ async fn direct_inputs_close_frame_and_persist_drain() {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            &default_scheduler_rules(),
+            &default_protocol_config(),
         )
         .expect("append safe direct input");
 
@@ -469,7 +469,7 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            &default_scheduler_rules(),
+            &default_protocol_config(),
         )
         .expect("append safe batch-submitter input");
 
@@ -509,7 +509,7 @@ async fn direct_inputs_are_paginated_by_buffer_capacity() {
         });
     }
     feeder_storage
-        .append_safe_inputs(10, directs.as_slice(), &default_scheduler_rules())
+        .append_safe_inputs(10, directs.as_slice(), &default_protocol_config())
         .expect("append safe direct inputs");
 
     let drained = wait_until(Duration::from_secs(2), || {
@@ -538,7 +538,7 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            &default_scheduler_rules(),
+            &default_protocol_config(),
         )
         .expect("append safe direct input");
 

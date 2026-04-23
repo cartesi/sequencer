@@ -17,7 +17,7 @@ use super::internals::{
     u64_to_i64,
 };
 use super::{
-    BatchPolicy, SafeFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
+    BatchPolicy, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
     batch_size_target_bytes,
 };
 use crate::ingress::inclusion_lane::PendingUserOp;
@@ -88,14 +88,14 @@ impl Storage {
 
     /// Snapshot the current L1 view: safe block + exclusive safe-input cursor.
     /// The lane uses this to decide whether to advance.
-    pub fn load_safe_frontier(&mut self) -> Result<SafeFrontier> {
+    pub fn load_safe_input_frontier(&mut self) -> Result<SafeInputFrontier> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let safe_block = super::internals::query_current_safe_block(&tx)?;
         let end_exclusive = super::internals::query_latest_safe_input_index_exclusive(&tx)?;
         tx.commit()?;
-        Ok(SafeFrontier {
+        Ok(SafeInputFrontier {
             safe_block,
             end_exclusive,
         })
@@ -312,7 +312,7 @@ fn insert_user_ops_batch(
 mod tests {
     use crate::storage::{
         SafeInputRange, Storage, StoredSafeInput,
-        test_helpers::{default_scheduler_rules, temp_db},
+        test_helpers::{default_protocol_config, temp_db},
     };
     use alloy_primitives::Address;
     use sequencer_core::l2_tx::SequencedL2Tx;
@@ -479,7 +479,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, drained.as_slice(), &default_scheduler_rules())
+            .append_safe_inputs(10, drained.as_slice(), &default_protocol_config())
             .expect("insert direct inputs");
         let mut head = head;
         storage
@@ -537,7 +537,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, drained.as_slice(), &default_scheduler_rules())
+            .append_safe_inputs(10, drained.as_slice(), &default_protocol_config())
             .expect("insert direct inputs");
         let mut head = head;
         storage

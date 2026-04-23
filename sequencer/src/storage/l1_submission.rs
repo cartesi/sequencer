@@ -3,9 +3,9 @@
 
 //! Batch submitter writer: assigns nonces, populates the scheduler-accepted
 //! frontier, and exposes the read-only queries that drive each tick (frontier
-//! lookup, danger-zone check, pending-batch loading).
+//! lookup, pending-batch loading).
 //!
-//! Recovery shares all of these — `recovery::run_startup_recovery` calls the
+//! Recovery shares all of these — `Storage::detect_and_recover` calls the
 //! same helpers under one transaction. The split is by *frequency*: this file
 //! is what runs every tick; recovery is the once-per-startup composer.
 
@@ -16,36 +16,30 @@ use super::internals::{
     decode_l2_tx_row, i64_to_u16, i64_to_u32, i64_to_u64, query_current_safe_block, u64_to_i64,
 };
 use super::safe_accepted_batches::query_latest_safe_accepted_batch;
-use super::{FrameHeader, PendingBatch};
+use super::{FrameHeader, PendingBatch, SubmitterFrontier};
 use sequencer_core::batch::{Batch, BatchForSubmission, Frame as BatchFrame, WireUserOp};
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
     /// Read-only frontier view used by the submitter each tick to derive the
-    /// next batch nonce. Returns `(current_safe_block, safe_next_expected_nonce)`.
+    /// next batch nonce. `accepted_next_nonce` is the next nonce the scheduler
+    /// is expected to accept, derived from `safe_accepted_batches`.
     ///
     /// The scheduler-accepted frontier is maintained by
     /// [`Storage::append_safe_inputs`], so this is a pure read.
-    pub fn submitter_frontier_view(&mut self) -> Result<(u64, u64)> {
+    pub fn submitter_frontier(&mut self) -> Result<SubmitterFrontier> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let safe_block = query_current_safe_block(&tx)?;
-        let next_expected_nonce = query_latest_safe_accepted_batch(&tx)?
+        let accepted_next_nonce = query_latest_safe_accepted_batch(&tx)?
             .map(|row| i64_to_u64(row.nonce).saturating_add(1))
             .unwrap_or(0);
         tx.commit()?;
-        Ok((safe_block, next_expected_nonce))
-    }
-
-    /// Load the scheduler-accepted safe frontier persisted in `safe_accepted_batches`.
-    ///
-    /// Test-only alias for [`Self::submitter_frontier_view`]. Several tests
-    /// were written against this name before the submitter_frontier_view
-    /// rename; keep it for continuity.
-    #[cfg(test)]
-    pub fn load_safe_accepted_frontier(&mut self) -> Result<(u64, u64)> {
-        self.submitter_frontier_view()
+        Ok(SubmitterFrontier {
+            safe_block,
+            accepted_next_nonce,
+        })
     }
 
     /// Highest valid (non-invalidated) `batch_index`, or `None` if no valid
@@ -228,12 +222,13 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{
-        SENDER_A, SENDER_B, scheduler_rules_for, seed_closed_batches,
+        SENDER_A, SENDER_B, protocol_config_for, seed_closed_batches,
         seed_safe_inputs_with_batch_nonces, temp_db,
     };
-    use crate::storage::{SafeInputRange, SchedulerRules, Storage, StoredSafeInput};
+    use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use alloy_primitives::Address;
     use sequencer_core::batch::{Batch, Frame as BatchFrame};
+    use sequencer_core::protocol::ProtocolConfig;
 
     #[test]
     fn batch_for_submission_builds_from_storage() {
@@ -359,35 +354,32 @@ mod tests {
     }
 
     #[test]
-    fn load_safe_accepted_frontier_returns_zero_when_no_batches_were_accepted() {
-        let db = temp_db("safe-accepted-frontier-empty");
+    fn submitter_frontier_returns_zero_when_no_batches_were_accepted() {
+        let db = temp_db("submitter-frontier-empty");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        let (safe_block, next) = storage
-            .load_safe_accepted_frontier()
-            .expect("load safe accepted frontier");
-        assert_eq!(safe_block, 0);
-        assert_eq!(next, 0);
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(frontier.safe_block, 0);
+        assert_eq!(frontier.accepted_next_nonce, 0);
     }
 
     #[test]
-    fn load_safe_accepted_frontier_tracks_accepted_prefix() {
-        let db = temp_db("safe-accepted-frontier-prefix");
+    fn submitter_frontier_tracks_accepted_prefix() {
+        let db = temp_db("submitter-frontier-prefix");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
         // seed_safe_inputs_with_batch_nonces already calls append_safe_inputs,
         // which auto-populates safe_accepted_batches.
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4, 5]);
 
-        let (safe_block, next) = storage
-            .load_safe_accepted_frontier()
-            .expect("load safe accepted frontier");
-        assert_eq!(safe_block, 10);
-        assert_eq!(next, 2);
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(frontier.safe_block, 10);
+        assert_eq!(frontier.accepted_next_nonce, 2);
     }
 
-    fn default_test_params() -> crate::recovery::RecoveryParams {
-        crate::recovery::RecoveryParams {
+    fn default_test_protocol() -> ProtocolConfig {
+        ProtocolConfig {
+            batch_submitter: SENDER_A,
             max_wait_blocks: 1200,
-            danger_threshold: 1125,
+            preemptive_margin_blocks: 75,
             seconds_per_block: 12,
         }
     }
@@ -397,20 +389,6 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
-    }
-
-    #[test]
-    fn submitter_frontier_view_tracks_accepted_prefix() {
-        let db = temp_db("submitter-frontier-view");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4]);
-
-        let (safe_block, safe_next_expected_nonce) = storage
-            .submitter_frontier_view()
-            .expect("submitter frontier view");
-
-        assert_eq!(safe_block, 10);
-        assert_eq!(safe_next_expected_nonce, 2);
     }
 
     #[test]
@@ -427,7 +405,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 1");
 
-        let rules = SchedulerRules::new(SENDER_A, 1200);
+        let protocol = default_test_protocol();
         storage
             .append_safe_inputs(
                 1135,
@@ -443,12 +421,12 @@ mod tests {
                     }),
                     block_number: 20,
                 }],
-                &rules,
+                &protocol,
             )
             .expect("append accepted batch 0");
 
         let status = storage
-            .check_danger(default_test_params(), unix_now_ms())
+            .check_danger(&protocol, unix_now_ms())
             .expect("check_danger");
         assert_eq!(status, crate::storage::DangerStatus::Strict(1));
     }
@@ -471,7 +449,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 1");
 
-        let rules = SchedulerRules::new(SENDER_A, 1200);
+        let protocol = default_test_protocol();
         storage
             .append_safe_inputs(
                 1200,
@@ -487,7 +465,7 @@ mod tests {
                     }),
                     block_number: 200,
                 }],
-                &rules,
+                &protocol,
             )
             .expect("append accepted batch 0");
 
@@ -502,7 +480,7 @@ mod tests {
             .expect("rewind safe-progress timestamp");
 
         let status = storage
-            .check_danger(default_test_params(), now_ms)
+            .check_danger(&protocol, now_ms)
             .expect("check_danger");
         assert_eq!(status, crate::storage::DangerStatus::Stalled(1));
     }
@@ -515,7 +493,7 @@ mod tests {
         let db = temp_db("check-danger-never-synced");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
         let status = storage
-            .check_danger(default_test_params(), unix_now_ms())
+            .check_danger(&default_test_protocol(), unix_now_ms())
             .expect("check_danger");
         assert_eq!(status, crate::storage::DangerStatus::Safe);
     }
@@ -524,7 +502,7 @@ mod tests {
     fn populate_safe_accepted_batches_resumes_from_latest_row() {
         let db = temp_db("safe-accepted-frontier-resume");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        let rules = scheduler_rules_for(SENDER_A);
+        let protocol = protocol_config_for(SENDER_A);
 
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1]);
 
@@ -557,14 +535,12 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(11, second_wave.as_slice(), &rules)
+            .append_safe_inputs(11, second_wave.as_slice(), &protocol)
             .expect("append second wave");
 
-        let (safe_block, next) = storage
-            .load_safe_accepted_frontier()
-            .expect("load safe accepted frontier");
-        assert_eq!(safe_block, 11);
-        assert_eq!(next, 4);
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(frontier.safe_block, 11);
+        assert_eq!(frontier.accepted_next_nonce, 4);
 
         let accepted_count: i64 = storage
             .conn
@@ -576,10 +552,10 @@ mod tests {
     }
 
     #[test]
-    fn load_safe_accepted_frontier_skips_stale_payloads() {
+    fn safe_accepted_frontier_skips_stale_payloads() {
         let db = temp_db("safe-accepted-frontier-skip-stale");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        let rules = SchedulerRules::new(SENDER_A, 1200);
+        let protocol = default_test_protocol();
 
         // Seed a non-stale batch with nonce 0 (safe_block=100, block_number=200, max_wait=1200 → not stale)
         let non_stale_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
@@ -627,13 +603,11 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(2000, inputs.as_slice(), &rules)
+            .append_safe_inputs(2000, inputs.as_slice(), &protocol)
             .expect("append");
 
-        let (_, next) = storage
-            .load_safe_accepted_frontier()
-            .expect("load safe accepted frontier");
-        assert_eq!(next, 2);
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(frontier.accepted_next_nonce, 2);
     }
 
     #[test]
@@ -671,7 +645,12 @@ mod tests {
         });
 
         let batch_submitter = Address::repeat_byte(0xCC);
-        let rules = SchedulerRules::new(batch_submitter, u64::MAX);
+        let protocol = ProtocolConfig {
+            batch_submitter,
+            max_wait_blocks: u64::MAX,
+            preemptive_margin_blocks: 75,
+            seconds_per_block: 12,
+        };
         let inputs = vec![
             StoredSafeInput {
                 sender: batch_submitter,
@@ -685,13 +664,14 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(200, inputs.as_slice(), &rules)
+            .append_safe_inputs(200, inputs.as_slice(), &protocol)
             .expect("append");
 
-        let (_, next) = storage
-            .load_safe_accepted_frontier()
-            .expect("load safe accepted frontier");
-        assert_eq!(next, 2, "both batches should be in accepted frontier");
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(
+            frontier.accepted_next_nonce, 2,
+            "both batches should be in accepted frontier"
+        );
     }
 
     #[test]
@@ -766,7 +746,7 @@ mod tests {
     fn populate_safe_accepted_batches_skips_duplicate_nonces() {
         let db = temp_db("populate-dup-nonces");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        let rules = SchedulerRules::new(SENDER_A, 1200);
+        let protocol = default_test_protocol();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -788,21 +768,22 @@ mod tests {
                         block_number: 20,
                     },
                 ],
-                &rules,
+                &protocol,
             )
             .expect("append");
 
-        let (_, next) = storage
-            .load_safe_accepted_frontier()
-            .expect("load frontier");
-        assert_eq!(next, 1, "duplicate nonce must be skipped");
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(
+            frontier.accepted_next_nonce, 1,
+            "duplicate nonce must be skipped"
+        );
     }
 
     #[test]
     fn populate_safe_accepted_batches_handles_large_nonce_gap() {
         let db = temp_db("populate-nonce-gap");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        let rules = SchedulerRules::new(SENDER_A, 1200);
+        let protocol = default_test_protocol();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -817,21 +798,19 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(5, 10),
                     block_number: 20,
                 }],
-                &rules,
+                &protocol,
             )
             .expect("append");
 
-        let (_, next) = storage
-            .load_safe_accepted_frontier()
-            .expect("load frontier");
-        assert_eq!(next, 0, "gap must stall frontier");
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(frontier.accepted_next_nonce, 0, "gap must stall frontier");
     }
 
     #[test]
     fn populate_safe_accepted_batches_out_of_order_arrivals_stalls_frontier() {
         let db = temp_db("populate-out-of-order");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        let rules = SchedulerRules::new(SENDER_A, 1200);
+        let protocol = default_test_protocol();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -849,14 +828,15 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(1, 10),
                     block_number: 20,
                 }],
-                &rules,
+                &protocol,
             )
             .expect("append");
 
-        let (_, next) = storage
-            .load_safe_accepted_frontier()
-            .expect("load frontier");
-        assert_eq!(next, 0, "out of order must stall frontier");
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(
+            frontier.accepted_next_nonce, 0,
+            "out of order must stall frontier"
+        );
 
         storage
             .append_safe_inputs(
@@ -866,13 +846,14 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(0, 10),
                     block_number: 21,
                 }],
-                &rules,
+                &protocol,
             )
             .expect("append nonce 0");
 
-        let (_, next2) = storage
-            .load_safe_accepted_frontier()
-            .expect("load frontier again");
-        assert_eq!(next2, 1, "frontier must remain stalled");
+        let frontier2 = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(
+            frontier2.accepted_next_nonce, 1,
+            "frontier must remain stalled"
+        );
     }
 }

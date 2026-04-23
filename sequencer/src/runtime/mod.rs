@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Process orchestration: bootstraps L1 state, opens storage, runs preemptive
-//! recovery, then spawns the lane / input reader / batch submitter / feed /
-//! HTTP servers and awaits their completion.
+//! recovery, then spawns the lane / input reader / batch submitter /
+//! danger detector / feed / HTTP servers and awaits their completion.
 
+pub mod clock;
 pub mod config;
 pub mod shutdown;
+
+use std::time::Duration;
 
 use thiserror::Error;
 use tracing::warn;
@@ -16,15 +19,22 @@ use crate::http::{self, ApiConfig};
 use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
 use crate::l1::submitter::{BatchPosterConfig, EthereumBatchPoster};
-use crate::l1::submitter::{BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError};
-use crate::storage::{self, SchedulerRules, StorageOpenError};
+use crate::l1::submitter::{
+    BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError, SubmitterExit,
+};
+use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit};
+use crate::storage::{self, StorageOpenError};
 use config::{L1Config, RunConfig};
 use sequencer_core::application::Application;
+use sequencer_core::protocol::ProtocolConfig;
 use shutdown::ShutdownSignal;
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 const QUEUE_CAPACITY: usize = 8192;
-const INPUT_READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const INPUT_READER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Danger detector cadence. Cheap DB-only check; re-running quickly bounds the
+/// lag on entering the danger zone. The preemptive margin absorbs bounded lag.
+const DANGER_DETECTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -75,6 +85,21 @@ pub enum RunError {
         #[source]
         source: tokio::task::JoinError,
     },
+    #[error("danger detector exited: {source}")]
+    DangerDetector {
+        #[source]
+        source: DangerDetectorError,
+    },
+    #[error("danger detector join error: {source}")]
+    DangerDetectorJoin {
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    /// Deliberate shutdown triggered by the danger detector. Not an error in
+    /// the usual sense — the orchestrator is expected to respawn, at which
+    /// point `run_preemptive_recovery` handles it.
+    #[error("danger zone detected at batch {batch_index} — stopping for recovery")]
+    DangerZoneDetected { batch_index: u64 },
     #[error("RPC chain ID {rpc} does not match --chain-id {config}")]
     ChainIdMismatch { rpc: u64, config: u64 },
 }
@@ -85,6 +110,7 @@ enum FirstExit {
     InclusionLane(RunError),
     InputReader(RunError),
     BatchSubmitter(RunError),
+    DangerDetector(RunError),
 }
 
 pub async fn run<A>(app: A, config: RunConfig) -> Result<(), RunError>
@@ -98,7 +124,6 @@ where
     std::fs::create_dir_all(&config.data_dir)?;
     let db_path = config.db_path();
 
-    // Single L1/InputBox config shared by input reader and batch submitter (no duplicate RPC URL or addresses).
     let batch_submitter_private_key = config.resolve_private_key()?;
 
     let batch_submitter_address = {
@@ -108,26 +133,32 @@ where
             .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?
             .address()
     };
-    // Bootstrap L1 config: try L1 first, fall back to DB cache if unreachable.
-    // On first startup, L1 is required (no cache). On subsequent startups, the
-    // cache allows the sequencer to start without L1 (e.g., during provider outages).
+
+    // One ProtocolConfig shared across the whole process: the input reader,
+    // the danger detector, and startup recovery all mirror the same
+    // scheduler-acceptance rules.
+    let protocol = ProtocolConfig {
+        batch_submitter: batch_submitter_address,
+        max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+        preemptive_margin_blocks: config.preemptive_margin_blocks,
+        seconds_per_block: config.seconds_per_block,
+    };
+
     let input_reader_config = InputReaderConfig {
         rpc_url: config.eth_rpc_url.clone(),
         app_address: config.app_address,
         poll_interval: INPUT_READER_POLL_INTERVAL,
         long_block_range_error_codes: config.long_block_range_error_codes.clone(),
     };
-    // Scheduler acceptance rules: shared between the input reader (which
-    // maintains `safe_accepted_batches` atomically with each safe-head advance)
-    // and any other storage caller that needs to re-populate the view.
-    let scheduler_rules =
-        SchedulerRules::new(batch_submitter_address, sequencer_core::MAX_WAIT_BLOCKS);
 
+    // Bootstrap L1 config: try L1 first, fall back to DB cache if unreachable.
+    // On first startup, L1 is required (no cache). On subsequent startups, the
+    // cache allows the sequencer to start without L1 (e.g., during provider outages).
     let (mut input_reader, input_reader_genesis_block, l1_config) = match InputReader::new(
         db_path.clone(),
         shutdown.clone(),
         input_reader_config.clone(),
-        scheduler_rules,
+        protocol,
     )
     .await
     {
@@ -200,7 +231,7 @@ where
                 genesis,
                 db_path.clone(),
                 shutdown.clone(),
-                scheduler_rules,
+                protocol,
             );
             let l1 = L1Config {
                 eth_rpc_url: config.eth_rpc_url.clone(),
@@ -213,8 +244,6 @@ where
         }
         Err(source) => return Err(RunError::InputReader { source }),
     };
-    // ── Startup config ──────────────────────────────────────────────
-    let danger_threshold = compute_danger_threshold(config.preemptive_margin_blocks);
 
     tracing::info!(
         http_addr = %config.http_addr,
@@ -225,26 +254,17 @@ where
         chain_id = config.chain_id,
         app_address = %l1_config.app_address,
         batch_submitter_address = %l1_config.batch_submitter_address,
-        max_wait_blocks = sequencer_core::MAX_WAIT_BLOCKS,
-        preemptive_margin_blocks = config.preemptive_margin_blocks,
-        danger_threshold,
+        max_wait_blocks = protocol.max_wait_blocks,
+        preemptive_margin_blocks = protocol.preemptive_margin_blocks,
+        danger_threshold = protocol.danger_threshold(),
         "sequencer startup"
     );
 
     // ── Preemptive recovery ────────────────────────────────────────
     // See docs/recovery/ for the full design and TLA+ spec.
-    crate::recovery::run_preemptive_recovery(
-        &db_path,
-        &mut input_reader,
-        &l1_config,
-        crate::recovery::RecoveryParams {
-            max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-            danger_threshold,
-            seconds_per_block: config.seconds_per_block,
-        },
-    )
-    .await
-    .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
+    crate::recovery::run_preemptive_recovery(&db_path, &mut input_reader, &l1_config, &protocol)
+        .await
+        .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
 
     let storage = storage::Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
     let (tx, mut inclusion_lane_handle) = InclusionLane::start(
@@ -256,12 +276,8 @@ where
     );
     let mut input_reader_handle = input_reader.start()?;
 
-    // Batch submitter uses the same L1 config (InputBox address and RPC URL) as the input reader.
     let batch_submitter_config = BatchSubmitterConfig {
         idle_poll_interval_ms: config.batch_submitter_idle_poll_interval_ms,
-        max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-        preemptive_margin_blocks: config.preemptive_margin_blocks,
-        seconds_per_block: config.seconds_per_block,
     };
     let poster_config = BatchPosterConfig {
         l1_submit_address: l1_config.input_box_address,
@@ -282,6 +298,14 @@ where
         batch_submitter_config,
     );
     let mut batch_submitter_handle = submitter.start().map_err(RunError::OpenStorage)?;
+
+    let detector = DangerDetector::new(
+        db_path.clone(),
+        protocol,
+        DANGER_DETECTOR_POLL_INTERVAL,
+        shutdown.clone(),
+    );
+    let mut danger_detector_handle = detector.start().map_err(RunError::OpenStorage)?;
 
     let tx_feed = L2TxFeed::new(
         db_path.clone(),
@@ -324,6 +348,9 @@ where
         submitter_result = &mut batch_submitter_handle => {
             FirstExit::BatchSubmitter(map_batch_submitter_exit(submitter_result))
         }
+        detector_result = &mut danger_detector_handle => {
+            FirstExit::DangerDetector(map_danger_detector_exit(detector_result))
+        }
     };
 
     begin_runtime_shutdown(&shutdown);
@@ -333,6 +360,7 @@ where
         inclusion_lane_handle,
         input_reader_handle,
         batch_submitter_handle,
+        danger_detector_handle,
     )
     .await
 }
@@ -345,12 +373,14 @@ async fn wait_for_clean_shutdown(
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
     inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
     input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
-    batch_submitter_handle: tokio::task::JoinHandle<Result<(), BatchSubmitterError>>,
+    batch_submitter_handle: tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
+    danger_detector_handle: tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>,
 ) -> Result<(), RunError> {
     wait_for_server_shutdown(server_task).await?;
     wait_for_lane_shutdown(inclusion_lane_handle).await?;
     wait_for_input_reader_shutdown(input_reader_handle).await?;
     wait_for_batch_submitter_shutdown(batch_submitter_handle).await?;
+    wait_for_danger_detector_shutdown(danger_detector_handle).await?;
     Ok(())
 }
 
@@ -359,7 +389,8 @@ async fn finish_runtime(
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
     inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
     input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
-    batch_submitter_handle: tokio::task::JoinHandle<Result<(), BatchSubmitterError>>,
+    batch_submitter_handle: tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
+    danger_detector_handle: tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>,
 ) -> Result<(), RunError> {
     match first_exit {
         FirstExit::Signal(signal_error) => {
@@ -368,6 +399,7 @@ async fn finish_runtime(
                 inclusion_lane_handle,
                 input_reader_handle,
                 batch_submitter_handle,
+                danger_detector_handle,
             )
             .await;
             match (signal_error, shutdown_result) {
@@ -389,6 +421,10 @@ async fn finish_runtime(
                 "batch submitter",
                 wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
             );
+            log_cleanup_result(
+                "danger detector",
+                wait_for_danger_detector_shutdown(danger_detector_handle).await,
+            );
             Err(primary)
         }
         FirstExit::InclusionLane(primary) => {
@@ -400,6 +436,10 @@ async fn finish_runtime(
             log_cleanup_result(
                 "batch submitter",
                 wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
+            );
+            log_cleanup_result(
+                "danger detector",
+                wait_for_danger_detector_shutdown(danger_detector_handle).await,
             );
             Err(primary)
         }
@@ -413,6 +453,10 @@ async fn finish_runtime(
                 "batch submitter",
                 wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
             );
+            log_cleanup_result(
+                "danger detector",
+                wait_for_danger_detector_shutdown(danger_detector_handle).await,
+            );
             Err(primary)
         }
         FirstExit::BatchSubmitter(primary) => {
@@ -424,6 +468,26 @@ async fn finish_runtime(
             log_cleanup_result(
                 "input reader",
                 wait_for_input_reader_shutdown(input_reader_handle).await,
+            );
+            log_cleanup_result(
+                "danger detector",
+                wait_for_danger_detector_shutdown(danger_detector_handle).await,
+            );
+            Err(primary)
+        }
+        FirstExit::DangerDetector(primary) => {
+            log_cleanup_result("server", wait_for_server_shutdown(server_task).await);
+            log_cleanup_result(
+                "inclusion lane",
+                wait_for_lane_shutdown(inclusion_lane_handle).await,
+            );
+            log_cleanup_result(
+                "input reader",
+                wait_for_input_reader_shutdown(input_reader_handle).await,
+            );
+            log_cleanup_result(
+                "batch submitter",
+                wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
             );
             Err(primary)
         }
@@ -461,12 +525,25 @@ async fn wait_for_input_reader_shutdown(
 }
 
 async fn wait_for_batch_submitter_shutdown(
-    batch_submitter_handle: tokio::task::JoinHandle<Result<(), BatchSubmitterError>>,
+    batch_submitter_handle: tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
 ) -> Result<(), RunError> {
     match batch_submitter_handle.await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(SubmitterExit::Shutdown)) => Ok(()),
         Ok(Err(source)) => Err(RunError::BatchSubmitter { source }),
         Err(source) => Err(RunError::BatchSubmitterJoin { source }),
+    }
+}
+
+async fn wait_for_danger_detector_shutdown(
+    danger_detector_handle: tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>,
+) -> Result<(), RunError> {
+    match danger_detector_handle.await {
+        Ok(Ok(DetectorExit::Shutdown)) => Ok(()),
+        Ok(Ok(DetectorExit::DangerZone { batch_index })) => {
+            Err(RunError::DangerZoneDetected { batch_index })
+        }
+        Ok(Err(source)) => Err(RunError::DangerDetector { source }),
+        Err(source) => Err(RunError::DangerDetectorJoin { source }),
     }
 }
 
@@ -499,12 +576,31 @@ fn map_input_reader_exit(
 }
 
 fn map_batch_submitter_exit(
-    result: Result<Result<(), BatchSubmitterError>, tokio::task::JoinError>,
+    result: Result<Result<SubmitterExit, BatchSubmitterError>, tokio::task::JoinError>,
 ) -> RunError {
     match result {
-        Ok(Ok(())) => RunError::BatchSubmitterStoppedUnexpectedly,
+        Ok(Ok(SubmitterExit::Shutdown)) => RunError::BatchSubmitterStoppedUnexpectedly,
         Ok(Err(source)) => RunError::BatchSubmitter { source },
         Err(source) => RunError::BatchSubmitterJoin { source },
+    }
+}
+
+fn map_danger_detector_exit(
+    result: Result<Result<DetectorExit, DangerDetectorError>, tokio::task::JoinError>,
+) -> RunError {
+    match result {
+        Ok(Ok(DetectorExit::Shutdown)) => {
+            // Shouldn't happen — detector Shutdown means its own shutdown signal
+            // fired, which only happens after someone else triggered
+            // runtime-wide shutdown. Treat this as a real exit only if nothing
+            // else did first.
+            RunError::BatchSubmitterStoppedUnexpectedly
+        }
+        Ok(Ok(DetectorExit::DangerZone { batch_index })) => {
+            RunError::DangerZoneDetected { batch_index }
+        }
+        Ok(Err(source)) => RunError::DangerDetector { source },
+        Err(source) => RunError::DangerDetectorJoin { source },
     }
 }
 
@@ -521,54 +617,53 @@ fn build_batch_submitter_provider(
         .map_err(std::io::Error::other)
 }
 
-/// Resolve the preemptive danger threshold from the configured margin.
-///
-/// Panics if `preemptive_margin_blocks >= MAX_WAIT_BLOCKS` — the danger
-/// threshold would be zero or underflow, making preemptive recovery
-/// indistinguishable from hard staleness. Caught at startup so the process
-/// never runs in that configuration.
-fn compute_danger_threshold(preemptive_margin_blocks: u64) -> u64 {
-    assert!(
-        preemptive_margin_blocks < sequencer_core::MAX_WAIT_BLOCKS,
-        "preemptive_margin_blocks ({}) must be less than MAX_WAIT_BLOCKS ({})",
-        preemptive_margin_blocks,
-        sequencer_core::MAX_WAIT_BLOCKS,
-    );
-    sequencer_core::MAX_WAIT_BLOCKS - preemptive_margin_blocks
-}
-
 #[cfg(test)]
 mod tests {
-    use super::compute_danger_threshold;
     use sequencer_core::MAX_WAIT_BLOCKS;
+    use sequencer_core::protocol::ProtocolConfig;
+
+    fn protocol_with_margin(preemptive_margin_blocks: u64) -> ProtocolConfig {
+        ProtocolConfig {
+            batch_submitter: alloy_primitives::Address::ZERO,
+            max_wait_blocks: MAX_WAIT_BLOCKS,
+            preemptive_margin_blocks,
+            seconds_per_block: 12,
+        }
+    }
 
     // ── §8.4.1 preemptive_margin_blocks validation ────────────────────
 
     #[test]
     #[should_panic(expected = "preemptive_margin_blocks")]
     fn margin_equal_to_max_wait_panics() {
-        compute_danger_threshold(MAX_WAIT_BLOCKS);
+        let _ = protocol_with_margin(MAX_WAIT_BLOCKS).danger_threshold();
     }
 
     #[test]
     #[should_panic(expected = "preemptive_margin_blocks")]
     fn margin_greater_than_max_wait_panics() {
-        compute_danger_threshold(MAX_WAIT_BLOCKS + 1);
+        let _ = protocol_with_margin(MAX_WAIT_BLOCKS + 1).danger_threshold();
     }
 
     #[test]
     fn margin_one_below_max_wait_yields_threshold_one() {
-        assert_eq!(compute_danger_threshold(MAX_WAIT_BLOCKS - 1), 1);
+        assert_eq!(
+            protocol_with_margin(MAX_WAIT_BLOCKS - 1).danger_threshold(),
+            1
+        );
     }
 
     #[test]
     fn zero_margin_yields_full_wait_window() {
-        assert_eq!(compute_danger_threshold(0), MAX_WAIT_BLOCKS);
+        assert_eq!(protocol_with_margin(0).danger_threshold(), MAX_WAIT_BLOCKS);
     }
 
     #[test]
     fn default_margin_matches_production_setting() {
-        // Default is 75 per `SEQ_PREEMPTIVE_MARGIN_BLOCKS`; threshold = MAX - 75.
-        assert_eq!(compute_danger_threshold(75), MAX_WAIT_BLOCKS - 75);
+        // Default is 75 per `SEQ_PREEMPTIVE_MARGIN_BLOCKS`.
+        assert_eq!(
+            protocol_with_margin(75).danger_threshold(),
+            MAX_WAIT_BLOCKS - 75
+        );
     }
 }

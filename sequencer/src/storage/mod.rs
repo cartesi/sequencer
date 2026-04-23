@@ -26,7 +26,6 @@ mod l1_submission;
 mod open;
 mod recovery;
 mod safe_accepted_batches;
-mod scheduler_rules;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -36,7 +35,6 @@ use thiserror::Error;
 
 pub use open::Storage;
 pub use recovery::DangerStatus;
-pub use scheduler_rules::SchedulerRules;
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
 /// the L1 block where it was included.
@@ -127,12 +125,21 @@ impl Iterator for SafeInputRangeChunks {
     }
 }
 
-/// Snapshot of the L1 view: current safe block, plus the exclusive cursor
-/// into `safe_inputs`. Read by the inclusion lane to decide when to advance.
+/// Snapshot of the L1 view: current safe block plus the exclusive cursor into
+/// `safe_inputs`. Read by the inclusion lane to decide when to advance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SafeFrontier {
+pub struct SafeInputFrontier {
     pub safe_block: u64,
     pub end_exclusive: u64,
+}
+
+/// Snapshot of the scheduler-accepted frontier: current safe block plus the
+/// next nonce the scheduler is expected to accept. Read by the batch submitter
+/// each tick to derive the next unresolved nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitterFrontier {
+    pub safe_block: u64,
+    pub accepted_next_nonce: u64,
 }
 
 /// Per-frame metadata: position within batch, committed fee, and the

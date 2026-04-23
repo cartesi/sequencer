@@ -127,7 +127,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             return Ok(LaneState::new(last_drained_direct_range, head));
         }
 
-        let frontier = self.storage.load_safe_frontier()?;
+        let frontier = self.storage.load_safe_input_frontier()?;
         assert!(
             frontier.end_exclusive >= last_drained_direct_range.end(),
             "safe-input head regressed during lane initialization: safe_end={}, next={}",
@@ -210,7 +210,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         }
         lane_state.mark_frontier_checked();
 
-        let frontier = self.storage.load_safe_frontier()?;
+        let frontier = self.storage.load_safe_input_frontier()?;
         assert!(
             frontier.end_exclusive >= lane_state.last_drained_direct_range.end(),
             "safe-input head regressed: safe_end={}, next={}",
