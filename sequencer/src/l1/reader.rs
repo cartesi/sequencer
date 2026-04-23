@@ -23,8 +23,6 @@ use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{Storage, StorageOpenError, StoredSafeInput};
 use sequencer_core::protocol::ProtocolConfig;
 
-const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
-
 #[derive(Debug, Clone)]
 pub struct InputReaderConfig {
     pub rpc_url: String,
@@ -126,7 +124,7 @@ impl InputReader {
     }
 
     pub fn start(self) -> Result<JoinHandle<Result<(), InputReaderError>>, StorageOpenError> {
-        let _ = Storage::open(self.db_path.as_str(), SQLITE_SYNCHRONOUS_PRAGMA)?;
+        let _ = Storage::open(self.db_path.as_str())?;
         Ok(tokio::spawn(async move { self.run_forever().await }))
     }
 
@@ -232,7 +230,7 @@ impl InputReader {
     async fn current_safe_block(&self) -> Result<u64, InputReaderError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            let mut storage = Storage::open(&db_path)?;
             storage.current_safe_block().map_err(InputReaderError::from)
         })
         .await
@@ -243,7 +241,7 @@ impl InputReader {
         let db_path = self.db_path.clone();
         let minimum_safe_block = self.genesis_block.saturating_sub(1);
         tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            let mut storage = Storage::open(&db_path)?;
             storage
                 .ensure_minimum_safe_block(minimum_safe_block)
                 .map_err(InputReaderError::from)
@@ -255,7 +253,7 @@ impl InputReader {
     async fn initialize_safe_progress_if_unset(&self) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            let mut storage = Storage::open(&db_path)?;
             storage
                 .initialize_safe_progress_if_unset()
                 .map_err(InputReaderError::from)
@@ -272,7 +270,7 @@ impl InputReader {
         let db_path = self.db_path.clone();
         let protocol = self.protocol;
         tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+            let mut storage = Storage::open(&db_path)?;
             storage
                 .append_safe_inputs(current_safe_block, &batch, &protocol)
                 .map_err(InputReaderError::from)
@@ -440,11 +438,8 @@ mod tests {
         reader.advance_once(&provider).await.expect("advance_once");
         let safe_block = reader.current_safe_block().await.expect("read safe block");
         let safe_end = {
-            let mut storage = Storage::open(
-                db_file.path().to_string_lossy().as_ref(),
-                SQLITE_SYNCHRONOUS_PRAGMA,
-            )
-            .expect("open storage");
+            let mut storage =
+                Storage::open(db_file.path().to_string_lossy().as_ref()).expect("open storage");
             storage.safe_input_end_exclusive().expect("safe end")
         };
         assert_eq!(safe_end, 0, "no InputAdded contract so no direct inputs");
@@ -488,11 +483,8 @@ mod tests {
 
         assert!(matches!(result, Err(InputReaderError::Provider(_))));
 
-        let mut storage = Storage::open(
-            db_file.path().to_string_lossy().as_ref(),
-            SQLITE_SYNCHRONOUS_PRAGMA,
-        )
-        .expect("open storage");
+        let mut storage =
+            Storage::open(db_file.path().to_string_lossy().as_ref()).expect("open storage");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
             genesis_block - 1
@@ -530,7 +522,7 @@ mod tests {
         let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
         let db_file = NamedTempFile::new().expect("temp file");
         let db_path = db_file.path().to_string_lossy().into_owned();
-        let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let mut storage = Storage::open(&db_path).expect("open storage");
         let protocol = test_protocol();
         storage
             .append_safe_inputs(1000, &[], &protocol)
@@ -563,11 +555,8 @@ mod tests {
             "safe head should remain unchanged when already ahead of chain"
         );
 
-        let storage = Storage::open(
-            db_file.path().to_string_lossy().as_ref(),
-            SQLITE_SYNCHRONOUS_PRAGMA,
-        )
-        .expect("re-open storage");
+        let storage =
+            Storage::open(db_file.path().to_string_lossy().as_ref()).expect("re-open storage");
         assert_eq!(
             storage
                 .last_safe_progress_ms()

@@ -151,7 +151,7 @@ mod tests {
     async fn submit_tx_rejects_when_shutdown_has_started() {
         let db = TempDir::new().expect("create temp dir");
         let db_path = db.path().join("sequencer.db");
-        let _storage = Storage::open(&db_path.to_string_lossy(), "NORMAL").expect("create db");
+        let _storage = Storage::open(&db_path.to_string_lossy()).expect("create db");
         let shutdown = ShutdownSignal::default();
         shutdown.request_shutdown();
 

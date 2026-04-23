@@ -10,7 +10,9 @@
 //! slots reach safe finality, the recovery procedure can read fully-finalized L1 state.
 
 use alloy::network::TransactionBuilder;
-use alloy::providers::{DynProvider, PendingTransactionConfig, PendingTransactionError, Provider};
+use alloy::providers::{
+    DynProvider, PendingTransactionConfig, PendingTransactionError, Provider, WatchTxError,
+};
 use alloy::rpc::types::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, U256};
 use std::time::Duration;
@@ -58,6 +60,35 @@ fn bumped_replacement_fees(base_max_fee: u128, base_priority_fee: u128) -> (u128
     let new_max_fee = base_max_fee.saturating_mul(11) / 10 + 1;
     let new_priority_fee = base_priority_fee.saturating_mul(2).max(1);
     (new_max_fee, new_priority_fee)
+}
+
+fn send_failures_error(failures: &[(u64, String)]) -> FlushError {
+    const MAX_SAMPLES: usize = 3;
+
+    let samples = failures
+        .iter()
+        .take(MAX_SAMPLES)
+        .map(|(nonce, message)| format!("nonce {nonce}: {message}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let remaining = failures.len().saturating_sub(MAX_SAMPLES);
+    let suffix = if remaining == 0 {
+        String::new()
+    } else {
+        format!("; ... and {remaining} more")
+    };
+
+    FlushError::Provider(format!(
+        "failed to submit {} flush no-op transaction(s): {samples}{suffix}",
+        failures.len()
+    ))
+}
+
+fn map_watch_error(err: PendingTransactionError) -> Result<bool, FlushError> {
+    match err {
+        PendingTransactionError::TxWatcher(WatchTxError::Timeout) => Ok(false),
+        other => Err(FlushError::Provider(other.to_string())),
+    }
 }
 
 impl MempoolFlusher {
@@ -170,6 +201,7 @@ impl MempoolFlusher {
         );
 
         let mut tx_hashes = Vec::new();
+        let mut send_failures = Vec::new();
         for nonce in from_nonce..to_nonce {
             let tx = alloy::rpc::types::TransactionRequest::default()
                 .with_to(self.address)
@@ -185,11 +217,15 @@ impl MempoolFlusher {
                     tx_hashes.push(tx_hash);
                 }
                 Err(e) => {
-                    // Nonce already consumed (tx confirmed between our read and submit).
-                    // This is expected and safe to ignore.
-                    debug!(nonce, error = %e, "flush no-op send failed (slot likely already consumed)");
+                    let message = e.to_string();
+                    error!(nonce, error = %message, "flush no-op send failed");
+                    send_failures.push((nonce, message));
                 }
             }
+        }
+
+        if !send_failures.is_empty() {
+            return Err(send_failures_error(send_failures.as_slice()));
         }
 
         Ok(tx_hashes)
@@ -208,9 +244,7 @@ impl MempoolFlusher {
                 Ok(_) => {
                     debug!(%tx_hash, "flush no-op included on L1");
                 }
-                Err(PendingTransactionError::TxWatcher(
-                    alloy::providers::WatchTxError::Timeout,
-                )) => {
+                Err(err @ PendingTransactionError::TxWatcher(WatchTxError::Timeout)) => {
                     // This should not happen during normal L1 operation.
                     // Possible causes: L1 congestion, tx dropped from mempool,
                     // gas price too low to compete.
@@ -219,13 +253,9 @@ impl MempoolFlusher {
                         timeout_secs = self.confirmation_timeout.as_secs(),
                         "flush no-op timed out waiting for L1 inclusion — will retry"
                     );
-                    return Ok(false);
+                    return map_watch_error(err);
                 }
-                Err(err) => {
-                    // Tx may have been replaced by the original batch tx winning the slot.
-                    // This is expected — the slot is consumed either way.
-                    debug!(%tx_hash, error = %err, "flush no-op watch ended (slot likely consumed by original batch)");
-                }
+                Err(err) => return map_watch_error(err),
             }
         }
         Ok(true)
@@ -281,6 +311,35 @@ mod tests {
         let (new_max, new_prio) = bumped_replacement_fees(0, 0);
         assert!(new_max >= 1);
         assert!(new_prio >= 1);
+    }
+
+    #[test]
+    fn send_failure_error_summarizes_failed_slots() {
+        let err = send_failures_error(&[
+            (7, "nonce too low".to_string()),
+            (8, "replacement transaction underpriced".to_string()),
+            (9, "insufficient funds".to_string()),
+            (10, "fee cap less than block base fee".to_string()),
+        ]);
+
+        let message = err.to_string();
+        assert!(message.contains("failed to submit 4 flush no-op transaction(s)"));
+        assert!(message.contains("nonce 7: nonce too low"));
+        assert!(message.contains("nonce 8: replacement transaction underpriced"));
+        assert!(message.contains("nonce 9: insufficient funds"));
+        assert!(message.contains("and 1 more"));
+        assert!(!message.contains("nonce 10"));
+    }
+
+    #[test]
+    fn watch_error_mapping_retries_only_timeouts() {
+        let timeout = map_watch_error(PendingTransactionError::TxWatcher(WatchTxError::Timeout))
+            .expect("timeout should be a retryable watch result");
+        assert!(!timeout, "timeout should ask the caller to retry");
+
+        let err = map_watch_error(PendingTransactionError::FailedToRegister)
+            .expect_err("non-timeout watcher failures must surface");
+        assert!(matches!(err, FlushError::Provider(_)));
     }
 
     #[test]

@@ -84,8 +84,7 @@ async fn chain_id_mismatch_from_cache_returns_typed_error() {
     // Pre-populate the bootstrap cache with chain_id=31337.
     let db_path = format!("{data_dir}/sequencer.db");
     {
-        let mut storage =
-            sequencer::storage::Storage::open(&db_path, "NORMAL").expect("open db for seed");
+        let mut storage = sequencer::storage::Storage::open(&db_path).expect("open db for seed");
         storage
             .save_l1_bootstrap_cache(
                 Address::from_slice(&[0x22; 20]), // input_box

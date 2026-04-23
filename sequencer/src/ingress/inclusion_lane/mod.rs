@@ -120,14 +120,14 @@ impl<A: Application + 'static> InclusionLane<A> {
         &mut self,
         safe_inputs: &mut Vec<StoredSafeInput>,
     ) -> Result<LaneState, InclusionLaneError> {
-        let next_safe_input_index = self.storage.load_next_undrained_safe_input_index()?;
+        let next_safe_input_index = self.storage.next_undrained_safe_input_index()?;
 
         let last_drained_direct_range = SafeInputRange::empty_at(next_safe_input_index);
-        if let Some(head) = self.storage.load_open_state()? {
+        if let Some(head) = self.storage.open_state()? {
             return Ok(LaneState::new(last_drained_direct_range, head));
         }
 
-        let frontier = self.storage.load_safe_input_frontier()?;
+        let frontier = self.storage.safe_input_frontier()?;
         assert!(
             frontier.end_exclusive >= last_drained_direct_range.end(),
             "safe-input head regressed during lane initialization: safe_end={}, next={}",
@@ -178,14 +178,20 @@ impl<A: Application + 'static> InclusionLane<A> {
         included: &mut Vec<PendingUserOp>,
     ) -> Result<(usize, ChunkOutcome), InclusionLaneError> {
         included.clear();
-        let outcome = dequeue_and_execute_user_op_chunk::<A>(
+        let outcome = match dequeue_and_execute_user_op_chunk::<A>(
             &mut self.rx,
             &mut self.app,
             head.frame_fee,
             self.config.max_user_ops_per_chunk.max(1),
             head,
             included,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                Self::respond_internal_to_all(included, "application internal error".to_string());
+                return Err(err);
+            }
+        };
         let included_count = included.len();
 
         self.persist_included_user_ops(head, included)?;
@@ -210,7 +216,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         }
         lane_state.mark_frontier_checked();
 
-        let frontier = self.storage.load_safe_input_frontier()?;
+        let frontier = self.storage.safe_input_frontier()?;
         assert!(
             frontier.end_exclusive >= lane_state.last_drained_direct_range.end(),
             "safe-input head regressed: safe_end={}, next={}",
@@ -342,7 +348,7 @@ fn execute_user_op(
     item: PendingUserOp,
     current_frame_fee: u16,
     included: &mut Vec<PendingUserOp>,
-) {
+) -> Result<(), InclusionLaneError> {
     match app.validate_and_execute_user_op(
         item.signed.sender,
         &item.signed.user_op,
@@ -355,9 +361,15 @@ fn execute_user_op(
                 .send(Err(SequencerError::invalid(reason.to_string())));
         }
         Err(AppError::Internal { reason }) => {
-            let _ = item.respond_to.send(Err(SequencerError::internal(reason)));
+            let _ = item
+                .respond_to
+                .send(Err(SequencerError::internal(reason.clone())));
+            return Err(InclusionLaneError::ExecuteUserOp {
+                source: AppError::Internal { reason },
+            });
         }
     }
+    Ok(())
 }
 
 /// Dequeue and execute up to `max_chunk` user ops, stopping early if the batch
@@ -380,7 +392,7 @@ pub(super) fn dequeue_and_execute_user_op_chunk<A: Application>(
     while executed < max_chunk {
         match rx.try_recv() {
             Ok(item) => {
-                execute_user_op(app, item, current_frame_fee, included);
+                execute_user_op(app, item, current_frame_fee, included)?;
                 executed = executed.saturating_add(1);
 
                 let projected = head

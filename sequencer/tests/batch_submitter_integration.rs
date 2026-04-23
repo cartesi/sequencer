@@ -106,11 +106,9 @@ impl BatchPoster for TestMock {
     }
 }
 
-const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
-
 /// Seeds storage so batches 1 and 2 are closed and batch 3 is open.
 fn seed_two_closed_batches(db_path: &str) {
-    let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -128,7 +126,7 @@ fn seed_two_closed_batches(db_path: &str) {
 
 /// Seeds storage so batch 0 is closed and batch 1 is the open Tip.
 fn seed_one_closed_batch(db_path: &str) {
-    let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -140,9 +138,9 @@ fn seed_one_closed_batch(db_path: &str) {
 
 /// Close the current open Tip so it becomes eligible for submission.
 fn close_current_tip(db_path: &str) {
-    let mut storage = Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
-        .load_open_state()
+        .open_state()
         .expect("load open state")
         .expect("open Tip exists");
     let next_safe = head.safe_block;

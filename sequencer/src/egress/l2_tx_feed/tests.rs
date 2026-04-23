@@ -168,7 +168,7 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
     // must not inflate the catch-up event count. The check should count actual
     // valid events, not subtract rowids.
     let db = temp_db("catchup-holes");
-    let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
     // Create two closed batches, each with one direct input.
     let mut head = storage
@@ -228,7 +228,7 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
 
     // Invalidate batch 0 — this creates a hole in the offset space.
     // Now only 1 valid event remains (from batch 1).
-    let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("reopen storage");
+    let mut storage = Storage::open(db.path.as_str()).expect("reopen storage");
     storage.insert_invalid_batch(0).expect("invalidate batch 0");
     drop(storage);
 
@@ -250,7 +250,7 @@ async fn catchup_window_excludes_batch_submitter_direct_inputs() {
     let batch_submitter = Address::from([0xfe; 20]);
     let user_address = Address::from([0x01; 20]);
 
-    let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -330,7 +330,7 @@ fn seed_ordered_txs(db_path: &str) {
 }
 
 fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
-    let mut storage = Storage::open(db_path, "NORMAL").expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");

@@ -61,8 +61,6 @@ pub use detector::{DangerDetector, DangerDetectorError, DetectorExit};
 pub use flusher::MempoolFlusher;
 use sequencer_core::protocol::ProtocolConfig;
 
-const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
-
 #[derive(Debug, Error)]
 pub enum RecoveryError {
     #[error(transparent)]
@@ -186,7 +184,7 @@ pub async fn run_preemptive_recovery(
 
     // ── Step 2: Read danger + last-progress, decide action ─────────
     let (danger, last_safe_progress_ms) = {
-        let mut storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+        let mut storage = storage::Storage::open(db_path)?;
         let last = storage.last_safe_progress_ms()?;
         let danger = storage.check_danger(protocol, crate::runtime::clock::unix_now_ms())?;
         (danger, last)
@@ -237,7 +235,7 @@ pub async fn run_preemptive_recovery(
     // and, if we flushed, step 3 re-synced it). The recovery transaction only
     // needs to cascade + open.
     tracing::info!("running startup recovery (detect stale, cascade-invalidate, open recovery)");
-    let mut det_storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
+    let mut det_storage = storage::Storage::open(db_path)?;
     let invalidated = det_storage.detect_and_recover(protocol.max_wait_blocks)?;
 
     if invalidated.is_empty() {
