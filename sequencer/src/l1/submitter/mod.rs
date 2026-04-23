@@ -14,4 +14,4 @@ mod worker;
 
 pub use config::BatchSubmitterConfig;
 pub use poster::{BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster, TxHash};
-pub use worker::{BatchSubmitter, BatchSubmitterError};
+pub use worker::{BatchSubmitter, BatchSubmitterError, SubmitterExit};

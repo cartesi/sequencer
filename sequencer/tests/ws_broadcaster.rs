@@ -339,10 +339,12 @@ fn seed_ordered_txs(db_path: &str) {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            &sequencer::storage::SchedulerRules::new(
-                Address::ZERO,
-                sequencer_core::MAX_WAIT_BLOCKS,
-            ),
+            &sequencer_core::protocol::ProtocolConfig {
+                batch_submitter: Address::ZERO,
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                seconds_per_block: 12,
+            },
         )
         .expect("append direct input");
     storage
@@ -371,10 +373,12 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
                 payload,
                 block_number: safe_block,
             }],
-            &sequencer::storage::SchedulerRules::new(
-                Address::ZERO,
-                sequencer_core::MAX_WAIT_BLOCKS,
-            ),
+            &sequencer_core::protocol::ProtocolConfig {
+                batch_submitter: Address::ZERO,
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                seconds_per_block: 12,
+            },
         )
         .expect("append direct input");
     storage

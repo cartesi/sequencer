@@ -23,47 +23,37 @@
 //! assumption, not a gap.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior, params};
+use sequencer_core::protocol::{ProtocolConfig, age_exceeds};
 
 use super::Storage;
 use super::internals::{
-    batch_age_is_stale, i64_to_u64, insert_new_batch, insert_open_frame, now_unix_ms,
-    persist_frame_direct_sequence, query_batch_policy, query_current_safe_block,
-    query_latest_safe_input_index_exclusive, u64_to_i64,
+    i64_to_u64, insert_new_batch, insert_open_frame, now_unix_ms, persist_frame_direct_sequence,
+    query_batch_policy, query_current_safe_block, query_latest_safe_input_index_exclusive,
+    u64_to_i64,
 };
 use super::safe_accepted_batches::query_latest_safe_accepted_batch;
 
 /// Outcome of a danger-zone check.
 ///
 /// Callers pattern-match on the variant to decide what action the condition
-/// warrants. The submitter flattens via [`DangerStatus::batch_index`]; the
-/// startup recovery path distinguishes because the two variants imply
-/// different responses (fresh-L1 flush-and-cascade vs stalled-L1 refuse-boot).
+/// warrants. The runtime danger detector treats Strict and Stalled the same
+/// (both trigger a crash-for-recovery); the startup recovery path distinguishes
+/// because the two variants imply different responses (fresh-L1
+/// flush-and-cascade vs stalled-L1 refuse-boot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DangerStatus {
     /// No danger detected — neither check tripped.
     Safe,
     /// Strict, block-based check tripped: a closed batch past the accepted
-    /// frontier is aged beyond `params.danger_threshold` against the observed
-    /// safe block. L1 view is fresh; flushing and cascading is meaningful.
+    /// frontier is aged beyond `protocol.danger_threshold()` against the
+    /// observed safe block. L1 view is fresh; flushing and cascading is
+    /// meaningful.
     Strict(u64),
     /// Wall-clock-adjusted check tripped: an unresolved batch is estimated
     /// past the adjusted threshold because wall-clock time has elapsed past
     /// our last safe-head observation. The safe-head view may be stale or
     /// frozen — flushing against L1 may not terminate.
     Stalled(u64),
-}
-
-impl DangerStatus {
-    pub fn is_dangerous(&self) -> bool {
-        matches!(self, Self::Strict(_) | Self::Stalled(_))
-    }
-
-    pub fn batch_index(&self) -> Option<u64> {
-        match self {
-            Self::Safe => None,
-            Self::Strict(idx) | Self::Stalled(idx) => Some(*idx),
-        }
-    }
 }
 
 /// Wall-clock-adjusted danger threshold, if a correction applies.
@@ -80,17 +70,17 @@ impl DangerStatus {
 pub(super) fn wall_clock_adjusted_threshold(
     last_safe_progress_ms: u64,
     now_ms: u64,
-    params: crate::recovery::RecoveryParams,
+    protocol: &ProtocolConfig,
 ) -> Option<u64> {
     if last_safe_progress_ms == 0 {
         return None;
     }
     let elapsed_secs = now_ms.saturating_sub(last_safe_progress_ms) / 1000;
-    let missed = elapsed_secs / params.seconds_per_block.max(1);
+    let missed = elapsed_secs / protocol.seconds_per_block.max(1);
     if missed == 0 {
         return None;
     }
-    Some(params.danger_threshold.saturating_sub(missed))
+    Some(protocol.danger_threshold().saturating_sub(missed))
 }
 
 impl Storage {
@@ -99,7 +89,7 @@ impl Storage {
     /// Runs two checks inside a single read transaction:
     ///
     /// 1. **Strict (block-based)**: `find_closed_frontier_batch_in_danger`
-    ///    against `params.danger_threshold`. Uses the observed safe block.
+    ///    against `protocol.danger_threshold()`. Uses the observed safe block.
     /// 2. **Wall-clock adjusted**: if a correction applies
     ///    ([`wall_clock_adjusted_threshold`] returns `Some`), widens to
     ///    `find_first_batch_in_danger` against `danger_threshold − missed_blocks`.
@@ -111,16 +101,12 @@ impl Storage {
     /// `now_ms` is passed in (rather than read from `SystemTime::now()` here)
     /// so the storage layer stays testable without time mocking. Production
     /// callers pass the current Unix-ms clock.
-    pub fn check_danger(
-        &mut self,
-        params: crate::recovery::RecoveryParams,
-        now_ms: u64,
-    ) -> Result<DangerStatus> {
+    pub fn check_danger(&mut self, protocol: &ProtocolConfig, now_ms: u64) -> Result<DangerStatus> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
 
-        if let Some(idx) = find_closed_frontier_batch_in_danger(&tx, params.danger_threshold)? {
+        if let Some(idx) = find_closed_frontier_batch_in_danger(&tx, protocol.danger_threshold())? {
             tx.commit()?;
             return Ok(DangerStatus::Strict(idx));
         }
@@ -132,7 +118,8 @@ impl Storage {
         )?;
         let last_safe_progress_ms = i64_to_u64(last_safe_progress_ms);
 
-        if let Some(adjusted) = wall_clock_adjusted_threshold(last_safe_progress_ms, now_ms, params)
+        if let Some(adjusted) =
+            wall_clock_adjusted_threshold(last_safe_progress_ms, now_ms, protocol)
             && let Some(idx) = find_first_batch_in_danger(&tx, adjusted)?
         {
             tx.commit()?;
@@ -177,16 +164,22 @@ impl Storage {
         Ok(())
     }
 
-    /// Detect stale batches and cascade-invalidate, then restore the open-batch invariant.
+    /// Detect stale batches, cascade-invalidate, and restore the open-batch
+    /// invariant. Called once per boot and by direct tests.
     ///
-    /// Runs detection, cascade invalidation, and recovery-batch opening inside a single
-    /// `Immediate` transaction so the operation is crash-safe and atomic.
+    /// Runs detection, cascade invalidation, and recovery-batch opening inside
+    /// a single `Immediate` transaction so the operation is crash-safe and
+    /// atomic.
     ///
-    /// Also handles the edge case where a previous boot invalidated the suffix but crashed
-    /// before opening the fresh batch: if no new invalidations are found but no valid open
-    /// batch exists, a recovery batch is opened.
+    /// Handles the edge case where a previous boot invalidated the suffix but
+    /// crashed before opening the fresh batch: if no new invalidations are
+    /// found but no valid open batch exists, a recovery batch is opened.
     ///
-    /// Returns the list of newly invalidated batch indices (empty if no stale batches found).
+    /// Does NOT populate `safe_accepted_batches` — the caller is expected to
+    /// have already synced L1 state via [`Storage::append_safe_inputs`], which
+    /// maintains the frontier view atomically with each sync.
+    ///
+    /// Returns the newly invalidated batch indices (empty if none).
     pub fn detect_and_recover(&mut self, max_wait_blocks: u64) -> Result<Vec<u64>> {
         let tx = self
             .conn
@@ -194,21 +187,6 @@ impl Storage {
         let to_invalidate = detect_and_recover_inner(&tx, max_wait_blocks)?;
         tx.commit()?;
         Ok(to_invalidate)
-    }
-
-    /// Startup recovery: cascade-invalidate stale batches and reopen the Tip
-    /// in one atomic transaction. Returns the newly invalidated batch indices.
-    ///
-    /// Does NOT populate `safe_accepted_batches` — the caller is expected to
-    /// have already synced L1 state via [`Storage::append_safe_inputs`], which
-    /// maintains the frontier view atomically with each sync.
-    pub fn run_startup_recovery(&mut self, max_wait_blocks: u64) -> Result<Vec<u64>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let invalidated = detect_and_recover_inner(&tx, max_wait_blocks)?;
-        tx.commit()?;
-        Ok(invalidated)
     }
 }
 
@@ -290,7 +268,7 @@ pub(super) fn find_closed_frontier_batch_in_danger(
 
     let first_frame_safe_block = first_frame_safe_block_of(conn, batch_index)?;
     let safe_block = query_current_safe_block(conn)?;
-    if batch_age_is_stale(safe_block, first_frame_safe_block, threshold) {
+    if age_exceeds(safe_block, first_frame_safe_block, threshold) {
         Ok(Some(i64_to_u64(batch_index)))
     } else {
         Ok(None)
@@ -312,7 +290,7 @@ fn find_tip_batch_in_danger(conn: &Connection, threshold: u64) -> Result<Option<
 
     let first_frame_safe_block = first_frame_safe_block_of(conn, tip_bi)?;
     let safe_block = query_current_safe_block(conn)?;
-    if batch_age_is_stale(safe_block, first_frame_safe_block, threshold) {
+    if age_exceeds(safe_block, first_frame_safe_block, threshold) {
         Ok(Some(i64_to_u64(tip_bi)))
     } else {
         Ok(None)
@@ -417,7 +395,7 @@ fn open_recovery_batch_in_tx(tx: &Transaction<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{
-        SENDER_A, default_scheduler_rules, load_all_ordered_l2_txs, make_stale_batch_payload,
+        SENDER_A, default_protocol_config, load_all_ordered_l2_txs, make_stale_batch_payload,
         seed_closed_batches, temp_db,
     };
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
@@ -461,7 +439,7 @@ mod tests {
                 block_number: 10,
             }];
             storage
-                .append_safe_inputs(10, directs_0.as_slice(), &default_scheduler_rules())
+                .append_safe_inputs(10, directs_0.as_slice(), &default_protocol_config())
                 .expect("append");
             storage
                 .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
@@ -476,7 +454,7 @@ mod tests {
                 block_number: 20,
             }];
             storage
-                .append_safe_inputs(20, directs_1.as_slice(), &default_scheduler_rules())
+                .append_safe_inputs(20, directs_1.as_slice(), &default_protocol_config())
                 .expect("append");
             storage
                 .close_frame_only(&mut head, 20, SafeInputRange::new(1, 2))
@@ -509,7 +487,7 @@ mod tests {
                 block_number: 10,
             }];
             storage
-                .append_safe_inputs(10, directs.as_slice(), &default_scheduler_rules())
+                .append_safe_inputs(10, directs.as_slice(), &default_protocol_config())
                 .expect("append");
             storage
                 .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
@@ -551,7 +529,7 @@ mod tests {
                 },
             ];
             storage
-                .append_safe_inputs(10, directs.as_slice(), &default_scheduler_rules())
+                .append_safe_inputs(10, directs.as_slice(), &default_protocol_config())
                 .expect("append");
             storage
                 .close_frame_only(&mut head, 10, SafeInputRange::new(0, 2))
@@ -601,7 +579,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append safe input");
             let invalidated = storage
@@ -635,7 +613,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append safe input");
             let first = storage.detect_and_recover(1200).expect("first detect");
@@ -666,7 +644,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append stale safe input");
             let first = storage.detect_and_recover(1200).expect("first recovery");
@@ -705,7 +683,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append gen1 stale safe input");
             let first = storage.detect_and_recover(1200).expect("gen1 recovery");
@@ -724,7 +702,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 100),
                         block_number: 2410,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append gen2 stale safe input");
             let second = storage.detect_and_recover(1200).expect("gen2 recovery");
@@ -771,7 +749,7 @@ mod tests {
             // Advance the safe head so the open batch's first frame (safe_block=10)
             // is now stale: 1500 - 10 >= 1200.
             storage
-                .append_safe_inputs(1500, &[], &default_scheduler_rules())
+                .append_safe_inputs(1500, &[], &default_protocol_config())
                 .expect("advance safe head past MAX_WAIT_BLOCKS");
 
             let invalidated = storage
@@ -802,7 +780,7 @@ mod tests {
                 .expect("initialize open state at safe_block=10");
 
             storage
-                .append_safe_inputs(1100, &[], &default_scheduler_rules())
+                .append_safe_inputs(1100, &[], &default_protocol_config())
                 .expect("advance safe head below threshold");
 
             let invalidated = storage
@@ -833,7 +811,7 @@ mod tests {
                 .expect("initialize");
 
             storage
-                .append_safe_inputs(1210, &[], &default_scheduler_rules())
+                .append_safe_inputs(1210, &[], &default_protocol_config())
                 .expect("advance safe head to exact threshold");
 
             let invalidated = storage.detect_and_recover(1200).expect("recover");
@@ -851,7 +829,7 @@ mod tests {
                 .expect("initialize");
 
             storage
-                .append_safe_inputs(1209, &[], &default_scheduler_rules())
+                .append_safe_inputs(1209, &[], &default_protocol_config())
                 .expect("advance safe head to one block below threshold");
 
             let invalidated = storage.detect_and_recover(1200).expect("recover");
@@ -879,7 +857,7 @@ mod tests {
 
             // Advance safe head so batch 0's first frame (safe_block=10) is stale.
             storage
-                .append_safe_inputs(1500, &[], &default_scheduler_rules())
+                .append_safe_inputs(1500, &[], &default_protocol_config())
                 .expect("advance safe head past staleness");
 
             let invalidated = storage.detect_and_recover(1200).expect("recover");
@@ -929,7 +907,7 @@ mod tests {
 
             // Advance safe head so batch 0's first frame (safe_block=10) is stale.
             storage
-                .append_safe_inputs(1500, &[], &default_scheduler_rules())
+                .append_safe_inputs(1500, &[], &default_protocol_config())
                 .expect("advance safe head past staleness");
 
             storage
@@ -1008,7 +986,7 @@ mod tests {
                 },
             ];
             storage
-                .append_safe_inputs(10, deposits.as_slice(), &default_scheduler_rules())
+                .append_safe_inputs(10, deposits.as_slice(), &default_protocol_config())
                 .expect("append deposits");
             storage
                 .close_frame_only(&mut head, 10, SafeInputRange::new(0, 2))
@@ -1029,7 +1007,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append stale batch submission");
             let invalidated = storage
@@ -1092,7 +1070,7 @@ mod tests {
                         payload: vec![0xde, 0xad],
                         block_number: 20,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append undrained deposit");
             let before = load_all_ordered_l2_txs(&mut storage);
@@ -1113,7 +1091,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append stale batch submission");
             let invalidated = storage.detect_and_recover(1200).expect("recover");
@@ -1164,7 +1142,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append stale batch submission");
             let invalidated = storage.detect_and_recover(1200).expect("recover");
@@ -1211,7 +1189,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append stale batch submission");
             let invalidated = storage.detect_and_recover(1200).expect("recover");
@@ -1283,7 +1261,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append stale submission");
             // First call: full recovery runs to completion and opens a new Tip.
@@ -1351,14 +1329,14 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 20,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append safe input");
             // Advance to a current safe block where batch 0 (safe_block=10) is
             // past threshold (1200-10=1190>=1125) but batch 1 (safe_block=100)
             // is still fresh (1200-100=1100<1125).
             storage
-                .append_safe_inputs(1200, &[], &default_scheduler_rules())
+                .append_safe_inputs(1200, &[], &default_protocol_config())
                 .expect("advance safe block");
 
             let result = storage.check_danger_zone(1125).expect("check danger zone");
@@ -1386,7 +1364,7 @@ mod tests {
                 .expect("initialize open batch at safe_block=10");
 
             storage
-                .append_safe_inputs(1200, &[], &default_scheduler_rules())
+                .append_safe_inputs(1200, &[], &default_protocol_config())
                 .expect("advance safe head past danger threshold");
 
             let result = storage.check_danger_zone(1125).expect("check danger zone");
@@ -1417,7 +1395,7 @@ mod tests {
                 .expect("initialize open batch at safe_block=10");
 
             storage
-                .append_safe_inputs(1200, &[], &default_scheduler_rules())
+                .append_safe_inputs(1200, &[], &default_protocol_config())
                 .expect("advance safe head past threshold");
 
             let result = storage
@@ -1442,7 +1420,7 @@ mod tests {
                 .expect("initialize open batch at safe_block=10");
 
             storage
-                .append_safe_inputs(1100, &[], &default_scheduler_rules())
+                .append_safe_inputs(1100, &[], &default_protocol_config())
                 .expect("advance safe head below threshold");
 
             let result = storage
@@ -1478,11 +1456,11 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 20,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append safe input");
             storage
-                .append_safe_inputs(1200, &[], &default_scheduler_rules())
+                .append_safe_inputs(1200, &[], &default_protocol_config())
                 .expect("advance safe block");
 
             let result = storage.check_danger_zone(1125).expect("check danger zone");
@@ -1513,11 +1491,11 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 20,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append safe input");
             storage
-                .append_safe_inputs(1134, &[], &default_scheduler_rules())
+                .append_safe_inputs(1134, &[], &default_protocol_config())
                 .expect("advance safe block");
 
             let result = storage.check_danger_zone(1125).expect("check danger zone");
@@ -1554,7 +1532,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 100),
                         block_number: 1300,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append safe input");
             let invalidated = storage.detect_and_recover(max_wait).expect("detect");
@@ -1590,7 +1568,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 100),
                         block_number: 1299,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append safe input");
             let invalidated = storage.detect_and_recover(max_wait).expect("detect");
@@ -1621,7 +1599,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append");
             let inv = storage.detect_and_recover(max_wait).expect("detect");
@@ -1648,7 +1626,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append gen1");
             let inv1 = storage.detect_and_recover(max_wait).expect("recover gen1");
@@ -1667,7 +1645,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 1210),
                         block_number: 2410,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append gen2");
             let inv2 = storage.detect_and_recover(max_wait).expect("recover gen2");
@@ -1693,7 +1671,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append");
             storage.detect_and_recover(max_wait).expect("recover gen1");
@@ -1710,7 +1688,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 1210),
                         block_number: 2410,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append gen2");
             storage.detect_and_recover(max_wait).expect("recover gen2");
@@ -1727,7 +1705,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 2410),
                         block_number: 2420,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append gen3");
             let inv3 = storage.detect_and_recover(max_wait).expect("recover gen3");
@@ -1755,7 +1733,7 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 1210,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append");
             let inv = storage.detect_and_recover(max_wait).expect("detect");
@@ -1987,13 +1965,13 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 20,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append batch 0 submission");
             // Advance safe head so batches 1, 2, 3 (first_frame=100) are stale.
             // current_safe=1400 → 1400-100=1300 >= 1200.
             storage
-                .append_safe_inputs(1400, &[], &default_scheduler_rules())
+                .append_safe_inputs(1400, &[], &default_protocol_config())
                 .expect("advance past threshold");
 
             let inv = storage.detect_and_recover(1200).expect("recover");
@@ -2292,11 +2270,11 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 20,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append accepted");
             storage
-                .append_safe_inputs(1400, &[], &default_scheduler_rules())
+                .append_safe_inputs(1400, &[], &default_protocol_config())
                 .expect("advance past threshold");
             let inv = storage.detect_and_recover(1200).expect("recover");
             assert!(!inv.is_empty(), "partial cascade should invalidate");
@@ -2355,11 +2333,11 @@ mod tests {
                         payload: make_stale_batch_payload(0, 10),
                         block_number: 20,
                     }],
-                    &default_scheduler_rules(),
+                    &default_protocol_config(),
                 )
                 .expect("append accepted");
             storage
-                .append_safe_inputs(1400, &[], &default_scheduler_rules())
+                .append_safe_inputs(1400, &[], &default_protocol_config())
                 .expect("advance");
             let _ = storage.detect_and_recover(1200).expect("cascade 1");
 

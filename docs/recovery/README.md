@@ -4,6 +4,42 @@ This document describes the recovery design for the sequencer: how the system de
 
 See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and function names.
 
+## Runtime lifecycle at a glance
+
+The sequencer's recovery loop spans two process lifetimes: an in-process **danger detector** observes and crashes the process; an external orchestrator (systemd, k8s, …) respawns; the fresh boot runs `run_preemptive_recovery` before any writers come online.
+
+```text
+  steady state                       danger
+  ┌──────────┐                       ┌──────────┐
+  │ running  │───detector tick──▶ 🚨 │ exiting  │
+  └──────────┘                       └─────┬────┘
+       ▲                                   │ RunError::DangerZoneDetected
+       │                                   ▼
+  ┌────┴─────┐                 ┌─────────────────┐
+  │  normal  │◀────────────────│ orchestrator    │──respawn──▶ startup
+  │  ticks   │                 │ (systemd/k8s)   │                │
+  └──────────┘                 └─────────────────┘                ▼
+                                                          ┌────────────────────────┐
+                                                          │ run_preemptive_recovery│
+                                                          │   1. sync L1 safe head │
+                                                          │   2. decide action     │
+                                                          │       (pure function)  │
+                                                          │   3. flush mempool     │
+                                                          │      + re-sync         │
+                                                          │   4. detect_and_recover│
+                                                          └────────────────────────┘
+```
+
+Key abstractions, by responsibility:
+
+- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::DangerZone` when either the strict or wall-clock-adjusted check fires. The runtime converts that into `RunError::DangerZoneDetected` and the process exits.
+- **`BatchSubmitter`** ([`l1/submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs)): makes L1 progress only — never checks danger. Productive ticks re-enter immediately; idle/transient ticks sleep `idle_poll_interval`. A pure `decide_submit_start` function folds observed L1 nonces over the scheduler-accepted frontier.
+- **`decide_startup_action`** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): pure function. Takes `(danger, l1_reachable, last_safe_progress_ms)` and returns `Proceed | FlushAndCascade | Refuse(reason)`. The side-effectful driver executes the chosen action.
+- **`MempoolFlusher`** ([`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs)): submits no-op transactions to consume all pending wallet-nonce slots and waits for safe finality. Does **not** retry internally on provider errors — the orchestrator's respawn loop is the retry mechanism.
+- **`ProtocolConfig`** ([`sequencer-core/src/protocol.rs`](../../sequencer-core/src/protocol.rs)): single source of truth for the scheduler-mirroring fields (`batch_submitter`, `max_wait_blocks`) plus the sequencer-local tuning knobs (`preemptive_margin_blocks`, `seconds_per_block`). Exposes `scheduler_accepts`, `is_scheduler_stale`, `danger_threshold`.
+
+All five pieces are replaceable at the abstraction boundary: the tick decision is a pure function; the storage surface returns structs, not ad-hoc tuples; the danger detector and submitter are independently testable.
+
 ## The Batch Tree
 
 Batches form a tree where each node is a batch and edges point from child to parent. Each batch has a single parent: the preceding batch in the valid chain.

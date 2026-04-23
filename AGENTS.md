@@ -72,18 +72,19 @@ If a batch is stale, all existing subsequent batches are also invalid. The sched
 
 ### Preemptive recovery
 
-Rather than waiting for a batch to go stale on L1, the sequencer uses a **danger threshold** (`MAX_WAIT_BLOCKS − MARGIN`). When the frontier batch's staleness reaches this threshold the sequencer:
+Rather than waiting for a batch to go stale on L1, the sequencer uses a **danger threshold** (`MAX_WAIT_BLOCKS − MARGIN`). The cycle crosses a process boundary by design:
 
-1. **Goes offline** — stops accepting user ops.
-2. **Flushes the mempool** — submits no-op transactions at every pending wallet-nonce slot and waits for safe finality. This consumes all pending slots so adversarially-delayed "zombie" batch submissions cannot land later. The flusher is load-bearing, not defense-in-depth.
-3. **Runs recovery** — on fully finalized L1 state: cascade-invalidate stale batches, open a recovery batch, re-drain direct inputs from invalidated batches.
-4. **Resumes** — restarts batch submission and user-op acceptance.
+1. **Detector trips + process exits** — the in-process [`DangerDetector`](sequencer/src/recovery/detector.rs) polls `Storage::check_danger` on a cadence. When either the strict block-based or wall-clock-adjusted arm fires, the detector exits with `DetectorExit::DangerZone`, the runtime maps that to `RunError::DangerZoneDetected`, and the process exits with a non-zero status. Stopping the process is how the sequencer goes offline: no more user-op acceptance, no more batch submission.
+2. **Orchestrator respawns** — systemd/k8s/etc. restarts the process.
+3. **Startup flushes the mempool** — [`MempoolFlusher`](sequencer/src/recovery/flusher.rs) submits no-op transactions at every pending wallet-nonce slot and waits for safe finality. This consumes all pending slots so adversarially-delayed "zombie" batch submissions cannot land later. The flusher is load-bearing, not defense-in-depth.
+4. **Startup runs recovery** — on fully finalized L1 state: cascade-invalidate stale batches, open a recovery batch, re-drain direct inputs from invalidated batches. Driven by [`run_preemptive_recovery`](sequencer/src/recovery/mod.rs) with the decision table in the pure [`decide_startup_action`](sequencer/src/recovery/mod.rs).
+5. **Normal operation resumes** — the lane, submitter, input reader, and a fresh detector all start up.
 
 ### Detection: safe-only, with wall-clock fallback
 
 Staleness is only checked against L1 **safe** state, never latest. Stale batches in latest that haven't reached safe yet will eventually become safe, and the check will fire at that point. This avoids reacting to L1 reorgs.
 
-When L1 is unreachable, the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The batch submitter falls back to **wall-clock estimation**: `estimated_missed_blocks = (now − last_l1_success) / seconds_per_block`, and the danger threshold is adjusted downward by this estimate. Prevents silently issuing doomed soft confirmations during extended L1 outages.
+When L1 is unreachable, the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The danger detector falls back to **wall-clock estimation**: `estimated_missed_blocks = (now − last_l1_success) / seconds_per_block`, and the danger threshold is adjusted downward by this estimate. Prevents silently issuing doomed soft confirmations during extended L1 outages.
 
 ### Formal verification
 
@@ -120,7 +121,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - `sequencer/src/main.rs` — thin binary entrypoint.
 - `sequencer/src/lib.rs` — public sequencer API (`run`, `RunConfig`).
 - `sequencer/src/http.rs` — shared HTTP error type, JSON `ErrorResponse`, `ApiConfig`, and `axum::serve` orchestration.
-- `sequencer/src/runtime/` — process bootstrap, `RunConfig`, EIP-712 domain, `ShutdownSignal`.
+- `sequencer/src/runtime/` — process bootstrap, `RunConfig`, EIP-712 domain, `ShutdownSignal`, shared `clock::unix_now_ms`.
 - `sequencer/src/ingress/` — public write path.
   - `api.rs` — `POST /tx` handler, JSON-rejection mapping.
   - `inclusion_lane/` — single-lane hot-path loop (`mod.rs`), catch-up replay, config, error types.
@@ -132,7 +133,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
   - `submitter/` — stateless batch submitter (`worker.rs` + `poster.rs`).
   - `provider.rs` — alloy provider construction.
   - `partition.rs` — long-block-range retry helper.
-- `sequencer/src/recovery/` — preemptive recovery startup procedure and mempool flusher.
+- `sequencer/src/recovery/` — preemptive recovery startup procedure (`mod.rs`), runtime danger detector (`detector.rs`), and mempool flusher (`flusher.rs`).
 - `sequencer/src/storage/` — SQLite persistence, split by writer role (`ingress`, `egress`, `l1_inputs`, `l1_submission`, `recovery`, `admin`, plus shared `mod`, `open`, `internals`, and `migrations/`).
 
 ## Key Concepts
@@ -141,7 +142,8 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Frame** — ordering boundary; commits `safe_block` + user ops.
 - **Batch** — list of frames posted on-chain as one L1 transaction (SSZ-encoded).
 - **Inclusion lane** — hot-path single-lane loop that dequeues, executes, persists, and rotates frame/batch boundaries. The only writer of open batch/frame state.
-- **Batch submitter** — stateless worker that assigns nonces, bulk-submits all pending batches each tick.
+- **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Nonces are assigned by storage (structural `parent.nonce + 1`) when batches are closed; the submitter just reads them.
+- **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `DangerZone` when the strict or wall-clock-adjusted check fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery can run.
 - **Input reader** — ingests safe inputs from L1 InputBox into SQLite.
 - **L2 tx feed** — DB-backed ordered-tx stream used by WS subscribers.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.

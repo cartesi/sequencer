@@ -5,25 +5,30 @@
 
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
+use sequencer_core::protocol::ProtocolConfig;
 use tempfile::TempDir;
 
-use super::{SafeInputRange, SchedulerRules, Storage, StoredSafeInput};
+use super::{SafeInputRange, Storage, StoredSafeInput};
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
 pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
 
-/// Default scheduler rules for tests that don't care about the specific
-/// submitter address or staleness bound. Uses `SENDER_A` as the submitter
-/// and `MAX_WAIT_BLOCKS` as the staleness bound.
-pub(crate) fn default_scheduler_rules() -> SchedulerRules {
-    SchedulerRules::new(SENDER_A, sequencer_core::MAX_WAIT_BLOCKS)
+/// Default protocol config for tests that don't care about the specific
+/// submitter address or margin. Uses `SENDER_A` as the submitter.
+pub(crate) fn default_protocol_config() -> ProtocolConfig {
+    protocol_config_for(SENDER_A)
 }
 
-/// Scheduler rules with a specific submitter address and the default
+/// Protocol config with a specific submitter address and the default
 /// `MAX_WAIT_BLOCKS`. Common test shape: seed via this sender, assert against
-/// it. For explicit `max_wait_blocks` tuning use `SchedulerRules::new`.
-pub(crate) fn scheduler_rules_for(sender: Address) -> SchedulerRules {
-    SchedulerRules::new(sender, sequencer_core::MAX_WAIT_BLOCKS)
+/// it. For explicit `max_wait_blocks` tuning build `ProtocolConfig` directly.
+pub(crate) fn protocol_config_for(sender: Address) -> ProtocolConfig {
+    ProtocolConfig {
+        batch_submitter: sender,
+        max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+        preemptive_margin_blocks: 75,
+        seconds_per_block: 12,
+    }
 }
 
 pub(crate) struct TestDb {
@@ -44,7 +49,7 @@ pub(crate) fn temp_db(name: &str) -> TestDb {
 }
 
 /// Insert safe inputs whose payloads are SSZ-encoded batches with the given nonces,
-/// all attributed to `sender`. Uses `scheduler_rules_for(sender)` so the
+/// all attributed to `sender`. Uses `protocol_config_for(sender)` so the
 /// populated `safe_accepted_batches` view matches this sender.
 pub(crate) fn seed_safe_inputs_with_batch_nonces(
     storage: &mut Storage,
@@ -63,9 +68,9 @@ pub(crate) fn seed_safe_inputs_with_batch_nonces(
             block_number: safe_block,
         })
         .collect();
-    let rules = scheduler_rules_for(sender);
+    let protocol = protocol_config_for(sender);
     storage
-        .append_safe_inputs(safe_block, inputs.as_slice(), &rules)
+        .append_safe_inputs(safe_block, inputs.as_slice(), &protocol)
         .expect("append safe inputs");
 }
 

@@ -51,13 +51,12 @@ pub enum RespawnAttemptOutcome {
     Stable,
     /// `respawn()` itself returned `Err` — the child exited during bootstrap
     /// before HTTP became ready. Typically surfaces
-    /// `RecoveryError::StartupDangerZoneEstimate` from the startup
-    /// fallback.
+    /// `RecoveryError::Refuse(...)` from the startup decision table.
     RespawnFailed(String),
     /// `respawn()` returned `Ok` but the child exited within the
     /// stabilization window. Typically surfaces
-    /// `BatchSubmitterError::DangerZone` from the submitter's first post-boot
-    /// tick.
+    /// `RunError::DangerZoneDetected` from the runtime danger detector's
+    /// first post-boot poll.
     ExitedPostRespawn(std::process::ExitStatus),
 }
 
@@ -587,13 +586,12 @@ impl ManagedSequencer {
     /// There are two distinct "unstable" shapes the sequencer can take:
     ///   - The child dies during bootstrap (before HTTP readiness), which
     ///     makes `respawn()` itself return `Err`. Canonical cause:
-    ///     `RecoveryError::StartupDangerZoneEstimate` from the startup
-    ///     fallback when L1 is unreachable.
+    ///     `RecoveryError::Refuse(...)` from the startup decision table
+    ///     when L1 is unreachable and the persisted state looks stalled.
     ///   - The child comes up (HTTP ready, bootstrap passed), then one of
     ///     the internal tasks returns a fatal error and the process exits.
-    ///     Canonical cause: `BatchSubmitterError::DangerZone` when the first
-    ///     submitter tick after boot sees a closed batch past
-    ///     `danger_threshold`.
+    ///     Canonical cause: `RunError::DangerZoneDetected` when the first
+    ///     danger-detector poll after boot sees a batch past `danger_threshold`.
     ///
     /// The race between bootstrap-finishes and submitter-first-tick is
     /// short (the poll interval is 5s by default, but the first tick runs
