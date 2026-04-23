@@ -20,6 +20,7 @@ permissions:
   contents: write
 
 env:
+  RUST_TOOLCHAIN: "1.95.0"
   XGENEXT2FS_VERSION: v1.5.6
   XGENEXT2FS_SHA256_AMD64: 996e4e68a638b5dc5967d3410f92ecb8d2f41e32218bbe0f8b4c4474d7eebc59
   XGENEXT2FS_SHA256_ARM64: e5aca81164b762bbe5447bacef41e4fa9e357fd9c8f44e519c5206227d43144d
@@ -59,6 +60,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Cache Rust artifacts
@@ -123,6 +125,7 @@ jobs:
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
         with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
           xgenext2fs-version: ${{ env.XGENEXT2FS_VERSION }}
           xgenext2fs-sha256-amd64: ${{ env.XGENEXT2FS_SHA256_AMD64 }}
           xgenext2fs-sha256-arm64: ${{ env.XGENEXT2FS_SHA256_ARM64 }}

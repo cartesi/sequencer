@@ -35,6 +35,7 @@ use std::time::SystemTime;
 use thiserror::Error;
 
 pub use open::Storage;
+pub use recovery::DangerStatus;
 pub use scheduler_rules::SchedulerRules;
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
@@ -150,16 +151,6 @@ pub struct PendingBatch {
     pub batch_index: u64,
     pub nonce: u64,
     pub encoded: Vec<u8>,
-}
-
-/// Coherent DB snapshot for one batch-submitter tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SubmitterTickSnapshot {
-    pub safe_block: u64,
-    pub safe_next_expected_nonce: u64,
-    pub danger_batch_index: Option<u64>,
-    /// Wall-clock time when we last observed the safe frontier advance.
-    pub last_safe_progress_ms: u64,
 }
 
 /// Returned by [`Storage::open`] and friends; either the SQLite handle failed
