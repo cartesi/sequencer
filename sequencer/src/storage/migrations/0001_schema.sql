@@ -262,8 +262,9 @@ WHERE batch_index NOT IN (SELECT batch_index FROM batches WHERE invalidated_at_m
 -- Derived log of batch submissions the scheduler would actually execute.
 -- Unlike a raw log of all safe submissions, this only contains the accepted
 -- prefix: batches whose nonce matched the expected sequence and were not stale.
--- Populated by populate_safe_accepted_batches() which simulates the scheduler's
--- acceptance logic over safe_inputs.
+-- Maintained atomically by Storage::append_safe_inputs (via
+-- populate_safe_accepted_batches_inner), which simulates the scheduler's
+-- acceptance logic over new safe_inputs rows.
 CREATE TABLE IF NOT EXISTS safe_accepted_batches (
     safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),
     nonce                INTEGER NOT NULL,

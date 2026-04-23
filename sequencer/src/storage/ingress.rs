@@ -310,7 +310,10 @@ fn insert_user_ops_batch(
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{SafeInputRange, Storage, StoredSafeInput, test_helpers::temp_db};
+    use crate::storage::{
+        SafeInputRange, Storage, StoredSafeInput,
+        test_helpers::{default_scheduler_rules, temp_db},
+    };
     use alloy_primitives::Address;
     use sequencer_core::l2_tx::SequencedL2Tx;
 
@@ -476,7 +479,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, drained.as_slice())
+            .append_safe_inputs(10, drained.as_slice(), &default_scheduler_rules())
             .expect("insert direct inputs");
         let mut head = head;
         storage
@@ -534,7 +537,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, drained.as_slice())
+            .append_safe_inputs(10, drained.as_slice(), &default_scheduler_rules())
             .expect("insert direct inputs");
         let mut head = head;
         storage

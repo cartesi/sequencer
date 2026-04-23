@@ -93,6 +93,23 @@ impl EthereumBatchPoster {
             .map_err(|err| BatchPosterError::Provider(err.to_string()))
     }
 
+    /// Wait serially for each tx to reach `confirmation_depth + 1` confirmations.
+    ///
+    /// **Serial is not a performance concession; it's correct.** Ethereum mines
+    /// transactions from a single EOA in strict wallet-nonce order: tx[k] cannot
+    /// land on-chain until tx[k-1] has landed. So:
+    ///
+    /// - If tx[0] times out, tx[1..] cannot have been mined either; watching
+    ///   them is provably pointless. We return `Ok(())` early and let the next
+    ///   tick retry the whole sequence.
+    /// - If tx[0] confirms, tx[1] was blocked only on tx[0] and is unblocked by
+    ///   the time we start watching it.
+    ///
+    /// Timeouts return `Ok(())` rather than `Err` because the safe response is
+    /// "re-enter `submit_batches` on the next tick" — which re-estimates fees
+    /// (natural replacement bump) and re-submits at the same wallet nonces. The
+    /// wallet-nonce ordering invariant above guarantees we cannot accidentally
+    /// skip work by returning early here.
     async fn wait_for_confirmations(&self, tx_hashes: &[TxHash]) -> Result<(), BatchPosterError> {
         let timeout = self.confirmation_timeout();
         for tx_hash in tx_hashes {

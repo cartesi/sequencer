@@ -9,34 +9,30 @@
 //! same helpers under one transaction. The split is by *frequency*: this file
 //! is what runs every tick; recovery is the once-per-startup composer.
 
-use alloy_primitives::Address;
 use rusqlite::{OptionalExtension, Result, TransactionBehavior, params};
 
 use super::Storage;
 use super::internals::{
     decode_l2_tx_row, i64_to_u16, i64_to_u32, i64_to_u64, query_current_safe_block, u64_to_i64,
 };
-use super::recovery::{
-    find_closed_frontier_batch_in_danger, find_first_batch_in_danger,
-    populate_safe_accepted_batches_inner, query_latest_safe_accepted_batch,
-};
+use super::recovery::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
+use super::safe_accepted_batches::query_latest_safe_accepted_batch;
 use super::{FrameHeader, PendingBatch, SubmitterTickSnapshot};
 use sequencer_core::batch::{Batch, BatchForSubmission, Frame as BatchFrame, WireUserOp};
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
-    /// Refresh recovery metadata and load the coherent DB snapshot the live
-    /// submitter uses for one tick.
+    /// Load the coherent DB snapshot the live submitter uses for one tick.
+    ///
+    /// Pure reads: the `safe_accepted_batches` view is maintained atomically by
+    /// [`Storage::append_safe_inputs`], so the submitter never populates.
     pub fn prepare_submitter_tick_snapshot(
         &mut self,
-        batch_submitter_address: Address,
-        max_wait_blocks: u64,
         danger_threshold: u64,
     ) -> Result<SubmitterTickSnapshot> {
         let tx = self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        populate_safe_accepted_batches_inner(&tx, batch_submitter_address, max_wait_blocks)?;
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
 
         let safe_block = query_current_safe_block(&tx)?;
         let safe_next_expected_nonce = query_latest_safe_accepted_batch(&tx)?
@@ -60,7 +56,10 @@ impl Storage {
 
     /// Load the scheduler-accepted safe frontier persisted in `safe_accepted_batches`.
     ///
-    /// Returns `(current_safe_block, next_expected_nonce)`.
+    /// Returns `(current_safe_block, next_expected_nonce)`. Test-only helper;
+    /// production callers use [`Storage::prepare_submitter_tick_snapshot`] for
+    /// a coherent view including the danger-zone flag.
+    #[cfg(test)]
     pub fn load_safe_accepted_frontier(&mut self) -> Result<(u64, u64)> {
         let tx = self
             .conn
@@ -71,23 +70,6 @@ impl Storage {
             .unwrap_or(0);
         tx.commit()?;
         Ok((safe_block, next_expected_nonce))
-    }
-
-    /// Bring `safe_accepted_batches` up to date with new L1 safe inputs from
-    /// `batch_submitter_address`. Idempotent and resumes from the latest
-    /// accepted row, so calling this each tick costs only the new rows.
-    /// See [`populate_safe_accepted_batches_inner`] for the simulation logic.
-    pub fn populate_safe_accepted_batches(
-        &mut self,
-        batch_submitter_address: Address,
-        max_wait_blocks: u64,
-    ) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        populate_safe_accepted_batches_inner(&tx, batch_submitter_address, max_wait_blocks)?;
-        tx.commit()?;
-        Ok(())
     }
 
     /// Check if the first unresolved batch (past the accepted frontier) is in the
@@ -108,9 +90,9 @@ impl Storage {
     /// is handled at `MAX_WAIT_BLOCKS` by `detect_and_recover` and (for
     /// L1-unreachable boots) by [`Self::check_any_unresolved_batch_in_danger`].
     ///
-    /// Requires `safe_accepted_batches` to be populated first (call
-    /// `populate_safe_accepted_batches` or `refresh_recovery_metadata` before
-    /// this).
+    /// Reads `safe_accepted_batches`, which is maintained atomically with
+    /// each [`Storage::append_safe_inputs`] call; no separate populate step
+    /// is required.
     pub fn check_danger_zone(&mut self, danger_threshold: u64) -> Result<Option<u64>> {
         find_closed_frontier_batch_in_danger(&self.conn, danger_threshold)
     }
@@ -312,9 +294,10 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{
-        SENDER_A, SENDER_B, seed_closed_batches, seed_safe_inputs_with_batch_nonces, temp_db,
+        SENDER_A, SENDER_B, scheduler_rules_for, seed_closed_batches,
+        seed_safe_inputs_with_batch_nonces, temp_db,
     };
-    use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+    use crate::storage::{SafeInputRange, SchedulerRules, Storage, StoredSafeInput};
     use alloy_primitives::Address;
     use sequencer_core::batch::{Batch, Frame as BatchFrame};
 
@@ -456,10 +439,9 @@ mod tests {
     fn load_safe_accepted_frontier_tracks_accepted_prefix() {
         let db = temp_db("safe-accepted-frontier-prefix");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        // seed_safe_inputs_with_batch_nonces already calls append_safe_inputs,
+        // which auto-populates safe_accepted_batches.
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4, 5]);
-        storage
-            .populate_safe_accepted_batches(SENDER_A, u64::MAX)
-            .expect("populate safe accepted batches");
 
         let (safe_block, next) = storage
             .load_safe_accepted_frontier()
@@ -475,7 +457,7 @@ mod tests {
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4]);
 
         let snapshot = storage
-            .prepare_submitter_tick_snapshot(SENDER_A, u64::MAX, 1125)
+            .prepare_submitter_tick_snapshot(1125)
             .expect("prepare submitter tick snapshot");
 
         assert_eq!(snapshot.safe_block, 10);
@@ -501,6 +483,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 1");
 
+        let rules = SchedulerRules::new(SENDER_A, 1200);
         storage
             .append_safe_inputs(
                 1135,
@@ -516,11 +499,12 @@ mod tests {
                     }),
                     block_number: 20,
                 }],
+                &rules,
             )
             .expect("append accepted batch 0");
 
         let snapshot = storage
-            .prepare_submitter_tick_snapshot(SENDER_A, 1200, 1125)
+            .prepare_submitter_tick_snapshot(1125)
             .expect("prepare submitter tick snapshot");
 
         assert_eq!(snapshot.safe_block, 1135);
@@ -532,11 +516,12 @@ mod tests {
     fn populate_safe_accepted_batches_resumes_from_latest_row() {
         let db = temp_db("safe-accepted-frontier-resume");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1]);
-        storage
-            .populate_safe_accepted_batches(SENDER_A, u64::MAX)
-            .expect("populate first page");
+        let rules = scheduler_rules_for(SENDER_A);
 
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1]);
+
+        // Mixed-sender wave: the SENDER_B row must be ignored, SENDER_A rows
+        // must resume from the cursor and advance the frontier.
         let second_wave = vec![
             StoredSafeInput {
                 sender: SENDER_B,
@@ -564,11 +549,8 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(11, second_wave.as_slice())
+            .append_safe_inputs(11, second_wave.as_slice(), &rules)
             .expect("append second wave");
-        storage
-            .populate_safe_accepted_batches(SENDER_A, u64::MAX)
-            .expect("populate second wave");
 
         let (safe_block, next) = storage
             .load_safe_accepted_frontier()
@@ -589,6 +571,7 @@ mod tests {
     fn load_safe_accepted_frontier_skips_stale_payloads() {
         let db = temp_db("safe-accepted-frontier-skip-stale");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let rules = SchedulerRules::new(SENDER_A, 1200);
 
         // Seed a non-stale batch with nonce 0 (safe_block=100, block_number=200, max_wait=1200 → not stale)
         let non_stale_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
@@ -636,12 +619,8 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(2000, inputs.as_slice())
+            .append_safe_inputs(2000, inputs.as_slice(), &rules)
             .expect("append");
-
-        storage
-            .populate_safe_accepted_batches(SENDER_A, 1200)
-            .expect("populate safe accepted batches");
 
         let (_, next) = storage
             .load_safe_accepted_frontier()
@@ -684,6 +663,7 @@ mod tests {
         });
 
         let batch_submitter = Address::repeat_byte(0xCC);
+        let rules = SchedulerRules::new(batch_submitter, u64::MAX);
         let inputs = vec![
             StoredSafeInput {
                 sender: batch_submitter,
@@ -697,12 +677,9 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(200, inputs.as_slice())
+            .append_safe_inputs(200, inputs.as_slice(), &rules)
             .expect("append");
 
-        storage
-            .populate_safe_accepted_batches(batch_submitter, u64::MAX)
-            .expect("populate");
         let (_, next) = storage
             .load_safe_accepted_frontier()
             .expect("load safe accepted frontier");
@@ -781,6 +758,7 @@ mod tests {
     fn populate_safe_accepted_batches_skips_duplicate_nonces() {
         let db = temp_db("populate-dup-nonces");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let rules = SchedulerRules::new(SENDER_A, 1200);
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -802,11 +780,9 @@ mod tests {
                         block_number: 20,
                     },
                 ],
+                &rules,
             )
             .expect("append");
-        storage
-            .populate_safe_accepted_batches(SENDER_A, 1200)
-            .expect("populate");
 
         let (_, next) = storage
             .load_safe_accepted_frontier()
@@ -818,6 +794,7 @@ mod tests {
     fn populate_safe_accepted_batches_handles_large_nonce_gap() {
         let db = temp_db("populate-nonce-gap");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let rules = SchedulerRules::new(SENDER_A, 1200);
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -832,11 +809,9 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(5, 10),
                     block_number: 20,
                 }],
+                &rules,
             )
             .expect("append");
-        storage
-            .populate_safe_accepted_batches(SENDER_A, 1200)
-            .expect("populate");
 
         let (_, next) = storage
             .load_safe_accepted_frontier()
@@ -848,6 +823,7 @@ mod tests {
     fn populate_safe_accepted_batches_out_of_order_arrivals_stalls_frontier() {
         let db = temp_db("populate-out-of-order");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let rules = SchedulerRules::new(SENDER_A, 1200);
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -865,11 +841,9 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(1, 10),
                     block_number: 20,
                 }],
+                &rules,
             )
             .expect("append");
-        storage
-            .populate_safe_accepted_batches(SENDER_A, 1200)
-            .expect("populate");
 
         let (_, next) = storage
             .load_safe_accepted_frontier()
@@ -884,11 +858,9 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(0, 10),
                     block_number: 21,
                 }],
+                &rules,
             )
             .expect("append nonce 0");
-        storage
-            .populate_safe_accepted_batches(SENDER_A, 1200)
-            .expect("populate again");
 
         let (_, next2) = storage
             .load_safe_accepted_frontier()

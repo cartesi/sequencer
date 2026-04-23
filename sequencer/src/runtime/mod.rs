@@ -17,7 +17,7 @@ use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, Inclusi
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
 use crate::l1::submitter::{BatchPosterConfig, EthereumBatchPoster};
 use crate::l1::submitter::{BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError};
-use crate::storage::{self, StorageOpenError};
+use crate::storage::{self, SchedulerRules, StorageOpenError};
 use config::{L1Config, RunConfig};
 use sequencer_core::application::Application;
 use shutdown::ShutdownSignal;
@@ -117,11 +117,17 @@ where
         poll_interval: INPUT_READER_POLL_INTERVAL,
         long_block_range_error_codes: config.long_block_range_error_codes.clone(),
     };
+    // Scheduler acceptance rules: shared between the input reader (which
+    // maintains `safe_accepted_batches` atomically with each safe-head advance)
+    // and any other storage caller that needs to re-populate the view.
+    let scheduler_rules =
+        SchedulerRules::new(batch_submitter_address, sequencer_core::MAX_WAIT_BLOCKS);
 
     let (mut input_reader, input_reader_genesis_block, l1_config) = match InputReader::new(
         db_path.clone(),
         shutdown.clone(),
         input_reader_config.clone(),
+        scheduler_rules,
     )
     .await
     {
@@ -194,6 +200,7 @@ where
                 genesis,
                 db_path.clone(),
                 shutdown.clone(),
+                scheduler_rules,
             );
             let l1 = L1Config {
                 eth_rpc_url: config.eth_rpc_url.clone(),
@@ -270,7 +277,6 @@ where
     let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
     let submitter = BatchSubmitter::new(
         db_path.clone(),
-        l1_config.batch_submitter_address,
         poster,
         shutdown.clone(),
         batch_submitter_config,
