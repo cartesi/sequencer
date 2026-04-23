@@ -20,7 +20,7 @@ use tracing::info;
 
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events};
 use crate::runtime::shutdown::ShutdownSignal;
-use crate::storage::{Storage, StorageOpenError, StoredSafeInput};
+use crate::storage::{SchedulerRules, Storage, StorageOpenError, StoredSafeInput};
 
 const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 
@@ -53,6 +53,9 @@ pub struct InputReader {
     genesis_block: u64,
     db_path: String,
     shutdown: ShutdownSignal,
+    /// Scheduler acceptance rules used to keep `safe_accepted_batches`
+    /// consistent with every `append_safe_inputs` write.
+    scheduler_rules: SchedulerRules,
 }
 
 impl InputReader {
@@ -60,6 +63,7 @@ impl InputReader {
         db_path: impl Into<String>,
         shutdown: ShutdownSignal,
         config: InputReaderConfig,
+        scheduler_rules: SchedulerRules,
     ) -> Result<Self, InputReaderError> {
         let provider = crate::l1::provider::create_provider(&config.rpc_url)
             .map_err(InputReaderError::Bootstrap)?;
@@ -90,6 +94,7 @@ impl InputReader {
             genesis_block,
             db_path.into(),
             shutdown,
+            scheduler_rules,
         ))
     }
 
@@ -99,6 +104,7 @@ impl InputReader {
         genesis_block: u64,
         db_path: String,
         shutdown: ShutdownSignal,
+        scheduler_rules: SchedulerRules,
     ) -> Self {
         Self {
             config,
@@ -106,6 +112,7 @@ impl InputReader {
             genesis_block,
             db_path,
             shutdown,
+            scheduler_rules,
         }
     }
 
@@ -262,10 +269,11 @@ impl InputReader {
         batch: Vec<StoredSafeInput>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
+        let rules = self.scheduler_rules;
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
             storage
-                .append_safe_inputs(current_safe_block, &batch)
+                .append_safe_inputs(current_safe_block, &batch, &rules)
                 .map_err(InputReaderError::from)
         })
         .await
@@ -333,6 +341,7 @@ mod tests {
             genesis_block,
             db_path,
             shutdown,
+            SchedulerRules::new(Address::ZERO, sequencer_core::MAX_WAIT_BLOCKS),
         )
     }
 
@@ -493,6 +502,7 @@ mod tests {
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: Vec::new(),
             },
+            SchedulerRules::new(Address::ZERO, sequencer_core::MAX_WAIT_BLOCKS),
         )
         .await;
 
@@ -511,8 +521,9 @@ mod tests {
         let db_file = NamedTempFile::new().expect("temp file");
         let db_path = db_file.path().to_string_lossy().into_owned();
         let mut storage = Storage::open(&db_path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
+        let rules = SchedulerRules::new(Address::ZERO, sequencer_core::MAX_WAIT_BLOCKS);
         storage
-            .append_safe_inputs(1000, &[])
+            .append_safe_inputs(1000, &[], &rules)
             .expect("set safe head ahead of chain");
         let recorded_sync = storage
             .last_safe_progress_ms()

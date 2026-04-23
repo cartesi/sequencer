@@ -16,6 +16,8 @@ use super::internals::{
     i64_to_u64, now_unix_ms, query_current_safe_block, query_latest_safe_input_index_exclusive,
     u64_to_i64,
 };
+use super::safe_accepted_batches::populate_safe_accepted_batches;
+use super::scheduler_rules::SchedulerRules;
 
 impl Storage {
     /// `MAX(safe_input_index) + 1` (or 0 if empty). The exclusive bound on the
@@ -73,13 +75,23 @@ impl Storage {
 
     /// Atomically: insert `inputs` (assigned contiguous indexes starting from
     /// the current MAX+1), advance `l1_safe_head.block_number` to `safe_block`,
-    /// and stamp `synced_at_ms` as the wall-clock time when the safe frontier
-    /// advanced. Asserts `safe_block` is monotonic and that it strictly
-    /// advances when `inputs` is non-empty.
+    /// stamp `synced_at_ms` as the wall-clock time when the safe frontier
+    /// advanced, and update `safe_accepted_batches` via `rules` so the
+    /// scheduler-accepted frontier view stays consistent with the safe head.
+    ///
+    /// The materialized `safe_accepted_batches` view is an invariant of this
+    /// operation: after a successful `append_safe_inputs`, every safe input up
+    /// to `safe_block` has been evaluated against the scheduler's acceptance
+    /// rules and recorded in `safe_accepted_batches`. Readers (submitter,
+    /// recovery, danger checks) never need to populate separately.
+    ///
+    /// Asserts `safe_block` is monotonic and that it strictly advances when
+    /// `inputs` is non-empty.
     pub fn append_safe_inputs(
         &mut self,
         safe_block: u64,
         inputs: &[StoredSafeInput],
+        rules: &SchedulerRules,
     ) -> Result<()> {
         let tx = self
             .conn
@@ -105,6 +117,8 @@ impl Storage {
         if changed != 1 {
             return Err(rusqlite::Error::StatementChangedRows(changed));
         }
+
+        populate_safe_accepted_batches(&tx, rules)?;
 
         tx.commit()?;
         Ok(())
@@ -187,13 +201,17 @@ fn insert_safe_inputs_batch(
 mod tests {
     use std::{thread, time::Duration};
 
-    use crate::storage::{SafeInputRange, Storage, StoredSafeInput, test_helpers::temp_db};
+    use crate::storage::{
+        SafeInputRange, Storage, StoredSafeInput,
+        test_helpers::{default_scheduler_rules, temp_db},
+    };
     use alloy_primitives::Address;
 
     #[test]
     fn safe_input_api_uses_half_open_intervals() {
         let db = temp_db("safe-input-api");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let rules = default_scheduler_rules();
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 0);
         let mut out = Vec::new();
@@ -215,7 +233,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, inserted.as_slice())
+            .append_safe_inputs(10, inserted.as_slice(), &rules)
             .expect("insert safe directs");
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 2);

@@ -1237,7 +1237,14 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
             })
             .collect();
         storage
-            .append_safe_inputs(1, &safe_inputs)
+            .append_safe_inputs(
+                1,
+                &safe_inputs,
+                &sequencer::storage::SchedulerRules::new(
+                    Address::ZERO,
+                    sequencer_core::MAX_WAIT_BLOCKS,
+                ),
+            )
             .expect("seed deposits");
     }
 
@@ -1282,6 +1289,10 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 payload,
                 block_number: safe_block,
             }],
+            &sequencer::storage::SchedulerRules::new(
+                Address::ZERO,
+                sequencer_core::MAX_WAIT_BLOCKS,
+            ),
         )
         .expect("append safe direct input");
 }

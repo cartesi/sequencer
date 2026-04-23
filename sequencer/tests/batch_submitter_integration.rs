@@ -6,7 +6,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::Address;
 use async_trait::async_trait;
 use sequencer::l1::submitter::{BatchPoster, BatchPosterError, TxHash};
 use sequencer::l1::submitter::{BatchSubmitter, BatchSubmitterConfig};
@@ -16,8 +15,6 @@ use sequencer_core::batch::Batch;
 
 mod common;
 use common::{TestDb, temp_db};
-
-const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
 
 /// Minimal mock for integration tests: records submissions.
 struct TestMock {
@@ -102,13 +99,7 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
         preemptive_margin_blocks: 75,
         seconds_per_block: 12,
     };
-    let submitter = BatchSubmitter::new(
-        path,
-        BATCH_SUBMITTER_ADDRESS,
-        mock.clone(),
-        shutdown.clone(),
-        config,
-    );
+    let submitter = BatchSubmitter::new(path, mock.clone(), shutdown.clone(), config);
     let handle = submitter.start().expect("start batch submitter");
 
     // Allow at least one tick to run (worker may submit batch 1 and 2 in one tick).

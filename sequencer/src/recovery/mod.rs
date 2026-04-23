@@ -27,7 +27,6 @@
 
 mod flusher;
 
-use alloy_primitives::Address;
 use thiserror::Error;
 
 use crate::l1::reader::{InputReader, InputReaderError};
@@ -91,6 +90,11 @@ pub async fn run_preemptive_recovery(
     let batch_submitter_address = l1_config.batch_submitter_address;
 
     // ── Step 1: Sync safe head (tolerate L1 failure) ───────────────
+    //
+    // `sync_to_current_safe_head` goes through `append_safe_inputs`, which
+    // maintains `safe_accepted_batches` atomically with each advance. After
+    // this step, the scheduler-frontier view is consistent with l1_safe_head
+    // for every downstream reader.
     match input_reader.sync_to_current_safe_head().await {
         Ok(()) => {
             tracing::info!("L1 safe head synced");
@@ -103,7 +107,7 @@ pub async fn run_preemptive_recovery(
 
             // L1 is down. Estimate whether the frontier batch has crossed the danger
             // threshold since the last successful sync.
-            let in_danger = wall_clock_danger_estimate(db_path, batch_submitter_address, params)?;
+            let in_danger = wall_clock_danger_estimate(db_path, params)?;
 
             if let Some(batch_index) = in_danger {
                 tracing::error!(
@@ -120,9 +124,7 @@ pub async fn run_preemptive_recovery(
         }
     }
 
-    if let Some(batch_index) =
-        stalled_safe_head_danger_estimate(db_path, batch_submitter_address, params)?
-    {
+    if let Some(batch_index) = stalled_safe_head_danger_estimate(db_path, params)? {
         tracing::error!(
             batch_index,
             "safe head has not progressed and the estimated frontier is in danger zone at startup"
@@ -130,10 +132,9 @@ pub async fn run_preemptive_recovery(
         return Err(RecoveryError::StartupDangerZoneEstimate);
     }
 
-    // ── Step 2: Populate frontier + check danger zone ───────────────
+    // ── Step 2: Check danger zone ───────────────────────────────────
     let needs_flush = {
         let mut det_storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
-        det_storage.refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)?;
         det_storage.check_danger_zone(danger_threshold)?
     };
 
@@ -162,9 +163,13 @@ pub async fn run_preemptive_recovery(
     }
 
     // ── Step 4: Atomic recovery ────────────────────────────────────
-    tracing::info!("running startup recovery (populate frontier, assign nonces, detect stale)");
+    //
+    // `safe_accepted_batches` is already caught up to `l1_safe_head` (step 1
+    // and, if we flushed, step 3 re-synced it). The recovery transaction only
+    // needs to cascade + open.
+    tracing::info!("running startup recovery (detect stale, cascade-invalidate, open recovery)");
     let mut det_storage = storage::Storage::open(db_path, SQLITE_SYNCHRONOUS_PRAGMA)?;
-    let invalidated = det_storage.run_startup_recovery(batch_submitter_address, max_wait_blocks)?;
+    let invalidated = det_storage.run_startup_recovery(max_wait_blocks)?;
 
     if invalidated.is_empty() {
         tracing::info!("no stale batches found — continuing normally");
@@ -189,13 +194,15 @@ pub async fn run_preemptive_recovery(
 /// This is the same check the batch submitter uses at runtime. Both ask:
 /// "given the frontier age at our last safe-head progress, how much additional
 /// age should we attribute to the outage?"
+///
+/// The materialized `safe_accepted_batches` view is assumed to be consistent
+/// with `l1_safe_head` — maintained by [`crate::storage::Storage::append_safe_inputs`].
 pub(crate) fn wall_clock_danger_estimate(
     db_path: &str,
-    batch_submitter_address: Address,
     params: RecoveryParams,
 ) -> Result<Option<u64>, RecoveryError> {
     let RecoveryParams {
-        max_wait_blocks,
+        max_wait_blocks: _,
         danger_threshold,
         seconds_per_block,
     } = params;
@@ -215,7 +222,6 @@ pub(crate) fn wall_clock_danger_estimate(
         estimate_missed_blocks_since(last_sync_ms, seconds_per_block);
     let adjusted_threshold = danger_threshold.saturating_sub(estimated_missed_blocks);
 
-    storage.refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)?;
     // Use the unified check here (not `check_danger_zone`): if L1 is
     // unreachable, we want to refuse to boot whenever *any* unresolved batch
     // may be past the threshold, including the open batch. `check_danger_zone`
@@ -247,13 +253,15 @@ pub(crate) fn wall_clock_danger_estimate(
 
 /// Estimate danger when L1 remains reachable but the safe frontier has failed
 /// to advance for at least one expected block interval.
+///
+/// Like [`wall_clock_danger_estimate`], this reads the already-maintained
+/// `safe_accepted_batches` view; no populate needed.
 pub(crate) fn stalled_safe_head_danger_estimate(
     db_path: &str,
-    batch_submitter_address: Address,
     params: RecoveryParams,
 ) -> Result<Option<u64>, RecoveryError> {
     let RecoveryParams {
-        max_wait_blocks,
+        max_wait_blocks: _,
         danger_threshold,
         seconds_per_block,
     } = params;
@@ -271,7 +279,6 @@ pub(crate) fn stalled_safe_head_danger_estimate(
     }
 
     let adjusted_threshold = danger_threshold.saturating_sub(estimated_missed_blocks);
-    storage.refresh_recovery_metadata(batch_submitter_address, max_wait_blocks)?;
     let estimated_danger_batch =
         storage.check_any_unresolved_batch_in_danger(adjusted_threshold)?;
 
@@ -311,10 +318,15 @@ fn estimate_missed_blocks_since(last_sync_ms: u64, seconds_per_block: u64) -> (u
 mod tests {
     use super::*;
     use crate::storage::test_helpers::temp_db;
-    use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+    use crate::storage::{SafeInputRange, SchedulerRules, Storage, StoredSafeInput};
+    use alloy_primitives::Address;
 
     const SQLITE_SYNCHRONOUS_PRAGMA: &str = "NORMAL";
     const BATCH_SUBMITTER: Address = Address::repeat_byte(0xAA);
+
+    fn test_rules() -> SchedulerRules {
+        SchedulerRules::new(BATCH_SUBMITTER, 1200)
+    }
 
     fn set_last_safe_progress_ms(db_path: &str, synced_at_ms: u64) {
         let conn = Storage::open_connection(db_path, SQLITE_SYNCHRONOUS_PRAGMA)
@@ -343,7 +355,6 @@ mod tests {
 
         let err = wall_clock_danger_estimate(
             &db.path,
-            BATCH_SUBMITTER,
             RecoveryParams {
                 max_wait_blocks: 1200,
                 danger_threshold: 1125,
@@ -377,6 +388,7 @@ mod tests {
                     payload: batch_payload(0, 100),
                     block_number: 200,
                 }],
+                &test_rules(),
             )
             .expect("append accepted batch");
         drop(storage);
@@ -390,7 +402,6 @@ mod tests {
 
         let batch_index = wall_clock_danger_estimate(
             &db.path,
-            BATCH_SUBMITTER,
             RecoveryParams {
                 max_wait_blocks: 1200,
                 danger_threshold: 1125,
@@ -410,13 +421,12 @@ mod tests {
         let db = temp_db("stall-estimate-needs-gap");
         let mut storage = Storage::open(&db.path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
         storage
-            .append_safe_inputs(1200, &[])
+            .append_safe_inputs(1200, &[], &test_rules())
             .expect("record current safe progress");
         drop(storage);
 
         let batch_index = stalled_safe_head_danger_estimate(
             &db.path,
-            BATCH_SUBMITTER,
             RecoveryParams {
                 max_wait_blocks: 1200,
                 danger_threshold: 1125,
@@ -450,6 +460,7 @@ mod tests {
                     payload: batch_payload(0, 100),
                     block_number: 200,
                 }],
+                &test_rules(),
             )
             .expect("append accepted batch");
         drop(storage);
@@ -462,7 +473,6 @@ mod tests {
 
         let batch_index = stalled_safe_head_danger_estimate(
             &db.path,
-            BATCH_SUBMITTER,
             RecoveryParams {
                 max_wait_blocks: 1200,
                 danger_threshold: 1125,

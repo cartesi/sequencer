@@ -1,0 +1,140 @@
+// (c) Cartesi and individual authors (see AUTHORS)
+// SPDX-License-Identifier: Apache-2.0 (see LICENSE)
+
+//! Materialized view of the scheduler-accepted batches.
+//!
+//! `safe_accepted_batches` caches the prefix of submitted batches that the
+//! on-chain scheduler would accept, based on an off-chain simulation of its
+//! acceptance rules (see [`super::scheduler_rules::SchedulerRules`]).
+//!
+//! Maintenance contract: the view is advanced atomically with each
+//! [`super::Storage::append_safe_inputs`] write, so any reader that sees
+//! `l1_safe_head` at block B also sees every acceptance decision up to B. No
+//! caller should populate this view directly.
+//!
+//! Readers:
+//! - batch submitter tick snapshot (`prepare_submitter_tick_snapshot`)
+//! - recovery cascade (`find_closed_frontier_batch_in_danger`)
+//! - wall-clock and stalled-safe-head danger estimates
+//!
+//! The only writer is [`populate_safe_accepted_batches`], invoked from
+//! `append_safe_inputs` inside its transaction.
+
+use rusqlite::{Connection, OptionalExtension, Result, params};
+
+use super::internals::i64_to_u64;
+use super::scheduler_rules::{SafeInputRef, SchedulerRules};
+
+/// One row of `safe_accepted_batches`, exposing just the columns the
+/// frontier-read code paths need.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SafeAcceptedBatchRow {
+    pub safe_input_index: i64,
+    pub nonce: i64,
+}
+
+/// The most recently accepted row, or `None` if the view is empty.
+pub(super) fn query_latest_safe_accepted_batch(
+    conn: &Connection,
+) -> Result<Option<SafeAcceptedBatchRow>> {
+    conn.query_row(
+        "SELECT safe_input_index, nonce FROM safe_accepted_batches \
+         ORDER BY safe_input_index DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(SafeAcceptedBatchRow {
+                safe_input_index: row.get(0)?,
+                nonce: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Simulate the scheduler's acceptance logic over new safe inputs and append
+/// matches to `safe_accepted_batches`.
+///
+/// Paginates through `safe_inputs` rows newer than the cursor (latest accepted
+/// row), pre-filtered at SQL to the batch-submitter's sender. For each row,
+/// delegates to [`SchedulerRules::evaluate`] with the currently-expected
+/// nonce — on `Some`, inserts the accepted row and advances expected; on
+/// `None`, moves on. The SQL sender filter is an optimization; `evaluate`
+/// re-checks defensively, so the filter is correctness-neutral.
+///
+/// Paginated to bound memory. The cursor tracks the scan regardless of
+/// acceptance, so a long run of rejected rows between acceptances still
+/// makes forward progress.
+pub(super) fn populate_safe_accepted_batches(
+    conn: &Connection,
+    rules: &SchedulerRules,
+) -> Result<()> {
+    const PAGE_SIZE: i64 = 256;
+    const SELECT_SQL: &str = "SELECT safe_input_index, payload, block_number \
+                              FROM safe_inputs \
+                              WHERE sender = ?1 AND safe_input_index > ?2 \
+                              ORDER BY safe_input_index ASC LIMIT ?3";
+    const INSERT_SQL: &str = "INSERT OR IGNORE INTO safe_accepted_batches \
+                              (safe_input_index, nonce, first_frame_safe_block, inclusion_block) \
+                              VALUES (?1, ?2, ?3, ?4)";
+
+    let latest_accepted = query_latest_safe_accepted_batch(conn)?;
+    let mut cursor = latest_accepted
+        .map(|row| row.safe_input_index)
+        .unwrap_or(-1);
+    let mut expected = latest_accepted
+        .map(|row| i64_to_u64(row.nonce).saturating_add(1))
+        .unwrap_or(0);
+
+    loop {
+        // Materialize one page before executing any INSERTs. rusqlite's row
+        // iterator borrows the prepared statement, so we can't INSERT on the
+        // same connection while iterating. Once the page is collected and the
+        // statement is dropped, the connection is free for inserts.
+        let page: Vec<(i64, Vec<u8>, i64)> = {
+            let mut stmt = conn.prepare_cached(SELECT_SQL)?;
+            stmt.query_map(
+                params![
+                    rules.batch_submitter_address().as_slice(),
+                    cursor,
+                    PAGE_SIZE,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+            .collect::<Result<_>>()?
+        };
+
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len() as i64;
+
+        for (safe_input_index, payload, block_number) in &page {
+            cursor = *safe_input_index;
+            let input = SafeInputRef {
+                safe_input_index: *safe_input_index,
+                sender: rules.batch_submitter_address(),
+                payload: payload.as_slice(),
+                inclusion_block: i64_to_u64(*block_number),
+            };
+            let Some(accepted) = rules.evaluate(input, expected) else {
+                continue;
+            };
+            conn.execute(
+                INSERT_SQL,
+                params![
+                    accepted.safe_input_index,
+                    i64::try_from(accepted.nonce).unwrap_or(i64::MAX),
+                    i64::try_from(accepted.first_frame_safe_block).unwrap_or(i64::MAX),
+                    i64::try_from(accepted.inclusion_block).unwrap_or(i64::MAX),
+                ],
+            )?;
+            expected = expected.saturating_add(1);
+        }
+
+        if page_len < PAGE_SIZE {
+            break;
+        }
+    }
+
+    Ok(())
+}
