@@ -3,16 +3,29 @@
 
 //! Batch submitter worker: stateless, at-least-once submission to L1.
 //!
-//! On each tick the worker:
-//! 1. Reads a coherent DB snapshot (`safe_block`, `safe_next_expected_nonce`,
-//!    `danger_batch_index`, `last_safe_progress_ms`). The scheduler-accepted
-//!    frontier is maintained by the input reader via `append_safe_inputs`;
-//!    the worker is a pure reader here.
-//! 2. Checks if any valid batch is in the danger zone — triggers shutdown if found.
-//! 3. Queries L1 for the next expected batch nonce.
-//! 4. Loads the valid unresolved suffix with nonce >= next expected.
-//! 5. Submits the pending suffix to L1 with incrementing wallet nonces.
-//! 6. Waits for confirmations or timeout, then loops.
+//! The worker alternates between running one tick of work and sleeping for
+//! `idle_poll_interval`, until either shutdown fires or a fatal error
+//! propagates. A tick:
+//!
+//! 1. Reads a lightweight snapshot ([`TickSnapshot`]) — safe block, next
+//!    expected batch nonce, and a folded danger-zone check (strict
+//!    block-based + wall-clock adjusted). The scheduler-accepted frontier is
+//!    maintained by the input reader via `append_safe_inputs`; the worker is
+//!    a pure reader.
+//! 2. Crashes with `DangerZone` if the snapshot flags any batch past the
+//!    (possibly adjusted) threshold — startup recovery will then flush and
+//!    cascade.
+//! 3. Queries L1 for batch submissions past the accepted frontier, advances
+//!    the expected nonce over any contiguous matches, and submits the remaining
+//!    suffix. Provider errors propagate and the outer loop logs + retries.
+//!
+//! Intentional simplifications:
+//! - The worker sleeps for one `idle_poll_interval` after every non-fatal
+//!   tick outcome, including a successful submission attempt. This keeps the
+//!   loop single-cadence rather than special-casing "productive" ticks.
+//! - Danger detection and frontier reads are eventually consistent rather than
+//!   transactionally atomic. A danger transition may lag by up to one worker
+//!   tick, which the preemptive margin is expected to absorb.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +34,17 @@ use thiserror::Error;
 use tracing::{debug, error};
 
 use crate::l1::submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig};
+use crate::recovery::RecoveryParams;
 use crate::runtime::shutdown::ShutdownSignal;
-use crate::storage::{PendingBatch, Storage, StorageOpenError, SubmitterTickSnapshot};
+use crate::storage::{DangerStatus, PendingBatch, Storage, StorageOpenError};
+
+/// In-memory snapshot the worker builds from two storage reads each tick.
+#[derive(Debug, Clone, Copy)]
+struct TickSnapshot {
+    safe_block: u64,
+    safe_next_expected_nonce: u64,
+    danger: DangerStatus,
+}
 
 #[derive(Debug, Error)]
 pub enum BatchSubmitterError {
@@ -40,19 +62,11 @@ pub enum BatchSubmitterError {
     DangerZone { batch_index: u64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TickOutcome {
-    Idle,
-    Submitted { count: usize },
-}
-
 pub struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
     poster: Arc<P>,
     idle_poll_interval: Duration,
-    max_wait_blocks: u64,
-    danger_threshold: u64,
-    seconds_per_block: u64,
+    recovery_params: RecoveryParams,
     shutdown: ShutdownSignal,
 }
 
@@ -67,9 +81,11 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             db_path: db_path.into(),
             poster,
             idle_poll_interval: config.idle_poll_interval(),
-            max_wait_blocks: config.max_wait_blocks,
-            danger_threshold: config.danger_threshold(),
-            seconds_per_block: config.seconds_per_block,
+            recovery_params: RecoveryParams {
+                max_wait_blocks: config.max_wait_blocks,
+                danger_threshold: config.danger_threshold(),
+                seconds_per_block: config.seconds_per_block,
+            },
             shutdown,
         }
     }
@@ -81,70 +97,58 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         Ok(tokio::spawn(async move { self.run_forever().await }))
     }
 
+    /// Top-level driver: race the work loop against the shutdown signal.
+    ///
+    /// Any mid-tick await (DB read, RPC call, confirmation watch, sleep) is
+    /// cancellable at a shutdown. Mid-tick cancellation is crash-safe:
+    /// storage operations either commit or auto-roll-back on drop, and any
+    /// already-sent L1 transaction will be picked up by the next startup's
+    /// `observed_submitted_batch_nonces` scan.
     async fn run_forever(self) -> Result<(), BatchSubmitterError> {
-        loop {
-            if self.shutdown.is_shutdown_requested() {
-                return Ok(());
-            }
-
-            match self.tick_once().await {
-                Ok(TickOutcome::Submitted { .. }) => continue,
-                Ok(TickOutcome::Idle) => {}
-                Err(BatchSubmitterError::Poster(source)) => {
-                    error!(error = %source, "L1 provider error — will retry");
-
-                    // Wall-clock danger check: read the persisted safe-progress
-                    // marker from DB and estimate how many blocks have passed
-                    // since then. Same logic as the startup outage check —
-                    // stateless, reads from DB each time.
-                    let in_danger = crate::recovery::wall_clock_danger_estimate(
-                        &self.db_path,
-                        crate::recovery::RecoveryParams {
-                            max_wait_blocks: self.max_wait_blocks,
-                            danger_threshold: self.danger_threshold,
-                            seconds_per_block: self.seconds_per_block,
-                        },
-                    );
-                    match in_danger {
-                        Ok(Some(batch_index)) => {
-                            return Err(BatchSubmitterError::DangerZone { batch_index });
-                        }
-                        Ok(None) => {} // safe to retry
-                        Err(e) => {
-                            error!(error = %e, "wall-clock danger check failed");
-                        }
-                    }
-                }
-                Err(err) => return Err(err),
-            }
-
-            tokio::select! {
-                _ = self.shutdown.wait_for_shutdown() => return Ok(()),
-                _ = tokio::time::sleep(self.idle_poll_interval) => {}
-            }
+        tokio::select! {
+            biased;
+            _ = self.shutdown.wait_for_shutdown() => Ok(()),
+            result = self.run_loop() => result,
         }
     }
 
-    pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
+    /// Infinite work loop: tick, sleep, repeat. Only fatal errors propagate;
+    /// provider errors are logged and the next tick retries.
+    ///
+    /// The cadence is intentionally uniform: even after a successful submit,
+    /// the worker waits `idle_poll_interval` before re-entering. That trades a
+    /// small amount of responsiveness for a simpler, one-state loop.
+    async fn run_loop(&self) -> Result<(), BatchSubmitterError> {
+        loop {
+            if let Err(err) = self.tick_once().await {
+                match err {
+                    BatchSubmitterError::Poster(source) => {
+                        error!(error = %source, "L1 provider error — will retry");
+                    }
+                    fatal => return Err(fatal),
+                }
+            }
+            tokio::time::sleep(self.idle_poll_interval).await;
+        }
+    }
+
+    pub(crate) async fn tick_once(&self) -> Result<(), BatchSubmitterError> {
         let snapshot = self.load_tick_snapshot().await?;
 
-        // Crash on danger zone so the startup sequence can flush the mempool and recover.
-        if let Some(batch_index) = snapshot.danger_batch_index {
+        // Either kind of danger exits for recovery. The submitter doesn't
+        // distinguish Strict vs Stalled — both imply "stop and let startup
+        // decide what to do next."
+        if let Some(batch_index) = snapshot.danger.batch_index() {
             tracing::error!(
                 batch_index,
-                danger_threshold = self.danger_threshold,
+                status = ?snapshot.danger,
+                danger_threshold = self.recovery_params.danger_threshold,
                 "danger zone detected — triggering shutdown for flush and recovery"
             );
             return Err(BatchSubmitterError::DangerZone { batch_index });
         }
 
-        if safe_progress_has_stalled(snapshot.last_safe_progress_ms, self.seconds_per_block)
-            && let Some(batch_index) = self.check_stalled_safe_head_danger().await?
-        {
-            return Err(BatchSubmitterError::DangerZone { batch_index });
-        }
-
-        // Step 3: Derive the next unresolved batch nonce from the safe frontier plus
+        // Derive the next unresolved batch nonce from the safe frontier plus
         // latest-chain mined submissions beyond that safe prefix.
         //
         // This must start at `safe_block + 1`: after a danger-zone shutdown, the
@@ -161,16 +165,15 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             advance_expected_batch_nonce(snapshot.safe_next_expected_nonce, recent_observed_nonces)
         };
 
-        // Step 4: Load the unresolved suffix (all valid batches with nonce >= next_nonce).
         let pending = self.load_pending_batches(next_nonce).await?;
         if pending.is_empty() {
-            return Ok(TickOutcome::Idle);
+            return Ok(());
         }
 
-        // Step 5: Submit the whole suffix in one shot, then let the poster wait for
-        // confirmations serially. Using latest mined submissions plus the latest L1
-        // account nonce makes the next tick naturally replace unresolved txs at the
-        // same wallet nonces after a timeout.
+        // Submit the whole suffix in one shot, then let the poster wait for
+        // confirmations serially. Using latest mined submissions plus the
+        // latest L1 account nonce makes the next tick naturally replace
+        // unresolved txs at the same wallet nonces after a timeout.
         for batch in &pending {
             debug!(
                 batch_index = batch.batch_index,
@@ -178,58 +181,41 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
                 "queueing batch for L1 submission"
             );
         }
-        let submitted_batches: Vec<(u64, u64)> =
-            pending.iter().map(|b| (b.batch_index, b.nonce)).collect();
+        let submitted_count = pending.len();
         let payloads: Vec<Vec<u8>> = pending.into_iter().map(|b| b.encoded).collect();
         let tx_hashes = self.poster.submit_batches(payloads).await?;
-        if tx_hashes.len() != submitted_batches.len() {
+        if tx_hashes.len() != submitted_count {
             return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
                 format!(
-                    "poster returned {} tx hashes for {} submitted batches",
+                    "poster returned {} tx hashes for {submitted_count} submitted batches",
                     tx_hashes.len(),
-                    submitted_batches.len()
                 ),
             )));
         }
 
-        Ok(TickOutcome::Submitted {
-            count: submitted_batches.len(),
-        })
+        Ok(())
     }
 
-    async fn load_tick_snapshot(&self) -> Result<SubmitterTickSnapshot, BatchSubmitterError> {
+    /// Two storage reads in one `spawn_blocking` — not an SQL transaction but
+    /// a single blocking task.
+    ///
+    /// This is intentionally eventual-consistent: the danger decision and the
+    /// frontier view may come from slightly different DB moments if the input
+    /// reader advances between reads. The design tolerates that bounded lag in
+    /// exchange for keeping danger detection and submitter frontier logic
+    /// decoupled.
+    async fn load_tick_snapshot(&self) -> Result<TickSnapshot, BatchSubmitterError> {
         let db_path = self.db_path.clone();
-        let danger_threshold = self.danger_threshold;
+        let params = self.recovery_params;
+        let now_ms = crate::recovery::unix_now_ms();
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open_read_only(&db_path)?;
-            storage
-                .prepare_submitter_tick_snapshot(danger_threshold)
-                .map_err(BatchSubmitterError::from)
-        })
-        .await
-        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
-    }
-
-    async fn check_stalled_safe_head_danger(&self) -> Result<Option<u64>, BatchSubmitterError> {
-        let db_path = self.db_path.clone();
-        let params = crate::recovery::RecoveryParams {
-            max_wait_blocks: self.max_wait_blocks,
-            danger_threshold: self.danger_threshold,
-            seconds_per_block: self.seconds_per_block,
-        };
-        tokio::task::spawn_blocking(move || {
-            crate::recovery::stalled_safe_head_danger_estimate(&db_path, params).map_err(|err| {
-                match err {
-                    crate::recovery::RecoveryError::OpenStorage(err) => {
-                        BatchSubmitterError::OpenStorage(err)
-                    }
-                    crate::recovery::RecoveryError::Storage(err) => {
-                        BatchSubmitterError::Storage(err)
-                    }
-                    other => {
-                        BatchSubmitterError::Poster(BatchPosterError::Provider(other.to_string()))
-                    }
-                }
+            let danger = storage.check_danger(params, now_ms)?;
+            let (safe_block, safe_next_expected_nonce) = storage.submitter_frontier_view()?;
+            Ok::<_, BatchSubmitterError>(TickSnapshot {
+                safe_block,
+                safe_next_expected_nonce,
+                danger,
             })
         })
         .await
@@ -284,19 +270,6 @@ fn advance_expected_batch_nonce(
     expected
 }
 
-fn safe_progress_has_stalled(last_safe_progress_ms: u64, seconds_per_block: u64) -> bool {
-    if last_safe_progress_ms == 0 {
-        return false;
-    }
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let min_stall_ms = seconds_per_block.saturating_mul(1000);
-    now_ms.saturating_sub(last_safe_progress_ms) >= min_stall_ms
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -304,7 +277,7 @@ mod tests {
     use alloy_primitives::Address;
 
     use crate::l1::submitter::{
-        BatchSubmitterConfig, BatchSubmitterError, TickOutcome, poster::mock::MockBatchPoster,
+        BatchSubmitterConfig, BatchSubmitterError, poster::mock::MockBatchPoster,
     };
     use crate::runtime::shutdown::ShutdownSignal;
     use crate::storage::test_helpers::{TestDb, temp_db};
@@ -317,6 +290,15 @@ mod tests {
     /// their test submitter, so populate sees the seeded safe_inputs.
     fn submitter_test_rules() -> SchedulerRules {
         SchedulerRules::new(BATCH_SUBMITTER_ADDRESS, sequencer_core::MAX_WAIT_BLOCKS)
+    }
+
+    fn default_test_config() -> BatchSubmitterConfig {
+        BatchSubmitterConfig {
+            idle_poll_interval_ms: 1000,
+            max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+            preemptive_margin_blocks: 75,
+            seconds_per_block: 12,
+        }
     }
 
     fn set_last_safe_progress_ms(db_path: &str, synced_at_ms: u64) {
@@ -373,23 +355,16 @@ mod tests {
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
-        let config = BatchSubmitterConfig {
-            idle_poll_interval_ms: 1000,
-            max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-            preemptive_margin_blocks: 75,
-            seconds_per_block: 12,
-        };
         let submitter = super::BatchSubmitter::new(
             path.clone(),
             mock.clone(),
             ShutdownSignal::default(),
-            config,
+            default_test_config(),
         );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
-        // seed_two_closed_batches creates 3 closed batches (0, 1, 2) + open batch 3.
-        assert_eq!(outcome, TickOutcome::Submitted { count: 3 });
+        submitter.tick_once().await.expect("tick once");
 
+        // seed_two_closed_batches creates 3 closed batches (0, 1, 2) + open batch 3.
         let submissions = mock.submissions();
         assert_eq!(submissions.len(), 3);
         assert_eq!(submissions[0].0, 0);
@@ -405,21 +380,14 @@ mod tests {
 
         let mock = Arc::new(MockBatchPoster::new());
         mock.set_observed_submitted_nonces(vec![2]);
-        let config = BatchSubmitterConfig {
-            idle_poll_interval_ms: 1000,
-            max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-            preemptive_margin_blocks: 75,
-            seconds_per_block: 12,
-        };
         let submitter = super::BatchSubmitter::new(
             path.clone(),
             mock.clone(),
             ShutdownSignal::default(),
-            config,
+            default_test_config(),
         );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
-        assert_eq!(outcome, TickOutcome::Idle);
+        submitter.tick_once().await.expect("tick once");
         assert!(mock.submissions().is_empty());
         assert_eq!(mock.last_from_block(), Some(11));
     }
@@ -436,17 +404,12 @@ mod tests {
             path.clone(),
             mock.clone(),
             ShutdownSignal::default(),
-            BatchSubmitterConfig {
-                idle_poll_interval_ms: 1000,
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                seconds_per_block: 12,
-            },
+            default_test_config(),
         );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
+        submitter.tick_once().await.expect("tick once");
         // All 3 closed batches already submitted (nonces 0, 1, 2 in safe_inputs).
-        assert_eq!(outcome, TickOutcome::Idle);
+        assert!(mock.submissions().is_empty());
     }
 
     #[tokio::test]
@@ -460,16 +423,10 @@ mod tests {
             path.clone(),
             mock.clone(),
             ShutdownSignal::default(),
-            BatchSubmitterConfig {
-                idle_poll_interval_ms: 1000,
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                seconds_per_block: 12,
-            },
+            default_test_config(),
         );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
-        assert_eq!(outcome, TickOutcome::Submitted { count: 1 });
+        submitter.tick_once().await.expect("tick once");
         assert_eq!(mock.last_from_block(), Some(11));
 
         let submissions = mock.submissions();
@@ -489,16 +446,10 @@ mod tests {
             path.clone(),
             mock.clone(),
             ShutdownSignal::default(),
-            BatchSubmitterConfig {
-                idle_poll_interval_ms: 1000,
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                seconds_per_block: 12,
-            },
+            default_test_config(),
         );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
-        assert_eq!(outcome, TickOutcome::Submitted { count: 1 });
+        submitter.tick_once().await.expect("tick once");
         assert_eq!(mock.last_from_block(), Some(11));
 
         let submissions = mock.submissions();
@@ -517,12 +468,7 @@ mod tests {
             path,
             mock,
             ShutdownSignal::default(),
-            BatchSubmitterConfig {
-                idle_poll_interval_ms: 1000,
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                seconds_per_block: 12,
-            },
+            default_test_config(),
         );
 
         let err = submitter
@@ -533,7 +479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_once_detects_stalled_safe_head_before_poster_error() {
+    async fn tick_once_detects_stalled_safe_head_from_snapshot() {
         let TestDb { _dir, path } = temp_db("tick-stalled-safe-head");
         let mut storage = Storage::open(&path, SQLITE_SYNCHRONOUS_PRAGMA).expect("open storage");
         let mut head = storage
@@ -576,12 +522,7 @@ mod tests {
             path,
             mock,
             ShutdownSignal::default(),
-            BatchSubmitterConfig {
-                idle_poll_interval_ms: 1000,
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                seconds_per_block: 12,
-            },
+            default_test_config(),
         );
 
         let err = submitter
@@ -595,7 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_danger_zone_detects_reused_nonce_after_recovery() {
+    async fn snapshot_reports_reused_nonce_as_danger_after_recovery() {
         let TestDb { _dir, path } = temp_db("tick-stale-reused-nonce");
         let batch_submitter = BATCH_SUBMITTER_ADDRESS;
 
@@ -675,7 +616,7 @@ mod tests {
             .await
             .expect("load coherent submitter snapshot");
         assert!(
-            snapshot.danger_batch_index.is_some(),
+            snapshot.danger.is_dangerous(),
             "reused frontier nonce should still be detected as in danger zone"
         );
     }
@@ -693,18 +634,5 @@ mod tests {
         );
         assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 2, 1]), 2);
         assert_eq!(super::advance_expected_batch_nonce(2, vec![2, 3]), 4);
-    }
-
-    #[test]
-    fn safe_progress_has_stalled_requires_at_least_one_estimated_block() {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        assert!(!super::safe_progress_has_stalled(now_ms, 12));
-        assert!(super::safe_progress_has_stalled(
-            now_ms.saturating_sub(12_000),
-            12
-        ));
     }
 }

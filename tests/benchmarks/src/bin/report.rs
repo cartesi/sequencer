@@ -282,7 +282,7 @@ fn load_latest_multi_row_sweep(dir: &Path) -> Option<BenchmarkJsonOutput<SweepRu
         }
     }
     // Sort by timestamp descending.
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     // Return the first one that has more than 1 row.
     for (_, path) in candidates {
         let raw = fs::read_to_string(&path).ok()?;

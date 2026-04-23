@@ -28,6 +28,10 @@ inputs:
     description: "Foundry version tag"
     required: false
     default: "v1.4.3"
+  rust-toolchain:
+    description: "Rust toolchain version or channel"
+    required: false
+    default: "1.95.0"
   rust-components:
     description: "Extra rustup components (comma-separated)"
     required: false
@@ -109,6 +113,7 @@ runs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
+        toolchain: ${{ inputs.rust-toolchain }}
         components: ${{ inputs.rust-components }}
 
     - name: Cache Rust artifacts

@@ -32,7 +32,136 @@ use super::internals::{
 };
 use super::safe_accepted_batches::query_latest_safe_accepted_batch;
 
+/// Outcome of a danger-zone check.
+///
+/// Callers pattern-match on the variant to decide what action the condition
+/// warrants. The submitter flattens via [`DangerStatus::batch_index`]; the
+/// startup recovery path distinguishes because the two variants imply
+/// different responses (fresh-L1 flush-and-cascade vs stalled-L1 refuse-boot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DangerStatus {
+    /// No danger detected — neither check tripped.
+    Safe,
+    /// Strict, block-based check tripped: a closed batch past the accepted
+    /// frontier is aged beyond `params.danger_threshold` against the observed
+    /// safe block. L1 view is fresh; flushing and cascading is meaningful.
+    Strict(u64),
+    /// Wall-clock-adjusted check tripped: an unresolved batch is estimated
+    /// past the adjusted threshold because wall-clock time has elapsed past
+    /// our last safe-head observation. The safe-head view may be stale or
+    /// frozen — flushing against L1 may not terminate.
+    Stalled(u64),
+}
+
+impl DangerStatus {
+    pub fn is_dangerous(&self) -> bool {
+        matches!(self, Self::Strict(_) | Self::Stalled(_))
+    }
+
+    pub fn batch_index(&self) -> Option<u64> {
+        match self {
+            Self::Safe => None,
+            Self::Strict(idx) | Self::Stalled(idx) => Some(*idx),
+        }
+    }
+}
+
+/// Wall-clock-adjusted danger threshold, if a correction applies.
+///
+/// Returns `None` when either:
+/// - `last_safe_progress_ms == 0` (no baseline — correction is undefined).
+/// - Elapsed wall-clock hasn't reached at least one block interval yet (no
+///   correction needed).
+///
+/// Returns `Some(adjusted_threshold)` where
+/// `adjusted = danger_threshold - (elapsed_secs / seconds_per_block)`,
+/// saturating at 0. The caller picks which DB-view query to run against this
+/// threshold.
+pub(super) fn wall_clock_adjusted_threshold(
+    last_safe_progress_ms: u64,
+    now_ms: u64,
+    params: crate::recovery::RecoveryParams,
+) -> Option<u64> {
+    if last_safe_progress_ms == 0 {
+        return None;
+    }
+    let elapsed_secs = now_ms.saturating_sub(last_safe_progress_ms) / 1000;
+    let missed = elapsed_secs / params.seconds_per_block.max(1);
+    if missed == 0 {
+        return None;
+    }
+    Some(params.danger_threshold.saturating_sub(missed))
+}
+
 impl Storage {
+    /// Unified danger-zone detection.
+    ///
+    /// Runs two checks inside a single read transaction:
+    ///
+    /// 1. **Strict (block-based)**: `find_closed_frontier_batch_in_danger`
+    ///    against `params.danger_threshold`. Uses the observed safe block.
+    /// 2. **Wall-clock adjusted**: if a correction applies
+    ///    ([`wall_clock_adjusted_threshold`] returns `Some`), widens to
+    ///    `find_first_batch_in_danger` against `danger_threshold − missed_blocks`.
+    ///
+    /// Returns [`DangerStatus::Strict`] if (1) fires (stronger statement about
+    /// fresh data takes priority), [`DangerStatus::Stalled`] if only (2) fires,
+    /// [`DangerStatus::Safe`] otherwise.
+    ///
+    /// `now_ms` is passed in (rather than read from `SystemTime::now()` here)
+    /// so the storage layer stays testable without time mocking. Production
+    /// callers pass the current Unix-ms clock.
+    pub fn check_danger(
+        &mut self,
+        params: crate::recovery::RecoveryParams,
+        now_ms: u64,
+    ) -> Result<DangerStatus> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+
+        if let Some(idx) = find_closed_frontier_batch_in_danger(&tx, params.danger_threshold)? {
+            tx.commit()?;
+            return Ok(DangerStatus::Strict(idx));
+        }
+
+        let last_safe_progress_ms: i64 = tx.query_row(
+            "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let last_safe_progress_ms = i64_to_u64(last_safe_progress_ms);
+
+        if let Some(adjusted) = wall_clock_adjusted_threshold(last_safe_progress_ms, now_ms, params)
+            && let Some(idx) = find_first_batch_in_danger(&tx, adjusted)?
+        {
+            tx.commit()?;
+            return Ok(DangerStatus::Stalled(idx));
+        }
+
+        tx.commit()?;
+        Ok(DangerStatus::Safe)
+    }
+
+    /// Test-only wrapper around the strict (closed-frontier) danger helper,
+    /// isolated so tests can target it directly without also running the
+    /// wall-clock arm inside `check_danger`.
+    #[cfg(test)]
+    pub(crate) fn check_danger_zone(&mut self, danger_threshold: u64) -> Result<Option<u64>> {
+        find_closed_frontier_batch_in_danger(&self.conn, danger_threshold)
+    }
+
+    /// Test-only wrapper around the broader (any-unresolved) danger helper.
+    /// Same role as `check_danger_zone`: targeted testing of one arm in
+    /// isolation.
+    #[cfg(test)]
+    pub(crate) fn check_any_unresolved_batch_in_danger(
+        &mut self,
+        threshold: u64,
+    ) -> Result<Option<u64>> {
+        find_first_batch_in_danger(&self.conn, threshold)
+    }
+
     /// Mark a single batch as invalid. Test-only seeder — production code goes
     /// through [`Storage::detect_and_recover`] / [`Storage::run_startup_recovery`].
     #[cfg(test)]
@@ -112,9 +241,8 @@ fn detect_and_recover_inner(tx: &Transaction<'_>, max_wait_blocks: u64) -> Resul
 /// the Tip automatically via `batch_index >= N`.
 ///
 /// Used by:
-///   - `Storage::check_any_unresolved_batch_in_danger` — startup wall-clock
-///     fallback when L1 is unreachable.
-///   - `detect_and_recover_inner` — atomic cascade-invalidation path.
+///   - [`Storage::check_danger`]'s wall-clock-adjusted arm.
+///   - [`detect_and_recover_inner`] — atomic cascade-invalidation path.
 ///
 /// Keeping both call sites behind this single helper keeps the "any unresolved
 /// batch may already be too old" logic symmetric between the startup fallback

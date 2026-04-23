@@ -15,52 +15,18 @@ use super::Storage;
 use super::internals::{
     decode_l2_tx_row, i64_to_u16, i64_to_u32, i64_to_u64, query_current_safe_block, u64_to_i64,
 };
-use super::recovery::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
 use super::safe_accepted_batches::query_latest_safe_accepted_batch;
-use super::{FrameHeader, PendingBatch, SubmitterTickSnapshot};
+use super::{FrameHeader, PendingBatch};
 use sequencer_core::batch::{Batch, BatchForSubmission, Frame as BatchFrame, WireUserOp};
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
-    /// Load the coherent DB snapshot the live submitter uses for one tick.
+    /// Read-only frontier view used by the submitter each tick to derive the
+    /// next batch nonce. Returns `(current_safe_block, safe_next_expected_nonce)`.
     ///
-    /// Pure reads: the `safe_accepted_batches` view is maintained atomically by
-    /// [`Storage::append_safe_inputs`], so the submitter never populates.
-    pub fn prepare_submitter_tick_snapshot(
-        &mut self,
-        danger_threshold: u64,
-    ) -> Result<SubmitterTickSnapshot> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-
-        let safe_block = query_current_safe_block(&tx)?;
-        let safe_next_expected_nonce = query_latest_safe_accepted_batch(&tx)?
-            .map(|row| i64_to_u64(row.nonce).saturating_add(1))
-            .unwrap_or(0);
-        let danger_batch_index = find_closed_frontier_batch_in_danger(&tx, danger_threshold)?;
-        let last_safe_progress_ms: i64 = tx.query_row(
-            "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
-            [],
-            |row| row.get(0),
-        )?;
-
-        tx.commit()?;
-        Ok(SubmitterTickSnapshot {
-            safe_block,
-            safe_next_expected_nonce,
-            danger_batch_index,
-            last_safe_progress_ms: i64_to_u64(last_safe_progress_ms),
-        })
-    }
-
-    /// Load the scheduler-accepted safe frontier persisted in `safe_accepted_batches`.
-    ///
-    /// Returns `(current_safe_block, next_expected_nonce)`. Test-only helper;
-    /// production callers use [`Storage::prepare_submitter_tick_snapshot`] for
-    /// a coherent view including the danger-zone flag.
-    #[cfg(test)]
-    pub fn load_safe_accepted_frontier(&mut self) -> Result<(u64, u64)> {
+    /// The scheduler-accepted frontier is maintained by
+    /// [`Storage::append_safe_inputs`], so this is a pure read.
+    pub fn submitter_frontier_view(&mut self) -> Result<(u64, u64)> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -72,46 +38,14 @@ impl Storage {
         Ok((safe_block, next_expected_nonce))
     }
 
-    /// Check if the first unresolved batch (past the accepted frontier) is in the
-    /// danger zone (approaching staleness).
+    /// Load the scheduler-accepted safe frontier persisted in `safe_accepted_batches`.
     ///
-    /// Returns the `batch_index` of the first **valid closed** batch past the
-    /// accepted frontier whose age (`current_safe_block - first_frame_safe_block`)
-    /// meets or exceeds `danger_threshold`.
-    ///
-    /// Scope: closed batches only. This is the **zombie-detection** check —
-    /// an answer of `Some(_)` means "there is a batch submitted (or about to
-    /// be submitted) to L1 that may become stale before landing safely;
-    /// flush pending wallet-nonce slots and trigger recovery."
-    ///
-    /// Does NOT consider the Tip. An aging Tip is not a zombie risk (nothing
-    /// submitted to L1 yet), so flushing it would be a no-op and triggering
-    /// recovery just for it would produce a restart loop. The Tip's staleness
-    /// is handled at `MAX_WAIT_BLOCKS` by `detect_and_recover` and (for
-    /// L1-unreachable boots) by [`Self::check_any_unresolved_batch_in_danger`].
-    ///
-    /// Reads `safe_accepted_batches`, which is maintained atomically with
-    /// each [`Storage::append_safe_inputs`] call; no separate populate step
-    /// is required.
-    pub fn check_danger_zone(&mut self, danger_threshold: u64) -> Result<Option<u64>> {
-        find_closed_frontier_batch_in_danger(&self.conn, danger_threshold)
-    }
-
-    /// Returns the `batch_index` of the first **unresolved** batch (closed-
-    /// unaccepted OR open) whose age meets or exceeds `threshold`.
-    ///
-    /// Scope: the full zombie-or-aging check. Used when the caller cannot
-    /// distinguish between pending-closed-batch danger and open-batch
-    /// aging — specifically, the wall-clock fallback at startup, where L1
-    /// is unreachable and we want to refuse to boot if *any* unresolved
-    /// batch might be past the threshold.
-    ///
-    /// Distinct from [`Self::check_danger_zone`] because the responses to
-    /// "closed batch in danger" and "open batch in danger" are different:
-    /// the former triggers flush + shutdown, the latter should be handled
-    /// by closing/submitting the batch or waiting for its natural close.
-    pub fn check_any_unresolved_batch_in_danger(&mut self, threshold: u64) -> Result<Option<u64>> {
-        find_first_batch_in_danger(&self.conn, threshold)
+    /// Test-only alias for [`Self::submitter_frontier_view`]. Several tests
+    /// were written against this name before the submitter_frontier_view
+    /// rename; keep it for continuity.
+    #[cfg(test)]
+    pub fn load_safe_accepted_frontier(&mut self) -> Result<(u64, u64)> {
+        self.submitter_frontier_view()
     }
 
     /// Highest valid (non-invalidated) `batch_index`, or `None` if no valid
@@ -450,28 +384,38 @@ mod tests {
         assert_eq!(next, 2);
     }
 
-    #[test]
-    fn prepare_submitter_tick_snapshot_returns_coherent_frontier_view() {
-        let db = temp_db("submitter-tick-snapshot-frontier");
-        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
-        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4]);
+    fn default_test_params() -> crate::recovery::RecoveryParams {
+        crate::recovery::RecoveryParams {
+            max_wait_blocks: 1200,
+            danger_threshold: 1125,
+            seconds_per_block: 12,
+        }
+    }
 
-        let snapshot = storage
-            .prepare_submitter_tick_snapshot(1125)
-            .expect("prepare submitter tick snapshot");
-
-        assert_eq!(snapshot.safe_block, 10);
-        assert_eq!(snapshot.safe_next_expected_nonce, 2);
-        assert_eq!(snapshot.danger_batch_index, None);
-        assert!(
-            snapshot.last_safe_progress_ms > 0,
-            "safe-input append should stamp safe progress"
-        );
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 
     #[test]
-    fn prepare_submitter_tick_snapshot_reports_closed_frontier_danger() {
-        let db = temp_db("submitter-tick-snapshot-danger");
+    fn submitter_frontier_view_tracks_accepted_prefix() {
+        let db = temp_db("submitter-frontier-view");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4]);
+
+        let (safe_block, safe_next_expected_nonce) = storage
+            .submitter_frontier_view()
+            .expect("submitter frontier view");
+
+        assert_eq!(safe_block, 10);
+        assert_eq!(safe_next_expected_nonce, 2);
+    }
+
+    #[test]
+    fn check_danger_reports_strict_on_closed_frontier() {
+        let db = temp_db("check-danger-strict");
         let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -503,13 +447,77 @@ mod tests {
             )
             .expect("append accepted batch 0");
 
-        let snapshot = storage
-            .prepare_submitter_tick_snapshot(1125)
-            .expect("prepare submitter tick snapshot");
+        let status = storage
+            .check_danger(default_test_params(), unix_now_ms())
+            .expect("check_danger");
+        assert_eq!(status, crate::storage::DangerStatus::Strict(1));
+    }
 
-        assert_eq!(snapshot.safe_block, 1135);
-        assert_eq!(snapshot.safe_next_expected_nonce, 1);
-        assert_eq!(snapshot.danger_batch_index, Some(1));
+    #[test]
+    fn check_danger_reports_stalled_on_wall_clock_drift() {
+        // Strict block-based check wouldn't fire (batch 1 has first_frame_safe_block
+        // = 100 and safe_block = 200, age = 100 < 1125). But wall-clock says the
+        // safe head hasn't advanced in ~25 blocks — effective threshold drops to
+        // 1100, batch 1's age jumps past it via the wall-clock correction.
+        let db = temp_db("check-danger-stalled");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let mut head = storage
+            .initialize_open_state(100, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 0");
+        storage
+            .close_frame_and_batch(&mut head, 100)
+            .expect("close batch 1");
+
+        let rules = SchedulerRules::new(SENDER_A, 1200);
+        storage
+            .append_safe_inputs(
+                1200,
+                &[StoredSafeInput {
+                    sender: SENDER_A,
+                    payload: ssz::Encode::as_ssz_bytes(&Batch {
+                        nonce: 0,
+                        frames: vec![BatchFrame {
+                            user_ops: vec![],
+                            safe_block: 100,
+                            fee_price: 0,
+                        }],
+                    }),
+                    block_number: 200,
+                }],
+                &rules,
+            )
+            .expect("append accepted batch 0");
+
+        // Pretend safe-progress was recorded 25 blocks' worth of wall-clock ago.
+        let now_ms = unix_now_ms();
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+                [i64::try_from(now_ms.saturating_sub(25 * 12 * 1000)).unwrap_or(i64::MAX)],
+            )
+            .expect("rewind safe-progress timestamp");
+
+        let status = storage
+            .check_danger(default_test_params(), now_ms)
+            .expect("check_danger");
+        assert_eq!(status, crate::storage::DangerStatus::Stalled(1));
+    }
+
+    #[test]
+    fn check_danger_safe_when_never_synced() {
+        // Fresh DB, no prior safe-progress observation. check_danger reports
+        // Safe — never-synced is benign at this layer; callers that need
+        // "refuse on never-synced" (startup L1-unreachable) check explicitly.
+        let db = temp_db("check-danger-never-synced");
+        let mut storage = Storage::open(db.path.as_str(), "NORMAL").expect("open storage");
+        let status = storage
+            .check_danger(default_test_params(), unix_now_ms())
+            .expect("check_danger");
+        assert_eq!(status, crate::storage::DangerStatus::Safe);
     }
 
     #[test]

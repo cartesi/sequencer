@@ -13,7 +13,8 @@
 //! caller should populate this view directly.
 //!
 //! Readers:
-//! - batch submitter tick snapshot (`prepare_submitter_tick_snapshot`)
+//! - batch submitter frontier / danger reads (`submitter_frontier_view`,
+//!   `check_danger`)
 //! - recovery cascade (`find_closed_frontier_batch_in_danger`)
 //! - wall-clock and stalled-safe-head danger estimates
 //!
