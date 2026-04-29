@@ -12,6 +12,9 @@ check-all-targets:
 test:
     cargo test --workspace
 
+test-watchdog:
+    lua watchdog/tests/run.lua
+
 # Run sequencer tests sequentially so partition static config (init) is not shared across parallel tests.
 test-sequencer:
     cargo test -p sequencer --lib -- --test-threads=1
