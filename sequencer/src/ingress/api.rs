@@ -220,7 +220,7 @@ mod tests {
         Address::from_raw_public_key(&verifying.as_bytes()[1..])
     }
 
-    // ── §1.7 S-malleability — no alternate signature can recover a different
+    // ── S-malleability — no alternate signature can recover a different
     // address at our boundary. Structurally guaranteed by alloy+k256; this is
     // a regression lock.
 

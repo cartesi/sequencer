@@ -117,14 +117,16 @@ impl Storage {
     }
 
     /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance.
-    /// Returns 0 if no real safe-head observation has occurred yet.
-    pub fn last_safe_progress_ms(&self) -> Result<u64> {
+    /// Returns `None` if no real safe-head observation has occurred yet (the
+    /// underlying column stores `0` as the never-synced sentinel; this method
+    /// is the only place that translation lives).
+    pub fn last_safe_progress_ms(&self) -> Result<Option<u64>> {
         let value: i64 = self.conn.query_row(
             "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
             [],
             |row| row.get(0),
         )?;
-        Ok(i64_to_u64(value))
+        Ok(Some(i64_to_u64(value)).filter(|&v| v != 0))
     }
 
     /// Read cached L1 bootstrap data (input_box_address, genesis_block, chain_id).
@@ -265,11 +267,11 @@ mod tests {
         storage
             .ensure_minimum_safe_block(7)
             .expect("advance bootstrap safe head");
-        assert_eq!(
+        assert!(
             storage
                 .last_safe_progress_ms()
-                .expect("read sync timestamp"),
-            0,
+                .expect("read sync timestamp")
+                .is_none(),
             "bootstrap safe-head initialization must not count as safe progress"
         );
 
@@ -278,11 +280,8 @@ mod tests {
             .expect("record first real safe-head observation");
         let recorded_sync = storage
             .last_safe_progress_ms()
-            .expect("read sync timestamp");
-        assert!(
-            recorded_sync > 0,
-            "initial observation should record wall-clock time"
-        );
+            .expect("read sync timestamp")
+            .expect("first observation should record wall-clock time");
 
         thread::sleep(Duration::from_millis(5));
         storage
@@ -292,7 +291,7 @@ mod tests {
             storage
                 .last_safe_progress_ms()
                 .expect("read unchanged sync timestamp"),
-            recorded_sync,
+            Some(recorded_sync),
             "repeat observations of the same safe head must not refresh the marker"
         );
 
@@ -303,7 +302,7 @@ mod tests {
             storage
                 .last_safe_progress_ms()
                 .expect("read sync timestamp"),
-            recorded_sync,
+            Some(recorded_sync),
             "bootstrap safe-head updates must preserve the last real safe-progress timestamp"
         );
     }

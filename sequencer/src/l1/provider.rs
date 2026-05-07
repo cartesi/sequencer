@@ -12,7 +12,13 @@ use alloy::{
 };
 use alloy_transport::layers::RetryBackoffLayer;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+// Public Ethereum providers (Infura, Alchemy) commonly take 30–60s on heavy
+// `eth_getLogs` queries under load. The partition-retry helper in
+// `l1/partition.rs` only kicks on RPC error codes (e.g. -32005), not on
+// transport timeouts — a request that silently chews past the timeout slips
+// past partitioning. 60s is long enough that hitting it signals a genuine
+// problem rather than a slow query.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RATE_LIMIT_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 200;
 const COMPUTE_UNITS_PER_SEC: u64 = 500;
@@ -76,7 +82,7 @@ pub fn create_signer_provider(url: &str, private_key: &str) -> Result<DynProvide
 mod tests {
     use super::*;
 
-    // ── §8.5.2 / §8.5.3 — H4 regression: URL scheme enforcement ─────────────
+    // ── H4 regression: URL scheme enforcement ─────────────
 
     #[test]
     fn create_client_rejects_http_for_remote_host() {
@@ -108,7 +114,7 @@ mod tests {
         create_client("https://mainnet.infura.io/v3/abc123").expect("https:// must be accepted");
     }
 
-    // ── §8.5.1 — H3 regression: private-key parse error must not echo bytes ─
+    // ── H3 regression: private-key parse error must not echo bytes ─
 
     #[test]
     fn create_signer_provider_does_not_echo_key_bytes_on_invalid_hex() {

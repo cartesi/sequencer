@@ -21,10 +21,36 @@
 
 use crate::batch::Batch;
 use alloy_primitives::Address;
+use thiserror::Error;
+
+/// Error surfaced by [`ProtocolConfig::try_new`] when the configuration would
+/// produce an unusable danger threshold.
+///
+/// Returning a typed error rather than panicking lets the runtime convert this
+/// into a `Result` at config-parse time and surface it through the structured
+/// `RunError` taxonomy, instead of crashing later inside
+/// [`ProtocolConfig::danger_threshold`] (or worse, inside a logging macro).
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProtocolConfigError {
+    /// `preemptive_margin_blocks >= max_wait_blocks` — the danger threshold
+    /// would be 0, making preemptive recovery indistinguishable from hard
+    /// staleness. The margin is supposed to be operator runway *before*
+    /// hitting `MAX_WAIT_BLOCKS`, so this is always an operator misconfig.
+    #[error(
+        "preemptive_margin_blocks ({margin}) must be strictly less than \
+         max_wait_blocks ({max_wait})"
+    )]
+    MarginNotLessThanMaxWait { margin: u64, max_wait: u64 },
+}
 
 /// Bundled protocol config: scheduler-acceptance parameters plus
 /// sequencer-side preemptive-recovery tuning.
-#[derive(Debug, Clone, Copy)]
+///
+/// Construct via [`ProtocolConfig::try_new`] in production code so the
+/// `margin < max_wait` invariant is checked once up front. The fields stay
+/// public to keep test fixtures concise — direct struct-literal construction
+/// is fine where the inputs are controlled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolConfig {
     /// L1 address that submits batches. The scheduler only accepts batches
     /// whose `msg_sender` matches this.
@@ -34,7 +60,7 @@ pub struct ProtocolConfig {
     pub max_wait_blocks: u64,
     /// How many blocks before `max_wait_blocks` the sequencer triggers
     /// preemptive recovery. Sequencer-local; must be strictly less than
-    /// `max_wait_blocks`.
+    /// `max_wait_blocks` (enforced by [`ProtocolConfig::try_new`]).
     pub preemptive_margin_blocks: u64,
     /// Wall-clock estimate of L1 block time, used as a fallback when the L1
     /// safe head appears frozen. Sequencer-local.
@@ -42,19 +68,42 @@ pub struct ProtocolConfig {
 }
 
 impl ProtocolConfig {
+    /// Validated constructor. Returns
+    /// [`ProtocolConfigError::MarginNotLessThanMaxWait`] when
+    /// `preemptive_margin_blocks >= max_wait_blocks`.
+    ///
+    /// Production callers should use this; tests can still construct
+    /// `ProtocolConfig` directly via struct-literal syntax with controlled
+    /// inputs.
+    pub fn try_new(
+        batch_submitter: Address,
+        max_wait_blocks: u64,
+        preemptive_margin_blocks: u64,
+        seconds_per_block: u64,
+    ) -> Result<Self, ProtocolConfigError> {
+        if preemptive_margin_blocks >= max_wait_blocks {
+            return Err(ProtocolConfigError::MarginNotLessThanMaxWait {
+                margin: preemptive_margin_blocks,
+                max_wait: max_wait_blocks,
+            });
+        }
+        Ok(Self {
+            batch_submitter,
+            max_wait_blocks,
+            preemptive_margin_blocks,
+            seconds_per_block,
+        })
+    }
+
     /// The block-age threshold at which preemptive recovery triggers.
     ///
-    /// Panics if `preemptive_margin_blocks >= max_wait_blocks` — a threshold of
-    /// zero would make preemptive recovery indistinguishable from hard
-    /// staleness. Callers should catch this at startup.
+    /// `saturating_sub` keeps this infallible even on a directly-constructed
+    /// `ProtocolConfig` with an invalid margin (returns 0 in that case).
+    /// Production code goes through [`ProtocolConfig::try_new`], which
+    /// rejects that configuration up front.
     pub fn danger_threshold(&self) -> u64 {
-        assert!(
-            self.preemptive_margin_blocks < self.max_wait_blocks,
-            "preemptive_margin_blocks ({}) must be less than max_wait_blocks ({})",
-            self.preemptive_margin_blocks,
-            self.max_wait_blocks,
-        );
-        self.max_wait_blocks - self.preemptive_margin_blocks
+        self.max_wait_blocks
+            .saturating_sub(self.preemptive_margin_blocks)
     }
 
     /// Scheduler's staleness predicate: a batch is stale when
@@ -171,13 +220,58 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "preemptive_margin_blocks")]
-    fn danger_threshold_panics_when_margin_ge_max_wait() {
+    fn danger_threshold_saturates_to_zero_on_invalid_margin() {
+        // try_new rejects this configuration; if a test ever constructs it
+        // directly via struct-literal syntax, danger_threshold returns 0
+        // rather than panicking. (Cleaner than a hard panic during a logging
+        // macro on production startup.)
         let cfg = ProtocolConfig {
             preemptive_margin_blocks: MAX_WAIT,
             ..config()
         };
-        let _ = cfg.danger_threshold();
+        assert_eq!(cfg.danger_threshold(), 0);
+
+        let cfg = ProtocolConfig {
+            preemptive_margin_blocks: MAX_WAIT + 1,
+            ..config()
+        };
+        assert_eq!(cfg.danger_threshold(), 0);
+    }
+
+    #[test]
+    fn try_new_rejects_margin_equal_to_max_wait() {
+        assert_eq!(
+            ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT, 12),
+            Err(ProtocolConfigError::MarginNotLessThanMaxWait {
+                margin: MAX_WAIT,
+                max_wait: MAX_WAIT,
+            }),
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_margin_greater_than_max_wait() {
+        assert_eq!(
+            ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT + 1, 12),
+            Err(ProtocolConfigError::MarginNotLessThanMaxWait {
+                margin: MAX_WAIT + 1,
+                max_wait: MAX_WAIT,
+            }),
+        );
+    }
+
+    #[test]
+    fn try_new_accepts_margin_one_below_max_wait() {
+        let cfg = ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT - 1, 12)
+            .expect("strictly-less margin must be accepted");
+        assert_eq!(cfg.danger_threshold(), 1);
+    }
+
+    #[test]
+    fn try_new_accepts_zero_margin() {
+        let cfg = ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, 0, 12)
+            .expect("zero margin is valid (degenerate but valid)");
+        assert_eq!(cfg.danger_threshold(), MAX_WAIT);
     }
 
     #[test]

@@ -73,7 +73,7 @@ cargo run -p sequencer
 
 Required: `SEQ_ETH_RPC_URL`, `SEQ_CHAIN_ID`, `SEQ_APP_ADDRESS`, `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` (or `_FILE`).
 
-Optional: `SEQ_HTTP_ADDR` (default `127.0.0.1:3000`), `SEQ_DATA_DIR` (default `sequencer-data`), `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default `75`), `SEQ_SECONDS_PER_BLOCK` (default `12`), `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
+Optional: `SEQ_HTTP_ADDR` (default `127.0.0.1:3000`), `SEQ_DATA_DIR` (default `sequencer-data`), `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `SEQ_SECONDS_PER_BLOCK` (default `12`), `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
 
 ## Development
 
@@ -92,7 +92,6 @@ Some tests require [Foundry](https://getfoundry.sh) (`anvil` on PATH). They run 
 - [`CLAUDE.md`](CLAUDE.md) — quick reference for shell setup and commands.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
 - [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.
-- [`SECURITY_TODO.md`](SECURITY_TODO.md) — open security findings.
 - [`sequencer-core/`](sequencer-core/) — shared domain types (`Application`, `SignedUserOp`, `Batch`, `Frame`).
 - [`examples/app-core/`](examples/app-core/) — placeholder wallet app implementing the `Application` trait.
 

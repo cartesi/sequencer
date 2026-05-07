@@ -80,7 +80,7 @@ This assumes a **known, bounded-variance relationship** between elapsed wall-clo
 - **Operator misconfigures `SEQ_SECONDS_PER_BLOCK`.** Typo or copy-paste error pointing at the wrong chain's cadence. Operator-trust scope.
 - **Significant host clock drift.** A sequencer host whose clock lags or leads the real-world by minutes per day could slowly desynchronize its danger estimates from reality.
 
-**Corollary for test design.** To deterministically exercise the wall-clock fallback, tests must maintain this coupling: when advancing the L1 block count, they should also advance (or simulate) the corresponding wall-clock interval. Our e2e harness does the reverse — it rewinds `l1_safe_head.synced_at_ms` to an older timestamp, which is semantically equivalent to advancing the wall clock. See [`tests/TEST_PLAN.md`](../../tests/TEST_PLAN.md) §7.8 and tool T7.
+**Corollary for test design.** To deterministically exercise the wall-clock fallback, tests must maintain this coupling: when advancing the L1 block count, they should also advance (or simulate) the corresponding wall-clock interval. Our e2e harness does the reverse — it rewinds `l1_safe_head.synced_at_ms` to an older timestamp, which is semantically equivalent to advancing the wall clock.
 
 ## How to apply this doc in code review
 
@@ -99,4 +99,3 @@ For each code path under review:
 
 - [`../recovery/README.md`](../recovery/README.md) — recovery design, TLA+ formal verification
 - [`../../AGENTS.md`](../../AGENTS.md) — architecture, coding conventions, hot-path invariants
-- [`../../SECURITY_TODO.md`](../../SECURITY_TODO.md) — open findings from staged security review

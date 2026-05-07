@@ -93,11 +93,18 @@ impl DangerDetector {
                 DangerStatus::Safe => {
                     debug!("danger check: safe");
                 }
-                DangerStatus::Strict(batch_index) | DangerStatus::Stalled(batch_index) => {
+                DangerStatus::Strict(batch_index)
+                | DangerStatus::Tip(batch_index)
+                | DangerStatus::Stalled(batch_index) => {
+                    // All three non-Safe variants exit for recovery. The
+                    // dispatch difference (flush vs no-flush vs refuse)
+                    // only matters at the next startup — `decide_startup_action`
+                    // re-runs `check_danger` and routes based on which variant
+                    // fires this time.
                     tracing::error!(
                         batch_index,
                         danger_threshold = self.protocol.danger_threshold(),
-                        "danger zone detected — triggering shutdown for flush and recovery"
+                        "danger zone detected — triggering shutdown for recovery"
                     );
                     return Ok(DetectorExit::DangerZone { batch_index });
                 }

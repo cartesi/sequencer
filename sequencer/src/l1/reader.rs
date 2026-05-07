@@ -529,11 +529,8 @@ mod tests {
             .expect("set safe head ahead of chain");
         let recorded_sync = storage
             .last_safe_progress_ms()
-            .expect("read safe-progress timestamp");
-        assert!(
-            recorded_sync > 0,
-            "append_safe_inputs should stamp safe progress"
-        );
+            .expect("read safe-progress timestamp")
+            .expect("append_safe_inputs should stamp safe progress");
         drop(storage);
 
         let mut reader = test_reader(
@@ -561,7 +558,7 @@ mod tests {
             storage
                 .last_safe_progress_ms()
                 .expect("read unchanged safe-progress timestamp"),
-            recorded_sync,
+            Some(recorded_sync),
             "same-head polls must not refresh the safe-progress marker"
         );
     }

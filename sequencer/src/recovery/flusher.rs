@@ -277,7 +277,7 @@ mod tests {
     use alloy::node_bindings::Anvil;
     use alloy::providers::Provider;
 
-    // ── §7.7.4 H5: replacement-fee bump satisfies EIP-1559 rules ─────────
+    // ── H5: replacement-fee bump satisfies EIP-1559 rules ─────────
 
     #[test]
     fn replacement_fee_bump_exceeds_ten_percent_for_max_fee() {
@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(new_prio, u128::MAX);
     }
 
-    // ── §7.7.5 H6: timeouts derive from seconds_per_block ────────────────
+    // ── H6: timeouts derive from seconds_per_block ────────────────
 
     #[test]
     fn timeouts_derive_from_seconds_per_block() {
@@ -570,15 +570,15 @@ mod tests {
         );
     }
 
-    // ── §7.7.7 flusher under extended provider outage ────────────────────
+    // ── flusher under extended provider outage ──────────────────────────
     //
     // Implementation note (matters for what this test pins): `flush_and_wait`
     // does NOT retry internally on `Provider` errors — a failed `nonce_at`
-    // call propagates via `?` and the function returns. The "retry forever"
-    // language in TEST_PLAN §7.7.7 is really about the orchestrator restart
-    // loop: on each respawn a fresh flusher is constructed and tried, and
-    // this repeats until the provider becomes reachable again (covered at
-    // e2e by §11.2.2-followup / §11.1.5's `respawn_until_stable`).
+    // call propagates via `?` and the function returns. "Retry forever" is
+    // really the orchestrator's restart loop: on each respawn a fresh flusher
+    // is constructed and tried, and this repeats until the provider becomes
+    // reachable again. The e2e suite covers that orchestrator-loop story via
+    // `respawn_until_stable`.
     //
     // This test pins the two ends of that contract: (a) a mid-flush
     // disconnect surfaces as `FlushError::Provider` fast (no hang, no
