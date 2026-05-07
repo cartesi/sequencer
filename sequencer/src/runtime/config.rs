@@ -100,7 +100,12 @@ pub struct RunConfig {
     /// Blocks before MAX_WAIT_BLOCKS to trigger preemptive recovery.
     /// The danger threshold is MAX_WAIT_BLOCKS minus this margin.
     /// Must be less than MAX_WAIT_BLOCKS (validated at startup).
-    #[arg(long, env = "SEQ_PREEMPTIVE_MARGIN_BLOCKS", default_value = "75")]
+    ///
+    /// Default 300 (~1h at 12s/block) is sized to give operators meaningful
+    /// runway to investigate before the system gives up on the current
+    /// batches — see `docs/recovery/README.md` "Step 1: Danger threshold"
+    /// for the rationale.
+    #[arg(long, env = "SEQ_PREEMPTIVE_MARGIN_BLOCKS", default_value = "300")]
     pub preemptive_margin_blocks: u64,
 
     /// Assumed L1 block time in seconds. Used to estimate block progression from
@@ -227,7 +232,7 @@ mod tests {
         );
     }
 
-    // ── §8.4.2 — H8 regression: SEQ_SECONDS_PER_BLOCK=0 is rejected by clap ──
+    // ── H8 regression: SEQ_SECONDS_PER_BLOCK=0 is rejected by clap ──
     //
     // The H8 hardening added `value_parser = clap::value_parser!(u64).range(1..)`
     // on `seconds_per_block` to prevent a divide-by-zero panic in the

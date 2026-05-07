@@ -151,13 +151,19 @@ mod invalid_batches {
     }
 }
 
-mod detect_and_recover {
+mod recover_post_flush {
     use super::*;
 
-    // ── detect_and_recover ─────────────────────────────────────────────
+    // ── recover_post_flush: cascade from first non-gold ────────────────
+    //
+    // These tests simulate the post-flush state directly: append safe-inputs
+    // to drive `populate_safe_accepted_batches`, then call
+    // `recover_post_flush()`. The cascade is unconditional (no threshold) —
+    // any closed batch past the gold frontier is doomed and gets cascaded
+    // along with everything after it.
 
     #[test]
-    fn detect_and_recover_cascades_from_stale() {
+    fn cascades_from_stale() {
         let db = temp_db("detect-stale");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
@@ -183,7 +189,7 @@ mod detect_and_recover {
             )
             .expect("append safe input");
         let invalidated = storage
-            .detect_and_recover(1200)
+            .recover_post_flush(1200)
             .expect("detect and recover");
         assert_eq!(invalidated, vec![0, 1, 2, 3]);
 
@@ -193,7 +199,7 @@ mod detect_and_recover {
     }
 
     #[test]
-    fn detect_and_recover_is_idempotent() {
+    fn is_idempotent() {
         let db = temp_db("detect-idempotent");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
@@ -216,16 +222,23 @@ mod detect_and_recover {
                 &default_protocol_config(),
             )
             .expect("append safe input");
-        let first = storage.detect_and_recover(1200).expect("first detect");
+        let first = storage.recover_post_flush(1200).expect("first detect");
         assert_eq!(first, vec![0, 1]);
 
-        let second = storage.detect_and_recover(1200).expect("second detect");
+        let second = storage.recover_post_flush(1200).expect("second detect");
         assert!(second.is_empty());
     }
 
     #[test]
-    fn detect_and_recover_does_not_false_match_after_nonce_reuse() {
-        let db = temp_db("detect-nonce-reuse");
+    fn no_op_when_recovery_batch_landed_fresh_in_new_generation() {
+        // Post-flush contract: `recover_post_flush` is called only after the
+        // gold frontier has been re-synced. If the recovery batch from a
+        // previous cycle landed on L1 fresh (within MAX_WAIT) and was
+        // accepted by `populate_safe_accepted_batches`, the new generation
+        // is gold and a fresh `recover_post_flush` call should be a no-op —
+        // the stale ancestor's safe-input must not false-match the
+        // nonce-reused gen-2 batch.
+        let db = temp_db("post-flush-no-op-after-fresh-gen2");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         let mut head = storage
@@ -247,23 +260,43 @@ mod detect_and_recover {
                 &default_protocol_config(),
             )
             .expect("append stale safe input");
-        let first = storage.detect_and_recover(1200).expect("first recovery");
+        // Gen 1 cascade. Stale batch 0 + open Tip 1 invalidated; recovery
+        // batch 2 opened with nonce reused (= 0).
+        let first = storage.recover_post_flush(1200).expect("gen1 recovery");
         assert_eq!(first, vec![0, 1]);
 
+        // Submitter posts the recovery batch; it lands fresh on L1.
         let mut head = storage.open_state().expect("load").unwrap();
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_frame_and_batch(&mut head, 1300)
             .expect("close recovery batch");
+        storage
+            .append_safe_inputs(
+                1310,
+                &[StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: make_stale_batch_payload(0, 1300),
+                    block_number: 1310,
+                }],
+                &default_protocol_config(),
+            )
+            .expect("append fresh safe input for recovery batch");
 
-        let second = storage.detect_and_recover(1200).expect("second recovery");
+        // populate_safe_accepted_batches accepts the gen-2 batch (nonce 0 at
+        // first_frame=1300, inclusion=1310 → inclusion-staleness 10 < MAX_WAIT).
+        // Gold advances. A fresh recover_post_flush is a no-op: the only
+        // closed-non-gold candidate would have to be past the new frontier,
+        // but everything is gold.
+        let second = storage.recover_post_flush(1200).expect("post-flush no-op");
         assert!(
             second.is_empty(),
-            "old stale row must not false-match new-generation batch with reused nonce"
+            "fresh gen-2 batch must be gold; old stale row must not false-match \
+             via reused nonce, got: {second:?}"
         );
     }
 
     #[test]
-    fn detect_and_recover_detects_stale_reused_nonce_in_new_generation() {
+    fn detects_stale_reused_nonce_in_new_generation() {
         let db = temp_db("detect-reused-stale");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
@@ -286,7 +319,7 @@ mod detect_and_recover {
                 &default_protocol_config(),
             )
             .expect("append gen1 stale safe input");
-        let first = storage.detect_and_recover(1200).expect("gen1 recovery");
+        let first = storage.recover_post_flush(1200).expect("gen1 recovery");
         assert_eq!(first, vec![0, 1]);
 
         let mut head = storage.open_state().expect("load").unwrap();
@@ -305,34 +338,145 @@ mod detect_and_recover {
                 &default_protocol_config(),
             )
             .expect("append gen2 stale safe input");
-        let second = storage.detect_and_recover(1200).expect("gen2 recovery");
+        let second = storage.recover_post_flush(1200).expect("gen2 recovery");
         assert_eq!(
             second,
             vec![2, 3],
             "stale reused nonce in gen2 must still be detected"
         );
     }
+
+    #[test]
+    fn cascades_aging_tip_when_no_closed_pivot_exists() {
+        // Regression for the no-pivot Tip case: the closed batch landed fresh
+        // (becomes gold) but the Tip's `first_frame.safe_block` matches the
+        // closed batch's, and after the flush wait the current safe block has
+        // pushed the Tip's age into the danger zone. Pure monotonicity
+        // (`S_tip >= S_closed`) doesn't rule this out — equality is allowed
+        // when the lane rotates without a safe-block advance between frames.
+        //
+        // Earlier `recover_post_flush` only checked the first non-gold closed
+        // batch; on no closed pivot it became a no-op, leaving the stale Tip
+        // for the next danger trip to catch. Fix: fall through to a Tip
+        // check against `danger_threshold` and cascade the Tip directly.
+        let db = temp_db("post-flush-tip-no-pivot");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        // S_closed = S_tip = 10 (lane rotated without a safe-block advance).
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0; open Tip with same safe_block=10");
+
+        let batch_submitter = Address::repeat_byte(0xAA);
+        // Closed batch 0 landed fresh: inclusion_block=200 → inclusion-staleness 190
+        // is well below MAX_WAIT, so populate accepts it as gold.
+        // Then advance safe head to 1100: batch 0 age (gold) is irrelevant,
+        // but Tip's age = 1100 - 10 = 1090 > danger_threshold (let's pass 1000).
+        storage
+            .append_safe_inputs(
+                200,
+                &[StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: make_stale_batch_payload(0, 10),
+                    block_number: 200,
+                }],
+                &default_protocol_config(),
+            )
+            .expect("append fresh safe input — batch 0 becomes gold");
+        storage
+            .append_safe_inputs(1100, &[], &default_protocol_config())
+            .expect("advance safe head past Tip's danger threshold");
+
+        // Sanity: no closed batch is past gold (all gold).
+        assert_eq!(
+            storage.check_danger_zone(900).expect("strict check"),
+            None,
+            "all closed batches gold; closed-frontier check returns None"
+        );
+
+        // recover_post_flush(danger_threshold=1000): Tip's age (1090) > 1000.
+        // Fall-through Tip check fires; Tip cascaded; recovery batch opened.
+        let invalidated = storage
+            .recover_post_flush(1000)
+            .expect("recover_post_flush with danger_threshold=1000");
+        assert_eq!(
+            invalidated,
+            vec![1],
+            "Tip (batch 1) cascaded via danger_threshold fall-through"
+        );
+
+        // A fresh recovery Tip exists with a higher batch_index.
+        let head = storage.open_state().expect("load").expect("recovery Tip");
+        assert_eq!(head.batch_index, 2);
+    }
+
+    #[test]
+    fn no_op_when_tip_age_below_danger_threshold() {
+        // Negative companion to the above: closed batch is gold, Tip exists,
+        // but Tip's age is below `danger_threshold`. Cascade must not fire.
+        let db = temp_db("post-flush-tip-below-danger");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+
+        let batch_submitter = Address::repeat_byte(0xAA);
+        storage
+            .append_safe_inputs(
+                200,
+                &[StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: make_stale_batch_payload(0, 10),
+                    block_number: 200,
+                }],
+                &default_protocol_config(),
+            )
+            .expect("append fresh safe input — batch 0 becomes gold");
+        // current=500: Tip's age = 490, below threshold 1000.
+        storage
+            .append_safe_inputs(500, &[], &default_protocol_config())
+            .expect("advance safe head, but not past danger threshold");
+
+        let invalidated = storage
+            .recover_post_flush(1000)
+            .expect("recover_post_flush with fresh Tip");
+        assert!(
+            invalidated.is_empty(),
+            "Tip below danger_threshold must not be cascaded, got: {invalidated:?}"
+        );
+
+        // Tip preserved.
+        let head = storage.open_state().expect("load").expect("Tip");
+        assert_eq!(head.batch_index, 1);
+    }
 }
 
 mod tip_staleness {
     use super::*;
 
-    // ── §7.3 — Tip staleness regression ───────────────────────────────────
+    // ── Tip staleness — `recover_aging_tip` and post-flush combined cases ──
     //
-    // Original bug: a Tip (unsealed) whose first frame was pinned to an old
-    // safe_block escaped detection. The frontier lookup only considered
-    // closed batches, leaving the Tip out of scope.
+    // The Proceed startup path uses `recover_aging_tip` to handle the case
+    // where all closed batches are gold but the open Tip has aged past
+    // `MAX_WAIT_BLOCKS`. The Tip has no L1 footprint (no `w_nonce`, no
+    // `safe_input`), so it can be invalidated directly without a flush.
     //
-    // Fix: `find_first_batch_in_danger` first tries the closed-frontier
-    // check, then falls through to `find_tip_batch_in_danger`. Both the
-    // preemptive danger check and the reactive cascade path go through this
-    // helper, so they can never diverge on what counts as "in danger".
-    //
-    // Below covers four cases:
+    // The first four tests cover that path:
     //   - positive: Tip IS stale → invalidated
     //   - negative: Tip is fresh → NOT invalidated (no false positives)
-    //   - combined: closed+stale AND tip+stale → both invalidated in one cascade
-    //   - no-batch: empty DB with no Tip → no-op, no panic
+    //   - boundary at threshold: invalidated
+    //   - boundary just below threshold: not invalidated
+    //
+    // The remaining tests cover the FlushAndCascade path's combined
+    // closed+open behavior (`recover_post_flush`'s `batch_index >= N`
+    // cascade rule catches the Tip too).
 
     #[test]
     fn open_batch_stale_by_current_safe_block_is_invalidated() {
@@ -353,7 +497,7 @@ mod tip_staleness {
             .expect("advance safe head past MAX_WAIT_BLOCKS");
 
         let invalidated = storage
-            .detect_and_recover(1200)
+            .recover_aging_tip(1200)
             .expect("recover from stale open batch");
         assert_eq!(
             invalidated,
@@ -370,8 +514,7 @@ mod tip_staleness {
     fn open_batch_not_yet_stale_is_not_invalidated() {
         // Negative: open batch's first frame safe_block=10 with current safe=1100.
         // 1100 - 10 = 1090 < 1200. Must NOT cascade.
-        // Catches false-positive regressions in the open-batch arm of
-        // `find_first_batch_in_danger`.
+        // Catches false-positive regressions in `recover_aging_tip`.
         let db = temp_db("open-batch-fresh");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
@@ -384,7 +527,7 @@ mod tip_staleness {
             .expect("advance safe head below threshold");
 
         let invalidated = storage
-            .detect_and_recover(1200)
+            .recover_aging_tip(1200)
             .expect("recover with non-stale open batch");
         assert!(
             invalidated.is_empty(),
@@ -414,7 +557,7 @@ mod tip_staleness {
             .append_safe_inputs(1210, &[], &default_protocol_config())
             .expect("advance safe head to exact threshold");
 
-        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        let invalidated = storage.recover_aging_tip(1200).expect("recover");
         assert_eq!(invalidated, vec![0], "boundary (>= threshold) invalidates");
     }
 
@@ -432,7 +575,7 @@ mod tip_staleness {
             .append_safe_inputs(1209, &[], &default_protocol_config())
             .expect("advance safe head to one block below threshold");
 
-        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        let invalidated = storage.recover_aging_tip(1200).expect("recover");
         assert!(
             invalidated.is_empty(),
             "one-block-below-threshold must not invalidate, got: {invalidated:?}"
@@ -460,7 +603,7 @@ mod tip_staleness {
             .append_safe_inputs(1500, &[], &default_protocol_config())
             .expect("advance safe head past staleness");
 
-        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(
             invalidated,
             vec![0, 1],
@@ -469,7 +612,7 @@ mod tip_staleness {
     }
 
     #[test]
-    fn detect_and_recover_opens_batch_after_torn_invalidation() {
+    fn opens_batch_after_torn_invalidation() {
         let db = temp_db("detect-torn");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
@@ -484,7 +627,7 @@ mod tip_staleness {
         storage.insert_invalid_batch(1).expect("invalidate 1");
 
         let invalidated = storage
-            .detect_and_recover(1200)
+            .recover_post_flush(1200)
             .expect("recover from torn state");
         assert!(invalidated.is_empty(), "no new invalidations");
 
@@ -494,7 +637,7 @@ mod tip_staleness {
     }
 
     #[test]
-    fn detect_and_recover_rolls_back_when_cascade_update_aborts() {
+    fn rolls_back_when_cascade_update_aborts() {
         let db = temp_db("detect-cascade-abort");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
@@ -524,7 +667,7 @@ mod tip_staleness {
             .expect("install failure trigger");
 
         let err = storage
-            .detect_and_recover(1200)
+            .recover_post_flush(1200)
             .expect_err("trigger should abort recovery transaction");
         assert!(
             err.to_string().contains("injected cascade failure"),
@@ -610,7 +753,7 @@ mod tip_staleness {
             )
             .expect("append stale batch submission");
         let invalidated = storage
-            .detect_and_recover(1200)
+            .recover_post_flush(1200)
             .expect("detect and recover");
         assert!(!invalidated.is_empty(), "should have invalidated batches");
 
@@ -646,9 +789,9 @@ mod tip_staleness {
 
     #[test]
     fn undrained_safe_input_appears_in_recovery_batch_first_frame() {
-        // §7.4.2: a deposit ingested into safe_inputs but not yet drained
+        // a deposit ingested into safe_inputs but not yet drained
         // into any frame must be sequenced into the recovery batch's first
-        // frame after cascade. Complements §7.4.1 (re-drain from
+        // frame after cascade. Complements  (re-drain from
         // invalidated) with the never-drained case.
         let db = temp_db("recovery-includes-undrained");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
@@ -693,7 +836,7 @@ mod tip_staleness {
                 &default_protocol_config(),
             )
             .expect("append stale batch submission");
-        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert!(!invalidated.is_empty(), "stale batch must cascade");
 
         let recovery = storage.open_state().expect("load").unwrap();
@@ -716,7 +859,7 @@ mod tip_staleness {
 
     #[test]
     fn recovery_batch_opens_empty_when_no_direct_inputs_pending() {
-        // §7.4.3: no drained-into-invalidated inputs AND no undrained safe
+        // no drained-into-invalidated inputs AND no undrained safe
         // inputs → recovery batch opens with an empty first frame (aside
         // from the batch-submitter's own self-submission, which is drained
         // but carries no user-visible payload).
@@ -742,7 +885,7 @@ mod tip_staleness {
                 &default_protocol_config(),
             )
             .expect("append stale batch submission");
-        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(invalidated, vec![0, 1]);
 
         let recovery = storage.open_state().expect("load").unwrap();
@@ -764,7 +907,7 @@ mod tip_staleness {
 
     #[test]
     fn first_batch_stale_recovery_reuses_nonce_zero() {
-        // §7.5.1: first-ever batch (nonce 0) goes stale before reaching
+        // first-ever batch (nonce 0) goes stale before reaching
         // Gold. Cascade invalidates it; recovery opens a fresh batch that
         // reuses nonce 0 (no valid ancestor exists to advance the nonce).
         let db = temp_db("first-batch-stale-nonce-zero");
@@ -789,7 +932,7 @@ mod tip_staleness {
                 &default_protocol_config(),
             )
             .expect("append stale batch submission");
-        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(
             invalidated,
             vec![0, 1],
@@ -829,13 +972,13 @@ mod tip_staleness {
     }
 
     #[test]
-    fn detect_and_recover_after_post_recovery_crash_is_no_op() {
-        // §7.6.3: simulate a crash AFTER open_recovery_batch has run. On
+    fn after_post_recovery_crash_is_no_op() {
+        // simulate a crash AFTER open_recovery_batch has run. On
         // restart, the state contains a valid open recovery batch (no stale
-        // tail remains). A fresh `detect_and_recover` call must be a no-op:
+        // tail remains). A fresh `recover_post_flush` call must be a no-op:
         // no new invalidations, and the same recovery batch remains the Tip.
         //
-        // Distinct from §7.6.1 (idempotent back-to-back call on the same
+        // Distinct from  (idempotent back-to-back call on the same
         // Storage handle) — this test drops and reopens Storage to model a
         // full restart over the persisted DB.
         let db = temp_db("post-recovery-crash-idempotent");
@@ -861,7 +1004,7 @@ mod tip_staleness {
             )
             .expect("append stale submission");
         // First call: full recovery runs to completion and opens a new Tip.
-        let invalidated = storage.detect_and_recover(1200).expect("recover");
+        let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(invalidated, vec![0, 1]);
         let recovery_index = storage
             .open_state()
@@ -875,7 +1018,7 @@ mod tip_staleness {
         drop(storage);
         let mut storage = Storage::open(db.path.as_str()).expect("reopen storage");
 
-        let second = storage.detect_and_recover(1200).expect("second detect");
+        let second = storage.recover_post_flush(1200).expect("second detect");
         assert!(
             second.is_empty(),
             "post-recovery restart must be a no-op, got invalidations: {second:?}",
@@ -1108,10 +1251,9 @@ mod boundary {
     // ── boundary tests ─────────────────────────────────────────────────
 
     #[test]
-    fn detect_and_recover_boundary_exactly_max_wait_is_stale() {
+    fn boundary_exactly_max_wait_is_stale() {
         let db = temp_db("detect-boundary-exact");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let max_wait: u64 = 1200;
 
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
@@ -1131,16 +1273,15 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append safe input");
-        let invalidated = storage.detect_and_recover(max_wait).expect("detect");
+        let invalidated = storage.recover_post_flush(1200).expect("detect");
         assert_eq!(invalidated, vec![0, 1], "exactly at max_wait must be stale");
         assert_eq!(storage.open_state().expect("load").unwrap().batch_index, 2);
     }
 
     #[test]
-    fn detect_and_recover_boundary_one_below_max_wait_is_not_stale() {
+    fn boundary_one_below_max_wait_is_not_stale() {
         let db = temp_db("detect-boundary-one-below");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let max_wait: u64 = 1200;
 
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
@@ -1160,7 +1301,7 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append safe input");
-        let invalidated = storage.detect_and_recover(max_wait).expect("detect");
+        let invalidated = storage.recover_post_flush(1200).expect("detect");
         assert!(
             invalidated.is_empty(),
             "one below max_wait must not be stale"
@@ -1168,10 +1309,9 @@ mod boundary {
     }
 
     #[test]
-    fn detect_and_recover_all_batches_invalidated_frontier_zero() {
+    fn all_batches_invalidated_frontier_zero() {
         let db = temp_db("detect-frontier-zero");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let max_wait: u64 = 1200;
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1191,16 +1331,15 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append");
-        let inv = storage.detect_and_recover(max_wait).expect("detect");
+        let inv = storage.recover_post_flush(1200).expect("detect");
         assert_eq!(inv, vec![0, 1, 2, 3]);
         assert!(storage.open_state().expect("open").is_some());
     }
 
     #[test]
-    fn detect_and_recover_recovery_batch_itself_becomes_stale() {
+    fn recovery_batch_itself_becomes_stale() {
         let db = temp_db("detect-recovery-stale");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let max_wait: u64 = 1200;
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1218,7 +1357,7 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append gen1");
-        let inv1 = storage.detect_and_recover(max_wait).expect("recover gen1");
+        let inv1 = storage.recover_post_flush(1200).expect("recover gen1");
         assert_eq!(inv1, vec![0, 1]);
 
         let mut head2 = storage.open_state().expect("load").unwrap();
@@ -1237,16 +1376,15 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append gen2");
-        let inv2 = storage.detect_and_recover(max_wait).expect("recover gen2");
+        let inv2 = storage.recover_post_flush(1200).expect("recover gen2");
         assert_eq!(inv2, vec![2, 3]);
         assert!(storage.open_state().expect("open").is_some());
     }
 
     #[test]
-    fn detect_and_recover_multi_round_gen3_recovery() {
+    fn multi_round_gen3_recovery() {
         let db = temp_db("detect-gen3");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let max_wait: u64 = 1200;
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1263,7 +1401,7 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append");
-        storage.detect_and_recover(max_wait).expect("recover gen1");
+        storage.recover_post_flush(1200).expect("recover gen1");
 
         let mut head2 = storage.open_state().expect("load").unwrap();
         storage
@@ -1280,7 +1418,7 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append gen2");
-        storage.detect_and_recover(max_wait).expect("recover gen2");
+        storage.recover_post_flush(1200).expect("recover gen2");
 
         let mut head3 = storage.open_state().expect("load").unwrap();
         storage
@@ -1297,15 +1435,14 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append gen3");
-        let inv3 = storage.detect_and_recover(max_wait).expect("recover gen3");
+        let inv3 = storage.recover_post_flush(1200).expect("recover gen3");
         assert!(inv3.is_empty(), "gen3 should be healthy");
     }
 
     #[test]
-    fn detect_and_recover_large_cascade_50_batches() {
+    fn large_cascade_50_batches() {
         let db = temp_db("detect-large-cascade");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let max_wait: u64 = 1200;
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1325,7 +1462,7 @@ mod boundary {
                 &default_protocol_config(),
             )
             .expect("append");
-        let inv = storage.detect_and_recover(max_wait).expect("detect");
+        let inv = storage.recover_post_flush(1200).expect("detect");
         assert_eq!(inv.len(), 51);
     }
 }
@@ -1563,7 +1700,7 @@ mod schema_invariants {
             .append_safe_inputs(1400, &[], &default_protocol_config())
             .expect("advance past threshold");
 
-        let inv = storage.detect_and_recover(1200).expect("recover");
+        let inv = storage.recover_post_flush(1200).expect("recover");
         // Batches 1, 2, 3 invalidated; batch 0 (accepted) stays valid.
         assert_eq!(inv, vec![1, 2, 3], "only the suffix cascades, got {inv:?}");
 
@@ -1582,7 +1719,7 @@ mod schema_invariants {
         assert_eq!(tip_parent, 0, "recovery Tip's parent is batch 0");
     }
 
-    // ── §12.1.1 CHECK-constraint regressions ──────────────────────────
+    // ── CHECK-constraint regressions ──────────────────────────
     //
     // These differ from the trigger-based tests above: they exercise raw
     // `CHECK` clauses declared in `migrations/0001_schema.sql`. The
@@ -1591,7 +1728,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_safe_input_with_wrong_sender_length() {
-        // §12.1.1: `safe_inputs.sender` must be exactly 20 bytes (an
+        // `safe_inputs.sender` must be exactly 20 bytes (an
         // Ethereum address). A shorter or longer blob must be refused
         // by the schema even if it bypasses the Rust API.
         let db = temp_db("schema-safe-input-sender-len");
@@ -1609,7 +1746,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_user_op_with_wrong_sender_length() {
-        // §12.1.1: `user_ops.sender` must be 20 bytes.
+        // `user_ops.sender` must be 20 bytes.
         let db = temp_db("schema-user-op-sender-len");
         let storage = Storage::open(db.path.as_str()).expect("open storage");
         // Seed a frame to satisfy the composite FK — initialize_open_state
@@ -1632,7 +1769,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_user_op_with_wrong_signature_length() {
-        // §12.1.1: `user_ops.sig` must be exactly 65 bytes (secp256k1
+        // `user_ops.sig` must be exactly 65 bytes (secp256k1
         // r || s || v). Regression for "accidentally accepted a non-65
         // signature and crashed a downstream consumer."
         let db = temp_db("schema-user-op-sig-len");
@@ -1656,7 +1793,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_sequenced_l2_tx_with_neither_xor_branch() {
-        // §12.1.1: `sequenced_l2_txs` must be either a user-op row
+        // `sequenced_l2_txs` must be either a user-op row
         // (user_op_pos_in_frame IS NOT NULL) or a direct-input row
         // (safe_input_index IS NOT NULL), never both and never neither.
         // Setting both to NULL is the clean XOR violation to test —
@@ -1681,7 +1818,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_l1_bootstrap_cache_with_zero_chain_id() {
-        // §12.1.1: `l1_bootstrap_cache.chain_id > 0`. chain_id = 0 would
+        // `l1_bootstrap_cache.chain_id > 0`. chain_id = 0 would
         // collide with the EIP-712 domain's unspecified-chain sentinel
         // and break signature recovery; the CHECK refuses to persist it
         // in the first place.
@@ -1702,7 +1839,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_safe_input_with_negative_block_number() {
-        // §12.1.1: `safe_inputs.block_number >= 0`. Catches a regression
+        // `safe_inputs.block_number >= 0`. Catches a regression
         // that would let a negative block number slip through — the rest
         // of the system assumes non-negative and could panic on cast.
         let db = temp_db("schema-safe-input-neg-block");
@@ -1723,7 +1860,7 @@ mod schema_invariants {
 mod tree_invariants {
     use super::*;
 
-    // ── §12.5 Parent-pointer tree invariants ──────────────────────────────
+    // ── Parent-pointer tree invariants ──────────────────────────────
     use crate::storage::convert::{i64_to_u64, u64_to_i64};
     use rusqlite::params;
 
@@ -1865,7 +2002,7 @@ mod tree_invariants {
         storage
             .append_safe_inputs(1400, &[], &default_protocol_config())
             .expect("advance past threshold");
-        let inv = storage.detect_and_recover(1200).expect("recover");
+        let inv = storage.recover_post_flush(1200).expect("recover");
         assert!(!inv.is_empty(), "partial cascade should invalidate");
         assert_tree_invariants(&mut storage);
 
@@ -1883,7 +2020,7 @@ mod tree_invariants {
         for bi in 0..=latest {
             storage.insert_invalid_batch(bi).expect("invalidate");
         }
-        storage.detect_and_recover(1200).expect("recover from torn");
+        storage.recover_post_flush(1200).expect("recover from torn");
         assert_tree_invariants(&mut storage);
 
         // Phase 5: rotations after torn cascade — new Tip has parent=NULL, nonce=0.
@@ -1898,7 +2035,7 @@ mod tree_invariants {
 
     #[test]
     fn subtree_by_batch_index_equals_subtree_by_parent_walk() {
-        // §12.5.2: cascade queries use `batch_index >= N` as a shortcut for
+        // cascade queries use `batch_index >= N` as a shortcut for
         // "subtree rooted at N". This test asserts the equivalence on a
         // realistic scenario with multiple cascade generations.
         let db = temp_db("subtree-equivalence");
@@ -1928,7 +2065,7 @@ mod tree_invariants {
         storage
             .append_safe_inputs(1400, &[], &default_protocol_config())
             .expect("advance");
-        let _ = storage.detect_and_recover(1200).expect("cascade 1");
+        let _ = storage.recover_post_flush(1200).expect("cascade 1");
 
         let mut head = storage.open_state().expect("load").unwrap();
         for _ in 0..2 {

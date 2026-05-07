@@ -1,22 +1,22 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! §8.3 — H7 regression: chain-id mismatch is caught early in bootstrap.
+//! H7 regression: chain-id mismatch is caught early in bootstrap.
 //!
 //! The H7 hardening moved the chain-id check before any DB writes and replaced
 //! `assert_eq!` with a typed `RunError::ChainIdMismatch`. This file locks two
 //! of the three code paths where the check matters:
 //!
-//!   - §8.3.2 Cache path: L1 is unreachable but a cache exists with a different
+//!   - Cache path: L1 is unreachable but a cache exists with a different
 //!     chain_id. Check fires before `InputReader::from_parts`.
 //!   - Positive control: with a matched chain_id, `ChainIdMismatch` does NOT
 //!     fire, so the check doesn't misfire on the happy path.
 //!
-//! §8.3.1 (RPC path: L1 reachable, chain_id from `eth_chainId` mismatches) is
+//! The RPC path (L1 reachable, chain_id from `eth_chainId` mismatches) is
 //! NOT covered here because `InputReader::new` needs a real InputBox contract
 //! deployed at `config.app_address` before the chain-id check fires. That
-//! setup only exists in the full rollups-e2e harness (after `just setup`).
-//! Tracking in `tests/TEST_PLAN.md` §8.3.1.
+//! setup only exists in the full rollups-e2e harness (after `just setup`) —
+//! see `chain_id_mismatch_via_live_rpc_refuses_boot_test` there.
 
 use std::time::Duration;
 
@@ -70,7 +70,7 @@ fn build_app() -> WalletApp {
     WalletApp::new(WalletConfig::default())
 }
 
-// ── §8.3.2 — Cache path ──────────────────────────────────────────────────────
+// ── Cache path ──────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_id_mismatch_from_cache_returns_typed_error() {

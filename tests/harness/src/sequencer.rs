@@ -94,7 +94,6 @@ pub struct ManagedSequencer {
     /// Overrides the `--chain-id` argument passed to the sequencer binary.
     /// When `None`, defaults to `DEVNET_CHAIN_ID` (matches Anvil). Set to
     /// a non-matching value to test chain-id-mismatch failure modes
-    /// (§8.2.1 / §8.3.1).
     chain_id_override: Option<u64>,
     /// Path to the file libfaketime re-reads for its offset, on every time
     /// call (combined with `FAKETIME_NO_CACHE=1`). Writing to this file
@@ -187,7 +186,7 @@ impl ManagedSequencer {
     /// the next [`Self::respawn`]. When `None`, defaults to the devnet
     /// chain id (matches Anvil).
     ///
-    /// Used by §8.2.1 / §8.3.1 to inject a mismatched chain id and assert
+    /// Used by chain-id mismatch tests to inject a mismatched chain id and assert
     /// that bootstrap returns `RunError::ChainIdMismatch` instead of
     /// silently writing a wrong-chain bootstrap cache. Does not affect
     /// the currently-running sequencer process.
@@ -223,7 +222,7 @@ impl ManagedSequencer {
     /// `input_box_address` / `genesis_block` / `chain_id`). Call while the
     /// sequencer is stopped.
     ///
-    /// Used by §8.1.2: with no cache and L1 unreachable, the bootstrap
+    /// Used by the no-cache-bootstrap test: with no cache and L1 unreachable, the bootstrap
     /// path returns the "L1 required for first startup" error before any
     /// recovery logic can run.
     pub fn clear_l1_bootstrap_cache(&self) -> HarnessResult<()> {
@@ -239,7 +238,7 @@ impl ManagedSequencer {
     /// never successfully synced from L1. Call while the sequencer is
     /// stopped.
     ///
-    /// Used by §7.8.2: the wall-clock fallback treats `synced_at_ms == 0`
+    /// Used by the wall-clock-never-synced test: the wall-clock fallback treats `synced_at_ms == 0`
     /// as "first boot, L1 required" and refuses to proceed if L1 is
     /// unreachable. Setting this field while the bootstrap cache is
     /// populated lets us hit that branch without losing the cached chain
@@ -263,7 +262,7 @@ impl ManagedSequencer {
     /// min_nonce)` — count is the row count, min_nonce is `MIN(nonce)` or
     /// `None` if empty.
     ///
-    /// Used by §7.5.2 to confirm a recovery batch (which reuses nonce 0)
+    /// Used by the nonce-0 recovery test to confirm a recovery batch (which reuses nonce 0)
     /// actually lands and gets accepted on L1 — proving the
     /// `populate_safe_accepted_batches_inner` cursor handles
     /// reused-nonce-after-cascade correctly.
@@ -342,8 +341,7 @@ impl ManagedSequencer {
     ///   4. The nonces on the valid path form a contiguous `0..N` sequence.
     ///
     /// Panics with a specific violation message if any invariant fails.
-    /// See `tests/TEST_PLAN.md` §12.5.3 for the design rationale — this is
-    /// a harness-only check (no sequencer changes) that catches regressions
+    /// Harness-only check (no sequencer changes) that catches regressions
     /// which slip past user-visible e2e assertions.
     pub fn assert_schema_invariants(&self) -> HarnessResult<()> {
         let db_path = self.data_dir_path.join("sequencer.db");

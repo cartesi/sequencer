@@ -31,7 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 mod common;
 use common::temp_db;
 
-// ── §1.1 — V1 regression: cross-boundary signature domain consistency ────────
+// ── V1 regression: cross-boundary signature domain consistency ────────
 //
 // The sequencer signs user-ops with `sequencer_core::build_input_domain`. The
 // scheduler (canonical-app) recovers senders with the same function. If the
@@ -391,7 +391,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
         "expected bad-request error code, got: {body}"
     );
 
-    // §2.10 / H2 regression: the message must come from the fixed taxonomy
+    //  / H2 regression: the message must come from the fixed taxonomy
     // ("invalid JSON"), NOT reflect serde's line/column/token excerpt. The
     // malformed input contains the token `0x1234` — assert it doesn't appear
     // in the response body so no attacker-submitted bytes are echoed.
@@ -409,7 +409,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_missing_content_type_with_fixed_message() {
-    // §2.10 / H2 regression: missing Content-Type must produce a fixed
+    //  / H2 regression: missing Content-Type must produce a fixed
     // `"missing content type"` message, not reflect any part of the request.
     let db = temp_db("missing-content-type");
     let domain = test_domain();
@@ -517,7 +517,7 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
-    // §2.3.3 / H2 regression: a body that is valid JSON but missing required
+    //  / H2 regression: a body that is valid JSON but missing required
     // fields must respond with the fixed `"invalid JSON"` envelope. The
     // response must not echo serde's deserialization error text — that would
     // leak our internal field names and parser internals to callers.
@@ -571,7 +571,7 @@ async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_payload_size_check_fires_before_signature_recovery() {
-    // §2.3.5 sharpening: oversized `data` must be rejected by
+    //  sharpening: oversized `data` must be rejected by
     // `validate_payload_size` BEFORE any cryptographic work. We submit an
     // oversized payload paired with a garbage-but-correctly-shaped signature:
     // if the size check is enforced first, the response says "user op payload
@@ -633,7 +633,7 @@ async fn api_payload_size_check_fires_before_signature_recovery() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_signature_with_invalid_parity_byte() {
-    // §2.2.3: signature with correct length (65 bytes) but a parity byte
+    // signature with correct length (65 bytes) but a parity byte
     // outside the valid set (0/1 or 27/28) must be rejected at the crypto
     // boundary with 422. Catches regressions where a new signature codec
     // accepts arbitrary parity values and silently drifts recovery.
@@ -661,10 +661,8 @@ async fn api_rejects_signature_with_invalid_parity_byte() {
         .submit_tx_with_status(&request)
         .await
         .expect("submit tx");
-    // Observed: 400 with `INVALID_SIGNATURE` code. (TEST_PLAN originally said
-    // 422; the code returns 400 for all signature-class rejections, same as
-    // §2.2.1 `forged_signature_rejected_test`. This test pins the actual
-    // contract.)
+    // Observed contract: 400 with `INVALID_SIGNATURE` code, same as
+    // `forged_signature_rejected_test`. This test pins it.
     assert_eq!(
         status, 400,
         "invalid parity byte must produce 400 (signature-class error), got {status}: {body}",
@@ -674,7 +672,7 @@ async fn api_rejects_signature_with_invalid_parity_byte() {
         "expected INVALID_SIGNATURE code, got: {body}",
     );
     // Defensive: make sure the rejection is from the signature layer, not the
-    // hex-length gate (§2.2.2 covers that) and not the payload-size gate.
+    // hex-length gate ( covers that) and not the payload-size gate.
     assert!(
         !body.contains("signature must be") && !body.contains("payload too large"),
         "expected sig-recovery class error, not hex-length or size: {body}",
@@ -685,7 +683,7 @@ async fn api_rejects_signature_with_invalid_parity_byte() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
-    // §2.2.4: `sender` field in the request must equal the address recovered
+    // `sender` field in the request must equal the address recovered
     // from the signature. A valid signature over a user-op paired with a
     // different claimed `sender` must be rejected — can't accept someone
     // else's signed op as if it came from ourselves. Complements the
@@ -725,8 +723,8 @@ async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
         .submit_tx_with_status(&request)
         .await
         .expect("submit tx");
-    // Observed: 400 `INVALID_SIGNATURE` `"sender mismatch"`. See parity-byte
-    // test above for the TEST_PLAN-vs-reality note on the status code.
+    // Observed: 400 `INVALID_SIGNATURE` `"sender mismatch"` — same
+    // signature-class status as the parity-byte test above.
     assert_eq!(
         status, 400,
         "sender-mismatch must produce 400 (signature-class error), got {status}: {body}",
@@ -745,9 +743,9 @@ async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_user_op_with_nonce_gap() {
-    // §2.4.3: submitting a user-op with a nonce above the next expected one
+    // submitting a user-op with a nonce above the next expected one
     // (i.e., a gap) must return 422 `InvalidNonce` and leave state
-    // unchanged. Complement to §2.4.2 (nonce too low / replay) — together
+    // unchanged. Complement to  (nonce too low / replay) — together
     // they pin the strict-equality requirement on `current_user_nonce`.
     let db = temp_db("nonce-gap-too-high");
     let domain = test_domain();
@@ -797,9 +795,9 @@ async fn api_rejects_user_op_with_nonce_gap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
-    // §2.5.2 boundary: the check is `max_fee >= current_frame_fee` (strict
+    //  boundary: the check is `max_fee >= current_frame_fee` (strict
     // less-than rejects). An op with `max_fee == current_frame_fee` must be
-    // accepted. Pairs with §2.5.1 (`fee_below_minimum_rejected_test`) — the
+    // accepted. Pairs with  (`fee_below_minimum_rejected_test`) — the
     // two together pin the comparator.
     let db = temp_db("fee-boundary-equal");
     let domain = test_domain();
@@ -848,7 +846,7 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_user_op_when_balance_below_gas_cost() {
-    // §2.6.1: if sender's balance < `fee_to_linear(current_frame_fee)` the
+    // if sender's balance < `fee_to_linear(current_frame_fee)` the
     // user op must be rejected with 422 `InsufficientGasBalance` and leave
     // state unchanged. Exercises the balance check in
     // `WalletApp::validate_user_op` (app-core). A fresh sender with no
@@ -901,7 +899,7 @@ async fn api_rejects_user_op_when_balance_below_gas_cost() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_concurrent_same_nonce_leaves_exactly_one_committed() {
-    // §2.8.2: two concurrent POSTs for the same (sender, nonce) — one
+    // two concurrent POSTs for the same (sender, nonce) — one
     // succeeds, one is rejected with a nonce-class error. Pins the invariant
     // that the rejected half does NOT leave any state artifact: the final
     // balance/nonce must match the single-commit path.

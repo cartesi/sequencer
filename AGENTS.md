@@ -72,19 +72,27 @@ If a batch is stale, all existing subsequent batches are also invalid. The sched
 
 ### Preemptive recovery
 
-Rather than waiting for a batch to go stale on L1, the sequencer uses a **danger threshold** (`MAX_WAIT_BLOCKS − MARGIN`). The cycle crosses a process boundary by design:
+Rather than waiting for a batch to go stale on L1, the sequencer uses a **danger threshold** (`MAX_WAIT_BLOCKS − MARGIN`). The threshold is *only a trigger*: it tells the system "stop running, hand off to recovery." It does not encode "this batch is doomed" — that decision belongs to the post-flush cascade.
 
-1. **Detector trips + process exits** — the in-process [`DangerDetector`](sequencer/src/recovery/detector.rs) polls `Storage::check_danger` on a cadence. When either the strict block-based or wall-clock-adjusted arm fires, the detector exits with `DetectorExit::DangerZone`, the runtime maps that to `RunError::DangerZoneDetected`, and the process exits with a non-zero status. Stopping the process is how the sequencer goes offline: no more user-op acceptance, no more batch submission.
+The cycle crosses a process boundary by design:
+
+1. **Detector trips + process exits** — the in-process [`DangerDetector`](sequencer/src/recovery/detector.rs) polls `Storage::check_danger` on a cadence. When the closed-frontier strict, Tip strict, or wall-clock-adjusted arm fires, the detector exits with `DetectorExit::DangerZone`, the runtime maps that to `RunError::DangerZoneDetected`, and the process exits with a non-zero status. Stopping the process is how the sequencer goes offline: no more user-op acceptance, no more batch submission.
 2. **Orchestrator respawns** — systemd/k8s/etc. restarts the process.
-3. **Startup flushes the mempool** — [`MempoolFlusher`](sequencer/src/recovery/flusher.rs) submits no-op transactions at every pending wallet-nonce slot and waits for safe finality. This consumes all pending slots so adversarially-delayed "zombie" batch submissions cannot land later. The flusher is load-bearing, not defense-in-depth.
-4. **Startup runs recovery** — on fully finalized L1 state: cascade-invalidate stale batches, open a recovery batch, re-drain direct inputs from invalidated batches. Driven by [`run_preemptive_recovery`](sequencer/src/recovery/mod.rs) with the decision table in the pure [`decide_startup_action`](sequencer/src/recovery/mod.rs).
+3. **Startup syncs and dispatches** — the fresh process syncs the L1 safe head if reachable, re-runs `Storage::check_danger`, then [`decide_startup_action`](sequencer/src/recovery/mod.rs) chooses the startup path.
+4. **Startup runs recovery** — dispatched by the danger status:
+   - **`RecoverTip`** → [`Storage::recover_aging_tip(danger_threshold)`](sequencer/src/storage/recovery.rs): no flush ran. The open Tip has no L1 footprint, so invalidate it directly once its first frame has aged past the danger threshold.
+   - **`FlushAndCascade`** → [`MempoolFlusher`](sequencer/src/recovery/flusher.rs) consumes pending wallet-nonce slots, startup re-syncs L1, then [`Storage::recover_post_flush(danger_threshold)`](sequencer/src/storage/recovery.rs) cascades from the first non-gold closed batch (every non-gold batch past the post-flush gold frontier is doomed — Silver-stale, Silver-poisoned, or no-op'd Pending). If all closed batches landed gold, fall through to a Tip check against `danger_threshold` (handles the corner case where `S_tip = S_closed`, the closed batch lands fresh, and the Tip's age clears the danger zone after the flush wait).
+   - **`Proceed`** → [`Storage::recover_aging_tip(danger_threshold)`](sequencer/src/storage/recovery.rs): no flush ran and no danger was detected. Closed batches past gold may still be in their natural lifecycle, so leave them alone; the Tip check is defensive and normally a no-op.
+   - **`Refuse`** → startup stops and surfaces the reason to the operator.
 5. **Normal operation resumes** — the lane, submitter, input reader, and a fresh detector all start up.
+
+See [`docs/recovery/README.md`](docs/recovery/README.md) Step 5 for the "everything past gold is doomed" mental model and why the post-flush cascade is unconditional rather than threshold-based.
 
 ### Detection: safe-only, with wall-clock fallback
 
 Staleness is only checked against L1 **safe** state, never latest. Stale batches in latest that haven't reached safe yet will eventually become safe, and the check will fire at that point. This avoids reacting to L1 reorgs.
 
-When L1 is unreachable, the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The danger detector falls back to **wall-clock estimation**: `estimated_missed_blocks = (now − last_l1_success) / seconds_per_block`, and the danger threshold is adjusted downward by this estimate. Prevents silently issuing doomed soft confirmations during extended L1 outages.
+When L1 is unreachable, the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The danger detector falls back to **wall-clock estimation**: `estimated_missed_blocks = (now − last_safe_progress_ms) / seconds_per_block`, and the danger threshold is adjusted downward by this estimate. Prevents silently issuing doomed soft confirmations during extended L1 outages.
 
 ### Formal verification
 
@@ -99,8 +107,6 @@ See [`docs/threat-model/README.md`](docs/threat-model/README.md) for the full mo
 - **Semi-trusted, fail-stop:** fallback RPC providers (Infura / Alchemy).
 - **Self-trust:** the sequencer trusts its own code is correct. Bugs that emit malformed batches are fault states requiring manual intervention, not threats to defend against at runtime.
 - **In scope:** correctness bugs *and* exploitation. Under rollup semantics, a correctness bug that causes scheduler/sequencer state divergence is as severe as direct theft.
-
-Open findings from staged security review live in [`SECURITY_TODO.md`](SECURITY_TODO.md).
 
 ## Architecture Map
 
@@ -156,7 +162,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is sampled from `batch_policy_derived.recommended_fee` at rotation.
 - Wallet state (balances, nonces) is in-memory today — not persisted.
-- **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`. `chainId` and `verifyingContract` come from `SEQ_CHAIN_ID` and `SEQ_APP_ADDRESS` (validated against the RPC chain id at startup). All four fields must be present on both sides — see [`SECURITY_TODO.md`](SECURITY_TODO.md) for the open divergence finding.
+- **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`. `chainId` and `verifyingContract` come from `SEQ_CHAIN_ID` and `SEQ_APP_ADDRESS` (validated against the RPC chain id at startup). All four fields must be present on both sides — both the sequencer and the on-chain scheduler construct the domain via `sequencer_core::build_input_domain`, the canonical shared constructor.
 
 ### InputBox payload classification
 
@@ -238,7 +244,7 @@ Health semantics: `/livez` — 200 if the process is alive. `/readyz` — 200 if
 - `SEQ_LONG_BLOCK_RANGE_ERROR_CODES`
 - `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS` (default 5000)
 - `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH` (default 2)
-- `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default 75)
+- `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default 300, ~1h at 12s/block)
 - `SEQ_SECONDS_PER_BLOCK` (default 12)
 
 ## Coding Conventions
@@ -332,5 +338,4 @@ Before finishing a change, ensure:
 - [`CLAUDE.md`](CLAUDE.md) — shell setup, quick reference, pointer back here.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
 - [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.
-- [`SECURITY_TODO.md`](SECURITY_TODO.md) — open security findings from staged review.
 - [`sequencer-core/`](sequencer-core/) — shared domain types and protocol contracts.

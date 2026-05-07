@@ -27,7 +27,7 @@ use crate::storage::{self, StorageOpenError};
 use alloy_primitives::Address;
 use config::{L1Config, RunConfig};
 use sequencer_core::application::Application;
-use sequencer_core::protocol::ProtocolConfig;
+use sequencer_core::protocol::{ProtocolConfig, ProtocolConfigError};
 use shutdown::ShutdownSignal;
 
 const QUEUE_CAPACITY: usize = 8192;
@@ -104,6 +104,17 @@ pub enum RunError {
     DangerZoneDetected { batch_index: u64 },
     #[error("RPC chain ID {rpc} does not match --chain-id {config}")]
     ChainIdMismatch { rpc: u64, config: u64 },
+    /// `eth_chainId` failed on a reachable RPC. We treat this as fatal
+    /// rather than warn-and-continue: proceeding with an unverified chain id
+    /// would write a possibly-wrong value into the L1 bootstrap cache and
+    /// poison subsequent cache-fallback boots, in addition to issuing soft
+    /// confirmations against the wrong chain's state. Operator should retry.
+    #[error("could not query chain ID from RPC: {message}")]
+    ChainIdRpc { message: String },
+    /// Protocol-level config (`preemptive_margin_blocks` vs `max_wait_blocks`)
+    /// failed validation at startup. See [`ProtocolConfigError`].
+    #[error(transparent)]
+    InvalidProtocolConfig(#[from] ProtocolConfigError),
 }
 
 enum FirstExit {
@@ -134,12 +145,18 @@ where
     // One ProtocolConfig shared across the whole process: the input reader,
     // the danger detector, and startup recovery all mirror the same
     // scheduler-acceptance rules.
-    let protocol = ProtocolConfig {
-        batch_submitter: batch_submitter_address,
-        max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-        preemptive_margin_blocks: config.preemptive_margin_blocks,
-        seconds_per_block: config.seconds_per_block,
-    };
+    //
+    // `try_new` validates `preemptive_margin_blocks < max_wait_blocks`
+    // *before* any subsequent code touches `protocol.danger_threshold()` —
+    // including the startup info log below — so a bad config produces a
+    // clean typed `RunError::InvalidProtocolConfig` instead of panicking
+    // mid-log.
+    let protocol = ProtocolConfig::try_new(
+        batch_submitter_address,
+        sequencer_core::MAX_WAIT_BLOCKS,
+        config.preemptive_margin_blocks,
+        config.seconds_per_block,
+    )?;
 
     let input_reader_config = InputReaderConfig {
         rpc_url: config.eth_rpc_url.clone(),
@@ -163,7 +180,11 @@ where
             let genesis = reader.genesis_block();
             let input_box = reader.input_box_address();
 
-            // Validate chain ID early — before any DB writes.
+            // Validate chain ID early — before any DB writes. If the
+            // RPC errors, refuse to boot rather than writing an unverified
+            // chain id into the bootstrap cache: a transient `eth_chainId`
+            // failure on a misconfigured node would otherwise let us cache
+            // and operate against the wrong chain entirely.
             {
                 use alloy::providers::Provider;
                 let check_provider = crate::l1::provider::create_provider(&config.eth_rpc_url)
@@ -177,10 +198,9 @@ where
                     }
                     Ok(_) => {} // verified
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "could not validate RPC chain ID at bootstrap"
-                        );
+                        return Err(RunError::ChainIdRpc {
+                            message: e.to_string(),
+                        });
                     }
                 }
             }
@@ -628,51 +648,67 @@ mod tests {
     use super::{RunError, batch_submitter_address_from_private_key, map_danger_detector_exit};
     use crate::recovery::{DangerDetectorError, DetectorExit};
     use sequencer_core::MAX_WAIT_BLOCKS;
-    use sequencer_core::protocol::ProtocolConfig;
+    use sequencer_core::protocol::{ProtocolConfig, ProtocolConfigError};
 
-    fn protocol_with_margin(preemptive_margin_blocks: u64) -> ProtocolConfig {
-        ProtocolConfig {
-            batch_submitter: alloy_primitives::Address::ZERO,
-            max_wait_blocks: MAX_WAIT_BLOCKS,
+    fn try_protocol_with_margin(
+        preemptive_margin_blocks: u64,
+    ) -> Result<ProtocolConfig, ProtocolConfigError> {
+        ProtocolConfig::try_new(
+            alloy_primitives::Address::ZERO,
+            MAX_WAIT_BLOCKS,
             preemptive_margin_blocks,
-            seconds_per_block: 12,
-        }
+            12,
+        )
     }
 
-    // ── §8.4.1 preemptive_margin_blocks validation ────────────────────
+    // ── preemptive_margin_blocks validation ────────────────────
 
     #[test]
-    #[should_panic(expected = "preemptive_margin_blocks")]
-    fn margin_equal_to_max_wait_panics() {
-        let _ = protocol_with_margin(MAX_WAIT_BLOCKS).danger_threshold();
+    fn margin_equal_to_max_wait_is_rejected() {
+        assert!(matches!(
+            try_protocol_with_margin(MAX_WAIT_BLOCKS),
+            Err(ProtocolConfigError::MarginNotLessThanMaxWait { .. })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "preemptive_margin_blocks")]
-    fn margin_greater_than_max_wait_panics() {
-        let _ = protocol_with_margin(MAX_WAIT_BLOCKS + 1).danger_threshold();
+    fn margin_greater_than_max_wait_is_rejected() {
+        assert!(matches!(
+            try_protocol_with_margin(MAX_WAIT_BLOCKS + 1),
+            Err(ProtocolConfigError::MarginNotLessThanMaxWait { .. })
+        ));
     }
 
     #[test]
     fn margin_one_below_max_wait_yields_threshold_one() {
-        assert_eq!(
-            protocol_with_margin(MAX_WAIT_BLOCKS - 1).danger_threshold(),
-            1
-        );
+        let cfg = try_protocol_with_margin(MAX_WAIT_BLOCKS - 1).expect("valid margin");
+        assert_eq!(cfg.danger_threshold(), 1);
     }
 
     #[test]
     fn zero_margin_yields_full_wait_window() {
-        assert_eq!(protocol_with_margin(0).danger_threshold(), MAX_WAIT_BLOCKS);
+        let cfg = try_protocol_with_margin(0).expect("zero margin valid");
+        assert_eq!(cfg.danger_threshold(), MAX_WAIT_BLOCKS);
     }
 
     #[test]
     fn default_margin_matches_production_setting() {
-        // Default is 75 per `SEQ_PREEMPTIVE_MARGIN_BLOCKS`.
-        assert_eq!(
-            protocol_with_margin(75).danger_threshold(),
-            MAX_WAIT_BLOCKS - 75
-        );
+        // Default is 300 per `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (~1h at 12s/block).
+        let cfg = try_protocol_with_margin(300).expect("default margin valid");
+        assert_eq!(cfg.danger_threshold(), MAX_WAIT_BLOCKS - 300);
+    }
+
+    #[test]
+    fn invalid_protocol_config_propagates_through_run_error() {
+        // Sanity: the typed `From<ProtocolConfigError>` conversion plugged
+        // into `RunError` produces the expected variant (so the early-return
+        // in `run()` actually surfaces a structured error).
+        let err: RunError = ProtocolConfigError::MarginNotLessThanMaxWait {
+            margin: 1200,
+            max_wait: 1200,
+        }
+        .into();
+        assert!(matches!(err, RunError::InvalidProtocolConfig(_)));
     }
 
     #[test]

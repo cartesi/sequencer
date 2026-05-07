@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn closed_batch_becomes_eligible_for_submission_with_assigned_nonce() {
-        // §3.3.3: closing a batch transitions it from "open Tip" to "eligible
+        // : closing a batch transitions it from "open Tip" to "eligible
         // for L1 submission" — it appears in `valid_closed_batches` with a
         // nonce derived from its parent pointer. Pins the submitter's
         // contract: open batches are NOT pulled into the submission pipeline,
@@ -458,6 +458,55 @@ mod tests {
             .check_danger(&protocol, now_ms)
             .expect("check_danger");
         assert_eq!(status, crate::storage::DangerStatus::Stalled(1));
+    }
+
+    #[test]
+    fn check_danger_prefers_stalled_over_strict_when_both_fire() {
+        // Regression: when the safe head appears frozen (wall-clock arm fires)
+        // AND the closed frontier is past the strict threshold, prefer Stalled.
+        // The strict reading is computed against a possibly-frozen
+        // `current_safe_block`, and `MempoolFlusher::flush_and_wait` would spin
+        // forever waiting for `Pending <= Safe` against a frozen safe head.
+        // Earlier ordering returned Strict and dispatched FlushAndCascade,
+        // causing the spin.
+        let db = temp_db("check-danger-stalled-wins");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+
+        let protocol = default_test_protocol();
+        // Advance safe head so batch 0 is past `danger_threshold` (1125):
+        // current=1200 - first_frame=10 = 1190 >= 1125. Strict would fire.
+        // No safe_input ingested for batch 0, so it stays non-gold.
+        storage
+            .append_safe_inputs(1200, &[], &protocol)
+            .expect("advance safe head past strict threshold");
+
+        // Pretend safe-progress was recorded 25 blocks' worth of wall-clock
+        // ago. With the wall-clock correction, the adjusted threshold is
+        // 1100 — batch 0's age (1190) also clears that, so wall-clock fires.
+        let now_ms = unix_now_ms();
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+                [i64::try_from(now_ms.saturating_sub(25 * 12 * 1000)).unwrap_or(i64::MAX)],
+            )
+            .expect("rewind safe-progress timestamp");
+
+        let status = storage
+            .check_danger(&protocol, now_ms)
+            .expect("check_danger");
+        assert_eq!(
+            status,
+            crate::storage::DangerStatus::Stalled(0),
+            "Stalled must win when both arms fire — flushing against a frozen \
+             safe head wouldn't terminate, so refusing boot is the safe call",
+        );
     }
 
     #[test]
@@ -700,7 +749,7 @@ mod tests {
         storage.insert_invalid_batch(0).expect("invalidate batch 0");
         storage.insert_invalid_batch(1).expect("invalidate batch 1");
         storage
-            .detect_and_recover(1200)
+            .recover_post_flush(1200)
             .expect("open recovery batch after torn invalidation");
 
         let head = storage

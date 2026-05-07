@@ -55,4 +55,3 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 - **[`AGENTS.md`](AGENTS.md)** — mission, requirements, invariants, duality, recovery, conventions, rules.
 - **[`docs/threat-model/README.md`](docs/threat-model/README.md)** — trust boundaries and in-scope threats.
 - **[`docs/recovery/README.md`](docs/recovery/README.md)** — preemptive recovery design + TLA+ proofs.
-- **[`SECURITY_TODO.md`](SECURITY_TODO.md)** — open security findings awaiting fixes.

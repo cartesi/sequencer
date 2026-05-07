@@ -101,7 +101,7 @@ mod tests {
         }
     }
 
-    // ── §1.4 SSZ round-trip determinism ──────────────────────────────────
+    // ── SSZ round-trip determinism ──────────────────────────────────
 
     #[test]
     fn ssz_roundtrip_empty_batch_is_identity() {
@@ -153,7 +153,7 @@ mod tests {
         assert_eq!(batch.as_ssz_bytes(), batch.as_ssz_bytes());
     }
 
-    // ── §1.5 Decode robustness (no panics on adversarial bytes) ──────────
+    // ── Decode robustness (no panics on adversarial bytes) ──────────
 
     #[test]
     fn ssz_decode_empty_payload_returns_error() {

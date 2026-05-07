@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn frame_fee_is_immutable_for_the_lifetime_of_the_frame() {
-        // §3.2.3: once a frame is opened at fee F, a policy update mid-frame
+        // : once a frame is opened at fee F, a policy update mid-frame
         // must NOT change the open frame's committed fee. Only the *next*
         // frame (after close) sees the new policy. This pins the write-once
         // contract `frames.fee` relies on — users submitting against the open
