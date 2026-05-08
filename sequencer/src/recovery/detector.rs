@@ -4,9 +4,9 @@
 //! Runtime danger detector.
 //!
 //! A tiny background task that, every `poll_interval`, asks [`Storage::check_danger`]
-//! whether any batch is past the preemptive threshold. If so, the task exits
-//! with [`DetectorExit::DangerZone`] — the runtime turns that into a deliberate
-//! non-error process shutdown, the orchestrator respawns, and
+//! whether recovery or refusal is needed. If so, the task exits with
+//! [`DetectorExit::RecoveryRequired`] — the runtime turns that into a
+//! deliberate non-error process shutdown, the orchestrator respawns, and
 //! `run_preemptive_recovery` takes over on startup.
 //!
 //! This is its own worker (not part of the batch submitter) because the two
@@ -31,16 +31,16 @@ use sequencer_core::protocol::ProtocolConfig;
 
 /// How the detector's loop exited.
 ///
-/// `DangerZone` is a *deliberate* exit — not an error. The runtime maps it to
-/// a distinct `RunError` variant so operators can tell "time to recover" apart
-/// from "something crashed".
+/// `RecoveryRequired` is a *deliberate* exit — not an error. The runtime maps
+/// it to a distinct `RunError` variant so operators can tell "time to recover
+/// or refuse startup" apart from "something crashed".
 #[derive(Debug)]
 pub enum DetectorExit {
     /// Shutdown signal fired before any danger was detected.
     Shutdown,
-    /// The strict or wall-clock-adjusted check flagged a batch. Stop for
-    /// recovery.
-    DangerZone { batch_index: u64 },
+    /// A non-safe danger status was observed. Stop and let startup dispatch
+    /// the recovery/refusal path from a fresh read.
+    RecoveryRequired { status: DangerStatus },
 }
 
 #[derive(Debug, Error)]
@@ -93,20 +93,19 @@ impl DangerDetector {
                 DangerStatus::Safe => {
                     debug!("danger check: safe");
                 }
-                DangerStatus::Strict(batch_index)
-                | DangerStatus::Tip(batch_index)
-                | DangerStatus::Stalled(batch_index) => {
-                    // All three non-Safe variants exit for recovery. The
+                status => {
+                    // All non-Safe variants exit for recovery/refusal. The
                     // dispatch difference (flush vs no-flush vs refuse)
                     // only matters at the next startup — `decide_startup_action`
                     // re-runs `check_danger` and routes based on which variant
                     // fires this time.
                     tracing::error!(
-                        batch_index,
+                        ?status,
                         danger_threshold = self.protocol.danger_threshold(),
-                        "danger zone detected — triggering shutdown for recovery"
+                        l1_read_stale_after_blocks = self.protocol.l1_read_stale_after_blocks,
+                        "danger detected — triggering shutdown for startup recovery"
                     );
-                    return Ok(DetectorExit::DangerZone { batch_index });
+                    return Ok(DetectorExit::RecoveryRequired { status });
                 }
             }
 
@@ -145,6 +144,7 @@ mod tests {
             batch_submitter: SENDER_A,
             max_wait_blocks: 1200,
             preemptive_margin_blocks: 75,
+            l1_read_stale_after_blocks: 900,
             seconds_per_block: 12,
         }
     }
@@ -167,6 +167,9 @@ mod tests {
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
+        storage
+            .append_safe_inputs(10, &[], &test_protocol())
+            .expect("record fresh safe-head observation");
         drop(storage);
 
         let shutdown = ShutdownSignal::default();
@@ -189,10 +192,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exits_with_danger_zone_when_strict_check_fires() {
+    async fn exits_with_recovery_required_when_observed_closed_check_fires() {
         // Closed frontier batch is aged past `danger_threshold` against the
-        // observed safe block — the strict arm of `check_danger` trips.
-        let db = temp_db("detector-strict-danger");
+        // observed safe block — the closed-batch arm of `check_danger` trips.
+        let db = temp_db("detector-observed-closed-danger");
         let mut storage = Storage::open(&db.path).expect("open storage");
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -233,24 +236,25 @@ mod tests {
             .expect("join")
             .expect("detector result");
         match exit {
-            DetectorExit::DangerZone { batch_index } => {
-                assert_eq!(batch_index, 1, "closed frontier batch 1 is in danger");
+            DetectorExit::RecoveryRequired { status } => {
+                assert_eq!(status, DangerStatus::ClosedBatchInDanger(1));
             }
-            other => panic!("expected DangerZone, got {other:?}"),
+            other => panic!("expected recovery-required exit, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn exits_with_danger_zone_when_wall_clock_fallback_fires() {
-        // Safe head appears frozen — the strict block-based arm wouldn't trip
+    async fn exits_with_recovery_required_when_wall_clock_fallback_fires() {
+        // Safe head appears frozen — observed block-based checks wouldn't trip
         // (ages look fine against the last observed safe block), but the
         // wall-clock-adjusted check infers extended L1 silence and lowers the
         // effective threshold.
         //
-        // The detector treats Strict and Stalled identically (both exit with
-        // DangerZone), but the Stalled path goes through `wall_clock_adjusted_threshold`
+        // The detector treats observed and estimated danger identically (both
+        // exit for startup recovery), but the estimated path goes through
+        // `wall_clock_adjusted_danger_threshold`
         // — a completely separate code path that deserves its own test.
-        let db = temp_db("detector-stalled-danger");
+        let db = temp_db("detector-estimated-danger");
         let mut storage = Storage::open(&db.path).expect("open storage");
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
@@ -275,12 +279,13 @@ mod tests {
             )
             .expect("append accepted batch 0");
 
-        // Strict check: batch 1's first_frame_safe_block = 100, current safe = 1200.
-        // age = 1100 < danger_threshold (1125). Strict would NOT fire.
+        // Observed check: batch 1's first_frame_safe_block = 100, current
+        // safe = 1200. age = 1100 < danger_threshold (1125), so observed
+        // closed-batch danger would NOT fire.
         //
         // Rewind synced_at_ms by 25 blocks' worth of wall-clock time so the
         // wall-clock arm shaves 25 off the threshold (1125 → 1100). At 1100,
-        // batch 1's age = 1100 trips `>=`. Stalled fires.
+        // batch 1's age = 1100 trips `>=`. Estimated batch danger fires.
         let now_ms = crate::runtime::clock::unix_now_ms();
         drop(storage);
         let rewind_conn =
@@ -308,13 +313,12 @@ mod tests {
             .expect("join")
             .expect("detector result");
         match exit {
-            DetectorExit::DangerZone { batch_index } => {
-                assert_eq!(
-                    batch_index, 1,
-                    "wall-clock-adjusted check must report the same batch the strict arm would",
-                );
+            DetectorExit::RecoveryRequired { status } => {
+                assert_eq!(status, DangerStatus::EstimatedBatchInDanger(1));
             }
-            other => panic!("expected DangerZone from wall-clock fallback, got {other:?}"),
+            other => {
+                panic!("expected recovery-required exit from wall-clock fallback, got {other:?}")
+            }
         }
     }
 }

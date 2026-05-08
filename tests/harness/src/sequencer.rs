@@ -55,7 +55,7 @@ pub enum RespawnAttemptOutcome {
     RespawnFailed(String),
     /// `respawn()` returned `Ok` but the child exited within the
     /// stabilization window. Typically surfaces
-    /// `RunError::DangerZoneDetected` from the runtime danger detector's
+    /// `RunError::DangerDetected` from the runtime danger detector's
     /// first post-boot poll.
     ExitedPostRespawn(std::process::ExitStatus),
 }
@@ -234,25 +234,22 @@ impl ManagedSequencer {
         Ok(())
     }
 
-    /// Rewrite `l1_safe_head.synced_at_ms` to `0`, simulating a DB that has
-    /// never successfully synced from L1. Call while the sequencer is
-    /// stopped.
+    /// Rewrite the L1 safe-head observation to "unknown", simulating a DB
+    /// that has never successfully synced from L1. Call while the sequencer
+    /// is stopped.
     ///
-    /// Used by the wall-clock-never-synced test: the wall-clock fallback treats `synced_at_ms == 0`
-    /// as "first boot, L1 required" and refuses to proceed if L1 is
-    /// unreachable. Setting this field while the bootstrap cache is
+    /// Used by the wall-clock-never-synced test: the danger check treats a
+    /// missing safe-head row as an unusable L1 view and refuses to
+    /// proceed. Deleting this row while the bootstrap cache is
     /// populated lets us hit that branch without losing the cached chain
     /// ID / InputBox address (which would fail earlier in bootstrap, not
     /// in the wall-clock fallback).
-    pub fn reset_l1_safe_head_synced_at_ms(&self) -> HarnessResult<()> {
+    pub fn clear_l1_safe_head_observation(&self) -> HarnessResult<()> {
         let db_path = self.data_dir_path.join("sequencer.db");
         let conn = rusqlite::Connection::open(db_path.as_path())
             .map_err(|err| io_other(format!("open DB: {err}")))?;
-        conn.execute(
-            "UPDATE l1_safe_head SET synced_at_ms = 0 WHERE singleton_id = 0",
-            [],
-        )
-        .map_err(|err| io_other(format!("reset synced_at_ms: {err}")))?;
+        conn.execute("DELETE FROM l1_safe_head WHERE singleton_id = 0", [])
+            .map_err(|err| io_other(format!("reset L1 safe-head observation: {err}")))?;
         Ok(())
     }
 
@@ -588,7 +585,7 @@ impl ManagedSequencer {
     ///     when L1 is unreachable and the persisted state looks stalled.
     ///   - The child comes up (HTTP ready, bootstrap passed), then one of
     ///     the internal tasks returns a fatal error and the process exits.
-    ///     Canonical cause: `RunError::DangerZoneDetected` when the first
+    ///     Canonical cause: `RunError::DangerDetected` when the first
     ///     danger-detector poll after boot sees a batch past `danger_threshold`.
     ///
     /// The race between bootstrap-finishes and submitter-first-tick is
@@ -624,7 +621,7 @@ impl ManagedSequencer {
     ///
     /// The restart-loop convergence story: an aged Tip in the danger zone
     /// (not yet past-stale) auto-closes on respawn, and the resulting closed
-    /// batch is in the danger zone, so the submitter exits with `DangerZone`.
+    /// batch is in the danger zone, so the detector exits with `DangerDetected`.
     /// Startup recovery's cascade fires at `MAX_WAIT_BLOCKS`, not at the
     /// danger threshold — so the loop only converges once enough *additional*
     /// L1 blocks have aged the batch past `MAX_WAIT_BLOCKS`. In production

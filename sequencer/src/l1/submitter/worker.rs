@@ -268,6 +268,7 @@ mod tests {
             batch_submitter: BATCH_SUBMITTER_ADDRESS,
             max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
             preemptive_margin_blocks: 75,
+            l1_read_stale_after_blocks: 900,
             seconds_per_block: 12,
         }
     }
@@ -280,6 +281,9 @@ mod tests {
 
     fn seed_two_closed_batches(db_path: &str) {
         let mut storage = Storage::open(db_path).expect("open storage");
+        storage
+            .append_safe_inputs(0, &[], &submitter_test_protocol())
+            .expect("record observed safe head");
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");

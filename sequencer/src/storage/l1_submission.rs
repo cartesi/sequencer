@@ -16,8 +16,8 @@ use rusqlite::{Result, params};
 
 use super::Storage;
 use super::convert::{i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
-use super::queries::{decode_l2_tx_row, query_current_safe_block};
-use super::safe_accepted_batches::query_latest_safe_accepted_batch;
+use super::queries::{current_safe_block_required, decode_l2_tx_row};
+use super::safe_accepted_batches::frontier_nonce;
 use super::{FrameHeader, PendingBatch, SubmitterFrontier};
 use sequencer_core::batch::{Batch, Frame as BatchFrame, WireUserOp};
 use sequencer_core::l2_tx::SequencedL2Tx;
@@ -29,13 +29,17 @@ impl Storage {
     ///
     /// The scheduler-accepted frontier is maintained by
     /// [`Storage::append_safe_inputs`], so this is a pure read.
+    ///
+    /// **Precondition:** at least one safe-head observation must have been
+    /// recorded (via [`Storage::append_safe_inputs`]). In production this is
+    /// always true because `run_preemptive_recovery` either syncs L1 first
+    /// or refuses to boot via `L1ViewStale`. Tests must seed an observation
+    /// explicitly; calling against a fresh DB returns `QueryReturnedNoRows`.
     pub fn submitter_frontier(&mut self) -> Result<SubmitterFrontier> {
         self.read(|tx| {
             Ok(SubmitterFrontier {
-                safe_block: query_current_safe_block(tx)?,
-                accepted_next_nonce: query_latest_safe_accepted_batch(tx)?
-                    .map(|row| i64_to_u64(row.nonce).saturating_add(1))
-                    .unwrap_or(0),
+                safe_block: current_safe_block_required(tx)?,
+                accepted_next_nonce: frontier_nonce(tx)?,
             })
         })
     }
@@ -332,6 +336,9 @@ mod tests {
     fn submitter_frontier_returns_zero_when_no_batches_were_accepted() {
         let db = temp_db("submitter-frontier-empty");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage
+            .append_safe_inputs(0, &[], &default_test_protocol())
+            .expect("record observed safe head");
         let frontier = storage.submitter_frontier().expect("submitter frontier");
         assert_eq!(frontier.safe_block, 0);
         assert_eq!(frontier.accepted_next_nonce, 0);
@@ -355,6 +362,7 @@ mod tests {
             batch_submitter: SENDER_A,
             max_wait_blocks: 1200,
             preemptive_margin_blocks: 75,
+            l1_read_stale_after_blocks: 900,
             seconds_per_block: 12,
         }
     }
@@ -367,8 +375,8 @@ mod tests {
     }
 
     #[test]
-    fn check_danger_reports_strict_on_closed_frontier() {
-        let db = temp_db("check-danger-strict");
+    fn check_danger_reports_observed_closed_batch_danger() {
+        let db = temp_db("check-danger-observed-closed");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -403,16 +411,17 @@ mod tests {
         let status = storage
             .check_danger(&protocol, unix_now_ms())
             .expect("check_danger");
-        assert_eq!(status, crate::storage::DangerStatus::Strict(1));
+        assert_eq!(status, crate::storage::DangerStatus::ClosedBatchInDanger(1));
     }
 
     #[test]
-    fn check_danger_reports_stalled_on_wall_clock_drift() {
-        // Strict block-based check wouldn't fire (batch 1 has first_frame_safe_block
-        // = 100 and safe_block = 200, age = 100 < 1125). But wall-clock says the
-        // safe head hasn't advanced in ~25 blocks — effective threshold drops to
-        // 1100, batch 1's age jumps past it via the wall-clock correction.
-        let db = temp_db("check-danger-stalled");
+    fn check_danger_reports_estimated_batch_danger_on_wall_clock_drift() {
+        // Observed block-based checks wouldn't fire (batch 1 has
+        // first_frame_safe_block = 100 and safe_block = 1200, age = 1100 <
+        // 1125). But wall-clock says the safe head hasn't advanced in ~25
+        // blocks: the effective threshold drops to 1100, so batch 1 reaches
+        // danger via the wall-clock correction.
+        let db = temp_db("check-danger-estimated");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
@@ -457,19 +466,18 @@ mod tests {
         let status = storage
             .check_danger(&protocol, now_ms)
             .expect("check_danger");
-        assert_eq!(status, crate::storage::DangerStatus::Stalled(1));
+        assert_eq!(
+            status,
+            crate::storage::DangerStatus::EstimatedBatchInDanger(1)
+        );
     }
 
     #[test]
-    fn check_danger_prefers_stalled_over_strict_when_both_fire() {
-        // Regression: when the safe head appears frozen (wall-clock arm fires)
-        // AND the closed frontier is past the strict threshold, prefer Stalled.
-        // The strict reading is computed against a possibly-frozen
-        // `current_safe_block`, and `MempoolFlusher::flush_and_wait` would spin
-        // forever waiting for `Pending <= Safe` against a frozen safe head.
-        // Earlier ordering returned Strict and dispatched FlushAndCascade,
-        // causing the spin.
-        let db = temp_db("check-danger-stalled-wins");
+    fn check_danger_prefers_observed_closed_over_estimated_when_both_fire() {
+        // If the observed safe head already puts the closed frontier past
+        // `danger_threshold`, route to observed closed-batch recovery. The
+        // wall-clock arm is a fallback, not a mask over observed danger.
+        let db = temp_db("check-danger-observed-closed-wins");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -480,11 +488,11 @@ mod tests {
 
         let protocol = default_test_protocol();
         // Advance safe head so batch 0 is past `danger_threshold` (1125):
-        // current=1200 - first_frame=10 = 1190 >= 1125. Strict would fire.
+        // current=1200 - first_frame=10 = 1190 >= 1125.
         // No safe_input ingested for batch 0, so it stays non-gold.
         storage
             .append_safe_inputs(1200, &[], &protocol)
-            .expect("advance safe head past strict threshold");
+            .expect("advance safe head past observed danger threshold");
 
         // Pretend safe-progress was recorded 25 blocks' worth of wall-clock
         // ago. With the wall-clock correction, the adjusted threshold is
@@ -503,23 +511,105 @@ mod tests {
             .expect("check_danger");
         assert_eq!(
             status,
-            crate::storage::DangerStatus::Stalled(0),
-            "Stalled must win when both arms fire — flushing against a frozen \
-             safe head wouldn't terminate, so refusing boot is the safe call",
+            crate::storage::DangerStatus::ClosedBatchInDanger(0),
+            "observed closed-batch danger must win once safe-state has crossed danger",
+        );
+    }
+
+    #[test]
+    fn check_danger_prefers_observed_tip_over_estimated_when_both_fire() {
+        // Same fallback rule for the open Tip: if observed safe-state already
+        // puts the Tip in danger, recover the Tip directly instead of refusing
+        // under the wall-clock classification.
+        let db = temp_db("check-danger-observed-tip-wins");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0; batch 1 is Tip");
+
+        let protocol = default_test_protocol();
+        storage
+            .append_safe_inputs(
+                1200,
+                &[StoredSafeInput {
+                    sender: SENDER_A,
+                    payload: ssz::Encode::as_ssz_bytes(&Batch {
+                        nonce: 0,
+                        frames: vec![BatchFrame {
+                            user_ops: vec![],
+                            safe_block: 10,
+                            fee_price: 0,
+                        }],
+                    }),
+                    block_number: 20,
+                }],
+                &protocol,
+            )
+            .expect("append accepted batch 0");
+
+        // The Tip's observed age is 1190 >= 1125, and the wall-clock-adjusted
+        // arm would also fire. Observed Tip danger must win.
+        let now_ms = unix_now_ms();
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+                [i64::try_from(now_ms.saturating_sub(25 * 12 * 1000)).unwrap_or(i64::MAX)],
+            )
+            .expect("rewind safe-progress timestamp");
+
+        let status = storage
+            .check_danger(&protocol, now_ms)
+            .expect("check_danger");
+        assert_eq!(
+            status,
+            crate::storage::DangerStatus::TipInDanger(1),
+            "Tip must win when observed safe-state has already crossed danger",
+        );
+    }
+
+    #[test]
+    fn check_danger_refuses_when_l1_view_is_stale() {
+        let db = temp_db("check-danger-l1-view-stale");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+
+        let protocol = default_test_protocol();
+        let old_safe_timestamp = 1_000_u64;
+        storage
+            .append_safe_inputs_with_timestamp(1200, old_safe_timestamp, &[], &protocol)
+            .expect("advance safe head with stale L1 timestamp");
+
+        let now_ms =
+            (old_safe_timestamp + protocol.l1_read_stale_after_secs()).saturating_mul(1000);
+        let status = storage
+            .check_danger(&protocol, now_ms)
+            .expect("check_danger");
+        assert_eq!(
+            status,
+            crate::storage::DangerStatus::L1ViewStale,
+            "global L1 view staleness must refuse before observed batch recovery",
         );
     }
 
     #[test]
     fn check_danger_safe_when_never_synced() {
-        // Fresh DB, no prior safe-progress observation. check_danger reports
-        // Safe — never-synced is benign at this layer; callers that need
-        // "refuse on never-synced" (startup L1-unreachable) check explicitly.
+        // Fresh DB, no prior safe block timestamp. The L1 view is unusable
+        // until the input reader records a real safe-head observation.
         let db = temp_db("check-danger-never-synced");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let status = storage
             .check_danger(&default_test_protocol(), unix_now_ms())
             .expect("check_danger");
-        assert_eq!(status, crate::storage::DangerStatus::Safe);
+        assert_eq!(status, crate::storage::DangerStatus::L1ViewStale);
     }
 
     #[test]
@@ -673,6 +763,7 @@ mod tests {
             batch_submitter,
             max_wait_blocks: u64::MAX,
             preemptive_margin_blocks: 75,
+            l1_read_stale_after_blocks: 900,
             seconds_per_block: 12,
         };
         let inputs = vec![
@@ -748,6 +839,9 @@ mod tests {
 
         storage.insert_invalid_batch(0).expect("invalidate batch 0");
         storage.insert_invalid_batch(1).expect("invalidate batch 1");
+        storage
+            .append_safe_inputs(10, &[], &default_test_protocol())
+            .expect("record observed safe head");
         storage
             .recover_post_flush(1200)
             .expect("open recovery batch after torn invalidation");

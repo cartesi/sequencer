@@ -227,7 +227,10 @@ async fn start_lane(
     ShutdownSignal,
     tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
 ) {
-    let storage = Storage::open(db_path).expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
+    storage
+        .append_safe_inputs(0, &[], &default_protocol_config())
+        .expect("seed observed safe head");
     let shutdown = ShutdownSignal::default();
     let (tx, handle) =
         InclusionLane::start(128, shutdown.clone(), TestApp::default(), storage, config);
@@ -460,7 +463,10 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     let db = temp_db("sequenced-safe-inputs-skip");
     let batch_submitter_address = Address::from([0xfe; 20]);
     let executed_direct_inputs = Arc::new(AtomicU64::new(0));
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    storage
+        .append_safe_inputs(0, &[], &default_protocol_config())
+        .expect("seed observed safe head");
     let shutdown = ShutdownSignal::default();
     let (_tx, lane_handle) = InclusionLane::start(
         128,

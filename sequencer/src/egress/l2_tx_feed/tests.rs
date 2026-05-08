@@ -186,6 +186,7 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
                 batch_submitter: Address::ZERO,
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
                 seconds_per_block: 12,
             },
         )
@@ -209,6 +210,7 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
                 batch_submitter: Address::ZERO,
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
                 seconds_per_block: 12,
             },
         )
@@ -275,6 +277,7 @@ async fn catchup_window_excludes_batch_submitter_direct_inputs() {
                 batch_submitter: Address::ZERO,
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
                 seconds_per_block: 12,
             },
         )
@@ -365,6 +368,7 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
                 batch_submitter: Address::ZERO,
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
                 seconds_per_block: 12,
             },
         )

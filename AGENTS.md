@@ -76,14 +76,14 @@ Rather than waiting for a batch to go stale on L1, the sequencer uses a **danger
 
 The cycle crosses a process boundary by design:
 
-1. **Detector trips + process exits** — the in-process [`DangerDetector`](sequencer/src/recovery/detector.rs) polls `Storage::check_danger` on a cadence. When the closed-frontier strict, Tip strict, or wall-clock-adjusted arm fires, the detector exits with `DetectorExit::DangerZone`, the runtime maps that to `RunError::DangerZoneDetected`, and the process exits with a non-zero status. Stopping the process is how the sequencer goes offline: no more user-op acceptance, no more batch submission.
+1. **Detector trips + process exits** — the in-process [`DangerDetector`](sequencer/src/recovery/detector.rs) polls `Storage::check_danger` on a cadence. When the L1-view-stale, observed closed-batch, observed Tip, or batch-relative wall-clock arm fires, the detector exits with `DetectorExit::RecoveryRequired`, the runtime maps that to `RunError::DangerDetected`, and the process exits with a non-zero status. Stopping the process is how the sequencer goes offline: no more user-op acceptance, no more batch submission.
 2. **Orchestrator respawns** — systemd/k8s/etc. restarts the process.
 3. **Startup syncs and dispatches** — the fresh process syncs the L1 safe head if reachable, re-runs `Storage::check_danger`, then [`decide_startup_action`](sequencer/src/recovery/mod.rs) chooses the startup path.
 4. **Startup runs recovery** — dispatched by the danger status:
    - **`RecoverTip`** → [`Storage::recover_aging_tip(danger_threshold)`](sequencer/src/storage/recovery.rs): no flush ran. The open Tip has no L1 footprint, so invalidate it directly once its first frame has aged past the danger threshold.
    - **`FlushAndCascade`** → [`MempoolFlusher`](sequencer/src/recovery/flusher.rs) consumes pending wallet-nonce slots, startup re-syncs L1, then [`Storage::recover_post_flush(danger_threshold)`](sequencer/src/storage/recovery.rs) cascades from the first non-gold closed batch (every non-gold batch past the post-flush gold frontier is doomed — Silver-stale, Silver-poisoned, or no-op'd Pending). If all closed batches landed gold, fall through to a Tip check against `danger_threshold` (handles the corner case where `S_tip = S_closed`, the closed batch lands fresh, and the Tip's age clears the danger zone after the flush wait).
    - **`Proceed`** → [`Storage::recover_aging_tip(danger_threshold)`](sequencer/src/storage/recovery.rs): no flush ran and no danger was detected. Closed batches past gold may still be in their natural lifecycle, so leave them alone; the Tip check is defensive and normally a no-op.
-   - **`Refuse`** → startup stops and surfaces the reason to the operator.
+   - **`Refuse`** → startup stops and surfaces the reason to the operator. Refusal is used when the L1 safe block timestamp is missing/too old, or when batch-relative wall-clock estimation says unresolved work has consumed its remaining runway without observed safe-state support for recovery.
 5. **Normal operation resumes** — the lane, submitter, input reader, and a fresh detector all start up.
 
 See [`docs/recovery/README.md`](docs/recovery/README.md) Step 5 for the "everything past gold is doomed" mental model and why the post-flush cascade is unconditional rather than threshold-based.
@@ -92,7 +92,7 @@ See [`docs/recovery/README.md`](docs/recovery/README.md) Step 5 for the "everyth
 
 Staleness is only checked against L1 **safe** state, never latest. Stale batches in latest that haven't reached safe yet will eventually become safe, and the check will fire at that point. This avoids reacting to L1 reorgs.
 
-When L1 is unreachable, the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The danger detector falls back to **wall-clock estimation**: `estimated_missed_blocks = (now − last_safe_progress_ms) / seconds_per_block`, and the danger threshold is adjusted downward by this estimate. Prevents silently issuing doomed soft confirmations during extended L1 outages.
+When the sequencer's view of L1 stops advancing — most often because the RPC gateway is stalled or returning stale reads, occasionally because L1 itself is unhealthy — the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The danger detector uses two wall-clock signals: the recorded L1 safe block timestamp must remain younger than `SEQ_L1_READ_STALE_AFTER_BLOCKS`, and unresolved batches are also checked with `estimated_missed_blocks = (now − last_safe_progress_ms) / seconds_per_block` by adjusting the danger threshold downward. This prevents silently issuing doomed soft confirmations during stale-provider periods or L1 outages.
 
 ### Formal verification
 
@@ -149,7 +149,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Batch** — list of frames posted on-chain as one L1 transaction (SSZ-encoded).
 - **Inclusion lane** — hot-path single-lane loop that dequeues, executes, persists, and rotates frame/batch boundaries. The only writer of open batch/frame state.
 - **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Nonces are assigned by storage (structural `parent.nonce + 1`) when batches are closed; the submitter just reads them.
-- **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `DangerZone` when the strict or wall-clock-adjusted check fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery can run.
+- **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `RecoveryRequired` when any non-`Safe` danger status fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery or refusal can run.
 - **Input reader** — ingests safe inputs from L1 InputBox into SQLite.
 - **L2 tx feed** — DB-backed ordered-tx stream used by WS subscribers.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
@@ -245,6 +245,7 @@ Health semantics: `/livez` — 200 if the process is alive. `/readyz` — 200 if
 - `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS` (default 5000)
 - `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH` (default 2)
 - `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default 300, ~1h at 12s/block)
+- `SEQ_L1_READ_STALE_AFTER_BLOCKS` (default derived before the danger threshold)
 - `SEQ_SECONDS_PER_BLOCK` (default 12)
 
 ## Coding Conventions

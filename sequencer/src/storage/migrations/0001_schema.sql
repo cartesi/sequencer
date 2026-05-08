@@ -276,13 +276,12 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     -- Highest L1 safe block the input reader has observed and atomically synced into storage.
     block_number INTEGER NOT NULL CHECK (block_number >= 0),
+    -- L1 timestamp (Unix seconds) of block_number.
+    block_timestamp INTEGER NOT NULL CHECK (block_timestamp >= 0),
     -- Wall-clock time (Unix ms) of the last successful L1 sync.
     -- Used for wall-clock danger estimation when L1 is unreachable.
-    synced_at_ms INTEGER NOT NULL DEFAULT 0
+    synced_at_ms INTEGER NOT NULL CHECK (synced_at_ms >= 0)
 );
-
-INSERT OR IGNORE INTO l1_safe_head (singleton_id, block_number, synced_at_ms)
-VALUES (0, 0, 0);
 
 -- L1 bootstrap cache: discovered addresses and block numbers from on-chain contracts.
 -- Allows the sequencer to start without L1 if it has run before.

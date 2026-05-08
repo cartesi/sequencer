@@ -129,16 +129,12 @@ impl InputReader {
     }
 
     pub async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
-        self.bootstrap_safe_head().await?;
-
         let provider = crate::l1::provider::create_provider(&self.config.rpc_url)
             .map_err(InputReaderError::Bootstrap)?;
         self.advance_once(&provider).await
     }
 
     async fn run_forever(mut self) -> Result<(), InputReaderError> {
-        self.bootstrap_safe_head().await?;
-
         let provider = crate::l1::provider::create_provider(&self.config.rpc_url)
             .map_err(InputReaderError::Bootstrap)?;
 
@@ -166,18 +162,25 @@ impl InputReader {
         &mut self,
         provider: &impl Provider,
     ) -> Result<(), InputReaderError> {
-        let current_safe_block = latest_safe_block(provider).await?;
+        let current_safe_head = latest_safe_head(provider).await?;
+        let current_safe_block = current_safe_head.block_number;
         let previous_safe_block = self.current_safe_block().await?;
+        let scan_floor =
+            previous_safe_block.unwrap_or_else(|| self.genesis_block.saturating_sub(1));
 
         // If our persisted safe head is already at the current safe frontier,
-        // there is nothing new to scan. We only seed the progress marker on the
-        // first real observation; subsequent same-head polls must not refresh it.
-        if current_safe_block <= previous_safe_block {
-            self.initialize_safe_progress_if_unset().await?;
+        // there is nothing new to scan. On the first observation we still
+        // persist the real safe head so storage distinguishes "observed L1"
+        // from "no L1 view yet".
+        if current_safe_block <= scan_floor {
+            if previous_safe_block.is_none() {
+                self.append_safe_inputs(current_safe_head, Vec::new())
+                    .await?;
+            }
             return Ok(());
         }
 
-        let start_block = previous_safe_block + 1;
+        let start_block = scan_floor + 1;
         let events = get_input_added_events(
             provider,
             self.config.app_address,
@@ -224,10 +227,10 @@ impl InputReader {
             "appending safe inputs"
         );
 
-        self.append_safe_inputs(current_safe_block, batch).await
+        self.append_safe_inputs(current_safe_head, batch).await
     }
 
-    async fn current_safe_block(&self) -> Result<u64, InputReaderError> {
+    async fn current_safe_block(&self) -> Result<Option<u64>, InputReaderError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path)?;
@@ -237,34 +240,9 @@ impl InputReader {
         .map_err(|err| InputReaderError::Join(err.to_string()))?
     }
 
-    async fn bootstrap_safe_head(&self) -> Result<(), InputReaderError> {
-        let db_path = self.db_path.clone();
-        let minimum_safe_block = self.genesis_block.saturating_sub(1);
-        tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open(&db_path)?;
-            storage
-                .ensure_minimum_safe_block(minimum_safe_block)
-                .map_err(InputReaderError::from)
-        })
-        .await
-        .map_err(|err| InputReaderError::Join(err.to_string()))?
-    }
-
-    async fn initialize_safe_progress_if_unset(&self) -> Result<(), InputReaderError> {
-        let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open(&db_path)?;
-            storage
-                .initialize_safe_progress_if_unset()
-                .map_err(InputReaderError::from)
-        })
-        .await
-        .map_err(|err| InputReaderError::Join(err.to_string()))?
-    }
-
     async fn append_safe_inputs(
         &self,
-        current_safe_block: u64,
+        current_safe_head: SafeHead,
         batch: Vec<StoredSafeInput>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
@@ -272,7 +250,12 @@ impl InputReader {
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path)?;
             storage
-                .append_safe_inputs(current_safe_block, &batch, &protocol)
+                .append_safe_inputs_with_timestamp(
+                    current_safe_head.block_number,
+                    current_safe_head.block_timestamp,
+                    &batch,
+                    &protocol,
+                )
                 .map_err(InputReaderError::from)
         })
         .await
@@ -306,13 +289,22 @@ fn map_contract_bootstrap_error(err: alloy::contract::Error) -> InputReaderError
     }
 }
 
-async fn latest_safe_block(provider: &impl Provider) -> Result<u64, InputReaderError> {
+#[derive(Debug, Clone, Copy)]
+struct SafeHead {
+    block_number: u64,
+    block_timestamp: u64,
+}
+
+async fn latest_safe_head(provider: &impl Provider) -> Result<SafeHead, InputReaderError> {
     let block = provider
         .get_block(Safe.into())
         .await
         .map_err(|e| InputReaderError::Provider(e.to_string()))?
         .ok_or_else(|| InputReaderError::Provider("get_block returned None".to_string()))?;
-    Ok(block.header.number)
+    Ok(SafeHead {
+        block_number: block.header.number,
+        block_timestamp: block.header.timestamp,
+    })
 }
 
 #[cfg(test)]
@@ -327,6 +319,7 @@ mod tests {
             batch_submitter: Address::ZERO,
             max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
             preemptive_margin_blocks: 75,
+            l1_read_stale_after_blocks: 900,
             seconds_per_block: 12,
         }
     }
@@ -443,11 +436,14 @@ mod tests {
             storage.safe_input_end_exclusive().expect("safe end")
         };
         assert_eq!(safe_end, 0, "no InputAdded contract so no direct inputs");
-        let _ = safe_block;
+        assert!(
+            safe_block.is_some(),
+            "first successful safe-head observation should create the row"
+        );
     }
 
     #[tokio::test]
-    async fn advance_once_with_genesis_block_uses_genesis_as_effective_prev() {
+    async fn current_safe_block_is_unknown_before_first_observation() {
         let db_file = NamedTempFile::new().expect("temp file");
         let genesis_block = 2_u64;
         let reader = test_reader(
@@ -458,17 +454,12 @@ mod tests {
             ShutdownSignal::default(),
         );
 
-        reader
-            .bootstrap_safe_head()
-            .await
-            .expect("bootstrap safe head");
-
         let safe_block = reader.current_safe_block().await.expect("read safe block");
-        assert_eq!(safe_block, genesis_block - 1);
+        assert_eq!(safe_block, None);
     }
 
     #[tokio::test]
-    async fn sync_to_current_safe_head_with_genesis_block_bootstraps_safe_head() {
+    async fn sync_to_current_safe_head_failure_leaves_safe_head_unknown() {
         let db_file = NamedTempFile::new().expect("temp file");
         let genesis_block = 5_u64;
         let mut reader = test_reader(
@@ -487,7 +478,8 @@ mod tests {
             Storage::open(db_file.path().to_string_lossy().as_ref()).expect("open storage");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
-            genesis_block - 1
+            None,
+            "failed sync must not create a synthetic safe-head row"
         );
     }
 
@@ -548,7 +540,7 @@ mod tests {
         reader.advance_once(&provider).await.expect("advance_once");
         assert_eq!(
             reader.current_safe_block().await.expect("read"),
-            1000,
+            Some(1000),
             "safe head should remain unchanged when already ahead of chain"
         );
 

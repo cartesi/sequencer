@@ -13,7 +13,10 @@ use rusqlite::{OptionalExtension, Result, Transaction, params};
 use super::Storage;
 use super::StoredSafeInput;
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
-use super::queries::{query_current_safe_block, query_latest_safe_input_index_exclusive};
+use super::queries::{
+    current_safe_block, current_safe_block_timestamp, last_safe_progress_ms,
+    query_latest_safe_input_index_exclusive,
+};
 use super::safe_accepted_batches::populate_safe_accepted_batches;
 use sequencer_core::protocol::ProtocolConfig;
 
@@ -24,50 +27,12 @@ impl Storage {
         query_latest_safe_input_index_exclusive(&self.conn)
     }
 
-    pub fn current_safe_block(&mut self) -> Result<u64> {
-        query_current_safe_block(&self.conn)
+    pub fn current_safe_block(&mut self) -> Result<Option<u64>> {
+        current_safe_block(&self.conn)
     }
 
-    /// Advance `l1_safe_head.block_number` to `minimum_safe_block` if it is
-    /// behind. One-shot bootstrap helper — does NOT touch `synced_at_ms`, so
-    /// it doesn't masquerade as a real L1 sync to the wall-clock danger
-    /// estimator.
-    pub fn ensure_minimum_safe_block(&mut self, minimum_safe_block: u64) -> Result<()> {
-        self.write(|tx| {
-            let current = query_current_safe_block(tx)?;
-            if current < minimum_safe_block {
-                // `synced_at_ms` is intentionally NOT touched here: this is a
-                // bootstrap setup (genesis-block sync), not a real L1 read.
-                // Leaving it preserves the wall-clock danger estimate's "time
-                // since last real sync" semantics.
-                let changed = tx.execute(
-                    "UPDATE l1_safe_head SET block_number = ?1 WHERE singleton_id = 0",
-                    params![u64_to_i64(minimum_safe_block)],
-                )?;
-                if changed != 1 {
-                    return Err(rusqlite::Error::StatementChangedRows(changed));
-                }
-            }
-            Ok(())
-        })
-    }
-
-    /// Record the first real safe-head observation if no prior observation was
-    /// persisted yet.
-    ///
-    /// Used when the input reader successfully contacts L1 but the observed
-    /// safe block matches the bootstrap floor (for example, first startup on a
-    /// chain that has not advanced past genesis). This seeds the wall-clock
-    /// estimator once without repeatedly refreshing it while the safe head is
-    /// frozen.
-    pub fn initialize_safe_progress_if_unset(&mut self) -> Result<()> {
-        let now_ms = now_unix_ms();
-        self.conn.execute(
-            "UPDATE l1_safe_head SET synced_at_ms = ?1 \
-             WHERE singleton_id = 0 AND synced_at_ms = 0",
-            params![now_ms],
-        )?;
-        Ok(())
+    pub fn current_safe_block_timestamp(&mut self) -> Result<Option<u64>> {
+        current_safe_block_timestamp(&self.conn)
     }
 
     /// Atomically: insert `inputs` (assigned contiguous indexes starting from
@@ -90,23 +55,53 @@ impl Storage {
         inputs: &[StoredSafeInput],
         protocol: &ProtocolConfig,
     ) -> Result<()> {
+        self.append_safe_inputs_with_timestamp(
+            safe_block,
+            i64_to_u64(now_unix_ms()) / 1000,
+            inputs,
+            protocol,
+        )
+    }
+
+    /// Same as [`Storage::append_safe_inputs`], but records the L1 timestamp
+    /// of `safe_block`. Production input-reader code should use this path;
+    /// the shorter helper exists for tests that only need a fresh synthetic
+    /// safe head.
+    pub fn append_safe_inputs_with_timestamp(
+        &mut self,
+        safe_block: u64,
+        safe_block_timestamp: u64,
+        inputs: &[StoredSafeInput],
+        protocol: &ProtocolConfig,
+    ) -> Result<()> {
         self.write(|tx| {
-            let current = query_current_safe_block(tx)?;
-            assert!(
-                safe_block >= current,
-                "safe block regressed: current={current}, next={safe_block}"
-            );
-            assert!(
-                safe_block > current || inputs.is_empty(),
-                "safe block must advance when appending new safe inputs"
-            );
+            if let Some(current) = current_safe_block(tx)? {
+                assert!(
+                    safe_block >= current,
+                    "safe block regressed: current={current}, next={safe_block}"
+                );
+                assert!(
+                    safe_block > current || inputs.is_empty(),
+                    "safe block must advance when appending new safe inputs"
+                );
+            }
 
             let next_index = query_latest_safe_input_index_exclusive(tx)?;
             insert_safe_inputs_batch(tx, next_index, inputs)?;
 
             let changed = tx.execute(
-                "UPDATE l1_safe_head SET block_number = ?1, synced_at_ms = ?2 WHERE singleton_id = 0",
-                params![u64_to_i64(safe_block), now_unix_ms()],
+                "INSERT INTO l1_safe_head \
+                    (singleton_id, block_number, block_timestamp, synced_at_ms) \
+                 VALUES (0, ?1, ?2, ?3) \
+                 ON CONFLICT(singleton_id) DO UPDATE SET \
+                    block_number = excluded.block_number, \
+                    block_timestamp = excluded.block_timestamp, \
+                    synced_at_ms = excluded.synced_at_ms",
+                params![
+                    u64_to_i64(safe_block),
+                    u64_to_i64(safe_block_timestamp),
+                    now_unix_ms()
+                ],
             )?;
             if changed != 1 {
                 return Err(rusqlite::Error::StatementChangedRows(changed));
@@ -116,17 +111,10 @@ impl Storage {
         })
     }
 
-    /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance.
-    /// Returns `None` if no real safe-head observation has occurred yet (the
-    /// underlying column stores `0` as the never-synced sentinel; this method
-    /// is the only place that translation lives).
+    /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance,
+    /// or `None` if no real safe-head observation has occurred yet.
     pub fn last_safe_progress_ms(&self) -> Result<Option<u64>> {
-        let value: i64 = self.conn.query_row(
-            "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(Some(i64_to_u64(value)).filter(|&v| v != 0))
+        last_safe_progress_ms(&self.conn)
     }
 
     /// Read cached L1 bootstrap data (input_box_address, genesis_block, chain_id).
@@ -193,8 +181,6 @@ fn insert_safe_inputs_batch(
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
-
     use crate::storage::{
         SafeInputRange, Storage, StoredSafeInput,
         test_helpers::{default_protocol_config, temp_db},
@@ -244,66 +230,79 @@ mod tests {
     }
 
     #[test]
-    fn ensure_minimum_safe_block_only_moves_forward() {
-        let db = temp_db("ensure-min-safe-block");
+    fn new_db_has_no_observed_safe_head() {
+        let db = temp_db("new-db-no-safe-head");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
-        storage
-            .ensure_minimum_safe_block(7)
-            .expect("advance bootstrap safe head");
-        assert_eq!(storage.current_safe_block().expect("read advanced"), 7);
-
-        storage
-            .ensure_minimum_safe_block(3)
-            .expect("do not regress bootstrap safe head");
-        assert_eq!(storage.current_safe_block().expect("read unchanged"), 7);
-    }
-
-    #[test]
-    fn ensure_minimum_safe_block_does_not_record_safe_progress() {
-        let db = temp_db("ensure-min-safe-block-no-sync");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-
-        storage
-            .ensure_minimum_safe_block(7)
-            .expect("advance bootstrap safe head");
-        assert!(
-            storage
-                .last_safe_progress_ms()
-                .expect("read sync timestamp")
-                .is_none(),
-            "bootstrap safe-head initialization must not count as safe progress"
+        assert_eq!(
+            storage.current_safe_block().expect("read safe block"),
+            None,
+            "fresh storage should not pretend to have observed L1"
         );
-
-        storage
-            .initialize_safe_progress_if_unset()
-            .expect("record first real safe-head observation");
-        let recorded_sync = storage
-            .last_safe_progress_ms()
-            .expect("read sync timestamp")
-            .expect("first observation should record wall-clock time");
-
-        thread::sleep(Duration::from_millis(5));
-        storage
-            .initialize_safe_progress_if_unset()
-            .expect("do not refresh unchanged safe head");
         assert_eq!(
             storage
-                .last_safe_progress_ms()
-                .expect("read unchanged sync timestamp"),
-            Some(recorded_sync),
-            "repeat observations of the same safe head must not refresh the marker"
+                .current_safe_block_timestamp()
+                .expect("read block timestamp"),
+            None,
+            "fresh storage should not have a safe block timestamp"
         );
-
-        storage
-            .ensure_minimum_safe_block(9)
-            .expect("advance bootstrap safe head again");
         assert_eq!(
             storage
                 .last_safe_progress_ms()
                 .expect("read sync timestamp"),
-            Some(recorded_sync),
-            "bootstrap safe-head updates must preserve the last real safe-progress timestamp"
+            None,
+            "fresh storage should not have a safe-progress timestamp"
+        );
+    }
+
+    #[test]
+    fn append_safe_inputs_creates_and_advances_safe_head() {
+        let db = temp_db("append-safe-inputs-creates-safe-head");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_protocol_config();
+
+        storage
+            .append_safe_inputs_with_timestamp(7, 1234, &[], &protocol)
+            .expect("record first real safe-head observation");
+        assert_eq!(
+            storage.current_safe_block().expect("read safe block"),
+            Some(7),
+            "append should create the safe-head row"
+        );
+        let recorded_sync = storage
+            .last_safe_progress_ms()
+            .expect("read sync timestamp")
+            .expect("first observation should record wall-clock time");
+        assert_eq!(
+            storage
+                .current_safe_block_timestamp()
+                .expect("read block timestamp"),
+            Some(1234),
+            "first observation should record the L1 safe block timestamp"
+        );
+
+        storage
+            .append_safe_inputs_with_timestamp(9, 5678, &[], &protocol)
+            .expect("advance safe head");
+        assert_eq!(
+            storage.current_safe_block().expect("read safe block"),
+            Some(9),
+            "append should advance the safe-head row"
+        );
+        assert_eq!(
+            storage
+                .current_safe_block_timestamp()
+                .expect("read advanced block timestamp"),
+            Some(5678),
+            "append should record the observed L1 block timestamp"
+        );
+        assert!(
+            storage
+                .last_safe_progress_ms()
+                .expect("read sync timestamp")
+                .expect("advanced observation should record wall-clock time")
+                >= recorded_sync,
+            "safe-progress timestamp should stay monotonic across appends"
         );
     }
 }

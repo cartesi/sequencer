@@ -5,13 +5,13 @@
 //! or post-flush cascade.
 //!
 //! At runtime a dedicated [`DangerDetector`] worker polls `Storage::check_danger` each
-//! tick. If a closed batch past the gold frontier crosses `danger_threshold`, the
-//! open Tip crosses `danger_threshold`, or the wall-clock-adjusted variant fires
-//! during an L1 outage, the detector exits with `DetectorExit::DangerZone`, the
-//! runtime maps that to `RunError::DangerZoneDetected`, and the process exits.
-//! The detector tripping is *only* a trigger to enter recovery — it doesn't make
-//! the cascade decision. External orchestration restarts the sequencer, and this
-//! startup path runs.
+//! tick. If the L1 view is stale, a closed batch or Tip crosses
+//! `danger_threshold`, or the batch-relative wall-clock estimate fires during
+//! an L1 outage, the detector exits with `DetectorExit::RecoveryRequired`, the
+//! runtime maps that to `RunError::DangerDetected`, and the process exits. The
+//! detector tripping is *only* a trigger to enter startup recovery/refusal — it
+//! doesn't make the cascade decision. External orchestration restarts the
+//! sequencer, and this startup path runs.
 //!
 //! Startup recovery branches on [`decide_startup_action`]:
 //!
@@ -25,7 +25,8 @@
 //! - `Proceed`: no danger detected. Call [`Storage::recover_aging_tip`] which only
 //!   invalidates the open Tip if it has aged past `danger_threshold`. Closed batches
 //!   past gold are left alone (they may still be in their natural lifecycle).
-//! - `Refuse`: bail out and surface to the operator.
+//! - `Refuse`: L1 view is stale or batch-relative estimated danger fired; bail
+//!   out and surface to the operator.
 //!
 //! ## Fault model
 //!
@@ -69,27 +70,20 @@ pub enum RecoveryError {
 
 /// Why startup cannot proceed safely.
 ///
-/// Each variant captures a distinct combination of L1 reachability and DB
-/// state that makes the flush-then-cascade recovery either unsafe or
-/// impossible. The operator sees the variant in logs and must intervene.
+/// Each variant captures a DB/L1-view state that makes recovery or normal
+/// startup unsafe. The operator sees the variant in logs and must intervene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefuseReason {
-    /// No prior safe-head observation was ever recorded AND L1 is unreachable.
-    /// We have no baseline to trust for the wall-clock estimate, and can't
-    /// refresh it either. First boot requires L1.
-    NeverSyncedAndUnreachable,
-    /// The wall-clock-adjusted check flagged a stale batch, which means the
-    /// safe head itself appears frozen. `flush_and_wait` would spin waiting
-    /// for a safe head that isn't advancing, so we refuse instead.
-    StalledSafeHead { batch_index: u64 },
-    /// Strict danger detected but L1 is unreachable. We can't run the flush
-    /// step safely without a live L1 provider; refusing gives the operator a
-    /// chance to restore L1 before retrying.
-    StrictDangerButUnreachable { batch_index: u64 },
+    /// The L1 safe block timestamp is too old or unknown, so the local L1 view
+    /// is not usable for recovery or continued soft confirmations.
+    L1ViewStale,
+    /// Batch-relative wall-clock estimation says this batch consumed its
+    /// remaining runway, but the observed safe block has not crossed danger.
+    /// Refuse rather than recover from estimated state.
+    EstimatedBatchInDanger { batch_index: u64 },
 }
 
-/// What a fresh startup must do, given the current (danger, L1-reachable,
-/// ever-synced) state.
+/// What a fresh startup must do, given the current danger state.
 ///
 /// Pure function output — no side effects. The `run_preemptive_recovery`
 /// driver executes the chosen action.
@@ -118,46 +112,69 @@ pub enum StartupAction {
     Refuse(RefuseReason),
 }
 
-/// Pure decision: given the danger status, whether L1 is reachable, and
-/// whether we've ever recorded a safe-head observation, return what startup
-/// should do. All the startup-policy complexity lives here, isolated from
-/// storage and RPC side effects.
-pub fn decide_startup_action(
-    danger: DangerStatus,
-    l1_reachable: bool,
-    last_safe_progress_ms: Option<u64>,
-) -> StartupAction {
-    // First-boot guard: if we've never seen a real safe-head observation AND
-    // we can't contact L1 to refresh it, we have nothing to base a safety
-    // decision on. Refuse.
-    if last_safe_progress_ms.is_none() && !l1_reachable {
-        return StartupAction::Refuse(RefuseReason::NeverSyncedAndUnreachable);
-    }
-
-    match (danger, l1_reachable) {
-        (DangerStatus::Safe, _) => StartupAction::Proceed,
-        // Tip-in-danger doesn't require L1 (no flush needed), so we recover
-        // even when L1 is unreachable. The freshly-opened recovery Tip uses
-        // the cached `current_safe_block`; if L1 stays down, the wall-clock
-        // arm will eventually fire on the new Tip and we'll Refuse.
-        (DangerStatus::Tip(batch_index), _) => StartupAction::RecoverTip { batch_index },
-        (DangerStatus::Strict(batch_index), true) => StartupAction::FlushAndCascade { batch_index },
-        (DangerStatus::Strict(batch_index), false) => {
-            StartupAction::Refuse(RefuseReason::StrictDangerButUnreachable { batch_index })
+impl StartupAction {
+    fn label(self) -> &'static str {
+        match self {
+            StartupAction::Proceed => "proceed",
+            StartupAction::RecoverTip { .. } => "recover_tip",
+            StartupAction::FlushAndCascade { .. } => "flush_and_cascade",
+            StartupAction::Refuse(_) => "refuse",
         }
-        (DangerStatus::Stalled(batch_index), _) => {
-            StartupAction::Refuse(RefuseReason::StalledSafeHead { batch_index })
+    }
+}
+
+fn danger_status_label(danger: DangerStatus) -> &'static str {
+    match danger {
+        DangerStatus::Safe => "safe",
+        DangerStatus::L1ViewStale => "l1_view_stale",
+        DangerStatus::ClosedBatchInDanger(_) => "closed_batch_in_danger",
+        DangerStatus::TipInDanger(_) => "tip_in_danger",
+        DangerStatus::EstimatedBatchInDanger(_) => "estimated_batch_in_danger",
+    }
+}
+
+fn danger_batch_index(danger: DangerStatus) -> Option<u64> {
+    match danger {
+        DangerStatus::ClosedBatchInDanger(batch_index)
+        | DangerStatus::TipInDanger(batch_index)
+        | DangerStatus::EstimatedBatchInDanger(batch_index) => Some(batch_index),
+        DangerStatus::Safe | DangerStatus::L1ViewStale => None,
+    }
+}
+
+fn refuse_reason_label(reason: RefuseReason) -> &'static str {
+    match reason {
+        RefuseReason::L1ViewStale => "l1_view_stale",
+        RefuseReason::EstimatedBatchInDanger { .. } => "estimated_batch_in_danger",
+    }
+}
+
+/// Pure decision: given the danger status, return what startup should do. L1
+/// reachability is an execution concern: if `FlushAndCascade` cannot reach L1,
+/// the flusher returns an error and the orchestrator retries.
+pub fn decide_startup_action(danger: DangerStatus) -> StartupAction {
+    match danger {
+        DangerStatus::Safe => StartupAction::Proceed,
+        DangerStatus::ClosedBatchInDanger(batch_index) => {
+            StartupAction::FlushAndCascade { batch_index }
+        }
+        DangerStatus::TipInDanger(batch_index) => StartupAction::RecoverTip { batch_index },
+        DangerStatus::L1ViewStale => StartupAction::Refuse(RefuseReason::L1ViewStale),
+        DangerStatus::EstimatedBatchInDanger(batch_index) => {
+            StartupAction::Refuse(RefuseReason::EstimatedBatchInDanger { batch_index })
         }
     }
 }
 
 /// Run the full preemptive recovery procedure at startup.
 ///
-/// 1. Try to sync the safe head from L1. If L1 is unreachable, fall through
-///    using the persisted safe head plus the wall-clock estimator.
+/// 1. Try to sync the safe head from L1. If L1 is unreachable, continue with
+///    the persisted view; whether that view is fresh enough is decided by
+///    `check_danger` in step 2 — a stale persisted view returns
+///    `L1ViewStale` and step 3 refuses.
 /// 2. Consult [`decide_startup_action`] to pick what to do.
 /// 3. If the decision is `FlushAndCascade`: flush the mempool, re-sync, then
-///    continue.
+///    continue. If `Refuse`: bail out and let the orchestrator retry.
 /// 4. Run the atomic recovery transaction (cascade stale batches if any,
 ///    always re-open the Tip if missing).
 ///
@@ -188,14 +205,22 @@ pub async fn run_preemptive_recovery(
         }
     };
 
-    // ── Step 2: Read danger + last-progress, decide action ─────────
-    let (danger, last_safe_progress_ms) = {
+    // ── Step 2: Read danger and decide action ─────────────────────
+    let danger = {
         let mut storage = storage::Storage::open(db_path)?;
-        let last = storage.last_safe_progress_ms()?;
-        let danger = storage.check_danger(protocol, crate::runtime::clock::unix_now_ms())?;
-        (danger, last)
+        storage.check_danger(protocol, crate::runtime::clock::unix_now_ms())?
     };
-    let action = decide_startup_action(danger, l1_reachable, last_safe_progress_ms);
+    let action = decide_startup_action(danger);
+    tracing::info!(
+        danger_status = danger_status_label(danger),
+        danger_batch_index = ?danger_batch_index(danger),
+        startup_action = action.label(),
+        l1_reachable,
+        danger_threshold = protocol.danger_threshold(),
+        max_wait_blocks = protocol.max_wait_blocks,
+        l1_read_stale_after_blocks = protocol.l1_read_stale_after_blocks,
+        "startup recovery decision"
+    );
 
     // ── Step 3: Execute decision ───────────────────────────────────
     //
@@ -203,8 +228,8 @@ pub async fn run_preemptive_recovery(
     //
     // - `Proceed`: no flush. Closed batches past the gold frontier (if any)
     //   may still be in their natural lifecycle and shouldn't be cascaded. The
-    //   Tip check is defensive and should normally be a no-op because `Tip`
-    //   danger routes to `RecoverTip`.
+    //   Tip check is defensive and should normally be a no-op because
+    //   `TipInDanger` routes to `RecoverTip`.
     //
     // - `RecoverTip`: no flush. Only the open Tip crossed `danger_threshold`;
     //   it has no L1 slot to resolve, so it can be invalidated directly.
@@ -217,7 +242,12 @@ pub async fn run_preemptive_recovery(
     let mut det_storage = storage::Storage::open(db_path)?;
     let invalidated = match action {
         StartupAction::Proceed => {
-            tracing::info!("no danger zone detected — skipping flush");
+            tracing::info!(
+                danger_status = danger_status_label(danger),
+                danger_batch_index = ?danger_batch_index(danger),
+                startup_action = action.label(),
+                "no danger zone detected — skipping flush"
+            );
             // Pass the threshold defensively: in the Proceed path the Tip
             // shouldn't be in danger (the danger check would have surfaced
             // RecoverTip), but the threshold check inside `recover_aging_tip`
@@ -226,6 +256,9 @@ pub async fn run_preemptive_recovery(
         }
         StartupAction::RecoverTip { batch_index } => {
             tracing::error!(
+                danger_status = danger_status_label(danger),
+                danger_batch_index = ?danger_batch_index(danger),
+                startup_action = action.label(),
                 tip_batch_index = batch_index,
                 danger_threshold = protocol.danger_threshold(),
                 "open Tip in danger zone — invalidating and opening fresh Tip (no flush)"
@@ -234,6 +267,9 @@ pub async fn run_preemptive_recovery(
         }
         StartupAction::FlushAndCascade { batch_index } => {
             tracing::error!(
+                danger_status = danger_status_label(danger),
+                danger_batch_index = ?danger_batch_index(danger),
+                startup_action = action.label(),
                 batch_index,
                 danger_threshold = protocol.danger_threshold(),
                 max_wait_blocks = protocol.max_wait_blocks,
@@ -260,8 +296,12 @@ pub async fn run_preemptive_recovery(
         }
         StartupAction::Refuse(reason) => {
             tracing::error!(
+                danger_status = danger_status_label(danger),
+                danger_batch_index = ?danger_batch_index(danger),
+                startup_action = action.label(),
                 ?reason,
-                reachable = l1_reachable,
+                refuse_reason = refuse_reason_label(reason),
+                l1_reachable,
                 "startup refused: cannot recover safely"
             );
             return Err(RecoveryError::Refuse(reason));
@@ -269,16 +309,25 @@ pub async fn run_preemptive_recovery(
     };
 
     if invalidated.is_empty() {
-        tracing::info!("no batches invalidated — continuing normally");
+        tracing::info!(
+            danger_status = danger_status_label(danger),
+            danger_batch_index = ?danger_batch_index(danger),
+            startup_action = action.label(),
+            invalidated_count = 0,
+            "startup recovery complete — no batches invalidated"
+        );
     } else {
         // Successful self-heal: the system invalidated the doomed suffix and
         // opened a recovery batch as designed. The upstream "danger detected"
         // log already alerted the operator at error level; this completes
         // that incident with a non-error outcome.
         tracing::warn!(
-            count = invalidated.len(),
+            danger_status = danger_status_label(danger),
+            danger_batch_index = ?danger_batch_index(danger),
+            startup_action = action.label(),
+            invalidated_count = invalidated.len(),
             batches = ?invalidated,
-            "batches invalidated — recovery batch opened"
+            "startup recovery complete — batches invalidated and recovery batch opened"
         );
     }
 
@@ -290,75 +339,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proceed_on_safe_regardless_of_l1() {
+    fn proceed_on_safe() {
         assert_eq!(
-            decide_startup_action(DangerStatus::Safe, true, None),
-            StartupAction::Proceed
-        );
-        assert_eq!(
-            decide_startup_action(DangerStatus::Safe, false, Some(1_000_000)),
+            decide_startup_action(DangerStatus::Safe),
             StartupAction::Proceed
         );
     }
 
     #[test]
-    fn flush_and_cascade_on_strict_plus_reachable() {
+    fn flush_and_cascade_on_closed_batch_in_danger() {
         assert_eq!(
-            decide_startup_action(DangerStatus::Strict(42), true, Some(1_000_000)),
+            decide_startup_action(DangerStatus::ClosedBatchInDanger(42)),
             StartupAction::FlushAndCascade { batch_index: 42 }
         );
     }
 
     #[test]
-    fn refuse_on_strict_plus_unreachable() {
+    fn refuse_on_l1_view_stale() {
         assert_eq!(
-            decide_startup_action(DangerStatus::Strict(42), false, Some(1_000_000)),
-            StartupAction::Refuse(RefuseReason::StrictDangerButUnreachable { batch_index: 42 })
+            decide_startup_action(DangerStatus::L1ViewStale),
+            StartupAction::Refuse(RefuseReason::L1ViewStale)
         );
     }
 
     #[test]
-    fn refuse_on_stalled_regardless_of_l1() {
+    fn refuse_on_estimated_batch_in_danger() {
         assert_eq!(
-            decide_startup_action(DangerStatus::Stalled(7), true, Some(1_000_000)),
-            StartupAction::Refuse(RefuseReason::StalledSafeHead { batch_index: 7 })
-        );
-        assert_eq!(
-            decide_startup_action(DangerStatus::Stalled(7), false, Some(1_000_000)),
-            StartupAction::Refuse(RefuseReason::StalledSafeHead { batch_index: 7 })
+            decide_startup_action(DangerStatus::EstimatedBatchInDanger(7)),
+            StartupAction::Refuse(RefuseReason::EstimatedBatchInDanger { batch_index: 7 })
         );
     }
 
     #[test]
-    fn recover_tip_regardless_of_l1_reachability() {
-        // Tip recovery doesn't need a flush, so it works even when L1 is
-        // unreachable. The Tip's first frame is in our DB; we can cascade
-        // and open a fresh Tip without any RPC.
+    fn recover_tip_in_danger() {
         assert_eq!(
-            decide_startup_action(DangerStatus::Tip(11), true, Some(1_000_000)),
+            decide_startup_action(DangerStatus::TipInDanger(11)),
             StartupAction::RecoverTip { batch_index: 11 }
-        );
-        assert_eq!(
-            decide_startup_action(DangerStatus::Tip(11), false, Some(1_000_000)),
-            StartupAction::RecoverTip { batch_index: 11 }
-        );
-    }
-
-    #[test]
-    fn refuse_when_never_synced_and_unreachable() {
-        assert_eq!(
-            decide_startup_action(DangerStatus::Safe, false, None),
-            StartupAction::Refuse(RefuseReason::NeverSyncedAndUnreachable)
-        );
-    }
-
-    #[test]
-    fn never_synced_but_reachable_proceeds() {
-        // First-boot happy path: we've never observed the safe head before,
-        // but L1 is reachable so step 1 just did the first sync.
-        assert_eq!(
-            decide_startup_action(DangerStatus::Safe, true, None),
-            StartupAction::Proceed
         );
     }
 }

@@ -10,14 +10,15 @@
 //!   These match the on-chain scheduler's behavior exactly — mis-aligning them
 //!   would cause the sequencer's cached "gold frontier" to diverge from the
 //!   scheduler's actual accepted set.
-//! - **Preemptive-recovery** tuning (`danger_threshold`, `seconds_per_block`).
-//!   These do not exist on the scheduler side; they control when the sequencer
-//!   proactively stops to avoid letting a batch age into the scheduler's skip
-//!   window.
+//! - **Preemptive-recovery** tuning (`danger_threshold`,
+//!   `l1_read_stale_after_blocks`, `seconds_per_block`). These do not exist on
+//!   the scheduler side; they control when the sequencer proactively stops to
+//!   avoid issuing soft confirmations against stale or unknowable L1 state.
 //!
 //! Keep the scheduler-mirroring fields (`batch_submitter`, `max_wait_blocks`)
-//! aligned with the scheduler's config at deployment time. The two tuning
-//! fields (`preemptive_margin_blocks`, `seconds_per_block`) are sequencer-local.
+//! aligned with the scheduler's config at deployment time. The tuning fields
+//! (`preemptive_margin_blocks`, `l1_read_stale_after_blocks`,
+//! `seconds_per_block`) are sequencer-local.
 
 use crate::batch::Batch;
 use alloy_primitives::Address;
@@ -41,6 +42,21 @@ pub enum ProtocolConfigError {
          max_wait_blocks ({max_wait})"
     )]
     MarginNotLessThanMaxWait { margin: u64, max_wait: u64 },
+    /// `l1_read_stale_after_blocks == 0` would make the L1 view unusable
+    /// immediately, so the sequencer could never start.
+    #[error("l1_read_stale_after_blocks must be greater than zero")]
+    ReadStaleAfterZero,
+    /// The read-staleness threshold should be no later than the write danger
+    /// threshold. Otherwise a closed batch could be observed in danger while
+    /// the L1 read view is already too stale to support recovery.
+    #[error(
+        "l1_read_stale_after_blocks ({read_stale_after}) must be less than or \
+         equal to danger_threshold ({danger_threshold})"
+    )]
+    ReadStaleAfterPastDanger {
+        read_stale_after: u64,
+        danger_threshold: u64,
+    },
 }
 
 /// Bundled protocol config: scheduler-acceptance parameters plus
@@ -62,6 +78,10 @@ pub struct ProtocolConfig {
     /// preemptive recovery. Sequencer-local; must be strictly less than
     /// `max_wait_blocks` (enforced by [`ProtocolConfig::try_new`]).
     pub preemptive_margin_blocks: u64,
+    /// How long the L1 safe block itself may be stale, measured in assumed L1
+    /// blocks. Sequencer-local; startup refuses once the safe block timestamp
+    /// is older than this threshold.
+    pub l1_read_stale_after_blocks: u64,
     /// Wall-clock estimate of L1 block time, used as a fallback when the L1
     /// safe head appears frozen. Sequencer-local.
     pub seconds_per_block: u64,
@@ -79,6 +99,7 @@ impl ProtocolConfig {
         batch_submitter: Address,
         max_wait_blocks: u64,
         preemptive_margin_blocks: u64,
+        l1_read_stale_after_blocks: u64,
         seconds_per_block: u64,
     ) -> Result<Self, ProtocolConfigError> {
         if preemptive_margin_blocks >= max_wait_blocks {
@@ -87,10 +108,21 @@ impl ProtocolConfig {
                 max_wait: max_wait_blocks,
             });
         }
+        if l1_read_stale_after_blocks == 0 {
+            return Err(ProtocolConfigError::ReadStaleAfterZero);
+        }
+        let danger_threshold = max_wait_blocks - preemptive_margin_blocks;
+        if l1_read_stale_after_blocks > danger_threshold {
+            return Err(ProtocolConfigError::ReadStaleAfterPastDanger {
+                read_stale_after: l1_read_stale_after_blocks,
+                danger_threshold,
+            });
+        }
         Ok(Self {
             batch_submitter,
             max_wait_blocks,
             preemptive_margin_blocks,
+            l1_read_stale_after_blocks,
             seconds_per_block,
         })
     }
@@ -104,6 +136,53 @@ impl ProtocolConfig {
     pub fn danger_threshold(&self) -> u64 {
         self.max_wait_blocks
             .saturating_sub(self.preemptive_margin_blocks)
+    }
+
+    /// Wall-clock age, in seconds, after which the L1 safe block is too old
+    /// for the sequencer to trust its L1 view.
+    pub fn l1_read_stale_after_secs(&self) -> u64 {
+        self.l1_read_stale_after_blocks
+            .saturating_mul(self.seconds_per_block.max(1))
+    }
+
+    /// Whether the safe block timestamp is too old to support recovery or
+    /// continued soft confirmations. `None` means the view is unknown and is
+    /// treated as unusable.
+    pub fn l1_view_is_stale(&self, safe_block_timestamp_secs: Option<u64>, now_ms: u64) -> bool {
+        let Some(timestamp_secs) = safe_block_timestamp_secs else {
+            return true;
+        };
+        let now_secs = now_ms / 1000;
+        now_secs.saturating_sub(timestamp_secs) >= self.l1_read_stale_after_secs()
+    }
+
+    /// Wall-clock-adjusted danger threshold, used when the L1 safe head may be
+    /// stale.
+    ///
+    /// Translates "wall-clock time elapsed since the last L1 safe-head
+    /// observation" into "blocks the safe head is presumed to be behind", and
+    /// shaves that off the strict [`Self::danger_threshold`]. Returns `None`
+    /// when the wall-clock arm should be skipped:
+    ///
+    /// - `last_safe_progress_ms` is `None` — no baseline to extrapolate from.
+    /// - Less than one block-time has elapsed — adjustment would be 0, so the
+    ///   strict check covers this case directly.
+    ///
+    /// Returns `Some(adjusted)` where
+    /// `adjusted = danger_threshold − (elapsed_secs / seconds_per_block)`,
+    /// saturating at 0.
+    pub fn wall_clock_adjusted_danger_threshold(
+        &self,
+        last_safe_progress_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Option<u64> {
+        let last = last_safe_progress_ms?;
+        let elapsed_secs = now_ms.saturating_sub(last) / 1000;
+        let missed = elapsed_secs / self.seconds_per_block.max(1);
+        if missed == 0 {
+            return None;
+        }
+        Some(self.danger_threshold().saturating_sub(missed))
     }
 
     /// Scheduler's staleness predicate: a batch is stale when
@@ -195,6 +274,7 @@ mod tests {
             batch_submitter: SUBMITTER,
             max_wait_blocks: MAX_WAIT,
             preemptive_margin_blocks: 75,
+            l1_read_stale_after_blocks: 900,
             seconds_per_block: 12,
         }
     }
@@ -220,6 +300,68 @@ mod tests {
     }
 
     #[test]
+    fn l1_read_stale_after_secs_uses_configured_block_time() {
+        assert_eq!(config().l1_read_stale_after_secs(), 900 * 12);
+    }
+
+    #[test]
+    fn l1_view_is_stale_without_timestamp() {
+        assert!(config().l1_view_is_stale(None, 1_000_000));
+    }
+
+    #[test]
+    fn l1_view_is_stale_at_threshold() {
+        let cfg = config();
+        let timestamp_secs = 1_000;
+        let before = (timestamp_secs + cfg.l1_read_stale_after_secs() - 1) * 1000;
+        let at = (timestamp_secs + cfg.l1_read_stale_after_secs()) * 1000;
+        assert!(!cfg.l1_view_is_stale(Some(timestamp_secs), before));
+        assert!(cfg.l1_view_is_stale(Some(timestamp_secs), at));
+    }
+
+    #[test]
+    fn wall_clock_adjusted_threshold_returns_none_without_baseline() {
+        assert_eq!(
+            config().wall_clock_adjusted_danger_threshold(None, 1_000_000),
+            None,
+        );
+    }
+
+    #[test]
+    fn wall_clock_adjusted_threshold_returns_none_below_one_block_time() {
+        // 11 seconds elapsed, seconds_per_block = 12 → missed = 0.
+        let last = 1_000_000;
+        let now = last + 11_000;
+        assert_eq!(
+            config().wall_clock_adjusted_danger_threshold(Some(last), now),
+            None,
+        );
+    }
+
+    #[test]
+    fn wall_clock_adjusted_threshold_shaves_one_block_per_block_time() {
+        // 25 blocks of elapsed time (300s) → adjusted = danger_threshold - 25.
+        let last = 1_000_000;
+        let now = last + 300_000;
+        let cfg = config();
+        assert_eq!(
+            cfg.wall_clock_adjusted_danger_threshold(Some(last), now),
+            Some(cfg.danger_threshold() - 25),
+        );
+    }
+
+    #[test]
+    fn wall_clock_adjusted_threshold_saturates_at_zero() {
+        // Wildly long outage — adjustment shaves more blocks than the threshold.
+        let last = 0;
+        let now = u64::MAX / 2;
+        assert_eq!(
+            config().wall_clock_adjusted_danger_threshold(Some(last), now),
+            Some(0),
+        );
+    }
+
+    #[test]
     fn danger_threshold_saturates_to_zero_on_invalid_margin() {
         // try_new rejects this configuration; if a test ever constructs it
         // directly via struct-literal syntax, danger_threshold returns 0
@@ -241,7 +383,7 @@ mod tests {
     #[test]
     fn try_new_rejects_margin_equal_to_max_wait() {
         assert_eq!(
-            ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT, 12),
+            ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT, 1, 12),
             Err(ProtocolConfigError::MarginNotLessThanMaxWait {
                 margin: MAX_WAIT,
                 max_wait: MAX_WAIT,
@@ -252,7 +394,7 @@ mod tests {
     #[test]
     fn try_new_rejects_margin_greater_than_max_wait() {
         assert_eq!(
-            ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT + 1, 12),
+            ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT + 1, 1, 12),
             Err(ProtocolConfigError::MarginNotLessThanMaxWait {
                 margin: MAX_WAIT + 1,
                 max_wait: MAX_WAIT,
@@ -262,16 +404,36 @@ mod tests {
 
     #[test]
     fn try_new_accepts_margin_one_below_max_wait() {
-        let cfg = ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT - 1, 12)
+        let cfg = ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, MAX_WAIT - 1, 1, 12)
             .expect("strictly-less margin must be accepted");
         assert_eq!(cfg.danger_threshold(), 1);
     }
 
     #[test]
     fn try_new_accepts_zero_margin() {
-        let cfg = ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, 0, 12)
+        let cfg = ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, 0, MAX_WAIT, 12)
             .expect("zero margin is valid (degenerate but valid)");
         assert_eq!(cfg.danger_threshold(), MAX_WAIT);
+    }
+
+    #[test]
+    fn try_new_rejects_zero_l1_read_stale_after() {
+        assert_eq!(
+            ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, 75, 0, 12),
+            Err(ProtocolConfigError::ReadStaleAfterZero),
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_l1_read_stale_after_past_danger() {
+        let danger_threshold = MAX_WAIT - 75;
+        assert_eq!(
+            ProtocolConfig::try_new(SUBMITTER, MAX_WAIT, 75, danger_threshold + 1, 12),
+            Err(ProtocolConfigError::ReadStaleAfterPastDanger {
+                read_stale_after: danger_threshold + 1,
+                danger_threshold,
+            }),
+        );
     }
 
     #[test]

@@ -1219,34 +1219,37 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
     let mut storage = Storage::open(db_path).expect("open storage");
     let config = WalletConfig::default();
 
-    if !deposits.is_empty() {
-        let safe_inputs: Vec<StoredSafeInput> = deposits
-            .iter()
-            .map(|(sender, amount)| {
-                let mut payload = Vec::with_capacity(72);
-                payload.extend_from_slice(config.supported_erc20_token.as_slice());
-                payload.extend_from_slice(sender.as_slice());
-                payload.extend_from_slice(amount.to_be_bytes::<32>().as_slice());
-                StoredSafeInput {
-                    sender: config.erc20_portal_address,
-                    payload,
-                    block_number: 1,
-                }
-            })
-            .collect();
-        storage
-            .append_safe_inputs(
-                1,
-                &safe_inputs,
-                &sequencer_core::protocol::ProtocolConfig {
-                    batch_submitter: Address::ZERO,
-                    max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                    preemptive_margin_blocks: 75,
-                    seconds_per_block: 12,
-                },
-            )
-            .expect("seed deposits");
-    }
+    // Always record a safe-head observation: production callers are gated by
+    // `run_preemptive_recovery`, so storage paths like `safe_input_frontier`
+    // assume a row exists. With no deposits we still write an empty advance
+    // so the lane can start without `current_safe_block_required` failing.
+    let safe_inputs: Vec<StoredSafeInput> = deposits
+        .iter()
+        .map(|(sender, amount)| {
+            let mut payload = Vec::with_capacity(72);
+            payload.extend_from_slice(config.supported_erc20_token.as_slice());
+            payload.extend_from_slice(sender.as_slice());
+            payload.extend_from_slice(amount.to_be_bytes::<32>().as_slice());
+            StoredSafeInput {
+                sender: config.erc20_portal_address,
+                payload,
+                block_number: 1,
+            }
+        })
+        .collect();
+    storage
+        .append_safe_inputs(
+            1,
+            &safe_inputs,
+            &sequencer_core::protocol::ProtocolConfig {
+                batch_submitter: Address::ZERO,
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
+                seconds_per_block: 12,
+            },
+        )
+        .expect("seed safe head (and any deposits)");
 
     let safe_input_count = deposits.len() as u64;
     let leading_range = SafeInputRange::new(0, safe_input_count);
@@ -1293,6 +1296,7 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 batch_submitter: Address::ZERO,
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
                 seconds_per_block: 12,
             },
         )
