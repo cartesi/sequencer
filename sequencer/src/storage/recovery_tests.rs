@@ -2,6 +2,7 @@ use super::super::test_helpers::{
     SENDER_A, all_ordered_l2_txs, default_protocol_config, make_stale_batch_payload,
     seed_closed_batches, temp_db,
 };
+use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
@@ -392,7 +393,7 @@ mod recover_post_flush {
 
         // Sanity: no closed batch is past gold (all gold).
         assert_eq!(
-            storage.check_danger_zone(900).expect("strict check"),
+            find_closed_frontier_batch_in_danger(&storage.conn, 900).expect("strict check"),
             None,
             "all closed batches gold; closed-frontier check returns None"
         );
@@ -625,6 +626,9 @@ mod tip_staleness {
 
         storage.insert_invalid_batch(0).expect("invalidate 0");
         storage.insert_invalid_batch(1).expect("invalidate 1");
+        storage
+            .append_safe_inputs(10, &[], &default_protocol_config())
+            .expect("record observed safe head");
 
         let invalidated = storage
             .recover_post_flush(1200)
@@ -1078,7 +1082,8 @@ mod check_danger_zone {
             .append_safe_inputs(1200, &[], &default_protocol_config())
             .expect("advance safe block");
 
-        let result = storage.check_danger_zone(1125).expect("check danger zone");
+        let result =
+            find_closed_frontier_batch_in_danger(&storage.conn, 1125).expect("check danger zone");
         assert!(
             result.is_none(),
             "old Gold batches should not trigger danger zone; got batch_index={result:?}"
@@ -1106,7 +1111,8 @@ mod check_danger_zone {
             .append_safe_inputs(1200, &[], &default_protocol_config())
             .expect("advance safe head past danger threshold");
 
-        let result = storage.check_danger_zone(1125).expect("check danger zone");
+        let result =
+            find_closed_frontier_batch_in_danger(&storage.conn, 1125).expect("check danger zone");
         assert!(
             result.is_none(),
             "open batch (no zombie) must not trigger check_danger_zone; got batch_index={result:?}"
@@ -1137,8 +1143,7 @@ mod check_any_unresolved {
             .append_safe_inputs(1200, &[], &default_protocol_config())
             .expect("advance safe head past threshold");
 
-        let result = storage
-            .check_any_unresolved_batch_in_danger(1125)
+        let result = find_first_batch_in_danger(&storage.conn, 1125)
             .expect("check any unresolved in danger");
         assert_eq!(
             result,
@@ -1162,8 +1167,7 @@ mod check_any_unresolved {
             .append_safe_inputs(1100, &[], &default_protocol_config())
             .expect("advance safe head below threshold");
 
-        let result = storage
-            .check_any_unresolved_batch_in_danger(1125)
+        let result = find_first_batch_in_danger(&storage.conn, 1125)
             .expect("check any unresolved in danger");
         assert!(
             result.is_none(),
@@ -1202,7 +1206,8 @@ mod check_any_unresolved {
             .append_safe_inputs(1200, &[], &default_protocol_config())
             .expect("advance safe block");
 
-        let result = storage.check_danger_zone(1125).expect("check danger zone");
+        let result =
+            find_closed_frontier_batch_in_danger(&storage.conn, 1125).expect("check danger zone");
         assert_eq!(result, Some(1), "frontier batch should trigger danger zone");
     }
 
@@ -1237,7 +1242,8 @@ mod check_any_unresolved {
             .append_safe_inputs(1134, &[], &default_protocol_config())
             .expect("advance safe block");
 
-        let result = storage.check_danger_zone(1125).expect("check danger zone");
+        let result =
+            find_closed_frontier_batch_in_danger(&storage.conn, 1125).expect("check danger zone");
         assert!(
             result.is_none(),
             "should not trigger below threshold; got batch_index={result:?}"

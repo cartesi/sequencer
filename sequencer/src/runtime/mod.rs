@@ -22,8 +22,8 @@ use crate::l1::submitter::{BatchPosterConfig, EthereumBatchPoster};
 use crate::l1::submitter::{
     BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError, SubmitterExit,
 };
-use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit};
-use crate::storage::{self, StorageOpenError};
+use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit, RecoveryError};
+use crate::storage::{self, DangerStatus, StorageOpenError};
 use alloy_primitives::Address;
 use config::{L1Config, RunConfig};
 use sequencer_core::application::Application;
@@ -100,8 +100,15 @@ pub enum RunError {
     /// Deliberate shutdown triggered by the danger detector. Not an error in
     /// the usual sense — the orchestrator is expected to respawn, at which
     /// point `run_preemptive_recovery` handles it.
-    #[error("danger zone detected at batch {batch_index} — stopping for recovery")]
-    DangerZoneDetected { batch_index: u64 },
+    #[error("danger detected ({status:?}) — stopping for startup recovery")]
+    DangerDetected { status: DangerStatus },
+    /// Startup recovery/refusal failed before runtime workers were started.
+    #[error("startup recovery failed: {source}")]
+    Recovery {
+        #[from]
+        #[source]
+        source: RecoveryError,
+    },
     #[error("RPC chain ID {rpc} does not match --chain-id {config}")]
     ChainIdMismatch { rpc: u64, config: u64 },
     /// `eth_chainId` failed on a reachable RPC. We treat this as fatal
@@ -151,10 +158,17 @@ where
     // including the startup info log below — so a bad config produces a
     // clean typed `RunError::InvalidProtocolConfig` instead of panicking
     // mid-log.
+    let l1_read_stale_after_blocks = config.l1_read_stale_after_blocks.unwrap_or_else(|| {
+        default_l1_read_stale_after_blocks(
+            sequencer_core::MAX_WAIT_BLOCKS,
+            config.preemptive_margin_blocks,
+        )
+    });
     let protocol = ProtocolConfig::try_new(
         batch_submitter_address,
         sequencer_core::MAX_WAIT_BLOCKS,
         config.preemptive_margin_blocks,
+        l1_read_stale_after_blocks,
         config.seconds_per_block,
     )?;
 
@@ -280,8 +294,7 @@ where
     // ── Preemptive recovery ────────────────────────────────────────
     // See docs/recovery/ for the full design and TLA+ spec.
     crate::recovery::run_preemptive_recovery(&db_path, &mut input_reader, &l1_config, &protocol)
-        .await
-        .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
+        .await?;
 
     let storage = storage::Storage::open(&db_path)?;
     let (tx, mut inclusion_lane_handle) = InclusionLane::start(
@@ -565,8 +578,8 @@ async fn wait_for_danger_detector_shutdown(
 ) -> Result<(), RunError> {
     match danger_detector_handle.await {
         Ok(Ok(DetectorExit::Shutdown)) => Ok(()),
-        Ok(Ok(DetectorExit::DangerZone { batch_index })) => {
-            Err(RunError::DangerZoneDetected { batch_index })
+        Ok(Ok(DetectorExit::RecoveryRequired { status })) => {
+            Err(RunError::DangerDetected { status })
         }
         Ok(Err(source)) => Err(RunError::DangerDetector { source }),
         Err(source) => Err(RunError::DangerDetectorJoin { source }),
@@ -589,6 +602,13 @@ fn map_lane_exit(
         Ok(Err(source)) => RunError::InclusionLane { source },
         Err(source) => RunError::InclusionLaneJoin { source },
     }
+}
+
+fn default_l1_read_stale_after_blocks(max_wait_blocks: u64, preemptive_margin_blocks: u64) -> u64 {
+    let danger_threshold = max_wait_blocks.saturating_sub(preemptive_margin_blocks);
+    danger_threshold
+        .saturating_sub(preemptive_margin_blocks)
+        .max(1)
 }
 
 fn map_input_reader_exit(
@@ -622,9 +642,7 @@ fn map_danger_detector_exit(
             // else did first.
             RunError::DangerDetectorStoppedUnexpectedly
         }
-        Ok(Ok(DetectorExit::DangerZone { batch_index })) => {
-            RunError::DangerZoneDetected { batch_index }
-        }
+        Ok(Ok(DetectorExit::RecoveryRequired { status })) => RunError::DangerDetected { status },
         Ok(Err(source)) => RunError::DangerDetector { source },
         Err(source) => RunError::DangerDetectorJoin { source },
     }
@@ -646,7 +664,8 @@ fn build_batch_submitter_provider(
 #[cfg(test)]
 mod tests {
     use super::{RunError, batch_submitter_address_from_private_key, map_danger_detector_exit};
-    use crate::recovery::{DangerDetectorError, DetectorExit};
+    use crate::recovery::{DangerDetectorError, DetectorExit, RecoveryError, RefuseReason};
+    use crate::storage::DangerStatus;
     use sequencer_core::MAX_WAIT_BLOCKS;
     use sequencer_core::protocol::{ProtocolConfig, ProtocolConfigError};
 
@@ -657,6 +676,7 @@ mod tests {
             alloy_primitives::Address::ZERO,
             MAX_WAIT_BLOCKS,
             preemptive_margin_blocks,
+            super::default_l1_read_stale_after_blocks(MAX_WAIT_BLOCKS, preemptive_margin_blocks),
             12,
         )
     }
@@ -696,6 +716,23 @@ mod tests {
         // Default is 300 per `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (~1h at 12s/block).
         let cfg = try_protocol_with_margin(300).expect("default margin valid");
         assert_eq!(cfg.danger_threshold(), MAX_WAIT_BLOCKS - 300);
+        assert_eq!(cfg.l1_read_stale_after_blocks, MAX_WAIT_BLOCKS - 600);
+    }
+
+    #[test]
+    fn explicit_l1_read_stale_after_past_danger_is_rejected() {
+        let err = ProtocolConfig::try_new(
+            alloy_primitives::Address::ZERO,
+            MAX_WAIT_BLOCKS,
+            300,
+            MAX_WAIT_BLOCKS,
+            12,
+        )
+        .expect_err("read stale threshold after danger must be rejected");
+        assert!(matches!(
+            err,
+            ProtocolConfigError::ReadStaleAfterPastDanger { .. }
+        ));
     }
 
     #[test]
@@ -709,6 +746,17 @@ mod tests {
         }
         .into();
         assert!(matches!(err, RunError::InvalidProtocolConfig(_)));
+    }
+
+    #[test]
+    fn startup_recovery_error_preserves_recovery_category() {
+        let err: RunError = RecoveryError::Refuse(RefuseReason::L1ViewStale).into();
+        assert!(matches!(
+            err,
+            RunError::Recovery {
+                source: RecoveryError::Refuse(RefuseReason::L1ViewStale)
+            }
+        ));
     }
 
     #[test]
@@ -732,11 +780,15 @@ mod tests {
     }
 
     #[test]
-    fn danger_detector_danger_zone_maps_to_deliberate_runtime_exit() {
-        let err = map_danger_detector_exit(Ok(Ok(DetectorExit::DangerZone { batch_index: 7 })));
+    fn danger_detector_recovery_required_maps_to_deliberate_runtime_exit() {
+        let err = map_danger_detector_exit(Ok(Ok(DetectorExit::RecoveryRequired {
+            status: DangerStatus::ClosedBatchInDanger(7),
+        })));
         assert!(matches!(
             err,
-            RunError::DangerZoneDetected { batch_index: 7 }
+            RunError::DangerDetected {
+                status: DangerStatus::ClosedBatchInDanger(7)
+            }
         ));
     }
 

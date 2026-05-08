@@ -343,6 +343,7 @@ fn seed_ordered_txs(db_path: &str) {
                 batch_submitter: Address::ZERO,
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
                 seconds_per_block: 12,
             },
         )
@@ -361,6 +362,7 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
     let safe_block = storage
         .current_safe_block()
         .expect("read current safe block")
+        .expect("safe head should have been observed")
         .saturating_add(1);
     let next_direct_index = storage
         .safe_input_end_exclusive()
@@ -377,6 +379,7 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
                 batch_submitter: Address::ZERO,
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
                 seconds_per_block: 12,
             },
         )

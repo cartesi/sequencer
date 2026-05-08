@@ -16,7 +16,7 @@ use super::mutations::{
     insert_new_batch, insert_open_frame, persist_frame_direct_sequence, seal_batch,
 };
 use super::queries::{
-    load_current_write_head, query_batch_policy, query_current_safe_block,
+    current_safe_block_required, load_current_write_head, query_batch_policy,
     query_latest_safe_input_index_exclusive,
 };
 use super::{
@@ -84,10 +84,14 @@ impl Storage {
 
     /// Snapshot the current L1 view: safe block + exclusive safe-input cursor.
     /// The lane uses this to decide whether to advance.
+    ///
+    /// **Precondition:** at least one safe-head observation must have been
+    /// recorded. The lane only starts after `run_preemptive_recovery`
+    /// completes, which guarantees this in production.
     pub fn safe_input_frontier(&mut self) -> Result<SafeInputFrontier> {
         self.read(|tx| {
             Ok(SafeInputFrontier {
-                safe_block: query_current_safe_block(tx)?,
+                safe_block: current_safe_block_required(tx)?,
                 end_exclusive: query_latest_safe_input_index_exclusive(tx)?,
             })
         })

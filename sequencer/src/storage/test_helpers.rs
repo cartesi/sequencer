@@ -27,6 +27,7 @@ pub(crate) fn protocol_config_for(sender: Address) -> ProtocolConfig {
         batch_submitter: sender,
         max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
         preemptive_margin_blocks: 75,
+        l1_read_stale_after_blocks: 900,
         seconds_per_block: 12,
     }
 }

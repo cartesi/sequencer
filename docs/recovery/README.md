@@ -8,7 +8,7 @@ See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and fu
 
 The sequencer's recovery loop spans two process lifetimes:
 
-1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any arm fires (closed-frontier strict, Tip strict, or wall-clock-adjusted), the runtime converts that into `RunError::DangerZoneDetected` and the process exits with non-zero status.
+1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `RunError::DangerDetected` and the process exits with non-zero status.
 2. **External respawn.** An orchestrator (systemd, k8s, …) restarts the process.
 3. **Startup dispatch.** The fresh boot runs `run_preemptive_recovery` before any writers come online: sync L1, re-run `check_danger`, then `decide_startup_action` routes to one of `Proceed`, `RecoverTip`, `FlushAndCascade`, or `Refuse`. The chosen action runs as a single SQLite transaction.
 
@@ -16,11 +16,11 @@ The detector trip and the startup dispatch share the same `check_danger` functio
 
 Key abstractions, by responsibility:
 
-- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::DangerZone` when any of the three arms fires — strict (closed-frontier-in-danger), Tip (open-Tip-in-danger), or wall-clock-adjusted (frozen safe head). The runtime converts that into `RunError::DangerZoneDetected` and the process exits. The dispatch difference between the three arms only matters at the next startup, where `decide_startup_action` re-runs `check_danger` and routes accordingly.
+- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::RecoveryRequired` when any non-`Safe` status fires. The runtime converts that into `RunError::DangerDetected` and the process exits. The dispatch difference between statuses only matters at the next startup, where `decide_startup_action` re-runs `check_danger` and routes accordingly.
 - **`BatchSubmitter`** ([`l1/submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs)): makes L1 progress only — never checks danger. Productive ticks re-enter immediately; idle/transient ticks sleep `idle_poll_interval`. A pure `decide_submit_start` function folds observed L1 nonces over the scheduler-accepted frontier.
-- **`decide_startup_action`** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): pure function. Takes `(danger, l1_reachable, last_safe_progress_ms)` and returns `Proceed | RecoverTip { batch_index } | FlushAndCascade { batch_index } | Refuse(reason)`. The side-effectful driver executes the chosen action.
+- **`decide_startup_action`** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): pure function. Takes `danger` and returns `Proceed | RecoverTip { batch_index } | FlushAndCascade { batch_index } | Refuse(reason)`. L1 reachability is an execution concern: if the flush path cannot reach L1, startup fails and the orchestrator retries.
 - **`MempoolFlusher`** ([`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs)): submits no-op transactions to consume all pending wallet-nonce slots and waits for safe finality. Does **not** retry internally on provider errors — the orchestrator's respawn loop is the retry mechanism.
-- **`ProtocolConfig`** ([`sequencer-core/src/protocol.rs`](../../sequencer-core/src/protocol.rs)): single source of truth for the scheduler-mirroring fields (`batch_submitter`, `max_wait_blocks`) plus the sequencer-local tuning knobs (`preemptive_margin_blocks`, `seconds_per_block`). Exposes `scheduler_accepts`, `is_scheduler_stale`, `danger_threshold`.
+- **`ProtocolConfig`** ([`sequencer-core/src/protocol.rs`](../../sequencer-core/src/protocol.rs)): single source of truth for the scheduler-mirroring fields (`batch_submitter`, `max_wait_blocks`) plus the sequencer-local tuning knobs (`preemptive_margin_blocks`, `l1_read_stale_after_blocks`, `seconds_per_block`). Exposes `scheduler_accepts`, `is_scheduler_stale`, `danger_threshold`, and `l1_view_is_stale`.
 
 All five pieces are replaceable at the abstraction boundary: the tick decision is a pure function; the storage surface returns structs, not ad-hoc tuples; the danger detector and submitter are independently testable.
 
@@ -240,7 +240,7 @@ After step 3 (flush) and step 4 (re-sync), the gold frontier is fresh. Run the a
 
 #### Path B — `recover_aging_tip(danger_threshold)` (called from RecoverTip)
 
-The `RecoverTip` action is dispatched when `check_danger` returns `Tip(idx)`: no closed batch is past the gold frontier in the danger zone, but the open Tip's first frame has aged past `danger_threshold`. **No flush ran** — the Tip has no L1 footprint, so there's nothing to flush.
+The `RecoverTip` action is dispatched when `check_danger` returns `TipInDanger(idx)`: no closed batch is past the gold frontier in the danger zone, but the open Tip's first frame has aged past `danger_threshold`. **No flush ran** — the Tip has no L1 footprint, so there's nothing to flush.
 
 Closed batches past gold (if any) are still in their natural lifecycle — pending in the mempool, recently included, awaiting safe finality. Cascading them would prematurely abort their progression. We act only on the Tip:
 
@@ -257,7 +257,7 @@ The Tip threshold is a **policy choice**, not a mathematical staleness bound. A 
 We invalidate at `danger_threshold` because:
 
 1. **Pre-confirmation honesty.** Once the Tip's age crosses the danger zone, the system has decided this generation is operationally suspect. Continuing to issue soft confirmations against it is dishonest to users.
-2. **Avoid retrip risk.** The runtime danger detector also fires on Tip-strict (`DangerStatus::Tip`). Without invalidating at startup, we'd resume operation, the detector would re-trip on the next tick, and we'd cycle. Cascading at startup converges in one cycle.
+2. **Avoid retrip risk.** The runtime danger detector also fires on `DangerStatus::TipInDanger`. Without invalidating at startup, we'd resume operation, the detector would re-trip on the next tick, and we'd cycle. Cascading at startup converges in one cycle.
 3. **Symmetry with the closed-batch trigger.** The closed-batch detector trips at `danger_threshold`. Using the same threshold for the Tip preserves the framing: "danger zone = committed to recovery."
 
 ### Step 6: Resume
@@ -281,34 +281,48 @@ Each loop iteration burns gas (no-ops + doomed resubs), takes ~12 minutes (the f
 
 ### Startup behavior summary
 
-The startup flow is dispatched by `decide_startup_action(danger, l1_reachable, last_safe_progress)`:
+The startup flow is dispatched by `decide_startup_action(danger)`:
 
-| `check_danger` result | L1 reachable? | Action | Recovery primitive |
+| `check_danger` result | Action | Recovery primitive | Why this dispatch |
 |---|---|---|---|
-| `Safe` | yes | `Proceed` | `recover_aging_tip(danger_threshold)` (defensive — typically a no-op) |
-| `Safe` | no, never synced | `Refuse(NeverSyncedAndUnreachable)` | — |
-| `Tip(N)` | any | `RecoverTip { N }` | `recover_aging_tip(danger_threshold)` (no flush — Tip has no L1 slot) |
-| `Strict(N)` | yes | `FlushAndCascade { N }` | flush + `recover_post_flush(danger_threshold)` |
-| `Strict(N)` | no | `Refuse(StrictDangerButUnreachable)` | — |
-| `Stalled(N)` | any | `Refuse(StalledSafeHead)` | — (frozen safe head; flush would spin) |
+| `Safe` | `Proceed` | `recover_aging_tip(danger_threshold)` (defensive — typically a no-op) | Nothing crossed danger; observed Tip check is a cheap belt-and-suspenders. |
+| `L1ViewStale` | `Refuse(L1ViewStale)` | — | The L1 view is too old to support honest recovery or new soft confirmations. |
+| `TipInDanger(N)` | `RecoverTip { N }` | `recover_aging_tip(danger_threshold)` (no flush — Tip has no L1 slot) | Tip has no L1 footprint; cascade and reopen directly. |
+| `ClosedBatchInDanger(N)` | `FlushAndCascade { N }` | flush + `recover_post_flush(danger_threshold)` | Closed batch has L1 transactions whose fate must be resolved before cascading. |
+| `EstimatedBatchInDanger(N)` | `Refuse(EstimatedBatchInDanger { N })` | — | Observed safe-state did not cross danger; only batch-relative wall-clock extrapolation did, and we don't recover from estimated state. |
 
-**Stalled wins ties.** `check_danger` evaluates the wall-clock-adjusted (stalled-safe-head) arm before the strict arm, so when both fire — safe head froze recently AND the closed frontier crossed the strict threshold — it returns `Stalled`. The strict reading is computed against a possibly-frozen `current_safe_block`, so we can't trust it; refusing boot is the safe call. Earlier ordering returned `Strict` first and routed to `FlushAndCascade`, which would then spin in `flush_and_wait` (the loop waits for `Pending <= Safe`, and Safe never advances under a frozen head).
+**L1 view freshness gates recovery.** `check_danger` first checks the L1 safe block timestamp against `l1_read_stale_after_blocks`. If the timestamp is missing or too old, startup refuses: the sequencer has no trustworthy L1 view from which to recover or issue new soft confirmations. With a fresh L1 view, observed-safe checks decide concrete recovery: `ClosedBatchInDanger` runs flush + cascade, while `TipInDanger` invalidates the open Tip directly. `EstimatedBatchInDanger` is the final batch-relative wall-clock fallback: observed safe-state has not crossed the threshold, but elapsed time since the last safe-head advance says the batch consumed its remaining runway, so startup refuses instead of recovering from estimated state.
 
 The Refuse variants block boot and surface to the operator. Every non-Refuse action ends with an atomic SQLite transaction: `Proceed` normally just ensures the Tip exists, `RecoverTip` invalidates the aging Tip and opens a fresh one, and `FlushAndCascade` cascades the post-flush non-gold suffix and opens a fresh Tip when needed.
 
 **What TLA+ proves here**: the model still abstracts away the full startup cutover/flush decision. It proves ZombieSafety once wallet-nonce slots resolve, and separately models direct recovery of an aging open Tip. The claim that past `MAX_WAIT`, closed-batch staleness self-resolves is external reasoning from L1 monotonicity. The post-flush "cascade everything past gold" choice is also external reasoning (the "everything past gold is doomed" mental model above).
 
-### L1 unreachability
+### Startup observability
 
-The danger zone check and the flush both require L1. If L1 is unreachable, the sequencer must decide whether to proceed (before danger zone) or block (in danger zone).
+Startup recovery logs the decision and outcome with stable structured fields:
 
-**At startup**: the sequencer attempts to sync the safe head from L1. If this fails, it falls back to a **wall-clock danger estimate** based on the persisted last-L1-sync marker: compute `estimated_missed_blocks = (now - last_l1_sync_ms) / seconds_per_block`, adjust the danger threshold downward by that estimate, and run the unresolved-batch danger check against the stale DB view. If the estimate is before the danger zone, the sequencer proceeds with stale DB data — the input reader and batch submitter will catch up when L1 returns. If the estimate is in or past the danger zone, the sequencer refuses to start (it can't safely issue soft confirmations without knowing L1 state).
+- `danger_status` — `safe`, `l1_view_stale`, `closed_batch_in_danger`, `tip_in_danger`, or `estimated_batch_in_danger`.
+- `danger_batch_index` — set for batch-specific danger statuses.
+- `startup_action` — `proceed`, `recover_tip`, `flush_and_cascade`, or `refuse`.
+- `refuse_reason` — present on refusal.
+- `l1_reachable`, `danger_threshold`, `max_wait_blocks`, and `l1_read_stale_after_blocks` on the decision log.
+- `invalidated_count` on the completion log, plus `batches` when any batch was invalidated.
 
-**At runtime**: the `DangerDetector` polls `Storage::check_danger` on its cadence. The wall-clock-adjusted arm runs the same estimate as at startup: `estimated_missed_blocks = (now - last_l1_sync_ms) / seconds_per_block`, then `find_first_batch_in_danger(danger_threshold − missed)`. When the input reader can't refresh `last_safe_progress_ms` (provider unreachable, dropped polls), `missed` grows and the adjusted threshold drops, eventually firing `Stalled` regardless of the strict reading. The detector then exits with `DangerZone`, the orchestrator respawns, and startup re-runs the same check — producing `Refuse(StalledSafeHead)` if L1 is still unreachable. The batch submitter never observes danger; this responsibility lives entirely with the detector.
+The orchestrator should still be the source of restart-loop policy and alert routing, but it should not need to parse free-form messages to distinguish "refused because the L1 view is stale" from "recovering a Tip" or "running flush + cascade."
+
+### L1 view freshness
+
+The safety policy does not branch directly on a provider-reachability boolean. Reachability is an execution concern: startup tries to sync the safe head, and if `FlushAndCascade` later cannot reach L1, the flusher errors and the orchestrator retries. The decision primitive is the freshness of the L1 view recorded in SQLite.
+
+The most common real-world trigger for `L1ViewStale` is a stalled RPC gateway: the provider answers, but its safe-head response stops advancing (a degraded upstream node, a load-balancer routing to a lagging replica, or a temporary indexing pause). The sequencer can't distinguish "fresh answer from a stalled view" from "L1 itself is unhealthy" without a second source of truth, so it treats both the same way: refuse to commit to soft confirmations until the recorded safe block is fresh again.
+
+**At startup**: the sequencer attempts to sync the safe head from L1. Whether that succeeds or fails, it then checks the persisted safe block timestamp. If the timestamp is missing or older than `l1_read_stale_after_blocks * seconds_per_block`, `check_danger` returns `L1ViewStale` and startup refuses. If the view is fresh, observed-safe checks can route to recovery, and the batch-relative wall-clock estimate remains as a final refusal guard for unresolved batches whose safe-block age has effectively crossed the danger threshold.
+
+**At runtime**: the `DangerDetector` polls `Storage::check_danger` on its cadence. The input reader records both the observed safe block timestamp and the local time at which the safe head last advanced. If safe-head observations stop advancing, either the global safe block timestamp crosses the read-staleness threshold (`L1ViewStale`) or a specific unresolved batch crosses the batch-relative adjusted threshold (`EstimatedBatchInDanger`). The detector then exits with `RecoveryRequired`, the orchestrator respawns, and startup re-runs the same check. The batch submitter never observes danger; this responsibility lives entirely with the detector.
 
 **Other workers during L1 outages**: the inclusion lane and API are purely local (SQLite) and continue operating. The input reader retries L1 polling with error logging. All L1-dependent workers log errors at the `error` level to alert operators.
 
-The `seconds_per_block` parameter (default: 12 for Ethereum) is configurable via `SEQ_SECONDS_PER_BLOCK`. The wall-clock estimate is conservative — it may overestimate age (if blocks are slower than assumed), which causes earlier detection. This is correct: better to crash early than to issue doomed soft confirmations.
+The `seconds_per_block` parameter (default: 12 for Ethereum) is configurable via `SEQ_SECONDS_PER_BLOCK`. The L1 read-staleness threshold is configurable via `SEQ_L1_READ_STALE_AFTER_BLOCKS`; if unset, startup derives it before the write danger threshold. These estimates are conservative — they may cause earlier detection if blocks are slower than assumed. This is correct: better to crash early than to issue doomed soft confirmations.
 
 ## Dead Batches
 
@@ -333,7 +347,9 @@ These constraints were discovered during TLA+ model checking and are required fo
 
 3. **`SubmitBatch` must assign ALL pending batches at once, in spine-position order.** If batches are submitted individually, a flush-win can bump one batch's `w_nonce` past a later batch's, violating the spine ordering invariant.
 
-4. **Wall-clock fallback when L1 is unreachable.** The input reader records the last safe-head progress time, and `Storage::check_danger` uses that timestamp to estimate block progression from wall-clock time (`elapsed / seconds_per_block`). If the adjusted check crosses the danger threshold, the danger detector crashes the process so startup can refuse or recover safely. Without this, an L1 outage can silently push batches past the danger zone while the DB-based check sees stale (frozen) data.
+4. **Wall-clock freshness when the L1 view stops advancing.** The input reader records the L1 safe block timestamp and the local last-safe-head-progress time. `Storage::check_danger` first refuses on an old or missing safe block timestamp, then uses the local progress timestamp to estimate unresolved-batch age (`elapsed / seconds_per_block`). Without these checks, an L1 outage can silently push batches past the danger zone while the DB-based safe-block number remains frozen.
+
+5. **The accepted-frontier cache persists acceptances, not scan progress.** `safe_accepted_batches` stores the scheduler-accepted prefix and resumes from the latest accepted safe input. Rejected batch-submitter inputs after that frontier can be rescanned on later safe-head syncs until a later batch is accepted. This is a performance tradeoff, not a correctness bug: recovery batches can reuse a scheduler nonce after earlier rejected rows, so a separate persistent scan cursor would need careful nonce-reuse tests before being introduced.
 
 ## Formal Verification
 

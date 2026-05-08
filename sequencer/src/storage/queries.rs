@@ -9,7 +9,7 @@
 //! them; only the reads reused by two or more roles live here.
 
 use alloy_primitives::Address;
-use rusqlite::{Connection, Result, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
 
 use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64};
 use super::{BatchPolicy, WriteHead};
@@ -86,13 +86,50 @@ pub(super) fn query_latest_safe_input_index_exclusive(conn: &Connection) -> Resu
     })
 }
 
-pub(super) fn query_current_safe_block(conn: &Connection) -> Result<u64> {
-    let value: i64 = conn.query_row(
-        "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(i64_to_u64(value))
+pub(super) fn current_safe_block(conn: &Connection) -> Result<Option<u64>> {
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT block_number FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.map(i64_to_u64))
+}
+
+/// Current safe block, or `QueryReturnedNoRows` if no observation has been
+/// recorded yet. Use from code paths that only run after preemptive recovery
+/// has produced a safe-head observation (submitter, lane, post-recovery
+/// open-batch helpers); callers that legitimately handle the "never synced"
+/// case should use [`current_safe_block`] instead.
+pub(super) fn current_safe_block_required(conn: &Connection) -> Result<u64> {
+    current_safe_block(conn)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// L1 timestamp (Unix seconds) of the current safe block, or `None` if no
+/// real safe-head observation has recorded one yet.
+pub(super) fn current_safe_block_timestamp(conn: &Connection) -> Result<Option<u64>> {
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT block_timestamp FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.map(i64_to_u64))
+}
+
+/// Wall-clock timestamp (Unix ms) of the last observed safe-head advance, or
+/// `None` if no real safe-head observation has occurred yet.
+pub(super) fn last_safe_progress_ms(conn: &Connection) -> Result<Option<u64>> {
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.map(i64_to_u64))
 }
 
 pub(super) fn query_batch_policy(conn: &Connection) -> Result<BatchPolicy> {

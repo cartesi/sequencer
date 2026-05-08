@@ -13,6 +13,7 @@ use sequencer::l1::submitter::{BatchSubmitter, BatchSubmitterConfig};
 use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
+use sequencer_core::protocol::ProtocolConfig;
 
 mod common;
 use common::{TestDb, temp_db};
@@ -106,9 +107,28 @@ impl BatchPoster for TestMock {
     }
 }
 
+/// Mirrors what `run_preemptive_recovery` does in production: persist a real
+/// safe-head observation so `submitter_frontier` has a row to read. Without
+/// this, the submitter's first tick errors out on `current_safe_block_required`
+/// and the loop exits before submitting anything.
+fn seed_observed_safe_head(storage: &mut Storage) {
+    let protocol = ProtocolConfig::try_new(
+        alloy_primitives::Address::ZERO,
+        sequencer_core::MAX_WAIT_BLOCKS,
+        75,
+        900,
+        12,
+    )
+    .expect("default test protocol");
+    storage
+        .append_safe_inputs(0, &[], &protocol)
+        .expect("seed observed safe head");
+}
+
 /// Seeds storage so batches 1 and 2 are closed and batch 3 is open.
 fn seed_two_closed_batches(db_path: &str) {
     let mut storage = Storage::open(db_path).expect("open storage");
+    seed_observed_safe_head(&mut storage);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -127,6 +147,7 @@ fn seed_two_closed_batches(db_path: &str) {
 /// Seeds storage so batch 0 is closed and batch 1 is the open Tip.
 fn seed_one_closed_batch(db_path: &str) {
     let mut storage = Storage::open(db_path).expect("open storage");
+    seed_observed_safe_head(&mut storage);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");

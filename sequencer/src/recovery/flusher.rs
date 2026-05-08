@@ -48,14 +48,14 @@ fn derive_timeouts(seconds_per_block: u64) -> (Duration, Duration) {
     )
 }
 
-/// Bump base 1559 fees to satisfy Ethereum's transaction replacement rule
-/// (EIP-1559 §Replacement, ≥10% bump on both `max_fee_per_gas` and
-/// `max_priority_fee_per_gas`).
+/// Bump current 1559 fee estimates so flush no-ops are competitive with
+/// pending batch transactions at the same wallet nonces.
 ///
-/// H5 regression: a replacement no-op must out-bid any pending batch tx at the
-/// same nonce to guarantee slot consumption. The `+ 1` on `max_fee` handles the
-/// edge case where `base * 11 / 10` equals `base * 11 / 10` after integer
-/// rounding; the priority doubling is generous but preserves the invariant.
+/// Safety does not depend on the no-op winning. Either the original batch tx
+/// or the no-op can consume the slot; `flush_and_wait` only returns once
+/// `Pending <= Safe`. These bumped fees are an operational acceleration, not a
+/// correctness precondition. The `+ 1` on `max_fee` avoids integer-rounding
+/// flat spots, and the priority doubling is intentionally generous.
 fn bumped_replacement_fees(base_max_fee: u128, base_priority_fee: u128) -> (u128, u128) {
     let new_max_fee = base_max_fee.saturating_mul(11) / 10 + 1;
     let new_priority_fee = base_priority_fee.saturating_mul(2).max(1);
@@ -113,18 +113,20 @@ impl MempoolFlusher {
         self
     }
 
-    /// Flush the mempool by submitting no-op transactions for all pending nonce slots,
-    /// then waiting for safe finality on all of them.
+    /// Flush the mempool by submitting no-op transactions for pending nonce
+    /// slots, then waiting until every slot is safe.
     ///
     /// The loop runs until `get_transaction_count(Pending) <= get_transaction_count(Safe)`,
     /// meaning every slot has reached safe finality.
     ///
     /// At each iteration:
     /// 1. Submit 0-ETH self-transfers for nonces between `Latest` and `Pending`.
-    ///    These compete with any batch transactions still in the mempool.
-    /// 2. Watch each submitted tx for L1 inclusion (same pattern as batch poster).
+    ///    These compete with any batch transactions still in the mempool. If
+    ///    an original batch wins, that is also success: the slot advanced.
+    /// 2. Watch each submitted no-op for L1 inclusion.
     /// 3. Sleep to let the safe head advance, then re-check the loop condition.
-    /// 4. If any watch times out, retry the outer loop (tx may have been dropped).
+    /// 4. If any watch times out, retry the outer loop (tx may have been dropped,
+    ///    or the original batch may be making progress instead).
     pub async fn flush_and_wait(&self) -> Result<(), FlushError> {
         let mut attempt = 0u32;
         loop {
@@ -161,7 +163,9 @@ impl MempoolFlusher {
             }
             attempt += 1;
 
-            // Submit no-ops for nonces between Latest and Pending.
+            // Submit no-ops for nonces between Latest and Pending. We submit
+            // the full range before watching any tx, so every unresolved slot
+            // gets a competing no-op attempt in this pass.
             let latest_nonce = self.nonce_at(BlockNumberOrTag::Latest).await?;
             let tx_hashes = self.submit_noops(latest_nonce, pending_nonce).await?;
 
@@ -277,7 +281,7 @@ mod tests {
     use alloy::node_bindings::Anvil;
     use alloy::providers::Provider;
 
-    // ── H5: replacement-fee bump satisfies EIP-1559 rules ─────────
+    // ── H5: replacement-fee bump keeps no-ops competitive ─────────
 
     #[test]
     fn replacement_fee_bump_exceeds_ten_percent_for_max_fee() {

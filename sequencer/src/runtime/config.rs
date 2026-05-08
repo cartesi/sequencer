@@ -108,6 +108,12 @@ pub struct RunConfig {
     #[arg(long, env = "SEQ_PREEMPTIVE_MARGIN_BLOCKS", default_value = "300")]
     pub preemptive_margin_blocks: u64,
 
+    /// Blocks of safe-head age after which the L1 read view is considered too
+    /// stale to trust. If unset, derived from the preemptive margin so the read
+    /// staleness threshold is earlier than the write danger threshold.
+    #[arg(long, env = "SEQ_L1_READ_STALE_AFTER_BLOCKS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub l1_read_stale_after_blocks: Option<u64>,
+
     /// Assumed L1 block time in seconds. Used to estimate block progression from
     /// wall-clock time when the L1 provider is unreachable.
     #[arg(long, env = "SEQ_SECONDS_PER_BLOCK", default_value = "12", value_parser = clap::value_parser!(u64).range(1..))]
@@ -247,6 +253,13 @@ mod tests {
         args
     }
 
+    fn args_with_l1_read_stale_after_blocks(value: &str) -> Vec<&str> {
+        let mut args: Vec<&str> = TEST_ARGS.to_vec();
+        args.push("--l1-read-stale-after-blocks");
+        args.push(value);
+        args
+    }
+
     #[test]
     fn run_config_rejects_seconds_per_block_zero() {
         let err = RunConfig::try_parse_from(args_with_seconds_per_block("0"))
@@ -275,5 +288,30 @@ mod tests {
             config.seconds_per_block, 12,
             "default should reflect Ethereum block time"
         );
+    }
+
+    #[test]
+    fn run_config_rejects_l1_read_stale_after_blocks_zero() {
+        let err = RunConfig::try_parse_from(args_with_l1_read_stale_after_blocks("0"))
+            .expect_err("l1_read_stale_after_blocks=0 must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("--l1-read-stale-after-blocks")
+                || message.contains("l1_read_stale_after_blocks"),
+            "error must name the offending field, got: {message}"
+        );
+    }
+
+    #[test]
+    fn run_config_l1_read_stale_after_blocks_is_optional() {
+        let config = RunConfig::try_parse_from(TEST_ARGS).expect("parse run config");
+        assert_eq!(config.l1_read_stale_after_blocks, None);
+    }
+
+    #[test]
+    fn run_config_accepts_l1_read_stale_after_blocks_one() {
+        let config = RunConfig::try_parse_from(args_with_l1_read_stale_after_blocks("1"))
+            .expect("parse succeeds");
+        assert_eq!(config.l1_read_stale_after_blocks, Some(1));
     }
 }

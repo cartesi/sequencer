@@ -1087,7 +1087,7 @@ async fn run_sequencer_outage_pre_danger_no_recovery_test(
 //
 // Sequencer stops; L1 advances into the danger zone (past `danger_threshold`)
 // but strictly below `MAX_WAIT_BLOCKS`. On restart:
-//   - `check_danger` returns `Tip(idx)` — the closed-frontier check finds
+//   - `check_danger` returns `TipInDanger(idx)` — the closed-frontier check finds
 //     nothing past gold, but the open Tip's first frame has aged past
 //     `danger_threshold`.
 //   - `decide_startup_action` returns `RecoverTip` (no flush — the Tip has
@@ -1261,7 +1261,7 @@ async fn run_provider_outage_past_stale_cascades_test(
 
     // Step 4: Respawn. The sequencer dials the proxy, the proxy forwards
     // to Anvil, `sync_to_current_safe_head` returns 1250+ blocks past the
-    // open Tip's first frame. `check_danger` fires `Tip(idx)`,
+    // open Tip's first frame. `check_danger` fires `TipInDanger(idx)`,
     // `decide_startup_action` returns `RecoverTip`, `recover_aging_tip`
     // cascades the Tip and opens a fresh one.
     runtime.respawn().await?;
@@ -1357,11 +1357,9 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
 
     // Step 3: Attempt respawn with proxy disconnected. The sequencer:
     //   - dials the proxy → sync_to_current_safe_head fails (L1 unreachable).
-    //   - falls back to wall-clock estimation.
-    //   - computes missed_blocks = 18000s / 12 = 1500 > danger_threshold 900.
-    //   - `find_first_batch_in_danger(adjusted_threshold=0)` flags the open
-    //     batch (first_frame_safe_block << current_safe_block - 0).
-    //   - decide_startup_action returns Refuse(StalledSafeHead) → process exits with failure.
+    //   - sees the persisted safe block timestamp is older than the L1
+    //     read-staleness threshold.
+    //   - decide_startup_action returns Refuse(L1ViewStale) → process exits with failure.
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -1448,21 +1446,22 @@ async fn run_wall_clock_backward_jump_no_panic_test(
 
 // Provider reachable, safe head frozen, startup refuses to boot.
 //
-// Tests the wall-clock-stalled startup arm in isolation: when L1 is
+// Tests the stale-L1-view startup arm in isolation: when L1 is
 // reachable but the safe head hasn't advanced since the last observation,
-// the wall-clock-adjusted danger check fires `Stalled` and startup refuses.
+// the safe block timestamp crosses the read-staleness threshold and startup
+// refuses.
 //
 // Scenario:
 //   1. Set up baseline state (deposit + transfer in the open Tip). The Tip
 //      stays well below `danger_threshold` — we don't pre-age it, because
-//      the runtime detector now exits on `DangerStatus::Tip` and we want
+//      the runtime detector now exits on `DangerStatus::TipInDanger` and we want
 //      a clean stop.
 //   2. Stop the sequencer.
 //   3. Advance only the sequencer's wall clock (no mining → safe head
 //      frozen). The offset must exceed `danger_threshold * SECONDS_PER_BLOCK`
 //      so the wall-clock-adjusted threshold saturates to 0 and catches even
 //      a fresh Tip.
-//   4. Respawn → `check_danger` fires `Stalled` → `Refuse(StalledSafeHead)`.
+//   4. Respawn → `check_danger` fires `L1ViewStale` → `Refuse(L1ViewStale)`.
 //   5. Mine one L1 block and clear the faketime offset; safe-head progress
 //      resumes, the timestamp refreshes on sync, and the sequencer stays up.
 async fn run_stalled_safe_head_startup_refuses_boot_test(
@@ -1504,7 +1503,7 @@ async fn run_stalled_safe_head_startup_refuses_boot_test(
     assert!(
         respawn_result.is_err(),
         "startup must refuse when L1 is reachable but the safe head stayed frozen \
-         long enough that the wall-clock arm fires Stalled",
+         long enough that the L1 view is stale",
     );
 
     let counts = runtime.count_batches()?;
@@ -1655,7 +1654,7 @@ async fn run_provider_outage_pre_danger_sequencer_continues_test(
 
 // provider outage aging into the danger zone while the sequencer is
 // running — sequencer detects via its live wall-clock fallback and self-exits
-// with `DangerZone`. Also verifies the startup wall-clock fallback refuses
+// with `DangerDetected`. Also verifies the startup freshness checks refuse
 // subsequent boots while L1 is still unreachable.
 //
 // The full "reconnect → recover → no cascade" cycle needs the harness to
@@ -1712,8 +1711,8 @@ async fn run_provider_outage_danger_zone_sequencer_self_exits_test(
     // Step 3: Disconnect the proxy and advance both clocks into the danger
     // zone. The running `DangerDetector` polls `Storage::check_danger`
     // every cadence; with the proxy down the input reader can't refresh
-    // `last_safe_progress_ms`, so the wall-clock-adjusted arm sees
-    // elapsed > danger_threshold and exits with DangerZone.
+    // `last_safe_progress_ms` or the safe block timestamp, so the freshness
+    // checks eventually emit a non-Safe status and the process exits.
     proxy.disconnect();
     runtime.advance_wall_and_mine(INTO_DANGER).await?;
 
@@ -1723,7 +1722,7 @@ async fn run_provider_outage_danger_zone_sequencer_self_exits_test(
     let exit_status = runtime.wait_for_exit(Duration::from_secs(30)).await?;
     assert!(
         !exit_status.success(),
-        "sequencer must self-exit with non-zero status on DangerZone, got {exit_status:?}",
+        "sequencer must self-exit with non-zero status on danger detection, got {exit_status:?}",
     );
 
     // Step 5: Try to respawn while proxy is still disconnected. Startup
@@ -1922,7 +1921,7 @@ async fn run_both_down_danger_zone_sequencer_first_refuses_boot_test(
 // Complement to  (sequencer first): here L1 comes back before the
 // sequencer does. Once the sequencer restarts, startup recovery sees L1
 // reachable and the Tip aged past `danger_threshold`, so `check_danger`
-// returns `Tip(idx)` → `decide_startup_action` returns `RecoverTip` →
+// returns `TipInDanger(idx)` → `decide_startup_action` returns `RecoverTip` →
 // `recover_aging_tip` cascades the Tip and opens a fresh one. Convergence
 // typically happens on the first respawn.
 //
@@ -2042,7 +2041,7 @@ async fn run_both_down_danger_zone_proxy_first_restart_cycle_recovers_test(
 // L1 and wall clock advance together.
 //
 // The most likely outcome on respawn is `RecoverTip`: the open Tip's first
-// frame has aged past `danger_threshold` and `check_danger` fires `Tip(idx)`
+// frame has aged past `danger_threshold` and `check_danger` fires `TipInDanger(idx)`
 // (the closed-frontier check finds nothing past the gold frontier). Recovery
 // cascades the Tip directly without a flush; on a healthy L1, the first
 // respawn typically converges to Stable.
@@ -2149,7 +2148,7 @@ async fn run_sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test(
 }
 
 //  follow-up — Provider outage into the danger zone while the
-// sequencer is running, mid-run DangerZone exit, then reconnect + restart
+// sequencer is running, mid-run danger-detected exit, then reconnect + restart
 // cycle converges.
 //
 // The provider-outage danger-zone test stops at "refuse to reboot while proxy still
@@ -2207,15 +2206,14 @@ async fn run_provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recover
 
     // Mid-run outage: proxy goes down, coupled wall+L1 advance into danger.
     // The running sequencer's submitter tick hits the disconnect, runs
-    // wall_clock_danger_estimate, sees past-danger, and exits with
-    // `DangerZone`.
+    // danger check, sees a non-Safe status, and exits.
     proxy.disconnect();
     runtime.advance_wall_and_mine(INTO_DANGER).await?;
 
     let exit_status = runtime.wait_for_exit(Duration::from_secs(30)).await?;
     assert!(
         !exit_status.success(),
-        "sequencer must self-exit on mid-run DangerZone, got {exit_status:?}",
+        "sequencer must self-exit on mid-run danger detection, got {exit_status:?}",
     );
 
     // L1 comes back. Run the orchestrator cycle: the aged closed batch
@@ -2272,16 +2270,15 @@ async fn run_provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recover
 //
 // How we reach the condition: the harness's `spawn()` does a successful
 // first boot (needs L1 reachable to deploy contracts and bootstrap the
-// chain-id/InputBox cache). We stop, rewrite `l1_safe_head.synced_at_ms`
-// to 0 directly, then respawn with the proxy disconnected. The bootstrap
-// cache is still populated — so the sequencer gets past the
-// contract-discovery phase — but the wall-clock fallback sees the zeroed
-// timestamp and `decide_startup_action` returns
-// `Refuse(NeverSyncedAndUnreachable)`.
+// chain-id/InputBox cache). We stop, rewrite the recorded L1 safe-head
+// observation to unknown, then respawn with the proxy disconnected. The
+// bootstrap cache is still populated — so the sequencer gets past the
+// contract-discovery phase — but `check_danger` sees the missing safe-head
+// row and `decide_startup_action` returns `Refuse(L1ViewStale)`.
 //
 // Scope note: a "truly" first-ever boot would fail even earlier (no
 // bootstrap cache, can't discover contracts). That's a separate test; this
-// one targets only the wall-clock-fallback branch.
+// one targets only the L1-view freshness branch.
 async fn run_first_boot_l1_unreachable_never_synced_refuses_boot_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
@@ -2292,10 +2289,8 @@ async fn run_first_boot_l1_unreachable_never_synced_refuses_boot_test(
 
     runtime.stop().await?;
 
-    // Simulate "never synced L1" by zeroing the timestamp. The block number
-    // stays whatever it already is — the wall-clock fallback keys off
-    // `synced_at_ms == 0`, not the block count.
-    runtime.reset_l1_safe_head_synced_at_ms()?;
+    // Simulate "never synced L1" by clearing the safe-head observation.
+    runtime.clear_l1_safe_head_observation()?;
 
     // Route the sequencer through a disconnected proxy so L1 is unreachable
     // from the sequencer's perspective.
@@ -2458,7 +2453,7 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
 // Aging open Tip trips the runtime detector and the next startup
 // runs RecoverTip.
 //
-// The runtime danger detector intentionally fires on `DangerStatus::Tip(_)`:
+// The runtime danger detector intentionally fires on `DangerStatus::TipInDanger(_)`:
 // once the open Tip's first frame has aged past `danger_threshold`, the
 // inclusion lane has failed to rotate it within `max_batch_open` (2 h ≈
 // 600 blocks, comfortably below `danger_threshold` ≈ 900 blocks), which
@@ -2477,7 +2472,7 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
 //      ~1150 past X, so the Tip's age clears `danger_threshold`. Wall
 //      clock untouched (decoupled advance).
 //   3. `wait_for_exit` — input reader catches up; detector ticks; sees
-//      `DangerStatus::Tip(_)`; process exits non-zero.
+//      `DangerStatus::TipInDanger(_)`; process exits non-zero.
 //   4. Respawn — startup `check_danger` again sees Tip in danger →
 //      `RecoverTip` → `recover_aging_tip` cascades the Tip + opens a fresh
 //      one. Alice's pre-outage transfer was a soft confirmation against
@@ -2510,13 +2505,13 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
     // L1 jumps into the danger window; wall clock stays put.
     runtime.mine_l1_blocks(DANGER_ZONE_BLOCKS).await?;
 
-    // The detector must trip on `DangerStatus::Tip` once the input reader
+    // The detector must trip on `DangerStatus::TipInDanger` once the input reader
     // catches up. Allow a window for input-reader poll (~2 s) plus
     // detector poll (2 s) plus margin.
     let exit = runtime.wait_for_exit(Duration::from_secs(15)).await?;
     assert!(
         !exit.success(),
-        "sequencer must exit non-zero on `DangerStatus::Tip` once the Tip's \
+        "sequencer must exit non-zero on `DangerStatus::TipInDanger` once the Tip's \
          first frame ages past `danger_threshold`, got {exit:?}",
     );
 
@@ -2566,13 +2561,13 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
     Ok(())
 }
 
-// Provider reachable, safe head frozen, live wall-clock arm fires
-// `Stalled` and the running detector self-exits.
+// Provider reachable, safe head frozen, live freshness check fires and the
+// running detector self-exits.
 //
 // Runtime twin of . Tests that the wall-clock-adjusted danger arm
 // fires at runtime when L1 stays reachable but the safe head stops
 // advancing. We don't pre-age the Tip — the detector now exits on
-// `DangerStatus::Tip` independently, which would conflate test signals.
+// `DangerStatus::TipInDanger` independently, which would conflate test signals.
 // Instead, we let the Tip stay fresh and jump the wall clock past
 // `danger_threshold * SECONDS_PER_BLOCK` so the wall-clock arm saturates
 // to threshold 0 and catches the fresh Tip via `find_first_batch_in_danger`.
@@ -2630,7 +2625,7 @@ async fn run_stalled_safe_head_live_exit_test(
 // after the WS connection dropped.
 //
 // A WS connection cannot span invalidation: the sequencer necessarily exits
-// (DangerZone or stop) before any cascade runs (`recover_post_flush` or
+// (danger detection or stop) before any cascade runs (`recover_post_flush` or
 // `recover_aging_tip`), and the socket dies with the process. The
 // meaningful invariant is the **reconnect** behavior —
 // a client that reconnects at `from_offset=N`, where `N` was an offset it
