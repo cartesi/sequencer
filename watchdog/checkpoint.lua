@@ -56,8 +56,8 @@ local function parse_pointer(data)
     return data:match('"checkpoint"%s*:%s*"([^"]+)"')
 end
 
-function checkpoint.safe_block_from_manifest(manifest_json)
-    local value = tostring(manifest_json or ""):match('"safe_block"%s*:%s*(%d+)')
+function checkpoint.safe_block_from_manifest(manifest_data)
+    local value = tostring(manifest_data or ""):match('"safe_block"%s*:%s*(%d+)')
     if not value then
         return nil, "manifest missing safe_block"
     end
@@ -98,9 +98,9 @@ function checkpoint.prepare(dir, safe_block)
     local full_path = join(dir, relative_path)
     local snapshot_dir = join(full_path, "snapshot")
 
-    local ok = os.execute("mkdir -p " .. shell_quote(snapshot_dir))
+    local ok = os.execute("mkdir -p " .. shell_quote(full_path))
     if ok ~= true and ok ~= 0 then
-        return nil, "mkdir failed: " .. snapshot_dir
+        return nil, "mkdir failed: " .. full_path
     end
 
     return {
