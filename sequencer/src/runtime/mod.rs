@@ -1,399 +1,100 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Process orchestration: bootstraps L1 state, opens storage, runs preemptive
-//! recovery, then spawns the lane / input reader / batch submitter /
-//! danger detector / feed / HTTP servers and awaits their completion.
+//! Process orchestration. Three phases:
+//!
+//! 1. **Bootstrap**: parse config, validate identity, build the L1 config.
+//! 2. **Preemptive recovery**: run the startup recovery procedure
+//!    ([`crate::recovery::run_preemptive_recovery`]).
+//! 3. **Workers**: hand off to [`workers::Workers`] for spawn → select →
+//!    finish.
+//!
+//! Errors live in [`error`]; worker lifecycle in [`workers`].
 
 pub mod clock;
 pub mod config;
+pub mod error;
 pub mod shutdown;
+mod workers;
 
 use std::time::Duration;
 
-use thiserror::Error;
-use tracing::warn;
-
-use crate::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
-use crate::http::{self, ApiConfig};
-use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
-use crate::l1::submitter::{BatchPosterConfig, EthereumBatchPoster};
-use crate::l1::submitter::{
-    BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError, SubmitterExit,
-};
-use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit, RecoveryError};
-use crate::storage::{self, DangerStatus, StorageOpenError};
+use crate::storage::{self, DeploymentIdentity};
 use alloy_primitives::Address;
 use config::{L1Config, RunConfig};
 use sequencer_core::application::Application;
-use sequencer_core::protocol::{ProtocolConfig, ProtocolConfigError};
-use shutdown::ShutdownSignal;
+use sequencer_core::protocol::ProtocolTiming;
 
-const QUEUE_CAPACITY: usize = 8192;
+pub use error::{
+    BatchSubmitterExit, BootstrapError, DangerDetectorExit, IdentityError, InputReaderExit,
+    LaneExit, RunError, ServerExit, WorkerExit,
+};
+
+use workers::{Workers, WorkersConfig};
+
 const INPUT_READER_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// Danger detector cadence. Cheap DB-only check; re-running quickly bounds the
-/// lag on entering the danger zone. The preemptive margin absorbs bounded lag.
-const DANGER_DETECTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-#[derive(Debug, Error)]
-pub enum RunError {
-    #[error(transparent)]
-    OpenStorage(#[from] StorageOpenError),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error("server stopped unexpectedly")]
-    ServerStoppedUnexpectedly,
-    #[error("server join error: {source}")]
-    ServerJoin {
-        #[source]
-        source: tokio::task::JoinError,
-    },
-    #[error("inclusion lane stopped unexpectedly")]
-    InclusionLaneStoppedUnexpectedly,
-    #[error("inclusion lane exited: {source}")]
-    InclusionLane {
-        #[source]
-        source: InclusionLaneError,
-    },
-    #[error("inclusion lane join error: {source}")]
-    InclusionLaneJoin {
-        #[source]
-        source: tokio::task::JoinError,
-    },
-    #[error("input reader stopped unexpectedly")]
-    InputReaderStoppedUnexpectedly,
-    #[error("input reader exited: {source}")]
-    InputReader {
-        #[source]
-        source: InputReaderError,
-    },
-    #[error("input reader join error: {source}")]
-    InputReaderJoin {
-        #[source]
-        source: tokio::task::JoinError,
-    },
-    #[error("batch submitter stopped unexpectedly")]
-    BatchSubmitterStoppedUnexpectedly,
-    #[error("batch submitter exited: {source}")]
-    BatchSubmitter {
-        #[source]
-        source: BatchSubmitterError,
-    },
-    #[error("batch submitter join error: {source}")]
-    BatchSubmitterJoin {
-        #[source]
-        source: tokio::task::JoinError,
-    },
-    #[error("danger detector exited: {source}")]
-    DangerDetector {
-        #[source]
-        source: DangerDetectorError,
-    },
-    #[error("danger detector join error: {source}")]
-    DangerDetectorJoin {
-        #[source]
-        source: tokio::task::JoinError,
-    },
-    #[error("danger detector stopped unexpectedly")]
-    DangerDetectorStoppedUnexpectedly,
-    /// Deliberate shutdown triggered by the danger detector. Not an error in
-    /// the usual sense — the orchestrator is expected to respawn, at which
-    /// point `run_preemptive_recovery` handles it.
-    #[error("danger detected ({status:?}) — stopping for startup recovery")]
-    DangerDetected { status: DangerStatus },
-    /// Startup recovery/refusal failed before runtime workers were started.
-    #[error("startup recovery failed: {source}")]
-    Recovery {
-        #[from]
-        #[source]
-        source: RecoveryError,
-    },
-    #[error("RPC chain ID {rpc} does not match --chain-id {config}")]
-    ChainIdMismatch { rpc: u64, config: u64 },
-    /// `eth_chainId` failed on a reachable RPC. We treat this as fatal
-    /// rather than warn-and-continue: proceeding with an unverified chain id
-    /// would write a possibly-wrong value into the L1 bootstrap cache and
-    /// poison subsequent cache-fallback boots, in addition to issuing soft
-    /// confirmations against the wrong chain's state. Operator should retry.
-    #[error("could not query chain ID from RPC: {message}")]
-    ChainIdRpc { message: String },
-    /// Protocol-level config (`preemptive_margin_blocks` vs `max_wait_blocks`)
-    /// failed validation at startup. See [`ProtocolConfigError`].
-    #[error(transparent)]
-    InvalidProtocolConfig(#[from] ProtocolConfigError),
-}
-
-enum FirstExit {
-    Signal(Option<RunError>),
-    Server(RunError),
-    InclusionLane(RunError),
-    InputReader(RunError),
-    BatchSubmitter(RunError),
-    DangerDetector(RunError),
-}
 
 pub async fn run<A>(app: A, config: RunConfig) -> Result<(), RunError>
 where
     A: Application + 'static,
 {
-    let domain = config.build_domain();
-    let shutdown = ShutdownSignal::default();
-
-    // Ensure the data directory exists before any component tries to open the DB.
+    // ── Bootstrap ────────────────────────────────────────────
     std::fs::create_dir_all(&config.data_dir)?;
     let db_path = config.db_path();
+    let key = config.resolve_private_key()?;
+    let batch_submitter_address = batch_submitter_address_from_private_key(&key)?;
 
-    let batch_submitter_private_key = config.resolve_private_key()?;
+    // One ProtocolTiming shared across the whole process. `try_new` validates
+    // margin/stale relationships up front — including before the startup log
+    // below — so a bad config produces a clean typed error instead of
+    // panicking mid-log.
+    let timing = config.protocol_timing()?;
 
-    let batch_submitter_address =
-        batch_submitter_address_from_private_key(batch_submitter_private_key.as_str())?;
-
-    // One ProtocolConfig shared across the whole process: the input reader,
-    // the danger detector, and startup recovery all mirror the same
-    // scheduler-acceptance rules.
-    //
-    // `try_new` validates `preemptive_margin_blocks < max_wait_blocks`
-    // *before* any subsequent code touches `protocol.danger_threshold()` —
-    // including the startup info log below — so a bad config produces a
-    // clean typed `RunError::InvalidProtocolConfig` instead of panicking
-    // mid-log.
-    let l1_read_stale_after_blocks = config.l1_read_stale_after_blocks.unwrap_or_else(|| {
-        default_l1_read_stale_after_blocks(
-            sequencer_core::MAX_WAIT_BLOCKS,
-            config.preemptive_margin_blocks,
-        )
-    });
-    let protocol = ProtocolConfig::try_new(
+    let (mut input_reader, l1_config) = bootstrap_l1_config(
+        &config,
+        db_path.as_str(),
+        timing,
         batch_submitter_address,
-        sequencer_core::MAX_WAIT_BLOCKS,
-        config.preemptive_margin_blocks,
-        l1_read_stale_after_blocks,
-        config.seconds_per_block,
-    )?;
-
-    let input_reader_config = InputReaderConfig {
-        rpc_url: config.eth_rpc_url.clone(),
-        app_address: config.app_address,
-        poll_interval: INPUT_READER_POLL_INTERVAL,
-        long_block_range_error_codes: config.long_block_range_error_codes.clone(),
-    };
-
-    // Bootstrap L1 config: try L1 first, fall back to DB cache if unreachable.
-    // On first startup, L1 is required (no cache). On subsequent startups, the
-    // cache allows the sequencer to start without L1 (e.g., during provider outages).
-    let (mut input_reader, input_reader_genesis_block, l1_config) = match InputReader::new(
-        db_path.clone(),
-        shutdown.clone(),
-        input_reader_config.clone(),
-        protocol,
+        key,
     )
-    .await
-    {
-        Ok(reader) => {
-            let genesis = reader.genesis_block();
-            let input_box = reader.input_box_address();
-
-            // Validate chain ID early — before any DB writes. If the
-            // RPC errors, refuse to boot rather than writing an unverified
-            // chain id into the bootstrap cache: a transient `eth_chainId`
-            // failure on a misconfigured node would otherwise let us cache
-            // and operate against the wrong chain entirely.
-            {
-                use alloy::providers::Provider;
-                let check_provider = crate::l1::provider::create_provider(&config.eth_rpc_url)
-                    .map_err(|e| RunError::Io(std::io::Error::other(e)))?;
-                match check_provider.get_chain_id().await {
-                    Ok(rpc_chain_id) if rpc_chain_id != config.chain_id => {
-                        return Err(RunError::ChainIdMismatch {
-                            rpc: rpc_chain_id,
-                            config: config.chain_id,
-                        });
-                    }
-                    Ok(_) => {} // verified
-                    Err(e) => {
-                        return Err(RunError::ChainIdRpc {
-                            message: e.to_string(),
-                        });
-                    }
-                }
-            }
-
-            // Cache for future startups when L1 might be unreachable.
-            if let Ok(mut s) = storage::Storage::open(&db_path) {
-                let _ = s.save_l1_bootstrap_cache(input_box, genesis, config.chain_id);
-            }
-
-            let l1 = L1Config {
-                eth_rpc_url: config.eth_rpc_url.clone(),
-                input_box_address: input_box,
-                app_address: config.app_address,
-                batch_submitter_private_key,
-                batch_submitter_address,
-            };
-            (reader, genesis, l1)
-        }
-        Err(InputReaderError::Provider(e)) => {
-            // L1 unreachable. Try the DB cache.
-            tracing::error!(
-                error = %e,
-                "L1 unreachable during bootstrap — checking DB cache"
-            );
-            let cache_storage = storage::Storage::open(&db_path)?;
-            let cached = cache_storage
-                .l1_bootstrap_cache()
-                .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
-            let Some((input_box, genesis, cached_chain_id)) = cached else {
-                return Err(RunError::Io(std::io::Error::other(
-                    "L1 unreachable and no bootstrap cache — \
-                         L1 is required for first startup",
-                )));
-            };
-            if cached_chain_id != config.chain_id {
-                return Err(RunError::ChainIdMismatch {
-                    rpc: cached_chain_id,
-                    config: config.chain_id,
-                });
-            }
-
-            let reader = InputReader::from_parts(
-                input_reader_config,
-                input_box,
-                genesis,
-                db_path.clone(),
-                shutdown.clone(),
-                protocol,
-            );
-            let l1 = L1Config {
-                eth_rpc_url: config.eth_rpc_url.clone(),
-                input_box_address: input_box,
-                app_address: config.app_address,
-                batch_submitter_private_key,
-                batch_submitter_address,
-            };
-            (reader, genesis, l1)
-        }
-        Err(source) => return Err(RunError::InputReader { source }),
-    };
+    .await?;
 
     tracing::info!(
         http_addr = %config.http_addr,
         data_dir = %config.data_dir,
         eth_rpc_url = %l1_config.eth_rpc_url,
         input_box_address = %l1_config.input_box_address,
-        input_reader_genesis_block,
+        input_reader_genesis_block = input_reader.genesis_block(),
         chain_id = config.chain_id,
         app_address = %l1_config.app_address,
         batch_submitter_address = %l1_config.batch_submitter_address,
-        max_wait_blocks = protocol.max_wait_blocks,
-        preemptive_margin_blocks = protocol.preemptive_margin_blocks,
-        danger_threshold = protocol.danger_threshold(),
+        max_wait_blocks = timing.max_wait_blocks,
+        preemptive_margin_blocks = timing.preemptive_margin_blocks,
+        danger_threshold = timing.danger_threshold(),
         "sequencer startup"
     );
 
-    // ── Preemptive recovery ────────────────────────────────────────
+    // ── Preemptive recovery ──────────────────────────────────
     // See docs/recovery/ for the full design and TLA+ spec.
-    crate::recovery::run_preemptive_recovery(&db_path, &mut input_reader, &l1_config, &protocol)
+    crate::recovery::run_preemptive_recovery(&db_path, &mut input_reader, &l1_config, &timing)
         .await?;
 
-    let storage = storage::Storage::open(&db_path)?;
-    let (tx, mut inclusion_lane_handle) = InclusionLane::start(
-        QUEUE_CAPACITY,
-        shutdown.clone(),
+    // ── Workers ──────────────────────────────────────────────
+    let mut workers = Workers::spawn(WorkersConfig {
         app,
-        storage,
-        InclusionLaneConfig::new(l1_config.batch_submitter_address),
-    );
-    let mut input_reader_handle = input_reader.start()?;
-
-    let batch_submitter_config = BatchSubmitterConfig {
-        idle_poll_interval_ms: config.batch_submitter_idle_poll_interval_ms,
-    };
-    let poster_config = BatchPosterConfig {
-        l1_submit_address: l1_config.input_box_address,
-        app_address: l1_config.app_address,
-        batch_submitter_address: l1_config.batch_submitter_address,
-        start_block: input_reader_genesis_block,
-        confirmation_depth: config.batch_submitter_confirmation_depth,
-        seconds_per_block: config.seconds_per_block,
-        long_block_range_error_codes: config.long_block_range_error_codes,
-    };
-    let provider = build_batch_submitter_provider(&l1_config)?;
-
-    let poster = std::sync::Arc::new(EthereumBatchPoster::new(provider, poster_config));
-    let submitter = BatchSubmitter::new(
-        db_path.clone(),
-        poster,
-        shutdown.clone(),
-        batch_submitter_config,
-    );
-    let mut batch_submitter_handle = submitter.start().map_err(RunError::OpenStorage)?;
-
-    let detector = DangerDetector::new(
-        db_path.clone(),
-        protocol,
-        DANGER_DETECTOR_POLL_INTERVAL,
-        shutdown.clone(),
-    );
-    let mut danger_detector_handle = detector.start().map_err(RunError::OpenStorage)?;
-
-    let tx_feed = L2TxFeed::new(
-        db_path.clone(),
-        shutdown.clone(),
-        L2TxFeedConfig {
-            batch_submitter_address: Some(l1_config.batch_submitter_address),
-            ..L2TxFeedConfig::default()
-        },
-    );
-
-    let mut server_task = http::start(
-        &config.http_addr,
-        tx,
-        domain,
-        A::MAX_METHOD_PAYLOAD_BYTES,
-        shutdown.clone(),
-        tx_feed,
-        ApiConfig::default(),
-    )
+        run_config: config,
+        l1_config,
+        timing,
+        input_reader,
+    })
     .await?;
 
-    tracing::info!(address = %config.http_addr, "listening");
-
-    let shutdown_signal = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown_signal);
-
-    let first_exit = tokio::select! {
-        signal_result = &mut shutdown_signal => {
-            FirstExit::Signal(signal_result.err().map(RunError::from))
-        }
-        server_result = &mut server_task => {
-            FirstExit::Server(map_server_exit(server_result))
-        }
-        lane_result = &mut inclusion_lane_handle => {
-            FirstExit::InclusionLane(map_lane_exit(lane_result))
-        }
-        reader_result = &mut input_reader_handle => {
-            FirstExit::InputReader(map_input_reader_exit(reader_result))
-        }
-        submitter_result = &mut batch_submitter_handle => {
-            FirstExit::BatchSubmitter(map_batch_submitter_exit(submitter_result))
-        }
-        detector_result = &mut danger_detector_handle => {
-            FirstExit::DangerDetector(map_danger_detector_exit(detector_result))
-        }
-    };
-
-    begin_runtime_shutdown(&shutdown);
-    finish_runtime(
-        first_exit,
-        server_task,
-        inclusion_lane_handle,
-        input_reader_handle,
-        batch_submitter_handle,
-        danger_detector_handle,
-    )
-    .await
+    let first_exit = workers.select_first_exit().await;
+    workers.finish(first_exit).await
 }
+
+// ── Bootstrap helpers ──────────────────────────────────────────────────
 
 fn batch_submitter_address_from_private_key(private_key: &str) -> Result<Address, RunError> {
     use alloy::signers::local::PrivateKeySigner;
@@ -404,348 +105,220 @@ fn batch_submitter_address_from_private_key(private_key: &str) -> Result<Address
         .address())
 }
 
-fn begin_runtime_shutdown(shutdown: &ShutdownSignal) {
-    shutdown.request_shutdown();
+/// Resolve `(InputReader, L1Config)` from the configured RPC, falling back to
+/// the DB-pinned deployment identity when L1 is unreachable.
+///
+/// On first startup, L1 is required (no cached identity to fall back on). On
+/// subsequent startups, the identity allows the sequencer to start without L1
+/// while refusing to interpret the DB under a different deployment.
+///
+/// The genesis block is available via `input_reader.genesis_block()` on the
+/// returned reader.
+async fn bootstrap_l1_config(
+    config: &RunConfig,
+    db_path: &str,
+    timing: ProtocolTiming,
+    batch_submitter_address: Address,
+    batch_submitter_private_key: String,
+) -> Result<(InputReader, L1Config), RunError> {
+    let input_reader_config = InputReaderConfig {
+        rpc_url: config.eth_rpc_url.clone(),
+        app_address: config.app_address,
+        poll_interval: INPUT_READER_POLL_INTERVAL,
+        long_block_range_error_codes: config.long_block_range_error_codes.clone(),
+    };
+
+    let (input_reader, input_box_address) = match InputReader::new(
+        db_path.to_owned(),
+        input_reader_config.clone(),
+        batch_submitter_address,
+        timing,
+    )
+    .await
+    {
+        Ok(reader) => {
+            let input_box = reader.input_box_address();
+
+            // Validate chain ID early — before any DB identity writes.
+            validate_rpc_chain_id(&config.eth_rpc_url, config.chain_id).await?;
+
+            let expected_identity = DeploymentIdentity {
+                chain_id: config.chain_id,
+                app_address: config.app_address,
+                input_box_address: input_box,
+                input_box_genesis_block: reader.genesis_block(),
+                batch_submitter_address,
+            };
+            ensure_deployment_identity(db_path, expected_identity)?;
+
+            (reader, input_box)
+        }
+        Err(InputReaderError::Provider(e)) => {
+            tracing::error!(
+                error = %e,
+                "L1 unreachable during bootstrap — checking deployment identity"
+            );
+            let cached = cached_deployment_identity(
+                db_path,
+                config.chain_id,
+                config.app_address,
+                batch_submitter_address,
+            )?;
+            let reader = InputReader::from_parts(
+                input_reader_config,
+                cached.input_box_address,
+                cached.input_box_genesis_block,
+                db_path.to_owned(),
+                batch_submitter_address,
+                timing,
+            );
+            (reader, cached.input_box_address)
+        }
+        Err(source) => {
+            // L1 reachable but `InputReader::new` failed for a non-provider
+            // reason — wrap as a startup-time worker source error.
+            return Err(RunError::Worker(WorkerExit::InputReader(
+                InputReaderExit::Source(source),
+            )));
+        }
+    };
+
+    let l1_config = L1Config {
+        eth_rpc_url: config.eth_rpc_url.clone(),
+        input_box_address,
+        app_address: config.app_address,
+        batch_submitter_private_key,
+        batch_submitter_address,
+    };
+    Ok((input_reader, l1_config))
 }
 
-async fn wait_for_clean_shutdown(
-    server_task: tokio::task::JoinHandle<std::io::Result<()>>,
-    inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
-    input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
-    batch_submitter_handle: tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
-    danger_detector_handle: tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>,
+/// Verify that the RPC's `eth_chainId` matches the configured chain id.
+///
+/// Treated as fatal on mismatch *and* on RPC error: pinning a wrong or
+/// unverified chain id into storage would poison subsequent L1-unreachable
+/// boots and issue soft confirmations against the wrong chain. Caller is
+/// expected to retry on `ChainIdRpc`.
+async fn validate_rpc_chain_id(eth_rpc_url: &str, expected: u64) -> Result<(), RunError> {
+    use alloy::providers::Provider;
+    let check_provider = crate::l1::provider::create_provider(eth_rpc_url)
+        .map_err(|e| RunError::Io(std::io::Error::other(e)))?;
+    match check_provider.get_chain_id().await {
+        Ok(rpc_chain_id) if rpc_chain_id != expected => {
+            Err(RunError::Bootstrap(BootstrapError::ChainIdMismatch {
+                rpc: rpc_chain_id,
+                config: expected,
+            }))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(RunError::Bootstrap(BootstrapError::ChainIdRpc {
+            message: e.to_string(),
+        })),
+    }
+}
+
+fn ensure_deployment_identity(db_path: &str, expected: DeploymentIdentity) -> Result<(), RunError> {
+    let mut storage = storage::Storage::open(db_path)?;
+    if let Some(stored) = storage.deployment_identity()? {
+        return require_deployment_identity_match(stored, expected);
+    }
+    if storage.has_persisted_deployment_state()? {
+        return Err(IdentityError::OrphanedState.into());
+    }
+    let stored = storage.load_or_insert_deployment_identity(expected)?;
+    require_deployment_identity_match(stored, expected)
+}
+
+fn cached_deployment_identity(
+    db_path: &str,
+    chain_id: u64,
+    app_address: Address,
+    batch_submitter_address: Address,
+) -> Result<DeploymentIdentity, RunError> {
+    let storage = storage::Storage::open(db_path)?;
+    let Some(stored) = storage.deployment_identity()? else {
+        return Err(IdentityError::FirstBootRequiresL1.into());
+    };
+    let expected = DeploymentIdentity {
+        chain_id,
+        app_address,
+        input_box_address: stored.input_box_address,
+        input_box_genesis_block: stored.input_box_genesis_block,
+        batch_submitter_address,
+    };
+    require_deployment_identity_match(stored, expected)?;
+    Ok(stored)
+}
+
+fn require_deployment_identity_match(
+    stored: DeploymentIdentity,
+    expected: DeploymentIdentity,
 ) -> Result<(), RunError> {
-    wait_for_server_shutdown(server_task).await?;
-    wait_for_lane_shutdown(inclusion_lane_handle).await?;
-    wait_for_input_reader_shutdown(input_reader_handle).await?;
-    wait_for_batch_submitter_shutdown(batch_submitter_handle).await?;
-    wait_for_danger_detector_shutdown(danger_detector_handle).await?;
-    Ok(())
-}
-
-async fn finish_runtime(
-    first_exit: FirstExit,
-    server_task: tokio::task::JoinHandle<std::io::Result<()>>,
-    inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
-    input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
-    batch_submitter_handle: tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
-    danger_detector_handle: tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>,
-) -> Result<(), RunError> {
-    match first_exit {
-        FirstExit::Signal(signal_error) => {
-            let shutdown_result = wait_for_clean_shutdown(
-                server_task,
-                inclusion_lane_handle,
-                input_reader_handle,
-                batch_submitter_handle,
-                danger_detector_handle,
-            )
-            .await;
-            match (signal_error, shutdown_result) {
-                (Some(err), _) => Err(err),
-                (None, Ok(())) => Ok(()),
-                (None, Err(err)) => Err(err),
-            }
-        }
-        FirstExit::Server(primary) => {
-            log_cleanup_result(
-                "inclusion lane",
-                wait_for_lane_shutdown(inclusion_lane_handle).await,
-            );
-            log_cleanup_result(
-                "input reader",
-                wait_for_input_reader_shutdown(input_reader_handle).await,
-            );
-            log_cleanup_result(
-                "batch submitter",
-                wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
-            );
-            log_cleanup_result(
-                "danger detector",
-                wait_for_danger_detector_shutdown(danger_detector_handle).await,
-            );
-            Err(primary)
-        }
-        FirstExit::InclusionLane(primary) => {
-            log_cleanup_result("server", wait_for_server_shutdown(server_task).await);
-            log_cleanup_result(
-                "input reader",
-                wait_for_input_reader_shutdown(input_reader_handle).await,
-            );
-            log_cleanup_result(
-                "batch submitter",
-                wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
-            );
-            log_cleanup_result(
-                "danger detector",
-                wait_for_danger_detector_shutdown(danger_detector_handle).await,
-            );
-            Err(primary)
-        }
-        FirstExit::InputReader(primary) => {
-            log_cleanup_result("server", wait_for_server_shutdown(server_task).await);
-            log_cleanup_result(
-                "inclusion lane",
-                wait_for_lane_shutdown(inclusion_lane_handle).await,
-            );
-            log_cleanup_result(
-                "batch submitter",
-                wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
-            );
-            log_cleanup_result(
-                "danger detector",
-                wait_for_danger_detector_shutdown(danger_detector_handle).await,
-            );
-            Err(primary)
-        }
-        FirstExit::BatchSubmitter(primary) => {
-            log_cleanup_result("server", wait_for_server_shutdown(server_task).await);
-            log_cleanup_result(
-                "inclusion lane",
-                wait_for_lane_shutdown(inclusion_lane_handle).await,
-            );
-            log_cleanup_result(
-                "input reader",
-                wait_for_input_reader_shutdown(input_reader_handle).await,
-            );
-            log_cleanup_result(
-                "danger detector",
-                wait_for_danger_detector_shutdown(danger_detector_handle).await,
-            );
-            Err(primary)
-        }
-        FirstExit::DangerDetector(primary) => {
-            log_cleanup_result("server", wait_for_server_shutdown(server_task).await);
-            log_cleanup_result(
-                "inclusion lane",
-                wait_for_lane_shutdown(inclusion_lane_handle).await,
-            );
-            log_cleanup_result(
-                "input reader",
-                wait_for_input_reader_shutdown(input_reader_handle).await,
-            );
-            log_cleanup_result(
-                "batch submitter",
-                wait_for_batch_submitter_shutdown(batch_submitter_handle).await,
-            );
-            Err(primary)
-        }
+    let fields = deployment_identity_mismatch_fields(stored, expected);
+    if fields.is_empty() {
+        return Ok(());
     }
-}
-
-async fn wait_for_server_shutdown(
-    server_task: tokio::task::JoinHandle<std::io::Result<()>>,
-) -> Result<(), RunError> {
-    match server_task.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(RunError::Io(source)),
-        Err(source) => Err(RunError::ServerJoin { source }),
+    Err(IdentityError::Mismatch {
+        fields: fields.join(", "),
+        stored: Box::new(stored),
+        expected: Box::new(expected),
     }
+    .into())
 }
 
-async fn wait_for_lane_shutdown(
-    inclusion_lane_handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
-) -> Result<(), RunError> {
-    match inclusion_lane_handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(RunError::InclusionLane { source }),
-        Err(source) => Err(RunError::InclusionLaneJoin { source }),
+fn deployment_identity_mismatch_fields(
+    stored: DeploymentIdentity,
+    expected: DeploymentIdentity,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if stored.chain_id != expected.chain_id {
+        fields.push("chain_id");
     }
-}
-
-async fn wait_for_input_reader_shutdown(
-    input_reader_handle: tokio::task::JoinHandle<Result<(), InputReaderError>>,
-) -> Result<(), RunError> {
-    match input_reader_handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(RunError::InputReader { source }),
-        Err(source) => Err(RunError::InputReaderJoin { source }),
+    if stored.app_address != expected.app_address {
+        fields.push("app_address");
     }
-}
-
-async fn wait_for_batch_submitter_shutdown(
-    batch_submitter_handle: tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
-) -> Result<(), RunError> {
-    match batch_submitter_handle.await {
-        Ok(Ok(SubmitterExit::Shutdown)) => Ok(()),
-        Ok(Err(source)) => Err(RunError::BatchSubmitter { source }),
-        Err(source) => Err(RunError::BatchSubmitterJoin { source }),
+    if stored.input_box_address != expected.input_box_address {
+        fields.push("input_box_address");
     }
-}
-
-async fn wait_for_danger_detector_shutdown(
-    danger_detector_handle: tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>,
-) -> Result<(), RunError> {
-    match danger_detector_handle.await {
-        Ok(Ok(DetectorExit::Shutdown)) => Ok(()),
-        Ok(Ok(DetectorExit::RecoveryRequired { status })) => {
-            Err(RunError::DangerDetected { status })
-        }
-        Ok(Err(source)) => Err(RunError::DangerDetector { source }),
-        Err(source) => Err(RunError::DangerDetectorJoin { source }),
+    if stored.input_box_genesis_block != expected.input_box_genesis_block {
+        fields.push("input_box_genesis_block");
     }
-}
-
-fn map_server_exit(result: Result<std::io::Result<()>, tokio::task::JoinError>) -> RunError {
-    match result {
-        Ok(Ok(())) => RunError::ServerStoppedUnexpectedly,
-        Ok(Err(source)) => RunError::Io(source),
-        Err(source) => RunError::ServerJoin { source },
+    if stored.batch_submitter_address != expected.batch_submitter_address {
+        fields.push("batch_submitter_address");
     }
-}
-
-fn map_lane_exit(
-    result: Result<Result<(), InclusionLaneError>, tokio::task::JoinError>,
-) -> RunError {
-    match result {
-        Ok(Ok(())) => RunError::InclusionLaneStoppedUnexpectedly,
-        Ok(Err(source)) => RunError::InclusionLane { source },
-        Err(source) => RunError::InclusionLaneJoin { source },
-    }
-}
-
-fn default_l1_read_stale_after_blocks(max_wait_blocks: u64, preemptive_margin_blocks: u64) -> u64 {
-    let danger_threshold = max_wait_blocks.saturating_sub(preemptive_margin_blocks);
-    danger_threshold
-        .saturating_sub(preemptive_margin_blocks)
-        .max(1)
-}
-
-fn map_input_reader_exit(
-    result: Result<Result<(), InputReaderError>, tokio::task::JoinError>,
-) -> RunError {
-    match result {
-        Ok(Ok(())) => RunError::InputReaderStoppedUnexpectedly,
-        Ok(Err(source)) => RunError::InputReader { source },
-        Err(source) => RunError::InputReaderJoin { source },
-    }
-}
-
-fn map_batch_submitter_exit(
-    result: Result<Result<SubmitterExit, BatchSubmitterError>, tokio::task::JoinError>,
-) -> RunError {
-    match result {
-        Ok(Ok(SubmitterExit::Shutdown)) => RunError::BatchSubmitterStoppedUnexpectedly,
-        Ok(Err(source)) => RunError::BatchSubmitter { source },
-        Err(source) => RunError::BatchSubmitterJoin { source },
-    }
-}
-
-fn map_danger_detector_exit(
-    result: Result<Result<DetectorExit, DangerDetectorError>, tokio::task::JoinError>,
-) -> RunError {
-    match result {
-        Ok(Ok(DetectorExit::Shutdown)) => {
-            // Shouldn't happen — detector Shutdown means its own shutdown signal
-            // fired, which only happens after someone else triggered
-            // runtime-wide shutdown. Treat this as a real exit only if nothing
-            // else did first.
-            RunError::DangerDetectorStoppedUnexpectedly
-        }
-        Ok(Ok(DetectorExit::RecoveryRequired { status })) => RunError::DangerDetected { status },
-        Ok(Err(source)) => RunError::DangerDetector { source },
-        Err(source) => RunError::DangerDetectorJoin { source },
-    }
-}
-
-fn log_cleanup_result(component: &str, result: Result<(), RunError>) {
-    if let Err(err) = result {
-        warn!(component, error = %err, "component shutdown after primary failure also errored");
-    }
-}
-
-fn build_batch_submitter_provider(
-    l1: &L1Config,
-) -> Result<alloy::providers::DynProvider, std::io::Error> {
-    crate::l1::provider::create_signer_provider(&l1.eth_rpc_url, &l1.batch_submitter_private_key)
-        .map_err(std::io::Error::other)
+    fields
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RunError, batch_submitter_address_from_private_key, map_danger_detector_exit};
-    use crate::recovery::{DangerDetectorError, DetectorExit, RecoveryError, RefuseReason};
-    use crate::storage::DangerStatus;
-    use sequencer_core::MAX_WAIT_BLOCKS;
-    use sequencer_core::protocol::{ProtocolConfig, ProtocolConfigError};
+    use super::{
+        BootstrapError, IdentityError, RunError, batch_submitter_address_from_private_key,
+        deployment_identity_mismatch_fields, ensure_deployment_identity,
+        require_deployment_identity_match,
+    };
+    use crate::recovery::{RecoveryError, RefuseReason};
+    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
+    use crate::storage::{DeploymentIdentity, Storage};
+    use alloy_primitives::Address;
+    use sequencer_core::protocol::ProtocolTimingError;
 
-    fn try_protocol_with_margin(
-        preemptive_margin_blocks: u64,
-    ) -> Result<ProtocolConfig, ProtocolConfigError> {
-        ProtocolConfig::try_new(
-            alloy_primitives::Address::ZERO,
-            MAX_WAIT_BLOCKS,
-            preemptive_margin_blocks,
-            super::default_l1_read_stale_after_blocks(MAX_WAIT_BLOCKS, preemptive_margin_blocks),
-            12,
-        )
-    }
-
-    // ── preemptive_margin_blocks validation ────────────────────
-
-    #[test]
-    fn margin_equal_to_max_wait_is_rejected() {
-        assert!(matches!(
-            try_protocol_with_margin(MAX_WAIT_BLOCKS),
-            Err(ProtocolConfigError::MarginNotLessThanMaxWait { .. })
-        ));
-    }
-
-    #[test]
-    fn margin_greater_than_max_wait_is_rejected() {
-        assert!(matches!(
-            try_protocol_with_margin(MAX_WAIT_BLOCKS + 1),
-            Err(ProtocolConfigError::MarginNotLessThanMaxWait { .. })
-        ));
-    }
-
-    #[test]
-    fn margin_one_below_max_wait_yields_threshold_one() {
-        let cfg = try_protocol_with_margin(MAX_WAIT_BLOCKS - 1).expect("valid margin");
-        assert_eq!(cfg.danger_threshold(), 1);
-    }
-
-    #[test]
-    fn zero_margin_yields_full_wait_window() {
-        let cfg = try_protocol_with_margin(0).expect("zero margin valid");
-        assert_eq!(cfg.danger_threshold(), MAX_WAIT_BLOCKS);
-    }
-
-    #[test]
-    fn default_margin_matches_production_setting() {
-        // Default is 300 per `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (~1h at 12s/block).
-        let cfg = try_protocol_with_margin(300).expect("default margin valid");
-        assert_eq!(cfg.danger_threshold(), MAX_WAIT_BLOCKS - 300);
-        assert_eq!(cfg.l1_read_stale_after_blocks, MAX_WAIT_BLOCKS - 600);
-    }
-
-    #[test]
-    fn explicit_l1_read_stale_after_past_danger_is_rejected() {
-        let err = ProtocolConfig::try_new(
-            alloy_primitives::Address::ZERO,
-            MAX_WAIT_BLOCKS,
-            300,
-            MAX_WAIT_BLOCKS,
-            12,
-        )
-        .expect_err("read stale threshold after danger must be rejected");
-        assert!(matches!(
-            err,
-            ProtocolConfigError::ReadStaleAfterPastDanger { .. }
-        ));
-    }
+    // Margin/stale-boundary validation is exercised directly in
+    // `sequencer-core/src/protocol.rs`. The runtime tests below only cover
+    // the typed `From` conversions into `RunError` and the bootstrap-time
+    // identity guards. Worker `From<JoinResult>` conversions live in
+    // `runtime/workers.rs`.
 
     #[test]
     fn invalid_protocol_config_propagates_through_run_error() {
-        // Sanity: the typed `From<ProtocolConfigError>` conversion plugged
-        // into `RunError` produces the expected variant (so the early-return
-        // in `run()` actually surfaces a structured error).
-        let err: RunError = ProtocolConfigError::MarginNotLessThanMaxWait {
+        let err: RunError = ProtocolTimingError::MarginNotLessThanMaxWait {
             margin: 1200,
             max_wait: 1200,
         }
         .into();
-        assert!(matches!(err, RunError::InvalidProtocolConfig(_)));
+        assert!(matches!(
+            err,
+            RunError::Bootstrap(BootstrapError::InvalidProtocolTiming(_))
+        ));
     }
 
     #[test]
@@ -753,9 +326,66 @@ mod tests {
         let err: RunError = RecoveryError::Refuse(RefuseReason::L1ViewStale).into();
         assert!(matches!(
             err,
-            RunError::Recovery {
-                source: RecoveryError::Refuse(RefuseReason::L1ViewStale)
-            }
+            RunError::Bootstrap(BootstrapError::Recovery(RecoveryError::Refuse(
+                RefuseReason::L1ViewStale
+            )))
+        ));
+    }
+
+    fn identity() -> DeploymentIdentity {
+        DeploymentIdentity {
+            chain_id: 31337,
+            app_address: Address::repeat_byte(0x11),
+            input_box_address: Address::repeat_byte(0x22),
+            input_box_genesis_block: 42,
+            batch_submitter_address: Address::repeat_byte(0x33),
+        }
+    }
+
+    #[test]
+    fn deployment_identity_match_accepts_same_identity() {
+        let identity = identity();
+        require_deployment_identity_match(identity, identity).expect("same identity should match");
+    }
+
+    #[test]
+    fn deployment_identity_mismatch_reports_changed_fields() {
+        let stored = identity();
+        let expected = DeploymentIdentity {
+            chain_id: 31338,
+            app_address: Address::repeat_byte(0x44),
+            batch_submitter_address: Address::repeat_byte(0x55),
+            ..stored
+        };
+
+        assert_eq!(
+            deployment_identity_mismatch_fields(stored, expected),
+            vec!["chain_id", "app_address", "batch_submitter_address"]
+        );
+        let err = require_deployment_identity_match(stored, expected)
+            .expect_err("mismatch should refuse startup");
+        assert!(matches!(
+            err,
+            RunError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch { fields, .. }))
+                if fields == "chain_id, app_address, batch_submitter_address"
+        ));
+    }
+
+    #[test]
+    fn deployment_identity_refuses_non_empty_unpinned_db() {
+        let db = temp_db("runtime-unpinned-deployment-state");
+        {
+            let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+            storage
+                .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+                .expect("seed deployment-bound state");
+        }
+
+        let err = ensure_deployment_identity(db.path.as_str(), identity())
+            .expect_err("non-empty unpinned DB must refuse");
+        assert!(matches!(
+            err,
+            RunError::Bootstrap(BootstrapError::Identity(IdentityError::OrphanedState))
         ));
     }
 
@@ -771,30 +401,5 @@ mod tests {
             !message.contains(secret),
             "private key material must not be reflected in startup errors"
         );
-    }
-
-    #[test]
-    fn danger_detector_shutdown_maps_to_detector_specific_unexpected_exit() {
-        let err = map_danger_detector_exit(Ok(Ok(DetectorExit::Shutdown)));
-        assert!(matches!(err, RunError::DangerDetectorStoppedUnexpectedly));
-    }
-
-    #[test]
-    fn danger_detector_recovery_required_maps_to_deliberate_runtime_exit() {
-        let err = map_danger_detector_exit(Ok(Ok(DetectorExit::RecoveryRequired {
-            status: DangerStatus::ClosedBatchInDanger(7),
-        })));
-        assert!(matches!(
-            err,
-            RunError::DangerDetected {
-                status: DangerStatus::ClosedBatchInDanger(7)
-            }
-        ));
-    }
-
-    #[test]
-    fn danger_detector_errors_preserve_source_category() {
-        let err = map_danger_detector_exit(Ok(Err(DangerDetectorError::Join("boom".into()))));
-        assert!(matches!(err, RunError::DangerDetector { .. }));
     }
 }

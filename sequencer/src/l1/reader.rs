@@ -21,7 +21,7 @@ use tracing::info;
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{Storage, StorageOpenError, StoredSafeInput};
-use sequencer_core::protocol::ProtocolConfig;
+use sequencer_core::protocol::ProtocolTiming;
 
 #[derive(Debug, Clone)]
 pub struct InputReaderConfig {
@@ -51,18 +51,21 @@ pub struct InputReader {
     input_box_address: Address,
     genesis_block: u64,
     db_path: String,
-    shutdown: ShutdownSignal,
-    /// Protocol config used to keep `safe_accepted_batches` consistent with
+    /// Scheduler-acceptance identity — passed into
+    /// [`Storage::append_safe_inputs`] so the persisted scheduler-accepted
+    /// frontier filters by the right sender.
+    batch_submitter: Address,
+    /// Protocol timing used to keep `safe_accepted_batches` consistent with
     /// every `append_safe_inputs` write.
-    protocol: ProtocolConfig,
+    timing: ProtocolTiming,
 }
 
 impl InputReader {
     pub async fn new(
         db_path: impl Into<String>,
-        shutdown: ShutdownSignal,
         config: InputReaderConfig,
-        protocol: ProtocolConfig,
+        batch_submitter: Address,
+        timing: ProtocolTiming,
     ) -> Result<Self, InputReaderError> {
         let provider = crate::l1::provider::create_provider(&config.rpc_url)
             .map_err(InputReaderError::Bootstrap)?;
@@ -92,8 +95,8 @@ impl InputReader {
             input_box_address,
             genesis_block,
             db_path.into(),
-            shutdown,
-            protocol,
+            batch_submitter,
+            timing,
         ))
     }
 
@@ -102,16 +105,16 @@ impl InputReader {
         input_box_address: Address,
         genesis_block: u64,
         db_path: String,
-        shutdown: ShutdownSignal,
-        protocol: ProtocolConfig,
+        batch_submitter: Address,
+        timing: ProtocolTiming,
     ) -> Self {
         Self {
             config,
             input_box_address,
             genesis_block,
             db_path,
-            shutdown,
-            protocol,
+            batch_submitter,
+            timing,
         }
     }
 
@@ -123,9 +126,18 @@ impl InputReader {
         self.genesis_block
     }
 
-    pub fn start(self) -> Result<JoinHandle<Result<(), InputReaderError>>, StorageOpenError> {
+    /// Spawn the worker loop. The `shutdown` signal is what the loop respects;
+    /// passing it at start time (instead of construction time) keeps the
+    /// construction phase pure and ensures the same instance can't accidentally
+    /// be started under two different shutdown signals.
+    pub fn start(
+        self,
+        shutdown: ShutdownSignal,
+    ) -> Result<JoinHandle<Result<(), InputReaderError>>, StorageOpenError> {
         let _ = Storage::open(self.db_path.as_str())?;
-        Ok(tokio::spawn(async move { self.run_forever().await }))
+        Ok(tokio::spawn(
+            async move { self.run_forever(shutdown).await },
+        ))
     }
 
     pub async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
@@ -134,15 +146,27 @@ impl InputReader {
         self.advance_once(&provider).await
     }
 
-    async fn run_forever(mut self) -> Result<(), InputReaderError> {
+    /// Top-level driver. Races the work loop against the shutdown signal.
+    ///
+    /// `biased;` polls the shutdown arm first on every wakeup so a concurrent
+    /// shutdown wins over an in-flight `run_loop` step. Without `biased`,
+    /// `select!` would pick randomly between two ready branches and could
+    /// process one more iteration before shutting down.
+    async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), InputReaderError> {
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for_shutdown() => Ok(()),
+            result = self.run_loop() => result,
+        }
+    }
+
+    /// Tick → sleep → tick. Provider errors are logged and retried; other
+    /// errors propagate. Shutdown is handled by the outer `run_forever`
+    /// select, so this loop has no shutdown concerns.
+    async fn run_loop(mut self) -> Result<(), InputReaderError> {
         let provider = crate::l1::provider::create_provider(&self.config.rpc_url)
             .map_err(InputReaderError::Bootstrap)?;
-
         loop {
-            if self.shutdown.is_shutdown_requested() {
-                return Ok(());
-            }
-
             match self.advance_once(&provider).await {
                 Ok(()) => {}
                 Err(InputReaderError::Provider(error)) => {
@@ -150,11 +174,7 @@ impl InputReader {
                 }
                 Err(err) => return Err(err),
             }
-
-            tokio::select! {
-                _ = self.shutdown.wait_for_shutdown() => return Ok(()),
-                _ = tokio::time::sleep(self.config.poll_interval) => {}
-            }
+            tokio::time::sleep(self.config.poll_interval).await;
         }
     }
 
@@ -246,7 +266,8 @@ impl InputReader {
         batch: Vec<StoredSafeInput>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
-        let protocol = self.protocol;
+        let batch_submitter = self.batch_submitter;
+        let timing = self.timing;
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path)?;
             storage
@@ -254,7 +275,8 @@ impl InputReader {
                     current_safe_head.block_number,
                     current_safe_head.block_timestamp,
                     &batch,
-                    &protocol,
+                    batch_submitter,
+                    &timing,
                 )
                 .map_err(InputReaderError::from)
         })
@@ -314,9 +336,8 @@ mod tests {
     use alloy::sol_types::SolCall;
     use tempfile::NamedTempFile;
 
-    fn test_protocol() -> ProtocolConfig {
-        ProtocolConfig {
-            batch_submitter: Address::ZERO,
+    fn test_timing() -> ProtocolTiming {
+        ProtocolTiming {
             max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
             preemptive_margin_blocks: 75,
             l1_read_stale_after_blocks: 900,
@@ -329,7 +350,6 @@ mod tests {
         rpc_url: String,
         genesis_block: u64,
         poll_interval: Duration,
-        shutdown: ShutdownSignal,
     ) -> InputReader {
         InputReader::from_parts(
             InputReaderConfig {
@@ -341,8 +361,8 @@ mod tests {
             Address::ZERO,
             genesis_block,
             db_path,
-            shutdown,
-            test_protocol(),
+            Address::ZERO,
+            test_timing(),
         )
     }
 
@@ -368,9 +388,8 @@ mod tests {
             "http://127.0.0.1:0".to_string(),
             0,
             Duration::from_millis(20),
-            shutdown.clone(),
         );
-        let handle = reader.start().expect("start input reader");
+        let handle = reader.start(shutdown.clone()).expect("start input reader");
 
         shutdown.request_shutdown();
         let join_result = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -394,9 +413,8 @@ mod tests {
             anvil.endpoint_url().to_string(),
             0,
             Duration::from_millis(50),
-            shutdown.clone(),
         );
-        let handle = reader.start().expect("start input reader");
+        let handle = reader.start(shutdown.clone()).expect("start input reader");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         shutdown.request_shutdown();
@@ -421,7 +439,6 @@ mod tests {
             anvil.endpoint_url().to_string(),
             0,
             Duration::from_secs(1),
-            ShutdownSignal::default(),
         );
         let provider = alloy::providers::ProviderBuilder::new()
             .connect(anvil.endpoint_url().to_string().as_str())
@@ -451,7 +468,6 @@ mod tests {
             "http://127.0.0.1:0".to_string(),
             genesis_block,
             Duration::from_secs(1),
-            ShutdownSignal::default(),
         );
 
         let safe_block = reader.current_safe_block().await.expect("read safe block");
@@ -467,7 +483,6 @@ mod tests {
             "http://127.0.0.1:0".to_string(),
             genesis_block,
             Duration::from_secs(1),
-            ShutdownSignal::default(),
         );
 
         let result = reader.sync_to_current_safe_head().await;
@@ -489,14 +504,14 @@ mod tests {
 
         let result = InputReader::new(
             db_file.path().to_string_lossy().into_owned(),
-            ShutdownSignal::default(),
             InputReaderConfig {
                 rpc_url: "not-a-valid-url".to_string(),
                 app_address: Address::ZERO,
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: Vec::new(),
             },
-            test_protocol(),
+            Address::ZERO,
+            test_timing(),
         )
         .await;
 
@@ -515,9 +530,9 @@ mod tests {
         let db_file = NamedTempFile::new().expect("temp file");
         let db_path = db_file.path().to_string_lossy().into_owned();
         let mut storage = Storage::open(&db_path).expect("open storage");
-        let protocol = test_protocol();
+        let timing = test_timing();
         storage
-            .append_safe_inputs(1000, &[], &protocol)
+            .append_safe_inputs(1000, &[], Address::ZERO, &timing)
             .expect("set safe head ahead of chain");
         let recorded_sync = storage
             .last_safe_progress_ms()
@@ -530,7 +545,6 @@ mod tests {
             anvil.endpoint_url().to_string(),
             0,
             Duration::from_secs(1),
-            ShutdownSignal::default(),
         );
         let provider = alloy::providers::ProviderBuilder::new()
             .connect(anvil.endpoint_url().to_string().as_str())

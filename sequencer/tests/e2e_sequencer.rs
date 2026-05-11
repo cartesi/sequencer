@@ -1241,8 +1241,8 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
         .append_safe_inputs(
             1,
             &safe_inputs,
-            &sequencer_core::protocol::ProtocolConfig {
-                batch_submitter: Address::ZERO,
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
                 l1_read_stale_after_blocks: 900,
@@ -1292,8 +1292,8 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 payload,
                 block_number: safe_block,
             }],
-            &sequencer_core::protocol::ProtocolConfig {
-                batch_submitter: Address::ZERO,
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
                 l1_read_stale_after_blocks: 900,

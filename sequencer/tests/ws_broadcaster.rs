@@ -339,8 +339,8 @@ fn seed_ordered_txs(db_path: &str) {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            &sequencer_core::protocol::ProtocolConfig {
-                batch_submitter: Address::ZERO,
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
                 l1_read_stale_after_blocks: 900,
@@ -375,8 +375,8 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
                 payload,
                 block_number: safe_block,
             }],
-            &sequencer_core::protocol::ProtocolConfig {
-                batch_submitter: Address::ZERO,
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
                 l1_read_stale_after_blocks: 900,

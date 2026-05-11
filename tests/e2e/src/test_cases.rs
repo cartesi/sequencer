@@ -282,9 +282,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
             },
         ),
         (
-            "first_boot_no_cache_l1_unreachable_refuses_boot_test",
+            "first_boot_no_identity_l1_unreachable_refuses_boot_test",
             |runtime| {
-                Box::pin(run_first_boot_no_cache_l1_unreachable_refuses_boot_test(
+                Box::pin(run_first_boot_no_identity_l1_unreachable_refuses_boot_test(
                     runtime,
                 ))
             },
@@ -2269,20 +2269,20 @@ async fn run_provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recover
 // respects it end-to-end.
 //
 // How we reach the condition: the harness's `spawn()` does a successful
-// first boot (needs L1 reachable to deploy contracts and bootstrap the
-// chain-id/InputBox cache). We stop, rewrite the recorded L1 safe-head
-// observation to unknown, then respawn with the proxy disconnected. The
-// bootstrap cache is still populated — so the sequencer gets past the
-// contract-discovery phase — but `check_danger` sees the missing safe-head
-// row and `decide_startup_action` returns `Refuse(L1ViewStale)`.
+// first boot (needs L1 reachable to deploy contracts and pin the deployment
+// identity). We stop, rewrite the recorded L1 safe-head observation to
+// unknown, then respawn with the proxy disconnected. The deployment identity
+// is still populated — so the sequencer gets past the contract-discovery
+// phase — but `check_danger` sees the missing safe-head row and
+// `decide_startup_action` returns `Refuse(L1ViewStale)`.
 //
 // Scope note: a "truly" first-ever boot would fail even earlier (no
-// bootstrap cache, can't discover contracts). That's a separate test; this
+// deployment identity, can't discover contracts). That's a separate test; this
 // one targets only the L1-view freshness branch.
 async fn run_first_boot_l1_unreachable_never_synced_refuses_boot_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    // Baseline boot so the bootstrap cache lands on disk.
+    // Baseline boot so the deployment identity lands on disk.
     {
         let _ws = runtime.ws(0).await?;
     }
@@ -2781,7 +2781,7 @@ async fn run_ws_subscribe_from_future_offset_waits_silently_test(
 // Safe direct input that was NOT yet drained before the cascade
 // must be drained into the recovery batch's first frame.
 //
-// Distinct from  (`recovery_after_stale_batches_test`), where the
+// Distinct from `recovery_after_stale_batches_test`, where the
 // direct input was drained into an invalidated batch and gets *re*-drained
 // on recovery. Here we exercise the simpler case: the input hit the
 // sequencer's view post-stop, so it was never referenced by any frame;
@@ -3001,8 +3001,8 @@ async fn run_replay_matches_live_for_mixed_workload_test(
 // retry on provider errors (connection refused, timeout) without
 // crashing, and pick up the backlog on reconnect.
 //
-// Distinct from  (short hiccup under load), which tests the batch
-// submitter's retry path via POST activity. Here the interesting
+// Distinct from `provider_outage_short_hiccup_no_recovery_test`, which tests
+// the batch submitter's retry path via POST activity. Here the interesting
 // component is the **input reader**: its only job is polling L1 for new
 // events, so the only observable signal that its retry loop works is
 // whether a deposit made *during the disconnect* (and thus invisible
@@ -3091,31 +3091,32 @@ async fn run_provider_outage_input_reader_retries_after_reconnect_test(
     Ok(())
 }
 
-// First-ever boot with empty bootstrap cache + L1 unreachable
-// returns a fixed `RunError::Io("L1 unreachable and no bootstrap cache")`.
+// First-ever boot with no deployment identity + L1 unreachable refuses before
+// recovery logic runs.
 //
-// Distinct from  (already covered): that test exercises the
-// wall-clock fallback inside `run_preemptive_recovery`, which only fires
-// AFTER bootstrap discovery has succeeded once (so the cache is
-// populated).  targets the EARLIER failure — the
+// Distinct from `run_first_boot_l1_unreachable_never_synced_refuses_boot_test`
+// (already covered): that test exercises the wall-clock fallback inside
+// `run_preemptive_recovery`, which only fires AFTER bootstrap discovery has
+// succeeded once (so the deployment identity is pinned). This test targets
+// the earlier failure: the
 // `InputReader::new` discovery step where the sequencer asks L1 for the
-// InputBox address + chain id. With nothing cached, that call has no
+// InputBox address. With no deployment identity, that call has no
 // fallback and the boot fails before recovery logic runs.
 //
-// The harness simulates "no cache" by `clear_l1_bootstrap_cache()` after
+// The harness simulates "no deployment identity" by `reset_database()` after
 // a normal boot has populated it (truly first-ever boot would also lack
-// a chain-id cache, but the failure mode is identical: the bootstrap
+// a pinned identity, but the failure mode is identical: the bootstrap
 // step has nothing to fall back to).
-async fn run_first_boot_no_cache_l1_unreachable_refuses_boot_test(
+async fn run_first_boot_no_identity_l1_unreachable_refuses_boot_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     // Baseline boot to ensure the schema is fully migrated. We then
-    // clear the cache to mimic a first-ever boot.
+    // reset the DB to mimic a first-ever boot.
     {
         let _ws = runtime.ws(0).await?;
     }
     runtime.stop().await?;
-    runtime.clear_l1_bootstrap_cache()?;
+    runtime.reset_database()?;
 
     // Route through a disconnected proxy so InputReader::new fails with
     // a provider error.
@@ -3126,11 +3127,11 @@ async fn run_first_boot_no_cache_l1_unreachable_refuses_boot_test(
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
-        "first boot with no cache + L1 unreachable must refuse boot, got {respawn_result:?}",
+        "first boot with no deployment identity + L1 unreachable must refuse boot, got {respawn_result:?}",
     );
 
     // Verify reversibility: reconnect proxy, respawn, this time the
-    // bootstrap step succeeds and populates the cache.
+    // bootstrap step succeeds and pins the deployment identity.
     proxy.reconnect();
     runtime.respawn().await?;
 
@@ -3140,21 +3141,19 @@ async fn run_first_boot_no_cache_l1_unreachable_refuses_boot_test(
 
 // Chain-id mismatch via the live RPC path.
 //
-// Companion to `chain_id_mismatch_from_cache_returns_typed_error` in
-// `sequencer/tests/chain_id_validation.rs`. The cache-path test runs
-// in-process against a stub; this test runs the full sequencer binary
-// against real Anvil with a deliberately mismatched `--chain-id`,
-// proving the RPC-comparison path returns
-// `RunError::ChainIdMismatch` *before* writing the wrong-chain
-// bootstrap cache.
+// Companion to `chain_id_mismatch_from_deployment_identity_returns_typed_error`
+// in `sequencer/tests/chain_id_validation.rs`. The identity-fallback test runs
+// in-process against a pre-seeded DB; this test runs the full sequencer binary
+// against real Anvil with a deliberately mismatched `--chain-id`, proving the
+// RPC-comparison path refuses before pinning a wrong deployment identity.
 //
 // The pre-write ordering matters: a regression that swapped the
-// cache-write and the chain-id check would leave a bad cache row on
+// identity-write and the chain-id check would leave a bad identity row on
 // disk, poisoning future startups. Asserting `respawn_result.is_err()`
 // alone catches the bad-error case; we additionally verify a
-// post-correction respawn succeeds, which only happens if the cache
-// wasn't poisoned (bootstrap reads the L1 chain-id again, sees it
-// matches, writes the correct cache).
+// post-correction respawn succeeds, which only happens if identity pinning
+// wasn't poisoned (bootstrap checks the L1 chain id again, sees it matches,
+// then writes the correct deployment identity).
 async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
@@ -3162,16 +3161,16 @@ async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
     // different that's still valid (chain_id > 0).
     const WRONG_CHAIN_ID: u64 = 99_999;
 
-    // Initial boot completes normally (no override). This populates the
-    // cache with the correct chain id.
+    // Initial boot completes normally (no override). This pins the correct
+    // deployment identity.
     {
         let _ws = runtime.ws(0).await?;
     }
     runtime.stop().await?;
 
-    // Clear the cache so the live RPC path runs (otherwise the cache
+    // Reset the DB so the live RPC path runs (otherwise the identity-fallback
     // path would catch the mismatch first).
-    runtime.clear_l1_bootstrap_cache()?;
+    runtime.reset_database()?;
 
     // Configure a mismatched chain id and respawn. The bootstrap-time
     // RPC check returns the actual chain id (31337), compares it with
@@ -3194,14 +3193,16 @@ async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
 // Nonce-0 first batch recovery edge.
 //
 // Two coupled invariants:
-//   - : If the FIRST-EVER batch (nonce 0) goes stale before any
+//   - Cascade from no valid ancestor: if the first-ever batch (nonce 0)
+//     goes stale before any
 //     batch reaches `Gold` (i.e., before any batch is L1-accepted),
 //     recovery cascades it and opens a fresh recovery batch that itself
 //     has nonce 0 (parent NULL — there's no valid ancestor to point
 //     at). No genesis sentinel exists in the implementation; the
 //     parent-pointer schema must handle "all batches invalidated"
 //     natively.
-//   - : After , the recovery batch (with nonce 0 reused)
+//   - Reused nonce acceptance: after recovery, the recovery batch (with
+//     nonce 0 reused)
 //     submits to L1, gets accepted by `populate_safe_accepted_batches`,
 //     and lands in `safe_accepted_batches` — proving the scheduler-
 //     simulation cursor handles a reused nonce after cascade correctly.

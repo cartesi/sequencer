@@ -102,17 +102,6 @@ impl MempoolFlusher {
         }
     }
 
-    #[cfg(test)]
-    fn with_timeouts(
-        mut self,
-        confirmation_timeout: Duration,
-        safe_poll_interval: Duration,
-    ) -> Self {
-        self.confirmation_timeout = confirmation_timeout;
-        self.safe_poll_interval = safe_poll_interval;
-        self
-    }
-
     /// Flush the mempool by submitting no-op transactions for pending nonce
     /// slots, then waiting until every slot is safe.
     ///
@@ -271,6 +260,19 @@ impl MempoolFlusher {
             .block_id(block.into())
             .await
             .map_err(|e| FlushError::Provider(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+impl MempoolFlusher {
+    fn with_timeouts(
+        mut self,
+        confirmation_timeout: Duration,
+        safe_poll_interval: Duration,
+    ) -> Self {
+        self.confirmation_timeout = confirmation_timeout;
+        self.safe_poll_interval = safe_poll_interval;
+        self
     }
 }
 

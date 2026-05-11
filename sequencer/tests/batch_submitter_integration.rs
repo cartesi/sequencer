@@ -13,7 +13,7 @@ use sequencer::l1::submitter::{BatchSubmitter, BatchSubmitterConfig};
 use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
-use sequencer_core::protocol::ProtocolConfig;
+use sequencer_core::protocol::ProtocolTiming;
 
 mod common;
 use common::{TestDb, temp_db};
@@ -112,16 +112,10 @@ impl BatchPoster for TestMock {
 /// this, the submitter's first tick errors out on `current_safe_block_required`
 /// and the loop exits before submitting anything.
 fn seed_observed_safe_head(storage: &mut Storage) {
-    let protocol = ProtocolConfig::try_new(
-        alloy_primitives::Address::ZERO,
-        sequencer_core::MAX_WAIT_BLOCKS,
-        75,
-        900,
-        12,
-    )
-    .expect("default test protocol");
+    let timing =
+        ProtocolTiming::try_new(sequencer_core::MAX_WAIT_BLOCKS, 75, 900, 12).expect("test timing");
     storage
-        .append_safe_inputs(0, &[], &protocol)
+        .append_safe_inputs(0, &[], alloy_primitives::Address::ZERO, &timing)
         .expect("seed observed safe head");
 }
 
@@ -180,8 +174,10 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
     let config = BatchSubmitterConfig {
         idle_poll_interval_ms: 5000,
     };
-    let submitter = BatchSubmitter::new(path, mock.clone(), shutdown.clone(), config);
-    let handle = submitter.start().expect("start batch submitter");
+    let submitter = BatchSubmitter::new(path, mock.clone(), config);
+    let handle = submitter
+        .start(shutdown.clone())
+        .expect("start batch submitter");
 
     // Allow at least one tick to run (worker may submit batch 1 and 2 in one tick).
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -234,8 +230,10 @@ async fn submitter_re_enters_immediately_after_productive_tick() {
         // immediate-retry cadence regressed to always-sleep.
         idle_poll_interval_ms: 10_000,
     };
-    let submitter = BatchSubmitter::new(path.clone(), mock.clone(), shutdown.clone(), config);
-    let handle = submitter.start().expect("start batch submitter");
+    let submitter = BatchSubmitter::new(path.clone(), mock.clone(), config);
+    let handle = submitter
+        .start(shutdown.clone())
+        .expect("start batch submitter");
 
     // Let tick 1 enter `submit_batches` (which is now blocking on the delay),
     // then close the Tip so batch 1 is eligible by the time tick 2 runs.
@@ -287,8 +285,10 @@ async fn submitter_recovers_from_transient_poster_error_without_exiting() {
         // would delay the single submission past the assertion.
         idle_poll_interval_ms: 50,
     };
-    let submitter = BatchSubmitter::new(path.clone(), mock.clone(), shutdown.clone(), config);
-    let handle = submitter.start().expect("start batch submitter");
+    let submitter = BatchSubmitter::new(path.clone(), mock.clone(), config);
+    let handle = submitter
+        .start(shutdown.clone())
+        .expect("start batch submitter");
 
     tokio::time::sleep(Duration::from_millis(250)).await;
 

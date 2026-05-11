@@ -186,13 +186,12 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{
-        SENDER_A, SENDER_B, protocol_config_for, seed_closed_batches,
-        seed_safe_inputs_with_batch_nonces, temp_db,
+        SENDER_A, SENDER_B, seed_closed_batches, seed_safe_inputs_with_batch_nonces, temp_db,
     };
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use alloy_primitives::Address;
     use sequencer_core::batch::{Batch, Frame as BatchFrame};
-    use sequencer_core::protocol::ProtocolConfig;
+    use sequencer_core::protocol::ProtocolTiming;
 
     #[test]
     fn pending_batches_stamps_authoritative_nonce_into_wire_bytes() {
@@ -337,7 +336,7 @@ mod tests {
         let db = temp_db("submitter-frontier-empty");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage
-            .append_safe_inputs(0, &[], &default_test_protocol())
+            .append_safe_inputs(0, &[], SENDER_A, &default_test_protocol())
             .expect("record observed safe head");
         let frontier = storage.submitter_frontier().expect("submitter frontier");
         assert_eq!(frontier.safe_block, 0);
@@ -357,9 +356,8 @@ mod tests {
         assert_eq!(frontier.accepted_next_nonce, 2);
     }
 
-    fn default_test_protocol() -> ProtocolConfig {
-        ProtocolConfig {
-            batch_submitter: SENDER_A,
+    fn default_test_protocol() -> ProtocolTiming {
+        ProtocolTiming {
             max_wait_blocks: 1200,
             preemptive_margin_blocks: 75,
             l1_read_stale_after_blocks: 900,
@@ -404,6 +402,7 @@ mod tests {
                     }),
                     block_number: 20,
                 }],
+                SENDER_A,
                 &protocol,
             )
             .expect("append accepted batch 0");
@@ -449,6 +448,7 @@ mod tests {
                     }),
                     block_number: 200,
                 }],
+                SENDER_A,
                 &protocol,
             )
             .expect("append accepted batch 0");
@@ -491,7 +491,7 @@ mod tests {
         // current=1200 - first_frame=10 = 1190 >= 1125.
         // No safe_input ingested for batch 0, so it stays non-gold.
         storage
-            .append_safe_inputs(1200, &[], &protocol)
+            .append_safe_inputs(1200, &[], SENDER_A, &protocol)
             .expect("advance safe head past observed danger threshold");
 
         // Pretend safe-progress was recorded 25 blocks' worth of wall-clock
@@ -546,6 +546,7 @@ mod tests {
                     }),
                     block_number: 20,
                 }],
+                SENDER_A,
                 &protocol,
             )
             .expect("append accepted batch 0");
@@ -585,7 +586,7 @@ mod tests {
         let protocol = default_test_protocol();
         let old_safe_timestamp = 1_000_u64;
         storage
-            .append_safe_inputs_with_timestamp(1200, old_safe_timestamp, &[], &protocol)
+            .append_safe_inputs_with_timestamp(1200, old_safe_timestamp, &[], SENDER_A, &protocol)
             .expect("advance safe head with stale L1 timestamp");
 
         let now_ms =
@@ -616,7 +617,7 @@ mod tests {
     fn populate_safe_accepted_batches_resumes_from_latest_row() {
         let db = temp_db("safe-accepted-frontier-resume");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = protocol_config_for(SENDER_A);
+        let protocol = default_test_protocol();
 
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1]);
 
@@ -649,7 +650,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(11, second_wave.as_slice(), &protocol)
+            .append_safe_inputs(11, second_wave.as_slice(), SENDER_A, &protocol)
             .expect("append second wave");
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");
@@ -717,7 +718,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(2000, inputs.as_slice(), &protocol)
+            .append_safe_inputs(2000, inputs.as_slice(), SENDER_A, &protocol)
             .expect("append");
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");
@@ -759,8 +760,7 @@ mod tests {
         });
 
         let batch_submitter = Address::repeat_byte(0xCC);
-        let protocol = ProtocolConfig {
-            batch_submitter,
+        let protocol = ProtocolTiming {
             max_wait_blocks: u64::MAX,
             preemptive_margin_blocks: 75,
             l1_read_stale_after_blocks: 900,
@@ -779,7 +779,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(200, inputs.as_slice(), &protocol)
+            .append_safe_inputs(200, inputs.as_slice(), batch_submitter, &protocol)
             .expect("append");
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");
@@ -840,7 +840,7 @@ mod tests {
         storage.insert_invalid_batch(0).expect("invalidate batch 0");
         storage.insert_invalid_batch(1).expect("invalidate batch 1");
         storage
-            .append_safe_inputs(10, &[], &default_test_protocol())
+            .append_safe_inputs(10, &[], SENDER_A, &default_test_protocol())
             .expect("record observed safe head");
         storage
             .recover_post_flush(1200)
@@ -890,6 +890,7 @@ mod tests {
                         block_number: 20,
                     },
                 ],
+                SENDER_A,
                 &protocol,
             )
             .expect("append");
@@ -920,6 +921,7 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(5, 10),
                     block_number: 20,
                 }],
+                SENDER_A,
                 &protocol,
             )
             .expect("append");
@@ -950,6 +952,7 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(1, 10),
                     block_number: 20,
                 }],
+                SENDER_A,
                 &protocol,
             )
             .expect("append");
@@ -968,6 +971,7 @@ mod tests {
                     payload: super::super::test_helpers::make_stale_batch_payload(0, 10),
                     block_number: 21,
                 }],
+                SENDER_A,
                 &protocol,
             )
             .expect("append nonce 0");

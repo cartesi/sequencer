@@ -27,7 +27,7 @@ use tracing::debug;
 use crate::runtime::clock::unix_now_ms;
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{DangerStatus, Storage, StorageOpenError};
-use sequencer_core::protocol::ProtocolConfig;
+use sequencer_core::protocol::ProtocolTiming;
 
 /// How the detector's loop exited.
 ///
@@ -55,40 +55,59 @@ pub enum DangerDetectorError {
 
 pub struct DangerDetector {
     db_path: String,
-    protocol: ProtocolConfig,
+    protocol: ProtocolTiming,
     poll_interval: Duration,
-    shutdown: ShutdownSignal,
 }
 
 impl DangerDetector {
     pub fn new(
         db_path: impl Into<String>,
-        protocol: ProtocolConfig,
+        protocol: ProtocolTiming,
         poll_interval: Duration,
-        shutdown: ShutdownSignal,
     ) -> Self {
         Self {
             db_path: db_path.into(),
             protocol,
             poll_interval,
-            shutdown,
         }
     }
 
+    /// Spawn the detector loop. The `shutdown` signal is what the loop
+    /// respects; passing it at start time (instead of construction time) keeps
+    /// the construction phase pure.
     pub fn start(
         self,
+        shutdown: ShutdownSignal,
     ) -> Result<tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>, StorageOpenError>
     {
         let _ = Storage::open_read_only(self.db_path.as_str())?;
-        Ok(tokio::spawn(async move { self.run_forever().await }))
+        Ok(tokio::spawn(
+            async move { self.run_forever(shutdown).await },
+        ))
     }
 
-    async fn run_forever(self) -> Result<DetectorExit, DangerDetectorError> {
-        loop {
-            if self.shutdown.is_shutdown_requested() {
-                return Ok(DetectorExit::Shutdown);
-            }
+    /// Top-level driver. Races the work loop against the shutdown signal.
+    ///
+    /// `biased;` polls the shutdown arm first on every wakeup so a concurrent
+    /// shutdown wins over an in-flight `run_loop` step. Without `biased`,
+    /// `select!` would pick randomly between two ready branches and could
+    /// process one more iteration before shutting down.
+    async fn run_forever(
+        self,
+        shutdown: ShutdownSignal,
+    ) -> Result<DetectorExit, DangerDetectorError> {
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for_shutdown() => Ok(DetectorExit::Shutdown),
+            result = self.run_loop() => result,
+        }
+    }
 
+    /// Tick → sleep → tick. Returns `RecoveryRequired` when a non-Safe danger
+    /// status fires. Shutdown is handled by the outer `run_forever` select,
+    /// so this loop has no shutdown concerns.
+    async fn run_loop(self) -> Result<DetectorExit, DangerDetectorError> {
+        loop {
             match self.check_once().await? {
                 DangerStatus::Safe => {
                     debug!("danger check: safe");
@@ -108,12 +127,7 @@ impl DangerDetector {
                     return Ok(DetectorExit::RecoveryRequired { status });
                 }
             }
-
-            tokio::select! {
-                biased;
-                _ = self.shutdown.wait_for_shutdown() => return Ok(DetectorExit::Shutdown),
-                _ = tokio::time::sleep(self.poll_interval) => {}
-            }
+            tokio::time::sleep(self.poll_interval).await;
         }
     }
 
@@ -139,9 +153,8 @@ mod tests {
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use std::time::Duration;
 
-    fn test_protocol() -> ProtocolConfig {
-        ProtocolConfig {
-            batch_submitter: SENDER_A,
+    fn test_protocol() -> ProtocolTiming {
+        ProtocolTiming {
             max_wait_blocks: 1200,
             preemptive_margin_blocks: 75,
             l1_read_stale_after_blocks: 900,
@@ -168,18 +181,14 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .append_safe_inputs(10, &[], &test_protocol())
+            .append_safe_inputs(10, &[], SENDER_A, &test_protocol())
             .expect("record fresh safe-head observation");
         drop(storage);
 
         let shutdown = ShutdownSignal::default();
-        let detector = DangerDetector::new(
-            db.path.clone(),
-            test_protocol(),
-            Duration::from_millis(50),
-            shutdown.clone(),
-        );
-        let handle = detector.start().expect("start detector");
+        let detector =
+            DangerDetector::new(db.path.clone(), test_protocol(), Duration::from_millis(50));
+        let handle = detector.start(shutdown.clone()).expect("start detector");
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         shutdown.request_shutdown();
@@ -216,19 +225,15 @@ mod tests {
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 20,
                 }],
+                SENDER_A,
                 &protocol,
             )
             .expect("append");
         drop(storage);
 
         let shutdown = ShutdownSignal::default();
-        let detector = DangerDetector::new(
-            db.path.clone(),
-            protocol,
-            Duration::from_millis(50),
-            shutdown,
-        );
-        let handle = detector.start().expect("start detector");
+        let detector = DangerDetector::new(db.path.clone(), protocol, Duration::from_millis(50));
+        let handle = detector.start(shutdown).expect("start detector");
 
         let exit = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
@@ -275,6 +280,7 @@ mod tests {
                     payload: make_stale_batch_payload(0, 100),
                     block_number: 200,
                 }],
+                SENDER_A,
                 &protocol,
             )
             .expect("append accepted batch 0");
@@ -299,13 +305,8 @@ mod tests {
         drop(rewind_conn);
 
         let shutdown = ShutdownSignal::default();
-        let detector = DangerDetector::new(
-            db.path.clone(),
-            protocol,
-            Duration::from_millis(50),
-            shutdown,
-        );
-        let handle = detector.start().expect("start detector");
+        let detector = DangerDetector::new(db.path.clone(), protocol, Duration::from_millis(50));
+        let handle = detector.start(shutdown).expect("start detector");
 
         let exit = tokio::time::timeout(Duration::from_secs(2), handle)
             .await

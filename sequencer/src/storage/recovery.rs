@@ -23,7 +23,7 @@
 //! assumption, not a gap.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
-use sequencer_core::protocol::{ProtocolConfig, age_exceeds};
+use sequencer_core::protocol::{ProtocolTiming, age_exceeds};
 
 use super::Storage;
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
@@ -93,7 +93,7 @@ impl Storage {
     ///    batches are gold but the Tip is aging — the lane is stuck or the
     ///    Tip rotated without a safe-block advance.
     /// 4. **Batch-relative wall-clock estimate**: if a correction applies
-    ///    ([`ProtocolConfig::wall_clock_adjusted_danger_threshold`] returns
+    ///    ([`ProtocolTiming::wall_clock_adjusted_danger_threshold`] returns
     ///    `Some`), widens to `find_first_batch_in_danger` against
     ///    `danger_threshold − missed_blocks`. This is a fallback for when the
     ///    observed safe block has not crossed danger yet, but wall-clock time
@@ -122,7 +122,7 @@ impl Storage {
     /// `now_ms` is passed in (rather than read from `SystemTime::now()` here)
     /// so the storage layer stays testable without time mocking. Production
     /// callers pass the current Unix-ms clock.
-    pub fn check_danger(&mut self, protocol: &ProtocolConfig, now_ms: u64) -> Result<DangerStatus> {
+    pub fn check_danger(&mut self, protocol: &ProtocolTiming, now_ms: u64) -> Result<DangerStatus> {
         self.read(|tx| {
             if protocol.l1_view_is_stale(current_safe_block_timestamp(tx)?, now_ms) {
                 return Ok(DangerStatus::L1ViewStale);

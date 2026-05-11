@@ -302,7 +302,7 @@ fn insert_user_ops_batch(
 mod tests {
     use crate::storage::{
         SafeInputRange, Storage, StoredSafeInput,
-        test_helpers::{default_protocol_config, temp_db},
+        test_helpers::{SENDER_A, default_protocol_timing, temp_db},
     };
     use alloy_primitives::Address;
     use sequencer_core::l2_tx::SequencedL2Tx;
@@ -466,7 +466,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, drained.as_slice(), &default_protocol_config())
+            .append_safe_inputs(10, drained.as_slice(), SENDER_A, &default_protocol_timing())
             .expect("insert direct inputs");
         let mut head = head;
         storage
@@ -524,7 +524,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, drained.as_slice(), &default_protocol_config())
+            .append_safe_inputs(10, drained.as_slice(), SENDER_A, &default_protocol_timing())
             .expect("insert direct inputs");
         let mut head = head;
         storage

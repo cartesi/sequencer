@@ -182,8 +182,8 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            &sequencer_core::protocol::ProtocolConfig {
-                batch_submitter: Address::ZERO,
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
                 l1_read_stale_after_blocks: 900,
@@ -206,8 +206,8 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
                 payload: vec![0xbb],
                 block_number: 20,
             }],
-            &sequencer_core::protocol::ProtocolConfig {
-                batch_submitter: Address::ZERO,
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
                 l1_read_stale_after_blocks: 900,
@@ -273,8 +273,8 @@ async fn catchup_window_excludes_batch_submitter_direct_inputs() {
                     block_number: 10,
                 },
             ],
-            &sequencer_core::protocol::ProtocolConfig {
-                batch_submitter: Address::ZERO,
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
                 l1_read_stale_after_blocks: 900,
@@ -364,8 +364,8 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            &sequencer_core::protocol::ProtocolConfig {
-                batch_submitter: Address::ZERO,
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
                 l1_read_stale_after_blocks: 900,

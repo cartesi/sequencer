@@ -88,37 +88,44 @@ pub struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
     poster: Arc<P>,
     idle_poll_interval: Duration,
-    shutdown: ShutdownSignal,
 }
 
 impl<P: BatchPoster + 'static> BatchSubmitter<P> {
-    pub fn new(
-        db_path: impl Into<String>,
-        poster: Arc<P>,
-        shutdown: ShutdownSignal,
-        config: BatchSubmitterConfig,
-    ) -> Self {
+    pub fn new(db_path: impl Into<String>, poster: Arc<P>, config: BatchSubmitterConfig) -> Self {
         Self {
             db_path: db_path.into(),
             poster,
             idle_poll_interval: config.idle_poll_interval(),
-            shutdown,
         }
     }
 
+    /// Spawn the worker loop. The `shutdown` signal is what the loop respects;
+    /// passing it at start time (instead of construction time) keeps the
+    /// construction phase pure.
     pub fn start(
         self,
+        shutdown: ShutdownSignal,
     ) -> Result<tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>, StorageOpenError>
     {
         let _ = Storage::open_read_only(self.db_path.as_str())?;
-        Ok(tokio::spawn(async move { self.run_forever().await }))
+        Ok(tokio::spawn(
+            async move { self.run_forever(shutdown).await },
+        ))
     }
 
     /// Top-level driver. Races the work loop against the shutdown signal.
-    async fn run_forever(self) -> Result<SubmitterExit, BatchSubmitterError> {
+    ///
+    /// `biased;` polls the shutdown arm first on every wakeup so a concurrent
+    /// shutdown wins over an in-flight `run_loop` step. Without `biased`,
+    /// `select!` would pick randomly between two ready branches and could
+    /// process one more iteration before shutting down.
+    async fn run_forever(
+        self,
+        shutdown: ShutdownSignal,
+    ) -> Result<SubmitterExit, BatchSubmitterError> {
         tokio::select! {
             biased;
-            _ = self.shutdown.wait_for_shutdown() => Ok(SubmitterExit::Shutdown),
+            _ = shutdown.wait_for_shutdown() => Ok(SubmitterExit::Shutdown),
             result = self.run_loop() => result,
         }
     }
@@ -254,18 +261,16 @@ mod tests {
 
     use super::{TickOutcome, decide_submit_start};
     use crate::l1::submitter::{BatchSubmitterConfig, poster::mock::MockBatchPoster};
-    use crate::runtime::shutdown::ShutdownSignal;
     use crate::storage::test_helpers::{TestDb, temp_db};
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput, SubmitterFrontier};
-    use sequencer_core::protocol::ProtocolConfig;
+    use sequencer_core::protocol::ProtocolTiming;
 
     const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
 
     /// Protocol pinned to `BATCH_SUBMITTER_ADDRESS` — worker tests use that as
     /// their test submitter, so populate sees the seeded safe_inputs.
-    fn submitter_test_protocol() -> ProtocolConfig {
-        ProtocolConfig {
-            batch_submitter: BATCH_SUBMITTER_ADDRESS,
+    fn submitter_test_protocol() -> ProtocolTiming {
+        ProtocolTiming {
             max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
             preemptive_margin_blocks: 75,
             l1_read_stale_after_blocks: 900,
@@ -282,7 +287,7 @@ mod tests {
     fn seed_two_closed_batches(db_path: &str) {
         let mut storage = Storage::open(db_path).expect("open storage");
         storage
-            .append_safe_inputs(0, &[], &submitter_test_protocol())
+            .append_safe_inputs(0, &[], BATCH_SUBMITTER_ADDRESS, &submitter_test_protocol())
             .expect("record observed safe head");
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -313,7 +318,12 @@ mod tests {
             })
             .collect();
         storage
-            .append_safe_inputs(safe_block, inputs.as_slice(), &submitter_test_protocol())
+            .append_safe_inputs(
+                safe_block,
+                inputs.as_slice(),
+                BATCH_SUBMITTER_ADDRESS,
+                &submitter_test_protocol(),
+            )
             .expect("append safe submitted batches");
     }
 
@@ -323,12 +333,8 @@ mod tests {
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
-        let submitter = super::BatchSubmitter::new(
-            path.clone(),
-            mock.clone(),
-            ShutdownSignal::default(),
-            default_test_config(),
-        );
+        let submitter =
+            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
 
         let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(3));
@@ -348,12 +354,8 @@ mod tests {
 
         let mock = Arc::new(MockBatchPoster::new());
         mock.set_observed_submitted_nonces(vec![2]);
-        let submitter = super::BatchSubmitter::new(
-            path.clone(),
-            mock.clone(),
-            ShutdownSignal::default(),
-            default_test_config(),
-        );
+        let submitter =
+            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
 
         let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Idle);
@@ -368,12 +370,8 @@ mod tests {
         seed_safe_submitted_batches(&path, 10, &[0, 1, 2]);
 
         let mock = Arc::new(MockBatchPoster::new());
-        let submitter = super::BatchSubmitter::new(
-            path.clone(),
-            mock.clone(),
-            ShutdownSignal::default(),
-            default_test_config(),
-        );
+        let submitter =
+            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
 
         let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Idle);
@@ -387,12 +385,8 @@ mod tests {
         seed_safe_submitted_batches(&path, 10, &[0, 1]);
 
         let mock = Arc::new(MockBatchPoster::new());
-        let submitter = super::BatchSubmitter::new(
-            path.clone(),
-            mock.clone(),
-            ShutdownSignal::default(),
-            default_test_config(),
-        );
+        let submitter =
+            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
 
         let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(1));
@@ -411,12 +405,8 @@ mod tests {
 
         let mock = Arc::new(MockBatchPoster::new());
         mock.set_observed_submitted_nonces(vec![1]);
-        let submitter = super::BatchSubmitter::new(
-            path.clone(),
-            mock.clone(),
-            ShutdownSignal::default(),
-            default_test_config(),
-        );
+        let submitter =
+            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
 
         let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(1));
@@ -434,12 +424,7 @@ mod tests {
 
         let mock = Arc::new(MockBatchPoster::new());
         mock.set_observed_submitted_error(Some("rpc fail"));
-        let submitter = super::BatchSubmitter::new(
-            path,
-            mock,
-            ShutdownSignal::default(),
-            default_test_config(),
-        );
+        let submitter = super::BatchSubmitter::new(path, mock, default_test_config());
 
         let err = submitter
             .tick_once()
