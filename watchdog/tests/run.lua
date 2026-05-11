@@ -58,7 +58,7 @@ end)
 test("partitions long block range errors", function()
     local calls = {}
     local rpc = {}
-    function rpc:get_logs(filter)
+    function rpc.get_logs(_self, filter)
         table.insert(calls, { filter.from_block, filter.to_block, filter.input_added_topic })
         if filter.from_block == 1 and filter.to_block == 4 then
             return nil, "RPC error -32005: query returned more than allowed"
@@ -94,7 +94,7 @@ test("jsonrpc get_logs builds InputAdded app filter", function()
     end
 
     local http = {}
-    function http:post(url, body, headers)
+    function http.post(_self, url, body, headers)
         assert_eq(url, "http://rpc")
         assert_eq(body, "encoded")
         assert_eq(headers["content-type"], "application/json")
@@ -111,8 +111,10 @@ test("jsonrpc get_logs builds InputAdded app filter", function()
     })
 
     assert(logs, err)
-    assert_eq(captured.method, "eth_getLogs")
-    local filter = captured.params[1]
+    assert(type(captured) == "table", "json request captured")
+    local request = captured
+    assert_eq(request.method, "eth_getLogs")
+    local filter = request.params[1]
     assert_eq(filter.fromBlock, "0xa")
     assert_eq(filter.toBlock, "0xc")
     assert_eq(filter.address, "0x9999999999999999999999999999999999999999")
@@ -162,7 +164,9 @@ test("checkpoint writes manifest-backed current pointer", function()
     os.execute(string.format('mkdir -p "%s"', dir))
 
     local written, err = checkpoint.write(dir, 12, function(snapshot_dir)
+        os.execute(string.format('mkdir -p "%s"', snapshot_dir))
         local file = io.open(snapshot_dir .. "/marker", "wb")
+        assert(file ~= nil, "marker file opened")
         file:write("snapshot")
         file:close()
         return true
@@ -208,7 +212,7 @@ local function fake_machine(inspect_state)
         self.fed_inputs = inputs
         return true
     end
-    function machine:inspect_state(_instance)
+    function machine.inspect_state(_self, _instance)
         return inspect_state
     end
     function machine:save(_instance, snapshot_dir)
@@ -294,6 +298,7 @@ test("runner alarms on raw state mismatch", function()
     })
 
     assert_eq(result, nil)
+    assert(type(err) == "table", "expected mismatch payload")
     assert_eq(err.kind, "state_mismatch")
     assert_eq(#alarms, 1)
     assert_eq(alarms[1].kind, "state_mismatch")
@@ -323,13 +328,14 @@ test("runner alarms on sequencer safe block regression", function()
     })
 
     assert_eq(result, nil)
+    assert(type(err) == "table", "expected regression payload")
     assert_eq(err.kind, "safe_block_regressed")
     assert_eq(#alarms, 1)
 end)
 
 test("sequencer client validates generic state response", function()
     local http = {}
-    function http:get(url)
+    function http.get(_self, url)
         assert_eq(url, "http://sequencer/get_state")
         return {
             status = 200,
@@ -353,7 +359,7 @@ end)
 
 test("sequencer client rejects invalid JSON", function()
     local http = {}
-    function http:get(_url)
+    function http.get(_self, _url)
         return {
             status = 200,
             body = "not-json",
@@ -424,6 +430,19 @@ test("machine cli adapter writes raw input files", function()
     file:close()
 end)
 
+test("machine cli adapter leaves snapshot directory creation to cartesi-machine", function()
+    local base = os.tmpname()
+    os.remove(base)
+    os.execute(string.format('mkdir -p "%s"', base))
+    local driver = machine_cli.new({ work_dir = base, executable = "true" })
+    local instance = assert(driver:load("/tmp/source-snapshot"))
+    local snapshot_dir = base .. "/snapshot"
+
+    assert(driver:save(instance, snapshot_dir))
+    local exists = os.rename(snapshot_dir, snapshot_dir)
+    assert(not exists, "adapter must not pre-create --store target")
+end)
+
 test("retry succeeds after transient failures", function()
     local attempts = 0
     local sleeps = 0
@@ -467,7 +486,7 @@ end)
 test("alarm webhook posts JSON payload", function()
     local sent = {}
     local http = {}
-    function http:post(url, body, headers)
+    function http.post(_self, url, body, headers)
         sent.url = url
         sent.body = body
         sent.headers = headers
@@ -488,7 +507,7 @@ end)
 
 test("alarm webhook reports non-success status", function()
     local http = {}
-    function http:post(_url, _body, _headers)
+    function http.post(_self, _url, _body, _headers)
         return { status = 500, body = "" }
     end
 
