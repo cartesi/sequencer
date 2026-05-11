@@ -7,5 +7,6 @@ sequencer.db-wal
 /out/
 examples/canonical-app/out/
 /.DS_Store
+.vscode/
 soljson-latest.js
 **/states/
