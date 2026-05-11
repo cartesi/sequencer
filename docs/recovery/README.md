@@ -8,19 +8,19 @@ See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and fu
 
 The sequencer's recovery loop spans two process lifetimes:
 
-1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `RunError::DangerDetected` and the process exits with non-zero status.
+1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `DangerDetectorExit::DangerDetected` under `RunError::Worker` and the process exits with non-zero status.
 2. **External respawn.** An orchestrator (systemd, k8s, …) restarts the process.
-3. **Startup dispatch.** The fresh boot runs `run_preemptive_recovery` before any writers come online: sync L1, re-run `check_danger`, then `decide_startup_action` routes to one of `Proceed`, `RecoverTip`, `FlushAndCascade`, or `Refuse`. The chosen action runs as a single SQLite transaction.
+3. **Startup dispatch.** The fresh boot runs `run_preemptive_recovery` before any writers come online: sync L1, re-run `check_danger`, then `decide_startup_action` routes to one of `Proceed`, `RecoverTip`, `FlushAndCascade`, or `Refuse`. Recovery actions run their DB mutations as single SQLite transactions; `Proceed` intentionally does no DB writes.
 
 The detector trip and the startup dispatch share the same `check_danger` function; the detector cares only that *some* arm fired, while the startup dispatch examines *which* arm fired to pick the right action.
 
 Key abstractions, by responsibility:
 
-- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::RecoveryRequired` when any non-`Safe` status fires. The runtime converts that into `RunError::DangerDetected` and the process exits. The dispatch difference between statuses only matters at the next startup, where `decide_startup_action` re-runs `check_danger` and routes accordingly.
+- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::RecoveryRequired` when any non-`Safe` status fires. The runtime converts that into a `DangerDetectorExit::DangerDetected` worker exit and the process exits. The dispatch difference between statuses only matters at the next startup, where `decide_startup_action` re-runs `check_danger` and routes accordingly.
 - **`BatchSubmitter`** ([`l1/submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs)): makes L1 progress only — never checks danger. Productive ticks re-enter immediately; idle/transient ticks sleep `idle_poll_interval`. A pure `decide_submit_start` function folds observed L1 nonces over the scheduler-accepted frontier.
 - **`decide_startup_action`** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): pure function. Takes `danger` and returns `Proceed | RecoverTip { batch_index } | FlushAndCascade { batch_index } | Refuse(reason)`. L1 reachability is an execution concern: if the flush path cannot reach L1, startup fails and the orchestrator retries.
 - **`MempoolFlusher`** ([`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs)): submits no-op transactions to consume all pending wallet-nonce slots and waits for safe finality. Does **not** retry internally on provider errors — the orchestrator's respawn loop is the retry mechanism.
-- **`ProtocolConfig`** ([`sequencer-core/src/protocol.rs`](../../sequencer-core/src/protocol.rs)): single source of truth for the scheduler-mirroring fields (`batch_submitter`, `max_wait_blocks`) plus the sequencer-local tuning knobs (`preemptive_margin_blocks`, `l1_read_stale_after_blocks`, `seconds_per_block`). Exposes `scheduler_accepts`, `is_scheduler_stale`, `danger_threshold`, and `l1_view_is_stale`.
+- **`ProtocolTiming`** ([`sequencer-core/src/protocol.rs`](../../sequencer-core/src/protocol.rs)): single source of truth for scheduler timing (`max_wait_blocks`) plus the sequencer-local tuning knobs (`preemptive_margin_blocks`, `l1_read_stale_after_blocks`, `seconds_per_block`). The batch-submitter address is deployment identity and is passed separately to `scheduler_accepts`.
 
 All five pieces are replaceable at the abstraction boundary: the tick decision is a pure function; the storage surface returns structs, not ad-hoc tuples; the danger detector and submitter are independently testable.
 
@@ -248,7 +248,7 @@ Closed batches past gold (if any) are still in their natural lifecycle — pendi
 2. Open a fresh recovery batch.
 3. If no Tip in danger and no Tip exists at all (torn-state crash recovery), open a Tip anyway.
 
-The same function is called defensively from the `Proceed` path. Under that dispatch the Tip shouldn't be in danger (the danger check would have surfaced `RecoverTip`), but the threshold check inside `recover_aging_tip` is cheap and guards against a stale `check_danger` reading.
+The `Proceed` path does not call this function. Under that dispatch, no danger arm fired and the persisted state is left untouched; genesis Tip creation is handled by the inclusion lane's normal `initialize_open_state` path.
 
 #### Why `danger_threshold`, not `MAX_WAIT_BLOCKS`, for the Tip threshold
 
@@ -285,7 +285,7 @@ The startup flow is dispatched by `decide_startup_action(danger)`:
 
 | `check_danger` result | Action | Recovery primitive | Why this dispatch |
 |---|---|---|---|
-| `Safe` | `Proceed` | `recover_aging_tip(danger_threshold)` (defensive — typically a no-op) | Nothing crossed danger; observed Tip check is a cheap belt-and-suspenders. |
+| `Safe` | `Proceed` | none | Nothing crossed danger; leave persisted state alone and let the inclusion lane initialize genesis if the DB is fresh. |
 | `L1ViewStale` | `Refuse(L1ViewStale)` | — | The L1 view is too old to support honest recovery or new soft confirmations. |
 | `TipInDanger(N)` | `RecoverTip { N }` | `recover_aging_tip(danger_threshold)` (no flush — Tip has no L1 slot) | Tip has no L1 footprint; cascade and reopen directly. |
 | `ClosedBatchInDanger(N)` | `FlushAndCascade { N }` | flush + `recover_post_flush(danger_threshold)` | Closed batch has L1 transactions whose fate must be resolved before cascading. |
@@ -293,7 +293,7 @@ The startup flow is dispatched by `decide_startup_action(danger)`:
 
 **L1 view freshness gates recovery.** `check_danger` first checks the L1 safe block timestamp against `l1_read_stale_after_blocks`. If the timestamp is missing or too old, startup refuses: the sequencer has no trustworthy L1 view from which to recover or issue new soft confirmations. With a fresh L1 view, observed-safe checks decide concrete recovery: `ClosedBatchInDanger` runs flush + cascade, while `TipInDanger` invalidates the open Tip directly. `EstimatedBatchInDanger` is the final batch-relative wall-clock fallback: observed safe-state has not crossed the threshold, but elapsed time since the last safe-head advance says the batch consumed its remaining runway, so startup refuses instead of recovering from estimated state.
 
-The Refuse variants block boot and surface to the operator. Every non-Refuse action ends with an atomic SQLite transaction: `Proceed` normally just ensures the Tip exists, `RecoverTip` invalidates the aging Tip and opens a fresh one, and `FlushAndCascade` cascades the post-flush non-gold suffix and opens a fresh Tip when needed.
+The Refuse variants block boot and surface to the operator. `Proceed` performs no recovery writes; the normal inclusion-lane startup path initializes the Tip if the DB is fresh. The mutating recovery actions each commit atomically: `RecoverTip` invalidates the aging Tip and opens a fresh one, while `FlushAndCascade` cascades the post-flush non-gold suffix and opens a fresh Tip when needed.
 
 **What TLA+ proves here**: the model still abstracts away the full startup cutover/flush decision. It proves ZombieSafety once wallet-nonce slots resolve, and separately models direct recovery of an aging open Tip. The claim that past `MAX_WAIT`, closed-batch staleness self-resolves is external reasoning from L1 monotonicity. The post-flush "cascade everything past gold" choice is also external reasoning (the "everything past gold is doomed" mental model above).
 

@@ -1,14 +1,14 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! H7 regression: chain-id mismatch is caught early in bootstrap.
+//! H7 regression: chain-id/deployment mismatch is caught early in bootstrap.
 //!
-//! The H7 hardening moved the chain-id check before any DB writes and replaced
-//! `assert_eq!` with a typed `RunError::ChainIdMismatch`. This file locks two
-//! of the three code paths where the check matters:
+//! The H7 hardening moved the live RPC chain-id check before deployment
+//! identity writes and replaced `assert_eq!` with typed bootstrap errors. This
+//! file locks two code paths where the check matters:
 //!
-//!   - Cache path: L1 is unreachable but a cache exists with a different
-//!     chain_id. Check fires before `InputReader::from_parts`.
+//!   - Identity path: L1 is unreachable but a deployment identity exists with
+//!     a different chain_id. Check fires before `InputReader::from_parts`.
 //!   - Positive control: with a matched chain_id, `ChainIdMismatch` does NOT
 //!     fire, so the check doesn't misfire on the happy path.
 //!
@@ -20,11 +20,11 @@
 
 use std::time::Duration;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, address};
 use app_core::application::{WalletApp, WalletConfig};
 use clap::Parser;
 use sequencer::RunConfig;
-use sequencer::runtime::RunError;
+use sequencer::runtime::{BootstrapError, IdentityError, RunError};
 use tempfile::TempDir;
 
 // Anvil's default devnet private key #0.
@@ -70,33 +70,35 @@ fn build_app() -> WalletApp {
     WalletApp::new(WalletConfig::default())
 }
 
-// ── Cache path ──────────────────────────────────────────────────────
+// ── Deployment-identity fallback path ───────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chain_id_mismatch_from_cache_returns_typed_error() {
-    // Scenario: L1 is unreachable, but a bootstrap cache exists from a previous
-    // successful run. The cached chain_id does NOT match the current config.
-    // The cache-fallback arm must return ChainIdMismatch (was `assert_eq!` before H7).
+async fn chain_id_mismatch_from_deployment_identity_returns_typed_error() {
+    // Scenario: L1 is unreachable, but a deployment identity exists from a
+    // previous successful run. The stored chain_id does NOT match the current
+    // config. The fallback arm must return a typed identity mismatch.
 
     let dir = TempDir::new().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();
 
-    // Pre-populate the bootstrap cache with chain_id=31337.
+    // Pre-populate deployment identity with chain_id=31337.
     let db_path = format!("{data_dir}/sequencer.db");
     {
         let mut storage = sequencer::storage::Storage::open(&db_path).expect("open db for seed");
         storage
-            .save_l1_bootstrap_cache(
-                Address::from_slice(&[0x22; 20]), // input_box
-                100,                              // genesis
-                31_337,                           // chain_id
-            )
-            .expect("seed cache");
+            .load_or_insert_deployment_identity(sequencer::storage::DeploymentIdentity {
+                chain_id: 31_337,
+                app_address: address!("0x1111111111111111111111111111111111111111"),
+                input_box_address: Address::from_slice(&[0x22; 20]),
+                input_box_genesis_block: 100,
+                batch_submitter_address: address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+            })
+            .expect("seed deployment identity");
     }
 
     // Point the sequencer at an unreachable RPC (port 1, reliably refused) and
-    // a MISMATCHED chain_id=1. L1 is unreachable → cache-fallback path runs
-    // → cached chain_id (31337) mismatches config (1) → ChainIdMismatch.
+    // a MISMATCHED chain_id=1. L1 is unreachable → identity-fallback path runs
+    // → stored chain_id (31337) mismatches config (1).
     let config = build_config(data_dir, "http://127.0.0.1:1", 1).expect("parse config");
 
     let result = tokio::time::timeout(Duration::from_secs(30), sequencer::run(build_app(), config))
@@ -104,11 +106,16 @@ async fn chain_id_mismatch_from_cache_returns_typed_error() {
         .expect("run() must return quickly on mismatch");
 
     match result {
-        Err(RunError::ChainIdMismatch { rpc, config }) => {
-            assert_eq!(rpc, 31_337, "rpc field carries the cached value");
-            assert_eq!(config, 1, "config field carries the configured value");
+        Err(RunError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
+            fields,
+            stored,
+            expected,
+        }))) => {
+            assert_eq!(fields, "chain_id");
+            assert_eq!(stored.chain_id, 31_337);
+            assert_eq!(expected.chain_id, 1);
         }
-        other => panic!("expected RunError::ChainIdMismatch, got: {other:?}"),
+        other => panic!("expected IdentityError::Mismatch, got: {other:?}"),
     }
 }
 
@@ -135,7 +142,7 @@ async fn chain_id_match_does_not_produce_mismatch_error() {
 
     match result {
         Err(_timeout) => {} // expected — sequencer is running
-        Ok(Err(RunError::ChainIdMismatch { rpc, config })) => {
+        Ok(Err(RunError::Bootstrap(BootstrapError::ChainIdMismatch { rpc, config }))) => {
             panic!(
                 "matched chain_id must not produce ChainIdMismatch, got rpc={rpc} config={config}"
             );

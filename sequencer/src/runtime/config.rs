@@ -4,6 +4,7 @@
 use alloy_primitives::Address;
 use alloy_sol_types::Eip712Domain;
 use clap::{ArgGroup, Parser};
+use sequencer_core::protocol::{ProtocolTiming, ProtocolTimingError};
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_DATA_DIR: &str = "sequencer-data";
@@ -109,10 +110,14 @@ pub struct RunConfig {
     pub preemptive_margin_blocks: u64,
 
     /// Blocks of safe-head age after which the L1 read view is considered too
-    /// stale to trust. If unset, derived from the preemptive margin so the read
-    /// staleness threshold is earlier than the write danger threshold.
-    #[arg(long, env = "SEQ_L1_READ_STALE_AFTER_BLOCKS", value_parser = clap::value_parser!(u64).range(1..))]
-    pub l1_read_stale_after_blocks: Option<u64>,
+    /// stale to trust. Independent of the preemptive margin — a separate
+    /// concern ("how old is the cached L1 view before we stop trusting it" vs.
+    /// "how much runway before write-side recovery trips"). Must be strictly
+    /// less than the danger threshold (validated at startup).
+    ///
+    /// Default 600 (~2h at 12s/block).
+    #[arg(long, env = "SEQ_L1_READ_STALE_AFTER_BLOCKS", default_value = "600", value_parser = clap::value_parser!(u64).range(1..))]
+    pub l1_read_stale_after_blocks: u64,
 
     /// Assumed L1 block time in seconds. Used to estimate block progression from
     /// wall-clock time when the L1 provider is unreachable.
@@ -123,6 +128,18 @@ pub struct RunConfig {
 impl RunConfig {
     pub fn build_domain(&self) -> Eip712Domain {
         sequencer_core::build_input_domain(self.chain_id, self.app_address)
+    }
+
+    /// Build a validated [`ProtocolTiming`] from this config's tuning fields.
+    /// Pure derivation — does not touch I/O. `max_wait_blocks` is the shared
+    /// scheduler constant; the rest come from the operator-tunable CLI args.
+    pub fn protocol_timing(&self) -> Result<ProtocolTiming, ProtocolTimingError> {
+        ProtocolTiming::try_new(
+            sequencer_core::MAX_WAIT_BLOCKS,
+            self.preemptive_margin_blocks,
+            self.l1_read_stale_after_blocks,
+            self.seconds_per_block,
+        )
     }
 
     /// Full path to the SQLite database file inside `data_dir`.
@@ -303,15 +320,16 @@ mod tests {
     }
 
     #[test]
-    fn run_config_l1_read_stale_after_blocks_is_optional() {
+    fn run_config_default_l1_read_stale_after_blocks_is_600() {
+        // Independent default (NOT derived from margin) — see field doc.
         let config = RunConfig::try_parse_from(TEST_ARGS).expect("parse run config");
-        assert_eq!(config.l1_read_stale_after_blocks, None);
+        assert_eq!(config.l1_read_stale_after_blocks, 600);
     }
 
     #[test]
     fn run_config_accepts_l1_read_stale_after_blocks_one() {
         let config = RunConfig::try_parse_from(args_with_l1_read_stale_after_blocks("1"))
             .expect("parse succeeds");
-        assert_eq!(config.l1_read_stale_after_blocks, Some(1));
+        assert_eq!(config.l1_read_stale_after_blocks, 1);
     }
 }

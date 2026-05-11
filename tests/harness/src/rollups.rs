@@ -208,6 +208,17 @@ impl ManagedAnvil {
     }
 
     async fn mine_blocks(&self, block_count: u64) -> HarnessResult<()> {
+        // L1 block-time coupling: each mined block advances the L1
+        // timestamp by `SECONDS_PER_BLOCK` (Ethereum mainnet parity, also
+        // what `ManagedSequencer::advance_wall_and_mine` assumes when
+        // pairing faketime advances with block counts).
+        //
+        // Without the explicit `interval`, anvil defaults to 1s/block —
+        // which then desyncs from faketime, making large advances trip
+        // spurious `L1ViewStale` even when wall clock and L1 should move
+        // together. See `ManagedSequencer::advance_wall_and_mine`.
+        const SECONDS_PER_BLOCK: u64 = 12;
+
         if block_count == 0 {
             return Ok(());
         }
@@ -217,7 +228,7 @@ impl ManagedAnvil {
             .await
             .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
         provider
-            .anvil_mine(Some(block_count), None)
+            .anvil_mine(Some(block_count), Some(SECONDS_PER_BLOCK))
             .await
             .map_err(|err| {
                 io_other(format!(

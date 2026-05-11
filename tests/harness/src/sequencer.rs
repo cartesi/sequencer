@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::fs::{self, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -54,9 +55,8 @@ pub enum RespawnAttemptOutcome {
     /// `RecoveryError::Refuse(...)` from the startup decision table.
     RespawnFailed(String),
     /// `respawn()` returned `Ok` but the child exited within the
-    /// stabilization window. Typically surfaces
-    /// `RunError::DangerDetected` from the runtime danger detector's
-    /// first post-boot poll.
+    /// stabilization window. Typically surfaces a danger-detector worker
+    /// exit from the first post-boot poll.
     ExitedPostRespawn(std::process::ExitStatus),
 }
 
@@ -187,8 +187,8 @@ impl ManagedSequencer {
     /// chain id (matches Anvil).
     ///
     /// Used by chain-id mismatch tests to inject a mismatched chain id and assert
-    /// that bootstrap returns `RunError::ChainIdMismatch` instead of
-    /// silently writing a wrong-chain bootstrap cache. Does not affect
+    /// that bootstrap refuses before silently pinning a wrong deployment
+    /// identity. Does not affect
     /// the currently-running sequencer process.
     pub fn set_chain_id_override(&mut self, chain_id: Option<u64>) {
         self.chain_id_override = chain_id;
@@ -217,20 +217,27 @@ impl ManagedSequencer {
         Ok(())
     }
 
-    /// Delete the row in `l1_bootstrap_cache`, simulating a DB that has
-    /// never successfully completed bootstrap discovery (no cached
-    /// `input_box_address` / `genesis_block` / `chain_id`). Call while the
-    /// sequencer is stopped.
+    /// Delete the sequencer DB file (and its `-wal` / `-shm` siblings),
+    /// simulating a brand-new install — no pinned identity, no batches, no
+    /// safe-input rows. Call while the sequencer is stopped.
     ///
-    /// Used by the no-cache-bootstrap test: with no cache and L1 unreachable, the bootstrap
-    /// path returns the "L1 required for first startup" error before any
-    /// recovery logic can run.
-    pub fn clear_l1_bootstrap_cache(&self) -> HarnessResult<()> {
+    /// Distinct from "clear only the identity row": that would leave the DB
+    /// holding `batches` / `safe_inputs` / `l1_safe_head` rows from prior
+    /// boots, which `IdentityError::OrphanedState` then refuses on the next
+    /// boot. The right "first boot" simulation is to start from an empty DB.
+    ///
+    /// Used by the no-cache-bootstrap and live-RPC chain-id-mismatch tests:
+    /// both want to exercise the no-cached-identity bootstrap path.
+    pub fn reset_database(&self) -> HarnessResult<()> {
         let db_path = self.data_dir_path.join("sequencer.db");
-        let conn = rusqlite::Connection::open(db_path.as_path())
-            .map_err(|err| io_other(format!("open DB: {err}")))?;
-        conn.execute("DELETE FROM l1_bootstrap_cache", [])
-            .map_err(|err| io_other(format!("clear l1_bootstrap_cache: {err}")))?;
+        for suffix in ["", "-wal", "-shm"] {
+            let path = db_path.with_extension(format!("db{suffix}"));
+            match fs::remove_file(path.as_path()) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_other(format!("reset DB ({path:?}): {err}")).into()),
+            }
+        }
         Ok(())
     }
 
@@ -240,8 +247,8 @@ impl ManagedSequencer {
     ///
     /// Used by the wall-clock-never-synced test: the danger check treats a
     /// missing safe-head row as an unusable L1 view and refuses to
-    /// proceed. Deleting this row while the bootstrap cache is
-    /// populated lets us hit that branch without losing the cached chain
+    /// proceed. Deleting this row while the deployment identity is
+    /// populated lets us hit that branch without losing the pinned chain
     /// ID / InputBox address (which would fail earlier in bootstrap, not
     /// in the wall-clock fallback).
     pub fn clear_l1_safe_head_observation(&self) -> HarnessResult<()> {
@@ -585,8 +592,8 @@ impl ManagedSequencer {
     ///     when L1 is unreachable and the persisted state looks stalled.
     ///   - The child comes up (HTTP ready, bootstrap passed), then one of
     ///     the internal tasks returns a fatal error and the process exits.
-    ///     Canonical cause: `RunError::DangerDetected` when the first
-    ///     danger-detector poll after boot sees a batch past `danger_threshold`.
+    ///     Canonical cause: danger-detector worker exit when the first
+    ///     post-boot poll sees a batch past `danger_threshold`.
     ///
     /// The race between bootstrap-finishes and submitter-first-tick is
     /// short (the poll interval is 5s by default, but the first tick runs

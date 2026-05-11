@@ -283,13 +283,16 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
     synced_at_ms INTEGER NOT NULL CHECK (synced_at_ms >= 0)
 );
 
--- L1 bootstrap cache: discovered addresses and block numbers from on-chain contracts.
--- Allows the sequencer to start without L1 if it has run before.
-CREATE TABLE IF NOT EXISTS l1_bootstrap_cache (
-    singleton_id       INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    input_box_address  BLOB    NOT NULL CHECK (length(input_box_address) = 20),
-    genesis_block      INTEGER NOT NULL CHECK (genesis_block >= 0),
-    chain_id           INTEGER NOT NULL CHECK (chain_id > 0)
+-- Deployment identity: the persisted DB is only valid for this deployment.
+-- Allows L1-unreachable startup after first boot, and prevents interpreting
+-- historical sequencer state under a different app or batch-submitter address.
+CREATE TABLE IF NOT EXISTS deployment_identity (
+    singleton_id              INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    chain_id                  INTEGER NOT NULL CHECK (chain_id > 0),
+    app_address               BLOB    NOT NULL CHECK (length(app_address) = 20),
+    input_box_address         BLOB    NOT NULL CHECK (length(input_box_address) = 20),
+    input_box_genesis_block   INTEGER NOT NULL CHECK (input_box_genesis_block >= 0),
+    batch_submitter_address   BLOB    NOT NULL CHECK (length(batch_submitter_address) = 20)
 );
 
 

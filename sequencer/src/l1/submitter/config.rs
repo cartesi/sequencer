@@ -9,7 +9,7 @@ use std::time::Duration;
 /// passed through at runtime.
 ///
 /// Danger-zone tuning (`max_wait_blocks`, `preemptive_margin_blocks`,
-/// `seconds_per_block`) lives in `ProtocolConfig`, not here — the submitter
+/// `seconds_per_block`) lives in `ProtocolTiming`, not here — the submitter
 /// doesn't read it. The [`crate::recovery::DangerDetector`] worker owns that.
 #[derive(Debug, Clone)]
 pub struct BatchSubmitterConfig {

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Input reader writer: ingests L1 InputBox events into `safe_inputs`,
-//! advances `l1_safe_head`, and maintains the L1 bootstrap cache.
+//! advances `l1_safe_head`, and pins the deployment identity.
 //!
 //! Also exposes the read-side queries the input reader and other callers need
 //! (current safe block, safe-input bounds, last safe-progress timestamp).
@@ -11,14 +11,14 @@ use alloy_primitives::Address;
 use rusqlite::{OptionalExtension, Result, Transaction, params};
 
 use super::Storage;
-use super::StoredSafeInput;
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
 use super::queries::{
     current_safe_block, current_safe_block_timestamp, last_safe_progress_ms,
     query_latest_safe_input_index_exclusive,
 };
 use super::safe_accepted_batches::populate_safe_accepted_batches;
-use sequencer_core::protocol::ProtocolConfig;
+use super::{DeploymentIdentity, StoredSafeInput};
+use sequencer_core::protocol::ProtocolTiming;
 
 impl Storage {
     /// `MAX(safe_input_index) + 1` (or 0 if empty). The exclusive bound on the
@@ -53,13 +53,15 @@ impl Storage {
         &mut self,
         safe_block: u64,
         inputs: &[StoredSafeInput],
-        protocol: &ProtocolConfig,
+        batch_submitter: Address,
+        timing: &ProtocolTiming,
     ) -> Result<()> {
         self.append_safe_inputs_with_timestamp(
             safe_block,
             i64_to_u64(now_unix_ms()) / 1000,
             inputs,
-            protocol,
+            batch_submitter,
+            timing,
         )
     }
 
@@ -72,7 +74,8 @@ impl Storage {
         safe_block: u64,
         safe_block_timestamp: u64,
         inputs: &[StoredSafeInput],
-        protocol: &ProtocolConfig,
+        batch_submitter: Address,
+        timing: &ProtocolTiming,
     ) -> Result<()> {
         self.write(|tx| {
             if let Some(current) = current_safe_block(tx)? {
@@ -107,7 +110,7 @@ impl Storage {
                 return Err(rusqlite::Error::StatementChangedRows(changed));
             }
 
-            populate_safe_accepted_batches(tx, protocol)
+            populate_safe_accepted_batches(tx, batch_submitter, timing)
         })
     }
 
@@ -117,43 +120,77 @@ impl Storage {
         last_safe_progress_ms(&self.conn)
     }
 
-    /// Read cached L1 bootstrap data (input_box_address, genesis_block, chain_id).
-    /// Returns `None` on first startup.
-    pub fn l1_bootstrap_cache(&self) -> Result<Option<(Address, u64, u64)>> {
-        let row: Option<(Vec<u8>, i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT input_box_address, genesis_block, chain_id \
-                 FROM l1_bootstrap_cache WHERE singleton_id = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        Ok(row.map(|(addr_bytes, genesis, chain_id)| {
-            let addr = Address::from_slice(&addr_bytes);
-            (addr, i64_to_u64(genesis), i64_to_u64(chain_id))
-        }))
+    /// Read the deployment identity this DB is pinned to. Returns `None` on
+    /// first startup, before L1 bootstrap has discovered the InputBox stream.
+    pub fn deployment_identity(&self) -> Result<Option<DeploymentIdentity>> {
+        query_deployment_identity(&self.conn)
     }
 
-    /// Cache L1 bootstrap data so future startups can boot without L1.
-    pub fn save_l1_bootstrap_cache(
-        &mut self,
-        input_box_address: Address,
-        genesis_block: u64,
-        chain_id: u64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO l1_bootstrap_cache \
-             (singleton_id, input_box_address, genesis_block, chain_id) \
-             VALUES (0, ?1, ?2, ?3)",
-            params![
-                input_box_address.as_slice(),
-                u64_to_i64(genesis_block),
-                u64_to_i64(chain_id),
-            ],
+    /// Whether this DB already contains deployment-bound state. Used to avoid
+    /// silently pinning an old, non-empty DB that predates `deployment_identity`
+    /// to whatever config happens to start it next.
+    pub fn has_persisted_deployment_state(&self) -> Result<bool> {
+        let present: i64 = self.conn.query_row(
+            "SELECT \
+                EXISTS(SELECT 1 FROM batches) OR \
+                EXISTS(SELECT 1 FROM safe_inputs) OR \
+                EXISTS(SELECT 1 FROM l1_safe_head)",
+            [],
+            |row| row.get(0),
         )?;
-        Ok(())
+        Ok(present != 0)
     }
+
+    /// Insert `identity` on first startup, or return the already-persisted
+    /// identity on later startups. The caller compares the returned value with
+    /// its configured/discovered identity and refuses on mismatch.
+    pub fn load_or_insert_deployment_identity(
+        &mut self,
+        identity: DeploymentIdentity,
+    ) -> Result<DeploymentIdentity> {
+        self.write(|tx| {
+            if let Some(existing) = query_deployment_identity(tx)? {
+                return Ok(existing);
+            }
+
+            let changed = tx.execute(
+                "INSERT INTO deployment_identity \
+                    (singleton_id, chain_id, app_address, input_box_address, \
+                     input_box_genesis_block, batch_submitter_address) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    u64_to_i64(identity.chain_id),
+                    identity.app_address.as_slice(),
+                    identity.input_box_address.as_slice(),
+                    u64_to_i64(identity.input_box_genesis_block),
+                    identity.batch_submitter_address.as_slice(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(rusqlite::Error::StatementChangedRows(changed));
+            }
+            Ok(identity)
+        })
+    }
+}
+
+fn query_deployment_identity(conn: &rusqlite::Connection) -> Result<Option<DeploymentIdentity>> {
+    conn.query_row(
+        "SELECT chain_id, app_address, input_box_address, \
+                input_box_genesis_block, batch_submitter_address \
+         FROM deployment_identity WHERE singleton_id = 0",
+        [],
+        |row| {
+            Ok(DeploymentIdentity {
+                chain_id: i64_to_u64(row.get::<_, i64>(0)?),
+                app_address: Address::from_slice(&row.get::<_, Vec<u8>>(1)?),
+                input_box_address: Address::from_slice(&row.get::<_, Vec<u8>>(2)?),
+                input_box_genesis_block: i64_to_u64(row.get::<_, i64>(3)?),
+                batch_submitter_address: Address::from_slice(&row.get::<_, Vec<u8>>(4)?),
+            })
+        },
+    )
+    .optional()
 }
 
 fn insert_safe_inputs_batch(
@@ -182,16 +219,26 @@ fn insert_safe_inputs_batch(
 #[cfg(test)]
 mod tests {
     use crate::storage::{
-        SafeInputRange, Storage, StoredSafeInput,
-        test_helpers::{default_protocol_config, temp_db},
+        DeploymentIdentity, SafeInputRange, Storage, StoredSafeInput,
+        test_helpers::{SENDER_A, SENDER_B, default_protocol_timing, temp_db},
     };
     use alloy_primitives::Address;
+
+    fn identity() -> DeploymentIdentity {
+        DeploymentIdentity {
+            chain_id: 31337,
+            app_address: Address::repeat_byte(0x11),
+            input_box_address: Address::repeat_byte(0x22),
+            input_box_genesis_block: 42,
+            batch_submitter_address: SENDER_A,
+        }
+    }
 
     #[test]
     fn safe_input_api_uses_half_open_intervals() {
         let db = temp_db("safe-input-api");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_protocol_config();
+        let protocol = default_protocol_timing();
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 0);
         let mut out = Vec::new();
@@ -213,7 +260,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, inserted.as_slice(), &protocol)
+            .append_safe_inputs(10, inserted.as_slice(), SENDER_A, &protocol)
             .expect("insert safe directs");
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 2);
@@ -256,13 +303,55 @@ mod tests {
     }
 
     #[test]
+    fn deployment_identity_is_inserted_once() {
+        let db = temp_db("deployment-identity-insert-once");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let first = identity();
+
+        assert_eq!(
+            storage.deployment_identity().expect("read empty identity"),
+            None
+        );
+        assert_eq!(
+            storage
+                .load_or_insert_deployment_identity(first)
+                .expect("insert identity"),
+            first
+        );
+        assert_eq!(
+            storage
+                .deployment_identity()
+                .expect("read persisted identity"),
+            Some(first)
+        );
+
+        let changed = DeploymentIdentity {
+            batch_submitter_address: SENDER_B,
+            ..first
+        };
+        assert_eq!(
+            storage
+                .load_or_insert_deployment_identity(changed)
+                .expect("load existing identity"),
+            first,
+            "identity must be pinned after the first insert"
+        );
+        assert_eq!(
+            storage
+                .deployment_identity()
+                .expect("read persisted identity"),
+            Some(first)
+        );
+    }
+
+    #[test]
     fn append_safe_inputs_creates_and_advances_safe_head() {
         let db = temp_db("append-safe-inputs-creates-safe-head");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_protocol_config();
+        let protocol = default_protocol_timing();
 
         storage
-            .append_safe_inputs_with_timestamp(7, 1234, &[], &protocol)
+            .append_safe_inputs_with_timestamp(7, 1234, &[], SENDER_A, &protocol)
             .expect("record first real safe-head observation");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
@@ -282,7 +371,7 @@ mod tests {
         );
 
         storage
-            .append_safe_inputs_with_timestamp(9, 5678, &[], &protocol)
+            .append_safe_inputs_with_timestamp(9, 5678, &[], SENDER_A, &protocol)
             .expect("advance safe head");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),

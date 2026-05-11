@@ -5,7 +5,7 @@
 
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
-use sequencer_core::protocol::ProtocolConfig;
+use sequencer_core::protocol::ProtocolTiming;
 use tempfile::TempDir;
 
 use super::{SafeInputRange, Storage, StoredSafeInput};
@@ -13,18 +13,11 @@ use super::{SafeInputRange, Storage, StoredSafeInput};
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
 pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
 
-/// Default protocol config for tests that don't care about the specific
-/// submitter address or margin. Uses `SENDER_A` as the submitter.
-pub(crate) fn default_protocol_config() -> ProtocolConfig {
-    protocol_config_for(SENDER_A)
-}
-
-/// Protocol config with a specific submitter address and the default
-/// `MAX_WAIT_BLOCKS`. Common test shape: seed via this sender, assert against
-/// it. For explicit `max_wait_blocks` tuning build `ProtocolConfig` directly.
-pub(crate) fn protocol_config_for(sender: Address) -> ProtocolConfig {
-    ProtocolConfig {
-        batch_submitter: sender,
+/// Default protocol timing for tests that don't care about specific tuning.
+/// Sender-independent (timing carries no address); pair with a submitter
+/// address as needed at the call site.
+pub(crate) fn default_protocol_timing() -> ProtocolTiming {
+    ProtocolTiming {
         max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
         preemptive_margin_blocks: 75,
         l1_read_stale_after_blocks: 900,
@@ -49,9 +42,10 @@ pub(crate) fn temp_db(name: &str) -> TestDb {
     }
 }
 
-/// Insert safe inputs whose payloads are SSZ-encoded batches with the given nonces,
-/// all attributed to `sender`. Uses `protocol_config_for(sender)` so the
-/// populated `safe_accepted_batches` view matches this sender.
+/// Insert safe inputs whose payloads are SSZ-encoded batches with the given
+/// nonces, all attributed to `sender`. `sender` doubles as the
+/// batch-submitter address passed to `append_safe_inputs`, so the populated
+/// `safe_accepted_batches` view matches this sender.
 pub(crate) fn seed_safe_inputs_with_batch_nonces(
     storage: &mut Storage,
     sender: Address,
@@ -69,9 +63,13 @@ pub(crate) fn seed_safe_inputs_with_batch_nonces(
             block_number: safe_block,
         })
         .collect();
-    let protocol = protocol_config_for(sender);
     storage
-        .append_safe_inputs(safe_block, inputs.as_slice(), &protocol)
+        .append_safe_inputs(
+            safe_block,
+            inputs.as_slice(),
+            sender,
+            &default_protocol_timing(),
+        )
         .expect("append safe inputs");
 }
 

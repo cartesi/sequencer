@@ -9,7 +9,7 @@
 //!
 //! - `ingress` — inclusion lane: user-op append, frame/batch close
 //! - `egress` — WS feed and catch-up replay (read-only)
-//! - `l1_inputs` — input reader: safe-input ingestion, L1 head, bootstrap cache
+//! - `l1_inputs` — input reader: safe-input ingestion, L1 head, deployment identity
 //! - `l1_submission` — batch-aggregate reads (submitter frontier, pending
 //!   batches, per-batch replay) shared between the submitter and egress
 //! - `recovery` — cascade invalidation, recovery-batch open, danger checks
@@ -167,6 +167,21 @@ pub struct PendingBatch {
     pub batch_index: u64,
     pub nonce: u64,
     pub encoded: Vec<u8>,
+}
+
+/// Deployment identity the database is bound to.
+///
+/// The persisted sequencer state is not portable across these fields:
+/// historical safe inputs are classified using the batch-submitter address,
+/// user-op signatures use the app/domain identity, and recovery/frontier logic
+/// depends on the InputBox stream that began at `input_box_genesis_block`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploymentIdentity {
+    pub chain_id: u64,
+    pub app_address: alloy_primitives::Address,
+    pub input_box_address: alloy_primitives::Address,
+    pub input_box_genesis_block: u64,
+    pub batch_submitter_address: alloy_primitives::Address,
 }
 
 /// Returned by [`Storage::open`] and friends; either the SQLite handle failed

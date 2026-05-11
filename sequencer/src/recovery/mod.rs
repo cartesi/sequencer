@@ -8,10 +8,11 @@
 //! tick. If the L1 view is stale, a closed batch or Tip crosses
 //! `danger_threshold`, or the batch-relative wall-clock estimate fires during
 //! an L1 outage, the detector exits with `DetectorExit::RecoveryRequired`, the
-//! runtime maps that to `RunError::DangerDetected`, and the process exits. The
-//! detector tripping is *only* a trigger to enter startup recovery/refusal — it
-//! doesn't make the cascade decision. External orchestration restarts the
-//! sequencer, and this startup path runs.
+//! runtime maps that to `DangerDetectorExit::DangerDetected` under
+//! `RunError::Worker`, and the process exits. The detector tripping is *only*
+//! a trigger to enter startup recovery/refusal — it doesn't make the cascade
+//! decision. External orchestration restarts the sequencer, and this startup
+//! path runs.
 //!
 //! Startup recovery branches on [`decide_startup_action`]:
 //!
@@ -22,9 +23,8 @@
 //!   falls through to a Tip danger-zone check — see `docs/recovery/README.md` Step 5.
 //! - `RecoverTip`: only the open Tip is dangerous. It has no L1 footprint, so call
 //!   [`Storage::recover_aging_tip`] directly without flushing.
-//! - `Proceed`: no danger detected. Call [`Storage::recover_aging_tip`] which only
-//!   invalidates the open Tip if it has aged past `danger_threshold`. Closed batches
-//!   past gold are left alone (they may still be in their natural lifecycle).
+//! - `Proceed`: no danger detected. No DB writes; the lane handles genesis init
+//!   via [`Storage::initialize_open_state`] if the DB is fresh.
 //! - `Refuse`: L1 view is stale or batch-relative estimated danger fired; bail
 //!   out and surface to the operator.
 //!
@@ -50,7 +50,7 @@ use crate::runtime::config::L1Config;
 use crate::storage::{self, DangerStatus, StorageOpenError};
 pub use detector::{DangerDetector, DangerDetectorError, DetectorExit};
 pub use flusher::MempoolFlusher;
-use sequencer_core::protocol::ProtocolConfig;
+use sequencer_core::protocol::ProtocolTiming;
 
 #[derive(Debug, Error)]
 pub enum RecoveryError {
@@ -90,8 +90,8 @@ pub enum RefuseReason {
 ///
 /// The four non-Refuse variants encode the recovery split:
 ///
-/// - `Proceed`: no danger detected. Just ensure the Tip exists (torn-state
-///   crash recovery branch).
+/// - `Proceed`: no danger detected. No recovery work needed; the lane handles
+///   genesis init on first start.
 /// - `RecoverTip`: aging Tip, no closed batch in danger. The Tip has no L1
 ///   footprint, so we cascade it directly with no flush.
 /// - `FlushAndCascade`: closed batch in danger. We need a flush to resolve
@@ -99,7 +99,7 @@ pub enum RefuseReason {
 /// - `Refuse`: can't proceed safely; surface to the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupAction {
-    /// No danger; ensure the Tip exists if missing (no cascade).
+    /// No danger; no DB writes (lane handles genesis init).
     Proceed,
     /// Open Tip is past `danger_threshold` and no closed batch is in danger.
     /// No flush needed (Tip has no L1 slot to resolve); cascade the Tip
@@ -183,7 +183,7 @@ pub async fn run_preemptive_recovery(
     db_path: &str,
     input_reader: &mut InputReader,
     l1_config: &L1Config,
-    protocol: &ProtocolConfig,
+    protocol: &ProtocolTiming,
 ) -> Result<Vec<u64>, RecoveryError> {
     // ── Step 1: Sync safe head (tolerate L1 failure) ───────────────
     //
@@ -226,10 +226,9 @@ pub async fn run_preemptive_recovery(
     //
     // The three non-Refuse paths split the recovery work:
     //
-    // - `Proceed`: no flush. Closed batches past the gold frontier (if any)
-    //   may still be in their natural lifecycle and shouldn't be cascaded. The
-    //   Tip check is defensive and should normally be a no-op because
-    //   `TipInDanger` routes to `RecoverTip`.
+    // - `Proceed`: no DB writes. A `Proceed` decision means no batch is in
+    //   danger and the persisted state is fine as-is. Closed batches past
+    //   gold (if any) stay in their natural lifecycle.
     //
     // - `RecoverTip`: no flush. Only the open Tip crossed `danger_threshold`;
     //   it has no L1 slot to resolve, so it can be invalidated directly.
@@ -239,20 +238,22 @@ pub async fn run_preemptive_recovery(
     //   point, *everything past gold is doomed* (Silver-stale,
     //   Silver-poisoned, or Pending-killed — see `Storage::recover_post_flush`
     //   docs). Cascade unconditionally from the first non-gold.
-    let mut det_storage = storage::Storage::open(db_path)?;
     let invalidated = match action {
         StartupAction::Proceed => {
             tracing::info!(
                 danger_status = danger_status_label(danger),
                 danger_batch_index = ?danger_batch_index(danger),
                 startup_action = action.label(),
-                "no danger zone detected — skipping flush"
+                "no danger zone detected — proceeding without recovery"
             );
-            // Pass the threshold defensively: in the Proceed path the Tip
-            // shouldn't be in danger (the danger check would have surfaced
-            // RecoverTip), but the threshold check inside `recover_aging_tip`
-            // is cheap and guards against a stale check_danger reading.
-            det_storage.recover_aging_tip(protocol.danger_threshold())?
+            // No Tip-creation here. The only production scenario where the DB
+            // has no Tip is genesis (fresh DB, never started). The lane handles
+            // that via `initialize_open_state`, which it skips when a Tip
+            // exists. All other Tip-mutating paths (lane rotation, recovery
+            // cascade) are wrapped in single rusqlite transactions and cannot
+            // leave the DB Tip-less. Code between this point and the lane's
+            // first init is construction-only and does not read the Tip.
+            Vec::new()
         }
         StartupAction::RecoverTip { batch_index } => {
             tracing::error!(
@@ -263,7 +264,8 @@ pub async fn run_preemptive_recovery(
                 danger_threshold = protocol.danger_threshold(),
                 "open Tip in danger zone — invalidating and opening fresh Tip (no flush)"
             );
-            det_storage.recover_aging_tip(protocol.danger_threshold())?
+            let mut storage = storage::Storage::open(db_path)?;
+            storage.recover_aging_tip(protocol.danger_threshold())?
         }
         StartupAction::FlushAndCascade { batch_index } => {
             tracing::error!(
@@ -275,24 +277,7 @@ pub async fn run_preemptive_recovery(
                 max_wait_blocks = protocol.max_wait_blocks,
                 "closed batch in danger zone — entering preemptive recovery (flush + cascade)"
             );
-
-            let flush_provider = crate::l1::provider::create_signer_provider(
-                &l1_config.eth_rpc_url,
-                &l1_config.batch_submitter_private_key,
-            )
-            .map_err(|e| RecoveryError::Provider(e.to_string()))?;
-            let flusher = MempoolFlusher::new(
-                flush_provider,
-                l1_config.batch_submitter_address,
-                protocol.seconds_per_block,
-            );
-            flusher.flush_and_wait().await?;
-
-            tracing::info!("re-syncing L1 safe head after flush");
-            input_reader.sync_to_current_safe_head().await?;
-
-            tracing::info!("running post-flush recovery (cascade non-gold suffix)");
-            det_storage.recover_post_flush(protocol.danger_threshold())?
+            run_flush_and_cascade(db_path, input_reader, l1_config, protocol).await?
         }
         StartupAction::Refuse(reason) => {
             tracing::error!(
@@ -332,6 +317,58 @@ pub async fn run_preemptive_recovery(
     }
 
     Ok(invalidated)
+}
+
+/// Execute the flush-and-cascade phase: resolve every pending wallet-nonce
+/// slot on L1, re-sync the safe head so the gold frontier reflects post-flush
+/// state, then cascade-invalidate the doomed non-gold suffix and open a fresh
+/// recovery Tip.
+///
+/// The four steps form one logical phase — they have no meaning on their own
+/// and the orchestrator only ever runs them as a unit.
+async fn run_flush_and_cascade(
+    db_path: &str,
+    input_reader: &mut InputReader,
+    l1_config: &L1Config,
+    protocol: &ProtocolTiming,
+) -> Result<Vec<u64>, RecoveryError> {
+    let flush_provider = crate::l1::provider::create_signer_provider(
+        &l1_config.eth_rpc_url,
+        &l1_config.batch_submitter_private_key,
+    )
+    .map_err(|e| RecoveryError::Provider(e.to_string()))?;
+    let flusher = MempoolFlusher::new(
+        flush_provider,
+        l1_config.batch_submitter_address,
+        protocol.seconds_per_block,
+    );
+    flusher.flush_and_wait().await?;
+
+    // If this re-sync errors out, L1 has been flushed but the DB has NOT been
+    // cascaded — we exit with the InputReaderError and rely on the orchestrator
+    // to respawn. That's safe by design:
+    //
+    // - `flush_and_wait` is idempotent: on the next attempt it queries L1 for
+    //   pending wallet-nonces, finds zero (the previous flush cleared them),
+    //   and returns immediately.
+    // - `check_danger` is stable across the failure window: safe_block only
+    //   moves forward and flush doesn't retroactively change closed batches'
+    //   `first_frame_safe_block`, so the danger condition that fired before
+    //   still fires after the restart.
+    // - `recover_post_flush` is idempotent against the resulting DB state
+    //   (verified by `after_post_recovery_crash_is_no_op` in `recovery_tests`).
+    //
+    // So a failure here just costs an extra orchestrator respawn; correctness
+    // is preserved.
+    //
+    // More importantly, it refuses to boot, during a recovery scenario, when
+    // we can't reach L1.
+    tracing::info!("re-syncing L1 safe head after flush");
+    input_reader.sync_to_current_safe_head().await?;
+
+    tracing::info!("running post-flush recovery (cascade non-gold suffix)");
+    let mut storage = storage::Storage::open(db_path)?;
+    Ok(storage.recover_post_flush(protocol.danger_threshold())?)
 }
 
 #[cfg(test)]
