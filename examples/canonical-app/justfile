@@ -35,13 +35,13 @@ build-dapp: build-dapp-devnet
 
 build-dapp-devnet:
     mkdir -p {{out_dir}}
-    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --bin canonical-app-devnet --target riscv64gc-unknown-linux-musl --release
+    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_TARGET_DIR=../../target CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --bin canonical-app-devnet --target riscv64gc-unknown-linux-musl --release
     cp ../../target/riscv64gc-unknown-linux-musl/release/canonical-app-devnet {{dapp_binary_devnet}}
     cp {{dapp_binary_devnet}} {{dapp_binary}}
 
 build-dapp-sepolia:
     mkdir -p {{out_dir}}
-    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --bin canonical-app-sepolia --target riscv64gc-unknown-linux-musl --release
+    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_TARGET_DIR=../../target CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package canonical-app --bin canonical-app-sepolia --target riscv64gc-unknown-linux-musl --release
     cp ../../target/riscv64gc-unknown-linux-musl/release/canonical-app-sepolia {{dapp_binary_sepolia}}
     cp {{dapp_binary_sepolia}} {{dapp_binary}}
 

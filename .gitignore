@@ -5,6 +5,7 @@ sequencer.db
 sequencer.db-shm
 sequencer.db-wal
 /out/
+examples/canonical-app/out/
 /.DS_Store
 soljson-latest.js
 **/states/

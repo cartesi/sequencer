@@ -14,7 +14,7 @@ function http.new_curl()
 
     local client = {}
 
-    function client:post(url, body, headers)
+    function client.post(_self, url, body, headers)
         local chunks = {}
         local header_list = {}
         for key, value in pairs(headers or {}) do
@@ -50,7 +50,7 @@ function http.new_curl()
         }
     end
 
-    function client:get(url, headers)
+    function client.get(_self, url, headers)
         local chunks = {}
         local header_list = {}
         for key, value in pairs(headers or {}) do

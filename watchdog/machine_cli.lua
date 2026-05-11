@@ -101,11 +101,6 @@ function machine_cli.new(opts)
         assert(type(instance) == "table", "machine instance is required")
         assert(type(snapshot_dir) == "string" and snapshot_dir ~= "", "snapshot_dir is required")
 
-        local ok, err = mkdir_p(snapshot_dir)
-        if not ok then
-            return nil, err
-        end
-
         local command = table.concat({
             shell_quote(executable),
             "--no-rollback",
