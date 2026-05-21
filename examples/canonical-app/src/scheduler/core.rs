@@ -1043,10 +1043,28 @@ mod tests {
             scheduler.process_input(direct_input(1, 7)),
             ProcessOutcome::DirectEnqueued
         );
-
+        // Inspect reflects executed app state, not the direct-input queue.
         let state = scheduler
             .inspect_state(STATE_INSPECT_QUERY)
             .expect("inspect state");
+        assert_eq!(state, b"events:0");
+
+        let batch = Batch {
+            nonce: 0,
+            frames: vec![Frame {
+                user_ops: vec![],
+                safe_block: 1,
+                fee_price: 0,
+            }],
+        };
+        assert_eq!(
+            scheduler.process_input(batch_input(2, batch)),
+            ProcessOutcome::BatchExecuted
+        );
+
+        let state = scheduler
+            .inspect_state(STATE_INSPECT_QUERY)
+            .expect("inspect state after drain");
         assert_eq!(state, b"events:1");
     }
 
