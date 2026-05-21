@@ -3568,6 +3568,8 @@ dependencies = [
  "rollups-harness",
  "sequencer-core",
  "sequencer-rust-client",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

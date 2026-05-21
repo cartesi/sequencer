@@ -430,6 +430,31 @@ test("machine cli adapter writes raw input files", function()
     file:close()
 end)
 
+test("machine cli adapter inspect reads report file", function()
+    local base = os.tmpname()
+    os.remove(base)
+    os.execute(string.format('mkdir -p "%s"', base))
+    local script_path = base .. "/fake-cartesi-machine.sh"
+    local driver = machine_cli.new({ work_dir = base, executable = script_path })
+    local instance = assert(driver:load("/tmp/source-snapshot"))
+
+    local script = io.open(script_path, "wb")
+    assert(script ~= nil, "fake cartesi-machine script opened")
+    script:write(string.format([[
+#!/bin/sh
+mkdir -p "%s"
+printf '%%s' '{"ok":true}' > "%s/inspect-report-0.bin"
+exit 0
+]], instance.work_dir, instance.work_dir))
+    script:close()
+    os.execute(string.format('chmod +x "%s"', script_path))
+
+    local state, err = driver:inspect_state(instance)
+
+    assert_eq(err, nil)
+    assert_eq(state, '{"ok":true}')
+end)
+
 test("machine cli adapter leaves snapshot directory creation to cartesi-machine", function()
     local base = os.tmpname()
     os.remove(base)

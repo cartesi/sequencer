@@ -87,6 +87,15 @@ impl PartialEq<ProcessResult> for ProcessOutcome {
     }
 }
 
+/// Inspect query accepted by the scheduler's state export endpoint.
+pub const STATE_INSPECT_QUERY: &[u8] = b"state";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum InspectError {
+    UnsupportedQuery,
+    Application(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BatchRejectReason {
     DecodeFailed,
@@ -128,6 +137,17 @@ impl<A: Application> Scheduler<A> {
     #[cfg(test)]
     pub fn next_expected_batch_nonce(&self) -> u64 {
         self.next_expected_batch_nonce
+    }
+
+    pub(super) fn inspect_state(&self, query: &[u8]) -> Result<Vec<u8>, InspectError> {
+        if !query.is_empty() && query != STATE_INSPECT_QUERY {
+            return Err(InspectError::UnsupportedQuery);
+        }
+
+        self.app
+            .export_state()
+            .map(|state| state.into_bytes())
+            .map_err(|err| InspectError::Application(err.to_string()))
     }
 
     pub(super) fn process_input(&mut self, input: SchedulerInput) -> ProcessResult {
@@ -482,6 +502,10 @@ mod tests {
 
         fn state_file_in_dump(_prefix: &std::path::Path) -> std::path::PathBuf {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
+        }
+
+        fn export_state(&self) -> Result<String, sequencer_core::application::AppError> {
+            Ok(format!("events:{}", self.executed.len()))
         }
     }
 
@@ -1004,6 +1028,42 @@ mod tests {
             ProcessOutcome::BatchExecuted
         );
         assert_eq!(scheduler.app.events(), [RecordedTx::UserOp(9)]);
+    }
+
+    #[test]
+    fn inspect_exports_application_state_for_state_query() {
+        let mut scheduler = Scheduler::new(
+            RecordingApp::default(),
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 100,
+            },
+        );
+        assert_eq!(
+            scheduler.process_input(direct_input(1, 7)),
+            ProcessOutcome::DirectEnqueued
+        );
+
+        let state = scheduler
+            .inspect_state(STATE_INSPECT_QUERY)
+            .expect("inspect state");
+        assert_eq!(state, b"events:1");
+    }
+
+    #[test]
+    fn inspect_rejects_unsupported_query() {
+        let scheduler = Scheduler::new(
+            RecordingApp::default(),
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 100,
+            },
+        );
+
+        assert_eq!(
+            scheduler.inspect_state(b"balances"),
+            Err(InspectError::UnsupportedQuery)
+        );
     }
 
     #[test]

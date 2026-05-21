@@ -37,7 +37,7 @@ const INPUT_READER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn run<A>(app: A, config: RunConfig) -> Result<(), RunError>
 where
-    A: Application + 'static,
+    A: Application + Clone + Sync + 'static,
 {
     // ── Bootstrap ────────────────────────────────────────────
     std::fs::create_dir_all(&config.data_dir)?;

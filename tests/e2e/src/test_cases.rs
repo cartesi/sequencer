@@ -305,6 +305,11 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 )
             },
         ),
+        ("watchdog_genesis_compare_test", |runtime| {
+            Box::pin(crate::watchdog_compare::run_watchdog_genesis_compare_test(
+                runtime,
+            ))
+        }),
     ]
 }
 

@@ -35,7 +35,7 @@ end
 
 local function main()
     local cfg = config.load()
-    local http = http_mod.new_curl()
+    local http = http_mod.new_auto()
     local json = load_json()
     local deps = {
         http = http,

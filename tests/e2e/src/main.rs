@@ -3,7 +3,9 @@
 
 use libtest_mimic::{Arguments, Trial};
 use rollups_e2e::run_trial;
-use rollups_harness::{ManagedSequencer, default_devnet_sequencer_config};
+use rollups_harness::{
+    ManagedSequencer, default_devnet_sequencer_config, devnet_sequencer_config_no_faketime,
+};
 
 fn main() {
     let mut args = Arguments::from_args();
@@ -14,10 +16,13 @@ fn main() {
         .map(|(name, scenario)| {
             Trial::test(name, move || {
                 let log_prefix = format!("rollups-e2e-{name}");
+                let spawn_config = if name == "watchdog_genesis_compare_test" {
+                    devnet_sequencer_config_no_faketime(log_prefix)
+                } else {
+                    default_devnet_sequencer_config(log_prefix)
+                };
                 run_trial(name, || async move {
-                    let mut runtime =
-                        ManagedSequencer::spawn(default_devnet_sequencer_config(log_prefix))
-                            .await?;
+                    let mut runtime = ManagedSequencer::spawn(spawn_config).await?;
                     let scenario_result = scenario(&mut runtime).await;
                     // Post-test schema invariants: assert the DB's structural
                     // invariants only if the scenario succeeded — otherwise

@@ -25,6 +25,7 @@ use tower_http::trace::TraceLayer;
 
 pub use crate::egress::api::SnapshotState;
 use crate::egress::api::SubscribeState;
+use crate::egress::app_state::StateSnapshotProvider;
 use crate::egress::l2_tx_feed::L2TxFeed;
 use crate::ingress::api::SubmitState;
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
@@ -175,6 +176,7 @@ pub async fn start(
     max_user_op_data_bytes: usize,
     shutdown: ShutdownSignal,
     tx_feed: L2TxFeed,
+    state_snapshotter: Arc<dyn StateSnapshotProvider>,
     config: ApiConfig,
     snapshot_state: SnapshotState,
 ) -> io::Result<ApiServerTask> {
@@ -186,6 +188,7 @@ pub async fn start(
         max_user_op_data_bytes,
         shutdown,
         tx_feed,
+        state_snapshotter,
         config,
         snapshot_state,
     ))
@@ -199,6 +202,7 @@ pub fn start_on_listener(
     max_user_op_data_bytes: usize,
     shutdown: ShutdownSignal,
     tx_feed: L2TxFeed,
+    state_snapshotter: Arc<dyn StateSnapshotProvider>,
     config: ApiConfig,
     snapshot_state: SnapshotState,
 ) -> ApiServerTask {
@@ -218,10 +222,15 @@ pub fn start_on_listener(
         config.ws_max_subscribers,
         config.ws_max_catchup_events,
     ));
+    let get_state_state = crate::egress::api::GetStateState {
+        shutdown: shutdown.clone(),
+        snapshotter: state_snapshotter,
+    };
 
     let app: Router = crate::ingress::api::router(submit_state)
         .merge(crate::egress::api::router(
             subscribe_state,
+            get_state_state,
             health_state,
             Arc::new(snapshot_state),
         ))
