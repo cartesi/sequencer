@@ -3,7 +3,9 @@
 
 mod core;
 
-pub use core::{DEVNET_SEQUENCER_ADDRESS, SEPOLIA_SEQUENCER_ADDRESS, SchedulerConfig};
+pub use core::{
+    DEVNET_SEQUENCER_ADDRESS, SEPOLIA_SEQUENCER_ADDRESS, STATE_INSPECT_QUERY, SchedulerConfig,
+};
 
 use sequencer_core::application::AppOutput;
 use sequencer_core::application::Application;
@@ -46,9 +48,12 @@ pub fn run_scheduler_forever<R: Rollup, A: Application>(
                         });
                 }
             }
-            Ok(RollupRequest::Inspect { .. }) => {
+            Ok(RollupRequest::Inspect { payload }) => {
+                let report = scheduler
+                    .inspect_state(&payload)
+                    .unwrap_or_else(|err| panic!("scheduler inspect failed: {err:?}"));
                 rollup
-                    .emit_report(b"scheduler inspect endpoint not implemented")
+                    .emit_report(&report)
                     .unwrap_or_else(|err| panic!("scheduler failed to emit inspect report: {err}"));
             }
             Err(err) => panic!("scheduler failed while reading next input: {err}"),
@@ -155,6 +160,42 @@ mod tests {
             prev_randao: U256::ZERO,
             index: U256::ZERO,
         }
+    }
+
+    #[test]
+    fn run_scheduler_emits_exported_state_for_state_inspect() {
+        let inspect = RollupRequest::Inspect {
+            payload: STATE_INSPECT_QUERY.to_vec(),
+        };
+        let terminal_err = Err(RollupError::CmtCallFailed {
+            operation: "next_input",
+            code: -22,
+        });
+        let (rollup, reports) = MockRollup::with_inputs(vec![Ok(inspect), terminal_err]);
+        let expected = WalletApp::new(WalletConfig::default())
+            .export_state()
+            .expect("export state")
+            .into_bytes();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_scheduler_forever(
+                rollup,
+                WalletApp::new(WalletConfig::default()),
+                SchedulerConfig::default(),
+            )
+        }));
+
+        assert!(
+            result.is_err(),
+            "scheduler loop should panic on rollup error"
+        );
+        let reports = reports.lock().expect("poisoned reports mutex");
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.as_slice() == expected.as_slice()),
+            "missing state inspect report, got: {reports:?}"
+        );
     }
 
     #[test]

@@ -5,6 +5,8 @@ local machine = require("watchdog.machine")
 
 local machine_cli = {}
 
+local STATE_INSPECT_QUERY = "state"
+
 local function shell_quote(value)
     value = tostring(value)
     return "'" .. value:gsub("'", "'\\''") .. "'"
@@ -26,6 +28,16 @@ local function write_all(path, data)
     file:write(data)
     file:close()
     return true
+end
+
+local function read_all(path)
+    local file, err = io.open(path, "rb")
+    if not file then
+        return nil, err
+    end
+    local data = file:read("*a")
+    file:close()
+    return data
 end
 
 local function run_command(command)
@@ -90,11 +102,50 @@ function machine_cli.new(opts)
         return true
     end
 
-    function binding.inspect_state(_instance)
-        -- Inspect requires rollback semantics around the loaded snapshot. The
-        -- advance-only watchdog mode does not call this; compare mode remains
-        -- deferred until the canonical app inspect contract exists.
-        return nil, "CM inspect is not implemented for the CLI adapter yet"
+    function binding.inspect_state(instance)
+        assert(type(instance) == "table", "machine instance is required")
+
+        local query_path = instance.work_dir .. "/inspect-query.bin"
+        local report_path = instance.work_dir .. "/inspect-report-0.bin"
+
+        local ok, err = write_all(query_path, STATE_INSPECT_QUERY)
+        if not ok then
+            return nil, err
+        end
+
+        local command_parts = {
+            shell_quote(executable),
+            "--no-rollback",
+            "--load=" .. shell_quote(instance.source_snapshot_dir) .. ",sharing:none",
+        }
+        if instance.input_count > 0 then
+            table.insert(
+                command_parts,
+                "--cmio-advance-state=input:"
+                    .. shell_quote(instance.input_dir .. "/input-%i.bin")
+                    .. ",input_index_begin:0,input_index_end:"
+                    .. tostring(instance.input_count)
+            )
+        end
+        table.insert(
+            command_parts,
+            "--cmio-inspect-state=query:"
+                .. shell_quote(query_path)
+                .. ",report:"
+                .. shell_quote(instance.work_dir .. "/inspect-report-%o.bin")
+        )
+        table.insert(command_parts, "--quiet")
+
+        ok, err = run_command(table.concat(command_parts, " "))
+        if not ok then
+            return nil, err
+        end
+
+        local report, read_err = read_all(report_path)
+        if not report then
+            return nil, "failed to read inspect report: " .. tostring(read_err)
+        end
+        return report
     end
 
     function binding.save_snapshot(instance, snapshot_dir)
@@ -119,6 +170,7 @@ end
 
 machine_cli._private = {
     shell_quote = shell_quote,
+    STATE_INSPECT_QUERY = STATE_INSPECT_QUERY,
 }
 
 return machine_cli

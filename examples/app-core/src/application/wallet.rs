@@ -51,7 +51,7 @@ impl Default for WalletConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WalletApp {
     config: WalletConfig,
     balances: HashMap<Address, U256>,
@@ -224,6 +224,39 @@ impl WalletApp {
             executed_input_count: decoded.executed_input_count,
         })
     }
+
+    fn state_json(&self) -> String {
+        let mut balances: Vec<_> = self
+            .balances
+            .iter()
+            .filter(|(_, balance)| **balance != U256::ZERO)
+            .collect();
+        balances.sort_by_key(|(address, _)| address.as_slice());
+
+        let mut nonces: Vec<_> = self
+            .nonces
+            .iter()
+            .filter(|(_, nonce)| **nonce != 0)
+            .collect();
+        nonces.sort_by_key(|(address, _)| address.as_slice());
+
+        let balance_entries = balances
+            .into_iter()
+            .map(|(address, balance)| format!("\"{}\":\"{balance}\"", json_address(address)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let nonce_entries = nonces
+            .into_iter()
+            .map(|(address, nonce)| format!("\"{}\":{nonce}", json_address(address)))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!("{{\"balances\":{{{balance_entries}}},\"nonces\":{{{nonce_entries}}}}}")
+    }
+}
+
+fn json_address(address: &Address) -> String {
+    format!("0x{}", alloy_primitives::hex::encode(address.as_slice()))
 }
 
 impl Default for WalletApp {
@@ -406,6 +439,10 @@ impl Application for WalletApp {
 
     fn state_file_in_dump(prefix: &Path) -> PathBuf {
         prefix.join("state")
+    }
+
+    fn export_state(&self) -> Result<String, AppError> {
+        Ok(self.state_json())
     }
 }
 
@@ -993,5 +1030,31 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("wallet-dump-{}-{nanos}-{n}", std::process::id()));
         path
+    }
+
+    #[test]
+    fn export_state_is_deterministic_and_omits_defaults() {
+        let mut app = WalletApp::new(WalletConfig::default());
+        let high = address!("0xffffffffffffffffffffffffffffffffffffffff");
+        let low = address!("0x1111111111111111111111111111111111111111");
+        app.balances.insert(high, U256::from(20_u64));
+        app.balances.insert(low, U256::from(10_u64));
+        app.balances.insert(Address::ZERO, U256::ZERO);
+        app.nonces.insert(high, 2);
+        app.nonces.insert(low, 1);
+        app.nonces.insert(Address::ZERO, 0);
+
+        assert_eq!(
+            app.export_state().expect("export state"),
+            concat!(
+                "{\"balances\":{",
+                "\"0x1111111111111111111111111111111111111111\":\"10\",",
+                "\"0xffffffffffffffffffffffffffffffffffffffff\":\"20\"",
+                "},\"nonces\":{",
+                "\"0x1111111111111111111111111111111111111111\":1,",
+                "\"0xffffffffffffffffffffffffffffffffffffffff\":2",
+                "}}"
+            )
+        );
     }
 }

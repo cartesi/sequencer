@@ -15,6 +15,23 @@ test:
 test-watchdog:
     lua watchdog/tests/run.lua
 
+test-watchdog-e2e:
+    lua watchdog/tests/e2e.lua
+
+# POST sample alarms to WATCHDOG_WEBHOOK_URL (staging smoke).
+test-watchdog-webhook-drill: watchdog-lua-deps
+    @test -n "${WATCHDOG_WEBHOOK_URL:-}" || { echo "set WATCHDOG_WEBHOOK_URL"; exit 1; }
+    WATCHDOG_LUA_DEPS={{justfile_directory()}}/.deps/lua lua watchdog/tests/drill_webhook.lua
+    WATCHDOG_LUA_DEPS={{justfile_directory()}}/.deps/lua lua watchdog/tests/drill_divergence.lua
+
+# Build lua-cjson into .deps/lua (for compare harness / drills without system packages).
+watchdog-lua-deps:
+    @bash scripts/watchdog-lua-deps.sh
+
+test-watchdog-compare-harness: setup watchdog-lua-deps ensure-machine-image
+    cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e
+    RUN_WATCHDOG_E2E=1 cargo run -p rollups-e2e -- watchdog_genesis_compare_test --exact --nocapture
+
 # Run sequencer tests sequentially so partition static config (init) is not shared across parallel tests.
 test-sequencer:
     cargo test -p sequencer --lib -- --test-threads=1

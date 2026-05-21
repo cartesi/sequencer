@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::io::ErrorKind;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
-use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
+use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, WalletApp, WalletConfig};
 use futures_util::{SinkExt, StreamExt};
+use sequencer::egress::app_state::StateSnapshotter;
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::http::{self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
 use sequencer::ingress::inclusion_lane::{PendingUserOp, SequencerError};
@@ -459,6 +461,11 @@ async fn start_test_server_with_limits(
         MAX_METHOD_PAYLOAD_BYTES,
         shutdown.clone(),
         tx_feed,
+        Arc::new(StateSnapshotter::new(
+            db_path.to_string(),
+            WalletApp::new(WalletConfig::default()),
+            Address::from([0xff; 20]),
+        )),
         ApiConfig {
             ws_max_subscribers,
             ws_max_catchup_events,
