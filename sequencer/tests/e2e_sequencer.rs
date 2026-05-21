@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::io::ErrorKind;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, Signature, U256};
@@ -12,6 +13,7 @@ use app_core::application::{
 use futures_util::StreamExt;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
+use sequencer::egress::app_state::StateSnapshotter;
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::http::{self, ApiConfig};
 use sequencer::ingress::inclusion_lane::{
@@ -190,6 +192,49 @@ fn v1_regression_domain_fields_all_affect_recovery() {
     assert_ne!(
         recovered_app_other, signer_address,
         "cross-app replay must not recover signer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_state_returns_safe_only_projection_over_http() {
+    let db = temp_db("get-state-http");
+    let domain = test_domain();
+    let sender = Address::repeat_byte(0x11);
+    bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(10_u64))]);
+
+    let Some(runtime) = start_api_only_server(db.path.as_str(), domain, 4 * 1024, 8).await else {
+        return;
+    };
+
+    let (status, body) = get_raw(runtime.addr, "/get_state").await;
+    shutdown_runtime(runtime).await;
+
+    assert_eq!(status, 200, "get_state response: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse get_state JSON");
+    assert_eq!(parsed["safe_block"], 1);
+    assert_eq!(
+        parsed["state"], "{\"balances\":{},\"nonces\":{}}",
+        "soft-confirmed tip deposits must not appear in safe-only export"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_state_is_unavailable_before_safe_head_is_observed() {
+    let db = temp_db("get-state-no-safe-head");
+    let domain = test_domain();
+    let _storage = Storage::open(db.path.as_str()).expect("open storage");
+
+    let Some(runtime) = start_api_only_server(db.path.as_str(), domain, 4 * 1024, 8).await else {
+        return;
+    };
+
+    let (status, body) = get_raw(runtime.addr, "/get_state").await;
+    shutdown_runtime(runtime).await;
+
+    assert_eq!(status, 503, "get_state without safe head: {body}");
+    assert!(
+        body.contains("safe L1 head has not been observed yet"),
+        "expected safe-head unavailable message, got: {body}"
     );
 }
 
@@ -1138,6 +1183,11 @@ async fn start_full_server_with_max_body(
         MAX_METHOD_PAYLOAD_BYTES,
         shutdown.clone(),
         tx_feed,
+        Arc::new(StateSnapshotter::new(
+            db_path.to_string(),
+            WalletApp::new(WalletConfig::default()),
+            Address::from([0xff; 20]),
+        )),
         ApiConfig {
             max_body_bytes,
             ..ApiConfig::default()
@@ -1192,6 +1242,11 @@ async fn start_api_only_server(
         MAX_METHOD_PAYLOAD_BYTES,
         shutdown.clone(),
         tx_feed,
+        Arc::new(StateSnapshotter::new(
+            db_path.to_string(),
+            WalletApp::new(WalletConfig::default()),
+            Address::from([0xff; 20]),
+        )),
         ApiConfig {
             max_body_bytes,
             ..ApiConfig::default()
@@ -1402,6 +1457,26 @@ async fn post_raw_body_no_content_type(addr: std::net::SocketAddr, body: &str) -
         "POST /tx HTTP/1.1\r\nHost: {host_port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw request");
+    stream.flush().await.expect("flush raw request");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read raw response");
+    parse_http_response(response.as_slice())
+}
+
+async fn get_raw(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
+    let host_port = addr.to_string();
+    let mut stream = tokio::net::TcpStream::connect(host_port.as_str())
+        .await
+        .expect("connect test http socket");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await

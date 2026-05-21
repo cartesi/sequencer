@@ -19,4 +19,6 @@ alloy-sol-types = "1.4.1"
 futures = "0.3"
 libtest-mimic = "0.6.1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net"] }
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net", "process", "io-util"] }
+serde_json = "1.0"
+tempfile = "3.10"

@@ -83,7 +83,7 @@ pub(crate) struct Workers {
 impl Workers {
     /// Build the worker configs, spawn each worker, return the owning struct.
     /// Logs `listening` once the HTTP server is bound.
-    pub(crate) async fn spawn<A: Application + 'static>(
+    pub(crate) async fn spawn<A: Application + Clone + Sync + 'static>(
         cfg: WorkersConfig<A>,
     ) -> Result<Self, RunError> {
         let WorkersConfig {
@@ -101,6 +101,12 @@ impl Workers {
         let input_reader_genesis_block = input_reader.genesis_block();
 
         let shutdown = ShutdownSignal::default();
+
+        let state_snapshotter = Arc::new(crate::egress::app_state::StateSnapshotter::new(
+            db_path.clone(),
+            app.clone(),
+            l1_config.batch_submitter_address,
+        ));
 
         // Inclusion lane: takes the app, returns the tx-sender the HTTP
         // ingress route will publish to.
@@ -186,6 +192,7 @@ impl Workers {
             A::MAX_METHOD_PAYLOAD_BYTES,
             shutdown.clone(),
             tx_feed,
+            state_snapshotter,
             ApiConfig::default(),
             http::SnapshotState {
                 db_path: db_path.clone(),

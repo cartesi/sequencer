@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 pub mod test_cases;
+mod watchdog_compare;
 
 use std::future::Future;
 use std::pin::Pin;

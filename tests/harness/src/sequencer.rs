@@ -33,6 +33,9 @@ pub struct ManagedSequencerConfig {
     pub sequencer_bin: PathBuf,
     pub log_prefix: String,
     pub logs_dir: PathBuf,
+    /// When false, the child runs without libfaketime (for tests that never
+    /// manipulate wall clock). Requires libfaketime in PATH when true.
+    pub faketime: bool,
 }
 
 /// Snapshot of the `batches` table. Returned by
@@ -95,13 +98,12 @@ pub struct ManagedSequencer {
     /// When `None`, defaults to `DEVNET_CHAIN_ID` (matches Anvil). Set to
     /// a non-matching value to test chain-id-mismatch failure modes
     chain_id_override: Option<u64>,
-    /// Path to the file libfaketime re-reads for its offset, on every time
-    /// call (combined with `FAKETIME_NO_CACHE=1`). Writing to this file
-    /// shifts the sequencer's view of `SystemTime::now()` / `Instant::now()`
-    /// immediately — no respawn needed.
-    faketime_rc_path: PathBuf,
-    /// Cached libfaketime dylib/so path (computed once on spawn).
-    libfaketime_path: PathBuf,
+    /// Cached libfaketime dylib/so path (computed once on spawn). `None` when
+    /// [`ManagedSequencerConfig::faketime`] is false.
+    libfaketime_path: Option<PathBuf>,
+    /// Path to the file libfaketime re-reads for its offset. `None` when
+    /// faketime is disabled.
+    faketime_rc_path: Option<PathBuf>,
     /// Internal cumulative forward-offset tracker for
     /// [`Self::advance_wall_and_mine`]. Not touched by
     /// [`Self::set_faketime_offset`].
@@ -110,16 +112,31 @@ pub struct ManagedSequencer {
 
 pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> ManagedSequencerConfig {
     ManagedSequencerConfig {
-        sequencer_bin: PathBuf::from(DEFAULT_DEVNET_SEQUENCER_BIN),
+        sequencer_bin: paths::resolve_devnet_sequencer_bin(),
         log_prefix: log_prefix.into(),
         logs_dir: PathBuf::from(DEFAULT_TEST_LOGS_DIR),
+        faketime: true,
+    }
+}
+
+/// Devnet config without libfaketime (watchdog compare and other wall-clock-neutral tests).
+pub fn devnet_sequencer_config_no_faketime(
+    log_prefix: impl Into<String>,
+) -> ManagedSequencerConfig {
+    ManagedSequencerConfig {
+        faketime: false,
+        ..default_devnet_sequencer_config(log_prefix)
     }
 }
 
 impl ManagedSequencer {
     pub async fn spawn(config: ManagedSequencerConfig) -> HarnessResult<Self> {
         let logs_dir = paths::resolve_from_workspace(&config.logs_dir);
-        let sequencer_bin = paths::resolve_from_workspace(&config.sequencer_bin);
+        let sequencer_bin = if config.sequencer_bin.is_absolute() {
+            config.sequencer_bin.clone()
+        } else {
+            paths::resolve_from_workspace(&config.sequencer_bin)
+        };
         let log_prefix = config.log_prefix;
         let rollups = DevnetRollupsStack::spawn(log_prefix.as_str(), logs_dir.as_path()).await?;
 
@@ -128,14 +145,15 @@ impl ManagedSequencer {
             .map_err(|err| io_other(format!("failed to create temp data dir: {err}")))?;
         let data_dir_path = data_dir.path().to_path_buf();
 
-        // Set up faketime: locate libfaketime + create the rc file. Initial
-        // content `+0` means no offset; tests can overwrite with a new offset
-        // at any time and the running sequencer will see it on its next
-        // `SystemTime::now()` / `Instant::now()` call (FAKETIME_NO_CACHE=1).
-        let libfaketime_path = find_libfaketime()?;
-        let faketime_rc_path = data_dir_path.join("faketime.rc");
-        fs::write(faketime_rc_path.as_path(), "+0\n")
-            .map_err(|err| io_other(format!("create faketime rc file: {err}")))?;
+        let (libfaketime_path, faketime_rc_path) = if config.faketime {
+            let libfaketime_path = find_libfaketime()?;
+            let faketime_rc_path = data_dir_path.join("faketime.rc");
+            fs::write(faketime_rc_path.as_path(), "+0\n")
+                .map_err(|err| io_other(format!("create faketime rc file: {err}")))?;
+            (Some(libfaketime_path), Some(faketime_rc_path))
+        } else {
+            (None, None)
+        };
 
         let SpawnedSequencerProcess {
             child,
@@ -149,8 +167,8 @@ impl ManagedSequencer {
             &rollups,
             None,
             None,
-            libfaketime_path.as_path(),
-            faketime_rc_path.as_path(),
+            libfaketime_path.as_deref(),
+            faketime_rc_path.as_deref(),
         )
         .await?;
 
@@ -210,8 +228,12 @@ impl ManagedSequencer {
     /// Replaces any cumulative advance tracked by
     /// [`Self::advance_wall_and_mine`], and resets its counter.
     pub fn set_faketime_offset(&mut self, offset: Option<String>) -> HarnessResult<()> {
+        let rc = self
+            .faketime_rc_path
+            .as_ref()
+            .ok_or_else(|| io_other("faketime is disabled for this ManagedSequencer"))?;
         let s = offset.as_deref().unwrap_or("+0");
-        fs::write(self.faketime_rc_path.as_path(), format!("{s}\n"))
+        fs::write(rc.as_path(), format!("{s}\n"))
             .map_err(|err| io_other(format!("write faketime rc file: {err}")))?;
         self.cumulative_offset_secs = 0;
         Ok(())
@@ -462,6 +484,10 @@ impl ManagedSequencer {
         self.rollups.app_address()
     }
 
+    pub fn input_box_address(&self) -> Address {
+        self.rollups.input_box_address()
+    }
+
     pub fn erc20_portal_address(&self) -> Address {
         self.rollups.erc20_portal_address()
     }
@@ -522,11 +548,12 @@ impl ManagedSequencer {
         let blocks = secs / SECONDS_PER_BLOCK;
         self.mine_l1_blocks(blocks).await?;
         self.cumulative_offset_secs = self.cumulative_offset_secs.saturating_add(secs);
-        fs::write(
-            self.faketime_rc_path.as_path(),
-            format!("+{}s\n", self.cumulative_offset_secs),
-        )
-        .map_err(|err| io_other(format!("write faketime rc file: {err}")))?;
+        let rc = self
+            .faketime_rc_path
+            .as_ref()
+            .ok_or_else(|| io_other("faketime is disabled for this ManagedSequencer"))?;
+        fs::write(rc.as_path(), format!("+{}s\n", self.cumulative_offset_secs))
+            .map_err(|err| io_other(format!("write faketime rc file: {err}")))?;
         Ok(())
     }
 
@@ -682,8 +709,8 @@ impl ManagedSequencer {
             &self.rollups,
             self.l1_endpoint_override.as_deref(),
             self.chain_id_override,
-            self.libfaketime_path.as_path(),
-            self.faketime_rc_path.as_path(),
+            self.libfaketime_path.as_deref(),
+            self.faketime_rc_path.as_deref(),
         )
         .await?;
         self.child = child;
@@ -772,8 +799,8 @@ async fn spawn_sequencer_process(
     rollups: &DevnetRollupsStack,
     l1_endpoint_override: Option<&str>,
     chain_id_override: Option<u64>,
-    libfaketime_path: &Path,
-    faketime_rc_path: &Path,
+    libfaketime_path: Option<&Path>,
+    faketime_rc_path: Option<&Path>,
 ) -> HarnessResult<SpawnedSequencerProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;
     let log_path = timestamped_log_path(logs_dir, log_prefix);
@@ -796,7 +823,9 @@ async fn spawn_sequencer_process(
     // `Instant::now()` call thanks to FAKETIME_NO_CACHE=1, so tests can
     // shift the clock dynamically during a run.
     let mut cmd = Command::new(path_as_str(sequencer_bin)?);
-    apply_faketime_env(&mut cmd, libfaketime_path, faketime_rc_path)?;
+    if let (Some(lib), Some(rc)) = (libfaketime_path, faketime_rc_path) {
+        apply_faketime_env(&mut cmd, lib, rc)?;
+    }
 
     let chain_id = chain_id_override.unwrap_or(DEVNET_CHAIN_ID);
     let mut child = cmd

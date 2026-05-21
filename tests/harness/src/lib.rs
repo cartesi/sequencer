@@ -18,6 +18,7 @@ pub use rollups::{DEVNET_CHAIN_ID, DevnetRollupsStack};
 pub use sequencer::{
     BatchCounts, DEFAULT_DEVNET_SEQUENCER_BIN, DEFAULT_TEST_LOGS_DIR, ManagedSequencer,
     ManagedSequencerConfig, RespawnAttemptOutcome, RespawnPolicy, default_devnet_sequencer_config,
+    devnet_sequencer_config_no_faketime,
 };
 pub use wallet::{
     TestSigner, WalletL1Client, WalletL2Client, address_from_signing_key, sign_user_op_hex,

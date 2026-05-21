@@ -1,4 +1,6 @@
 /target
+.deps/
+watchdog-e2e-*/
 .env
 .env.fish
 sequencer.db
