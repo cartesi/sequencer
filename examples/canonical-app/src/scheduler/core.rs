@@ -460,6 +460,29 @@ mod tests {
             self.executed.push(RecordedTx::Direct(marker));
             Ok(Vec::new())
         }
+
+        fn from_dump(
+            _prefix: &std::path::Path,
+        ) -> Result<Self, sequencer_core::application::AppError> {
+            unimplemented!("RecordingApp does not participate in snapshot lifecycle")
+        }
+
+        fn create_dump(
+            &self,
+            _prefix: &std::path::Path,
+        ) -> Result<(), sequencer_core::application::AppError> {
+            unimplemented!("RecordingApp does not participate in snapshot lifecycle")
+        }
+
+        fn delete_dump(
+            _prefix: &std::path::Path,
+        ) -> Result<(), sequencer_core::application::AppError> {
+            unimplemented!("RecordingApp does not participate in snapshot lifecycle")
+        }
+
+        fn state_file_in_dump(_prefix: &std::path::Path) -> std::path::PathBuf {
+            unimplemented!("RecordingApp does not participate in snapshot lifecycle")
+        }
     }
 
     const SEQUENCER: Address = address!("0x1111111111111111111111111111111111111111");

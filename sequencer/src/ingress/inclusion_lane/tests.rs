@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -64,6 +65,22 @@ impl Application for TestApp {
     fn executed_input_count(&self) -> u64 {
         self.executed_input_count
     }
+
+    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
+        unimplemented!("TestApp does not participate in snapshot lifecycle")
+    }
+
+    fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
+        unimplemented!("TestApp does not participate in snapshot lifecycle")
+    }
+
+    fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
+        unimplemented!("TestApp does not participate in snapshot lifecycle")
+    }
+
+    fn state_file_in_dump(_prefix: &Path) -> PathBuf {
+        unimplemented!("TestApp does not participate in snapshot lifecycle")
+    }
 }
 
 struct InternalUserOpApp;
@@ -92,6 +109,22 @@ impl Application for InternalUserOpApp {
         Err(AppError::Internal {
             reason: "app invariant failed".to_string(),
         })
+    }
+
+    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
+        unimplemented!("InternalUserOpApp does not participate in snapshot lifecycle")
+    }
+
+    fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
+        unimplemented!("InternalUserOpApp does not participate in snapshot lifecycle")
+    }
+
+    fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
+        unimplemented!("InternalUserOpApp does not participate in snapshot lifecycle")
+    }
+
+    fn state_file_in_dump(_prefix: &Path) -> PathBuf {
+        unimplemented!("InternalUserOpApp does not participate in snapshot lifecycle")
     }
 }
 
@@ -144,6 +177,22 @@ impl Application for SharedCountingApp {
     fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
         self.executed_direct_inputs.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
+    }
+
+    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
+        unimplemented!("SharedCountingApp does not participate in snapshot lifecycle")
+    }
+
+    fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
+        unimplemented!("SharedCountingApp does not participate in snapshot lifecycle")
+    }
+
+    fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
+        unimplemented!("SharedCountingApp does not participate in snapshot lifecycle")
+    }
+
+    fn state_file_in_dump(_prefix: &Path) -> PathBuf {
+        unimplemented!("SharedCountingApp does not participate in snapshot lifecycle")
     }
 }
 
@@ -203,6 +252,22 @@ impl Application for ReplayRecordingApp {
 
     fn executed_input_count(&self) -> u64 {
         self.executed_input_count
+    }
+
+    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
+        unimplemented!("ReplayRecordingApp does not participate in snapshot lifecycle")
+    }
+
+    fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
+        unimplemented!("ReplayRecordingApp does not participate in snapshot lifecycle")
+    }
+
+    fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
+        unimplemented!("ReplayRecordingApp does not participate in snapshot lifecycle")
+    }
+
+    fn state_file_in_dump(_prefix: &Path) -> PathBuf {
+        unimplemented!("ReplayRecordingApp does not participate in snapshot lifecycle")
     }
 }
 
