@@ -73,20 +73,7 @@ cargo run -p sequencer
 
 Required: `SEQ_ETH_RPC_URL`, `SEQ_CHAIN_ID`, `SEQ_APP_ADDRESS`, `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` (or `_FILE`).
 
-Optional: `SEQ_HTTP_ADDR` (default `127.0.0.1:3000`), `SEQ_DATA_DIR` (default `sequencer-data`), `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `SEQ_SECONDS_PER_BLOCK` (default `12`), `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
-
-- `SEQ_HTTP_ADDR` defaults to `127.0.0.1:3000`
-- `SEQ_DATA_DIR` defaults to `sequencer-data` (SQLite file is `sequencer.db` inside that directory; the directory is created if missing)
-- `SEQ_LONG_BLOCK_RANGE_ERROR_CODES` defaults to `-32005,-32600,-32602,-32616`
-- `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE` instead of `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` (first line of the file is the key)
-- `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH`
-
-Required runtime inputs:
-
-- `SEQ_ETH_RPC_URL`
-- `SEQ_CHAIN_ID`
-- `SEQ_APP_ADDRESS`
-- `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` or `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE`
+Optional: `SEQ_HTTP_ADDR` (default `127.0.0.1:3000`), `SEQ_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; created if missing), `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `SEQ_SECONDS_PER_BLOCK` (default `12`), `SEQ_LONG_BLOCK_RANGE_ERROR_CODES` (default `-32005,-32600,-32602,-32616`), `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE` (alternative to `SEQ_BATCH_SUBMITTER_PRIVATE_KEY`; first line of the file is the key), `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
 
 Fixed protocol identity (EIP-712):
 
@@ -185,7 +172,7 @@ Related docs:
 
 ## Prototype Limits
 
-- Wallet state is in-memory and not persisted.
+- The `Application` trait exposes dump/load capability (see `docs/app-snapshot-format.md`); inclusion-lane wiring that drives the lifecycle is in progress, so wallet state is effectively in-memory at runtime today.
 - Schema and migrations are still in prototype mode and may change.
 
 ## Local Test Prerequisites

@@ -1,18 +1,86 @@
 # App Snapshot Format (Wallet Toy App)
 
-This document defines the current on-disk snapshot format for the toy wallet app in `examples/app-core`.
+This document defines the on-disk snapshot format produced by the toy wallet
+app in `examples/app-core` via the `Application` trait's dump methods.
 
-Scope note: this only covers the **capability** to serialize/deserialize app state. It does not define when snapshots are triggered or how runtime wiring invokes save/load.
+## Scope
 
-## Encoding
+This document covers two things:
 
-- **Format:** SSZ
-- **Current version:** `WalletSnapshotV1` (Rust struct name)
-- **Byte order for balances:** big-endian 32-byte integers (`U256`)
+1. The trait shape that any `Application` implementation must satisfy to
+   participate in snapshot lifecycle (`from_dump`, `create_dump`,
+   `delete_dump`, `state_file_in_dump`).
+2. The wire format the toy wallet uses to encode its canonical state into
+   the dump's state file.
 
-## Serialized State
+It does NOT define when snapshots are triggered, how the inclusion lane
+records and promotes them, how the HTTP layer serves them, or recovery
+interactions. Those are layered above the trait and live in their own
+modules.
 
-`WalletSnapshotV1` encodes:
+## Trait Surface
+
+```rust
+trait Application: Send + Sized {
+    // ... other methods ...
+
+    fn from_dump(prefix: &Path) -> Result<Self, AppError>;
+    fn create_dump(&self, prefix: &Path) -> Result<(), AppError>;
+    fn delete_dump(prefix: &Path) -> Result<(), AppError>;
+    fn state_file_in_dump(prefix: &Path) -> PathBuf;
+}
+```
+
+Contract:
+
+- `prefix` is always a directory. The impl owns whatever layout lives
+  inside; callers treat the path as opaque after creation.
+- `create_dump` is responsible for creating `prefix` (which must not
+  already exist) and writing the dump artifacts inside.
+- `state_file_in_dump` is a pure function of `prefix`: callers may
+  compute it without loading the dump or instantiating the Application.
+  Each impl pins its own layout convention.
+- The bytes at `state_file_in_dump(prefix)` are the canonical state —
+  the bytes a watchdog running an independent canonical machine would
+  produce for the same logical state via its `inspect_state` procedure.
+  They must be deterministic: identical logical state must produce
+  byte-identical files across runs, hosts, and toolchains.
+- For implementations whose persistence representation IS the canonical
+  state (the toy wallet, the bare-metal DEX), `create_dump` writes the
+  same bytes that `state_file_in_dump` names — a single file with no
+  duplication. For implementations whose persistence is richer than the
+  canonical state (e.g. a Cartesi Machine wrapping app), `create_dump`
+  writes the full machine state alongside a separate canonical-state file
+  under the same prefix.
+
+Genesis construction is intentionally not on the trait. The way an
+Application comes into existence at cold start varies per impl (CLI
+config for the toy wallet, machine image path for a CM-wrapping app,
+etc.) and lives on the concrete type, called by the runtime at bootstrap.
+The inclusion lane only needs `from_dump` to rehydrate from a previously
+persisted state during catch-up.
+
+## Toy Wallet Layout
+
+`WalletApp::state_file_in_dump(prefix)` returns `prefix/state`. The dump
+contains exactly that one file. The wallet's persistence representation
+and its canonical state coincide; one write per `create_dump`.
+
+```
+{prefix}/
+  state    SSZ-encoded WalletSnapshotV1 bytes
+```
+
+## Toy Wallet Wire Format
+
+- **Encoding**: SSZ
+- **Top-level type**: `WalletSnapshotV1` (Rust struct name; the version is
+  protocol-external — see below)
+- **Byte order for balances**: big-endian 32-byte integers (`U256`)
+
+### Schema
+
+`WalletSnapshotV1`:
 
 - `erc20_portal_address` (`[u8; 20]`)
 - `supported_erc20_token` (`[u8; 20]`)
@@ -25,45 +93,69 @@ Scope note: this only covers the **capability** to serialize/deserialize app sta
   - `nonce` (`u32`)
 - `executed_input_count` (`u64`)
 
-## Determinism Guarantees
+### Determinism
 
-`WalletApp` stores balances/nonces in hash maps, so iteration order is nondeterministic. Before encoding:
+`WalletApp` stores balances and nonces in `HashMap`s, so iteration order
+is nondeterministic. Before encoding:
 
-- `balances` entries are sorted by `address`
-- `nonces` entries are sorted by `address`
+- `balances` entries are sorted ascending by `address`
+- `nonces` entries are sorted ascending by `address`
 
-This guarantees stable snapshot bytes for equivalent logical state.
+This guarantees byte-identical snapshot files for byte-identical logical
+state, regardless of insertion order. Tests assert this property by
+calling `create_dump` twice on the same `WalletApp` and comparing the
+resulting state files for byte equality.
 
-## Compatibility Policy
+### Decode Rules
 
-- Restores must decode the exact current snapshot schema.
-- Malformed bytes fail restore with a decode error.
-- Future breaking changes must introduce a new versioned schema type (for example, `WalletSnapshotV2`) and explicit migration/dispatch logic.
-- Do not reorder or reinterpret existing fields in-place without a version bump.
+The decoder rejects:
 
-## API Surface
+- Malformed SSZ bytes (any decode error from the SSZ library).
+- A snapshot containing two entries in `balances` with the same address.
+- A snapshot containing two entries in `nonces` with the same address.
 
-Current wallet snapshot API:
+The duplicate-address checks exist to keep the encoded bytes canonical:
+without them, multiple distinct byte sequences could decode to the same
+logical state (the second entry would silently overwrite the first),
+breaking the property that watchdog-side and sequencer-side bytes are
+comparable.
 
-- `snapshot_bytes(&self) -> Vec<u8>`
-- `restore_from_snapshot_bytes(&mut self, snapshot: &[u8]) -> Result<(), WalletSnapshotError>`
-- `save_snapshot<P: AsRef<Path>>(&self, path: P) -> Result<(), WalletSnapshotError>`
-- `load_snapshot<P: AsRef<Path>>(&mut self, path: P) -> Result<(), WalletSnapshotError>`
+## Versioning
 
-## Disk Write Semantics
+The struct name carries the wire-format version (`WalletSnapshotV1`), but
+the encoded bytes contain no leading version tag. Version dispatch is
+expected to live outside the bytes — for example, in an HTTP route prefix
+(`/state/v1/...`), a `Content-Type` header, or whatever protocol-level
+mechanism the consumer and sequencer agree on.
 
-`save_snapshot` uses an atomic replacement pattern:
+Future breaking changes must:
 
-- write bytes to a temporary file in the same directory as the target
-- `sync_all` the temp file
-- rename temp file to the final path
+1. Introduce a new versioned schema type (e.g. `WalletSnapshotV2`).
+2. Provide explicit dispatch at the protocol layer so consumers know
+   which decoder to use for a given dump.
 
-This avoids exposing partially written snapshot bytes at the target path.
+Do not reorder, repurpose, or reinterpret existing fields in place
+without a version bump.
+
+## Trust Model
+
+The dump file is part of the sequencer's persistent data directory and
+shares its trust boundary. An attacker with write access to the data
+directory has already won; no integrity tag, checksum, or HMAC is
+included on the snapshot bytes for this reason. Consumers that obtain
+the bytes via a less trusted channel (e.g. a future peer-to-peer
+distribution mechanism) would need to add an outer integrity layer; the
+format itself does not provide one.
 
 ## Out of Scope
 
-This document intentionally does not define:
+This document deliberately does not define:
 
-- periodic vs explicit snapshot trigger policy
-- mount paths and runtime drive conventions
-- atomic file replacement protocol for production snapshot lifecycle
+- When the inclusion lane decides to take a snapshot.
+- How dumps are registered, promoted from pending to finalized, or
+  garbage-collected.
+- The on-the-wire archive format for streaming a dump over HTTP.
+- Inspect-state procedures on other implementations (Cartesi Machine,
+  bare-metal DEX).
+- Cross-implementation determinism test vectors (will land when a
+  second implementation of the wallet exists to validate against).

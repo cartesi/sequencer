@@ -360,13 +360,13 @@ fn execute_user_op(
                 .respond_to
                 .send(Err(SequencerError::invalid(reason.to_string())));
         }
-        Err(AppError::Internal { reason }) => {
-            let _ = item
-                .respond_to
-                .send(Err(SequencerError::internal(reason.clone())));
-            return Err(InclusionLaneError::ExecuteUserOp {
-                source: AppError::Internal { reason },
-            });
+        Err(err) => {
+            let reason = match &err {
+                AppError::Internal { reason } => reason.clone(),
+                AppError::Io(io) => io.to_string(),
+            };
+            let _ = item.respond_to.send(Err(SequencerError::internal(reason)));
+            return Err(InclusionLaneError::ExecuteUserOp { source: err });
         }
     }
     Ok(())
