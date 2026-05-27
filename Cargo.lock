@@ -760,7 +760,6 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "sequencer-core",
- "thiserror 1.0.69",
  "tracing",
  "types",
 ]

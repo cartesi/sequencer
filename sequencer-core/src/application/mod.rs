@@ -6,12 +6,16 @@ use crate::l2_tx::ValidUserOp;
 use crate::user_op::UserOp;
 use alloy_primitives::{Address, U256};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("internal: {reason}")]
     Internal { reason: String },
+
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +84,7 @@ impl fmt::Display for InvalidReason {
     }
 }
 
-pub trait Application: Send {
+pub trait Application: Send + Sized {
     const MAX_METHOD_PAYLOAD_BYTES: usize;
 
     fn current_user_nonce(&self, sender: Address) -> u32;
@@ -131,4 +135,44 @@ pub trait Application: Send {
     fn executed_input_count(&self) -> u64 {
         0
     }
+
+    // -------- snapshot / dump lifecycle --------
+    //
+    // These methods are used by the inclusion lane to drive snapshot
+    // lifecycle (write dumps at batch close, load from the latest dump
+    // during catch-up, garbage-collect superseded dumps). Genesis
+    // construction is intentionally NOT on the trait — it varies per
+    // impl (CLI config for the toy wallet, machine image path for a
+    // CM-wrapping app, etc.) and lives on the concrete type, called
+    // by the runtime at bootstrap.
+
+    /// Construct an instance from a dump at `prefix`. The dump must have
+    /// been produced by a previous call to [`Application::create_dump`]
+    /// on the same implementation; loading a dump written by a different
+    /// impl is undefined.
+    fn from_dump(prefix: &Path) -> Result<Self, AppError>;
+
+    /// Write a complete recovery dump rooted at the directory `prefix`,
+    /// which must not already exist. The implementation is responsible
+    /// for creating `prefix` and populating it with whatever files it
+    /// needs; a subsequent [`Application::from_dump`] call on the same
+    /// impl must rehydrate equivalent logical state from those bytes.
+    ///
+    /// Implementations must also ensure that
+    /// [`Application::state_file_in_dump`] points at a file inside
+    /// `prefix` whose bytes match what an independent canonical machine's
+    /// `inspect_state` procedure would produce for the same logical
+    /// state. For impls whose persistence representation already IS the
+    /// canonical state, the file written by `create_dump` and the file
+    /// named by `state_file_in_dump` can be the same file.
+    fn create_dump(&self, prefix: &Path) -> Result<(), AppError>;
+
+    /// Delete a previously-created dump at `prefix`.
+    fn delete_dump(prefix: &Path) -> Result<(), AppError>;
+
+    /// Path of the canonical state file within a dump at `prefix`. The
+    /// returned path must point at a single file (not a directory). It
+    /// is a pure function of `prefix`: callers may invoke it without
+    /// loading the dump or instantiating the Application.
+    fn state_file_in_dump(prefix: &Path) -> PathBuf;
 }

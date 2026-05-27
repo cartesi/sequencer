@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, U256, address};
 use ssz::{Decode, Encode};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
-use thiserror::Error;
 use tracing::{error, warn};
 use types::alloy_sol_types::SolCall;
 use types::{Erc20Deposit, Erc20Transfer};
@@ -58,20 +56,6 @@ pub struct WalletApp {
     balances: HashMap<Address, U256>,
     nonces: HashMap<Address, u32>,
     executed_input_count: u64,
-}
-
-#[derive(Debug, Error)]
-pub enum WalletSnapshotError {
-    #[error("snapshot decode failed: {0}")]
-    Decode(String),
-    #[error("snapshot I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-impl From<ssz::DecodeError> for WalletSnapshotError {
-    fn from(value: ssz::DecodeError) -> Self {
-        Self::Decode(format!("{value:?}"))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
@@ -153,7 +137,12 @@ impl WalletApp {
         Erc20Deposit::decode(&input.payload).map(Some)
     }
 
-    pub fn snapshot_bytes(&self) -> Vec<u8> {
+    /// Serialize the wallet's logical state to deterministic SSZ bytes.
+    ///
+    /// Determinism is enforced by sorting `balances` and `nonces` by
+    /// address before encoding; `WalletApp` stores them in `HashMap`s
+    /// whose iteration order is non-deterministic.
+    fn snapshot_bytes(&self) -> Vec<u8> {
         let mut balances: Vec<_> = self
             .balances
             .iter()
@@ -185,61 +174,54 @@ impl WalletApp {
         .as_ssz_bytes()
     }
 
-    pub fn restore_from_snapshot_bytes(
-        &mut self,
-        snapshot: &[u8],
-    ) -> Result<(), WalletSnapshotError> {
-        let decoded = WalletSnapshotV1::from_ssz_bytes(snapshot)?;
-        self.config = WalletConfig {
-            erc20_portal_address: Address::from(decoded.erc20_portal_address),
-            supported_erc20_token: Address::from(decoded.supported_erc20_token),
-            sequencer_address: Address::from(decoded.sequencer_address),
-        };
-        self.balances = decoded
-            .balances
-            .into_iter()
-            .map(|entry| {
-                (
-                    Address::from(entry.address),
-                    U256::from_be_bytes(entry.balance_be),
-                )
-            })
-            .collect();
-        self.nonces = decoded
-            .nonces
-            .into_iter()
-            .map(|entry| (Address::from(entry.address), entry.nonce))
-            .collect();
-        self.executed_input_count = decoded.executed_input_count;
-        Ok(())
-    }
+    /// Decode SSZ-encoded snapshot bytes into a fresh `WalletApp`.
+    ///
+    /// Rejects snapshots containing duplicate addresses in `balances` or
+    /// `nonces`. Without this check, multiple distinct byte sequences
+    /// could decode to the same logical state (whichever entry came
+    /// last in the encoded list would win silently), breaking the
+    /// canonicality the watchdog relies on for byte-for-byte comparison.
+    fn from_snapshot_bytes(bytes: &[u8]) -> Result<Self, AppError> {
+        let decoded = WalletSnapshotV1::from_ssz_bytes(bytes).map_err(|e| AppError::Internal {
+            // ssz::DecodeError doesn't implement Display, so Debug is the
+            // only way to surface variant info as a string. If downstream
+            // needs to match on decode kinds programmatically, introduce a
+            // dedicated AppError variant that carries the typed error
+            // instead of fixing the format string.
+            reason: format!("snapshot decode failed: {e:?}"),
+        })?;
 
-    pub fn save_snapshot<P: AsRef<Path>>(&self, path: P) -> Result<(), WalletSnapshotError> {
-        let path = path.as_ref();
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("wallet-snapshot");
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let temp_path = parent.join(format!(".{file_name}.tmp-{}-{}", std::process::id(), nanos));
+        let mut balances = HashMap::with_capacity(decoded.balances.len());
+        for entry in decoded.balances {
+            let address = Address::from(entry.address);
+            let balance = U256::from_be_bytes(entry.balance_be);
+            if balances.insert(address, balance).is_some() {
+                return Err(AppError::Internal {
+                    reason: format!("snapshot contains duplicate balance entry for {address}"),
+                });
+            }
+        }
 
-        let bytes = self.snapshot_bytes();
-        let mut temp_file = std::fs::File::create(&temp_path)?;
-        temp_file.write_all(&bytes)?;
-        temp_file.sync_all()?;
-        drop(temp_file);
+        let mut nonces = HashMap::with_capacity(decoded.nonces.len());
+        for entry in decoded.nonces {
+            let address = Address::from(entry.address);
+            if nonces.insert(address, entry.nonce).is_some() {
+                return Err(AppError::Internal {
+                    reason: format!("snapshot contains duplicate nonce entry for {address}"),
+                });
+            }
+        }
 
-        std::fs::rename(&temp_path, path)?;
-        Ok(())
-    }
-
-    pub fn load_snapshot<P: AsRef<Path>>(&mut self, path: P) -> Result<(), WalletSnapshotError> {
-        let bytes = std::fs::read(path)?;
-        self.restore_from_snapshot_bytes(&bytes)
+        Ok(Self {
+            config: WalletConfig {
+                erc20_portal_address: Address::from(decoded.erc20_portal_address),
+                supported_erc20_token: Address::from(decoded.supported_erc20_token),
+                sequencer_address: Address::from(decoded.sequencer_address),
+            },
+            balances,
+            nonces,
+            executed_input_count: decoded.executed_input_count,
+        })
     }
 }
 
@@ -382,6 +364,32 @@ impl Application for WalletApp {
     fn executed_input_count(&self) -> u64 {
         self.executed_input_count
     }
+
+    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
+        let state_path = Self::state_file_in_dump(prefix);
+        let bytes = std::fs::read(&state_path)?;
+        Self::from_snapshot_bytes(&bytes)
+    }
+
+    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+        // `create_dir` (not `create_dir_all`) deliberately errors if the
+        // prefix already exists. Snapshot prefixes are expected to be
+        // unique per call; a collision means a lane bug worth surfacing
+        // loudly rather than silently overwriting prior state.
+        std::fs::create_dir(prefix)?;
+        let bytes = self.snapshot_bytes();
+        std::fs::write(Self::state_file_in_dump(prefix), bytes)?;
+        Ok(())
+    }
+
+    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+        std::fs::remove_dir_all(prefix)?;
+        Ok(())
+    }
+
+    fn state_file_in_dump(prefix: &Path) -> PathBuf {
+        prefix.join("state")
+    }
 }
 
 #[cfg(test)]
@@ -397,7 +405,7 @@ mod tests {
 
     use super::{WalletApp, WalletConfig};
     use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};
-    use sequencer_core::application::{AppOutput, Application, InvalidReason};
+    use sequencer_core::application::{AppError, AppOutput, Application, InvalidReason};
     use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
     use sequencer_core::user_op::UserOp;
 
@@ -779,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_roundtrip_restores_full_state() {
+    fn create_dump_then_from_dump_round_trips_full_state() {
         let mut app = WalletApp::new(WalletConfig {
             erc20_portal_address: address!("0x1212121212121212121212121212121212121212"),
             supported_erc20_token: address!("0x3434343434343434343434343434343434343434"),
@@ -793,11 +801,12 @@ mod tests {
         app.nonces.insert(bob, 9);
         app.executed_input_count = 42;
 
-        let snapshot = app.snapshot_bytes();
-        let mut restored = WalletApp::default();
-        restored
-            .restore_from_snapshot_bytes(&snapshot)
-            .expect("snapshot should decode");
+        let prefix = temp_dump_prefix();
+        app.create_dump(&prefix).expect("create dump");
+
+        let restored = WalletApp::from_dump(&prefix).expect("load dump");
+
+        WalletApp::delete_dump(&prefix).expect("cleanup dump");
 
         assert_eq!(
             restored.config.erc20_portal_address,
@@ -817,41 +826,155 @@ mod tests {
     }
 
     #[test]
-    fn save_then_load_snapshot_persists_state_to_disk() {
+    fn create_dump_produces_deterministic_bytes() {
+        // Insert in scrambled order so the HashMap's non-deterministic
+        // iteration order is exercised. The encoder must sort to make
+        // the resulting bytes stable; without sorting, two `create_dump`
+        // calls on the same logical state could produce different files.
         let mut app = WalletApp::new(WalletConfig::default());
-        let user = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        app.balances.insert(user, U256::from(999_u64));
-        app.nonces.insert(user, 3);
-        app.executed_input_count = 11;
+        app.balances.insert(
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            U256::from(1_u64),
+        );
+        app.balances.insert(
+            address!("0x1111111111111111111111111111111111111111"),
+            U256::from(2_u64),
+        );
+        app.balances.insert(
+            address!("0x5555555555555555555555555555555555555555"),
+            U256::from(3_u64),
+        );
+        app.nonces
+            .insert(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), 7);
+        app.nonces
+            .insert(address!("0x1111111111111111111111111111111111111111"), 8);
+        app.executed_input_count = 99;
 
-        let path = temp_snapshot_file_path("wallet-snapshot");
-        app.save_snapshot(&path).expect("save snapshot");
+        let prefix_a = temp_dump_prefix();
+        let prefix_b = temp_dump_prefix();
+        app.create_dump(&prefix_a).expect("first dump");
+        app.create_dump(&prefix_b).expect("second dump");
 
-        let mut loaded = WalletApp::default();
-        loaded.load_snapshot(&path).expect("load snapshot");
-        std::fs::remove_file(&path).expect("cleanup snapshot file");
+        let bytes_a = std::fs::read(WalletApp::state_file_in_dump(&prefix_a)).expect("read a");
+        let bytes_b = std::fs::read(WalletApp::state_file_in_dump(&prefix_b)).expect("read b");
 
-        assert_eq!(loaded.balances, app.balances);
-        assert_eq!(loaded.nonces, app.nonces);
-        assert_eq!(loaded.executed_input_count, app.executed_input_count);
+        WalletApp::delete_dump(&prefix_a).expect("cleanup a");
+        WalletApp::delete_dump(&prefix_b).expect("cleanup b");
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "create_dump must produce byte-identical files for identical logical state"
+        );
     }
 
     #[test]
-    fn restore_rejects_malformed_snapshot() {
-        let mut app = WalletApp::default();
-        let err = app
-            .restore_from_snapshot_bytes(&[0x01, 0x02, 0x03])
-            .expect_err("invalid bytes should fail");
-        assert!(matches!(err, super::WalletSnapshotError::Decode(_)));
+    fn from_dump_rejects_malformed_bytes() {
+        let prefix = temp_dump_prefix();
+        std::fs::create_dir_all(&prefix).expect("mkdir");
+        std::fs::write(WalletApp::state_file_in_dump(&prefix), [0x01, 0x02, 0x03])
+            .expect("write malformed");
+
+        let err = WalletApp::from_dump(&prefix).expect_err("invalid bytes should fail");
+        WalletApp::delete_dump(&prefix).expect("cleanup");
+
+        match err {
+            AppError::Internal { reason } => assert!(
+                reason.contains("snapshot decode failed"),
+                "expected decode error, got: {reason}"
+            ),
+            other => panic!("expected Internal decode error, got {other:?}"),
+        }
     }
 
-    fn temp_snapshot_file_path(prefix: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
+    #[test]
+    fn from_snapshot_bytes_rejects_duplicate_balance_addresses() {
+        // Hand-crafted snapshot with two entries for the same address.
+        // The encoder never produces this, but the decoder must reject it
+        // to keep snapshot bytes canonical: without this check, multiple
+        // distinct byte sequences could decode to the same logical state.
+        let snapshot = super::WalletSnapshotV1 {
+            erc20_portal_address: [0; 20],
+            supported_erc20_token: [0; 20],
+            sequencer_address: [0; 20],
+            balances: vec![
+                super::SnapshotBalance {
+                    address: [1; 20],
+                    balance_be: [0; 32],
+                },
+                super::SnapshotBalance {
+                    address: [1; 20],
+                    balance_be: [0; 32],
+                },
+            ],
+            nonces: vec![],
+            executed_input_count: 0,
+        };
+        let bytes = ssz::Encode::as_ssz_bytes(&snapshot);
+
+        let err =
+            WalletApp::from_snapshot_bytes(&bytes).expect_err("duplicate balance should reject");
+        match err {
+            AppError::Internal { reason } => assert!(
+                reason.contains("duplicate balance"),
+                "expected duplicate-balance error, got: {reason}"
+            ),
+            other => panic!("expected Internal duplicate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_snapshot_bytes_rejects_duplicate_nonce_addresses() {
+        let snapshot = super::WalletSnapshotV1 {
+            erc20_portal_address: [0; 20],
+            supported_erc20_token: [0; 20],
+            sequencer_address: [0; 20],
+            balances: vec![],
+            nonces: vec![
+                super::SnapshotNonce {
+                    address: [1; 20],
+                    nonce: 0,
+                },
+                super::SnapshotNonce {
+                    address: [1; 20],
+                    nonce: 1,
+                },
+            ],
+            executed_input_count: 0,
+        };
+        let bytes = ssz::Encode::as_ssz_bytes(&snapshot);
+
+        let err =
+            WalletApp::from_snapshot_bytes(&bytes).expect_err("duplicate nonce should reject");
+        match err {
+            AppError::Internal { reason } => assert!(
+                reason.contains("duplicate nonce"),
+                "expected duplicate-nonce error, got: {reason}"
+            ),
+            other => panic!("expected Internal duplicate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_file_in_dump_lives_inside_prefix() {
+        let prefix = PathBuf::from("/tmp/example-prefix");
+        let state = WalletApp::state_file_in_dump(&prefix);
+        assert!(
+            state.starts_with(&prefix),
+            "state file path {state:?} must live under prefix {prefix:?}"
+        );
+    }
+
+    fn temp_dump_prefix() -> PathBuf {
+        // Combine pid + nanos + a process-local counter so concurrent tests
+        // never collide on the same prefix path, even within a single nanosecond.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
-        path.push(format!("{prefix}-{}-{nanos}.bin", std::process::id()));
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("wallet-dump-{}-{nanos}-{n}", std::process::id()));
         path
     }
 }
