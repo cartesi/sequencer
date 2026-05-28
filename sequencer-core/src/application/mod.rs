@@ -158,6 +158,16 @@ pub trait Application: Send + Sized {
     /// needs; a subsequent [`Application::from_dump`] call on the same
     /// impl must rehydrate equivalent logical state from those bytes.
     ///
+    /// **Durability**: when this method returns `Ok`, the dump on disk
+    /// must survive an immediate kernel crash. Concretely, the impl
+    /// must `fsync` the dump's files and the directory entries that
+    /// reference them (on POSIX, that means `fsync`ing the prefix
+    /// directory and its parent) before returning. The sequencer
+    /// inserts the SQLite row that references this path after
+    /// `create_dump` returns; without the in-method fsync, the OS may
+    /// flush the SQLite WAL ahead of our file contents and leave a
+    /// crash-recovered DB with a row pointing at a missing path.
+    ///
     /// Implementations must also ensure that
     /// [`Application::state_file_in_dump`] points at a file inside
     /// `prefix` whose bytes match what an independent canonical machine's

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, U256, address};
@@ -378,7 +379,23 @@ impl Application for WalletApp {
         // loudly rather than silently overwriting prior state.
         std::fs::create_dir(prefix)?;
         let bytes = self.snapshot_bytes();
-        std::fs::write(Self::state_file_in_dump(prefix), bytes)?;
+
+        let state_path = Self::state_file_in_dump(prefix);
+        let mut file = std::fs::File::create(&state_path)?;
+        file.write_all(&bytes)?;
+        // fsync the file's contents, then walk up the parents to make
+        // the new directory entries durable. Without this, the OS may
+        // flush the SQLite WAL containing the pending-dump row to disk
+        // ahead of our file contents/dentries, leaving a SQLite row
+        // pointing at a path that the next crash-recovery sees as
+        // missing.
+        file.sync_all()?;
+        // prefix/ contains state's dentry.
+        std::fs::File::open(prefix)?.sync_all()?;
+        // dumps_dir/ contains prefix's dentry.
+        if let Some(parent) = prefix.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 

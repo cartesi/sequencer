@@ -38,6 +38,8 @@ pub enum RunError {
     Io(#[from] std::io::Error),
     #[error("storage operation failed: {0}")]
     Storage(#[from] rusqlite::Error),
+    #[error("application bootstrap failed: {0}")]
+    AppBootstrap(#[from] sequencer_core::application::AppError),
 }
 
 // ── Bootstrap-phase errors ─────────────────────────────────────────────

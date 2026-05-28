@@ -3,8 +3,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use alloy_primitives::{Address, Signature, U256};
@@ -66,17 +64,18 @@ impl Application for TestApp {
         self.executed_input_count
     }
 
-    // The lane calls `create_dump` and `delete_dump` at batch close /
-    // GC time even in tests that don't observe snapshot state. Provide
-    // a no-op pair that satisfies the trait contract. `from_dump` is
-    // only reached on the runtime's startup load path, which tests
-    // bypass, so it stays `unimplemented!()`.
+    // The lane loads its app via `from_dump` after the runtime
+    // registers a genesis dump, so test stubs must reload to the
+    // initial state (an empty `nonces` map). `create_dump` writes
+    // an empty marker file — `from_dump` ignores the contents and
+    // returns `Self::default()`.
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        unimplemented!("TestApp is constructed directly in tests, not via from_dump")
+        Ok(Self::default())
     }
 
     fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
+        std::fs::write(Self::state_file_in_dump(prefix), b"")?;
         Ok(())
     }
 
@@ -119,11 +118,12 @@ impl Application for InternalUserOpApp {
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        unimplemented!("InternalUserOpApp is constructed directly in tests")
+        Ok(InternalUserOpApp)
     }
 
     fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
+        std::fs::write(Self::state_file_in_dump(prefix), b"")?;
         Ok(())
     }
 
@@ -155,8 +155,23 @@ struct ReplayRecordingApp {
     replayed: Vec<ReplayEvent>,
 }
 
+/// App that counts direct-input executions and persists the count
+/// through `create_dump` / `from_dump`. Tests verify the count by
+/// reading the state file from a snapshot (rather than by sharing
+/// an `Arc<AtomicU64>` across thread boundaries) — the lane loads
+/// its own instance via `from_dump`, so external observation has to
+/// go through the on-disk snapshot.
 struct SharedCountingApp {
-    executed_direct_inputs: Arc<AtomicU64>,
+    executed_direct_inputs: u64,
+}
+
+impl SharedCountingApp {
+    fn new() -> Self {
+        Self {
+            executed_direct_inputs: 0,
+        }
+    }
+
 }
 
 impl Application for SharedCountingApp {
@@ -184,16 +199,32 @@ impl Application for SharedCountingApp {
     }
 
     fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
-        self.executed_direct_inputs.fetch_add(1, Ordering::SeqCst);
+        self.executed_direct_inputs = self.executed_direct_inputs.saturating_add(1);
         Ok(Vec::new())
     }
 
-    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        unimplemented!("SharedCountingApp is constructed directly in tests")
+    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
+        let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
+        let counter =
+            u64::from_le_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| AppError::Internal {
+                        reason: "SharedCountingApp dump must be exactly 8 bytes".to_string(),
+                    })?,
+            );
+        Ok(Self {
+            executed_direct_inputs: counter,
+        })
     }
 
     fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
+        std::fs::write(
+            Self::state_file_in_dump(prefix),
+            self.executed_direct_inputs.to_le_bytes(),
+        )?;
         Ok(())
     }
 
@@ -266,11 +297,12 @@ impl Application for ReplayRecordingApp {
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        unimplemented!("ReplayRecordingApp is constructed directly in tests")
+        Ok(Self::default())
     }
 
     fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
+        std::fs::write(Self::state_file_in_dump(prefix), b"")?;
         Ok(())
     }
 
@@ -303,6 +335,23 @@ fn default_test_config() -> InclusionLaneConfig {
     }
 }
 
+/// Register a genesis snapshot for `app` so the lane's always-load
+/// invariant holds. Tests use this to satisfy the catch-up
+/// precondition; production startup goes through the runtime's
+/// `bootstrap_application` which does the same thing.
+fn register_genesis_snapshot<A: Application>(app: &A, storage: &mut Storage, dumps_dir: &Path) {
+    // Unique per call: the dumps_dir is a tempdir but tests may
+    // register multiple snapshots within one test (e.g., catch-up
+    // tests that re-seed storage), so reuse-free naming matters.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let prefix = dumps_dir.join(format!("genesis-{counter}"));
+    app.create_dump(&prefix).expect("create genesis dump");
+    storage
+        .insert_finalized_dump(&prefix, 0, 0)
+        .expect("insert finalized snapshot");
+}
+
 async fn start_lane(
     db_path: &str,
     config: InclusionLaneConfig,
@@ -315,9 +364,13 @@ async fn start_lane(
     storage
         .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
         .expect("seed observed safe head");
+    let app = TestApp::default();
+    register_genesis_snapshot(&app, &mut storage, &config.dumps_dir);
+    // `app` instance is dropped here; the lane reloads it from the
+    // genesis dump on its background thread.
+    drop(app);
     let shutdown = ShutdownSignal::default();
-    let (tx, handle) =
-        InclusionLane::start(128, shutdown.clone(), TestApp::default(), storage, config);
+    let (tx, handle) = InclusionLane::<TestApp>::start(128, shutdown.clone(), storage, config);
     let initialized = wait_until(Duration::from_secs(2), || {
         let mut storage = Storage::open(db_path).expect("open storage");
         storage.open_state().expect("load open state").is_some()
@@ -550,24 +603,21 @@ async fn direct_inputs_close_frame_and_persist_drain() {
 async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     let db = temp_db("sequenced-safe-inputs-skip");
     let batch_submitter_address = Address::from([0xfe; 20]);
-    let executed_direct_inputs = Arc::new(AtomicU64::new(0));
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
         .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
         .expect("seed observed safe head");
+    let config = InclusionLaneConfig {
+        batch_submitter_address,
+        ..default_test_config()
+    };
+    {
+        let app = SharedCountingApp::new();
+        register_genesis_snapshot(&app, &mut storage, &config.dumps_dir);
+    }
     let shutdown = ShutdownSignal::default();
-    let (_tx, lane_handle) = InclusionLane::start(
-        128,
-        shutdown.clone(),
-        SharedCountingApp {
-            executed_direct_inputs: executed_direct_inputs.clone(),
-        },
-        storage,
-        InclusionLaneConfig {
-            batch_submitter_address,
-            ..default_test_config()
-        },
-    );
+    let (_tx, lane_handle) =
+        InclusionLane::<SharedCountingApp>::start(128, shutdown.clone(), storage, config);
     let initialized = wait_until(Duration::from_secs(2), || {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage.open_state().expect("load open state").is_some()
@@ -599,9 +649,19 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
         drained,
         "expected sequenced safe input to be drained into frame 1"
     );
+
+    // The lane's own batch input was drained into a frame and
+    // sequenced into `sequenced_l2_txs`, but the lane skipped
+    // `app.execute_direct_input` for it. Catch-up replays the same
+    // sequenced stream and also filters batch-submitter rows — so a
+    // fresh `SharedCountingApp` driven through `catch_up_application`
+    // ends with counter == 0, confirming the symmetric skip.
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut fresh_app = SharedCountingApp::new();
+    catch_up_application_paged(&mut fresh_app, &mut storage, batch_submitter_address, 16)
+        .expect("catch up");
     assert_eq!(
-        executed_direct_inputs.load(Ordering::SeqCst),
-        0,
+        fresh_app.executed_direct_inputs, 0,
         "batch-submitter safe input should be skipped by the local app"
     );
 }
@@ -842,12 +902,27 @@ fn dequeue_returns_lane_error_when_app_reports_internal() {
     ));
 }
 
+/// Register a genesis snapshot with `l2_tx_index = 0` for a
+/// catch-up test. The lane's always-load invariant requires a
+/// snapshot before `catch_up_application_paged` runs; offset 0
+/// means "replay everything since the start," preserving the
+/// pre-snapshot tests' behavior.
+fn register_catch_up_test_genesis<A: Application>(
+    app: &A,
+    storage: &mut Storage,
+) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("catch-up dumps dir");
+    register_genesis_snapshot(app, storage, dir.path());
+    dir
+}
+
 #[test]
 fn catch_up_replays_multiple_pages() {
     let db = temp_db("catch-up-multi-page");
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::default();
+    let _dumps_dir = register_catch_up_test_genesis(&app, &mut storage);
 
     catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
         .expect("catch up in pages");
@@ -862,6 +937,7 @@ fn catch_up_replays_from_storage_even_when_app_reports_executed_inputs() {
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::with_executed_input_count(3);
+    let _dumps_dir = register_catch_up_test_genesis(&app, &mut storage);
 
     catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
         .expect("catch up from storage");
@@ -876,6 +952,7 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::default();
+    let _dumps_dir = register_catch_up_test_genesis(&app, &mut storage);
 
     catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 4)
         .expect("catch up across page boundary");
