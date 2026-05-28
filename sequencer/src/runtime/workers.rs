@@ -105,12 +105,14 @@ impl Workers {
         // Inclusion lane: takes the app, returns the tx-sender the HTTP
         // ingress route will publish to.
         let storage = crate::storage::Storage::open(&db_path)?;
+        let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
+        std::fs::create_dir_all(&dumps_dir)?;
         let (tx, lane) = InclusionLane::start(
             QUEUE_CAPACITY,
             shutdown.clone(),
             app,
             storage,
-            InclusionLaneConfig::new(l1_config.batch_submitter_address),
+            InclusionLaneConfig::new(l1_config.batch_submitter_address, dumps_dir),
         );
 
         // Input reader: produces safe-input rows from L1.

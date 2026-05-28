@@ -7,6 +7,8 @@
 use sequencer_core::application::AppError;
 use thiserror::Error;
 
+use super::snapshot::{PromoteError, TakeDumpError};
+
 #[derive(Debug, Error)]
 pub enum InclusionLaneError {
     #[error("inclusion lane input channel closed")]
@@ -28,6 +30,10 @@ pub enum InclusionLaneError {
         #[source]
         source: AppError,
     },
+    #[error("snapshot at batch close failed")]
+    Snapshot(#[from] TakeDumpError),
+    #[error("snapshot promotion failed")]
+    Promote(#[from] PromoteError),
 }
 
 #[derive(Debug, Error)]

@@ -16,6 +16,7 @@
 mod catch_up;
 mod config;
 mod error;
+mod snapshot;
 mod types;
 
 #[cfg(test)]
@@ -99,8 +100,20 @@ impl<A: Application + 'static> InclusionLane<A> {
                 || should_close_batch_by_time(&lane_state.head, &self.config)
             {
                 let next_safe_block = lane_state.head.safe_block;
+                let closed_batch_index = lane_state.head.batch_index;
                 self.storage
                     .close_frame_and_batch(&mut lane_state.head, next_safe_block)?;
+                // The snapshot is a recovery anchor for this state;
+                // a failed dump silently breaks the invariant "after
+                // batch close, a dump on disk corresponds to this
+                // state." Propagate so the operator sees it.
+                snapshot::take_dump_at_batch_close(
+                    &self.app,
+                    &mut self.storage,
+                    &self.config.dumps_dir,
+                    closed_batch_index,
+                )
+                .map_err(InclusionLaneError::Snapshot)?;
             } else if !drain.drained_any() {
                 thread::sleep(self.config.idle_poll_interval);
             }
@@ -258,22 +271,58 @@ impl<A: Application + 'static> InclusionLane<A> {
         direct_range: SafeInputRange,
         chunk: &mut Vec<StoredSafeInput>,
     ) -> Result<(), InclusionLaneError> {
+        let mut observation = snapshot::BlockObservation::new();
         let max_chunk_len = self.config.safe_input_buffer_capacity.max(1) as u64;
         for chunk_range in direct_range.chunks(max_chunk_len) {
             self.storage.fill_safe_inputs(chunk_range, chunk)?;
-            self.execute_safe_inputs_chunk(chunk.as_slice())?;
+            self.execute_safe_inputs_chunk(
+                chunk.as_slice(),
+                chunk_range.start(),
+                &mut observation,
+            )?;
         }
+        // Flush any accumulated observations for the last block in
+        // the range. A failure here breaks the snapshot-promotion
+        // invariant; propagate so the lane restarts and catch-up can
+        // recover from the previous good finalized.
+        observation
+            .flush(&mut self.storage)
+            .map_err(InclusionLaneError::Promote)?;
         Ok(())
     }
 
     fn execute_safe_inputs_chunk(
         &mut self,
         chunk: &[StoredSafeInput],
+        base_safe_input_index: u64,
+        observation: &mut snapshot::BlockObservation,
     ) -> Result<(), InclusionLaneError> {
-        for input in chunk {
+        for (offset, input) in chunk.iter().enumerate() {
+            let safe_input_index = base_safe_input_index + offset as u64;
+            let own_batch_nonce = if input.sender == self.config.batch_submitter_address {
+                // Look up whether the scheduler accepted this batch.
+                // Stale-nonce batches end up in safe_inputs but NOT in
+                // safe_accepted_batches; only accepted ones get promoted.
+                self.storage
+                    .accepted_batch_nonce_at(safe_input_index)
+                    .map_err(InclusionLaneError::Storage)?
+            } else {
+                None
+            };
+
+            // Record block and any observed nonce before processing.
+            // A storage error here breaks the promotion invariant —
+            // propagate so the lane restarts and catch-up recovers.
+            observation
+                .record(&mut self.storage, input.block_number, own_batch_nonce)
+                .map_err(InclusionLaneError::Promote)?;
+
             if input.sender == self.config.batch_submitter_address {
+                // Our own batch (accepted or rejected) — never replayed
+                // as a direct input.
                 continue;
             }
+
             let direct_input = DirectInput {
                 sender: input.sender,
                 block_number: input.block_number,

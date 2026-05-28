@@ -66,20 +66,27 @@ impl Application for TestApp {
         self.executed_input_count
     }
 
+    // The lane calls `create_dump` and `delete_dump` at batch close /
+    // GC time even in tests that don't observe snapshot state. Provide
+    // a no-op pair that satisfies the trait contract. `from_dump` is
+    // only reached on the runtime's startup load path, which tests
+    // bypass, so it stays `unimplemented!()`.
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        unimplemented!("TestApp does not participate in snapshot lifecycle")
+        unimplemented!("TestApp is constructed directly in tests, not via from_dump")
     }
 
-    fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
-        unimplemented!("TestApp does not participate in snapshot lifecycle")
+    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+        std::fs::create_dir(prefix)?;
+        Ok(())
     }
 
-    fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
-        unimplemented!("TestApp does not participate in snapshot lifecycle")
+    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+        std::fs::remove_dir_all(prefix)?;
+        Ok(())
     }
 
-    fn state_file_in_dump(_prefix: &Path) -> PathBuf {
-        unimplemented!("TestApp does not participate in snapshot lifecycle")
+    fn state_file_in_dump(prefix: &Path) -> PathBuf {
+        prefix.join("state")
     }
 }
 
@@ -112,19 +119,21 @@ impl Application for InternalUserOpApp {
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        unimplemented!("InternalUserOpApp does not participate in snapshot lifecycle")
+        unimplemented!("InternalUserOpApp is constructed directly in tests")
     }
 
-    fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
-        unimplemented!("InternalUserOpApp does not participate in snapshot lifecycle")
+    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+        std::fs::create_dir(prefix)?;
+        Ok(())
     }
 
-    fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
-        unimplemented!("InternalUserOpApp does not participate in snapshot lifecycle")
+    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+        std::fs::remove_dir_all(prefix)?;
+        Ok(())
     }
 
-    fn state_file_in_dump(_prefix: &Path) -> PathBuf {
-        unimplemented!("InternalUserOpApp does not participate in snapshot lifecycle")
+    fn state_file_in_dump(prefix: &Path) -> PathBuf {
+        prefix.join("state")
     }
 }
 
@@ -180,19 +189,21 @@ impl Application for SharedCountingApp {
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        unimplemented!("SharedCountingApp does not participate in snapshot lifecycle")
+        unimplemented!("SharedCountingApp is constructed directly in tests")
     }
 
-    fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
-        unimplemented!("SharedCountingApp does not participate in snapshot lifecycle")
+    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+        std::fs::create_dir(prefix)?;
+        Ok(())
     }
 
-    fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
-        unimplemented!("SharedCountingApp does not participate in snapshot lifecycle")
+    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+        std::fs::remove_dir_all(prefix)?;
+        Ok(())
     }
 
-    fn state_file_in_dump(_prefix: &Path) -> PathBuf {
-        unimplemented!("SharedCountingApp does not participate in snapshot lifecycle")
+    fn state_file_in_dump(prefix: &Path) -> PathBuf {
+        prefix.join("state")
     }
 }
 
@@ -255,25 +266,33 @@ impl Application for ReplayRecordingApp {
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        unimplemented!("ReplayRecordingApp does not participate in snapshot lifecycle")
+        unimplemented!("ReplayRecordingApp is constructed directly in tests")
     }
 
-    fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
-        unimplemented!("ReplayRecordingApp does not participate in snapshot lifecycle")
+    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+        std::fs::create_dir(prefix)?;
+        Ok(())
     }
 
-    fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
-        unimplemented!("ReplayRecordingApp does not participate in snapshot lifecycle")
+    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+        std::fs::remove_dir_all(prefix)?;
+        Ok(())
     }
 
-    fn state_file_in_dump(_prefix: &Path) -> PathBuf {
-        unimplemented!("ReplayRecordingApp does not participate in snapshot lifecycle")
+    fn state_file_in_dump(prefix: &Path) -> PathBuf {
+        prefix.join("state")
     }
 }
 
 fn default_test_config() -> InclusionLaneConfig {
     InclusionLaneConfig {
         batch_submitter_address: Address::from_slice(&[0xff; 20]),
+        // A leaked tempdir per call: the lane unconditionally writes
+        // dump artifacts there, and the test stubs' `create_dump`
+        // creates the directory. Tempdir gets reaped by the OS.
+        dumps_dir: tempfile::tempdir()
+            .expect("create dumps_dir tempdir")
+            .keep(),
         max_user_ops_per_chunk: 16,
         safe_input_buffer_capacity: 16,
         max_batch_open: Duration::MAX,
