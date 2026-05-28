@@ -14,6 +14,7 @@
 //!   batches, per-batch replay) shared between the submitter and egress
 //! - `recovery` — cascade invalidation, recovery-batch open, danger checks
 //! - `admin` — operator policy tunables (gas price, alpha)
+//! - `snapshot_dumps` — pending/finalized snapshot lifecycle, lease counts
 //!
 //! Cross-writer helpers are split by concern:
 //!
@@ -35,6 +36,7 @@ mod open;
 mod queries;
 mod recovery;
 mod safe_accepted_batches;
+mod snapshot_dumps;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -44,6 +46,7 @@ use thiserror::Error;
 
 pub use open::Storage;
 pub use recovery::DangerStatus;
+pub use snapshot_dumps::{DumpRow, FinalizedDump, PendingDump};
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
 /// the L1 block where it was included.

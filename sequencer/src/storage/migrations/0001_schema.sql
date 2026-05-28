@@ -377,3 +377,59 @@ SELECT *,
     log_base_gas - log_alpha - log_delta
         AS log_batch_size_target
 FROM batch_policy;
+
+-- ---------------------------------------------------------------------------
+-- Snapshot dumps
+--
+-- Three tables together implement the snapshot lifecycle:
+--
+--   * dumps                — master table: every on-disk dump has a row here,
+--                            with a lease_count tracking in-flight readers
+--                            (typically HTTP handlers streaming the dump).
+--                            Rows are FK-referenced by pending_snapshots and
+--                            finalized_snapshot via ON DELETE RESTRICT, so a
+--                            dump can't be removed while still referenced.
+--   * pending_snapshots    — one row per batch that has been closed and
+--                            dumped, but not yet observed landed on L1. Keyed
+--                            by nonce so the inclusion lane can match its own
+--                            batches in the direct-input stream.
+--   * finalized_snapshot   — single-row table holding the latest L1-finalized
+--                            snapshot. INSERT OR REPLACE on promotion;
+--                            consumers (the watchdog) read this row to learn
+--                            which dump corresponds to the canonical state.
+--
+-- Garbage collection: dumps with lease_count = 0 AND no row in either
+-- pending_snapshots or finalized_snapshot are eligible for filesystem +
+-- DB-row removal. The Rust caller drives this; the FK constraints prevent
+-- accidental deletion while a reference still exists.
+--
+-- Lifecycle:
+--   * batch close:        INSERT into dumps; INSERT into pending_snapshots.
+--   * batch observed:     INSERT OR REPLACE into finalized_snapshot; DELETE
+--                         the promoted nonces from pending_snapshots in one tx.
+--                         The previous finalized's dump becomes GC-eligible.
+--   * cascade invalidate: DELETE from pending_snapshots; sweep dumps via GC.
+--   * HTTP serving:       acquire/release lease_count to prevent GC during
+--                         in-flight streams.
+--   * startup:            UPDATE dumps SET lease_count = 0 (clear stale
+--                         in-process leases from a crashed previous run).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS dumps (
+    id           INTEGER PRIMARY KEY,
+    prefix       TEXT NOT NULL UNIQUE,
+    lease_count  INTEGER NOT NULL DEFAULT 0 CHECK (lease_count >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS pending_snapshots (
+    nonce        INTEGER PRIMARY KEY CHECK (nonce >= 0),
+    dump_id      INTEGER NOT NULL REFERENCES dumps(id) ON DELETE RESTRICT,
+    l2_tx_index  INTEGER NOT NULL CHECK (l2_tx_index >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS finalized_snapshot (
+    singleton_id     INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    dump_id          INTEGER NOT NULL REFERENCES dumps(id) ON DELETE RESTRICT,
+    inclusion_block  INTEGER NOT NULL CHECK (inclusion_block >= 0),
+    l2_tx_index      INTEGER NOT NULL CHECK (l2_tx_index >= 0)
+);
