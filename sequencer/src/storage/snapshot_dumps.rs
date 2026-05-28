@@ -386,7 +386,12 @@ fn list_dump_rows_in(tx: &Transaction<'_>) -> Result<Vec<DumpRow>> {
     rows
 }
 
-fn clear_pending_dumps_in(tx: &Transaction<'_>) -> Result<usize> {
+/// Visible to siblings within the `storage` module so that the
+/// danger-zone recovery path can compose pending-dump cleanup into
+/// the same transaction as `cascade_invalidate_from` — otherwise a
+/// crash between the cascade and the clear would leave stale pending
+/// snapshots pointing at states the canonical stream will never reach.
+pub(super) fn clear_pending_dumps_in(tx: &Transaction<'_>) -> Result<usize> {
     tx.execute("DELETE FROM pending_snapshots", [])
 }
 

@@ -171,7 +171,6 @@ impl SharedCountingApp {
             executed_direct_inputs: 0,
         }
     }
-
 }
 
 impl Application for SharedCountingApp {
