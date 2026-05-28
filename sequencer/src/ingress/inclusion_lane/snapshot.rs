@@ -7,19 +7,23 @@
 //!
 //! 1. **At batch close**, call [`take_dump_at_batch_close`]: produce a
 //!    snapshot dump of the live Application's state and register it in
-//!    `pending_snapshots` keyed by the just-closed batch's nonce. A
-//!    failure here breaks the "after batch close, a recovery dump
-//!    exists for this state" invariant; the lane propagates the
-//!    error rather than silently continuing.
+//!    `pending_snapshots` keyed by the just-closed batch's nonce.
+//!    Errors propagate through the lane's exit per the fail-loud
+//!    policy.
 //!
 //! 2. **While processing safe inputs**, thread a [`BlockObservation`]
 //!    through `execute_safe_inputs_chunk`. The observer tracks the
 //!    current L1 block under iteration; when the block transitions (or
-//!    the input range ends), it promotes any of our own batches that
-//!    landed in the previous block as a single atomic operation. This
-//!    is the "block-atomic promotion" property the watchdog endpoint
-//!    relies on. Safe-input ranges always cover whole L1 blocks, so
-//!    the observer never strands a partial block.
+//!    the input range ends), it promotes our latest-nonce batch landed
+//!    in the previous block in one atomic operation. This is the
+//!    "block-atomic promotion" property the watchdog endpoint relies
+//!    on. Safe-input ranges always cover whole L1 blocks, so the
+//!    observer never strands a partial block.
+//!
+//! The observer's working state is two `Option<u64>`s (current block,
+//! max observed nonce); the lane creates one per
+//! `execute_safe_inputs_range` call on the stack. No allocation in
+//! the hot loop.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,9 +51,10 @@ pub enum PromoteError {
 
 /// Take a snapshot for a batch that has just been closed. On success
 /// the dump is on disk and `pending_snapshots` has a new row keyed by
-/// the batch's nonce. Errors propagate to the lane's main loop; the
-/// snapshot is part of the lane's state-preservation contract, not a
-/// best-effort side effect.
+/// the batch's nonce. Errors propagate to the lane's main loop per
+/// the lane's fail-loud policy — a chronic snapshot failure indicates
+/// an operational problem the operator should investigate, not paper
+/// over.
 pub(super) fn take_dump_at_batch_close<A: Application>(
     app: &A,
     storage: &mut Storage,
@@ -72,29 +77,37 @@ pub(super) fn take_dump_at_batch_close<A: Application>(
 
 /// Accumulator for batch-promotion observations across safe-input
 /// processing. Tracks the L1 block currently being scanned and the
-/// nonces of our own batches observed within it; when the block
-/// boundary moves, flushes the accumulation to `finalized_snapshot`
-/// in one transaction. Safe-input ranges always cover whole blocks
-/// (the lane only advances when the safe head moves), so the observer
-/// always sees complete groups.
+/// largest nonce of our own batches observed within it. When the
+/// block boundary moves, flushes the latest-nonce dump to
+/// `finalized_snapshot` in one transaction (which also cleans up any
+/// stale pending rows behind it). Safe-input ranges always cover
+/// whole blocks (the lane only advances when the safe head moves), so
+/// the observer always sees complete groups.
+///
+/// Constant memory: two `Option<u64>`s, no allocation. Tracking only
+/// the max is sufficient because the promotion's job is to point
+/// finalized at the latest-state dump and clean pending; both
+/// concerns are about `max_observed_nonce`, not the full set, and L1
+/// wallet nonces guarantee batches land in monotonic order so
+/// "everything ≤ max landed somewhere ≤ this block".
 pub(super) struct BlockObservation {
     current_block: Option<u64>,
-    observed_nonces: Vec<u64>,
+    max_observed_nonce: Option<u64>,
 }
 
 impl BlockObservation {
     pub(super) fn new() -> Self {
         Self {
             current_block: None,
-            observed_nonces: Vec::new(),
+            max_observed_nonce: None,
         }
     }
 
     /// Record that a safe input belongs to L1 block `block`, and if it
     /// was identified as one of our accepted batches, with `nonce`. If
-    /// `block` differs from the block we were tracking, any
-    /// accumulated nonces from the previous block are promoted (in one
-    /// SQL transaction) before starting fresh on `block`.
+    /// `block` differs from the block we were tracking, the previous
+    /// block's max nonce (if any) is promoted in one SQL transaction
+    /// before starting fresh on `block`.
     pub(super) fn record(
         &mut self,
         storage: &mut Storage,
@@ -111,22 +124,21 @@ impl BlockObservation {
         }
 
         if let Some(nonce) = own_batch_nonce {
-            self.observed_nonces.push(nonce);
+            self.max_observed_nonce = Some(self.max_observed_nonce.map_or(nonce, |m| m.max(nonce)));
         }
         Ok(())
     }
 
-    /// Flush any accumulated observations to `finalized_snapshot`,
-    /// then clear the observer. Must be called at the end of a
-    /// processing range so the last block's observations don't go
-    /// un-promoted.
+    /// Promote the current block's max-observed nonce (if any) to
+    /// `finalized_snapshot`, then clear the observer. Must be called
+    /// at the end of a processing range so the last block's
+    /// observation isn't dropped.
     pub(super) fn flush(&mut self, storage: &mut Storage) -> Result<(), PromoteError> {
-        if let Some(block) = self.current_block.take()
-            && !self.observed_nonces.is_empty()
-        {
-            storage.promote_pending_dumps(&self.observed_nonces, block)?;
+        let block = self.current_block.take();
+        let max_nonce = self.max_observed_nonce.take();
+        if let (Some(block), Some(max_nonce)) = (block, max_nonce) {
+            storage.promote_finalized(max_nonce, block)?;
         }
-        self.observed_nonces.clear();
         Ok(())
     }
 }

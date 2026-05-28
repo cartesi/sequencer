@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{OptionalExtension, Result, ToSql, Transaction, params};
+use rusqlite::{OptionalExtension, Result, Transaction, params};
 
 use super::Storage;
 use super::convert::{i64_to_u64, u64_to_i64};
@@ -60,17 +60,19 @@ impl Storage {
         self.write(|tx| insert_pending_dump_in(tx, prefix, nonce, l2_tx_index))
     }
 
-    /// Atomically promote a non-empty set of pending nonces into the
-    /// single `finalized_snapshot` row. The nonce with the largest
-    /// value becomes the new finalized snapshot; its `l2_tx_index` is
-    /// carried over from `pending_snapshots`, and the promoted nonces
-    /// are removed from `pending_snapshots` in the same transaction.
+    /// Atomically promote the pending dump for `max_nonce` into the
+    /// single `finalized_snapshot` row, carrying over its
+    /// `l2_tx_index`. In the same transaction, every pending row with
+    /// `nonce <= max_nonce` is deleted — that's the explicitly-promoted
+    /// row plus any stale rows behind it from earlier promotions that
+    /// failed to clean up. L1 wallet nonces guarantee batches land in
+    /// monotonic order, so anything with a smaller nonce has landed
+    /// by the time we're observing `max_nonce`.
     ///
-    /// All passed nonces must currently exist in `pending_snapshots`;
-    /// a missing nonce surfaces as a `QueryReturnedNoRows` error.
-    /// Empty `nonces` slice is a no-op.
-    pub fn promote_pending_dumps(&mut self, nonces: &[u64], inclusion_block: u64) -> Result<()> {
-        self.write(|tx| promote_pending_dumps_in(tx, nonces, inclusion_block))
+    /// `max_nonce` must currently exist in `pending_snapshots`; a
+    /// missing row surfaces as `QueryReturnedNoRows`.
+    pub fn promote_finalized(&mut self, max_nonce: u64, inclusion_block: u64) -> Result<()> {
+        self.write(|tx| promote_finalized_in(tx, max_nonce, inclusion_block))
     }
 
     /// Increment a dump's lease count. Called by HTTP handlers at the
@@ -136,6 +138,49 @@ impl Storage {
     /// reach. The dumps themselves become GC-eligible immediately.
     pub fn clear_pending_dumps(&mut self) -> Result<usize> {
         self.write(clear_pending_dumps_in)
+    }
+
+    /// Insert a new dump row and a finalized-snapshot row in one
+    /// transaction. Used at first startup to register the genesis dump
+    /// directly as finalized (bypassing pending). Fails if a finalized
+    /// row already exists (the singleton constraint).
+    pub fn insert_finalized_dump(
+        &mut self,
+        prefix: &Path,
+        inclusion_block: u64,
+        l2_tx_index: u64,
+    ) -> Result<i64> {
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO dumps (prefix) VALUES (?1)",
+                params![path_to_text(prefix)],
+            )?;
+            let dump_id = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO finalized_snapshot \
+                 (singleton_id, dump_id, inclusion_block, l2_tx_index) \
+                 VALUES (0, ?1, ?2, ?3)",
+                params![
+                    dump_id,
+                    u64_to_i64(inclusion_block),
+                    u64_to_i64(l2_tx_index)
+                ],
+            )?;
+            Ok(dump_id)
+        })
+    }
+
+    /// Return the `l2_tx_index` of the snapshot the lane should catch
+    /// up from on startup: the latest pending (preferred — closer to
+    /// current) or the finalized (fallback). Returns `None` when no
+    /// snapshot has been registered yet; the always-load invariant
+    /// expects callers to guarantee at least the genesis dump exists
+    /// before the lane starts.
+    pub fn catch_up_starting_offset(&mut self) -> Result<Option<u64>> {
+        if let Some(pending) = self.latest_pending_dump()? {
+            return Ok(Some(pending.l2_tx_index));
+        }
+        Ok(self.finalized_dump()?.map(|f| f.l2_tx_index))
     }
 
     /// Look up a batch's nonce from `batches`. Errors with
@@ -211,20 +256,9 @@ fn insert_pending_dump_in(
     Ok(dump_id)
 }
 
-fn promote_pending_dumps_in(
-    tx: &Transaction<'_>,
-    nonces: &[u64],
-    inclusion_block: u64,
-) -> Result<()> {
-    if nonces.is_empty() {
-        return Ok(());
-    }
-    // Promote the dump associated with the largest nonce: it represents
-    // the latest state in the block. The l2_tx_index is carried over
-    // from the pending row — the snapshot bytes correspond to state at
-    // batch close, and that's the offset they reflect.
-    let max_nonce = nonces.iter().copied().max().expect("non-empty checked");
-
+fn promote_finalized_in(tx: &Transaction<'_>, max_nonce: u64, inclusion_block: u64) -> Result<()> {
+    // The promoted dump's bytes correspond to state at batch close, so
+    // we carry over its `l2_tx_index` directly.
     let (new_dump_id, l2_tx_index): (i64, i64) = tx.query_row(
         "SELECT dump_id, l2_tx_index FROM pending_snapshots WHERE nonce = ?1",
         params![u64_to_i64(max_nonce)],
@@ -238,16 +272,13 @@ fn promote_pending_dumps_in(
         params![new_dump_id, u64_to_i64(inclusion_block), l2_tx_index],
     )?;
 
-    // Remove the promoted nonces from pending. The dumps for the
-    // non-max promoted nonces (and any previous finalized) become GC
+    // Clean up the promoted row plus any stale ones behind it. The
+    // dumps for non-max nonces (and the previous finalized) become GC
     // candidates from this point.
-    let placeholders = std::iter::repeat_n("?", nonces.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let stmt = format!("DELETE FROM pending_snapshots WHERE nonce IN ({placeholders})");
-    let params_i64: Vec<i64> = nonces.iter().copied().map(u64_to_i64).collect();
-    let params_dyn: Vec<&dyn ToSql> = params_i64.iter().map(|n| n as &dyn ToSql).collect();
-    tx.execute(&stmt, params_dyn.as_slice())?;
+    tx.execute(
+        "DELETE FROM pending_snapshots WHERE nonce <= ?1",
+        params![u64_to_i64(max_nonce)],
+    )?;
 
     Ok(())
 }
@@ -458,7 +489,7 @@ mod tests {
         let id_c = storage.insert_pending_dump(&prefix(2), 2, 102).unwrap();
         let id_unrelated = storage.insert_pending_dump(&prefix(3), 3, 103).unwrap();
 
-        storage.promote_pending_dumps(&[0, 1, 2], 500).unwrap();
+        storage.promote_finalized(2, 500).unwrap();
 
         // Finalized points at the dump for nonce 2.
         let finalized = storage.finalized_dump().unwrap().unwrap();
@@ -491,27 +522,15 @@ mod tests {
     }
 
     #[test]
-    fn promote_empty_nonces_is_noop() {
-        let db = temp_db("promote-empty");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-
-        storage.insert_pending_dump(&prefix(0), 0, 0).unwrap();
-        storage.promote_pending_dumps(&[], 0).unwrap();
-
-        assert!(storage.finalized_dump().unwrap().is_none());
-        assert!(storage.latest_pending_dump().unwrap().is_some());
-    }
-
-    #[test]
     fn promote_overwrites_previous_finalized_and_makes_old_dump_gc_eligible() {
         let db = temp_db("promote-overwrite");
         let mut storage = Storage::open(db.path.as_str()).expect("open");
 
         let id_first = storage.insert_pending_dump(&prefix(0), 0, 100).unwrap();
-        storage.promote_pending_dumps(&[0], 500).unwrap();
+        storage.promote_finalized(0, 500).unwrap();
 
         let id_second = storage.insert_pending_dump(&prefix(1), 1, 101).unwrap();
-        storage.promote_pending_dumps(&[1], 501).unwrap();
+        storage.promote_finalized(1, 501).unwrap();
 
         let finalized = storage.finalized_dump().unwrap().unwrap();
         assert_eq!(finalized.dump.id, id_second);
@@ -531,11 +550,11 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
 
         let dump_id = storage.insert_pending_dump(&prefix(0), 0, 0).unwrap();
-        storage.promote_pending_dumps(&[0], 500).unwrap();
+        storage.promote_finalized(0, 500).unwrap();
 
         // Promote another so the first becomes a GC candidate.
         let _ = storage.insert_pending_dump(&prefix(1), 1, 1).unwrap();
-        storage.promote_pending_dumps(&[1], 501).unwrap();
+        storage.promote_finalized(1, 501).unwrap();
 
         // Without a lease the first dump is GC-eligible.
         assert!(
@@ -573,9 +592,9 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
 
         let dump_id = storage.insert_pending_dump(&prefix(0), 0, 0).unwrap();
-        storage.promote_pending_dumps(&[0], 0).unwrap();
+        storage.promote_finalized(0, 0).unwrap();
         let _ = storage.insert_pending_dump(&prefix(1), 1, 1).unwrap();
-        storage.promote_pending_dumps(&[1], 1).unwrap();
+        storage.promote_finalized(1, 1).unwrap();
 
         // Two concurrent readers.
         storage.acquire_dump_lease(dump_id).unwrap();
@@ -636,7 +655,7 @@ mod tests {
         // references, both rows still have pending references and
         // aren't GC-eligible — but a follow-up promote would correctly
         // surface them.
-        storage.promote_pending_dumps(&[0, 1], 0).unwrap();
+        storage.promote_finalized(1, 0).unwrap();
         // id_a's dump is now superseded; id_b is finalized.
         let gc: Vec<i64> = storage
             .gc_dump_rows()
@@ -653,7 +672,7 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
 
         let dump_id = storage.insert_pending_dump(&prefix(0), 0, 0).unwrap();
-        storage.promote_pending_dumps(&[0], 0).unwrap();
+        storage.promote_finalized(0, 0).unwrap();
 
         // While in finalized, delete should fail (FK restrict).
         let err = storage
@@ -666,7 +685,7 @@ mod tests {
 
         // Promote a successor so finalized no longer references the row.
         let _ = storage.insert_pending_dump(&prefix(1), 1, 0).unwrap();
-        storage.promote_pending_dumps(&[1], 0).unwrap();
+        storage.promote_finalized(1, 0).unwrap();
 
         storage.delete_dump_row(dump_id).expect("delete after gc");
         assert!(
@@ -686,7 +705,7 @@ mod tests {
         let _id_a = storage.insert_pending_dump(&prefix(0), 0, 0).unwrap();
         let id_b = storage.insert_pending_dump(&prefix(1), 1, 0).unwrap();
         // Move id_a into finalized.
-        storage.promote_pending_dumps(&[0], 0).unwrap();
+        storage.promote_finalized(0, 0).unwrap();
         // id_b stays in pending.
 
         let cleared = storage.clear_pending_dumps().unwrap();
@@ -712,7 +731,7 @@ mod tests {
         storage.insert_pending_dump(&prefix(0), 0, 0).unwrap();
         storage.insert_pending_dump(&prefix(1), 1, 0).unwrap();
         storage.insert_pending_dump(&prefix(2), 2, 0).unwrap();
-        storage.promote_pending_dumps(&[0], 0).unwrap();
+        storage.promote_finalized(0, 0).unwrap();
 
         let rows = storage.list_dump_rows().unwrap();
         assert_eq!(rows.len(), 3);
@@ -726,7 +745,7 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
 
         let err = storage
-            .promote_pending_dumps(&[42], 0)
+            .promote_finalized(42, 0)
             .expect_err("missing nonce should error");
         assert!(matches!(err, rusqlite::Error::QueryReturnedNoRows));
     }

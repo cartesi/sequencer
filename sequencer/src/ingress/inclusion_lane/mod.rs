@@ -51,16 +51,21 @@ pub struct InclusionLane<A: Application + 'static> {
 }
 
 impl<A: Application + 'static> InclusionLane<A> {
-    /// Spawn the lane on a blocking thread. Returns the input MPSC sender (for
-    /// the API to enqueue user ops) and the join handle (for the runtime to
-    /// observe lane shutdown).
+    /// Spawn the lane on a blocking thread. The lane loads its
+    /// Application from the latest finalized snapshot via
+    /// [`Application::from_dump`]; the runtime is responsible for
+    /// ensuring a finalized snapshot exists before this is called
+    /// (cold start: register a genesis dump; warm start: nothing to
+    /// do, the previous run left one). A missing snapshot surfaces
+    /// as [`CatchUpError::NoSnapshot`].
     ///
-    /// The handle resolves to `Ok(())` on graceful shutdown, or an
-    /// `InclusionLaneError` if the lane crashed.
+    /// Returns the input MPSC sender (for the API to enqueue user
+    /// ops) and the join handle (for the runtime to observe lane
+    /// shutdown). The handle resolves to `Ok(())` on graceful
+    /// shutdown, or an `InclusionLaneError` if the lane crashed.
     pub fn start(
         queue_capacity: usize,
         shutdown: ShutdownSignal,
-        app: A,
         storage: Storage,
         config: InclusionLaneConfig,
     ) -> (
@@ -68,7 +73,15 @@ impl<A: Application + 'static> InclusionLane<A> {
         JoinHandle<Result<(), InclusionLaneError>>,
     ) {
         let (tx, rx) = mpsc::channel::<PendingUserOp>(queue_capacity.max(1));
-        let handle = tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || -> Result<(), InclusionLaneError> {
+            let mut storage = storage;
+            let finalized = storage
+                .finalized_dump()?
+                .ok_or(InclusionLaneError::CatchUp {
+                    source: error::CatchUpError::NoSnapshot,
+                })?;
+            let app =
+                A::from_dump(&finalized.dump.prefix).map_err(InclusionLaneError::LoadFromDump)?;
             let mut lane = Self {
                 rx,
                 shutdown,
@@ -103,10 +116,11 @@ impl<A: Application + 'static> InclusionLane<A> {
                 let closed_batch_index = lane_state.head.batch_index;
                 self.storage
                     .close_frame_and_batch(&mut lane_state.head, next_safe_block)?;
-                // The snapshot is a recovery anchor for this state;
-                // a failed dump silently breaks the invariant "after
-                // batch close, a dump on disk corresponds to this
-                // state." Propagate so the operator sees it.
+                // Lane policy: propagate snapshot errors. Catch-up on
+                // restart still loads from the previous good
+                // finalized, so this doesn't risk correctness — but
+                // a failing snapshot path indicates an operational
+                // problem we want surfaced, not silently logged.
                 snapshot::take_dump_at_batch_close(
                     &self.app,
                     &mut self.storage,
@@ -282,9 +296,9 @@ impl<A: Application + 'static> InclusionLane<A> {
             )?;
         }
         // Flush any accumulated observations for the last block in
-        // the range. A failure here breaks the snapshot-promotion
-        // invariant; propagate so the lane restarts and catch-up can
-        // recover from the previous good finalized.
+        // the range. Lane policy: propagate per the fail-loud
+        // contract; catch-up on restart still loads from the previous
+        // good finalized.
         observation
             .flush(&mut self.storage)
             .map_err(InclusionLaneError::Promote)?;
@@ -311,8 +325,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             };
 
             // Record block and any observed nonce before processing.
-            // A storage error here breaks the promotion invariant —
-            // propagate so the lane restarts and catch-up recovers.
+            // Lane policy: propagate per the fail-loud contract.
             observation
                 .record(&mut self.storage, input.block_number, own_batch_nonce)
                 .map_err(InclusionLaneError::Promote)?;
