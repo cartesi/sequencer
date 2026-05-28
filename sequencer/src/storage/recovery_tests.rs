@@ -1,6 +1,6 @@
 use super::super::test_helpers::{
     SENDER_A, all_ordered_l2_txs, default_protocol_timing, make_stale_batch_payload,
-    seed_closed_batches, temp_db,
+    seed_closed_batches, seed_safe_inputs_with_batch_nonces, temp_db,
 };
 use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
@@ -2180,5 +2180,161 @@ mod tree_invariants {
                 "cascade root {n}: valid batch_index >= N diverged from valid parent-walk subtree"
             );
         }
+    }
+}
+
+mod recovery_clears_pending_snapshots {
+    //! Recovery's interaction with `pending_snapshots`.
+    //!
+    //! When a cascade invalidates a span of batches, their pending
+    //! snapshots correspond to states the canonical replay will never
+    //! reach. Catch-up after recovery would load one of those rows
+    //! and end up with state ahead of the canonical stream — a real
+    //! correctness issue, not hygiene. So the recovery transaction
+    //! clears `pending_snapshots` atomically with the cascade.
+    //!
+    //! `finalized_snapshot` is untouched: it's bytes for an
+    //! L1-confirmed batch, which survives any cascade.
+
+    use super::*;
+    use std::path::PathBuf;
+
+    fn register_finalized(storage: &mut Storage, prefix: &str) {
+        storage
+            .insert_finalized_dump(&PathBuf::from(format!("/tmp/test-{prefix}")), 0, 0)
+            .expect("insert finalized");
+    }
+
+    fn register_pending(storage: &mut Storage, nonce: u64) {
+        storage
+            .insert_pending_dump(
+                &PathBuf::from(format!("/tmp/test-pending-{nonce}")),
+                nonce,
+                0,
+            )
+            .expect("insert pending");
+    }
+
+    #[test]
+    fn post_flush_cascade_clears_pending_dumps() {
+        let db = temp_db("recovery-clears-pending-post-flush");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        for _ in 0..3 {
+            storage
+                .close_frame_and_batch(&mut head, 10)
+                .expect("close batch");
+        }
+        register_finalized(&mut storage, "fin");
+        register_pending(&mut storage, 0);
+        register_pending(&mut storage, 1);
+        register_pending(&mut storage, 2);
+        assert!(storage.latest_pending_dump().unwrap().is_some());
+
+        let batch_submitter = Address::repeat_byte(0xAA);
+        storage
+            .append_safe_inputs(
+                1210,
+                &[StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: make_stale_batch_payload(0, 10),
+                    block_number: 1210,
+                }],
+                SENDER_A,
+                &default_protocol_timing(),
+            )
+            .expect("append safe input");
+
+        let invalidated = storage
+            .recover_post_flush(1200)
+            .expect("post-flush recover");
+        assert_eq!(invalidated, vec![0, 1, 2, 3]);
+
+        assert!(
+            storage.latest_pending_dump().unwrap().is_none(),
+            "cascade should clear pending snapshots"
+        );
+        assert!(
+            storage.finalized_dump().unwrap().is_some(),
+            "cascade must not touch finalized"
+        );
+    }
+
+    #[test]
+    fn aging_tip_cascade_clears_pending_dumps() {
+        let db = temp_db("recovery-clears-pending-aging-tip");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        // Initialize Tip and age it past the threshold by advancing the
+        // safe head well beyond the Tip's safe_block.
+        let _head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        register_finalized(&mut storage, "fin-aging");
+        register_pending(&mut storage, 0);
+        assert!(storage.latest_pending_dump().unwrap().is_some());
+
+        let batch_submitter = Address::repeat_byte(0xAA);
+        storage
+            .append_safe_inputs(1210, &[], batch_submitter, &default_protocol_timing())
+            .expect("advance safe head past threshold");
+
+        let invalidated = storage.recover_aging_tip(1200).expect("aging-tip recover");
+        assert_eq!(invalidated, vec![0], "Tip should cascade");
+
+        assert!(
+            storage.latest_pending_dump().unwrap().is_none(),
+            "Tip cascade should clear pending snapshots"
+        );
+        assert!(
+            storage.finalized_dump().unwrap().is_some(),
+            "Tip cascade must not touch finalized"
+        );
+    }
+
+    #[test]
+    fn no_op_recovery_does_not_touch_pending_dumps() {
+        // When recovery has nothing to invalidate (closed batches are
+        // all "gold" — their nonces are below the scheduler's
+        // frontier — and the Tip isn't aged), pending snapshots must
+        // stay: their batches are in-flight, the snapshots still
+        // useful for catch-up.
+        let db = temp_db("recovery-noop-keeps-pending");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch");
+
+        // Acknowledge our batch (nonce 0) at L1, advancing the gold
+        // frontier to nonce 1 so the closed batch we just made falls
+        // "below" frontier and isn't a cascade pivot.
+        let batch_submitter = Address::repeat_byte(0xAA);
+        seed_safe_inputs_with_batch_nonces(&mut storage, batch_submitter, 10, &[0]);
+
+        register_finalized(&mut storage, "fin-noop");
+        register_pending(&mut storage, 1);
+
+        let post_flush_invalidated = storage.recover_post_flush(1200).expect("post-flush no-op");
+        let aging_tip_invalidated = storage.recover_aging_tip(1200).expect("aging-tip no-op");
+
+        assert!(
+            post_flush_invalidated.is_empty(),
+            "post-flush should be a no-op"
+        );
+        assert!(
+            aging_tip_invalidated.is_empty(),
+            "aging-tip should be a no-op"
+        );
+        assert!(
+            storage.latest_pending_dump().unwrap().is_some(),
+            "no-op recovery must preserve in-flight pending snapshots"
+        );
     }
 }
