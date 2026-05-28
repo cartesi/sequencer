@@ -33,6 +33,7 @@ use super::queries::{
     query_batch_policy, query_latest_safe_input_index_exclusive,
 };
 use super::safe_accepted_batches::frontier_nonce;
+use super::snapshot_dumps::clear_pending_dumps_in;
 
 /// Outcome of a danger-zone check.
 ///
@@ -295,6 +296,15 @@ fn recover_post_flush_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resu
         Some(batch_index) => cascade_invalidate_from(tx, batch_index)?,
         None => Vec::new(),
     };
+    if !invalidated.is_empty() {
+        // Pending snapshots correspond to batches that haven't been
+        // observed landing on L1 yet. Once those batches are
+        // cascade-invalidated, the snapshots represent states the
+        // canonical replay will never reach — leaving them would
+        // poison catch-up after restart. Finalized is untouched
+        // because its bytes are for an L1-confirmed batch.
+        clear_pending_dumps_in(tx)?;
+    }
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
         open_recovery_batch_in_tx(tx)?;
     }
@@ -307,6 +317,10 @@ fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resul
         Some(batch_index) => cascade_invalidate_from(tx, batch_index)?,
         None => Vec::new(),
     };
+    if !invalidated.is_empty() {
+        // See `recover_post_flush_inner` for why we clear pending here.
+        clear_pending_dumps_in(tx)?;
+    }
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
         open_recovery_batch_in_tx(tx)?;
     }
