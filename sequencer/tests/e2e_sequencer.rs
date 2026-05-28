@@ -1093,6 +1093,7 @@ async fn start_full_server_with_max_body(
         storage,
         InclusionLaneConfig {
             batch_submitter_address: Address::from([0xff; 20]),
+            dumps_dir: tempfile::tempdir().expect("e2e dumps dir").keep(),
             max_user_ops_per_chunk: 32,
             safe_input_buffer_capacity: 32,
             max_batch_open: Duration::from_secs(60 * 60),
