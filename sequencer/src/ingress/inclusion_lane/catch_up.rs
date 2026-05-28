@@ -34,9 +34,17 @@ pub(super) fn catch_up_application_paged(
     batch_submitter_address: Address,
     page_size: usize,
 ) -> Result<(), CatchUpError> {
-    // Cursor tracks the DB offset of the last processed item.
-    // SQLite rowids start at 1, so 0 means "before all items".
-    let mut next_offset: u64 = 0;
+    // The lane's always-load invariant: a snapshot (at minimum the
+    // genesis dump registered by the runtime at first startup) must
+    // exist by the time catch-up runs, and `app` was constructed
+    // from it. Catch-up replays L2 txs from the snapshot's offset
+    // forward; `ordered_l2_txs_page_from` uses `offset > ?1`, so
+    // passing the snapshot's `l2_tx_index` returns the first
+    // unapplied tx. Catch-up missing a snapshot is a setup bug.
+    let mut next_offset: u64 = storage
+        .catch_up_starting_offset()
+        .map_err(|source| CatchUpError::LoadReplay { offset: 0, source })?
+        .ok_or(CatchUpError::NoSnapshot)?;
     let page_size = page_size.max(1);
 
     loop {

@@ -34,6 +34,8 @@ pub enum InclusionLaneError {
     Snapshot(#[from] TakeDumpError),
     #[error("snapshot promotion failed")]
     Promote(#[from] PromoteError),
+    #[error("loading Application from finalized snapshot failed: {0}")]
+    LoadFromDump(AppError),
 }
 
 #[derive(Debug, Error)]
@@ -48,4 +50,9 @@ pub enum CatchUpError {
     ReplayUserOpInternal { reason: String },
     #[error("replay direct input failed: {reason}")]
     ReplayDirectInputInternal { reason: String },
+    #[error(
+        "no snapshot registered before lane catch-up; \
+         runtime must ensure a genesis dump exists at first startup"
+    )]
+    NoSnapshot,
 }

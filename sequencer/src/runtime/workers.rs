@@ -104,13 +104,19 @@ impl Workers {
 
         // Inclusion lane: takes the app, returns the tx-sender the HTTP
         // ingress route will publish to.
-        let storage = crate::storage::Storage::open(&db_path)?;
+        let mut storage = crate::storage::Storage::open(&db_path)?;
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
         std::fs::create_dir_all(&dumps_dir)?;
-        let (tx, lane) = InclusionLane::start(
+        // Always-load invariant: the lane loads its Application from
+        // the latest finalized dump on the background thread. On warm
+        // start, a finalized dump already exists. On cold start, we
+        // use the passed-in app to create a genesis dump and register
+        // it as finalized — the app instance itself is discarded
+        // here, the lane will load it back via `from_dump`.
+        ensure_finalized_snapshot::<A>(app, &mut storage, &dumps_dir)?;
+        let (tx, lane) = InclusionLane::<A>::start(
             QUEUE_CAPACITY,
             shutdown.clone(),
-            app,
             storage,
             InclusionLaneConfig::new(l1_config.batch_submitter_address, dumps_dir),
         );
@@ -404,6 +410,39 @@ fn log_cleanup_result(component: &str, result: Result<(), WorkerExit>) {
 fn build_batch_submitter_provider(l1: &L1Config) -> Result<DynProvider, std::io::Error> {
     crate::l1::provider::create_signer_provider(&l1.eth_rpc_url, &l1.batch_submitter_private_key)
         .map_err(std::io::Error::other)
+}
+
+/// Ensure a finalized snapshot exists before the lane starts.
+///
+/// - **Warm start** (finalized snapshot exists): no-op. The lane
+///   loads its Application via `from_dump` on its own thread.
+/// - **Cold start** (no snapshot yet): consume `initial_app`, write
+///   its state as the genesis dump, register it as finalized. The
+///   instance is dropped at the end of this function; the lane
+///   reloads from the dump it just wrote.
+///
+/// Either way, by the time this returns there's a finalized dump
+/// the lane can `from_dump` against.
+fn ensure_finalized_snapshot<A: Application + 'static>(
+    initial_app: A,
+    storage: &mut crate::storage::Storage,
+    dumps_dir: &std::path::Path,
+) -> Result<(), RunError> {
+    if storage.finalized_dump()?.is_some() {
+        // Warm start: drop `initial_app` and let the lane reload.
+        return Ok(());
+    }
+    // Cold start: the genesis prefix is unique-per-attempt so a crash
+    // between `create_dump` and `insert_finalized_dump` doesn't wedge
+    // a stale directory on the next startup.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let genesis_prefix = dumps_dir.join(format!("genesis-{nanos}"));
+    initial_app.create_dump(&genesis_prefix)?;
+    storage.insert_finalized_dump(&genesis_prefix, 0, 0)?;
+    Ok(())
 }
 
 #[cfg(test)]

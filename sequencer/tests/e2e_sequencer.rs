@@ -20,6 +20,7 @@ use sequencer::ingress::inclusion_lane::{
 use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
+use sequencer_core::application::Application;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
@@ -1083,17 +1084,30 @@ async fn start_full_server_with_max_body(
     };
     let addr = listener.local_addr().expect("read listener addr");
 
-    let storage = Storage::open(db_path).expect("open storage");
+    let mut storage = Storage::open(db_path).expect("open storage");
     let shutdown = ShutdownSignal::default();
 
-    let (tx, lane_handle) = InclusionLane::start(
+    let dumps_dir = tempfile::tempdir().expect("e2e dumps dir").keep();
+    // Always-load invariant: ensure a finalized snapshot exists
+    // before the lane starts. On warm restart there's already one;
+    // on cold start we register a genesis dump from a fresh wallet.
+    // The lane reloads via `from_dump` either way.
+    if storage.finalized_dump().expect("read finalized").is_none() {
+        let app = WalletApp::new(WalletConfig::default());
+        let genesis_prefix = dumps_dir.join("genesis");
+        app.create_dump(&genesis_prefix).expect("genesis dump");
+        storage
+            .insert_finalized_dump(&genesis_prefix, 0, 0)
+            .expect("register genesis");
+    }
+
+    let (tx, lane_handle) = InclusionLane::<WalletApp>::start(
         128,
         shutdown.clone(),
-        WalletApp::new(WalletConfig::default()),
         storage,
         InclusionLaneConfig {
             batch_submitter_address: Address::from([0xff; 20]),
-            dumps_dir: tempfile::tempdir().expect("e2e dumps dir").keep(),
+            dumps_dir,
             max_user_ops_per_chunk: 32,
             safe_input_buffer_capacity: 32,
             max_batch_open: Duration::from_secs(60 * 60),
