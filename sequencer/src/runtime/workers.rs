@@ -107,13 +107,30 @@ impl Workers {
         let mut storage = crate::storage::Storage::open(&db_path)?;
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
         std::fs::create_dir_all(&dumps_dir)?;
-        // Always-load invariant: the lane loads its Application from
-        // the latest finalized dump on the background thread. On warm
-        // start, a finalized dump already exists. On cold start, we
-        // use the passed-in app to create a genesis dump and register
-        // it as finalized — the app instance itself is discarded
-        // here, the lane will load it back via `from_dump`.
+
+        // Snapshot lifecycle startup, in this order:
+        //
+        // 1. Reset stale leases. A crashed previous run may have left
+        //    `lease_count > 0` on dumps that aren't being read by
+        //    anyone now; without this, GC would skip them forever.
+        // 2. Ensure a finalized snapshot exists (always-load
+        //    invariant) — cold start uses `app` for the genesis dump.
+        // 3. GC SQLite-side: drop any rows now unreferenced after
+        //    promotions or invalidations that finalized just before
+        //    the previous shutdown.
+        // 4. Orphan FS sweep: remove directories under `dumps_dir`
+        //    that aren't tracked by SQLite (crash-during-create_dump
+        //    or crash-during-GC-after-row-delete artifacts).
+        storage.reset_dump_leases()?;
         ensure_finalized_snapshot::<A>(app, &mut storage, &dumps_dir)?;
+        let gc_removed = snapshot_gc_at_startup::<A>(&mut storage)?;
+        let sweep_removed = sweep_orphan_dumps::<A>(&mut storage, &dumps_dir)?;
+        tracing::debug!(
+            gc_removed,
+            sweep_removed,
+            "snapshot startup cleanup complete",
+        );
+
         let (tx, lane) = InclusionLane::<A>::start(
             QUEUE_CAPACITY,
             shutdown.clone(),
@@ -445,6 +462,68 @@ fn ensure_finalized_snapshot<A: Application + 'static>(
     Ok(())
 }
 
+/// Drop any dump rows that are now unreferenced (no pending, no
+/// finalized, no leases). The companion `sweep_orphan_dumps` then
+/// catches anything on disk that this leaves behind, plus
+/// crash-during-create_dump orphans the SQLite layer never saw.
+fn snapshot_gc_at_startup<A: Application + 'static>(
+    storage: &mut crate::storage::Storage,
+) -> Result<usize, RunError> {
+    let removed = storage.gc_unreferenced_dumps()?;
+    for row in &removed {
+        if let Err(err) = A::delete_dump(&row.prefix) {
+            tracing::warn!(
+                error = %err,
+                prefix = ?row.prefix,
+                "startup GC: filesystem delete failed; orphan left for sweep",
+            );
+        }
+    }
+    Ok(removed.len())
+}
+
+/// Walk `dumps_dir` and `Application::delete_dump` anything that
+/// isn't in `Storage::list_dump_rows`. Catches:
+///
+/// - **crash-during-create_dump**: file/directory exists on disk but
+///   no SQLite row was ever written for it.
+/// - **crash-during-GC**: SQLite row was deleted but
+///   `Application::delete_dump` either wasn't called or failed.
+///
+/// Filesystem-only — no SQLite writes here. Failures log and
+/// continue (the next startup retries). The post-`ensure_finalized`
+/// ordering matters: the genesis dump's prefix is in
+/// `list_dump_rows` by the time this runs, so we never delete it.
+fn sweep_orphan_dumps<A: Application + 'static>(
+    storage: &mut crate::storage::Storage,
+    dumps_dir: &std::path::Path,
+) -> Result<usize, RunError> {
+    let known: std::collections::HashSet<std::path::PathBuf> = storage
+        .list_dump_rows()?
+        .into_iter()
+        .map(|row| row.prefix)
+        .collect();
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dumps_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if known.contains(&path) {
+            continue;
+        }
+        match A::delete_dump(&path) {
+            Ok(()) => removed += 1,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    ?path,
+                    "orphan dump sweep: delete failed; will retry next startup",
+                );
+            }
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +563,134 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    // ── Snapshot startup hygiene ────────────────────────────────────
+    //
+    // `sweep_orphan_dumps` removes filesystem entries under `dumps_dir`
+    // that aren't tracked in SQLite. Catches crash-during-create_dump
+    // (file exists, no row) and crash-during-GC (row deleted, file
+    // remains). Must NOT touch directories that ARE in `dumps` —
+    // those are the genesis dump, finalized, and any pending the
+    // lane is still working with.
+
+    use crate::storage::Storage;
+    use crate::storage::test_helpers::temp_db;
+    use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
+    use sequencer_core::l2_tx::ValidUserOp;
+    use sequencer_core::user_op::UserOp;
+    use std::path::Path;
+
+    /// Application stub used in the sweep tests: `create_dump` makes
+    /// a directory with a marker file inside, `delete_dump` is
+    /// `remove_dir_all`. The actual marker content is irrelevant —
+    /// we only care about which directories exist post-sweep.
+    struct SweepTestApp;
+
+    impl Application for SweepTestApp {
+        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+        fn current_user_nonce(&self, _sender: alloy_primitives::Address) -> u32 {
+            0
+        }
+        fn current_user_balance(
+            &self,
+            _sender: alloy_primitives::Address,
+        ) -> alloy_primitives::U256 {
+            alloy_primitives::U256::ZERO
+        }
+        fn validate_user_op(
+            &self,
+            _sender: alloy_primitives::Address,
+            _user_op: &UserOp,
+            _current_fee: u16,
+        ) -> Result<(), InvalidReason> {
+            Ok(())
+        }
+        fn execute_valid_user_op(
+            &mut self,
+            _user_op: &ValidUserOp,
+        ) -> Result<AppOutputs, AppError> {
+            Ok(Vec::new())
+        }
+        fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
+            Ok(SweepTestApp)
+        }
+        fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+            std::fs::create_dir(prefix)?;
+            std::fs::write(prefix.join("state"), b"")?;
+            Ok(())
+        }
+        fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+            std::fs::remove_dir_all(prefix)?;
+            Ok(())
+        }
+        fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {
+            prefix.join("state")
+        }
+    }
+
+    #[test]
+    fn sweep_orphan_dumps_removes_directories_not_in_storage() {
+        let db = temp_db("sweep-orphans");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let dumps_dir = tempfile::tempdir().expect("dumps dir");
+
+        // Tracked dump (in SQLite).
+        let tracked = dumps_dir.path().join("tracked");
+        SweepTestApp.create_dump(&tracked).expect("tracked");
+        storage
+            .insert_finalized_dump(&tracked, 0, 0)
+            .expect("register tracked");
+
+        // Two orphans (NOT in SQLite).
+        let orphan_a = dumps_dir.path().join("orphan-a");
+        let orphan_b = dumps_dir.path().join("orphan-b");
+        SweepTestApp.create_dump(&orphan_a).expect("orphan a");
+        SweepTestApp.create_dump(&orphan_b).expect("orphan b");
+
+        let removed = sweep_orphan_dumps::<SweepTestApp>(&mut storage, dumps_dir.path()).unwrap();
+        assert_eq!(removed, 2);
+        assert!(tracked.exists(), "tracked dump must survive");
+        assert!(!orphan_a.exists());
+        assert!(!orphan_b.exists());
+    }
+
+    #[test]
+    fn sweep_orphan_dumps_on_empty_directory_is_noop() {
+        let db = temp_db("sweep-empty");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let dumps_dir = tempfile::tempdir().expect("dumps dir");
+
+        let removed = sweep_orphan_dumps::<SweepTestApp>(&mut storage, dumps_dir.path()).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn snapshot_gc_at_startup_removes_unreferenced_rows() {
+        let db = temp_db("gc-startup");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let dumps_dir = tempfile::tempdir().expect("dumps dir");
+
+        // Two dumps: superseded + finalized.
+        let superseded = dumps_dir.path().join("superseded");
+        let finalized = dumps_dir.path().join("finalized");
+        SweepTestApp.create_dump(&superseded).expect("superseded");
+        SweepTestApp.create_dump(&finalized).expect("finalized");
+        storage
+            .insert_pending_dump(&superseded, 0, 0)
+            .expect("pending 0");
+        storage.promote_finalized(0, 0).expect("promote 0");
+        storage
+            .insert_pending_dump(&finalized, 1, 0)
+            .expect("pending 1");
+        storage.promote_finalized(1, 0).expect("promote 1");
+        // `superseded`'s row is now unreferenced (replaced by
+        // finalized's promotion), but the directory is still on disk.
+
+        let removed = snapshot_gc_at_startup::<SweepTestApp>(&mut storage).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!superseded.exists(), "GC removed the superseded directory");
+        assert!(finalized.exists(), "current finalized survived");
     }
 
     #[test]

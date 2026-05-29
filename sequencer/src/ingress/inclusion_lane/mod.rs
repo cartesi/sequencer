@@ -38,7 +38,13 @@ use sequencer_core::application::{AppError, Application, ExecutionOutcome};
 use sequencer_core::l2_tx::DirectInput;
 use sequencer_core::user_op::SignedUserOp;
 
-use catch_up::catch_up_application;
+use catch_up::{catch_up_application, catch_up_snapshot};
+
+/// Cadence of the periodic GC pass. Cheap (one Immediate-mode
+/// transaction + zero or more `fs::remove_dir_all`s), so running
+/// once per minute keeps disk usage bounded without measurable
+/// impact on the lane's hot path.
+const GC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Owns the application instance, the `Storage` write handle, and the user-op
 /// receiver for the lifetime of the sequencer process.
@@ -51,13 +57,15 @@ pub struct InclusionLane<A: Application + 'static> {
 }
 
 impl<A: Application + 'static> InclusionLane<A> {
-    /// Spawn the lane on a blocking thread. The lane loads its
-    /// Application from the latest finalized snapshot via
-    /// [`Application::from_dump`]; the runtime is responsible for
-    /// ensuring a finalized snapshot exists before this is called
-    /// (cold start: register a genesis dump; warm start: nothing to
-    /// do, the previous run left one). A missing snapshot surfaces
-    /// as [`CatchUpError::NoSnapshot`].
+    /// Spawn the lane on a blocking thread. The lane selects one resume
+    /// checkpoint — the latest pending snapshot if any, else the
+    /// finalized snapshot (see `catch_up_snapshot`) — and uses it for
+    /// both `A::from_dump` and the catch-up replay offset, so the loaded
+    /// state and the replay cursor can never drift apart. The runtime
+    /// guarantees at least a genesis finalized snapshot exists before
+    /// this is called (cold start registers one; warm start reuses the
+    /// previous run's). A missing snapshot surfaces as
+    /// [`CatchUpError::NoSnapshot`].
     ///
     /// Returns the input MPSC sender (for the API to enqueue user
     /// ops) and the join handle (for the runtime to observe lane
@@ -75,13 +83,18 @@ impl<A: Application + 'static> InclusionLane<A> {
         let (tx, rx) = mpsc::channel::<PendingUserOp>(queue_capacity.max(1));
         let handle = tokio::task::spawn_blocking(move || -> Result<(), InclusionLaneError> {
             let mut storage = storage;
-            let finalized = storage
-                .finalized_dump()?
-                .ok_or(InclusionLaneError::CatchUp {
-                    source: error::CatchUpError::NoSnapshot,
-                })?;
-            let app =
-                A::from_dump(&finalized.dump.prefix).map_err(InclusionLaneError::LoadFromDump)?;
+            // Single checkpoint selection: the same snapshot supplies both
+            // the prefix we load the Application from and the offset we
+            // replay from, so the loaded state and the catch-up cursor
+            // can never drift apart.
+            let checkpoint = catch_up_snapshot(&mut storage)
+                .map_err(|source| InclusionLaneError::CatchUp { source })?;
+            let app = A::from_dump(&checkpoint.prefix).map_err(InclusionLaneError::LoadFromDump)?;
+            tracing::debug!(
+                kind = ?checkpoint.kind,
+                l2_tx_index = checkpoint.l2_tx_index,
+                "inclusion lane resuming from snapshot"
+            );
             let mut lane = Self {
                 rx,
                 shutdown,
@@ -89,16 +102,17 @@ impl<A: Application + 'static> InclusionLane<A> {
                 storage,
                 config,
             };
-            lane.run_forever()
+            lane.run_forever(checkpoint.l2_tx_index)
         });
         (tx, handle)
     }
 
-    fn run_forever(&mut self) -> Result<(), InclusionLaneError> {
-        self.run_catch_up()?;
+    fn run_forever(&mut self, catch_up_from: u64) -> Result<(), InclusionLaneError> {
+        self.run_catch_up(catch_up_from)?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
         let mut lane_state = self.load_or_initialize_lane_state(&mut safe_inputs)?;
+        let mut last_gc_at = Instant::now();
 
         loop {
             if self.shutdown.is_shutdown_requested() {
@@ -113,32 +127,43 @@ impl<A: Application + 'static> InclusionLane<A> {
                 || should_close_batch_by_time(&lane_state.head, &self.config)
             {
                 let next_safe_block = lane_state.head.safe_block;
-                let closed_batch_index = lane_state.head.batch_index;
-                self.storage
-                    .close_frame_and_batch(&mut lane_state.head, next_safe_block)?;
-                // Lane policy: propagate snapshot errors. Catch-up on
-                // restart still loads from the previous good
-                // finalized, so this doesn't risk correctness — but
-                // a failing snapshot path indicates an operational
-                // problem we want surfaced, not silently logged.
-                snapshot::take_dump_at_batch_close(
+                // Atomic close: dump the app state, then seal the batch
+                // and register its pending snapshot in one transaction.
+                // A create_dump failure leaves the batch open for retry;
+                // a committed close always has a promotable snapshot row.
+                // Errors propagate per the lane's fail-loud policy.
+                snapshot::close_batch_with_snapshot(
                     &self.app,
                     &mut self.storage,
+                    &mut lane_state.head,
+                    next_safe_block,
                     &self.config.dumps_dir,
-                    closed_batch_index,
                 )
                 .map_err(InclusionLaneError::Snapshot)?;
             } else if !drain.drained_any() {
+                // Periodic GC piggybacks on idle ticks: every
+                // GC_INTERVAL we sweep unreferenced dumps (previous
+                // finalizeds superseded by promotion, etc.). Failures
+                // propagate per the fail-loud policy.
+                if last_gc_at.elapsed() >= GC_INTERVAL {
+                    let removed =
+                        snapshot::run_gc::<A>(&mut self.storage).map_err(InclusionLaneError::Gc)?;
+                    if removed > 0 {
+                        tracing::debug!(removed, "lane GC removed unreferenced dumps");
+                    }
+                    last_gc_at = Instant::now();
+                }
                 thread::sleep(self.config.idle_poll_interval);
             }
         }
     }
 
-    fn run_catch_up(&mut self) -> Result<(), InclusionLaneError> {
+    fn run_catch_up(&mut self, start_offset: u64) -> Result<(), InclusionLaneError> {
         catch_up_application(
             &mut self.app,
             &mut self.storage,
             self.config.batch_submitter_address,
+            start_offset,
         )
         .map_err(|source| InclusionLaneError::CatchUp { source })
     }
