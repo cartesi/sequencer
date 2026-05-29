@@ -103,6 +103,28 @@ impl Storage {
         self.read(gc_dump_rows_in)
     }
 
+    /// Atomic GC pass: in one SQLite transaction, find all eligible
+    /// dumps and delete their rows. Returns the (id, prefix) pairs so
+    /// the caller can drive filesystem cleanup separately — file
+    /// deletion is best-effort, and an orphan file on failure is
+    /// acceptable per the no-dangling-row invariant.
+    ///
+    /// The single-transaction shape closes a race window: between a
+    /// non-atomic `gc_dump_rows()` and the per-row `delete_dump_row`,
+    /// an HTTP handler on another thread could `acquire_dump_lease`,
+    /// and a naive per-row delete would race against the lease.
+    /// Doing both inside one `write` (Immediate-mode tx) serializes
+    /// against any concurrent writer.
+    pub fn gc_unreferenced_dumps(&mut self) -> Result<Vec<DumpRow>> {
+        self.write(|tx| {
+            let candidates = gc_dump_rows_in(tx)?;
+            for row in &candidates {
+                tx.execute("DELETE FROM dumps WHERE id = ?1", params![row.id])?;
+            }
+            Ok(candidates)
+        })
+    }
+
     /// Delete a dump row from `dumps` by id. Errors if the row is
     /// still FK-referenced; the caller must clear pending/finalized
     /// rows referencing it first (or use [`Storage::gc_dump_rows`] to
@@ -170,17 +192,13 @@ impl Storage {
         })
     }
 
-    /// Return the `l2_tx_index` of the snapshot the lane should catch
-    /// up from on startup: the latest pending (preferred — closer to
-    /// current) or the finalized (fallback). Returns `None` when no
-    /// snapshot has been registered yet; the always-load invariant
-    /// expects callers to guarantee at least the genesis dump exists
-    /// before the lane starts.
-    pub fn catch_up_starting_offset(&mut self) -> Result<Option<u64>> {
-        if let Some(pending) = self.latest_pending_dump()? {
-            return Ok(Some(pending.l2_tx_index));
-        }
-        Ok(self.finalized_dump()?.map(|f| f.l2_tx_index))
+    /// Highest `offset` in the valid ordered L2-tx stream (the global
+    /// replay head), or 0 when empty. Recorded as a snapshot's
+    /// `l2_tx_index` at batch close so catch-up resumes strictly after
+    /// it — correct even for an empty batch, whose dump reflects state
+    /// through the prior head rather than genesis.
+    pub fn valid_ordered_l2_tx_head(&mut self) -> Result<u64> {
+        self.read(|tx| super::queries::valid_ordered_l2_tx_head(tx))
     }
 
     /// Look up a batch's nonce from `batches`. Errors with
@@ -195,24 +213,6 @@ impl Storage {
                 |row| row.get(0),
             )?;
             Ok(i64_to_u64(nonce))
-        })
-    }
-
-    /// Return the highest `offset` in `sequenced_l2_txs` for the given
-    /// batch, or `None` if the batch has no sequenced txs. Used at
-    /// batch close to record the l2_tx_index of the pending dump so
-    /// downstream consumers can subscribe to the WS feed at the right
-    /// depth.
-    pub fn max_l2_tx_offset_for_batch(&mut self, batch_index: u64) -> Result<Option<u64>> {
-        self.read(|tx| {
-            // MAX(offset) returns one row with NULL when no rows match
-            // the filter; wrap in Option<i64> to surface the empty case.
-            let offset: Option<i64> = tx.query_row(
-                "SELECT MAX(offset) FROM sequenced_l2_txs WHERE batch_index = ?1",
-                params![u64_to_i64(batch_index)],
-                |row| row.get(0),
-            )?;
-            Ok(offset.map(i64_to_u64))
         })
     }
 
@@ -237,7 +237,7 @@ impl Storage {
 
 // ── transaction-scoped helpers ────────────────────────────────────────────
 
-fn insert_pending_dump_in(
+pub(super) fn insert_pending_dump_in(
     tx: &Transaction<'_>,
     prefix: &Path,
     nonce: u64,
@@ -753,5 +753,78 @@ mod tests {
             .promote_finalized(42, 0)
             .expect_err("missing nonce should error");
         assert!(matches!(err, rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn gc_unreferenced_dumps_drops_rows_and_returns_them() {
+        let db = temp_db("gc-unreferenced");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+
+        // Set up: 4 dumps. ids 0, 1 superseded (unreferenced after
+        // promotion). id 2 in finalized. id 3 in pending.
+        let _id_a = storage.insert_pending_dump(&prefix(0), 0, 0).unwrap();
+        storage.promote_finalized(0, 0).unwrap();
+        let _id_b = storage.insert_pending_dump(&prefix(1), 1, 0).unwrap();
+        storage.promote_finalized(1, 0).unwrap();
+        // Now id_a is superseded by id_b's promotion. id_a is GC-eligible.
+        let _id_c = storage.insert_pending_dump(&prefix(2), 2, 0).unwrap();
+        storage.promote_finalized(2, 0).unwrap();
+        let _id_d = storage.insert_pending_dump(&prefix(3), 3, 0).unwrap();
+
+        let removed = storage.gc_unreferenced_dumps().unwrap();
+        let removed_ids: HashSet<i64> = removed.iter().map(|row| row.id).collect();
+
+        // The two superseded dumps got removed. The current finalized
+        // (id_c) and the pending (id_d) survived.
+        assert_eq!(removed.len(), 2);
+        assert!(!removed_ids.is_empty());
+
+        // Confirm the survivors are still in dumps.
+        let surviving: HashSet<PathBuf> = storage
+            .list_dump_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.prefix)
+            .collect();
+        assert!(surviving.contains(&prefix(2)));
+        assert!(surviving.contains(&prefix(3)));
+        assert!(!surviving.contains(&prefix(0)));
+        assert!(!surviving.contains(&prefix(1)));
+    }
+
+    #[test]
+    fn gc_unreferenced_dumps_skips_leased_rows() {
+        let db = temp_db("gc-leased");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+
+        // Two dumps that would both be GC-eligible…
+        let id_a = storage.insert_pending_dump(&prefix(0), 0, 0).unwrap();
+        storage.promote_finalized(0, 0).unwrap();
+        let id_b = storage.insert_pending_dump(&prefix(1), 1, 0).unwrap();
+        storage.promote_finalized(1, 0).unwrap();
+        // id_a is superseded. Both ids might be candidates; the
+        // promotion of 1 makes id_a unreferenced and id_b finalized.
+
+        // … but we hold a lease on id_a, so GC must skip it.
+        storage.acquire_dump_lease(id_a).unwrap();
+
+        let removed = storage.gc_unreferenced_dumps().unwrap();
+        let removed_ids: HashSet<i64> = removed.iter().map(|row| row.id).collect();
+        assert!(!removed_ids.contains(&id_a), "lease blocks GC");
+        assert!(!removed_ids.contains(&id_b), "id_b is still finalized");
+
+        // Releasing the lease makes id_a eligible.
+        storage.release_dump_lease(id_a).unwrap();
+        let removed_again = storage.gc_unreferenced_dumps().unwrap();
+        let removed_again_ids: HashSet<i64> = removed_again.iter().map(|row| row.id).collect();
+        assert!(removed_again_ids.contains(&id_a));
+    }
+
+    #[test]
+    fn gc_unreferenced_dumps_on_empty_db_returns_empty() {
+        let db = temp_db("gc-empty");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let removed = storage.gc_unreferenced_dumps().unwrap();
+        assert!(removed.is_empty());
     }
 }

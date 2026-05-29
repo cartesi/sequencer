@@ -8,6 +8,8 @@
 //! state (resumed on startup) — those reads live here too because they're driven
 //! by the lane's flow, not by an L1 ingress event.
 
+use std::path::Path;
+
 use alloy_primitives::Address;
 use rusqlite::{Result, Transaction, params};
 
@@ -17,8 +19,9 @@ use super::mutations::{
 };
 use super::queries::{
     current_safe_block_required, load_current_write_head, query_batch_policy,
-    query_latest_safe_input_index_exclusive,
+    query_latest_safe_input_index_exclusive, valid_ordered_l2_tx_head,
 };
+use super::snapshot_dumps::insert_pending_dump_in;
 use super::{
     BatchPolicy, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
     batch_size_target_bytes,
@@ -246,6 +249,59 @@ impl Storage {
                 policy.recommended_fee,
                 next_safe_block,
             )?;
+            Ok((next_batch_index, now_ms, policy))
+        })?;
+        head.move_to_next_batch(
+            next_batch_index,
+            from_unix_ms(now_ms),
+            policy,
+            next_safe_block,
+        );
+        Ok(())
+    }
+
+    /// Like [`Storage::close_frame_and_batch`], but in the same
+    /// transaction also registers the pending snapshot for the batch
+    /// being sealed.
+    ///
+    /// The caller must have already created the dump on disk at
+    /// `dump_prefix` (filesystem-first, outside this tx). That ordering
+    /// gives clean failure semantics:
+    /// - `create_dump` fails → caller never reaches here → batch stays
+    ///   the open Tip → retried next pass.
+    /// - this tx fails → seal rolls back → no sealed-without-dump batch,
+    ///   only an orphan directory the startup sweep reaps.
+    /// - this tx commits → the sealed batch always has a promotable
+    ///   `pending_snapshots` row, closing the "seal succeeds, snapshot
+    ///   fails, promotion wedges on `QueryReturnedNoRows` forever" gap.
+    ///
+    /// `nonce` is the closing batch's nonce (assigned at open, so known
+    /// before the seal). The snapshot's `l2_tx_index` is read inside the
+    /// tx as the global valid replay head — correct even when the
+    /// closing batch is empty.
+    pub fn close_frame_and_batch_with_pending_dump(
+        &mut self,
+        head: &mut WriteHead,
+        next_safe_block: u64,
+        dump_prefix: &Path,
+        nonce: u64,
+    ) -> Result<()> {
+        let (next_batch_index, now_ms, policy) = self.write(|tx| {
+            let now_ms = now_unix_ms();
+            let policy = query_batch_policy(tx)?;
+            let l2_tx_index = valid_ordered_l2_tx_head(tx)?;
+
+            seal_batch(tx, head.batch_index, now_ms)?;
+            let next_batch_index = insert_new_batch(tx, None, Some(head.batch_index), now_ms)?;
+            insert_open_frame(
+                tx,
+                next_batch_index,
+                0,
+                now_ms,
+                policy.recommended_fee,
+                next_safe_block,
+            )?;
+            insert_pending_dump_in(tx, dump_prefix, nonce, l2_tx_index)?;
             Ok((next_batch_index, now_ms, policy))
         })?;
         head.move_to_next_batch(

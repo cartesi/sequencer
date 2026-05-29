@@ -657,7 +657,7 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     // ends with counter == 0, confirming the symmetric skip.
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut fresh_app = SharedCountingApp::new();
-    catch_up_application_paged(&mut fresh_app, &mut storage, batch_submitter_address, 16)
+    catch_up_application_paged(&mut fresh_app, &mut storage, batch_submitter_address, 0, 16)
         .expect("catch up");
     assert_eq!(
         fresh_app.executed_direct_inputs, 0,
@@ -901,29 +901,14 @@ fn dequeue_returns_lane_error_when_app_reports_internal() {
     ));
 }
 
-/// Register a genesis snapshot with `l2_tx_index = 0` for a
-/// catch-up test. The lane's always-load invariant requires a
-/// snapshot before `catch_up_application_paged` runs; offset 0
-/// means "replay everything since the start," preserving the
-/// pre-snapshot tests' behavior.
-fn register_catch_up_test_genesis<A: Application>(
-    app: &A,
-    storage: &mut Storage,
-) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("catch-up dumps dir");
-    register_genesis_snapshot(app, storage, dir.path());
-    dir
-}
-
 #[test]
 fn catch_up_replays_multiple_pages() {
     let db = temp_db("catch-up-multi-page");
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::default();
-    let _dumps_dir = register_catch_up_test_genesis(&app, &mut storage);
 
-    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
+    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 2)
         .expect("catch up in pages");
 
     assert_eq!(app.replayed, expected);
@@ -936,9 +921,8 @@ fn catch_up_replays_from_storage_even_when_app_reports_executed_inputs() {
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::with_executed_input_count(3);
-    let _dumps_dir = register_catch_up_test_genesis(&app, &mut storage);
 
-    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
+    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 2)
         .expect("catch up from storage");
 
     assert_eq!(app.replayed, expected);
@@ -951,9 +935,8 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::default();
-    let _dumps_dir = register_catch_up_test_genesis(&app, &mut storage);
 
-    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 4)
+    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 4)
         .expect("catch up across page boundary");
 
     assert_eq!(app.replayed, expected);
@@ -965,8 +948,278 @@ fn catch_up_load_error_reports_offset() {
     let mut storage = Storage::open_without_migrations(db.path.as_str()).expect("open raw storage");
     let mut app = ReplayRecordingApp::default();
 
-    let err = catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 2)
         .expect_err("catch up should fail without schema");
 
     assert!(matches!(err, CatchUpError::LoadReplay { offset: 0, .. }));
+}
+
+/// App that counts executed user ops and persists the count through
+/// `create_dump` / `from_dump` (8 LE bytes at `prefix/state`). The
+/// restart-resume regression test reads this count back from the
+/// snapshot the lane writes on its own thread — the only way to observe
+/// how much state the lane rebuilt across a restart.
+struct UserOpCounterApp {
+    executed_user_ops: u64,
+}
+
+impl UserOpCounterApp {
+    fn new() -> Self {
+        Self {
+            executed_user_ops: 0,
+        }
+    }
+}
+
+impl Application for UserOpCounterApp {
+    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+
+    fn current_user_nonce(&self, _sender: Address) -> u32 {
+        0
+    }
+
+    fn current_user_balance(&self, _sender: Address) -> U256 {
+        U256::MAX
+    }
+
+    fn validate_user_op(
+        &self,
+        _sender: Address,
+        _user_op: &UserOp,
+        _current_fee: u16,
+    ) -> Result<(), InvalidReason> {
+        Ok(())
+    }
+
+    fn execute_valid_user_op(&mut self, _user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
+        self.executed_user_ops = self.executed_user_ops.saturating_add(1);
+        Ok(Vec::new())
+    }
+
+    fn executed_input_count(&self) -> u64 {
+        self.executed_user_ops
+    }
+
+    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
+        let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
+        let count =
+            u64::from_le_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| AppError::Internal {
+                        reason: "UserOpCounterApp dump must be exactly 8 bytes".to_string(),
+                    })?,
+            );
+        Ok(Self {
+            executed_user_ops: count,
+        })
+    }
+
+    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+        std::fs::create_dir(prefix)?;
+        std::fs::write(
+            Self::state_file_in_dump(prefix),
+            self.executed_user_ops.to_le_bytes(),
+        )?;
+        Ok(())
+    }
+
+    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+        std::fs::remove_dir_all(prefix)?;
+        Ok(())
+    }
+
+    fn state_file_in_dump(prefix: &Path) -> PathBuf {
+        prefix.join("state")
+    }
+}
+
+fn read_dump_counter(prefix: &Path) -> u64 {
+    let bytes = std::fs::read(prefix.join("state")).expect("read dump state file");
+    u64::from_le_bytes(
+        bytes
+            .as_slice()
+            .try_into()
+            .expect("dump state must be 8 bytes"),
+    )
+}
+
+/// Regression for the resume-checkpoint bug: the lane used to load its
+/// Application from one snapshot (the finalized) but replay catch-up
+/// from a *different* snapshot's offset (the latest pending). With a
+/// pending snapshot present at restart — the common "closed batch not
+/// yet observed on L1" case — the loaded state and the replay cursor
+/// must come from the *same* checkpoint, or restart silently drops the
+/// pending batch's txs.
+///
+/// Setup: 3 user ops each close their own batch (aggressive sizing) →
+/// 3 pending snapshots, none promoted, so finalized stays at genesis
+/// (counter 0) while the latest pending reflects counter 3. After
+/// restart, one more op must land the snapshot at 4. A result of 1
+/// means the lane resumed from genesis and skipped the pending state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
+    let db = temp_db("restart-resume-pending-checkpoint");
+
+    {
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // Batch size target < one user op, so every op closes its batch.
+        storage.set_alpha(17000, 1000).expect("set alpha");
+        storage
+            .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+            .expect("seed observed safe head");
+    }
+
+    // Generation 1: no idle closes (Duration::MAX), so the latest pending is
+    // always the last user-op batch with a correct global offset.
+    let mut config1 = default_test_config();
+    config1.max_batch_open = Duration::MAX;
+
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    // `app` only writes the genesis dump here; the lane reloads its own
+    // instance via `from_dump` on its background thread.
+    let app = UserOpCounterApp::new();
+    register_genesis_snapshot(&app, &mut storage, &config1.dumps_dir);
+    let shutdown1 = ShutdownSignal::default();
+    let (tx1, handle1) =
+        InclusionLane::<UserOpCounterApp>::start(128, shutdown1.clone(), storage, config1.clone());
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            Storage::open(db.path.as_str())
+                .expect("open")
+                .open_state()
+                .expect("open state")
+                .is_some()
+        })
+        .await,
+        "gen-1 lane should initialize"
+    );
+
+    for seed in 0..3u8 {
+        let (pending, recv) = make_pending_user_op(0x10 + seed);
+        tx1.send(pending).await.expect("send gen-1 op");
+        tokio::time::timeout(Duration::from_secs(2), recv)
+            .await
+            .expect("gen-1 ack timeout")
+            .expect("gen-1 ack channel")
+            .expect("gen-1 op included");
+    }
+
+    let snapshotted = wait_until(Duration::from_secs(2), || {
+        let mut s = Storage::open(db.path.as_str()).expect("open");
+        s.latest_pending_dump()
+            .expect("read pending")
+            .map(|p| read_dump_counter(&p.dump.prefix) == 3)
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        snapshotted,
+        "gen-1 should snapshot 3 executed ops into the latest pending dump"
+    );
+    {
+        let mut s = Storage::open(db.path.as_str()).expect("open");
+        assert_eq!(
+            s.finalized_dump()
+                .expect("finalized")
+                .expect("genesis finalized exists")
+                .l2_tx_index,
+            0,
+            "finalized must still be genesis (nothing was promoted)"
+        );
+    }
+    shutdown_lane(&shutdown1, handle1).await;
+
+    // Generation 2: restart on the same DB + dumps_dir. A moderate
+    // max_batch_open lets the post-restart op's batch close so its snapshot
+    // externalizes the resumed counter.
+    let mut config2 = config1.clone();
+    config2.max_batch_open = Duration::from_millis(50);
+
+    let storage2 = Storage::open(db.path.as_str()).expect("reopen storage");
+    let shutdown2 = ShutdownSignal::default();
+    let (tx2, handle2) =
+        InclusionLane::<UserOpCounterApp>::start(128, shutdown2.clone(), storage2, config2);
+
+    let (pending, recv) = make_pending_user_op(0x20);
+    tx2.send(pending).await.expect("send gen-2 op");
+    tokio::time::timeout(Duration::from_secs(2), recv)
+        .await
+        .expect("gen-2 ack timeout")
+        .expect("gen-2 ack channel")
+        .expect("gen-2 op included");
+
+    let reached_four = wait_until(Duration::from_secs(2), || {
+        let mut s = Storage::open(db.path.as_str()).expect("open");
+        s.latest_pending_dump()
+            .expect("read pending")
+            .map(|p| read_dump_counter(&p.dump.prefix) == 4)
+            .unwrap_or(false)
+    })
+    .await;
+    let observed = {
+        let mut s = Storage::open(db.path.as_str()).expect("open");
+        s.latest_pending_dump()
+            .expect("read pending")
+            .map(|p| read_dump_counter(&p.dump.prefix))
+    };
+    shutdown_lane(&shutdown2, handle2).await;
+
+    assert!(
+        reached_four,
+        "after restart the snapshot counter should reach 4 (resumed 3 + 1 new op); observed {observed:?}. \
+         A counter of 1 means the lane loaded genesis (0) and skipped the pending batch's txs."
+    );
+}
+
+/// Regression for the empty-batch snapshot offset: a batch that closes
+/// with no sequenced txs of its own still reflects state through the
+/// prior global replay head. Recording `0` means a later promotion to
+/// finalized would make catch-up replay the entire history again,
+/// double-applying every prior tx.
+#[test]
+fn empty_batch_snapshot_records_global_replay_head_not_genesis() {
+    let db = temp_db("empty-batch-snapshot-head");
+    // Batch 0 gets 6 sequenced txs; close it, then close an empty batch 1.
+    let _expected = seed_replay_fixture(db.path.as_str());
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut head = storage
+        .open_state()
+        .expect("open state")
+        .expect("batch 0 is the open tip");
+    storage
+        .close_frame_and_batch(&mut head, 30)
+        .expect("close batch 0 (6 txs)");
+    storage
+        .close_frame_and_batch(&mut head, 30)
+        .expect("close empty batch 1");
+
+    let dumps_dir = tempfile::tempdir().expect("dumps dir");
+    let app = TestApp::default();
+    super::snapshot::take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 1)
+        .expect("take dump for empty batch 1");
+
+    let pending = storage
+        .latest_pending_dump()
+        .expect("read pending")
+        .expect("pending row for batch 1");
+    assert_eq!(
+        pending.nonce, 1,
+        "snapshot keyed by the empty batch's nonce"
+    );
+
+    let global_head: u64 = {
+        let conn = Storage::open_connection(db.path.as_str()).expect("open reader");
+        conn.query_row("SELECT MAX(offset) FROM sequenced_l2_txs", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("max offset") as u64
+    };
+
+    assert_eq!(
+        pending.l2_tx_index, global_head,
+        "empty-batch snapshot must record the global replay head ({global_head}), not genesis (0); \
+         otherwise catch-up after this snapshot is finalized replays the whole stream and double-applies it"
+    );
 }

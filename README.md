@@ -155,14 +155,14 @@ Success response:
 ## Project Layout
 
 - `sequencer/src/main.rs`: thin binary entrypoint
-- `sequencer/src/lib.rs`: public crate surface
-- `sequencer/src/config.rs`: runtime input parsing and EIP-712 domain construction
-- `sequencer/src/runtime.rs`: sequencer bootstrap and component wiring
-- `sequencer/src/api/`: HTTP API and error mapping
-- `sequencer/src/inclusion_lane/`: hot-path inclusion loop, chunk/frame/batch rotation, catch-up
-- `sequencer/src/input_reader/`: safe-input ingestion from InputBox into SQLite
-- `sequencer/src/l2_tx_feed/`: DB-backed ordered-L2Tx feed for WS subscriptions
-- `sequencer/src/storage/`: schema, migrations, SQLite persistence, and replay reads
+- `sequencer/src/lib.rs`: public crate surface (`run`, `RunConfig`)
+- `sequencer/src/http.rs`: shared HTTP error type, JSON error shape, and `axum::serve` orchestration
+- `sequencer/src/runtime/`: process bootstrap, config parsing, EIP-712 domain, shutdown signal, shared clock
+- `sequencer/src/ingress/`: public write path — `POST /tx` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)
+- `sequencer/src/egress/`: internal read path — WS subscribe + health probes (`api/`) and the DB-backed ordered-L2Tx feed (`l2_tx_feed/`)
+- `sequencer/src/l1/`: L1 client surface — input reader, batch submitter, provider, partition helper
+- `sequencer/src/recovery/`: preemptive recovery startup, runtime danger detector, mempool flusher
+- `sequencer/src/storage/`: schema, migrations, SQLite persistence (split per writer role), and replay reads
 - `sequencer-core/src/`: shared domain types and interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, feed message types)
 - `examples/app-core/src/`: wallet prototype implementing `Application`
 - `tests/benchmarks/`: benchmark harnesses and benchmark spec
@@ -172,7 +172,7 @@ Related docs:
 
 ## Prototype Limits
 
-- The `Application` trait exposes dump/load capability (see `docs/app-snapshot-format.md`); inclusion-lane wiring that drives the lifecycle is in progress, so wallet state is effectively in-memory at runtime today.
+- The `Application` trait exposes snapshot dump/load capability (see `docs/app-snapshot-format.md`). The inclusion lane drives the snapshot lifecycle — dump at batch close, promote to finalized on L1 observation, and garbage-collect superseded dumps — and at startup rebuilds application state by loading the latest snapshot and replaying the persisted L2-tx stream from that snapshot's offset. Serving snapshots over HTTP is not yet wired.
 - Schema and migrations are still in prototype mode and may change.
 
 ## Local Test Prerequisites
