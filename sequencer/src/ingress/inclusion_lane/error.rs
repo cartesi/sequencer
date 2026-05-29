@@ -7,7 +7,7 @@
 use sequencer_core::application::AppError;
 use thiserror::Error;
 
-use super::snapshot::{PromoteError, TakeDumpError};
+use super::snapshot::{GcError, PromoteError, TakeDumpError};
 
 #[derive(Debug, Error)]
 pub enum InclusionLaneError {
@@ -36,10 +36,17 @@ pub enum InclusionLaneError {
     Promote(#[from] PromoteError),
     #[error("loading Application from finalized snapshot failed: {0}")]
     LoadFromDump(AppError),
+    #[error("snapshot garbage collection failed")]
+    Gc(#[from] GcError),
 }
 
 #[derive(Debug, Error)]
 pub enum CatchUpError {
+    #[error("cannot load resume snapshot")]
+    LoadSnapshot {
+        #[source]
+        source: rusqlite::Error,
+    },
     #[error("cannot load replay entries from offset {offset}")]
     LoadReplay {
         offset: u64,
