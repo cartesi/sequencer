@@ -6,10 +6,12 @@
 //! the schema rationale.
 //!
 //! This module exposes SQLite operations only; filesystem cleanup of the
-//! actual dump artifacts is the caller's responsibility (`gc_dump_rows`
-//! returns the prefixes to remove, then the caller invokes
-//! `delete_dump_row` after the filesystem delete succeeds). The lane
-//! drives the lifecycle from `inclusion_lane/` in a subsequent commit.
+//! actual dump artifacts is the caller's responsibility:
+//! `gc_unreferenced_dumps` deletes unreferenced rows in one transaction
+//! and returns their prefixes, and the lane (`inclusion_lane/snapshot.rs`)
+//! removes the directories afterward. The lane drives the lifecycle —
+//! register at batch close, promote on L1 observation (atomically with the
+//! drain), GC after each promotion.
 
 use std::path::{Path, PathBuf};
 
@@ -81,13 +83,25 @@ impl Storage {
     ///
     /// `max_nonce` must currently exist in `pending_snapshots`; a
     /// missing row surfaces as `QueryReturnedNoRows`.
+    ///
+    /// Standalone promotion, retained for test setup (it's the only way to
+    /// *supersede* an existing finalized row, which `insert_finalized_dump`
+    /// can't). **Production does not call this**: the lane promotes via
+    /// `promote_finalized_in` folded into the safe-frontier-advance
+    /// transaction ([`Storage::close_frame_only_promoting`]), so the promotion
+    /// commits atomically with the drain it derives from — a separate promotion
+    /// could commit ahead of the drain and wedge a restart on a deleted pending
+    /// row.
     pub fn promote_finalized(&mut self, max_nonce: u64, inclusion_block: u64) -> Result<()> {
         self.write(|tx| promote_finalized_in(tx, max_nonce, inclusion_block))
     }
 
-    /// Increment a dump's lease count. Called by HTTP handlers at the
-    /// start of a stream to prevent GC from removing the dump while in
-    /// use.
+    /// Increment a dump's lease count, non-atomically with any row read.
+    /// Test-only: production leases atomically with the row read via
+    /// [`Storage::acquire_finalized_lease`] /
+    /// [`Storage::acquire_latest_snapshot_lease`], which call
+    /// `acquire_dump_lease_in` inside the read transaction.
+    #[cfg(test)]
     pub fn acquire_dump_lease(&mut self, dump_id: i64) -> Result<()> {
         self.write(|tx| acquire_dump_lease_in(tx, dump_id))
     }
@@ -118,11 +132,13 @@ impl Storage {
         })
     }
 
-    /// Return dumps eligible for garbage collection: `lease_count = 0`
-    /// AND not referenced by `pending_snapshots` or
-    /// `finalized_snapshot`. The caller is responsible for filesystem
-    /// cleanup; once that succeeds, the caller invokes
-    /// [`Storage::delete_dump_row`] for each id.
+    /// Return dumps eligible for garbage collection (`lease_count = 0`
+    /// AND not referenced by `pending_snapshots` or `finalized_snapshot`)
+    /// without deleting them. Test-only: production reads and deletes in
+    /// one transaction via [`Storage::gc_unreferenced_dumps`], closing the
+    /// race a read-then-delete split would open against a concurrent
+    /// `acquire_dump_lease_in`.
+    #[cfg(test)]
     pub fn gc_dump_rows(&mut self) -> Result<Vec<DumpRow>> {
         self.read(gc_dump_rows_in)
     }
@@ -149,10 +165,10 @@ impl Storage {
         })
     }
 
-    /// Delete a dump row from `dumps` by id. Errors if the row is
-    /// still FK-referenced; the caller must clear pending/finalized
-    /// rows referencing it first (or use [`Storage::gc_dump_rows`] to
-    /// only delete unreferenced rows).
+    /// Delete a dump row from `dumps` by id. Errors if the row is still
+    /// FK-referenced. Test-only: production deletes unreferenced rows
+    /// atomically via [`Storage::gc_unreferenced_dumps`].
+    #[cfg(test)]
     pub fn delete_dump_row(&mut self, dump_id: i64) -> Result<()> {
         self.write(|tx| delete_dump_row_in(tx, dump_id))
     }
@@ -218,10 +234,12 @@ impl Storage {
         self.read(list_dump_rows_in)
     }
 
-    /// Delete every row from `pending_snapshots`. Used by danger-zone
-    /// recovery: the underlying batches are cascade-invalidated and
-    /// their snapshots represent states the canonical stream will never
-    /// reach. The dumps themselves become GC-eligible immediately.
+    /// Delete every row from `pending_snapshots`. Test-only convenience
+    /// wrapper: production danger-zone recovery composes
+    /// `clear_pending_dumps_in` into the same transaction as the cascade
+    /// invalidation (see `storage/recovery.rs`), so the pending rows for
+    /// cascade-doomed batches are cleared atomically with them.
+    #[cfg(test)]
     pub fn clear_pending_dumps(&mut self) -> Result<usize> {
         self.write(clear_pending_dumps_in)
     }
@@ -257,10 +275,12 @@ impl Storage {
     }
 
     /// Highest `offset` in the valid ordered L2-tx stream (the global
-    /// replay head), or 0 when empty. Recorded as a snapshot's
-    /// `l2_tx_index` at batch close so catch-up resumes strictly after
-    /// it — correct even for an empty batch, whose dump reflects state
-    /// through the prior head rather than genesis.
+    /// replay head), or 0 when empty. Test-only standalone read: the
+    /// production batch-close path reads the same value via the
+    /// `valid_ordered_l2_tx_head` free function *inside* its seal
+    /// transaction (see `close_frame_and_batch_with_pending_dump`), so
+    /// the recorded `l2_tx_index` is consistent with the seal.
+    #[cfg(test)]
     pub fn valid_ordered_l2_tx_head(&mut self) -> Result<u64> {
         self.read(|tx| super::queries::valid_ordered_l2_tx_head(tx))
     }
@@ -320,7 +340,11 @@ pub(super) fn insert_pending_dump_in(
     Ok(dump_id)
 }
 
-fn promote_finalized_in(tx: &Transaction<'_>, max_nonce: u64, inclusion_block: u64) -> Result<()> {
+pub(super) fn promote_finalized_in(
+    tx: &Transaction<'_>,
+    max_nonce: u64,
+    inclusion_block: u64,
+) -> Result<()> {
     // The promoted dump's bytes correspond to state at batch close, so
     // we carry over its `l2_tx_index` directly.
     let (new_dump_id, l2_tx_index): (i64, i64) = tx.query_row(
@@ -385,6 +409,7 @@ fn gc_dump_rows_in(tx: &Transaction<'_>) -> Result<Vec<DumpRow>> {
     rows
 }
 
+#[cfg(test)]
 fn delete_dump_row_in(tx: &Transaction<'_>, dump_id: i64) -> Result<()> {
     let changed = tx.execute("DELETE FROM dumps WHERE id = ?1", params![dump_id])?;
     if changed != 1 {

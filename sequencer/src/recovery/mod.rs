@@ -17,14 +17,14 @@
 //! Startup recovery branches on [`decide_startup_action`]:
 //!
 //! - `FlushAndCascade`: a closed batch past gold is dangerous. Flush the mempool,
-//!   re-sync the safe head, then call [`Storage::recover_post_flush`] which cascades
+//!   re-sync the safe head, then call [`crate::storage::Storage::recover_post_flush`] which cascades
 //!   everything past the gold frontier (every non-gold batch is doomed:
 //!   Silver-stale, Silver-poisoned, or Pending no-op'd). If all closed are gold,
 //!   falls through to a Tip danger-zone check — see `docs/recovery/README.md` Step 5.
 //! - `RecoverTip`: only the open Tip is dangerous. It has no L1 footprint, so call
-//!   [`Storage::recover_aging_tip`] directly without flushing.
+//!   [`crate::storage::Storage::recover_aging_tip`] directly without flushing.
 //! - `Proceed`: no danger detected. No DB writes; the lane handles genesis init
-//!   via [`Storage::initialize_open_state`] if the DB is fresh.
+//!   via [`crate::storage::Storage::initialize_open_state`] if the DB is fresh.
 //! - `Refuse`: L1 view is stale or batch-relative estimated danger fired; bail
 //!   out and surface to the operator.
 //!
