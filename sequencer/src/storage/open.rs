@@ -43,10 +43,13 @@ impl Storage {
         Ok(Self { conn })
     }
 
-    /// Test-only: open without running migrations. Lets tests pre-seed the
-    /// schema before the migration runner touches it.
-    #[cfg(test)]
-    pub fn open_without_migrations(path: &str) -> Result<Self, StorageOpenError> {
+    /// Read-write handle that does NOT run migrations — for components that
+    /// open the DB *after* startup has already migrated it (e.g. egress
+    /// snapshot handlers doing brief lease writes, and tests that pre-seed
+    /// the schema). Same pragmas as [`Storage::open`] (WAL, `foreign_keys`,
+    /// 5s `busy_timeout`); running migrations is the caller's responsibility
+    /// (the runtime does it once via [`Storage::open`] at startup).
+    pub fn open_writer(path: &str) -> Result<Self, StorageOpenError> {
         let conn = open_writer_connection(path)?;
         Ok(Self { conn })
     }

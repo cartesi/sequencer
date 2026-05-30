@@ -220,13 +220,15 @@ Application state changes must flow exclusively through `execute_valid_user_op` 
 ## HTTP Endpoints
 
 - **Ingress** (public-facing): `POST /tx`.
-- **Egress** (internal indexers): `GET /ws/subscribe`, `GET /livez`, `GET /readyz`, `GET /healthz`.
+- **Egress** (internal indexers/watchdog): `GET /ws/subscribe`, `GET /finalized_state`, `GET /finalized_state/inclusion_block`, `GET /latest_snapshot`, `GET /livez`, `GET /readyz`, `GET /healthz`.
 
 Today both sides serve from one listener; the planned API split puts each side on its own port (same binary) so internal probes and subscribers can be firewalled from public submit traffic.
 
 `/ws/subscribe` internal guardrails: subscriber cap 64, catch-up cap 50000. When the catch-up window is exceeded, the handler upgrades and then closes with WebSocket close code `1008` (`POLICY`), reason `catch-up window exceeded`.
 
 Health semantics: `/livez` — 200 if the process is alive. `/readyz` — 200 if shutdown not requested AND inclusion-lane channel still open, else 503. `/healthz` — JSON `{ status, inclusion_lane }` mirroring the same 200/503.
+
+Snapshot endpoints (`/finalized_state`, `/finalized_state/inclusion_block`, `/latest_snapshot`) are **operator-only** (no auth) — they serve the watchdog and indexers and must not be exposed publicly. The two streaming routes hold a GC lease on the dump for the response lifetime, released even on client disconnect (via a drop-guard); `Storage::reset_dump_leases` at startup is the crash backstop. Shapes are in [`README.md`](README.md); dump format in [`docs/app-snapshot-format.md`](docs/app-snapshot-format.md).
 
 ## Environment Variables
 

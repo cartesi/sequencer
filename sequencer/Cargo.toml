@@ -13,7 +13,8 @@ authors.workspace = true
 app-core = { path = "../examples/app-core" }
 sequencer-core = { path = "../sequencer-core" }
 axum = { version = "0.8.8", features = ["ws"] }
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -36,6 +37,7 @@ async-trait = "0.1"
 
 [dev-dependencies]
 futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 tokio-tungstenite = "0.28"
 k256 = "0.13.4"
 tempfile = "3"

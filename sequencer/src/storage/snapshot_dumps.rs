@@ -42,6 +42,16 @@ pub struct FinalizedDump {
     pub l2_tx_index: u64,
 }
 
+/// The snapshot the `/latest_snapshot` endpoint serves: the latest pending
+/// dump, or the finalized dump as fallback. Carries the dump row (id +
+/// prefix) and the replay offset; the source (pending vs finalized) is
+/// immaterial to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasedSnapshot {
+    pub dump: DumpRow,
+    pub l2_tx_index: u64,
+}
+
 impl Storage {
     /// Insert a new dump row plus its pending-snapshot row in one
     /// transaction. Caller has already created the dump on disk at
@@ -94,6 +104,20 @@ impl Storage {
         self.write(reset_dump_leases_in)
     }
 
+    /// Current lease count for a dump, or `None` if the row doesn't exist.
+    /// Read-only; exposed for operational visibility (in-flight stream
+    /// count) and tests.
+    pub fn dump_lease_count(&mut self, dump_id: i64) -> Result<Option<i64>> {
+        self.read(|tx| {
+            tx.query_row(
+                "SELECT lease_count FROM dumps WHERE id = ?1",
+                params![dump_id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+    }
+
     /// Return dumps eligible for garbage collection: `lease_count = 0`
     /// AND not referenced by `pending_snapshots` or
     /// `finalized_snapshot`. The caller is responsible for filesystem
@@ -144,6 +168,46 @@ impl Storage {
     /// snapshot exists.
     pub fn finalized_dump(&mut self) -> Result<Option<FinalizedDump>> {
         self.read(finalized_dump_in)
+    }
+
+    /// Atomically read the finalized snapshot AND increment its dump's
+    /// lease, in one transaction. This closes the race where an HTTP
+    /// handler reads the finalized row, a promotion + GC delete that dump,
+    /// and the handler then fails to open the file: holding the lease from
+    /// the moment of the read keeps GC off the dump. Returns `None` if no
+    /// finalized snapshot exists. The caller MUST release the lease when
+    /// done — the HTTP layer does this through a drop-guard, and
+    /// [`Storage::reset_dump_leases`] at startup is the crash backstop.
+    pub fn acquire_finalized_lease(&mut self) -> Result<Option<FinalizedDump>> {
+        self.write(|tx| {
+            let finalized = finalized_dump_in(tx)?;
+            if let Some(ref f) = finalized {
+                acquire_dump_lease_in(tx, f.dump.id)?;
+            }
+            Ok(finalized)
+        })
+    }
+
+    /// Atomically read the snapshot to serve (latest pending, else
+    /// finalized) AND lease its dump, in one transaction. Same race-closing
+    /// guarantee and release contract as [`Storage::acquire_finalized_lease`].
+    pub fn acquire_latest_snapshot_lease(&mut self) -> Result<Option<LeasedSnapshot>> {
+        self.write(|tx| {
+            let snapshot = match latest_pending_dump_in(tx)? {
+                Some(pending) => Some(LeasedSnapshot {
+                    dump: pending.dump,
+                    l2_tx_index: pending.l2_tx_index,
+                }),
+                None => finalized_dump_in(tx)?.map(|f| LeasedSnapshot {
+                    dump: f.dump,
+                    l2_tx_index: f.l2_tx_index,
+                }),
+            };
+            if let Some(ref s) = snapshot {
+                acquire_dump_lease_in(tx, s.dump.id)?;
+            }
+            Ok(snapshot)
+        })
     }
 
     /// Return every row in `dumps`. Used at startup to reconcile
@@ -826,5 +890,101 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
         let removed = storage.gc_unreferenced_dumps().unwrap();
         assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn acquire_finalized_lease_returns_none_when_no_finalized() {
+        let db = temp_db("acquire-finalized-none");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        assert!(storage.acquire_finalized_lease().unwrap().is_none());
+    }
+
+    #[test]
+    fn acquire_finalized_lease_reads_and_leases_atomically_blocking_gc() {
+        let db = temp_db("acquire-finalized-lease");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+
+        let id_a = storage.insert_finalized_dump(&prefix(0), 100, 5).unwrap();
+        let finalized = storage
+            .acquire_finalized_lease()
+            .unwrap()
+            .expect("a finalized snapshot exists");
+        assert_eq!(finalized.dump.id, id_a);
+        assert_eq!(finalized.inclusion_block, 100);
+        assert_eq!(finalized.l2_tx_index, 5);
+
+        // Supersede A with a promotion so A becomes unreferenced — but the
+        // lease must keep GC off it.
+        storage.insert_pending_dump(&prefix(1), 0, 7).unwrap();
+        storage.promote_finalized(0, 101).unwrap();
+        let eligible: HashSet<i64> = storage
+            .gc_dump_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(
+            !eligible.contains(&id_a),
+            "lease must block GC of the superseded-but-leased dump"
+        );
+
+        // Releasing makes it GC-eligible.
+        storage.release_dump_lease(id_a).unwrap();
+        let eligible: HashSet<i64> = storage
+            .gc_dump_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(eligible.contains(&id_a), "released dump is GC-eligible");
+    }
+
+    #[test]
+    fn acquire_latest_snapshot_lease_prefers_pending_and_leases() {
+        let db = temp_db("acquire-latest-pending");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+
+        storage.insert_finalized_dump(&prefix(0), 100, 5).unwrap();
+        let id_pending = storage.insert_pending_dump(&prefix(1), 3, 9).unwrap();
+
+        let leased = storage
+            .acquire_latest_snapshot_lease()
+            .unwrap()
+            .expect("a snapshot exists");
+        assert_eq!(leased.dump.id, id_pending, "prefers the latest pending");
+        assert_eq!(leased.l2_tx_index, 9);
+
+        // Clear pending so the leased dump is unreferenced; the lease still
+        // blocks GC until released.
+        storage.clear_pending_dumps().unwrap();
+        let eligible: HashSet<i64> = storage
+            .gc_dump_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(!eligible.contains(&id_pending), "lease blocks GC");
+        storage.release_dump_lease(id_pending).unwrap();
+        let eligible: HashSet<i64> = storage
+            .gc_dump_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(eligible.contains(&id_pending));
+    }
+
+    #[test]
+    fn acquire_latest_snapshot_lease_falls_back_to_finalized() {
+        let db = temp_db("acquire-latest-finalized");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+
+        let id_finalized = storage.insert_finalized_dump(&prefix(0), 100, 5).unwrap();
+        let leased = storage
+            .acquire_latest_snapshot_lease()
+            .unwrap()
+            .expect("falls back to finalized");
+        assert_eq!(leased.dump.id, id_finalized);
+        assert_eq!(leased.l2_tx_index, 5);
     }
 }

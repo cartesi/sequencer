@@ -5,6 +5,7 @@
 //! Additional read endpoints will land here.
 
 mod health;
+mod snapshot;
 mod state;
 mod subscribe;
 
@@ -14,13 +15,16 @@ use axum::Router;
 use axum::routing::get;
 
 pub(crate) use health::HealthState;
+pub use snapshot::SnapshotState;
 pub(crate) use state::SubscribeState;
 
 /// Build the egress router. Each subrouter has its own state; the merge is
-/// transparent to axum's routing.
+/// transparent to axum's routing. Snapshot routes are always part of the
+/// egress (internal) side — the public/ingress side is a separate router.
 pub(crate) fn router(
     subscribe_state: Arc<SubscribeState>,
     health_state: Arc<HealthState>,
+    snapshot_state: Arc<SnapshotState>,
 ) -> Router {
     let subscribe_router = Router::new()
         .route("/ws/subscribe", get(subscribe::subscribe_l2_txs))
@@ -32,5 +36,7 @@ pub(crate) fn router(
         .route("/healthz", get(health::healthz))
         .with_state(health_state);
 
-    subscribe_router.merge(health_router)
+    subscribe_router
+        .merge(health_router)
+        .merge(snapshot::router(snapshot_state))
 }
