@@ -38,7 +38,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 
-use crate::storage::Storage;
+use crate::storage::{LeaseGuard, LeasedDump, Storage};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -156,35 +156,13 @@ fn stream_body(file: File, guard: LeaseGuard) -> Body {
     }))
 }
 
-// ── Lease acquisition (returns the guard, inseparable from the lease) ──────
-
-/// The acquire result: the lease guard plus the info the handler needs for
-/// headers and the file open. Dropping it releases the lease (via the
-/// embedded guard) — so there's no code path with a held lease and no armed
-/// release.
-struct LeasedDump {
-    guard: LeaseGuard,
-    prefix: PathBuf,
-    l2_tx_index: u64,
-    /// `Some` for the finalized snapshot, `None` for the latest pending.
-    inclusion_block: Option<u64>,
-}
+// ── Lease acquisition (storage returns the dump bundled with its release) ──
 
 async fn acquire_finalized(state: &SnapshotState) -> Result<Option<LeasedDump>, BoxError> {
     let db_path = state.db_path.clone();
     tokio::task::spawn_blocking(move || -> Result<Option<LeasedDump>, BoxError> {
         let mut storage = Storage::open_writer(&db_path)?;
-        Ok(storage
-            .acquire_finalized_lease()?
-            .map(|finalized| LeasedDump {
-                guard: LeaseGuard {
-                    db_path: db_path.clone(),
-                    dump_id: finalized.dump.id,
-                },
-                prefix: finalized.dump.prefix,
-                l2_tx_index: finalized.l2_tx_index,
-                inclusion_block: Some(finalized.inclusion_block),
-            }))
+        Ok(storage.acquire_finalized_lease(spawn_blocking_release)?)
     })
     .await?
 }
@@ -193,61 +171,24 @@ async fn acquire_latest(state: &SnapshotState) -> Result<Option<LeasedDump>, Box
     let db_path = state.db_path.clone();
     tokio::task::spawn_blocking(move || -> Result<Option<LeasedDump>, BoxError> {
         let mut storage = Storage::open_writer(&db_path)?;
-        Ok(storage
-            .acquire_latest_snapshot_lease()?
-            .map(|snapshot| LeasedDump {
-                guard: LeaseGuard {
-                    db_path: db_path.clone(),
-                    dump_id: snapshot.dump.id,
-                },
-                prefix: snapshot.dump.prefix,
-                l2_tx_index: snapshot.l2_tx_index,
-                inclusion_block: None,
-            }))
+        Ok(storage.acquire_latest_snapshot_lease(spawn_blocking_release)?)
     })
     .await?
 }
 
-// ── Lease guard: releases on drop, even on client disconnect ───────────────
+// ── Release scheduler: keep the lease release off the async worker ─────────
 
-/// Holds a dump lease for the duration of a streaming response. Its `Drop`
-/// releases the lease, and `Drop` runs in every in-process outcome — stream
-/// completion, I/O error, handler panic (unwind), and client disconnect
-/// (the response body future is dropped). The crash case (no unwinding) is
-/// covered by `Storage::reset_dump_leases` at the next startup.
-struct LeaseGuard {
-    db_path: String,
-    dump_id: i64,
-}
-
-impl Drop for LeaseGuard {
-    fn drop(&mut self) {
-        let db_path = std::mem::take(&mut self.db_path);
-        let dump_id = self.dump_id;
-        let release = move || match Storage::open_writer(&db_path) {
-            Ok(mut storage) => {
-                if let Err(err) = storage.release_dump_lease(dump_id) {
-                    tracing::warn!(
-                        error = %err, dump_id,
-                        "snapshot lease release failed; will be reset at next startup",
-                    );
-                }
-            }
-            Err(err) => tracing::warn!(
-                error = %err, dump_id,
-                "snapshot lease release: open failed; will be reset at next startup",
-            ),
-        };
-        // Offload to the blocking pool so the release write — which contends
-        // with the inclusion lane's single-writer lock and can wait on
-        // `busy_timeout` — never stalls an async worker on client disconnect.
-        // If we're somehow dropped off-runtime, release inline.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn_blocking(release);
-            }
-            Err(_) => release(),
+/// The `ReleaseScheduler` the egress layer hands to `acquire_*_lease`. The
+/// lease release is a write-lock-contended SQLite write, and on client
+/// disconnect the guard drops on an async worker thread — so offload it to the
+/// blocking pool rather than stall the worker. Off-runtime (shouldn't happen
+/// from here), run it inline.
+fn spawn_blocking_release(release: Box<dyn FnOnce() + Send + 'static>) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(release);
         }
+        Err(_) => release(),
     }
 }
 

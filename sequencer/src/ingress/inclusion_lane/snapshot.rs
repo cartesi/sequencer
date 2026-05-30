@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sequencer_core::application::{AppError, Application};
 
-use crate::storage::{Storage, WriteHead};
+use crate::storage::{SafeInputRange, Storage, WriteHead};
 
 /// Errors from snapshot-taking at batch close.
 #[derive(Debug, thiserror::Error)]
@@ -130,8 +130,9 @@ pub(super) fn take_dump_at_batch_close<A: Application>(
 /// Accumulator for batch promotion across one safe-input processing range.
 ///
 /// Records the highest accepted-batch nonce observed in the range and the L1
-/// block it landed in. The lane promotes it **once**, at the end of the range,
-/// folded into the same transaction that advances the drain
+/// block it landed in, then **commits itself once** at range close (via
+/// [`BlockObservation::commit`]): the promotion, if any, folds into the same
+/// transaction that advances the drain
 /// ([`Storage::close_frame_only_promoting`]) — so a promotion and the drain it
 /// derives from commit atomically.
 ///
@@ -167,8 +168,45 @@ impl BlockObservation {
         }
     }
 
-    /// The promotion target for this range — `(max_nonce, inclusion_block)` —
-    /// or `None` if no own batch was observed.
+    /// Whether the range observed one of our accepted batches — i.e. whether
+    /// [`commit`](Self::commit) will promote.
+    pub(super) fn has_promotion(&self) -> bool {
+        self.max.is_some()
+    }
+
+    /// Close the frame for this safe-frontier advance, folding the observed
+    /// promotion — if any — into the **same transaction** as the drain
+    /// ([`Storage::close_frame_only_promoting`]); otherwise a plain frame close.
+    /// Returns whether a batch was promoted, so the caller can collect the dumps
+    /// it superseded. Consumes the observation — it is spent once committed.
+    pub(super) fn commit(
+        self,
+        storage: &mut Storage,
+        head: &mut WriteHead,
+        next_safe_block: u64,
+        drained: SafeInputRange,
+    ) -> Result<bool, rusqlite::Error> {
+        match self.max {
+            Some((max_nonce, inclusion_block)) => {
+                storage.close_frame_only_promoting(
+                    head,
+                    next_safe_block,
+                    drained,
+                    max_nonce,
+                    inclusion_block,
+                )?;
+                Ok(true)
+            }
+            None => {
+                storage.close_frame_only(head, next_safe_block, drained)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Test-only inspection of the accumulated `(max_nonce, inclusion_block)`.
+    /// Production drives promotion through [`commit`](Self::commit).
+    #[cfg(test)]
     pub(super) fn promotion(&self) -> Option<(u64, u64)> {
         self.max
     }
