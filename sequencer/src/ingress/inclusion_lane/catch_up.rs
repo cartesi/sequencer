@@ -26,13 +26,9 @@ const DEFAULT_CATCH_UP_PAGE_SIZE: usize = 256;
 pub(super) struct CatchUpSnapshot {
     pub(super) prefix: PathBuf,
     pub(super) l2_tx_index: u64,
-    pub(super) kind: SnapshotKind,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) enum SnapshotKind {
-    Pending,
-    Finalized,
+    /// `"pending"` or `"finalized"` — which table the checkpoint came
+    /// from. Carried for the resume log line only.
+    pub(super) kind: &'static str,
 }
 
 /// Select the resume checkpoint. Prefers the latest pending snapshot
@@ -55,7 +51,7 @@ pub(super) fn catch_up_snapshot(storage: &mut Storage) -> Result<CatchUpSnapshot
         return Ok(CatchUpSnapshot {
             prefix: pending.dump.prefix,
             l2_tx_index: pending.l2_tx_index,
-            kind: SnapshotKind::Pending,
+            kind: "pending",
         });
     }
     let finalized = storage
@@ -65,7 +61,7 @@ pub(super) fn catch_up_snapshot(storage: &mut Storage) -> Result<CatchUpSnapshot
     Ok(CatchUpSnapshot {
         prefix: finalized.dump.prefix,
         l2_tx_index: finalized.l2_tx_index,
-        kind: SnapshotKind::Finalized,
+        kind: "finalized",
     })
 }
 

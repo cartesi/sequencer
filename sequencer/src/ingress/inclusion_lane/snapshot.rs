@@ -1,9 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Snapshot lifecycle integration for the inclusion lane.
-//!
-//! Two responsibilities:
+//! Snapshot lifecycle integration for the inclusion lane. Three
+//! responsibilities (see `docs/snapshots/lifecycle.md` for the full design):
 //!
 //! 1. **At batch close**, call [`close_batch_with_snapshot`]: dump the
 //!    live Application's state, then seal the batch and register the
@@ -13,18 +12,21 @@
 //!    lane's exit per the fail-loud policy.
 //!
 //! 2. **While processing safe inputs**, thread a [`BlockObservation`]
-//!    through `execute_safe_inputs_chunk`. The observer tracks the
-//!    current L1 block under iteration; when the block transitions (or
-//!    the input range ends), it promotes our latest-nonce batch landed
-//!    in the previous block in one atomic operation. This is the
-//!    "block-atomic promotion" property the watchdog endpoint relies
-//!    on. Safe-input ranges always cover whole L1 blocks, so the
-//!    observer never strands a partial block.
+//!    through `execute_safe_inputs_chunk` to accumulate the highest-nonce
+//!    batch of ours that landed in the range. At range close the lane
+//!    promotes that one `(nonce, block)` target, folded into the same
+//!    transaction that advances the drain
+//!    ([`crate::storage::Storage::close_frame_only_promoting`]) — so a
+//!    promotion and its drain commit atomically. Promotion is **per-range,
+//!    not per-block**: the range's max nonce supersedes every lower one,
+//!    and the skipped intermediate checkpoints were never observable.
 //!
-//! The observer's working state is two `Option<u64>`s (current block,
-//! max observed nonce); the lane creates one per
-//! `execute_safe_inputs_range` call on the stack. No allocation in
-//! the hot loop.
+//! 3. **After a promotion**, the lane runs [`run_gc`] to reclaim the
+//!    now-superseded dump(s). GC tracks garbage creation, not idleness.
+//!
+//! The observer's working state is one `Option<(nonce, block)>`; the lane
+//! creates one per `execute_safe_inputs_range` call on the stack. No
+//! allocation in the hot loop.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,14 +45,7 @@ pub enum TakeDumpError {
     App(#[from] AppError),
 }
 
-/// Errors from accumulated-observation promotion.
-#[derive(Debug, thiserror::Error)]
-pub enum PromoteError {
-    #[error("storage: {0}")]
-    Storage(#[from] rusqlite::Error),
-}
-
-/// Errors from the periodic GC pass.
+/// Errors from the post-promotion GC pass.
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {
     #[error("storage: {0}")]
@@ -132,71 +127,50 @@ pub(super) fn take_dump_at_batch_close<A: Application>(
     Ok(())
 }
 
-/// Accumulator for batch-promotion observations across safe-input
-/// processing. Tracks the L1 block currently being scanned and the
-/// largest nonce of our own batches observed within it. When the
-/// block boundary moves, flushes the latest-nonce dump to
-/// `finalized_snapshot` in one transaction (which also cleans up any
-/// stale pending rows behind it). Safe-input ranges always cover
-/// whole blocks (the lane only advances when the safe head moves), so
-/// the observer always sees complete groups.
+/// Accumulator for batch promotion across one safe-input processing range.
 ///
-/// Constant memory: two `Option<u64>`s, no allocation. Tracking only
-/// the max is sufficient because the promotion's job is to point
-/// finalized at the latest-state dump and clean pending; both
-/// concerns are about `max_observed_nonce`, not the full set, and L1
-/// wallet nonces guarantee batches land in monotonic order so
-/// "everything ≤ max landed somewhere ≤ this block".
+/// Records the highest accepted-batch nonce observed in the range and the L1
+/// block it landed in. The lane promotes it **once**, at the end of the range,
+/// folded into the same transaction that advances the drain
+/// ([`Storage::close_frame_only_promoting`]) — so a promotion and the drain it
+/// derives from commit atomically.
+///
+/// Per-range (not per-block) promotion is sound because nonces land in
+/// monotonic order: the range's max nonce sits in its latest
+/// block-with-our-batch and supersedes every lower one (`promote_finalized`
+/// deletes all pending `<= max`). Intermediate per-block checkpoints were never
+/// observable anyway — `finalized` is a single async-polled row — so collapsing
+/// to one promotion loses nothing.
+///
+/// Constant memory: one `Option<(u64, u64)>`, no allocation, and infallible to
+/// update (no storage on the hot path).
 pub(super) struct BlockObservation {
-    current_block: Option<u64>,
-    max_observed_nonce: Option<u64>,
+    /// `(nonce, inclusion_block)` of the highest accepted batch seen, or
+    /// `None` if the range observed none of our batches.
+    max: Option<(u64, u64)>,
 }
 
 impl BlockObservation {
     pub(super) fn new() -> Self {
-        Self {
-            current_block: None,
-            max_observed_nonce: None,
-        }
+        Self { max: None }
     }
 
-    /// Record that a safe input belongs to L1 block `block`, and if it
-    /// was identified as one of our accepted batches, with `nonce`. If
-    /// `block` differs from the block we were tracking, the previous
-    /// block's max nonce (if any) is promoted in one SQL transaction
-    /// before starting fresh on `block`.
-    pub(super) fn record(
-        &mut self,
-        storage: &mut Storage,
-        block: u64,
-        own_batch_nonce: Option<u64>,
-    ) -> Result<(), PromoteError> {
-        match self.current_block {
-            None => self.current_block = Some(block),
-            Some(current) if current == block => {}
-            Some(_) => {
-                self.flush(storage)?;
-                self.current_block = Some(block);
+    /// Record a safe input belonging to L1 block `block`; if it was one of our
+    /// accepted batches, with `nonce`. Keeps the highest nonce and its block.
+    pub(super) fn observe(&mut self, block: u64, own_batch_nonce: Option<u64>) {
+        if let Some(nonce) = own_batch_nonce {
+            // Monotonic landing order ⇒ a higher nonce is in a later-or-equal
+            // block, so the max nonce's block is the latest block-with-our-batch.
+            if self.max.is_none_or(|(max_nonce, _)| nonce > max_nonce) {
+                self.max = Some((nonce, block));
             }
         }
-
-        if let Some(nonce) = own_batch_nonce {
-            self.max_observed_nonce = Some(self.max_observed_nonce.map_or(nonce, |m| m.max(nonce)));
-        }
-        Ok(())
     }
 
-    /// Promote the current block's max-observed nonce (if any) to
-    /// `finalized_snapshot`, then clear the observer. Must be called
-    /// at the end of a processing range so the last block's
-    /// observation isn't dropped.
-    pub(super) fn flush(&mut self, storage: &mut Storage) -> Result<(), PromoteError> {
-        let block = self.current_block.take();
-        let max_nonce = self.max_observed_nonce.take();
-        if let (Some(block), Some(max_nonce)) = (block, max_nonce) {
-            storage.promote_finalized(max_nonce, block)?;
-        }
-        Ok(())
+    /// The promotion target for this range — `(max_nonce, inclusion_block)` —
+    /// or `None` if no own batch was observed.
+    pub(super) fn promotion(&self) -> Option<(u64, u64)> {
+        self.max
     }
 }
 
@@ -332,109 +306,35 @@ mod tests {
     }
 
     #[test]
-    fn block_observation_promotes_at_block_transition() {
-        let (mut storage, _db) = temp_storage_with_closed_batches("observation-transition", 3);
-        let dumps_dir = tempfile::tempdir().unwrap();
-        let app = RecordingDumpApp::new();
-
-        take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 0).unwrap();
-        take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 1).unwrap();
-
-        let mut observation = BlockObservation::new();
-        // First input: block 500, not our batch.
-        observation.record(&mut storage, 500, None).unwrap();
-        // Second input: block 500, IS our batch with nonce 0.
-        observation.record(&mut storage, 500, Some(0)).unwrap();
-        // No promotion yet — same block.
-        assert!(storage.finalized_dump().unwrap().is_none());
-
-        // Block transition to 501 flushes block 500's accumulation.
-        observation.record(&mut storage, 501, None).unwrap();
-        let finalized = storage.finalized_dump().unwrap().unwrap();
-        assert_eq!(finalized.inclusion_block, 500);
-        assert_eq!(finalized.dump.prefix, app.recorded()[0]);
-
-        // Second observation in block 501.
-        observation.record(&mut storage, 501, Some(1)).unwrap();
-        // Still not promoted (no block transition yet).
-        assert_eq!(
-            storage.finalized_dump().unwrap().unwrap().inclusion_block,
-            500
-        );
-
-        // Final flush promotes block 501's accumulation.
-        observation.flush(&mut storage).unwrap();
-        let finalized = storage.finalized_dump().unwrap().unwrap();
-        assert_eq!(finalized.inclusion_block, 501);
-        assert_eq!(finalized.dump.prefix, app.recorded()[1]);
+    fn block_observation_keeps_the_max_nonce_and_its_block() {
+        let mut obs = BlockObservation::new();
+        obs.observe(500, None); // not one of our batches
+        obs.observe(500, Some(0)); // our batch nonce 0, block 500
+        obs.observe(501, Some(1)); // our batch nonce 1, block 501
+        obs.observe(502, None); // not one of our batches
+        // Promotes the highest nonce at the block it landed in.
+        assert_eq!(obs.promotion(), Some((1, 501)));
     }
 
     #[test]
-    fn block_observation_groups_multiple_batches_in_same_block_atomically() {
-        let (mut storage, _db) = temp_storage_with_closed_batches("observation-multi-block", 4);
-        let dumps_dir = tempfile::tempdir().unwrap();
-        let app = RecordingDumpApp::new();
-
-        // Seed three pending dumps with nonces 0, 1, 2.
-        for nonce in 0..3 {
-            take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), nonce).unwrap();
-        }
-        assert_eq!(app.recorded().len(), 3);
-
-        let mut observation = BlockObservation::new();
-        // All three batches land in block 999.
-        observation.record(&mut storage, 999, Some(0)).unwrap();
-        observation.record(&mut storage, 999, Some(1)).unwrap();
-        observation.record(&mut storage, 999, Some(2)).unwrap();
-        observation.flush(&mut storage).unwrap();
-
-        // After the single block's flush, finalized points at the dump
-        // for the largest nonce (2). The lesser-nonce dumps for 0 and
-        // 1 are unreferenced and GC-eligible.
-        let finalized = storage.finalized_dump().unwrap().unwrap();
-        assert_eq!(finalized.inclusion_block, 999);
-        assert_eq!(finalized.dump.prefix, app.recorded()[2]);
-
-        let gc_prefixes: Vec<PathBuf> = storage
-            .gc_dump_rows()
-            .unwrap()
-            .into_iter()
-            .map(|row| row.prefix)
-            .collect();
-        assert_eq!(gc_prefixes.len(), 2);
-        assert!(gc_prefixes.contains(&app.recorded()[0]));
-        assert!(gc_prefixes.contains(&app.recorded()[1]));
+    fn block_observation_max_block_is_the_latest_block_with_our_batch() {
+        // Several of our batches across blocks; the max nonce's block wins,
+        // even when a still-later block has none of our batches.
+        let mut obs = BlockObservation::new();
+        obs.observe(999, Some(0));
+        obs.observe(999, Some(1));
+        obs.observe(1000, Some(2));
+        obs.observe(1001, None);
+        assert_eq!(obs.promotion(), Some((2, 1000)));
     }
 
     #[test]
-    fn block_observation_with_no_observed_nonces_does_not_finalize() {
-        let (mut storage, _db) = temp_storage_with_closed_batches("observation-empty", 1);
-        let mut observation = BlockObservation::new();
-
-        observation.record(&mut storage, 500, None).unwrap();
-        observation.record(&mut storage, 500, None).unwrap();
-        observation.record(&mut storage, 501, None).unwrap();
-        observation.flush(&mut storage).unwrap();
-
-        assert!(storage.finalized_dump().unwrap().is_none());
-    }
-
-    #[test]
-    fn block_observation_flush_is_idempotent_after_first_call() {
-        let (mut storage, _db) = temp_storage_with_closed_batches("observation-idempotent", 2);
-        let dumps_dir = tempfile::tempdir().unwrap();
-        let app = RecordingDumpApp::new();
-
-        take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 0).unwrap();
-
-        let mut observation = BlockObservation::new();
-        observation.record(&mut storage, 500, Some(0)).unwrap();
-        observation.flush(&mut storage).unwrap();
-        // A second flush with no new observations is a no-op.
-        observation.flush(&mut storage).unwrap();
-
-        let finalized = storage.finalized_dump().unwrap().unwrap();
-        assert_eq!(finalized.inclusion_block, 500);
+    fn block_observation_with_no_observed_nonces_has_no_promotion() {
+        let mut obs = BlockObservation::new();
+        obs.observe(500, None);
+        obs.observe(500, None);
+        obs.observe(501, None);
+        assert_eq!(obs.promotion(), None);
     }
 
     #[test]
@@ -444,15 +344,11 @@ mod tests {
         let app = RecordingDumpApp::new();
 
         // Create two snapshots and promote both — the first becomes
-        // unreferenced when the second supersedes it.
+        // unreferenced when the second supersedes it as finalized.
         take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 0).unwrap();
         take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 1).unwrap();
-        let mut obs = BlockObservation::new();
-        obs.record(&mut storage, 500, Some(0)).unwrap();
-        obs.flush(&mut storage).unwrap();
-        let mut obs = BlockObservation::new();
-        obs.record(&mut storage, 501, Some(1)).unwrap();
-        obs.flush(&mut storage).unwrap();
+        storage.promote_finalized(0, 500).unwrap();
+        storage.promote_finalized(1, 501).unwrap();
 
         // The first dump's directory is on disk (RecordingDumpApp
         // wrote a "state" file in it). After GC it should be gone.

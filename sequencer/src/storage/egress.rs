@@ -72,14 +72,11 @@ impl Storage {
     }
 
     /// Returns the maximum offset in `valid_sequenced_l2_txs`, or 0 if empty.
-    /// Used as the head cursor for feed subscribers.
+    /// Used as the head cursor for feed subscribers. Shares the single
+    /// `valid_ordered_l2_tx_head` reader with the snapshot batch-close path,
+    /// so the feed cursor and the snapshot replay cursor can't drift.
     pub fn ordered_l2_tx_head_offset(&mut self) -> Result<u64> {
-        let value: Option<i64> = self.conn.query_row(
-            "SELECT MAX(offset) FROM valid_sequenced_l2_txs",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(value.map(i64_to_u64).unwrap_or(0))
+        super::queries::valid_ordered_l2_tx_head(&self.conn)
     }
 
     /// Count broadcastable events with offset > `from_offset`, capped at `limit`.

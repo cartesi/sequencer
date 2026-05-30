@@ -6,10 +6,10 @@
 //! 1. **Bootstrap**: parse config, validate identity, build the L1 config.
 //! 2. **Preemptive recovery**: run the startup recovery procedure
 //!    ([`crate::recovery::run_preemptive_recovery`]).
-//! 3. **Workers**: hand off to [`workers::Workers`] for spawn → select →
+//! 3. **Workers**: hand off to `workers::Workers` for spawn → select →
 //!    finish.
 //!
-//! Errors live in [`error`]; worker lifecycle in [`workers`].
+//! Errors live in [`error`]; worker lifecycle in `workers`.
 
 pub mod clock;
 pub mod config;

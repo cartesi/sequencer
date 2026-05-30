@@ -1223,3 +1223,126 @@ fn empty_batch_snapshot_records_global_replay_head_not_genesis() {
          otherwise catch-up after this snapshot is finalized replays the whole stream and double-applies it"
     );
 }
+
+/// Regression for the promote/drain wedge. The pre-fix per-block path promoted
+/// a batch in one transaction and advanced the safe-input drain
+/// (`close_frame_only`) in a *separate* one. A crash between them left a
+/// promoted-but-undrained batch; on restart the lane re-processed the same safe
+/// input, re-derived the accepted nonce, and called `promote_finalized` on a
+/// now-deleted pending row → `QueryReturnedNoRows` → crash-loop (verified
+/// against the SQL: `accepted_batch_nonce_at` has no pending-row gate, and
+/// `next_undrained` advances only when inputs are sequenced by the drain).
+///
+/// `close_frame_only_promoting` folds the promotion into the drain's
+/// transaction, so a committed promotion always comes with an advanced drain —
+/// the wedge state is unrepresentable.
+#[test]
+fn promotion_advances_drain_atomically_so_restart_cannot_re_promote() {
+    let db = temp_db("promote-drain-atomic");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("open batch 0");
+
+    // Our batch 0 lands on L1 as safe input 0; the scheduler accepts it as
+    // nonce 0 (this is what populates `safe_accepted_batches`).
+    let batch0 = StoredSafeInput {
+        sender: SENDER_A,
+        payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+            nonce: 0,
+            frames: Vec::new(),
+        }),
+        block_number: 100,
+    };
+    storage
+        .append_safe_inputs(
+            100,
+            std::slice::from_ref(&batch0),
+            SENDER_A,
+            &default_protocol_timing(),
+        )
+        .expect("append our batch as a safe input");
+
+    // Close batch 0 off-chain and register its pending snapshot.
+    storage
+        .close_frame_and_batch(&mut head, 100)
+        .expect("close batch 0");
+    let dumps = tempfile::tempdir().expect("dumps dir");
+    super::snapshot::take_dump_at_batch_close(&TestApp::default(), &mut storage, dumps.path(), 0)
+        .expect("pending snapshot for batch 0");
+
+    // The lane advances the safe frontier over batch 0's landing: it promotes
+    // batch 0 AND sequences the drain in one transaction.
+    storage
+        .close_frame_only_promoting(&mut head, 100, SafeInputRange::new(0, 1), 0, 100)
+        .expect("atomic close-frame + promote");
+
+    // The promotion committed...
+    assert_eq!(
+        storage
+            .finalized_dump()
+            .unwrap()
+            .expect("finalized")
+            .inclusion_block,
+        100,
+    );
+    // ...and the drain advanced past batch 0's safe input in the SAME commit, so
+    // a restart resumes *after* it and never re-processes (hence never
+    // re-promotes) the batch whose pending row promotion deleted.
+    assert!(
+        storage.next_undrained_safe_input_index().unwrap() > 0,
+        "drain must advance past the promoted batch's safe input atomically with \
+         the promotion — otherwise a restart re-processes safe input 0 and \
+         re-promotes a now-deleted pending row (QueryReturnedNoRows wedge)",
+    );
+}
+
+/// The atomicity complement: if the promotion fails *inside* the combined
+/// transaction (here, a missing pending row), the drain advance rolls back with
+/// it. There is never a half-applied "drained but not promoted" state — the
+/// mirror of the wedge.
+#[test]
+fn close_frame_only_promoting_rolls_back_the_drain_when_promotion_fails() {
+    let db = temp_db("close-promote-rollback");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("open batch 0");
+
+    // A safe input exists to drain, but there is no pending snapshot for the
+    // nonce we ask to promote, so `promote_finalized_in` errors mid-transaction.
+    let batch0 = StoredSafeInput {
+        sender: SENDER_A,
+        payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+            nonce: 0,
+            frames: Vec::new(),
+        }),
+        block_number: 100,
+    };
+    storage
+        .append_safe_inputs(
+            100,
+            std::slice::from_ref(&batch0),
+            SENDER_A,
+            &default_protocol_timing(),
+        )
+        .expect("append safe input");
+
+    let result =
+        storage.close_frame_only_promoting(&mut head, 100, SafeInputRange::new(0, 1), 7, 100);
+    assert!(
+        result.is_err(),
+        "promoting a missing pending row must fail the whole call",
+    );
+
+    // Nothing committed: no finalized promotion, and the drain did not advance.
+    assert!(
+        storage.finalized_dump().unwrap().is_none(),
+        "no finalized snapshot after the failed promotion",
+    );
+    assert_eq!(
+        storage.next_undrained_safe_input_index().unwrap(),
+        0,
+        "the drain rolled back together with the failed promotion",
+    );
+}
