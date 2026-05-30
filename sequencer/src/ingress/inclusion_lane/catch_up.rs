@@ -26,9 +26,6 @@ const DEFAULT_CATCH_UP_PAGE_SIZE: usize = 256;
 pub(super) struct CatchUpSnapshot {
     pub(super) prefix: PathBuf,
     pub(super) l2_tx_index: u64,
-    /// `"pending"` or `"finalized"` — which table the checkpoint came
-    /// from. Carried for the resume log line only.
-    pub(super) kind: &'static str,
 }
 
 /// Select the resume checkpoint. Prefers the latest pending snapshot
@@ -44,24 +41,13 @@ pub(super) struct CatchUpSnapshot {
 /// Absence is a violated invariant (runtime/setup bug), surfaced
 /// fail-loud as [`CatchUpError::NoSnapshot`].
 pub(super) fn catch_up_snapshot(storage: &mut Storage) -> Result<CatchUpSnapshot, CatchUpError> {
-    if let Some(pending) = storage
-        .latest_pending_dump()
-        .map_err(|source| CatchUpError::LoadSnapshot { source })?
-    {
-        return Ok(CatchUpSnapshot {
-            prefix: pending.dump.prefix,
-            l2_tx_index: pending.l2_tx_index,
-            kind: "pending",
-        });
-    }
-    let finalized = storage
-        .finalized_dump()
+    let (dump, l2_tx_index) = storage
+        .latest_snapshot()
         .map_err(|source| CatchUpError::LoadSnapshot { source })?
         .ok_or(CatchUpError::NoSnapshot)?;
     Ok(CatchUpSnapshot {
-        prefix: finalized.dump.prefix,
-        l2_tx_index: finalized.l2_tx_index,
-        kind: "finalized",
+        prefix: dump.prefix,
+        l2_tx_index,
     })
 }
 
