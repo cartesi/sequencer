@@ -40,12 +40,6 @@ use sequencer_core::user_op::SignedUserOp;
 
 use catch_up::{catch_up_application, catch_up_snapshot};
 
-/// Cadence of the periodic GC pass. Cheap (one Immediate-mode
-/// transaction + zero or more `fs::remove_dir_all`s), so running
-/// once per minute keeps disk usage bounded without measurable
-/// impact on the lane's hot path.
-const GC_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Owns the application instance, the `Storage` write handle, and the user-op
 /// receiver for the lifetime of the sequencer process.
 pub struct InclusionLane<A: Application + 'static> {
@@ -65,7 +59,7 @@ impl<A: Application + 'static> InclusionLane<A> {
     /// guarantees at least a genesis finalized snapshot exists before
     /// this is called (cold start registers one; warm start reuses the
     /// previous run's). A missing snapshot surfaces as
-    /// [`CatchUpError::NoSnapshot`].
+    /// `CatchUpError::NoSnapshot`.
     ///
     /// Returns the input MPSC sender (for the API to enqueue user
     /// ops) and the join handle (for the runtime to observe lane
@@ -91,7 +85,7 @@ impl<A: Application + 'static> InclusionLane<A> {
                 .map_err(|source| InclusionLaneError::CatchUp { source })?;
             let app = A::from_dump(&checkpoint.prefix).map_err(InclusionLaneError::LoadFromDump)?;
             tracing::debug!(
-                kind = ?checkpoint.kind,
+                kind = checkpoint.kind,
                 l2_tx_index = checkpoint.l2_tx_index,
                 "inclusion lane resuming from snapshot"
             );
@@ -112,7 +106,6 @@ impl<A: Application + 'static> InclusionLane<A> {
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
         let mut lane_state = self.load_or_initialize_lane_state(&mut safe_inputs)?;
-        let mut last_gc_at = Instant::now();
 
         loop {
             if self.shutdown.is_shutdown_requested() {
@@ -141,18 +134,10 @@ impl<A: Application + 'static> InclusionLane<A> {
                 )
                 .map_err(InclusionLaneError::Snapshot)?;
             } else if !drain.drained_any() {
-                // Periodic GC piggybacks on idle ticks: every
-                // GC_INTERVAL we sweep unreferenced dumps (previous
-                // finalizeds superseded by promotion, etc.). Failures
-                // propagate per the fail-loud policy.
-                if last_gc_at.elapsed() >= GC_INTERVAL {
-                    let removed =
-                        snapshot::run_gc::<A>(&mut self.storage).map_err(InclusionLaneError::Gc)?;
-                    if removed > 0 {
-                        tracing::debug!(removed, "lane GC removed unreferenced dumps");
-                    }
-                    last_gc_at = Instant::now();
-                }
+                // Nothing to drain and no batch to close: back off. GC no longer
+                // lives here — it runs after a promotion in
+                // `maybe_advance_safe_frontier`, so it tracks garbage creation
+                // rather than idleness and is never starved under load.
                 thread::sleep(self.config.idle_poll_interval);
             }
         }
@@ -188,7 +173,16 @@ impl<A: Application + 'static> InclusionLane<A> {
         );
 
         let leading_direct_range = last_drained_direct_range.advance_to(frontier.end_exclusive);
-        self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
+        // Cold start (no open tip) only happens on a genuinely fresh DB: no
+        // closed batches, hence none of our batches in the safe range to
+        // promote. (After recovery there is always an open tip, so we'd have
+        // taken the warm path above.) So this range observes no own batch.
+        let promotion = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
+        debug_assert!(
+            promotion.is_none(),
+            "cold-start lane init observed an own accepted batch ({promotion:?}); \
+             expected none on a fresh DB"
+        );
         let head = self
             .storage
             .initialize_open_state(frontier.safe_block, leading_direct_range)?;
@@ -282,13 +276,39 @@ impl<A: Application + 'static> InclusionLane<A> {
         let leading_direct_range = lane_state
             .last_drained_direct_range
             .advance_to(frontier.end_exclusive);
-        self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
-        self.storage.close_frame_only(
-            &mut lane_state.head,
-            frontier.safe_block,
-            leading_direct_range,
-        )?;
+        let promotion = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
+        // The drain advance and any promotion it implies commit in one
+        // transaction, so a crash can never leave a promoted-but-undrained batch
+        // — the state a restart would re-process and re-promote on a deleted
+        // pending row.
+        match promotion {
+            Some((max_nonce, inclusion_block)) => self.storage.close_frame_only_promoting(
+                &mut lane_state.head,
+                frontier.safe_block,
+                leading_direct_range,
+                max_nonce,
+                inclusion_block,
+            )?,
+            None => self.storage.close_frame_only(
+                &mut lane_state.head,
+                frontier.safe_block,
+                leading_direct_range,
+            )?,
+        }
         lane_state.last_drained_direct_range = leading_direct_range;
+
+        // A promotion supersedes the previous finalized (and any lower-nonce
+        // pendings); reclaim them now. The full pass also collects earlier
+        // lease-released garbage. On the lane's own thread, only when a
+        // promotion actually created garbage — so GC tracks garbage creation,
+        // never starved by load.
+        if promotion.is_some() {
+            let removed =
+                snapshot::run_gc::<A>(&mut self.storage).map_err(InclusionLaneError::Gc)?;
+            if removed > 0 {
+                tracing::debug!(removed, "post-promotion GC removed unreferenced dumps");
+            }
+        }
         Ok(())
     }
 
@@ -305,11 +325,15 @@ impl<A: Application + 'static> InclusionLane<A> {
             })
     }
 
+    /// Process the safe inputs in `direct_range`, accumulating which of our
+    /// batches landed. Returns the promotion target `(max_nonce,
+    /// inclusion_block)` for the caller to apply atomically with the drain
+    /// (`close_frame_only_promoting`), or `None` if no own batch landed.
     fn execute_safe_inputs_range(
         &mut self,
         direct_range: SafeInputRange,
         chunk: &mut Vec<StoredSafeInput>,
-    ) -> Result<(), InclusionLaneError> {
+    ) -> Result<Option<(u64, u64)>, InclusionLaneError> {
         let mut observation = snapshot::BlockObservation::new();
         let max_chunk_len = self.config.safe_input_buffer_capacity.max(1) as u64;
         for chunk_range in direct_range.chunks(max_chunk_len) {
@@ -320,14 +344,7 @@ impl<A: Application + 'static> InclusionLane<A> {
                 &mut observation,
             )?;
         }
-        // Flush any accumulated observations for the last block in
-        // the range. Lane policy: propagate per the fail-loud
-        // contract; catch-up on restart still loads from the previous
-        // good finalized.
-        observation
-            .flush(&mut self.storage)
-            .map_err(InclusionLaneError::Promote)?;
-        Ok(())
+        Ok(observation.promotion())
     }
 
     fn execute_safe_inputs_chunk(
@@ -349,11 +366,9 @@ impl<A: Application + 'static> InclusionLane<A> {
                 None
             };
 
-            // Record block and any observed nonce before processing.
-            // Lane policy: propagate per the fail-loud contract.
-            observation
-                .record(&mut self.storage, input.block_number, own_batch_nonce)
-                .map_err(InclusionLaneError::Promote)?;
+            // Accumulate the observation — infallible, no storage. The lane
+            // promotes once at range close, atomically with the drain.
+            observation.observe(input.block_number, own_batch_nonce);
 
             if input.sender == self.config.batch_submitter_address {
                 // Our own batch (accepted or rejected) — never replayed

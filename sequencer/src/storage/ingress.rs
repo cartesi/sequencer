@@ -21,7 +21,7 @@ use super::queries::{
     current_safe_block_required, load_current_write_head, query_batch_policy,
     query_latest_safe_input_index_exclusive, valid_ordered_l2_tx_head,
 };
-use super::snapshot_dumps::insert_pending_dump_in;
+use super::snapshot_dumps::{insert_pending_dump_in, promote_finalized_in};
 use super::{
     BatchPolicy, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
     batch_size_target_bytes,
@@ -198,24 +198,33 @@ impl Storage {
         next_safe_block: u64,
         leading_direct_range: SafeInputRange,
     ) -> Result<()> {
+        let policy =
+            self.write(|tx| close_frame_in(tx, head, next_safe_block, leading_direct_range))?;
+        head.advance_frame(policy, next_safe_block);
+        Ok(())
+    }
+
+    /// Like [`Storage::close_frame_only`], but in the **same transaction** also
+    /// promotes the snapshot for `max_nonce` (which landed at `inclusion_block`)
+    /// to finalized.
+    ///
+    /// Used when a safe-frontier advance observed one of our batches landing on
+    /// L1. The promotion and the drain advance it derives from commit
+    /// atomically, so a crash can never leave a promoted-but-undrained batch —
+    /// the state where a restart re-processes the safe input, re-derives the
+    /// accepted nonce, and re-promotes on a now-deleted pending row
+    /// (`QueryReturnedNoRows`, a fail-loud wedge).
+    pub fn close_frame_only_promoting(
+        &mut self,
+        head: &mut WriteHead,
+        next_safe_block: u64,
+        leading_direct_range: SafeInputRange,
+        max_nonce: u64,
+        inclusion_block: u64,
+    ) -> Result<()> {
         let policy = self.write(|tx| {
-            let now_ms = now_unix_ms();
-            let policy = query_batch_policy(tx)?;
-            let next_frame_in_batch = head.frame_in_batch.saturating_add(1);
-            insert_open_frame(
-                tx,
-                head.batch_index,
-                next_frame_in_batch,
-                now_ms,
-                policy.recommended_fee,
-                next_safe_block,
-            )?;
-            persist_frame_direct_sequence(
-                tx,
-                head.batch_index,
-                next_frame_in_batch,
-                leading_direct_range,
-            )?;
+            let policy = close_frame_in(tx, head, next_safe_block, leading_direct_range)?;
+            promote_finalized_in(tx, max_nonce, inclusion_block)?;
             Ok(policy)
         })?;
         head.advance_frame(policy, next_safe_block);
@@ -234,23 +243,8 @@ impl Storage {
         head: &mut WriteHead,
         next_safe_block: u64,
     ) -> Result<()> {
-        let (next_batch_index, now_ms, policy) = self.write(|tx| {
-            let now_ms = now_unix_ms();
-            // Batch policy is sampled here: the derived fee is committed to the newly
-            // opened frame, and the batch size target is stored on the write head.
-            let policy = query_batch_policy(tx)?;
-            seal_batch(tx, head.batch_index, now_ms)?;
-            let next_batch_index = insert_new_batch(tx, None, Some(head.batch_index), now_ms)?;
-            insert_open_frame(
-                tx,
-                next_batch_index,
-                0,
-                now_ms,
-                policy.recommended_fee,
-                next_safe_block,
-            )?;
-            Ok((next_batch_index, now_ms, policy))
-        })?;
+        let (next_batch_index, now_ms, policy) =
+            self.write(|tx| seal_and_open_next_batch(tx, head.batch_index, next_safe_block))?;
         head.move_to_next_batch(
             next_batch_index,
             from_unix_ms(now_ms),
@@ -287,20 +281,11 @@ impl Storage {
         nonce: u64,
     ) -> Result<()> {
         let (next_batch_index, now_ms, policy) = self.write(|tx| {
-            let now_ms = now_unix_ms();
-            let policy = query_batch_policy(tx)?;
+            // Read the replay head before sealing so the snapshot records
+            // the global valid head as of the close.
             let l2_tx_index = valid_ordered_l2_tx_head(tx)?;
-
-            seal_batch(tx, head.batch_index, now_ms)?;
-            let next_batch_index = insert_new_batch(tx, None, Some(head.batch_index), now_ms)?;
-            insert_open_frame(
-                tx,
-                next_batch_index,
-                0,
-                now_ms,
-                policy.recommended_fee,
-                next_safe_block,
-            )?;
+            let (next_batch_index, now_ms, policy) =
+                seal_and_open_next_batch(tx, head.batch_index, next_safe_block)?;
             insert_pending_dump_in(tx, dump_prefix, nonce, l2_tx_index)?;
             Ok((next_batch_index, now_ms, policy))
         })?;
@@ -316,6 +301,68 @@ impl Storage {
     pub fn batch_policy(&mut self) -> Result<BatchPolicy> {
         query_batch_policy(&self.conn)
     }
+}
+
+/// Seal the current Tip and open the successor batch's first frame, in `tx`.
+///
+/// Shared by [`Storage::close_frame_and_batch`] and
+/// [`Storage::close_frame_and_batch_with_pending_dump`] so the seal ordering
+/// invariant lives in one place: seal first (which frees the old row from the
+/// `ux_single_valid_tip` partial index), then insert the successor as the new
+/// Tip. Returns the new batch index, the close timestamp, and the sampled
+/// policy for the caller to apply to its in-memory write head.
+fn seal_and_open_next_batch(
+    tx: &Transaction<'_>,
+    closing_batch_index: u64,
+    next_safe_block: u64,
+) -> Result<(u64, i64, BatchPolicy)> {
+    let now_ms = now_unix_ms();
+    // Batch policy is sampled here: the derived fee is committed to the newly
+    // opened frame, and the batch size target is stored on the write head.
+    let policy = query_batch_policy(tx)?;
+    seal_batch(tx, closing_batch_index, now_ms)?;
+    let next_batch_index = insert_new_batch(tx, None, Some(closing_batch_index), now_ms)?;
+    insert_open_frame(
+        tx,
+        next_batch_index,
+        0,
+        now_ms,
+        policy.recommended_fee,
+        next_safe_block,
+    )?;
+    Ok((next_batch_index, now_ms, policy))
+}
+
+/// Rotate to the next frame inside the current batch, in `tx`: open the
+/// successor frame (fresh fee/safe-block) and sequence the drained safe-input
+/// range into it. Shared by [`Storage::close_frame_only`] and
+/// [`Storage::close_frame_only_promoting`] so the frame-rotation invariant
+/// lives in one place. Returns the sampled policy for the caller to apply to
+/// the in-memory write head.
+fn close_frame_in(
+    tx: &Transaction<'_>,
+    head: &WriteHead,
+    next_safe_block: u64,
+    leading_direct_range: SafeInputRange,
+) -> Result<BatchPolicy> {
+    let now_ms = now_unix_ms();
+    let policy = query_batch_policy(tx)?;
+    let next_frame_in_batch = head.frame_in_batch.saturating_add(1);
+    insert_open_frame(
+        tx,
+        head.batch_index,
+        next_frame_in_batch,
+        now_ms,
+        policy.recommended_fee,
+        next_safe_block,
+    )?;
+    persist_frame_direct_sequence(
+        tx,
+        head.batch_index,
+        next_frame_in_batch,
+        leading_direct_range,
+    )?;
+    Ok(policy)
 }
 
 /// Insert user ops into `user_ops`. The `trg_sequence_user_op` trigger then

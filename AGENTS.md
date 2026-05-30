@@ -153,6 +153,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Input reader** — ingests safe inputs from L1 InputBox into SQLite.
 - **L2 tx feed** — DB-backed ordered-tx stream used by WS subscribers.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
+- **Snapshot** — durable copy of the app's canonical state at a known L2-tx offset; *pending* at batch close, *promoted* to finalized on L1 observation (per-range, atomically with the drain), garbage-collected when superseded. Backs catch-up, the watchdog, and indexers. Lifecycle + rationale (incl. the promote/drain crash-safety): [`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md).
 
 ## Domain Truths
 
@@ -228,7 +229,7 @@ Today both sides serve from one listener; the planned API split puts each side o
 
 Health semantics: `/livez` — 200 if the process is alive. `/readyz` — 200 if shutdown not requested AND inclusion-lane channel still open, else 503. `/healthz` — JSON `{ status, inclusion_lane }` mirroring the same 200/503.
 
-Snapshot endpoints (`/finalized_state`, `/finalized_state/inclusion_block`, `/latest_snapshot`) are **operator-only** (no auth) — they serve the watchdog and indexers and must not be exposed publicly. The two streaming routes hold a GC lease on the dump for the response lifetime, released even on client disconnect (via a drop-guard); `Storage::reset_dump_leases` at startup is the crash backstop. Shapes are in [`README.md`](README.md); dump format in [`docs/app-snapshot-format.md`](docs/app-snapshot-format.md).
+Snapshot endpoints (`/finalized_state`, `/finalized_state/inclusion_block`, `/latest_snapshot`) are **operator-only** (no auth) — they serve the watchdog and indexers and must not be exposed publicly. The two streaming routes hold a GC lease on the dump for the response lifetime, released even on client disconnect (via a drop-guard); `Storage::reset_dump_leases` at startup is the crash backstop. Shapes are in [`README.md`](README.md); dump format in [`docs/snapshots/format.md`](docs/snapshots/format.md) and the snapshot lifecycle (take/promote/GC/lease, crash-safety) in [`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md).
 
 ## Environment Variables
 
@@ -341,4 +342,5 @@ Before finishing a change, ensure:
 - [`CLAUDE.md`](CLAUDE.md) — shell setup, quick reference, pointer back here.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
 - [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.
+- [`docs/snapshots/`](docs/snapshots/) — app snapshots: [`format.md`](docs/snapshots/format.md) (dump trait + wire format) and [`lifecycle.md`](docs/snapshots/lifecycle.md) (take/promote/GC/lease design + crash-safety).
 - [`sequencer-core/`](sequencer-core/) — shared domain types and protocol contracts.
