@@ -945,7 +945,7 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
 #[test]
 fn catch_up_load_error_reports_offset() {
     let db = temp_db("catch-up-load-error");
-    let mut storage = Storage::open_without_migrations(db.path.as_str()).expect("open raw storage");
+    let mut storage = Storage::open_writer(db.path.as_str()).expect("open raw storage");
     let mut app = ReplayRecordingApp::default();
 
     let err = catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 2)

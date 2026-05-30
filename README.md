@@ -142,6 +142,26 @@ Success response:
 }
 ```
 
+### Operator snapshot endpoints (internal only)
+
+These serve application state to the operator's watchdog and indexers.
+**They are operator-internal — no auth — and must not be exposed publicly**
+(gated by network controls today; bound to a separate internal port once the
+api split lands).
+
+- `GET /finalized_state/inclusion_block` — cheap JSON the watchdog polls to
+  detect advance: `{ "inclusion_block": <u64>, "l2_tx_index": <u64> }`. `404`
+  if no finalized snapshot exists.
+- `GET /finalized_state` — streams the L1-finalized state file
+  (`application/octet-stream`); headers `X-Inclusion-Block`, `X-L2-Tx-Index`,
+  and `ETag: "block-<n>"` (send `If-None-Match` for a `304`).
+- `GET /latest_snapshot` — streams the latest snapshot (latest pending if any,
+  else finalized) for indexers that fetch state then subscribe at
+  `X-L2-Tx-Index`.
+
+Both streaming routes hold a GC lease on the dump for the response lifetime,
+released even on client disconnect.
+
 ## Storage Model
 
 - `batches`: batch metadata
@@ -172,7 +192,7 @@ Related docs:
 
 ## Prototype Limits
 
-- The `Application` trait exposes snapshot dump/load capability (see `docs/app-snapshot-format.md`). The inclusion lane drives the snapshot lifecycle — dump at batch close, promote to finalized on L1 observation, and garbage-collect superseded dumps — and at startup rebuilds application state by loading the latest snapshot and replaying the persisted L2-tx stream from that snapshot's offset. Serving snapshots over HTTP is not yet wired.
+- The `Application` trait exposes snapshot dump/load capability (see `docs/app-snapshot-format.md`). The inclusion lane drives the snapshot lifecycle — dump at batch close, promote to finalized on L1 observation, and garbage-collect superseded dumps — and at startup rebuilds application state by loading the latest snapshot and replaying the persisted L2-tx stream from that snapshot's offset. The snapshot is served to the operator's watchdog/indexers over internal-only HTTP routes (`/finalized_state`, `/finalized_state/inclusion_block`, `/latest_snapshot`) — no auth, gated by network-level access control until the planned per-port api split lands.
 - Schema and migrations are still in prototype mode and may change.
 
 ## Local Test Prerequisites

@@ -180,6 +180,10 @@ impl Workers {
             shutdown.clone(),
             tx_feed,
             ApiConfig::default(),
+            http::SnapshotState {
+                db_path: db_path.clone(),
+                state_file_in_dump: A::state_file_in_dump,
+            },
         )
         .await?;
         tracing::info!(address = %run_config.http_addr, "listening");

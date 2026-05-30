@@ -46,7 +46,7 @@ use thiserror::Error;
 
 pub use open::Storage;
 pub use recovery::DangerStatus;
-pub use snapshot_dumps::{DumpRow, FinalizedDump, PendingDump};
+pub use snapshot_dumps::{DumpRow, FinalizedDump, LeasedSnapshot, PendingDump};
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
 /// the L1 block where it was included.
