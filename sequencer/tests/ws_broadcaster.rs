@@ -408,6 +408,12 @@ impl Drop for WsServerRuntime {
     }
 }
 
+/// Trivial dump layout for the test server's `SnapshotState`. These WS tests
+/// don't hit the snapshot routes, but the egress server always wires them.
+fn snapshot_state_file(prefix: &std::path::Path) -> std::path::PathBuf {
+    prefix.join("state")
+}
+
 async fn start_test_server(db_path: &str) -> Option<WsServerRuntime> {
     start_test_server_with_limits(db_path, 64, 50_000).await
 }
@@ -457,6 +463,10 @@ async fn start_test_server_with_limits(
             ws_max_subscribers,
             ws_max_catchup_events,
             ..ApiConfig::default()
+        },
+        http::SnapshotState {
+            db_path: db_path.to_string(),
+            state_file_in_dump: snapshot_state_file,
         },
     );
 

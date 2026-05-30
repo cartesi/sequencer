@@ -1137,6 +1137,10 @@ async fn start_full_server_with_max_body(
             max_body_bytes,
             ..ApiConfig::default()
         },
+        http::SnapshotState {
+            db_path: db_path.to_string(),
+            state_file_in_dump: WalletApp::state_file_in_dump,
+        },
     );
 
     Some(FullServerRuntime {
@@ -1186,6 +1190,10 @@ async fn start_api_only_server(
         ApiConfig {
             max_body_bytes,
             ..ApiConfig::default()
+        },
+        http::SnapshotState {
+            db_path: db_path.to_string(),
+            state_file_in_dump: WalletApp::state_file_in_dump,
         },
     );
 

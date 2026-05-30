@@ -23,6 +23,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 
+pub use crate::egress::api::SnapshotState;
 use crate::egress::api::SubscribeState;
 use crate::egress::l2_tx_feed::L2TxFeed;
 use crate::ingress::api::SubmitState;
@@ -175,6 +176,7 @@ pub async fn start(
     shutdown: ShutdownSignal,
     tx_feed: L2TxFeed,
     config: ApiConfig,
+    snapshot_state: SnapshotState,
 ) -> io::Result<ApiServerTask> {
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
     Ok(start_on_listener(
@@ -185,6 +187,7 @@ pub async fn start(
         shutdown,
         tx_feed,
         config,
+        snapshot_state,
     ))
 }
 
@@ -197,6 +200,7 @@ pub fn start_on_listener(
     shutdown: ShutdownSignal,
     tx_feed: L2TxFeed,
     config: ApiConfig,
+    snapshot_state: SnapshotState,
 ) -> ApiServerTask {
     let health_state = Arc::new(crate::egress::api::HealthState {
         tx_sender: tx_sender.clone(),
@@ -216,7 +220,11 @@ pub fn start_on_listener(
     ));
 
     let app: Router = crate::ingress::api::router(submit_state)
-        .merge(crate::egress::api::router(subscribe_state, health_state))
+        .merge(crate::egress::api::router(
+            subscribe_state,
+            health_state,
+            Arc::new(snapshot_state),
+        ))
         // Enforces a raw request-body cap before JSON deserialization, including whitespace.
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
         .layer(TraceLayer::new_for_http());
