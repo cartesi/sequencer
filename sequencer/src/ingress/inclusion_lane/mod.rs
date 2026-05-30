@@ -85,7 +85,6 @@ impl<A: Application + 'static> InclusionLane<A> {
                 .map_err(|source| InclusionLaneError::CatchUp { source })?;
             let app = A::from_dump(&checkpoint.prefix).map_err(InclusionLaneError::LoadFromDump)?;
             tracing::debug!(
-                kind = checkpoint.kind,
                 l2_tx_index = checkpoint.l2_tx_index,
                 "inclusion lane resuming from snapshot"
             );
@@ -177,11 +176,10 @@ impl<A: Application + 'static> InclusionLane<A> {
         // closed batches, hence none of our batches in the safe range to
         // promote. (After recovery there is always an open tip, so we'd have
         // taken the warm path above.) So this range observes no own batch.
-        let promotion = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
+        let observation = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
         debug_assert!(
-            promotion.is_none(),
-            "cold-start lane init observed an own accepted batch ({promotion:?}); \
-             expected none on a fresh DB"
+            !observation.has_promotion(),
+            "cold-start lane init observed an own accepted batch; expected none on a fresh DB"
         );
         let head = self
             .storage
@@ -276,33 +274,25 @@ impl<A: Application + 'static> InclusionLane<A> {
         let leading_direct_range = lane_state
             .last_drained_direct_range
             .advance_to(frontier.end_exclusive);
-        let promotion = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
-        // The drain advance and any promotion it implies commit in one
-        // transaction, so a crash can never leave a promoted-but-undrained batch
-        // — the state a restart would re-process and re-promote on a deleted
-        // pending row.
-        match promotion {
-            Some((max_nonce, inclusion_block)) => self.storage.close_frame_only_promoting(
-                &mut lane_state.head,
-                frontier.safe_block,
-                leading_direct_range,
-                max_nonce,
-                inclusion_block,
-            )?,
-            None => self.storage.close_frame_only(
-                &mut lane_state.head,
-                frontier.safe_block,
-                leading_direct_range,
-            )?,
-        }
+        // The observation commits its promotion (if any) in the same
+        // transaction as the drain, so a crash can never leave a
+        // promoted-but-undrained batch — the state a restart would re-process
+        // and re-promote on a deleted pending row.
+        let observation = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
+        let promoted = observation.commit(
+            &mut self.storage,
+            &mut lane_state.head,
+            frontier.safe_block,
+            leading_direct_range,
+        )?;
         lane_state.last_drained_direct_range = leading_direct_range;
 
         // A promotion supersedes the previous finalized (and any lower-nonce
         // pendings); reclaim them now. The full pass also collects earlier
         // lease-released garbage. On the lane's own thread, only when a
-        // promotion actually created garbage — so GC tracks garbage creation,
-        // never starved by load.
-        if promotion.is_some() {
+        // promotion created garbage — so GC tracks garbage creation, never
+        // starved by load.
+        if promoted {
             let removed =
                 snapshot::run_gc::<A>(&mut self.storage).map_err(InclusionLaneError::Gc)?;
             if removed > 0 {
@@ -326,14 +316,13 @@ impl<A: Application + 'static> InclusionLane<A> {
     }
 
     /// Process the safe inputs in `direct_range`, accumulating which of our
-    /// batches landed. Returns the promotion target `(max_nonce,
-    /// inclusion_block)` for the caller to apply atomically with the drain
-    /// (`close_frame_only_promoting`), or `None` if no own batch landed.
+    /// batches landed into a [`snapshot::BlockObservation`] for the caller to
+    /// [`commit`](snapshot::BlockObservation::commit).
     fn execute_safe_inputs_range(
         &mut self,
         direct_range: SafeInputRange,
         chunk: &mut Vec<StoredSafeInput>,
-    ) -> Result<Option<(u64, u64)>, InclusionLaneError> {
+    ) -> Result<snapshot::BlockObservation, InclusionLaneError> {
         let mut observation = snapshot::BlockObservation::new();
         let max_chunk_len = self.config.safe_input_buffer_capacity.max(1) as u64;
         for chunk_range in direct_range.chunks(max_chunk_len) {
@@ -344,7 +333,7 @@ impl<A: Application + 'static> InclusionLane<A> {
                 &mut observation,
             )?;
         }
-        Ok(observation.promotion())
+        Ok(observation)
     }
 
     fn execute_safe_inputs_chunk(

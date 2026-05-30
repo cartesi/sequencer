@@ -26,6 +26,11 @@ const SYNCHRONOUS_PRAGMA: &str = "NORMAL";
 /// `Storage` instance opened via [`Storage::open_read_only`].
 pub struct Storage {
     pub(super) conn: Connection,
+    /// The path this connection was opened from. Carried so a lease guard can
+    /// re-open a brief writer connection to release on drop (see
+    /// `snapshot_dumps::LeaseGuard`); the egress snapshot handlers open
+    /// per-op, so the guard can't borrow this `Storage`.
+    pub(super) path: String,
 }
 
 impl Storage {
@@ -33,14 +38,20 @@ impl Storage {
     pub fn open(path: &str) -> Result<Self, StorageOpenError> {
         let mut conn = open_writer_connection(path)?;
         run_migrations(&mut conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: path.to_string(),
+        })
     }
 
     /// Read-only handle. Uses a 50ms `busy_timeout` (vs. 5s for writers) so
     /// readers fail fast under write pressure and don't block on hot paths.
     pub fn open_read_only(path: &str) -> Result<Self, StorageOpenError> {
         let conn = open_reader_connection(path)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: path.to_string(),
+        })
     }
 
     /// Read-write handle that does NOT run migrations — for components that
@@ -51,7 +62,10 @@ impl Storage {
     /// (the runtime does it once via [`Storage::open`] at startup).
     pub fn open_writer(path: &str) -> Result<Self, StorageOpenError> {
         let conn = open_writer_connection(path)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: path.to_string(),
+        })
     }
 
     /// Test-only: return a raw `Connection` with the same pragmas as
