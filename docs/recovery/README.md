@@ -248,7 +248,7 @@ Closed batches past gold (if any) are still in their natural lifecycle — pendi
 2. Open a fresh recovery batch.
 3. If no Tip in danger and no Tip exists at all (torn-state crash recovery), open a Tip anyway.
 
-The `Proceed` path does not call this function. Under that dispatch, no danger arm fired and the persisted state is left untouched; genesis Tip creation is handled by the inclusion lane's normal `initialize_open_state` path.
+The `Proceed` path does not call this function. Under that dispatch, no danger arm fired and the persisted state is left untouched; genesis Tip creation is handled by the structural `Storage::ensure_open_tip` step in `Workers::spawn` (after recovery, before the lane), not by recovery and not by the lane.
 
 #### Why `danger_threshold`, not `MAX_WAIT_BLOCKS`, for the Tip threshold
 
@@ -285,7 +285,7 @@ The startup flow is dispatched by `decide_startup_action(danger)`:
 
 | `check_danger` result | Action | Recovery primitive | Why this dispatch |
 |---|---|---|---|
-| `Safe` | `Proceed` | none | Nothing crossed danger; leave persisted state alone and let the inclusion lane initialize genesis if the DB is fresh. |
+| `Safe` | `Proceed` | none | Nothing crossed danger; leave persisted state alone. The structural `ensure_open_tip` step opens the genesis Tip if the DB is fresh. |
 | `L1ViewStale` | `Refuse(L1ViewStale)` | — | The L1 view is too old to support honest recovery or new soft confirmations. |
 | `TipInDanger(N)` | `RecoverTip { N }` | `recover_aging_tip(danger_threshold)` (no flush — Tip has no L1 slot) | Tip has no L1 footprint; cascade and reopen directly. |
 | `ClosedBatchInDanger(N)` | `FlushAndCascade { N }` | flush + `recover_post_flush(danger_threshold)` | Closed batch has L1 transactions whose fate must be resolved before cascading. |
@@ -293,7 +293,7 @@ The startup flow is dispatched by `decide_startup_action(danger)`:
 
 **L1 view freshness gates recovery.** `check_danger` first checks the L1 safe block timestamp against `l1_read_stale_after_blocks`. If the timestamp is missing or too old, startup refuses: the sequencer has no trustworthy L1 view from which to recover or issue new soft confirmations. With a fresh L1 view, observed-safe checks decide concrete recovery: `ClosedBatchInDanger` runs flush + cascade, while `TipInDanger` invalidates the open Tip directly. `EstimatedBatchInDanger` is the final batch-relative wall-clock fallback: observed safe-state has not crossed the threshold, but elapsed time since the last safe-head advance says the batch consumed its remaining runway, so startup refuses instead of recovering from estimated state.
 
-The Refuse variants block boot and surface to the operator. `Proceed` performs no recovery writes; the normal inclusion-lane startup path initializes the Tip if the DB is fresh. The mutating recovery actions each commit atomically: `RecoverTip` invalidates the aging Tip and opens a fresh one, while `FlushAndCascade` cascades the post-flush non-gold suffix and opens a fresh Tip when needed.
+The Refuse variants block boot and surface to the operator. `Proceed` performs no recovery writes; the genesis Tip (fresh DB) is opened by the structural `Storage::ensure_open_tip` step that runs after recovery and before the lane. The mutating recovery actions each commit atomically: `RecoverTip` invalidates the aging Tip and opens a fresh one, while `FlushAndCascade` cascades the post-flush non-gold suffix and opens a fresh Tip when needed. So the tip-existence invariant holds at every commit boundary — recovery maintains it across cascades (reopening atomically via the shared `open_fresh_tip_in_tx` mechanism), `ensure_open_tip` closes the genesis gap with the same mechanism, and the inclusion lane loads the resulting head from storage (fail-loud if absent) rather than branching on tip existence.
 
 **What TLA+ proves here**: the model still abstracts away the full startup cutover/flush decision. It proves ZombieSafety once wallet-nonce slots resolve, and separately models direct recovery of an aging open Tip. The claim that past `MAX_WAIT`, closed-batch staleness self-resolves is external reasoning from L1 monotonicity. The post-flush "cascade everything past gold" choice is also external reasoning (the "everything past gold is doomed" mental model above).
 

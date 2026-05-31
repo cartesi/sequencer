@@ -51,15 +51,20 @@ pub struct InclusionLane<A: Application + 'static> {
 }
 
 impl<A: Application + 'static> InclusionLane<A> {
-    /// Spawn the lane on a blocking thread. The lane selects one resume
-    /// checkpoint — the latest pending snapshot if any, else the
-    /// finalized snapshot (see `catch_up_snapshot`) — and uses it for
-    /// both `A::from_dump` and the catch-up replay offset, so the loaded
-    /// state and the replay cursor can never drift apart. The runtime
-    /// guarantees at least a genesis finalized snapshot exists before
-    /// this is called (cold start registers one; warm start reuses the
-    /// previous run's). A missing snapshot surfaces as
-    /// `CatchUpError::NoSnapshot`.
+    /// Spawn the lane on a blocking thread. The runtime establishes the open
+    /// Tip structurally before this — via [`Storage::ensure_open_tip`] (genesis)
+    /// or recovery's atomic reopen — so the lane only ever *loads* its resume
+    /// state and never initializes a Tip. It fail-louds with
+    /// [`InclusionLaneError::NoOpenTip`] if the invariant was somehow violated.
+    ///
+    /// The lane selects one resume checkpoint — the latest pending
+    /// snapshot if any, else the finalized snapshot (see
+    /// `catch_up_snapshot`) — and uses it for both `A::from_dump` and the
+    /// catch-up replay offset, so the loaded state and the replay cursor
+    /// can never drift apart. The runtime guarantees at least a genesis
+    /// finalized snapshot exists before this is called (cold start
+    /// registers one; warm start reuses the previous run's). A missing
+    /// snapshot surfaces as `CatchUpError::NoSnapshot`.
     ///
     /// Returns the input MPSC sender (for the API to enqueue user
     /// ops) and the join handle (for the runtime to observe lane
@@ -104,7 +109,19 @@ impl<A: Application + 'static> InclusionLane<A> {
         self.run_catch_up(catch_up_from)?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
-        let mut lane_state = self.load_or_initialize_lane_state(&mut safe_inputs)?;
+        // The Tip exists by construction: the runtime established it via
+        // `Storage::ensure_open_tip` before the lane started. The lane only
+        // loads — read the open frame (fail-loud if absent) and the drain
+        // cursor together from storage, so both come from the same place. Any
+        // leading range already sequenced into the Tip's frames (genesis or a
+        // recovery batch) was replayed into the app by `run_catch_up` above,
+        // so there is no cold-start drain here.
+        let head = self
+            .storage
+            .open_state()?
+            .ok_or(InclusionLaneError::NoOpenTip)?;
+        let next_undrained = self.storage.next_undrained_safe_input_index()?;
+        let mut lane_state = LaneState::new(SafeInputRange::empty_at(next_undrained), head);
 
         loop {
             if self.shutdown.is_shutdown_requested() {
@@ -150,42 +167,6 @@ impl<A: Application + 'static> InclusionLane<A> {
             start_offset,
         )
         .map_err(|source| InclusionLaneError::CatchUp { source })
-    }
-
-    fn load_or_initialize_lane_state(
-        &mut self,
-        safe_inputs: &mut Vec<StoredSafeInput>,
-    ) -> Result<LaneState, InclusionLaneError> {
-        let next_safe_input_index = self.storage.next_undrained_safe_input_index()?;
-
-        let last_drained_direct_range = SafeInputRange::empty_at(next_safe_input_index);
-        if let Some(head) = self.storage.open_state()? {
-            return Ok(LaneState::new(last_drained_direct_range, head));
-        }
-
-        let frontier = self.storage.safe_input_frontier()?;
-        assert!(
-            frontier.end_exclusive >= last_drained_direct_range.end(),
-            "safe-input head regressed during lane initialization: safe_end={}, next={}",
-            frontier.end_exclusive,
-            last_drained_direct_range.end()
-        );
-
-        let leading_direct_range = last_drained_direct_range.advance_to(frontier.end_exclusive);
-        // Cold start (no open tip) only happens on a genuinely fresh DB: no
-        // closed batches, hence none of our batches in the safe range to
-        // promote. (After recovery there is always an open tip, so we'd have
-        // taken the warm path above.) So this range observes no own batch.
-        let observation = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
-        debug_assert!(
-            !observation.has_promotion(),
-            "cold-start lane init observed an own accepted batch; expected none on a fresh DB"
-        );
-        let head = self
-            .storage
-            .initialize_open_state(frontier.safe_block, leading_direct_range)?;
-
-        Ok(LaneState::new(leading_direct_range, head))
     }
 
     /// Drain user ops in chunks until the queue empties or we cross the batch

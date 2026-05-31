@@ -368,14 +368,11 @@ async fn start_lane(
     // `app` instance is dropped here; the lane reloads it from the
     // genesis dump on its background thread.
     drop(app);
+    // Establish the tip structurally (as the runtime does at startup), then
+    // hand its head to the lane — which now only loads, never initializes.
+    storage.ensure_open_tip().expect("establish genesis tip");
     let shutdown = ShutdownSignal::default();
     let (tx, handle) = InclusionLane::<TestApp>::start(128, shutdown.clone(), storage, config);
-    let initialized = wait_until(Duration::from_secs(2), || {
-        let mut storage = Storage::open(db_path).expect("open storage");
-        storage.open_state().expect("load open state").is_some()
-    })
-    .await;
-    assert!(initialized, "lane should initialize its first open state");
     (tx, shutdown, handle)
 }
 
@@ -614,6 +611,7 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
         let app = SharedCountingApp::new();
         register_genesis_snapshot(&app, &mut storage, &config.dumps_dir);
     }
+    storage.ensure_open_tip().expect("establish genesis tip");
     let shutdown = ShutdownSignal::default();
     let (_tx, lane_handle) =
         InclusionLane::<SharedCountingApp>::start(128, shutdown.clone(), storage, config);
@@ -1081,6 +1079,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
     // instance via `from_dump` on its background thread.
     let app = UserOpCounterApp::new();
     register_genesis_snapshot(&app, &mut storage, &config1.dumps_dir);
+    storage.ensure_open_tip().expect("establish genesis tip");
     let shutdown1 = ShutdownSignal::default();
     let (tx1, handle1) =
         InclusionLane::<UserOpCounterApp>::start(128, shutdown1.clone(), storage, config1.clone());
@@ -1137,7 +1136,9 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
     let mut config2 = config1.clone();
     config2.max_batch_open = Duration::from_millis(50);
 
-    let storage2 = Storage::open(db.path.as_str()).expect("reopen storage");
+    let mut storage2 = Storage::open(db.path.as_str()).expect("reopen storage");
+    // Restart: the Tip already exists, so this loads its head (warm path).
+    storage2.ensure_open_tip().expect("load existing tip");
     let shutdown2 = ShutdownSignal::default();
     let (tx2, handle2) =
         InclusionLane::<UserOpCounterApp>::start(128, shutdown2.clone(), storage2, config2);
