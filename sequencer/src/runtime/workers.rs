@@ -108,21 +108,28 @@ impl Workers {
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
         std::fs::create_dir_all(&dumps_dir)?;
 
-        // Snapshot lifecycle startup, in this order:
+        // Structural startup, in this order:
         //
         // 1. Reset stale leases. A crashed previous run may have left
         //    `lease_count > 0` on dumps that aren't being read by
         //    anyone now; without this, GC would skip them forever.
         // 2. Ensure a finalized snapshot exists (always-load
         //    invariant) — cold start uses `app` for the genesis dump.
-        // 3. GC SQLite-side: drop any rows now unreferenced after
+        // 3. Ensure an open Tip exists (tip-existence invariant). Opens the
+        //    genesis Tip on a fresh DB, no-op otherwise. The lane loads the
+        //    head itself after catch-up; this step only establishes the
+        //    invariant. Runs after preemptive recovery has synced the safe
+        //    head, so the genesis frame's `safe_block` dates to startup (full
+        //    landing budget), not to an earlier, possibly stale view.
+        // 4. GC SQLite-side: drop any rows now unreferenced after
         //    promotions or invalidations that finalized just before
         //    the previous shutdown.
-        // 4. Orphan FS sweep: remove directories under `dumps_dir`
+        // 5. Orphan FS sweep: remove directories under `dumps_dir`
         //    that aren't tracked by SQLite (crash-during-create_dump
         //    or crash-during-GC-after-row-delete artifacts).
         storage.reset_dump_leases()?;
         ensure_finalized_snapshot::<A>(app, &mut storage, &dumps_dir)?;
+        storage.ensure_open_tip()?;
         let gc_removed = snapshot_gc_at_startup::<A>(&mut storage)?;
         let sweep_removed = sweep_orphan_dumps::<A>(&mut storage, &dumps_dir)?;
         tracing::debug!(

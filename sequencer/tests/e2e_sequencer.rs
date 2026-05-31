@@ -1101,6 +1101,11 @@ async fn start_full_server_with_max_body(
             .expect("register genesis");
     }
 
+    // Tip-existence invariant: open the genesis Tip if the DB is fresh
+    // (no-op on warm restart), mirroring the runtime's structural startup.
+    // The lane loads the head itself after catch-up.
+    storage.ensure_open_tip().expect("establish open tip");
+
     let (tx, lane_handle) = InclusionLane::<WalletApp>::start(
         128,
         shutdown.clone(),

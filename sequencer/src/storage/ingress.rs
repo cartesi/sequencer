@@ -22,10 +22,7 @@ use super::queries::{
     query_latest_safe_input_index_exclusive, valid_ordered_l2_tx_head,
 };
 use super::snapshot_dumps::{insert_pending_dump_in, promote_finalized_in};
-use super::{
-    BatchPolicy, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
-    batch_size_target_bytes,
-};
+use super::{BatchPolicy, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use crate::ingress::inclusion_lane::PendingUserOp;
 
 impl Storage {
@@ -37,13 +34,7 @@ impl Storage {
     /// when a batch is invalidated, those rows drop out of the view and the
     /// cursor naturally rewinds, allowing the recovery batch to re-drain.
     pub fn next_undrained_safe_input_index(&mut self) -> Result<u64> {
-        const SQL: &str = "
-            SELECT COALESCE(MAX(safe_input_index) + 1, 0)
-            FROM valid_sequenced_l2_txs
-            WHERE safe_input_index IS NOT NULL
-        ";
-        let value: i64 = self.conn.query_row(SQL, [], |row| row.get(0))?;
-        Ok(i64_to_u64(value))
+        self.read(next_undrained_safe_input_index_in)
     }
 
     /// Resume the lane on startup. Returns `None` if storage is empty (caller
@@ -52,8 +43,13 @@ impl Storage {
         self.read(load_current_write_head)
     }
 
-    /// Bootstrap the very first batch + frame. Asserts that no open state
-    /// exists; call only when [`Storage::open_state`] returns `None`.
+    /// Bootstrap the very first batch + frame with explicit values, returning
+    /// its loaded [`WriteHead`]. Asserts no open state exists.
+    ///
+    /// Production opens the genesis Tip through [`Storage::ensure_open_tip`],
+    /// which derives `safe_block`/leading range from the synced L1 view; this
+    /// explicit form is kept for tests that seed a specific open state without
+    /// a safe-head observation.
     pub fn initialize_open_state(
         &mut self,
         safe_block: u64,
@@ -64,24 +60,40 @@ impl Storage {
                 load_current_write_head(tx)?.is_none(),
                 "open state already exists"
             );
+            insert_tip_rows(tx, Some(0), None, safe_block, leading_direct_range)?;
+            Ok(load_current_write_head(tx)?.expect("genesis tip just inserted"))
+        })
+    }
 
-            let now_ms = now_unix_ms();
-            let policy = query_batch_policy(tx)?;
-            // Genesis: explicit batch_index = 0, parent = None, nonce = 0.
-            insert_new_batch(tx, Some(0), None, now_ms)?;
-            insert_open_frame(tx, 0, 0, now_ms, policy.recommended_fee, safe_block)?;
-            persist_frame_direct_sequence(tx, 0, 0, leading_direct_range)?;
-
-            Ok(WriteHead {
-                batch_index: 0,
-                batch_created_at: from_unix_ms(now_ms),
-                frame_fee: policy.recommended_fee,
-                safe_block,
-                batch_user_op_count: 0,
-                open_frame_user_op_count: 0,
-                frame_in_batch: 0,
-                max_batch_user_op_bytes: batch_size_target_bytes(policy),
-            })
+    /// Ensure a valid open Tip exists. Establishes the tip-existence
+    /// invariant; does **not** return the head — callers that need it load it
+    /// via [`Storage::open_state`], so [`WriteHead`] has a single constructor
+    /// (`load_current_write_head`) rather than a hand-built twin.
+    ///
+    /// No-op on a warm DB (or after a recovery cascade already reopened the
+    /// Tip). On a genuinely fresh DB it opens the genesis Tip via the shared
+    /// `open_fresh_tip_in_tx` mechanism: index 0 / nonce 0 at the current
+    /// safe head, the leading safe-input range **sequenced but not executed**.
+    /// Those directs are executed by the lane's catch-up replay (the same path
+    /// warm resume and recovery batches use), so there is no cold-start drain.
+    ///
+    /// This is the genesis / first-startup guard. The runtime calls it once at
+    /// startup — after recovery has synced the safe head and the genesis
+    /// snapshot is registered, immediately before the lane starts — so the lane
+    /// only ever *loads* a Tip (fail-loud if absent) and never initializes one.
+    /// Recovery owns its own atomic reopen (it repairs a tip-lessness it
+    /// created inside the cascade transaction), reusing the same mechanism.
+    ///
+    /// **Precondition (genesis branch only):** a safe-head observation must
+    /// exist. A fresh DB requires L1 at bootstrap plus a successful recovery
+    /// sync, else startup refuses before reaching here; the warm-DB early
+    /// return fires before any safe-head read.
+    pub fn ensure_open_tip(&mut self) -> Result<()> {
+        self.write(|tx| {
+            if load_current_write_head(tx)?.is_some() {
+                return Ok(());
+            }
+            open_fresh_tip_in_tx(tx)
         })
     }
 
@@ -301,6 +313,91 @@ impl Storage {
     pub fn batch_policy(&mut self) -> Result<BatchPolicy> {
         query_batch_policy(&self.conn)
     }
+}
+
+/// Insert a fresh open batch (the Tip) and its first frame inside `tx`,
+/// sequencing `leading_direct_range` into that frame (**sequenced, not
+/// executed** — the app catches up by replaying the same rows). Lineage is the
+/// caller's: `batch_index_opt = Some(0)` forces the genesis index, `None`
+/// auto-assigns the PK; `parent = None` roots a nonce-0 batch (genesis or a
+/// fully-torn refork), else it inherits `parent.nonce + 1`. The single-Tip
+/// invariant is enforced by the `ux_single_valid_tip` partial index.
+///
+/// Does **not** build a [`WriteHead`] — callers load it via
+/// `load_current_write_head`, so the head has one constructor. Returns the new
+/// `batch_index`.
+fn insert_tip_rows(
+    tx: &Transaction<'_>,
+    batch_index_opt: Option<u64>,
+    parent: Option<u64>,
+    safe_block: u64,
+    leading_direct_range: SafeInputRange,
+) -> Result<u64> {
+    let now_ms = now_unix_ms();
+    let policy = query_batch_policy(tx)?;
+    let batch_index = insert_new_batch(tx, batch_index_opt, parent, now_ms)?;
+    insert_open_frame(
+        tx,
+        batch_index,
+        0,
+        now_ms,
+        policy.recommended_fee,
+        safe_block,
+    )?;
+    persist_frame_direct_sequence(tx, batch_index, 0, leading_direct_range)?;
+    Ok(batch_index)
+}
+
+/// Extend the valid batch path with a fresh open Tip at the current safe head,
+/// draining all currently-undrained safe inputs into its first frame.
+///
+/// One mechanism, two callers with distinct intents (each keeps its own guard):
+/// the runtime's [`Storage::ensure_open_tip`] (genesis / first startup) and
+/// recovery's cascade (reopening the Tip it just invalidated, atomically — see
+/// `storage/recovery.rs`). Lineage is derived from the tree: `parent` is the
+/// highest-indexed valid batch — `None` when the valid path is empty (genesis,
+/// or a fully-torn cascade), rooting a nonce-0 batch; `batch_index` is the
+/// explicit genesis `0` only when the `batches` table is empty, otherwise the
+/// monotonic PK (so recovery batches keep climbing and indices are never
+/// reused).
+pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
+    let safe_block = current_safe_block_required(tx)?;
+    let table_empty = tx
+        .query_row("SELECT MAX(batch_index) FROM batches", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+        .is_none();
+    let parent = tx
+        .query_row("SELECT MAX(batch_index) FROM valid_batches", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+        .map(i64_to_u64);
+    let batch_index_opt = if table_empty { Some(0) } else { None };
+    let leading_direct_range = SafeInputRange::new(
+        next_undrained_safe_input_index_in(tx)?,
+        query_latest_safe_input_index_exclusive(tx)?,
+    );
+    insert_tip_rows(
+        tx,
+        batch_index_opt,
+        parent,
+        safe_block,
+        leading_direct_range,
+    )?;
+    Ok(())
+}
+
+/// `MAX(safe_input_index) + 1` over the valid drained rows (or 0 if none),
+/// inside `tx`. The cursor rewinds when a batch is invalidated, so a recovery
+/// batch re-drains the same range its invalidated predecessor was working from.
+fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
+    const SQL: &str = "
+        SELECT COALESCE(MAX(safe_input_index) + 1, 0)
+        FROM valid_sequenced_l2_txs
+        WHERE safe_input_index IS NOT NULL
+    ";
+    let value: i64 = tx.query_row(SQL, [], |row| row.get(0))?;
+    Ok(i64_to_u64(value))
 }
 
 /// Seal the current Tip and open the successor batch's first frame, in `tx`.
@@ -646,5 +743,97 @@ mod tests {
             SequencedL2Tx::Direct(value) => assert_eq!(value.payload.as_slice(), &[0xbb]),
             _ => panic!("expected direct input at position 1"),
         }
+    }
+
+    #[test]
+    fn ensure_open_tip_opens_genesis_and_sequences_leading_range() {
+        let db = temp_db("ensure-tip-genesis");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        // Pre-existing L1 history: two safe inputs at block 10, and an
+        // observed safe head of 10 (as the startup recovery sync would leave).
+        let leading = vec![
+            StoredSafeInput {
+                sender: Address::ZERO,
+                payload: vec![0xaa],
+                block_number: 10,
+            },
+            StoredSafeInput {
+                sender: Address::ZERO,
+                payload: vec![0xbb],
+                block_number: 10,
+            },
+        ];
+        storage
+            .append_safe_inputs(10, leading.as_slice(), SENDER_A, &default_protocol_timing())
+            .expect("seed safe inputs + head");
+
+        assert!(
+            storage.open_state().expect("load open state").is_none(),
+            "fresh DB has no Tip before ensure_open_tip"
+        );
+
+        storage.ensure_open_tip().expect("open genesis tip");
+
+        // The Tip now exists; load its head the way the lane does (it loads
+        // from storage, never receives the head).
+        let head = storage
+            .open_state()
+            .expect("load open state")
+            .expect("genesis tip exists");
+        assert_eq!(head.batch_index, 0, "genesis batch is index 0");
+        assert_eq!(head.frame_in_batch, 0);
+        assert_eq!(
+            head.safe_block, 10,
+            "genesis frame opens at the synced safe head"
+        );
+
+        // The leading range is *sequenced* into the Tip, so the drain cursor
+        // has advanced past it.
+        assert_eq!(
+            storage
+                .next_undrained_safe_input_index()
+                .expect("derived cursor"),
+            2,
+            "leading range [0,2) sequenced into genesis frame 0"
+        );
+
+        // Sequenced, not executed: the rows are in the ordered L2-tx stream
+        // for catch-up to replay, but ensure_open_tip ran no application code.
+        let replay = storage
+            .ordered_l2_txs_page_from(0, 100)
+            .expect("load replay");
+        assert_eq!(
+            replay.len(),
+            2,
+            "leading directs are in the replay stream for catch-up"
+        );
+    }
+
+    #[test]
+    fn ensure_open_tip_is_noop_when_tip_already_exists() {
+        let db = temp_db("ensure-tip-noop");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        // Seed an explicit open Tip at safe_block 5. Note: no safe-head
+        // observation is recorded, so a genesis-branch `current_safe_block`
+        // read would fail — proving the warm path returns before it.
+        let seeded = storage
+            .initialize_open_state(5, SafeInputRange::empty_at(0))
+            .expect("seed open state");
+
+        storage.ensure_open_tip().expect("warm path is a no-op");
+        let head = storage
+            .open_state()
+            .expect("load open state")
+            .expect("tip still exists");
+        assert_eq!(
+            head.batch_index, seeded.batch_index,
+            "warm path leaves the existing Tip, does not reopen"
+        );
+        assert_eq!(
+            head.safe_block, 5,
+            "existing frame's safe_block is preserved, not refreshed"
+        );
     }
 }

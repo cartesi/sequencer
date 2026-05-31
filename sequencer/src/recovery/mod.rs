@@ -23,8 +23,9 @@
 //!   falls through to a Tip danger-zone check — see `docs/recovery/README.md` Step 5.
 //! - `RecoverTip`: only the open Tip is dangerous. It has no L1 footprint, so call
 //!   [`crate::storage::Storage::recover_aging_tip`] directly without flushing.
-//! - `Proceed`: no danger detected. No DB writes; the lane handles genesis init
-//!   via [`crate::storage::Storage::initialize_open_state`] if the DB is fresh.
+//! - `Proceed`: no danger detected. No DB writes here; the genesis Tip (on a
+//!   fresh DB) is opened by the structural [`crate::storage::Storage::ensure_open_tip`]
+//!   step in `Workers::spawn`, after recovery and before the lane starts.
 //! - `Refuse`: L1 view is stale or batch-relative estimated danger fired; bail
 //!   out and surface to the operator.
 //!
@@ -90,8 +91,8 @@ pub enum RefuseReason {
 ///
 /// The four non-Refuse variants encode the recovery split:
 ///
-/// - `Proceed`: no danger detected. No recovery work needed; the lane handles
-///   genesis init on first start.
+/// - `Proceed`: no danger detected. No recovery work needed; the genesis Tip
+///   (fresh DB) is opened by the structural `ensure_open_tip` step, not here.
 /// - `RecoverTip`: aging Tip, no closed batch in danger. The Tip has no L1
 ///   footprint, so we cascade it directly with no flush.
 /// - `FlushAndCascade`: closed batch in danger. We need a flush to resolve
@@ -99,7 +100,7 @@ pub enum RefuseReason {
 /// - `Refuse`: can't proceed safely; surface to the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupAction {
-    /// No danger; no DB writes (lane handles genesis init).
+    /// No danger; no DB writes (genesis Tip handled by `ensure_open_tip`).
     Proceed,
     /// Open Tip is past `danger_threshold` and no closed batch is in danger.
     /// No flush needed (Tip has no L1 slot to resolve); cascade the Tip
@@ -246,13 +247,12 @@ pub async fn run_preemptive_recovery(
                 startup_action = action.label(),
                 "no danger zone detected — proceeding without recovery"
             );
-            // No Tip-creation here. The only production scenario where the DB
-            // has no Tip is genesis (fresh DB, never started). The lane handles
-            // that via `initialize_open_state`, which it skips when a Tip
-            // exists. All other Tip-mutating paths (lane rotation, recovery
-            // cascade) are wrapped in single rusqlite transactions and cannot
-            // leave the DB Tip-less. Code between this point and the lane's
-            // first init is construction-only and does not read the Tip.
+            // No DB writes here. A `Proceed` decision means no batch is in
+            // danger and the persisted state is fine as-is; closed batches past
+            // gold (if any) stay in their natural lifecycle. The tip-existence
+            // invariant — including opening the genesis Tip on a fresh DB — is
+            // established structurally by `Storage::ensure_open_tip` in
+            // `Workers::spawn`, after this returns and before the lane starts.
             Vec::new()
         }
         StartupAction::RecoverTip { batch_index } => {
