@@ -27,10 +27,9 @@ use sequencer_core::protocol::{ProtocolTiming, age_exceeds};
 
 use super::Storage;
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
-use super::mutations::{insert_new_batch, insert_open_frame, persist_frame_direct_sequence};
+use super::ingress::open_fresh_tip_in_tx;
 use super::queries::{
     current_safe_block_required, current_safe_block_timestamp, last_safe_progress_ms,
-    query_batch_policy, query_latest_safe_input_index_exclusive,
 };
 use super::safe_accepted_batches::frontier_nonce;
 use super::snapshot_dumps::clear_pending_dumps_in;
@@ -306,7 +305,10 @@ fn recover_post_flush_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resu
         clear_pending_dumps_in(tx)?;
     }
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
-        open_recovery_batch_in_tx(tx)?;
+        // Reopen the Tip the cascade just invalidated (or one a torn crash
+        // left missing), atomically with the cascade. Same mechanism the
+        // runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
+        open_fresh_tip_in_tx(tx)?;
     }
     Ok(invalidated)
 }
@@ -322,7 +324,10 @@ fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resul
         clear_pending_dumps_in(tx)?;
     }
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
-        open_recovery_batch_in_tx(tx)?;
+        // Reopen the Tip the cascade just invalidated (or one a torn crash
+        // left missing), atomically with the cascade. Same mechanism the
+        // runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
+        open_fresh_tip_in_tx(tx)?;
     }
     Ok(invalidated)
 }
@@ -476,52 +481,6 @@ fn has_valid_open_batch(tx: &Connection) -> Result<bool> {
         row.get(0)
     })?;
     Ok(count > 0)
-}
-
-/// Open a fresh recovery batch inside an existing transaction.
-///
-/// The new Tip's parent is the highest-indexed valid batch (the last valid
-/// ancestor after the cascade). If none exists — the torn-state case where
-/// every batch has been invalidated — the new Tip has no parent (nonce 0,
-/// like a fresh genesis).
-///
-/// Requires an observed safe head (uses `current_safe_block_required`); only
-/// reachable from `recover_post_flush` / `recover_aging_tip`, which run from
-/// `run_preemptive_recovery` after a successful sync or behind the
-/// `L1ViewStale` refusal gate.
-fn open_recovery_batch_in_tx(tx: &Transaction<'_>) -> Result<()> {
-    let now_ms = now_unix_ms();
-    let safe_block = current_safe_block_required(tx)?;
-
-    let parent_batch_index: Option<u64> = tx
-        .query_row("SELECT MAX(batch_index) FROM valid_batches", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })?
-        .map(i64_to_u64);
-
-    let policy = query_batch_policy(tx)?;
-    let next_bi = insert_new_batch(tx, None, parent_batch_index, now_ms)?;
-    insert_open_frame(tx, next_bi, 0, now_ms, policy.recommended_fee, safe_block)?;
-
-    // Drain leading directs into the new batch's first frame.
-    // Direct inputs from invalidated batches are re-drained into the recovery batch
-    // (the UNIQUE(safe_input_index) constraint was removed to allow this).
-    let next_undrained: u64 = {
-        // MAX(safe_input_index) + 1 over the valid drained rows. Cursor rewinds
-        // when a batch is invalidated, so the recovery batch sees the same
-        // undrained range its invalidated predecessor was working from.
-        let value: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(safe_input_index) + 1, 0) FROM valid_sequenced_l2_txs \
-             WHERE safe_input_index IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        i64_to_u64(value)
-    };
-    let safe_input_end = query_latest_safe_input_index_exclusive(tx)?;
-    let leading_range = super::SafeInputRange::new(next_undrained, safe_input_end);
-    persist_frame_direct_sequence(tx, next_bi, 0, leading_range)?;
-    Ok(())
 }
 
 #[cfg(test)]

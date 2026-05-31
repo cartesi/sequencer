@@ -168,12 +168,6 @@ impl BlockObservation {
         }
     }
 
-    /// Whether the range observed one of our accepted batches — i.e. whether
-    /// [`commit`](Self::commit) will promote.
-    pub(super) fn has_promotion(&self) -> bool {
-        self.max.is_some()
-    }
-
     /// Close the frame for this safe-frontier advance, folding the observed
     /// promotion — if any — into the **same transaction** as the drain
     /// ([`Storage::close_frame_only_promoting`]); otherwise a plain frame close.

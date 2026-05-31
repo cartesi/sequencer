@@ -24,6 +24,11 @@ aren't. Section references point to the full reasoning below.
 - **Always-load.** A finalized snapshot exists before the lane starts (genesis
   at cold start). Absence is a bug, surfaced fail-loud as
   `CatchUpError::NoSnapshot` — never a branch the happy path handles. (§2)
+- **Tip exists before the lane.** A valid open Tip exists when the lane starts:
+  `ensure_open_tip` opens the genesis Tip on a fresh DB (after recovery's safe-head
+  sync, before the lane); recovery reopens it atomically across cascades. The lane
+  loads the resulting head from storage (fail-loud if absent), so it only ever
+  *loads* — it never branches on tip existence or initializes one. (§7)
 - **A committed promotion implies an advanced drain.** Promotion is folded into
   the drain's transaction (`close_frame_only_promoting`), so the two commit
   together — this is what makes a crash safe. (§5, §6)
@@ -318,11 +323,12 @@ backstop. (Endpoint shapes: [`AGENTS.md`](../../AGENTS.md) and the root
 
 ### Startup sequence
 
-`Workers::spawn` runs four steps, order-critical: (1) `reset_dump_leases`
+`Workers::spawn` runs five steps, order-critical: (1) `reset_dump_leases`
 (clear stale leases from a crashed run), (2) `ensure_finalized_snapshot`
-(genesis if cold), (3) `snapshot_gc_at_startup`, (4) `sweep_orphan_dumps`
-(remove on-disk dirs not in `dumps`; runs *after* (2) so the genesis prefix is
-registered and not swept).
+(genesis snapshot if cold), (3) `ensure_open_tip` (genesis Tip if cold — the
+tip-existence invariant below; the lane loads the head itself after catch-up),
+(4) `snapshot_gc_at_startup`, (5) `sweep_orphan_dumps` (remove on-disk dirs not
+in `dumps`; runs *after* (2) so the genesis prefix is registered and not swept).
 
 ## 8. Recovery interaction
 

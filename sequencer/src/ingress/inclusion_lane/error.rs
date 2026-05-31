@@ -36,6 +36,11 @@ pub enum InclusionLaneError {
     LoadFromDump(AppError),
     #[error("snapshot garbage collection failed")]
     Gc(#[from] GcError),
+    #[error(
+        "no open Tip at lane startup; the runtime must establish it via \
+         Storage::ensure_open_tip before starting the lane"
+    )]
+    NoOpenTip,
 }
 
 #[derive(Debug, Error)]
