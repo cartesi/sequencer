@@ -4,7 +4,7 @@
 local alarm = require("watchdog.alarm")
 local checkpoint = require("watchdog.checkpoint")
 local compare = require("watchdog.compare")
-local l1 = require("watchdog.l1")
+local l1_reader = require("watchdog.l1_reader")
 
 local runner = {}
 
@@ -43,7 +43,7 @@ local function fetch_inputs(cfg, deps, from_block, to_block)
     end
 
     local rpc = require_dep(deps, "rpc")
-    return l1.fetch_inputs(rpc, {
+    return l1_reader.fetch_inputs(rpc, {
         start_block = from_block,
         end_block = to_block,
         input_box_address = cfg.input_box_address,
@@ -82,37 +82,93 @@ local function target_safe_block(cfg, deps)
     return nil, "target safe block is not configured"
 end
 
-function runner.run_once(cfg, deps)
-    deps = deps or {}
+local function advance_compare_and_checkpoint(
+    cfg,
+    deps,
+    loaded,
+    inputs,
+    safe_block_prev,
+    safe_block_next,
+    with_compare
+)
     local checkpoint_mod = deps.checkpoint or checkpoint
-    local sequencer = require_dep(deps, "sequencer")
     local machine = require_dep(deps, "machine")
 
-    step(deps, "load checkpoint or bootstrap CM snapshot")
-    local loaded = load_checkpoint(cfg, checkpoint_mod)
-    step(deps, "fetch sequencer GET /get_state")
-    local sequencer_state, state_err = sequencer:get_state()
-    if not sequencer_state then
-        return nil, state_err
+    step(deps, "load CM snapshot directory")
+    local instance, load_err = machine:load(loaded.snapshot_dir, safe_block_prev)
+    if not instance then
+        return nil, load_err
     end
 
-    local safe_block_prev = loaded.safe_block or 0
-    local safe_block_next = sequencer_state.safe_block
-    step(deps, string.format(
-        "check safe_block monotonicity (prev=%s next=%s)",
-        tostring(safe_block_prev),
-        tostring(safe_block_next)
-    ))
-    if safe_block_next < safe_block_prev then
-        local payload = {
-            kind = "safe_block_regressed",
-            previous_safe_block = safe_block_prev,
-            sequencer_safe_block = safe_block_next,
-        }
-        send_alarm(cfg, deps, payload)
-        return nil, payload
+    if safe_block_next > safe_block_prev then
+        step(deps, string.format("advance CM for blocks %d..%d", safe_block_prev + 1, safe_block_next))
+        local advanced, advance_err = machine:advance(instance, inputs, {
+            from_block = safe_block_prev + 1,
+            to_block = safe_block_next,
+        })
+        if not advanced then
+            return nil, advance_err
+        end
+    else
+        instance.reference_block = safe_block_prev
     end
 
+    if with_compare then
+        step(deps, "run CM inspect (state query)")
+        local cm_state, inspect_err = machine:inspect(instance)
+        if not cm_state then
+            return nil, inspect_err
+        end
+
+        local sequencer = require_dep(deps, "sequencer")
+        step(deps, "fetch sequencer GET /finalized_state")
+        local finalized, state_err = sequencer:get_finalized_state()
+        if not finalized then
+            return nil, state_err
+        end
+        if finalized.not_modified then
+            return nil, "finalized state unexpectedly returned 304 during compare"
+        end
+
+        step(deps, "compare finalized SSZ bytes against CM inspect report")
+        local equal, mismatch_offset = compare.raw_equal(finalized.state, cm_state)
+        if not equal then
+            local payload = {
+                kind = "state_mismatch",
+                previous_safe_block = safe_block_prev,
+                sequencer_inclusion_block = finalized.inclusion_block,
+                mismatch_offset = mismatch_offset,
+            }
+            send_alarm(cfg, deps, payload)
+            return nil, payload
+        end
+    end
+
+    if safe_block_next > safe_block_prev then
+        step(deps, "persist new manifest-backed checkpoint")
+        local written, write_err = checkpoint_mod.write(cfg.checkpoint_dir, safe_block_next, function(snapshot_dir)
+            return machine:dump(instance, snapshot_dir, safe_block_next)
+        end, {
+            created_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            cm_image_hash = cfg.cm_image_hash,
+        })
+        if not written then
+            return nil, write_err
+        end
+    else
+        step(deps, "reference block unchanged; skip checkpoint write")
+    end
+
+    return {
+        ok = true,
+        previous_safe_block = safe_block_prev,
+        safe_block = safe_block_next,
+        input_count = #inputs,
+    }
+end
+
+--- Shared path: L1 fetch → CM advance/inspect/compare → optional checkpoint write.
+local function run_pass(cfg, deps, loaded, safe_block_prev, safe_block_next, with_compare)
     step(deps, string.format(
         "fetch L1 InputAdded logs for blocks %s..%s",
         tostring(safe_block_prev + 1),
@@ -123,74 +179,86 @@ function runner.run_once(cfg, deps)
         return nil, input_err
     end
 
-    step(deps, "load CM snapshot directory")
-    local instance, load_err = machine:load(loaded.snapshot_dir)
-    if not instance then
-        return nil, load_err
-    end
-
     step(deps, string.format("feed %d decoded inputs into CM", #inputs))
-    local fed, feed_err = machine:feed_inputs(instance, inputs)
-    if not fed then
-        return nil, feed_err
+    return advance_compare_and_checkpoint(
+        cfg,
+        deps,
+        loaded,
+        inputs,
+        safe_block_prev,
+        safe_block_next,
+        with_compare
+    )
+end
+
+local function skip_result(safe_block_prev, safe_block_next, reason)
+    return {
+        ok = true,
+        skipped = true,
+        skip_reason = reason,
+        previous_safe_block = safe_block_prev,
+        safe_block = safe_block_next,
+        input_count = 0,
+    }
+end
+
+function runner.run_once(cfg, deps)
+    deps = deps or {}
+    local checkpoint_mod = deps.checkpoint or checkpoint
+
+    step(deps, "load checkpoint or bootstrap CM snapshot")
+    local loaded = load_checkpoint(cfg, checkpoint_mod)
+
+    local safe_block_prev = loaded.safe_block or 0
+    local sequencer = require_dep(deps, "sequencer")
+    step(deps, "fetch sequencer GET /finalized_state/inclusion_block")
+    local head, head_err = sequencer:get_finalized_inclusion_block()
+    if not head then
+        return nil, head_err
     end
 
-    step(deps, "run CM inspect (state query)")
-    local cm_state, inspect_err = machine:inspect_state(instance)
-    if not cm_state then
-        return nil, inspect_err
-    end
-
-    step(deps, "compare sequencer state bytes against CM inspect report")
-    local equal, mismatch_offset = compare.raw_equal(sequencer_state.state, cm_state)
-    if not equal then
+    local safe_block_next = head.inclusion_block
+    step(deps, string.format(
+        "check inclusion_block monotonicity (prev=%s next=%s)",
+        tostring(safe_block_prev),
+        tostring(safe_block_next)
+    ))
+    if safe_block_next < safe_block_prev then
         local payload = {
-            kind = "state_mismatch",
+            kind = "inclusion_block_regressed",
             previous_safe_block = safe_block_prev,
-            sequencer_safe_block = safe_block_next,
-            mismatch_offset = mismatch_offset,
+            sequencer_inclusion_block = safe_block_next,
         }
         send_alarm(cfg, deps, payload)
         return nil, payload
     end
 
-    if safe_block_next > safe_block_prev then
-        step(deps, "persist new manifest-backed checkpoint")
-        local written, write_err = checkpoint_mod.write(cfg.checkpoint_dir, safe_block_next, function(snapshot_dir)
-            return machine:save(instance, snapshot_dir)
-        end, {
-            created_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-            cm_image_hash = cfg.cm_image_hash,
-        })
-        if not written then
-            return nil, write_err
-        end
-    else
-        step(deps, "safe_block unchanged; skip checkpoint write")
+    if safe_block_next <= safe_block_prev then
+        step(deps, "finalized inclusion_block unchanged; skip L1/CM/compare cycle")
+        return skip_result(safe_block_prev, safe_block_next, "finalized_unchanged")
     end
 
-    step(deps, "compare pass complete")
-    return {
-        ok = true,
-        previous_safe_block = safe_block_prev,
-        safe_block = safe_block_next,
-        input_count = #inputs,
-    }
+    local result, err = run_pass(cfg, deps, loaded, safe_block_prev, safe_block_next, true)
+    if result then
+        step(deps, "compare pass complete")
+    end
+    return result, err
 end
 
 function runner.advance_checkpoint_once(cfg, deps)
     deps = deps or {}
     local checkpoint_mod = deps.checkpoint or checkpoint
-    local machine = require_dep(deps, "machine")
 
     step(deps, "load checkpoint or bootstrap CM snapshot")
     local loaded = load_checkpoint(cfg, checkpoint_mod)
     local safe_block_prev = loaded.safe_block or 0
+
     step(deps, "resolve target safe block")
     local safe_block_next, safe_err = target_safe_block(cfg, deps)
     if not safe_block_next then
         return nil, safe_err
     end
+
     step(deps, string.format(
         "check safe_block monotonicity (prev=%s next=%s)",
         tostring(safe_block_prev),
@@ -204,50 +272,16 @@ function runner.advance_checkpoint_once(cfg, deps)
         }
     end
 
-    step(deps, string.format(
-        "fetch L1 InputAdded logs for blocks %s..%s",
-        tostring(safe_block_prev + 1),
-        tostring(safe_block_next)
-    ))
-    local inputs, input_err = fetch_inputs(cfg, deps, safe_block_prev + 1, safe_block_next)
-    if not inputs then
-        return nil, input_err
+    if safe_block_next <= safe_block_prev then
+        step(deps, "L1 safe block unchanged; skip advance cycle")
+        return skip_result(safe_block_prev, safe_block_next, "safe_unchanged")
     end
 
-    step(deps, "load CM snapshot directory")
-    local instance, load_err = machine:load(loaded.snapshot_dir)
-    if not instance then
-        return nil, load_err
+    local result, err = run_pass(cfg, deps, loaded, safe_block_prev, safe_block_next, false)
+    if result then
+        step(deps, "advance pass complete")
     end
-
-    step(deps, string.format("feed %d decoded inputs into CM", #inputs))
-    local fed, feed_err = machine:feed_inputs(instance, inputs)
-    if not fed then
-        return nil, feed_err
-    end
-
-    if safe_block_next > safe_block_prev then
-        step(deps, "persist new manifest-backed checkpoint")
-        local written, write_err = checkpoint_mod.write(cfg.checkpoint_dir, safe_block_next, function(snapshot_dir)
-            return machine:save(instance, snapshot_dir)
-        end, {
-            created_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-            cm_image_hash = cfg.cm_image_hash,
-        })
-        if not written then
-            return nil, write_err
-        end
-    else
-        step(deps, "safe_block unchanged; skip checkpoint write")
-    end
-
-    step(deps, "advance pass complete")
-    return {
-        ok = true,
-        previous_safe_block = safe_block_prev,
-        safe_block = safe_block_next,
-        input_count = #inputs,
-    }
+    return result, err
 end
 
 return runner

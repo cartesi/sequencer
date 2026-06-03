@@ -145,8 +145,7 @@ impl<A: Application> Scheduler<A> {
         }
 
         self.app
-            .export_state()
-            .map(|state| state.into_bytes())
+            .canonical_snapshot_bytes()
             .map_err(|err| InspectError::Application(err.to_string()))
     }
 
@@ -504,8 +503,10 @@ mod tests {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
         }
 
-        fn export_state(&self) -> Result<String, sequencer_core::application::AppError> {
-            Ok(format!("events:{}", self.executed.len()))
+        fn canonical_snapshot_bytes(
+            &self,
+        ) -> Result<Vec<u8>, sequencer_core::application::AppError> {
+            Ok(format!("events:{}", self.executed.len()).into_bytes())
         }
     }
 

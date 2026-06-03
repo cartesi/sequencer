@@ -6,5 +6,4 @@
 //! split puts these on a separate port from ingress.
 
 pub mod api;
-pub mod app_state;
 pub mod l2_tx_feed;

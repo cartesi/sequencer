@@ -1,0 +1,104 @@
+{
+  "long_block_range_error_codes": ["-32005", "-32600", "-32602", "-32616"],
+  "scenarios": [
+    {
+      "name": "bisect_on_default_infura_code",
+      "start_block": 1,
+      "end_block": 4,
+      "fail_ranges": [
+        {
+          "from": 1,
+          "to": 4,
+          "message": "RPC error -32005: query returned more than allowed"
+        }
+      ],
+      "expect_calls": [[1, 4], [1, 2], [3, 4]],
+      "expect_ok": true
+    },
+    {
+      "name": "single_range_success",
+      "start_block": 10,
+      "end_block": 12,
+      "fail_ranges": [],
+      "expect_calls": [[10, 12]],
+      "expect_ok": true
+    },
+    {
+      "name": "empty_range_no_calls",
+      "start_block": 5,
+      "end_block": 4,
+      "fail_ranges": [],
+      "expect_calls": [],
+      "expect_ok": true
+    },
+    {
+      "name": "non_retryable_error_aborts",
+      "start_block": 1,
+      "end_block": 4,
+      "fail_ranges": [
+        {
+          "from": 1,
+          "to": 4,
+          "message": "connection refused"
+        }
+      ],
+      "expect_calls": [[1, 4]],
+      "expect_ok": false
+    },
+    {
+      "name": "nested_bisect_alchemy_code",
+      "start_block": 1,
+      "end_block": 8,
+      "fail_ranges": [
+        { "from": 1, "to": 8, "message": "error -32600: block range too large" },
+        { "from": 1, "to": 4, "message": "error -32600: block range too large" },
+        { "from": 1, "to": 2, "message": "error -32600: block range too large" }
+      ],
+      "expect_calls": [
+        [1, 8],
+        [1, 4],
+        [1, 2],
+        [1, 1],
+        [2, 2],
+        [3, 4],
+        [5, 8]
+      ],
+      "expect_ok": true
+    },
+    {
+      "name": "single_block_fail_no_split",
+      "start_block": 7,
+      "end_block": 7,
+      "fail_ranges": [
+        {
+          "from": 7,
+          "to": 7,
+          "message": "error -32616: range limit"
+        }
+      ],
+      "expect_calls": [[7, 7]],
+      "expect_ok": false
+    }
+  ],
+  "log_sort": {
+    "unsorted": [
+      {
+        "blockNumber": "0x2",
+        "transactionIndex": "0x0",
+        "logIndex": "0x5"
+      },
+      {
+        "blockNumber": "0x1",
+        "transactionIndex": "0x9",
+        "logIndex": "0x0"
+      },
+      {
+        "blockNumber": "0x2",
+        "transactionIndex": "0x0",
+        "logIndex": "0x1"
+      }
+    ],
+    "expect_block_order": ["0x1", "0x2", "0x2"],
+    "expect_log_index_order": ["0x0", "0x1", "0x5"]
+  }
+}

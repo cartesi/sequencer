@@ -14,15 +14,11 @@ end
 local config = require("watchdog.config")
 local http_mod = require("watchdog.http")
 local jsonrpc = require("watchdog.jsonrpc")
-local machine_cli = require("watchdog.machine_cli")
+local machine_cartesi = require("watchdog.machine_cartesi")
 local runner = require("watchdog.runner")
-local sequencer_mod = require("watchdog.sequencer")
+local sequencer_reader = require("watchdog.sequencer_reader")
 
-local ok_json, cjson = pcall(require, "cjson")
-if not ok_json then
-    io.stderr:write("lua-cjson is required\n")
-    os.exit(1)
-end
+local json = require("watchdog.json").new()
 
 local function getenv_table()
     return setmetatable({}, {
@@ -38,15 +34,12 @@ if cfg.mode ~= "compare" then
     os.exit(1)
 end
 
-local http = http_mod.new_auto()
+local http = http_mod.new()
 local deps = {
     http = http,
-    rpc = jsonrpc.new(http, cjson, cfg.l1_rpc_url),
-    sequencer = sequencer_mod.new(http, cjson, cfg.sequencer_url),
-    machine = machine_cli.new({
-        executable = cfg.cm_executable,
-        work_dir = cfg.cm_work_dir,
-    }),
+    rpc = jsonrpc.new(http, json, cfg.l1_rpc_url),
+    sequencer = sequencer_reader.new(http, json, cfg.sequencer_url),
+    machine = machine_cartesi.new(),
 }
 
 local result, err = runner.run_once(cfg, deps)

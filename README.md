@@ -189,6 +189,7 @@ released even on client disconnect.
 
 Related docs:
 - App snapshots (format + lifecycle): `docs/snapshots/`
+- Watchdog — local dev: [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md); Sepolia/mainnet: [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md)
 
 ## Prototype Limits
 
@@ -217,6 +218,9 @@ Some tests require [Foundry](https://getfoundry.sh) (`anvil` on PATH). They run 
 - [`CLAUDE.md`](CLAUDE.md) — quick reference for shell setup and commands.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
 - [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.
+- [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md) — step-by-step: run the watchdog with a local sequencer.
+- [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md) — watchdog on live L1 (Sepolia staging, mainnet production).
+- [`docs/watchdog/README.md`](docs/watchdog/README.md) — watchdog architecture, modules, and test commands.
 - [`sequencer-core/`](sequencer-core/) — shared domain types (`Application`, `SignedUserOp`, `Batch`, `Frame`).
 - [`examples/app-core/`](examples/app-core/) — placeholder wallet app implementing the `Application` trait.
 
