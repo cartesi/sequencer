@@ -102,12 +102,6 @@ impl Workers {
 
         let shutdown = ShutdownSignal::default();
 
-        let state_snapshotter = Arc::new(crate::egress::app_state::StateSnapshotter::new(
-            db_path.clone(),
-            app.clone(),
-            l1_config.batch_submitter_address,
-        ));
-
         // Inclusion lane: takes the app, returns the tx-sender the HTTP
         // ingress route will publish to.
         let mut storage = crate::storage::Storage::open(&db_path)?;
@@ -192,7 +186,6 @@ impl Workers {
             A::MAX_METHOD_PAYLOAD_BYTES,
             shutdown.clone(),
             tx_feed,
-            state_snapshotter,
             ApiConfig::default(),
             http::SnapshotState {
                 db_path: db_path.clone(),

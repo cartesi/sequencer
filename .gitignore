@@ -1,5 +1,7 @@
 /target
 .deps/
+watchdog/third_party/lua-curl/*
+!watchdog/third_party/lua-curl/UPSTREAM
 watchdog-e2e-*/
 .env
 .env.fish
@@ -12,3 +14,5 @@ examples/canonical-app/out/
 .vscode/
 soljson-latest.js
 **/states/
+__pycache__/
+/benchmarks/

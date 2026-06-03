@@ -199,15 +199,20 @@ table.insert(scenarios, {
         local report, inspect_err = machine:inspect_state(instance)
         assert_true(report, "inspect failed: " .. tostring(inspect_err))
 
-        log.step(scenario, 4, 4, "validate inspect report looks like wallet JSON state")
+        log.step(scenario, 4, 4, "validate inspect report is SSZ (not legacy JSON)")
         if report:find("inspect endpoint not implemented", 1, true) then
             return skip(
                 scenario,
                 "machine image dapp is stale; rebuild with: just canonical-build-machine-image"
             )
         end
-        assert_true(report:sub(1, 1) == "{", "inspect report is not JSON object bytes: " .. report)
-        assert_true(report:find('"balances"', 1, true) ~= nil, "inspect report missing balances field")
+        if report:sub(1, 1) == "{" then
+            return skip(
+                scenario,
+                "machine image still returns JSON export_state; rebuild with: just canonical-build-machine-image"
+            )
+        end
+        assert_true(#report >= 76, "inspect SSZ report too short: " .. tostring(#report))
         log.info("inspect report bytes=" .. tostring(#report))
     end,
 })
@@ -232,17 +237,14 @@ table.insert(scenarios, {
 
         local http_mod = require("watchdog.http")
         local jsonrpc = require("watchdog.jsonrpc")
-        local sequencer_mod = require("watchdog.sequencer")
-        local ok_json, cjson = pcall(require, "cjson")
-        if not ok_json then
-            return skip(scenario, "lua-cjson required for live sequencer compare")
-        end
+        local sequencer_reader = require("watchdog.sequencer_reader")
+        local json = require("watchdog.json").new()
 
         local checkpoint_dir = temp_dir("watchdog-e2e-compare")
         log.step(scenario, 1, 2, "prepare compare-mode deps (sequencer=" .. sequencer_url .. ")")
         log.step(scenario, 2, 2, "run compare runner against live sequencer + CM")
 
-        local http = http_mod.new_auto()
+        local http = http_mod.new()
         local cfg = {
             mode = "compare",
             sequencer_url = sequencer_url,
@@ -262,8 +264,8 @@ table.insert(scenarios, {
         local step_no = 0
         local result, err = runner.run_once(cfg, {
             http = http,
-            rpc = jsonrpc.new(http, cjson, cfg.l1_rpc_url),
-            sequencer = sequencer_mod.new(http, cjson, sequencer_url),
+            rpc = jsonrpc.new(http, json, cfg.l1_rpc_url),
+            sequencer = sequencer_reader.new(http, json, sequencer_url),
             machine = machine_cli.new({
                 executable = cfg.cm_executable,
                 work_dir = cfg.cm_work_dir,

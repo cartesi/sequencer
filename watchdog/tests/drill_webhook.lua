@@ -28,23 +28,23 @@ local drills = {
         payload = {
             kind = "state_mismatch",
             previous_safe_block = 10,
-            sequencer_safe_block = 12,
+            sequencer_inclusion_block = 12,
             mismatch_offset = 4,
             run_id = "drill-state-mismatch",
         },
     },
     {
-        name = "safe_block_regressed",
+        name = "inclusion_block_regressed",
         payload = {
-            kind = "safe_block_regressed",
+            kind = "inclusion_block_regressed",
             previous_safe_block = 20,
-            sequencer_safe_block = 19,
-            run_id = "drill-safe-block-regressed",
+            sequencer_inclusion_block = 19,
+            run_id = "drill-inclusion-block-regressed",
         },
     },
 }
 
-local http = http_mod.new_auto()
+local http = http_mod.new()
 local failures = 0
 
 log.banner("webhook-delivery-drills")

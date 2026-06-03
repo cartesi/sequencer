@@ -1,7 +1,7 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-local machine = require("watchdog.machine")
+local machine_runner = require("watchdog.machine_runner")
 
 local machine_cli = {}
 
@@ -148,7 +148,17 @@ function machine_cli.new(opts)
         return report
     end
 
-    function binding.save_snapshot(instance, snapshot_dir)
+    function binding.advance_inputs(instance, inputs, _range)
+        for _, input in ipairs(inputs or {}) do
+            local ok, err = binding.feed_input(instance, input)
+            if not ok then
+                return nil, err
+            end
+        end
+        return true
+    end
+
+    function binding.store_snapshot(instance, snapshot_dir)
         assert(type(instance) == "table", "machine instance is required")
         assert(type(snapshot_dir) == "string" and snapshot_dir ~= "", "snapshot_dir is required")
 
@@ -165,7 +175,7 @@ function machine_cli.new(opts)
         return run_command(command)
     end
 
-    return machine.new(binding)
+    return machine_runner.new(binding)
 end
 
 machine_cli._private = {

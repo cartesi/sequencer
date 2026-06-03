@@ -6,8 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, U256, address};
-use ssz::{Decode, Encode};
-use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
+use ssz::Decode;
 use tracing::{error, warn};
 use types::alloy_sol_types::SolCall;
 use types::{Erc20Deposit, Erc20Transfer};
@@ -59,28 +58,6 @@ pub struct WalletApp {
     executed_input_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
-struct SnapshotBalance {
-    address: [u8; 20],
-    balance_be: [u8; 32],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
-struct SnapshotNonce {
-    address: [u8; 20],
-    nonce: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
-struct WalletSnapshotV1 {
-    erc20_portal_address: [u8; 20],
-    supported_erc20_token: [u8; 20],
-    sequencer_address: [u8; 20],
-    balances: Vec<SnapshotBalance>,
-    nonces: Vec<SnapshotNonce>,
-    executed_input_count: u64,
-}
-
 pub const SEPOLIA_ERC20_PORTAL_ADDRESS: Address =
     address!("0xACA6586A0Cf05bD831f2501E7B4aea550dA6562D");
 pub const SEPOLIA_USDC_ADDRESS: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
@@ -92,12 +69,52 @@ pub const DEVNET_SEQUENCER_ADDRESS: Address =
     address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 impl WalletApp {
     pub fn new(config: WalletConfig) -> Self {
+        Self::from_snapshot_parts(config, HashMap::new(), HashMap::new(), 0)
+    }
+
+    pub(crate) fn from_snapshot_parts(
+        config: WalletConfig,
+        balances: HashMap<Address, U256>,
+        nonces: HashMap<Address, u32>,
+        executed_input_count: u64,
+    ) -> Self {
         Self {
             config,
-            balances: HashMap::new(),
-            nonces: HashMap::new(),
-            executed_input_count: 0,
+            balances,
+            nonces,
+            executed_input_count,
         }
+    }
+
+    pub(crate) fn config(&self) -> &WalletConfig {
+        &self.config
+    }
+
+    pub(crate) fn balances_iter(&self) -> impl Iterator<Item = (&Address, &U256)> {
+        self.balances.iter()
+    }
+
+    pub(crate) fn nonces_iter(&self) -> impl Iterator<Item = (&Address, &u32)> {
+        self.nonces.iter()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn balances_mut(&mut self) -> &mut HashMap<Address, U256> {
+        &mut self.balances
+    }
+
+    #[cfg(test)]
+    pub(crate) fn nonces_mut(&mut self) -> &mut HashMap<Address, u32> {
+        &mut self.nonces
+    }
+
+    pub(crate) fn executed_input_count(&self) -> u64 {
+        self.executed_input_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_executed_input_count(&mut self, count: u64) {
+        self.executed_input_count = count;
     }
 
     fn balance_of(&self, addr: &Address) -> U256 {
@@ -136,93 +153,6 @@ impl WalletApp {
         }
 
         Erc20Deposit::decode(&input.payload).map(Some)
-    }
-
-    /// Serialize the wallet's logical state to deterministic SSZ bytes.
-    ///
-    /// Determinism is enforced by sorting `balances` and `nonces` by
-    /// address before encoding; `WalletApp` stores them in `HashMap`s
-    /// whose iteration order is non-deterministic.
-    fn snapshot_bytes(&self) -> Vec<u8> {
-        let mut balances: Vec<_> = self
-            .balances
-            .iter()
-            .map(|(address, balance)| SnapshotBalance {
-                address: address.into_array(),
-                balance_be: balance.to_be_bytes(),
-            })
-            .collect();
-        balances.sort_unstable_by_key(|entry| entry.address);
-
-        let mut nonces: Vec<_> = self
-            .nonces
-            .iter()
-            .map(|(address, nonce)| SnapshotNonce {
-                address: address.into_array(),
-                nonce: *nonce,
-            })
-            .collect();
-        nonces.sort_unstable_by_key(|entry| entry.address);
-
-        WalletSnapshotV1 {
-            erc20_portal_address: self.config.erc20_portal_address.into_array(),
-            supported_erc20_token: self.config.supported_erc20_token.into_array(),
-            sequencer_address: self.config.sequencer_address.into_array(),
-            balances,
-            nonces,
-            executed_input_count: self.executed_input_count,
-        }
-        .as_ssz_bytes()
-    }
-
-    /// Decode SSZ-encoded snapshot bytes into a fresh `WalletApp`.
-    ///
-    /// Rejects snapshots containing duplicate addresses in `balances` or
-    /// `nonces`. Without this check, multiple distinct byte sequences
-    /// could decode to the same logical state (whichever entry came
-    /// last in the encoded list would win silently), breaking the
-    /// canonicality the watchdog relies on for byte-for-byte comparison.
-    fn from_snapshot_bytes(bytes: &[u8]) -> Result<Self, AppError> {
-        let decoded = WalletSnapshotV1::from_ssz_bytes(bytes).map_err(|e| AppError::Internal {
-            // ssz::DecodeError doesn't implement Display, so Debug is the
-            // only way to surface variant info as a string. If downstream
-            // needs to match on decode kinds programmatically, introduce a
-            // dedicated AppError variant that carries the typed error
-            // instead of fixing the format string.
-            reason: format!("snapshot decode failed: {e:?}"),
-        })?;
-
-        let mut balances = HashMap::with_capacity(decoded.balances.len());
-        for entry in decoded.balances {
-            let address = Address::from(entry.address);
-            let balance = U256::from_be_bytes(entry.balance_be);
-            if balances.insert(address, balance).is_some() {
-                return Err(AppError::Internal {
-                    reason: format!("snapshot contains duplicate balance entry for {address}"),
-                });
-            }
-        }
-
-        let mut nonces = HashMap::with_capacity(decoded.nonces.len());
-        for entry in decoded.nonces {
-            let address = Address::from(entry.address);
-            if nonces.insert(address, entry.nonce).is_some() {
-                return Err(AppError::Internal {
-                    reason: format!("snapshot contains duplicate nonce entry for {address}"),
-                });
-            }
-        }
-
-        Ok(Self {
-            config: WalletConfig {
-                erc20_portal_address: Address::from(decoded.erc20_portal_address),
-                supported_erc20_token: Address::from(decoded.supported_erc20_token),
-                sequencer_address: Address::from(decoded.sequencer_address),
-            },
-            balances,
-            nonces,
-            executed_input_count: decoded.executed_input_count,
-        })
     }
 
     fn state_json(&self) -> String {
@@ -402,7 +332,11 @@ impl Application for WalletApp {
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
         let state_path = Self::state_file_in_dump(prefix);
         let bytes = std::fs::read(&state_path)?;
-        Self::from_snapshot_bytes(&bytes)
+        crate::wallet_snapshot::decode(&bytes)
+    }
+
+    fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError> {
+        Ok(crate::wallet_snapshot::encode(self))
     }
 
     fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
@@ -411,7 +345,7 @@ impl Application for WalletApp {
         // unique per call; a collision means a lane bug worth surfacing
         // loudly rather than silently overwriting prior state.
         std::fs::create_dir(prefix)?;
-        let bytes = self.snapshot_bytes();
+        let bytes = crate::wallet_snapshot::encode(self);
 
         let state_path = Self::state_file_in_dump(prefix);
         let mut file = std::fs::File::create(&state_path)?;
@@ -451,8 +385,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::wallet_snapshot::{SnapshotBalance, SnapshotNonce, WalletSnapshotV1};
     use alloy_primitives::{Address, U256, address};
-    use ssz_derive::{Decode, Encode};
+    use ssz::Encode as SszEncodeTrait;
+    use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
     use types::ERC20_DEPOSIT_PREFIX_BYTES;
     use types::Erc20Transfer;
     use types::alloy_sol_types::SolCall;
@@ -523,24 +459,24 @@ mod tests {
         assert_eq!(app.current_user_balance(recipient), U256::ZERO);
     }
 
-    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
+    #[derive(PartialEq, Debug, SszEncode, SszDecode, Clone)]
     struct LegacyDeposit {
         amount: U256,
         to: Address,
     }
 
-    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
+    #[derive(PartialEq, Debug, SszEncode, SszDecode, Clone)]
     struct LegacyWithdrawal {
         amount: U256,
     }
 
-    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
+    #[derive(PartialEq, Debug, SszEncode, SszDecode, Clone)]
     struct LegacyTransfer {
         amount: U256,
         to: Address,
     }
 
-    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
+    #[derive(PartialEq, Debug, SszEncode, SszDecode, Clone)]
     #[ssz(enum_behaviour = "union")]
     enum LegacyMethod {
         Withdrawal(LegacyWithdrawal),
@@ -566,7 +502,7 @@ mod tests {
         let valid = ValidUserOp {
             sender,
             fee: 0,
-            data: ssz::Encode::as_ssz_bytes(&legacy),
+            data: SszEncodeTrait::as_ssz_bytes(&legacy),
         };
 
         let outputs = app
@@ -880,6 +816,16 @@ mod tests {
     }
 
     #[test]
+    fn create_dump_state_file_matches_canonical_encode() {
+        let app = WalletApp::new(WalletConfig::default());
+        let prefix = temp_dump_prefix();
+        app.create_dump(&prefix).expect("create dump");
+        let on_disk = std::fs::read(WalletApp::state_file_in_dump(&prefix)).expect("read state");
+        WalletApp::delete_dump(&prefix).expect("cleanup");
+        assert_eq!(on_disk, crate::wallet_snapshot::encode(&app));
+    }
+
+    #[test]
     fn create_dump_produces_deterministic_bytes() {
         // Insert in scrambled order so the HashMap's non-deterministic
         // iteration order is exercised. The encoder must sort to make
@@ -946,16 +892,16 @@ mod tests {
         // The encoder never produces this, but the decoder must reject it
         // to keep snapshot bytes canonical: without this check, multiple
         // distinct byte sequences could decode to the same logical state.
-        let snapshot = super::WalletSnapshotV1 {
+        let snapshot = WalletSnapshotV1 {
             erc20_portal_address: [0; 20],
             supported_erc20_token: [0; 20],
             sequencer_address: [0; 20],
             balances: vec![
-                super::SnapshotBalance {
+                SnapshotBalance {
                     address: [1; 20],
                     balance_be: [0; 32],
                 },
-                super::SnapshotBalance {
+                SnapshotBalance {
                     address: [1; 20],
                     balance_be: [0; 32],
                 },
@@ -966,7 +912,7 @@ mod tests {
         let bytes = ssz::Encode::as_ssz_bytes(&snapshot);
 
         let err =
-            WalletApp::from_snapshot_bytes(&bytes).expect_err("duplicate balance should reject");
+            crate::wallet_snapshot::decode(&bytes).expect_err("duplicate balance should reject");
         match err {
             AppError::Internal { reason } => assert!(
                 reason.contains("duplicate balance"),
@@ -978,17 +924,17 @@ mod tests {
 
     #[test]
     fn from_snapshot_bytes_rejects_duplicate_nonce_addresses() {
-        let snapshot = super::WalletSnapshotV1 {
+        let snapshot = WalletSnapshotV1 {
             erc20_portal_address: [0; 20],
             supported_erc20_token: [0; 20],
             sequencer_address: [0; 20],
             balances: vec![],
             nonces: vec![
-                super::SnapshotNonce {
+                SnapshotNonce {
                     address: [1; 20],
                     nonce: 0,
                 },
-                super::SnapshotNonce {
+                SnapshotNonce {
                     address: [1; 20],
                     nonce: 1,
                 },
@@ -998,7 +944,7 @@ mod tests {
         let bytes = ssz::Encode::as_ssz_bytes(&snapshot);
 
         let err =
-            WalletApp::from_snapshot_bytes(&bytes).expect_err("duplicate nonce should reject");
+            crate::wallet_snapshot::decode(&bytes).expect_err("duplicate nonce should reject");
         match err {
             AppError::Internal { reason } => assert!(
                 reason.contains("duplicate nonce"),

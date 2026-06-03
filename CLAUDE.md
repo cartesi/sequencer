@@ -56,3 +56,5 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 - **[`docs/threat-model/README.md`](docs/threat-model/README.md)** — trust boundaries and in-scope threats.
 - **[`docs/recovery/README.md`](docs/recovery/README.md)** — preemptive recovery design + TLA+ proofs.
 - **[`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md)** — snapshot lifecycle design + invariants (take/promote/GC, crash-safety). Read before touching the inclusion lane's safe-frontier/snapshot path.
+- **[`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md)** — watchdog on live L1 (Sepolia / mainnet, production-like).
+- **[`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md)** — local dev: watchdog + `sequencer-devnet` on Anvil.

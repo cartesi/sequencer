@@ -9,8 +9,13 @@ repository.workspace = true
 readme.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "devnet-stack"
+path = "src/bin/devnet_stack.rs"
+
 [dependencies]
 rollups-harness = { path = "../harness" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 app-core = { path = "../../examples/app-core" }
 sequencer-core = { path = "../../sequencer-core" }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
@@ -19,6 +24,6 @@ alloy-sol-types = "1.4.1"
 futures = "0.3"
 libtest-mimic = "0.6.1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net", "process", "io-util"] }
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net", "process", "io-util", "signal"] }
 serde_json = "1.0"
 tempfile = "3.10"
