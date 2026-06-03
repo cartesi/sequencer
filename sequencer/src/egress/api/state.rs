@@ -1,13 +1,12 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Egress-side axum state for WS subscribe, `GET /get_state`, and health probes.
+//! Egress-side axum state for WS subscribe and health probes.
 
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::egress::app_state::StateSnapshotProvider;
 use crate::egress::l2_tx_feed::L2TxFeed;
 use crate::http::ApiError;
 use crate::runtime::shutdown::ShutdownSignal;
@@ -18,22 +17,6 @@ pub(crate) struct SubscribeState {
     pub ws_subscriber_limit: Arc<Semaphore>,
     pub ws_max_catchup_events: u64,
     pub tx_feed: L2TxFeed,
-}
-
-#[derive(Clone)]
-pub(crate) struct GetStateState {
-    pub shutdown: ShutdownSignal,
-    pub snapshotter: Arc<dyn StateSnapshotProvider>,
-}
-
-impl GetStateState {
-    pub(crate) fn reject_if_shutting_down(&self) -> Result<(), ApiError> {
-        if self.shutdown.is_shutdown_requested() {
-            Err(ApiError::unavailable("sequencer shutting down"))
-        } else {
-            Ok(())
-        }
-    }
 }
 
 impl SubscribeState {

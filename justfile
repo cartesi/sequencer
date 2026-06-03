@@ -24,13 +24,19 @@ test-watchdog-webhook-drill: watchdog-lua-deps
     WATCHDOG_LUA_DEPS={{justfile_directory()}}/.deps/lua lua watchdog/tests/drill_webhook.lua
     WATCHDOG_LUA_DEPS={{justfile_directory()}}/.deps/lua lua watchdog/tests/drill_divergence.lua
 
-# Build lua-cjson into .deps/lua (for compare harness / drills without system packages).
+# Build lcurl (lua-cURLv3) into .deps/lua; JSON is pure Lua under watchdog/third_party/.
 watchdog-lua-deps:
     @bash scripts/watchdog-lua-deps.sh
 
+# Anvil + rollups + sequencer-devnet; prints WATCHDOG_* exports until Ctrl+C.
+devnet-for-watchdog: setup ensure-machine-image
+    cargo build -p sequencer --bin sequencer-devnet
+    cargo build -p rollups-e2e --bin devnet-stack
+    cargo run -p rollups-e2e --bin devnet-stack
+
 test-watchdog-compare-harness: setup watchdog-lua-deps ensure-machine-image
-    cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e
-    RUN_WATCHDOG_E2E=1 cargo run -p rollups-e2e -- watchdog_genesis_compare_test --exact --nocapture
+    cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e --bin rollups-e2e
+    RUN_WATCHDOG_E2E=1 cargo run -p rollups-e2e --bin rollups-e2e -- watchdog_genesis_compare_test --exact --nocapture
 
 # Run sequencer tests sequentially so partition static config (init) is not shared across parallel tests.
 test-sequencer:
@@ -40,8 +46,8 @@ test-sequencer:
     cargo test -p sequencer --test batch_submitter_integration -- --test-threads=1
 
 test-rollups-e2e: setup ensure-machine-image
-    cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e
-    cargo run -p rollups-e2e
+    cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e --bin rollups-e2e
+    cargo run -p rollups-e2e --bin rollups-e2e
 
 ensure-machine-image:
     @test -d examples/canonical-app/out/canonical-machine-image || just canonical-build-machine-image

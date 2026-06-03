@@ -9,11 +9,11 @@ local checkpoint = require("watchdog.checkpoint")
 local compare = require("watchdog.compare")
 local config = require("watchdog.config")
 local jsonrpc = require("watchdog.jsonrpc")
-local l1 = require("watchdog.l1")
+local l1_reader = require("watchdog.l1_reader")
 local machine_cli = require("watchdog.machine_cli")
 local retry = require("watchdog.retry")
 local runner = require("watchdog.runner")
-local sequencer = require("watchdog.sequencer")
+local sequencer_reader = require("watchdog.sequencer_reader")
 
 local tests = {}
 
@@ -49,37 +49,112 @@ test("sorts logs in L1 order", function()
         { blockNumber = "0x1", transactionIndex = "0x9", logIndex = "0x0" },
         { blockNumber = "0x2", transactionIndex = "0x0", logIndex = "0x1" },
     }
-    l1.sort_logs(logs)
+    l1_reader.sort_logs(logs)
     assert_eq(logs[1].blockNumber, "0x1")
     assert_eq(logs[2].logIndex, "0x1")
     assert_eq(logs[3].logIndex, "0x5")
 end)
 
-test("partitions long block range errors", function()
-    local calls = {}
-    local rpc = {}
-    function rpc.get_logs(_self, filter)
-        table.insert(calls, { filter.from_block, filter.to_block, filter.input_added_topic })
-        if filter.from_block == 1 and filter.to_block == 4 then
-            return nil, "RPC error -32005: query returned more than allowed"
-        end
-        return {}
+local function load_partition_vector()
+    local json = require("watchdog.json").new()
+    local path = "tests/fixtures/l1_partition_vector.json"
+    local file, err = io.open(path, "rb")
+    if not file then
+        error("open " .. path .. ": " .. tostring(err))
+    end
+    local body = file:read("*a")
+    file:close()
+    return json.decode(body)
+end
+
+local function fail_lookup(fail_ranges)
+    local map = {}
+    for _, entry in ipairs(fail_ranges) do
+        map[entry.from .. ":" .. entry.to] = entry.message
+    end
+    return map
+end
+
+local function load_wallet_snapshot_hex_fixture()
+    local path = "tests/fixtures/wallet_snapshot_v1_empty.hex"
+    local file, err = io.open(path, "rb")
+    if not file then
+        error("open " .. path .. ": " .. tostring(err))
+    end
+    local hex = file:read("*a"):gsub("%s+", "")
+    file:close()
+    local bytes = {}
+    for i = 1, #hex, 2 do
+        table.insert(bytes, string.char(tonumber(hex:sub(i, i + 1), 16)))
+    end
+    return table.concat(bytes)
+end
+
+test("wallet SSZ golden fixture loads for cross-stack parity", function()
+    local bytes = load_wallet_snapshot_hex_fixture()
+    assert(#bytes > 0, "golden fixture must not be empty")
+    -- Fixed prefix from WalletSnapshotV1 default config (see wallet_snapshot.rs tests).
+    assert_eq(bytes:byte(1), 0xac)
+    assert_eq(bytes:byte(2), 0xa6)
+end)
+
+test("shared partition vector matches l1_reader bisect plan", function()
+    local vector = load_partition_vector()
+    local codes = vector.long_block_range_error_codes
+
+    local defaults = l1_reader.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
+    assert_eq(#codes, #defaults)
+    for i, code in ipairs(codes) do
+        assert_eq(code, defaults[i])
     end
 
-    local logs, err = l1.fetch_logs_partitioned(rpc, {
-        start_block = 1,
-        end_block = 4,
-        input_box_address = "0xinputbox",
-        app_address = "0x1111111111111111111111111111111111111111",
-    })
+    for _, scenario in ipairs(vector.scenarios) do
+        local calls = {}
+        local fails = fail_lookup(scenario.fail_ranges)
+        local rpc = {}
+        function rpc.get_logs(_self, filter)
+            table.insert(calls, { filter.from_block, filter.to_block })
+            local message = fails[filter.from_block .. ":" .. filter.to_block]
+            if message then
+                return nil, message
+            end
+            return {}
+        end
 
-    assert(logs, err)
-    assert_eq(#calls, 3)
-    assert_eq(calls[2][1], 1)
-    assert_eq(calls[2][2], 2)
-    assert_eq(calls[3][1], 3)
-    assert_eq(calls[3][2], 4)
-    assert_eq(calls[3][3], l1.INPUT_ADDED_TOPIC)
+        local logs, err = l1_reader.fetch_logs_partitioned(rpc, {
+            start_block = scenario.start_block,
+            end_block = scenario.end_block,
+            input_box_address = "0xinputbox",
+            app_address = "0x1111111111111111111111111111111111111111",
+            long_block_range_error_codes = codes,
+        })
+
+        if scenario.expect_ok then
+            assert(logs, scenario.name .. ": " .. tostring(err))
+        else
+            assert_eq(logs, nil, scenario.name)
+            assert(type(err) == "string", scenario.name)
+        end
+
+        assert_eq(#calls, #scenario.expect_calls, scenario.name .. " call count")
+        for i, expected in ipairs(scenario.expect_calls) do
+            assert_eq(calls[i][1], expected[1], scenario.name .. " call " .. i .. " from")
+            assert_eq(calls[i][2], expected[2], scenario.name .. " call " .. i .. " to")
+        end
+    end
+end)
+
+test("shared log sort vector matches l1_reader.sort_logs", function()
+    local vector = load_partition_vector()
+    local logs = vector.log_sort.unsorted
+    l1_reader.sort_logs(logs)
+
+    for i, expected in ipairs(vector.log_sort.expect_block_order) do
+        assert_eq(logs[i].blockNumber, expected, "block order at " .. i)
+    end
+    for i, expected in ipairs(vector.log_sort.expect_log_index_order) do
+        assert_eq(logs[i].logIndex, expected, "log index order at " .. i)
+    end
 end)
 
 test("jsonrpc get_logs builds InputAdded app filter", function()
@@ -107,7 +182,7 @@ test("jsonrpc get_logs builds InputAdded app filter", function()
         app_address = "0x1111111111111111111111111111111111111111",
         from_block = 10,
         to_block = 12,
-        input_added_topic = l1.INPUT_ADDED_TOPIC,
+        input_added_topic = l1_reader.INPUT_ADDED_TOPIC,
     })
 
     assert(logs, err)
@@ -118,7 +193,7 @@ test("jsonrpc get_logs builds InputAdded app filter", function()
     assert_eq(filter.fromBlock, "0xa")
     assert_eq(filter.toBlock, "0xc")
     assert_eq(filter.address, "0x9999999999999999999999999999999999999999")
-    assert_eq(filter.topics[1], l1.INPUT_ADDED_TOPIC)
+    assert_eq(filter.topics[1], l1_reader.INPUT_ADDED_TOPIC)
     assert_eq(
         filter.topics[2],
         "0x0000000000000000000000001111111111111111111111111111111111111111"
@@ -195,7 +270,7 @@ local function fake_cfg()
         input_box_address = "0xinputbox",
         app_address = "0x1111111111111111111111111111111111111111",
         input_added_topic = "0xtopic",
-        long_block_range_error_codes = l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
+        long_block_range_error_codes = l1_reader.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
     }
 end
 
@@ -204,20 +279,32 @@ local function fake_machine(inspect_state)
         loaded_path = nil,
         fed_inputs = nil,
     }
-    function machine:load(path)
+    function machine:load(path, reference_block)
         self.loaded_path = path
-        return { path = path }
+        return { path = path, reference_block = reference_block or 0 }
     end
-    function machine:feed_inputs(_instance, inputs)
+    function machine:advance(_instance, inputs, range)
         self.fed_inputs = inputs
+        _instance.reference_block = range.to_block
         return true
     end
-    function machine.inspect_state(_self, _instance)
+    function machine:inspect(_self, _instance)
         return inspect_state
     end
-    function machine:save(_instance, snapshot_dir)
+    function machine:dump(_instance, snapshot_dir, reference_block)
         self.saved_snapshot_dir = snapshot_dir
+        _instance.reference_block = reference_block
         return true
+    end
+    function machine:feed_inputs(instance, inputs)
+        local from = (instance.reference_block or 0) + 1
+        return self:advance(instance, inputs, { from_block = from, to_block = from })
+    end
+    function machine:inspect_state(_self, instance)
+        return self:inspect(_self, instance)
+    end
+    function machine:save(instance, snapshot_dir)
+        return self:dump(instance, snapshot_dir, instance.reference_block)
     end
     return machine
 end
@@ -246,9 +333,13 @@ test("runner happy path replays inputs and writes checkpoint", function()
     local result, err = runner.run_once(fake_cfg(), {
         checkpoint = checkpoint_mod,
         sequencer = {
-            get_state = function()
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 12, l2_tx_index = 0 }
+            end,
+            get_finalized_state = function()
                 return {
-                    safe_block = 12,
+                    inclusion_block = 12,
+                    l2_tx_index = 0,
                     state = '{"ok":true}',
                 }
             end,
@@ -280,14 +371,20 @@ test("runner alarms on raw state mismatch", function()
             end,
         },
         sequencer = {
-            get_state = function()
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 2, l2_tx_index = 0 }
+            end,
+            get_finalized_state = function()
                 return {
-                    safe_block = 1,
+                    inclusion_block = 2,
+                    l2_tx_index = 0,
                     state = '{"a":1}',
                 }
             end,
         },
-        fetch_inputs = function()
+        fetch_inputs = function(from_block, to_block)
+            assert_eq(from_block, 2)
+            assert_eq(to_block, 2)
             return {}
         end,
         machine = fake_machine('{ "a": 1 }'),
@@ -304,7 +401,36 @@ test("runner alarms on raw state mismatch", function()
     assert_eq(alarms[1].kind, "state_mismatch")
 end)
 
-test("runner alarms on sequencer safe block regression", function()
+test("runner skips compare cycle when finalized inclusion_block is unchanged", function()
+    local machine = fake_machine('{"ok":true}')
+    local result, err = runner.run_once(fake_cfg(), {
+        checkpoint = {
+            load = function(_dir)
+                return { snapshot_dir = "/tmp/snapshot", safe_block = 5 }
+            end,
+        },
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 5, l2_tx_index = 0 }
+            end,
+            get_finalized_state = function()
+                error("get_finalized_state must not run when inclusion_block is unchanged")
+            end,
+        },
+        fetch_inputs = function()
+            error("fetch_inputs must not run when inclusion_block is unchanged")
+        end,
+        machine = machine,
+    })
+
+    assert(result, err)
+    assert_eq(result.skipped, true)
+    assert_eq(result.skip_reason, "finalized_unchanged")
+    assert_eq(result.safe_block, 5)
+    assert_eq(machine.fed_inputs, nil)
+end)
+
+test("runner alarms on sequencer inclusion_block regression", function()
     local alarms = {}
     local result, err = runner.run_once(fake_cfg(), {
         checkpoint = {
@@ -313,9 +439,13 @@ test("runner alarms on sequencer safe block regression", function()
             end,
         },
         sequencer = {
-            get_state = function()
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 4, l2_tx_index = 0 }
+            end,
+            get_finalized_state = function()
                 return {
-                    safe_block = 4,
+                    inclusion_block = 4,
+                    l2_tx_index = 0,
                     state = "{}",
                 }
             end,
@@ -329,40 +459,68 @@ test("runner alarms on sequencer safe block regression", function()
 
     assert_eq(result, nil)
     assert(type(err) == "table", "expected regression payload")
-    assert_eq(err.kind, "safe_block_regressed")
+    assert_eq(err.kind, "inclusion_block_regressed")
     assert_eq(#alarms, 1)
 end)
 
-test("sequencer client validates generic state response", function()
+test("sequencer client reads finalized inclusion_block", function()
     local http = {}
     function http.get(_self, url)
-        assert_eq(url, "http://sequencer/get_state")
+        assert_eq(url, "http://sequencer/finalized_state/inclusion_block")
         return {
             status = 200,
-            body = "body",
+            body = '{"inclusion_block":7,"l2_tx_index":3}',
+            headers = {},
+        }
+    end
+    local json = {}
+    function json.decode(body)
+        return {
+            inclusion_block = 7,
+            l2_tx_index = 3,
+        }
+    end
+
+    local client = sequencer_reader.new(http, json, "http://sequencer/")
+    local head, err = client:get_finalized_inclusion_block()
+    assert(head, err)
+    assert_eq(head.inclusion_block, 7)
+    assert_eq(head.l2_tx_index, 3)
+end)
+
+test("sequencer client reads finalized SSZ body and headers", function()
+    local http = {}
+    function http.get(_self, url, _headers)
+        assert_eq(url, "http://sequencer/finalized_state")
+        return {
+            status = 200,
+            body = "raw-state",
+            headers = {
+                ["x-inclusion-block"] = "9",
+                ["x-l2-tx-index"] = "1",
+            },
         }
     end
     local json = {}
     function json.decode(_body)
-        return {
-            safe_block = 7,
-            state = "raw-state",
-        }
+        error("unexpected JSON decode for finalized_state body")
     end
 
-    local client = sequencer.new(http, json, "http://sequencer/")
-    local state, err = client:get_state()
+    local client = sequencer_reader.new(http, json, "http://sequencer")
+    local state, err = client:get_finalized_state()
     assert(state, err)
-    assert_eq(state.safe_block, 7)
+    assert_eq(state.inclusion_block, 9)
+    assert_eq(state.l2_tx_index, 1)
     assert_eq(state.state, "raw-state")
 end)
 
-test("sequencer client rejects invalid JSON", function()
+test("sequencer client rejects invalid inclusion_block JSON", function()
     local http = {}
     function http.get(_self, _url)
         return {
             status = 200,
             body = "not-json",
+            headers = {},
         }
     end
     local json = {}
@@ -370,10 +528,10 @@ test("sequencer client rejects invalid JSON", function()
         error("decode failed")
     end
 
-    local client = sequencer.new(http, json, "http://sequencer")
-    local state, err = client:get_state()
-    assert_eq(state, nil)
-    assert_eq(err, "invalid get_state response JSON")
+    local client = sequencer_reader.new(http, json, "http://sequencer")
+    local head, err = client:get_finalized_inclusion_block()
+    assert_eq(head, nil)
+    assert_eq(err, "invalid finalized inclusion_block response JSON")
 end)
 
 test("advance runner fetches inputs and saves checkpoint without sequencer", function()

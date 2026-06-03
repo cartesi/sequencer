@@ -186,8 +186,16 @@ pub trait Application: Send + Sized {
     /// loading the dump or instantiating the Application.
     fn state_file_in_dump(prefix: &Path) -> PathBuf;
 
-    /// Human-readable state for `GET /get_state` and CM inspect (watchdog
-    /// dev path). Canonical dumps use SSZ via [`Application::create_dump`].
+    /// Deterministic canonical state bytes (SSZ for the toy wallet). Used by
+    /// CM `inspect_state` and the watchdog's `/finalized_state` compare.
+    /// Default: not implemented.
+    fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError> {
+        Err(AppError::Internal {
+            reason: "canonical snapshot bytes are not implemented".to_string(),
+        })
+    }
+
+    /// Optional human-readable JSON for debugging only (not loaded on recovery).
     fn export_state(&self) -> Result<String, AppError> {
         Err(AppError::Internal {
             reason: "application state export is not implemented".to_string(),

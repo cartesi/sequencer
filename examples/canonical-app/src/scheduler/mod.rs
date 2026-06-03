@@ -172,10 +172,7 @@ mod tests {
             code: -22,
         });
         let (rollup, reports) = MockRollup::with_inputs(vec![Ok(inspect), terminal_err]);
-        let expected = WalletApp::new(WalletConfig::default())
-            .export_state()
-            .expect("export state")
-            .into_bytes();
+        let expected = app_core::wallet_snapshot::encode(&WalletApp::new(WalletConfig::default()));
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_scheduler_forever(

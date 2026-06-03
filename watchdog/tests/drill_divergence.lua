@@ -44,7 +44,7 @@ local payload = {
 log.banner("divergence-webhook-drill")
 log.step("divergence-webhook-drill", 1, 1, "POST state_mismatch payload (synthetic bytes)")
 
-local http = http_mod.new_auto()
+local http = http_mod.new()
 local ok, err = alarm.send_webhook(http, webhook_url, payload)
 if not ok then
     log.fail("divergence-webhook-drill", err)

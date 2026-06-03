@@ -3,11 +3,11 @@
 
 local abi = require("watchdog.abi")
 
-local l1 = {}
+local l1_reader = {}
 
-l1.INPUT_ADDED_TOPIC = "0xc05d337121a6e8605c6ec0b72aa29c4210ffe6e5b9cefdd6a7058188a8f66f98"
+l1_reader.INPUT_ADDED_TOPIC = "0xc05d337121a6e8605c6ec0b72aa29c4210ffe6e5b9cefdd6a7058188a8f66f98"
 
-l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES = {
+l1_reader.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES = {
     "-32005",
     "-32600",
     "-32602",
@@ -42,7 +42,7 @@ local function log_order_key(log)
     }
 end
 
-function l1.sort_logs(logs)
+function l1_reader.sort_logs(logs)
     table.sort(logs, function(a, b)
         local ak = log_order_key(a)
         local bk = log_order_key(b)
@@ -57,14 +57,14 @@ function l1.sort_logs(logs)
     return logs
 end
 
-function l1.fetch_logs_partitioned(rpc, params)
+function l1_reader.fetch_logs_partitioned(rpc, params)
     assert(type(rpc) == "table" and type(rpc.get_logs) == "function", "rpc.get_logs is required")
     assert(type(params) == "table", "params are required")
 
     local start_block = assert(params.start_block, "start_block is required")
     local end_block = assert(params.end_block, "end_block is required")
-    local codes = params.long_block_range_error_codes or l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
-    local input_added_topic = params.input_added_topic or l1.INPUT_ADDED_TOPIC
+    local codes = params.long_block_range_error_codes or l1_reader.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
+    local input_added_topic = params.input_added_topic or l1_reader.INPUT_ADDED_TOPIC
 
     local function go(from_block, to_block)
         local logs, err = rpc:get_logs({
@@ -105,10 +105,10 @@ function l1.fetch_logs_partitioned(rpc, params)
     if not logs then
         return nil, err
     end
-    return l1.sort_logs(logs)
+    return l1_reader.sort_logs(logs)
 end
 
-function l1.decode_and_validate_log(log)
+function l1_reader.decode_and_validate_log(log)
     local decoded = abi.decode_input_added_log(log)
     local block_number = hex_quantity_to_number(log.blockNumber, "blockNumber")
     if decoded.block_number ~= block_number then
@@ -121,17 +121,17 @@ function l1.decode_and_validate_log(log)
     return decoded
 end
 
-function l1.fetch_inputs(rpc, params)
-    local logs, err = l1.fetch_logs_partitioned(rpc, params)
+function l1_reader.fetch_inputs(rpc, params)
+    local logs, err = l1_reader.fetch_logs_partitioned(rpc, params)
     if not logs then
         return nil, err
     end
 
     local inputs = {}
     for _, log in ipairs(logs) do
-        table.insert(inputs, l1.decode_and_validate_log(log))
+        table.insert(inputs, l1_reader.decode_and_validate_log(log))
     end
     return inputs
 end
 
-return l1
+return l1_reader

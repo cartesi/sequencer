@@ -89,17 +89,230 @@ pub fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) 
     codes.iter().any(|c| error_message.contains(c))
 }
 
+/// Simulates partitioned `eth_getLogs` bisect (same rules as `watchdog/l1_reader.lua`).
+/// `get_logs` returns `Ok` for a successful leaf query or `Err(message)` on RPC failure.
+/// Records every attempted `(from_block, to_block)` in call order.
+pub fn simulate_partitioned_get_logs<F>(
+    start_block: u64,
+    end_block: u64,
+    long_block_range_error_codes: &[String],
+    mut get_logs: F,
+) -> (Vec<(u64, u64)>, Result<(), String>)
+where
+    F: FnMut(u64, u64) -> Result<(), String>,
+{
+    if end_block < start_block {
+        return (Vec::new(), Ok(()));
+    }
+
+    fn go<F>(
+        start_block: u64,
+        end_block: u64,
+        long_block_range_error_codes: &[String],
+        get_logs: &mut F,
+        calls: &mut Vec<(u64, u64)>,
+    ) -> Result<(), String>
+    where
+        F: FnMut(u64, u64) -> Result<(), String>,
+    {
+        calls.push((start_block, end_block));
+        match get_logs(start_block, end_block) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if start_block < end_block
+                    && error_message_matches_retry_codes(&err, long_block_range_error_codes)
+                {
+                    let middle = start_block + (end_block - start_block) / 2;
+                    go(
+                        start_block,
+                        middle,
+                        long_block_range_error_codes,
+                        get_logs,
+                        calls,
+                    )?;
+                    go(
+                        middle + 1,
+                        end_block,
+                        long_block_range_error_codes,
+                        get_logs,
+                        calls,
+                    )?;
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    let mut calls = Vec::new();
+    let result = go(
+        start_block,
+        end_block,
+        long_block_range_error_codes,
+        &mut get_logs,
+        &mut calls,
+    );
+    (calls, result)
+}
+
+/// Total order for merged logs (block, tx index, log index) — matches Lua `sort_logs`.
+pub fn sort_logs_by_l1_order<T, FBlock, FTx, FLog>(
+    logs: &mut [T],
+    block: FBlock,
+    tx_index: FTx,
+    log_index: FLog,
+) where
+    FBlock: Fn(&T) -> u64,
+    FTx: Fn(&T) -> u64,
+    FLog: Fn(&T) -> u64,
+{
+    logs.sort_by(|a, b| {
+        block(a)
+            .cmp(&block(b))
+            .then_with(|| tx_index(a).cmp(&tx_index(b)))
+            .then_with(|| log_index(a).cmp(&log_index(b)))
+    });
+}
+
 pub fn decode_evm_advance_input(input: &[u8]) -> Result<EvmAdvanceCall, String> {
     EvmAdvanceCall::abi_decode(input).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use alloy_primitives::{U256, address};
     use alloy_sol_types::SolCall;
     use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
+    use serde::Deserialize;
 
-    use super::{decode_evm_advance_input, error_message_matches_retry_codes};
+    use super::{
+        DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES, decode_evm_advance_input,
+        error_message_matches_retry_codes, simulate_partitioned_get_logs, sort_logs_by_l1_order,
+    };
+
+    const PARTITION_VECTOR: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/fixtures/l1_partition_vector.json"
+    ));
+
+    #[derive(Debug, Deserialize)]
+    struct FailRange {
+        from: u64,
+        to: u64,
+        message: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PartitionScenario {
+        name: String,
+        start_block: u64,
+        end_block: u64,
+        fail_ranges: Vec<FailRange>,
+        expect_calls: Vec<[u64; 2]>,
+        expect_ok: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LogSortFixture {
+        unsorted: Vec<LogSortEntry>,
+        expect_block_order: Vec<String>,
+        expect_log_index_order: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LogSortEntry {
+        #[serde(rename = "blockNumber")]
+        block_number: String,
+        #[serde(rename = "transactionIndex", default)]
+        transaction_index: String,
+        #[serde(rename = "logIndex", default)]
+        log_index: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PartitionVector {
+        long_block_range_error_codes: Vec<String>,
+        scenarios: Vec<PartitionScenario>,
+        log_sort: LogSortFixture,
+    }
+
+    fn load_partition_vector() -> PartitionVector {
+        serde_json::from_str(PARTITION_VECTOR).expect("parse l1_partition_vector.json")
+    }
+
+    fn fail_map(fail_ranges: &[FailRange]) -> HashMap<(u64, u64), String> {
+        fail_ranges
+            .iter()
+            .map(|r| ((r.from, r.to), r.message.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn fixture_default_codes_match_rust_defaults() {
+        let vector = load_partition_vector();
+        let expected: Vec<String> = DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect();
+        assert_eq!(vector.long_block_range_error_codes, expected);
+    }
+
+    #[test]
+    fn partition_vector_simulation_matches_watchdog() {
+        let vector = load_partition_vector();
+        for scenario in vector.scenarios {
+            let fails = fail_map(&scenario.fail_ranges);
+            let codes = vector.long_block_range_error_codes.clone();
+            let (calls, result) = simulate_partitioned_get_logs(
+                scenario.start_block,
+                scenario.end_block,
+                &codes,
+                |from, to| {
+                    if let Some(message) = fails.get(&(from, to)) {
+                        Err(message.clone())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            let expected_calls: Vec<(u64, u64)> = scenario
+                .expect_calls
+                .iter()
+                .map(|pair| (pair[0], pair[1]))
+                .collect();
+            assert_eq!(calls, expected_calls, "scenario {}", scenario.name);
+            assert_eq!(
+                result.is_ok(),
+                scenario.expect_ok,
+                "scenario {}",
+                scenario.name
+            );
+        }
+    }
+
+    #[test]
+    fn log_sort_vector_matches_watchdog_order() {
+        let vector = load_partition_vector();
+        let mut logs = vector.log_sort.unsorted;
+        sort_logs_by_l1_order(
+            &mut logs,
+            |e| parse_hex_quantity(&e.block_number),
+            |e| parse_hex_quantity(&e.transaction_index),
+            |e| parse_hex_quantity(&e.log_index),
+        );
+        let blocks: Vec<String> = logs.iter().map(|e| e.block_number.clone()).collect();
+        let indices: Vec<String> = logs.iter().map(|e| e.log_index.clone()).collect();
+        assert_eq!(blocks, vector.log_sort.expect_block_order);
+        assert_eq!(indices, vector.log_sort.expect_log_index_order);
+    }
+
+    fn parse_hex_quantity(value: &str) -> u64 {
+        u64::from_str_radix(value.strip_prefix("0x").unwrap_or(value), 16).expect("hex quantity")
+    }
 
     #[test]
     fn error_message_matches_retry_codes_returns_true_when_message_contains_code() {

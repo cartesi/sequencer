@@ -7,6 +7,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use app_core::application::{WalletApp, WalletConfig};
+use app_core::wallet_snapshot;
 use rollups_harness::ManagedSequencer;
 use rollups_harness::paths;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,7 +18,6 @@ use tokio::process::Command;
 use crate::ScenarioResult;
 
 const MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
-const EMPTY_WALLET_STATE: &str = "{\"balances\":{},\"nonces\":{}}";
 const GENESIS_SAFE_BLOCK: &str = "0";
 
 pub async fn run_watchdog_genesis_compare_test(
@@ -37,33 +38,38 @@ pub async fn run_watchdog_genesis_compare_test(
         .into());
     }
 
-    eprintln!("[watchdog-harness] step 1/5: wait for sequencer GET /get_state (safe head)");
-    let get_state_url = format!("{}/get_state", runtime.endpoint());
-    let (_status, body) =
-        wait_for_get_state(get_state_url.as_str(), Duration::from_secs(30)).await?;
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|err| format!("invalid /get_state JSON: {err}; body={body}"))?;
-    let sequencer_state = parsed["state"]
-        .as_str()
-        .ok_or("get_state response missing state field")?;
-    let safe_block = parsed["safe_block"]
-        .as_u64()
-        .ok_or("get_state response missing safe_block field")?;
-    eprintln!("[watchdog-harness] sequencer safe_block={safe_block} state={sequencer_state}");
-    if sequencer_state != EMPTY_WALLET_STATE {
+    // `sequencer-devnet` uses `WalletConfig::devnet()` (not `default()` / Sepolia).
+    let expected_snapshot = wallet_snapshot::encode(&WalletApp::new(WalletConfig::devnet()));
+
+    eprintln!("[watchdog-harness] step 1/5: wait for sequencer GET /finalized_state");
+    let finalized_url = format!("{}/finalized_state", runtime.endpoint());
+    let (_status, body, headers) =
+        wait_for_finalized_state(finalized_url.as_str(), Duration::from_secs(30)).await?;
+    let inclusion_block = header_u64(&headers, "x-inclusion-block")
+        .ok_or("finalized_state response missing X-Inclusion-Block header")?;
+    eprintln!(
+        "[watchdog-harness] sequencer inclusion_block={inclusion_block} snapshot_bytes={}",
+        body.len()
+    );
+    if body.as_slice() != expected_snapshot.as_slice() {
         return Err(format!(
-            "expected genesis-empty wallet state {EMPTY_WALLET_STATE}, got {sequencer_state}"
+            "finalized_state bytes mismatch (len {} vs expected {})",
+            body.len(),
+            expected_snapshot.len()
         )
         .into());
     }
 
-    eprintln!("[watchdog-harness] step 2/5: prove CM inspect JSON on genesis image");
+    eprintln!("[watchdog-harness] step 2/5: prove CM inspect SSZ on genesis image");
     let inspect_state =
         prove_cm_inspect_genesis(workspace.as_path(), machine_image.as_path()).await?;
-    if inspect_state != EMPTY_WALLET_STATE {
-        return Err(
-            format!("CM inspect expected {EMPTY_WALLET_STATE}, got {inspect_state}").into(),
-        );
+    if inspect_state.as_slice() != expected_snapshot.as_slice() {
+        return Err(format!(
+            "CM inspect bytes mismatch (len {} vs expected {})",
+            inspect_state.len(),
+            expected_snapshot.len()
+        )
+        .into());
     }
 
     eprintln!("[watchdog-harness] step 3/5: prepare watchdog checkpoint dir");
@@ -105,7 +111,7 @@ pub async fn run_watchdog_genesis_compare_test(
 async fn prove_cm_inspect_genesis(
     workspace: &Path,
     machine_image: &Path,
-) -> ScenarioResult<String> {
+) -> ScenarioResult<Vec<u8>> {
     let work_dir = tempfile::tempdir().map_err(|err| format!("temp cm work dir: {err}"))?;
     let query_path = work_dir.path().join("inspect-query.bin");
     let report_path = work_dir.path().join("inspect-report-0.bin");
@@ -129,18 +135,30 @@ async fn prove_cm_inspect_genesis(
         return Err(format!("cartesi-machine inspect exited with {status}").into());
     }
 
-    let report = std::fs::read_to_string(report_path.as_path())
+    let report = std::fs::read(report_path.as_path())
         .map_err(|err| format!("read inspect report: {err}"))?;
-    if report.contains("inspect endpoint not implemented") {
+    if report.starts_with(b"inspect endpoint not implemented".as_slice())
+        || report.starts_with("inspect endpoint not implemented".as_bytes())
+    {
         return Err(
-            "CM dapp is stale (inspect not implemented); rebuild with just canonical-build-machine-image"
+            "CM dapp is stale (inspect not implemented); rebuild with: just canonical-build-machine-image"
                 .into(),
         );
+    }
+    // Pre-SSZ images returned JSON from export_state (~27 bytes for empty wallet).
+    if report.first() == Some(&b'{') {
+        return Err(format!(
+            "CM inspect returned JSON ({} bytes), expected SSZ; rebuild devnet image: \
+             just canonical-build-machine-image (report starts with {:?})",
+            report.len(),
+            String::from_utf8_lossy(&report[..report.len().min(40)])
+        )
+        .into());
     }
     Ok(report)
 }
 
-async fn http_get(url: &str) -> std::io::Result<(u16, String)> {
+async fn http_get(url: &str) -> std::io::Result<(u16, Vec<u8>, Vec<(String, String)>)> {
     let remainder = url.strip_prefix("http://").ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -159,30 +177,111 @@ async fn http_get(url: &str) -> std::io::Result<(u16, String)> {
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await?;
-    let text = String::from_utf8(raw).map_err(std::io::Error::other)?;
-    let (headers, body) = text
-        .split_once("\r\n\r\n")
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| std::io::Error::other("missing HTTP body"))?;
-    let status = headers
+    let header_bytes = &raw[..header_end];
+    let body_raw = raw[header_end + 4..].to_vec();
+    let header_text = std::str::from_utf8(header_bytes).map_err(std::io::Error::other)?;
+    let status = header_text
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
         .unwrap_or(500);
-    Ok((status, body.to_string()))
+    let header_pairs: Vec<(String, String)> = header_text
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(": "))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+        .collect();
+    let body = decode_response_body(&header_pairs, body_raw)?;
+    Ok((status, body, header_pairs))
 }
 
-async fn wait_for_get_state(url: &str, deadline: Duration) -> ScenarioResult<(u16, String)> {
+/// Axum streams snapshot files without `Content-Length`, so bodies are often
+/// `Transfer-Encoding: chunked`. Raw TCP clients must decode (lcurl does this
+/// automatically; this harness must too).
+fn decode_response_body(headers: &[(String, String)], body: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    let chunked = headers.iter().any(|(name, value)| {
+        name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
+    });
+    if chunked {
+        return decode_chunked_body(body.as_slice());
+    }
+    if let Some(len) = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+    {
+        let mut out = body;
+        out.truncate(len.min(out.len()));
+        return Ok(out);
+    }
+    Ok(body)
+}
+
+fn decode_chunked_body(mut input: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = input
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| std::io::Error::other("chunked body: missing size line"))?;
+        let size_line = std::str::from_utf8(&input[..line_end])
+            .map_err(std::io::Error::other)?
+            .trim_end_matches('\r');
+        let chunk_size = usize::from_str_radix(size_line, 16).map_err(std::io::Error::other)?;
+        input = &input[line_end + 1..];
+        if chunk_size == 0 {
+            break;
+        }
+        if input.len() < chunk_size + 2 {
+            return Err(std::io::Error::other("chunked body: truncated chunk"));
+        }
+        out.extend_from_slice(&input[..chunk_size]);
+        input = &input[chunk_size + 2..];
+    }
+    Ok(out)
+}
+
+fn body_snippet_for_error(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "(empty body)".to_string();
+    }
+    match std::str::from_utf8(body) {
+        Ok(text) if text.len() <= 512 => text.to_string(),
+        Ok(text) => format!("{}…", &text[..512.min(text.len())]),
+        Err(_) => format!("{} binary octets", body.len()),
+    }
+}
+
+fn header_u64(headers: &[(String, String)], name: &str) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .and_then(|(_, value)| value.parse().ok())
+}
+
+async fn wait_for_finalized_state(
+    url: &str,
+    deadline: Duration,
+) -> ScenarioResult<(u16, Vec<u8>, Vec<(String, String)>)> {
     let started = std::time::Instant::now();
     let mut last = String::new();
     while started.elapsed() < deadline {
         match http_get(url).await {
-            Ok((200, body)) => return Ok((200, body)),
-            Ok((503, body)) => {
-                last = body;
+            Ok((200, body, headers)) => return Ok((200, body, headers)),
+            Ok((404, body, _)) => {
+                last = body_snippet_for_error(body.as_slice());
             }
-            Ok((status, body)) => {
-                return Err(format!("GET /get_state returned HTTP {status}: {body}").into());
+            Ok((status, body, _)) => {
+                return Err(format!(
+                    "GET /finalized_state returned HTTP {status}: {}",
+                    body_snippet_for_error(body.as_slice())
+                )
+                .into());
             }
             Err(err) => {
                 last = err.to_string();
@@ -190,5 +289,5 @@ async fn wait_for_get_state(url: &str, deadline: Duration) -> ScenarioResult<(u1
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Err(format!("timed out waiting for GET /get_state 200; last response: {last}").into())
+    Err(format!("timed out waiting for GET /finalized_state 200; last response: {last}").into())
 }
