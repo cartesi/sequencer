@@ -1,6 +1,6 @@
 # Watchdog Staging Drills
 
-Operator drills for webhook delivery and divergence detection.
+Operator drills for divergence detection and compare-mode verification.
 
 - **Sepolia / mainnet:** [`operator-deployment.md`](operator-deployment.md). **Local dev:** [`getting-started.md`](getting-started.md).
 - Module map and local test recipes: [`README.md`](README.md).
@@ -9,42 +9,31 @@ This document covers staging and manual verification beyond the devnet tutorial.
 
 ## Prerequisites
 
+- **Release bundle (staging/production):** deploy `sequencer-watchdog-vX` and `canonical-machine-image-*-vX` from the same git tag; see [`release/README.md`](../../release/README.md).
 - Built canonical machine image: `just canonical-build-machine-image`
 - `cartesi-machine`, `lua`, and `curl` on PATH
 - `just watchdog-lua-deps` — builds `lcurl.so` into `.deps/lua` (libcurl + Lua headers on host)
 - JSON is pure Lua (`watchdog/third_party/json.lua`); no cjson compile step
 - Staging or local sequencer reachable at `WATCHDOG_SEQUENCER_URL`
 - L1 RPC + InputBox + app addresses matching that deployment
-- Webhook receiver URL (Slack incoming webhook, PagerDuty, or `https://httpbin.org/post` for smoke tests)
+- Log collection for `watchdog_event` lines and process exit codes
 
-## Drill 1 — Webhook delivery (no sequencer)
+## Drill 1 — Divergence signal (synthetic mismatch, no CM)
 
-Verifies the alarm transport reaches your receiver.
+Verifies the watchdog's signal contract (`watchdog_event` + exit code `2`) without a sequencer.
 
 ```bash
 just watchdog-lua-deps
-export WATCHDOG_WEBHOOK_URL="https://your-receiver.example/hook"
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_webhook.lua
-# or: just test-watchdog-webhook-drill
-```
-
-Expected: HTTP 2xx for both `state_mismatch` and `inclusion_block_regressed` sample payloads.
-Check the receiver shows JSON with `"kind"` and `"run_id"` fields.
-
-## Drill 2 — Divergence webhook (synthetic mismatch, no CM)
-
-Verifies the receiver gets a realistic `state_mismatch` payload without running compare mode:
-
-```bash
-export WATCHDOG_WEBHOOK_URL="https://your-receiver.example/hook"
 WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua
+# or: just test-watchdog-divergence-drill
 ```
 
-Expected: HTTP 2xx, receiver shows `kind=state_mismatch` and a non-zero `mismatch_offset`.
+Expected: a structured `watchdog_event` line containing `kind=state_mismatch` and non-zero
+`mismatch_offset`, then process exits with code `2`.
 
-Unit coverage: `just test-watchdog` (`runner alarms on raw state mismatch`).
+Unit coverage: `just test-watchdog` (`runner returns state mismatch payload`).
 
-## Drill 3 — Happy compare (local Anvil harness)
+## Drill 2 — Happy compare (local Anvil harness)
 
 Full stack: Anvil + devnet rollups + sequencer + CM inspect + `GET /finalized_state`.
 
@@ -53,7 +42,7 @@ just test-watchdog-compare-harness
 # equivalent:
 # just setup && just watchdog-lua-deps && just ensure-machine-image
 # cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e
-# RUN_WATCHDOG_E2E=1 cargo run -p rollups-e2e --bin rollups-e2e -- watchdog_genesis_compare_test --exact
+# cargo run -p rollups-e2e --bin rollups-e2e -- watchdog_genesis_compare_test --exact
 ```
 
 Or run the Lua compare pass manually after starting a devnet sequencer yourself:
@@ -75,19 +64,24 @@ Expected: exit 0, stdout `watchdog compare ok: safe_block=... input_count=...`, 
 byte-identical genesis SSZ state on sequencer `/finalized_state` and CM inspect
 (`tests/fixtures/wallet_snapshot_v1_empty.hex`).
 
-## Drill 4 — Production compare daemon
+## Drill 3 — Production compare daemon
 
 Run the watchdog in compare mode against staging (daemon or cron):
 
 ```bash
 export WATCHDOG_MODE=compare
 export WATCHDOG_ONCE=1          # or 0 for daemon
-export WATCHDOG_WEBHOOK_URL=...
 # ... all WATCHDOG_* vars from config.lua ...
 lua watchdog/main.lua
 ```
 
-On mismatch: non-zero exit, webhook fired, logs show `state_mismatch` and byte offset.
+Exit codes from `watchdog/main.lua`:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Compare/advance pass completed (or `WATCHDOG_ONCE=1` clean exit) |
+| `1` | Transient error after retries (RPC, CM, network) |
+| `2` | Deterministic divergence — `watchdog_event` on stderr with `{kind, previous_safe_block, sequencer_inclusion_block, mismatch_offset?}` |
 
 ## Triage checklist
 
@@ -95,7 +89,5 @@ On mismatch: non-zero exit, webhook fired, logs show `state_mismatch` and byte o
 |---------|----------------|
 | `inspect endpoint not implemented` | Stale CM image — rebuild |
 | `state_mismatch` at genesis | Checkpoint not aligned with sequencer history |
-| Webhook 4xx | Wrong URL or auth on receiver |
 | Compare skipped in Lua e2e | Set `WATCHDOG_E2E_SEQUENCER_URL` to a live sequencer |
-| Compare harness skipped | Set `RUN_WATCHDOG_E2E=1` (see `just test-watchdog-compare-harness`) |
 | CM inspect 27 bytes / harness byte mismatch | Rebuild devnet image: `just canonical-build-machine-image` — see [`README.md`](README.md#troubleshooting-just-test-watchdog-compare-harness) |

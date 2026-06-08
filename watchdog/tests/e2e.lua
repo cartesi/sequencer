@@ -267,8 +267,8 @@ table.insert(scenarios, {
             rpc = jsonrpc.new(http, json, cfg.l1_rpc_url),
             sequencer = sequencer_reader.new(http, json, sequencer_url),
             machine = machine_cli.new({
-                executable = cfg.cm_executable,
-                work_dir = cfg.cm_work_dir,
+                executable = "cartesi-machine",
+                work_dir = temp_dir("watchdog-e2e-advance-work"),
             }),
             log_step = function(message)
                 step_no = step_no + 1

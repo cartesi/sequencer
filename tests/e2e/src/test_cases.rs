@@ -7,7 +7,7 @@ use crate::{ScenarioFn, ScenarioResult};
 use alloy_primitives::{Address, U256};
 use rollups_harness::{
     ManagedSequencer, ReplayWalletApp, RespawnAttemptOutcome, RespawnPolicy, TcpProxy, TestSigner,
-    WalletL1Client, WsClient, sign_user_op_hex,
+    WalletL1Client, WalletL2Client, WsClient, sign_user_op_hex,
 };
 use sequencer_core::api::{TxRequest, WsTxMessage};
 use sequencer_core::fee::fee_to_linear;
@@ -327,7 +327,9 @@ async fn run_deposit_transfer_withdrawal_test(
     let mut bob_l2 = runtime.wallet_l2(bob)?;
     let mut replay = ReplayWalletApp::devnet();
 
-    let deposit_amount = U256::from(600_000_u64);
+    // Large deposit leaves headroom for the post-scenario batch-close pump
+    // (~150 user ops) that drives a gold finalized snapshot for watchdog compare.
+    let deposit_amount = U256::from(10_000_000_u64);
     let transfer_amount = U256::from(400_000_u64);
     let withdrawal_amount = U256::from(150_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
@@ -340,7 +342,6 @@ async fn run_deposit_transfer_withdrawal_test(
     bob_l2.withdraw(withdrawal_amount).await?;
     replay.apply(ws.expect_user_op_from(bob_address).await?)?;
 
-    // Alice: 600_000 - 400_000 - gas. Bob: 400_000 - 150_000 - gas.
     assert_wallet_state(
         &replay,
         ExpectedWalletState {
@@ -355,6 +356,47 @@ async fn run_deposit_transfer_withdrawal_test(
         },
         3,
     );
+
+    drive_finalized_gold_batch_for_watchdog(
+        runtime,
+        &mut ws,
+        &mut replay,
+        &mut alice_l2,
+        alice_address,
+    )
+    .await?;
+
+    crate::watchdog_compare::run_watchdog_non_genesis_compare_test(runtime).await?;
+    Ok(())
+}
+
+/// Close the open batch, land it on L1, and wait for snapshot promotion so
+/// `/finalized_state` reports `inclusion_block > 0`.
+async fn drive_finalized_gold_batch_for_watchdog(
+    runtime: &ManagedSequencer,
+    ws: &mut WsClient,
+    replay: &mut ReplayWalletApp,
+    alice_l2: &mut WalletL2Client,
+    alice_address: Address,
+) -> ScenarioResult<()> {
+    const TRANSFERS_TO_FORCE_BATCH_CLOSE: usize = 150;
+    const SUBMITTER_TICK_WAIT: Duration = Duration::from_secs(7);
+
+    let batches_before = runtime.count_batches()?;
+    for _ in 0..TRANSFERS_TO_FORCE_BATCH_CLOSE {
+        alice_l2.transfer(alice_address, U256::from(1_u64)).await?;
+        replay.apply(ws.expect_user_op_from(alice_address).await?)?;
+    }
+    let batches_after = runtime.count_batches()?;
+    if batches_after.sealed <= batches_before.sealed {
+        return Err(format!(
+            "expected batch close before watchdog compare: before={batches_before:?} after={batches_after:?}"
+        )
+        .into());
+    }
+
+    tokio::time::sleep(SUBMITTER_TICK_WAIT).await;
+    runtime.mine_l1_blocks(3).await?;
     Ok(())
 }
 

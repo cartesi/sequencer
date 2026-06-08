@@ -4,7 +4,6 @@
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local abi = require("watchdog.abi")
-local alarm = require("watchdog.alarm")
 local checkpoint = require("watchdog.checkpoint")
 local compare = require("watchdog.compare")
 local config = require("watchdog.config")
@@ -362,8 +361,7 @@ test("runner happy path replays inputs and writes checkpoint", function()
     assert_eq(checkpoint_writes[1].safe_block, 12)
 end)
 
-test("runner alarms on raw state mismatch", function()
-    local alarms = {}
+test("runner returns state mismatch payload", function()
     local result, err = runner.run_once(fake_cfg(), {
         checkpoint = {
             load = function(_dir)
@@ -388,17 +386,11 @@ test("runner alarms on raw state mismatch", function()
             return {}
         end,
         machine = fake_machine('{ "a": 1 }'),
-        alarm = function(payload)
-            table.insert(alarms, payload)
-            return true
-        end,
     })
 
     assert_eq(result, nil)
     assert(type(err) == "table", "expected mismatch payload")
     assert_eq(err.kind, "state_mismatch")
-    assert_eq(#alarms, 1)
-    assert_eq(alarms[1].kind, "state_mismatch")
 end)
 
 test("runner skips compare cycle when finalized inclusion_block is unchanged", function()
@@ -430,8 +422,7 @@ test("runner skips compare cycle when finalized inclusion_block is unchanged", f
     assert_eq(machine.fed_inputs, nil)
 end)
 
-test("runner alarms on sequencer inclusion_block regression", function()
-    local alarms = {}
+test("runner returns sequencer inclusion_block regression payload", function()
     local result, err = runner.run_once(fake_cfg(), {
         checkpoint = {
             load = function(_dir)
@@ -451,16 +442,11 @@ test("runner alarms on sequencer inclusion_block regression", function()
             end,
         },
         machine = fake_machine("{}"),
-        alarm = function(payload)
-            table.insert(alarms, payload)
-            return true
-        end,
     })
 
     assert_eq(result, nil)
     assert(type(err) == "table", "expected regression payload")
     assert_eq(err.kind, "inclusion_block_regressed")
-    assert_eq(#alarms, 1)
 end)
 
 test("sequencer client reads finalized inclusion_block", function()
@@ -666,37 +652,28 @@ test("retry returns final error after exhaustion", function()
     assert_eq(attempts, 2)
 end)
 
-test("alarm webhook posts JSON payload", function()
-    local sent = {}
-    local http = {}
-    function http.post(_self, url, body, headers)
-        sent.url = url
-        sent.body = body
-        sent.headers = headers
-        return { status = 204, body = "" }
-    end
-
-    local ok, err = alarm.send_webhook(http, "http://alarm", {
-        kind = "state_mismatch",
-        safe_block = 12,
+test("retry stops immediately on terminal errors", function()
+    local attempts = 0
+    local sleeps = 0
+    local result, err = retry.with_retries(function()
+        attempts = attempts + 1
+        return nil, { kind = "state_mismatch" }
+    end, {
+        attempts = 3,
+        delay_sec = 1,
+        should_retry = function(retry_err)
+            return not (type(retry_err) == "table" and retry_err.kind == "state_mismatch")
+        end,
+        sleep = function(_seconds)
+            sleeps = sleeps + 1
+        end,
     })
 
-    assert(ok, err)
-    assert_eq(sent.url, "http://alarm")
-    assert_eq(sent.headers["content-type"], "application/json")
-    assert(sent.body:find('"kind":"state_mismatch"', 1, true) ~= nil, "body includes kind")
-    assert(sent.body:find('"safe_block":12', 1, true) ~= nil, "body includes safe block")
-end)
-
-test("alarm webhook reports non-success status", function()
-    local http = {}
-    function http.post(_self, _url, _body, _headers)
-        return { status = 500, body = "" }
-    end
-
-    local ok, err = alarm.send_webhook(http, "http://alarm", { kind = "test" })
-    assert_eq(ok, nil)
-    assert_eq(err, "alarm webhook HTTP 500")
+    assert_eq(result, nil)
+    assert(type(err) == "table", "terminal payload returned")
+    assert_eq(err.kind, "state_mismatch")
+    assert_eq(attempts, 1)
+    assert_eq(sleeps, 0)
 end)
 
 local failures = 0

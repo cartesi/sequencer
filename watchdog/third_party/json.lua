@@ -1,5 +1,5 @@
 --
--- json.lua — vendored pure-Lua JSON (RPC + webhook payloads only).
+-- json.lua — vendored pure-Lua JSON (RPC + structured watchdog events).
 -- UPSTREAM: https://github.com/rxi/json.lua @ 0.1.2 (commit on master, MIT)
 -- See LICENSE note in file header below.
 

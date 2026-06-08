@@ -1,7 +1,6 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-local alarm = require("watchdog.alarm")
 local checkpoint = require("watchdog.checkpoint")
 local compare = require("watchdog.compare")
 local l1_reader = require("watchdog.l1_reader")
@@ -57,16 +56,6 @@ local function step(deps, message)
     if deps and type(deps.log_step) == "function" then
         deps.log_step(message)
     end
-end
-
-local function send_alarm(cfg, deps, payload)
-    if deps.alarm then
-        return deps.alarm(payload)
-    end
-    if deps.http and cfg.webhook_url then
-        return alarm.send_webhook(deps.http, cfg.webhook_url, payload)
-    end
-    return true
 end
 
 local function target_safe_block(cfg, deps)
@@ -133,14 +122,12 @@ local function advance_compare_and_checkpoint(
         step(deps, "compare finalized SSZ bytes against CM inspect report")
         local equal, mismatch_offset = compare.raw_equal(finalized.state, cm_state)
         if not equal then
-            local payload = {
+            return nil, {
                 kind = "state_mismatch",
                 previous_safe_block = safe_block_prev,
                 sequencer_inclusion_block = finalized.inclusion_block,
                 mismatch_offset = mismatch_offset,
             }
-            send_alarm(cfg, deps, payload)
-            return nil, payload
         end
     end
 
@@ -224,13 +211,11 @@ function runner.run_once(cfg, deps)
         tostring(safe_block_next)
     ))
     if safe_block_next < safe_block_prev then
-        local payload = {
+        return nil, {
             kind = "inclusion_block_regressed",
             previous_safe_block = safe_block_prev,
             sequencer_inclusion_block = safe_block_next,
         }
-        send_alarm(cfg, deps, payload)
-        return nil, payload
     end
 
     if safe_block_next <= safe_block_prev then
