@@ -18,9 +18,9 @@ test-watchdog:
 test-watchdog-e2e:
     lua watchdog/tests/e2e.lua
 
-# Verify divergence signal event+exit-code contract.
+# Verify divergence signal event+exit-code contract (drill exits 2 like production).
 test-watchdog-divergence-drill: watchdog-lua-deps
-    WATCHDOG_LUA_DEPS={{justfile_directory()}}/.deps/lua lua watchdog/tests/drill_divergence.lua
+    WATCHDOG_LUA_DEPS={{justfile_directory()}}/.deps/lua lua watchdog/tests/drill_divergence.lua || test $? -eq 2
 
 # Build lcurl (lua-cURLv3) into .deps/lua; JSON is pure Lua under watchdog/third_party/.
 watchdog-lua-deps:
