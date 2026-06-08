@@ -19,15 +19,6 @@ on:
 permissions:
   contents: write
 
-env:
-  RUST_TOOLCHAIN: "1.95.0"
-  XGENEXT2FS_VERSION: v1.5.6
-  XGENEXT2FS_SHA256_AMD64: 996e4e68a638b5dc5967d3410f92ecb8d2f41e32218bbe0f8b4c4474d7eebc59
-  XGENEXT2FS_SHA256_ARM64: e5aca81164b762bbe5447bacef41e4fa9e357fd9c8f44e519c5206227d43144d
-  CARTESI_MACHINE_VERSION: v0.20.0-test2
-  CARTESI_MACHINE_SHA256_AMD64: 39bbfc96a6cc6606307294b719df65f4f2725e8d200d062bcbd8c22355b99b56
-  CARTESI_MACHINE_SHA256_ARM64: 787d823756000cdecd72da8a3494b4c08613087379035959e561bbaef7a220ba
-
 jobs:
   build-sequencer:
     name: Build sequencer (${{ matrix.arch }})
@@ -44,6 +35,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Load release versions
+        uses: ./.github/actions/load-release-versions
 
       - name: Install system dependencies
         run: |
@@ -85,6 +79,10 @@ jobs:
 
           mkdir -p "package/sequencer-${TAG}-linux-${ARCH}"
           cp "target/${TARGET}/release/sequencer" "package/sequencer-${TAG}-linux-${ARCH}/sequencer"
+          bash scripts/generate-release-manifest.sh \
+            --tag "${TAG}" \
+            --git-sha "${GITHUB_SHA}" \
+            --output "package/sequencer-${TAG}-linux-${ARCH}/RELEASE.json"
 
           cat > "package/sequencer-${TAG}-linux-${ARCH}/RUNNING.md" <<'EOF'
           ## Running
@@ -121,6 +119,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Load release versions
+        uses: ./.github/actions/load-release-versions
 
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
@@ -159,29 +160,93 @@ jobs:
           name: canonical-machine-images
           path: dist/canonical-machine-image-*.tar.gz
 
+  build-watchdog-image:
+    name: Build watchdog image (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            deb_sha_env: CARTESI_MACHINE_SHA256_AMD64
+          - arch: arm64
+            platform: linux/arm64
+            deb_sha_env: CARTESI_MACHINE_SHA256_ARM64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Load release versions
+        uses: ./.github/actions/load-release-versions
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and export watchdog image
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          DEB_SHA_ENV: ${{ matrix.deb_sha_env }}
+        run: |
+          set -euo pipefail
+          DEB_SHA="${!DEB_SHA_ENV}"
+          image="sequencer-watchdog:${TAG}"
+          docker build \
+            --platform "${{ matrix.platform }}" \
+            --build-arg "RELEASE_TAG=${TAG}" \
+            --build-arg "GIT_COMMIT=${GITHUB_SHA}" \
+            --build-arg "CARTESI_MACHINE_VERSION=${CARTESI_MACHINE_VERSION}" \
+            --build-arg "CARTESI_MACHINE_DEB_SHA256=${DEB_SHA}" \
+            --build-arg "LUA_CURL_UPSTREAM_SHA=${LUA_CURL_UPSTREAM_SHA}" \
+            -f watchdog/Dockerfile \
+            -t "${image}" \
+            .
+          mkdir -p dist
+          docker save "${image}" | gzip -9 > "dist/sequencer-watchdog-${TAG}-linux-${{ matrix.arch }}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: watchdog-image-linux-${{ matrix.arch }}
+          path: dist/sequencer-watchdog-*.tar.gz
+
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs:
       - build-sequencer
       - build-canonical-machine-image
+      - build-watchdog-image
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Load release versions
+        uses: ./.github/actions/load-release-versions
+
       - name: Download build artifacts
         uses: actions/download-artifact@v6
         with:
           path: dist
 
       - name: Flatten artifacts
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           mkdir -p out
           find dist -type f -name '*.tar.gz' -exec cp -v '{}' out/ \;
+          bash scripts/generate-release-manifest.sh \
+            --tag "${TAG}" \
+            --git-sha "${GITHUB_SHA}" \
+            --output "out/release-manifest-${TAG}.json"
 
       - name: Generate checksums
         working-directory: out
         run: |
           set -euo pipefail
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.json > SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -191,4 +256,5 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             out/*.tar.gz
+            out/*.json
             out/SHA256SUMS
