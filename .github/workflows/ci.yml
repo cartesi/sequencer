@@ -4,15 +4,6 @@ on:
   push:
   pull_request:
 
-env:
-  RUST_TOOLCHAIN: "1.95.0"
-  XGENEXT2FS_VERSION: v1.5.6
-  XGENEXT2FS_SHA256_AMD64: 996e4e68a638b5dc5967d3410f92ecb8d2f41e32218bbe0f8b4c4474d7eebc59
-  XGENEXT2FS_SHA256_ARM64: e5aca81164b762bbe5447bacef41e4fa9e357fd9c8f44e519c5206227d43144d
-  CARTESI_MACHINE_VERSION: v0.20.0-test2
-  CARTESI_MACHINE_SHA256_AMD64: 39bbfc96a6cc6606307294b719df65f4f2725e8d200d062bcbd8c22355b99b56
-  CARTESI_MACHINE_SHA256_ARM64: 787d823756000cdecd72da8a3494b4c08613087379035959e561bbaef7a220ba
-
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -21,6 +12,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Load release versions
+        uses: ./.github/actions/load-release-versions
+
+      - name: Verify release version alignment
+        run: bash scripts/verify-release-versions.sh
 
       - name: Install system dependencies
         run: |
@@ -33,7 +30,7 @@ jobs:
             libslirp-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.91.1
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
@@ -71,6 +68,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Load release versions
+        uses: ./.github/actions/load-release-versions
+
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
         with:
@@ -96,6 +96,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Load release versions
+        uses: ./.github/actions/load-release-versions
 
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
