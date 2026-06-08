@@ -74,7 +74,7 @@ On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/i
 | `built lcurl.so but lua cannot load it` | Lua version mismatch: build with the same `lua` you run (`lua -v` vs headers under `lua5.4`) |
 | `need curl or wget` | Fetch tool to download pinned lua-cURL sources into `watchdog/third_party/lua-curl/` |
 
-CI runs **`just test-watchdog`** (mocked HTTP) only; it does **not** install libcurl or run `watchdog-lua-deps`. Full HTTP + compare smoke is local: `just test-watchdog-compare-harness` after deps above.
+CI runs **`just test-watchdog`** (mocked HTTP) and the Rust watchdog compare harness (`watchdog_genesis_compare_test`) in the rollups-e2e job. Full local smoke remains available via `just test-watchdog-compare-harness`.
 
 ## V1 Shape
 
@@ -82,17 +82,18 @@ The implementation lives in `watchdog/` and is intentionally split into small
 Lua modules:
 
 - `http.lua`: HTTP adapter via in-tree **lua-cURLv3** / `lcurl` (`just watchdog-lua-deps`).
-- `json.lua` / `third_party/json.lua`: pure-Lua JSON (RPC + webhooks).
+- `json.lua` / `third_party/json.lua`: pure-Lua JSON (RPC + structured watchdog events).
 - `jsonrpc.lua`: JSON-RPC request/response validation.
 - `l1_reader.lua`: partitioned `eth_getLogs` scanning and strict L1 log ordering.
 - `abi.lua`: decoding for the `InputAdded` / `EvmAdvance` envelope.
 - `machine_runner.lua`: CM driver (`load`, `advance`, `inspect`, `dump`).
 - `machine_cartesi.lua`: in-process `cartesi` Lua module binding (production path).
-- `machine_cli.lua`: legacy CLI adapter (tests only; prefer `machine_cartesi`).
+- `machine_cli.lua`: CLI adapter (`cartesi-machine` subprocess). Used by the Rust
+  compare harness (`run_compare_once.lua`) and Lua CM e2e; `main.lua` uses
+  `machine_cartesi` in production.
 - `sequencer_reader.lua`: sequencer HTTP client (`GET /finalized_state/inclusion_block`, `GET /finalized_state`).
 - `compare.lua`: raw byte comparison.
 - `checkpoint.lua`: manifest-backed checkpoint persistence.
-- `alarm.lua`: webhook alarm delivery.
 - `retry.lua`: bounded retry helper used by the runtime.
 - `runner.lua`: one-shot orchestration — cheap `/finalized_state/inclusion_block`
   poll, optional full pass (L1 fetch, CM replay, SSZ compare, checkpoint write).
@@ -180,8 +181,9 @@ Useful runtime knobs:
 |---------|-------------------|
 | `just test-watchdog` | Lua unit tests (fake HTTP/RPC/CM; no live chain) |
 | `just test-watchdog-e2e` | Real CM: advance, inspect; optional live compare if `WATCHDOG_E2E_SEQUENCER_URL` set |
-| `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua compare |
-| `just test-watchdog-webhook-drill` | Webhook delivery smoke (`WATCHDOG_WEBHOOK_URL` required) |
+| `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua compare (genesis) |
+| `just test-rollups-e2e` | All rollups e2e scenarios; includes `deposit_transfer_withdrawal_test` (wallet workload + **non-genesis** watchdog compare) and `watchdog_genesis_compare_test` |
+| `just test-watchdog-divergence-drill` | Synthetic divergence signal drill (`watchdog_event` + exit `2`) |
 
 Prerequisites for CM-backed tests: see **[Host dependencies](#host-dependencies-watchdog-lua-deps)** above, then:
 
@@ -199,7 +201,7 @@ just test-watchdog
 
 Covers raw comparison, golden InputAdded ABI decoding, L1 ordering, recursive
 range partitioning, config, checkpoints, advance/compare runner (fakes), CM CLI
-staging, retry, and alarm webhook encoding.
+staging, and retry behavior.
 
 ### Lua CM end-to-end
 
@@ -226,9 +228,9 @@ just test-watchdog-compare-harness
 Spawns Anvil + rollups devnet + `sequencer-devnet`, proves CM inspect SSZ at
 genesis matches `wallet_snapshot::encode(WalletConfig::devnet())` (same as
 `tests/fixtures/wallet_snapshot_v1_empty.hex` only for Sepolia `default()`), then runs
-`watchdog/tests/run_compare_once.lua` (in-process `cartesi` binding) in compare mode.
-Requires `RUN_WATCHDOG_E2E=1` (set by the recipe).
-
+`watchdog/tests/run_compare_once.lua` (CLI `machine_cli` binding) in compare mode.
+When `inclusion_block` is unchanged at genesis, the runner skips L1/CM work (idle-cheap);
+`deposit_transfer_withdrawal_test` drives a gold batch first so compare replays real L1 inputs.
 **Before first run (or after changing scheduler / SSZ / inspect code):**
 
 ```bash
@@ -255,14 +257,13 @@ exists; it does **not** detect a stale guest. If you pulled SSZ/inspect changes,
 Manual equivalent of the recipe:
 
 ```bash
-RUN_WATCHDOG_E2E=1 cargo run -p rollups-e2e --bin rollups-e2e -- \
+cargo run -p rollups-e2e --bin rollups-e2e -- \
   watchdog_genesis_compare_test --exact --nocapture
 ```
 
 ### Staging / operator drills
 
-See [`staging-drills.md`](staging-drills.md) for webhook smoke, synthetic
-divergence POST, and manual compare env vars.
+See [`staging-drills.md`](staging-drills.md) for divergence signal and compare-mode drills.
 
 ## Related sequencer tests
 

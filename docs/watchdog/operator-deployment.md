@@ -46,7 +46,13 @@ curl -sS -o /dev/null -w "%{http_code}\n" "$WATCHDOG_SEQUENCER_URL/finalized_sta
 # expect 200 when a finalized snapshot exists (404 = not promoted yet or wrong host)
 ```
 
-### 2. Build watchdog runtime (once per host)
+### 2. Watchdog runtime (release bundle or local build)
+
+**Production (recommended):** use the **release bundle** for tag `vX` — same git tag as the sequencer binary and `canonical-machine-image-*-vX.tar.gz`. Load `sequencer-watchdog-vX-linux-<arch>.tar.gz` (`docker load`), verify alignment via `release-manifest-vX.json` and `/opt/watchdog/RELEASE.json` inside the image. See [`release/README.md`](../../release/README.md).
+
+`cartesi-machine` in the watchdog image **must** match `CARTESI_MACHINE_VERSION` in `release/versions.env` (the emulator that built the CM image tarball). Mismatch causes load failures or false `state_mismatch`.
+
+**Local / dev build:**
 
 ```bash
 eval "$(direnv export bash 2>/dev/null)"
@@ -55,7 +61,7 @@ just watchdog-lua-deps    # .deps/lua/lcurl.so — needs libcurl + Lua dev heade
 
 Host packages and build errors: [`README.md` — Host dependencies](README.md#host-dependencies-watchdog-lua-deps).
 
-Requires: `lua`, `cartesi-machine` (in-process `cartesi` Lua module), libcurl + Lua headers.
+Requires: `lua`, `cartesi-machine` (in-process `cartesi` Lua module), libcurl + Lua headers. Pin `cartesi-machine` to the same version as your CM bootstrap tarball.
 
 ### 3. Build the CM image for **this chain**
 
@@ -83,7 +89,6 @@ Today `WalletApp::default()` / `WalletConfig::sepolia()` align with Sepolia stag
 | `WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block that bootstrap snapshot represents (= finalized `inclusion_block` at bootstrap) |
 | `WATCHDOG_LUA_DEPS` | `.deps/lua` |
 | `WATCHDOG_POLL_INTERVAL_SEC` | `120`–`300` on public L1 (finalized advances slowly) |
-| `WATCHDOG_WEBHOOK_URL` | Optional alarm receiver |
 
 The sequencer discovers and pins `input_box_address` at startup; use the same values as `SEQ_ETH_RPC_URL` / `SEQ_APP_ADDRESS` configuration.
 
@@ -147,7 +152,6 @@ export WATCHDOG_CM_SNAPSHOT_DIR="/path/to/canonical-machine-image-sepolia"
 export WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<finalized inclusion_block at bootstrap>"
 export WATCHDOG_LUA_DEPS="/path/to/sequencer/.deps/lua"
 export WATCHDOG_POLL_INTERVAL_SEC=120
-export WATCHDOG_WEBHOOK_URL="https://<alarms>"
 ```
 
 ### Operating the Sepolia sequencer
@@ -171,7 +175,7 @@ When the rollup runs on Ethereum mainnet, **reuse the same operator checklist ab
 | Contracts | Mainnet InputBox, application, portals from production deployment manifest |
 | CM image | Build from production app/scheduler artifacts (mainnet wallet constants when defined in app-core) |
 | `WATCHDOG_POLL_INTERVAL_SEC` | Often 300+; finalized promotion follows mainnet safe head |
-| Security | Stricter firewall between public ingress and internal snapshot tier; secrets management for RPC and webhooks |
+| Security | Stricter firewall between public ingress and internal snapshot tier; secrets management for RPC credentials |
 | Bootstrap | Almost always ops-provided CM snapshot or continued checkpoint dir — not genesis replay |
 
 There is no `just devnet-for-watchdog` or automated harness on mainnet; treat Sepolia compare success as the gate before mainnet go-live.
@@ -187,7 +191,7 @@ Same on Sepolia and mainnet:
 3. If advanced: `eth_getLogs` on InputBox for `(last_block+1)..inclusion_block`.
 4. Advance CM incrementally; `inspect` → SSZ bytes.
 5. `GET /finalized_state` → SSZ bytes.
-6. Raw compare; alarm + non-zero exit on mismatch.
+6. Raw compare; emit `watchdog_event` + non-zero exit on mismatch.
 7. Write new CM checkpoint on success.
 
 Details: [`README.md`](README.md), [`docs/snapshots/lifecycle.md`](../snapshots/lifecycle.md).

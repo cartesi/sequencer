@@ -20,13 +20,22 @@ use crate::ScenarioResult;
 const MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
 const GENESIS_SAFE_BLOCK: &str = "0";
 
+fn require_cartesi_machine() {
+    assert!(
+        std::process::Command::new("cartesi-machine")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok(),
+        "cartesi-machine not found on PATH — install Cartesi tools (or run `nix develop`)"
+    );
+}
+
 pub async fn run_watchdog_genesis_compare_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    if std::env::var("RUN_WATCHDOG_E2E").ok().as_deref() != Some("1") {
-        eprintln!("skipping watchdog_genesis_compare_test: set RUN_WATCHDOG_E2E=1 to enable");
-        return Ok(());
-    }
+    require_cartesi_machine();
 
     let workspace = paths::workspace_root();
     let machine_image = workspace.join(MACHINE_IMAGE);
@@ -78,9 +87,69 @@ pub async fn run_watchdog_genesis_compare_test(
         .keep();
 
     eprintln!("[watchdog-harness] step 4/5: run Lua compare-mode pass");
+    run_lua_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
+
+    eprintln!("[watchdog-harness] step 5/5: compare pass completed successfully");
+    Ok(())
+}
+
+pub async fn run_watchdog_non_genesis_compare_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    require_cartesi_machine();
+
+    let workspace = paths::workspace_root();
+    let machine_image = workspace.join(MACHINE_IMAGE);
+    if !machine_image.is_dir() {
+        return Err(format!(
+            "canonical machine image missing at {}; run: just canonical-build-machine-image",
+            machine_image.display()
+        )
+        .into());
+    }
+
+    eprintln!("[watchdog-harness] step 1/3: wait for non-genesis GET /finalized_state");
+    let finalized_url = format!("{}/finalized_state", runtime.endpoint());
+    let (_status, body, headers) = wait_for_non_genesis_finalized_state(
+        finalized_url.as_str(),
+        runtime,
+        Duration::from_secs(60),
+    )
+    .await?;
+    let inclusion_block = header_u64(&headers, "x-inclusion-block")
+        .ok_or("finalized_state response missing X-Inclusion-Block header")?;
+    eprintln!(
+        "[watchdog-harness] finalized non-genesis snapshot inclusion_block={inclusion_block} snapshot_bytes={}",
+        body.len()
+    );
+
+    eprintln!("[watchdog-harness] step 2/3: prepare watchdog checkpoint dir");
+    let checkpoint_dir = tempfile::tempdir()
+        .map_err(|err| format!("temp checkpoint dir: {err}"))?
+        .keep();
+
+    eprintln!("[watchdog-harness] step 3/3: run Lua compare-mode pass");
+    run_lua_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
+    Ok(())
+}
+
+async fn run_lua_compare(
+    runtime: &mut ManagedSequencer,
+    workspace: &Path,
+    checkpoint_dir: &Path,
+) -> ScenarioResult<()> {
+    let machine_image = workspace.join(MACHINE_IMAGE);
     let lua_deps = workspace.join(".deps/lua");
+    let lcurl_so = lua_deps.join("lcurl.so");
+    if !lcurl_so.is_file() {
+        return Err(format!(
+            "lcurl.so missing at {}; run: just watchdog-lua-deps (needs libcurl + Lua dev headers)",
+            lcurl_so.display()
+        )
+        .into());
+    }
     let compare_status = Command::new("lua")
-        .current_dir(workspace.as_path())
+        .current_dir(workspace)
         .arg("watchdog/tests/run_compare_once.lua")
         .env("WATCHDOG_LUA_DEPS", lua_deps.as_os_str())
         .env("WATCHDOG_MODE", "compare")
@@ -103,8 +172,6 @@ pub async fn run_watchdog_genesis_compare_test(
     if !compare_status.success() {
         return Err(format!("watchdog compare lua exited with {}", compare_status).into());
     }
-
-    eprintln!("[watchdog-harness] step 5/5: compare pass completed successfully");
     Ok(())
 }
 
@@ -262,6 +329,49 @@ fn header_u64(headers: &[(String, String)], name: &str) -> Option<u64> {
         .iter()
         .find(|(key, _)| key == name)
         .and_then(|(_, value)| value.parse().ok())
+}
+
+async fn wait_for_non_genesis_finalized_state(
+    url: &str,
+    runtime: &ManagedSequencer,
+    deadline: Duration,
+) -> ScenarioResult<(u16, Vec<u8>, Vec<(String, String)>)> {
+    let started = std::time::Instant::now();
+    let mut last = String::new();
+    while started.elapsed() < deadline {
+        match http_get(url).await {
+            Ok((200, body, headers)) => {
+                let inclusion_block = header_u64(&headers, "x-inclusion-block")
+                    .ok_or("finalized_state response missing X-Inclusion-Block header")?;
+                if inclusion_block > 0 {
+                    return Ok((200, body, headers));
+                }
+                last = format!("inclusion_block still at 0 (snapshot_bytes={})", body.len());
+            }
+            Ok((404, body, _)) => {
+                last = body_snippet_for_error(body.as_slice());
+            }
+            Ok((status, body, _)) => {
+                return Err(format!(
+                    "GET /finalized_state returned HTTP {status}: {}",
+                    body_snippet_for_error(body.as_slice())
+                )
+                .into());
+            }
+            Err(err) => {
+                last = err.to_string();
+            }
+        }
+        runtime
+            .mine_l1_blocks(1)
+            .await
+            .map_err(|err| format!("mine while waiting for non-genesis finalized state: {err}"))?;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    }
+    Err(format!(
+        "timed out waiting for GET /finalized_state with inclusion_block > 0; last: {last}"
+    )
+    .into())
 }
 
 async fn wait_for_finalized_state(

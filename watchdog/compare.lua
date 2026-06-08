@@ -27,8 +27,8 @@ function compare.raw_equal(expected, actual)
 end
 
 function compare.assert_state_response(state)
-    if type(state) ~= "string" then
-        return nil, "state must be a string"
+    if type(state) ~= "string" or #state == 0 then
+        return nil, "state must be a non-empty string"
     end
     return true
 end

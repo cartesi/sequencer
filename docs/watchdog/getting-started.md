@@ -128,7 +128,9 @@ export WATCHDOG_ONCE=1          # single pass; omit for daemon (poll every 30s)
 WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua
 ```
 
-Success: exit **0**, stderr shows steps ending in `compare pass complete`.
+Success: exit **0**, stderr shows `watchdog_step` lines ending in `compare pass complete`.
+
+Exit codes from `watchdog/main.lua`: **0** clean, **1** transient failure (RPC/CM/network after retries), **2** deterministic divergence (`watchdog_event` emitted on stderr before exit).
 
 Daemon mode (production-like loop):
 
@@ -182,7 +184,6 @@ Full operator runbook: **[`operator-deployment.md`](operator-deployment.md)**.
 | `WATCHDOG_LUA_DEPS` | yes | `.deps/lua` after `just watchdog-lua-deps` |
 | `WATCHDOG_ONCE` | no | `1` = one pass then exit |
 | `WATCHDOG_POLL_INTERVAL_SEC` | no | Default `30` (daemon) |
-| `WATCHDOG_WEBHOOK_URL` | no | Alarm POST on mismatch/regression |
 
 See `watchdog/config.lua` for the full list.
 
@@ -201,7 +202,6 @@ See `watchdog/config.lua` for the full list.
 | HTTP 404 on `/finalized_state/inclusion_block` | Sequencer not promoted yet; wait or drive L1 + batches |
 | `state_mismatch` at genesis | Wrong `WATCHDOG_CM_SNAPSHOT_*` or stale CM image vs sequencer build |
 | `inclusion_block_regressed` | Checkpoint ahead of sequencer (reset checkpoint dir or fix bootstrap block) |
-| Compare harness skipped | Use `just test-watchdog-compare-harness` (sets `RUN_WATCHDOG_E2E=1` internally) |
 | `could not determine which binary to run` | Use `just test-watchdog-compare-harness` (not bare `cargo run -p rollups-e2e`) |
 | Harness `87 vs 76` or `27 vs 76` byte mismatch | Stale CM image and/or wrong fixture; see [harness troubleshooting](README.md#troubleshooting-just-test-watchdog-compare-harness) |
 

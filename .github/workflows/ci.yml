@@ -114,5 +114,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y faketime libfaketime
 
+      - name: Build watchdog Lua deps
+        run: |
+          sudo apt-get install -y libcurl4-openssl-dev build-essential pkg-config
+          just watchdog-lua-deps
+
       - name: Run rollups E2E tests
         run: just test-rollups-e2e
+
+      - name: Run watchdog genesis compare harness
+        run: |
+          cargo run -p rollups-e2e --bin rollups-e2e -- \
+            watchdog_genesis_compare_test --exact --nocapture
