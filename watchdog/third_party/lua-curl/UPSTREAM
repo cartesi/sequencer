@@ -4,11 +4,9 @@ URL:    https://github.com/Lua-cURL/Lua-cURLv3
 Commit: 9f8b6dba8b5ef1b26309a571ae75cda4034279e5
 License: MIT (see upstream LICENSE)
 
-Sources are extracted here by `scripts/watchdog-lua-deps.sh` (pinned tarball).
-We build only the lcurl C module into `.deps/lua/lcurl.so` — not the optional
-`cURL/*.lua` helper layer.
+Sources are not vendored in git. `scripts/watchdog-lua-deps.sh` downloads this
+pinned tarball at build time into `.deps/lua-curl-src/<sha>/` and compiles
+`lcurl.so` into `.deps/lua/`. Pin is also recorded in `release/versions.env`
+as `LUA_CURL_UPSTREAM_SHA`.
 
-To populate manually:
-
-  curl -fsSL https://github.com/Lua-cURL/Lua-cURLv3/archive/9f8b6dba8b5ef1b26309a571ae75cda4034279e5.tar.gz \
-    | tar -xz -C watchdog/third_party/lua-curl --strip-components=1
+We build only the lcurl C module — not the optional `cURL/*.lua` helper layer.

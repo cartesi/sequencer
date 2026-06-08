@@ -1,6 +1,7 @@
 /target
 .deps/
-# lua-curl sources are vendored under watchdog/third_party/lua-curl/ (see UPSTREAM).
+watchdog/third_party/lua-curl/*
+!watchdog/third_party/lua-curl/UPSTREAM
 watchdog-e2e-*/
 .env
 .env.fish
