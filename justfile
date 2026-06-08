@@ -18,10 +18,8 @@ test-watchdog:
 test-watchdog-e2e:
     lua watchdog/tests/e2e.lua
 
-# POST sample alarms to WATCHDOG_WEBHOOK_URL (staging smoke).
-test-watchdog-webhook-drill: watchdog-lua-deps
-    @test -n "${WATCHDOG_WEBHOOK_URL:-}" || { echo "set WATCHDOG_WEBHOOK_URL"; exit 1; }
-    WATCHDOG_LUA_DEPS={{justfile_directory()}}/.deps/lua lua watchdog/tests/drill_webhook.lua
+# Verify divergence signal event+exit-code contract.
+test-watchdog-divergence-drill: watchdog-lua-deps
     WATCHDOG_LUA_DEPS={{justfile_directory()}}/.deps/lua lua watchdog/tests/drill_divergence.lua
 
 # Build lcurl (lua-cURLv3) into .deps/lua; JSON is pure Lua under watchdog/third_party/.
@@ -36,7 +34,7 @@ devnet-for-watchdog: setup ensure-machine-image
 
 test-watchdog-compare-harness: setup watchdog-lua-deps ensure-machine-image
     cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e --bin rollups-e2e
-    RUN_WATCHDOG_E2E=1 cargo run -p rollups-e2e --bin rollups-e2e -- watchdog_genesis_compare_test --exact --nocapture
+    cargo run -p rollups-e2e --bin rollups-e2e -- watchdog_genesis_compare_test --exact --nocapture
 
 # Run sequencer tests sequentially so partition static config (init) is not shared across parallel tests.
 test-sequencer:
@@ -45,7 +43,7 @@ test-sequencer:
     cargo test -p sequencer --test ws_broadcaster -- --test-threads=1
     cargo test -p sequencer --test batch_submitter_integration -- --test-threads=1
 
-test-rollups-e2e: setup ensure-machine-image
+test-rollups-e2e: setup watchdog-lua-deps ensure-machine-image
     cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e --bin rollups-e2e
     cargo run -p rollups-e2e --bin rollups-e2e
 

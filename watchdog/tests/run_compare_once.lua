@@ -14,7 +14,7 @@ end
 local config = require("watchdog.config")
 local http_mod = require("watchdog.http")
 local jsonrpc = require("watchdog.jsonrpc")
-local machine_cartesi = require("watchdog.machine_cartesi")
+local machine_cli = require("watchdog.machine_cli")
 local runner = require("watchdog.runner")
 local sequencer_reader = require("watchdog.sequencer_reader")
 
@@ -39,7 +39,12 @@ local deps = {
     http = http,
     rpc = jsonrpc.new(http, json, cfg.l1_rpc_url),
     sequencer = sequencer_reader.new(http, json, cfg.sequencer_url),
-    machine = machine_cartesi.new(),
+    -- Harness uses the CLI binding: it tracks `cartesi-machine` archive support
+    -- for stored snapshots (the in-process `cartesi` module can lag the CLI).
+    machine = machine_cli.new({
+        executable = cfg.cm_executable,
+        work_dir = cfg.cm_work_dir,
+    }),
 }
 
 local result, err = runner.run_once(cfg, deps)
