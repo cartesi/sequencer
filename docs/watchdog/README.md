@@ -62,7 +62,7 @@ pkg-config --exists libcurl && echo "libcurl ok"
 test -f /usr/include/lua5.4/lua.h && echo "lua headers ok"
 ```
 
-On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/include/`. The repo script passes `LUA_INC` accordingly when invoking the vendored lua-cURL Makefile (`scripts/watchdog-lua-deps.sh`).
+On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/include/`. The repo script fetches pinned lua-cURLv3 at build time and passes `LUA_INC` accordingly (`scripts/watchdog-lua-deps.sh`).
 
 ### Troubleshooting `just watchdog-lua-deps`
 
@@ -72,7 +72,7 @@ On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/i
 | `install Lua headers` | `sudo apt-get install -y liblua5.4-dev` |
 | `fatal error: lua.h: No such file or directory` | Install `liblua5.4-dev`. If headers are present but build still fails, ensure you are on a tree where `scripts/watchdog-lua-deps.sh` passes **`LUA_INC`** (not `LUA_INCLUDE_DIR`) to make — see script in repo |
 | `built lcurl.so but lua cannot load it` | Lua version mismatch: build with the same `lua` you run (`lua -v` vs headers under `lua5.4`) |
-| `need curl or wget` | Fetch tool to download pinned lua-cURL sources into `watchdog/third_party/lua-curl/` |
+| `need curl or wget` | Install `curl` or `wget` to download pinned lua-cURLv3 into `.deps/lua-curl-src/` |
 
 CI runs **`just test-watchdog`** (mocked HTTP) and the Rust watchdog compare harness (`watchdog_genesis_compare_test`) in the rollups-e2e job. Full local smoke remains available via `just test-watchdog-compare-harness`.
 

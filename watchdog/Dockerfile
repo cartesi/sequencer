@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 COPY scripts/watchdog-lua-deps.sh scripts/watchdog-lua-deps.sh
-COPY watchdog/third_party/lua-curl watchdog/third_party/lua-curl
+COPY watchdog/third_party/lua-curl/UPSTREAM watchdog/third_party/lua-curl/UPSTREAM
 COPY watchdog/third_party/json.lua watchdog/third_party/json.lua
 
 ENV LUA_CURL_UPSTREAM_SHA=${LUA_CURL_UPSTREAM_SHA}
