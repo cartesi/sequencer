@@ -7,7 +7,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_dir="${root}/.deps/lua"
 out_so="${out_dir}/lcurl.so"
 vendor_dir="${root}/watchdog/third_party/lua-curl"
-upstream_sha="9f8b6dba8b5ef1b26309a571ae75cda4034279e5"
+upstream_sha="${LUA_CURL_UPSTREAM_SHA:-9f8b6dba8b5ef1b26309a571ae75cda4034279e5}"
 upstream_tar="https://github.com/Lua-cURL/Lua-cURLv3/archive/${upstream_sha}.tar.gz"
 
 mkdir -p "${out_dir}"
