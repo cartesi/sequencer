@@ -81,7 +81,7 @@ CI runs **`just test-watchdog`** (mocked HTTP) and the Rust watchdog compare har
 The implementation lives in `watchdog/` and is intentionally split into small
 Lua modules:
 
-- `http.lua`: HTTP adapter via in-tree **lua-cURLv3** / `lcurl` (`just watchdog-lua-deps`).
+- `http.lua`: HTTP adapter via pinned **lua-cURLv3** / `lcurl` (`just watchdog-lua-deps`, fetch-at-build).
 - `json.lua` / `third_party/json.lua`: pure-Lua JSON (RPC + structured watchdog events).
 - `jsonrpc.lua`: JSON-RPC request/response validation.
 - `l1_reader.lua`: partitioned `eth_getLogs` scanning and strict L1 log ordering.
@@ -100,7 +100,7 @@ Lua modules:
 - `main.lua`: compare or advance loop (daemon or `WATCHDOG_ONCE=1`).
 
 The L1 reader follows the Rust partition strategy from
-`sequencer/src/partition.rs`: if an RPC provider rejects a large range, the
+`sequencer/src/l1/partition.rs`: if an RPC provider rejects a large range, the
 range is split recursively and retried. Lua decodes and validates input
 envelopes, but it does not classify payload tags. Direct input vs batch
 submission remains scheduler logic inside the canonical machine.

@@ -34,6 +34,10 @@ if [[ -f "${upstream_file}" ]]; then
     echo "lua-curl UPSTREAM commit=${upstream_sha} != LUA_CURL_UPSTREAM_SHA=${LUA_CURL_UPSTREAM_SHA}" >&2
     errors=$((errors + 1))
   fi
+  if [[ -z "${LUA_CURL_TARBALL_SHA256:-}" ]]; then
+    echo "LUA_CURL_TARBALL_SHA256 missing in ${versions}" >&2
+    errors=$((errors + 1))
+  fi
 else
   echo "missing ${upstream_file}" >&2
   errors=$((errors + 1))

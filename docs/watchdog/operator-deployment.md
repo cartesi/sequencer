@@ -198,6 +198,15 @@ Details: [`README.md`](README.md), [`docs/snapshots/lifecycle.md`](../snapshots/
 
 ---
 
+## Checkpoint disk usage
+
+Each successful promotion stores a full CM snapshot under
+`$WATCHDOG_CHECKPOINT_DIR/checkpoints/<block>/`. The watchdog keeps every
+checkpoint directory on disk today — there is no automatic pruning. For
+long-running deployments, plan operator cleanup: retain the current pointer
+target plus one prior checkpoint for rollback forensics, and delete older
+`checkpoints/*` directories during maintenance windows.
+
 ## Troubleshooting (live deployments)
 
 | Symptom | Likely cause |
@@ -206,6 +215,7 @@ Details: [`README.md`](README.md), [`docs/snapshots/lifecycle.md`](../snapshots/
 | `state_mismatch` | CM image / wallet constants ≠ sequencer build; or wrong bootstrap block |
 | `inclusion_block_regressed` | Stale checkpoint dir vs sequencer finalized head |
 | Slow or failing `getLogs` | RPC range limits — watchdog uses same partition strategy as sequencer |
+| Transient `L1 RPC latest head lags target block` | Fallback RPC is behind the sequencer's finalized inclusion block; watchdog retries until the node has indexed through the target (avoids truncated `eth_getLogs` false mismatches) |
 | `inspect endpoint not implemented` | Rebuild CM image for the correct chain target |
 | Works on Sepolia, fails on mainnet | Different deployment addresses or different guest build — do not reuse Sepolia env verbatim |
 
@@ -216,4 +226,3 @@ Details: [`README.md`](README.md), [`docs/snapshots/lifecycle.md`](../snapshots/
 - **Local dev / CI:** [`getting-started.md`](getting-started.md)
 - **Architecture:** [`README.md`](README.md)
 - **Webhooks:** [`staging-drills.md`](staging-drills.md)
-- **Public Sepolia latency demos** (not watchdog): [`docs/live-demo.md`](../live-demo.md)

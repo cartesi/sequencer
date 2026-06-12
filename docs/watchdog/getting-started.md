@@ -107,7 +107,7 @@ In another shell (use the printed `WATCHDOG_SEQUENCER_URL`):
 curl -s "$WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
 ```
 
-When you see JSON like `{"inclusion_block":0,"l2_tx_index":0}` (numbers may differ), the watchdog can compare. If it stays 404 for a long time, check sequencer logs in `tests/logs/` and that L1 is mining (devnet Anvil auto-mines by default).
+When you see JSON like `{"inclusion_block":0,"l2_tx_index":0}` (numbers may differ), the watchdog can compare. If it stays 404 for a long time, check sequencer logs in `tests/e2e/results/` and that L1 is mining (devnet Anvil auto-mines by default).
 
 Optional — inspect SSZ size:
 
@@ -194,7 +194,7 @@ See `watchdog/config.lua` for the full list.
 | Symptom | What to check |
 |---------|----------------|
 | `install libcurl dev package` | Install `libcurl4-openssl-dev` (or distro equivalent); see [Host dependencies](README.md#host-dependencies-watchdog-lua-deps) |
-| `lua.h: No such file or directory` when building lcurl | Install `liblua5.4-dev`; see [troubleshooting table](README.md#troubleshooting-just-watchdog-lua-deps) |
+| `lua.h: No such file or directory` when building lcurl | Install `liblua5.4-dev` (Debian/WSL), or set `LUA_INC` to your Lua headers directory (Homebrew/nix) before `just watchdog-lua-deps` |
 | `lcurl` / `cURL` not found at runtime | Run `just watchdog-lua-deps`, set `WATCHDOG_LUA_DEPS=.deps/lua` |
 | `cartesi Lua module is required` | Install Cartesi Machine; use nix/direnv shell; ensure `cartesi-machine` on `PATH` |
 | `inspect endpoint not implemented` | Rebuild CM image: `just canonical-build-machine-image` |
