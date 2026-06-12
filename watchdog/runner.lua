@@ -118,6 +118,13 @@ local function advance_compare_and_checkpoint(
         if finalized.not_modified then
             return nil, "finalized state unexpectedly returned 304 during compare"
         end
+        if finalized.inclusion_block ~= safe_block_next then
+            return nil, string.format(
+                "finalized inclusion_block moved during compare cycle (%s -> %s); retry",
+                tostring(safe_block_next),
+                tostring(finalized.inclusion_block)
+            )
+        end
 
         step(deps, "compare finalized SSZ bytes against CM inspect report")
         local equal, mismatch_offset = compare.raw_equal(finalized.state, cm_state)
