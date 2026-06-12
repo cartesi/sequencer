@@ -393,6 +393,38 @@ test("runner returns state mismatch payload", function()
     assert_eq(err.kind, "state_mismatch")
 end)
 
+test("runner returns transient error when finalized inclusion_block moves during compare", function()
+    local result, err = runner.run_once(fake_cfg(), {
+        checkpoint = {
+            load = function(_dir)
+                return { snapshot_dir = "/tmp/snapshot", safe_block = 0 }
+            end,
+        },
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 1, l2_tx_index = 0 }
+            end,
+            get_finalized_state = function()
+                return {
+                    inclusion_block = 2,
+                    l2_tx_index = 0,
+                    state = string.char(1),
+                }
+            end,
+        },
+        fetch_inputs = function(from_block, to_block)
+            assert_eq(from_block, 1)
+            assert_eq(to_block, 1)
+            return {}
+        end,
+        machine = fake_machine(string.char(1)),
+    })
+
+    assert_eq(result, nil)
+    assert(type(err) == "string", "expected transient retry error")
+    assert(err:find("inclusion_block moved", 1, true) ~= nil, err)
+end)
+
 test("runner skips compare cycle when finalized inclusion_block is unchanged", function()
     local machine = fake_machine('{"ok":true}')
     local result, err = runner.run_once(fake_cfg(), {
