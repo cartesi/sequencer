@@ -8,10 +8,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use app_core::application::{WalletApp, WalletConfig};
-use sequencer_core::application::Application;
 use app_core::wallet_snapshot;
 use rollups_harness::ManagedSequencer;
 use rollups_harness::paths;
+use sequencer_core::application::Application;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
@@ -160,11 +160,20 @@ fn compare_env(
     lua_deps: &Path,
 ) -> Vec<(String, String)> {
     vec![
-        ("WATCHDOG_LUA_DEPS".into(), lua_deps.to_string_lossy().into_owned()),
+        (
+            "WATCHDOG_LUA_DEPS".into(),
+            lua_deps.to_string_lossy().into_owned(),
+        ),
         ("WATCHDOG_MODE".into(), "compare".into()),
         ("WATCHDOG_ONCE".into(), "1".into()),
-        ("WATCHDOG_SEQUENCER_URL".into(), runtime.endpoint().to_string()),
-        ("WATCHDOG_L1_RPC_URL".into(), runtime.l1_endpoint().to_string()),
+        (
+            "WATCHDOG_SEQUENCER_URL".into(),
+            runtime.endpoint().to_string(),
+        ),
+        (
+            "WATCHDOG_L1_RPC_URL".into(),
+            runtime.l1_endpoint().to_string(),
+        ),
         (
             "WATCHDOG_INPUTBOX_ADDRESS".into(),
             runtime.input_box_address().to_string(),

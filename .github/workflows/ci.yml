@@ -56,7 +56,7 @@ jobs:
         run: lua watchdog/tests/run.lua
 
       - name: Watchdog divergence drill
-        run: just test-watchdog-divergence-drill
+        run: bash scripts/test-watchdog-divergence-drill.sh
 
       - name: Test
         timeout-minutes: 15
