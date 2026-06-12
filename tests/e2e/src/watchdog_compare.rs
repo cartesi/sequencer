@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use app_core::application::{WalletApp, WalletConfig};
+use sequencer_core::application::Application;
 use app_core::wallet_snapshot;
 use rollups_harness::ManagedSequencer;
 use rollups_harness::paths;
@@ -86,10 +87,13 @@ pub async fn run_watchdog_genesis_compare_test(
         .map_err(|err| format!("temp checkpoint dir: {err}"))?
         .keep();
 
-    eprintln!("[watchdog-harness] step 4/5: run Lua compare-mode pass");
+    eprintln!("[watchdog-harness] step 4/6: run Lua compare-mode pass (CLI binding)");
     run_lua_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
 
-    eprintln!("[watchdog-harness] step 5/5: compare pass completed successfully");
+    eprintln!("[watchdog-harness] step 5/6: run production main.lua pass (machine_cartesi)");
+    run_lua_main_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
+
+    eprintln!("[watchdog-harness] step 6/6: compare pass completed successfully");
     Ok(())
 }
 
@@ -123,14 +127,73 @@ pub async fn run_watchdog_non_genesis_compare_test(
         body.len()
     );
 
+    let genesis_snapshot = wallet_snapshot::encode(&WalletApp::new(WalletConfig::devnet()));
+    if body.as_slice() == genesis_snapshot.as_slice() {
+        return Err(
+            "non-genesis finalized_state still matches empty devnet genesis snapshot".into(),
+        );
+    }
+    let decoded = wallet_snapshot::decode(body.as_slice())
+        .map_err(|err| format!("decode non-genesis finalized_state: {err}"))?;
+    if decoded.executed_input_count() == 0 {
+        return Err("expected non-genesis finalized_state executed_input_count > 0".into());
+    }
+
     eprintln!("[watchdog-harness] step 2/3: prepare watchdog checkpoint dir");
     let checkpoint_dir = tempfile::tempdir()
         .map_err(|err| format!("temp checkpoint dir: {err}"))?
         .keep();
 
-    eprintln!("[watchdog-harness] step 3/3: run Lua compare-mode pass");
+    eprintln!("[watchdog-harness] step 3/4: run Lua compare-mode pass (CLI binding)");
     run_lua_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
+
+    eprintln!("[watchdog-harness] step 4/4: run production main.lua pass (machine_cartesi)");
+    run_lua_main_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
     Ok(())
+}
+
+fn compare_env(
+    runtime: &ManagedSequencer,
+    workspace: &Path,
+    checkpoint_dir: &Path,
+    machine_image: &Path,
+    lua_deps: &Path,
+) -> Vec<(String, String)> {
+    vec![
+        ("WATCHDOG_LUA_DEPS".into(), lua_deps.to_string_lossy().into_owned()),
+        ("WATCHDOG_MODE".into(), "compare".into()),
+        ("WATCHDOG_ONCE".into(), "1".into()),
+        ("WATCHDOG_SEQUENCER_URL".into(), runtime.endpoint().to_string()),
+        ("WATCHDOG_L1_RPC_URL".into(), runtime.l1_endpoint().to_string()),
+        (
+            "WATCHDOG_INPUTBOX_ADDRESS".into(),
+            runtime.input_box_address().to_string(),
+        ),
+        (
+            "WATCHDOG_APP_ADDRESS".into(),
+            runtime.app_address().to_string(),
+        ),
+        (
+            "WATCHDOG_CHECKPOINT_DIR".into(),
+            checkpoint_dir.to_string_lossy().into_owned(),
+        ),
+        (
+            "WATCHDOG_CM_SNAPSHOT_DIR".into(),
+            machine_image.to_string_lossy().into_owned(),
+        ),
+        (
+            "WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK".into(),
+            GENESIS_SAFE_BLOCK.into(),
+        ),
+        ("WATCHDOG_CM_EXECUTABLE".into(), "cartesi-machine".into()),
+        (
+            "WATCHDOG_CM_WORK_DIR".into(),
+            workspace
+                .join(".watchdog-cm-work")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]
 }
 
 async fn run_lua_compare(
@@ -140,6 +203,69 @@ async fn run_lua_compare(
 ) -> ScenarioResult<()> {
     let machine_image = workspace.join(MACHINE_IMAGE);
     let lua_deps = workspace.join(".deps/lua");
+    ensure_lcurl(lua_deps.as_path())?;
+    let mut command = Command::new("lua");
+    command
+        .current_dir(workspace)
+        .arg("watchdog/tests/run_compare_once.lua")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    for (key, value) in compare_env(
+        runtime,
+        workspace,
+        checkpoint_dir,
+        machine_image.as_path(),
+        lua_deps.as_path(),
+    ) {
+        command.env(key, value);
+    }
+    let compare_status = command
+        .status()
+        .await
+        .map_err(|err| format!("failed to run watchdog compare lua: {err}"))?;
+    if !compare_status.success() {
+        return Err(format!("watchdog compare lua exited with {}", compare_status).into());
+    }
+    Ok(())
+}
+
+async fn run_lua_main_compare(
+    runtime: &mut ManagedSequencer,
+    workspace: &Path,
+    checkpoint_dir: &Path,
+) -> ScenarioResult<()> {
+    let machine_image = workspace.join(MACHINE_IMAGE);
+    let lua_deps = workspace.join(".deps/lua");
+    ensure_lcurl(lua_deps.as_path())?;
+    std::fs::create_dir_all(workspace.join(".watchdog-cm-work"))
+        .map_err(|err| format!("create watchdog CM work dir: {err}"))?;
+
+    let mut command = Command::new("lua");
+    command
+        .current_dir(workspace)
+        .arg("watchdog/main.lua")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    for (key, value) in compare_env(
+        runtime,
+        workspace,
+        checkpoint_dir,
+        machine_image.as_path(),
+        lua_deps.as_path(),
+    ) {
+        command.env(key, value);
+    }
+    let status = command
+        .status()
+        .await
+        .map_err(|err| format!("failed to run watchdog main.lua: {err}"))?;
+    if !status.success() {
+        return Err(format!("watchdog main.lua exited with {}", status).into());
+    }
+    Ok(())
+}
+
+fn ensure_lcurl(lua_deps: &Path) -> ScenarioResult<()> {
     let lcurl_so = lua_deps.join("lcurl.so");
     if !lcurl_so.is_file() {
         return Err(format!(
@@ -147,30 +273,6 @@ async fn run_lua_compare(
             lcurl_so.display()
         )
         .into());
-    }
-    let compare_status = Command::new("lua")
-        .current_dir(workspace)
-        .arg("watchdog/tests/run_compare_once.lua")
-        .env("WATCHDOG_LUA_DEPS", lua_deps.as_os_str())
-        .env("WATCHDOG_MODE", "compare")
-        .env("WATCHDOG_SEQUENCER_URL", runtime.endpoint())
-        .env("WATCHDOG_L1_RPC_URL", runtime.l1_endpoint())
-        .env(
-            "WATCHDOG_INPUTBOX_ADDRESS",
-            runtime.input_box_address().to_string(),
-        )
-        .env("WATCHDOG_APP_ADDRESS", runtime.app_address().to_string())
-        .env("WATCHDOG_CHECKPOINT_DIR", checkpoint_dir.as_os_str())
-        .env("WATCHDOG_CM_SNAPSHOT_DIR", machine_image.as_os_str())
-        .env("WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK", GENESIS_SAFE_BLOCK)
-        .env("WATCHDOG_CM_EXECUTABLE", "cartesi-machine")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .map_err(|err| format!("failed to run watchdog compare lua: {err}"))?;
-    if !compare_status.success() {
-        return Err(format!("watchdog compare lua exited with {}", compare_status).into());
     }
     Ok(())
 }

@@ -47,13 +47,14 @@ local function is_terminal_error(value)
         or value.kind == "safe_block_regressed"
 end
 
-local function emit_watchdog_event(json, payload)
+local function emit_watchdog_event(json, payload, deps)
+    if deps and type(deps.on_watchdog_event) == "function" then
+        deps.on_watchdog_event(payload)
+    end
     io.stderr:write("watchdog_event " .. json.encode(payload) .. "\n")
 end
 
-local function main()
-    prepend_deps_cpath()
-    local cfg = config.load()
+local function default_deps(cfg)
     local http = http_mod.new()
     local json = json_mod.new()
     local deps = {
@@ -67,26 +68,45 @@ local function main()
     if cfg.sequencer_url then
         deps.sequencer = sequencer_reader.new(http, json, cfg.sequencer_url)
     end
+    return deps, json
+end
+
+local function run_compare_cycle(cfg, deps)
+    deps = deps or select(1, default_deps(cfg))
+    local json = json_mod.new()
+    local result, err = retry.with_retries(function()
+        local ok, value, run_err = pcall(run_once, cfg, deps)
+        if not ok then
+            return nil, value
+        end
+        return value, run_err
+    end, {
+        attempts = cfg.retry_attempts,
+        delay_sec = cfg.retry_delay_sec,
+        should_retry = function(retry_err)
+            return not is_terminal_error(retry_err)
+        end,
+    })
+    if result == nil then
+        if is_terminal_error(err) then
+            emit_watchdog_event(json, err, deps)
+            return EXIT_DIVERGENCE, err
+        end
+        return EXIT_TRANSIENT, err
+    end
+    return EXIT_OK, result
+end
+
+local function main()
+    prepend_deps_cpath()
+    local cfg = config.load()
 
     repeat
-        local result, err = retry.with_retries(function()
-            local ok, value, run_err = pcall(run_once, cfg, deps)
-            if not ok then
-                return nil, value
-            end
-            return value, run_err
-        end, {
-            attempts = cfg.retry_attempts,
-            delay_sec = cfg.retry_delay_sec,
-            should_retry = function(retry_err)
-                return not is_terminal_error(retry_err)
-            end,
-        })
-        if result == nil then
-            if is_terminal_error(err) then
-                emit_watchdog_event(json, err)
-                os.exit(EXIT_DIVERGENCE)
-            end
+        local exit_code, err = run_compare_cycle(cfg)
+        if exit_code == EXIT_DIVERGENCE then
+            os.exit(EXIT_DIVERGENCE)
+        end
+        if exit_code == EXIT_TRANSIENT then
             io.stderr:write("watchdog run failed: " .. tostring(err) .. "\n")
             os.exit(EXIT_TRANSIENT)
         end
@@ -104,4 +124,8 @@ end
 return {
     main = main,
     run_once = run_once,
+    run_compare_cycle = run_compare_cycle,
+    EXIT_OK = EXIT_OK,
+    EXIT_TRANSIENT = EXIT_TRANSIENT,
+    EXIT_DIVERGENCE = EXIT_DIVERGENCE,
 }

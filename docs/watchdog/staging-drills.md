@@ -20,16 +20,17 @@ This document covers staging and manual verification beyond the devnet tutorial.
 
 ## Drill 1 — Divergence signal (synthetic mismatch, no CM)
 
-Verifies the watchdog's signal contract (`watchdog_event` + exit code `2`) without a sequencer.
+Verifies the production `main.lua` divergence path (`watchdog_event` + exit code `2`) with
+injected fake deps — no sequencer required.
 
 ```bash
 just watchdog-lua-deps
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua
-# or: just test-watchdog-divergence-drill
+WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua   # exits 2
+# or: just test-watchdog-divergence-drill   # wraps the drill; recipe exits 0
 ```
 
-Expected: a structured `watchdog_event` line containing `kind=state_mismatch` and non-zero
-`mismatch_offset`, then process exits with code `2`.
+Expected: `main.lua` emits a structured `watchdog_event` with `kind=state_mismatch` and
+non-zero `mismatch_offset`, then the drill process exits with code `2`.
 
 Unit coverage: `just test-watchdog` (`runner returns state mismatch payload`).
 
