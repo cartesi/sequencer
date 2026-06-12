@@ -57,6 +57,25 @@ function l1_reader.sort_logs(logs)
     return logs
 end
 
+--- Return the RPC latest head when it is at least `target_block`; otherwise a transient retry error.
+function l1_reader.ensure_rpc_head_at_least(rpc, target_block)
+    assert(type(rpc) == "table" and type(rpc.get_block_number_by_tag) == "function", "rpc.get_block_number_by_tag is required")
+    assert(type(target_block) == "number", "target_block is required")
+
+    local head, err = rpc:get_block_number_by_tag("latest")
+    if not head then
+        return nil, err
+    end
+    if head < target_block then
+        return nil, string.format(
+            "L1 RPC latest head %d lags target block %d; retry",
+            head,
+            target_block
+        )
+    end
+    return head
+end
+
 function l1_reader.fetch_logs_partitioned(rpc, params)
     assert(type(rpc) == "table" and type(rpc.get_logs) == "function", "rpc.get_logs is required")
     assert(type(params) == "table", "params are required")

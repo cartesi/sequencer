@@ -134,6 +134,9 @@ local function inspect_on_machine(machine, cartesi)
     if #reports == 0 then
         return nil, "inspect produced no report"
     end
+    if #reports > 1 then
+        return nil, "inspect produced multiple reports; multi-chunk state not supported yet"
+    end
     return reports[1]
 end
 

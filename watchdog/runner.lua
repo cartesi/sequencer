@@ -32,6 +32,23 @@ local function load_checkpoint(cfg, checkpoint_mod)
     }
 end
 
+local function ensure_rpc_head_covers_target(deps, target_block)
+    if deps.fetch_inputs then
+        return true
+    end
+
+    local rpc = deps.rpc
+    if not rpc or type(rpc.get_block_number_by_tag) ~= "function" then
+        return true
+    end
+
+    local head, err = l1_reader.ensure_rpc_head_at_least(rpc, target_block)
+    if not head then
+        return nil, err
+    end
+    return true
+end
+
 local function fetch_inputs(cfg, deps, from_block, to_block)
     if from_block > to_block then
         return {}
@@ -163,6 +180,12 @@ end
 
 --- Shared path: L1 fetch → CM advance/inspect/compare → optional checkpoint write.
 local function run_pass(cfg, deps, loaded, safe_block_prev, safe_block_next, with_compare)
+    step(deps, string.format("check L1 RPC head covers target block %d", safe_block_next))
+    local head_ok, head_err = ensure_rpc_head_covers_target(deps, safe_block_next)
+    if not head_ok then
+        return nil, head_err
+    end
+
     step(deps, string.format(
         "fetch L1 InputAdded logs for blocks %s..%s",
         tostring(safe_block_prev + 1),

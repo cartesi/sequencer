@@ -15,7 +15,8 @@ All release artifacts for tag `vX.Y.Z` share one **bundle version** (`vX.Y.Z`) a
 Edit **`release/versions.env` only** — CI and release workflows load it via
 [`.github/actions/load-release-versions`](../.github/actions/load-release-versions/action.yml).
 After editing, run `bash scripts/verify-release-versions.sh` (also enforced in CI) and bump
-`rust-toolchain.toml` / `watchdog/third_party/lua-curl/UPSTREAM` when those pins change.
+`rust-toolchain.toml`, `watchdog/third_party/lua-curl/UPSTREAM`, and `LUA_CURL_TARBALL_SHA256`
+(when the commit pin changes) together.
 
 `CARTESI_MACHINE_VERSION` must match:
 
@@ -33,7 +34,12 @@ docker run --rm \
   -e WATCHDOG_ONCE=1 \
   -e WATCHDOG_SEQUENCER_URL=... \
   -e WATCHDOG_L1_RPC_URL=... \
+  -e WATCHDOG_INPUTBOX_ADDRESS=... \
+  -e WATCHDOG_APP_ADDRESS=... \
+  -e WATCHDOG_CHECKPOINT_DIR=/checkpoints \
+  -e WATCHDOG_CM_SNAPSHOT_DIR=/cm-bootstrap \
   -v /var/lib/watchdog/checkpoints:/checkpoints \
+  -v /var/lib/watchdog/cm-bootstrap:/cm-bootstrap:ro \
   sequencer-watchdog:vX
 ```
 

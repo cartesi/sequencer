@@ -62,8 +62,9 @@ lua watchdog/tests/run_compare_once.lua
 ```
 
 Expected: exit 0, stdout `watchdog compare ok: safe_block=... input_count=...`, and
-byte-identical genesis SSZ state on sequencer `/finalized_state` and CM inspect
-(`tests/fixtures/wallet_snapshot_v1_empty.hex`).
+byte-identical **devnet** genesis SSZ on sequencer `/finalized_state` and CM inspect
+(same bytes as `wallet_snapshot::encode(WalletConfig::devnet())`; the `.hex` fixture
+is for Sepolia `default()` — do not use it as the devnet golden).
 
 ## Drill 3 — Production compare daemon
 

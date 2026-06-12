@@ -51,7 +51,7 @@ pub async fn run_watchdog_genesis_compare_test(
     // `sequencer-devnet` uses `WalletConfig::devnet()` (not `default()` / Sepolia).
     let expected_snapshot = wallet_snapshot::encode(&WalletApp::new(WalletConfig::devnet()));
 
-    eprintln!("[watchdog-harness] step 1/5: wait for sequencer GET /finalized_state");
+    eprintln!("[watchdog-harness] step 1/6: wait for sequencer GET /finalized_state");
     let finalized_url = format!("{}/finalized_state", runtime.endpoint());
     let (_status, body, headers) =
         wait_for_finalized_state(finalized_url.as_str(), Duration::from_secs(30)).await?;
@@ -70,7 +70,7 @@ pub async fn run_watchdog_genesis_compare_test(
         .into());
     }
 
-    eprintln!("[watchdog-harness] step 2/5: prove CM inspect SSZ on genesis image");
+    eprintln!("[watchdog-harness] step 2/6: prove CM inspect SSZ on genesis image");
     let inspect_state =
         prove_cm_inspect_genesis(workspace.as_path(), machine_image.as_path()).await?;
     if inspect_state.as_slice() != expected_snapshot.as_slice() {
@@ -82,7 +82,7 @@ pub async fn run_watchdog_genesis_compare_test(
         .into());
     }
 
-    eprintln!("[watchdog-harness] step 3/5: prepare watchdog checkpoint dir");
+    eprintln!("[watchdog-harness] step 3/6: prepare watchdog checkpoint dir");
     let checkpoint_dir = tempfile::tempdir()
         .map_err(|err| format!("temp checkpoint dir: {err}"))?
         .keep();
@@ -112,7 +112,7 @@ pub async fn run_watchdog_non_genesis_compare_test(
         .into());
     }
 
-    eprintln!("[watchdog-harness] step 1/3: wait for non-genesis GET /finalized_state");
+    eprintln!("[watchdog-harness] step 1/4: wait for non-genesis GET /finalized_state");
     let finalized_url = format!("{}/finalized_state", runtime.endpoint());
     let (_status, body, headers) = wait_for_non_genesis_finalized_state(
         finalized_url.as_str(),
@@ -139,7 +139,7 @@ pub async fn run_watchdog_non_genesis_compare_test(
         return Err("expected non-genesis finalized_state executed_input_count > 0".into());
     }
 
-    eprintln!("[watchdog-harness] step 2/3: prepare watchdog checkpoint dir");
+    eprintln!("[watchdog-harness] step 2/4: prepare watchdog checkpoint dir");
     let checkpoint_dir = tempfile::tempdir()
         .map_err(|err| format!("temp checkpoint dir: {err}"))?
         .keep();
