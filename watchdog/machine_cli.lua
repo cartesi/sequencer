@@ -145,6 +145,12 @@ function machine_cli.new(opts)
         if not report then
             return nil, "failed to read inspect report: " .. tostring(read_err)
         end
+        local extra_report = instance.work_dir .. "/inspect-report-1.bin"
+        local extra = io.open(extra_report, "rb")
+        if extra then
+            extra:close()
+            return nil, "inspect produced multiple reports; multi-chunk state not supported yet"
+        end
         return report
     end
 

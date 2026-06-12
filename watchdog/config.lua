@@ -78,7 +78,6 @@ function config.load(env)
         poll_interval_sec = optional_number("WATCHDOG_POLL_INTERVAL_SEC", 30, env),
         retry_attempts = optional_number("WATCHDOG_RETRY_ATTEMPTS", 3, env),
         retry_delay_sec = optional_number("WATCHDOG_RETRY_DELAY_SEC", 5, env),
-        safe_confirmations = optional_number("WATCHDOG_SAFE_CONFIRMATIONS", 12, env),
         once = env.WATCHDOG_ONCE == "1",
         long_block_range_error_codes = split_csv(
             env.WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES or "-32005,-32600,-32602,-32616"

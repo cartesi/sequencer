@@ -143,6 +143,28 @@ test("shared partition vector matches l1_reader bisect plan", function()
     end
 end)
 
+test("l1_reader ensure_rpc_head_at_least accepts head at target", function()
+    local head, err = l1_reader.ensure_rpc_head_at_least({
+        get_block_number_by_tag = function(_self, tag)
+            assert_eq(tag, "latest")
+            return 42
+        end,
+    }, 42)
+    assert_eq(head, 42)
+    assert_eq(err, nil)
+end)
+
+test("l1_reader ensure_rpc_head_at_least rejects lagging head", function()
+    local head, err = l1_reader.ensure_rpc_head_at_least({
+        get_block_number_by_tag = function()
+            return 8
+        end,
+    }, 10)
+    assert_eq(head, nil)
+    assert(type(err) == "string", "expected retry error")
+    assert(err:find("lags target block", 1, true) ~= nil, err)
+end)
+
 test("shared log sort vector matches l1_reader.sort_logs", function()
     local vector = load_partition_vector()
     local logs = vector.log_sort.unsorted
@@ -259,6 +281,33 @@ test("checkpoint rejects manifest without safe block", function()
     local safe_block, err = checkpoint.safe_block_from_manifest("{}")
     assert_eq(safe_block, nil)
     assert_eq(err, "manifest missing safe_block")
+end)
+
+test("checkpoint prepare clears stale snapshot dir before write", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+    local stale_snapshot = dir .. "/checkpoints/00000000000000000012/snapshot"
+    os.execute(string.format('mkdir -p "%s"', stale_snapshot))
+    local stale = io.open(stale_snapshot .. "/garbage", "wb")
+    assert(stale ~= nil, "stale file opened")
+    stale:write("leftover")
+    stale:close()
+
+    local written, err = checkpoint.write(dir, 12, function(snapshot_dir)
+        os.execute(string.format('mkdir -p "%s"', snapshot_dir))
+        local file = io.open(snapshot_dir .. "/marker", "wb")
+        assert(file ~= nil, "marker file opened")
+        file:write("fresh")
+        file:close()
+        return true
+    end)
+    assert(written, err)
+
+    local marker = io.open(stale_snapshot .. "/marker", "rb")
+    assert(marker ~= nil, "fresh marker exists")
+    assert_eq(marker:read("*a"), "fresh")
+    marker:close()
+    assert_eq(io.open(stale_snapshot .. "/garbage", "rb"), nil)
 end)
 
 local function fake_cfg()
@@ -391,6 +440,35 @@ test("runner returns state mismatch payload", function()
     assert_eq(result, nil)
     assert(type(err) == "table", "expected mismatch payload")
     assert_eq(err.kind, "state_mismatch")
+end)
+
+test("runner returns transient error when L1 RPC head lags target block", function()
+    local result, err = runner.run_once(fake_cfg(), {
+        checkpoint = {
+            load = function(_dir)
+                return { snapshot_dir = "/tmp/snapshot", safe_block = 5 }
+            end,
+        },
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 10, l2_tx_index = 0 }
+            end,
+        },
+        rpc = {
+            get_block_number_by_tag = function(_self, tag)
+                assert_eq(tag, "latest")
+                return 8
+            end,
+            get_logs = function()
+                error("get_logs must not run when RPC head lags target block")
+            end,
+        },
+        machine = fake_machine(string.char(1)),
+    })
+
+    assert_eq(result, nil)
+    assert(type(err) == "string", "expected transient retry error")
+    assert(err:find("RPC latest head", 1, true) ~= nil, err)
 end)
 
 test("runner returns transient error when finalized inclusion_block moves during compare", function()
@@ -708,17 +786,30 @@ test("retry stops immediately on terminal errors", function()
     assert_eq(sleeps, 0)
 end)
 
-local failures = 0
+local passed = 0
+local failed = {}
 for _, t in ipairs(tests) do
     local ok, err = pcall(t.fn)
     if ok then
+        passed = passed + 1
         io.write("ok - " .. t.name .. "\n")
     else
-        failures = failures + 1
-        io.write("not ok - " .. t.name .. ": " .. tostring(err) .. "\n")
+        table.insert(failed, { name = t.name, err = tostring(err) })
+        io.stderr:write("FAIL - " .. t.name .. ": " .. tostring(err) .. "\n")
     end
 end
 
-if failures > 0 then
+local total = #tests
+io.write(string.format("\nwatchdog unit tests: %d/%d passed\n", passed, total))
+if #failed > 0 then
+    io.stderr:write(string.format(
+        "\n*** %d TEST(S) FAILED ***\n",
+        #failed
+    ))
+    for i, entry in ipairs(failed) do
+        io.stderr:write(string.format("  %d. %s\n     %s\n", i, entry.name, entry.err))
+    end
+    io.stderr:write("\n")
     os.exit(1)
 end
+io.write("all tests passed\n")

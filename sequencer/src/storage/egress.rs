@@ -16,61 +16,6 @@ use super::queries::decode_l2_tx_row;
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
-    /// Load L2 transactions for the scheduler-accepted safe batch prefix.
-    ///
-    /// This is the replay source for safe app-state export. Unlike
-    /// `valid_sequenced_l2_txs`, it excludes the soft-confirmed Tip and any
-    /// valid closed batches that have not yet been accepted by the L1 scheduler.
-    pub fn safe_accepted_l2_txs(
-        &mut self,
-        batch_submitter_address: Address,
-    ) -> Result<Vec<SequencedL2Tx>> {
-        const SQL: &str = "
-            SELECT
-                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END AS kind,
-                CASE
-                    WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.sender
-                    WHEN s.safe_input_index IS NOT NULL THEN d.sender
-                    ELSE NULL
-                END AS sender,
-                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.data ELSE NULL END AS data,
-                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN f.fee  ELSE NULL END AS fee,
-                CASE WHEN s.safe_input_index   IS NOT NULL THEN d.payload      ELSE NULL END AS payload,
-                CASE WHEN s.safe_input_index   IS NOT NULL THEN d.block_number ELSE NULL END AS block_number
-            FROM safe_accepted_batches a
-            JOIN valid_closed_batches b
-              ON b.nonce = a.nonce
-            JOIN valid_sequenced_l2_txs s
-              ON s.batch_index = b.batch_index
-             AND NOT (s.safe_input_index IS NOT NULL
-                 AND EXISTS (SELECT 1 FROM safe_inputs si
-                     WHERE si.safe_input_index = s.safe_input_index
-                       AND si.sender = ?1))
-            LEFT JOIN user_ops u
-              ON u.batch_index    = s.batch_index
-             AND u.frame_in_batch = s.frame_in_batch
-             AND u.pos_in_frame   = s.user_op_pos_in_frame
-            LEFT JOIN frames f
-              ON f.batch_index    = s.batch_index
-             AND f.frame_in_batch = s.frame_in_batch
-            LEFT JOIN safe_inputs d
-              ON d.safe_input_index = s.safe_input_index
-            ORDER BY a.nonce ASC, s.offset ASC
-        ";
-        let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(params![batch_submitter_address.as_slice()], |row| {
-            Ok(decode_l2_tx_row(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })?;
-        rows.collect::<Result<Vec<_>>>()
-    }
-
     /// Load a page of ordered L2 transactions starting after the given offset.
     /// Returns `(db_offset, tx)` pairs. Callers should track `db_offset` of the
     /// last item as their cursor, not increment a counter.

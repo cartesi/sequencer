@@ -33,7 +33,27 @@ resolve_upstream_sha() {
         grep -E '^Commit:' "${upstream_file}" | awk '{print $2}'
         return
     fi
-    echo "9f8b6dba8b5ef1b26309a571ae75cda4034279e5"
+}
+
+resolve_tarball_sha256() {
+    if [[ -n "${LUA_CURL_TARBALL_SHA256:-}" ]]; then
+        echo "${LUA_CURL_TARBALL_SHA256}"
+        return
+    fi
+    if [[ -f "${versions_file}" ]]; then
+        # shellcheck disable=SC1090
+        local from_versions
+        from_versions="$(
+            set -a
+            source "${versions_file}"
+            set +a
+            echo "${LUA_CURL_TARBALL_SHA256:-}"
+        )"
+        if [[ -n "${from_versions}" ]]; then
+            echo "${from_versions}"
+            return
+        fi
+    fi
 }
 
 upstream_sha="$(resolve_upstream_sha)"
@@ -42,13 +62,35 @@ if [[ -z "${upstream_sha}" ]]; then
     exit 1
 fi
 
+tarball_sha256="$(resolve_tarball_sha256)"
+if [[ -z "${tarball_sha256}" ]]; then
+    echo "watchdog-lua-deps: could not resolve Lua-cURLv3 tarball sha256 pin" >&2
+    exit 1
+fi
+
 upstream_tar="https://github.com/Lua-cURL/Lua-cURLv3/archive/${upstream_sha}.tar.gz"
 src_cache="${root}/.deps/lua-curl-src/${upstream_sha}"
 
 mkdir -p "${out_dir}"
 
+resolve_lua_bin() {
+    if [[ -n "${LUA_BIN:-}" ]]; then
+        echo "${LUA_BIN}"
+        return
+    fi
+    for bin in lua5.4 lua; do
+        if command -v "${bin}" >/dev/null 2>&1; then
+            echo "${bin}"
+            return
+        fi
+    done
+}
+
+lua_bin="$(resolve_lua_bin || true)"
+
 lcurl_loadable() {
-    lua -e "package.cpath='${out_dir}/?.so;'..package.cpath; require('lcurl')" >/dev/null 2>&1
+    [[ -n "${lua_bin}" ]] || return 1
+    "${lua_bin}" -e "package.cpath='${out_dir}/?.so;'..package.cpath; require('lcurl')" >/dev/null 2>&1
 }
 
 if [[ -f "${out_so}" ]] && lcurl_loadable; then
@@ -57,17 +99,20 @@ fi
 
 fetch_sources() {
     echo "watchdog-lua-deps: fetching Lua-cURLv3 ${upstream_sha}" >&2
-    local tmp
+    local tmp archive
     tmp="$(mktemp -d)"
+    archive="${tmp}/lua-curl.tar.gz"
     trap 'rm -rf "${tmp}"' RETURN
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "${upstream_tar}" | tar -xz -C "${tmp}"
+        curl -fsSL "${upstream_tar}" -o "${archive}"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO- "${upstream_tar}" | tar -xz -C "${tmp}"
+        wget -qO "${archive}" "${upstream_tar}"
     else
         echo "watchdog-lua-deps: need curl or wget to fetch Lua-cURLv3" >&2
         exit 1
     fi
+    echo "${tarball_sha256}  ${archive}" | sha256sum --check
+    tar -xzf "${archive}" -C "${tmp}"
     shopt -s nullglob
     local dirs=("${tmp}"/Lua-cURLv3-*)
     if [[ ${#dirs[@]} -ne 1 ]]; then
@@ -83,13 +128,15 @@ if [[ ! -f "${src_cache}/Makefile" ]]; then
     fetch_sources
 fi
 
-lua_inc=""
+lua_inc="${LUA_INC:-}"
+if [[ -z "${lua_inc}" ]]; then
 for dir in /usr/include/lua5.4 /usr/include/lua5.3 /usr/include/lua; do
     if [[ -f "${dir}/lua.h" ]]; then
         lua_inc="${dir}"
         break
     fi
 done
+fi
 
 if [[ -z "${lua_inc}" ]]; then
     echo "watchdog-lua-deps: install Lua headers (e.g. lua5.4-dev)" >&2
@@ -119,6 +166,11 @@ make_args=(
     "LUA_INC=${lua_inc}"
     "CURL_LIBS=$(pkg-config --libs libcurl)"
 )
+if [[ -z "${lua_impl}" && "${lua_inc}" == *lua5.4* ]]; then
+    lua_impl="lua5.4"
+elif [[ -z "${lua_impl}" && "${lua_inc}" == *lua5.3* ]]; then
+    lua_impl="lua5.3"
+fi
 if [[ -n "${lua_impl}" ]]; then
     make_args+=("LUA_IMPL=${lua_impl}")
 fi
@@ -132,7 +184,12 @@ if [[ -z "${built_so}" ]]; then
 fi
 cp "${built_so}" "${out_so}"
 
+if [[ -z "${lua_bin}" ]]; then
+    echo "watchdog-lua-deps: install lua5.4 (or set LUA_BIN) to verify lcurl.so" >&2
+    exit 1
+fi
+
 if ! lcurl_loadable; then
-    echo "watchdog-lua-deps: built lcurl.so but lua cannot load it (Lua version mismatch?)" >&2
+    echo "watchdog-lua-deps: built lcurl.so but ${lua_bin} cannot load it (Lua version mismatch?)" >&2
     exit 1
 fi

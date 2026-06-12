@@ -2,7 +2,8 @@
 # Build args RELEASE_TAG, GIT_COMMIT, and cartesi-machine pins must match release/versions.env
 # and the canonical-machine-image-* tarballs produced in the same release.
 
-ARG DEBIAN_VERSION=bookworm-slim
+# cartesi-machine v0.20.x libs require glibc >= 2.38 (bookworm is 2.36).
+ARG DEBIAN_VERSION=trixie-slim
 FROM debian:${DEBIAN_VERSION} AS build
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -19,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make \
     gcc \
     pkg-config \
+    lua5.4 \
     liblua5.4-dev \
     libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -26,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 COPY scripts/watchdog-lua-deps.sh scripts/watchdog-lua-deps.sh
+COPY release/versions.env release/versions.env
 COPY watchdog/third_party/lua-curl/UPSTREAM watchdog/third_party/lua-curl/UPSTREAM
 COPY watchdog/third_party/json.lua watchdog/third_party/json.lua
 
@@ -66,6 +69,8 @@ LABEL org.opencontainers.image.title="sequencer-watchdog" \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     lua5.4 \
     libcurl4 \
+    libslirp0 \
+    libgomp1 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -74,10 +79,13 @@ COPY --from=build /out/share/cartesi-machine /usr/local/share/cartesi-machine
 COPY --from=build /out/lib/lcurl.so /opt/watchdog/lib/lcurl.so
 COPY --from=build /out/lib/lua/5.4/ /usr/local/lib/lua/5.4/
 COPY --from=build /out/share/lua/5.4/ /usr/local/share/lua/5.4/
+COPY --from=build /out/share/lua/5.4/ /usr/share/lua/5.4/
 COPY --from=build /out/lib/libcartesi*.so /usr/local/lib/
 
 COPY watchdog /opt/watchdog/lua/watchdog
 COPY watchdog/third_party/json.lua /opt/watchdog/lua/watchdog/third_party/json.lua
+# Shared cross-stack fixtures (watchdog/tests/run.lua expects repo-root tests/fixtures/).
+COPY tests/fixtures /opt/watchdog/lua/tests/fixtures
 COPY watchdog/docker-entrypoint.sh /usr/local/bin/watchdog
 
 RUN chmod +x /usr/local/bin/watchdog /usr/local/bin/cartesi-machine \
