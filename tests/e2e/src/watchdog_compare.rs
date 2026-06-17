@@ -97,7 +97,9 @@ pub async fn run_watchdog_genesis_compare_test(
     )
     .await?;
 
-    eprintln!("[watchdog-harness] step 5/6: run a second main.lua compare pass (checkpoint reload)");
+    eprintln!(
+        "[watchdog-harness] step 5/6: run a second main.lua compare pass (checkpoint reload)"
+    );
     run_lua_main_compare(
         runtime,
         workspace.as_path(),
@@ -166,7 +168,9 @@ pub async fn run_watchdog_non_genesis_compare_test(
     )
     .await?;
 
-    eprintln!("[watchdog-harness] step 4/4: run a second main.lua compare pass (checkpoint reload)");
+    eprintln!(
+        "[watchdog-harness] step 4/4: run a second main.lua compare pass (checkpoint reload)"
+    );
     run_lua_main_compare(
         runtime,
         workspace.as_path(),
@@ -204,7 +208,9 @@ pub async fn run_watchdog_non_genesis_divergence_test(
         .ok_or("finalized_state response missing X-Inclusion-Block header")?;
     eprintln!("[watchdog-harness] divergence target inclusion_block={inclusion_block}");
 
-    eprintln!("[watchdog-harness] divergence step 2/3: run main.lua against mismatched sepolia snapshot");
+    eprintln!(
+        "[watchdog-harness] divergence step 2/3: run main.lua against mismatched sepolia snapshot"
+    );
     let checkpoint_dir = tempfile::tempdir()
         .map_err(|err| format!("temp checkpoint dir: {err}"))?
         .keep();
@@ -227,10 +233,7 @@ pub async fn run_watchdog_non_genesis_divergence_test(
     eprintln!("[watchdog-harness] divergence step 3/3: assert watchdog_event kind=state_mismatch");
     let stderr = String::from_utf8_lossy(output.stderr.as_slice());
     if !stderr.contains("watchdog_event") || !stderr.contains("\"kind\":\"state_mismatch\"") {
-        return Err(format!(
-            "missing state_mismatch watchdog_event in stderr: {stderr}"
-        )
-        .into());
+        return Err(format!("missing state_mismatch watchdog_event in stderr: {stderr}").into());
     }
     Ok(())
 }
