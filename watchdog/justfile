@@ -31,4 +31,5 @@ doctor:
         exit 1; \
     }
     @lua -e "package.cpath = '.deps/lua/?.so;' .. package.cpath; require('lcurl'); print('doctor: lcurl ok')"
+    @lua -e "package.path = './?.lua;./?/init.lua;' .. package.path; local m=require('watchdog.machine_cartesi').new(); local inst,err=m:load('examples/canonical-app/out/canonical-machine-image'); if not inst then error('doctor: machine_cartesi cannot load devnet image: '..tostring(err)) end; print('doctor: machine_cartesi load ok')"
     @echo "doctor: watchdog toolchain ok"
