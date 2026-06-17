@@ -145,10 +145,8 @@ When `inclusion_block` has not advanced since the last verified checkpoint, the 
 ### One-shot compare (same stack, no daemon)
 
 ```bash
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/run_compare_once.lua
+WATCHDOG_ONCE=1 WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua
 ```
-
-Uses the same env vars as `main.lua` in compare mode.
 
 ---
 

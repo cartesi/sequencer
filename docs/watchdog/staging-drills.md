@@ -58,7 +58,7 @@ export WATCHDOG_CHECKPOINT_DIR=/tmp/watchdog-checkpoints
 export WATCHDOG_CM_SNAPSHOT_DIR=examples/canonical-app/out/canonical-machine-image
 export WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0
 export WATCHDOG_LUA_DEPS=.deps/lua
-lua watchdog/tests/run_compare_once.lua
+WATCHDOG_ONCE=1 lua watchdog/main.lua
 ```
 
 Expected: exit 0, stdout `watchdog compare ok: safe_block=... input_count=...`, and

@@ -18,6 +18,7 @@ fn main() {
                 let log_prefix = format!("rollups-e2e-{name}");
                 let spawn_config = if name == "watchdog_genesis_compare_test"
                     || name == "deposit_transfer_withdrawal_test"
+                    || name == "watchdog_non_genesis_divergence_test"
                 {
                     devnet_sequencer_config_no_faketime(log_prefix)
                 } else {

@@ -18,7 +18,8 @@ use tokio::process::Command;
 
 use crate::ScenarioResult;
 
-const MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
+const DEVNET_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
+const SEPOLIA_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image-sepolia";
 const GENESIS_SAFE_BLOCK: &str = "0";
 
 fn require_cartesi_machine() {
@@ -39,7 +40,7 @@ pub async fn run_watchdog_genesis_compare_test(
     require_cartesi_machine();
 
     let workspace = paths::workspace_root();
-    let machine_image = workspace.join(MACHINE_IMAGE);
+    let machine_image = workspace.join(DEVNET_MACHINE_IMAGE);
     if !machine_image.is_dir() {
         return Err(format!(
             "canonical machine image missing at {}; run: just canonical-build-machine-image",
@@ -87,11 +88,23 @@ pub async fn run_watchdog_genesis_compare_test(
         .map_err(|err| format!("temp checkpoint dir: {err}"))?
         .keep();
 
-    eprintln!("[watchdog-harness] step 4/6: run Lua compare-mode pass (CLI binding)");
-    run_lua_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
+    eprintln!("[watchdog-harness] step 4/6: run production main.lua pass (machine_cartesi)");
+    run_lua_main_compare(
+        runtime,
+        workspace.as_path(),
+        checkpoint_dir.as_path(),
+        machine_image.as_path(),
+    )
+    .await?;
 
-    eprintln!("[watchdog-harness] step 5/6: run production main.lua pass (machine_cartesi)");
-    run_lua_main_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
+    eprintln!("[watchdog-harness] step 5/6: run a second main.lua compare pass (checkpoint reload)");
+    run_lua_main_compare(
+        runtime,
+        workspace.as_path(),
+        checkpoint_dir.as_path(),
+        machine_image.as_path(),
+    )
+    .await?;
 
     eprintln!("[watchdog-harness] step 6/6: compare pass completed successfully");
     Ok(())
@@ -103,7 +116,7 @@ pub async fn run_watchdog_non_genesis_compare_test(
     require_cartesi_machine();
 
     let workspace = paths::workspace_root();
-    let machine_image = workspace.join(MACHINE_IMAGE);
+    let machine_image = workspace.join(DEVNET_MACHINE_IMAGE);
     if !machine_image.is_dir() {
         return Err(format!(
             "canonical machine image missing at {}; run: just canonical-build-machine-image",
@@ -144,11 +157,81 @@ pub async fn run_watchdog_non_genesis_compare_test(
         .map_err(|err| format!("temp checkpoint dir: {err}"))?
         .keep();
 
-    eprintln!("[watchdog-harness] step 3/4: run Lua compare-mode pass (CLI binding)");
-    run_lua_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
+    eprintln!("[watchdog-harness] step 3/4: run production main.lua pass (machine_cartesi)");
+    run_lua_main_compare(
+        runtime,
+        workspace.as_path(),
+        checkpoint_dir.as_path(),
+        machine_image.as_path(),
+    )
+    .await?;
 
-    eprintln!("[watchdog-harness] step 4/4: run production main.lua pass (machine_cartesi)");
-    run_lua_main_compare(runtime, workspace.as_path(), checkpoint_dir.as_path()).await?;
+    eprintln!("[watchdog-harness] step 4/4: run a second main.lua compare pass (checkpoint reload)");
+    run_lua_main_compare(
+        runtime,
+        workspace.as_path(),
+        checkpoint_dir.as_path(),
+        machine_image.as_path(),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn run_watchdog_non_genesis_divergence_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    require_cartesi_machine();
+
+    let workspace = paths::workspace_root();
+    let mismatch_image = workspace.join(SEPOLIA_MACHINE_IMAGE);
+    if !mismatch_image.is_dir() {
+        return Err(format!(
+            "sepolia machine image missing at {}; run: just canonical-build-machine-image-sepolia",
+            mismatch_image.display()
+        )
+        .into());
+    }
+
+    eprintln!("[watchdog-harness] divergence step 1/3: wait for non-genesis GET /finalized_state");
+    let finalized_url = format!("{}/finalized_state", runtime.endpoint());
+    let (_status, _body, headers) = wait_for_non_genesis_finalized_state(
+        finalized_url.as_str(),
+        runtime,
+        Duration::from_secs(60),
+    )
+    .await?;
+    let inclusion_block = header_u64(&headers, "x-inclusion-block")
+        .ok_or("finalized_state response missing X-Inclusion-Block header")?;
+    eprintln!("[watchdog-harness] divergence target inclusion_block={inclusion_block}");
+
+    eprintln!("[watchdog-harness] divergence step 2/3: run main.lua against mismatched sepolia snapshot");
+    let checkpoint_dir = tempfile::tempdir()
+        .map_err(|err| format!("temp checkpoint dir: {err}"))?
+        .keep();
+    let output = run_lua_main(
+        runtime,
+        workspace.as_path(),
+        checkpoint_dir.as_path(),
+        mismatch_image.as_path(),
+    )
+    .await?;
+    let exit = output.status.code().unwrap_or(-1);
+    if exit != 2 {
+        return Err(format!(
+            "expected watchdog divergence exit 2, got {exit}; stderr: {}",
+            String::from_utf8_lossy(output.stderr.as_slice())
+        )
+        .into());
+    }
+
+    eprintln!("[watchdog-harness] divergence step 3/3: assert watchdog_event kind=state_mismatch");
+    let stderr = String::from_utf8_lossy(output.stderr.as_slice());
+    if !stderr.contains("watchdog_event") || !stderr.contains("\"kind\":\"state_mismatch\"") {
+        return Err(format!(
+            "missing state_mismatch watchdog_event in stderr: {stderr}"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -205,71 +288,55 @@ fn compare_env(
     ]
 }
 
-async fn run_lua_compare(
+async fn run_lua_main(
     runtime: &mut ManagedSequencer,
     workspace: &Path,
     checkpoint_dir: &Path,
-) -> ScenarioResult<()> {
-    let machine_image = workspace.join(MACHINE_IMAGE);
+    machine_image: &Path,
+) -> ScenarioResult<std::process::Output> {
     let lua_deps = workspace.join(".deps/lua");
     ensure_lcurl(lua_deps.as_path())?;
+    std::fs::create_dir_all(workspace.join(".watchdog-cm-work"))
+        .map_err(|err| format!("create watchdog CM work dir: {err}"))?;
     let mut command = Command::new("lua");
     command
         .current_dir(workspace)
-        .arg("watchdog/tests/run_compare_once.lua")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .arg("watchdog/main.lua")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (key, value) in compare_env(
         runtime,
         workspace,
         checkpoint_dir,
-        machine_image.as_path(),
+        machine_image,
         lua_deps.as_path(),
     ) {
         command.env(key, value);
     }
-    let compare_status = command
-        .status()
+    command
+        .output()
         .await
-        .map_err(|err| format!("failed to run watchdog compare lua: {err}"))?;
-    if !compare_status.success() {
-        return Err(format!("watchdog compare lua exited with {}", compare_status).into());
-    }
-    Ok(())
+        .map_err(|err| format!("failed to run watchdog main.lua: {err}").into())
 }
 
 async fn run_lua_main_compare(
     runtime: &mut ManagedSequencer,
     workspace: &Path,
     checkpoint_dir: &Path,
+    machine_image: &Path,
 ) -> ScenarioResult<()> {
-    let machine_image = workspace.join(MACHINE_IMAGE);
-    let lua_deps = workspace.join(".deps/lua");
-    ensure_lcurl(lua_deps.as_path())?;
-    std::fs::create_dir_all(workspace.join(".watchdog-cm-work"))
-        .map_err(|err| format!("create watchdog CM work dir: {err}"))?;
-
-    let mut command = Command::new("lua");
-    command
-        .current_dir(workspace)
-        .arg("watchdog/main.lua")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    for (key, value) in compare_env(
-        runtime,
-        workspace,
-        checkpoint_dir,
-        machine_image.as_path(),
-        lua_deps.as_path(),
-    ) {
-        command.env(key, value);
+    let output = run_lua_main(runtime, workspace, checkpoint_dir, machine_image).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "watchdog main.lua exited with {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(output.stderr.as_slice())
+        )
+        .into());
     }
-    let status = command
-        .status()
-        .await
-        .map_err(|err| format!("failed to run watchdog main.lua: {err}"))?;
-    if !status.success() {
-        return Err(format!("watchdog main.lua exited with {}", status).into());
+    let stdout = String::from_utf8_lossy(output.stdout.as_slice());
+    if !stdout.is_empty() {
+        eprint!("{stdout}");
     }
     Ok(())
 }

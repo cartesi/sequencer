@@ -66,7 +66,7 @@ function machine_runner.new(binding)
         return self.binding.store_snapshot(instance, path)
     end
 
-    -- Legacy helpers used by machine_cli tests and older unit tests.
+    -- Legacy helpers kept for compatibility with older tests.
     function driver:feed_inputs(instance, inputs)
         local from = (instance.reference_block or 0) + 1
         return self:advance(instance, inputs, { from_block = from, to_block = from })

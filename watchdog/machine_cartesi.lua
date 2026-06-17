@@ -155,6 +155,13 @@ function machine_cartesi.new(_opts)
             return cartesi.machine():load(snapshot_dir, runtime_config)
         end)
         if not ok then
+            -- Older cartesi Lua bindings may reject runtime_config; retry with
+            -- default runtime settings for compatibility in local environments.
+            ok, machine = pcall(function()
+                return cartesi.machine():load(snapshot_dir, {})
+            end)
+        end
+        if not ok then
             return nil, tostring(machine)
         end
         return {

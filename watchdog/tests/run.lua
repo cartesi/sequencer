@@ -9,7 +9,6 @@ local compare = require("watchdog.compare")
 local config = require("watchdog.config")
 local jsonrpc = require("watchdog.jsonrpc")
 local l1_reader = require("watchdog.l1_reader")
-local machine_cli = require("watchdog.machine_cli")
 local retry = require("watchdog.retry")
 local runner = require("watchdog.runner")
 local sequencer_reader = require("watchdog.sequencer_reader")
@@ -661,65 +660,6 @@ test("advance runner fetches inputs and saves checkpoint without sequencer", fun
     assert_eq(result.input_count, 2)
     assert_eq(machine.saved_snapshot_dir, "/tmp/advanced-snapshot")
     assert_eq(#checkpoint_writes, 1)
-end)
-
-test("machine cli adapter writes raw input files", function()
-    local base = os.tmpname()
-    os.remove(base)
-    os.execute(string.format('mkdir -p "%s"', base))
-    local driver = machine_cli.new({ work_dir = base, executable = "cartesi-machine" })
-    local instance = assert(driver:load("/tmp/source-snapshot"))
-    assert(driver:feed_inputs(instance, {
-        { raw_input = "abc" },
-        { raw_input = "def" },
-    }))
-
-    local file = io.open(instance.input_dir .. "/input-0.bin", "rb")
-    assert(file ~= nil, "first input file exists")
-    assert_eq(file:read("*a"), "abc")
-    file:close()
-    file = io.open(instance.input_dir .. "/input-1.bin", "rb")
-    assert(file ~= nil, "second input file exists")
-    assert_eq(file:read("*a"), "def")
-    file:close()
-end)
-
-test("machine cli adapter inspect reads report file", function()
-    local base = os.tmpname()
-    os.remove(base)
-    os.execute(string.format('mkdir -p "%s"', base))
-    local script_path = base .. "/fake-cartesi-machine.sh"
-    local driver = machine_cli.new({ work_dir = base, executable = script_path })
-    local instance = assert(driver:load("/tmp/source-snapshot"))
-
-    local script = io.open(script_path, "wb")
-    assert(script ~= nil, "fake cartesi-machine script opened")
-    script:write(string.format([[
-#!/bin/sh
-mkdir -p "%s"
-printf '%%s' '{"ok":true}' > "%s/inspect-report-0.bin"
-exit 0
-]], instance.work_dir, instance.work_dir))
-    script:close()
-    os.execute(string.format('chmod +x "%s"', script_path))
-
-    local state, err = driver:inspect_state(instance)
-
-    assert_eq(err, nil)
-    assert_eq(state, '{"ok":true}')
-end)
-
-test("machine cli adapter leaves snapshot directory creation to cartesi-machine", function()
-    local base = os.tmpname()
-    os.remove(base)
-    os.execute(string.format('mkdir -p "%s"', base))
-    local driver = machine_cli.new({ work_dir = base, executable = "true" })
-    local instance = assert(driver:load("/tmp/source-snapshot"))
-    local snapshot_dir = base .. "/snapshot"
-
-    assert(driver:save(instance, snapshot_dir))
-    local exists = os.rename(snapshot_dir, snapshot_dir)
-    assert(not exists, "adapter must not pre-create --store target")
 end)
 
 test("retry succeeds after transient failures", function()
