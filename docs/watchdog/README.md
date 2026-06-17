@@ -74,7 +74,7 @@ On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/i
 | `built lcurl.so but lua cannot load it` | Lua version mismatch: build with the same `lua` you run (`lua -v` vs headers under `lua5.4`) |
 | `need curl or wget` | Install `curl` or `wget` to download pinned lua-cURLv3 into `.deps/lua-curl-src/` |
 
-CI runs **`just test-watchdog`** (mocked HTTP) and the Rust watchdog compare harness (`watchdog_genesis_compare_test`) in the rollups-e2e job. Full local smoke remains available via `just test-watchdog-compare-harness`.
+CI runs **`just test-watchdog`** (mocked HTTP), the divergence drill script, and watchdog rollups-e2e trials (`watchdog_genesis_compare_test`, non-genesis compare inside `deposit_transfer_withdrawal_test`, `watchdog_non_genesis_divergence_test`) plus a **`watchdog-docker`** image smoke job. Run **`just doctor`** locally before CM-backed work. Full local smoke: `just test-watchdog-compare-harness`.
 
 ## V1 Shape
 
@@ -179,13 +179,16 @@ Useful runtime knobs:
 | `just test-watchdog` | Lua unit tests (fake HTTP/RPC/CM; no live chain) |
 | `just test-watchdog-e2e` | Real CM: advance, inspect; optional live compare if `WATCHDOG_E2E_SEQUENCER_URL` set |
 | `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua compare (`main.lua`) |
-| `just test-rollups-e2e` | All rollups e2e scenarios; includes watchdog genesis/non-genesis compare plus a non-genesis divergence assertion |
+| `just test-rollups-e2e` | All rollups e2e scenarios; includes watchdog genesis/non-genesis compare plus `watchdog_non_genesis_divergence_test` (needs Sepolia CM image) |
 | `just test-watchdog-divergence-drill` | Synthetic divergence signal drill (`watchdog_event` + exit `2`) |
+| `just doctor` | Toolchain sanity: lua, cartesi-machine, lcurl, devnet CM image loadable via `machine_cartesi` |
 
 Prerequisites for CM-backed tests: see **[Host dependencies](#host-dependencies-watchdog-lua-deps)** above, then:
 
 ```bash
+just doctor                          # fail fast before long harness runs
 just canonical-build-machine-image   # once, if out/ image is missing
+just canonical-build-machine-image-sepolia   # rollups-e2e divergence trial (auto-built by test-rollups-e2e)
 just watchdog-lua-deps
 export WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"
 ```
@@ -210,6 +213,7 @@ Scenarios (verbose `step NN/NN` logging):
 - `prerequisites` — `cartesi-machine` on PATH and machine image present.
 - `advance-empty-range` — real CM advance + checkpoint write with zero new inputs.
 - `cm-inspect-state-query` — real `--cmio-inspect-state` with query `state`.
+- `machine-cartesi-store-reload-advance` — store checkpoint snapshot, reload, advance again (in-process binding).
 - `compare-runner-with-sequencer` — skipped unless `WATCHDOG_E2E_SEQUENCER_URL` is set.
 
 Rebuild the machine image after changing the canonical scheduler/dapp. A stale
