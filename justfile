@@ -13,18 +13,18 @@ test:
     cargo test --workspace
 
 test-watchdog:
-    lua watchdog/tests/run.lua
+    just -f watchdog/justfile test
 
 test-watchdog-e2e:
-    lua watchdog/tests/e2e.lua
+    just -f watchdog/justfile test-e2e
 
 # Verify divergence signal via main.lua (drill exits 2 like production).
 test-watchdog-divergence-drill: watchdog-lua-deps
-    @bash scripts/test-watchdog-divergence-drill.sh
+    @just -f watchdog/justfile test-divergence-drill
 
 # Build lcurl (lua-cURLv3) into .deps/lua; JSON is pure Lua under watchdog/third_party/.
 watchdog-lua-deps:
-    @bash scripts/watchdog-lua-deps.sh
+    @just -f watchdog/justfile lua-deps
 
 # Anvil + rollups + sequencer-devnet; prints WATCHDOG_* exports until Ctrl+C.
 devnet-for-watchdog: setup ensure-machine-image
@@ -56,6 +56,10 @@ bench target="all":
 setup:
     just -f examples/canonical-app/justfile download-deps
     just -f tests/benchmarks/justfile setup
+    just watchdog-lua-deps
+
+doctor:
+    just -f watchdog/justfile doctor
 
 canonical-build-machine-image:
     just -f examples/canonical-app/justfile build-machine-image

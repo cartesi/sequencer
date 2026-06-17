@@ -310,12 +310,29 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 runtime,
             ))
         }),
+        ("watchdog_non_genesis_divergence_test", |runtime| {
+            Box::pin(run_watchdog_non_genesis_divergence_test(runtime))
+        }),
     ]
 }
 
 async fn run_deposit_transfer_withdrawal_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
+    prepare_non_genesis_watchdog_state(runtime).await?;
+    crate::watchdog_compare::run_watchdog_non_genesis_compare_test(runtime).await?;
+    Ok(())
+}
+
+async fn run_watchdog_non_genesis_divergence_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    prepare_non_genesis_watchdog_state(runtime).await?;
+    crate::watchdog_compare::run_watchdog_non_genesis_divergence_test(runtime).await?;
+    Ok(())
+}
+
+async fn prepare_non_genesis_watchdog_state(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
     let alice_address = alice.address();
@@ -365,8 +382,6 @@ async fn run_deposit_transfer_withdrawal_test(
         alice_address,
     )
     .await?;
-
-    crate::watchdog_compare::run_watchdog_non_genesis_compare_test(runtime).await?;
     Ok(())
 }
 

@@ -16,3 +16,11 @@ soljson-latest.js
 **/states/
 __pycache__/
 /benchmarks/
+/.watchdog-cm-work/
+
+# Local CM / demo scratch (not part of the repo)
+/input-*-output-*.bin
+docs/live-demo.md
+tests/scripts/sepolia-demo.txt
+tests/scripts/sepolia_accounts.txt
+tests/scripts/tests/
