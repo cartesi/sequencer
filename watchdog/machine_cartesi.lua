@@ -149,17 +149,17 @@ function machine_cartesi.new(_opts)
 
     local binding = {}
 
+    local function load_machine(snapshot_dir, config)
+        local machine = cartesi.new()
+        machine:load(snapshot_dir, config)
+        return machine
+    end
+
     function binding.load_snapshot(snapshot_dir)
         assert(type(snapshot_dir) == "string" and snapshot_dir ~= "", "snapshot_dir is required")
-        local ok, machine = pcall(function()
-            return cartesi.machine():load(snapshot_dir, runtime_config)
-        end)
+        local ok, machine = pcall(load_machine, snapshot_dir, runtime_config)
         if not ok then
-            -- Older cartesi Lua bindings may reject runtime_config; retry with
-            -- default runtime settings for compatibility in local environments.
-            ok, machine = pcall(function()
-                return cartesi.machine():load(snapshot_dir, {})
-            end)
+            ok, machine = pcall(load_machine, snapshot_dir, {})
         end
         if not ok then
             return nil, tostring(machine)
