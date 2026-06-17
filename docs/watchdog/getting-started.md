@@ -6,7 +6,7 @@ Step-by-step guide for running the watchdog alongside a **local** `sequencer-dev
 
 - Architecture and module map: [`README.md`](README.md)
 - **Sepolia / mainnet (production-like):** [`operator-deployment.md`](operator-deployment.md)
-- Webhook / staging drills: [`staging-drills.md`](staging-drills.md)
+- Staging drills: [`staging-drills.md`](staging-drills.md)
 - Implementation: [`watchdog/`](../../watchdog/) (Lua)
 
 ## Contents
@@ -61,6 +61,7 @@ From the repo root:
    just setup                      # Anvil state + contract artifacts
    just canonical-build-machine-image   # CM image (~minutes, needs cross toolchain)
    just watchdog-lua-deps          # builds .deps/lua/lcurl.so
+   just doctor                     # lua + cartesi + lcurl + machine_cartesi load probe
    ```
 
 6. **Unit smoke (optional)**:
@@ -210,6 +211,7 @@ Full harness failure table: **[`README.md` — Troubleshooting compare harness](
 ## Related commands
 
 ```bash
+just doctor                           # toolchain sanity before CM-backed tests
 just test-watchdog                    # Lua unit tests (no live chain)
 just test-watchdog-e2e                # CM advance/inspect (optional live sequencer URL)
 just test-watchdog-compare-harness    # Full stack smoke
