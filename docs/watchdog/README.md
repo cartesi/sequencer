@@ -88,9 +88,6 @@ Lua modules:
 - `abi.lua`: decoding for the `InputAdded` / `EvmAdvance` envelope.
 - `machine_runner.lua`: CM driver (`load`, `advance`, `inspect`, `dump`).
 - `machine_cartesi.lua`: in-process `cartesi` Lua module binding (production path).
-- `machine_cli.lua`: CLI adapter (`cartesi-machine` subprocess). Used by the Rust
-  compare harness (`run_compare_once.lua`) and Lua CM e2e; `main.lua` uses
-  `machine_cartesi` in production.
 - `sequencer_reader.lua`: sequencer HTTP client (`GET /finalized_state/inclusion_block`, `GET /finalized_state`).
 - `compare.lua`: raw byte comparison.
 - `checkpoint.lua`: manifest-backed checkpoint persistence.
@@ -169,8 +166,8 @@ compares the SSZ report bytes against `GET /finalized_state`.
 
 Useful runtime knobs:
 
-- `WATCHDOG_CM_EXECUTABLE` / `WATCHDOG_CM_WORK_DIR`: used only by `machine_cli.lua`
-  tests; production `main.lua` uses the in-process `cartesi` Lua module.
+- `WATCHDOG_CM_EXECUTABLE` / `WATCHDOG_CM_WORK_DIR`: compatibility/test knobs.
+  Production compare uses the in-process `cartesi` Lua module.
 - `WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
 - `WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.
 - `WATCHDOG_TARGET_SAFE_BLOCK`: manual/test override for the target safe block.
@@ -181,8 +178,8 @@ Useful runtime knobs:
 |---------|-------------------|
 | `just test-watchdog` | Lua unit tests (fake HTTP/RPC/CM; no live chain) |
 | `just test-watchdog-e2e` | Real CM: advance, inspect; optional live compare if `WATCHDOG_E2E_SEQUENCER_URL` set |
-| `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua compare (genesis) |
-| `just test-rollups-e2e` | All rollups e2e scenarios; includes `deposit_transfer_withdrawal_test` (wallet workload + **non-genesis** watchdog compare) and `watchdog_genesis_compare_test` |
+| `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua compare (`main.lua`) |
+| `just test-rollups-e2e` | All rollups e2e scenarios; includes watchdog genesis/non-genesis compare plus a non-genesis divergence assertion |
 | `just test-watchdog-divergence-drill` | Synthetic divergence signal drill (`watchdog_event` + exit `2`) |
 
 Prerequisites for CM-backed tests: see **[Host dependencies](#host-dependencies-watchdog-lua-deps)** above, then:
@@ -200,8 +197,7 @@ just test-watchdog
 ```
 
 Covers raw comparison, golden InputAdded ABI decoding, L1 ordering, recursive
-range partitioning, config, checkpoints, advance/compare runner (fakes), CM CLI
-staging, and retry behavior.
+range partitioning, config, checkpoints, advance/compare runner (fakes), and retry behavior.
 
 ### Lua CM end-to-end
 
@@ -228,7 +224,7 @@ just test-watchdog-compare-harness
 Spawns Anvil + rollups devnet + `sequencer-devnet`, proves CM inspect SSZ at
 genesis matches `wallet_snapshot::encode(WalletConfig::devnet())` (same as
 `tests/fixtures/wallet_snapshot_v1_empty.hex` only for Sepolia `default()`), then runs
-`watchdog/tests/run_compare_once.lua` (CLI `machine_cli` binding) in compare mode.
+`watchdog/main.lua` in compare mode.
 When `inclusion_block` is unchanged at genesis, the runner skips L1/CM work (idle-cheap);
 `deposit_transfer_withdrawal_test` drives a gold batch first so compare replays real L1 inputs.
 **Before first run (or after changing scheduler / SSZ / inspect code):**
