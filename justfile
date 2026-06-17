@@ -43,12 +43,16 @@ test-sequencer:
     cargo test -p sequencer --test ws_broadcaster -- --test-threads=1
     cargo test -p sequencer --test batch_submitter_integration -- --test-threads=1
 
-test-rollups-e2e: setup watchdog-lua-deps ensure-machine-image
+test-rollups-e2e: setup ensure-machine-image ensure-sepolia-machine-image
+    just watchdog-lua-deps
     cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e --bin rollups-e2e
     cargo run -p rollups-e2e --bin rollups-e2e
 
 ensure-machine-image:
     @test -d examples/canonical-app/out/canonical-machine-image || just canonical-build-machine-image
+
+ensure-sepolia-machine-image:
+    @test -d examples/canonical-app/out/canonical-machine-image-sepolia || just canonical-build-machine-image-sepolia
 
 bench target="all":
     just -f tests/benchmarks/justfile {{target}}
