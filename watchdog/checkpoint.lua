@@ -99,7 +99,10 @@ function checkpoint.prepare(dir, safe_block)
     local snapshot_dir = join(full_path, "snapshot")
 
     -- Crash mid-store can leave a half-written snapshot; clear before retrying this block.
-    os.execute("rm -rf " .. shell_quote(snapshot_dir))
+    local rm_ok = os.execute("rm -rf " .. shell_quote(snapshot_dir))
+    if rm_ok ~= true and rm_ok ~= 0 then
+        return nil, "rm failed: " .. snapshot_dir
+    end
 
     local ok = os.execute("mkdir -p " .. shell_quote(full_path))
     if ok ~= true and ok ~= 0 then

@@ -61,7 +61,7 @@ export WATCHDOG_LUA_DEPS=.deps/lua
 WATCHDOG_ONCE=1 lua watchdog/main.lua
 ```
 
-Expected: exit 0, stdout `watchdog compare ok: safe_block=... input_count=...`, and
+Expected: exit **0**, stderr `watchdog_step` lines ending in `compare pass complete`, and
 byte-identical **devnet** genesis SSZ on sequencer `/finalized_state` and CM inspect
 (same bytes as `wallet_snapshot::encode(WalletConfig::devnet())`; the `.hex` fixture
 is for Sepolia `default()` — do not use it as the devnet golden).
