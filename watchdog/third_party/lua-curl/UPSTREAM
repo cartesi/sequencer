@@ -1,12 +1,15 @@
 Lua-cURLv3 (lcurl native binding; libcurl must be installed on the host).
 
-URL:    https://github.com/Lua-cURL/Lua-cURLv3
-Commit: 9f8b6dba8b5ef1b26309a571ae75cda4034279e5
-License: MIT (see upstream LICENSE)
+URL:     https://github.com/Lua-cURL/Lua-cURLv3
+Commit:  9f8b6dba8b5ef1b26309a571ae75cda4034279e5
+License: MIT (see LICENSE in this directory)
 
-Sources are not vendored in git. `scripts/watchdog-lua-deps.sh` downloads this
-pinned tarball at build time into `.deps/lua-curl-src/<sha>/` and compiles
-`lcurl.so` into `.deps/lua/`. Pin is also recorded in `release/versions.env`
-as `LUA_CURL_UPSTREAM_SHA`.
+Vendored in-tree: the curated C subset is committed under `src/` (the `src/*.c`
++ `src/*.h` that make up the `lcurl` C module). We do NOT vendor the optional
+`cURL/*.lua` helper layer, the upstream Makefile/build glue, tests, docs, or CI
+config. `scripts/watchdog-lua-deps.sh` compiles `src/*.c` directly into
+`.deps/lua/lcurl.so` -- there is no build-time download and no pin to verify,
+because the compiled bytes are exactly this in-tree source.
 
-We build only the lcurl C module — not the optional `cURL/*.lua` helper layer.
+Updating: replace `src/` from a newer upstream commit, refresh LICENSE, and
+update the Commit line above.

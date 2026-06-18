@@ -159,9 +159,6 @@ function machine_cartesi.new(_opts)
         assert(type(snapshot_dir) == "string" and snapshot_dir ~= "", "snapshot_dir is required")
         local ok, machine = pcall(load_machine, snapshot_dir, runtime_config)
         if not ok then
-            ok, machine = pcall(load_machine, snapshot_dir, {})
-        end
-        if not ok then
             return nil, tostring(machine)
         end
         return {

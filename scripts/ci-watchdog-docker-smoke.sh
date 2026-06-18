@@ -6,7 +6,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${root}"
 
 # shellcheck disable=SC1091
-source release/versions.env
+source toolchain-pins.env
 
 image="sequencer-watchdog:ci-smoke"
 if command -v dpkg >/dev/null 2>&1; then
@@ -35,7 +35,6 @@ docker build \
   --build-arg "GIT_COMMIT=local" \
   --build-arg "CARTESI_MACHINE_VERSION=${CARTESI_MACHINE_VERSION}" \
   --build-arg "CARTESI_MACHINE_DEB_SHA256=${deb_sha}" \
-  --build-arg "LUA_CURL_UPSTREAM_SHA=${LUA_CURL_UPSTREAM_SHA}" \
   -f watchdog/Dockerfile \
   -t "${image}" \
   .
@@ -43,5 +42,7 @@ docker build \
 docker run --rm -e WATCHDOG_PRINT_RELEASE_INFO=1 "${image}" >/dev/null
 docker run --rm --entrypoint cartesi-machine "${image}" --version >/dev/null
 docker run --rm --entrypoint lua5.4 "${image}" -e "require('cartesi'); print('cartesi ok')"
+# Validate the vendored lcurl build loads in the runtime image.
+docker run --rm --entrypoint lua5.4 "${image}" -e "require('lcurl'); print('lcurl ok')"
 
 echo "watchdog docker smoke ok"

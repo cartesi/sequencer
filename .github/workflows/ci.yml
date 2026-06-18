@@ -13,11 +13,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Load release versions
-        uses: ./.github/actions/load-release-versions
+      - name: Load toolchain pins
+        uses: ./.github/actions/load-toolchain-pins
 
-      - name: Verify release version alignment
-        run: bash scripts/verify-release-versions.sh
+      - name: Verify toolchain pin alignment
+        run: bash scripts/verify-toolchain-pins.sh
 
       - name: Install system dependencies
         run: |
@@ -71,8 +71,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Load release versions
-        uses: ./.github/actions/load-release-versions
+      - name: Load toolchain pins
+        uses: ./.github/actions/load-toolchain-pins
 
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
@@ -100,8 +100,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Load release versions
-        uses: ./.github/actions/load-release-versions
+      - name: Load toolchain pins
+        uses: ./.github/actions/load-toolchain-pins
 
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
@@ -128,6 +128,12 @@ jobs:
       - name: Run rollups E2E tests
         run: just test-rollups-e2e
 
+      # Runs after the e2e step so the canonical machine image is already built;
+      # exercises the in-process machine_cartesi binding incl. store -> reload -> advance,
+      # which the Rust harness never loads (its compare passes only load the genesis image).
+      - name: Watchdog Lua CM e2e
+        run: just test-watchdog-e2e
+
   watchdog-docker:
     name: Watchdog Docker image smoke
     runs-on: ubuntu-latest
@@ -138,8 +144,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Load release versions
-        uses: ./.github/actions/load-release-versions
+      - name: Load toolchain pins
+        uses: ./.github/actions/load-toolchain-pins
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

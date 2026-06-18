@@ -19,8 +19,7 @@ local log = dofile("watchdog/tests/e2e_log.lua")
 
 local function fake_cfg()
     return {
-        mode = "compare",
-        checkpoint_dir = "/tmp/watchdog-drill",
+        state_dir = "/tmp/watchdog-drill",
         cm_snapshot_dir = "/tmp/genesis-snapshot",
         cm_snapshot_safe_block = 0,
         input_box_address = "0xinputbox",
