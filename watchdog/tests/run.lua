@@ -9,9 +9,11 @@ local compare = require("watchdog.compare")
 local config = require("watchdog.config")
 local jsonrpc = require("watchdog.jsonrpc")
 local l1_reader = require("watchdog.l1_reader")
+local main_mod = require("watchdog.main")
 local retry = require("watchdog.retry")
 local runner = require("watchdog.runner")
 local sequencer_reader = require("watchdog.sequencer_reader")
+local state_mod = require("watchdog.state")
 
 local tests = {}
 
@@ -142,6 +144,62 @@ test("shared partition vector matches l1_reader bisect plan", function()
     end
 end)
 
+test("l1_reader streams successful partitions in L1 order", function()
+    local calls = {}
+    local chunks = {}
+    local rpc = {}
+    function rpc.get_logs(_self, filter)
+        table.insert(calls, { filter.from_block, filter.to_block })
+        if filter.from_block == 1 and filter.to_block == 4 then
+            return nil, "-32005: range too large"
+        end
+        if filter.from_block == 1 and filter.to_block == 2 then
+            return {
+                { blockNumber = "0x2", transactionIndex = "0x0", logIndex = "0x2" },
+                { blockNumber = "0x1", transactionIndex = "0x0", logIndex = "0x1" },
+            }
+        end
+        if filter.from_block == 3 and filter.to_block == 4 then
+            return {
+                { blockNumber = "0x4", transactionIndex = "0x0", logIndex = "0x0" },
+            }
+        end
+        error("unexpected range")
+    end
+
+    local count, err = l1_reader.for_each_log_chunk_partitioned(rpc, {
+        start_block = 1,
+        end_block = 4,
+        input_box_address = "0xinputbox",
+        app_address = "0x1111111111111111111111111111111111111111",
+        long_block_range_error_codes = { "-32005" },
+    }, function(logs, range)
+        table.insert(chunks, {
+            from_block = range.from_block,
+            to_block = range.to_block,
+            first_block = logs[1] and logs[1].blockNumber,
+            count = #logs,
+        })
+        return true
+    end)
+
+    assert(count, err)
+    assert_eq(count, 3)
+    assert_eq(#calls, 3)
+    assert_eq(calls[1][1], 1)
+    assert_eq(calls[1][2], 4)
+    assert_eq(calls[2][1], 1)
+    assert_eq(calls[2][2], 2)
+    assert_eq(calls[3][1], 3)
+    assert_eq(calls[3][2], 4)
+    assert_eq(#chunks, 2)
+    assert_eq(chunks[1].from_block, 1)
+    assert_eq(chunks[1].to_block, 2)
+    assert_eq(chunks[1].first_block, "0x1")
+    assert_eq(chunks[2].from_block, 3)
+    assert_eq(chunks[2].to_block, 4)
+end)
+
 test("l1_reader ensure_rpc_head_at_least accepts head at target", function()
     local head, err = l1_reader.ensure_rpc_head_at_least({
         get_block_number_by_tag = function(_self, tag)
@@ -222,11 +280,11 @@ end)
 
 test("config loads snapshot directory safe block and optional topic", function()
     local env = {
-        WATCHDOG_L1_RPC_URL = "http://rpc",
+        WATCHDOG_SEQUENCER_URL = "http://seq",
         WATCHDOG_INPUTBOX_ADDRESS = "0x9999999999999999999999999999999999999999",
         WATCHDOG_APP_ADDRESS = "0x1111111111111111111111111111111111111111",
         WATCHDOG_INPUT_ADDED_TOPIC = "0xtopic",
-        WATCHDOG_CHECKPOINT_DIR = "/tmp/checkpoints",
+        WATCHDOG_STATE_DIR = "/tmp/watchdog-state",
         WATCHDOG_CM_SNAPSHOT_DIR = "/tmp/snapshot",
         WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK = "42",
     }
@@ -234,26 +292,25 @@ test("config loads snapshot directory safe block and optional topic", function()
     local cfg = config.load(env)
 
     assert_eq(cfg.input_added_topic, "0xtopic")
+    assert_eq(cfg.state_dir, "/tmp/watchdog-state")
     assert_eq(cfg.cm_snapshot_dir, "/tmp/snapshot")
     assert_eq(cfg.cm_snapshot_safe_block, 42)
-    assert_eq(cfg.mode, "advance")
+    assert_eq(cfg.l1_rpc_url, nil)
 end)
 
-test("config rejects unknown mode", function()
+test("config requires a sequencer URL", function()
     local ok, err = pcall(function()
         config.load({
-            WATCHDOG_MODE = "bad",
-            WATCHDOG_L1_RPC_URL = "http://rpc",
             WATCHDOG_INPUTBOX_ADDRESS = "0x9999999999999999999999999999999999999999",
             WATCHDOG_APP_ADDRESS = "0x1111111111111111111111111111111111111111",
-            WATCHDOG_CHECKPOINT_DIR = "/tmp/checkpoints",
+            WATCHDOG_STATE_DIR = "/tmp/watchdog-state",
         })
     end)
     assert_eq(ok, false)
-    assert(tostring(err):find("WATCHDOG_MODE", 1, true) ~= nil, "mode error is explicit")
+    assert(tostring(err):find("WATCHDOG_SEQUENCER_URL", 1, true) ~= nil, "sequencer URL is required")
 end)
 
-test("checkpoint writes manifest-backed current pointer", function()
+test("checkpoint writes manifest-backed head pointer", function()
     local dir = os.tmpname()
     os.remove(dir)
     os.execute(string.format('mkdir -p "%s"', dir))
@@ -274,6 +331,29 @@ test("checkpoint writes manifest-backed current pointer", function()
     assert(loaded, load_err)
     assert_eq(loaded.snapshot_dir, dir .. "/checkpoints/00000000000000000012/snapshot")
     assert(loaded.manifest_json:find('"safe_block":12', 1, true) ~= nil, "manifest has safe block")
+end)
+
+test("checkpoint load rejects missing head pointer", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute(string.format('mkdir -p "%s"', dir))
+
+    local loaded, err = checkpoint.load(dir)
+    assert_eq(loaded, nil)
+    assert_eq(err, "missing head.json")
+end)
+
+test("checkpoint rejects head pointer outside checkpoint namespace", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute(string.format('mkdir -p "%s"', dir))
+    local file = assert(io.open(dir .. "/head.json", "wb"), "head pointer opened")
+    file:write('{"checkpoint":"../outside"}\n')
+    file:close()
+
+    local loaded, err = checkpoint.load(dir)
+    assert_eq(loaded, nil)
+    assert_eq(err, "invalid checkpoint pointer")
 end)
 
 test("checkpoint rejects manifest without safe block", function()
@@ -309,15 +389,87 @@ test("checkpoint prepare clears stale snapshot dir before write", function()
     assert_eq(io.open(stale_snapshot .. "/garbage", "rb"), nil)
 end)
 
+test("checkpoint refuses same-block rewrite before clearing selected snapshot", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local written, err = checkpoint.write(dir, 12, function(snapshot_dir)
+        os.execute(string.format('mkdir -p "%s"', snapshot_dir))
+        local file = io.open(snapshot_dir .. "/marker", "wb")
+        assert(file ~= nil, "marker file opened")
+        file:write("original")
+        file:close()
+        return true
+    end)
+    assert(written, err)
+
+    local second, second_err = checkpoint.write(dir, 12, function(_snapshot_dir)
+        error("same-block rewrite must fail before snapshot_writer")
+    end)
+    assert_eq(second, nil)
+    assert(tostring(second_err):find("refusing to rewrite selected checkpoint", 1, true) ~= nil, tostring(second_err))
+
+    local marker = io.open(dir .. "/checkpoints/00000000000000000012/snapshot/marker", "rb")
+    assert(marker ~= nil, "selected checkpoint snapshot remains intact")
+    assert_eq(marker:read("*a"), "original")
+    marker:close()
+end)
+
+test("checkpoint write keeps only the current checkpoint (prunes predecessor)", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute(string.format('mkdir -p "%s"', dir))
+
+    -- A non-checkpoint sentinel must never be touched by GC: head.json never
+    -- points at it.
+    local sentinel = dir .. "/genesis-image"
+    os.execute(string.format('mkdir -p "%s"', sentinel))
+
+    local function write_block(safe_block)
+        local written, err = checkpoint.write(dir, safe_block, function(snapshot_dir)
+            os.execute(string.format('mkdir -p "%s"', snapshot_dir))
+            local file = assert(io.open(snapshot_dir .. "/marker", "wb"), "marker opened")
+            file:write("snapshot")
+            file:close()
+            return true
+        end)
+        assert(written, err)
+    end
+
+    local function dir_exists(path)
+        local ok, _, code = os.rename(path, path)
+        return ok or code == 13
+    end
+
+    write_block(1)
+    write_block(2)
+    write_block(3)
+
+    -- Only the latest checkpoint survives; the two predecessors are reclaimed.
+    assert(dir_exists(dir .. "/checkpoints/00000000000000000003"), "current checkpoint kept")
+    assert_eq(dir_exists(dir .. "/checkpoints/00000000000000000002"), false)
+    assert_eq(dir_exists(dir .. "/checkpoints/00000000000000000001"), false)
+
+    -- head.json still resolves to the latest, and GC never touched the sentinel.
+    local loaded, load_err = checkpoint.load(dir)
+    assert(loaded, load_err)
+    assert_eq(loaded.safe_block, 3)
+    assert(dir_exists(sentinel), "non-checkpoint dir must be untouched")
+end)
+
 local function fake_cfg()
     return {
-        checkpoint_dir = "/tmp/watchdog-test",
+        state_dir = "/tmp/watchdog-test",
+        sequencer_url = "http://sequencer",
+        l1_rpc_url = "http://rpc",
         cm_snapshot_dir = "/tmp/genesis-snapshot",
         cm_snapshot_safe_block = 0,
         input_box_address = "0xinputbox",
         app_address = "0x1111111111111111111111111111111111111111",
         input_added_topic = "0xtopic",
         long_block_range_error_codes = l1_reader.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
+        retry_attempts = 1,
+        retry_delay_sec = 0,
     }
 end
 
@@ -325,6 +477,7 @@ local function fake_machine(inspect_state)
     local machine = {
         loaded_path = nil,
         fed_inputs = nil,
+        advance_calls = {},
     }
     function machine:load(path, reference_block)
         self.loaded_path = path
@@ -332,6 +485,11 @@ local function fake_machine(inspect_state)
     end
     function machine:advance(_instance, inputs, range)
         self.fed_inputs = inputs
+        table.insert(self.advance_calls, {
+            from_block = range.from_block,
+            to_block = range.to_block,
+            input_count = #inputs,
+        })
         _instance.reference_block = range.to_block
         return true
     end
@@ -355,6 +513,75 @@ local function fake_machine(inspect_state)
     end
     return machine
 end
+
+test("init stores bootstrap snapshot as watchdog head", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+    cfg.cm_snapshot_safe_block = 5
+
+    local machine = fake_machine("{}")
+    local result, err = main_mod.run_init(cfg, {
+        machine = machine,
+    })
+    assert(result, err)
+    assert_eq(result.safe_block, 5)
+    assert_eq(machine.loaded_path, "/tmp/genesis-snapshot")
+
+    local loaded, load_err = checkpoint.load(dir)
+    assert(loaded, load_err)
+    assert_eq(loaded.safe_block, 5)
+    assert_eq(loaded.snapshot_dir, dir .. "/checkpoints/00000000000000000005/snapshot")
+
+    local persisted, cfg_err = state_mod.read_json(dir, "config.json", require("watchdog.json").new())
+    assert(persisted, cfg_err)
+    assert_eq(persisted.sequencer_url, "http://sequencer")
+    assert_eq(persisted.l1_rpc_url, nil)
+
+    local tick_cfg = main_mod.load_tick_config({
+        WATCHDOG_STATE_DIR = dir,
+        WATCHDOG_L1_RPC_URL = "http://tick-rpc",
+    })
+    assert_eq(tick_cfg.state_dir, dir)
+    assert_eq(tick_cfg.sequencer_url, "http://sequencer")
+    assert_eq(tick_cfg.l1_rpc_url, "http://tick-rpc")
+end)
+
+test("tick config requires current RPC URL outside persisted state", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+
+    local result, err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert(result, err)
+
+    local ok, load_err = pcall(function()
+        main_mod.load_tick_config({
+            WATCHDOG_STATE_DIR = dir,
+        })
+    end)
+    assert_eq(ok, false)
+    assert(tostring(load_err):find("WATCHDOG_L1_RPC_URL", 1, true) ~= nil, tostring(load_err))
+end)
+
+test("init refuses an already initialized state directory", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+
+    local first, first_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert(first, first_err)
+
+    local second, second_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert_eq(second, nil)
+    assert(tostring(second_err):find("already initialized", 1, true) ~= nil, tostring(second_err))
+end)
 
 test("runner happy path replays inputs and writes checkpoint", function()
     local checkpoint_writes = {}
@@ -409,6 +636,121 @@ test("runner happy path replays inputs and writes checkpoint", function()
     assert_eq(checkpoint_writes[1].safe_block, 12)
 end)
 
+test("runner advances CM as streamed input chunks arrive", function()
+    local checkpoint_writes = {}
+    local checkpoint_mod = {
+        load = function(_dir)
+            return {
+                snapshot_dir = "/tmp/checkpoints/0001/snapshot",
+                safe_block = 10,
+            }
+        end,
+        write = function(_dir, safe_block, snapshot_writer, _manifest)
+            local ok, err = snapshot_writer("/tmp/new-snapshot")
+            assert(ok, err)
+            table.insert(checkpoint_writes, safe_block)
+            return true
+        end,
+    }
+    local machine = fake_machine('{"ok":true}')
+    local result, err = runner.run_once(fake_cfg(), {
+        checkpoint = checkpoint_mod,
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 12, l2_tx_index = 0 }
+            end,
+            get_finalized_state = function()
+                return {
+                    inclusion_block = 12,
+                    l2_tx_index = 0,
+                    state = '{"ok":true}',
+                }
+            end,
+        },
+        for_each_input_chunk = function(from_block, to_block, on_chunk)
+            assert_eq(from_block, 11)
+            assert_eq(to_block, 12)
+            local ok, chunk_err = on_chunk({ { raw_input = "a" } }, {
+                from_block = 11,
+                to_block = 11,
+            })
+            assert(ok, chunk_err)
+            ok, chunk_err = on_chunk({ { raw_input = "b" }, { raw_input = "c" } }, {
+                from_block = 12,
+                to_block = 12,
+            })
+            assert(ok, chunk_err)
+            return 3
+        end,
+        machine = machine,
+    })
+
+    assert(result, err)
+    assert_eq(result.input_count, 3)
+    assert_eq(#machine.advance_calls, 2)
+    assert_eq(machine.advance_calls[1].from_block, 11)
+    assert_eq(machine.advance_calls[1].input_count, 1)
+    assert_eq(machine.advance_calls[2].from_block, 12)
+    assert_eq(machine.advance_calls[2].input_count, 2)
+    assert_eq(#checkpoint_writes, 1)
+    assert_eq(checkpoint_writes[1], 12)
+end)
+
+test("runner advances CM over empty streamed partitions", function()
+    local machine = fake_machine('{"ok":true}')
+    local result, err = runner.run_once(fake_cfg(), {
+        checkpoint = {
+            load = function(_dir)
+                return {
+                    snapshot_dir = "/tmp/checkpoints/0001/snapshot",
+                    safe_block = 10,
+                }
+            end,
+            write = function(_dir, safe_block, snapshot_writer, _manifest)
+                local ok, write_err = snapshot_writer("/tmp/new-snapshot")
+                assert(ok, write_err)
+                assert_eq(safe_block, 12)
+                return true
+            end,
+        },
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 12, l2_tx_index = 0 }
+            end,
+            get_finalized_state = function()
+                return {
+                    inclusion_block = 12,
+                    l2_tx_index = 0,
+                    state = '{"ok":true}',
+                }
+            end,
+        },
+        for_each_input_chunk = function(_from_block, _to_block, on_chunk)
+            local ok, chunk_err = on_chunk({}, {
+                from_block = 11,
+                to_block = 11,
+            })
+            assert(ok, chunk_err)
+            ok, chunk_err = on_chunk({ { raw_input = "a" } }, {
+                from_block = 12,
+                to_block = 12,
+            })
+            assert(ok, chunk_err)
+            return 1
+        end,
+        machine = machine,
+    })
+
+    assert(result, err)
+    assert_eq(result.input_count, 1)
+    assert_eq(#machine.advance_calls, 2)
+    assert_eq(machine.advance_calls[1].from_block, 11)
+    assert_eq(machine.advance_calls[1].to_block, 11)
+    assert_eq(machine.advance_calls[1].input_count, 0)
+    assert_eq(machine.advance_calls[2].from_block, 12)
+    assert_eq(machine.advance_calls[2].input_count, 1)
+end)
+
 test("runner returns state mismatch payload", function()
     local result, err = runner.run_once(fake_cfg(), {
         checkpoint = {
@@ -439,6 +781,27 @@ test("runner returns state mismatch payload", function()
     assert_eq(result, nil)
     assert(type(err) == "table", "expected mismatch payload")
     assert_eq(err.kind, "state_mismatch")
+end)
+
+test("runner refuses missing or corrupt watchdog head", function()
+    local ok, err = pcall(function()
+        return runner.run_once(fake_cfg(), {
+            checkpoint = {
+                load = function(_dir)
+                    return nil, "invalid checkpoint pointer"
+                end,
+            },
+            sequencer = {
+                get_finalized_inclusion_block = function()
+                    error("sequencer must not be queried after corrupt checkpoint")
+                end,
+            },
+            machine = fake_machine("{}"),
+        })
+    end)
+
+    assert_eq(ok, false)
+    assert(tostring(err):find("failed to load watchdog head", 1, true) ~= nil, tostring(err))
 end)
 
 test("runner returns transient error when L1 RPC head lags target block", function()
@@ -627,39 +990,6 @@ test("sequencer client rejects invalid inclusion_block JSON", function()
     local head, err = client:get_finalized_inclusion_block()
     assert_eq(head, nil)
     assert_eq(err, "invalid finalized inclusion_block response JSON")
-end)
-
-test("advance runner fetches inputs and saves checkpoint without sequencer", function()
-    local checkpoint_writes = {}
-    local machine = fake_machine("unused")
-    local result, err = runner.advance_checkpoint_once(fake_cfg(), {
-        checkpoint = {
-            load = function(_dir)
-                return { snapshot_dir = "/tmp/snapshot", safe_block = 7 }
-            end,
-            write = function(dir, safe_block, snapshot_writer, manifest)
-                local ok, write_err = snapshot_writer("/tmp/advanced-snapshot")
-                assert(ok, write_err)
-                table.insert(checkpoint_writes, { dir = dir, safe_block = safe_block, manifest = manifest })
-                return true
-            end,
-        },
-        safe_block = function()
-            return 9
-        end,
-        fetch_inputs = function(from_block, to_block)
-            assert_eq(from_block, 8)
-            assert_eq(to_block, 9)
-            return { { raw_input = "one" }, { raw_input = "two" } }
-        end,
-        machine = machine,
-    })
-
-    assert(result, err)
-    assert_eq(result.safe_block, 9)
-    assert_eq(result.input_count, 2)
-    assert_eq(machine.saved_snapshot_dir, "/tmp/advanced-snapshot")
-    assert_eq(#checkpoint_writes, 1)
 end)
 
 test("retry succeeds after transient failures", function()

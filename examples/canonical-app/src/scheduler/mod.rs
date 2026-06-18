@@ -49,9 +49,18 @@ pub fn run_scheduler_forever<R: Rollup, A: Application>(
                 }
             }
             Ok(RollupRequest::Inspect { payload }) => {
-                let report = scheduler
-                    .inspect_state(&payload)
-                    .unwrap_or_else(|err| panic!("scheduler inspect failed: {err:?}"));
+                // Inspect is a public, read-only query endpoint: an unknown query
+                // (or a state-encode error) must not halt the guest. Emit a
+                // structured error report and keep serving, as it did before.
+                let report = match scheduler.inspect_state(&payload) {
+                    Ok(bytes) => bytes,
+                    Err(core::InspectError::UnsupportedQuery) => {
+                        b"unsupported inspect query".to_vec()
+                    }
+                    Err(core::InspectError::Application(reason)) => {
+                        format!("inspect failed: {reason}").into_bytes()
+                    }
+                };
                 rollup
                     .emit_report(&report)
                     .unwrap_or_else(|err| panic!("scheduler failed to emit inspect report: {err}"));
@@ -192,6 +201,41 @@ mod tests {
                 .iter()
                 .any(|report| report.as_slice() == expected.as_slice()),
             "missing state inspect report, got: {reports:?}"
+        );
+    }
+
+    #[test]
+    fn run_scheduler_reports_unsupported_inspect_query_without_panicking() {
+        // A non-"state" inspect payload must produce a graceful report, not a
+        // guest panic. The loop should survive the inspect and only panic when
+        // it later hits the terminal rollup error.
+        let inspect = RollupRequest::Inspect {
+            payload: b"balances".to_vec(),
+        };
+        let terminal_err = Err(RollupError::CmtCallFailed {
+            operation: "next_input",
+            code: -22,
+        });
+        let (rollup, reports) = MockRollup::with_inputs(vec![Ok(inspect), terminal_err]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_scheduler_forever(
+                rollup,
+                WalletApp::new(WalletConfig::default()),
+                SchedulerConfig::default(),
+            )
+        }));
+
+        assert!(
+            result.is_err(),
+            "scheduler loop should panic only on the terminal rollup error"
+        );
+        let reports = reports.lock().expect("poisoned reports mutex");
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.as_slice() == b"unsupported inspect query"),
+            "expected a graceful unsupported-query report, got: {reports:?}"
         );
     }
 

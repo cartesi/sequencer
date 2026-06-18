@@ -22,7 +22,7 @@ async fn main() -> HarnessResult<()> {
         ManagedSequencer::spawn(devnet_sequencer_config_no_faketime("devnet-stack")).await?;
 
     let machine_image = paths::devnet_machine_image_path();
-    let checkpoint_dir = std::env::temp_dir().join("watchdog-checkpoints-devnet");
+    let state_dir = std::env::temp_dir().join("watchdog-state-devnet");
 
     eprintln!();
     eprintln!("=== Devnet stack is up ===");
@@ -31,8 +31,9 @@ async fn main() -> HarnessResult<()> {
     eprintln!("App address:     {}", runtime.app_address());
     eprintln!("InputBox:        {}", runtime.input_box_address());
     eprintln!();
-    eprintln!("--- export these (watchdog compare mode) ---");
-    eprintln!("export WATCHDOG_MODE=compare");
+    eprintln!(
+        "--- export these, then run: lua watchdog/main.lua init && lua watchdog/main.lua tick ---"
+    );
     eprintln!("export WATCHDOG_SEQUENCER_URL={}", runtime.endpoint());
     eprintln!("export WATCHDOG_L1_RPC_URL={}", runtime.l1_endpoint());
     eprintln!(
@@ -40,10 +41,7 @@ async fn main() -> HarnessResult<()> {
         runtime.input_box_address()
     );
     eprintln!("export WATCHDOG_APP_ADDRESS={}", runtime.app_address());
-    eprintln!(
-        "export WATCHDOG_CHECKPOINT_DIR={}",
-        checkpoint_dir.display()
-    );
+    eprintln!("export WATCHDOG_STATE_DIR={}", state_dir.display());
     eprintln!(
         "export WATCHDOG_CM_SNAPSHOT_DIR={}",
         machine_image.display()
@@ -53,7 +51,6 @@ async fn main() -> HarnessResult<()> {
         "export WATCHDOG_LUA_DEPS={}/.deps/lua",
         paths::workspace_root().display()
     );
-    eprintln!("export WATCHDOG_ONCE=1   # or omit for daemon loop");
     eprintln!();
     eprintln!("Wait for finalized snapshot (404 until promotion):");
     eprintln!(
@@ -62,7 +59,8 @@ async fn main() -> HarnessResult<()> {
     );
     eprintln!();
     eprintln!("Run watchdog (from repo root, after `just watchdog-lua-deps`):");
-    eprintln!("  lua watchdog/main.lua");
+    eprintln!("  lua watchdog/main.lua init");
+    eprintln!("  lua watchdog/main.lua tick");
     eprintln!();
     eprintln!("Press Ctrl+C here to stop Anvil + sequencer.");
 

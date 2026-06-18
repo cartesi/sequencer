@@ -1,7 +1,5 @@
 /target
 .deps/
-watchdog/third_party/lua-curl/*
-!watchdog/third_party/lua-curl/UPSTREAM
 watchdog-e2e-*/
 .env
 .env.fish

@@ -28,32 +28,45 @@ just setup && just canonical-build-machine-image && just watchdog-lua-deps
 # Path A — full smoke (Anvil + sequencer + CM + compare), one command:
 just test-watchdog-compare-harness
 
-# Path B — two terminals: stack prints WATCHDOG_* exports, then run compare:
+# Path B — two terminals: stack prints WATCHDOG_* exports, then init + tick:
 just devnet-for-watchdog          # terminal 1 — leave running
 # terminal 2: paste exports, then:
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua
+WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua init
+WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua tick
 ```
+
+The production container entrypoint wraps `init`/`tick` with an advisory
+`flock` on `$WATCHDOG_STATE_DIR/run.lock`. Direct local `lua` runs are for
+development; production schedulers must also prevent overlapping ticks
+(`flock`, systemd, or Kubernetes `concurrencyPolicy: Forbid`).
 
 Details: **[`getting-started.md`](getting-started.md)**.
 
 ## Host dependencies (`watchdog-lua-deps`)
 
-Compare mode and any test that hits HTTP need a native **`lcurl.so`** built into `.deps/lua/`. JSON is pure Lua (no compile step).
+The watchdog cycle and any test that hits HTTP need a native **`lcurl.so`** built into `.deps/lua/`. JSON is pure Lua (no compile step).
 
 ```bash
 just watchdog-lua-deps    # idempotent; writes .deps/lua/lcurl.so
 export WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"
 ```
 
-You also need **`cartesi-machine`** on `PATH` (in-process `cartesi` Lua module) and **`lua`** (5.4 recommended).
+You also need **`cartesi-machine`** on `PATH` (in-process `cartesi`
+Lua module), **`lua`** (5.4 recommended), and a scheduler non-overlap
+guard. The release Docker image uses Linux `flock`; Nix also provides the
+same CLI on macOS/Linux via `nixpkgs#util-linux`:
+
+```bash
+nix shell nixpkgs#util-linux
+```
 
 ### System packages
 
 | OS | Packages |
 |----|----------|
-| Debian / Ubuntu / WSL | `libcurl4-openssl-dev` `liblua5.4-dev` `lua5.4` `build-essential` |
-| Fedora | `libcurl-devel` `lua-devel` |
-| Arch | `curl` `lua` |
+| Debian / Ubuntu / WSL | `libcurl4-openssl-dev` `liblua5.4-dev` `lua5.4` `build-essential` `util-linux` |
+| Fedora | `libcurl-devel` `lua-devel` `util-linux` |
+| Arch | `curl` `lua` `util-linux` |
 
 Verify before building:
 
@@ -62,7 +75,7 @@ pkg-config --exists libcurl && echo "libcurl ok"
 test -f /usr/include/lua5.4/lua.h && echo "lua headers ok"
 ```
 
-On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/include/`. The repo script fetches pinned lua-cURLv3 at build time and passes `LUA_INC` accordingly (`scripts/watchdog-lua-deps.sh`).
+On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/include/`. lua-cURLv3 is **vendored in-tree** under `watchdog/third_party/lua-curl/src`; `scripts/watchdog-lua-deps.sh` compiles it locally (no build-time download), discovering the Lua headers via `pkg-config` (override with `LUA_INC`).
 
 ### Troubleshooting `just watchdog-lua-deps`
 
@@ -72,7 +85,6 @@ On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/i
 | `install Lua headers` | `sudo apt-get install -y liblua5.4-dev` |
 | `fatal error: lua.h: No such file or directory` | Install `liblua5.4-dev`. If headers are present but build still fails, ensure you are on a tree where `scripts/watchdog-lua-deps.sh` passes **`LUA_INC`** (not `LUA_INCLUDE_DIR`) to make — see script in repo |
 | `built lcurl.so but lua cannot load it` | Lua version mismatch: build with the same `lua` you run (`lua -v` vs headers under `lua5.4`) |
-| `need curl or wget` | Install `curl` or `wget` to download pinned lua-cURLv3 into `.deps/lua-curl-src/` |
 
 CI runs **`just test-watchdog`** (mocked HTTP), the divergence drill script, and watchdog rollups-e2e trials (`watchdog_genesis_compare_test`, non-genesis compare inside `deposit_transfer_withdrawal_test`, `watchdog_non_genesis_divergence_test`) plus a **`watchdog-docker`** image smoke job. Run **`just doctor`** locally before CM-backed work. Full local smoke: `just test-watchdog-compare-harness`.
 
@@ -81,20 +93,24 @@ CI runs **`just test-watchdog`** (mocked HTTP), the divergence drill script, and
 The implementation lives in `watchdog/` and is intentionally split into small
 Lua modules:
 
-- `http.lua`: HTTP adapter via pinned **lua-cURLv3** / `lcurl` (`just watchdog-lua-deps`, fetch-at-build).
+- `http.lua`: HTTP adapter via **lua-cURLv3** / `lcurl`, vendored in-tree and compiled by `just watchdog-lua-deps` (no build-time download).
 - `json.lua` / `third_party/json.lua`: pure-Lua JSON (RPC + structured watchdog events).
 - `jsonrpc.lua`: JSON-RPC request/response validation.
-- `l1_reader.lua`: partitioned `eth_getLogs` scanning and strict L1 log ordering.
+- `l1_reader.lua`: partitioned `eth_getLogs` scanning, strict L1 log ordering,
+  and chunk callbacks so each successful provider response can be consumed and
+  discarded.
 - `abi.lua`: decoding for the `InputAdded` / `EvmAdvance` envelope.
 - `machine_runner.lua`: CM driver (`load`, `advance`, `inspect`, `dump`).
 - `machine_cartesi.lua`: in-process `cartesi` Lua module binding (production path).
 - `sequencer_reader.lua`: sequencer HTTP client (`GET /finalized_state/inclusion_block`, `GET /finalized_state`).
 - `compare.lua`: raw byte comparison.
-- `checkpoint.lua`: manifest-backed checkpoint persistence.
+- `checkpoint.lua`: manifest-backed checkpoint persistence (`head.json` pointer).
+- `state.lua`: persisted `config.json` and single-run state lock.
 - `retry.lua`: bounded retry helper used by the runtime.
-- `runner.lua`: one-shot orchestration — cheap `/finalized_state/inclusion_block`
-  poll, optional full pass (L1 fetch, CM replay, SSZ compare, checkpoint write).
-- `main.lua`: compare or advance loop (daemon or `WATCHDOG_ONCE=1`).
+- `runner.lua`: one compare cycle — cheap `/finalized_state/inclusion_block`
+  poll, then (when finalized advanced) L1 fetch, CM replay, SSZ compare,
+  checkpoint write.
+- `main.lua`: dispatches `init` and `tick`; `tick` exits `0`/`1`/`2`.
 
 The L1 reader follows the Rust partition strategy from
 `sequencer/src/l1/partition.rs`: if an RPC provider rejects a large range, the
@@ -113,8 +129,8 @@ The sequencer exposes operator-internal snapshot routes (see `sequencer/src/egre
 - `GET /finalized_state/inclusion_block` — cheap JSON `{ inclusion_block, l2_tx_index }` polled every compare tick.
 - `GET /finalized_state` — streams the finalized SSZ state file (`application/octet-stream`) with `X-Inclusion-Block` and `X-L2-Tx-Index` headers.
 
-**Idle optimization (compare mode):** when `inclusion_block` has not advanced past the
-checkpoint's `safe_block` (the last verified inclusion block), the runner returns
+**Idle optimization:** when `inclusion_block` has not advanced past the watchdog
+checkpoint's `safe_block`, the tick returns
 immediately — no `/finalized_state` download, no L1 `eth_getLogs`, no CM load/advance/inspect.
 
 The watchdog compares the finalized SSZ bytes with the bytes returned by CM
@@ -130,8 +146,10 @@ V1 persists only the resulting Cartesi Machine checkpoint, not the fetched L1
 inputs.
 
 ```text
-checkpoint_dir/
-  current.json
+state_dir/
+  config.json
+  head.json
+  run.lock       # advisory lock handle; file existence is not lock state
   checkpoints/
     00000000000001234567/
       snapshot/
@@ -139,38 +157,48 @@ checkpoint_dir/
 ```
 
 `manifest.json` records `safe_block` (the L1 reference block the CM snapshot
-covers — in compare mode this is the finalized `inclusion_block`), timestamp,
+covers — the finalized `inclusion_block`), timestamp,
 and optionally the CM image hash. A new checkpoint directory is written first,
-then `current.json` is atomically replaced to point at it.
+then `head.json` is atomically replaced to point at it.
 
-When bootstrapping without an existing checkpoint, the operator provides both:
+`init` stores the operator-provided bootstrap CM snapshot into this layout. `tick`
+requires both `config.json` and `head.json`; it never bootstraps from env.
+`WATCHDOG_L1_RPC_URL` is intentionally read at tick time, not persisted in
+`config.json`, so operators can rotate RPC endpoints without rewriting watchdog
+state.
 
 - `WATCHDOG_CM_SNAPSHOT_DIR`
 - `WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
 
-## Modes
+## How it runs
 
-The default `WATCHDOG_MODE` is `advance`. In this mode the watchdog does not
-poll the sequencer. It:
+The watchdog has two subcommands:
 
-1. Loads the latest checkpoint, or the bootstrap snapshot directory.
-2. Reads the L1 safe block from the RPC (or `WATCHDOG_TARGET_SAFE_BLOCK` when
-   provided for tests/manual runs).
-3. Fetches and decodes `InputAdded` logs for the block range.
-4. Feeds the raw InputBox input bytes into the CM adapter.
-5. Saves a new snapshot directory and advances `current.json`.
+```bash
+lua watchdog/main.lua init   # one-time setup: writes config.json + head.json
+lua watchdog/main.lua tick   # one compare cycle; schedule this
+```
 
-`WATCHDOG_MODE=compare` polls `/finalized_state/inclusion_block` first; when the
-block advances, replays L1 inputs into the CM, inspects with query `state`, and
-compares the SSZ report bytes against `GET /finalized_state`.
+`tick` does one cycle per process, then exits — infra schedules re-runs
+(systemd timer / k8s CronJob) and reacts to the exit code. There is no daemon
+loop. The production Docker entrypoint takes a non-blocking `flock` for
+`init`/`tick`; direct host scheduling should provide the same non-overlap
+guarantee. Each tick:
 
-Useful runtime knobs:
+1. Loads the watchdog checkpoint from `head.json`.
+2. Polls `/finalized_state/inclusion_block`. If it has not advanced past a
+   watchdog checkpoint, exits `0` (idle). Otherwise:
+3. Streams and decodes `InputAdded` logs for the new block range.
+4. Replays each successful L1 partition into the in-process Cartesi Machine,
+   then inspects with query `state`.
+5. Byte-compares the SSZ report against `GET /finalized_state`; on match writes a
+   new checkpoint, on mismatch emits a `watchdog_event` and exits `2`.
 
-- `WATCHDOG_CM_EXECUTABLE` / `WATCHDOG_CM_WORK_DIR`: compatibility/test knobs.
-  Production compare uses the in-process `cartesi` Lua module.
+Runtime knobs:
+
+- `WATCHDOG_L1_RPC_URL`: current L1 JSON-RPC endpoint for tick.
 - `WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
 - `WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.
-- `WATCHDOG_TARGET_SAFE_BLOCK`: manual/test override for the target safe block.
 
 ## Local Tests
 
@@ -178,7 +206,7 @@ Useful runtime knobs:
 |---------|-------------------|
 | `just test-watchdog` | Lua unit tests (fake HTTP/RPC/CM; no live chain) |
 | `just test-watchdog-e2e` | Real CM: advance, inspect; optional live compare if `WATCHDOG_E2E_SEQUENCER_URL` set |
-| `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua compare (`main.lua`) |
+| `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua `init`/`tick` |
 | `just test-rollups-e2e` | All rollups e2e scenarios; includes watchdog genesis/non-genesis compare plus `watchdog_non_genesis_divergence_test` (needs Sepolia CM image) |
 | `just test-watchdog-divergence-drill` | Synthetic divergence signal drill (`watchdog_event` + exit `2`) |
 | `just doctor` | Toolchain sanity: lua, cartesi-machine, lcurl, devnet CM image loadable via `machine_cartesi` |
@@ -200,7 +228,8 @@ just test-watchdog
 ```
 
 Covers raw comparison, golden InputAdded ABI decoding, L1 ordering, recursive
-range partitioning, config, checkpoints, advance/compare runner (fakes), and retry behavior.
+range partitioning, streamed L1 chunks, config, checkpoints, the compare runner
+(fakes), and retry behavior.
 
 ### Lua CM end-to-end
 
@@ -211,7 +240,6 @@ just test-watchdog-e2e
 Scenarios (verbose `step NN/NN` logging):
 
 - `prerequisites` — `cartesi-machine` on PATH and machine image present.
-- `advance-empty-range` — real CM advance + checkpoint write with zero new inputs.
 - `cm-inspect-state-query` — real `--cmio-inspect-state` with query `state`.
 - `machine-cartesi-store-reload-advance` — store checkpoint snapshot, reload, advance again (in-process binding).
 - `compare-runner-with-sequencer` — skipped unless `WATCHDOG_E2E_SEQUENCER_URL` is set.
@@ -228,7 +256,7 @@ just test-watchdog-compare-harness
 Spawns Anvil + rollups devnet + `sequencer-devnet`, proves CM inspect SSZ at
 genesis matches `wallet_snapshot::encode(WalletConfig::devnet())` (same as
 `tests/fixtures/wallet_snapshot_v1_empty.hex` only for Sepolia `default()`), then runs
-`watchdog/main.lua` in compare mode.
+`watchdog/main.lua init` and `watchdog/main.lua tick`.
 When `inclusion_block` is unchanged at genesis, the runner skips L1/CM work (idle-cheap);
 `deposit_transfer_withdrawal_test` drives a gold batch first so compare replays real L1 inputs.
 **Before first run (or after changing scheduler / SSZ / inspect code):**
@@ -263,7 +291,7 @@ cargo run -p rollups-e2e --bin rollups-e2e -- \
 
 ### Staging / operator drills
 
-See [`staging-drills.md`](staging-drills.md) for divergence signal and compare-mode drills.
+See [`staging-drills.md`](staging-drills.md) for divergence signal and watchdog tick drills.
 
 ## Related sequencer tests
 

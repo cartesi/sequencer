@@ -48,9 +48,16 @@ curl -sS -o /dev/null -w "%{http_code}\n" "$WATCHDOG_SEQUENCER_URL/finalized_sta
 
 ### 2. Watchdog runtime (release bundle or local build)
 
-**Production (recommended):** use the **release bundle** for tag `vX` — same git tag as the sequencer binary and `canonical-machine-image-*-vX.tar.gz`. Load `sequencer-watchdog-vX-linux-<arch>.tar.gz` (`docker load`), verify alignment via `release-manifest-vX.json` and `/opt/watchdog/RELEASE.json` inside the image. See [`release/README.md`](../../release/README.md).
+**Production (recommended):** use the **release bundle** for tag `vX` — same
+git tag as the sequencer binary and `canonical-machine-image-*-vX.tar.gz`.
+Load `sequencer-watchdog-vX-linux-<arch>.tar.gz` (`docker load`) and verify
+alignment via `release-manifest-vX.json` and `/opt/watchdog/RELEASE.json`
+inside the image. Toolchain pins live in [`toolchain-pins.env`](../../toolchain-pins.env).
 
-`cartesi-machine` in the watchdog image **must** match `CARTESI_MACHINE_VERSION` in `release/versions.env` (the emulator that built the CM image tarball). Mismatch causes load failures or false `state_mismatch`.
+`cartesi-machine` in the watchdog image **must** match
+`CARTESI_MACHINE_VERSION` in [`toolchain-pins.env`](../../toolchain-pins.env)
+(the emulator that built the CM image tarball). Mismatch causes load failures
+or false `state_mismatch`.
 
 **Local / dev build:**
 
@@ -61,7 +68,11 @@ just watchdog-lua-deps    # .deps/lua/lcurl.so — needs libcurl + Lua dev heade
 
 Host packages and build errors: [`README.md` — Host dependencies](README.md#host-dependencies-watchdog-lua-deps).
 
-Requires: `lua`, `cartesi-machine` (in-process `cartesi` Lua module), libcurl + Lua headers. Pin `cartesi-machine` to the same version as your CM bootstrap tarball.
+Requires: `lua`, `cartesi-machine` (in-process `cartesi` Lua module),
+libcurl + Lua headers, and a scheduler non-overlap guard. The release image
+installs Linux `flock` from `util-linux`; for Nix shells, the package is
+`nixpkgs#util-linux`. Pin `cartesi-machine` to the same version as your CM
+bootstrap tarball.
 
 ### 3. Build the CM image for **this chain**
 
@@ -79,48 +90,55 @@ Today `WalletApp::default()` / `WalletConfig::sepolia()` align with Sepolia stag
 
 | Variable | Where it comes from |
 |----------|---------------------|
-| `WATCHDOG_MODE` | `compare` |
 | `WATCHDOG_SEQUENCER_URL` | Ops: internal HTTP base (see network diagram) |
-| `WATCHDOG_L1_RPC_URL` | Ops: chain RPC (archive for historical `getLogs`) |
+| `WATCHDOG_L1_RPC_URL` | Ops: current chain RPC for `tick` (archive for historical `getLogs`; not persisted by `init`) |
 | `WATCHDOG_APP_ADDRESS` | This rollup’s Cartesi **application** contract |
 | `WATCHDOG_INPUTBOX_ADDRESS` | InputBox on that L1 ([Cartesi deployed contracts](https://docs.cartesi.io/cartesi-rollups/2.0/deployment/self-hosted.md)) |
-| `WATCHDOG_CHECKPOINT_DIR` | Persistent volume on watchdog host |
-| `WATCHDOG_CM_SNAPSHOT_DIR` | Bootstrap CM snapshot (first run only) |
+| `WATCHDOG_STATE_DIR` | Persistent volume on watchdog host |
+| `WATCHDOG_CM_SNAPSHOT_DIR` | Bootstrap CM snapshot (`init` only) |
 | `WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block that bootstrap snapshot represents (= finalized `inclusion_block` at bootstrap) |
 | `WATCHDOG_LUA_DEPS` | `.deps/lua` |
-| `WATCHDOG_POLL_INTERVAL_SEC` | `120`–`300` on public L1 (finalized advances slowly) |
 
 The sequencer discovers and pins `input_box_address` at startup; use the same values as `SEQ_ETH_RPC_URL` / `SEQ_APP_ADDRESS` configuration.
 
-### 5. Bootstrap checkpoint (first run on a live chain)
+### 5. Initialize watchdog state (first run on a live chain)
 
 On a long-lived deployment, **`WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0` is usually wrong** unless finalized state is still at genesis.
 
 Pick one:
 
 1. **Ops hands off** a CM snapshot directory + block number matching current finalized `inclusion_block`, or
-2. **Watchdog reuses** `WATCHDOG_CHECKPOINT_DIR` from a prior successful compare on this deployment, or
+2. **Watchdog reuses** `WATCHDOG_STATE_DIR` from a prior run on this deployment, or
 3. **Replay from genesis** (only for new rollups / low block height — slow).
 
-After bootstrap, the watchdog advances its own checkpoint each successful compare.
-
-### 6. Run compare
-
-One shot (smoke):
+Run `init` once to store the bootstrap CM snapshot into the watchdog state
+layout. `init` does not need `WATCHDOG_L1_RPC_URL`; the RPC URL is read by
+each `tick` so it can rotate without editing state:
 
 ```bash
-export WATCHDOG_ONCE=1
-lua watchdog/main.lua
+lua watchdog/main.lua init
 ```
 
-Daemon (staging / production):
+After init, schedule `tick`; tick will fail if `head.json` is missing.
+
+### 6. Run tick
+
+The watchdog runs **one tick per process, then exits** — there is no daemon
+loop. Run it once as a smoke check, then schedule it (systemd timer / k8s
+CronJob) and alert on the exit code:
 
 ```bash
-unset WATCHDOG_ONCE
-lua watchdog/main.lua
+lua watchdog/main.lua tick   # exit 0 = clean/idle, 1 = transient, 2 = divergence
 ```
 
-When `inclusion_block` ≤ last verified checkpoint, the runner only hits `/finalized_state/inclusion_block` and skips L1/CM work.
+The release container entrypoint wraps `init` and `tick` with a non-blocking
+`flock` on `$WATCHDOG_STATE_DIR/run.lock`, which is released by the kernel if
+the process dies. If you run the Lua script directly on a host, use the
+scheduler's non-overlap primitive as well (for example Linux `flock`, systemd,
+or Kubernetes CronJob `concurrencyPolicy: Forbid`). A leftover `run.lock` path
+is only a lock handle; by itself it does not mean a lock is held.
+
+When `inclusion_block` ≤ the watchdog checkpoint, the runner only hits `/finalized_state/inclusion_block` and skips L1/CM work.
 
 ---
 
@@ -142,16 +160,14 @@ Use Sepolia to validate **the same procedure** you will run on mainnet: internal
 ### Example env block (fill from ops)
 
 ```bash
-export WATCHDOG_MODE=compare
 export WATCHDOG_SEQUENCER_URL="https://<internal-sepolia-sequencer>"
 export WATCHDOG_L1_RPC_URL="https://<sepolia-archive-rpc>"
 export WATCHDOG_APP_ADDRESS="0x..."
 export WATCHDOG_INPUTBOX_ADDRESS="0x..."
-export WATCHDOG_CHECKPOINT_DIR="/var/lib/watchdog/checkpoints-sepolia"
+export WATCHDOG_STATE_DIR="/var/lib/watchdog/state-sepolia"
 export WATCHDOG_CM_SNAPSHOT_DIR="/path/to/canonical-machine-image-sepolia"
 export WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<finalized inclusion_block at bootstrap>"
 export WATCHDOG_LUA_DEPS="/path/to/sequencer/.deps/lua"
-export WATCHDOG_POLL_INTERVAL_SEC=120
 ```
 
 ### Operating the Sepolia sequencer
@@ -174,19 +190,19 @@ When the rollup runs on Ethereum mainnet, **reuse the same operator checklist ab
 | L1 RPC | Production-grade archive provider; rate limits matter for wide `getLogs` ranges |
 | Contracts | Mainnet InputBox, application, portals from production deployment manifest |
 | CM image | Build from production app/scheduler artifacts (mainnet wallet constants when defined in app-core) |
-| `WATCHDOG_POLL_INTERVAL_SEC` | Often 300+; finalized promotion follows mainnet safe head |
+| Schedule cadence | A cron/timer interval of 300s+ is fine; finalized promotion follows mainnet safe head |
 | Security | Stricter firewall between public ingress and internal snapshot tier; secrets management for RPC credentials |
-| Bootstrap | Almost always ops-provided CM snapshot or continued checkpoint dir — not genesis replay |
+| Bootstrap | Almost always ops-provided CM snapshot or continued state dir — not genesis replay |
 
 There is no `just devnet-for-watchdog` or automated harness on mainnet; treat Sepolia compare success as the gate before mainnet go-live.
 
 ---
 
-## Compare mode behavior (all live chains)
+## Compare Cycle Behavior (All Live Chains)
 
 Same on Sepolia and mainnet:
 
-1. Load watchdog checkpoint (or bootstrap CM snapshot).
+1. Load watchdog checkpoint from `head.json`.
 2. `GET /finalized_state/inclusion_block` — if unchanged, **stop** (cheap).
 3. If advanced: `eth_getLogs` on InputBox for `(last_block+1)..inclusion_block`.
 4. Advance CM incrementally; `inspect` → SSZ bytes.
@@ -198,14 +214,21 @@ Details: [`README.md`](README.md), [`docs/snapshots/lifecycle.md`](../snapshots/
 
 ---
 
-## Checkpoint disk usage
+## Checkpoint disk usage and backups
 
 Each successful promotion stores a full CM snapshot under
-`$WATCHDOG_CHECKPOINT_DIR/checkpoints/<block>/`. The watchdog keeps every
-checkpoint directory on disk today — there is no automatic pruning. For
-long-running deployments, plan operator cleanup: retain the current pointer
-target plus one prior checkpoint for rollback forensics, and delete older
-`checkpoints/*` directories during maintenance windows.
+`$WATCHDOG_STATE_DIR/checkpoints/<block>/`, and the watchdog **keeps only
+the selected one** — after the atomic `head.json` flip it deletes the
+checkpoint it superseded (crash-safe: `head.json` always names a complete
+checkpoint). Local disk therefore stays bounded at a single snapshot; no
+operator cleanup is required.
+
+For backups / rollback history, schedule the watchdog tick (it runs one cycle and
+exits) and **after it exits** `aws s3 sync $WATCHDOG_STATE_DIR/checkpoints/
+s3://…` (without `--delete`). Because the process has exited there is no race
+with its store or prune, and omitting `--delete` **accumulates a per-block
+history in S3** while local disk stays at one snapshot. Restore feeds a chosen
+snapshot back through the watchdog/sequencer recovery workflow.
 
 ## Troubleshooting (live deployments)
 
@@ -213,7 +236,7 @@ target plus one prior checkpoint for rollback forensics, and delete older
 |---------|----------------|
 | `/finalized_state` missing on public URL | Wrong tier — use internal `WATCHDOG_SEQUENCER_URL` |
 | `state_mismatch` | CM image / wallet constants ≠ sequencer build; or wrong bootstrap block |
-| `inclusion_block_regressed` | Stale checkpoint dir vs sequencer finalized head |
+| `inclusion_block_regressed` | Stale watchdog state vs sequencer finalized head |
 | Slow or failing `getLogs` | RPC range limits — watchdog uses same partition strategy as sequencer |
 | Transient `L1 RPC latest head lags target block` | Fallback RPC is behind the sequencer's finalized inclusion block; watchdog retries until the node has indexed through the target (avoids truncated `eth_getLogs` false mismatches) |
 | `inspect endpoint not implemented` | Rebuild CM image for the correct chain target |

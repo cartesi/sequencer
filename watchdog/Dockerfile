@@ -1,5 +1,5 @@
-# Watchdog compare-mode runtime image.
-# Build args RELEASE_TAG, GIT_COMMIT, and cartesi-machine pins must match release/versions.env
+# Watchdog one-cycle runtime image.
+# Build args RELEASE_TAG, GIT_COMMIT, and cartesi-machine pins must match toolchain-pins.env
 # and the canonical-machine-image-* tarballs produced in the same release.
 
 # cartesi-machine v0.20.x libs require glibc >= 2.38 (bookworm is 2.36).
@@ -11,13 +11,13 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG CARTESI_MACHINE_VERSION
 ARG CARTESI_MACHINE_DEB_SHA256
 ARG TARGETARCH
-ARG LUA_CURL_UPSTREAM_SHA
 
+# wget + ca-certificates fetch the cartesi-machine .deb; gcc/pkg-config + Lua
+# headers compile the vendored lcurl.so. lua-curl is vendored in-tree under
+# watchdog/third_party/lua-curl/src, so the build needs no network for it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    curl \
     wget \
-    make \
     gcc \
     pkg-config \
     lua5.4 \
@@ -28,11 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 COPY scripts/watchdog-lua-deps.sh scripts/watchdog-lua-deps.sh
-COPY release/versions.env release/versions.env
-COPY watchdog/third_party/lua-curl/UPSTREAM watchdog/third_party/lua-curl/UPSTREAM
-COPY watchdog/third_party/json.lua watchdog/third_party/json.lua
+COPY watchdog/third_party watchdog/third_party
 
-ENV LUA_CURL_UPSTREAM_SHA=${LUA_CURL_UPSTREAM_SHA}
 RUN bash scripts/watchdog-lua-deps.sh
 
 RUN case "${TARGETARCH}" in \
@@ -57,14 +54,12 @@ FROM debian:${DEBIAN_VERSION}
 ARG RELEASE_TAG
 ARG GIT_COMMIT
 ARG CARTESI_MACHINE_VERSION
-ARG LUA_CURL_UPSTREAM_SHA
 
 LABEL org.opencontainers.image.title="sequencer-watchdog" \
       org.opencontainers.image.version="${RELEASE_TAG}" \
       org.opencontainers.image.revision="${GIT_COMMIT}" \
       org.cartesi.sequencer.release-tag="${RELEASE_TAG}" \
-      org.cartesi.cartesi-machine.version="${CARTESI_MACHINE_VERSION}" \
-      org.cartesi.lua-curl.upstream-sha="${LUA_CURL_UPSTREAM_SHA}"
+      org.cartesi.cartesi-machine.version="${CARTESI_MACHINE_VERSION}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     lua5.4 \
@@ -72,6 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libslirp0 \
     libgomp1 \
     ca-certificates \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/bin/cartesi-machine /usr/local/bin/cartesi-machine
@@ -94,8 +90,7 @@ RUN chmod +x /usr/local/bin/watchdog /usr/local/bin/cartesi-machine \
       "  \"component\": \"sequencer-watchdog\"," \
       "  \"release_tag\": \"${RELEASE_TAG}\"," \
       "  \"git_commit\": \"${GIT_COMMIT}\"," \
-      "  \"cartesi_machine_version\": \"${CARTESI_MACHINE_VERSION}\"," \
-      "  \"lua_curl_upstream_sha\": \"${LUA_CURL_UPSTREAM_SHA}\"" \
+      "  \"cartesi_machine_version\": \"${CARTESI_MACHINE_VERSION}\"" \
       "}" > /opt/watchdog/RELEASE.json
 
 ENV WATCHDOG_LUA_DEPS=/opt/watchdog/lib \

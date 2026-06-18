@@ -36,8 +36,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Load release versions
-        uses: ./.github/actions/load-release-versions
+      - name: Load toolchain pins
+        uses: ./.github/actions/load-toolchain-pins
 
       - name: Install system dependencies
         run: |
@@ -120,8 +120,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Load release versions
-        uses: ./.github/actions/load-release-versions
+      - name: Load toolchain pins
+        uses: ./.github/actions/load-toolchain-pins
 
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
@@ -178,8 +178,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Load release versions
-        uses: ./.github/actions/load-release-versions
+      - name: Load toolchain pins
+        uses: ./.github/actions/load-toolchain-pins
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -198,7 +198,6 @@ jobs:
             --build-arg "GIT_COMMIT=${GITHUB_SHA}" \
             --build-arg "CARTESI_MACHINE_VERSION=${CARTESI_MACHINE_VERSION}" \
             --build-arg "CARTESI_MACHINE_DEB_SHA256=${DEB_SHA}" \
-            --build-arg "LUA_CURL_UPSTREAM_SHA=${LUA_CURL_UPSTREAM_SHA}" \
             -f watchdog/Dockerfile \
             -t "${image}" \
             .
@@ -222,8 +221,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Load release versions
-        uses: ./.github/actions/load-release-versions
+      - name: Load toolchain pins
+        uses: ./.github/actions/load-toolchain-pins
 
       - name: Download build artifacts
         uses: actions/download-artifact@v6
