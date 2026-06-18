@@ -1,6 +1,6 @@
 # Watchdog Staging Drills
 
-Operator drills for divergence detection and compare-mode verification.
+Operator drills for divergence detection and watchdog tick verification.
 
 - **Sepolia / mainnet:** [`operator-deployment.md`](operator-deployment.md). **Local dev:** [`getting-started.md`](getting-started.md).
 - Module map and local test recipes: [`README.md`](README.md).
@@ -9,7 +9,7 @@ This document covers staging and manual verification beyond the devnet tutorial.
 
 ## Prerequisites
 
-- **Release bundle (staging/production):** deploy `sequencer-watchdog-vX` and `canonical-machine-image-*-vX` from the same git tag; see [`release/README.md`](../../release/README.md).
+- **Release bundle (staging/production):** deploy `sequencer-watchdog-vX` and `canonical-machine-image-*-vX` from the same git tag; toolchain pins live in [`toolchain-pins.env`](../../toolchain-pins.env).
 - Built canonical machine image: `just canonical-build-machine-image`
 - `cartesi-machine`, `lua`, and `curl` on PATH
 - `just watchdog-lua-deps` — builds `lcurl.so` into `.deps/lua` (libcurl + Lua headers on host)
@@ -49,39 +49,41 @@ just test-watchdog-compare-harness
 Or run the Lua compare pass manually after starting a devnet sequencer yourself:
 
 ```bash
-export WATCHDOG_MODE=compare
 export WATCHDOG_SEQUENCER_URL=http://127.0.0.1:<port>
 export WATCHDOG_L1_RPC_URL=http://127.0.0.1:8545
 export WATCHDOG_INPUTBOX_ADDRESS=<from Anvil deployments>
 export WATCHDOG_APP_ADDRESS=<deployed app>
-export WATCHDOG_CHECKPOINT_DIR=/tmp/watchdog-checkpoints
+export WATCHDOG_STATE_DIR=/tmp/watchdog-state
 export WATCHDOG_CM_SNAPSHOT_DIR=examples/canonical-app/out/canonical-machine-image
 export WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0
 export WATCHDOG_LUA_DEPS=.deps/lua
-WATCHDOG_ONCE=1 lua watchdog/main.lua
+lua watchdog/main.lua init
+lua watchdog/main.lua tick
 ```
 
-Expected: exit **0**, stderr `watchdog_step` lines ending in `compare pass complete`, and
-byte-identical **devnet** genesis SSZ on sequencer `/finalized_state` and CM inspect
+Expected: exit **0**; the tick may exit idle if the finalized block is unchanged.
+The harness path also proves byte-identical **devnet** genesis SSZ on sequencer `/finalized_state` and CM inspect
 (same bytes as `wallet_snapshot::encode(WalletConfig::devnet())`; the `.hex` fixture
 is for Sepolia `default()` — do not use it as the devnet golden).
 
-## Drill 3 — Production compare daemon
+## Drill 3 — Production compare (scheduled)
 
-Run the watchdog in compare mode against staging (daemon or cron):
+Run the watchdog against staging. Each tick runs one cycle and exits; schedule re-runs
+with a systemd timer / cron and alert on the exit code. Production scheduling
+must prevent overlapping ticks; the release container entrypoint does this with
+`flock`, while direct host runs should use systemd, Linux `flock`, or an
+equivalent scheduler guard:
 
 ```bash
-export WATCHDOG_MODE=compare
-export WATCHDOG_ONCE=1          # or 0 for daemon
 # ... all WATCHDOG_* vars from config.lua ...
-lua watchdog/main.lua
+lua watchdog/main.lua tick
 ```
 
-Exit codes from `watchdog/main.lua`:
+Exit codes from `watchdog/main.lua tick`:
 
 | Code | Meaning |
 |------|---------|
-| `0` | Compare/advance pass completed (or `WATCHDOG_ONCE=1` clean exit) |
+| `0` | Compare cycle completed — clean, or idle when finalized is unchanged |
 | `1` | Transient error after retries (RPC, CM, network) |
 | `2` | Deterministic divergence — `watchdog_event` on stderr with `{kind, previous_safe_block, sequencer_inclusion_block, mismatch_offset?}` |
 

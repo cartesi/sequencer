@@ -45,9 +45,11 @@ local function path_is_dir(path)
 end
 
 local function temp_dir(prefix)
+    -- Keep os.tmpname()'s full path (under the system temp dir) so scratch dirs
+    -- land in TMPDIR, not the repo root. Stripping the dir left them in cwd.
     local base = os.tmpname()
     os.remove(base)
-    local dir = string.format("%s-%s", prefix, base:match("([^/]+)$"))
+    local dir = string.format("%s-%s", base, prefix)
     local ok = os.execute('mkdir -p "' .. dir .. '"')
     if ok ~= true and ok ~= 0 then
         error("mkdir failed for " .. dir)
@@ -83,55 +85,43 @@ local function skip(scenario, reason)
     return "skip"
 end
 
-local function require_cartesi_machine(scenario)
+-- Toolchain prerequisites are hard requirements, not skips: in CI a missing
+-- dep must fail the run, never pass vacuously. (The genuinely-optional
+-- live-sequencer scenario still skips on its own, below.)
+local function require_cartesi_machine()
     if not command_exists("cartesi-machine") then
-        return skip(scenario, "cartesi-machine not on PATH (install via nix develop / Cartesi tools)")
+        error("cartesi-machine not on PATH (install via nix develop / Cartesi tools)", 0)
     end
-    return true
 end
 
-local function require_machine_image(scenario)
+local function require_machine_image()
     if not path_is_dir(MACHINE_IMAGE) then
-        return skip(
-            scenario,
-            "canonical machine image missing at "
-                .. MACHINE_IMAGE
-                .. " (run: just canonical-build-machine-image)"
+        error(
+            "canonical machine image missing at " .. MACHINE_IMAGE .. " (run: just canonical-build-machine-image)",
+            0
         )
     end
-    return true
 end
 
-local function require_machine_cartesi_binding(scenario)
-    if machine_cartesi_probe ~= nil then
-        if machine_cartesi_probe.ok then
-            return true
+-- A missing in-process cartesi binding is the exact failure that must not pass
+-- silently in CI (the prerequisites scenario does not cover it). Probe is
+-- cached so the machine is only loaded once.
+local function require_machine_cartesi_binding()
+    if machine_cartesi_probe == nil then
+        local machine = machine_cartesi.new()
+        local instance, err = machine:load(MACHINE_IMAGE)
+        if instance then
+            machine_cartesi_probe = { ok = true }
+        else
+            machine_cartesi_probe = {
+                ok = false,
+                err = "machine_cartesi binding unavailable on this host: " .. tostring(err),
+            }
         end
-        return skip(scenario, machine_cartesi_probe.err)
     end
-    local machine = machine_cartesi.new()
-    local instance, err = machine:load(MACHINE_IMAGE)
-    if not instance then
-        machine_cartesi_probe = {
-            ok = false,
-            err = "machine_cartesi binding unavailable on this host: " .. tostring(err),
-        }
-        return skip(scenario, machine_cartesi_probe.err)
+    if not machine_cartesi_probe.ok then
+        error(machine_cartesi_probe.err, 0)
     end
-    machine_cartesi_probe = { ok = true }
-    return true
-end
-
-local function advance_cfg(checkpoint_dir, target_safe_block)
-    return {
-        mode = "advance",
-        checkpoint_dir = checkpoint_dir,
-        cm_snapshot_dir = MACHINE_IMAGE,
-        cm_snapshot_safe_block = GENESIS_SAFE_BLOCK,
-        target_safe_block = target_safe_block,
-        cm_executable = "cartesi-machine",
-        cm_work_dir = temp_dir("watchdog-e2e-work"),
-    }
 end
 
 table.insert(scenarios, {
@@ -153,61 +143,12 @@ table.insert(scenarios, {
 })
 
 table.insert(scenarios, {
-    name = "advance-empty-range",
-    fn = function()
-        local scenario = "advance-empty-range"
-        if require_cartesi_machine(scenario) == "skip" then
-            return "skip"
-        end
-        if require_machine_image(scenario) == "skip" then
-            return "skip"
-        end
-        if require_machine_cartesi_binding(scenario) == "skip" then
-            return "skip"
-        end
-
-        local checkpoint_dir = temp_dir("watchdog-e2e-checkpoint")
-        local target_safe_block = 1
-        log.step(scenario, 1, 5, "prepare temp checkpoint dir: " .. checkpoint_dir)
-        log.step(scenario, 2, 5, "bootstrap from genesis snapshot at safe_block=" .. GENESIS_SAFE_BLOCK)
-        log.step(scenario, 3, 5, "run advance mode with empty L1 input range 1.." .. target_safe_block)
-        local result, err = runner.advance_checkpoint_once(advance_cfg(checkpoint_dir, target_safe_block), {
-            machine = machine_cartesi.new(),
-            log_step = make_step_logger(scenario .. "/runner", 8),
-            fetch_inputs = function(from_block, to_block)
-                assert_true(from_block == 1, "expected from_block=1")
-                assert_true(to_block == target_safe_block, "expected to_block=" .. target_safe_block)
-                return {}
-            end,
-        })
-        assert_true(result, "advance failed: " .. tostring(err))
-        assert_true(result.safe_block == target_safe_block, "unexpected safe_block")
-        assert_true(result.input_count == 0, "expected zero inputs")
-
-        log.step(scenario, 4, 5, "verify manifest-backed checkpoint was written")
-        local current = checkpoint.load(checkpoint_dir)
-        assert_true(current, "checkpoint current.json missing after advance")
-        assert_true(current.safe_block == target_safe_block, "checkpoint safe_block mismatch")
-
-        log.step(scenario, 5, 5, "verify snapshot directory exists under checkpoint")
-        assert_true(path_is_dir(current.snapshot_dir), "checkpoint snapshot dir missing")
-        log.info("wrote checkpoint safe_block=" .. tostring(current.safe_block))
-    end,
-})
-
-table.insert(scenarios, {
     name = "cm-inspect-state-query",
     fn = function()
         local scenario = "cm-inspect-state-query"
-        if require_cartesi_machine(scenario) == "skip" then
-            return "skip"
-        end
-        if require_machine_image(scenario) == "skip" then
-            return "skip"
-        end
-        if require_machine_cartesi_binding(scenario) == "skip" then
-            return "skip"
-        end
+        require_cartesi_machine()
+        require_machine_image()
+        require_machine_cartesi_binding()
 
         log.step(scenario, 1, 4, "create machine_cartesi adapter")
         local machine = machine_cartesi.new()
@@ -248,41 +189,39 @@ table.insert(scenarios, {
                 "set WATCHDOG_E2E_SEQUENCER_URL to a live sequencer base URL to run this scenario"
             )
         end
-        if require_cartesi_machine(scenario) == "skip" then
-            return "skip"
-        end
-        if require_machine_image(scenario) == "skip" then
-            return "skip"
-        end
-        if require_machine_cartesi_binding(scenario) == "skip" then
-            return "skip"
-        end
+        require_cartesi_machine()
+        require_machine_image()
+        require_machine_cartesi_binding()
 
         local http_mod = require("watchdog.http")
         local jsonrpc = require("watchdog.jsonrpc")
         local sequencer_reader = require("watchdog.sequencer_reader")
         local json = require("watchdog.json").new()
+        local main_mod = require("watchdog.main")
 
-        local checkpoint_dir = temp_dir("watchdog-e2e-compare")
-        log.step(scenario, 1, 2, "prepare compare-mode deps (sequencer=" .. sequencer_url .. ")")
+        local state_dir = temp_dir("watchdog-e2e-compare")
+        log.step(scenario, 1, 2, "prepare watchdog deps (sequencer=" .. sequencer_url .. ")")
         log.step(scenario, 2, 2, "run compare runner against live sequencer + CM")
 
         local http = http_mod.new()
         local cfg = {
-            mode = "compare",
             sequencer_url = sequencer_url,
-            checkpoint_dir = checkpoint_dir,
+            state_dir = state_dir,
             cm_snapshot_dir = MACHINE_IMAGE,
             cm_snapshot_safe_block = GENESIS_SAFE_BLOCK,
-            cm_executable = "cartesi-machine",
-            cm_work_dir = temp_dir("watchdog-e2e-compare-work"),
             l1_rpc_url = os.getenv("WATCHDOG_E2E_L1_RPC_URL") or "http://127.0.0.1:8545",
             input_box_address = os.getenv("WATCHDOG_E2E_INPUTBOX_ADDRESS")
                 or "0x0000000000000000000000000000000000000000",
             app_address = os.getenv("WATCHDOG_E2E_APP_ADDRESS")
                 or "0x1111111111111111111111111111111111111111",
             long_block_range_error_codes = { "-32005" },
+            retry_attempts = 1,
+            retry_delay_sec = 0,
         }
+
+        assert_true(main_mod.run_init(cfg, {
+            machine = machine_cartesi.new(),
+        }), "watchdog init failed")
 
         local step_no = 0
         local result, err = runner.run_once(cfg, {
@@ -309,47 +248,34 @@ table.insert(scenarios, {
     name = "machine-cartesi-store-reload-advance",
     fn = function()
         local scenario = "machine-cartesi-store-reload-advance"
-        if require_cartesi_machine(scenario) == "skip" then
-            return "skip"
-        end
-        if require_machine_image(scenario) == "skip" then
-            return "skip"
-        end
-        if require_machine_cartesi_binding(scenario) == "skip" then
-            return "skip"
-        end
+        require_cartesi_machine()
+        require_machine_image()
+        require_machine_cartesi_binding()
 
         local checkpoint_dir = temp_dir("watchdog-e2e-store-reload")
-        log.step(scenario, 1, 4, "advance from genesis to safe_block=1 and store checkpoint")
-        local first, first_err = runner.advance_checkpoint_once(advance_cfg(checkpoint_dir, 1), {
-            machine = machine_cartesi.new(),
-            log_step = make_step_logger(scenario .. "/first", 8),
-            fetch_inputs = function(from_block, to_block)
-                assert_true(from_block == 1, "expected first from_block=1")
-                assert_true(to_block == 1, "expected first to_block=1")
-                return {}
-            end,
-        })
-        assert_true(first, "first advance failed: " .. tostring(first_err))
-        assert_true(first.safe_block == 1, "first safe_block mismatch")
 
-        log.step(scenario, 2, 4, "reload checkpoint and advance to safe_block=2")
-        local second, second_err = runner.advance_checkpoint_once(advance_cfg(checkpoint_dir, 2), {
-            machine = machine_cartesi.new(),
-            log_step = make_step_logger(scenario .. "/second", 8),
-            fetch_inputs = function(from_block, to_block)
-                assert_true(from_block == 2, "expected second from_block=2")
-                assert_true(to_block == 2, "expected second to_block=2")
-                return {}
-            end,
-        })
-        assert_true(second, "second advance failed: " .. tostring(second_err))
-        assert_true(second.safe_block == 2, "second safe_block mismatch")
+        -- Advance the in-process CM one block from `source_dir` and store a
+        -- checkpoint at `block` via checkpoint.write (the production store path).
+        local function advance_and_store(source_dir, prev_block, block)
+            local machine = machine_cartesi.new()
+            local instance = assert(machine:load(source_dir, prev_block), "load failed")
+            assert(machine:advance(instance, {}, { from_block = prev_block + 1, to_block = block }))
+            return checkpoint.write(checkpoint_dir, block, function(snapshot_dir)
+                return machine:dump(instance, snapshot_dir, block)
+            end, { created_at = "2026-01-01T00:00:00Z" })
+        end
 
-        log.step(scenario, 3, 4, "load current checkpoint metadata")
+        log.step(scenario, 1, 4, "advance genesis -> block 1 and store a checkpoint")
+        assert_true(advance_and_store(MACHINE_IMAGE, GENESIS_SAFE_BLOCK, 1), "first store failed")
+
+        log.step(scenario, 2, 4, "reload the stored block-1 snapshot and advance -> block 2")
+        local reloaded = checkpoint.load(checkpoint_dir)
+        assert_true(reloaded and reloaded.safe_block == 1, "checkpoint at block 1 missing")
+        assert_true(advance_and_store(reloaded.snapshot_dir, 1, 2), "reload + store failed")
+
+        log.step(scenario, 3, 4, "load current checkpoint metadata (block 1 should be GC'd)")
         local current = checkpoint.load(checkpoint_dir)
-        assert_true(current, "checkpoint missing after second advance")
-        assert_true(current.safe_block == 2, "current safe_block mismatch")
+        assert_true(current and current.safe_block == 2, "current safe_block mismatch")
 
         log.step(scenario, 4, 4, "verify snapshot directory exists")
         assert_true(path_is_dir(current.snapshot_dir), "stored snapshot directory missing")

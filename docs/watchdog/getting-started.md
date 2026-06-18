@@ -16,7 +16,7 @@ Step-by-step guide for running the watchdog alongside a **local** `sequencer-dev
 3. [Path A — Full automated smoke](#path-a--full-automated-smoke-recommended-first)
 4. [Path B — Interactive (two terminals)](#path-b--interactive-sequencer--watchdog-two-terminals)
 5. [Production-like deployments](#production-like-deployments-sepolia--mainnet)
-6. [Environment reference](#environment-reference-compare-mode)
+6. [Environment reference](#environment-reference)
 7. [Troubleshooting](#troubleshooting)
 8. [Related commands](#related-commands)
 
@@ -28,7 +28,7 @@ Step-by-step guide for running the watchdog alongside a **local** `sequencer-dev
 |---------|------|
 | **Anvil** | Local L1 with Cartesi rollups contracts pre-deployed (`just setup`) |
 | **sequencer-devnet** | Off-chain sequencer (wallet app, batches, snapshot promotion) |
-| **watchdog** (`WATCHDOG_MODE=compare`) | Polls `/finalized_state/inclusion_block`, replays L1 inputs in CM, compares SSZ to `/finalized_state` |
+| **watchdog** | Polls `/finalized_state/inclusion_block`, replays L1 inputs in CM, compares SSZ to `/finalized_state` |
 
 The sequencer exposes (operator-internal, same HTTP listener today):
 
@@ -51,7 +51,7 @@ From the repo root:
 
    Without direnv you need on `PATH`: `anvil`, `lua`, `cartesi-machine`, and a C compiler for `lcurl`.
 
-3. **System packages for watchdog HTTP** — see [`README.md` — Host dependencies](README.md#host-dependencies-watchdog-lua-deps) (Debian/WSL: `libcurl4-openssl-dev`, `liblua5.4-dev`, `lua5.4`, then `just watchdog-lua-deps`).
+3. **System packages for watchdog HTTP + scheduling** — see [`README.md` — Host dependencies](README.md#host-dependencies-watchdog-lua-deps) (Debian/WSL: `libcurl4-openssl-dev`, `liblua5.4-dev`, `lua5.4`, `util-linux`, then `just watchdog-lua-deps`; Nix: `nixpkgs#util-linux` provides `flock`).
 
 4. **Cartesi Machine** — `cartesi-machine` on `PATH` so the in-process `cartesi` Lua module loads (ships with Cartesi Machine install / nix shell).
 
@@ -100,7 +100,7 @@ Leave Terminal 1 running until you are done; Ctrl+C stops Anvil and the sequence
 
 ### Wait for finalized snapshot
 
-Compare mode needs a **finalized** SSZ dump. Right after boot, the cheap endpoint may return **404** until the sequencer has promoted a snapshot.
+The watchdog needs a **finalized** SSZ dump. Right after boot, the cheap endpoint may return **404** until the sequencer has promoted a snapshot.
 
 In another shell (use the printed `WATCHDOG_SEQUENCER_URL`):
 
@@ -117,37 +117,24 @@ curl -s -D - "$WATCHDOG_SEQUENCER_URL/finalized_state" -o /tmp/finalized-state.b
 head -c 32 /tmp/finalized-state.bin | xxd
 ```
 
-### Terminal 2 — Watchdog (compare mode)
+### Terminal 2 — Watchdog
 
 From repo root, after `just watchdog-lua-deps`:
 
 ```bash
-# Paste exports from Terminal 1, then:
-export WATCHDOG_MODE=compare
-export WATCHDOG_ONCE=1          # single pass; omit for daemon (poll every 30s)
-
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua
+# Paste exports from Terminal 1, then initialize once and run one tick:
+WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua init
+WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua tick
 ```
 
-Success: exit **0**, stderr shows `watchdog_step` lines ending in `compare pass complete`.
+Success: exit **0**. If finalized has advanced, stderr ends in `compare pass complete`; if it has not, the tick exits idle after the cheap poll.
 
-Exit codes from `watchdog/main.lua`: **0** clean, **1** transient failure (RPC/CM/network after retries), **2** deterministic divergence (`watchdog_event` emitted on stderr before exit).
+Exit codes from `watchdog/main.lua tick`: **0** clean (or idle — finalized unchanged), **1** transient failure (RPC/CM/network after retries), **2** deterministic divergence (`watchdog_event` emitted on stderr before exit).
 
-Daemon mode (production-like loop):
-
-```bash
-export WATCHDOG_POLL_INTERVAL_SEC=30
-unset WATCHDOG_ONCE
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua
-```
-
-When `inclusion_block` has not advanced since the last verified checkpoint, the runner **skips** L1/CM work (idle-cheap).
-
-### One-shot compare (same stack, no daemon)
-
-```bash
-WATCHDOG_ONCE=1 WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua
-```
+The watchdog tick runs **one cycle per process and exits** — re-run it on a timer/cron for continuous monitoring. When `inclusion_block` has not advanced since the watchdog checkpoint, the cycle **skips** L1/CM work (idle-cheap) and exits 0.
+In production, prevent overlapping ticks with the container entrypoint, systemd,
+or Kubernetes CronJob `concurrencyPolicy: Forbid`; direct local `lua` commands
+are intended for development.
 
 ---
 
@@ -168,21 +155,18 @@ Full operator runbook: **[`operator-deployment.md`](operator-deployment.md)**.
 
 ---
 
-## Environment reference (compare mode)
+## Environment reference
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `WATCHDOG_MODE` | yes | `compare` |
 | `WATCHDOG_SEQUENCER_URL` | yes | e.g. `http://127.0.0.1:54321` |
-| `WATCHDOG_L1_RPC_URL` | yes | L1 JSON-RPC |
+| `WATCHDOG_L1_RPC_URL` | tick | Current L1 JSON-RPC; not persisted by `init` |
 | `WATCHDOG_INPUTBOX_ADDRESS` | yes | InputBox contract |
 | `WATCHDOG_APP_ADDRESS` | yes | Rollup application contract |
-| `WATCHDOG_CHECKPOINT_DIR` | yes | CM checkpoint storage |
-| `WATCHDOG_CM_SNAPSHOT_DIR` | first run | Genesis CM image dir if no checkpoint yet |
+| `WATCHDOG_STATE_DIR` | yes | Persistent watchdog state (`config.json`, `head.json`, checkpoints) |
+| `WATCHDOG_CM_SNAPSHOT_DIR` | init | Genesis CM image dir |
 | `WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | with above | Usually `0` on fresh devnet |
 | `WATCHDOG_LUA_DEPS` | yes | `.deps/lua` after `just watchdog-lua-deps` |
-| `WATCHDOG_ONCE` | no | `1` = one pass then exit |
-| `WATCHDOG_POLL_INTERVAL_SEC` | no | Default `30` (daemon) |
 
 See `watchdog/config.lua` for the full list.
 
@@ -200,7 +184,8 @@ See `watchdog/config.lua` for the full list.
 | CM inspect ~27 bytes / JSON in error | Stale image (old JSON inspect); rebuild: `just canonical-build-machine-image` |
 | HTTP 404 on `/finalized_state/inclusion_block` | Sequencer not promoted yet; wait or drive L1 + batches |
 | `state_mismatch` at genesis | Wrong `WATCHDOG_CM_SNAPSHOT_*` or stale CM image vs sequencer build |
-| `inclusion_block_regressed` | Checkpoint ahead of sequencer (reset checkpoint dir or fix bootstrap block) |
+| `inclusion_block_regressed` | Watchdog state ahead of sequencer (reset state dir or fix bootstrap block) |
+| `flock` lock conflict | Another tick is still running or the scheduler allows overlap. With the container `flock`, a leftover `run.lock` path alone is harmless. |
 | `could not determine which binary to run` | Use `just test-watchdog-compare-harness` (not bare `cargo run -p rollups-e2e`) |
 | Harness `87 vs 76` or `27 vs 76` byte mismatch | Stale CM image and/or wrong fixture; see [harness troubleshooting](README.md#troubleshooting-just-test-watchdog-compare-harness) |
 

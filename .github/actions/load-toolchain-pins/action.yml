@@ -1,0 +1,9 @@
+name: "Load toolchain pins"
+description: "Export toolchain-pins.env into the job environment."
+
+runs:
+  using: composite
+  steps:
+    - name: Load toolchain-pins.env
+      shell: bash
+      run: bash scripts/load-toolchain-pins.sh "${GITHUB_ENV}"

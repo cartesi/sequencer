@@ -4,6 +4,7 @@
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local config = require("watchdog.config")
+local checkpoint = require("watchdog.checkpoint")
 local http_mod = require("watchdog.http")
 local json_mod = require("watchdog.json")
 local jsonrpc = require("watchdog.jsonrpc")
@@ -11,6 +12,7 @@ local machine_cartesi = require("watchdog.machine_cartesi")
 local retry = require("watchdog.retry")
 local runner = require("watchdog.runner")
 local sequencer_reader = require("watchdog.sequencer_reader")
+local state = require("watchdog.state")
 
 local EXIT_OK = 0
 local EXIT_TRANSIENT = 1
@@ -27,11 +29,8 @@ local function load_machine(_cfg)
     return machine_cartesi.new()
 end
 
-local function run_once(cfg, deps)
-    if cfg.mode == "compare" then
-        return runner.run_once(cfg, deps)
-    end
-    return runner.advance_checkpoint_once(cfg, deps)
+local function log_step(message)
+    io.stderr:write("watchdog_step " .. tostring(message) .. "\n")
 end
 
 local function is_table_with_kind(value)
@@ -44,7 +43,6 @@ local function is_terminal_error(value)
     end
     return value.kind == "state_mismatch"
         or value.kind == "inclusion_block_regressed"
-        or value.kind == "safe_block_regressed"
 end
 
 local function emit_watchdog_event(json, payload, deps)
@@ -54,28 +52,83 @@ local function emit_watchdog_event(json, payload, deps)
     io.stderr:write("watchdog_event " .. json.encode(payload) .. "\n")
 end
 
+local function default_machine_deps(cfg)
+    return {
+        machine = load_machine(cfg),
+        log_step = log_step,
+    }
+end
+
 local function default_deps(cfg)
     local http = http_mod.new()
     local json = json_mod.new()
-    local deps = {
-        http = http,
-        rpc = jsonrpc.new(http, json, cfg.l1_rpc_url),
-        machine = load_machine(cfg),
-        log_step = function(message)
-            io.stderr:write("watchdog_step " .. tostring(message) .. "\n")
-        end,
-    }
-    if cfg.sequencer_url then
-        deps.sequencer = sequencer_reader.new(http, json, cfg.sequencer_url)
-    end
+    local deps = default_machine_deps(cfg)
+    deps.http = http
+    deps.rpc = jsonrpc.new(http, json, cfg.l1_rpc_url)
+    deps.sequencer = sequencer_reader.new(http, json, cfg.sequencer_url)
     return deps, json
+end
+
+local function run_init(cfg, deps)
+    deps = deps or default_machine_deps(cfg)
+    local json = json_mod.new()
+
+    local existing, load_err = checkpoint.load(cfg.state_dir)
+    if existing then
+        return nil, "watchdog state already initialized"
+    end
+    if load_err ~= "missing " .. checkpoint.HEAD_FILE then
+        return nil, "failed to load watchdog head: " .. tostring(load_err)
+    end
+
+    local ok, err = state.write_json_atomic(cfg.state_dir, "config.json", config.persisted(cfg), json)
+    if not ok then
+        return nil, err
+    end
+
+    local machine = deps.machine or load_machine(cfg)
+    if type(deps.log_step) == "function" then
+        deps.log_step("load bootstrap CM snapshot")
+    end
+    local instance, load_snapshot_err = machine:load(cfg.cm_snapshot_dir, cfg.cm_snapshot_safe_block)
+    if not instance then
+        return nil, load_snapshot_err
+    end
+
+    if type(deps.log_step) == "function" then
+        deps.log_step("persist initial watchdog checkpoint")
+    end
+    local written, write_err = checkpoint.write(cfg.state_dir, cfg.cm_snapshot_safe_block, function(snapshot_dir)
+        return machine:dump(instance, snapshot_dir, cfg.cm_snapshot_safe_block)
+    end, {
+        created_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        cm_image_hash = cfg.cm_image_hash,
+    })
+    if not written then
+        return nil, write_err
+    end
+
+    return {
+        ok = true,
+        safe_block = cfg.cm_snapshot_safe_block,
+    }
+end
+
+local function load_tick_config(env)
+    local json = json_mod.new()
+    local state_dir = config.load_state_dir(env)
+    local persisted, err = state.read_json(state_dir, "config.json", json)
+    if not persisted then
+        error("failed to load config.json: " .. tostring(err))
+    end
+    return config.from_persisted(state_dir, persisted, env)
 end
 
 local function run_compare_cycle(cfg, deps)
     deps = deps or select(1, default_deps(cfg))
     local json = json_mod.new()
     local result, err = retry.with_retries(function()
-        local ok, value, run_err = pcall(run_once, cfg, deps)
+        local ok, value, run_err = pcall(runner.run_once, cfg, deps)
         if not ok then
             return nil, value
         end
@@ -97,34 +150,99 @@ local function run_compare_cycle(cfg, deps)
     return EXIT_OK, result
 end
 
-local function main()
-    prepend_deps_cpath()
-    local cfg = config.load()
-
-    repeat
-        local exit_code, err = run_compare_cycle(cfg)
-        if exit_code == EXIT_DIVERGENCE then
-            os.exit(EXIT_DIVERGENCE)
-        end
-        if exit_code == EXIT_TRANSIENT then
-            io.stderr:write("watchdog run failed: " .. tostring(err) .. "\n")
-            os.exit(EXIT_TRANSIENT)
-        end
-        if cfg.once then
-            os.exit(EXIT_OK)
-        end
-        os.execute("sleep " .. tostring(cfg.poll_interval_sec))
-    until false
+local function run_tick(cfg, deps)
+    return run_compare_cycle(cfg, deps)
 end
 
-if ... == nil then
-    main()
+local function usage()
+    return "usage: watchdog <init|tick>"
+end
+
+local function load_or_error(loader)
+    local ok, value = pcall(loader)
+    if not ok then
+        return nil, value
+    end
+    return value
+end
+
+local function exit_for_result(command, exit_code, err)
+    if exit_code == EXIT_DIVERGENCE then
+        os.exit(EXIT_DIVERGENCE)
+    end
+    if exit_code == EXIT_TRANSIENT then
+        io.stderr:write("watchdog " .. command .. " failed: " .. tostring(err) .. "\n")
+        os.exit(EXIT_TRANSIENT)
+    end
+    os.exit(EXIT_OK)
+end
+
+-- One compare cycle per `tick` process. Infra (systemd timer / k8s CronJob)
+-- schedules re-runs and reacts to the exit code; the watchdog itself does not loop.
+local function main(argv)
+    argv = argv or arg or {}
+    prepend_deps_cpath()
+
+    local command = argv[1]
+    if command == "init" then
+        local cfg, cfg_err = load_or_error(function()
+            return config.load_init()
+        end)
+        if not cfg then
+            io.stderr:write("watchdog init failed: " .. tostring(cfg_err) .. "\n")
+            os.exit(EXIT_TRANSIENT)
+        end
+        local ok, result, err = pcall(run_init, cfg)
+        if not ok then
+            io.stderr:write("watchdog init failed: " .. tostring(result) .. "\n")
+            os.exit(EXIT_TRANSIENT)
+        end
+        if not result then
+            io.stderr:write("watchdog init failed: " .. tostring(err) .. "\n")
+            os.exit(EXIT_TRANSIENT)
+        end
+        os.exit(EXIT_OK)
+    end
+
+    if command == "tick" then
+        local cfg, cfg_err = load_or_error(function()
+            return load_tick_config()
+        end)
+        if not cfg then
+            io.stderr:write("watchdog tick failed: " .. tostring(cfg_err) .. "\n")
+            os.exit(EXIT_TRANSIENT)
+        end
+        local ok, exit_code, err = pcall(run_tick, cfg)
+        if not ok then
+            io.stderr:write("watchdog tick failed: " .. tostring(exit_code) .. "\n")
+            os.exit(EXIT_TRANSIENT)
+        end
+        if not exit_code then
+            exit_code = EXIT_TRANSIENT
+        end
+        exit_for_result(command, exit_code, err)
+    end
+
+    io.stderr:write(usage() .. "\n")
+    os.exit(EXIT_TRANSIENT)
+end
+
+local function invoked_as_script()
+    return type(arg) == "table"
+        and type(arg[0]) == "string"
+        and arg[0]:match("watchdog[/\\]main%.lua$") ~= nil
+end
+
+if invoked_as_script() then
+    main(arg)
 end
 
 return {
     main = main,
-    run_once = run_once,
+    run_init = run_init,
+    run_tick = run_tick,
     run_compare_cycle = run_compare_cycle,
+    load_tick_config = load_tick_config,
     EXIT_OK = EXIT_OK,
     EXIT_TRANSIENT = EXIT_TRANSIENT,
     EXIT_DIVERGENCE = EXIT_DIVERGENCE,

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-versions="${root}/release/versions.env"
+pins="${root}/toolchain-pins.env"
 
 usage() {
   echo "usage: $0 --tag TAG [--git-sha SHA] [--output PATH]" >&2
@@ -42,14 +42,14 @@ if [[ -z "${git_sha}" ]]; then
   git_sha="$(git -C "${root}" rev-parse HEAD 2>/dev/null || echo unknown)"
 fi
 
-if [[ ! -f "${versions}" ]]; then
-  echo "missing ${versions}" >&2
+if [[ ! -f "${pins}" ]]; then
+  echo "missing ${pins}" >&2
   exit 1
 fi
 
 # shellcheck disable=SC1090
 set -a
-source "${versions}"
+source "${pins}"
 set +a
 
 artifacts_json="$(cat <<EOF
@@ -64,7 +64,8 @@ artifacts_json="$(cat <<EOF
 EOF
 )"
 
-python3 - "${tag}" "${git_sha}" "${artifacts_json}" <<'PY' > "${output:-/dev/stdout}"
+emit_manifest() {
+  python3 - "${tag}" "${git_sha}" "${artifacts_json}" <<'PY'
 import json, os, sys
 
 tag, git_sha, artifacts_json = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -78,7 +79,6 @@ manifest = {
         "rust": os.environ["RUST_TOOLCHAIN"],
         "xgenext2fs": os.environ["XGENEXT2FS_VERSION"],
         "cartesi_machine": os.environ["CARTESI_MACHINE_VERSION"],
-        "lua_curl_upstream_sha": os.environ["LUA_CURL_UPSTREAM_SHA"],
     },
     "artifacts": artifacts,
     "alignment": {
@@ -89,3 +89,10 @@ manifest = {
 json.dump(manifest, sys.stdout, indent=2)
 sys.stdout.write("\n")
 PY
+}
+
+if [[ -n "${output}" ]]; then
+  emit_manifest > "${output}"
+else
+  emit_manifest
+fi

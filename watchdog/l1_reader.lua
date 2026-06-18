@@ -76,9 +76,10 @@ function l1_reader.ensure_rpc_head_at_least(rpc, target_block)
     return head
 end
 
-function l1_reader.fetch_logs_partitioned(rpc, params)
+local function scan_partitions(rpc, params, on_logs)
     assert(type(rpc) == "table" and type(rpc.get_logs) == "function", "rpc.get_logs is required")
     assert(type(params) == "table", "params are required")
+    assert(type(on_logs) == "function", "on_logs callback is required")
 
     local start_block = assert(params.start_block, "start_block is required")
     local end_block = assert(params.end_block, "end_block is required")
@@ -94,37 +95,58 @@ function l1_reader.fetch_logs_partitioned(rpc, params)
             input_added_topic = input_added_topic,
         })
         if logs then
-            return logs
+            l1_reader.sort_logs(logs)
+            return on_logs(logs, {
+                from_block = from_block,
+                to_block = to_block,
+            })
         end
 
         if from_block < to_block and contains_any(err, codes) then
             local mid = from_block + ((to_block - from_block) // 2)
-            local left, left_err = go(from_block, mid)
-            if not left then
+            local left_count, left_err = go(from_block, mid)
+            if not left_count then
                 return nil, left_err
             end
-            local right, right_err = go(mid + 1, to_block)
-            if not right then
+            local right_count, right_err = go(mid + 1, to_block)
+            if not right_count then
                 return nil, right_err
             end
-            for _, log in ipairs(right) do
-                table.insert(left, log)
-            end
-            return left
+            return left_count + right_count
         end
 
         return nil, err
     end
 
     if end_block < start_block then
-        return {}
+        return 0
     end
 
-    local logs, err = go(start_block, end_block)
-    if not logs then
+    return go(start_block, end_block)
+end
+
+function l1_reader.for_each_log_chunk_partitioned(rpc, params, on_logs)
+    return scan_partitions(rpc, params, function(logs, range)
+        local ok, err = on_logs(logs, range)
+        if not ok then
+            return nil, err
+        end
+        return #logs
+    end)
+end
+
+function l1_reader.fetch_logs_partitioned(rpc, params)
+    local all_logs = {}
+    local count, err = l1_reader.for_each_log_chunk_partitioned(rpc, params, function(logs)
+        for _, log in ipairs(logs) do
+            table.insert(all_logs, log)
+        end
+        return true
+    end)
+    if not count then
         return nil, err
     end
-    return l1_reader.sort_logs(logs)
+    return all_logs
 end
 
 function l1_reader.decode_and_validate_log(log)
@@ -140,15 +162,32 @@ function l1_reader.decode_and_validate_log(log)
     return decoded
 end
 
-function l1_reader.fetch_inputs(rpc, params)
-    local logs, err = l1_reader.fetch_logs_partitioned(rpc, params)
-    if not logs then
-        return nil, err
-    end
+function l1_reader.for_each_input_chunk_partitioned(rpc, params, on_inputs)
+    assert(type(on_inputs) == "function", "on_inputs callback is required")
 
+    return scan_partitions(rpc, params, function(logs, range)
+        local inputs = {}
+        for _, log in ipairs(logs) do
+            table.insert(inputs, l1_reader.decode_and_validate_log(log))
+        end
+        local ok, err = on_inputs(inputs, range)
+        if not ok then
+            return nil, err
+        end
+        return #inputs
+    end)
+end
+
+function l1_reader.fetch_inputs(rpc, params)
     local inputs = {}
-    for _, log in ipairs(logs) do
-        table.insert(inputs, l1_reader.decode_and_validate_log(log))
+    local count, err = l1_reader.for_each_input_chunk_partitioned(rpc, params, function(chunk)
+        for _, input in ipairs(chunk) do
+            table.insert(inputs, input)
+        end
+        return true
+    end)
+    if not count then
+        return nil, err
     end
     return inputs
 end
