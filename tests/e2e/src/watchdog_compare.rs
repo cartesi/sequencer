@@ -98,7 +98,12 @@ pub async fn run_watchdog_genesis_compare_test(
     )
     .await?;
 
-    eprintln!("[watchdog-harness] step 5/6: run production watchdog tick");
+    eprintln!(
+        "[watchdog-harness] step 5/6: run production watchdog tick (genesis unchanged -> idle skip)"
+    );
+    // The Rust checks above prove sequencer/CM byte parity at genesis. The
+    // watchdog tick itself intentionally idles because init selected block 0
+    // and the sequencer finalized block is still 0; init is not a compare.
     run_lua_main_success(
         runtime,
         workspace.as_path(),
@@ -108,9 +113,7 @@ pub async fn run_watchdog_genesis_compare_test(
     )
     .await?;
 
-    eprintln!(
-        "[watchdog-harness] step 6/6: run a second tick (idempotent re-run: unchanged finalized -> skip)"
-    );
+    eprintln!("[watchdog-harness] step 6/6: run a second tick (idempotent idle skip)");
     run_lua_main_success(
         runtime,
         workspace.as_path(),
@@ -320,20 +323,21 @@ async fn run_lua_main(
 ) -> ScenarioResult<std::process::Output> {
     let lua_deps = workspace.join(".deps/lua");
     ensure_lcurl(lua_deps.as_path())?;
-    let mut command = Command::new("lua");
+    let mut command = Command::new(workspace.join("watchdog/sequencer-watchdog"));
     command
         .current_dir(workspace)
-        .arg("watchdog/main.lua")
         .arg(command_name)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.env("WATCHDOG_LUA_ROOT", workspace);
+    command.env("WATCHDOG_LUA_BIN", "lua");
     for (key, value) in compare_env(runtime, state_dir, machine_image, lua_deps.as_path()) {
         command.env(key, value);
     }
     command
         .output()
         .await
-        .map_err(|err| format!("failed to run watchdog main.lua: {err}").into())
+        .map_err(|err| format!("failed to run sequencer-watchdog: {err}").into())
 }
 
 async fn run_lua_main_success(
@@ -346,7 +350,7 @@ async fn run_lua_main_success(
     let output = run_lua_main(runtime, workspace, state_dir, machine_image, command_name).await?;
     if !output.status.success() {
         return Err(format!(
-            "watchdog main.lua {command_name} exited with {}; stderr: {}",
+            "sequencer-watchdog {command_name} exited with {}; stderr: {}",
             output.status,
             String::from_utf8_lossy(output.stderr.as_slice())
         )

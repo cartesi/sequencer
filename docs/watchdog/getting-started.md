@@ -123,18 +123,21 @@ From repo root, after `just watchdog-lua-deps`:
 
 ```bash
 # Paste exports from Terminal 1, then initialize once and run one tick:
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua init
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua tick
+export WATCHDOG_LUA_ROOT="$(pwd)"
+export WATCHDOG_LUA_BIN=lua
+export WATCHDOG_LUA_DEPS=.deps/lua
+./watchdog/sequencer-watchdog init
+./watchdog/sequencer-watchdog tick
 ```
 
 Success: exit **0**. If finalized has advanced, stderr ends in `compare pass complete`; if it has not, the tick exits idle after the cheap poll.
 
-Exit codes from `watchdog/main.lua tick`: **0** clean (or idle — finalized unchanged), **1** transient failure (RPC/CM/network after retries), **2** deterministic divergence (`watchdog_event` emitted on stderr before exit).
+Exit codes from `sequencer-watchdog tick`: **0** clean (or idle — finalized unchanged), **1** transient failure (RPC/CM/network after retries), **2** deterministic divergence (`watchdog_event` emitted on stderr before exit).
 
 The watchdog tick runs **one cycle per process and exits** — re-run it on a timer/cron for continuous monitoring. When `inclusion_block` has not advanced since the watchdog checkpoint, the cycle **skips** L1/CM work (idle-cheap) and exits 0.
-In production, prevent overlapping ticks with the container entrypoint, systemd,
-or Kubernetes CronJob `concurrencyPolicy: Forbid`; direct local `lua` commands
-are intended for development.
+`sequencer-watchdog` takes a non-blocking `flock`; production schedulers should
+also prevent overlapping ticks with systemd or Kubernetes CronJob
+`concurrencyPolicy: Forbid`.
 
 ---
 

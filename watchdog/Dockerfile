@@ -82,9 +82,9 @@ COPY watchdog /opt/watchdog/lua/watchdog
 COPY watchdog/third_party/json.lua /opt/watchdog/lua/watchdog/third_party/json.lua
 # Shared cross-stack fixtures (watchdog/tests/run.lua expects repo-root tests/fixtures/).
 COPY tests/fixtures /opt/watchdog/lua/tests/fixtures
-COPY watchdog/docker-entrypoint.sh /usr/local/bin/watchdog
+COPY watchdog/sequencer-watchdog /usr/local/bin/sequencer-watchdog
 
-RUN chmod +x /usr/local/bin/watchdog /usr/local/bin/cartesi-machine \
+RUN chmod +x /usr/local/bin/sequencer-watchdog /usr/local/bin/cartesi-machine \
     && printf '%s\n' \
       "{" \
       "  \"component\": \"sequencer-watchdog\"," \
@@ -100,5 +100,5 @@ ENV WATCHDOG_LUA_DEPS=/opt/watchdog/lib \
     PATH="/usr/local/share/cartesi-machine:${PATH}"
 
 WORKDIR /opt/watchdog
-ENTRYPOINT ["/usr/local/bin/watchdog"]
+ENTRYPOINT ["/usr/local/bin/sequencer-watchdog"]
 CMD []
