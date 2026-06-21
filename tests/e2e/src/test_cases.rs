@@ -956,7 +956,9 @@ async fn run_recovery_after_stale_batches_test(
     let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
     let mut replay_before = ReplayWalletApp::devnet();
 
-    let deposit_amount = U256::from(600_000_u64);
+    // Large deposit leaves headroom for the post-recovery batch-close pump
+    // that drives a finalized snapshot for watchdog compare.
+    let deposit_amount = U256::from(10_000_000_u64);
     let transfer_amount = U256::from(100_000_u64);
     let post_recovery_transfer = U256::from(200_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
@@ -1044,6 +1046,16 @@ async fn run_recovery_after_stale_batches_test(
         post_recovery_transfer,
     );
     assert_eq!(replay_after.current_user_nonce(alice_address), 1);
+
+    drive_finalized_gold_batch_for_watchdog(
+        runtime,
+        &mut ws_after,
+        &mut replay_after,
+        &mut alice_l2_fresh,
+        alice_address,
+    )
+    .await?;
+    crate::watchdog_compare::run_watchdog_non_genesis_compare_test(runtime).await?;
 
     Ok(())
 }

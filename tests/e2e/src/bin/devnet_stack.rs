@@ -32,7 +32,7 @@ async fn main() -> HarnessResult<()> {
     eprintln!("InputBox:        {}", runtime.input_box_address());
     eprintln!();
     eprintln!(
-        "--- export these, then run: lua watchdog/main.lua init && lua watchdog/main.lua tick ---"
+        "--- export these, then run: ./watchdog/sequencer-watchdog init && ./watchdog/sequencer-watchdog tick ---"
     );
     eprintln!("export WATCHDOG_SEQUENCER_URL={}", runtime.endpoint());
     eprintln!("export WATCHDOG_L1_RPC_URL={}", runtime.l1_endpoint());
@@ -59,8 +59,10 @@ async fn main() -> HarnessResult<()> {
     );
     eprintln!();
     eprintln!("Run watchdog (from repo root, after `just watchdog-lua-deps`):");
-    eprintln!("  lua watchdog/main.lua init");
-    eprintln!("  lua watchdog/main.lua tick");
+    eprintln!("  export WATCHDOG_LUA_ROOT=$(pwd)");
+    eprintln!("  export WATCHDOG_LUA_BIN=lua");
+    eprintln!("  ./watchdog/sequencer-watchdog init");
+    eprintln!("  ./watchdog/sequencer-watchdog tick");
     eprintln!();
     eprintln!("Press Ctrl+C here to stop Anvil + sequencer.");
 

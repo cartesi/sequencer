@@ -14,14 +14,14 @@ scheduler result from L1.
 The watchdog has one executable with two subcommands:
 
 ```bash
-lua watchdog/main.lua init
-lua watchdog/main.lua tick
+sequencer-watchdog init
+sequencer-watchdog tick
 ```
 
 `init` records the watchdog's canonical starting state. `tick` runs one compare
 cycle and exits; infra schedules `tick` with a timer or CronJob. Runtime
-non-overlap is an infra contract: the release container uses a kernel `flock`,
-and Kubernetes/systemd deployments should use their native non-overlap guard.
+non-overlap is enforced by `sequencer-watchdog` with a kernel `flock`, and
+Kubernetes/systemd deployments should use their native non-overlap guard.
 
 Each tick:
 

@@ -56,9 +56,11 @@ export WATCHDOG_APP_ADDRESS=<deployed app>
 export WATCHDOG_STATE_DIR=/tmp/watchdog-state
 export WATCHDOG_CM_SNAPSHOT_DIR=examples/canonical-app/out/canonical-machine-image
 export WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0
+export WATCHDOG_LUA_ROOT="$(pwd)"
+export WATCHDOG_LUA_BIN=lua
 export WATCHDOG_LUA_DEPS=.deps/lua
-lua watchdog/main.lua init
-lua watchdog/main.lua tick
+./watchdog/sequencer-watchdog init
+./watchdog/sequencer-watchdog tick
 ```
 
 Expected: exit **0**; the tick may exit idle if the finalized block is unchanged.
@@ -69,17 +71,16 @@ is for Sepolia `default()` — do not use it as the devnet golden).
 ## Drill 3 — Production compare (scheduled)
 
 Run the watchdog against staging. Each tick runs one cycle and exits; schedule re-runs
-with a systemd timer / cron and alert on the exit code. Production scheduling
-must prevent overlapping ticks; the release container entrypoint does this with
-`flock`, while direct host runs should use systemd, Linux `flock`, or an
-equivalent scheduler guard:
+with a systemd timer / cron and alert on the exit code. `sequencer-watchdog`
+takes a non-blocking `flock`; production scheduling should also prevent
+overlapping ticks with systemd, Kubernetes, or an equivalent scheduler guard:
 
 ```bash
 # ... all WATCHDOG_* vars from config.lua ...
-lua watchdog/main.lua tick
+sequencer-watchdog tick
 ```
 
-Exit codes from `watchdog/main.lua tick`:
+Exit codes from `sequencer-watchdog tick`:
 
 | Code | Meaning |
 |------|---------|
