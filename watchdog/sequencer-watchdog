@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wrapper: run watchdog subcommands with image-bundled Lua paths.
+# Production CLI wrapper for watchdog subcommands.
 set -euo pipefail
 
 if [[ "${WATCHDOG_PRINT_RELEASE_INFO:-0}" == "1" ]]; then
@@ -8,12 +8,19 @@ if [[ "${WATCHDOG_PRINT_RELEASE_INFO:-0}" == "1" ]]; then
   exit 0
 fi
 
-cd /opt/watchdog/lua
+lua_root="${WATCHDOG_LUA_ROOT:-/opt/watchdog/lua}"
+lua_bin="${WATCHDOG_LUA_BIN:-lua5.4}"
+
+cd "${lua_root}"
 
 if [[ "$#" -gt 0 && ( "$1" == "init" || "$1" == "tick" ) ]]; then
   : "${WATCHDOG_STATE_DIR:?WATCHDOG_STATE_DIR is required}"
   mkdir -p "$WATCHDOG_STATE_DIR"
-  exec flock -n "$WATCHDOG_STATE_DIR/run.lock" lua5.4 watchdog/main.lua "$@"
+  exec 9>"$WATCHDOG_STATE_DIR/run.lock"
+  if ! flock -n 9; then
+    echo "watchdog state is already locked: $WATCHDOG_STATE_DIR/run.lock" >&2
+    exit 1
+  fi
 fi
 
-exec lua5.4 watchdog/main.lua "$@"
+exec "$lua_bin" watchdog/main.lua "$@"

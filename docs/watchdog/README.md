@@ -31,13 +31,16 @@ just test-watchdog-compare-harness
 # Path B — two terminals: stack prints WATCHDOG_* exports, then init + tick:
 just devnet-for-watchdog          # terminal 1 — leave running
 # terminal 2: paste exports, then:
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua init
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/main.lua tick
+export WATCHDOG_LUA_ROOT="$(pwd)"
+export WATCHDOG_LUA_BIN=lua
+export WATCHDOG_LUA_DEPS=.deps/lua
+./watchdog/sequencer-watchdog init
+./watchdog/sequencer-watchdog tick
 ```
 
-The production container entrypoint wraps `init`/`tick` with an advisory
-`flock` on `$WATCHDOG_STATE_DIR/run.lock`. Direct local `lua` runs are for
-development; production schedulers must also prevent overlapping ticks
+The `sequencer-watchdog` wrapper wraps `init`/`tick` with an advisory `flock`
+on `$WATCHDOG_STATE_DIR/run.lock`. Production schedulers must also prevent
+overlapping ticks
 (`flock`, systemd, or Kubernetes `concurrencyPolicy: Forbid`).
 
 Details: **[`getting-started.md`](getting-started.md)**.
@@ -175,15 +178,14 @@ state.
 The watchdog has two subcommands:
 
 ```bash
-lua watchdog/main.lua init   # one-time setup: writes config.json + head.json
-lua watchdog/main.lua tick   # one compare cycle; schedule this
+sequencer-watchdog init   # one-time setup: writes config.json + head.json
+sequencer-watchdog tick   # one compare cycle; schedule this
 ```
 
 `tick` does one cycle per process, then exits — infra schedules re-runs
 (systemd timer / k8s CronJob) and reacts to the exit code. There is no daemon
-loop. The production Docker entrypoint takes a non-blocking `flock` for
-`init`/`tick`; direct host scheduling should provide the same non-overlap
-guarantee. Each tick:
+loop. `sequencer-watchdog` takes a non-blocking `flock` for `init`/`tick`;
+host scheduling should provide the same non-overlap guarantee. Each tick:
 
 1. Loads the watchdog checkpoint from `head.json`.
 2. Polls `/finalized_state/inclusion_block`. If it has not advanced past a
@@ -256,7 +258,7 @@ just test-watchdog-compare-harness
 Spawns Anvil + rollups devnet + `sequencer-devnet`, proves CM inspect SSZ at
 genesis matches `wallet_snapshot::encode(WalletConfig::devnet())` (same as
 `tests/fixtures/wallet_snapshot_v1_empty.hex` only for Sepolia `default()`), then runs
-`watchdog/main.lua init` and `watchdog/main.lua tick`.
+`sequencer-watchdog init` and `sequencer-watchdog tick`.
 When `inclusion_block` is unchanged at genesis, the runner skips L1/CM work (idle-cheap);
 `deposit_transfer_withdrawal_test` drives a gold batch first so compare replays real L1 inputs.
 **Before first run (or after changing scheduler / SSZ / inspect code):**

@@ -59,6 +59,29 @@ inside the image. Toolchain pins live in [`toolchain-pins.env`](../../toolchain-
 (the emulator that built the CM image tarball). Mismatch causes load failures
 or false `state_mismatch`.
 
+Release image quick run:
+
+```bash
+docker load < sequencer-watchdog-vX-linux-amd64.tar.gz
+
+docker run --rm \
+  -e WATCHDOG_SEQUENCER_URL="https://<internal-sequencer>" \
+  -e WATCHDOG_INPUTBOX_ADDRESS="0x..." \
+  -e WATCHDOG_APP_ADDRESS="0x..." \
+  -e WATCHDOG_STATE_DIR=/watchdog-state \
+  -e WATCHDOG_CM_SNAPSHOT_DIR=/cm-bootstrap \
+  -e WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<bootstrap inclusion_block>" \
+  -v /var/lib/watchdog/state:/watchdog-state \
+  -v /var/lib/watchdog/cm-bootstrap:/cm-bootstrap:ro \
+  sequencer-watchdog:vX init
+
+docker run --rm \
+  -e WATCHDOG_L1_RPC_URL="https://<archive-rpc>" \
+  -e WATCHDOG_STATE_DIR=/watchdog-state \
+  -v /var/lib/watchdog/state:/watchdog-state \
+  sequencer-watchdog:vX tick
+```
+
 **Local / dev build:**
 
 ```bash
@@ -116,7 +139,7 @@ layout. `init` does not need `WATCHDOG_L1_RPC_URL`; the RPC URL is read by
 each `tick` so it can rotate without editing state:
 
 ```bash
-lua watchdog/main.lua init
+sequencer-watchdog init
 ```
 
 After init, schedule `tick`; tick will fail if `head.json` is missing.
@@ -128,15 +151,14 @@ loop. Run it once as a smoke check, then schedule it (systemd timer / k8s
 CronJob) and alert on the exit code:
 
 ```bash
-lua watchdog/main.lua tick   # exit 0 = clean/idle, 1 = transient, 2 = divergence
+sequencer-watchdog tick   # exit 0 = clean/idle, 1 = transient, 2 = divergence
 ```
 
-The release container entrypoint wraps `init` and `tick` with a non-blocking
-`flock` on `$WATCHDOG_STATE_DIR/run.lock`, which is released by the kernel if
-the process dies. If you run the Lua script directly on a host, use the
-scheduler's non-overlap primitive as well (for example Linux `flock`, systemd,
-or Kubernetes CronJob `concurrencyPolicy: Forbid`). A leftover `run.lock` path
-is only a lock handle; by itself it does not mean a lock is held.
+`sequencer-watchdog` wraps `init` and `tick` with a non-blocking `flock` on
+`$WATCHDOG_STATE_DIR/run.lock`, which is released by the kernel if the process
+dies. Use the scheduler's non-overlap primitive as well (for example systemd or
+Kubernetes CronJob `concurrencyPolicy: Forbid`). A leftover `run.lock` path is
+only a lock handle; by itself it does not mean a lock is held.
 
 When `inclusion_block` ≤ the watchdog checkpoint, the runner only hits `/finalized_state/inclusion_block` and skips L1/CM work.
 
