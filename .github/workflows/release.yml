@@ -162,16 +162,20 @@ jobs:
 
   build-watchdog-image:
     name: Build watchdog image (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    # arm64 must build on an arm64 host — docker build --platform linux/arm64 on
+    # ubuntu-latest (amd64) without QEMU hits "exec format error" in RUN steps.
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             platform: linux/amd64
+            runs_on: ubuntu-latest
             deb_sha_env: CARTESI_MACHINE_SHA256_AMD64
           - arch: arm64
             platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
             deb_sha_env: CARTESI_MACHINE_SHA256_ARM64
 
     steps:
