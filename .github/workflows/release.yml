@@ -1,3 +1,7 @@
+# Release workflow: git tag v* builds sequencer tarballs, CM images, watchdog
+# docker-save tarballs, and pushes watchdog OCI images to ghcr.io + docker.io
+# (requires DOCKERHUB_USERNAME / DOCKERHUB_TOKEN repo secrets, same as cartesi/cli).
+
 name: Release
 
 on:
@@ -18,6 +22,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build-sequencer:
@@ -188,14 +193,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build and export watchdog image
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build, push, and export watchdog image
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
           DEB_SHA_ENV: ${{ matrix.deb_sha_env }}
         run: |
           set -euo pipefail
           DEB_SHA="${!DEB_SHA_ENV}"
-          image="sequencer-watchdog:${TAG}"
+          local_image="sequencer-watchdog:${TAG}"
+          ghcr_image="ghcr.io/cartesi/sequencer-watchdog:${TAG}-${{ matrix.arch }}"
+          dockerhub_image="docker.io/cartesi/sequencer-watchdog:${TAG}-${{ matrix.arch }}"
           docker build \
             --platform "${{ matrix.platform }}" \
             --build-arg "RELEASE_TAG=${TAG}" \
@@ -203,16 +223,52 @@ jobs:
             --build-arg "CARTESI_MACHINE_VERSION=${CARTESI_MACHINE_VERSION}" \
             --build-arg "CARTESI_MACHINE_DEB_SHA256=${DEB_SHA}" \
             -f watchdog/Dockerfile \
-            -t "${image}" \
+            -t "${local_image}" \
+            -t "${ghcr_image}" \
+            -t "${dockerhub_image}" \
             .
           mkdir -p dist
-          docker save "${image}" | gzip -9 > "dist/sequencer-watchdog-${TAG}-linux-${{ matrix.arch }}.tar.gz"
+          docker save "${local_image}" | gzip -9 > "dist/sequencer-watchdog-${TAG}-linux-${{ matrix.arch }}.tar.gz"
+          docker push "${ghcr_image}"
+          docker push "${dockerhub_image}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: watchdog-image-linux-${{ matrix.arch }}
           path: dist/sequencer-watchdog-*.tar.gz
+
+  publish-watchdog-container-manifest:
+    name: Publish watchdog multi-arch manifest
+    runs-on: ubuntu-latest
+    needs: build-watchdog-image
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifest tags
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          for registry in ghcr.io/cartesi docker.io/cartesi; do
+            docker buildx imagetools create -t "${registry}/sequencer-watchdog:${TAG}" \
+              "${registry}/sequencer-watchdog:${TAG}-amd64" \
+              "${registry}/sequencer-watchdog:${TAG}-arm64"
+          done
 
   publish:
     name: Publish GitHub Release
@@ -221,6 +277,7 @@ jobs:
       - build-sequencer
       - build-canonical-machine-image
       - build-watchdog-image
+      - publish-watchdog-container-manifest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
