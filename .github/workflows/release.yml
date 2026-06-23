@@ -206,69 +206,59 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build, push, and export watchdog image
+      - name: Resolve Cartesi machine deb SHA
+        id: cartesi_deb
+        env:
+          DEB_SHA_ENV: ${{ matrix.deb_sha_env }}
+        run: echo "sha=${!DEB_SHA_ENV}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push watchdog image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: watchdog/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ghcr.io/cartesi/sequencer-watchdog:${{ inputs.tag || github.ref_name }}
+            docker.io/cartesi/sequencer-watchdog:${{ inputs.tag || github.ref_name }}
+          build-args: |
+            RELEASE_TAG=${{ inputs.tag || github.ref_name }}
+            GIT_COMMIT=${{ github.sha }}
+            CARTESI_MACHINE_VERSION=${{ env.CARTESI_MACHINE_VERSION }}
+            CARTESI_MACHINE_DEB_SHA256=${{ steps.cartesi_deb.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export docker-save tarball for GitHub Release
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: watchdog/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          tags: sequencer-watchdog:export
+          outputs: type=docker,dest=${{ runner.temp }}/watchdog-image.tar
+          build-args: |
+            RELEASE_TAG=${{ inputs.tag || github.ref_name }}
+            GIT_COMMIT=${{ github.sha }}
+            CARTESI_MACHINE_VERSION=${{ env.CARTESI_MACHINE_VERSION }}
+            CARTESI_MACHINE_DEB_SHA256=${{ steps.cartesi_deb.outputs.sha }}
+          cache-from: type=gha
+
+      - name: Compress docker-save artifact
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
-          DEB_SHA_ENV: ${{ matrix.deb_sha_env }}
         run: |
           set -euo pipefail
-          DEB_SHA="${!DEB_SHA_ENV}"
-          local_image="sequencer-watchdog:${TAG}"
-          ghcr_image="ghcr.io/cartesi/sequencer-watchdog:${TAG}-${{ matrix.arch }}"
-          dockerhub_image="docker.io/cartesi/sequencer-watchdog:${TAG}-${{ matrix.arch }}"
-          docker build \
-            --platform "${{ matrix.platform }}" \
-            --build-arg "RELEASE_TAG=${TAG}" \
-            --build-arg "GIT_COMMIT=${GITHUB_SHA}" \
-            --build-arg "CARTESI_MACHINE_VERSION=${CARTESI_MACHINE_VERSION}" \
-            --build-arg "CARTESI_MACHINE_DEB_SHA256=${DEB_SHA}" \
-            -f watchdog/Dockerfile \
-            -t "${local_image}" \
-            -t "${ghcr_image}" \
-            -t "${dockerhub_image}" \
-            .
           mkdir -p dist
-          docker save "${local_image}" | gzip -9 > "dist/sequencer-watchdog-${TAG}-linux-${{ matrix.arch }}.tar.gz"
-          docker push "${ghcr_image}"
-          docker push "${dockerhub_image}"
+          gzip -9 -c "${{ runner.temp }}/watchdog-image.tar" > "dist/sequencer-watchdog-${TAG}-linux-${{ matrix.arch }}.tar.gz"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: watchdog-image-linux-${{ matrix.arch }}
           path: dist/sequencer-watchdog-*.tar.gz
-
-  publish-watchdog-container-manifest:
-    name: Publish watchdog multi-arch manifest
-    runs-on: ubuntu-latest
-    needs: build-watchdog-image
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create multi-arch manifest tags
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          for registry in ghcr.io/cartesi docker.io/cartesi; do
-            docker buildx imagetools create -t "${registry}/sequencer-watchdog:${TAG}" \
-              "${registry}/sequencer-watchdog:${TAG}-amd64" \
-              "${registry}/sequencer-watchdog:${TAG}-arm64"
-          done
 
   publish:
     name: Publish GitHub Release
@@ -277,7 +267,6 @@ jobs:
       - build-sequencer
       - build-canonical-machine-image
       - build-watchdog-image
-      - publish-watchdog-container-manifest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
