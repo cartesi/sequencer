@@ -50,8 +50,18 @@ curl -sS -o /dev/null -w "%{http_code}\n" "$WATCHDOG_SEQUENCER_URL/finalized_sta
 
 **Production (recommended):** use the **release bundle** for tag `vX` — same
 git tag as the sequencer binary and `canonical-machine-image-*-vX.tar.gz`.
-Load `sequencer-watchdog-vX-linux-<arch>.tar.gz` (`docker load`) and verify
-alignment via `release-manifest-vX.json` and `/opt/watchdog/RELEASE.json`
+
+**Container images (preferred for Dockerfile / Fly.io assembly):**
+
+| Registry | Image |
+|----------|-------|
+| GHCR | `ghcr.io/cartesi/sequencer-watchdog:vX` |
+| Docker Hub | `docker.io/cartesi/sequencer-watchdog:vX` |
+
+Multi-arch manifest (`amd64` + `arm64`). Per-arch tags also exist as
+`vX-amd64` / `vX-arm64` if you need to pin architecture explicitly.
+
+Verify alignment via `release-manifest-vX.json` and `/opt/watchdog/RELEASE.json`
 inside the image. Toolchain pins live in [`toolchain-pins.env`](../../toolchain-pins.env).
 
 `cartesi-machine` in the watchdog image **must** match
@@ -59,10 +69,39 @@ inside the image. Toolchain pins live in [`toolchain-pins.env`](../../toolchain-
 (the emulator that built the CM image tarball). Mismatch causes load failures
 or false `state_mismatch`.
 
-Release image quick run:
+**Compose a custom image (e.g. Fly.io rootfs)** — base on `debian:trixie-slim`,
+install the same runtime packages as the release image, then copy from the
+published watchdog image:
+
+```dockerfile
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    lua5.4 libcurl4 libslirp0 libgomp1 ca-certificates util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /opt/watchdog /opt/watchdog
+COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/bin/sequencer-watchdog /usr/local/bin/sequencer-watchdog
+COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/bin/cartesi-machine /usr/local/bin/cartesi-machine
+COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/lib/ /usr/local/lib/
+COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/lib/lua/ /usr/local/lib/lua/
+COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/share/lua/ /usr/local/share/lua/
+COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/share/cartesi-machine/ /usr/local/share/cartesi-machine/
+
+ENV WATCHDOG_LUA_DEPS=/opt/watchdog/lib \
+    LUA_PATH="/opt/watchdog/lua/?.lua;/opt/watchdog/lua/?/init.lua;/usr/local/share/lua/5.4/?.lua;/usr/local/share/lua/5.4/?/init.lua;;" \
+    LUA_CPATH="/opt/watchdog/lib/?.so;/usr/local/lib/lua/5.4/?.so;;" \
+    LD_LIBRARY_PATH="/usr/local/lib" \
+    PATH="/usr/local/share/cartesi-machine:${PATH}"
+
+ENTRYPOINT ["/usr/local/bin/sequencer-watchdog"]
+```
+
+**Tarball fallback** (`docker load`):
 
 ```bash
-docker load < sequencer-watchdog-vX-linux-amd64.tar.gz
+docker pull ghcr.io/cartesi/sequencer-watchdog:vX
+# or: docker load < sequencer-watchdog-vX-linux-amd64.tar.gz
 
 docker run --rm \
   -e WATCHDOG_SEQUENCER_URL="https://<internal-sequencer>" \
@@ -73,13 +112,13 @@ docker run --rm \
   -e WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<bootstrap inclusion_block>" \
   -v /var/lib/watchdog/state:/watchdog-state \
   -v /var/lib/watchdog/cm-bootstrap:/cm-bootstrap:ro \
-  sequencer-watchdog:vX init
+  ghcr.io/cartesi/sequencer-watchdog:vX init
 
 docker run --rm \
   -e WATCHDOG_L1_RPC_URL="https://<archive-rpc>" \
   -e WATCHDOG_STATE_DIR=/watchdog-state \
   -v /var/lib/watchdog/state:/watchdog-state \
-  sequencer-watchdog:vX tick
+  ghcr.io/cartesi/sequencer-watchdog:vX tick
 ```
 
 **Local / dev build:**
