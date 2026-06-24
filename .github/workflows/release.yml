@@ -207,6 +207,8 @@ jobs:
 
       - name: Build and push watchdog image
         uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_SUMMARY: "false"
         with:
           context: .
           file: watchdog/Dockerfile
@@ -242,6 +244,7 @@ jobs:
         uses: actions/download-artifact@v6
         with:
           path: dist
+          pattern: "{sequencer-linux-*,canonical-machine-images}"
 
       - name: Flatten artifacts
         env:
