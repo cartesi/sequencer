@@ -46,9 +46,9 @@ curl -sS -o /dev/null -w "%{http_code}\n" "$WATCHDOG_SEQUENCER_URL/finalized_sta
 # expect 200 when a finalized snapshot exists (404 = not promoted yet or wrong host)
 ```
 
-### 2. Watchdog runtime (release bundle or local build)
+### 2. Watchdog runtime (release image or local build)
 
-**Production (recommended):** use the **release bundle** for tag `vX` — same
+**Production (recommended):** pull the **release container image** for tag `vX` — same
 git tag as the sequencer binary and `canonical-machine-image-*-vX.tar.gz`.
 
 **Container images (preferred for Dockerfile / Fly.io assembly):**
@@ -58,8 +58,7 @@ git tag as the sequencer binary and `canonical-machine-image-*-vX.tar.gz`.
 | GHCR | `ghcr.io/cartesi/sequencer-watchdog:vX` |
 | Docker Hub | `docker.io/cartesi/sequencer-watchdog:vX` |
 
-Multi-arch manifest (`amd64` + `arm64`). Per-arch tags also exist as
-`vX-amd64` / `vX-arm64` if you need to pin architecture explicitly.
+Multi-arch manifest (`amd64` + `arm64`).
 
 Verify alignment via `release-manifest-vX.json` and `/opt/watchdog/RELEASE.json`
 inside the image. Toolchain pins live in [`toolchain-pins.env`](../../toolchain-pins.env).
@@ -97,11 +96,10 @@ ENV WATCHDOG_LUA_DEPS=/opt/watchdog/lib \
 ENTRYPOINT ["/usr/local/bin/sequencer-watchdog"]
 ```
 
-**Tarball fallback** (`docker load`):
+**Run from the published image:**
 
 ```bash
 docker pull ghcr.io/cartesi/sequencer-watchdog:vX
-# or: docker load < sequencer-watchdog-vX-linux-amd64.tar.gz
 
 docker run --rm \
   -e WATCHDOG_SEQUENCER_URL="https://<internal-sequencer>" \
