@@ -9,32 +9,13 @@ cd "${root}"
 source toolchain-pins.env
 
 image="sequencer-watchdog:ci-smoke"
-if command -v dpkg >/dev/null 2>&1; then
-  arch="$(dpkg --print-architecture)"
-else
-  case "$(uname -m)" in
-    x86_64) arch=amd64 ;;
-    aarch64 | arm64) arch=arm64 ;;
-    *)
-      echo "unsupported arch for watchdog docker smoke: $(uname -m)" >&2
-      exit 1
-      ;;
-  esac
-fi
-case "${arch}" in
-  amd64) deb_sha="${CARTESI_MACHINE_SHA256_AMD64}" ;;
-  arm64) deb_sha="${CARTESI_MACHINE_SHA256_ARM64}" ;;
-  *)
-    echo "unsupported arch for watchdog docker smoke: ${arch}" >&2
-    exit 1
-    ;;
-esac
 
 docker build \
   --build-arg "RELEASE_TAG=ci-smoke" \
   --build-arg "GIT_COMMIT=local" \
   --build-arg "CARTESI_MACHINE_VERSION=${CARTESI_MACHINE_VERSION}" \
-  --build-arg "CARTESI_MACHINE_DEB_SHA256=${deb_sha}" \
+  --build-arg "CARTESI_MACHINE_DEB_SHA256_AMD64=${CARTESI_MACHINE_SHA256_AMD64}" \
+  --build-arg "CARTESI_MACHINE_DEB_SHA256_ARM64=${CARTESI_MACHINE_SHA256_ARM64}" \
   -f watchdog/Dockerfile \
   -t "${image}" \
   .

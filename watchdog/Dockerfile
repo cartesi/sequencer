@@ -9,7 +9,8 @@ FROM debian:${DEBIAN_VERSION} AS build
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG CARTESI_MACHINE_VERSION
-ARG CARTESI_MACHINE_DEB_SHA256
+ARG CARTESI_MACHINE_DEB_SHA256_AMD64
+ARG CARTESI_MACHINE_DEB_SHA256_ARM64
 ARG TARGETARCH
 
 # wget + ca-certificates fetch the cartesi-machine .deb; gcc/pkg-config + Lua
@@ -33,13 +34,13 @@ COPY watchdog/third_party watchdog/third_party
 RUN bash scripts/watchdog-lua-deps.sh
 
 RUN case "${TARGETARCH}" in \
-      amd64) CM_ARCH=amd64 ;; \
-      arm64) CM_ARCH=arm64 ;; \
+      amd64) DEB_SHA="${CARTESI_MACHINE_DEB_SHA256_AMD64}"; CM_ARCH=amd64 ;; \
+      arm64) DEB_SHA="${CARTESI_MACHINE_DEB_SHA256_ARM64}"; CM_ARCH=arm64 ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && wget -O /tmp/machine-emulator.deb \
       "https://github.com/cartesi/machine-emulator/releases/download/${CARTESI_MACHINE_VERSION}/machine-emulator_${CM_ARCH}.deb" \
-    && echo "${CARTESI_MACHINE_DEB_SHA256}  /tmp/machine-emulator.deb" | sha256sum --check \
+    && echo "${DEB_SHA}  /tmp/machine-emulator.deb" | sha256sum --check \
     && dpkg-deb -x /tmp/machine-emulator.deb /tmp/cm \
     && mkdir -p /out/bin /out/lib /out/lib/lua/5.4 /out/share/cartesi-machine /out/share/lua/5.4 \
     && cp -a /tmp/cm/usr/bin/cartesi-machine /out/bin/ \
