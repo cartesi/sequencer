@@ -1,10 +1,12 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+pins := "../../toolchain-pins.env"
+cartesi_machine_version := `sed -n 's/^CARTESI_MACHINE_VERSION=v//p' ../../toolchain-pins.env`
+linux_image_release := `grep '^CARTESI_LINUX_IMAGE_RELEASE=' ../../toolchain-pins.env | cut -d= -f2`
+linux_kernel_filename := `grep '^CARTESI_LINUX_KERNEL_FILENAME=' ../../toolchain-pins.env | cut -d= -f2`
+
 out_dir := "out"
 source_date_epoch := "0"
-cartesi_machine_version := "0.20.0"
-linux_image_release := "v0.20.0"
-linux_kernel_filename := "linux-6.5.13-ctsi-1-v0.20.0.bin"
 linux_kernel := out_dir + "/linux.bin"
 linux_kernel_sha512 := linux_kernel + ".sha512"
 linux_kernel_url := "https://github.com/cartesi/machine-linux-image/releases/download/" + linux_image_release + "/" + linux_kernel_filename

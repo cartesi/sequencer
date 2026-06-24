@@ -9,7 +9,7 @@ This document covers staging and manual verification beyond the devnet tutorial.
 
 ## Prerequisites
 
-- **Release bundle (staging/production):** deploy `sequencer-watchdog-vX` and `canonical-machine-image-*-vX` from the same git tag; toolchain pins live in [`toolchain-pins.env`](../../toolchain-pins.env).
+- **Release (staging/production):** pull `ghcr.io/cartesi/sequencer-watchdog:vX` and deploy `canonical-machine-image-*-vX` from the same git tag; toolchain pins live in [`toolchain-pins.env`](../../toolchain-pins.env).
 - Built canonical machine image: `just canonical-build-machine-image`
 - `cartesi-machine`, `lua`, and `curl` on PATH
 - `just watchdog-lua-deps` — builds `lcurl.so` into `.deps/lua` (libcurl + Lua headers on host)
