@@ -57,6 +57,8 @@ ARG GIT_COMMIT
 ARG CARTESI_MACHINE_VERSION
 
 LABEL org.opencontainers.image.title="sequencer-watchdog" \
+      org.opencontainers.image.description="Cartesi sequencer watchdog (compare daemon)" \
+      org.opencontainers.image.source="https://github.com/cartesi/sequencer" \
       org.opencontainers.image.version="${RELEASE_TAG}" \
       org.opencontainers.image.revision="${GIT_COMMIT}" \
       org.cartesi.sequencer.release-tag="${RELEASE_TAG}" \

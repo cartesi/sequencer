@@ -191,6 +191,13 @@ Related docs:
 - App snapshots (format + lifecycle): `docs/snapshots/`
 - Watchdog — local dev: [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md); Sepolia/mainnet: [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md)
 
+The watchdog ships as a multi-arch container image per release tag `vX`:
+
+```bash
+docker pull ghcr.io/cartesi/sequencer-watchdog:vX
+# mirror: docker.io/cartesi/sequencer-watchdog:vX
+```
+
 ## Prototype Limits
 
 - The `Application` trait exposes snapshot dump/load capability (format in `docs/snapshots/format.md`). The inclusion lane drives the snapshot lifecycle — dump at batch close, promote to finalized on L1 observation, and garbage-collect superseded dumps — and at startup rebuilds application state by loading the latest snapshot and replaying the persisted L2-tx stream from that snapshot's offset. The lifecycle and its rationale (per-range atomic promotion, GC, leasing, crash-safety) are documented in `docs/snapshots/lifecycle.md`. The snapshot is served to the operator's watchdog/indexers over internal-only HTTP routes (`/finalized_state`, `/finalized_state/inclusion_block`, `/latest_snapshot`) — no auth, gated by network-level access control until the planned per-port api split lands.
