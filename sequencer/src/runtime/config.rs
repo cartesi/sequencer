@@ -38,10 +38,10 @@ Examples:
     --app-address 0x1111111111111111111111111111111111111111 \\
     --batch-submitter-private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
-  SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \\
-  SEQ_CHAIN_ID=31337 \\
-  SEQ_APP_ADDRESS=0x1111111111111111111111111111111111111111 \\
-  SEQ_BATCH_SUBMITTER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \\
+  CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \\
+  CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \\
+  CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \\
+  CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \\
   sequencer\
 ",
     group(
@@ -52,32 +52,32 @@ Examples:
     )
 )]
 pub struct RunConfig {
-    #[arg(long, env = "SEQ_HTTP_ADDR", default_value = DEFAULT_HTTP_ADDR, value_parser = parse_non_empty_string)]
+    #[arg(long, env = "CARTESI_SEQUENCER_HTTP_ADDR", default_value = DEFAULT_HTTP_ADDR, value_parser = parse_non_empty_string)]
     pub http_addr: String,
-    #[arg(long, env = "SEQ_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
+    #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
     pub data_dir: String,
-    #[arg(long, env = "SEQ_ETH_RPC_URL", value_parser = parse_non_empty_string)]
+    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
-    #[arg(long, env = "SEQ_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::l1::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
+    #[arg(long, env = "CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::l1::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
     pub long_block_range_error_codes: Vec<String>,
     /// Expected chain ID. Validated against the RPC at startup.
-    #[arg(long, env = "SEQ_CHAIN_ID")]
+    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_ID")]
     pub chain_id: u64,
     /// Application (EIP-712 verifying contract) address.
-    #[arg(long, env = "SEQ_APP_ADDRESS", value_parser = parse_address)]
+    #[arg(long, env = "CARTESI_SEQUENCER_APP_ADDRESS", value_parser = parse_address)]
     pub app_address: Address,
     /// Hex-encoded private key for the batch submitter.
     #[arg(
         long,
-        env = "SEQ_BATCH_SUBMITTER_PRIVATE_KEY",
+        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
         group = "batch_submitter_key_source"
     )]
     batch_submitter_private_key: Option<String>,
     /// Path to a file whose first line contains the batch submitter private key.
     #[arg(
         long,
-        env = "SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE",
+        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
         group = "batch_submitter_key_source"
     )]
     batch_submitter_private_key_file: Option<String>,
@@ -85,7 +85,7 @@ pub struct RunConfig {
     /// How often the batch submitter polls for new work when idle.
     #[arg(
         long,
-        env = "SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS",
+        env = "CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS",
         default_value = "5000"
     )]
     pub batch_submitter_idle_poll_interval_ms: u64,
@@ -93,7 +93,7 @@ pub struct RunConfig {
     /// Additional confirmations to wait for after a batch-submission tx is included on L1.
     #[arg(
         long,
-        env = "SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH",
+        env = "CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH",
         default_value = "2"
     )]
     pub batch_submitter_confirmation_depth: u64,
@@ -106,7 +106,11 @@ pub struct RunConfig {
     /// runway to investigate before the system gives up on the current
     /// batches — see `docs/recovery/README.md` "Step 1: Danger threshold"
     /// for the rationale.
-    #[arg(long, env = "SEQ_PREEMPTIVE_MARGIN_BLOCKS", default_value = "300")]
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS",
+        default_value = "300"
+    )]
     pub preemptive_margin_blocks: u64,
 
     /// Blocks of safe-head age after which the L1 read view is considered too
@@ -116,12 +120,12 @@ pub struct RunConfig {
     /// less than the danger threshold (validated at startup).
     ///
     /// Default 600 (~2h at 12s/block).
-    #[arg(long, env = "SEQ_L1_READ_STALE_AFTER_BLOCKS", default_value = "600", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, env = "CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS", default_value = "600", value_parser = clap::value_parser!(u64).range(1..))]
     pub l1_read_stale_after_blocks: u64,
 
     /// Assumed L1 block time in seconds. Used to estimate block progression from
     /// wall-clock time when the L1 provider is unreachable.
-    #[arg(long, env = "SEQ_SECONDS_PER_BLOCK", default_value = "12", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, env = "CARTESI_SEQUENCER_SECONDS_PER_BLOCK", default_value = "12", value_parser = clap::value_parser!(u64).range(1..))]
     pub seconds_per_block: u64,
 }
 
@@ -255,7 +259,7 @@ mod tests {
         );
     }
 
-    // ── H8 regression: SEQ_SECONDS_PER_BLOCK=0 is rejected by clap ──
+    // ── H8 regression: CARTESI_SEQUENCER_SECONDS_PER_BLOCK=0 is rejected by clap ──
     //
     // The H8 hardening added `value_parser = clap::value_parser!(u64).range(1..)`
     // on `seconds_per_block` to prevent a divide-by-zero panic in the

@@ -280,13 +280,13 @@ end)
 
 test("config loads snapshot directory safe block and optional topic", function()
     local env = {
-        WATCHDOG_SEQUENCER_URL = "http://seq",
-        WATCHDOG_INPUTBOX_ADDRESS = "0x9999999999999999999999999999999999999999",
-        WATCHDOG_APP_ADDRESS = "0x1111111111111111111111111111111111111111",
-        WATCHDOG_INPUT_ADDED_TOPIC = "0xtopic",
-        WATCHDOG_STATE_DIR = "/tmp/watchdog-state",
-        WATCHDOG_CM_SNAPSHOT_DIR = "/tmp/snapshot",
-        WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK = "42",
+        CARTESI_WATCHDOG_SEQUENCER_URL = "http://seq",
+        CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS = "0x9999999999999999999999999999999999999999",
+        CARTESI_WATCHDOG_APP_ADDRESS = "0x1111111111111111111111111111111111111111",
+        CARTESI_WATCHDOG_INPUT_ADDED_TOPIC = "0xtopic",
+        CARTESI_WATCHDOG_STATE_DIR = "/tmp/watchdog-state",
+        CARTESI_WATCHDOG_CM_SNAPSHOT_DIR = "/tmp/snapshot",
+        CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK = "42",
     }
 
     local cfg = config.load(env)
@@ -301,13 +301,13 @@ end)
 test("config requires a sequencer URL", function()
     local ok, err = pcall(function()
         config.load({
-            WATCHDOG_INPUTBOX_ADDRESS = "0x9999999999999999999999999999999999999999",
-            WATCHDOG_APP_ADDRESS = "0x1111111111111111111111111111111111111111",
-            WATCHDOG_STATE_DIR = "/tmp/watchdog-state",
+            CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS = "0x9999999999999999999999999999999999999999",
+            CARTESI_WATCHDOG_APP_ADDRESS = "0x1111111111111111111111111111111111111111",
+            CARTESI_WATCHDOG_STATE_DIR = "/tmp/watchdog-state",
         })
     end)
     assert_eq(ok, false)
-    assert(tostring(err):find("WATCHDOG_SEQUENCER_URL", 1, true) ~= nil, "sequencer URL is required")
+    assert(tostring(err):find("CARTESI_WATCHDOG_SEQUENCER_URL", 1, true) ~= nil, "sequencer URL is required")
 end)
 
 test("checkpoint writes manifest-backed head pointer", function()
@@ -541,8 +541,8 @@ test("init stores bootstrap snapshot as watchdog head", function()
     assert_eq(persisted.l1_rpc_url, nil)
 
     local tick_cfg = main_mod.load_tick_config({
-        WATCHDOG_STATE_DIR = dir,
-        WATCHDOG_L1_RPC_URL = "http://tick-rpc",
+        CARTESI_WATCHDOG_STATE_DIR = dir,
+        CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT = "http://tick-rpc",
     })
     assert_eq(tick_cfg.state_dir, dir)
     assert_eq(tick_cfg.sequencer_url, "http://sequencer")
@@ -561,11 +561,11 @@ test("tick config requires current RPC URL outside persisted state", function()
 
     local ok, load_err = pcall(function()
         main_mod.load_tick_config({
-            WATCHDOG_STATE_DIR = dir,
+            CARTESI_WATCHDOG_STATE_DIR = dir,
         })
     end)
     assert_eq(ok, false)
-    assert(tostring(load_err):find("WATCHDOG_L1_RPC_URL", 1, true) ~= nil, tostring(load_err))
+    assert(tostring(load_err):find("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT", 1, true) ~= nil, tostring(load_err))
 end)
 
 test("init refuses an already initialized state directory", function()

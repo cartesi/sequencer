@@ -94,7 +94,7 @@ This builds `sequencer-devnet`, spawns the stack, waits for `GET /finalized_stat
 just devnet-for-watchdog
 ```
 
-This starts Anvil and `sequencer-devnet` on **ephemeral local ports** (not fixed 8545/3000) and prints a block of `export WATCHDOG_*=...` lines. **Copy those exports** into Terminal 2.
+This starts Anvil and `sequencer-devnet` on **ephemeral local ports** (not fixed 8545/3000) and prints a block of `export CARTESI_WATCHDOG_*=...` lines. **Copy those exports** into Terminal 2.
 
 Leave Terminal 1 running until you are done; Ctrl+C stops Anvil and the sequencer.
 
@@ -102,10 +102,10 @@ Leave Terminal 1 running until you are done; Ctrl+C stops Anvil and the sequence
 
 The watchdog needs a **finalized** SSZ dump. Right after boot, the cheap endpoint may return **404** until the sequencer has promoted a snapshot.
 
-In another shell (use the printed `WATCHDOG_SEQUENCER_URL`):
+In another shell (use the printed `CARTESI_WATCHDOG_SEQUENCER_URL`):
 
 ```bash
-curl -s "$WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
+curl -s "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
 ```
 
 When you see JSON like `{"inclusion_block":0,"l2_tx_index":0}` (numbers may differ), the watchdog can compare. If it stays 404 for a long time, check sequencer logs in `tests/e2e/results/` and that L1 is mining (devnet Anvil auto-mines by default).
@@ -113,7 +113,7 @@ When you see JSON like `{"inclusion_block":0,"l2_tx_index":0}` (numbers may diff
 Optional — inspect SSZ size:
 
 ```bash
-curl -s -D - "$WATCHDOG_SEQUENCER_URL/finalized_state" -o /tmp/finalized-state.bin
+curl -s -D - "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state" -o /tmp/finalized-state.bin
 head -c 32 /tmp/finalized-state.bin | xxd
 ```
 
@@ -123,9 +123,9 @@ From repo root, after `just watchdog-lua-deps`:
 
 ```bash
 # Paste exports from Terminal 1, then initialize once and run one tick:
-export WATCHDOG_LUA_ROOT="$(pwd)"
-export WATCHDOG_LUA_BIN=lua
-export WATCHDOG_LUA_DEPS=.deps/lua
+export CARTESI_WATCHDOG_LUA_ROOT="$(pwd)"
+export CARTESI_WATCHDOG_LUA_BIN=lua
+export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ./watchdog/sequencer-watchdog init
 ./watchdog/sequencer-watchdog tick
 ```
@@ -162,14 +162,14 @@ Full operator runbook: **[`operator-deployment.md`](operator-deployment.md)**.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `WATCHDOG_SEQUENCER_URL` | yes | e.g. `http://127.0.0.1:54321` |
-| `WATCHDOG_L1_RPC_URL` | tick | Current L1 JSON-RPC; not persisted by `init` |
-| `WATCHDOG_INPUTBOX_ADDRESS` | yes | InputBox contract |
-| `WATCHDOG_APP_ADDRESS` | yes | Rollup application contract |
-| `WATCHDOG_STATE_DIR` | yes | Persistent watchdog state (`config.json`, `head.json`, checkpoints) |
-| `WATCHDOG_CM_SNAPSHOT_DIR` | init | Genesis CM image dir |
-| `WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | with above | Usually `0` on fresh devnet |
-| `WATCHDOG_LUA_DEPS` | yes | `.deps/lua` after `just watchdog-lua-deps` |
+| `CARTESI_WATCHDOG_SEQUENCER_URL` | yes | e.g. `http://127.0.0.1:54321` |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | tick | Current L1 JSON-RPC; not persisted by `init` |
+| `CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS` | yes | InputBox contract |
+| `CARTESI_WATCHDOG_APP_ADDRESS` | yes | Rollup application contract |
+| `CARTESI_WATCHDOG_STATE_DIR` | yes | Persistent watchdog state (`config.json`, `head.json`, checkpoints) |
+| `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | init | Genesis CM image dir |
+| `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | with above | Usually `0` on fresh devnet |
+| `CARTESI_WATCHDOG_LUA_DEPS` | yes | `.deps/lua` after `just watchdog-lua-deps` |
 
 See `watchdog/config.lua` for the full list.
 
@@ -181,12 +181,12 @@ See `watchdog/config.lua` for the full list.
 |---------|----------------|
 | `install libcurl dev package` | Install `libcurl4-openssl-dev` (or distro equivalent); see [Host dependencies](README.md#host-dependencies-watchdog-lua-deps) |
 | `lua.h: No such file or directory` when building lcurl | Install `liblua5.4-dev` (Debian/WSL), or set `LUA_INC` to your Lua headers directory (Homebrew/nix) before `just watchdog-lua-deps` |
-| `lcurl` / `cURL` not found at runtime | Run `just watchdog-lua-deps`, set `WATCHDOG_LUA_DEPS=.deps/lua` |
+| `lcurl` / `cURL` not found at runtime | Run `just watchdog-lua-deps`, set `CARTESI_WATCHDOG_LUA_DEPS=.deps/lua` |
 | `cartesi Lua module is required` | Install Cartesi Machine; use nix/direnv shell; ensure `cartesi-machine` on `PATH` |
 | `inspect endpoint not implemented` | Rebuild CM image: `just canonical-build-machine-image` |
 | CM inspect ~27 bytes / JSON in error | Stale image (old JSON inspect); rebuild: `just canonical-build-machine-image` |
 | HTTP 404 on `/finalized_state/inclusion_block` | Sequencer not promoted yet; wait or drive L1 + batches |
-| `state_mismatch` at genesis | Wrong `WATCHDOG_CM_SNAPSHOT_*` or stale CM image vs sequencer build |
+| `state_mismatch` at genesis | Wrong `CARTESI_WATCHDOG_CM_SNAPSHOT_*` or stale CM image vs sequencer build |
 | `inclusion_block_regressed` | Watchdog state ahead of sequencer (reset state dir or fix bootstrap block) |
 | `flock` lock conflict | Another tick is still running or the scheduler allows overlap. With the container `flock`, a leftover `run.lock` path alone is harmless. |
 | `could not determine which binary to run` | Use `just test-watchdog-compare-harness` (not bare `cargo run -p rollups-e2e`) |

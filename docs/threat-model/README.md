@@ -64,20 +64,20 @@ These are preconditions the sequencer takes as given. They are neither "trust" n
 The wall-clock fallback in [`sequencer/src/recovery/mod.rs`](../../sequencer/src/recovery/mod.rs) estimates missed blocks as:
 
 ```
-estimated_missed_blocks = (now - last_sync_ms) / SEQ_SECONDS_PER_BLOCK
+estimated_missed_blocks = (now - last_sync_ms) / CARTESI_SEQUENCER_SECONDS_PER_BLOCK
 ```
 
 This assumes a **known, bounded-variance relationship** between elapsed wall-clock time and mined L1 block count. The assumption has three parts:
 
-1. **Known average block time** — `SEQ_SECONDS_PER_BLOCK` (default 12s, Ethereum mainnet) accurately reflects the target chain's block cadence.
+1. **Known average block time** — `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default 12s, Ethereum mainnet) accurately reflects the target chain's block cadence.
 2. **Bounded variance** — over the danger-threshold window (~4h on mainnet), the delta between `elapsed_seconds / avg_block_time` and actual mined blocks is small. On Ethereum mainnet this holds: slot proposers occasionally skip, but >99% of slots produce a block.
 3. **Wall clock is monotonic and accurate** — the host's `SystemTime::now()` does not jump backward significantly or drift. Handled by saturating subtraction against clock backward jumps, but not against systematic drift.
 
 **Where it matters.** Only on the fallback path — when L1 is unreachable and we cannot observe block numbers directly. When L1 is up, observed block numbers are authoritative and this assumption is not consulted.
 
 **Violation modes.**
-- **Chain with unstable block time.** A chain where average block time drifts substantially (e.g., PoW networks under major hashrate swings) would make the estimate less reliable. Mitigation: `SEQ_SECONDS_PER_BLOCK` should be tuned conservatively (overestimate block time → underestimate missed blocks → more cautious recovery triggers).
-- **Operator misconfigures `SEQ_SECONDS_PER_BLOCK`.** Typo or copy-paste error pointing at the wrong chain's cadence. Operator-trust scope.
+- **Chain with unstable block time.** A chain where average block time drifts substantially (e.g., PoW networks under major hashrate swings) would make the estimate less reliable. Mitigation: `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` should be tuned conservatively (overestimate block time → underestimate missed blocks → more cautious recovery triggers).
+- **Operator misconfigures `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`.** Typo or copy-paste error pointing at the wrong chain's cadence. Operator-trust scope.
 - **Significant host clock drift.** A sequencer host whose clock lags or leads the real-world by minutes per day could slowly desynchronize its danger estimates from reality.
 
 **Corollary for test design.** To deterministically exercise the wall-clock fallback, tests must maintain this coupling: when advancing the L1 block count, they should also advance (or simulate) the corresponding wall-clock interval. Our e2e harness does the reverse — it rewinds `l1_safe_head.synced_at_ms` to an older timestamp, which is semantically equivalent to advancing the wall clock.

@@ -280,35 +280,35 @@ fn compare_env(
 ) -> Vec<(String, String)> {
     vec![
         (
-            "WATCHDOG_LUA_DEPS".into(),
+            "CARTESI_WATCHDOG_LUA_DEPS".into(),
             lua_deps.to_string_lossy().into_owned(),
         ),
         (
-            "WATCHDOG_SEQUENCER_URL".into(),
+            "CARTESI_WATCHDOG_SEQUENCER_URL".into(),
             runtime.endpoint().to_string(),
         ),
         (
-            "WATCHDOG_L1_RPC_URL".into(),
+            "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT".into(),
             runtime.l1_endpoint().to_string(),
         ),
         (
-            "WATCHDOG_INPUTBOX_ADDRESS".into(),
+            "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS".into(),
             runtime.input_box_address().to_string(),
         ),
         (
-            "WATCHDOG_APP_ADDRESS".into(),
+            "CARTESI_WATCHDOG_APP_ADDRESS".into(),
             runtime.app_address().to_string(),
         ),
         (
-            "WATCHDOG_STATE_DIR".into(),
+            "CARTESI_WATCHDOG_STATE_DIR".into(),
             state_dir.to_string_lossy().into_owned(),
         ),
         (
-            "WATCHDOG_CM_SNAPSHOT_DIR".into(),
+            "CARTESI_WATCHDOG_CM_SNAPSHOT_DIR".into(),
             machine_image.to_string_lossy().into_owned(),
         ),
         (
-            "WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK".into(),
+            "CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK".into(),
             GENESIS_SAFE_BLOCK.into(),
         ),
     ]
@@ -329,8 +329,8 @@ async fn run_lua_main(
         .arg(command_name)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.env("WATCHDOG_LUA_ROOT", workspace);
-    command.env("WATCHDOG_LUA_BIN", "lua");
+    command.env("CARTESI_WATCHDOG_LUA_ROOT", workspace);
+    command.env("CARTESI_WATCHDOG_LUA_BIN", "lua");
     for (key, value) in compare_env(runtime, state_dir, machine_image, lua_deps.as_path()) {
         command.env(key, value);
     }

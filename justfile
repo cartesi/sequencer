@@ -26,7 +26,7 @@ test-watchdog-divergence-drill: watchdog-lua-deps
 watchdog-lua-deps:
     @just -f watchdog/justfile lua-deps
 
-# Anvil + rollups + sequencer-devnet; prints WATCHDOG_* exports until Ctrl+C.
+# Anvil + rollups + sequencer-devnet; prints CARTESI_WATCHDOG_* exports until Ctrl+C.
 devnet-for-watchdog: setup ensure-machine-image
     cargo build -p sequencer --bin sequencer-devnet
     cargo build -p rollups-e2e --bin devnet-stack
@@ -102,4 +102,4 @@ ci:
 
 run addr="127.0.0.1:3000" data_dir="sequencer-data":
     rm -rf {{data_dir}}
-    SEQ_HTTP_ADDR={{addr}} SEQ_DATA_DIR={{data_dir}} cargo run -p sequencer --release
+    CARTESI_SEQUENCER_HTTP_ADDR={{addr}} CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p sequencer --release

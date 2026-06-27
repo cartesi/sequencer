@@ -64,22 +64,22 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 ## Running
 
 ```bash
-SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \
-SEQ_CHAIN_ID=31337 \
-SEQ_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
-SEQ_BATCH_SUBMITTER_PRIVATE_KEY=0xac09...f2ff80 \
+CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
+CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \
+CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
+CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac09...f2ff80 \
 cargo run -p sequencer
 ```
 
-Required: `SEQ_ETH_RPC_URL`, `SEQ_CHAIN_ID`, `SEQ_APP_ADDRESS`, `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` (or `_FILE`).
+Required: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `_FILE`).
 
-Optional: `SEQ_HTTP_ADDR` (default `127.0.0.1:3000`), `SEQ_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; created if missing), `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `SEQ_SECONDS_PER_BLOCK` (default `12`), `SEQ_LONG_BLOCK_RANGE_ERROR_CODES` (default `-32005,-32600,-32602,-32616`), `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE` (alternative to `SEQ_BATCH_SUBMITTER_PRIVATE_KEY`; first line of the file is the key), `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
+Optional: `CARTESI_SEQUENCER_HTTP_ADDR` (default `127.0.0.1:3000`), `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; created if missing), `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default `12`), `CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES` (default `-32005,-32600,-32602,-32616`), `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (alternative to `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY`; first line of the file is the key), `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
 
 Fixed protocol identity (EIP-712):
 
 - domain name: `CartesiAppSequencer`
 - domain version: `1`
-- `chain_id` and `verifying_contract` come from `SEQ_CHAIN_ID` and `SEQ_APP_ADDRESS`
+- `chain_id` and `verifying_contract` come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS`
 
 Most queue sizes, polling intervals, and safety limits are now internal runtime constants instead of public launch-time configuration.
 

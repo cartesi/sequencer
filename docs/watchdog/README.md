@@ -28,18 +28,18 @@ just setup && just canonical-build-machine-image && just watchdog-lua-deps
 # Path A — full smoke (Anvil + sequencer + CM + compare), one command:
 just test-watchdog-compare-harness
 
-# Path B — two terminals: stack prints WATCHDOG_* exports, then init + tick:
+# Path B — two terminals: stack prints CARTESI_WATCHDOG_* exports, then init + tick:
 just devnet-for-watchdog          # terminal 1 — leave running
 # terminal 2: paste exports, then:
-export WATCHDOG_LUA_ROOT="$(pwd)"
-export WATCHDOG_LUA_BIN=lua
-export WATCHDOG_LUA_DEPS=.deps/lua
+export CARTESI_WATCHDOG_LUA_ROOT="$(pwd)"
+export CARTESI_WATCHDOG_LUA_BIN=lua
+export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ./watchdog/sequencer-watchdog init
 ./watchdog/sequencer-watchdog tick
 ```
 
 The `sequencer-watchdog` wrapper wraps `init`/`tick` with an advisory `flock`
-on `$WATCHDOG_STATE_DIR/run.lock`. Production schedulers must also prevent
+on `$CARTESI_WATCHDOG_STATE_DIR/run.lock`. Production schedulers must also prevent
 overlapping ticks
 (`flock`, systemd, or Kubernetes `concurrencyPolicy: Forbid`).
 
@@ -51,7 +51,7 @@ The watchdog cycle and any test that hits HTTP need a native **`lcurl.so`** buil
 
 ```bash
 just watchdog-lua-deps    # idempotent; writes .deps/lua/lcurl.so
-export WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"
+export CARTESI_WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"
 ```
 
 You also need **`cartesi-machine`** on `PATH` (in-process `cartesi`
@@ -166,12 +166,12 @@ then `head.json` is atomically replaced to point at it.
 
 `init` stores the operator-provided bootstrap CM snapshot into this layout. `tick`
 requires both `config.json` and `head.json`; it never bootstraps from env.
-`WATCHDOG_L1_RPC_URL` is intentionally read at tick time, not persisted in
+`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` is intentionally read at tick time, not persisted in
 `config.json`, so operators can rotate RPC endpoints without rewriting watchdog
 state.
 
-- `WATCHDOG_CM_SNAPSHOT_DIR`
-- `WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
+- `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR`
+- `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
 
 ## How it runs
 
@@ -198,16 +198,16 @@ host scheduling should provide the same non-overlap guarantee. Each tick:
 
 Runtime knobs:
 
-- `WATCHDOG_L1_RPC_URL`: current L1 JSON-RPC endpoint for tick.
-- `WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
-- `WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.
+- `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`: current L1 JSON-RPC endpoint for tick.
+- `CARTESI_WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
+- `CARTESI_WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.
 
 ## Local Tests
 
 | Command | What it exercises |
 |---------|-------------------|
 | `just test-watchdog` | Lua unit tests (fake HTTP/RPC/CM; no live chain) |
-| `just test-watchdog-e2e` | Real CM: advance, inspect; optional live compare if `WATCHDOG_E2E_SEQUENCER_URL` set |
+| `just test-watchdog-e2e` | Real CM: advance, inspect; optional live compare if `CARTESI_WATCHDOG_E2E_SEQUENCER_URL` set |
 | `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua `init`/`tick` |
 | `just test-rollups-e2e` | All rollups e2e scenarios; includes watchdog genesis/non-genesis compare plus `watchdog_non_genesis_divergence_test` (needs Sepolia CM image) |
 | `just test-watchdog-divergence-drill` | Synthetic divergence signal drill (`watchdog_event` + exit `2`) |
@@ -220,7 +220,7 @@ just doctor                          # fail fast before long harness runs
 just canonical-build-machine-image   # once, if out/ image is missing
 just canonical-build-machine-image-sepolia   # rollups-e2e divergence trial (auto-built by test-rollups-e2e)
 just watchdog-lua-deps
-export WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"
+export CARTESI_WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"
 ```
 
 ### Lua unit tests
@@ -244,7 +244,7 @@ Scenarios (verbose `step NN/NN` logging):
 - `prerequisites` — `cartesi-machine` on PATH and machine image present.
 - `cm-inspect-state-query` — real `--cmio-inspect-state` with query `state`.
 - `machine-cartesi-store-reload-advance` — store checkpoint snapshot, reload, advance again (in-process binding).
-- `compare-runner-with-sequencer` — skipped unless `WATCHDOG_E2E_SEQUENCER_URL` is set.
+- `compare-runner-with-sequencer` — skipped unless `CARTESI_WATCHDOG_E2E_SEQUENCER_URL` is set.
 
 Rebuild the machine image after changing the canonical scheduler/dapp. A stale
 image makes `cm-inspect-state-query` skip with `inspect endpoint not implemented`.
@@ -282,7 +282,7 @@ exists; it does **not** detect a stale guest. If you pulled SSZ/inspect changes,
 | `finalized_state bytes mismatch (len 87 vs expected 76)` | Wrong golden (Sepolia fixture vs devnet sequencer) and/or raw HTTP chunked framing | Harness expects **devnet** SSZ; `lcurl` decodes chunked responses automatically |
 | `CM inspect bytes mismatch (len 27 vs expected 76)` | **Stale CM image** still returns JSON `{"balances":{},"nonces":{}}` from pre-SSZ inspect | `just canonical-build-machine-image` then rerun harness |
 | `inspect endpoint not implemented` | Older guest without inspect handler | Same rebuild as above |
-| Harness passes step 1–2 but Lua compare fails | `WATCHDOG_LUA_DEPS` or checkpoint/bootstrap | Set `export WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"`; see [`getting-started.md`](getting-started.md) env table |
+| Harness passes step 1–2 but Lua compare fails | `CARTESI_WATCHDOG_LUA_DEPS` or checkpoint/bootstrap | Set `export CARTESI_WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"`; see [`getting-started.md`](getting-started.md) env table |
 
 Manual equivalent of the recipe:
 

@@ -96,7 +96,7 @@ RUN chmod +x /usr/local/bin/sequencer-watchdog /usr/local/bin/cartesi-machine \
       "  \"cartesi_machine_version\": \"${CARTESI_MACHINE_VERSION}\"" \
       "}" > /opt/watchdog/RELEASE.json
 
-ENV WATCHDOG_LUA_DEPS=/opt/watchdog/lib \
+ENV CARTESI_WATCHDOG_LUA_DEPS=/opt/watchdog/lib \
     LUA_PATH="/opt/watchdog/lua/?.lua;/opt/watchdog/lua/?/init.lua;/usr/local/share/lua/5.4/?.lua;/usr/local/share/lua/5.4/?/init.lua;;" \
     LUA_CPATH="/opt/watchdog/lib/?.so;/usr/local/lib/lua/5.4/?.so;;" \
     LD_LIBRARY_PATH="/usr/local/lib" \

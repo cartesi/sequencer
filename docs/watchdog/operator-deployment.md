@@ -35,14 +35,14 @@ Use this checklist for any live deployment. Chain-specific values are in the tab
 
 ### 1. Network access
 
-- [ ] Watchdog host can reach **internal** `WATCHDOG_SEQUENCER_URL` (not only the public `/tx` URL).
+- [ ] Watchdog host can reach **internal** `CARTESI_WATCHDOG_SEQUENCER_URL` (not only the public `/tx` URL).
 - [ ] Watchdog host can reach **L1 JSON-RPC** with `eth_getLogs` (archive recommended if replaying long history).
 - [ ] `/finalized_state` is **not** exposed on the public internet.
 
 Verify snapshot API before CM bootstrap:
 
 ```bash
-curl -sS -o /dev/null -w "%{http_code}\n" "$WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
+curl -sS -o /dev/null -w "%{http_code}\n" "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
 # expect 200 when a finalized snapshot exists (404 = not promoted yet or wrong host)
 ```
 
@@ -87,7 +87,7 @@ COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/lib/lua/ /usr/local
 COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/share/lua/ /usr/local/share/lua/
 COPY --from=ghcr.io/cartesi/sequencer-watchdog:vX /usr/local/share/cartesi-machine/ /usr/local/share/cartesi-machine/
 
-ENV WATCHDOG_LUA_DEPS=/opt/watchdog/lib \
+ENV CARTESI_WATCHDOG_LUA_DEPS=/opt/watchdog/lib \
     LUA_PATH="/opt/watchdog/lua/?.lua;/opt/watchdog/lua/?/init.lua;/usr/local/share/lua/5.4/?.lua;/usr/local/share/lua/5.4/?/init.lua;;" \
     LUA_CPATH="/opt/watchdog/lib/?.so;/usr/local/lib/lua/5.4/?.so;;" \
     LD_LIBRARY_PATH="/usr/local/lib" \
@@ -102,19 +102,19 @@ ENTRYPOINT ["/usr/local/bin/sequencer-watchdog"]
 docker pull ghcr.io/cartesi/sequencer-watchdog:vX
 
 docker run --rm \
-  -e WATCHDOG_SEQUENCER_URL="https://<internal-sequencer>" \
-  -e WATCHDOG_INPUTBOX_ADDRESS="0x..." \
-  -e WATCHDOG_APP_ADDRESS="0x..." \
-  -e WATCHDOG_STATE_DIR=/watchdog-state \
-  -e WATCHDOG_CM_SNAPSHOT_DIR=/cm-bootstrap \
-  -e WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<bootstrap inclusion_block>" \
+  -e CARTESI_WATCHDOG_SEQUENCER_URL="https://<internal-sequencer>" \
+  -e CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS="0x..." \
+  -e CARTESI_WATCHDOG_APP_ADDRESS="0x..." \
+  -e CARTESI_WATCHDOG_STATE_DIR=/watchdog-state \
+  -e CARTESI_WATCHDOG_CM_SNAPSHOT_DIR=/cm-bootstrap \
+  -e CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<bootstrap inclusion_block>" \
   -v /var/lib/watchdog/state:/watchdog-state \
   -v /var/lib/watchdog/cm-bootstrap:/cm-bootstrap:ro \
   ghcr.io/cartesi/sequencer-watchdog:vX init
 
 docker run --rm \
-  -e WATCHDOG_L1_RPC_URL="https://<archive-rpc>" \
-  -e WATCHDOG_STATE_DIR=/watchdog-state \
+  -e CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT="https://<archive-rpc>" \
+  -e CARTESI_WATCHDOG_STATE_DIR=/watchdog-state \
   -v /var/lib/watchdog/state:/watchdog-state \
   ghcr.io/cartesi/sequencer-watchdog:vX tick
 ```
@@ -150,29 +150,29 @@ Today `WalletApp::default()` / `WalletConfig::sepolia()` align with Sepolia stag
 
 | Variable | Where it comes from |
 |----------|---------------------|
-| `WATCHDOG_SEQUENCER_URL` | Ops: internal HTTP base (see network diagram) |
-| `WATCHDOG_L1_RPC_URL` | Ops: current chain RPC for `tick` (archive for historical `getLogs`; not persisted by `init`) |
-| `WATCHDOG_APP_ADDRESS` | This rollup’s Cartesi **application** contract |
-| `WATCHDOG_INPUTBOX_ADDRESS` | InputBox on that L1 ([Cartesi deployed contracts](https://docs.cartesi.io/cartesi-rollups/2.0/deployment/self-hosted.md)) |
-| `WATCHDOG_STATE_DIR` | Persistent volume on watchdog host |
-| `WATCHDOG_CM_SNAPSHOT_DIR` | Bootstrap CM snapshot (`init` only) |
-| `WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block that bootstrap snapshot represents (= finalized `inclusion_block` at bootstrap) |
-| `WATCHDOG_LUA_DEPS` | `.deps/lua` |
+| `CARTESI_WATCHDOG_SEQUENCER_URL` | Ops: internal HTTP base (see network diagram) |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | Ops: current chain RPC for `tick` (archive for historical `getLogs`; not persisted by `init`) |
+| `CARTESI_WATCHDOG_APP_ADDRESS` | This rollup’s Cartesi **application** contract |
+| `CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS` | InputBox on that L1 ([Cartesi deployed contracts](https://docs.cartesi.io/cartesi-rollups/2.0/deployment/self-hosted.md)) |
+| `CARTESI_WATCHDOG_STATE_DIR` | Persistent volume on watchdog host |
+| `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | Bootstrap CM snapshot (`init` only) |
+| `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block that bootstrap snapshot represents (= finalized `inclusion_block` at bootstrap) |
+| `CARTESI_WATCHDOG_LUA_DEPS` | `.deps/lua` |
 
-The sequencer discovers and pins `input_box_address` at startup; use the same values as `SEQ_ETH_RPC_URL` / `SEQ_APP_ADDRESS` configuration.
+The sequencer discovers and pins `input_box_address` at startup; use the same values as `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT` / `CARTESI_SEQUENCER_APP_ADDRESS` configuration.
 
 ### 5. Initialize watchdog state (first run on a live chain)
 
-On a long-lived deployment, **`WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0` is usually wrong** unless finalized state is still at genesis.
+On a long-lived deployment, **`CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0` is usually wrong** unless finalized state is still at genesis.
 
 Pick one:
 
 1. **Ops hands off** a CM snapshot directory + block number matching current finalized `inclusion_block`, or
-2. **Watchdog reuses** `WATCHDOG_STATE_DIR` from a prior run on this deployment, or
+2. **Watchdog reuses** `CARTESI_WATCHDOG_STATE_DIR` from a prior run on this deployment, or
 3. **Replay from genesis** (only for new rollups / low block height — slow).
 
 Run `init` once to store the bootstrap CM snapshot into the watchdog state
-layout. `init` does not need `WATCHDOG_L1_RPC_URL`; the RPC URL is read by
+layout. `init` does not need `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`; the RPC URL is read by
 each `tick` so it can rotate without editing state:
 
 ```bash
@@ -192,7 +192,7 @@ sequencer-watchdog tick   # exit 0 = clean/idle, 1 = transient, 2 = divergence
 ```
 
 `sequencer-watchdog` wraps `init` and `tick` with a non-blocking `flock` on
-`$WATCHDOG_STATE_DIR/run.lock`, which is released by the kernel if the process
+`$CARTESI_WATCHDOG_STATE_DIR/run.lock`, which is released by the kernel if the process
 dies. Use the scheduler's non-overlap primitive as well (for example systemd or
 Kubernetes CronJob `concurrencyPolicy: Forbid`). A leftover `run.lock` path is
 only a lock handle; by itself it does not mean a lock is held.
@@ -219,21 +219,21 @@ Use Sepolia to validate **the same procedure** you will run on mainnet: internal
 ### Example env block (fill from ops)
 
 ```bash
-export WATCHDOG_SEQUENCER_URL="https://<internal-sepolia-sequencer>"
-export WATCHDOG_L1_RPC_URL="https://<sepolia-archive-rpc>"
-export WATCHDOG_APP_ADDRESS="0x..."
-export WATCHDOG_INPUTBOX_ADDRESS="0x..."
-export WATCHDOG_STATE_DIR="/var/lib/watchdog/state-sepolia"
-export WATCHDOG_CM_SNAPSHOT_DIR="/path/to/canonical-machine-image-sepolia"
-export WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<finalized inclusion_block at bootstrap>"
-export WATCHDOG_LUA_DEPS="/path/to/sequencer/.deps/lua"
+export CARTESI_WATCHDOG_SEQUENCER_URL="https://<internal-sepolia-sequencer>"
+export CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT="https://<sepolia-archive-rpc>"
+export CARTESI_WATCHDOG_APP_ADDRESS="0x..."
+export CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS="0x..."
+export CARTESI_WATCHDOG_STATE_DIR="/var/lib/watchdog/state-sepolia"
+export CARTESI_WATCHDOG_CM_SNAPSHOT_DIR="/path/to/canonical-machine-image-sepolia"
+export CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<finalized inclusion_block at bootstrap>"
+export CARTESI_WATCHDOG_LUA_DEPS="/path/to/sequencer/.deps/lua"
 ```
 
 ### Operating the Sepolia sequencer
 
 If your team runs the sequencer on Sepolia (not only the public endpoint):
 
-1. `sequencer` / release binary with Sepolia `SEQ_*` (chain id, app address, batch submitter key, L1 RPC).
+1. `sequencer` / release binary with Sepolia `CARTESI_SEQUENCER_*` (chain id, app address, batch submitter key, L1 RPC).
 2. Inclusion lane promotes finalized snapshots when L1 safe advances — required for `/finalized_state` 200.
 3. Snapshot routes on an **internal** bind / port reachable by the watchdog host.
 4. Sequencer binary built with **`WalletApp::new(WalletConfig::sepolia())`** (see `sequencer-devnet` vs production binary choice in your release pipeline).
@@ -276,14 +276,14 @@ Details: [`README.md`](README.md), [`docs/snapshots/lifecycle.md`](../snapshots/
 ## Checkpoint disk usage and backups
 
 Each successful promotion stores a full CM snapshot under
-`$WATCHDOG_STATE_DIR/checkpoints/<block>/`, and the watchdog **keeps only
+`$CARTESI_WATCHDOG_STATE_DIR/checkpoints/<block>/`, and the watchdog **keeps only
 the selected one** — after the atomic `head.json` flip it deletes the
 checkpoint it superseded (crash-safe: `head.json` always names a complete
 checkpoint). Local disk therefore stays bounded at a single snapshot; no
 operator cleanup is required.
 
 For backups / rollback history, schedule the watchdog tick (it runs one cycle and
-exits) and **after it exits** `aws s3 sync $WATCHDOG_STATE_DIR/checkpoints/
+exits) and **after it exits** `aws s3 sync $CARTESI_WATCHDOG_STATE_DIR/checkpoints/
 s3://…` (without `--delete`). Because the process has exited there is no race
 with its store or prune, and omitting `--delete` **accumulates a per-block
 history in S3** while local disk stays at one snapshot. Restore feeds a chosen
@@ -293,7 +293,7 @@ snapshot back through the watchdog/sequencer recovery workflow.
 
 | Symptom | Likely cause |
 |---------|----------------|
-| `/finalized_state` missing on public URL | Wrong tier — use internal `WATCHDOG_SEQUENCER_URL` |
+| `/finalized_state` missing on public URL | Wrong tier — use internal `CARTESI_WATCHDOG_SEQUENCER_URL` |
 | `state_mismatch` | CM image / wallet constants ≠ sequencer build; or wrong bootstrap block |
 | `inclusion_block_regressed` | Stale watchdog state vs sequencer finalized head |
 | Slow or failing `getLogs` | RPC range limits — watchdog uses same partition strategy as sequencer |

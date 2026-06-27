@@ -539,7 +539,7 @@ impl ManagedSequencer {
     /// backward-jump test) should use [`Self::set_faketime_offset`] and
     /// [`Self::mine_l1_blocks`] directly.
     ///
-    /// Assumes `SEQ_SECONDS_PER_BLOCK = 12`. If a test changes that via env,
+    /// Assumes `CARTESI_SEQUENCER_SECONDS_PER_BLOCK = 12`. If a test changes that via env,
     /// this helper's block count will be wrong — prefer the direct dials in
     /// that case.
     pub async fn advance_wall_and_mine(&mut self, duration: Duration) -> HarnessResult<()> {
