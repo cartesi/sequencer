@@ -9,7 +9,7 @@
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
-local deps_lua = os.getenv("WATCHDOG_LUA_DEPS")
+local deps_lua = os.getenv("CARTESI_WATCHDOG_LUA_DEPS")
 if deps_lua and deps_lua ~= "" then
     package.cpath = deps_lua .. "/?.so;" .. package.cpath
 end

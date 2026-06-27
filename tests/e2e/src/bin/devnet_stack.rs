@@ -3,7 +3,7 @@
 
 //! Local Anvil + rollups devnet + `sequencer-devnet` for manual watchdog runs.
 //!
-//! Prints `WATCHDOG_*` exports, then blocks until Ctrl+C.
+//! Prints `CARTESI_WATCHDOG_*` exports, then blocks until Ctrl+C.
 
 use rollups_harness::{
     HarnessResult, ManagedSequencer, devnet_sequencer_config_no_faketime, paths,
@@ -34,21 +34,30 @@ async fn main() -> HarnessResult<()> {
     eprintln!(
         "--- export these, then run: ./watchdog/sequencer-watchdog init && ./watchdog/sequencer-watchdog tick ---"
     );
-    eprintln!("export WATCHDOG_SEQUENCER_URL={}", runtime.endpoint());
-    eprintln!("export WATCHDOG_L1_RPC_URL={}", runtime.l1_endpoint());
     eprintln!(
-        "export WATCHDOG_INPUTBOX_ADDRESS={}",
+        "export CARTESI_WATCHDOG_SEQUENCER_URL={}",
+        runtime.endpoint()
+    );
+    eprintln!(
+        "export CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT={}",
+        runtime.l1_endpoint()
+    );
+    eprintln!(
+        "export CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS={}",
         runtime.input_box_address()
     );
-    eprintln!("export WATCHDOG_APP_ADDRESS={}", runtime.app_address());
-    eprintln!("export WATCHDOG_STATE_DIR={}", state_dir.display());
     eprintln!(
-        "export WATCHDOG_CM_SNAPSHOT_DIR={}",
+        "export CARTESI_WATCHDOG_APP_ADDRESS={}",
+        runtime.app_address()
+    );
+    eprintln!("export CARTESI_WATCHDOG_STATE_DIR={}", state_dir.display());
+    eprintln!(
+        "export CARTESI_WATCHDOG_CM_SNAPSHOT_DIR={}",
         machine_image.display()
     );
-    eprintln!("export WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0");
+    eprintln!("export CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0");
     eprintln!(
-        "export WATCHDOG_LUA_DEPS={}/.deps/lua",
+        "export CARTESI_WATCHDOG_LUA_DEPS={}/.deps/lua",
         paths::workspace_root().display()
     );
     eprintln!();
@@ -59,8 +68,8 @@ async fn main() -> HarnessResult<()> {
     );
     eprintln!();
     eprintln!("Run watchdog (from repo root, after `just watchdog-lua-deps`):");
-    eprintln!("  export WATCHDOG_LUA_ROOT=$(pwd)");
-    eprintln!("  export WATCHDOG_LUA_BIN=lua");
+    eprintln!("  export CARTESI_WATCHDOG_LUA_ROOT=$(pwd)");
+    eprintln!("  export CARTESI_WATCHDOG_LUA_BIN=lua");
     eprintln!("  ./watchdog/sequencer-watchdog init");
     eprintln!("  ./watchdog/sequencer-watchdog tick");
     eprintln!();

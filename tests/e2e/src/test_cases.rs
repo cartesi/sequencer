@@ -25,7 +25,7 @@ const DEFAULT_MAX_FEE: u16 = 1200;
 // ── Zone-math constants for the outage-matrix and recovery tests ─────────
 //
 // These derive from the sequencer's default config so a change to
-// `MAX_WAIT_BLOCKS`, `SEQ_PREEMPTIVE_MARGIN_BLOCKS`, or `SEQ_SECONDS_PER_BLOCK`
+// `MAX_WAIT_BLOCKS`, `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`, or `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`
 // flows through here automatically. The compile-time asserts below catch any
 // drift that would invalidate the zone framing of the tests (e.g., a per-retry
 // advance that no longer crosses MAX_WAIT in the orchestrator loop).
@@ -37,13 +37,13 @@ const DEFAULT_MAX_FEE: u16 = 1200;
 /// `sequencer_core::MAX_WAIT_BLOCKS`.
 const MAX_WAIT_BLOCKS: u64 = sequencer_core::MAX_WAIT_BLOCKS;
 
-/// Default `SEQ_PREEMPTIVE_MARGIN_BLOCKS` from `runtime/config.rs`. The
+/// Default `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` from `runtime/config.rs`. The
 /// harness spawn path does not override this flag, so the binary uses the
 /// configured default. If the default changes, update here so
 /// `DANGER_THRESHOLD_BLOCKS` stays aligned.
 const DEFAULT_PREEMPTIVE_MARGIN_BLOCKS: u64 = 300;
 
-/// Default `SEQ_SECONDS_PER_BLOCK` from `runtime/config.rs`. The harness
+/// Default `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` from `runtime/config.rs`. The harness
 /// `advance_wall_and_mine` also assumes this value internally.
 const DEFAULT_SECONDS_PER_BLOCK: u64 = 12;
 

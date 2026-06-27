@@ -59,7 +59,7 @@ end
 
 function config.load_state_dir(env)
     env = normalize_env(env)
-    return required("WATCHDOG_STATE_DIR", env)
+    return required("CARTESI_WATCHDOG_STATE_DIR", env)
 end
 
 function config.load_init(env)
@@ -69,22 +69,22 @@ function config.load_init(env)
     -- a canonical CM re-derivation. One cycle per process; infra schedules it.
     return {
         version = config.VERSION,
-        sequencer_url = required("WATCHDOG_SEQUENCER_URL", env),
-        input_box_address = required("WATCHDOG_INPUTBOX_ADDRESS", env),
-        app_address = required("WATCHDOG_APP_ADDRESS", env),
-        input_added_topic = env.WATCHDOG_INPUT_ADDED_TOPIC,
-        state_dir = required("WATCHDOG_STATE_DIR", env),
-        cm_snapshot_dir = required("WATCHDOG_CM_SNAPSHOT_DIR", env),
+        sequencer_url = required("CARTESI_WATCHDOG_SEQUENCER_URL", env),
+        input_box_address = required("CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS", env),
+        app_address = required("CARTESI_WATCHDOG_APP_ADDRESS", env),
+        input_added_topic = env.CARTESI_WATCHDOG_INPUT_ADDED_TOPIC,
+        state_dir = required("CARTESI_WATCHDOG_STATE_DIR", env),
+        cm_snapshot_dir = required("CARTESI_WATCHDOG_CM_SNAPSHOT_DIR", env),
         cm_snapshot_safe_block = optional_required_number(
-            "WATCHDOG_CM_SNAPSHOT_DIR",
-            "WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK",
+            "CARTESI_WATCHDOG_CM_SNAPSHOT_DIR",
+            "CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK",
             env
         ),
-        cm_image_hash = env.WATCHDOG_CM_IMAGE_HASH,
-        retry_attempts = optional_number("WATCHDOG_RETRY_ATTEMPTS", 3, env),
-        retry_delay_sec = optional_number("WATCHDOG_RETRY_DELAY_SEC", 5, env),
+        cm_image_hash = env.CARTESI_WATCHDOG_CM_IMAGE_HASH,
+        retry_attempts = optional_number("CARTESI_WATCHDOG_RETRY_ATTEMPTS", 3, env),
+        retry_delay_sec = optional_number("CARTESI_WATCHDOG_RETRY_DELAY_SEC", 5, env),
         long_block_range_error_codes = split_csv(
-            env.WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES or "-32005,-32600,-32602,-32616"
+            env.CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES or "-32005,-32600,-32602,-32616"
         ),
     }
 end
@@ -131,7 +131,7 @@ function config.from_persisted(state_dir, data, env)
         version = config.VERSION,
         state_dir = state_dir,
         sequencer_url = required_field(data, "sequencer_url"),
-        l1_rpc_url = required("WATCHDOG_L1_RPC_URL", env),
+        l1_rpc_url = required("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT", env),
         input_box_address = required_field(data, "input_box_address"),
         app_address = required_field(data, "app_address"),
         input_added_topic = data.input_added_topic,

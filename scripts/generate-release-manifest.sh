@@ -83,7 +83,7 @@ manifest = {
     "artifacts": artifacts,
     "alignment": {
         "rule": "All artifacts sharing release_tag were built from git_commit with the same toolchain pins.",
-        "watchdog_cm_bootstrap": f"Use canonical-machine-image-<chain>-{tag}.tar.gz with WATCHDOG_CM_SNAPSHOT_DIR; cartesi-machine in the watchdog image matches CARTESI_MACHINE_VERSION.",
+        "watchdog_cm_bootstrap": f"Use canonical-machine-image-<chain>-{tag}.tar.gz with CARTESI_WATCHDOG_CM_SNAPSHOT_DIR; cartesi-machine in the watchdog image matches CARTESI_MACHINE_VERSION.",
     },
 }
 json.dump(manifest, sys.stdout, indent=2)

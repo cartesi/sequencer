@@ -39,7 +39,7 @@ pub struct MempoolFlusher {
 /// `safe_poll_interval` is one block — matches the natural cadence for
 /// `get_transaction_count(Safe)` to advance.
 ///
-/// H6 regression: both values must scale with `SEQ_SECONDS_PER_BLOCK`; a fixed
+/// H6 regression: both values must scale with `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`; a fixed
 /// 12s assumption would mis-pace on non-mainnet chains.
 fn derive_timeouts(seconds_per_block: u64) -> (Duration, Duration) {
     (
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(
             derive_timeouts(1),
             (Duration::from_secs(10), Duration::from_secs(1)),
-            "minimum accepted block time (H8: SEQ_SECONDS_PER_BLOCK >= 1)",
+            "minimum accepted block time (H8: CARTESI_SEQUENCER_SECONDS_PER_BLOCK >= 1)",
         );
     }
 

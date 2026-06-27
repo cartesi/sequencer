@@ -46,7 +46,7 @@ checkpoint layout. `tick` never bootstraps from env; missing `head.json` is an
 operator error.
 
 `config.json` stores stable deployment identity (`sequencer_url`,
-`input_box_address`, `app_address`, retry knobs). `WATCHDOG_L1_RPC_URL` is read
+`input_box_address`, `app_address`, retry knobs). `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` is read
 at tick time rather than persisted, because provider URLs and credentials are
 operational inputs that may rotate.
 

@@ -14,7 +14,7 @@ This document covers staging and manual verification beyond the devnet tutorial.
 - `cartesi-machine`, `lua`, and `curl` on PATH
 - `just watchdog-lua-deps` — builds `lcurl.so` into `.deps/lua` (libcurl + Lua headers on host)
 - JSON is pure Lua (`watchdog/third_party/json.lua`); no cjson compile step
-- Staging or local sequencer reachable at `WATCHDOG_SEQUENCER_URL`
+- Staging or local sequencer reachable at `CARTESI_WATCHDOG_SEQUENCER_URL`
 - L1 RPC + InputBox + app addresses matching that deployment
 - Log collection for `watchdog_event` lines and process exit codes
 
@@ -25,7 +25,7 @@ injected fake deps — no sequencer required.
 
 ```bash
 just watchdog-lua-deps
-WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua   # exits 2
+CARTESI_WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua   # exits 2
 # or: just test-watchdog-divergence-drill   # wraps the drill; recipe exits 0
 ```
 
@@ -49,16 +49,16 @@ just test-watchdog-compare-harness
 Or run the Lua compare pass manually after starting a devnet sequencer yourself:
 
 ```bash
-export WATCHDOG_SEQUENCER_URL=http://127.0.0.1:<port>
-export WATCHDOG_L1_RPC_URL=http://127.0.0.1:8545
-export WATCHDOG_INPUTBOX_ADDRESS=<from Anvil deployments>
-export WATCHDOG_APP_ADDRESS=<deployed app>
-export WATCHDOG_STATE_DIR=/tmp/watchdog-state
-export WATCHDOG_CM_SNAPSHOT_DIR=examples/canonical-app/out/canonical-machine-image
-export WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0
-export WATCHDOG_LUA_ROOT="$(pwd)"
-export WATCHDOG_LUA_BIN=lua
-export WATCHDOG_LUA_DEPS=.deps/lua
+export CARTESI_WATCHDOG_SEQUENCER_URL=http://127.0.0.1:<port>
+export CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545
+export CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS=<from Anvil deployments>
+export CARTESI_WATCHDOG_APP_ADDRESS=<deployed app>
+export CARTESI_WATCHDOG_STATE_DIR=/tmp/watchdog-state
+export CARTESI_WATCHDOG_CM_SNAPSHOT_DIR=examples/canonical-app/out/canonical-machine-image
+export CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0
+export CARTESI_WATCHDOG_LUA_ROOT="$(pwd)"
+export CARTESI_WATCHDOG_LUA_BIN=lua
+export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ./watchdog/sequencer-watchdog init
 ./watchdog/sequencer-watchdog tick
 ```
@@ -76,7 +76,7 @@ takes a non-blocking `flock`; production scheduling should also prevent
 overlapping ticks with systemd, Kubernetes, or an equivalent scheduler guard:
 
 ```bash
-# ... all WATCHDOG_* vars from config.lua ...
+# ... all CARTESI_WATCHDOG_* vars from config.lua ...
 sequencer-watchdog tick
 ```
 
@@ -94,5 +94,5 @@ Exit codes from `sequencer-watchdog tick`:
 |---------|----------------|
 | `inspect endpoint not implemented` | Stale CM image — rebuild |
 | `state_mismatch` at genesis | Checkpoint not aligned with sequencer history |
-| Compare skipped in Lua e2e | Set `WATCHDOG_E2E_SEQUENCER_URL` to a live sequencer |
+| Compare skipped in Lua e2e | Set `CARTESI_WATCHDOG_E2E_SEQUENCER_URL` to a live sequencer |
 | CM inspect 27 bytes / harness byte mismatch | Rebuild devnet image: `just canonical-build-machine-image` — see [`README.md`](README.md#troubleshooting-just-test-watchdog-compare-harness) |

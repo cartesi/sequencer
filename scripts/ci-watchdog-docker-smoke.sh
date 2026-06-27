@@ -20,7 +20,7 @@ docker build \
   -t "${image}" \
   .
 
-docker run --rm -e WATCHDOG_PRINT_RELEASE_INFO=1 "${image}" >/dev/null
+docker run --rm -e CARTESI_WATCHDOG_PRINT_RELEASE_INFO=1 "${image}" >/dev/null
 docker run --rm --entrypoint cartesi-machine "${image}" --version >/dev/null
 docker run --rm --entrypoint flock "${image}" --version >/dev/null
 docker run --rm --entrypoint lua5.4 "${image}" -e "require('cartesi'); print('cartesi ok')"
@@ -40,7 +40,7 @@ trap cleanup EXIT
 set +e
 tick_output="$(
   docker run --rm \
-    -e WATCHDOG_STATE_DIR=/state \
+    -e CARTESI_WATCHDOG_STATE_DIR=/state \
     -v "${state_dir}:/state" \
     "${image}" tick 2>&1
 )"
@@ -66,7 +66,7 @@ for _ in $(seq 1 30); do
   set +e
   lock_output="$(
     docker run --rm \
-      -e WATCHDOG_STATE_DIR=/state \
+      -e CARTESI_WATCHDOG_STATE_DIR=/state \
       -v "${state_dir}:/state" \
       "${image}" tick 2>&1
   )"

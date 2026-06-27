@@ -2,23 +2,23 @@
 # Production CLI wrapper for watchdog subcommands.
 set -euo pipefail
 
-if [[ "${WATCHDOG_PRINT_RELEASE_INFO:-0}" == "1" ]]; then
+if [[ "${CARTESI_WATCHDOG_PRINT_RELEASE_INFO:-0}" == "1" ]]; then
   cat /opt/watchdog/RELEASE.json || true
   cartesi-machine --version 2>&1 | sed 's/^/cartesi-machine: /' || true
   exit 0
 fi
 
-lua_root="${WATCHDOG_LUA_ROOT:-/opt/watchdog/lua}"
-lua_bin="${WATCHDOG_LUA_BIN:-lua5.4}"
+lua_root="${CARTESI_WATCHDOG_LUA_ROOT:-/opt/watchdog/lua}"
+lua_bin="${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}"
 
 cd "${lua_root}"
 
 if [[ "$#" -gt 0 && ( "$1" == "init" || "$1" == "tick" ) ]]; then
-  : "${WATCHDOG_STATE_DIR:?WATCHDOG_STATE_DIR is required}"
-  mkdir -p "$WATCHDOG_STATE_DIR"
-  exec 9>"$WATCHDOG_STATE_DIR/run.lock"
+  : "${CARTESI_WATCHDOG_STATE_DIR:?CARTESI_WATCHDOG_STATE_DIR is required}"
+  mkdir -p "$CARTESI_WATCHDOG_STATE_DIR"
+  exec 9>"$CARTESI_WATCHDOG_STATE_DIR/run.lock"
   if ! flock -n 9; then
-    echo "watchdog state is already locked: $WATCHDOG_STATE_DIR/run.lock" >&2
+    echo "watchdog state is already locked: $CARTESI_WATCHDOG_STATE_DIR/run.lock" >&2
     exit 1
   fi
 fi

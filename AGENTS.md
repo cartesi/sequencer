@@ -92,7 +92,7 @@ See [`docs/recovery/README.md`](docs/recovery/README.md) Step 5 for the "everyth
 
 Staleness is only checked against L1 **safe** state, never latest. Stale batches in latest that haven't reached safe yet will eventually become safe, and the check will fire at that point. This avoids reacting to L1 reorgs.
 
-When the sequencer's view of L1 stops advancing — most often because the RPC gateway is stalled or returning stale reads, occasionally because L1 itself is unhealthy — the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The danger detector uses two wall-clock signals: the recorded L1 safe block timestamp must remain younger than `SEQ_L1_READ_STALE_AFTER_BLOCKS`, and unresolved batches are also checked with `estimated_missed_blocks = (now − last_safe_progress_ms) / seconds_per_block` by adjusting the danger threshold downward. This prevents silently issuing doomed soft confirmations during stale-provider periods or L1 outages.
+When the sequencer's view of L1 stops advancing — most often because the RPC gateway is stalled or returning stale reads, occasionally because L1 itself is unhealthy — the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The danger detector uses two wall-clock signals: the recorded L1 safe block timestamp must remain younger than `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS`, and unresolved batches are also checked with `estimated_missed_blocks = (now − last_safe_progress_ms) / seconds_per_block` by adjusting the danger threshold downward. This prevents silently issuing doomed soft confirmations during stale-provider periods or L1 outages.
 
 ### Formal verification
 
@@ -163,7 +163,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is sampled from `batch_policy_derived.recommended_fee` at rotation.
 - Wallet state (balances, nonces) is in-memory today — not persisted.
-- **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`. `chainId` and `verifyingContract` come from `SEQ_CHAIN_ID` and `SEQ_APP_ADDRESS` (validated against the RPC chain id at startup). All four fields must be present on both sides — both the sequencer and the on-chain scheduler construct the domain via `sequencer_core::build_input_domain`, the canonical shared constructor.
+- **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`. `chainId` and `verifyingContract` come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS` (validated against the RPC chain id at startup). All four fields must be present on both sides — both the sequencer and the on-chain scheduler construct the domain via `sequencer_core::build_input_domain`, the canonical shared constructor.
 
 ### InputBox payload classification
 
@@ -235,21 +235,21 @@ Snapshot endpoints (`/finalized_state`, `/finalized_state/inclusion_block`, `/la
 
 **Required:**
 
-- `SEQ_ETH_RPC_URL`
-- `SEQ_CHAIN_ID`
-- `SEQ_APP_ADDRESS`
-- `SEQ_BATCH_SUBMITTER_PRIVATE_KEY` or `SEQ_BATCH_SUBMITTER_PRIVATE_KEY_FILE`
+- `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`
+- `CARTESI_SEQUENCER_BLOCKCHAIN_ID`
+- `CARTESI_SEQUENCER_APP_ADDRESS`
+- `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE`
 
 **Optional:**
 
-- `SEQ_HTTP_ADDR` (default `127.0.0.1:3000`)
-- `SEQ_DATA_DIR` (default `sequencer-data`; DB file `sequencer.db` inside it)
-- `SEQ_LONG_BLOCK_RANGE_ERROR_CODES`
-- `SEQ_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS` (default 5000)
-- `SEQ_BATCH_SUBMITTER_CONFIRMATION_DEPTH` (default 2)
-- `SEQ_PREEMPTIVE_MARGIN_BLOCKS` (default 300, ~1h at 12s/block)
-- `SEQ_L1_READ_STALE_AFTER_BLOCKS` (default derived before the danger threshold)
-- `SEQ_SECONDS_PER_BLOCK` (default 12)
+- `CARTESI_SEQUENCER_HTTP_ADDR` (default `127.0.0.1:3000`)
+- `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data`; DB file `sequencer.db` inside it)
+- `CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES`
+- `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS` (default 5000)
+- `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH` (default 2)
+- `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default 300, ~1h at 12s/block)
+- `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (default derived before the danger threshold)
+- `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default 12)
 
 ## Coding Conventions
 
@@ -289,10 +289,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 Run server:
 
 ```bash
-SEQ_ETH_RPC_URL=http://127.0.0.1:8545 \
-SEQ_CHAIN_ID=31337 \
-SEQ_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
-SEQ_BATCH_SUBMITTER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
+CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \
+CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
+CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
 cargo run -p sequencer
 ```
 

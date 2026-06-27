@@ -322,7 +322,7 @@ The most common real-world trigger for `L1ViewStale` is a stalled RPC gateway: t
 
 **Other workers during L1 outages**: the inclusion lane and API are purely local (SQLite) and continue operating. The input reader retries L1 polling with error logging. All L1-dependent workers log errors at the `error` level to alert operators.
 
-The `seconds_per_block` parameter (default: 12 for Ethereum) is configurable via `SEQ_SECONDS_PER_BLOCK`. The L1 read-staleness threshold is configurable via `SEQ_L1_READ_STALE_AFTER_BLOCKS`; if unset, startup derives it before the write danger threshold. These estimates are conservative — they may cause earlier detection if blocks are slower than assumed. This is correct: better to crash early than to issue doomed soft confirmations.
+The `seconds_per_block` parameter (default: 12 for Ethereum) is configurable via `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`. The L1 read-staleness threshold is configurable via `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS`; if unset, startup derives it before the write danger threshold. These estimates are conservative — they may cause earlier detection if blocks are slower than assumed. This is correct: better to crash early than to issue doomed soft confirmations.
 
 ## Dead Batches
 

@@ -182,11 +182,11 @@ table.insert(scenarios, {
     name = "compare-runner-with-sequencer",
     fn = function()
         local scenario = "compare-runner-with-sequencer"
-        local sequencer_url = os.getenv("WATCHDOG_E2E_SEQUENCER_URL")
+        local sequencer_url = os.getenv("CARTESI_WATCHDOG_E2E_SEQUENCER_URL")
         if not sequencer_url or sequencer_url == "" then
             return skip(
                 scenario,
-                "set WATCHDOG_E2E_SEQUENCER_URL to a live sequencer base URL to run this scenario"
+                "set CARTESI_WATCHDOG_E2E_SEQUENCER_URL to a live sequencer base URL to run this scenario"
             )
         end
         require_cartesi_machine()
@@ -209,10 +209,10 @@ table.insert(scenarios, {
             state_dir = state_dir,
             cm_snapshot_dir = MACHINE_IMAGE,
             cm_snapshot_safe_block = GENESIS_SAFE_BLOCK,
-            l1_rpc_url = os.getenv("WATCHDOG_E2E_L1_RPC_URL") or "http://127.0.0.1:8545",
-            input_box_address = os.getenv("WATCHDOG_E2E_INPUTBOX_ADDRESS")
+            l1_rpc_url = os.getenv("CARTESI_WATCHDOG_E2E_BLOCKCHAIN_HTTP_ENDPOINT") or "http://127.0.0.1:8545",
+            input_box_address = os.getenv("CARTESI_WATCHDOG_E2E_CONTRACTS_INPUT_BOX_ADDRESS")
                 or "0x0000000000000000000000000000000000000000",
-            app_address = os.getenv("WATCHDOG_E2E_APP_ADDRESS")
+            app_address = os.getenv("CARTESI_WATCHDOG_E2E_APP_ADDRESS")
                 or "0x1111111111111111111111111111111111111111",
             long_block_range_error_codes = { "-32005" },
             retry_attempts = 1,

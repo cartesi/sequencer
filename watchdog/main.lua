@@ -19,7 +19,7 @@ local EXIT_TRANSIENT = 1
 local EXIT_DIVERGENCE = 2
 
 local function prepend_deps_cpath()
-    local deps = os.getenv("WATCHDOG_LUA_DEPS")
+    local deps = os.getenv("CARTESI_WATCHDOG_LUA_DEPS")
     if deps and deps ~= "" then
         package.cpath = deps .. "/?.so;" .. package.cpath
     end
