@@ -56,6 +56,7 @@ pub struct WalletApp {
     balances: HashMap<Address, U256>,
     nonces: HashMap<Address, u32>,
     executed_input_count: u64,
+    last_executed_safe_block: u64,
 }
 
 pub const SEPOLIA_ERC20_PORTAL_ADDRESS: Address =
@@ -65,27 +66,47 @@ pub const DEVNET_MOCK_USDC_ADDRESS: Address =
     address!("0x95d0c8A7d11342299807A2Fc19ac44C2321cCc68");
 pub const SEPOLIA_SEQUENCER_ADDRESS: Address =
     address!("0x16d5FF3Fdd14e2a86FBA77cbcE6B3Cd9C32b8Ff3");
+/// Devnet batch-submitter / sequencer address — anvil account **9**,
+/// deliberately distinct from the deployer/funder (anvil account 0).
+///
+/// A dedicated submitter is a load-bearing assumption of `setup`'s detection
+/// gate: step 1 refuses when the submitter's wallet nonce is
+/// unsettled (`pending > safe`). The deployer has a non-zero nonce from
+/// contract creations whose tail isn't safe at setup time, so reusing it as
+/// the submitter false-positives. Account 9 starts at nonce 0. Kept in sync
+/// with the harness submitter key (`tests/harness` uses `default_private_keys`
+/// index 9) and `canonical-test`'s batch sender.
 pub const DEVNET_SEQUENCER_ADDRESS: Address =
-    address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+    address!("0xa0Ee7A142d267C1f36714E4a8F75612F20a79720");
 impl WalletApp {
     pub fn new(config: WalletConfig) -> Self {
-        Self::from_snapshot_parts(config, HashMap::new(), HashMap::new(), 0)
+        Self {
+            config,
+            balances: HashMap::new(),
+            nonces: HashMap::new(),
+            executed_input_count: 0,
+            last_executed_safe_block: 0,
+        }
     }
 
+    /// Reconstruct from decoded snapshot parts. Used by `crate::wallet_snapshot::decode`.
     pub(crate) fn from_snapshot_parts(
         config: WalletConfig,
         balances: HashMap<Address, U256>,
         nonces: HashMap<Address, u32>,
         executed_input_count: u64,
+        last_executed_safe_block: u64,
     ) -> Self {
         Self {
             config,
             balances,
             nonces,
             executed_input_count,
+            last_executed_safe_block,
         }
     }
 
+    // Accessors for the canonical snapshot encoder (`crate::wallet_snapshot`).
     pub(crate) fn config(&self) -> &WalletConfig {
         &self.config
     }
@@ -108,17 +129,61 @@ impl WalletApp {
         &mut self.nonces
     }
 
-    pub(crate) fn executed_input_count(&self) -> u64 {
-        self.executed_input_count
-    }
-
     #[cfg(test)]
     pub(crate) fn set_executed_input_count(&mut self, count: u64) {
         self.executed_input_count = count;
     }
 
+    pub(crate) fn executed_input_count(&self) -> u64 {
+        self.executed_input_count
+    }
+
+    pub(crate) fn last_executed_safe_block(&self) -> u64 {
+        self.last_executed_safe_block
+    }
+
+    /// Deterministic JSON of the non-default logical state (debug only).
+    fn state_json(&self) -> String {
+        let mut balances: Vec<_> = self
+            .balances
+            .iter()
+            .filter(|(_, balance)| **balance != U256::ZERO)
+            .collect();
+        balances.sort_by_key(|(address, _)| address.as_slice());
+
+        let mut nonces: Vec<_> = self
+            .nonces
+            .iter()
+            .filter(|(_, nonce)| **nonce != 0)
+            .collect();
+        nonces.sort_by_key(|(address, _)| address.as_slice());
+
+        let balance_entries = balances
+            .into_iter()
+            .map(|(address, balance)| format!("\"{}\":\"{balance}\"", json_address(address)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let nonce_entries = nonces
+            .into_iter()
+            .map(|(address, nonce)| format!("\"{}\":{nonce}", json_address(address)))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!("{{\"balances\":{{{balance_entries}}},\"nonces\":{{{nonce_entries}}}}}")
+    }
+
     fn balance_of(&self, addr: &Address) -> U256 {
         *self.balances.get(addr).unwrap_or(&U256::ZERO)
+    }
+
+    // Wallet-specific read queries (not on the Application trait — the
+    // sequencer never asks; app-specific query surface belongs to the app).
+    pub fn current_user_nonce(&self, sender: Address) -> u32 {
+        self.expected_nonce(&sender)
+    }
+
+    pub fn current_user_balance(&self, sender: Address) -> U256 {
+        self.balance_of(&sender)
     }
 
     fn credit(&mut self, addr: Address, amount: U256) {
@@ -154,35 +219,6 @@ impl WalletApp {
 
         Erc20Deposit::decode(&input.payload).map(Some)
     }
-
-    fn state_json(&self) -> String {
-        let mut balances: Vec<_> = self
-            .balances
-            .iter()
-            .filter(|(_, balance)| **balance != U256::ZERO)
-            .collect();
-        balances.sort_by_key(|(address, _)| address.as_slice());
-
-        let mut nonces: Vec<_> = self
-            .nonces
-            .iter()
-            .filter(|(_, nonce)| **nonce != 0)
-            .collect();
-        nonces.sort_by_key(|(address, _)| address.as_slice());
-
-        let balance_entries = balances
-            .into_iter()
-            .map(|(address, balance)| format!("\"{}\":\"{balance}\"", json_address(address)))
-            .collect::<Vec<_>>()
-            .join(",");
-        let nonce_entries = nonces
-            .into_iter()
-            .map(|(address, nonce)| format!("\"{}\":{nonce}", json_address(address)))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        format!("{{\"balances\":{{{balance_entries}}},\"nonces\":{{{nonce_entries}}}}}")
-    }
 }
 
 fn json_address(address: &Address) -> String {
@@ -198,14 +234,6 @@ impl Default for WalletApp {
 impl Application for WalletApp {
     const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
 
-    fn current_user_nonce(&self, sender: Address) -> u32 {
-        self.expected_nonce(&sender)
-    }
-
-    fn current_user_balance(&self, sender: Address) -> U256 {
-        self.balance_of(&sender)
-    }
-
     fn validate_user_op(
         &self,
         sender: Address,
@@ -220,14 +248,14 @@ impl Application for WalletApp {
             });
         }
 
-        // max_fee < current_fee is already checked by the trait default in
+        // max_fee < current_fee is already checked by the free function
         // validate_and_execute_user_op. No need to repeat here.
 
-        let gas_cost = sequencer_core::fee::fee_to_linear(current_fee);
+        let fee_cost = sequencer_core::fee::fee_to_linear(current_fee);
         let balance = self.balance_of(&sender);
-        if balance < gas_cost {
-            return Err(InvalidReason::InsufficientGasBalance {
-                required: gas_cost,
+        if balance < fee_cost {
+            return Err(InvalidReason::InsufficientFeeBalance {
+                required: fee_cost,
                 available: balance,
             });
         }
@@ -235,19 +263,23 @@ impl Application for WalletApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
+    fn execute_valid_user_op(
+        &mut self,
+        user_op: &ValidUserOp,
+        safe_block: u64,
+    ) -> Result<AppOutputs, AppError> {
         let sender = user_op.sender;
-        let gas_cost = sequencer_core::fee::fee_to_linear(user_op.fee);
+        let fee_cost = sequencer_core::fee::fee_to_linear(user_op.fee);
         let balance = self.balance_of(&sender);
-        if balance < gas_cost {
+        if balance < fee_cost {
             return Err(AppError::Internal {
-                reason: "validated user op cannot pay gas".to_string(),
+                reason: "validated user op cannot pay fee".to_string(),
             });
         }
 
         self.bump_nonce(sender);
-        self.balances.insert(sender, balance - gas_cost);
-        self.credit(self.config.sequencer_address, gas_cost);
+        self.balances.insert(sender, balance - fee_cost);
+        self.credit(self.config.sequencer_address, fee_cost);
         let mut outputs = Vec::new();
 
         let method = Method::from_ssz_bytes(user_op.data.as_slice()).ok();
@@ -280,6 +312,7 @@ impl Application for WalletApp {
         }
 
         self.executed_input_count = self.executed_input_count.saturating_add(1);
+        self.last_executed_safe_block = self.last_executed_safe_block.max(safe_block);
         Ok(outputs)
     }
 
@@ -322,6 +355,7 @@ impl Application for WalletApp {
         }
 
         self.executed_input_count = self.executed_input_count.saturating_add(1);
+        self.last_executed_safe_block = self.last_executed_safe_block.max(input.block_number);
         Ok(outputs)
     }
 
@@ -329,14 +363,22 @@ impl Application for WalletApp {
         self.executed_input_count
     }
 
-    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
-        let state_path = Self::state_file_in_dump(prefix);
-        let bytes = std::fs::read(&state_path)?;
-        crate::wallet_snapshot::decode(&bytes)
+    fn last_executed_safe_block(&self) -> u64 {
+        self.last_executed_safe_block
     }
 
     fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError> {
         Ok(crate::wallet_snapshot::encode(self))
+    }
+
+    fn export_state(&self) -> Result<String, AppError> {
+        Ok(self.state_json())
+    }
+
+    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
+        let state_path = Self::state_file_in_dump(prefix);
+        let bytes = std::fs::read(&state_path)?;
+        crate::wallet_snapshot::decode(&bytes)
     }
 
     fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
@@ -374,10 +416,6 @@ impl Application for WalletApp {
     fn state_file_in_dump(prefix: &Path) -> PathBuf {
         prefix.join("state")
     }
-
-    fn export_state(&self) -> Result<String, AppError> {
-        Ok(self.state_json())
-    }
 }
 
 #[cfg(test)]
@@ -385,10 +423,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::wallet_snapshot::{SnapshotBalance, SnapshotNonce, WalletSnapshotV1};
     use alloy_primitives::{Address, U256, address};
-    use ssz::Encode as SszEncodeTrait;
-    use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
+    use ssz_derive::{Decode, Encode};
     use types::ERC20_DEPOSIT_PREFIX_BYTES;
     use types::Erc20Transfer;
     use types::alloy_sol_types::SolCall;
@@ -401,7 +437,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_when_max_fee_below_current_fee() {
-        use sequencer_core::application::{Application, ExecutionOutcome};
+        use sequencer_core::application::{ExecutionOutcome, validate_and_execute_user_op};
 
         let mut app = WalletApp::new(WalletConfig::default());
         let sender = Address::from_slice(&[0x11; 20]);
@@ -413,10 +449,9 @@ mod tests {
             data: Vec::<u8>::new().into(),
         };
 
-        // The max_fee < current_fee check now lives in the trait default
-        // (validate_and_execute_user_op), not in validate_user_op directly.
-        let result = app
-            .validate_and_execute_user_op(sender, &user_op, 2)
+        // The max_fee < current_fee check lives in the free function
+        // validate_and_execute_user_op, not in validate_user_op directly.
+        let result = validate_and_execute_user_op(&mut app, sender, &user_op, 2, 0)
             .expect("should return Ok(Invalid), not Err");
         assert_eq!(
             result,
@@ -442,7 +477,9 @@ mod tests {
             data: Vec::new(),
         };
         let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
-        let outputs = app.execute_valid_user_op(&valid).expect("execute valid op");
+        let outputs = app
+            .execute_valid_user_op(&valid, 0)
+            .expect("execute valid op");
 
         assert_eq!(app.current_user_nonce(sender), 1);
         assert_eq!(app.current_user_balance(sender), initial_balance - gas_cost);
@@ -459,24 +496,24 @@ mod tests {
         assert_eq!(app.current_user_balance(recipient), U256::ZERO);
     }
 
-    #[derive(PartialEq, Debug, SszEncode, SszDecode, Clone)]
+    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
     struct LegacyDeposit {
         amount: U256,
         to: Address,
     }
 
-    #[derive(PartialEq, Debug, SszEncode, SszDecode, Clone)]
+    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
     struct LegacyWithdrawal {
         amount: U256,
     }
 
-    #[derive(PartialEq, Debug, SszEncode, SszDecode, Clone)]
+    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
     struct LegacyTransfer {
         amount: U256,
         to: Address,
     }
 
-    #[derive(PartialEq, Debug, SszEncode, SszDecode, Clone)]
+    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
     #[ssz(enum_behaviour = "union")]
     enum LegacyMethod {
         Withdrawal(LegacyWithdrawal),
@@ -502,11 +539,11 @@ mod tests {
         let valid = ValidUserOp {
             sender,
             fee: 0,
-            data: SszEncodeTrait::as_ssz_bytes(&legacy),
+            data: ssz::Encode::as_ssz_bytes(&legacy),
         };
 
         let outputs = app
-            .execute_valid_user_op(&valid)
+            .execute_valid_user_op(&valid, 0)
             .expect("execute valid user op");
 
         assert_eq!(app.current_user_nonce(sender), before_sender_nonce + 1);
@@ -644,7 +681,9 @@ mod tests {
             })),
         };
 
-        let outputs = app.execute_valid_user_op(&valid).expect("execute transfer");
+        let outputs = app
+            .execute_valid_user_op(&valid, 0)
+            .expect("execute transfer");
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -680,7 +719,7 @@ mod tests {
         };
 
         let outputs = app
-            .execute_valid_user_op(&valid)
+            .execute_valid_user_op(&valid, 0)
             .expect("execute withdrawal");
 
         assert_eq!(
@@ -736,7 +775,7 @@ mod tests {
             fee: fee_exponent,
             data: Vec::new(),
         };
-        app.execute_valid_user_op(&valid).expect("execute op");
+        app.execute_valid_user_op(&valid, 0).expect("execute op");
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -766,7 +805,7 @@ mod tests {
             fee: fee_exponent,
             data: Vec::new(),
         };
-        app.execute_valid_user_op(&valid).expect("execute op");
+        app.execute_valid_user_op(&valid, 0).expect("execute op");
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -790,6 +829,7 @@ mod tests {
         app.nonces.insert(alice, 4);
         app.nonces.insert(bob, 9);
         app.executed_input_count = 42;
+        app.last_executed_safe_block = 777;
 
         let prefix = temp_dump_prefix();
         app.create_dump(&prefix).expect("create dump");
@@ -813,16 +853,48 @@ mod tests {
         assert_eq!(restored.balances, app.balances);
         assert_eq!(restored.nonces, app.nonces);
         assert_eq!(restored.executed_input_count, app.executed_input_count);
+        assert_eq!(
+            restored.last_executed_safe_block,
+            app.last_executed_safe_block
+        );
     }
 
     #[test]
-    fn create_dump_state_file_matches_canonical_encode() {
-        let app = WalletApp::new(WalletConfig::default());
-        let prefix = temp_dump_prefix();
-        app.create_dump(&prefix).expect("create dump");
-        let on_disk = std::fs::read(WalletApp::state_file_in_dump(&prefix)).expect("read state");
-        WalletApp::delete_dump(&prefix).expect("cleanup");
-        assert_eq!(on_disk, crate::wallet_snapshot::encode(&app));
+    fn safe_block_clock_advances_by_max_on_both_execution_paths() {
+        let mut app = WalletApp::new(WalletConfig::default());
+        let sender = Address::from_slice(&[0x77; 20]);
+        app.balances.insert(sender, U256::from(10_000_u64));
+        assert_eq!(app.last_executed_safe_block(), 0);
+
+        // User op carries its covering frame's safe block.
+        let valid = ValidUserOp {
+            sender,
+            fee: 0,
+            data: Vec::new(),
+        };
+        app.execute_valid_user_op(&valid, 100).expect("execute op");
+        assert_eq!(app.last_executed_safe_block(), 100);
+
+        // A direct input advances the clock via its own inclusion block.
+        let direct = sequencer_core::l2_tx::DirectInput {
+            sender: Address::from_slice(&[0x88; 20]),
+            block_number: 150,
+            payload: Vec::new(),
+        };
+        app.execute_direct_input(&direct).expect("execute direct");
+        assert_eq!(app.last_executed_safe_block(), 150);
+
+        // max(): an older block must never regress the clock. A direct's
+        // inclusion block is <= its covering frame's safe block, so replays
+        // legitimately present blocks below the current clock.
+        let older_direct = sequencer_core::l2_tx::DirectInput {
+            sender: Address::from_slice(&[0x88; 20]),
+            block_number: 120,
+            payload: Vec::new(),
+        };
+        app.execute_direct_input(&older_direct)
+            .expect("execute older direct");
+        assert_eq!(app.last_executed_safe_block(), 150);
     }
 
     #[test]
@@ -887,74 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn from_snapshot_bytes_rejects_duplicate_balance_addresses() {
-        // Hand-crafted snapshot with two entries for the same address.
-        // The encoder never produces this, but the decoder must reject it
-        // to keep snapshot bytes canonical: without this check, multiple
-        // distinct byte sequences could decode to the same logical state.
-        let snapshot = WalletSnapshotV1 {
-            erc20_portal_address: [0; 20],
-            supported_erc20_token: [0; 20],
-            sequencer_address: [0; 20],
-            balances: vec![
-                SnapshotBalance {
-                    address: [1; 20],
-                    balance_be: [0; 32],
-                },
-                SnapshotBalance {
-                    address: [1; 20],
-                    balance_be: [0; 32],
-                },
-            ],
-            nonces: vec![],
-            executed_input_count: 0,
-        };
-        let bytes = ssz::Encode::as_ssz_bytes(&snapshot);
-
-        let err =
-            crate::wallet_snapshot::decode(&bytes).expect_err("duplicate balance should reject");
-        match err {
-            AppError::Internal { reason } => assert!(
-                reason.contains("duplicate balance"),
-                "expected duplicate-balance error, got: {reason}"
-            ),
-            other => panic!("expected Internal duplicate error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn from_snapshot_bytes_rejects_duplicate_nonce_addresses() {
-        let snapshot = WalletSnapshotV1 {
-            erc20_portal_address: [0; 20],
-            supported_erc20_token: [0; 20],
-            sequencer_address: [0; 20],
-            balances: vec![],
-            nonces: vec![
-                SnapshotNonce {
-                    address: [1; 20],
-                    nonce: 0,
-                },
-                SnapshotNonce {
-                    address: [1; 20],
-                    nonce: 1,
-                },
-            ],
-            executed_input_count: 0,
-        };
-        let bytes = ssz::Encode::as_ssz_bytes(&snapshot);
-
-        let err =
-            crate::wallet_snapshot::decode(&bytes).expect_err("duplicate nonce should reject");
-        match err {
-            AppError::Internal { reason } => assert!(
-                reason.contains("duplicate nonce"),
-                "expected duplicate-nonce error, got: {reason}"
-            ),
-            other => panic!("expected Internal duplicate error, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn state_file_in_dump_lives_inside_prefix() {
         let prefix = PathBuf::from("/tmp/example-prefix");
         let state = WalletApp::state_file_in_dump(&prefix);
@@ -976,31 +980,5 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("wallet-dump-{}-{nanos}-{n}", std::process::id()));
         path
-    }
-
-    #[test]
-    fn export_state_is_deterministic_and_omits_defaults() {
-        let mut app = WalletApp::new(WalletConfig::default());
-        let high = address!("0xffffffffffffffffffffffffffffffffffffffff");
-        let low = address!("0x1111111111111111111111111111111111111111");
-        app.balances.insert(high, U256::from(20_u64));
-        app.balances.insert(low, U256::from(10_u64));
-        app.balances.insert(Address::ZERO, U256::ZERO);
-        app.nonces.insert(high, 2);
-        app.nonces.insert(low, 1);
-        app.nonces.insert(Address::ZERO, 0);
-
-        assert_eq!(
-            app.export_state().expect("export state"),
-            concat!(
-                "{\"balances\":{",
-                "\"0x1111111111111111111111111111111111111111\":\"10\",",
-                "\"0xffffffffffffffffffffffffffffffffffffffff\":\"20\"",
-                "},\"nonces\":{",
-                "\"0x1111111111111111111111111111111111111111\":1,",
-                "\"0xffffffffffffffffffffffffffffffffffffffff\":2",
-                "}}"
-            )
-        );
     }
 }

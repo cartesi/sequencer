@@ -7,7 +7,7 @@
 //! [`WalletApp::create_dump`](crate::application::wallet::WalletApp::create_dump),
 //! CM `inspect_state`, and the watchdog's `/finalized_state` byte compare.
 //!
-//! Golden bytes: `tests/fixtures/wallet_snapshot_v1_empty.{hex,bin}` (shared with
+//! Golden bytes: `tests/fixtures/wallet_snapshot_empty.{hex,bin}` (shared with
 //! Rust and Lua parity tests).
 
 use std::collections::HashMap;
@@ -32,13 +32,14 @@ pub struct SnapshotNonce {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
-pub struct WalletSnapshotV1 {
+pub struct WalletSnapshot {
     pub erc20_portal_address: [u8; 20],
     pub supported_erc20_token: [u8; 20],
     pub sequencer_address: [u8; 20],
     pub balances: Vec<SnapshotBalance>,
     pub nonces: Vec<SnapshotNonce>,
     pub executed_input_count: u64,
+    pub last_executed_safe_block: u64,
 }
 
 /// Deterministic SSZ bytes for `app`'s logical state (sorted map entries).
@@ -61,20 +62,21 @@ pub fn encode(app: &WalletApp) -> Vec<u8> {
         .collect();
     nonces.sort_unstable_by_key(|entry| entry.address);
 
-    WalletSnapshotV1 {
+    WalletSnapshot {
         erc20_portal_address: app.config().erc20_portal_address.into_array(),
         supported_erc20_token: app.config().supported_erc20_token.into_array(),
         sequencer_address: app.config().sequencer_address.into_array(),
         balances,
         nonces,
         executed_input_count: app.executed_input_count(),
+        last_executed_safe_block: app.last_executed_safe_block(),
     }
     .as_ssz_bytes()
 }
 
 /// Rehydrate a [`WalletApp`] from SSZ snapshot bytes.
 pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
-    let decoded = WalletSnapshotV1::from_ssz_bytes(bytes).map_err(|e| AppError::Internal {
+    let decoded = WalletSnapshot::from_ssz_bytes(bytes).map_err(|e| AppError::Internal {
         reason: format!("snapshot decode failed: {e:?}"),
     })?;
 
@@ -108,6 +110,7 @@ pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
         balances,
         nonces,
         decoded.executed_input_count,
+        decoded.last_executed_safe_block,
     ))
 }
 
@@ -136,10 +139,7 @@ mod tests {
     #[test]
     fn encode_default_wallet_matches_golden_vector() {
         let app = WalletApp::new(WalletConfig::default());
-        assert_eq!(
-            encode(&app),
-            read_fixture_hex("wallet_snapshot_v1_empty.hex")
-        );
+        assert_eq!(encode(&app), read_fixture_hex("wallet_snapshot_empty.hex"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ What we are protecting:
 |-------|-------|--------------|
 | InputBox contract | Trusted | Authenticates `msg_sender` on `addInput`. Use correctly; do not model forgery. |
 | Our Ethereum node | Trusted, fail-stop | Inside our infra. May become unreachable; will never lie. |
-| Fallback RPC (Infura / Alchemy) | Semi-trusted, fail-stop | Liveness fallback during primary outages. May withhold or delay. Never byzantine. |
+| RPC endpoint (`SEQ_ETH_RPC_URL`) | Trusted, fail-stop — **must be one consistent node** | The code supports exactly **one** endpoint, shared by reader, submitter, poster, and flusher; no fallback tier exists yet. Behind a load-balanced fleet, lagging replicas can silently truncate `get_logs` ranges and desynchronize the flush/re-sync views (review F5/F2). The reader now fails loud on an incomplete InputAdded set (F5): a per-app index contiguity check (right prefix) plus a `getNumberOfInputs` count witness pinned at the scanned safe block (complete prefix), so a dropped/clamped/truncated-tail input is detected before the safe head advances rather than silently skipped, and recovery refuses if the re-sync lags the flush view (F2). The residual fleet exposure is a node that lies *consistently* about both its logs and its input count — outside the fail-stop model. A semi-trusted fallback tier (Infura/Alchemy) is future work. |
 | Operator env / CLI flags | Trusted | Configuration is authoritative. |
 | Batch-submitter private key | Private | Held in operator infra. Not reachable by the network. |
 | Sequencer's own code | Trusted (bug-free is a precondition) | Bugs are caught via tests and review, not defended against at runtime. See "self-trust" below. |
@@ -30,16 +30,18 @@ What we are protecting:
 
 ### Self-trust
 
-The sequencer trusts that its own code is correct. If the sequencer emits a malformed batch, frame, or user op, it is already in a bug state that requires manual intervention — we do not layer runtime defenses against sequencer self-misbehavior. Recovery addresses liveness failures (infrastructure outages, network partitions, gateway failure), not bug-induced malformed state.
+The sequencer trusts its own code in a specific sense: **impossible states are never *handled*.** There are no graceful fallback paths, no re-validation of a neighbor module's answer, no code that keeps running past a violated internal contract. If the sequencer emits a malformed batch, frame, or user op, it is in a bug state that requires manual intervention; recovery addresses liveness failures (infrastructure outages, network partitions, gateway failure), not bug-induced malformed state.
 
-This is not an excuse to skip validation at trust boundaries. Inputs from untrusted actors are validated rigorously. Internal invariants are enforced by type system, SQL constraints, and tests — not by defensive runtime checks against hypothetical self-misbehavior.
+This is **not** a prohibition on checking. Internal invariants are enforced loudly wherever a check is near-free — the type system, SQL constraints and triggers, boundary assertions — because in this system a loud crash is recoverable by design (orchestrator respawn + startup recovery), while a silently-tolerated bug that externalizes (a signed batch, an ack, a feed event) is state divergence: as severe as theft and undefendable at runtime. The rule, in short: **assert real invariants, fail loud, never absorb silently, never handle gracefully.** The decision test and the register of cross-module invariants live in [`docs/invariants.md`](../invariants.md).
+
+Inputs from untrusted actors are validated rigorously, as ever.
 
 ## In-scope failure modes
 
 - L1 provider outages (primary and fallback), minutes to hours
 - Process crashes at arbitrary points, including mid-transaction
 - **Adversarial mempool:** reorder, delay, drop, selective inclusion by builders
-- **Zombie transactions:** a submitted batch may sit in a private mempool indefinitely and land long after we believed it was gone. The recovery flusher is load-bearing for this threat: it consumes every pending `w_nonce` slot with a no-op so zombies cannot claim them.
+- **Zombie transactions:** a submitted batch may sit in a private mempool indefinitely and land long after we believed it was gone. Two load-bearing defenses: the recovery flusher consumes every wallet-nonce slot this deployment ever used (anchored by the persisted watermark, review R1a) so zombies cannot claim them; and the content-identity check (review R2) compares every *accepted* landing against the batch we sealed at that nonce — a zombie that lands anyway is detected within one safe-finality delay and the node refuses into cockroach recovery. This is trust-boundary validation of external input (the mempool replaying our own stale transactions at times we don't control), not defense-in-depth against self-bugs.
 - L1 reorgs up to safe depth
 - Malicious `POST /tx` callers: malformed signatures, spoofed sender, replay across chains or apps, nonce manipulation
 - Malicious direct-input senders: arbitrary payload, any intent; sender authenticity is guaranteed by InputBox

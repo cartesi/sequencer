@@ -31,8 +31,8 @@ use super::ingress::open_fresh_tip_in_tx;
 use super::queries::{
     current_safe_block_required, current_safe_block_timestamp, last_safe_progress_ms,
 };
-use super::safe_accepted_batches::frontier_nonce;
-use super::snapshot_dumps::clear_pending_dumps_in;
+use super::safe_accepted_batches::{canonical_divergence_in, frontier_nonce};
+use super::snapshot_dumps::{batch_nonce_in, clear_pending_dumps_from_nonce_in};
 
 /// Outcome of a danger-zone check.
 ///
@@ -59,6 +59,14 @@ use super::snapshot_dumps::clear_pending_dumps_in;
 pub enum DangerStatus {
     /// No danger detected — none of the checks tripped.
     Safe,
+    /// A fully-accepted L1 landing failed the content-identity check
+    /// (review R2): canonical state contains executed effects with no
+    /// reliable local source. Carries the diverged batch nonce. Ranked
+    /// ahead of every other arm so the respawn loop can never route a
+    /// diverged node into `Proceed`/`FlushAndCascade`. The remedy is
+    /// cockroach recovery (wipe + rebuild from L1), never standard
+    /// recovery.
+    CanonicalDivergence(u64),
     /// L1 safe-head timestamp is too old or unknown. Recovery cannot reason
     /// from the local L1 view, so startup must refuse.
     L1ViewStale,
@@ -76,6 +84,35 @@ pub enum DangerStatus {
     /// freshness check passed. We refuse rather than recover because the batch
     /// only crossed danger in estimated time, not observed safe-state.
     EstimatedBatchInDanger(u64),
+}
+
+impl DangerStatus {
+    /// Stable label for logs/metrics. An inherent method (not a free
+    /// projection) so a new variant must add its label right here.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            DangerStatus::Safe => "safe",
+            DangerStatus::CanonicalDivergence(_) => "canonical_divergence",
+            DangerStatus::L1ViewStale => "l1_view_stale",
+            DangerStatus::ClosedBatchInDanger(_) => "closed_batch_in_danger",
+            DangerStatus::TipInDanger(_) => "tip_in_danger",
+            DangerStatus::EstimatedBatchInDanger(_) => "estimated_batch_in_danger",
+        }
+    }
+
+    /// The batch nonce a danger arm points at, if any (log context). The
+    /// `CanonicalDivergence` nonce is deliberately not reported here — it is a
+    /// diverged-state nonce, not a batch in the danger pipeline.
+    pub(crate) fn batch_index(self) -> Option<u64> {
+        match self {
+            DangerStatus::ClosedBatchInDanger(batch_index)
+            | DangerStatus::TipInDanger(batch_index)
+            | DangerStatus::EstimatedBatchInDanger(batch_index) => Some(batch_index),
+            DangerStatus::Safe
+            | DangerStatus::L1ViewStale
+            | DangerStatus::CanonicalDivergence(_) => None,
+        }
+    }
 }
 
 impl Storage {
@@ -124,6 +161,14 @@ impl Storage {
     /// callers pass the current Unix-ms clock.
     pub fn check_danger(&mut self, protocol: &ProtocolTiming, now_ms: u64) -> Result<DangerStatus> {
         self.read(|tx| {
+            // The divergence marker outranks everything — including the
+            // L1-staleness gate: it records an already-confirmed fact about
+            // canonical state, not a view-dependent estimate, and no amount
+            // of L1 freshening or flushing repairs it (review R2).
+            if let Some((nonce, _)) = canonical_divergence_in(tx)? {
+                return Ok(DangerStatus::CanonicalDivergence(nonce));
+            }
+
             if protocol.l1_view_is_stale(current_safe_block_timestamp(tx)?, now_ms) {
                 return Ok(DangerStatus::L1ViewStale);
             }
@@ -241,7 +286,8 @@ impl Storage {
 
     /// Cascade the open Tip if its first frame has aged past
     /// `danger_threshold`. Called from the `RecoverTip` startup path (no flush
-    /// happened), and defensively from `Proceed`.
+    /// happened). The `Proceed` path performs no DB writes and does not call
+    /// this.
     ///
     /// # Why a threshold here, but no closed-frontier check
     ///
@@ -253,9 +299,8 @@ impl Storage {
     /// The Tip is different: it has no L1 footprint at all (no `w_nonce`,
     /// no `safe_input`), so there's no L1 outcome to wait on. Once its
     /// first frame has aged into the danger zone, the rule "everything
-    /// past gold is bad once we're committed to recovery" applies. In the
-    /// `RecoverTip` path startup is already committed; in `Proceed`, this
-    /// branch is defensive and should normally be a no-op.
+    /// past gold is bad once we're committed to recovery" applies, and in
+    /// the `RecoverTip` path startup is already committed.
     ///
     /// # Threshold = danger_threshold, not MAX_WAIT
     ///
@@ -291,42 +336,50 @@ fn recover_post_flush_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resu
         // in the danger zone — see `recover_post_flush` doc on Tip handling.
         None => find_tip_batch_in_danger(tx, danger_threshold)?,
     };
-    let invalidated = match pivot {
-        Some(batch_index) => cascade_invalidate_from(tx, batch_index)?,
-        None => Vec::new(),
-    };
-    if !invalidated.is_empty() {
-        // Pending snapshots correspond to batches that haven't been
-        // observed landing on L1 yet. Once those batches are
-        // cascade-invalidated, the snapshots represent states the
-        // canonical replay will never reach — leaving them would
-        // poison catch-up after restart. Finalized is untouched
-        // because its bytes are for an L1-confirmed batch.
-        clear_pending_dumps_in(tx)?;
-    }
-    if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
-        // Reopen the Tip the cascade just invalidated (or one a torn crash
-        // left missing), atomically with the cascade. Same mechanism the
-        // runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
-        open_fresh_tip_in_tx(tx)?;
-    }
-    Ok(invalidated)
+    cascade_and_reopen(tx, pivot)
 }
 
 /// See [`Storage::recover_aging_tip`] for the design rationale.
 fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Result<Vec<u64>> {
-    let invalidated = match find_tip_batch_in_danger(tx, danger_threshold)? {
-        Some(batch_index) => cascade_invalidate_from(tx, batch_index)?,
+    let pivot = find_tip_batch_in_danger(tx, danger_threshold)?;
+    cascade_and_reopen(tx, pivot)
+}
+
+/// Shared tail of both recovery paths — the pivot selection above is the
+/// only thing that varies. In the caller's transaction:
+///
+/// 1. **Cascade** from `pivot` (no-op when `None`): invalidate it and every
+///    successor, including the open Tip.
+/// 2. **Clear doomed pending snapshots, scoped to the cascade**: delete
+///    pending rows with `nonce >= pivot.nonce` — exactly the cascaded
+///    batches' pendings, states the canonical replay will never reach.
+///    Gold-but-unpromoted pendings (batches that landed while the process
+///    was down) carry lower nonces and *survive*: catch-up resumes from a
+///    fresher checkpoint, and the rows are cleaned up by the next
+///    promotion's `DELETE <= max_nonce`. Scoping is load-bearing (review
+///    F9): a blanket clear would arm a promote-wedge crash-loop whenever a
+///    *valid in-flight* closed batch existed at clear time — its pending
+///    row would be deleted while the batch stayed valid, and the lane's
+///    later promotion of its landing would hit the deleted row with no
+///    danger arm ever firing to heal it. With the scope, any nonce the
+///    lane can later observe as accepted either has its pending row intact
+///    or belongs to a post-recovery batch with a fresh row. In the
+///    `RecoverTip` path the scope deletes nothing — the Tip never has a
+///    pending row. Finalized is untouched (L1-confirmed bytes).
+/// 3. **Reopen the Tip** the cascade just invalidated (or one a torn crash
+///    left missing), atomically with the cascade. Same mechanism the
+///    runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
+fn cascade_and_reopen(tx: &Transaction<'_>, pivot: Option<u64>) -> Result<Vec<u64>> {
+    let invalidated = match pivot {
+        Some(batch_index) => {
+            let pivot_nonce = batch_nonce_in(tx, batch_index)?;
+            let invalidated = cascade_invalidate_from(tx, batch_index)?;
+            clear_pending_dumps_from_nonce_in(tx, pivot_nonce)?;
+            invalidated
+        }
         None => Vec::new(),
     };
-    if !invalidated.is_empty() {
-        // See `recover_post_flush_inner` for why we clear pending here.
-        clear_pending_dumps_in(tx)?;
-    }
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
-        // Reopen the Tip the cascade just invalidated (or one a torn crash
-        // left missing), atomically with the cascade. Same mechanism the
-        // runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
         open_fresh_tip_in_tx(tx)?;
     }
     Ok(invalidated)
@@ -365,10 +418,11 @@ fn first_non_gold_closed_batch(conn: &Connection) -> Result<Option<u64>> {
 /// [`Storage::check_danger`]'s wall-clock-adjusted arm, where the dispatch
 /// is the same (`Refuse`) regardless of which one fired.
 ///
-/// Closed-frontier wins ties: if a closed batch is in danger, the Tip is
-/// older still (sequencer opens new batches at non-decreasing `safe_block`),
-/// and cascading from the closed batch covers the Tip via
-/// `batch_index >= N`.
+/// Closed-frontier wins: frame `safe_block`s are non-decreasing along the
+/// spine, so the closed frontier is at least as *old* as the Tip — whenever
+/// the Tip is in danger, the closed frontier is too, and cascading from the
+/// closed batch covers the Tip via `batch_index >= N`. (This ordering is
+/// load-bearing for the pending-snapshot clear — see `docs/invariants.md`.)
 ///
 /// Reads `safe_accepted_batches`, which is maintained atomically with each
 /// [`Storage::append_safe_inputs`] call.

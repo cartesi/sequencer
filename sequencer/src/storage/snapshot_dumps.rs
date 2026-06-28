@@ -309,11 +309,12 @@ impl Storage {
         self.read(list_dump_rows_in)
     }
 
-    /// Delete every row from `pending_snapshots`. Test-only convenience
-    /// wrapper: production danger-zone recovery composes
-    /// `clear_pending_dumps_in` into the same transaction as the cascade
-    /// invalidation (see `storage/recovery.rs`), so the pending rows for
-    /// cascade-doomed batches are cleared atomically with them.
+    /// Delete every row from `pending_snapshots`. Test-only convenience wrapper
+    /// for the *unscoped* clear: production danger-zone recovery instead composes
+    /// the pivot-scoped `clear_pending_dumps_from_nonce_in` (F9) into the same
+    /// transaction as the cascade invalidation (see `storage/recovery.rs`), so
+    /// only the cascade-doomed batches' pending rows are cleared, atomically with
+    /// them.
     #[cfg(test)]
     pub fn clear_pending_dumps(&mut self) -> Result<usize> {
         self.write(clear_pending_dumps_in)
@@ -350,12 +351,11 @@ impl Storage {
     }
 
     /// Highest `offset` in the valid ordered L2-tx stream (the global
-    /// replay head), or 0 when empty. Test-only standalone read: the
-    /// production batch-close path reads the same value via the
-    /// `valid_ordered_l2_tx_head` free function *inside* its seal
-    /// transaction (see `close_frame_and_batch_with_pending_dump`), so
-    /// the recorded `l2_tx_index` is consistent with the seal.
-    #[cfg(test)]
+    /// replay head), or 0 when empty. The lane reads this before writing
+    /// a dump's `info.toml` at batch close; the seal transaction
+    /// re-asserts the same value (see
+    /// `close_frame_and_batch_with_pending_dump`), which is sound because
+    /// the lane is the single writer and nothing sequences in between.
     pub fn valid_ordered_l2_tx_head(&mut self) -> Result<u64> {
         self.read(|tx| super::queries::valid_ordered_l2_tx_head(tx))
     }
@@ -365,14 +365,7 @@ impl Storage {
     /// calls this immediately after `close_frame_and_batch` so the row
     /// should always be there.
     pub fn batch_nonce(&mut self, batch_index: u64) -> Result<u64> {
-        self.read(|tx| {
-            let nonce: i64 = tx.query_row(
-                "SELECT nonce FROM batches WHERE batch_index = ?1",
-                params![u64_to_i64(batch_index)],
-                |row| row.get(0),
-            )?;
-            Ok(i64_to_u64(nonce))
-        })
+        self.read(|tx| batch_nonce_in(tx, batch_index))
     }
 
     /// Look up the nonce of a previously-accepted batch by its safe
@@ -567,8 +560,37 @@ fn list_dump_rows_in(tx: &Transaction<'_>) -> Result<Vec<DumpRow>> {
 /// the same transaction as `cascade_invalidate_from` — otherwise a
 /// crash between the cascade and the clear would leave stale pending
 /// snapshots pointing at states the canonical stream will never reach.
+#[cfg(test)]
 pub(super) fn clear_pending_dumps_in(tx: &Transaction<'_>) -> Result<usize> {
     tx.execute("DELETE FROM pending_snapshots", [])
+}
+
+/// Scoped pending-snapshot clear for the recovery cascade: delete only the
+/// rows whose `nonce >= from_nonce` (the cascade pivot's nonce) — exactly
+/// the cascaded batches' pendings. Lower-nonce rows are gold-but-unpromoted
+/// pendings that must survive (review F9: deleting them arms a
+/// promote-wedge crash-loop when their landing is later observed). Same
+/// same-transaction composition rationale as [`clear_pending_dumps_in`].
+pub(super) fn clear_pending_dumps_from_nonce_in(
+    tx: &Transaction<'_>,
+    from_nonce: u64,
+) -> Result<usize> {
+    tx.execute(
+        "DELETE FROM pending_snapshots WHERE nonce >= ?1",
+        params![u64_to_i64(from_nonce)],
+    )
+}
+
+/// Free-function form of [`Storage::batch_nonce`] for composing into a
+/// larger transaction (the recovery cascade reads its pivot's nonce to
+/// scope the pending clear).
+pub(super) fn batch_nonce_in(conn: &rusqlite::Connection, batch_index: u64) -> Result<u64> {
+    let nonce: i64 = conn.query_row(
+        "SELECT nonce FROM batches WHERE batch_index = ?1",
+        params![u64_to_i64(batch_index)],
+        |row| row.get(0),
+    )?;
+    Ok(i64_to_u64(nonce))
 }
 
 fn row_to_dump_row(row: &rusqlite::Row<'_>) -> Result<DumpRow> {

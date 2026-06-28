@@ -1,6 +1,6 @@
 use super::super::test_helpers::{
-    SENDER_A, all_ordered_l2_txs, default_protocol_timing, make_stale_batch_payload,
-    seed_closed_batches, seed_safe_inputs_with_batch_nonces, temp_db,
+    SENDER_A, all_ordered_l2_txs, default_protocol_timing, local_batch_payload,
+    make_stale_batch_payload, seed_closed_batches, seed_safe_inputs_with_batch_nonces, temp_db,
 };
 use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
@@ -284,12 +284,13 @@ mod recover_post_flush {
         storage
             .close_frame_and_batch(&mut head, 1300)
             .expect("close recovery batch");
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 1310,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 1300),
+                    payload: landed,
                     block_number: 1310,
                 }],
                 SENDER_A,
@@ -392,12 +393,13 @@ mod recover_post_flush {
         // is well below MAX_WAIT, so populate accepts it as gold.
         // Then advance safe head to 1100: batch 0 age (gold) is irrelevant,
         // but Tip's age = 1100 - 10 = 1090 > danger_threshold (let's pass 1000).
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 200,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 200,
                 }],
                 SENDER_A,
@@ -446,12 +448,13 @@ mod recover_post_flush {
             .expect("close batch 0");
 
         let batch_submitter = Address::repeat_byte(0xAA);
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 200,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 200,
                 }],
                 SENDER_A,
@@ -1093,12 +1096,13 @@ mod check_danger_zone {
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 0");
 
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 20,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -1221,12 +1225,13 @@ mod check_any_unresolved {
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 1");
 
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 20,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -1258,12 +1263,13 @@ mod check_any_unresolved {
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 1");
 
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 20,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -1279,6 +1285,67 @@ mod check_any_unresolved {
         assert!(
             result.is_none(),
             "should not trigger below threshold; got batch_index={result:?}"
+        );
+    }
+
+    #[test]
+    fn find_first_batch_in_danger_prefers_closed_frontier_over_aged_tip() {
+        // When BOTH the closed frontier batch and the open Tip are aged past the
+        // threshold, find_first_batch_in_danger must return the CLOSED frontier:
+        // cascading from it covers the Tip (batch_index >= pivot), and the scoped
+        // pending-snapshot clear keys on the pivot's nonce (F9). Both existing
+        // find_*_in_danger tests use open-batch-only scenarios; the closed-over-Tip
+        // preference (the helper's whole point) was unasserted.
+        let db = temp_db("danger-prefers-closed-frontier");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        // batch 0 (frame sb 10) → made gold below; batch 1 (frame sb 50) → the
+        // closed frontier; batch 2 (Tip, frame sb 50) → open at the same safe
+        // block (the lane rotated without a safe-block advance).
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 50)
+            .expect("seal batch 0, open batch 1 @ sb 50");
+        storage
+            .close_frame_and_batch(&mut head, 50)
+            .expect("seal batch 1, open the Tip @ sb 50");
+
+        // Make batch 0 gold: land its genuine bytes (accepted) → frontier → nonce 1.
+        let landed = local_batch_payload(&mut storage, 0);
+        storage
+            .append_safe_inputs(
+                20,
+                &[StoredSafeInput {
+                    sender: SENDER_A,
+                    payload: landed,
+                    block_number: 20,
+                }],
+                SENDER_A,
+                &default_protocol_timing(),
+            )
+            .expect("land batch 0");
+        assert_eq!(
+            storage
+                .submitter_frontier()
+                .expect("frontier")
+                .accepted_next_nonce,
+            1,
+            "batch 0 is gold; the closed frontier is now batch 1 (nonce 1)"
+        );
+
+        // Advance the safe head so both batch 1 and the Tip (both sb 50) are aged:
+        // 1200 - 50 = 1150 >= threshold 1125.
+        storage
+            .append_safe_inputs(1200, &[], SENDER_A, &default_protocol_timing())
+            .expect("advance safe head");
+
+        let result = find_first_batch_in_danger(&storage.conn, 1125).expect("find first in danger");
+        assert_eq!(
+            result,
+            Some(1),
+            "must return the closed frontier batch (1), not the aged Tip (2)"
         );
     }
 }
@@ -1329,12 +1396,13 @@ mod boundary {
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch");
 
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 1299,
                 &[StoredSafeInput {
                     sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 100),
+                    payload: landed,
                     block_number: 1299,
                 }],
                 SENDER_A,
@@ -1469,12 +1537,13 @@ mod boundary {
         storage
             .close_frame_and_batch(&mut head3, 2410)
             .expect("close gen3");
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 2420,
                 &[StoredSafeInput {
                     sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 2410),
+                    payload: landed,
                     block_number: 2420,
                 }],
                 SENDER_A,
@@ -1581,6 +1650,8 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_genesis_with_nonzero_nonce() {
+        // Default anchor is 0, so a parentless root at a non-zero nonce ABORTs
+        // (genesis must be 0) — the exact-match form of the contiguity rule.
         let db = temp_db("schema-genesis-nonzero");
         let storage = Storage::open(db.path.as_str()).expect("open storage");
         let err = storage.conn.execute(
@@ -1589,8 +1660,119 @@ mod schema_invariants {
             [],
         );
         assert!(
-            format!("{err:?}").contains("genesis batch must have nonce 0"),
-            "expected genesis-nonce trigger, got: {err:?}"
+            format!("{err:?}").contains("parentless root must carry the batch-tree anchor nonce"),
+            "expected anchor-nonce trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_allows_parentless_root_at_anchor_nonce() {
+        // With the anchor set to N' (a recovered deployment), a parentless root
+        // at N' is permitted — the recovery generalization of "genesis at 0".
+        // (Rows are inserted sealed so the single-Tip partial index, which only
+        // covers open rows, doesn't mask the contiguity trigger under test.)
+        let db = temp_db("schema-anchor-root");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage
+            .conn
+            .execute(
+                "UPDATE batch_tree_anchor SET nonce = 42 WHERE singleton_id = 0",
+                [],
+            )
+            .expect("set anchor");
+        // A root at the anchor nonce (42) is accepted...
+        storage
+            .conn
+            .execute(
+                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
+                 VALUES (0, NULL, 42, 100, 100)",
+                [],
+            )
+            .expect("parentless root at the anchor nonce is allowed");
+        // ...but a root at 0 (the old hard-coded value) now ABORTs — the rule is
+        // an exact match against the anchor, tighter than the old "must be 0".
+        let err = storage.conn.execute(
+            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
+             VALUES (1, NULL, 0, 100, 100)",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("parentless root must carry the batch-tree anchor nonce"),
+            "a root at the wrong nonce must abort, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_second_valid_parentless_root() {
+        // At most one *valid* parentless root: a second parentless insert (both
+        // valid, both at the anchor nonce 0) ABORTs on the single-root guard.
+        // (Sealed inserts isolate this from the single-Tip index; a fully-torn
+        // cascade re-roots only after invalidating the old root, covered below.)
+        let db = temp_db("schema-two-roots");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage
+            .conn
+            .execute(
+                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
+                 VALUES (0, NULL, 0, 100, 100)",
+                [],
+            )
+            .expect("first root ok");
+        let err = storage.conn.execute(
+            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
+             VALUES (1, NULL, 0, 100, 100)",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("at most one valid parentless root"),
+            "expected single-root guard, got: {err:?}"
+        );
+        // Invalidate the first root, then a second parentless root is allowed —
+        // exactly the fully-torn-cascade re-root shape.
+        storage
+            .conn
+            .execute(
+                "UPDATE batches SET invalidated_at_ms = 200 WHERE batch_index = 0",
+                [],
+            )
+            .expect("invalidate first root");
+        storage
+            .conn
+            .execute(
+                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
+                 VALUES (1, NULL, 0, 100, 100)",
+                [],
+            )
+            .expect("re-root parentless after the old root is invalidated");
+    }
+
+    #[test]
+    fn schema_freezes_anchor_after_setup_complete() {
+        // The anchor is write-once: once `setup_complete` exists, UPDATEs abort.
+        let db = temp_db("schema-anchor-frozen");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        // Pre-marker: UPDATE is allowed (this is what recovery setup does).
+        storage
+            .conn
+            .execute(
+                "UPDATE batch_tree_anchor SET nonce = 7 WHERE singleton_id = 0",
+                [],
+            )
+            .expect("anchor settable before setup_complete");
+        storage
+            .conn
+            .execute(
+                "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, 1)",
+                [],
+            )
+            .expect("mark setup complete");
+        let err = storage.conn.execute(
+            "UPDATE batch_tree_anchor SET nonce = 8 WHERE singleton_id = 0",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("batch-tree anchor is frozen after setup completes"),
+            "expected anchor-freeze trigger, got: {err:?}"
         );
     }
 
@@ -1701,6 +1883,80 @@ mod schema_invariants {
     }
 
     #[test]
+    fn schema_rejects_sequenced_l2_tx_into_non_tip() {
+        // The third sibling of the tip-only triggers (frames + user_ops already
+        // have negative tests; sequenced_l2_txs did not). The global replay order
+        // is the source for recovery re-drain and catch-up; a stale-WriteHead row
+        // into a sealed batch would corrupt it.
+        let db = temp_db("schema-sequenced-into-sealed");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 0)
+            .expect("close batch 0; it is now sealed (no longer the Tip)");
+        // Target the sealed batch's existing frame (0, 0). The BEFORE-INSERT
+        // trigger fires before the safe_input_index FK is evaluated.
+        let err = storage.conn.execute(
+            "INSERT INTO sequenced_l2_txs \
+             (offset, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
+             VALUES (999, 0, 0, NULL, 0)",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("sequenced_l2_txs can only target the current Tip"),
+            "expected tip-only-sequenced trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_nonce_mutation() {
+        // Nonce immutability underpins the frontier + contiguity invariants.
+        let db = temp_db("schema-nonce-immutable");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 0)
+            .expect("close batch 0");
+        let err = storage.conn.execute(
+            "UPDATE batches SET nonce = nonce + 1 WHERE batch_index = 0",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("nonce is immutable"),
+            "expected nonce-immutable trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_payload_hash_rewrite() {
+        // payload_hash is the content-identity anchor for the R2 canonical-
+        // divergence check; a rewrite would let a foreign/zombie L1 landing
+        // false-match a local batch. Write-once once stamped at seal.
+        let db = temp_db("schema-payload-hash-write-once");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 0)
+            .expect("close batch 0; payload_hash is stamped at seal");
+        let err = storage.conn.execute(
+            "UPDATE batches SET payload_hash = \
+             X'0000000000000000000000000000000000000000000000000000000000000000' \
+             WHERE batch_index = 0",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("payload_hash is write-once"),
+            "expected payload-hash-write-once trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn nonce_reuse_after_cascade_with_valid_ancestor() {
         // Beautiful part of parent-pointer + structural nonce: after a cascade
         // that invalidates only the suffix (keeping an ancestor valid), the
@@ -1730,12 +1986,13 @@ mod schema_invariants {
         // Head is now batch 3 (nonce 3, first_frame_safe_block=100).
 
         // Batch 0 lands on L1 (accepted): safe_input at block 20 with nonce 0.
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 20,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -2037,12 +2294,13 @@ mod tree_invariants {
         // Tree: 0(Gold sentinel in concept)→1→2→3→4 (Tip)
 
         // Phase 2: cascade with a valid ancestor. Batch 0 is accepted first.
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 20,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -2101,12 +2359,13 @@ mod tree_invariants {
                 .close_frame_and_batch(&mut head, 100)
                 .expect("close");
         }
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 20,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -2335,6 +2594,57 @@ mod recovery_clears_pending_snapshots {
         assert!(
             storage.latest_pending_dump().unwrap().is_some(),
             "no-op recovery must preserve in-flight pending snapshots"
+        );
+    }
+
+    /// Review F9 regression: the cascade's pending clear is scoped to
+    /// `nonce >= pivot.nonce`. A gold-but-unpromoted pending (its batch
+    /// landed accepted while the process was down, the lane never
+    /// promoted it) sits *below* the pivot and must survive — deleting
+    /// it would arm a promote-wedge crash-loop when the lane later
+    /// observes the landing and promotion hits the deleted row.
+    #[test]
+    fn cascade_preserves_gold_unpromoted_pending_below_pivot() {
+        let db = temp_db("recovery-scoped-clear-preserves-gold");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        // Close two batches: nonce 0 (will land gold) and nonce 1 (doomed).
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch nonce 0");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch nonce 1");
+
+        register_finalized(&mut storage, "fin-scoped");
+        register_pending(&mut storage, 0); // gold-but-unpromoted
+        register_pending(&mut storage, 1); // doomed (past the frontier)
+
+        // Batch nonce 0 lands accepted: gold frontier advances to 1, so
+        // the post-flush cascade pivots at the nonce-1 batch.
+        let batch_submitter = Address::repeat_byte(0xAA);
+        seed_safe_inputs_with_batch_nonces(&mut storage, batch_submitter, 10, &[0]);
+
+        let invalidated = storage
+            .recover_post_flush(1200)
+            .expect("post-flush recover");
+        assert_eq!(
+            invalidated,
+            vec![1, 2],
+            "cascade covers the nonce-1 batch and the Tip"
+        );
+
+        let survivor = storage
+            .latest_pending_dump()
+            .unwrap()
+            .expect("gold-unpromoted pending must survive the scoped clear");
+        assert_eq!(survivor.nonce, 0, "the survivor is the gold pending");
+        assert!(
+            storage.finalized_dump().unwrap().is_some(),
+            "cascade must not touch finalized"
         );
     }
 }

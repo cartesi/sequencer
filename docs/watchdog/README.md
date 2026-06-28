@@ -257,7 +257,7 @@ just test-watchdog-compare-harness
 
 Spawns Anvil + rollups devnet + `sequencer-devnet`, proves CM inspect SSZ at
 genesis matches `wallet_snapshot::encode(WalletConfig::devnet())` (same as
-`tests/fixtures/wallet_snapshot_v1_empty.hex` only for Sepolia `default()`), then runs
+`tests/fixtures/wallet_snapshot_empty.hex` only for Sepolia `default()`), then runs
 `sequencer-watchdog init` and `sequencer-watchdog tick`.
 When `inclusion_block` is unchanged at genesis, the runner skips L1/CM work (idle-cheap);
 `deposit_transfer_withdrawal_test` drives a gold batch first so compare replays real L1 inputs.
@@ -303,4 +303,4 @@ cargo test -p app-core wallet_snapshot -- --test-threads=1
 ```
 
 HTTP integration for snapshot routes lives in `sequencer/tests/snapshot_endpoints.rs`.
-SSZ golden bytes for the toy wallet live in `tests/fixtures/wallet_snapshot_v1_empty.{hex,bin}`.
+SSZ golden bytes for the toy wallet live in `tests/fixtures/wallet_snapshot_empty.{hex,bin}`.

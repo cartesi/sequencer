@@ -54,8 +54,8 @@ set +a
 
 artifacts_json="$(cat <<EOF
 [
-  {"name":"sequencer-${tag}-linux-amd64.tar.gz","kind":"sequencer","arch":"amd64"},
-  {"name":"sequencer-${tag}-linux-arm64.tar.gz","kind":"sequencer","arch":"arm64"},
+  {"name":"wallet-sequencer-${tag}-linux-amd64.tar.gz","kind":"sequencer","arch":"amd64"},
+  {"name":"wallet-sequencer-${tag}-linux-arm64.tar.gz","kind":"sequencer","arch":"arm64"},
   {"name":"canonical-machine-image-devnet-${tag}.tar.gz","kind":"cm_image","chain":"devnet"},
   {"name":"canonical-machine-image-sepolia-${tag}.tar.gz","kind":"cm_image","chain":"sepolia"},
   {"name":"ghcr.io/cartesi/sequencer-watchdog:${tag}","kind":"watchdog_image","format":"oci","arch":"multi","registry":"ghcr"},

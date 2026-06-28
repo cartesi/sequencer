@@ -17,13 +17,17 @@ use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
     /// Load a page of ordered L2 transactions starting after the given offset.
-    /// Returns `(db_offset, tx)` pairs. Callers should track `db_offset` of the
-    /// last item as their cursor, not increment a counter.
+    /// Returns `(db_offset, tx, frame_safe_block)` triples — the third element
+    /// is the covering frame's `safe_block`. Catch-up replay feeds it to
+    /// `execute_valid_user_op` so the app's safe-block clock advances exactly
+    /// as it did live (directs use their own `block_number` instead; the feed
+    /// ignores it). Callers should track `db_offset` of the last item as their
+    /// cursor, not increment a counter.
     pub fn ordered_l2_txs_page_from(
         &mut self,
         offset: u64,
         limit: usize,
-    ) -> Result<Vec<(u64, SequencedL2Tx)>> {
+    ) -> Result<Vec<(u64, SequencedL2Tx, u64)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -40,7 +44,8 @@ impl Storage {
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.data ELSE NULL END AS data,
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN f.fee  ELSE NULL END AS fee,
                 CASE WHEN s.safe_input_index   IS NOT NULL THEN d.payload      ELSE NULL END AS payload,
-                CASE WHEN s.safe_input_index   IS NOT NULL THEN d.block_number ELSE NULL END AS block_number
+                CASE WHEN s.safe_input_index   IS NOT NULL THEN d.block_number ELSE NULL END AS block_number,
+                f.safe_block
             FROM valid_sequenced_l2_txs s
             LEFT JOIN user_ops u
               ON u.batch_index    = s.batch_index
@@ -66,7 +71,10 @@ impl Storage {
                 row.get(5)?,
                 row.get(6)?,
             );
-            Ok((i64_to_u64(db_offset), tx))
+            // Non-NULL for every sequenced row: the frames row is inserted
+            // when the frame opens, before anything is sequenced into it.
+            let frame_safe_block: i64 = row.get(7)?;
+            Ok((i64_to_u64(db_offset), tx, i64_to_u64(frame_safe_block)))
         })?;
         rows.collect::<Result<Vec<_>>>()
     }

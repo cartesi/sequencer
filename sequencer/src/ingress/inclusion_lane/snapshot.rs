@@ -32,8 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sequencer_core::application::{AppError, Application};
+use sequencer_core::application::Application;
 
+use super::dump_info::{self, DumpInfo};
 use crate::storage::{SafeInputRange, Storage, WriteHead};
 
 /// Errors from snapshot-taking at batch close.
@@ -41,8 +42,8 @@ use crate::storage::{SafeInputRange, Storage, WriteHead};
 pub enum TakeDumpError {
     #[error("storage: {0}")]
     Storage(#[from] rusqlite::Error),
-    #[error("app: {0}")]
-    App(#[from] AppError),
+    #[error(transparent)]
+    CreateDump(#[from] dump_info::CreateDumpDirError),
 }
 
 /// Errors from the post-promotion GC pass.
@@ -50,6 +51,16 @@ pub enum TakeDumpError {
 pub enum GcError {
     #[error("storage: {0}")]
     Storage(#[from] rusqlite::Error),
+}
+
+/// Errors from stamping promotion metadata (`B`) into the finalized
+/// dump's `info.toml`.
+#[derive(Debug, thiserror::Error)]
+pub enum StampError {
+    #[error("storage: {0}")]
+    Storage(#[from] rusqlite::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Run one garbage-collection pass: delete every unreferenced dump
@@ -61,7 +72,7 @@ pub enum GcError {
 pub(super) fn run_gc<A: Application + 'static>(storage: &mut Storage) -> Result<usize, GcError> {
     let removed = storage.gc_unreferenced_dumps()?;
     for row in &removed {
-        if let Err(err) = A::delete_dump(&row.prefix) {
+        if let Err(err) = dump_info::delete_dump_dir::<A>(&row.prefix) {
             tracing::warn!(
                 error = %err,
                 prefix = ?row.prefix,
@@ -72,14 +83,35 @@ pub(super) fn run_gc<A: Application + 'static>(storage: &mut Storage) -> Result<
     Ok(removed.len())
 }
 
+/// Stamp `B` — the promotion's L1 inclusion block — into the freshly
+/// finalized dump's `info.toml`, completing the checkpoint metadata
+/// whose other fields were written at batch close. During live operation
+/// the DB row is authoritative for `B` and `info.toml` mirrors it (a
+/// crash between the promoting commit and this stamp is healed by the
+/// idempotent startup re-stamp from the same row). But `info.toml` is
+/// also the durable checkpoint the operator backs up and `setup
+/// --recovery` reads — there the DB is gone and the file is the sole
+/// authority for the resume nonce `N` — so keeping the two coherent here
+/// is load-bearing, not cosmetic.
+pub(super) fn stamp_finalized_promotion(storage: &mut Storage) -> Result<(), StampError> {
+    let finalized = storage
+        .finalized_dump()?
+        .expect("a promotion just committed, so the finalized snapshot row exists");
+    dump_info::stamp_promoted_inclusion_block(&finalized.dump.prefix, finalized.inclusion_block)?;
+    Ok(())
+}
+
 /// Close the current batch and register its snapshot atomically.
 ///
 /// Order matters for crash/error safety:
-/// 1. Read the closing batch's nonce (assigned at open) and build a
-///    unique dump prefix.
-/// 2. [`Application::create_dump`] writes + fsyncs the dump **before**
-///    any DB mutation. On failure nothing is sealed — the batch stays
-///    the open Tip and the lane retries on its next pass.
+/// 1. Read the closing batch's nonce (assigned at open) and the replay
+///    head; build a unique dump directory.
+/// 2. [`dump_info::create_dump_dir_with_info`] writes + fsyncs the dir,
+///    `info.toml` (`N` = nonce + 1, the replay head; `B` stamped later
+///    at promotion), and the app's dump — all **before** any DB
+///    mutation. On failure nothing is sealed — the batch stays the open
+///    Tip; the error propagates per the lane's fail-loud policy (the
+///    retry happens on the next boot, after catch-up).
 /// 3. One DB transaction seals the batch, opens the next, and inserts
 ///    the `pending_snapshots` row
 ///    ([`Storage::close_frame_and_batch_with_pending_dump`]). A
@@ -98,9 +130,23 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
     dumps_dir: &Path,
 ) -> Result<(), TakeDumpError> {
     let nonce = storage.batch_nonce(head.batch_index)?;
-    let prefix = make_dump_prefix(dumps_dir, nonce);
-    app.create_dump(&prefix)?;
-    storage.close_frame_and_batch_with_pending_dump(head, next_safe_block, &prefix, nonce)?;
+    // The snapshot reflects state through the global valid replay head
+    // as of the close; single-writer lane, so the head can't move before
+    // the close transaction (which re-asserts equality).
+    let l2_tx_index = storage.valid_ordered_l2_tx_head()?;
+    let dump_dir = make_dump_dir(dumps_dir, nonce);
+    dump_info::create_dump_dir_with_info(
+        app,
+        &dump_dir,
+        &DumpInfo::at_batch_close(nonce, l2_tx_index),
+    )?;
+    storage.close_frame_and_batch_with_pending_dump(
+        head,
+        next_safe_block,
+        &dump_dir,
+        nonce,
+        l2_tx_index,
+    )?;
     Ok(())
 }
 
@@ -121,9 +167,13 @@ pub(super) fn take_dump_at_batch_close<A: Application>(
     // not just this batch's own rows — so an empty batch correctly
     // records the prior head rather than genesis.
     let l2_tx_index = storage.valid_ordered_l2_tx_head()?;
-    let prefix = make_dump_prefix(dumps_dir, nonce);
-    app.create_dump(&prefix)?;
-    storage.insert_pending_dump(&prefix, nonce, l2_tx_index)?;
+    let dump_dir = make_dump_dir(dumps_dir, nonce);
+    dump_info::create_dump_dir_with_info(
+        app,
+        &dump_dir,
+        &DumpInfo::at_batch_close(nonce, l2_tx_index),
+    )?;
+    storage.insert_pending_dump(&dump_dir, nonce, l2_tx_index)?;
     Ok(())
 }
 
@@ -206,10 +256,12 @@ impl BlockObservation {
     }
 }
 
-fn make_dump_prefix(dumps_dir: &Path, nonce: u64) -> PathBuf {
+fn make_dump_dir(dumps_dir: &Path, nonce: u64) -> PathBuf {
     // Unique per call within a process: nonce + nanos + atomic counter.
     // Nonces can be reused across recovery cascades, so they alone
-    // don't guarantee uniqueness; the nanos+counter pair does.
+    // don't guarantee uniqueness; the nanos+counter pair does. The name
+    // is opaque — checkpoint metadata lives in the dir's `info.toml`,
+    // never in the path.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -224,7 +276,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    use alloy_primitives::{Address, U256};
+    use alloy_primitives::Address;
     use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
     use sequencer_core::l2_tx::ValidUserOp;
     use sequencer_core::user_op::UserOp;
@@ -232,6 +284,7 @@ mod tests {
     use crate::storage::Storage;
     use crate::storage::test_helpers::{seed_closed_batches, temp_db};
 
+    use super::dump_info;
     use super::{BlockObservation, take_dump_at_batch_close};
 
     /// Minimal Application that records every `create_dump` call. The
@@ -255,14 +308,6 @@ mod tests {
     impl Application for RecordingDumpApp {
         const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
 
-        fn current_user_nonce(&self, _sender: Address) -> u32 {
-            0
-        }
-
-        fn current_user_balance(&self, _sender: Address) -> U256 {
-            U256::ZERO
-        }
-
         fn validate_user_op(
             &self,
             _sender: Address,
@@ -275,8 +320,24 @@ mod tests {
         fn execute_valid_user_op(
             &mut self,
             _user_op: &ValidUserOp,
+            _safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
             Ok(Vec::new())
+        }
+
+        fn execute_direct_input(
+            &mut self,
+            _input: &sequencer_core::l2_tx::DirectInput,
+        ) -> Result<AppOutputs, AppError> {
+            unimplemented!("not used in these tests")
+        }
+
+        fn executed_input_count(&self) -> u64 {
+            0
+        }
+
+        fn last_executed_safe_block(&self) -> u64 {
+            0
         }
 
         fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
@@ -327,14 +388,25 @@ mod tests {
 
         let recorded = app.recorded();
         assert_eq!(recorded.len(), 1);
-        let prefix = &recorded[0];
-        assert!(prefix.starts_with(dumps_dir.path()));
-        assert!(prefix.join("state").exists(), "dump's state file exists");
+        let app_prefix = &recorded[0];
+        assert!(app_prefix.starts_with(dumps_dir.path()));
+        assert!(
+            app_prefix.join("state").exists(),
+            "dump's state file exists"
+        );
 
         let pending = storage.latest_pending_dump().unwrap().unwrap();
         assert_eq!(pending.nonce, 1);
-        assert_eq!(pending.dump.prefix, *prefix);
+        // The DB row stores the dump dir; the app dumped into `state`.
+        assert_eq!(dump_info::app_prefix(&pending.dump.prefix), *app_prefix);
         assert_eq!(pending.l2_tx_index, 0); // empty batch → no L2 txs
+
+        // info.toml carries the resume nonce and the same cursor;
+        // B is unstamped until promotion.
+        let info = dump_info::read_info(&pending.dump.prefix).unwrap();
+        assert_eq!(info.next_batch_nonce, 2);
+        assert_eq!(info.l2_tx_index, 0);
+        assert_eq!(info.promoted_inclusion_block, None);
     }
 
     #[test]
@@ -417,14 +489,6 @@ mod tests {
     impl Application for FailingDumpApp {
         const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
 
-        fn current_user_nonce(&self, _sender: Address) -> u32 {
-            0
-        }
-
-        fn current_user_balance(&self, _sender: Address) -> U256 {
-            U256::ZERO
-        }
-
         fn validate_user_op(
             &self,
             _sender: Address,
@@ -437,8 +501,24 @@ mod tests {
         fn execute_valid_user_op(
             &mut self,
             _user_op: &ValidUserOp,
+            _safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
             Ok(Vec::new())
+        }
+
+        fn execute_direct_input(
+            &mut self,
+            _input: &sequencer_core::l2_tx::DirectInput,
+        ) -> Result<AppOutputs, AppError> {
+            unimplemented!("not used in these tests")
+        }
+
+        fn executed_input_count(&self) -> u64 {
+            0
+        }
+
+        fn last_executed_safe_block(&self) -> u64 {
+            0
         }
 
         fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
@@ -474,7 +554,10 @@ mod tests {
         let err =
             super::close_batch_with_snapshot(&app, &mut storage, &mut head, 0, dumps_dir.path())
                 .expect_err("create_dump failure must abort the close");
-        assert!(matches!(err, super::TakeDumpError::App(_)));
+        assert!(matches!(
+            err,
+            super::TakeDumpError::CreateDump(dump_info::CreateDumpDirError::App(_))
+        ));
 
         // Nothing sealed: the batch is still the open Tip, no successor,
         // and no pending snapshot row was written.

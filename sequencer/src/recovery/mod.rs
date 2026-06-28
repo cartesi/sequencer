@@ -50,7 +50,7 @@ use crate::l1::reader::{InputReader, InputReaderError};
 use crate::runtime::config::L1Config;
 use crate::storage::{self, DangerStatus, StorageOpenError};
 pub use detector::{DangerDetector, DangerDetectorError, DetectorExit};
-pub use flusher::MempoolFlusher;
+pub use flusher::{FlushError, MempoolFlusher};
 use sequencer_core::protocol::ProtocolTiming;
 
 #[derive(Debug, Error)]
@@ -65,8 +65,38 @@ pub enum RecoveryError {
     InputReader(#[from] InputReaderError),
     #[error("provider: {0}")]
     Provider(String),
+    #[error("recovery flush chain-id mismatch: rpc {rpc} != pinned {expected}")]
+    ChainIdMismatch { rpc: u64, expected: u64 },
     #[error("startup refused: {0:?}")]
     Refuse(RefuseReason),
+    #[error(
+        "post-flush re-sync reached safe block {resynced_safe_block}, behind the \
+         flusher's observed resolution at {flush_observed_safe_block}; refusing to \
+         cascade on a lagging L1 view (respawn retries with a fresher view)"
+    )]
+    ResyncBehindFlushView {
+        resynced_safe_block: u64,
+        flush_observed_safe_block: u64,
+    },
+}
+
+/// F2 coherence guard: refuse if the post-flush re-sync's safe head lags the
+/// block the flusher observed resolution at. Folding (`setup --recovery`) or
+/// cascading (runtime danger) on a view that stops short of the flush's
+/// resolution would miss inputs the flush already settled. Shared by both
+/// recovery paths; the orchestrator respawn retries with a fresher L1 view (the
+/// flush is idempotent). See [`RecoveryError::ResyncBehindFlushView`].
+pub(crate) fn assert_resync_caught_up(
+    resynced_safe_block: u64,
+    flush_observed_safe_block: u64,
+) -> Result<(), RecoveryError> {
+    if resynced_safe_block < flush_observed_safe_block {
+        return Err(RecoveryError::ResyncBehindFlushView {
+            resynced_safe_block,
+            flush_observed_safe_block,
+        });
+    }
+    Ok(())
 }
 
 /// Why startup cannot proceed safely.
@@ -75,6 +105,13 @@ pub enum RecoveryError {
 /// startup unsafe. The operator sees the variant in logs and must intervene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefuseReason {
+    /// A fully-accepted L1 landing failed the content-identity check
+    /// (review R2): canonical state diverged from the local batch tree.
+    /// Terminal — no restart self-heals it; the operator must run cockroach
+    /// recovery (wipe + rebuild from L1). Standard recovery is forbidden:
+    /// it reconciles the tree's *shape* assuming accepted nonce N is our
+    /// batch N, which is exactly what no longer holds.
+    CanonicalDivergence { nonce: u64 },
     /// The L1 safe block timestamp is too old or unknown, so the local L1 view
     /// is not usable for recovery or continued soft confirmations.
     L1ViewStale,
@@ -124,29 +161,15 @@ impl StartupAction {
     }
 }
 
-fn danger_status_label(danger: DangerStatus) -> &'static str {
-    match danger {
-        DangerStatus::Safe => "safe",
-        DangerStatus::L1ViewStale => "l1_view_stale",
-        DangerStatus::ClosedBatchInDanger(_) => "closed_batch_in_danger",
-        DangerStatus::TipInDanger(_) => "tip_in_danger",
-        DangerStatus::EstimatedBatchInDanger(_) => "estimated_batch_in_danger",
-    }
-}
-
-fn danger_batch_index(danger: DangerStatus) -> Option<u64> {
-    match danger {
-        DangerStatus::ClosedBatchInDanger(batch_index)
-        | DangerStatus::TipInDanger(batch_index)
-        | DangerStatus::EstimatedBatchInDanger(batch_index) => Some(batch_index),
-        DangerStatus::Safe | DangerStatus::L1ViewStale => None,
-    }
-}
-
-fn refuse_reason_label(reason: RefuseReason) -> &'static str {
-    match reason {
-        RefuseReason::L1ViewStale => "l1_view_stale",
-        RefuseReason::EstimatedBatchInDanger { .. } => "estimated_batch_in_danger",
+impl RefuseReason {
+    /// Stable label for logs/metrics. Inherent method, co-located with the
+    /// variants (`DangerStatus::label`/`batch_index` live next to that enum).
+    fn label(self) -> &'static str {
+        match self {
+            RefuseReason::CanonicalDivergence { .. } => "canonical_divergence",
+            RefuseReason::L1ViewStale => "l1_view_stale",
+            RefuseReason::EstimatedBatchInDanger { .. } => "estimated_batch_in_danger",
+        }
     }
 }
 
@@ -156,6 +179,9 @@ fn refuse_reason_label(reason: RefuseReason) -> &'static str {
 pub fn decide_startup_action(danger: DangerStatus) -> StartupAction {
     match danger {
         DangerStatus::Safe => StartupAction::Proceed,
+        DangerStatus::CanonicalDivergence(nonce) => {
+            StartupAction::Refuse(RefuseReason::CanonicalDivergence { nonce })
+        }
         DangerStatus::ClosedBatchInDanger(batch_index) => {
             StartupAction::FlushAndCascade { batch_index }
         }
@@ -213,8 +239,8 @@ pub async fn run_preemptive_recovery(
     };
     let action = decide_startup_action(danger);
     tracing::info!(
-        danger_status = danger_status_label(danger),
-        danger_batch_index = ?danger_batch_index(danger),
+        danger_status = danger.label(),
+        danger_batch_index = ?danger.batch_index(),
         startup_action = action.label(),
         l1_reachable,
         danger_threshold = protocol.danger_threshold(),
@@ -242,8 +268,8 @@ pub async fn run_preemptive_recovery(
     let invalidated = match action {
         StartupAction::Proceed => {
             tracing::info!(
-                danger_status = danger_status_label(danger),
-                danger_batch_index = ?danger_batch_index(danger),
+                danger_status = danger.label(),
+                danger_batch_index = ?danger.batch_index(),
                 startup_action = action.label(),
                 "no danger zone detected — proceeding without recovery"
             );
@@ -257,8 +283,8 @@ pub async fn run_preemptive_recovery(
         }
         StartupAction::RecoverTip { batch_index } => {
             tracing::error!(
-                danger_status = danger_status_label(danger),
-                danger_batch_index = ?danger_batch_index(danger),
+                danger_status = danger.label(),
+                danger_batch_index = ?danger.batch_index(),
                 startup_action = action.label(),
                 tip_batch_index = batch_index,
                 danger_threshold = protocol.danger_threshold(),
@@ -269,8 +295,8 @@ pub async fn run_preemptive_recovery(
         }
         StartupAction::FlushAndCascade { batch_index } => {
             tracing::error!(
-                danger_status = danger_status_label(danger),
-                danger_batch_index = ?danger_batch_index(danger),
+                danger_status = danger.label(),
+                danger_batch_index = ?danger.batch_index(),
                 startup_action = action.label(),
                 batch_index,
                 danger_threshold = protocol.danger_threshold(),
@@ -281,11 +307,11 @@ pub async fn run_preemptive_recovery(
         }
         StartupAction::Refuse(reason) => {
             tracing::error!(
-                danger_status = danger_status_label(danger),
-                danger_batch_index = ?danger_batch_index(danger),
+                danger_status = danger.label(),
+                danger_batch_index = ?danger.batch_index(),
                 startup_action = action.label(),
                 ?reason,
-                refuse_reason = refuse_reason_label(reason),
+                refuse_reason = reason.label(),
                 l1_reachable,
                 "startup refused: cannot recover safely"
             );
@@ -295,8 +321,8 @@ pub async fn run_preemptive_recovery(
 
     if invalidated.is_empty() {
         tracing::info!(
-            danger_status = danger_status_label(danger),
-            danger_batch_index = ?danger_batch_index(danger),
+            danger_status = danger.label(),
+            danger_batch_index = ?danger.batch_index(),
             startup_action = action.label(),
             invalidated_count = 0,
             "startup recovery complete — no batches invalidated"
@@ -307,8 +333,8 @@ pub async fn run_preemptive_recovery(
         // log already alerted the operator at error level; this completes
         // that incident with a non-error outcome.
         tracing::warn!(
-            danger_status = danger_status_label(danger),
-            danger_batch_index = ?danger_batch_index(danger),
+            danger_status = danger.label(),
+            danger_batch_index = ?danger.batch_index(),
             startup_action = action.label(),
             invalidated_count = invalidated.len(),
             batches = ?invalidated,
@@ -332,17 +358,41 @@ async fn run_flush_and_cascade(
     l1_config: &L1Config,
     protocol: &ProtocolTiming,
 ) -> Result<Vec<u64>, RecoveryError> {
-    let flush_provider = crate::l1::provider::create_signer_provider(
+    // Keyed-write chain-id gate (review): the flush signs L1 no-op txs, so it
+    // must confirm the RPC still serves the pinned chain *immediately before
+    // signing*. The boot-time `validate_rpc_chain_id` and the reader's one-shot
+    // `verify_chain_id` are both stale by now (a load-balanced RPC could have
+    // failed over to another chain since), so neither is a sufficient backstop
+    // for a fresh keyed write. `create_verified_signer_provider` folds the check
+    // into the signer build so this path cannot skip it. A mismatch is terminal
+    // (operator misconfig); an RPC error is retryable (handled like `Provider`).
+    let flush_provider = crate::l1::provider::create_verified_signer_provider(
         &l1_config.eth_rpc_url,
         &l1_config.batch_submitter_private_key,
+        l1_config.chain_id,
     )
-    .map_err(|e| RecoveryError::Provider(e.to_string()))?;
-    let flusher = MempoolFlusher::new(
+    .await
+    .map_err(|e| match e {
+        crate::l1::provider::VerifiedSignerProviderError::ChainIdMismatch { rpc, expected } => {
+            RecoveryError::ChainIdMismatch { rpc, expected }
+        }
+        other => RecoveryError::Provider(other.to_string()),
+    })?;
+    // The persisted watermark anchors the flush: every slot this deployment
+    // ever broadcast must resolve at safe depth, regardless of what the
+    // local node's pool remembers (review R1a / F1).
+    let watermark = {
+        let mut storage = storage::Storage::open(db_path)?;
+        storage.wallet_nonce_watermark()?
+    };
+    let flush_observed_safe_block = MempoolFlusher::flush_to_safe(
         flush_provider,
         l1_config.batch_submitter_address,
         protocol.seconds_per_block,
-    );
-    flusher.flush_and_wait().await?;
+        db_path,
+        watermark,
+    )
+    .await?;
 
     // If this re-sync errors out, L1 has been flushed but the DB has NOT been
     // cascaded — we exit with the InputReaderError and rely on the orchestrator
@@ -351,10 +401,13 @@ async fn run_flush_and_cascade(
     // - `flush_and_wait` is idempotent: on the next attempt it queries L1 for
     //   pending wallet-nonces, finds zero (the previous flush cleared them),
     //   and returns immediately.
-    // - `check_danger` is stable across the failure window: safe_block only
-    //   moves forward and flush doesn't retroactively change closed batches'
-    //   `first_frame_safe_block`, so the danger condition that fired before
-    //   still fires after the restart.
+    // - `check_danger` re-decides on the post-flush state. Two cases: the
+    //   danger persists (the restart re-enters this same path — flush is a
+    //   no-op the second time), or the original danger resolved during the
+    //   flush (e.g. the frontier batch landed gold), in which case the
+    //   restart proceeds normally with any no-op'd Pending batch left valid —
+    //   safe, since it simply resubmits at a fresh slot with no poisoned
+    //   ancestor.
     // - `recover_post_flush` is idempotent against the resulting DB state
     //   (verified by `after_post_recovery_crash_is_no_op` in `recovery_tests`).
     //
@@ -368,6 +421,17 @@ async fn run_flush_and_cascade(
 
     tracing::info!("running post-flush recovery (cascade non-gold suffix)");
     let mut storage = storage::Storage::open(db_path)?;
+
+    // Coherence check (review F2): the cascade's precondition is that the
+    // gold frontier reflects at least the safe view the flusher observed
+    // resolution at. Behind a load-balanced RPC, the reader's re-sync can be
+    // served by a replica lagging the flusher's view — cascading then could
+    // invalidate a batch the scheduler actually accepted and reuse its
+    // nonce. Refuse instead; the orchestrator respawn retries with a
+    // fresher view (the flush is idempotent).
+    let resynced_safe_block = storage.current_safe_block()?.unwrap_or(0);
+    assert_resync_caught_up(resynced_safe_block, flush_observed_safe_block)?;
+
     Ok(storage.recover_post_flush(protocol.danger_threshold())?)
 }
 
@@ -380,6 +444,17 @@ mod tests {
         assert_eq!(
             decide_startup_action(DangerStatus::Safe),
             StartupAction::Proceed
+        );
+    }
+
+    #[test]
+    fn refuse_on_canonical_divergence() {
+        // Terminal refusal — never `Proceed`, never a flush+cascade on top
+        // of a diverged frontier (review R2). The remedy is cockroach
+        // recovery, outside this dispatch entirely.
+        assert_eq!(
+            decide_startup_action(DangerStatus::CanonicalDivergence(7)),
+            StartupAction::Refuse(RefuseReason::CanonicalDivergence { nonce: 7 })
         );
     }
 

@@ -15,6 +15,7 @@
 
 mod catch_up;
 mod config;
+pub mod dump_info;
 mod error;
 mod snapshot;
 mod types;
@@ -34,7 +35,9 @@ use tokio::task::JoinHandle;
 
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput, WriteHead};
-use sequencer_core::application::{AppError, Application, ExecutionOutcome};
+use sequencer_core::application::{
+    AppError, Application, ExecutionOutcome, validate_and_execute_user_op,
+};
 use sequencer_core::l2_tx::DirectInput;
 use sequencer_core::user_op::SignedUserOp;
 
@@ -83,12 +86,13 @@ impl<A: Application + 'static> InclusionLane<A> {
         let handle = tokio::task::spawn_blocking(move || -> Result<(), InclusionLaneError> {
             let mut storage = storage;
             // Single checkpoint selection: the same snapshot supplies both
-            // the prefix we load the Application from and the offset we
+            // the dump dir we load the Application from and the offset we
             // replay from, so the loaded state and the catch-up cursor
             // can never drift apart.
             let checkpoint = catch_up_snapshot(&mut storage)
                 .map_err(|source| InclusionLaneError::CatchUp { source })?;
-            let app = A::from_dump(&checkpoint.prefix).map_err(InclusionLaneError::LoadFromDump)?;
+            let app = A::from_dump(&dump_info::app_prefix(&checkpoint.dump_dir))
+                .map_err(InclusionLaneError::LoadFromDump)?;
             tracing::debug!(
                 l2_tx_index = checkpoint.l2_tx_index,
                 "inclusion lane resuming from snapshot"
@@ -274,6 +278,9 @@ impl<A: Application + 'static> InclusionLane<A> {
         // promotion created garbage — so GC tracks garbage creation, never
         // starved by load.
         if promoted {
+            // Stamp `B` into the freshly finalized dump's info.toml before
+            // GC (the stamp targets the survivor; GC removes the superseded).
+            snapshot::stamp_finalized_promotion(&mut self.storage)?;
             let removed =
                 snapshot::run_gc::<A>(&mut self.storage).map_err(InclusionLaneError::Gc)?;
             if removed > 0 {
@@ -409,6 +416,10 @@ pub(super) enum ChunkOutcome {
 }
 
 fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) -> bool {
+    // A backwards clock step makes `duration_since` err; `unwrap_or_default`
+    // then reads as age 0, silently stalling the time-based close trigger
+    // until the clock catches up (review F8). Acceptable: the size trigger
+    // is unaffected, and a wedge here is liveness-only, never correctness.
     let age = SystemTime::now()
         .duration_since(head.batch_created_at)
         .unwrap_or_default();
@@ -419,12 +430,15 @@ fn execute_user_op(
     app: &mut impl Application,
     item: PendingUserOp,
     current_frame_fee: u16,
+    frame_safe_block: u64,
     included: &mut Vec<PendingUserOp>,
 ) -> Result<(), InclusionLaneError> {
-    match app.validate_and_execute_user_op(
+    match validate_and_execute_user_op(
+        app,
         item.signed.sender,
         &item.signed.user_op,
         current_frame_fee,
+        frame_safe_block,
     ) {
         Ok(ExecutionOutcome::Included { .. }) => included.push(item),
         Ok(ExecutionOutcome::Invalid(reason)) => {
@@ -432,6 +446,14 @@ fn execute_user_op(
                 .respond_to
                 .send(Err(SequencerError::invalid(reason.to_string())));
         }
+        // Fail loud — the lane half of an asymmetry with the canonical fold
+        // (`execute_frame_user_ops` in `sequencer-core`), which silently *skips*
+        // this same `AppError`. Duality (I1) is preserved: an `AppError` excludes
+        // the op from state on both sides (here it is never pushed to `included`,
+        // there `outputs` is never extended), so the canonical state agrees. The
+        // lane additionally aborts because an error from a *validated* op is an
+        // internal-invariant breach, not a user-facing rejection — dead by
+        // construction today (see the matching note in the scheduler).
         Err(err) => {
             let reason = match &err {
                 AppError::Internal { reason } => reason.clone(),
@@ -464,7 +486,7 @@ pub(super) fn dequeue_and_execute_user_op_chunk<A: Application>(
     while executed < max_chunk {
         match rx.try_recv() {
             Ok(item) => {
-                execute_user_op(app, item, current_frame_fee, included)?;
+                execute_user_op(app, item, current_frame_fee, head.safe_block, included)?;
                 executed = executed.saturating_add(1);
 
                 let projected = head

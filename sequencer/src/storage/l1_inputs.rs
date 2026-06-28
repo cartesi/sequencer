@@ -17,7 +17,7 @@ use super::queries::{
     query_latest_safe_input_index_exclusive,
 };
 use super::safe_accepted_batches::populate_safe_accepted_batches;
-use super::{DeploymentIdentity, StoredSafeInput};
+use super::{DeploymentIdentity, FrontierMode, StoredSafeInput};
 use sequencer_core::protocol::ProtocolTiming;
 
 impl Storage {
@@ -33,6 +33,85 @@ impl Storage {
 
     pub fn current_safe_block_timestamp(&mut self) -> Result<Option<u64>> {
         current_safe_block_timestamp(&self.conn)
+    }
+
+    /// First batch-submitter `safe_inputs` row strictly past `after_block`, by
+    /// ascending `safe_input_index` — returns `(safe_input_index, block_number)`
+    /// or `None`. Read-only; `setup`'s detection gate uses it
+    /// to find any previous-instance batch past the checkpoint block.
+    ///
+    /// Queries the reader-synced `safe_inputs` table rather than issuing its own
+    /// `get_logs`, so it inherits the reader's F5 completeness guarantees (a
+    /// per-app index contiguity check plus a `getNumberOfInputs` count witness):
+    /// the reader refuses to persist an incomplete `get_logs` response, so the
+    /// synced table is complete through the safe head. Do **not** replace this
+    /// with a fresh log scan, which would bypass that protection. Detection runs
+    /// after `setup`'s initial sync has populated `safe_inputs` up to the safe
+    /// head;
+    /// because step 1 has already confirmed the wallet nonce is settled
+    /// (nothing of ours sits unsafe), querying the synced safe inputs is
+    /// equivalent to scanning `(after_block, safe]`.
+    pub fn first_batch_submitter_input_after_block(
+        &mut self,
+        batch_submitter: Address,
+        after_block: u64,
+    ) -> Result<Option<(u64, u64)>> {
+        self.conn
+            .query_row(
+                "SELECT safe_input_index, block_number FROM safe_inputs \
+                 WHERE sender = ?1 AND block_number > ?2 \
+                 ORDER BY safe_input_index ASC LIMIT 1",
+                params![batch_submitter.as_slice(), u64_to_i64(after_block)],
+                |row| {
+                    let index: i64 = row.get(0)?;
+                    let block: i64 = row.get(1)?;
+                    Ok((i64_to_u64(index), i64_to_u64(block)))
+                },
+            )
+            .optional()
+    }
+
+    /// All `safe_inputs` rows whose `block_number` is in `(after_block,
+    /// through_block]`, ordered by `safe_input_index` ascending — i.e. L1
+    /// inclusion order. The recovery fold sources
+    /// its seeds from `(A, B]` and its replay stream from `(B, C]` through this:
+    /// half-open on the lower bound (directs at block `B` belong to the fridge,
+    /// batches at `B` are already in `S` — open-question 1 boundary convention).
+    ///
+    /// Returns both senders and directs; the caller classifies (a batch iff
+    /// `sender == batch_submitter`) and drops batches from the `(A, B]` seed set.
+    /// Read-only; queries the reader-synced table rather than a fresh log scan,
+    /// inheriting the reader's F5 completeness guarantees (see
+    /// [`Storage::first_batch_submitter_input_after_block`]).
+    pub fn safe_inputs_in_block_range(
+        &mut self,
+        after_block: u64,
+        through_block: u64,
+    ) -> Result<Vec<StoredSafeInput>> {
+        const SQL: &str = "SELECT sender, payload, block_number FROM safe_inputs \
+                           WHERE block_number > ?1 AND block_number <= ?2 \
+                           ORDER BY safe_input_index ASC";
+        let mut stmt = self.conn.prepare_cached(SQL)?;
+        let rows = stmt.query_map(
+            params![u64_to_i64(after_block), u64_to_i64(through_block)],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (sender, payload, block_number) = row?;
+            out.push(StoredSafeInput {
+                sender: Address::from_slice(sender.as_slice()),
+                payload,
+                block_number: i64_to_u64(block_number),
+            });
+        }
+        Ok(out)
     }
 
     /// Atomically: insert `inputs` (assigned contiguous indexes starting from
@@ -62,6 +141,7 @@ impl Storage {
             inputs,
             batch_submitter,
             timing,
+            FrontierMode::Populate,
         )
     }
 
@@ -69,6 +149,10 @@ impl Storage {
     /// of `safe_block`. Production input-reader code should use this path;
     /// the shorter helper exists for tests that only need a fresh synthetic
     /// safe head.
+    ///
+    /// `frontier` gates the `safe_accepted_batches` update — see
+    /// [`FrontierMode`]. Everything except `setup --recovery`'s interim syncs
+    /// uses [`FrontierMode::Populate`].
     pub fn append_safe_inputs_with_timestamp(
         &mut self,
         safe_block: u64,
@@ -76,6 +160,7 @@ impl Storage {
         inputs: &[StoredSafeInput],
         batch_submitter: Address,
         timing: &ProtocolTiming,
+        frontier: FrontierMode,
     ) -> Result<()> {
         self.write(|tx| {
             if let Some(current) = current_safe_block(tx)? {
@@ -110,7 +195,10 @@ impl Storage {
                 return Err(rusqlite::Error::StatementChangedRows(changed));
             }
 
-            populate_safe_accepted_batches(tx, batch_submitter, timing)
+            if matches!(frontier, FrontierMode::Populate) {
+                populate_safe_accepted_batches(tx, batch_submitter, timing)?;
+            }
+            Ok(())
         })
     }
 
@@ -172,6 +260,37 @@ impl Storage {
             Ok(identity)
         })
     }
+
+    /// Record that `setup` finished. This is `setup`'s LAST write — after
+    /// identity is pinned, the initial L1 sync is durable, and the genesis
+    /// finalized snapshot is registered.
+    /// Idempotent: re-running `setup` on an already-complete DB leaves the
+    /// original `completed_at_ms` untouched.
+    pub fn mark_setup_complete(&mut self) -> Result<()> {
+        self.write(|tx| {
+            // Deliberate idempotency (re-running `setup` is legitimate), not
+            // silent absorption: keep the first completion timestamp.
+            tx.execute(
+                "INSERT INTO setup_complete (singleton_id, completed_at_ms) \
+                 VALUES (0, ?1) \
+                 ON CONFLICT(singleton_id) DO NOTHING",
+                params![now_unix_ms()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether `setup` has completed on this DB. `run` refuses to boot when
+    /// this is `false` — the marker absent means either setup never ran or it
+    /// crashed midway, both of which require `setup` (re-)run, not `run`.
+    pub fn is_setup_complete(&self) -> Result<bool> {
+        let present: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM setup_complete WHERE singleton_id = 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(present != 0)
+    }
 }
 
 fn query_deployment_identity(conn: &rusqlite::Connection) -> Result<Option<DeploymentIdentity>> {
@@ -219,7 +338,7 @@ fn insert_safe_inputs_batch(
 #[cfg(test)]
 mod tests {
     use crate::storage::{
-        DeploymentIdentity, SafeInputRange, Storage, StoredSafeInput,
+        DeploymentIdentity, FrontierMode, SafeInputRange, Storage, StoredSafeInput,
         test_helpers::{SENDER_A, SENDER_B, default_protocol_timing, temp_db},
     };
     use alloy_primitives::Address;
@@ -274,6 +393,155 @@ mod tests {
             .fill_safe_inputs(SafeInputRange::new(1, 1), &mut out)
             .expect("query empty half-open interval");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn first_batch_submitter_input_after_block_scans_strictly_past() {
+        let db = temp_db("first-submitter-input-after");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_protocol_timing();
+
+        // index 0: submitter @5; index 1: non-submitter @12; index 2: submitter @18.
+        // Payloads are junk (scheduler no-ops on decode) — detection scans the
+        // raw safe_inputs rows, not the accepted frontier, so acceptance is
+        // irrelevant: ANY submitter activity past the checkpoint matters.
+        let inputs = vec![
+            StoredSafeInput {
+                sender: SENDER_A,
+                payload: vec![0x01],
+                block_number: 5,
+            },
+            StoredSafeInput {
+                sender: SENDER_B,
+                payload: vec![0x02],
+                block_number: 12,
+            },
+            StoredSafeInput {
+                sender: SENDER_A,
+                payload: vec![0x03],
+                block_number: 18,
+            },
+        ];
+        storage
+            .append_safe_inputs(20, inputs.as_slice(), SENDER_A, &protocol)
+            .expect("seed safe inputs");
+
+        // From genesis (0): the earliest submitter input is index 0 @5.
+        assert_eq!(
+            storage
+                .first_batch_submitter_input_after_block(SENDER_A, 0)
+                .expect("scan"),
+            Some((0, 5))
+        );
+        // Strictly past: block 5 is excluded; the non-submitter @12 is skipped;
+        // next submitter is index 2 @18.
+        assert_eq!(
+            storage
+                .first_batch_submitter_input_after_block(SENDER_A, 5)
+                .expect("scan"),
+            Some((2, 18))
+        );
+        // Past the last submitter input: nothing.
+        assert_eq!(
+            storage
+                .first_batch_submitter_input_after_block(SENDER_A, 18)
+                .expect("scan"),
+            None
+        );
+        // A different submitter address never matches SENDER_A's rows.
+        assert_eq!(
+            storage
+                .first_batch_submitter_input_after_block(Address::repeat_byte(0xCC), 0)
+                .expect("scan"),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_inputs_in_block_range_is_half_open_lower_and_ordered() {
+        let db = temp_db("safe-inputs-block-range");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_protocol_timing();
+
+        // Blocks 5 (direct), 10 (batch from SENDER_A + direct from SENDER_B),
+        // 15 (direct). SENDER_A is the batch submitter (identity above).
+        let inputs = vec![
+            StoredSafeInput {
+                sender: SENDER_B,
+                payload: vec![0x05],
+                block_number: 5,
+            },
+            StoredSafeInput {
+                sender: SENDER_A,
+                payload: vec![0x10],
+                block_number: 10,
+            },
+            StoredSafeInput {
+                sender: SENDER_B,
+                payload: vec![0x11],
+                block_number: 10,
+            },
+            StoredSafeInput {
+                sender: SENDER_B,
+                payload: vec![0x15],
+                block_number: 15,
+            },
+        ];
+        storage
+            .append_safe_inputs(15, inputs.as_slice(), SENDER_A, &protocol)
+            .expect("seed safe inputs");
+
+        // (5, 15] excludes block 5, includes block 15 — ordered by index.
+        let mid = storage
+            .safe_inputs_in_block_range(5, 15)
+            .expect("range (5,15]");
+        let blocks: Vec<u64> = mid.iter().map(|i| i.block_number).collect();
+        assert_eq!(blocks, vec![10, 10, 15], "half-open lower bound; ascending");
+
+        // Caller classifies: drop sender == batch_submitter to get the directs
+        // of the seed range (the (A,B] fridge reconstruction).
+        let directs: Vec<&[u8]> = mid
+            .iter()
+            .filter(|i| i.sender != SENDER_A)
+            .map(|i| i.payload.as_slice())
+            .collect();
+        assert_eq!(
+            directs,
+            vec![&[0x11u8][..], &[0x15u8][..]],
+            "batch at block 10 dropped"
+        );
+
+        // Empty when the lower bound covers everything.
+        assert!(
+            storage
+                .safe_inputs_in_block_range(15, 15)
+                .expect("empty")
+                .is_empty()
+        );
+        // Full span from genesis.
+        assert_eq!(
+            storage
+                .safe_inputs_in_block_range(0, 100)
+                .expect("all")
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn batch_tree_anchor_roundtrips_and_freezes_after_setup() {
+        let db = temp_db("anchor-roundtrip");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        assert_eq!(storage.batch_tree_anchor().expect("default"), 0);
+        storage.set_batch_tree_anchor(1200).expect("set anchor");
+        assert_eq!(storage.batch_tree_anchor().expect("read back"), 1200);
+        // Once setup is complete, the public setter aborts too (write-once).
+        storage.mark_setup_complete().expect("mark complete");
+        assert!(
+            storage.set_batch_tree_anchor(1300).is_err(),
+            "anchor must be frozen after setup_complete"
+        );
+        assert_eq!(storage.batch_tree_anchor().expect("unchanged"), 1200);
     }
 
     #[test]
@@ -345,13 +613,62 @@ mod tests {
     }
 
     #[test]
+    fn setup_complete_marker_absent_until_marked_then_idempotent() {
+        let db = temp_db("setup-complete-marker");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        assert!(
+            !storage
+                .is_setup_complete()
+                .expect("read marker on fresh DB"),
+            "fresh DB has no setup-complete marker"
+        );
+
+        storage.mark_setup_complete().expect("mark complete");
+        assert!(
+            storage.is_setup_complete().expect("read marker"),
+            "marker present after mark_setup_complete"
+        );
+
+        let first_ts: i64 = storage
+            .conn
+            .query_row(
+                "SELECT completed_at_ms FROM setup_complete WHERE singleton_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read completed_at_ms");
+
+        // Re-running setup is legitimate and must not error or move the
+        // original timestamp.
+        storage.mark_setup_complete().expect("mark complete again");
+        let second_ts: i64 = storage
+            .conn
+            .query_row(
+                "SELECT completed_at_ms FROM setup_complete WHERE singleton_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read completed_at_ms");
+        assert_eq!(first_ts, second_ts, "idempotent: first timestamp kept");
+        assert!(storage.is_setup_complete().expect("read marker"));
+    }
+
+    #[test]
     fn append_safe_inputs_creates_and_advances_safe_head() {
         let db = temp_db("append-safe-inputs-creates-safe-head");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_protocol_timing();
 
         storage
-            .append_safe_inputs_with_timestamp(7, 1234, &[], SENDER_A, &protocol)
+            .append_safe_inputs_with_timestamp(
+                7,
+                1234,
+                &[],
+                SENDER_A,
+                &protocol,
+                FrontierMode::Populate,
+            )
             .expect("record first real safe-head observation");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
@@ -371,7 +688,14 @@ mod tests {
         );
 
         storage
-            .append_safe_inputs_with_timestamp(9, 5678, &[], SENDER_A, &protocol)
+            .append_safe_inputs_with_timestamp(
+                9,
+                5678,
+                &[],
+                SENDER_A,
+                &protocol,
+                FrontierMode::Populate,
+            )
             .expect("advance safe head");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),

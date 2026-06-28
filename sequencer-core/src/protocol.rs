@@ -218,6 +218,17 @@ impl ProtocolTiming {
     /// Rejection paths (wrong sender, SSZ decode failure, stale by inclusion,
     /// nonce mismatch) return `None` without advancing — matching what the
     /// scheduler does on-chain.
+    ///
+    /// **Deliberately omitted structural rejects.** The canonical fold's
+    /// `batch_reject_reason_for_block` additionally rejects a batch whose frames
+    /// have a `safe_block` above the inclusion block
+    /// (`SafeBlockAboveInclusionBlock`) or that decrease across frames
+    /// (`NonMonotonicSafeBlocks`). This predicate does not re-check those: a
+    /// well-formed batch submitter never builds such a batch, so they are
+    /// reachable only under a buggy or forked submitter — already outside the
+    /// duality boundary. The I1 duality test pins this as a *documented*
+    /// asymmetry; mirror those two checks here if the submitter ever stops being
+    /// trusted to be well-formed.
     pub fn scheduler_accepts(
         &self,
         batch_submitter: Address,
@@ -252,6 +263,42 @@ impl ProtocolTiming {
 /// frame).
 pub fn age_exceeds(reference_block: u64, first_frame_safe_block: u64, threshold: u64) -> bool {
     reference_block.saturating_sub(first_frame_safe_block) >= threshold
+}
+
+/// Advance `expected` by greedily consuming any matching observed nonce.
+///
+/// `observed_nonces` is the stream of **batch nonces** (from the SSZ payload)
+/// decoded from `InputAdded` events sent by our batch-submitter EOA, in L1
+/// event order. Because L1 mines txs from a single EOA in strict wallet-nonce
+/// order, this stream is naturally gap-less at the wallet-nonce level:
+/// tx[k]'s event cannot appear on-chain without tx[k-1]'s event, and the
+/// observed batch nonce sequence therefore mirrors our submission order.
+///
+/// Batch nonces themselves (unlike wallet nonces) CAN repeat across recovery
+/// generations — e.g., after a cascade, a fresh batch reuses its invalidated
+/// predecessor's nonce. That's why we still match on equality rather than
+/// trusting a sort: in a post-recovery window, the same batch nonce can be
+/// observed twice (once from the invalidated generation, once from the new
+/// one), and we only want to advance once.
+///
+/// Under the wallet-nonce ordering above, once the next `expected` doesn't
+/// appear in the stream the frontier naturally stops advancing — the gap
+/// means the scheduler hasn't seen that nonce on-chain yet (or observed it at
+/// a different wallet nonce from an earlier generation).
+///
+/// Co-located here next to [`ProtocolTiming::scheduler_accepts`] so all
+/// scheduler-mirroring acceptance logic lives at the library seam (the
+/// off-chain mirror of the canonical scheduler's batch-nonce fold).
+pub fn advance_expected_batch_nonce(
+    mut expected: u64,
+    observed_nonces: impl IntoIterator<Item = u64>,
+) -> u64 {
+    for nonce in observed_nonces {
+        if nonce == expected {
+            expected = expected.saturating_add(1);
+        }
+    }
+    expected
 }
 
 /// Borrowed view of one safe-input row, in the shape scheduler_accepts needs.
@@ -596,5 +643,21 @@ mod tests {
             inclusion_block: MAX_WAIT.saturating_mul(10),
         };
         assert!(timing().scheduler_accepts(SUBMITTER, input, 0).is_some());
+    }
+
+    #[test]
+    fn advance_expected_batch_nonce_matches_scheduler_nonce_rule() {
+        use super::advance_expected_batch_nonce;
+        assert_eq!(advance_expected_batch_nonce(0, Vec::<u64>::new()), 0);
+        assert_eq!(advance_expected_batch_nonce(0, vec![0, 1, 2]), 3);
+        assert_eq!(advance_expected_batch_nonce(0, vec![0, 2, 3]), 1);
+        assert_eq!(advance_expected_batch_nonce(0, vec![1, 2, 3]), 0);
+        assert_eq!(advance_expected_batch_nonce(0, vec![0, 1, 1, 2]), 3);
+        assert_eq!(
+            advance_expected_batch_nonce(0, vec![6, 4, 3, 2, 2, 0, 1]),
+            2
+        );
+        assert_eq!(advance_expected_batch_nonce(0, vec![0, 2, 1]), 2);
+        assert_eq!(advance_expected_batch_nonce(2, vec![2, 3]), 4);
     }
 }

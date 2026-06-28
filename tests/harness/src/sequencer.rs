@@ -24,8 +24,21 @@ use crate::ws::WsClient;
 
 const DEFAULT_SEQUENCER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Cadence at which the harness mines an L1 block during a recovery boot's
+/// readiness wait when [`ManagedSequencer::set_mine_l1_during_boot`] is on.
+/// Fast enough that Anvil's `safe` tag advances past the flushed nonce within
+/// the readiness window; the exact value is a harness detail, not test-visible.
+const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_millis(200);
+/// Readiness budget for a *recovery* boot (mining-during-boot enabled). The WP2
+/// mempool flush polls `get_transaction_count(Safe)` once per L1 block time
+/// (`safe_poll_interval = seconds_per_block`, 12 s here), so it cannot resolve
+/// the stranded slot in under one poll cycle — well past the 10 s normal-boot
+/// budget. Allow several cycles of slack so a recovery boot has room to flush,
+/// cascade, and come up. Recovery boots are legitimately slow (review R4 class
+/// 10); this is the harness counterpart to that.
+const RECOVERY_BOOT_START_TIMEOUT: Duration = Duration::from_secs(45);
 const DEFAULT_SEQUENCER_RUST_LOG: &str = "info";
-pub const DEFAULT_DEVNET_SEQUENCER_BIN: &str = "target/debug/sequencer-devnet";
+pub const DEFAULT_DEVNET_SEQUENCER_BIN: &str = "target/debug/wallet-sequencer-devnet";
 pub const DEFAULT_TEST_LOGS_DIR: &str = "tests/e2e/results";
 
 #[derive(Debug, Clone)]
@@ -45,6 +58,31 @@ pub struct BatchCounts {
     pub total: u64,
     pub sealed: u64,
     pub invalidated: u64,
+}
+
+/// Drive the next respawn's `setup` phase into `--recovery` mode against a
+/// captured checkpoint. Set via [`ManagedSequencer::set_recovery_setup`] before
+/// wiping the DB and respawning.
+#[derive(Debug, Clone)]
+pub struct RecoverySetupParams {
+    /// `B` — the checkpoint's L1 inclusion block (`--checkpoint-block`).
+    pub checkpoint_block: u64,
+    /// The captured checkpoint dump dir (`--checkpoint-dump-dir`).
+    pub checkpoint_dump_dir: PathBuf,
+}
+
+/// A checkpoint captured from a running sequencer's finalized snapshot, ready to
+/// drive `setup --recovery`. Returned by
+/// [`ManagedSequencer::capture_finalized_checkpoint`].
+#[derive(Debug, Clone)]
+pub struct RecoveryCheckpoint {
+    /// The copied dump dir (lives outside the DB/`dumps` reset scope, so it
+    /// survives [`ManagedSequencer::reset_database`]).
+    pub dir: PathBuf,
+    /// `B` — the finalized snapshot's L1 inclusion block.
+    pub checkpoint_block: u64,
+    /// `N` — the snapshot's recorded resume nonce (`info.toml next_batch_nonce`).
+    pub resume_nonce: u64,
 }
 
 /// Outcome of a single [`ManagedSequencer::respawn_and_watch`] attempt.
@@ -108,6 +146,20 @@ pub struct ManagedSequencer {
     /// [`Self::advance_wall_and_mine`]. Not touched by
     /// [`Self::set_faketime_offset`].
     cumulative_offset_secs: u64,
+    /// When `true`, [`Self::respawn`] mines L1 blocks concurrently with the
+    /// post-boot readiness wait so a recovery boot's mempool flush can make
+    /// progress. See [`Self::set_mine_l1_during_boot`]. Persists across
+    /// respawns like the other overrides.
+    mine_l1_during_boot: bool,
+    /// When `Some`, [`Self::respawn`] runs the `setup` phase in `--recovery`
+    /// mode against this checkpoint (and mines L1 concurrently with setup so
+    /// its flush can settle). See [`Self::set_recovery_setup`].
+    recovery_setup: Option<RecoverySetupParams>,
+    /// When `Some(secs)`, passes `--max-batch-open-seconds` to the `run` phase
+    /// so the inclusion lane seals the open batch promptly (the default is 2h).
+    /// Used by tests that need a batch to close + be promoted. Persists across
+    /// respawns. See [`Self::set_max_batch_open_seconds`].
+    max_batch_open_seconds: Option<u64>,
 }
 
 pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> ManagedSequencerConfig {
@@ -169,6 +221,13 @@ impl ManagedSequencer {
             None,
             libfaketime_path.as_deref(),
             faketime_rc_path.as_deref(),
+            // First boot has no stranded nonce to flush, so it never needs L1
+            // to advance during readiness.
+            false,
+            // First boot is always genesis setup, never recovery.
+            None,
+            // Default batch-open deadline on first boot.
+            None,
         )
         .await?;
 
@@ -188,6 +247,9 @@ impl ManagedSequencer {
             faketime_rc_path,
             libfaketime_path,
             cumulative_offset_secs: 0,
+            mine_l1_during_boot: false,
+            recovery_setup: None,
+            max_batch_open_seconds: None,
         })
     }
 
@@ -200,16 +262,46 @@ impl ManagedSequencer {
         self.l1_endpoint_override = l1_endpoint;
     }
 
-    /// Override the `--chain-id` argument the sequencer is spawned with on
-    /// the next [`Self::respawn`]. When `None`, defaults to the devnet
-    /// chain id (matches Anvil).
+    /// Override the `--chain-id` argument passed to the `setup` phase on the
+    /// next [`Self::respawn`]. When `None`, defaults to the devnet chain id
+    /// (matches Anvil).
     ///
-    /// Used by chain-id mismatch tests to inject a mismatched chain id and assert
-    /// that bootstrap refuses before silently pinning a wrong deployment
-    /// identity. Does not affect
-    /// the currently-running sequencer process.
+    /// Used by chain-id mismatch tests to inject a mismatched chain id and
+    /// assert that bootstrap refuses before silently pinning a wrong identity.
+    /// NOTE (post setup/run split): `--chain-id` now flows only to `setup`,
+    /// which is idempotent and early-returns once the `setup_complete` marker
+    /// exists — so the override only takes effect on a fresh or
+    /// [`Self::reset_database`]-d data dir. On an already-set-up DB, `setup`
+    /// is a no-op and `run` validates against the *pinned* chain id, so the
+    /// override is silently inert. Does not affect a running process.
     pub fn set_chain_id_override(&mut self, chain_id: Option<u64>) {
         self.chain_id_override = chain_id;
+    }
+
+    /// Make [`Self::respawn`] (this one and subsequent ones, until cleared)
+    /// mine L1 blocks concurrently with the post-boot readiness wait.
+    ///
+    /// Why this exists: a *recovery* boot whose persisted state names a wallet
+    /// nonce that L1 never accepted — e.g. a batch-submission tx was dropped
+    /// from the mempool ([`Self::drop_all_pending_txs`]) — runs the WP2 mempool
+    /// flush during startup. The flush submits a no-op at the stranded nonce
+    /// slot and blocks until that slot becomes *safe* (`safe_nonce >=
+    /// watermark + 1`, review R1a). Re-enabling auto-mining is not enough:
+    /// auto-mining lands the no-op tx but mints no *further* blocks, so Anvil's
+    /// `safe` tag never advances past it and the flush waits until the boot
+    /// hits the readiness timeout. In production the chain keeps producing
+    /// blocks throughout a slow recovery boot; an on-demand-mining devnet
+    /// produces none. This makes the harness mine a steady trickle for the
+    /// boot window (dropped the instant readiness is reached), reproducing that
+    /// drift so the flush — and the cascade behind it — can complete on the
+    /// first respawn.
+    ///
+    /// Only the tests that deliberately strand a submitted nonce before a
+    /// recovery respawn need this. Leave it off otherwise: every other boot
+    /// reaches readiness without new blocks, and mining empty blocks during an
+    /// unrelated boot would perturb L1-block-sensitive assertions.
+    pub fn set_mine_l1_during_boot(&mut self, enabled: bool) {
+        self.mine_l1_during_boot = enabled;
     }
 
     /// Write a faketime offset to the rc file. Effective **immediately** for
@@ -239,17 +331,21 @@ impl ManagedSequencer {
         Ok(())
     }
 
-    /// Delete the sequencer DB file (and its `-wal` / `-shm` siblings),
-    /// simulating a brand-new install — no pinned identity, no batches, no
-    /// safe-input rows. Call while the sequencer is stopped.
+    /// Delete the sequencer DB file (and its `-wal` / `-shm` siblings) AND the
+    /// `dumps/` subtree, simulating a brand-new install — no pinned identity,
+    /// no batches, no safe-input rows, no genesis snapshot. Call while the
+    /// sequencer is stopped. (Clearing the DB but not `dumps/` would leave a
+    /// stale `genesis-*` dir; the next `setup` mints a fresh one and the old
+    /// one lingers until run's orphan sweep — harmless, but not "brand-new".)
     ///
     /// Distinct from "clear only the identity row": that would leave the DB
     /// holding `batches` / `safe_inputs` / `l1_safe_head` rows from prior
     /// boots, which `IdentityError::OrphanedState` then refuses on the next
-    /// boot. The right "first boot" simulation is to start from an empty DB.
+    /// `setup`. The right "first boot" simulation is to start from an empty DB.
     ///
     /// Used by the no-cache-bootstrap and live-RPC chain-id-mismatch tests:
-    /// both want to exercise the no-cached-identity bootstrap path.
+    /// both want to exercise the no-cached-identity bootstrap path (next boot
+    /// re-runs `setup`).
     pub fn reset_database(&self) -> HarnessResult<()> {
         let db_path = self.data_dir_path.join("sequencer.db");
         for suffix in ["", "-wal", "-shm"] {
@@ -260,7 +356,87 @@ impl ManagedSequencer {
                 Err(err) => return Err(io_other(format!("reset DB ({path:?}): {err}")).into()),
             }
         }
+        let dumps_dir = self.data_dir_path.join("dumps");
+        match fs::remove_dir_all(dumps_dir.as_path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_other(format!("reset dumps ({dumps_dir:?}): {err}")).into()),
+        }
         Ok(())
+    }
+
+    /// Drive the next [`Self::respawn`]'s `setup` phase into `--recovery` against
+    /// `params` (and mine L1 concurrently with setup so its flush can settle).
+    /// Set this after capturing a checkpoint and wiping the DB. `None` restores
+    /// the normal (genesis) setup. Persists across respawns until cleared.
+    pub fn set_recovery_setup(&mut self, params: Option<RecoverySetupParams>) {
+        self.recovery_setup = params;
+    }
+
+    /// Pass `--max-batch-open-seconds` to the `run` phase on the next (and
+    /// subsequent) respawns so the inclusion lane seals the open batch after
+    /// `secs` instead of the 2h default. `None` restores the default. Lets a
+    /// test drive a batch to close + promotion without a 2h clock advance.
+    pub fn set_max_batch_open_seconds(&mut self, secs: Option<u64>) {
+        self.max_batch_open_seconds = secs;
+    }
+
+    /// Read the finalized snapshot's `(inclusion_block B, resume_nonce N)`. `B`
+    /// is `0` for the genesis snapshot and `> 0` once a real batch has been
+    /// promoted — poll this (mining L1 in between) to wait for a recoverable
+    /// checkpoint. Read-only.
+    pub fn finalized_snapshot_info(&self) -> HarnessResult<(u64, u64)> {
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path.as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+        let (prefix, inclusion_block): (String, i64) = conn
+            .query_row(
+                "SELECT d.prefix, f.inclusion_block FROM finalized_snapshot f \
+                 JOIN dumps d ON d.id = f.dump_id WHERE f.singleton_id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|err| io_other(format!("read finalized_snapshot: {err}")))?;
+        let resume_nonce = read_info_next_batch_nonce(Path::new(&prefix))?;
+        Ok((inclusion_block as u64, resume_nonce))
+    }
+
+    /// Copy the current finalized snapshot dump to `<data_dir>/checkpoint` (which
+    /// survives [`Self::reset_database`], since that only clears `sequencer.db*`
+    /// and `dumps/`), returning the captured checkpoint. Call after a batch has
+    /// been promoted (`finalized_snapshot_info().0 > 0`).
+    pub fn capture_finalized_checkpoint(&self) -> HarnessResult<RecoveryCheckpoint> {
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path.as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+        let (prefix, inclusion_block): (String, i64) = conn
+            .query_row(
+                "SELECT d.prefix, f.inclusion_block FROM finalized_snapshot f \
+                 JOIN dumps d ON d.id = f.dump_id WHERE f.singleton_id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|err| io_other(format!("read finalized_snapshot: {err}")))?;
+        let src = PathBuf::from(prefix);
+        let dst = self.data_dir_path.join("checkpoint");
+        if dst.exists() {
+            fs::remove_dir_all(dst.as_path())
+                .map_err(|err| io_other(format!("clear prior checkpoint ({dst:?}): {err}")))?;
+        }
+        copy_dir_recursive(src.as_path(), dst.as_path())
+            .map_err(|err| io_other(format!("copy checkpoint {src:?} -> {dst:?}: {err}")))?;
+        let resume_nonce = read_info_next_batch_nonce(dst.as_path())?;
+        Ok(RecoveryCheckpoint {
+            dir: dst,
+            checkpoint_block: inclusion_block as u64,
+            resume_nonce,
+        })
     }
 
     /// Rewrite the L1 safe-head observation to "unknown", simulating a DB
@@ -290,7 +466,7 @@ impl ManagedSequencer {
     ///
     /// Used by the nonce-0 recovery test to confirm a recovery batch (which reuses nonce 0)
     /// actually lands and gets accepted on L1 — proving the
-    /// `populate_safe_accepted_batches_inner` cursor handles
+    /// `populate_safe_accepted_batches` cursor handles
     /// reused-nonce-after-cascade correctly.
     pub fn count_safe_accepted_batches(&self) -> HarnessResult<(u64, Option<u64>)> {
         let db_path = self.data_dir_path.join("sequencer.db");
@@ -311,6 +487,48 @@ impl ManagedSequencer {
             })
             .map_err(|err| io_other(format!("min nonce: {err}")))?;
         Ok((count as u64, min_nonce.map(|n| n as u64)))
+    }
+
+    /// The batch-tree anchor nonce, read from the run DB read-only: `N'` after
+    /// cockroach recovery, `0` for a genesis deployment. Lets a recovery e2e
+    /// assert the rebuilt tree is rooted at the checkpoint's resume nonce (I16).
+    pub fn batch_tree_anchor(&self) -> HarnessResult<u64> {
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path.as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+        let anchor: i64 = conn
+            .query_row(
+                "SELECT nonce FROM batch_tree_anchor WHERE singleton_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| io_other(format!("read batch_tree_anchor: {err}")))?;
+        Ok(anchor as u64)
+    }
+
+    /// The canonical-divergence marker (review R2/I15) from the run DB, or `None`
+    /// when the frontier is healthy. A recovery/resync e2e asserts this is `None`
+    /// to prove the content-identity check did NOT spuriously freeze the frontier
+    /// (e.g. a false-positive against below-anchor collapsed history) — otherwise
+    /// that silent-failure class is invisible at e2e level.
+    pub fn canonical_divergence(&self) -> HarnessResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path.as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+        conn.query_row(
+            "SELECT kind FROM canonical_divergence WHERE singleton_id = 0",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| io_other(format!("read canonical_divergence: {err}")).into())
     }
 
     /// Snapshot of the `batches` table: `(total, sealed, invalidated)`.
@@ -377,6 +595,15 @@ impl ManagedSequencer {
         )
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
 
+        // The batch-tree anchor: the nonce the single parentless root carries
+        // (0 for a genesis deployment, N' for a cockroach-recovered one). The
+        // root/contiguity invariants below are stated relative to it, so a
+        // recovered tree (rooted at N') passes the same checks a genesis tree
+        // (rooted at 0) does. Mirrors `trg_enforce_nonce_contiguity`. Reuses the
+        // `batch_tree_anchor()` accessor (its own short-lived read-only handle)
+        // rather than re-issuing the query against `conn`.
+        let anchor = self.batch_tree_anchor()? as i64;
+
         // 1. At most one valid open batch.
         let open_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM valid_open_batch", [], |row| {
@@ -385,6 +612,20 @@ impl ManagedSequencer {
             .map_err(|err| io_other(format!("count valid_open_batch: {err}")))?;
         if open_count > 1 {
             panic!("schema invariant: more than one valid Tip ({open_count} rows)");
+        }
+
+        // 1b. At most one *valid* parentless root (the anchored root).
+        let valid_root_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM valid_batches WHERE parent_batch_index IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| io_other(format!("count valid roots: {err}")))?;
+        if valid_root_count > 1 {
+            panic!(
+                "schema invariant: more than one valid parentless root ({valid_root_count} rows)"
+            );
         }
 
         // 2. Nonce contiguity via parent.
@@ -404,9 +645,9 @@ impl ManagedSequencer {
         for (bi, parent, nonce, parent_nonce) in &rows {
             match (parent, parent_nonce) {
                 (None, _) => {
-                    if *nonce != 0 {
+                    if *nonce != anchor {
                         panic!(
-                            "schema invariant: batch {bi} has NULL parent but nonce {nonce} (expected 0)"
+                            "schema invariant: batch {bi} has NULL parent but nonce {nonce} (expected anchor {anchor})"
                         );
                     }
                 }
@@ -444,8 +685,10 @@ impl ManagedSequencer {
             }
         }
         for (i, &n) in valid_nonces.iter().enumerate() {
-            if n != i as i64 {
-                panic!("schema invariant: valid nonces not contiguous: {valid_nonces:?}");
+            if n != anchor + i as i64 {
+                panic!(
+                    "schema invariant: valid nonces not contiguous from anchor {anchor}: {valid_nonces:?}"
+                );
             }
         }
 
@@ -711,6 +954,9 @@ impl ManagedSequencer {
             self.chain_id_override,
             self.libfaketime_path.as_deref(),
             self.faketime_rc_path.as_deref(),
+            self.mine_l1_during_boot,
+            self.recovery_setup.as_ref(),
+            self.max_batch_open_seconds,
         )
         .await?;
         self.child = child;
@@ -790,6 +1036,42 @@ struct SpawnedSequencerProcess {
     log_path: PathBuf,
 }
 
+/// Read `next_batch_nonce` out of a dump dir's `info.toml` (the resume nonce
+/// `N`). The file is the simple `key = value` form the sequencer writes.
+fn read_info_next_batch_nonce(dump_dir: &Path) -> HarnessResult<u64> {
+    let info_path = dump_dir.join("info.toml");
+    let content = fs::read_to_string(info_path.as_path())
+        .map_err(|err| io_other(format!("read {info_path:?}: {err}")))?;
+    for line in content.lines() {
+        if let Some((key, value)) = line.split_once(" = ")
+            && key.trim() == "next_batch_nonce"
+        {
+            return value
+                .trim()
+                .parse::<u64>()
+                .map_err(|err| io_other(format!("parse next_batch_nonce: {err}")).into());
+        }
+    }
+    Err(io_other(format!("info.toml missing next_batch_nonce: {info_path:?}")).into())
+}
+
+/// Recursively copy a directory tree (used to stash a checkpoint dump where
+/// [`ManagedSequencer::reset_database`] won't wipe it).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_sequencer_process(
     sequencer_bin: &Path,
@@ -801,36 +1083,72 @@ async fn spawn_sequencer_process(
     chain_id_override: Option<u64>,
     libfaketime_path: Option<&Path>,
     faketime_rc_path: Option<&Path>,
+    mine_l1_during_boot: bool,
+    recovery: Option<&RecoverySetupParams>,
+    max_batch_open_seconds: Option<u64>,
 ) -> HarnessResult<SpawnedSequencerProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;
     let log_path = timestamped_log_path(logs_dir, log_prefix);
-    let stdout_log = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(log_path.as_path())?;
-    let stderr_log = stdout_log.try_clone()?;
 
-    let batch_submitter_key = default_private_keys().first().cloned().unwrap_or_else(|| {
-        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()
-    });
+    // Dedicated batch submitter = anvil account 9 (NOT the deployer/funder,
+    // account 0). `setup`'s detection gate refuses when the
+    // submitter's wallet nonce is unsettled; the deployer's deploy-tx tail is
+    // not safe at setup time, so reusing it false-positives. Account 9 starts
+    // at nonce 0. Must match `DEVNET_SEQUENCER_ADDRESS` (app-core); a debug
+    // assert below pins that. Account 9 is the highest standard funded anvil
+    // account, so it stays clear of the e2e wallets (0–3) and the bench
+    // workload (indices 0..concurrency).
+    const DEVNET_SUBMITTER_ACCOUNT_INDEX: usize = 9;
+    let batch_submitter_key = default_private_keys()
+        .get(DEVNET_SUBMITTER_ACCOUNT_INDEX)
+        .cloned()
+        .unwrap_or_else(|| {
+            "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6".to_string()
+        });
+    // `setup` takes the submitter *address* (it never signs); `run` takes the
+    // key. Derive the address from the key so the harness configures both
+    // consistently.
+    let submitter_address = TestSigner::from_private_key_hex(&batch_submitter_key)?.address();
+    // `assert_eq!`, not `debug_assert_eq!`: benches build the harness `--release`,
+    // where a debug-assert is a no-op — drift between app-core and the harness
+    // submitter must fail fast in every build. Cost is one comparison per spawn.
+    assert_eq!(
+        submitter_address,
+        app_core::application::DEVNET_SEQUENCER_ADDRESS,
+        "harness submitter (anvil account {DEVNET_SUBMITTER_ACCOUNT_INDEX}) must equal \
+         DEVNET_SEQUENCER_ADDRESS — keep app-core and the harness in sync"
+    );
+    let batch_submitter_address = submitter_address.to_string();
     let eth_rpc_url = l1_endpoint_override.unwrap_or_else(|| rollups.l1_endpoint());
 
-    // Set up libfaketime via env vars (not the `faketime` wrapper binary).
-    // The wrapper sets the FAKETIME env var, which has priority over
-    // FAKETIME_TIMESTAMP_FILE — bypassing it lets the file-based mechanism
-    // work. The file's contents are re-read on every `SystemTime::now()` /
-    // `Instant::now()` call thanks to FAKETIME_NO_CACHE=1, so tests can
-    // shift the clock dynamically during a run.
-    let mut cmd = Command::new(path_as_str(sequencer_bin)?);
-    if let (Some(lib), Some(rc)) = (libfaketime_path, faketime_rc_path) {
-        apply_faketime_env(&mut cmd, lib, rc)?;
-    }
-
     let chain_id = chain_id_override.unwrap_or(DEVNET_CHAIN_ID);
-    let mut child = cmd
-        .arg("--http-addr")
-        .arg(http_addr)
+    let bin = path_as_str(sequencer_bin)?.to_owned();
+
+    // libfaketime is applied via env vars (not the `faketime` wrapper binary),
+    // which the file-based FAKETIME_TIMESTAMP_FILE mechanism reads on every
+    // time call (FAKETIME_NO_CACHE=1) so tests can shift the clock at runtime.
+    let open_log = |append: bool| -> HarnessResult<std::fs::File> {
+        Ok(OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(!append)
+            .append(append)
+            .open(log_path.as_path())?)
+    };
+
+    // Phase A — `setup` (run once; idempotent on re-spawns, so it is a cheap
+    // no-op once the DB is set up, and needs L1 only on the first run / after
+    // a DB reset). Run to completion as a blocking step; a bootstrap refusal
+    // (e.g. a chain-id mismatch) surfaces here as a non-zero exit, just as it
+    // surfaced from the monolithic boot before the split.
+    let mut setup_cmd = Command::new(&bin);
+    if let (Some(lib), Some(rc)) = (libfaketime_path, faketime_rc_path) {
+        apply_faketime_env(&mut setup_cmd, lib, rc)?;
+    }
+    let setup_log = open_log(false)?;
+    let setup_log_err = setup_log.try_clone()?;
+    setup_cmd
+        .arg("setup")
         .arg("--data-dir")
         .arg(path_as_str(data_dir)?)
         .arg("--eth-rpc-url")
@@ -839,25 +1157,152 @@ async fn spawn_sequencer_process(
         .arg(chain_id.to_string())
         .arg("--app-address")
         .arg(rollups.app_address().to_string())
-        .arg("--batch-submitter-private-key")
-        .arg(&batch_submitter_key)
+        .arg("--batch-submitter-address")
+        .arg(&batch_submitter_address);
+    if let Some(recovery) = recovery {
+        // Recovery setup rebuilds the wiped DB from a checkpoint: it signs (the
+        // flush), so it takes the key, plus the checkpoint block + dump dir.
+        setup_cmd
+            .arg("--recovery")
+            .arg("--checkpoint-block")
+            .arg(recovery.checkpoint_block.to_string())
+            .arg("--checkpoint-dump-dir")
+            .arg(path_as_str(&recovery.checkpoint_dump_dir)?)
+            .arg("--batch-submitter-private-key")
+            .arg(&batch_submitter_key);
+    }
+    setup_cmd
         .env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG)
-        .stdout(Stdio::from(stdout_log))
-        .stderr(Stdio::from(stderr_log))
+        .stdout(Stdio::from(setup_log))
+        .stderr(Stdio::from(setup_log_err));
+    let mut setup_child = setup_cmd
         .spawn()
-        .map_err(|err| {
-            io_other(format!(
-                "failed to spawn sequencer binary '{}': {err}",
-                sequencer_bin.display()
-            ))
-        })?;
+        .map_err(|err| io_other(format!("failed to spawn `setup` for '{bin}': {err}")))?;
+    // Bound the setup phase so a stalled/lagging RPC during the initial sync
+    // can't hang the harness indefinitely. Recovery setup additionally flushes
+    // the wallet nonce, which can block until a stranded slot becomes safe — so
+    // mine L1 concurrently (nothing else does on an on-demand devnet) and give
+    // it the generous recovery-boot budget. Genesis setup never flushes.
+    let setup_status = if recovery.is_some() {
+        let deadline = std::time::Instant::now() + RECOVERY_BOOT_START_TIMEOUT;
+        loop {
+            if let Some(status) = setup_child
+                .try_wait()
+                .map_err(|err| io_other(format!("poll recovery `setup`: {err}")))?
+            {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = setup_child.start_kill();
+                let _ = setup_child.wait().await;
+                return Err(io_other(format!(
+                    "recovery `setup` timed out after {:?} (see {})",
+                    RECOVERY_BOOT_START_TIMEOUT,
+                    log_path.display()
+                ))
+                .into());
+            }
+            let _ = rollups.mine_l1_blocks(1).await;
+            tokio::time::sleep(BOOT_L1_MINE_INTERVAL).await;
+        }
+    } else {
+        match tokio::time::timeout(DEFAULT_SEQUENCER_START_TIMEOUT, setup_child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                let _ = setup_child.start_kill();
+                let _ = setup_child.wait().await;
+                return Err(io_other(format!(
+                    "sequencer `setup` timed out after {:?} (see {})",
+                    DEFAULT_SEQUENCER_START_TIMEOUT,
+                    log_path.display()
+                ))
+                .into());
+            }
+        }
+    };
+    if !setup_status.success() {
+        return Err(io_other(format!(
+            "sequencer `setup` failed: status={setup_status} (see {})",
+            log_path.display()
+        ))
+        .into());
+    }
 
-    wait_for_http_readiness(
-        endpoint.as_str(),
-        &mut child,
-        DEFAULT_SEQUENCER_START_TIMEOUT,
-    )
-    .await?;
+    // Phase B — `run` (re-spawned on every restart; reads identity from the
+    // setup DB).
+    let mut run_cmd = Command::new(&bin);
+    if let (Some(lib), Some(rc)) = (libfaketime_path, faketime_rc_path) {
+        apply_faketime_env(&mut run_cmd, lib, rc)?;
+    }
+    let run_log = open_log(true)?;
+    let run_log_err = run_log.try_clone()?;
+    // `kill_on_drop`: a `ManagedSequencer` normally reaps its child via
+    // `shutdown()` / `stop()`, but an error path that drops the struct without
+    // either (e.g. a benchmark returning early on a misconfigured run) would
+    // otherwise leave the child running while the owning `TempDir` deletes the
+    // data dir — the child's next DB open then fails `ENOENT` and it exits with
+    // a confusing `unable to open database file` that masks the real failure.
+    // `child` is declared before `_data_dir`, so on drop the SIGKILL lands
+    // before the dir is removed.
+    run_cmd
+        .kill_on_drop(true)
+        .arg("run")
+        .arg("--http-addr")
+        .arg(http_addr)
+        .arg("--data-dir")
+        .arg(path_as_str(data_dir)?)
+        .arg("--eth-rpc-url")
+        .arg(eth_rpc_url)
+        .arg("--batch-submitter-private-key")
+        .arg(&batch_submitter_key);
+    if let Some(secs) = max_batch_open_seconds {
+        run_cmd
+            .arg("--max-batch-open-seconds")
+            .arg(secs.to_string());
+    }
+    run_cmd
+        .env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG)
+        .stdout(Stdio::from(run_log))
+        .stderr(Stdio::from(run_log_err));
+    let mut child = run_cmd.spawn().map_err(|err| {
+        io_other(format!(
+            "failed to spawn sequencer binary '{}': {err}",
+            sequencer_bin.display()
+        ))
+    })?;
+
+    if mine_l1_during_boot {
+        // A recovery boot blocks in the WP2 mempool flush until the stranded
+        // wallet-nonce slot becomes safe, which needs L1 to keep producing
+        // blocks. On an on-demand-mining devnet nothing produces them, so mine
+        // a trickle concurrently with the readiness wait — mirroring a live
+        // chain that advances during a slow boot. The miner is dropped the
+        // instant readiness resolves, so L1 only advances for the boot window.
+        let miner = async {
+            loop {
+                tokio::time::sleep(BOOT_L1_MINE_INTERVAL).await;
+                // Transient RPC hiccups mid-boot are non-fatal — the next tick
+                // retries. A genuine mining failure manifests as the boot
+                // timing out, reported by the readiness arm.
+                let _ = rollups.mine_l1_blocks(1).await;
+            }
+        };
+        tokio::select! {
+            res = wait_for_http_readiness(
+                endpoint.as_str(),
+                &mut child,
+                RECOVERY_BOOT_START_TIMEOUT,
+            ) => res?,
+            _ = miner => unreachable!("boot miner loops forever; only readiness resolves"),
+        }
+    } else {
+        wait_for_http_readiness(
+            endpoint.as_str(),
+            &mut child,
+            DEFAULT_SEQUENCER_START_TIMEOUT,
+        )
+        .await?;
+    }
 
     Ok(SpawnedSequencerProcess {
         child,

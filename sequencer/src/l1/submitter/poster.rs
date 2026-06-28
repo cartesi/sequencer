@@ -12,7 +12,8 @@ use sequencer_core::batch::Batch;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::l1::partition::{decode_evm_advance_input, get_input_added_events};
+use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
+use crate::l1::watermark::WalletNonceWatermarkSink;
 
 pub type TxHash = alloy_primitives::B256;
 
@@ -28,18 +29,33 @@ pub struct BatchPosterConfig {
     pub seconds_per_block: u64,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
     pub long_block_range_error_codes: Vec<String>,
+    /// The pinned deployment chain id. Re-confirmed against the RPC immediately
+    /// before every productive send (`submit_batches`), so a long-lived
+    /// submitter whose load-balanced RPC fails over to another chain refuses to
+    /// burn nonce slots on it rather than relying only on the one-shot boot /
+    /// reader checks.
+    pub expected_chain_id: u64,
 }
 
 #[derive(Debug, Error)]
 pub enum BatchPosterError {
     #[error("provider/transport: {0}")]
     Provider(String),
+    #[error("rpc chain id {rpc} does not match pinned chain id {expected}")]
+    ChainIdMismatch { rpc: u64, expected: u64 },
 }
 
 #[async_trait]
 pub trait BatchPoster: Send + Sync {
-    async fn submit_batches(&self, payloads: Vec<Vec<u8>>)
-    -> Result<Vec<TxHash>, BatchPosterError>;
+    /// Broadcast the payloads as L1 txs at consecutive wallet nonces.
+    /// Implementations must raise `watermark` to the highest nonce they
+    /// are about to use *before* the first send (write-before-broadcast,
+    /// review R1a).
+    async fn submit_batches(
+        &self,
+        payloads: Vec<Vec<u8>>,
+        watermark: &dyn WalletNonceWatermarkSink,
+    ) -> Result<Vec<TxHash>, BatchPosterError>;
 
     async fn observed_submitted_batch_nonces(
         &self,
@@ -158,9 +174,31 @@ impl BatchPoster for EthereumBatchPoster {
     async fn submit_batches(
         &self,
         payloads: Vec<Vec<u8>>,
+        watermark: &dyn WalletNonceWatermarkSink,
     ) -> Result<Vec<TxHash>, BatchPosterError> {
         if payloads.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Keyed-write chain-id gate (review): re-confirm the RPC still serves the
+        // pinned chain immediately before any productive send. The submitter is
+        // long-lived — its signing provider is built once at spawn and the
+        // boot-time / reader chain-id checks are one-shot — so a load-balanced
+        // RPC that fails over to another chain mid-life would otherwise burn
+        // submitter nonce slots on the wrong chain. Reached only when there is
+        // something to send (the empty early-return above), so idle ticks add no
+        // RPC load. A mismatch is terminal (lifted out of the transient bucket by
+        // the submitter run-loop); a transient RPC error retries like any blip.
+        let rpc_chain_id = self
+            .provider
+            .get_chain_id()
+            .await
+            .map_err(|err| BatchPosterError::Provider(err.to_string()))?;
+        if rpc_chain_id != self.config.expected_chain_id {
+            return Err(BatchPosterError::ChainIdMismatch {
+                rpc: rpc_chain_id,
+                expected: self.config.expected_chain_id,
+            });
         }
 
         let fees = self
@@ -169,6 +207,15 @@ impl BatchPoster for EthereumBatchPoster {
             .await
             .map_err(|err| BatchPosterError::Provider(err.to_string()))?;
         let mut next_nonce = self.latest_account_nonce().await?;
+
+        // Write-before-broadcast (R1a): durably cover every nonce this
+        // tick will use before the first send. One raise to the highest
+        // covers the whole consecutive range.
+        let highest_nonce = next_nonce.saturating_add(payloads.len() as u64 - 1);
+        watermark
+            .raise_to(highest_nonce)
+            .map_err(BatchPosterError::Provider)?;
+
         let mut tx_hashes = Vec::with_capacity(payloads.len());
 
         for payload in payloads {
@@ -202,7 +249,13 @@ impl BatchPoster for EthereumBatchPoster {
             return Ok(Vec::new());
         }
 
-        let events = get_input_added_events(
+        // Ordered fetch: `advance_expected_batch_nonce` folds these nonces
+        // assuming L1 event order, so a raw `eth_getLogs` reorder would
+        // under-advance the frontier and resubmit an already-mined suffix
+        // (wasted gas + InputBox noise). The `_ordered` helper guarantees the
+        // canonical (block, tx_index, log_index) order — the same the reader
+        // relies on for its contiguity check.
+        let events = get_input_added_events_ordered(
             &self.provider,
             self.config.app_address,
             &self.config.l1_submit_address,
@@ -239,6 +292,7 @@ impl BatchPoster for EthereumBatchPoster {
 #[cfg(test)]
 pub(crate) mod mock {
     use super::{Batch, BatchPoster, BatchPosterError, TxHash};
+    use crate::l1::watermark::WalletNonceWatermarkSink;
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -282,6 +336,7 @@ pub(crate) mod mock {
         async fn submit_batches(
             &self,
             payloads: Vec<Vec<u8>>,
+            _watermark: &dyn WalletNonceWatermarkSink,
         ) -> Result<Vec<TxHash>, BatchPosterError> {
             let mut tx_hashes = Vec::with_capacity(payloads.len());
             for payload in payloads {
@@ -322,9 +377,192 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
-    use super::{BatchPoster, derive_confirmation_timeout, mock::MockBatchPoster};
+    use super::{
+        BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster,
+        derive_confirmation_timeout, mock::MockBatchPoster,
+    };
+    use crate::l1::watermark::WalletNonceWatermarkSink;
+    use alloy::node_bindings::Anvil;
+    use alloy::providers::Provider;
+    use alloy::rpc::types::BlockNumberOrTag;
+
+    fn require_anvil() {
+        assert!(
+            std::process::Command::new("anvil")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok(),
+            "anvil not found on PATH — install Foundry (https://getfoundry.sh)"
+        );
+    }
+
+    /// A watermark sink that records every `raise_to` call and (optionally)
+    /// fails, so a test can observe whether the raise happened — and in what
+    /// order relative to the first send.
+    struct RecordingWatermarkSink {
+        calls: Mutex<Vec<u64>>,
+        fail: bool,
+    }
+
+    impl RecordingWatermarkSink {
+        fn failing() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: true,
+            }
+        }
+
+        fn passing() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+
+        fn calls(&self) -> Vec<u64> {
+            self.calls.lock().expect("lock").clone()
+        }
+    }
+
+    impl WalletNonceWatermarkSink for RecordingWatermarkSink {
+        fn raise_to(&self, highest: u64) -> Result<(), String> {
+            self.calls.lock().expect("lock").push(highest);
+            if self.fail {
+                Err("recording sink: forced failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// R1a write-before-broadcast: `submit_batches` must raise the watermark to
+    /// cover the whole consecutive nonce range *before* the first send. We lock
+    /// it with a sink that fails on `raise_to`: a correct poster aborts the tick
+    /// before broadcasting anything, so the submitter's pending nonce is
+    /// unchanged. If `raise_to` were moved after the first `addInput` send
+    /// (re-opening the F1 zombie-tx hole), that send would bump the pending
+    /// nonce and this test would go red. Also pins the raise count (once) and
+    /// value (`base + payloads.len() - 1`). (Mutation-checked: moving the raise
+    /// after the send loop fails this test.)
+    #[tokio::test]
+    async fn submit_batches_raises_watermark_before_any_send() {
+        require_anvil();
+        let anvil = Anvil::default().spawn();
+        // Anvil account 0 — the submitter; its key signs the (never-sent) txs.
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key)
+            .expect("signer provider");
+
+        let config = BatchPosterConfig {
+            l1_submit_address: alloy_primitives::Address::repeat_byte(0x11),
+            app_address: alloy_primitives::Address::repeat_byte(0x22),
+            batch_submitter_address: submitter,
+            start_block: 0,
+            confirmation_depth: 0,
+            seconds_per_block: 1,
+            long_block_range_error_codes: vec![],
+            expected_chain_id: anvil.chain_id(),
+        };
+        let poster = EthereumBatchPoster::new(provider.clone(), config);
+
+        let base_nonce = provider
+            .get_transaction_count(submitter)
+            .await
+            .expect("base nonce");
+        let sink = RecordingWatermarkSink::failing();
+        let payloads = vec![vec![0u8; 4], vec![1u8; 4], vec![2u8; 4]]; // 3 consecutive nonces
+
+        let result = poster.submit_batches(payloads, &sink).await;
+
+        assert!(
+            matches!(result, Err(BatchPosterError::Provider(_))),
+            "a failing watermark sink must abort submit_batches, got {result:?}"
+        );
+        // (a) raised exactly once, (b) to the highest nonce of the range.
+        assert_eq!(
+            sink.calls(),
+            vec![base_nonce + 2],
+            "raise_to must be called once with base_nonce + payloads.len() - 1"
+        );
+        // (c) before any send — no tx broadcast, so pending nonce is unchanged.
+        let pending = provider
+            .get_transaction_count(submitter)
+            .block_id(BlockNumberOrTag::Pending.into())
+            .await
+            .expect("pending nonce");
+        assert_eq!(
+            pending, base_nonce,
+            "raise_to must run before any send; a broadcast would have bumped the pending nonce"
+        );
+    }
+
+    /// Keyed-write chain-id gate: a long-lived submitter pointed at an RPC that
+    /// serves a different chain than the pinned one must refuse to submit, before
+    /// any productive work — no watermark raise, no broadcast. Anvil's chain id
+    /// is 31337; we pin a different one and assert the `ChainIdMismatch` refusal
+    /// fires ahead of the (would-otherwise-fail-later) watermark raise.
+    #[tokio::test]
+    async fn submit_batches_refuses_on_wrong_chain_before_any_work() {
+        require_anvil();
+        let anvil = Anvil::default().spawn();
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key)
+            .expect("signer provider");
+
+        let wrong_chain_id = anvil.chain_id() + 1;
+        let config = BatchPosterConfig {
+            l1_submit_address: alloy_primitives::Address::repeat_byte(0x11),
+            app_address: alloy_primitives::Address::repeat_byte(0x22),
+            batch_submitter_address: submitter,
+            start_block: 0,
+            confirmation_depth: 0,
+            seconds_per_block: 1,
+            long_block_range_error_codes: vec![],
+            expected_chain_id: wrong_chain_id,
+        };
+        let poster = EthereumBatchPoster::new(provider.clone(), config);
+
+        let base_nonce = provider
+            .get_transaction_count(submitter)
+            .await
+            .expect("base nonce");
+        // A sink that would *succeed* — so the only thing that can stop a send is
+        // the chain-id gate, not the watermark guard. (Recording proves the gate
+        // fires first: a passing chain check would reach `raise_to`.)
+        let sink = RecordingWatermarkSink::passing();
+        let payloads = vec![vec![0u8; 4], vec![1u8; 4]];
+
+        let result = poster.submit_batches(payloads, &sink).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(BatchPosterError::ChainIdMismatch { rpc, expected })
+                    if rpc == anvil.chain_id() && expected == wrong_chain_id
+            ),
+            "wrong-chain RPC must abort submit_batches with ChainIdMismatch, got {result:?}"
+        );
+        assert!(
+            sink.calls().is_empty(),
+            "chain-id gate must fire before the watermark raise (no raise_to call)"
+        );
+        let pending = provider
+            .get_transaction_count(submitter)
+            .block_id(BlockNumberOrTag::Pending.into())
+            .await
+            .expect("pending nonce");
+        assert_eq!(
+            pending, base_nonce,
+            "no tx may be broadcast on the wrong chain"
+        );
+    }
 
     #[tokio::test]
     async fn mock_poster_tracks_requested_suffix_start_block() {

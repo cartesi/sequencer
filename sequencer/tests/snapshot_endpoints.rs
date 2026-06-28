@@ -19,6 +19,7 @@ use futures_util::StreamExt;
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::http::{self, ApiConfig};
 use sequencer::ingress::inclusion_lane::PendingUserOp;
+use sequencer::ingress::inclusion_lane::dump_info;
 use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::Storage;
 use sequencer_core::application::Application;
@@ -78,7 +79,9 @@ async fn start_server(db_path: &str) -> Option<TestServer> {
         ApiConfig::default(),
         http::SnapshotState {
             db_path: db_path.to_string(),
-            state_file_in_dump: WalletApp::state_file_in_dump,
+            state_file_in_dump: |dump_dir| {
+                WalletApp::state_file_in_dump(&dump_info::app_prefix(dump_dir))
+            },
         },
     );
     Some(TestServer {
@@ -89,11 +92,24 @@ async fn start_server(db_path: &str) -> Option<TestServer> {
     })
 }
 
+/// Build a structured dump dir mirroring production layout: the app's
+/// state under `state`, plus a minimal `info.toml`.
 fn write_state(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
-    let prefix = dir.join(name);
-    std::fs::create_dir_all(&prefix).expect("mkdir dump");
-    std::fs::write(WalletApp::state_file_in_dump(&prefix), bytes).expect("write state file");
-    prefix
+    let dump_dir = dir.join(name);
+    let app_prefix = dump_info::app_prefix(&dump_dir);
+    std::fs::create_dir_all(&app_prefix).expect("mkdir dump");
+    std::fs::write(WalletApp::state_file_in_dump(&app_prefix), bytes).expect("write state file");
+    dump_info::write_info(
+        &dump_dir,
+        &dump_info::DumpInfo {
+            format_version: dump_info::FORMAT_VERSION,
+            next_batch_nonce: 0,
+            l2_tx_index: 0,
+            promoted_inclusion_block: None,
+        },
+    )
+    .expect("write info.toml");
+    dump_dir
 }
 
 fn register_finalized(
@@ -460,8 +476,10 @@ async fn finalized_state_file_open_failure_releases_lease() {
     let dump_id = register_finalized(db.path.as_str(), dir.path(), "fin", b"bytes", 1, 1);
     // Delete the state file out from under the registered row to force the
     // post-acquire `File::open` error path.
-    std::fs::remove_file(WalletApp::state_file_in_dump(&dir.path().join("fin")))
-        .expect("remove state file");
+    std::fs::remove_file(WalletApp::state_file_in_dump(&dump_info::app_prefix(
+        &dir.path().join("fin"),
+    )))
+    .expect("remove state file");
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };

@@ -162,17 +162,6 @@ mod tests {
         }
     }
 
-    fn make_stale_batch_payload(nonce: u64, safe_block: u64) -> Vec<u8> {
-        ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-            nonce,
-            frames: vec![sequencer_core::batch::Frame {
-                user_ops: Vec::new(),
-                safe_block,
-                fee_price: 0,
-            }],
-        })
-    }
-
     #[tokio::test]
     async fn exits_on_shutdown_when_safe() {
         let db = temp_db("detector-shutdown");
@@ -217,12 +206,13 @@ mod tests {
             .expect("close batch 1");
 
         let protocol = test_protocol();
+        let landed = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 1135,
                 &[StoredSafeInput {
                     sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -272,12 +262,13 @@ mod tests {
             .expect("close batch 1");
 
         let protocol = test_protocol();
+        let landed = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 1200,
                 &[StoredSafeInput {
                     sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 100),
+                    payload: landed,
                     block_number: 200,
                 }],
                 SENDER_A,

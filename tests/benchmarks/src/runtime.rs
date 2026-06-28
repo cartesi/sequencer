@@ -15,7 +15,7 @@ use crate::{BenchResult, BenchmarkDomain, WorkloadConfig};
 pub use rollups_harness::ManagedSequencer;
 use rollups_harness::TestSigner;
 
-pub const DEFAULT_SEQUENCER_BIN: &str = "target/release/sequencer-devnet";
+pub const DEFAULT_SEQUENCER_BIN: &str = "target/release/wallet-sequencer-devnet";
 pub const DEFAULT_MEMORY_SAMPLE_INTERVAL_MS: u64 = 500;
 pub const DEFAULT_RESULTS_DIR: &str = "tests/benchmarks/results";
 const BENCHMARK_FUNDING_SIGNER_PRIVATE_KEY: &str =

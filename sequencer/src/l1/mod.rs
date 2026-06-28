@@ -9,3 +9,4 @@ pub mod partition;
 pub mod provider;
 pub mod reader;
 pub mod submitter;
+pub mod watermark;

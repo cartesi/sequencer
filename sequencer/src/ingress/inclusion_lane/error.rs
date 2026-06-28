@@ -7,7 +7,7 @@
 use sequencer_core::application::AppError;
 use thiserror::Error;
 
-use super::snapshot::{GcError, TakeDumpError};
+use super::snapshot::{GcError, StampError, TakeDumpError};
 
 #[derive(Debug, Error)]
 pub enum InclusionLaneError {
@@ -36,6 +36,8 @@ pub enum InclusionLaneError {
     LoadFromDump(AppError),
     #[error("snapshot garbage collection failed")]
     Gc(#[from] GcError),
+    #[error("stamping promotion metadata into the finalized dump failed")]
+    PromotionStamp(#[from] StampError),
     #[error(
         "no open Tip at lane startup; the runtime must establish it via \
          Storage::ensure_open_tip before starting the lane"

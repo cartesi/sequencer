@@ -7,11 +7,12 @@ members = [
   "examples/app-core",
   "examples/canonical-app",
   "examples/canonical-test",
+  "examples/wallet-sequencer",
   "tests/benchmarks",
   "tests/harness",
   "tests/e2e",
 ]
-default-members = ["sequencer"]
+default-members = ["sequencer", "examples/wallet-sequencer"]
 
 [workspace.package]
 version = "0.1.0"

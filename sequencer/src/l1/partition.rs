@@ -21,8 +21,14 @@ use async_recursion::async_recursion;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
 
+/// Fetch every `InputAdded` log for `app_address_filter`, splitting the range
+/// on RPC long-range errors. The result is in **RPC-return order** — partition
+/// sub-ranges are concatenated and a single `eth_getLogs` may itself reorder —
+/// so any consumer that relies on L1 order must sort. Prefer
+/// [`get_input_added_events_ordered`], which folds that sort in; this raw form
+/// is the partition primitive (and the recursion's own building block).
 #[async_recursion]
-pub async fn get_input_added_events(
+pub(crate) async fn get_input_added_events(
     provider: &impl Provider,
     app_address_filter: Address,
     input_box_address: &Address,
@@ -173,6 +179,38 @@ pub fn sort_logs_by_l1_order<T, FBlock, FTx, FLog>(
             .then_with(|| tx_index(a).cmp(&tx_index(b)))
             .then_with(|| log_index(a).cmp(&log_index(b)))
     });
+}
+
+/// [`get_input_added_events`] with the logs returned in canonical L1 order
+/// `(block, tx_index, log_index)`. The single fetch path for every consumer that
+/// depends on L1 ordering — the reader's dense-index contiguity witness and the
+/// submitter's batch-nonce fold both require it — so the sort lives here once
+/// instead of being duplicated (and forgettable) at each call site. Matches the
+/// order the watchdog applies on its side.
+pub(crate) async fn get_input_added_events_ordered(
+    provider: &impl Provider,
+    app_address_filter: Address,
+    input_box_address: &Address,
+    start_block: u64,
+    end_block: u64,
+    long_block_range_error_codes: &[String],
+) -> Result<Vec<(InputAdded, alloy::rpc::types::Log)>, Vec<ContractError>> {
+    let mut events = get_input_added_events(
+        provider,
+        app_address_filter,
+        input_box_address,
+        start_block,
+        end_block,
+        long_block_range_error_codes,
+    )
+    .await?;
+    sort_logs_by_l1_order(
+        &mut events,
+        |(_, log)| log.block_number.unwrap_or(0),
+        |(_, log)| log.transaction_index.unwrap_or(0),
+        |(_, log)| log.log_index.unwrap_or(0),
+    );
+    Ok(events)
 }
 
 pub fn decode_evm_advance_input(input: &[u8]) -> Result<EvmAdvanceCall, String> {

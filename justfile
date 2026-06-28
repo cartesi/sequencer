@@ -1,5 +1,12 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# Nested justfiles as modules: `just watchdog <r>`, `just canonical <r>`,
+# `just bench <r>` (also `just <mod> --list`). The curated recipes below are
+# top-level shortcuts for the common cross-cutting operations.
+mod watchdog 'watchdog/justfile'
+mod canonical 'examples/canonical-app/justfile'
+mod bench 'tests/benchmarks/justfile'
+
 default:
     @just --list
 
@@ -13,27 +20,27 @@ test:
     cargo test --workspace
 
 test-watchdog:
-    just -f watchdog/justfile test
+    just watchdog test
 
 test-watchdog-e2e:
-    just -f watchdog/justfile test-e2e
+    just watchdog test-e2e
 
 # Verify divergence signal via main.lua (drill exits 2 like production).
 test-watchdog-divergence-drill: watchdog-lua-deps
-    @just -f watchdog/justfile test-divergence-drill
+    @just watchdog test-divergence-drill
 
 # Build lcurl (lua-cURLv3) into .deps/lua; JSON is pure Lua under watchdog/third_party/.
 watchdog-lua-deps:
-    @just -f watchdog/justfile lua-deps
+    @just watchdog lua-deps
 
-# Anvil + rollups + sequencer-devnet; prints CARTESI_WATCHDOG_* exports until Ctrl+C.
+# Anvil + rollups + wallet-sequencer-devnet; prints CARTESI_WATCHDOG_* exports until Ctrl+C.
 devnet-for-watchdog: setup ensure-machine-image
-    cargo build -p sequencer --bin sequencer-devnet
+    cargo build -p wallet-sequencer --bin wallet-sequencer-devnet
     cargo build -p rollups-e2e --bin devnet-stack
     cargo run -p rollups-e2e --bin devnet-stack
 
 test-watchdog-compare-harness: setup watchdog-lua-deps ensure-machine-image
-    cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e --bin rollups-e2e
+    cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p rollups-e2e --bin rollups-e2e
     cargo run -p rollups-e2e --bin rollups-e2e -- watchdog_genesis_compare_test --exact --nocapture
 
 # Run sequencer tests sequentially so partition static config (init) is not shared across parallel tests.
@@ -45,43 +52,40 @@ test-sequencer:
 
 test-rollups-e2e: setup ensure-machine-image ensure-sepolia-machine-image
     just watchdog-lua-deps
-    cargo build -p sequencer --bin sequencer-devnet -p rollups-e2e --bin rollups-e2e
+    cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p rollups-e2e --bin rollups-e2e
     cargo run -p rollups-e2e --bin rollups-e2e
 
 ensure-machine-image:
-    @test -d examples/canonical-app/out/canonical-machine-image || just canonical-build-machine-image
+    @test -d examples/canonical-app/out/canonical-machine-image || just canonical build-machine-image
 
 ensure-sepolia-machine-image:
-    @test -d examples/canonical-app/out/canonical-machine-image-sepolia || just canonical-build-machine-image-sepolia
-
-bench target="all":
-    just -f tests/benchmarks/justfile {{target}}
+    @test -d examples/canonical-app/out/canonical-machine-image-sepolia || just canonical build-machine-image-sepolia
 
 setup:
-    just -f examples/canonical-app/justfile download-deps
-    just -f tests/benchmarks/justfile setup
+    just canonical download-deps
+    just bench setup
     just watchdog-lua-deps
 
 doctor:
-    just -f watchdog/justfile doctor
+    just watchdog doctor
 
 canonical-build-machine-image:
-    just -f examples/canonical-app/justfile build-machine-image
+    just canonical build-machine-image
 
 canonical-build-machine-image-sepolia:
-    just -f examples/canonical-app/justfile build-machine-image-sepolia
+    just canonical build-machine-image-sepolia
 
 canonical-test-guest:
-    just -f examples/canonical-app/justfile test-guest
+    just canonical test-guest
 
 canonical-print-build-hashes:
-    just -f examples/canonical-app/justfile print-build-hashes
+    just canonical print-build-hashes
 
 clean:
     cargo clean
     rm -rf sequencer-data
-    just -f examples/canonical-app/justfile clean
-    just -f tests/benchmarks/justfile clean
+    just canonical clean
+    just bench clean
 
 fmt:
     cargo fmt --all
@@ -102,4 +106,4 @@ ci:
 
 run addr="127.0.0.1:3000" data_dir="sequencer-data":
     rm -rf {{data_dir}}
-    CARTESI_SEQUENCER_HTTP_ADDR={{addr}} CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p sequencer --release
+    CARTESI_SEQUENCER_HTTP_ADDR={{addr}} CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p wallet-sequencer --release

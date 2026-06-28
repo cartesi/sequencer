@@ -34,6 +34,14 @@ The sequencer is a **centralized, single-writer** system. It cannot steal funds 
 
 **Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it.
 
+Soft confirmations are an **optimistic prediction**: the sequencer also
+cross-checks every batch the scheduler accepts on L1 against the batch it
+sealed locally (a content-identity check), and refuses to operate further the
+moment they differ. Detection happens when the divergent batch reaches L1
+*safe* finality, so soft confirmations issued inside that window (~2 L1
+epochs) can be built on already-diverged state — an inherent, bounded
+property of the optimistic model.
+
 The third case is handled by the recovery subsystem. Batches that are too old when they reach L1 (`inclusion_block − safe_block ≥ MAX_WAIT_BLOCKS`) are skipped by the scheduler. This "staleness" poisons the nonce counter: all subsequent batches become unreachable regardless of their individual freshness. The sequencer detects this via a danger-zone threshold, preemptively goes offline, flushes the L1 mempool, and cascade-invalidates the doomed chain. See [`docs/recovery/`](docs/recovery/) for the full design, TLA+ formal verification, and design history.
 
 The sequencer trusts its own code is bug-free. Recovery means recovery from liveness failures, which can legitimately happen even in the absence of bugs (infrastructure outages, network failures, gateway failure). Code-level bugs are a separate problem handled by tests and review. See [`docs/threat-model/README.md`](docs/threat-model/README.md) for the complete threat model applied across the codebase.
@@ -63,17 +71,36 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 
 ## Running
 
+The sequencer runs in two phases. **`setup`** pins the
+deployment identity, does the initial L1 sync, and registers the genesis
+snapshot — run it once. It is L1-read-only: it takes the batch-submitter
+*address*, never the signing key. **`run`** boots the sequencer from the
+set-up DB, reading identity from it (so chain id / app address are not `run`
+arguments); it holds the signing key because it submits.
+
 ```bash
+# Phase A — set up the data dir (run once; idempotent).
 CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
 CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \
 CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
+CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+cargo run -p wallet-sequencer -- setup
+
+# Phase B — run the sequencer.
+CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
 CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac09...f2ff80 \
-cargo run -p sequencer
+cargo run -p wallet-sequencer -- run
 ```
 
-Required: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `_FILE`).
+A third subcommand, **`flush-mempool`**, settles the batch-submitter wallet
+nonce on demand (keyed operator tool).
 
-Optional: `CARTESI_SEQUENCER_HTTP_ADDR` (default `127.0.0.1:3000`), `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; created if missing), `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default `12`), `CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES` (default `-32005,-32600,-32602,-32616`), `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (alternative to `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY`; first line of the file is the key), `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
+`setup` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS`.
+`run` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `_FILE`); it refuses to boot until `setup` has completed.
+
+Optional: `CARTESI_SEQUENCER_HTTP_ADDR` (default `127.0.0.1:3000`, `run`), `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; created if missing), `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default `12`), `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (default `600`), `CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES` (default `-32005,-32600,-32602,-32616`), `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (alternative to `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY`; first line of the file is the key), `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
+
+Process exit codes follow the R4 orchestrator contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal (operator required — e.g. setup not complete, identity mismatch, canonical divergence), `1`/`101` unclassified/panic.
 
 Fixed protocol identity (EIP-712):
 
@@ -129,7 +156,7 @@ Message shapes:
 ```
 
 ```json
-{ "kind": "direct_input", "offset": 11, "payload": "0x..." }
+{ "kind": "direct_input", "offset": 11, "sender": "0x...", "block_number": 123, "payload": "0x..." }
 ```
 
 Success response:
@@ -174,8 +201,8 @@ released even on client disconnect.
 
 ## Project Layout
 
-- `sequencer/src/main.rs`: thin binary entrypoint
-- `sequencer/src/lib.rs`: public crate surface (`run`, `RunConfig`)
+- `sequencer/src/lib.rs`: public crate surface (`run`, `RunConfig`) — the sequencer is a library; app crates build the binary (see `examples/wallet-sequencer/`)
+- `examples/wallet-sequencer/`: binary crate composing the sequencer library with the placeholder wallet app
 - `sequencer/src/http.rs`: shared HTTP error type, JSON error shape, and `axum::serve` orchestration
 - `sequencer/src/runtime/`: process bootstrap, config parsing, EIP-712 domain, shutdown signal, shared clock
 - `sequencer/src/ingress/`: public write path — `POST /tx` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)

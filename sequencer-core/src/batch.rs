@@ -33,8 +33,10 @@ use ssz_derive::{Decode, Encode};
 //   linear gas price before converting to log space.
 // ---------------------------------------------------------------------------
 
-/// Batch submissions are sent as raw `ssz(Batch)` with no tag; classification at L1 is by
-/// attempting SSZ decode, and at the rollup by msg_sender.
+/// Batch submissions are sent as raw `ssz(Batch)` with no tag; classification is
+/// by `msg_sender` everywhere (sender == batch-submitter address ⇒ batch, any
+/// other sender ⇒ direct input) — never by decode-attempt. See AGENTS.md
+/// "InputBox payload classification".
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Batch {

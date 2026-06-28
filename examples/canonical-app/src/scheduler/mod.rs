@@ -1,34 +1,40 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-mod core;
+//! Canonical-app harness around the scheduler library.
+//!
+//! The pure scheduler fold lives in [`sequencer_core::scheduler`]; this module
+//! is the I/O shell that drives it inside the RISC-V app. It pulls inputs off
+//! the `trolley` rollup, coerces host `U256` metadata into the scheduler's
+//! `u64` domain, feeds them through [`Scheduler::process_input`], and emits the
+//! app's notices/vouchers/reports back to the rollup.
 
-pub use core::{
-    DEVNET_SEQUENCER_ADDRESS, SEPOLIA_SEQUENCER_ADDRESS, STATE_INSPECT_QUERY, SchedulerConfig,
-};
-
+use alloy_primitives::U256;
 use sequencer_core::application::AppOutput;
 use sequencer_core::application::Application;
+use sequencer_core::scheduler::{
+    InspectError, ProcessOutcome, Scheduler, SchedulerInput, input_domain,
+};
 use trolley::{Rollup, RollupRequest};
 use types::{Notice, Voucher};
+
+pub use sequencer_core::scheduler::{STATE_INSPECT_QUERY, SchedulerConfig};
 
 pub fn run_scheduler_forever<R: Rollup, A: Application>(
     mut rollup: R,
     app: A,
     scheduler_config: SchedulerConfig,
 ) -> ! {
-    let mut scheduler = core::Scheduler::new(app, scheduler_config);
+    let mut scheduler = Scheduler::new(app, scheduler_config);
 
     loop {
         match rollup.next_input() {
             Ok(RollupRequest::Advance { metadata, payload }) => {
-                let inclusion_block = core::block_to_u64(metadata.block_number);
-                let domain = core::input_domain(
-                    core::chain_id_to_u64(metadata.chain_id),
-                    metadata.app_contract,
-                );
+                let inclusion_block = block_to_u64(metadata.block_number);
+                let domain =
+                    input_domain(chain_id_to_u64(metadata.chain_id), metadata.app_contract);
 
-                let input = core::SchedulerInput {
+                let input = SchedulerInput {
                     sender: metadata.msg_sender,
                     inclusion_block,
                     domain,
@@ -40,7 +46,7 @@ pub fn run_scheduler_forever<R: Rollup, A: Application>(
                     emit_app_output(&mut rollup, output)
                         .unwrap_or_else(|err| panic!("scheduler failed to emit app output: {err}"));
                 }
-                if matches!(result.outcome, core::ProcessOutcome::BatchRejected(_)) {
+                if matches!(result.outcome, ProcessOutcome::BatchRejected(_)) {
                     rollup
                         .emit_report(b"scheduler dropped invalid batch")
                         .unwrap_or_else(|err| {
@@ -54,10 +60,8 @@ pub fn run_scheduler_forever<R: Rollup, A: Application>(
                 // structured error report and keep serving, as it did before.
                 let report = match scheduler.inspect_state(&payload) {
                     Ok(bytes) => bytes,
-                    Err(core::InspectError::UnsupportedQuery) => {
-                        b"unsupported inspect query".to_vec()
-                    }
-                    Err(core::InspectError::Application(reason)) => {
+                    Err(InspectError::UnsupportedQuery) => b"unsupported inspect query".to_vec(),
+                    Err(InspectError::Application(reason)) => {
                         format!("inspect failed: {reason}").into_bytes()
                     }
                 };
@@ -93,13 +97,26 @@ fn emit_app_output<R: Rollup>(rollup: &mut R, output: &AppOutput) -> trolley::Ro
     }
 }
 
+/// Coerce a host `U256` block number to the scheduler's `u64` domain. Solidity
+/// exposes block numbers as `uint256`; a value that does not fit `u64` is a
+/// malformed host input for this prototype. Host-side, so it stays in the
+/// harness rather than the pure scheduler library.
+fn block_to_u64(block: U256) -> u64 {
+    u64::try_from(block).expect("block number does not fit u64")
+}
+
+/// Coerce a host `U256` chain id to `u64` (same rationale as [`block_to_u64`]).
+fn chain_id_to_u64(chain_id: U256) -> u64 {
+    u64::try_from(chain_id).expect("chain id does not fit u64")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use alloy_primitives::{Address, U256};
-    use app_core::application::{WalletApp, WalletConfig};
+    use app_core::application::{SEPOLIA_SEQUENCER_ADDRESS, WalletApp, WalletConfig};
     use trolley::{InputMetadata, RollupError};
 
     use super::*;
@@ -187,7 +204,7 @@ mod tests {
             run_scheduler_forever(
                 rollup,
                 WalletApp::new(WalletConfig::default()),
-                SchedulerConfig::default(),
+                SchedulerConfig::new(SEPOLIA_SEQUENCER_ADDRESS),
             )
         }));
 
@@ -222,7 +239,7 @@ mod tests {
             run_scheduler_forever(
                 rollup,
                 WalletApp::new(WalletConfig::default()),
-                SchedulerConfig::default(),
+                SchedulerConfig::new(SEPOLIA_SEQUENCER_ADDRESS),
             )
         }));
 
@@ -241,7 +258,7 @@ mod tests {
 
     #[test]
     fn run_scheduler_emits_report_for_invalid_batch_before_rollup_error() {
-        let sequencer = SchedulerConfig::default().sequencer_address;
+        let sequencer = SEPOLIA_SEQUENCER_ADDRESS;
         let invalid_batch_input = RollupRequest::Advance {
             metadata: metadata(sequencer, 10),
             payload: vec![0xFF, 0xEE, 0xDD],
@@ -257,7 +274,7 @@ mod tests {
             run_scheduler_forever(
                 rollup,
                 WalletApp::new(WalletConfig::default()),
-                SchedulerConfig::default(),
+                SchedulerConfig::new(SEPOLIA_SEQUENCER_ADDRESS),
             )
         }));
 

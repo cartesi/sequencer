@@ -193,7 +193,10 @@ fn run_subscription(
             continue;
         }
 
-        for (db_offset, tx) in txs {
+        // The frame safe_block (third element) is a replay-only concern;
+        // the WS message shape doesn't carry it (review F7/WP5 owns any
+        // feed-protocol extension).
+        for (db_offset, tx, _frame_safe_block) in txs {
             if shutdown.is_shutdown_requested() || events_tx.is_closed() {
                 return Ok(());
             }

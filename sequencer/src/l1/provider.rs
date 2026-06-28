@@ -78,6 +78,51 @@ pub fn create_signer_provider(url: &str, private_key: &str) -> Result<DynProvide
     Ok(provider.erased())
 }
 
+/// Failure modes of [`create_verified_signer_provider`], split so callers can
+/// project them onto the right exit class: a chain mismatch is a terminal
+/// operator misconfig, an RPC failure is retryable, a build failure is a bad
+/// URL/key.
+#[derive(Debug, thiserror::Error)]
+pub enum VerifiedSignerProviderError {
+    /// The signing provider could not be built (bad URL or private key).
+    #[error("{0}")]
+    Create(String),
+    /// The chain-id query itself failed — the RPC is unreachable (retryable).
+    #[error("chain-id query failed: {0}")]
+    ChainIdRpc(String),
+    /// The RPC serves a different chain than the pinned one (terminal).
+    #[error("rpc chain id {rpc} does not match pinned chain id {expected}")]
+    ChainIdMismatch { rpc: u64, expected: u64 },
+}
+
+/// Create a signing provider, but only after confirming the RPC serves
+/// `expected_chain_id`. The guarded constructor for **keyed L1 writers**: it
+/// folds the wrong-chain check and the signer build into one call so a keyed
+/// path cannot broadcast onto the wrong chain by forgetting to validate first.
+/// The chain id is queried on the very provider that will sign, immediately
+/// before it is returned and before any transaction is sent — so it also closes
+/// the window where a long-lived process's earlier (boot-time / one-shot) check
+/// has gone stale because a load-balanced RPC failed over to another chain.
+pub async fn create_verified_signer_provider(
+    url: &str,
+    private_key: &str,
+    expected_chain_id: u64,
+) -> Result<DynProvider, VerifiedSignerProviderError> {
+    let provider =
+        create_signer_provider(url, private_key).map_err(VerifiedSignerProviderError::Create)?;
+    let rpc_chain_id = provider
+        .get_chain_id()
+        .await
+        .map_err(|e| VerifiedSignerProviderError::ChainIdRpc(e.to_string()))?;
+    if rpc_chain_id != expected_chain_id {
+        return Err(VerifiedSignerProviderError::ChainIdMismatch {
+            rpc: rpc_chain_id,
+            expected: expected_chain_id,
+        });
+    }
+    Ok(provider)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +197,52 @@ mod tests {
         let good_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
         create_signer_provider("http://127.0.0.1:8545", good_key)
             .expect("valid key must be accepted");
+    }
+
+    // ── Keyed-write chain-id gate (review): the guarded constructor must
+    //    confirm the served chain matches the pinned one before signing ─
+
+    fn require_anvil() {
+        assert!(
+            std::process::Command::new("anvil")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok(),
+            "anvil not found on PATH — install Foundry (https://getfoundry.sh)"
+        );
+    }
+
+    /// Anvil account 0 — a valid signing key for the guarded constructor.
+    const ANVIL_KEY_0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    #[tokio::test]
+    async fn verified_signer_provider_gates_on_chain_id() {
+        use alloy::node_bindings::Anvil;
+
+        require_anvil();
+        let anvil = Anvil::default().spawn();
+        let chain_id = anvil.chain_id();
+
+        // Matching chain id → a usable signing provider.
+        create_verified_signer_provider(&anvil.endpoint(), ANVIL_KEY_0, chain_id)
+            .await
+            .expect("matching chain id yields a verified signer provider");
+
+        // Wrong pinned chain id → terminal ChainIdMismatch, before any signing,
+        // surfacing the served id vs the pinned one.
+        let err = create_verified_signer_provider(&anvil.endpoint(), ANVIL_KEY_0, chain_id + 1)
+            .await
+            .expect_err("a mismatched pinned chain id must be rejected before signing");
+        assert!(
+            matches!(
+                err,
+                VerifiedSignerProviderError::ChainIdMismatch { rpc, expected }
+                    if rpc == chain_id && expected == chain_id + 1
+            ),
+            "expected ChainIdMismatch {{ rpc: {chain_id}, expected: {} }}, got {err:?}",
+            chain_id + 1
+        );
     }
 }

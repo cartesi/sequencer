@@ -24,8 +24,9 @@
 use alloy_primitives::Address;
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
-use super::convert::{i64_to_u64, u64_to_i64};
-use sequencer_core::protocol::{ProtocolTiming, SafeInputView};
+use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
+use super::mutations::batch_tree_anchor_in;
+use sequencer_core::protocol::{AcceptedBatch, ProtocolTiming, SafeInputView};
 
 /// One row of `safe_accepted_batches`, exposing just the columns the
 /// frontier-read code paths need.
@@ -61,9 +62,21 @@ pub(super) fn query_latest_safe_accepted_batch(
 /// pivot, when one exists) will carry, by the contiguity invariant on the
 /// valid path (`trg_enforce_nonce_contiguity`).
 pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
-    Ok(query_latest_safe_accepted_batch(conn)?
-        .map(|row| i64_to_u64(row.nonce).saturating_add(1))
-        .unwrap_or(0))
+    match query_latest_safe_accepted_batch(conn)? {
+        Some(row) => Ok(i64_to_u64(row.nonce).saturating_add(1)),
+        // Empty accepted table ⇒ the frontier sits at the batch-tree anchor: 0
+        // for a genesis deployment, N' for a cockroach-recovered one. Reading
+        // the anchor (not a hard-coded 0) keeps this in step with
+        // `populate_safe_accepted_batches`, which seeds `expected` from the same
+        // anchor. Without it, a freshly recovered deployment — whose frontier
+        // stays empty until `run`'s first sync lands an accepted row — would
+        // have its submitter fold from 0 and re-submit its first post-recovery
+        // batch (nonce N') every tick until then. The cascade reader
+        // (`first_non_gold_closed_batch`) is unaffected: no valid batch sits
+        // below the anchor (I16), so `nonce >= 0` and `nonce >= N'` select the
+        // same row. (See I16 / docs/recovery/cockroach.md.)
+        None => batch_tree_anchor_in(conn),
+    }
 }
 
 /// Simulate the scheduler's acceptance logic over new safe inputs and append
@@ -89,6 +102,16 @@ pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
 /// batch-submitter inputs after the gold frontier can be rescanned on later
 /// safe-head syncs until a later batch is accepted and moves the accepted
 /// cursor forward.
+///
+/// Scheduler-mirror co-location: the acceptance *predicate* lives at the
+/// library seam ([`ProtocolTiming::scheduler_accepts`]), and the bare
+/// nonce-advance fold in `protocol::advance_expected_batch_nonce`.
+/// This loop deliberately keeps its own inline `expected` advance rather than
+/// reusing that fold: the advance is interleaved with two storage-only side
+/// effects that cannot move below the protocol layer — the R2 content-identity
+/// check ([`content_identity_violation`]) and the `canonical_divergence` freeze.
+/// Sharing a fold here would force a callback contract for those (a refactor,
+/// not the no-behavior-change library move).
 pub(super) fn populate_safe_accepted_batches(
     conn: &Connection,
     batch_submitter: Address,
@@ -103,13 +126,34 @@ pub(super) fn populate_safe_accepted_batches(
                               (safe_input_index, nonce, first_frame_safe_block, inclusion_block) \
                               VALUES (?1, ?2, ?3, ?4)";
 
+    // A persisted divergence marker freezes the acceptance frontier: the
+    // local batch tree is no longer a reliable mirror of canonical state,
+    // and advancing it (or promoting on it) would compound the divergence.
+    // `check_danger` reports `CanonicalDivergence` ahead of every other arm,
+    // so the detector exits / startup refuses; the remedy is cockroach
+    // recovery, never standard recovery (review R2).
+    if canonical_divergence_in(conn)?.is_some() {
+        return Ok(());
+    }
+
+    // The frontier begins at the batch-tree anchor: 0 for a genesis
+    // deployment (unchanged), or N' for a cockroach-recovered one. Below the
+    // anchor the local tree has no batches — that history is folded into the
+    // recovered checkpoint `S'`, not kept as tree batches — so those L1
+    // landings are *trusted collapsed history*, not foreign. Seeding `expected`
+    // at the anchor makes the scan skip them by nonce-mismatch (they never
+    // reach the content-identity check), while landings at/above the anchor —
+    // the resumed instance's own batches — are accepted and checked normally.
+    // (See I16 / docs/recovery: the anchor is where the local tree's authority
+    // begins.)
+    let anchor = batch_tree_anchor_in(conn)?;
     let latest_accepted = query_latest_safe_accepted_batch(conn)?;
     let mut cursor = latest_accepted
         .map(|row| row.safe_input_index)
         .unwrap_or(-1);
     let mut expected = latest_accepted
         .map(|row| i64_to_u64(row.nonce).saturating_add(1))
-        .unwrap_or(0);
+        .unwrap_or(anchor);
 
     loop {
         // Materialize one page before executing any INSERTs. rusqlite's row
@@ -142,6 +186,27 @@ pub(super) fn populate_safe_accepted_batches(
             let Some(accepted) = timing.scheduler_accepts(batch_submitter, input, expected) else {
                 continue;
             };
+
+            // Content-identity check (review R2), gated on full acceptance —
+            // exactly here, where the simulated scheduler accepted the
+            // landing. Rejected/stale/undecodable copies are scheduler
+            // no-ops; their content is irrelevant by construction.
+            if let Some(kind) = content_identity_violation(conn, &accepted, payload.as_slice())? {
+                record_canonical_divergence_in(conn, &accepted, kind)?;
+                tracing::error!(
+                    nonce = accepted.nonce,
+                    safe_input_index = accepted.safe_input_index,
+                    kind = kind.as_str(),
+                    "CANONICAL DIVERGENCE: accepted L1 landing does not match \
+                     our batch at this nonce; freezing the acceptance frontier \
+                     — remedy is cockroach recovery (wipe + rebuild from L1)"
+                );
+                // Stop scanning; the marker (committed with this sync)
+                // freezes the frontier and routes every subsequent boot and
+                // detector tick to refusal.
+                return Ok(());
+            }
+
             insert_stmt.execute(params![
                 u64_to_i64(accepted.safe_input_index),
                 u64_to_i64(accepted.nonce),
@@ -156,5 +221,113 @@ pub(super) fn populate_safe_accepted_batches(
         }
     }
 
+    Ok(())
+}
+
+/// How an accepted landing failed the content-identity check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DivergenceKind {
+    /// No valid closed local batch exists at the accepted nonce — we never
+    /// (validly) submitted one, so the landing is a zombie or foreign batch
+    /// from our key.
+    Foreign,
+    /// A valid closed local batch exists, but the landed wire bytes hash
+    /// differently from the bytes we sealed.
+    Mismatch,
+}
+
+impl DivergenceKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreign => "foreign",
+            Self::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// R2 check proper: compare a fully-accepted landing against our valid
+/// closed batch at the same nonce. `None` = identical (the normal case).
+///
+/// Why content (not identity) suffices: accepted content-equal copies are
+/// effect-equal — which physical tx landed carries no semantic weight. The
+/// hash on our side was stamped at seal by the same encode path the
+/// submitter broadcasts, so the comparison survives wire-format upgrades.
+fn content_identity_violation(
+    conn: &Connection,
+    accepted: &AcceptedBatch,
+    landed_payload: &[u8],
+) -> Result<Option<DivergenceKind>> {
+    let ours: Option<Option<Vec<u8>>> = conn
+        .query_row(
+            "SELECT payload_hash FROM valid_closed_batches WHERE nonce = ?1",
+            params![u64_to_i64(accepted.nonce)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match ours {
+        None => Ok(Some(DivergenceKind::Foreign)),
+        Some(None) => {
+            // Sealed batches always carry a hash (stamped in the seal
+            // UPDATE); a NULL here is an impossible state — fail loud.
+            // (Recovery sentinels carry no hash, but they sit *behind* the
+            // acceptance frontier by construction and are never compared.)
+            // Surface it as a structured error (rolls back the reader's sync
+            // transaction and travels its normal error path) rather than a
+            // panic that would crash the reader task mid-transaction.
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                Some(format!(
+                    "valid closed batch at nonce {} has no payload_hash",
+                    accepted.nonce
+                )),
+            ))
+        }
+        Some(Some(hash)) => {
+            let landed = alloy_primitives::keccak256(landed_payload);
+            if hash.as_slice() == landed.as_slice() {
+                Ok(None)
+            } else {
+                Ok(Some(DivergenceKind::Mismatch))
+            }
+        }
+    }
+}
+
+/// The persisted divergence marker, if any: `(nonce, safe_input_index)`.
+pub(super) fn canonical_divergence_in(conn: &Connection) -> Result<Option<(u64, u64)>> {
+    conn.query_row(
+        "SELECT nonce, safe_input_index FROM canonical_divergence WHERE singleton_id = 0",
+        [],
+        |row| {
+            Ok((
+                i64_to_u64(row.get::<_, i64>(0)?),
+                i64_to_u64(row.get::<_, i64>(1)?),
+            ))
+        },
+    )
+    .optional()
+}
+
+/// Persist the poison marker, atomically with the sync that detected it
+/// (same transaction). Keep-first by construction: the frontier freezes at
+/// the first detection, so this can only ever run once per marker lifetime
+/// (the guard at the top of `populate_safe_accepted_batches`); a second
+/// INSERT would fail loud on the singleton PK.
+fn record_canonical_divergence_in(
+    conn: &Connection,
+    accepted: &AcceptedBatch,
+    kind: DivergenceKind,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO canonical_divergence \
+         (singleton_id, nonce, safe_input_index, kind, detected_at_ms) \
+         VALUES (0, ?1, ?2, ?3, ?4)",
+        params![
+            u64_to_i64(accepted.nonce),
+            u64_to_i64(accepted.safe_input_index),
+            kind.as_str(),
+            now_unix_ms(),
+        ],
+    )?;
     Ok(())
 }

@@ -28,7 +28,9 @@ use tracing::warn;
 
 use crate::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use crate::http::{self, ApiConfig};
-use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
+use crate::ingress::inclusion_lane::{
+    InclusionLane, InclusionLaneConfig, InclusionLaneError, dump_info, dump_info::delete_dump_dir,
+};
 use crate::l1::reader::{InputReader, InputReaderError};
 use crate::l1::submitter::{
     BatchPosterConfig, BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError,
@@ -58,14 +60,15 @@ pub(crate) enum FirstExit {
 /// Inputs to [`Workers::spawn`]. Consumed entirely; the caller has nothing
 /// further to do with these after the call.
 ///
-/// Pure derivations (`db_path`, `domain`, `input_reader.genesis_block()`) are
-/// computed inside `spawn` rather than threaded through here.
-pub(crate) struct WorkersConfig<A: Application> {
-    pub app: A,
+/// No genesis app instance: `setup` already registered the finalized genesis
+/// snapshot, so the lane reloads via `A::from_dump`. The `domain` is built by
+/// `run` from the pinned deployment identity.
+pub(crate) struct WorkersConfig {
     pub run_config: RunConfig,
     pub l1_config: L1Config,
     pub timing: ProtocolTiming,
     pub input_reader: InputReader,
+    pub domain: alloy_sol_types::Eip712Domain,
 }
 
 /// Owns the five worker handles + the shutdown signal that drives all of them.
@@ -84,20 +87,19 @@ impl Workers {
     /// Build the worker configs, spawn each worker, return the owning struct.
     /// Logs `listening` once the HTTP server is bound.
     pub(crate) async fn spawn<A: Application + Clone + Sync + 'static>(
-        cfg: WorkersConfig<A>,
+        cfg: WorkersConfig,
     ) -> Result<Self, RunError> {
         let WorkersConfig {
-            app,
             run_config,
             l1_config,
             timing,
             input_reader,
+            domain,
         } = cfg;
 
         // Derived values — kept inside `spawn` so `WorkersConfig` stays
         // minimal and these aren't computed twice in the caller.
         let db_path = run_config.db_path();
-        let domain = run_config.build_domain();
         let input_reader_genesis_block = input_reader.genesis_block();
 
         let shutdown = ShutdownSignal::default();
@@ -113,14 +115,18 @@ impl Workers {
         // 1. Reset stale leases. A crashed previous run may have left
         //    `lease_count > 0` on dumps that aren't being read by
         //    anyone now; without this, GC would skip them forever.
-        // 2. Ensure a finalized snapshot exists (always-load
-        //    invariant) — cold start uses `app` for the genesis dump.
+        // 2. Require the finalized snapshot (always-load invariant). `setup`
+        //    registered the genesis snapshot and `run` gated on the
+        //    `setup_complete` marker, so it must be present — a missing one
+        //    is a terminal incomplete-setup, not a cold-start to paper over
+        //    (run holds no genesis app instance).
         // 3. Ensure an open Tip exists (tip-existence invariant). Opens the
         //    genesis Tip on a fresh DB, no-op otherwise. The lane loads the
         //    head itself after catch-up; this step only establishes the
         //    invariant. Runs after preemptive recovery has synced the safe
         //    head, so the genesis frame's `safe_block` dates to startup (full
-        //    landing budget), not to an earlier, possibly stale view.
+        //    landing budget), not to an earlier, possibly stale view. (This
+        //    is a B-time quantity — it stays in `run`, never in `setup`.)
         // 4. GC SQLite-side: drop any rows now unreferenced after
         //    promotions or invalidations that finalized just before
         //    the previous shutdown.
@@ -128,7 +134,8 @@ impl Workers {
         //    that aren't tracked by SQLite (crash-during-create_dump
         //    or crash-during-GC-after-row-delete artifacts).
         storage.reset_dump_leases()?;
-        ensure_finalized_snapshot::<A>(app, &mut storage, &dumps_dir)?;
+        require_finalized_snapshot(&mut storage)?;
+        restamp_finalized_promotion(&mut storage)?;
         storage.ensure_open_tip()?;
         let gc_removed = snapshot_gc_at_startup::<A>(&mut storage)?;
         let sweep_removed = sweep_orphan_dumps::<A>(&mut storage, &dumps_dir)?;
@@ -142,7 +149,8 @@ impl Workers {
             QUEUE_CAPACITY,
             shutdown.clone(),
             storage,
-            InclusionLaneConfig::new(l1_config.batch_submitter_address, dumps_dir),
+            InclusionLaneConfig::new(l1_config.batch_submitter_address, dumps_dir)
+                .with_max_batch_open(run_config.max_batch_open()),
         );
 
         // Input reader: produces safe-input rows from L1.
@@ -155,8 +163,9 @@ impl Workers {
             batch_submitter_address: l1_config.batch_submitter_address,
             start_block: input_reader_genesis_block,
             confirmation_depth: run_config.batch_submitter_confirmation_depth,
-            seconds_per_block: run_config.seconds_per_block,
+            seconds_per_block: run_config.timing.seconds_per_block,
             long_block_range_error_codes: run_config.long_block_range_error_codes.clone(),
+            expected_chain_id: l1_config.chain_id,
         };
         let provider = build_batch_submitter_provider(&l1_config)?;
         let poster = Arc::new(EthereumBatchPoster::new(provider, poster_config));
@@ -189,7 +198,13 @@ impl Workers {
             ApiConfig::default(),
             http::SnapshotState {
                 db_path: db_path.clone(),
-                state_file_in_dump: A::state_file_in_dump,
+                // The DB row stores the dump *directory*; the app's state
+                // file lives under its `state` subtree.
+                state_file_in_dump: |dump_dir| {
+                    A::state_file_in_dump(&crate::ingress::inclusion_lane::dump_info::app_prefix(
+                        dump_dir,
+                    ))
+                },
             },
         )
         .await?;
@@ -235,19 +250,19 @@ impl Workers {
             detector,
             shutdown: _,
         } = self;
-        let components: [(&'static str, ComponentShutdown); 5] = [
-            ("server", Box::pin(wait_for_server_shutdown(server))),
-            ("inclusion lane", Box::pin(wait_for_lane_shutdown(lane))),
+        let components: [(WorkerId, ComponentShutdown); 5] = [
+            (WorkerId::Server, Box::pin(wait_for_server_shutdown(server))),
+            (WorkerId::Lane, Box::pin(wait_for_lane_shutdown(lane))),
             (
-                "input reader",
+                WorkerId::InputReader,
                 Box::pin(wait_for_input_reader_shutdown(reader)),
             ),
             (
-                "batch submitter",
+                WorkerId::BatchSubmitter,
                 Box::pin(wait_for_batch_submitter_shutdown(submitter)),
             ),
             (
-                "danger detector",
+                WorkerId::DangerDetector,
                 Box::pin(wait_for_danger_detector_shutdown(detector)),
             ),
         ];
@@ -259,35 +274,44 @@ impl Workers {
         // - Signal-driven shutdown: an OS signal triggered shutdown. Wait for
         //   everything to drain; the signal handler's own error (if any)
         //   takes priority over any subsequent component shutdown error.
-        let (worker_failure, signal_error): (Option<(&'static str, WorkerExit)>, Option<RunError>) =
+        let (worker_failure, signal_error): (Option<(WorkerId, WorkerExit)>, Option<RunError>) =
             match first_exit {
                 FirstExit::Signal(err) => (None, err),
                 FirstExit::Worker(exit) => {
-                    let name = exit.component_name();
-                    (Some((name, exit)), None)
+                    let id = exit.worker_id();
+                    (Some((id, exit)), None)
                 }
             };
 
         if let Some((failed, primary_exit)) = worker_failure {
-            for (name, fut) in components {
-                if name == failed {
+            for (id, fut) in components {
+                if id == failed {
                     // Drop the primary's future without awaiting — its task
                     // is already done (it's what tripped the select), and
                     // we'll surface its error directly below.
                     drop(fut);
                     continue;
                 }
-                log_cleanup_result(name, fut.await);
+                log_cleanup_result(id.label(), fut.await);
             }
             return Err(RunError::Worker(primary_exit));
         }
 
-        // Signal path: short-circuit on first shutdown error.
+        // Signal path: await EVERY component so each worker's JoinHandle is
+        // joined and its task fully drains. A `break` here would drop the
+        // remaining components' futures un-awaited, which DETACHES those tasks
+        // (only `JoinHandle::abort()` cancels a dropped handle) — they'd be
+        // killed mid-drain at runtime teardown, the exact abrupt-write case the
+        // startup snapshot hygiene (sweep/gc/re-stamp) exists to clean up after.
+        // Keep the first error to surface; log every error (the signal handler's
+        // own error, if any, still takes priority below).
         let mut shutdown_error: Option<WorkerExit> = None;
-        for (_, fut) in components {
+        for (id, fut) in components {
             if let Err(e) = fut.await {
-                shutdown_error = Some(e);
-                break;
+                warn!(component = id.label(), error = %e, "component errored during signal-driven shutdown");
+                if shutdown_error.is_none() {
+                    shutdown_error = Some(e);
+                }
             }
         }
         match (signal_error, shutdown_error) {
@@ -298,16 +322,40 @@ impl Workers {
     }
 }
 
-impl WorkerExit {
-    /// Human-readable component label, matching the names used in the
-    /// `Workers::finish` component list.
-    fn component_name(&self) -> &'static str {
+/// Stable identity of each long-lived worker. The `finish` worker-failure path
+/// skips the already-exited worker by matching on this enum, not on a label
+/// string that could silently drift from the component-array order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerId {
+    Server,
+    Lane,
+    InputReader,
+    BatchSubmitter,
+    DangerDetector,
+}
+
+impl WorkerId {
+    /// Human-readable label for logs, matching the `Workers::finish` list.
+    fn label(self) -> &'static str {
         match self {
-            WorkerExit::Server(_) => "server",
-            WorkerExit::Lane(_) => "inclusion lane",
-            WorkerExit::InputReader(_) => "input reader",
-            WorkerExit::BatchSubmitter(_) => "batch submitter",
-            WorkerExit::DangerDetector(_) => "danger detector",
+            WorkerId::Server => "server",
+            WorkerId::Lane => "inclusion lane",
+            WorkerId::InputReader => "input reader",
+            WorkerId::BatchSubmitter => "batch submitter",
+            WorkerId::DangerDetector => "danger detector",
+        }
+    }
+}
+
+impl WorkerExit {
+    /// Which worker produced this exit.
+    fn worker_id(&self) -> WorkerId {
+        match self {
+            WorkerExit::Server(_) => WorkerId::Server,
+            WorkerExit::Lane(_) => WorkerId::Lane,
+            WorkerExit::InputReader(_) => WorkerId::InputReader,
+            WorkerExit::BatchSubmitter(_) => WorkerId::BatchSubmitter,
+            WorkerExit::DangerDetector(_) => WorkerId::DangerDetector,
         }
     }
 }
@@ -435,41 +483,39 @@ fn log_cleanup_result(component: &str, result: Result<(), WorkerExit>) {
     }
 }
 
+// Built once at worker spawn (sync, raw `create_signer_provider`). The submitter
+// is long-lived, so a one-shot spawn-time chain-id check would go stale; the
+// keyed-write guard instead lives in `EthereumBatchPoster::submit_batches`,
+// which re-confirms the chain id immediately before every productive send.
 fn build_batch_submitter_provider(l1: &L1Config) -> Result<DynProvider, std::io::Error> {
     crate::l1::provider::create_signer_provider(&l1.eth_rpc_url, &l1.batch_submitter_private_key)
         .map_err(std::io::Error::other)
 }
 
-/// Ensure a finalized snapshot exists before the lane starts.
-///
-/// - **Warm start** (finalized snapshot exists): no-op. The lane
-///   loads its Application via `from_dump` on its own thread.
-/// - **Cold start** (no snapshot yet): consume `initial_app`, write
-///   its state as the genesis dump, register it as finalized. The
-///   instance is dropped at the end of this function; the lane
-///   reloads from the dump it just wrote.
-///
-/// Either way, by the time this returns there's a finalized dump
-/// the lane can `from_dump` against.
-fn ensure_finalized_snapshot<A: Application + 'static>(
-    initial_app: A,
-    storage: &mut crate::storage::Storage,
-    dumps_dir: &std::path::Path,
-) -> Result<(), RunError> {
-    if storage.finalized_dump()?.is_some() {
-        // Warm start: drop `initial_app` and let the lane reload.
-        return Ok(());
+/// Require the finalized snapshot the lane will `from_dump` against. `setup`
+/// registers the genesis snapshot and `run` gates on the `setup_complete`
+/// marker, so by the time the lane starts the snapshot must exist. A missing
+/// one means the DB's setup is incomplete/corrupt — terminal
+/// `SetupNotComplete` (re-run `setup`), not a cold-start to silently heal.
+fn require_finalized_snapshot(storage: &mut crate::storage::Storage) -> Result<(), RunError> {
+    if storage.finalized_dump()?.is_none() {
+        return Err(RunError::Bootstrap(
+            crate::runtime::error::BootstrapError::SetupNotComplete,
+        ));
     }
-    // Cold start: the genesis prefix is unique-per-attempt so a crash
-    // between `create_dump` and `insert_finalized_dump` doesn't wedge
-    // a stale directory on the next startup.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let genesis_prefix = dumps_dir.join(format!("genesis-{nanos}"));
-    initial_app.create_dump(&genesis_prefix)?;
-    storage.insert_finalized_dump(&genesis_prefix, 0, 0)?;
+    Ok(())
+}
+
+/// Re-stamp `B` into the finalized dump's `info.toml` from the
+/// authoritative DB row. Idempotent; closes the crash window between a
+/// promotion's commit and the lane's in-place stamp.
+fn restamp_finalized_promotion(storage: &mut crate::storage::Storage) -> Result<(), RunError> {
+    if let Some(finalized) = storage.finalized_dump()? {
+        dump_info::stamp_promoted_inclusion_block(
+            &finalized.dump.prefix,
+            finalized.inclusion_block,
+        )?;
+    }
     Ok(())
 }
 
@@ -482,7 +528,7 @@ fn snapshot_gc_at_startup<A: Application + 'static>(
 ) -> Result<usize, RunError> {
     let removed = storage.gc_unreferenced_dumps()?;
     for row in &removed {
-        if let Err(err) = A::delete_dump(&row.prefix) {
+        if let Err(err) = delete_dump_dir::<A>(&row.prefix) {
             tracing::warn!(
                 error = %err,
                 prefix = ?row.prefix,
@@ -493,17 +539,18 @@ fn snapshot_gc_at_startup<A: Application + 'static>(
     Ok(removed.len())
 }
 
-/// Walk `dumps_dir` and `Application::delete_dump` anything that
-/// isn't in `Storage::list_dump_rows`. Catches:
+/// Walk `dumps_dir` and delete any dump directory that isn't in
+/// `Storage::list_dump_rows`. Catches:
 ///
-/// - **crash-during-create_dump**: file/directory exists on disk but
-///   no SQLite row was ever written for it.
-/// - **crash-during-GC**: SQLite row was deleted but
-///   `Application::delete_dump` either wasn't called or failed.
+/// - **crash-during-create**: a dump dir exists on disk (possibly
+///   without its app subtree or `info.toml`) but no SQLite row was
+///   ever written for it.
+/// - **crash-during-GC**: SQLite row was deleted but the filesystem
+///   delete either wasn't reached or failed.
 ///
 /// Filesystem-only — no SQLite writes here. Failures log and
 /// continue (the next startup retries). The post-`ensure_finalized`
-/// ordering matters: the genesis dump's prefix is in
+/// ordering matters: the genesis dump's dir is in
 /// `list_dump_rows` by the time this runs, so we never delete it.
 fn sweep_orphan_dumps<A: Application + 'static>(
     storage: &mut crate::storage::Storage,
@@ -521,7 +568,7 @@ fn sweep_orphan_dumps<A: Application + 'static>(
         if known.contains(&path) {
             continue;
         }
-        match A::delete_dump(&path) {
+        match delete_dump_dir::<A>(&path) {
             Ok(()) => removed += 1,
             Err(err) => {
                 tracing::warn!(
@@ -585,60 +632,9 @@ mod tests {
     // those are the genesis dump, finalized, and any pending the
     // lane is still working with.
 
+    use crate::runtime::test_support::{SweepTestApp, create_structured_dump};
     use crate::storage::Storage;
     use crate::storage::test_helpers::temp_db;
-    use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
-    use sequencer_core::l2_tx::ValidUserOp;
-    use sequencer_core::user_op::UserOp;
-    use std::path::Path;
-
-    /// Application stub used in the sweep tests: `create_dump` makes
-    /// a directory with a marker file inside, `delete_dump` is
-    /// `remove_dir_all`. The actual marker content is irrelevant —
-    /// we only care about which directories exist post-sweep.
-    struct SweepTestApp;
-
-    impl Application for SweepTestApp {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
-        fn current_user_nonce(&self, _sender: alloy_primitives::Address) -> u32 {
-            0
-        }
-        fn current_user_balance(
-            &self,
-            _sender: alloy_primitives::Address,
-        ) -> alloy_primitives::U256 {
-            alloy_primitives::U256::ZERO
-        }
-        fn validate_user_op(
-            &self,
-            _sender: alloy_primitives::Address,
-            _user_op: &UserOp,
-            _current_fee: u16,
-        ) -> Result<(), InvalidReason> {
-            Ok(())
-        }
-        fn execute_valid_user_op(
-            &mut self,
-            _user_op: &ValidUserOp,
-        ) -> Result<AppOutputs, AppError> {
-            Ok(Vec::new())
-        }
-        fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-            Ok(SweepTestApp)
-        }
-        fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
-            std::fs::create_dir(prefix)?;
-            std::fs::write(prefix.join("state"), b"")?;
-            Ok(())
-        }
-        fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-            std::fs::remove_dir_all(prefix)?;
-            Ok(())
-        }
-        fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {
-            prefix.join("state")
-        }
-    }
 
     #[test]
     fn sweep_orphan_dumps_removes_directories_not_in_storage() {
@@ -648,16 +644,18 @@ mod tests {
 
         // Tracked dump (in SQLite).
         let tracked = dumps_dir.path().join("tracked");
-        SweepTestApp.create_dump(&tracked).expect("tracked");
+        create_structured_dump(&tracked);
         storage
             .insert_finalized_dump(&tracked, 0, 0)
             .expect("register tracked");
 
-        // Two orphans (NOT in SQLite).
+        // Two orphans (NOT in SQLite). One is fully formed; the other
+        // mimics a crash between dir creation and the app dump (no
+        // `state` subtree) — the sweep must remove both.
         let orphan_a = dumps_dir.path().join("orphan-a");
         let orphan_b = dumps_dir.path().join("orphan-b");
-        SweepTestApp.create_dump(&orphan_a).expect("orphan a");
-        SweepTestApp.create_dump(&orphan_b).expect("orphan b");
+        create_structured_dump(&orphan_a);
+        std::fs::create_dir(&orphan_b).expect("orphan b dir");
 
         let removed = sweep_orphan_dumps::<SweepTestApp>(&mut storage, dumps_dir.path()).unwrap();
         assert_eq!(removed, 2);
@@ -685,8 +683,8 @@ mod tests {
         // Two dumps: superseded + finalized.
         let superseded = dumps_dir.path().join("superseded");
         let finalized = dumps_dir.path().join("finalized");
-        SweepTestApp.create_dump(&superseded).expect("superseded");
-        SweepTestApp.create_dump(&finalized).expect("finalized");
+        create_structured_dump(&superseded);
+        create_structured_dump(&finalized);
         storage
             .insert_pending_dump(&superseded, 0, 0)
             .expect("pending 0");

@@ -56,7 +56,10 @@ pub enum InvalidReason {
         max_fee: u16,
         base_fee: u16,
     },
-    InsufficientGasBalance {
+    /// Sender cannot pay the frame fee. "Fee" (not "gas"): the current fee
+    /// tracks DA usage; compute metering, if it ever exists, will be a
+    /// separate concept.
+    InsufficientFeeBalance {
         required: U256,
         available: U256,
     },
@@ -71,13 +74,13 @@ impl fmt::Display for InvalidReason {
             Self::InvalidMaxFee { max_fee, base_fee } => {
                 write!(f, "max fee {max_fee} below base fee {base_fee}")
             }
-            Self::InsufficientGasBalance {
+            Self::InsufficientFeeBalance {
                 required,
                 available,
             } => {
                 write!(
                     f,
-                    "insufficient balance for gas: required {required}, available {available}"
+                    "insufficient balance for fee: required {required}, available {available}"
                 )
             }
         }
@@ -87,10 +90,11 @@ impl fmt::Display for InvalidReason {
 pub trait Application: Send + Sized {
     const MAX_METHOD_PAYLOAD_BYTES: usize;
 
-    fn current_user_nonce(&self, sender: Address) -> u32;
-
-    fn current_user_balance(&self, sender: Address) -> U256;
-
+    /// Pure validation predicate over current app state: nonce match
+    /// (user replay protection) and fee-balance coverage. Must not
+    /// mutate state. The protocol-level `max_fee >= current_fee` guard
+    /// is NOT this method's job — [`validate_and_execute_user_op`]
+    /// enforces it before calling here.
     fn validate_user_op(
         &self,
         sender: Address,
@@ -98,43 +102,37 @@ pub trait Application: Send + Sized {
         current_fee: u16,
     ) -> Result<(), InvalidReason>;
 
-    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError>;
-
-    fn validate_and_execute_user_op(
+    /// Execute a validated user op. `safe_block` is the covering frame's
+    /// safe block; the impl must advance its safe-block clock with it:
+    /// `clock = max(clock, safe_block)` (see
+    /// [`Application::last_executed_safe_block`]).
+    fn execute_valid_user_op(
         &mut self,
-        sender: Address,
-        user_op: &UserOp,
-        current_fee: u16,
-    ) -> Result<ExecutionOutcome, AppError> {
-        // Protocol invariant: max_fee must cover the current frame fee.
-        // Enforced here so every Application impl inherits it.
-        if user_op.max_fee < current_fee {
-            return Ok(ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
-                max_fee: user_op.max_fee,
-                base_fee: current_fee,
-            }));
-        }
+        user_op: &ValidUserOp,
+        safe_block: u64,
+    ) -> Result<AppOutputs, AppError>;
 
-        if let Err(reason) = self.validate_user_op(sender, user_op, current_fee) {
-            return Ok(ExecutionOutcome::Invalid(reason));
-        }
+    /// Required (no default): deposits are direct-input-only, so a silent
+    /// no-op impl would strand every deposit on L1 with no L2 credit.
+    /// The impl must advance its safe-block clock with
+    /// `input.block_number` (the direct's L1 inclusion block):
+    /// `clock = max(clock, block_number)`.
+    fn execute_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError>;
 
-        let valid = ValidUserOp {
-            sender,
-            fee: current_fee,
-            data: user_op.data.to_vec(),
-        };
-        let outputs = self.execute_valid_user_op(&valid)?;
-        Ok(ExecutionOutcome::Included { outputs })
-    }
+    /// The app's safe-block clock: the maximum block carried by any input
+    /// this instance has executed (frame safe blocks for user ops, L1
+    /// inclusion blocks for direct inputs), or 0 if nothing executed.
+    /// Carried in execution — not a setter — so an app cannot execute and
+    /// forget to advance it. Recovery reads this as `A`, the safe block a
+    /// checkpoint state reflects; it must therefore survive
+    /// `create_dump`/`from_dump` round-trips.
+    fn last_executed_safe_block(&self) -> u64;
 
-    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
-        Ok(Vec::new())
-    }
-
-    fn executed_input_count(&self) -> u64 {
-        0
-    }
+    /// Count of executed inputs (user ops + direct inputs). Diagnostic
+    /// seam: replay/catch-up tests compare live vs replayed apps with it.
+    /// Required (no default) for the same reason as
+    /// [`Application::execute_direct_input`].
+    fn executed_input_count(&self) -> u64;
 
     // -------- snapshot / dump lifecycle --------
     //
@@ -201,4 +199,41 @@ pub trait Application: Send + Sized {
             reason: "application state export is not implemented".to_string(),
         })
     }
+}
+
+/// The single entry point for executing a user op against an app: protocol
+/// guard, then app validation, then execution.
+///
+/// Deliberately a free function, not a trait method: an overridable default
+/// would let an `Application` impl skip the protocol-level
+/// `max_fee >= current_fee` invariant. As a free function the guard is
+/// non-bypassable by construction. Both consumers — the inclusion lane and
+/// the canonical scheduler — must execute user ops through here; agreement
+/// between them is the system's most load-bearing invariant.
+pub fn validate_and_execute_user_op<A: Application>(
+    app: &mut A,
+    sender: Address,
+    user_op: &UserOp,
+    current_fee: u16,
+    safe_block: u64,
+) -> Result<ExecutionOutcome, AppError> {
+    // Protocol invariant: max_fee must cover the current frame fee.
+    if user_op.max_fee < current_fee {
+        return Ok(ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
+            max_fee: user_op.max_fee,
+            base_fee: current_fee,
+        }));
+    }
+
+    if let Err(reason) = app.validate_user_op(sender, user_op, current_fee) {
+        return Ok(ExecutionOutcome::Invalid(reason));
+    }
+
+    let valid = ValidUserOp {
+        sender,
+        fee: current_fee,
+        data: user_op.data.to_vec(),
+    };
+    let outputs = app.execute_valid_user_op(&valid, safe_block)?;
+    Ok(ExecutionOutcome::Included { outputs })
 }

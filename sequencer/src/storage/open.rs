@@ -14,10 +14,28 @@ use super::StorageOpenError;
 const MIGRATION_0001_SCHEMA: &str = include_str!("migrations/0001_schema.sql");
 
 /// SQLite `synchronous` pragma used by every production writer connection.
-/// `NORMAL` is appropriate under WAL — fsyncs at checkpoint boundaries, not
-/// per-transaction. Tests use the same value; if a future test needs
-/// `FULL`/`OFF`, add a `#[cfg(test)]` override.
-const SYNCHRONOUS_PRAGMA: &str = "NORMAL";
+/// `FULL` under WAL fsyncs on every commit, so commits survive power loss /
+/// OS crash — not just process crash. Load-bearing (review R3/F3): the
+/// sequencer externalizes effects on commits (acks `POST /tx` after the
+/// chunk commit; the submitter broadcasts sealed batches), and a rewound
+/// commit after externalization is silent divergence — e.g. a re-sealed
+/// batch at the same nonce with different content than the one the
+/// scheduler executed. The dump side already pays the same cost
+/// (`create_dump` fsyncs); this closes the DB half. Also a precondition
+/// for the wallet-nonce watermark's write-before-broadcast guarantee
+/// (review R1a). And it is what makes the `setup_complete` marker a valid
+/// linearization point: the marker is committed in its own transaction
+/// after the genesis-snapshot row's transaction, so "marker durable ⇒
+/// snapshot row durable ⇒ dump dir durable" only holds because FULL fsyncs
+/// every commit — under NORMAL the marker's WAL frame could survive while
+/// the snapshot row's frames are lost, and `run` would boot a half-set-up
+/// DB. Benchmarked at the flip: round-trip/ack deltas were noise-level on
+/// NVMe (see review ledger WP1).
+///
+/// Do not relax to NORMAL without revisiting all three (R3/F3 externalized
+/// commits, R1a watermark, the setup-marker linearization in
+/// `runtime/setup.rs` + `storage/migrations/0001_schema.sql`).
+const SYNCHRONOUS_PRAGMA: &str = "FULL";
 
 /// Sequencer storage backed by a single SQLite database.
 ///
@@ -114,7 +132,8 @@ impl Storage {
     }
 }
 
-/// Open a read-write connection with WAL + `NORMAL` sync + 5s busy timeout.
+/// Open a read-write connection with WAL + `FULL` sync (`SYNCHRONOUS_PRAGMA`) +
+/// 5s busy timeout.
 fn open_writer_connection(path: &str) -> Result<Connection, StorageOpenError> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
