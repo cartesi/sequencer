@@ -49,7 +49,7 @@ pub async fn run_watchdog_genesis_compare_test(
         .into());
     }
 
-    // `sequencer-devnet` uses `WalletConfig::devnet()` (not `default()` / Sepolia).
+    // `wallet-sequencer-devnet` uses `WalletConfig::devnet()` (not `default()` / Sepolia).
     let expected_snapshot = wallet_snapshot::encode(&WalletApp::new(WalletConfig::devnet()));
 
     eprintln!("[watchdog-harness] step 1/6: wait for sequencer GET /finalized_state");

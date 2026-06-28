@@ -68,19 +68,18 @@ and its canonical state coincide; one write per `create_dump`.
 
 ```
 {prefix}/
-  state    SSZ-encoded WalletSnapshotV1 bytes
+  state    SSZ-encoded WalletSnapshot bytes
 ```
 
 ## Toy Wallet Wire Format
 
 - **Encoding**: SSZ
-- **Top-level type**: `WalletSnapshotV1` (Rust struct name; the version is
-  protocol-external — see below)
+- **Top-level type**: `WalletSnapshot`
 - **Byte order for balances**: big-endian 32-byte integers (`U256`)
 
 ### Schema
 
-`WalletSnapshotV1`:
+`WalletSnapshot`:
 
 - `erc20_portal_address` (`[u8; 20]`)
 - `supported_erc20_token` (`[u8; 20]`)
@@ -92,6 +91,14 @@ and its canonical state coincide; one write per `create_dump`.
   - `address` (`[u8; 20]`)
   - `nonce` (`u32`)
 - `executed_input_count` (`u64`)
+- `last_executed_safe_block` (`u64`) — the app's safe-block clock
+  (`Application::last_executed_safe_block`): max block carried by any
+  executed input. Recovery reads it as `A`, the safe block this state
+  reflects, so it must live in the canonical state bytes (both the
+  bare-metal and canonical-machine sides advance it identically).
+
+`last_executed_safe_block` was added before any environment was deployed; there
+is a single, unversioned schema today (see [Versioning](#versioning)).
 
 ### Determinism
 
@@ -122,20 +129,22 @@ comparable.
 
 ## Versioning
 
-The struct name carries the wire-format version (`WalletSnapshotV1`), but
-the encoded bytes contain no leading version tag. Version dispatch is
-expected to live outside the bytes — for example, in an HTTP route prefix
-(`/state/v1/...`), a `Content-Type` header, or whatever protocol-level
-mechanism the consumer and sequencer agree on.
+There is a single, unversioned schema: `WalletSnapshot`. The encoded bytes carry
+no leading version tag, and — because there is no backward-compatibility
+requirement yet (no long-lived deployment whose dumps a newer binary must read) —
+the struct name carries no version suffix either. An earlier draft distinguished
+a `V1`/`V2` pair (the `last_executed_safe_block` field was added before any
+environment existed); that split was collapsed since no `V1` dumps ever survived.
 
-Future breaking changes must:
+If a future change ever needs to break the wire format against live dumps:
 
-1. Introduce a new versioned schema type (e.g. `WalletSnapshotV2`).
-2. Provide explicit dispatch at the protocol layer so consumers know
-   which decoder to use for a given dump.
+1. Introduce a new, explicitly versioned schema type (e.g. `WalletSnapshotV2`).
+2. Provide explicit dispatch at the protocol layer — an HTTP route prefix
+   (`/state/v2/...`), a `Content-Type` header, or whatever the consumer and
+   sequencer agree on — so consumers know which decoder to use; the bytes
+   themselves stay tag-less.
 
-Do not reorder, repurpose, or reinterpret existing fields in place
-without a version bump.
+Until then, do not reorder, repurpose, or reinterpret existing fields in place.
 
 ## Trust Model
 

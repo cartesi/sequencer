@@ -39,15 +39,15 @@ pub fn devnet_machine_image_path() -> PathBuf {
     workspace_root().join(DEFAULT_DEVNET_MACHINE_IMAGE_PATH)
 }
 
-const DEVNET_SEQUENCER_BIN: &str = "sequencer-devnet";
+const DEVNET_SEQUENCER_BIN: &str = "wallet-sequencer-devnet";
 
-/// Resolve the `sequencer-devnet` binary built for the current Cargo invocation.
+/// Resolve the `wallet-sequencer-devnet` binary built for the current Cargo invocation.
 ///
 /// Prefers `CARGO_TARGET_DIR` (set by `cargo run` / `cargo test` in sandboxes and
 /// custom target dirs) over the workspace `target/debug/` tree, which may be stale
 /// when builds only run through Cargo with a redirected target directory.
 pub fn resolve_devnet_sequencer_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_SEQUENCER_DEVNET") {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_WALLET_SEQUENCER_DEVNET") {
         let path = PathBuf::from(path);
         if path.exists() {
             return path;

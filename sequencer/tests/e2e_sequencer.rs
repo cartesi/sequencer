@@ -15,7 +15,7 @@ use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::http::{self, ApiConfig};
 use sequencer::ingress::inclusion_lane::{
-    InclusionLane, InclusionLaneConfig, InclusionLaneError, PendingUserOp,
+    InclusionLane, InclusionLaneConfig, InclusionLaneError, PendingUserOp, dump_info,
 };
 use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
@@ -846,14 +846,14 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_rejects_user_op_when_balance_below_gas_cost() {
+async fn api_rejects_user_op_when_balance_below_fee_cost() {
     // if sender's balance < `fee_to_linear(current_frame_fee)` the
-    // user op must be rejected with 422 `InsufficientGasBalance` and leave
+    // user op must be rejected with 422 `InsufficientFeeBalance` and leave
     // state unchanged. Exercises the balance check in
     // `WalletApp::validate_user_op` (app-core). A fresh sender with no
     // deposits has balance 0, well below `fee_to_linear(1060)` (the
     // bootstrapped frame fee).
-    let db = temp_db("insufficient-gas-balance");
+    let db = temp_db("insufficient-fee-balance");
     let domain = test_domain();
     let signing_key = SigningKey::from_bytes((&[11_u8; 32]).into()).expect("create signing key");
     let sender = address_from_signing_key(&signing_key);
@@ -891,8 +891,8 @@ async fn api_rejects_user_op_when_balance_below_gas_cost() {
         "insufficient-balance must produce 422, got {status}: {body}",
     );
     assert!(
-        body.contains("insufficient balance for gas"),
-        "expected InsufficientGasBalance message, got: {body}",
+        body.contains("insufficient balance for fee"),
+        "expected InsufficientFeeBalance message, got: {body}",
     );
 
     shutdown_runtime(runtime).await;
@@ -1094,10 +1094,20 @@ async fn start_full_server_with_max_body(
     // The lane reloads via `from_dump` either way.
     if storage.finalized_dump().expect("read finalized").is_none() {
         let app = WalletApp::new(WalletConfig::default());
-        let genesis_prefix = dumps_dir.join("genesis");
-        app.create_dump(&genesis_prefix).expect("genesis dump");
+        let genesis_dir = dumps_dir.join("genesis");
+        dump_info::create_dump_dir_with_info(
+            &app,
+            &genesis_dir,
+            &dump_info::DumpInfo {
+                format_version: dump_info::FORMAT_VERSION,
+                next_batch_nonce: 0,
+                l2_tx_index: 0,
+                promoted_inclusion_block: Some(0),
+            },
+        )
+        .expect("genesis dump");
         storage
-            .insert_finalized_dump(&genesis_prefix, 0, 0)
+            .insert_finalized_dump(&genesis_dir, 0, 0)
             .expect("register genesis");
     }
 
@@ -1144,7 +1154,9 @@ async fn start_full_server_with_max_body(
         },
         http::SnapshotState {
             db_path: db_path.to_string(),
-            state_file_in_dump: WalletApp::state_file_in_dump,
+            state_file_in_dump: |dump_dir| {
+                WalletApp::state_file_in_dump(&dump_info::app_prefix(dump_dir))
+            },
         },
     );
 
@@ -1198,7 +1210,9 @@ async fn start_api_only_server(
         },
         http::SnapshotState {
             db_path: db_path.to_string(),
-            state_file_in_dump: WalletApp::state_file_in_dump,
+            state_file_in_dump: |dump_dir| {
+                WalletApp::state_file_in_dump(&dump_info::app_prefix(dump_dir))
+            },
         },
     );
 
@@ -1337,7 +1351,7 @@ fn all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
         .ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load ordered l2 txs")
         .into_iter()
-        .map(|(_offset, tx)| tx)
+        .map(|(_offset, tx, _frame_safe_block)| tx)
         .collect()
 }
 

@@ -265,7 +265,16 @@ pub async fn run_round_trip_benchmark(
     let total_wall = started.elapsed();
 
     if accepted_ack_samples.is_empty() {
-        return Err(std::io::Error::other("round-trip benchmark had no accepted txs").into());
+        // Surface why every op was rejected — otherwise a misconfigured run
+        // (e.g. `--max-fee` below the app's base fee) reports a bare "no
+        // accepted txs" and looks like a sequencer fault. The breakdown +
+        // first rejection body point straight at the cause.
+        return Err(std::io::Error::other(format!(
+            "round-trip benchmark had no accepted txs \
+             (rejected={rejected}, breakdown={rejection_breakdown:?}, \
+             first_rejection={first_rejection:?})"
+        ))
+        .into());
     }
 
     // Join submit starts with WS arrival timestamps to compute round-trip latencies.

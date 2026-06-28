@@ -6,8 +6,9 @@ use std::time::Duration;
 use crate::{ScenarioFn, ScenarioResult};
 use alloy_primitives::{Address, U256};
 use rollups_harness::{
-    ManagedSequencer, ReplayWalletApp, RespawnAttemptOutcome, RespawnPolicy, TcpProxy, TestSigner,
-    WalletL1Client, WalletL2Client, WsClient, sign_user_op_hex,
+    ManagedSequencer, RecoveryCheckpoint, RecoverySetupParams, ReplayWalletApp,
+    RespawnAttemptOutcome, RespawnPolicy, TcpProxy, TestSigner, WalletL1Client, WalletL2Client,
+    WsClient, sign_user_op_hex,
 };
 use sequencer_core::api::{TxRequest, WsTxMessage};
 use sequencer_core::fee::fee_to_linear;
@@ -21,6 +22,21 @@ const DEFAULT_FRAME_FEE: u16 = 1060;
 
 /// Max fee used for raw TxRequest construction. Must be >= DEFAULT_FRAME_FEE.
 const DEFAULT_MAX_FEE: u16 = 1200;
+
+/// Self-transfers that force the inclusion lane to seal a batch by size, so a
+/// finalized "gold" snapshot promotes for a watchdog compare — independent of
+/// the batch-open timer.
+const TRANSFERS_TO_FORCE_BATCH_CLOSE: usize = 150;
+
+/// Poll budget for [`mine_until_finalized_advances`]: mine + recheck the
+/// finalized snapshot up to this many times before timing out. With
+/// [`PROMOTION_POLL_INTERVAL`] this bounds the wait at ~40s, generous against
+/// CI scheduling jitter while never sleeping longer than the condition needs.
+const PROMOTION_POLL_ATTEMPTS: usize = 40;
+
+/// Per-attempt pause in [`mine_until_finalized_advances`], giving the submitter
+/// tick and the promoter room to run between mines.
+const PROMOTION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 // ── Zone-math constants for the outage-matrix and recovery tests ─────────
 //
@@ -157,6 +173,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ),
         ("recovery_after_stale_batches_test", |runtime| {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
+        }),
+        ("setup_recovery_round_trip_test", |runtime| {
+            Box::pin(run_setup_recovery_round_trip_test(runtime))
         }),
         ("sequencer_outage_pre_danger_no_recovery_test", |runtime| {
             Box::pin(run_sequencer_outage_pre_danger_no_recovery_test(runtime))
@@ -385,8 +404,33 @@ async fn prepare_non_genesis_watchdog_state(runtime: &mut ManagedSequencer) -> S
     Ok(())
 }
 
+/// Mine L1 forward until a finalized snapshot is promoted at an inclusion block
+/// strictly above `floor` (the value observed before the batch that should
+/// promote), polling the DB instead of sleeping a fixed submitter-tick
+/// interval. Each attempt mines a couple of blocks and pauses briefly, so the
+/// submitter and promoter get to run; returns the new inclusion block, or times
+/// out loudly. Robust against CI jitter — it waits exactly as long as promotion
+/// takes, no more.
+async fn mine_until_finalized_advances(
+    runtime: &ManagedSequencer,
+    floor: u64,
+) -> ScenarioResult<u64> {
+    for _ in 0..PROMOTION_POLL_ATTEMPTS {
+        runtime.mine_l1_blocks(2).await?;
+        tokio::time::sleep(PROMOTION_POLL_INTERVAL).await;
+        let (inclusion_block, _) = runtime.finalized_snapshot_info()?;
+        if inclusion_block > floor {
+            return Ok(inclusion_block);
+        }
+    }
+    Err(
+        format!("timed out waiting for finalized snapshot to advance past inclusion_block {floor}")
+            .into(),
+    )
+}
+
 /// Close the open batch, land it on L1, and wait for snapshot promotion so
-/// `/finalized_state` reports `inclusion_block > 0`.
+/// `/finalized_state` reports a new `inclusion_block`.
 async fn drive_finalized_gold_batch_for_watchdog(
     runtime: &ManagedSequencer,
     ws: &mut WsClient,
@@ -394,9 +438,7 @@ async fn drive_finalized_gold_batch_for_watchdog(
     alice_l2: &mut WalletL2Client,
     alice_address: Address,
 ) -> ScenarioResult<()> {
-    const TRANSFERS_TO_FORCE_BATCH_CLOSE: usize = 150;
-    const SUBMITTER_TICK_WAIT: Duration = Duration::from_secs(7);
-
+    let (floor_inclusion_block, _) = runtime.finalized_snapshot_info()?;
     let batches_before = runtime.count_batches()?;
     for _ in 0..TRANSFERS_TO_FORCE_BATCH_CLOSE {
         alice_l2.transfer(alice_address, U256::from(1_u64)).await?;
@@ -410,8 +452,7 @@ async fn drive_finalized_gold_batch_for_watchdog(
         .into());
     }
 
-    tokio::time::sleep(SUBMITTER_TICK_WAIT).await;
-    runtime.mine_l1_blocks(3).await?;
+    mine_until_finalized_advances(runtime, floor_inclusion_block).await?;
     Ok(())
 }
 
@@ -1055,6 +1096,139 @@ async fn run_recovery_after_stale_batches_test(
         alice_address,
     )
     .await?;
+    crate::watchdog_compare::run_watchdog_non_genesis_compare_test(runtime).await?;
+
+    Ok(())
+}
+
+// ── Cockroach recovery: setup --recovery round-trip (PR5) ────────
+//
+// The affirmative end-to-end test of cockroach recovery: build state, promote a
+// real finalized snapshot (the checkpoint), wipe the DB, rebuild it from the
+// checkpoint via `setup --recovery` (flush → fold → fill), boot `run`, and
+// prove the recovered state is correct — the resumed sequencer accepts a new
+// user-op at the *continuing* nonce (so the fold preserved the sender's nonce +
+// balance), and the rebuilt tree is anchored at the resume nonce N' (validated
+// structurally by the post-scenario `assert_schema_invariants`).
+//
+// `max_batch_open` is set to 5s (not the 2h default) so a batch seals + gets
+// promoted via plain L1 mining — no 2h clock jump, so the L1 view stays fresh
+// and no staleness/cascade fires.
+
+/// Mine + wait until a finalized snapshot is promoted past genesis (B > 0),
+/// then capture it as a checkpoint. Times out loudly if no promotion lands.
+async fn drive_promotion_and_capture(
+    runtime: &ManagedSequencer,
+) -> ScenarioResult<RecoveryCheckpoint> {
+    mine_until_finalized_advances(runtime, 0).await?;
+    runtime.capture_finalized_checkpoint()
+}
+
+async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
+    runtime.set_max_batch_open_seconds(Some(5));
+    runtime.restart().await?;
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
+
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
+    let mut replay = ReplayWalletApp::devnet();
+
+    // Build state: a deposit (direct) + a transfer (user-op). These land in the
+    // batch that will seal + promote into the checkpoint.
+    let deposit = U256::from(2_000_000_u64);
+    let transfer1 = U256::from(100_000_u64);
+    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit).await?;
+    alice_l2.transfer(bob_address, transfer1).await?;
+    replay.apply(ws.expect_user_op_from(alice_address).await?)?;
+    let expected_alice = deposit - transfer1 - gas;
+    assert_eq!(replay.current_user_balance(alice_address), expected_alice);
+    assert_eq!(replay.current_user_balance(bob_address), transfer1);
+    assert_eq!(replay.current_user_nonce(alice_address), 1);
+
+    // Drive the batch to seal + be accepted + promoted, and capture the
+    // resulting finalized snapshot as the recovery checkpoint.
+    let checkpoint = drive_promotion_and_capture(runtime).await?;
+    eprintln!(
+        "recovery checkpoint: B={} N={}",
+        checkpoint.checkpoint_block, checkpoint.resume_nonce
+    );
+
+    // Wipe the DB and rebuild it from the checkpoint via `setup --recovery`.
+    drop(ws);
+    runtime.stop().await?;
+    runtime.set_recovery_setup(Some(RecoverySetupParams {
+        checkpoint_block: checkpoint.checkpoint_block,
+        checkpoint_dump_dir: checkpoint.dir,
+    }));
+    runtime.reset_database()?;
+    // The recovery setup's flush + the post-recovery run boot both need L1 to
+    // keep advancing.
+    runtime.set_mine_l1_during_boot(true);
+    runtime.respawn().await?;
+
+    // Recovery booted (the respawn above succeeded — `setup --recovery` rebuilt
+    // the DB and `run` started clean). Now prove the fold preserved Alice's
+    // logical state: a transfer at her *continuing* nonce (1) is accepted. The
+    // sequencer validates it against the recovered state S' — a lost nonce would
+    // be rejected (wrong nonce), a lost balance rejected (insufficient funds).
+    // So acceptance is the end-to-end proof that the checkpoint's balances +
+    // nonces were folded into the rebuilt DB. (The local `replay` can't verify
+    // S' directly — the wiped pre-recovery transfer isn't re-fed — so the
+    // sequencer's own acceptance is the authority here.)
+    let mut alice_l2_after = runtime.wallet_l2(alice)?;
+    alice_l2_after.set_next_nonce(1);
+    let post_transfer = U256::from(70_000_u64);
+    alice_l2_after.transfer(bob_address, post_transfer).await?;
+
+    // Explicit recovery-correctness assertions, beyond the structural
+    // `assert_schema_invariants` (which checks `0..`-from-anchor contiguity):
+    //   1. the rebuilt tree is anchored at the checkpoint's resume nonce N' (I16);
+    //   2. recovery's resync did NOT spuriously freeze the frontier — the I15
+    //      content-identity false-positive against below-anchor collapsed history
+    //      is otherwise a silent failure, invisible at the e2e level (the same
+    //      silence the (C, H1] bug shipped behind).
+    assert_eq!(
+        runtime.batch_tree_anchor()?,
+        checkpoint.resume_nonce,
+        "the rebuilt tree must be anchored at the checkpoint resume nonce N'"
+    );
+    assert_eq!(
+        runtime.canonical_divergence()?,
+        None,
+        "recovery must not falsely freeze the frontier (no canonical divergence)"
+    );
+
+    // ── Watchdog agreement on the rebuilt + resumed state ────────────────
+    //
+    // The strongest end-to-end proof that `setup --recovery` reconstructed
+    // canonical state: drive a finalized gold batch on the *resumed* sequencer,
+    // then assert the watchdog's from-genesis CM replay is byte-identical to the
+    // finalized snapshot the sequencer now serves. The CM replays every L1 input
+    // from genesis — the pre-wipe batches (nonce < N') plus the post-recovery
+    // batches at the resume nonce N' — so agreement proves the fold-rebuilt state
+    // S' and the resumed submission both land exactly on the canonical chain
+    // state. The local `replay` can't check this (the wiped history is never
+    // re-fed), so the watchdog's independent CM is the authority.
+    let (floor_inclusion_block, _) = runtime.finalized_snapshot_info()?;
+    let batches_before = runtime.count_batches()?;
+    for _ in 0..TRANSFERS_TO_FORCE_BATCH_CLOSE {
+        alice_l2_after
+            .transfer(alice_address, U256::from(1_u64))
+            .await?;
+    }
+    let batches_after = runtime.count_batches()?;
+    assert!(
+        batches_after.sealed > batches_before.sealed,
+        "expected a sealed batch before the recovery watchdog compare: \
+         before={batches_before:?} after={batches_after:?}"
+    );
+    mine_until_finalized_advances(runtime, floor_inclusion_block).await?;
     crate::watchdog_compare::run_watchdog_non_genesis_compare_test(runtime).await?;
 
     Ok(())
@@ -2484,10 +2658,15 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
     // faketime offset so the wall-clock fallback stays in sync with L1.
     runtime.advance_wall_and_mine(PAST_STALE).await?;
 
-    // Re-enable auto-mining before respawn: startup recovery's flush step
-    // submits a no-op at the stuck wallet-nonce slot and needs it mined
-    // to progress. With auto-mining off, the flusher would hang.
+    // Re-enable auto-mining AND mine L1 throughout the recovery boot. Startup
+    // recovery's WP2 flush submits a no-op at the stranded wallet-nonce slot
+    // and blocks until that slot is *safe* (`safe_nonce >= watermark + 1`).
+    // Auto-mining alone lands the no-op but mints no further blocks, so Anvil's
+    // `safe` tag never advances past it and the boot would hang; the boot miner
+    // supplies the steady block production a live chain would (see
+    // `ManagedSequencer::set_mine_l1_during_boot`).
     runtime.set_automine(true).await?;
+    runtime.set_mine_l1_during_boot(true);
 
     runtime.respawn().await?;
 
@@ -3342,7 +3521,13 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
     runtime.drop_all_pending_txs().await?;
 
     runtime.advance_wall_and_mine(PAST_STALE).await?;
+    // Re-enable auto-mining AND mine L1 throughout the recovery boot: the WP2
+    // flush submits a no-op at the stranded nonce-0 slot and waits for it to
+    // become safe. Auto-mining lands the no-op but mints no further blocks, so
+    // the boot miner supplies the steady block production needed to advance
+    // Anvil's `safe` tag past it (see `set_mine_l1_during_boot`).
     runtime.set_automine(true).await?;
+    runtime.set_mine_l1_during_boot(true);
 
     runtime.respawn().await?;
 
@@ -3401,7 +3586,7 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
 
     // After confirmations land, the submitter's tick loop continues:
     // next iteration runs `refresh_recovery_metadata` →
-    // `populate_safe_accepted_batches_inner`, which appends the batch
+    // `populate_safe_accepted_batches`, which appends the batch
     // to `safe_accepted_batches` at its expected nonce (0, reused).
     tokio::time::sleep(Duration::from_secs(10)).await;
 

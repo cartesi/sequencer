@@ -4,9 +4,10 @@
 use std::path::PathBuf;
 
 use app_core::application::{
-    DepositNotice, Method, Transfer, TransferNotice, WalletConfig, Withdrawal,
+    DEVNET_SEQUENCER_ADDRESS, DepositNotice, Method, Transfer, TransferNotice, WalletConfig,
+    Withdrawal,
 };
-use canonical_app::{DEVNET_SEQUENCER_ADDRESS, SchedulerConfig};
+use canonical_app::SchedulerConfig;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer_core::batch::{Batch, Frame, WireUserOp};
@@ -51,7 +52,8 @@ pub fn scheduler_rejected_batch_does_not_consume_nonce() -> TestResult {
 #[testsi::test_dapp(kind("scheduler"))]
 pub fn scheduler_stale_batch_is_skipped_without_consuming_nonce() -> TestResult {
     let mut machine = devnet_machine()?;
-    let stale_trigger_block = SchedulerConfig::devnet().max_wait_blocks as usize + 1;
+    let stale_trigger_block =
+        SchedulerConfig::new(DEVNET_SEQUENCER_ADDRESS).max_wait_blocks as usize + 1;
 
     // Stale batch (nonce 0, safe_block 1, inclusion block > max_wait_blocks) → skipped silently.
     let (outputs, reports) = machine.advance_state(batch_input(
@@ -219,6 +221,86 @@ pub fn scheduler_emits_withdrawal_voucher_from_guest() -> TestResult {
     Ok(())
 }
 
+/// T3: the guest's fee arithmetic must agree with the host's `fee_to_linear`.
+/// Every other scheduler test runs frames at `fee_price: 0`, so the guest's gas
+/// charging and max-fee skip never ran with a nonzero fee — a guest-side
+/// divergence would be silent. This drives one nonzero-fee frame and pins the
+/// charged gas to the host's value from BOTH sides, plus the below-fee skip:
+///   - Alice transfers exactly `deposit - gas`: affordable iff guest gas <= host.
+///   - Carol transfers `deposit - gas + 1`: affordable iff guest gas <  host.
+///   - Dave's op has `max_fee < fee_price`: must be skipped (below the frame fee).
+/// A correct guest emits exactly one transfer notice (Alice's) — so guest gas ==
+/// host `fee_to_linear(fee_price)` bit-for-bit, and the max-fee skip holds.
+#[testsi::test_dapp(kind("scheduler"))]
+pub fn scheduler_fee_arithmetic_matches_host_from_guest() -> TestResult {
+    let mut machine = devnet_machine()?;
+    let token = WalletConfig::devnet().supported_erc20_token;
+    let bob = address!("0x8888888888888888888888888888888888888888");
+    let fee_price: u16 = 200;
+    let gas = sequencer_core::fee::fee_to_linear(fee_price);
+    let deposit = U256::from(10_000_u64);
+
+    let alice_key = signing_key(11);
+    let alice = address_from_signing_key(&alice_key);
+    let carol_key = signing_key(12);
+    let carol = address_from_signing_key(&carol_key);
+    let dave_key = signing_key(13);
+    let dave = address_from_signing_key(&dave_key);
+
+    // Fund all three; one drain batch executes the three pending deposits.
+    for who in [alice, carol, dave] {
+        let (outputs, reports) = machine.advance_state(portal_input(10, token, who, deposit))?;
+        assert_no_outputs_or_reports(&outputs, &reports);
+    }
+    let (outputs, reports) =
+        machine.advance_state(batch_input(10, batch_with_safe_blocks(0, &[10])))?;
+    assert!(reports.is_empty(), "drain reports: {reports:?}");
+    assert_eq!(
+        outputs.list().len(),
+        3,
+        "expected three deposit notices, got {:?}",
+        outputs.list()
+    );
+
+    let exact = deposit - gas;
+    let transfer =
+        |amount| ssz::Encode::as_ssz_bytes(&Method::Transfer(Transfer { amount, to: bob }));
+    let alice_exact = signed_user_op_with_fee(&alice_key, 0, fee_price, transfer(exact));
+    let carol_over = signed_user_op_with_fee(
+        &carol_key,
+        0,
+        fee_price,
+        transfer(exact + U256::from(1_u64)),
+    );
+    let dave_below_fee =
+        signed_user_op_with_fee(&dave_key, 0, fee_price - 1, transfer(U256::from(1_u64)));
+
+    let (outputs, reports) = machine.advance_state(batch_input(
+        11,
+        batch_with_frame_fee(
+            1,
+            10,
+            fee_price,
+            vec![alice_exact, carol_over, dave_below_fee],
+        ),
+    ))?;
+    assert!(reports.is_empty(), "fee-frame reports: {reports:?}");
+    assert_eq!(
+        outputs.list().len(),
+        1,
+        "expected exactly one transfer notice (Alice's exact transfer): Carol's \
+         over-by-one must be unaffordable (guest charged the full host gas) and \
+         Dave's below-fee op must be skipped, got {:?}",
+        outputs.list()
+    );
+    let notice = outputs[0].expect_notice();
+    let decoded = TransferNotice::abi_decode(&notice.payload).expect("decode transfer notice");
+    assert_eq!(decoded.sender, alice);
+    assert_eq!(decoded.recipient, bob);
+    assert_eq!(decoded.amount, exact);
+    Ok(())
+}
+
 fn devnet_machine() -> Result<Machine, Box<dyn std::error::Error + Send + Sync>> {
     let machine_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../canonical-app/out/canonical-machine-image");
@@ -246,9 +328,18 @@ fn address_from_signing_key(signing_key: &SigningKey) -> Address {
 }
 
 fn signed_user_op(signing_key: &SigningKey, nonce: u32, data: Vec<u8>) -> WireUserOp {
+    signed_user_op_with_fee(signing_key, nonce, 0, data)
+}
+
+fn signed_user_op_with_fee(
+    signing_key: &SigningKey,
+    nonce: u32,
+    max_fee: u16,
+    data: Vec<u8>,
+) -> WireUserOp {
     let user_op = UserOp {
         nonce,
-        max_fee: 0,
+        max_fee,
         data: data.clone().into(),
     };
     let signing_hash = user_op.eip712_signing_hash(&input_domain());
@@ -270,7 +361,7 @@ fn signed_user_op(signing_key: &SigningKey, nonce: u32, data: Vec<u8>) -> WireUs
 
     WireUserOp {
         nonce,
-        max_fee: 0,
+        max_fee,
         data,
         signature: signature.as_bytes().to_vec(),
     }
@@ -317,12 +408,21 @@ fn batch_with_safe_blocks(nonce: u64, safe_blocks: &[u64]) -> Batch {
 }
 
 fn batch_with_frame(nonce: u64, safe_block: u64, user_ops: Vec<WireUserOp>) -> Batch {
+    batch_with_frame_fee(nonce, safe_block, 0, user_ops)
+}
+
+fn batch_with_frame_fee(
+    nonce: u64,
+    safe_block: u64,
+    fee_price: u16,
+    user_ops: Vec<WireUserOp>,
+) -> Batch {
     Batch {
         nonce,
         frames: vec![Frame {
             user_ops,
             safe_block,
-            fee_price: 0,
+            fee_price,
         }],
     }
 }

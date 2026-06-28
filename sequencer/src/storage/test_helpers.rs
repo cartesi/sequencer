@@ -42,10 +42,34 @@ pub(crate) fn temp_db(name: &str) -> TestDb {
     }
 }
 
+/// Wire bytes of the local valid closed batch at `nonce` — the
+/// production-faithful "our batch landed on L1" payload. Hash-matches the
+/// seal-time stamp, so the content-identity check (review R2) accepts it.
+/// Panics if no valid closed local batch carries `nonce` (test bug: an
+/// accepted landing without a matching local batch is, by design, a
+/// canonical divergence).
+pub(crate) fn local_batch_payload(storage: &mut Storage, nonce: u64) -> Vec<u8> {
+    storage
+        .pending_batches(nonce)
+        .expect("load local closed batches")
+        .into_iter()
+        .find(|b| b.nonce == nonce)
+        .unwrap_or_else(|| panic!("no valid closed local batch at nonce {nonce}"))
+        .encoded
+}
+
 /// Insert safe inputs whose payloads are SSZ-encoded batches with the given
 /// nonces, all attributed to `sender`. `sender` doubles as the
 /// batch-submitter address passed to `append_safe_inputs`, so the populated
 /// `safe_accepted_batches` view matches this sender.
+///
+/// Nonces with a valid closed local batch land with that batch's real wire
+/// bytes (the landing will be *accepted* — the content-identity check
+/// requires byte equality with the seal-time hash). Nonces without one get
+/// a synthetic empty-batch payload — sound **only** for landings the
+/// acceptance fold rejects (e.g. past a nonce gap); a synthetic landing
+/// that would be accepted trips the divergence marker and freezes the
+/// frontier.
 pub(crate) fn seed_safe_inputs_with_batch_nonces(
     storage: &mut Storage,
     sender: Address,
@@ -54,13 +78,24 @@ pub(crate) fn seed_safe_inputs_with_batch_nonces(
 ) {
     let inputs: Vec<StoredSafeInput> = nonces
         .iter()
-        .map(|nonce| StoredSafeInput {
-            sender,
-            payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-                nonce: *nonce,
-                frames: Vec::new(),
-            }),
-            block_number: safe_block,
+        .map(|nonce| {
+            let payload = storage
+                .pending_batches(*nonce)
+                .expect("load local closed batches")
+                .into_iter()
+                .find(|b| b.nonce == *nonce)
+                .map(|b| b.encoded)
+                .unwrap_or_else(|| {
+                    ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+                        nonce: *nonce,
+                        frames: Vec::new(),
+                    })
+                });
+            StoredSafeInput {
+                sender,
+                payload,
+                block_number: safe_block,
+            }
         })
         .collect();
     storage
@@ -93,7 +128,7 @@ pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
         .ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load all ordered l2 txs")
         .into_iter()
-        .map(|(_offset, tx)| tx)
+        .map(|(_offset, tx, _frame_safe_block)| tx)
         .collect()
 }
 

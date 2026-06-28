@@ -76,7 +76,7 @@ local function fail_lookup(fail_ranges)
 end
 
 local function load_wallet_snapshot_hex_fixture()
-    local path = "tests/fixtures/wallet_snapshot_v1_empty.hex"
+    local path = "tests/fixtures/wallet_snapshot_empty.hex"
     local file, err = io.open(path, "rb")
     if not file then
         error("open " .. path .. ": " .. tostring(err))
@@ -93,7 +93,7 @@ end
 test("wallet SSZ golden fixture loads for cross-stack parity", function()
     local bytes = load_wallet_snapshot_hex_fixture()
     assert(#bytes > 0, "golden fixture must not be empty")
-    -- Fixed prefix from WalletSnapshotV1 default config (see wallet_snapshot.rs tests).
+    -- Fixed prefix from WalletSnapshot default config (see wallet_snapshot.rs tests).
     assert_eq(bytes:byte(1), 0xac)
     assert_eq(bytes:byte(2), 0xa6)
 end)

@@ -1,21 +1,22 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Batch-aggregate reads: frontier lookup, per-batch frames + user ops, the
-//! catch-up / per-batch replay reader, and the SSZ-encoded pending-batch list
-//! the submitter pulls each tick.
+//! The submitter's storage half: frontier lookup, per-batch frames + user
+//! ops, the catch-up / per-batch replay reader, the SSZ-encoded pending-batch
+//! list the submitter pulls each tick — and the one submission-side write,
+//! the wallet-nonce watermark (raised before every broadcast, review R1a).
 //!
-//! Despite the historical name, nothing in this file does writes — structural
-//! nonces are assigned by the `batches.nonce` trigger at close time (see
-//! `ingress`), and `safe_accepted_batches` is maintained by `append_safe_inputs`
-//! (see `l1_inputs`). The reads here are shared between the batch submitter
-//! (hot-path tick) and the egress replay path (catch-up reader); they live
-//! together because they all aggregate at the batch level.
+//! Structural nonces are assigned by the `batches.nonce` trigger at close
+//! time (see `ingress`), and `safe_accepted_batches` is maintained by
+//! `append_safe_inputs` (see `l1_inputs`). The reads here are shared between
+//! the batch submitter (hot-path tick) and the egress replay path (catch-up
+//! reader); they live together because they all aggregate at the batch level.
 
 use rusqlite::{Result, params};
 
 use super::Storage;
 use super::convert::{i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
+use super::mutations::{batch_tree_anchor_in, set_batch_tree_anchor_in};
 use super::queries::{current_safe_block_required, decode_l2_tx_row};
 use super::safe_accepted_batches::frontier_nonce;
 use super::{FrameHeader, PendingBatch, SubmitterFrontier};
@@ -44,6 +45,53 @@ impl Storage {
         })
     }
 
+    /// Set the batch-tree anchor nonce (the nonce the parentless root carries).
+    /// Used by `setup --recovery` to root the rebuilt tree at `N'`. Aborts if
+    /// `setup_complete` already exists (`trg_batch_tree_anchor_write_once`).
+    pub fn set_batch_tree_anchor(&mut self, nonce: u64) -> Result<()> {
+        self.write(|tx| set_batch_tree_anchor_in(tx, nonce))
+    }
+
+    /// Read the batch-tree anchor nonce (default 0).
+    pub fn batch_tree_anchor(&mut self) -> Result<u64> {
+        self.read(|tx| batch_tree_anchor_in(tx))
+    }
+
+    /// The highest wallet nonce ever broadcast by this deployment's
+    /// batch-submitter key, or `None` if nothing was ever broadcast
+    /// (review R1a — the durable realization of the TLA+ `walletNonce`).
+    /// The flush reads this as its coverage floor; it never resets.
+    pub fn wallet_nonce_watermark(&mut self) -> Result<Option<u64>> {
+        use rusqlite::OptionalExtension;
+        self.read(|tx| {
+            tx.query_row(
+                "SELECT watermark FROM wallet_nonce_watermark WHERE singleton_id = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|v| v.map(i64_to_u64))
+        })
+    }
+
+    /// Write-before-broadcast (review R1a): durably raise the watermark to
+    /// cover `nonce` *before* any tx at a nonce `<= nonce` is sent. The
+    /// commit is power-loss durable (`synchronous=FULL`); a crash between
+    /// commit and send only over-covers — the flush later no-ops a
+    /// never-used slot, which is harmless. Monotonic: never lowers.
+    pub fn raise_wallet_nonce_watermark(&mut self, nonce: u64) -> Result<()> {
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO wallet_nonce_watermark (singleton_id, watermark) \
+                 VALUES (0, ?1) \
+                 ON CONFLICT(singleton_id) \
+                 DO UPDATE SET watermark = MAX(watermark, excluded.watermark)",
+                params![u64_to_i64(nonce)],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Highest valid (non-invalidated) `batch_index`, or `None` if no valid
     /// batches exist. The open batch is included.
     pub fn latest_batch_index(&mut self) -> Result<Option<u64>> {
@@ -55,22 +103,25 @@ impl Storage {
         Ok(value.map(i64_to_u64))
     }
 
+    /// The structural nonce of the current open Tip (the single
+    /// `valid_open_batch`), or `None` if no Tip is open. Used by `setup
+    /// --recovery` to detect a partially-recovered DB whose root tip carries a
+    /// different resume nonce than the current attempt (the at-most-one-valid-
+    /// open-tip index makes this at most one row).
+    pub fn open_tip_nonce(&mut self) -> Result<Option<u64>> {
+        use rusqlite::OptionalExtension;
+        let value: Option<i64> = self
+            .conn
+            .query_row("SELECT nonce FROM valid_open_batch", [], |row| row.get(0))
+            .optional()?;
+        Ok(value.map(i64_to_u64))
+    }
+
     /// Frame headers for `batch_index` in `frame_in_batch` order. Reads the
     /// raw `frames` table — does NOT filter on validity, since callers only
     /// reach this method after they already know the batch is valid.
     pub fn frames_for_batch(&mut self, batch_index: u64) -> Result<Vec<FrameHeader>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT frame_in_batch, fee, safe_block FROM frames \
-             WHERE batch_index = ?1 ORDER BY frame_in_batch ASC",
-        )?;
-        let rows = stmt.query_map(params![u64_to_i64(batch_index)], |row| {
-            Ok(FrameHeader {
-                frame_in_batch: i64_to_u32(row.get(0)?),
-                fee: i64_to_u16(row.get(1)?),
-                safe_block: i64_to_u64(row.get(2)?),
-            })
-        })?;
-        rows.collect::<Result<Vec<_>>>()
+        frames_for_batch_in(&self.conn, batch_index)
     }
 
     /// Materialize all sequenced L2 txs in one batch (used by the catch-up /
@@ -153,44 +204,71 @@ impl Storage {
     /// Internal helper for [`Self::pending_batches`]; does NOT filter on
     /// validity — callers only reach this after they know the batch is valid.
     fn load_batch_frames(&mut self, batch_index: u64) -> Result<Vec<BatchFrame>> {
-        let frame_headers = self.frames_for_batch(batch_index)?;
-        let mut frames = Vec::with_capacity(frame_headers.len());
-        for header in frame_headers {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT nonce, max_fee, data, sig FROM user_ops \
-                 WHERE batch_index = ?1 AND frame_in_batch = ?2 \
-                 ORDER BY pos_in_frame ASC",
-            )?;
-            let rows = stmt.query_map(
-                params![u64_to_i64(batch_index), i64::from(header.frame_in_batch)],
-                |row| {
-                    Ok(WireUserOp {
-                        nonce: i64_to_u32(row.get(0)?),
-                        max_fee: i64_to_u16(row.get(1)?),
-                        data: row.get(2)?,
-                        signature: row.get(3)?,
-                    })
-                },
-            )?;
-            let user_ops: Vec<WireUserOp> = rows.collect::<Result<_>>()?;
-            frames.push(BatchFrame {
-                user_ops,
-                safe_block: header.safe_block,
-                fee_price: header.fee,
-            });
-        }
-        Ok(frames)
+        load_batch_frames_in(&self.conn, batch_index)
     }
+}
+
+fn frames_for_batch_in(conn: &rusqlite::Connection, batch_index: u64) -> Result<Vec<FrameHeader>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT frame_in_batch, fee, safe_block FROM frames \
+         WHERE batch_index = ?1 ORDER BY frame_in_batch ASC",
+    )?;
+    let rows = stmt.query_map(params![u64_to_i64(batch_index)], |row| {
+        Ok(FrameHeader {
+            frame_in_batch: i64_to_u32(row.get(0)?),
+            fee: i64_to_u16(row.get(1)?),
+            safe_block: i64_to_u64(row.get(2)?),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>>>()
+}
+
+/// Free-function form so the seal path can encode the closing batch inside
+/// its own transaction — the content-identity check's hash-at-seal must come
+/// from **the same encode path the submitter uses** (review R2); this
+/// function being that single path is load-bearing.
+pub(super) fn load_batch_frames_in(
+    conn: &rusqlite::Connection,
+    batch_index: u64,
+) -> Result<Vec<BatchFrame>> {
+    let frame_headers = frames_for_batch_in(conn, batch_index)?;
+    let mut frames = Vec::with_capacity(frame_headers.len());
+    for header in frame_headers {
+        let mut stmt = conn.prepare_cached(
+            "SELECT nonce, max_fee, data, sig FROM user_ops \
+             WHERE batch_index = ?1 AND frame_in_batch = ?2 \
+             ORDER BY pos_in_frame ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![u64_to_i64(batch_index), i64::from(header.frame_in_batch)],
+            |row| {
+                Ok(WireUserOp {
+                    nonce: i64_to_u32(row.get(0)?),
+                    max_fee: i64_to_u16(row.get(1)?),
+                    data: row.get(2)?,
+                    signature: row.get(3)?,
+                })
+            },
+        )?;
+        let user_ops: Vec<WireUserOp> = rows.collect::<Result<_>>()?;
+        frames.push(BatchFrame {
+            user_ops,
+            safe_block: header.safe_block,
+            fee_price: header.fee,
+        });
+    }
+    Ok(frames)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{
-        SENDER_A, SENDER_B, seed_closed_batches, seed_safe_inputs_with_batch_nonces, temp_db,
+        SENDER_A, SENDER_B, local_batch_payload, seed_closed_batches,
+        seed_safe_inputs_with_batch_nonces, temp_db,
     };
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use alloy_primitives::Address;
-    use sequencer_core::batch::{Batch, Frame as BatchFrame};
+    use sequencer_core::batch::Batch;
     use sequencer_core::protocol::ProtocolTiming;
 
     #[test]
@@ -332,6 +410,28 @@ mod tests {
     }
 
     #[test]
+    fn wallet_nonce_watermark_is_monotonic_and_absent_at_genesis() {
+        let db = temp_db("wallet-nonce-watermark");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        assert_eq!(
+            storage.wallet_nonce_watermark().expect("read"),
+            None,
+            "genesis: nothing ever broadcast"
+        );
+
+        storage.raise_wallet_nonce_watermark(5).expect("raise to 5");
+        assert_eq!(storage.wallet_nonce_watermark().expect("read"), Some(5));
+
+        // Monotonic: a lower raise never lowers the watermark.
+        storage.raise_wallet_nonce_watermark(3).expect("raise to 3");
+        assert_eq!(storage.wallet_nonce_watermark().expect("read"), Some(5));
+
+        storage.raise_wallet_nonce_watermark(9).expect("raise to 9");
+        assert_eq!(storage.wallet_nonce_watermark().expect("read"), Some(9));
+    }
+
+    #[test]
     fn submitter_frontier_returns_zero_when_no_batches_were_accepted() {
         let db = temp_db("submitter-frontier-empty");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
@@ -344,9 +444,40 @@ mod tests {
     }
 
     #[test]
+    fn submitter_frontier_uses_anchor_when_no_batches_accepted() {
+        // A cockroach-recovered deployment boots with an empty
+        // safe_accepted_batches and a non-zero batch-tree anchor (N'). The
+        // submitter's start frontier must be N', not 0 — otherwise it would
+        // re-submit its first post-recovery batch (nonce N') on every tick
+        // until the first accepted row lands. Regression test for the
+        // frontier_nonce/anchor asymmetry (frontier_nonce defaulted to 0 while
+        // populate_safe_accepted_batches seeds `expected` from the anchor).
+        let db = temp_db("submitter-frontier-anchor");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage.set_batch_tree_anchor(7).expect("anchor at N'=7");
+        storage
+            .append_safe_inputs(0, &[], SENDER_A, &default_test_protocol())
+            .expect("record observed safe head");
+        let frontier = storage.submitter_frontier().expect("submitter frontier");
+        assert_eq!(frontier.accepted_next_nonce, 7);
+    }
+
+    #[test]
     fn submitter_frontier_tracks_accepted_prefix() {
         let db = temp_db("submitter-frontier-prefix");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // Local closed batches 0 and 1 — their landings carry the real wire
+        // bytes (content-identity check); 3..5 stay synthetic, which is fine
+        // because the nonce gap means the fold never accepts them.
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close 0");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close 1");
         // seed_safe_inputs_with_batch_nonces already calls append_safe_inputs,
         // which auto-populates safe_accepted_batches.
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4, 5]);
@@ -387,19 +518,13 @@ mod tests {
             .expect("close batch 1");
 
         let protocol = default_test_protocol();
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 1135,
                 &[StoredSafeInput {
                     sender: SENDER_A,
-                    payload: ssz::Encode::as_ssz_bytes(&Batch {
-                        nonce: 0,
-                        frames: vec![BatchFrame {
-                            user_ops: vec![],
-                            safe_block: 10,
-                            fee_price: 0,
-                        }],
-                    }),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -433,19 +558,13 @@ mod tests {
             .expect("close batch 1");
 
         let protocol = default_test_protocol();
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 1200,
                 &[StoredSafeInput {
                     sender: SENDER_A,
-                    payload: ssz::Encode::as_ssz_bytes(&Batch {
-                        nonce: 0,
-                        frames: vec![BatchFrame {
-                            user_ops: vec![],
-                            safe_block: 100,
-                            fee_price: 0,
-                        }],
-                    }),
+                    payload: landed,
                     block_number: 200,
                 }],
                 SENDER_A,
@@ -531,19 +650,13 @@ mod tests {
             .expect("close batch 0; batch 1 is Tip");
 
         let protocol = default_test_protocol();
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 1200,
                 &[StoredSafeInput {
                     sender: SENDER_A,
-                    payload: ssz::Encode::as_ssz_bytes(&Batch {
-                        nonce: 0,
-                        frames: vec![BatchFrame {
-                            user_ops: vec![],
-                            safe_block: 10,
-                            fee_price: 0,
-                        }],
-                    }),
+                    payload: landed,
                     block_number: 20,
                 }],
                 SENDER_A,
@@ -586,7 +699,14 @@ mod tests {
         let protocol = default_test_protocol();
         let old_safe_timestamp = 1_000_u64;
         storage
-            .append_safe_inputs_with_timestamp(1200, old_safe_timestamp, &[], SENDER_A, &protocol)
+            .append_safe_inputs_with_timestamp(
+                1200,
+                old_safe_timestamp,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
             .expect("advance safe head with stale L1 timestamp");
 
         let now_ms =
@@ -619,6 +739,14 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_test_protocol();
 
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        for nonce in 0..4 {
+            storage
+                .close_frame_and_batch(&mut head, 10)
+                .unwrap_or_else(|e| panic!("close {nonce}: {e}"));
+        }
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1]);
 
         // Mixed-sender wave: the SENDER_B row must be ignored, SENDER_A rows
@@ -634,18 +762,12 @@ mod tests {
             },
             StoredSafeInput {
                 sender: SENDER_A,
-                payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-                    nonce: 2,
-                    frames: Vec::new(),
-                }),
+                payload: local_batch_payload(&mut storage, 2),
                 block_number: 11,
             },
             StoredSafeInput {
                 sender: SENDER_A,
-                payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-                    nonce: 3,
-                    frames: Vec::new(),
-                }),
+                payload: local_batch_payload(&mut storage, 3),
                 block_number: 11,
             },
         ];
@@ -672,33 +794,27 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_test_protocol();
 
-        // Seed a non-stale batch with nonce 0 (safe_block=100, block_number=200, max_wait=1200 → not stale)
-        let non_stale_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-            nonce: 0,
-            frames: vec![sequencer_core::batch::Frame {
-                user_ops: Vec::new(),
-                safe_block: 100,
-                fee_price: 0,
-            }],
-        });
-        // Seed a stale batch with nonce 1 (safe_block=100, block_number=2000, max_wait=1200 → stale)
-        let stale_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-            nonce: 1,
-            frames: vec![sequencer_core::batch::Frame {
-                user_ops: Vec::new(),
-                safe_block: 100,
-                fee_price: 0,
-            }],
-        });
-        // Seed a non-stale batch with nonce 1 (safe_block=1900, block_number=2000 → not stale)
-        let non_stale_payload_2 = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-            nonce: 1,
-            frames: vec![sequencer_core::batch::Frame {
-                user_ops: Vec::new(),
-                safe_block: 1900,
-                fee_price: 0,
-            }],
-        });
+        // Local batch 0 (first frame safe_block=100) and batch 1 (first frame
+        // safe_block=1900). Their landings carry the real wire bytes so the
+        // content-identity check accepts them.
+        let mut head = storage
+            .initialize_open_state(100, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 1900)
+            .expect("close 0");
+        storage
+            .close_frame_and_batch(&mut head, 1900)
+            .expect("close 1");
+
+        // Non-stale landing of batch 0 (block 200 - safe_block 100 < 1200).
+        let non_stale_payload = local_batch_payload(&mut storage, 0);
+        // Stale copy at nonce 1 (safe_block=100, block 2000 → age >= 1200):
+        // a scheduler no-op, so its content is never compared — synthetic
+        // bytes are deliberate here.
+        let stale_payload = super::super::test_helpers::make_stale_batch_payload(1, 100);
+        // Non-stale landing of batch 1 (block 2000 - safe_block 1900 < 1200).
+        let non_stale_payload_2 = local_batch_payload(&mut storage, 1);
 
         let inputs = vec![
             StoredSafeInput {
@@ -726,12 +842,109 @@ mod tests {
     }
 
     #[test]
-    fn frontier_accepts_future_safe_block_batch_by_design() {
-        // The scheduler rejects batches where frame safe_block > inclusion_block,
-        // but the sequencer trusts its own output and does not re-validate these
-        // invariants during recovery. This test documents the intentional design
-        // choice: populate_safe_accepted_batches accepts such batches because
-        // the sequencer would never produce them.
+    fn seal_stamps_payload_hash_of_the_submitter_encode_path() {
+        // Hash-at-seal (review R2): the hash stamped on the sealed row must
+        // be the keccak256 of exactly the bytes the submitter will broadcast
+        // (`pending_batches`'s encoding) — same code path, by construction.
+        let db = temp_db("seal-stamps-payload-hash");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+
+        let stamped: Vec<u8> = storage
+            .conn
+            .query_row(
+                "SELECT payload_hash FROM batches WHERE batch_index = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sealed batch must carry a payload hash");
+        let wire = local_batch_payload(&mut storage, 0);
+        assert_eq!(
+            stamped.as_slice(),
+            alloy_primitives::keccak256(&wire).as_slice(),
+            "seal-time hash must match the submitter's wire bytes"
+        );
+    }
+
+    #[test]
+    fn accepted_landing_with_mismatched_content_freezes_frontier() {
+        // The F1-zombie / F3-re-seal shape: a landing at the expected nonce
+        // whose bytes differ from the batch we sealed. The check records a
+        // 'mismatch' marker atomically with the sync and freezes the
+        // frontier; later syncs stay frozen.
+        let db = temp_db("mismatch-divergence");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_test_protocol();
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+
+        // Same nonce + same first-frame safe block (fresh by inclusion),
+        // different content (synthetic fee 0 vs the sealed fee).
+        let imposter = super::super::test_helpers::make_stale_batch_payload(0, 10);
+        storage
+            .append_safe_inputs(
+                20,
+                &[StoredSafeInput {
+                    sender: SENDER_A,
+                    payload: imposter,
+                    block_number: 20,
+                }],
+                SENDER_A,
+                &protocol,
+            )
+            .expect("sync commits; the marker rides the same transaction");
+
+        let kind: String = storage
+            .conn
+            .query_row(
+                "SELECT kind FROM canonical_divergence WHERE singleton_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("marker persisted");
+        assert_eq!(kind, "mismatch");
+        let frontier = storage.submitter_frontier().expect("frontier");
+        assert_eq!(frontier.accepted_next_nonce, 0, "frontier frozen");
+
+        // A later sync — even one carrying the *correct* bytes — must not
+        // thaw the frontier: the marker is terminal until cockroach recovery.
+        let genuine = local_batch_payload(&mut storage, 0);
+        storage
+            .append_safe_inputs(
+                21,
+                &[StoredSafeInput {
+                    sender: SENDER_A,
+                    payload: genuine,
+                    block_number: 21,
+                }],
+                SENDER_A,
+                &protocol,
+            )
+            .expect("append after marker");
+        let frontier = storage.submitter_frontier().expect("frontier");
+        assert_eq!(frontier.accepted_next_nonce, 0, "frontier stays frozen");
+    }
+
+    #[test]
+    fn sim_accepted_foreign_batch_freezes_frontier_with_divergence_marker() {
+        // `scheduler_accepts` deliberately omits the two structural
+        // rejections (future safe_block, non-monotonic frames) under
+        // self-trust — the sequencer never produces them. Before the
+        // content-identity check (review R2), such a foreign batch at the
+        // expected nonce would be sim-accepted and silently desync the
+        // frontier forever. With the check, it fails the local-batch lookup
+        // (kind = foreign), the poison marker persists atomically with the
+        // sync, the frontier freezes, and `check_danger` reports
+        // `CanonicalDivergence` ahead of every other arm.
         let db = temp_db("frontier-future-safe-block");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
@@ -743,21 +956,6 @@ mod tests {
                 fee_price: 0,
             }],
         });
-        let non_monotonic_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-            nonce: 1,
-            frames: vec![
-                sequencer_core::batch::Frame {
-                    user_ops: Vec::new(),
-                    safe_block: 200,
-                    fee_price: 0,
-                },
-                sequencer_core::batch::Frame {
-                    user_ops: Vec::new(),
-                    safe_block: 100,
-                    fee_price: 0,
-                },
-            ],
-        });
 
         let batch_submitter = Address::repeat_byte(0xCC);
         let protocol = ProtocolTiming {
@@ -766,26 +964,146 @@ mod tests {
             l1_read_stale_after_blocks: 900,
             seconds_per_block: 12,
         };
-        let inputs = vec![
-            StoredSafeInput {
-                sender: batch_submitter,
-                payload: future_safe_block_payload,
-                block_number: 100,
-            },
-            StoredSafeInput {
-                sender: batch_submitter,
-                payload: non_monotonic_payload,
-                block_number: 200,
-            },
-        ];
+        let inputs = vec![StoredSafeInput {
+            sender: batch_submitter,
+            payload: future_safe_block_payload,
+            block_number: 100,
+        }];
         storage
             .append_safe_inputs(200, inputs.as_slice(), batch_submitter, &protocol)
-            .expect("append");
+            .expect("append commits; the marker rides the same transaction");
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");
         assert_eq!(
-            frontier.accepted_next_nonce, 2,
-            "both batches should be in accepted frontier"
+            frontier.accepted_next_nonce, 0,
+            "the frontier must freeze before the diverged landing"
+        );
+        let status = storage
+            .check_danger(&protocol, unix_now_ms())
+            .expect("check_danger");
+        assert_eq!(
+            status,
+            crate::storage::DangerStatus::CanonicalDivergence(0),
+            "the marker outranks every other danger arm"
+        );
+    }
+
+    #[test]
+    fn populate_accepts_post_recovery_batch_at_anchor() {
+        // A cockroach-recovered deployment is anchored at N' > 0; its first
+        // post-recovery batch lands at nonce N'. populate must seed `expected`
+        // from the anchor and accept it (frontier → N'+1), content-identity
+        // passing against the genuine local batch. Every other populate test
+        // uses anchor=0, so the N' > 0 acceptance path had no coverage.
+        let db = temp_db("populate-at-anchor");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_test_protocol();
+        let submitter = SENDER_A;
+
+        // Root the tree at N' = 7, then build + seal one local batch — it carries
+        // nonce 7 (compute_next_nonce(None) reads the anchor).
+        storage.set_batch_tree_anchor(7).expect("anchor at N'=7");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close the nonce-7 batch");
+        assert_eq!(
+            storage.batch_nonce(0).expect("nonce"),
+            7,
+            "the root tip carries the anchor nonce N'"
+        );
+
+        // Its genuine wire bytes (looked up by nonce N'=7) land from the
+        // submitter at a fresh inclusion block.
+        let genuine = local_batch_payload(&mut storage, 7);
+        storage
+            .append_safe_inputs(
+                20,
+                &[StoredSafeInput {
+                    sender: submitter,
+                    payload: genuine,
+                    block_number: 20,
+                }],
+                submitter,
+                &protocol,
+            )
+            .expect("sync the N' landing");
+
+        assert_eq!(
+            storage
+                .submitter_frontier()
+                .expect("frontier")
+                .accepted_next_nonce,
+            8,
+            "the N'=7 batch is accepted; the frontier advances to 8"
+        );
+        let divergence: i64 = storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM canonical_divergence", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            divergence, 0,
+            "a genuine N' landing must not flag divergence"
+        );
+    }
+
+    #[test]
+    fn populate_skips_below_anchor_collapsed_history_without_divergence() {
+        // Below the anchor the local tree has no batches (that history was folded
+        // into S'). Old-generation L1 landings at nonces < N' are trusted
+        // collapsed history: skipped by nonce-mismatch BEFORE the content-identity
+        // check, so they must NOT be flagged Foreign (which would freeze the
+        // frontier and force a false recovery). Pins the anchor-aware-frontier
+        // (I15) skip arm — the inverse of the foreign-batch freeze test above.
+        let db = temp_db("populate-below-anchor");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_test_protocol();
+        let submitter = SENDER_A;
+        storage.set_batch_tree_anchor(7).expect("anchor at N'=7");
+
+        // Old-generation batches at nonces 0, 1, 2 (< anchor) land from the submitter.
+        let mk = |nonce: u64| {
+            ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+                nonce,
+                frames: vec![sequencer_core::batch::Frame {
+                    user_ops: Vec::new(),
+                    safe_block: 10,
+                    fee_price: 0,
+                }],
+            })
+        };
+        let landings: Vec<StoredSafeInput> = (0..3)
+            .map(|n| StoredSafeInput {
+                sender: submitter,
+                payload: mk(n),
+                block_number: 20 + n,
+            })
+            .collect();
+        storage
+            .append_safe_inputs(30, &landings, submitter, &protocol)
+            .expect("sync below-anchor landings");
+
+        let divergence: i64 = storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM canonical_divergence", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            divergence, 0,
+            "below-anchor history must be skipped by nonce-mismatch, not flagged Foreign"
+        );
+        assert_eq!(
+            storage
+                .submitter_frontier()
+                .expect("frontier")
+                .accepted_next_nonce,
+            7,
+            "nothing is accepted; the frontier stays at the anchor N'"
         );
     }
 
@@ -875,18 +1193,19 @@ mod tests {
             .expect("init");
         storage.close_frame_and_batch(&mut head, 10).expect("close");
 
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 20,
                 &[
                     StoredSafeInput {
                         sender: SENDER_A,
-                        payload: super::super::test_helpers::make_stale_batch_payload(0, 10),
+                        payload: landed.clone(),
                         block_number: 20,
                     },
                     StoredSafeInput {
                         sender: SENDER_A,
-                        payload: super::super::test_helpers::make_stale_batch_payload(0, 10),
+                        payload: landed,
                         block_number: 20,
                     },
                 ],
@@ -963,12 +1282,13 @@ mod tests {
             "out of order must stall frontier"
         );
 
+        let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
                 21,
                 &[StoredSafeInput {
                     sender: SENDER_A,
-                    payload: super::super::test_helpers::make_stale_batch_payload(0, 10),
+                    payload: landed,
                     block_number: 21,
                 }],
                 SENDER_A,

@@ -8,7 +8,7 @@ See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and fu
 
 The sequencer's recovery loop spans two process lifetimes:
 
-1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `DangerDetectorExit::DangerDetected` under `RunError::Worker` and the process exits with non-zero status.
+1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`CanonicalDivergence`, `L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `DangerDetectorExit::DangerDetected` under `RunError::Worker` and the process exits with non-zero status.
 2. **External respawn.** An orchestrator (systemd, k8s, …) restarts the process.
 3. **Startup dispatch.** The fresh boot runs `run_preemptive_recovery` before any writers come online: sync L1, re-run `check_danger`, then `decide_startup_action` routes to one of `Proceed`, `RecoverTip`, `FlushAndCascade`, or `Refuse`. Recovery actions run their DB mutations as single SQLite transactions; `Proceed` intentionally does no DB writes.
 
@@ -43,7 +43,13 @@ Recovery requires at least one Gold ancestor (the cascade invalidates a suffix a
 
 The TLA+ model handles this with a **genesis sentinel**: the initial state starts with a Gold batch at nonce 0. This is a modeling technique that eliminates the nonce-0 special case, allowing Resolve to use uniform logic (the `fng > 1` guard is always satisfied). Without it, the model would need a separate Resolve action with different arithmetic for the "no Gold ancestor" case.
 
-The implementation can handle the nonce-0 case either by submitting a sentinel batch at first startup, or by special-casing the recovery code for the "no Gold ancestor" branch.
+The implementation handles the nonce-0 case **structurally**: `open_fresh_tip_in_tx` (`storage/ingress.rs`) roots a nonce-0 batch whenever the valid path is empty (genesis, or a fully-torn cascade) — no sentinel batch is submitted and no recovery branch is special-cased. The model's sentinel and the implementation's structural root play the same role.
+
+#### Cockroach recovery generalizes the root nonce (the anchor)
+
+Cockroach recovery (`setup --recovery`) rebuilds a wiped DB from a trusted checkpoint and must resume submitting at nonce `N'` without replaying history — so the rebuilt tree is rooted at `N'`, not 0. Rather than plant a fake "sentinel" batch at `N'-1`, PR5 generalizes the structural root: a `batch_tree_anchor` singleton holds the nonce the parentless root carries (default `0`; recovery sets `N'`). The same `open_fresh_tip_in_tx` / `compute_next_nonce(parent = None)` path then roots `run`'s first tip at `N'`, and `trg_enforce_nonce_contiguity` validates the root against the anchor (exact match) instead of a hard-coded 0. There is **no sentinel batch row** — the root tip *is* the anchored batch. Normal deployments keep anchor `0` and are byte-identical. See [I16](../invariants.md) and the [cockroach-recovery design](#cockroach-recovery-setup---recovery) below.
+
+A sealed `N'-1` sentinel was considered and rejected: a valid closed batch at `N'-1` is a legal cascade pivot, so a runtime cascade could invalidate it and leave the tree re-rooting at 0 (ABORTed by the unchanged contiguity trigger) — an unguarded reliance on "the frontier never drops to `N'-1`". The anchor has no such hidden dependency.
 
 ## Coloring
 
@@ -192,9 +198,9 @@ Stop accepting new user operations. From the outside world, the sequencer is tem
 
 ### Step 3: Flush mempool
 
-Query the latest confirmed `w_nonce` (N) and the pending `w_nonce` (M). Submit `M - N` no-op transactions (e.g., self-transfer of 0 ETH) at nonces N, N+1, ..., M-1. These compete with any batches in the mempool at the same slots.
+Read the persisted **wallet-nonce watermark** `W` — the highest `w_nonce` this deployment ever broadcast (`wallet_nonce_watermark` singleton; see Implementation Constraint 1). Query the latest confirmed `w_nonce` (N) and the pending `w_nonce` (M). Submit no-op transactions (self-transfers of 0 ETH) at nonces N, N+1, ..., `max(M, W+1) - 1`. These compete with any of our transactions still alive anywhere in the network — including zombies the local node's pool has forgotten (review F1).
 
-Wait for all `M - N` slots to reach L1 safe finality.
+Wait until both `pending <= safe` **and** `safe >= W + 1`: every slot this deployment ever used is consumed at safe depth. The second conjunct is the durable anchor — without it the flush trusts the local node's volatile mempool memory, which a dropped-locally-but-alive-elsewhere zombie evades entirely. The flush reports the safe block at which it observed resolution; Step 5 refuses to cascade until the re-synced view reaches at least that block (review F2).
 
 ### Step 4: Post-flush state
 
@@ -205,7 +211,7 @@ Every `w_nonce` slot from N to M-1 is now resolved:
 
 There are no more mempool entries. All uncertainty is resolved.
 
-**Flush safety does not depend on eviction.** A no-op may fail to evict a still-pending batch tx (e.g. our local node rejects the replacement under EIP-1559's ≥10% bump rule). That's fine: the outer `flush_and_wait` loop is unbounded — it keeps running until `pending ≤ safe`, and *eventual* inclusion of either the original batch tx or the no-op resolves the slot. Safety holds regardless of which lands; eviction is only an operational efficiency concern.
+**Flush safety does not depend on eviction.** A no-op may fail to evict a still-pending batch tx (e.g. our local node rejects the replacement under EIP-1559's ≥10% bump rule). That's fine: a rejected send surfaces as a hard `FlushError` and the process exits, the orchestrator respawn re-runs the flush, and *eventual* inclusion of either the original batch tx or the no-op resolves the slot — the unbounded retry lives in the respawn loop, not inside `flush_and_wait`. Safety holds regardless of which lands; eviction is only an operational efficiency concern.
 
 ### Step 5: Run recovery
 
@@ -225,7 +231,9 @@ Any batch past that gold frontier is **doomed**, in one of three concrete senses
 
 **Why isn't this just "stale"?** Under self-trust (we don't defend against malformed self-submissions), the *first* non-gold closed batch can only be Silver-stale or Pending. Nonce-mismatch is impossible at the frontier — nonces are contiguous on the valid path (`trg_enforce_nonce_contiguity`). But *downstream* batches past that first non-gold are typically Silver-fresh-poisoned: their inclusion-staleness was fine, but they were processed when expected was stuck at the poisoned nonce.
 
-Cascading from the first non-gold catches all three. **No per-batch age check is needed for the cascade pivot itself** — every closed batch past gold is doomed by construction.
+A **fourth shape** sits outside this taxonomy: a closed batch that was **never submitted** (closed after the submitter's last tick before the detector exit). It has no L1 footprint, no killed tx, and is not literally doomed — it could simply be submitted after recovery. The cascade invalidates it anyway: once committed to recovery, cascading the entire non-gold suffix converges in one cycle and avoids spine-order reasoning about a half-submitted suffix. The cost is real (its soft confirmations are rolled back); this is a deliberate convergence-over-preservation policy choice.
+
+Cascading from the first non-gold catches all four. **No per-batch age check is needed for the cascade pivot itself** — every closed batch past gold is either doomed by construction or sacrificed by the convergence policy.
 
 #### Path A — `recover_post_flush(danger_threshold)` (called from FlushAndCascade)
 
@@ -337,11 +345,47 @@ A killed batch acts as **silent nonce poison**: the scheduler never sees it, so 
 
 Dead batches occupy `w_nonce` slots strictly below `walletNonce`. Recovery batches occupy `w_nonce` slots at or above `walletNonce`. **No overlap.** This is why no mutual exclusion is needed between dead batches and recovery batches -- they live in non-overlapping `w_nonce` ranges.
 
+## Cockroach recovery (`setup --recovery`)
+
+Everything above is **standard recovery**: the running sequencer's own bookkeeping (the batch tree, pending dumps) lets it cascade a doomed suffix and resume. It is automatic and in-process.
+
+**Cockroach recovery** is the catastrophe path — the local DB is lost or has diverged (`CanonicalDivergence`, [I15](../invariants.md)). There is no tree to cascade; the operator wipes the DB and rebuilds canonical logical state from a trusted checkpoint plus L1. It is an operator-driven, one-shot `setup` mode, not a runtime action. The summary:
+
+Given a trusted checkpoint machine `S` at block `B` (a finalized `dumps/<id>/` dir, carrying `N` = its resume nonce and `A` = its last-executed safe block), `setup --recovery --checkpoint-block B --checkpoint-dump-dir <dir>` runs **flush → fold → fill**:
+
+1. **Flush** the wallet nonce (keyed — recovery, unlike plain `setup`, signs) so every previous-instance batch resolves at safe depth `≤ C`, the post-flush safe head. Re-sync `safe_inputs` through `C`.
+2. **Fold** (the pure `sequencer-core` engine, shared with the on-chain scheduler so it is consistent by construction): seed the fridge from the `(A, B]` directs (drop batches — already in `S`), replay the `(B, C]` stream, drain the leftover fridge at `C`. Yields `(S', N')` = the advanced app state and the resume nonce.
+3. **Fill** a consistent DB: snapshot `S'` as finalized at `C`; **anchor the batch tree at `N'`** ([I16](../invariants.md) — the root tip *is* `N'`, no sentinel batch); sequence the `≤ C` directs so the replay cursor starts past them (they're already in `S'`, while `run`'s first on-chain batch re-drains them by `safe_block`). `run` boots from this state.
+
+During recovery the gold frontier (`safe_accepted_batches`) population is **deferred** (`FrontierMode::DeferUntilAnchorSet`): the tree is empty until fill, so simulating acceptance against it would flag every L1 batch as foreign and freeze the frontier ([I15](../invariants.md)). It is populated on `run`'s first sync — once the anchor `N'` is set — so the folded `< N'` history is skipped as trusted collapsed history. `N` is **trusted checkpoint metadata**, not re-verified at recovery time: a wrong-low `N` surfaces at `run` via the content-identity check, but a wrong-high `N` does not — sound because a sequencer-produced finalized dump cannot carry a wrong `N` by construction (see [`cockroach.md`](cockroach.md#data-dictionary) for the full trust boundary). Recovery is a **strict one-shot**: it refuses (terminal) on a DB that is already set up — the model is "wipe and re-run", and a crash before the `setup_complete` marker re-runs cleanly (the fill is idempotent).
+
+The detect-and-refuse gate is the *trigger*: a fresh `setup` that finds a previous instance's batches past the checkpoint refuses with exit `40` (`EXIT_SETUP_NEEDS_RECOVERY`), pointing the operator here.
+
+## Canonical divergence (terminal, outranks every arm)
+
+Independent of the staleness machinery, the input reader's acceptance
+simulation cross-checks every **accepted** landing against the local batch at
+that nonce (content-identity check, review R2: `keccak256` of the landed wire
+bytes vs the hash stamped at seal). On mismatch — or on an accepted landing
+with no valid closed local batch at all — it persists the
+`canonical_divergence` marker atomically with the sync, freezes the
+acceptance frontier, and `check_danger` reports `CanonicalDivergence`
+**ahead of every other arm**, so a respawn loop can never route a diverged
+node into `Proceed` or `FlushAndCascade`. The startup dispatch maps it to a
+terminal `Refuse`.
+
+The remedy is **cockroach recovery (wipe + rebuild from L1), never the
+standard recovery on this page**: the cascade reconciles the batch tree's
+*shape* under the assumption that accepted nonce N is our batch N — a content
+mismatch means canonical state contains executed effects with no reliable
+local source, so rebuild-from-L1 is the only honest repair.
+
 ## Implementation Constraints
 
 These constraints were discovered during TLA+ model checking and are required for correctness:
 
 1. **`walletNonce` must NOT be reset during recovery.** Recovery batches must use `w_nonces` strictly past all dead batch slots. The flush consumes dead batch slots by advancing `nextL1Slot` up to `walletNonce`. Recovery starts fresh from there.
+   **Mechanism (review R1a):** `walletNonce` is realized durably as the `wallet_nonce_watermark` singleton — the highest wallet nonce ever broadcast. Every broadcaster (the batch poster and the flusher's no-ops alike) commits `watermark = max(watermark, n)` power-loss-durably (`synchronous=FULL`) **before** sending at nonce `n` (write-before-broadcast; a crash between commit and send only over-covers — one wasted no-op). The flush's completion condition is `pending <= safe && safe >= watermark + 1`, so it cannot declare victory while any slot we ever used is unresolved — restoring this constraint against the local pool's volatile memory (review F1). The watermark is never reset and never lowered.
 
 2. **`SubmitBatch` must use `max(walletNonce, nextL1Slot)`.** Prevents assigning `w_nonce` values for slots L1 has already consumed.
 
@@ -361,7 +405,7 @@ The recovery design is verified with bounded TLA+ model checking. The canonical 
 
 Models the core slot-level mechanics of preemptive recovery. At every `w_nonce` slot, L1 non-deterministically includes the spine batch OR a flush no-op (killing the batch). This covers the case where the frontier batch itself is killed during flush. The model also treats the open Tip's `safe_block` as meaningful, so it can explicitly recover an aging Tip that has no L1 footprint yet.
 
-The model is a **safety over-approximation**: it allows `AdvanceTip` and `SubmitBatch` to interleave freely with recovery, which the real protocol prevents (the sequencer goes offline). This makes the proof stronger -- if `ZombieSafety` holds under more interleavings, it holds under fewer. However, the model does not verify the full sequential protocol phases (cutover, flush, wait, recover, resume) described above; in particular, the startup decision of whether a closed unresolved batch must flush before recovery remains an external argument layered on top of the slot-level proof.
+The model is a **safety over-approximation for the actions it shares with the implementation**: it allows `AdvanceTip` and `SubmitBatch` to interleave freely with recovery, which the real protocol prevents (the sequencer goes offline). This makes the proof stronger -- if `ZombieSafety` holds under more interleavings, it holds under fewer. However, the over-approximation claim does **not** hold action-for-action — two implementation actions sit *outside* the model's transition set: (1) the model discards an aging Tip only at `MAX_WAIT_BLOCKS`, while the implementation invalidates at `danger_threshold` (= `MAX_WAIT − MARGIN`); (2) the model's `Resolve` has no case for a killed-Pending frontier (it relies on resubmission until the frontier is Silver), while `recover_post_flush` cascades killed Pendings unconditionally. For those actions the implementation's enabled transitions are a *superset* of the model's, so TLC has not explored them; their safety rests on external arguments (an open Tip and a killed Pending have no L1/scheduler state to disagree with). The model also does not verify the full sequential protocol phases (cutover, flush, wait, recover, resume) described above; in particular, the startup decision of whether a closed unresolved batch must flush before recovery remains an external argument layered on top of the slot-level proof.
 
 **Verified**: 157M states, 0 violations.
 

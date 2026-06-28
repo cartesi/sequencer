@@ -19,12 +19,13 @@ const DEFAULT_CATCH_UP_PAGE_SIZE: usize = 256;
 
 /// The single checkpoint the lane resumes from: the latest pending
 /// snapshot if any, else the finalized snapshot. Carries both the dump
-/// `prefix` (to load the Application via `from_dump`) and the matching
-/// `l2_tx_index` (the replay cursor), so the loaded state and the
-/// catch-up cursor are guaranteed to come from the *same* checkpoint.
+/// directory (whose `state` subtree loads the Application via
+/// `from_dump`) and the matching `l2_tx_index` (the replay cursor), so
+/// the loaded state and the catch-up cursor are guaranteed to come from
+/// the *same* checkpoint.
 #[derive(Debug, Clone)]
 pub(super) struct CatchUpSnapshot {
-    pub(super) prefix: PathBuf,
+    pub(super) dump_dir: PathBuf,
     pub(super) l2_tx_index: u64,
 }
 
@@ -35,18 +36,19 @@ pub(super) struct CatchUpSnapshot {
 /// back to the finalized snapshot.
 ///
 /// Returns the checkpoint directly rather than an `Option`: the
-/// always-load invariant — `ensure_finalized_snapshot` runs in
-/// `Workers::spawn` before `InclusionLane::start` — guarantees at least
-/// the genesis finalized snapshot exists by the time the lane resumes.
-/// Absence is a violated invariant (runtime/setup bug), surfaced
-/// fail-loud as [`CatchUpError::NoSnapshot`].
+/// always-load invariant — `setup` registers the genesis finalized
+/// snapshot, `run` gates on it (`require_finalized_snapshot` in
+/// `Workers::spawn`, plus the boot-gate check) before `InclusionLane::start`
+/// — guarantees at least the genesis finalized snapshot exists by the time
+/// the lane resumes. Absence is a violated invariant (runtime/setup bug),
+/// surfaced fail-loud as [`CatchUpError::NoSnapshot`].
 pub(super) fn catch_up_snapshot(storage: &mut Storage) -> Result<CatchUpSnapshot, CatchUpError> {
     let (dump, l2_tx_index) = storage
         .latest_snapshot()
         .map_err(|source| CatchUpError::LoadSnapshot { source })?
         .ok_or(CatchUpError::NoSnapshot)?;
     Ok(CatchUpSnapshot {
-        prefix: dump.prefix,
+        dump_dir: dump.prefix,
         l2_tx_index,
     })
 }
@@ -94,8 +96,8 @@ pub(super) fn catch_up_application_paged(
             return Ok(());
         }
 
-        for (db_offset, item) in replay {
-            replay_sequenced_l2_tx(app, batch_submitter_address, item)?;
+        for (db_offset, item, frame_safe_block) in replay {
+            replay_sequenced_l2_tx(app, batch_submitter_address, item, frame_safe_block)?;
             next_offset = db_offset;
         }
     }
@@ -105,10 +107,14 @@ fn replay_sequenced_l2_tx(
     app: &mut impl Application,
     batch_submitter_address: Address,
     item: SequencedL2Tx,
+    frame_safe_block: u64,
 ) -> Result<(), CatchUpError> {
     match item {
         SequencedL2Tx::UserOp(value) => {
-            app.execute_valid_user_op(&value)
+            // The persisted covering frame's safe_block mirrors what the
+            // lane passed live, so the replayed app's safe-block clock
+            // lands on the same value.
+            app.execute_valid_user_op(&value, frame_safe_block)
                 .map(|_| ())
                 .map_err(|err| CatchUpError::ReplayUserOpInternal {
                     reason: err.to_string(),

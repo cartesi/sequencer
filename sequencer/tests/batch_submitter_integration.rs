@@ -10,6 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sequencer::l1::submitter::{BatchPoster, BatchPosterError, TxHash};
 use sequencer::l1::submitter::{BatchSubmitter, BatchSubmitterConfig};
+use sequencer::l1::watermark::WalletNonceWatermarkSink;
 use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
@@ -60,6 +61,7 @@ impl BatchPoster for TestMock {
     async fn submit_batches(
         &self,
         payloads: Vec<Vec<u8>>,
+        _watermark: &dyn WalletNonceWatermarkSink,
     ) -> Result<Vec<TxHash>, BatchPosterError> {
         // Transient-failure hook: consume one of the configured failures
         // before anything else, so the tick outcome maps to `Transient` and

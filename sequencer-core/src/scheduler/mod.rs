@@ -1,50 +1,44 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use alloy_primitives::{Address, Signature, U256, address};
+pub mod fold;
+
+pub use fold::{FoldInput, fold_replay};
+
+use crate::application::{AppOutputs, Application};
+use crate::batch::{Batch, Frame, WireUserOp};
+use crate::l2_tx::DirectInput;
+use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
 use alloy_sol_types::SolStruct;
-use sequencer_core::application::{AppOutputs, Application};
-use sequencer_core::batch::{Batch, Frame, WireUserOp};
-use sequencer_core::l2_tx::DirectInput;
 use std::collections::VecDeque;
 
-pub const DEVNET_SEQUENCER_ADDRESS: Address =
-    address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-pub const SEPOLIA_SEQUENCER_ADDRESS: Address =
-    address!("0x16d5FF3Fdd14e2a86FBA77cbcE6B3Cd9C32b8Ff3");
-pub const MAX_WAIT_BLOCKS: u64 = sequencer_core::MAX_WAIT_BLOCKS;
+pub const MAX_WAIT_BLOCKS: u64 = crate::MAX_WAIT_BLOCKS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerConfig {
+    /// L1 address whose inputs are trusted as sequencer batches; every other
+    /// sender is a direct input. This is deployment/app data (which key the
+    /// sequencer submits batches from), supplied by the app binary — the
+    /// protocol library never hardcodes a concrete sequencer address.
     pub sequencer_address: Address,
     pub max_wait_blocks: u64,
 }
 
 impl SchedulerConfig {
-    pub const fn devnet() -> Self {
+    /// Production config for `sequencer_address`, pinning the staleness window
+    /// to the protocol's [`MAX_WAIT_BLOCKS`]. Tests that need a custom window
+    /// construct the struct directly.
+    pub const fn new(sequencer_address: Address) -> Self {
         Self {
-            sequencer_address: DEVNET_SEQUENCER_ADDRESS,
+            sequencer_address,
             max_wait_blocks: MAX_WAIT_BLOCKS,
         }
-    }
-
-    pub const fn sepolia() -> Self {
-        Self {
-            sequencer_address: SEPOLIA_SEQUENCER_ADDRESS,
-            max_wait_blocks: MAX_WAIT_BLOCKS,
-        }
-    }
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self::sepolia()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SchedulerInput {
+pub struct SchedulerInput {
     pub sender: Address,
     pub inclusion_block: u64,
     pub domain: Eip712Domain,
@@ -52,7 +46,7 @@ pub(super) struct SchedulerInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProcessOutcome {
+pub enum ProcessOutcome {
     DirectEnqueued,
     BatchExecuted,
     BatchSkippedStale,
@@ -60,7 +54,7 @@ pub(super) enum ProcessOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProcessResult {
+pub struct ProcessResult {
     pub outcome: ProcessOutcome,
     pub outputs: AppOutputs,
 }
@@ -91,13 +85,13 @@ impl PartialEq<ProcessResult> for ProcessOutcome {
 pub const STATE_INSPECT_QUERY: &[u8] = b"state";
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum InspectError {
+pub enum InspectError {
     UnsupportedQuery,
     Application(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BatchRejectReason {
+pub enum BatchRejectReason {
     DecodeFailed,
     WrongNonce { expected: u64, got: u64 },
     SafeBlockAboveInclusionBlock,
@@ -120,26 +114,75 @@ struct QueuedDirectInput {
 }
 
 impl<A: Application> Scheduler<A> {
-    pub fn new(app: A, config: SchedulerConfig) -> Self {
+    /// Construct a scheduler that begins expecting batch nonce
+    /// `next_expected_batch_nonce`. The genesis scheduler starts at 0
+    /// ([`Scheduler::new`]); the recovery fold engine resumes at the
+    /// checkpoint's batch nonce, which the bare-metal app cannot recompute — it
+    /// rides as checkpoint metadata.
+    /// Sets the nonce field directly (not via the private advance).
+    pub fn resume_at(app: A, config: SchedulerConfig, next_expected_batch_nonce: u64) -> Self {
         Self {
             app,
             config,
             direct_q: VecDeque::new(),
-            next_expected_batch_nonce: 0,
+            next_expected_batch_nonce,
         }
     }
 
-    #[cfg(test)]
+    pub fn new(app: A, config: SchedulerConfig) -> Self {
+        Self::resume_at(app, config, 0)
+    }
+
+    /// Number of directs still queued in the fridge. The recovery fold asserts
+    /// this is zero after draining at the stop block `C`: any leftover direct
+    /// means an input arrived with `inclusion_block > C` (a caller contract
+    /// violation), which would otherwise be silently dropped by [`finish`].
     pub fn queued_direct_len(&self) -> usize {
         self.direct_q.len()
     }
 
-    #[cfg(test)]
+    /// The batch nonce the scheduler next expects (and that a resumed sequencer
+    /// submits at). The recovery fold reads it via [`Scheduler::finish`] as the
+    /// resume nonce `N`.
     pub fn next_expected_batch_nonce(&self) -> u64 {
         self.next_expected_batch_nonce
     }
 
-    pub(super) fn inspect_state(&self, query: &[u8]) -> Result<Vec<u8>, InspectError> {
+    /// Seed the fridge (direct-input queue) with a reconstructed direct. The
+    /// recovery fold uses this to rebuild the scheduler's `(A, B]` fridge before
+    /// replaying `(B, C]`. Callers MUST enqueue in ascending
+    /// L1 order (`inclusion_block`) so the FIFO drain matches the on-chain order.
+    pub fn enqueue_direct(&mut self, sender: Address, inclusion_block: u64, payload: Vec<u8>) {
+        self.direct_q.push_back(QueuedDirectInput {
+            sender,
+            payload,
+            inclusion_block,
+        });
+    }
+
+    /// Execute every fridge direct covered by `safe_block` (those with
+    /// `inclusion_block <= safe_block`), returning their outputs. The recovery
+    /// fold calls this once at the stopping block `C`: every
+    /// still-queued direct has `inclusion_block <= C`, so this drains them all —
+    /// exactly what the booting run's first frame at a safe block `>= C` would
+    /// do, except the booting run (bare-metal, no fridge) never sees them.
+    pub fn drain_covered_at(&mut self, safe_block: u64) -> AppOutputs {
+        let mut outputs = Vec::new();
+        self.drain_directs_safe_at(safe_block, &mut outputs);
+        outputs
+    }
+
+    /// Consume the scheduler, returning the advanced application state `S'` and
+    /// the resume batch nonce `N`: `S'` is the folded app state, `N`
+    /// the nonce the new sequencer resumes submitting at.
+    pub fn finish(self) -> (A, u64) {
+        (self.app, self.next_expected_batch_nonce)
+    }
+
+    /// Watchdog / CM `inspect_state` hook: the app's canonical snapshot bytes
+    /// for the `/finalized_state` byte-compare. `pub` (not `pub(super)`) because
+    /// the canonical-app harness is now a separate crate over this library.
+    pub fn inspect_state(&self, query: &[u8]) -> Result<Vec<u8>, InspectError> {
         if !query.is_empty() && query != STATE_INSPECT_QUERY {
             return Err(InspectError::UnsupportedQuery);
         }
@@ -149,7 +192,7 @@ impl<A: Application> Scheduler<A> {
             .map_err(|err| InspectError::Application(err.to_string()))
     }
 
-    pub(super) fn process_input(&mut self, input: SchedulerInput) -> ProcessResult {
+    pub fn process_input(&mut self, input: SchedulerInput) -> ProcessResult {
         // Execute overdue directs before any input to keep backstop semantics explicit.
         let mut outputs = Vec::new();
         self.force_execute_overdue(input.inclusion_block, &mut outputs);
@@ -253,7 +296,7 @@ impl<A: Application> Scheduler<A> {
     /// Execute user-ops in a frame, skipping any whose `max_fee` is below the frame's `fee_price`.
     ///
     /// Both `max_fee` and `fee_price` are log-space exponents (base 129/128).
-    /// See [`sequencer_core::fee`] for conversion to linear amounts.
+    /// See [`crate::fee`] for conversion to linear amounts.
     fn execute_frame_user_ops(
         &mut self,
         domain: &Eip712Domain,
@@ -261,28 +304,36 @@ impl<A: Application> Scheduler<A> {
         outputs: &mut AppOutputs,
     ) {
         for user_op in &frame.user_ops {
+            // An unrecoverable signature is dropped silently (the scheduler is a
+            // pure deterministic fold; diagnostics would be a nondeterministic
+            // side effect at the library seam).
             if let Some(sender) = self.recover_sender(domain, user_op) {
                 let plain = user_op.to_user_op();
-                // Defense-in-depth: the trait default in validate_and_execute_user_op
-                // now centralizes this check, but we keep it here as an extra guard.
-                if plain.max_fee < frame.fee_price {
-                    eprintln!("scheduler skipped frame user-op due to max_fee < fee_price");
-                    continue;
-                }
-                match self
-                    .app
-                    .validate_and_execute_user_op(sender, &plain, frame.fee_price)
-                {
-                    Ok(sequencer_core::application::ExecutionOutcome::Included {
+                match crate::application::validate_and_execute_user_op(
+                    &mut self.app,
+                    sender,
+                    &plain,
+                    frame.fee_price,
+                    frame.safe_block,
+                ) {
+                    Ok(crate::application::ExecutionOutcome::Included {
                         outputs: user_op_outputs,
                     }) => outputs.extend(user_op_outputs),
-                    Ok(sequencer_core::application::ExecutionOutcome::Invalid(_)) => {}
-                    Err(err) => {
-                        eprintln!("scheduler skipped frame user-op due to app error: {err}");
-                    }
+                    // Invalid op or app error: skip it (no state change, no output).
+                    //
+                    // The `Err(AppError)` arm is the canonical (fold) half of an
+                    // asymmetry with the inclusion lane (`execute_user_op` in
+                    // `inclusion_lane/mod.rs`), which fails *loud* on the same
+                    // error. Duality (I1) still holds: an `Err` excludes the op
+                    // from state on *both* sides (neither extends `outputs`), so
+                    // the canonical state agrees — the lane merely additionally
+                    // aborts, treating the error as the internal-invariant breach
+                    // it is. Dead by construction today: the wallet app's
+                    // `execute_valid_user_op` errors only on a fee/balance check
+                    // it already passed in `validate_user_op`, which cannot change
+                    // between the two calls within one fold step.
+                    Ok(crate::application::ExecutionOutcome::Invalid(_)) | Err(_) => {}
                 }
-            } else {
-                eprintln!("scheduler skipped frame user-op due to invalid signature");
             }
         }
     }
@@ -308,9 +359,9 @@ impl<A: Application> Scheduler<A> {
                 block_number: queued.inclusion_block,
                 payload: queued.payload,
             };
-            match self.app.execute_direct_input(&input) {
-                Ok(direct_outputs) => outputs.extend(direct_outputs),
-                Err(err) => eprintln!("scheduler failed to execute drained direct input: {err}"),
+            // A failing direct is skipped (deterministic fold; no diagnostics).
+            if let Ok(direct_outputs) = self.app.execute_direct_input(&input) {
+                outputs.extend(direct_outputs);
             }
         }
     }
@@ -327,11 +378,9 @@ impl<A: Application> Scheduler<A> {
                     block_number: front.inclusion_block,
                     payload: front.payload.clone(),
                 };
-                match self.app.execute_direct_input(&input) {
-                    Ok(direct_outputs) => outputs.extend(direct_outputs),
-                    Err(err) => {
-                        eprintln!("scheduler failed to execute overdue direct input: {err}")
-                    }
+                // A failing overdue direct is skipped (deterministic fold).
+                if let Ok(direct_outputs) = self.app.execute_direct_input(&input) {
+                    outputs.extend(direct_outputs);
                 }
 
                 self.direct_q.pop_front().expect("queue front must exist");
@@ -346,27 +395,17 @@ fn has_elapsed_since(start_block: u64, wait_blocks: u64, current_block: u64) -> 
     current_block.saturating_sub(start_block) >= wait_blocks
 }
 
-pub(super) fn input_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
-    sequencer_core::build_input_domain(chain_id, verifying_contract)
-}
-
-pub(super) fn block_to_u64(block: U256) -> u64 {
-    // Solidity ABI exposes block numbers as uint256, but scheduler semantics use u64.
-    // A value that does not fit u64 is a malformed host input for this prototype.
-    u64::try_from(block).expect("block number does not fit u64")
-}
-
-pub(super) fn chain_id_to_u64(chain_id: U256) -> u64 {
-    u64::try_from(chain_id).expect("chain id does not fit u64")
+pub fn input_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
+    crate::build_input_domain(chain_id, verifying_contract)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use crate::user_op::UserOp;
+    use alloy_primitives::{U256, address};
     use k256::ecdsa::SigningKey;
     use k256::ecdsa::signature::hazmat::PrehashSigner;
-    use sequencer_core::user_op::UserOp;
 
     #[cfg(test)]
     #[derive(Default)]
@@ -374,6 +413,7 @@ mod tests {
         executed: Vec<RecordedTx>,
         balances: std::collections::HashMap<Address, U256>,
         nonces: std::collections::HashMap<Address, u32>,
+        last_executed_safe_block: u64,
     }
 
     #[cfg(test)]
@@ -406,58 +446,52 @@ mod tests {
 
     #[cfg(test)]
     impl Application for RecordingApp {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = app_core::application::MAX_METHOD_PAYLOAD_BYTES;
-
-        fn current_user_nonce(&self, _sender: Address) -> u32 {
-            self.nonce_of(_sender)
-        }
-
-        fn current_user_balance(&self, _sender: Address) -> U256 {
-            self.balance_of(_sender)
-        }
+        // Mirrors the wallet app's method-payload cap (selector + amount +
+        // address). A local literal keeps sequencer-core free of an app-core
+        // dependency (which would invert the crate graph).
+        const MAX_METHOD_PAYLOAD_BYTES: usize = 1 + 32 + 20;
 
         fn validate_user_op(
             &self,
             sender: Address,
-            user_op: &sequencer_core::user_op::UserOp,
+            user_op: &crate::user_op::UserOp,
             current_fee: u16,
-        ) -> Result<(), sequencer_core::application::InvalidReason> {
+        ) -> Result<(), crate::application::InvalidReason> {
             let expected_nonce = self.nonce_of(sender);
             if user_op.nonce != expected_nonce {
-                return Err(sequencer_core::application::InvalidReason::InvalidNonce {
+                return Err(crate::application::InvalidReason::InvalidNonce {
                     expected: expected_nonce,
                     got: user_op.nonce,
                 });
             }
             if user_op.max_fee < current_fee {
-                return Err(sequencer_core::application::InvalidReason::InvalidMaxFee {
+                return Err(crate::application::InvalidReason::InvalidMaxFee {
                     max_fee: user_op.max_fee,
                     base_fee: current_fee,
                 });
             }
-            let required = sequencer_core::fee::fee_to_linear(current_fee);
+            let required = crate::fee::fee_to_linear(current_fee);
             let balance = self.balance_of(sender);
             if balance < required {
-                return Err(
-                    sequencer_core::application::InvalidReason::InsufficientGasBalance {
-                        required,
-                        available: balance,
-                    },
-                );
+                return Err(crate::application::InvalidReason::InsufficientFeeBalance {
+                    required,
+                    available: balance,
+                });
             }
             Ok(())
         }
 
         fn execute_valid_user_op(
             &mut self,
-            user_op: &sequencer_core::l2_tx::ValidUserOp,
-        ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
-        {
+            user_op: &crate::l2_tx::ValidUserOp,
+            safe_block: u64,
+        ) -> Result<crate::application::AppOutputs, crate::application::AppError> {
+            self.last_executed_safe_block = self.last_executed_safe_block.max(safe_block);
             let sender = user_op.sender;
-            let fee = sequencer_core::fee::fee_to_linear(user_op.fee);
+            let fee = crate::fee::fee_to_linear(user_op.fee);
             let balance = self.balance_of(sender);
             if balance < fee {
-                return Err(sequencer_core::application::AppError::Internal {
+                return Err(crate::application::AppError::Internal {
                     reason: "validated user op cannot pay fee".to_string(),
                 });
             }
@@ -473,29 +507,33 @@ mod tests {
         fn execute_direct_input(
             &mut self,
             input: &DirectInput,
-        ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
-        {
+        ) -> Result<crate::application::AppOutputs, crate::application::AppError> {
             let marker = input.payload.first().copied().unwrap_or(0);
             self.executed.push(RecordedTx::Direct(marker));
+            self.last_executed_safe_block = self.last_executed_safe_block.max(input.block_number);
             Ok(Vec::new())
         }
 
-        fn from_dump(
-            _prefix: &std::path::Path,
-        ) -> Result<Self, sequencer_core::application::AppError> {
+        fn executed_input_count(&self) -> u64 {
+            self.executed.len() as u64
+        }
+
+        fn last_executed_safe_block(&self) -> u64 {
+            self.last_executed_safe_block
+        }
+
+        fn from_dump(_prefix: &std::path::Path) -> Result<Self, crate::application::AppError> {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
         }
 
         fn create_dump(
             &self,
             _prefix: &std::path::Path,
-        ) -> Result<(), sequencer_core::application::AppError> {
+        ) -> Result<(), crate::application::AppError> {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
         }
 
-        fn delete_dump(
-            _prefix: &std::path::Path,
-        ) -> Result<(), sequencer_core::application::AppError> {
+        fn delete_dump(_prefix: &std::path::Path) -> Result<(), crate::application::AppError> {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
         }
 
@@ -503,9 +541,7 @@ mod tests {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
         }
 
-        fn canonical_snapshot_bytes(
-            &self,
-        ) -> Result<Vec<u8>, sequencer_core::application::AppError> {
+        fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, crate::application::AppError> {
             Ok(format!("events:{}", self.executed.len()).into_bytes())
         }
     }
@@ -1110,6 +1146,275 @@ mod tests {
                 expected: 0,
                 got: 1,
             })
+        );
+        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
+        assert!(scheduler.app.events().is_empty());
+    }
+
+    // ── I1 duality: off-chain predicate vs canonical fold ─────────────────
+    //
+    // `ProtocolTiming::scheduler_accepts` (the off-chain gold-frontier predicate)
+    // and `Scheduler::process_input` (the canonical fold) are hand-maintained in
+    // separate files and MUST agree on accept-vs-reject for every input — the
+    // system's most load-bearing invariant (I1). Nothing exercised both until
+    // now. The one *documented* divergence is the predicate's structural-reject
+    // omission (it trusts the sequencer to emit well-formed batches), pinned
+    // explicitly at the end so any *other* drift fails this test.
+
+    const DUALITY_MAX_WAIT: u64 = 5;
+
+    fn duality_timing() -> crate::protocol::ProtocolTiming {
+        crate::protocol::ProtocolTiming {
+            max_wait_blocks: DUALITY_MAX_WAIT,
+            preemptive_margin_blocks: 1,
+            l1_read_stale_after_blocks: 1,
+            seconds_per_block: 12,
+        }
+    }
+
+    // A frame with no user ops — accept/reject is then purely about
+    // sender/nonce/structure/staleness, no app credit needed.
+    fn empty_frame(safe_block: u64) -> Frame {
+        Frame {
+            user_ops: vec![],
+            safe_block,
+            fee_price: 0,
+        }
+    }
+
+    /// Run one input through BOTH sides at `expected_nonce`; return whether each
+    /// *accepted* it (canonical `BatchExecuted` / predicate `Some`).
+    fn duality_run(
+        sender: Address,
+        inclusion: u64,
+        expected_nonce: u64,
+        payload: &[u8],
+    ) -> (bool, bool) {
+        use crate::protocol::SafeInputView;
+        let mut scheduler = Scheduler::resume_at(
+            RecordingApp::default(),
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: DUALITY_MAX_WAIT,
+            },
+            expected_nonce,
+        );
+        let canonical_executed = scheduler.process_input(SchedulerInput {
+            sender,
+            inclusion_block: inclusion,
+            domain: test_domain(),
+            payload: payload.to_vec(),
+        }) == ProcessOutcome::BatchExecuted;
+        let offchain_accepted = duality_timing()
+            .scheduler_accepts(
+                SEQUENCER,
+                SafeInputView {
+                    safe_input_index: 0,
+                    sender,
+                    payload,
+                    inclusion_block: inclusion,
+                },
+                expected_nonce,
+            )
+            .is_some();
+        (canonical_executed, offchain_accepted)
+    }
+
+    fn ssz(batch: &Batch) -> Vec<u8> {
+        ssz::Encode::as_ssz_bytes(batch)
+    }
+
+    #[test]
+    fn scheduler_accepts_agrees_with_canonical_on_accept_reject() {
+        // (label, sender, inclusion, expected_nonce, payload) — structurally
+        // valid inputs where the two sides MUST agree.
+        let valid_fresh = ssz(&Batch {
+            nonce: 0,
+            frames: vec![empty_frame(10)],
+        });
+        let empty_frames = ssz(&Batch {
+            nonce: 0,
+            frames: vec![],
+        });
+        let wrong_nonce = ssz(&Batch {
+            nonce: 1,
+            frames: vec![empty_frame(10)],
+        });
+        let stale = ssz(&Batch {
+            nonce: 0,
+            frames: vec![empty_frame(1)],
+        });
+        let fresh_at_boundary = ssz(&Batch {
+            nonce: 0,
+            frames: vec![empty_frame(10)],
+        });
+
+        let agree_cases: &[(&str, Address, u64, u64, &[u8])] = &[
+            ("valid fresh, right nonce", SEQUENCER, 12, 0, &valid_fresh),
+            (
+                "empty frames (no-op batch)",
+                SEQUENCER,
+                100,
+                0,
+                &empty_frames,
+            ),
+            ("wrong nonce", SEQUENCER, 12, 0, &wrong_nonce),
+            // age = 10 - 1 = 9 >= MAX_WAIT(5): stale on both sides.
+            ("stale by first frame", SEQUENCER, 10, 0, &stale),
+            // wrong sender: canonical enqueues a direct, predicate rejects sender.
+            ("wrong sender", DIRECT_SENDER, 12, 0, &valid_fresh),
+            // garbage payload: DecodeFailed / decode error.
+            ("garbage payload", SEQUENCER, 1, 0, &[0xFF, 0xEE, 0xDD]),
+            // staleness boundary: age = 14 - 10 = 4 < 5 accepted.
+            (
+                "fresh just under stale",
+                SEQUENCER,
+                14,
+                0,
+                &fresh_at_boundary,
+            ),
+            // age = 15 - 10 = 5 >= 5: stale.
+            (
+                "stale just at boundary",
+                SEQUENCER,
+                15,
+                0,
+                &fresh_at_boundary,
+            ),
+        ];
+
+        for (label, sender, inclusion, expected, payload) in agree_cases {
+            let (canonical, offchain) = duality_run(*sender, *inclusion, *expected, payload);
+            assert_eq!(
+                canonical, offchain,
+                "I1 disagreement on `{label}`: canonical_executed={canonical}, \
+                 offchain_accepted={offchain} — the predicate and the canonical \
+                 fold must agree on accept/reject"
+            );
+        }
+
+        // Documented exception — the predicate's structural-reject omission. The
+        // canonical fold rejects these (it checks frame structure); the predicate
+        // accepts them (self-trust: the sequencer never emits such batches). If
+        // either side changes, these asserts flip and force a deliberate update.
+        let non_monotonic = ssz(&Batch {
+            nonce: 0,
+            frames: vec![empty_frame(8), empty_frame(7)],
+        });
+        let (canonical, offchain) = duality_run(SEQUENCER, 12, 0, &non_monotonic);
+        assert!(
+            !canonical && offchain,
+            "non-monotonic safe_blocks: expected canonical reject + predicate \
+             accept (documented structural omission), got canonical={canonical} \
+             offchain={offchain}"
+        );
+
+        let frame_above_inclusion = ssz(&Batch {
+            nonce: 0,
+            frames: vec![empty_frame(20)],
+        });
+        let (canonical, offchain) = duality_run(SEQUENCER, 12, 0, &frame_above_inclusion);
+        assert!(
+            !canonical && offchain,
+            "frame safe_block > inclusion: expected canonical reject + predicate \
+             accept (documented structural omission), got canonical={canonical} \
+             offchain={offchain}"
+        );
+    }
+
+    #[test]
+    fn force_execute_overdue_runs_before_a_rejected_or_stale_batch() {
+        // The backstop force-executes overdue fridge directs at the START of
+        // process_input — before the batch is even classified. So an overdue
+        // direct is drained even when the same tick's batch is rejected or
+        // skipped (a danger-zone shape). Previously tested only alongside an
+        // ACCEPTED batch.
+        for label in ["wrong-nonce", "stale"] {
+            let mut scheduler = Scheduler::new(
+                RecordingApp::default(),
+                SchedulerConfig {
+                    sequencer_address: SEQUENCER,
+                    max_wait_blocks: 5,
+                },
+            );
+            // A direct at block 1; by inclusion block 8 it is overdue (age 7 >= 5).
+            scheduler.process_input(direct_input(1, 1));
+
+            let batch = if label == "wrong-nonce" {
+                // expected 0, got 9 → BatchRejected(WrongNonce).
+                Batch {
+                    nonce: 9,
+                    frames: vec![Frame {
+                        user_ops: vec![],
+                        safe_block: 8,
+                        fee_price: 0,
+                    }],
+                }
+            } else {
+                // right nonce but a stale first frame (age 8 - 1 = 7 >= 5).
+                Batch {
+                    nonce: 0,
+                    frames: vec![Frame {
+                        user_ops: vec![],
+                        safe_block: 1,
+                        fee_price: 0,
+                    }],
+                }
+            };
+
+            let outcome = scheduler.process_input(batch_input(8, batch)).outcome;
+            assert!(
+                matches!(
+                    outcome,
+                    ProcessOutcome::BatchRejected(_) | ProcessOutcome::BatchSkippedStale
+                ),
+                "{label}: batch should be rejected/skipped, got {outcome:?}"
+            );
+            assert_eq!(
+                scheduler.app.events(),
+                [RecordedTx::Direct(1)],
+                "{label}: the overdue direct must be force-executed before the rejected batch"
+            );
+            assert_eq!(
+                scheduler.next_expected_batch_nonce(),
+                0,
+                "{label}: a rejected/stale batch consumes no nonce"
+            );
+        }
+    }
+
+    #[test]
+    fn multiframe_overheight_in_tail_frame_rejected_by_scheduler() {
+        // `batch_reject_reason_for_block` checks `safe_block <= inclusion` in
+        // BOTH the head and the tail frames; only the head case was tested. A
+        // tail frame above the inclusion block must reject the whole batch.
+        let mut scheduler = Scheduler::new(
+            RecordingApp::default(),
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 100,
+            },
+        );
+        let batch = Batch {
+            nonce: 0,
+            frames: vec![
+                // head: 5 <= 10, valid.
+                Frame {
+                    user_ops: vec![],
+                    safe_block: 5,
+                    fee_price: 0,
+                },
+                // tail: 11 > 10 (the inclusion block) → reject.
+                Frame {
+                    user_ops: vec![],
+                    safe_block: 11,
+                    fee_price: 0,
+                },
+            ],
+        };
+        assert_eq!(
+            scheduler.process_input(batch_input(10, batch)),
+            ProcessOutcome::BatchRejected(BatchRejectReason::SafeBlockAboveInclusionBlock)
         );
         assert_eq!(scheduler.next_expected_batch_nonce(), 0);
         assert!(scheduler.app.events().is_empty());

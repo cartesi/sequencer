@@ -27,26 +27,26 @@ ensure-machine-image:
     test -d {{template_machine_image}} || { echo "missing {{template_machine_image}}; run 'just canonical-build-machine-image' first"; exit 1; }
 
 bench-ack-self duration="45" max_fee="1200" extra="": ensure-machine-image
-    cargo build -p sequencer --release
+    cargo build -p wallet-sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency-list 1 --warmup-secs 5 --accounts-file {{accounts_file}} {{extra}}
 
 bench-round-trip-self duration="45" max_fee="1200" concurrency="1" extra="": ensure-machine-image
-    cargo build -p sequencer --release
+    cargo build -p wallet-sequencer --release
     cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency {{concurrency}} {{extra}}
 
 bench-sweep domain_chain_id verifying_contract duration="45" url="http://127.0.0.1:3000" max_fee="1200" conc_list="1 2 4 8 16 32 64 128 256" extra="":
     cargo run -p benchmarks --bin sweep --release -- --endpoint {{url}} --domain-chain-id {{domain_chain_id}} --domain-verifying-contract {{verifying_contract}} --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency-list "{{conc_list}}" {{extra}}
 
 bench-sweep-self duration="45" max_fee="1200" conc_list="1 2 4 8 16 32 64 128 256" extra="": ensure-machine-image
-    cargo build -p sequencer --release
+    cargo build -p wallet-sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency-list "{{conc_list}}" --accounts-file {{accounts_file}} {{extra}}
 
 bench-rt-sweep-self duration="45" max_fee="1200" conc_list="1 2 4 8" extra="": ensure-machine-image
-    cargo build -p sequencer --release
+    cargo build -p wallet-sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --round-trip --self-contained --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency-list "{{conc_list}}" --accounts-file {{accounts_file}} {{extra}}
 
 bench-capacity-sweep-self duration="45" max_fee="1200" conc_list="1 2 4 8 16 32 64 128 256 512" out="tests/benchmarks/results/capacity-sweep-self.json" extra="": ensure-machine-image
-    cargo build -p sequencer --release
+    cargo build -p wallet-sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency-list {{conc_list}} --json-out {{out}} --accounts-file {{accounts_file}} {{extra}}
 
 bench-report results_dir="tests/benchmarks/results":

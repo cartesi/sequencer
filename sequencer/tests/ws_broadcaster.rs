@@ -546,7 +546,7 @@ fn load_ordered_l2_txs_page(db_path: &str, from_offset: u64, limit: usize) -> Ve
         .ordered_l2_txs_page_from(from_offset, limit)
         .expect("load ordered l2 tx page")
         .into_iter()
-        .map(|(_offset, tx)| tx)
+        .map(|(_offset, tx, _frame_safe_block)| tx)
         .collect()
 }
 

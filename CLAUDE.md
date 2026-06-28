@@ -30,9 +30,10 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 
 ## Workspace Layout
 
-- `sequencer/` — main sequencer binary and library.
+- `sequencer/` — sequencer library (no binary; app crates build the binary).
 - `sequencer-core/` — shared domain types consumed by both sequencer and scheduler.
 - `examples/app-core/` — placeholder wallet app implementing `Application`.
+- `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.
 - `examples/canonical-test/` — e2e test harness for the canonical app.
 - `sdk/rust-client/` — Rust client library for the sequencer API.
@@ -53,6 +54,9 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 ## Before You Start Real Work
 
 - **[`AGENTS.md`](AGENTS.md)** — mission, requirements, invariants, duality, recovery, conventions, rules.
+- **[`docs/protocol/`](docs/protocol/)** — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (canonical acceptance algorithm) and [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` FFI trait). Read before touching the scheduler, the gold frontier, the fold, or an `Application` impl.
+- **[`docs/invariants.md`](docs/invariants.md)** — cross-module invariants register + the fail-loud check policy. Check it before changing anything it lists as load-bearing.
+- **[`docs/review/`](docs/review/)** — dated correctness-review ledgers: known-open findings, settled designs, work packages. Check for open findings in code you're about to touch.
 - **[`docs/threat-model/README.md`](docs/threat-model/README.md)** — trust boundaries and in-scope threats.
 - **[`docs/recovery/README.md`](docs/recovery/README.md)** — preemptive recovery design + TLA+ proofs.
 - **[`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md)** — snapshot lifecycle design + invariants (take/promote/GC, crash-safety). Read before touching the inclusion lane's safe-frontier/snapshot path.

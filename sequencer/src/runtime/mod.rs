@@ -1,9 +1,20 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Process orchestration. Three phases:
+//! Process orchestration for the `run` subcommand, plus the shared
+//! bootstrap helpers used by all three subcommands.
 //!
-//! 1. **Bootstrap**: parse config, validate identity, build the L1 config.
+//! The phase split: [`setup`] establishes the timeless deployment
+//! state (identity, initial sync, genesis snapshot, `setup_complete` marker);
+//! [`run`] boots workers from an already-set-up DB; [`flush`] settles the
+//! wallet nonce. The CLI harness that dispatches them lives in
+//! [`crate::harness`].
+//!
+//! `run`'s phases:
+//!
+//! 1. **Gate + identity**: refuse unless `setup` completed; read the pinned
+//!    deployment identity from the DB (chain id / app address are no longer
+//!    CLI args — they come from the identity).
 //! 2. **Preemptive recovery**: run the startup recovery procedure
 //!    ([`crate::recovery::run_preemptive_recovery`]).
 //! 3. **Workers**: hand off to `workers::Workers` for spawn → select →
@@ -14,51 +25,97 @@
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod flush;
+pub mod setup;
+mod setup_fill;
 pub mod shutdown;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod workers;
 
 use std::time::Duration;
 
-use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
+use crate::l1::reader::{InputReader, InputReaderConfig};
 use crate::storage::{self, DeploymentIdentity};
 use alloy_primitives::Address;
 use config::{L1Config, RunConfig};
 use sequencer_core::application::Application;
-use sequencer_core::protocol::ProtocolTiming;
 
 pub use error::{
     BatchSubmitterExit, BootstrapError, DangerDetectorExit, IdentityError, InputReaderExit,
-    LaneExit, RunError, ServerExit, WorkerExit,
+    LaneExit, RunError, ServerExit, SetupRecoveryError, SetupRefuse, WorkerExit,
 };
 
 use workers::{Workers, WorkersConfig};
 
-const INPUT_READER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const INPUT_READER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-pub async fn run<A>(app: A, config: RunConfig) -> Result<(), RunError>
+/// Boot the sequencer from an already-set-up DB. Generic over the app type
+/// (for the lane's `from_dump`, the egress state-file path, and the
+/// max-payload bound) but takes no app *value* — `setup` already registered
+/// the genesis snapshot, so the lane reloads via `A::from_dump`.
+pub async fn run<A>(config: RunConfig) -> Result<(), RunError>
 where
     A: Application + Clone + Sync + 'static,
 {
-    // ── Bootstrap ────────────────────────────────────────────
+    // ── Gate + identity ──────────────────────────────────────
     std::fs::create_dir_all(&config.data_dir)?;
     let db_path = config.db_path();
-    let key = config.resolve_private_key()?;
-    let batch_submitter_address = batch_submitter_address_from_private_key(&key)?;
-
-    // One ProtocolTiming shared across the whole process. `try_new` validates
-    // margin/stale relationships up front — including before the startup log
-    // below — so a bad config produces a clean typed error instead of
-    // panicking mid-log.
     let timing = config.protocol_timing()?;
 
-    let (mut input_reader, l1_config) = bootstrap_l1_config(
-        &config,
-        db_path.as_str(),
+    // Refuse to boot unless `setup` completed; the identity it pinned
+    // supplies chain id / app address / InputBox address / genesis block /
+    // submitter address — none of which are CLI args on `run`.
+    let identity = load_setup_identity(&db_path)?;
+
+    // `run` holds the signing key (it submits). The key's address must match
+    // the pinned submitter address — running with the wrong key against a DB
+    // pinned to another submitter is a fail-loud identity mismatch.
+    let key = verify_submitter_key(config.resolve_private_key()?, &identity)?;
+
+    // Validate the RPC chain id against the *pinned* chain id when L1 is
+    // reachable (guards against a wrong-chain RPC after setup, review F6);
+    // tolerate an unreachable L1 (warm boot — identity is already pinned). The
+    // tolerated case is backstopped by the input reader, which re-verifies the
+    // chain id on its first successful contact (`InputReaderConfig::expected_chain_id`),
+    // so a provider that reconnects on the wrong chain fails loud before
+    // ingesting any address-filtered foreign logs.
+    match validate_rpc_chain_id(&config.eth_rpc_url, identity.chain_id).await {
+        Ok(()) => {}
+        Err(RunError::Bootstrap(BootstrapError::ChainIdRpc { message })) => {
+            tracing::warn!(
+                error = %message,
+                "L1 unreachable at boot — continuing from pinned deployment identity"
+            );
+        }
+        Err(other) => return Err(other),
+    }
+
+    let l1_config = L1Config {
+        eth_rpc_url: config.eth_rpc_url.clone(),
+        input_box_address: identity.input_box_address,
+        app_address: identity.app_address,
+        batch_submitter_private_key: key,
+        batch_submitter_address: identity.batch_submitter_address,
+        chain_id: identity.chain_id,
+    };
+
+    // `run` never re-discovers identity from L1 — it builds the reader from
+    // the pinned InputBox address + genesis block and syncs incrementally.
+    let mut input_reader = InputReader::from_parts(
+        InputReaderConfig {
+            rpc_url: config.eth_rpc_url.clone(),
+            app_address: identity.app_address,
+            poll_interval: INPUT_READER_POLL_INTERVAL,
+            long_block_range_error_codes: config.long_block_range_error_codes.clone(),
+            expected_chain_id: identity.chain_id,
+        },
+        identity.input_box_address,
+        identity.input_box_genesis_block,
+        db_path.clone(),
+        identity.batch_submitter_address,
         timing,
-        batch_submitter_address,
-        key,
-    )
-    .await?;
+    );
 
     tracing::info!(
         http_addr = %config.http_addr,
@@ -66,7 +123,7 @@ where
         eth_rpc_url = %l1_config.eth_rpc_url,
         input_box_address = %l1_config.input_box_address,
         input_reader_genesis_block = input_reader.genesis_block(),
-        chain_id = config.chain_id,
+        chain_id = identity.chain_id,
         app_address = %l1_config.app_address,
         batch_submitter_address = %l1_config.batch_submitter_address,
         max_wait_blocks = timing.max_wait_blocks,
@@ -75,18 +132,30 @@ where
         "sequencer startup"
     );
 
+    // Always-load invariant, checked at the gate (before any recovery write):
+    // setup registers the genesis finalized snapshot, so a marker-present DB
+    // with no snapshot is a corrupt/incomplete setup. Fail loud here — ahead
+    // of preemptive recovery's DB mutations — rather than only at the lane.
+    {
+        let mut storage = storage::Storage::open(&db_path)?;
+        if storage.finalized_dump()?.is_none() {
+            return Err(BootstrapError::SetupNotComplete.into());
+        }
+    }
+
     // ── Preemptive recovery ──────────────────────────────────
     // See docs/recovery/ for the full design and TLA+ spec.
     crate::recovery::run_preemptive_recovery(&db_path, &mut input_reader, &l1_config, &timing)
         .await?;
 
     // ── Workers ──────────────────────────────────────────────
-    let mut workers = Workers::spawn(WorkersConfig {
-        app,
+    let domain = sequencer_core::build_input_domain(identity.chain_id, identity.app_address);
+    let mut workers = Workers::spawn::<A>(WorkersConfig {
         run_config: config,
         l1_config,
         timing,
         input_reader,
+        domain,
     })
     .await?;
 
@@ -94,9 +163,11 @@ where
     workers.finish(first_exit).await
 }
 
-// ── Bootstrap helpers ──────────────────────────────────────────────────
+// ── Bootstrap helpers (shared by setup / run / flush) ──────────────────
 
-fn batch_submitter_address_from_private_key(private_key: &str) -> Result<Address, RunError> {
+pub(crate) fn batch_submitter_address_from_private_key(
+    private_key: &str,
+) -> Result<Address, RunError> {
     use alloy::signers::local::PrivateKeySigner;
     use std::str::FromStr;
 
@@ -105,92 +176,19 @@ fn batch_submitter_address_from_private_key(private_key: &str) -> Result<Address
         .address())
 }
 
-/// Resolve `(InputReader, L1Config)` from the configured RPC, falling back to
-/// the DB-pinned deployment identity when L1 is unreachable.
-///
-/// On first startup, L1 is required (no cached identity to fall back on). On
-/// subsequent startups, the identity allows the sequencer to start without L1
-/// while refusing to interpret the DB under a different deployment.
-///
-/// The genesis block is available via `input_reader.genesis_block()` on the
-/// returned reader.
-async fn bootstrap_l1_config(
-    config: &RunConfig,
-    db_path: &str,
-    timing: ProtocolTiming,
-    batch_submitter_address: Address,
-    batch_submitter_private_key: String,
-) -> Result<(InputReader, L1Config), RunError> {
-    let input_reader_config = InputReaderConfig {
-        rpc_url: config.eth_rpc_url.clone(),
-        app_address: config.app_address,
-        poll_interval: INPUT_READER_POLL_INTERVAL,
-        long_block_range_error_codes: config.long_block_range_error_codes.clone(),
-    };
-
-    let (input_reader, input_box_address) = match InputReader::new(
-        db_path.to_owned(),
-        input_reader_config.clone(),
-        batch_submitter_address,
-        timing,
-    )
-    .await
-    {
-        Ok(reader) => {
-            let input_box = reader.input_box_address();
-
-            // Validate chain ID early — before any DB identity writes.
-            validate_rpc_chain_id(&config.eth_rpc_url, config.chain_id).await?;
-
-            let expected_identity = DeploymentIdentity {
-                chain_id: config.chain_id,
-                app_address: config.app_address,
-                input_box_address: input_box,
-                input_box_genesis_block: reader.genesis_block(),
-                batch_submitter_address,
-            };
-            ensure_deployment_identity(db_path, expected_identity)?;
-
-            (reader, input_box)
-        }
-        Err(InputReaderError::Provider(e)) => {
-            tracing::error!(
-                error = %e,
-                "L1 unreachable during bootstrap — checking deployment identity"
-            );
-            let cached = cached_deployment_identity(
-                db_path,
-                config.chain_id,
-                config.app_address,
-                batch_submitter_address,
-            )?;
-            let reader = InputReader::from_parts(
-                input_reader_config,
-                cached.input_box_address,
-                cached.input_box_genesis_block,
-                db_path.to_owned(),
-                batch_submitter_address,
-                timing,
-            );
-            (reader, cached.input_box_address)
-        }
-        Err(source) => {
-            // L1 reachable but `InputReader::new` failed for a non-provider
-            // reason — wrap as a startup-time worker source error.
-            return Err(RunError::Worker(WorkerExit::InputReader(
-                InputReaderExit::Source(source),
-            )));
-        }
-    };
-
-    let l1_config = L1Config {
-        eth_rpc_url: config.eth_rpc_url.clone(),
-        input_box_address,
-        app_address: config.app_address,
-        batch_submitter_private_key,
-        batch_submitter_address,
-    };
-    Ok((input_reader, l1_config))
+/// Gate `run`/`flush` on a completed `setup` and return the pinned identity.
+/// A missing marker — or a marker present but no identity (a corrupt /
+/// incomplete setup) — is a terminal `SetupNotComplete`: the operator must
+/// (re-)run `setup`, not retry `run`.
+pub(crate) fn load_setup_identity(db_path: &str) -> Result<DeploymentIdentity, RunError> {
+    let storage = storage::Storage::open(db_path)?;
+    if !storage.is_setup_complete()? {
+        return Err(BootstrapError::SetupNotComplete.into());
+    }
+    match storage.deployment_identity()? {
+        Some(identity) => Ok(identity),
+        None => Err(BootstrapError::SetupNotComplete.into()),
+    }
 }
 
 /// Verify that the RPC's `eth_chainId` matches the configured chain id.
@@ -199,7 +197,10 @@ async fn bootstrap_l1_config(
 /// unverified chain id into storage would poison subsequent L1-unreachable
 /// boots and issue soft confirmations against the wrong chain. Caller is
 /// expected to retry on `ChainIdRpc`.
-async fn validate_rpc_chain_id(eth_rpc_url: &str, expected: u64) -> Result<(), RunError> {
+pub(crate) async fn validate_rpc_chain_id(
+    eth_rpc_url: &str,
+    expected: u64,
+) -> Result<(), RunError> {
     use alloy::providers::Provider;
     let check_provider = crate::l1::provider::create_provider(eth_rpc_url)
         .map_err(|e| RunError::Io(std::io::Error::other(e)))?;
@@ -217,7 +218,10 @@ async fn validate_rpc_chain_id(eth_rpc_url: &str, expected: u64) -> Result<(), R
     }
 }
 
-fn ensure_deployment_identity(db_path: &str, expected: DeploymentIdentity) -> Result<(), RunError> {
+pub(crate) fn ensure_deployment_identity(
+    db_path: &str,
+    expected: DeploymentIdentity,
+) -> Result<(), RunError> {
     let mut storage = storage::Storage::open(db_path)?;
     if let Some(stored) = storage.deployment_identity()? {
         return require_deployment_identity_match(stored, expected);
@@ -227,27 +231,6 @@ fn ensure_deployment_identity(db_path: &str, expected: DeploymentIdentity) -> Re
     }
     let stored = storage.load_or_insert_deployment_identity(expected)?;
     require_deployment_identity_match(stored, expected)
-}
-
-fn cached_deployment_identity(
-    db_path: &str,
-    chain_id: u64,
-    app_address: Address,
-    batch_submitter_address: Address,
-) -> Result<DeploymentIdentity, RunError> {
-    let storage = storage::Storage::open(db_path)?;
-    let Some(stored) = storage.deployment_identity()? else {
-        return Err(IdentityError::FirstBootRequiresL1.into());
-    };
-    let expected = DeploymentIdentity {
-        chain_id,
-        app_address,
-        input_box_address: stored.input_box_address,
-        input_box_genesis_block: stored.input_box_genesis_block,
-        batch_submitter_address,
-    };
-    require_deployment_identity_match(stored, expected)?;
-    Ok(stored)
 }
 
 fn require_deployment_identity_match(
@@ -264,6 +247,26 @@ fn require_deployment_identity_match(
         expected: Box::new(expected),
     }
     .into())
+}
+
+/// Keyed-writer preflight shared by `run` and `flush`: confirm a resolved
+/// batch-submitter signing `key` signs for the submitter `setup` pinned in
+/// `identity`, returning the key on success. Both subcommands broadcast keyed
+/// L1 txs, so signing under the wrong key would consume the wrong wallet's
+/// nonce slots — a fail-loud identity mismatch, not a recoverable condition.
+pub(crate) fn verify_submitter_key(
+    key: String,
+    identity: &DeploymentIdentity,
+) -> Result<String, RunError> {
+    let key_address = batch_submitter_address_from_private_key(&key)?;
+    if key_address != identity.batch_submitter_address {
+        let expected = DeploymentIdentity {
+            batch_submitter_address: key_address,
+            ..*identity
+        };
+        require_deployment_identity_match(*identity, expected)?;
+    }
+    Ok(key)
 }
 
 fn deployment_identity_mismatch_fields(

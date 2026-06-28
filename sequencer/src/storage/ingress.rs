@@ -97,6 +97,26 @@ impl Storage {
         })
     }
 
+    /// Open the cockroach-recovery root tip: a fresh anchored tip (`batch_index`
+    /// 0, parentless, nonce = the batch-tree anchor `N'`) whose first frame sits
+    /// at the checkpoint stop block `C` and leads exactly the directs the fold
+    /// folded into `S'` — those with `block_number <= C`.
+    ///
+    /// Distinct from [`Storage::ensure_open_tip`] / [`open_fresh_tip_in_tx`],
+    /// which drain the **whole** synced table at the live safe head. That is
+    /// correct for genesis, but wrong here: `setup --recovery` resyncs to the
+    /// live safe head `H1`, which is normally **past** `C`, and the fold only
+    /// folded `<= C` into `S'`. Draining `(C, H1]` into this tip would sequence
+    /// those directs as "already executed" (advancing the cursor / snapshot
+    /// `l2_tx_index` past them) even though `S'` never executed them — they would
+    /// then be skipped by catch-up and never re-led, vanishing from local state
+    /// while the scheduler drains them on-chain (divergence). Capping the drain
+    /// at `C` leaves `(C, H1]` undrained, so `run`'s lane leads and executes them
+    /// exactly once as the safe frontier advances `C -> H1`.
+    pub fn open_recovery_tip(&mut self, stop_block: u64) -> Result<()> {
+        self.write(|tx| open_recovery_tip_in_tx(tx, stop_block))
+    }
+
     /// Snapshot the current L1 view: safe block + exclusive safe-input cursor.
     /// The lane uses this to decide whether to advance.
     ///
@@ -282,23 +302,30 @@ impl Storage {
     ///   fails, promotion wedges on `QueryReturnedNoRows` forever" gap.
     ///
     /// `nonce` is the closing batch's nonce (assigned at open, so known
-    /// before the seal). The snapshot's `l2_tx_index` is read inside the
-    /// tx as the global valid replay head — correct even when the
-    /// closing batch is empty.
+    /// before the seal). `l2_tx_index` is the global valid replay head
+    /// the caller read when writing the dump's `info.toml` — correct
+    /// even when the closing batch is empty.
     pub fn close_frame_and_batch_with_pending_dump(
         &mut self,
         head: &mut WriteHead,
         next_safe_block: u64,
-        dump_prefix: &Path,
+        dump_dir: &Path,
         nonce: u64,
+        l2_tx_index: u64,
     ) -> Result<()> {
         let (next_batch_index, now_ms, policy) = self.write(|tx| {
-            // Read the replay head before sealing so the snapshot records
-            // the global valid head as of the close.
-            let l2_tx_index = valid_ordered_l2_tx_head(tx)?;
+            // The lane is the single writer and nothing sequences between
+            // the caller's head read and this close, so the head cannot
+            // have moved. Assert it: the snapshot row and the dump's
+            // info.toml must record the same cursor.
+            let head_now = valid_ordered_l2_tx_head(tx)?;
+            assert_eq!(
+                head_now, l2_tx_index,
+                "replay head moved between dump creation and batch close"
+            );
             let (next_batch_index, now_ms, policy) =
                 seal_and_open_next_batch(tx, head.batch_index, next_safe_block)?;
-            insert_pending_dump_in(tx, dump_prefix, nonce, l2_tx_index)?;
+            insert_pending_dump_in(tx, dump_dir, nonce, l2_tx_index)?;
             Ok((next_batch_index, now_ms, policy))
         })?;
         head.move_to_next_batch(
@@ -373,18 +400,76 @@ pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
         })?
         .map(i64_to_u64);
     let batch_index_opt = if table_empty { Some(0) } else { None };
-    let leading_direct_range = SafeInputRange::new(
-        next_undrained_safe_input_index_in(tx)?,
-        query_latest_safe_input_index_exclusive(tx)?,
-    );
-    insert_tip_rows(
+    insert_draining_tip(
         tx,
         batch_index_opt,
         parent,
         safe_block,
-        leading_direct_range,
-    )?;
+        query_latest_safe_input_index_exclusive(tx)?,
+    )
+}
+
+/// The shared tail of [`open_fresh_tip_in_tx`] and [`open_recovery_tip_in_tx`]:
+/// open the single valid Tip draining `[next_undrained, drain_upper)`, framed at
+/// `safe_block`, with the given lineage. The two callers differ only in
+/// `drain_upper` — the live safe-input head on the fresh path vs the `<= C` cap
+/// on the recovery path (the load-bearing `(C, H1]` difference) — plus
+/// `safe_block` and lineage, which they pass explicitly so the cap rule stays
+/// visible at each call site rather than hidden in one branch.
+fn insert_draining_tip(
+    tx: &Transaction<'_>,
+    batch_index: Option<u64>,
+    parent: Option<u64>,
+    safe_block: u64,
+    drain_upper: u64,
+) -> Result<()> {
+    let leading_direct_range =
+        SafeInputRange::new(next_undrained_safe_input_index_in(tx)?, drain_upper);
+    insert_tip_rows(tx, batch_index, parent, safe_block, leading_direct_range)?;
     Ok(())
+}
+
+/// See [`Storage::open_recovery_tip`]. Like [`open_fresh_tip_in_tx`] but the
+/// frame's safe block is the checkpoint stop block `C` and the leading drain
+/// range is capped at the `<= C` directs (not the whole synced table), so the
+/// `(C, H1]` directs the resync pulled past `C` stay undrained for `run`.
+fn open_recovery_tip_in_tx(tx: &Transaction<'_>, stop_block: u64) -> Result<()> {
+    debug_assert!(
+        load_current_write_head(tx)?.is_none(),
+        "recovery tip opened over existing open state"
+    );
+    // Fresh DB after wipe: batch_index 0, parentless (rooted at the anchor via
+    // `compute_next_nonce(None)` -> `N'`); drain capped at the `<= C` safe
+    // inputs.
+    //
+    // That range is sender-unfiltered: it includes the `<= C` batch-submitter
+    // rows alongside the user directs, exactly as the fresh / genesis tip drains
+    // its whole `[next_undrained, latest)` span. Correct because the leading
+    // range is *sequenced, not executed* — it only advances the replay cursor so
+    // `run`'s catch-up (`offset > l2_tx_index`) skips the rows already in `S'`.
+    // The `sender != batch_submitter` drop belongs to the *fold's* seed filter
+    // (those batches were folded into `S'` as batches, not directs); it is not a
+    // cursor concern, so it deliberately does not reappear here.
+    insert_draining_tip(
+        tx,
+        Some(0),
+        None,
+        stop_block,
+        safe_input_index_exclusive_through_block_in(tx, stop_block)?,
+    )
+}
+
+/// Exclusive `safe_input_index` boundary separating directs at `block_number <=
+/// block` from those past it. `safe_input_index` is dense and assigned in
+/// block-ascending ingest order, so the `<= block` rows occupy `[0, count)` and
+/// this count is the boundary.
+fn safe_input_index_exclusive_through_block_in(tx: &Transaction<'_>, block: u64) -> Result<u64> {
+    let boundary: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM safe_inputs WHERE block_number <= ?1",
+        params![u64_to_i64(block)],
+        |row| row.get(0),
+    )?;
+    Ok(i64_to_u64(boundary))
 }
 
 /// `MAX(safe_input_index) + 1` over the valid drained rows (or 0 if none),
@@ -417,7 +502,15 @@ fn seal_and_open_next_batch(
     // Batch policy is sampled here: the derived fee is committed to the newly
     // opened frame, and the batch size target is stored on the write head.
     let policy = query_batch_policy(tx)?;
-    seal_batch(tx, closing_batch_index, now_ms)?;
+    // Hash-at-seal (review R2): encode the closing batch's wire bytes via
+    // the same path the submitter uses and stamp their keccak256 on the row,
+    // atomically with the seal. The content-identity check later compares
+    // accepted L1 landings against this hash.
+    let nonce = super::snapshot_dumps::batch_nonce_in(tx, closing_batch_index)?;
+    let frames = super::l1_submission::load_batch_frames_in(tx, closing_batch_index)?;
+    let encoded = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch { nonce, frames });
+    let payload_hash = alloy_primitives::keccak256(&encoded);
+    seal_batch(tx, closing_batch_index, now_ms, &payload_hash.0)?;
     let next_batch_index = insert_new_batch(tx, None, Some(closing_batch_index), now_ms)?;
     insert_open_frame(
         tx,

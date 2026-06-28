@@ -1,0 +1,17 @@
+[package]
+name = "wallet-sequencer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sequencer binary for the placeholder wallet app"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
+default-run = "wallet-sequencer"
+
+[dependencies]
+app-core = { path = "../app-core" }
+sequencer = { path = "../../sequencer" }
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

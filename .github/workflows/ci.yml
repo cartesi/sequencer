@@ -86,7 +86,7 @@ jobs:
           cartesi-machine-sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
 
       - name: Download canonical app deps
-        run: just -f examples/canonical-app/justfile download-deps
+        run: just canonical download-deps
 
       - name: Run guest tests
         run: just canonical-test-guest

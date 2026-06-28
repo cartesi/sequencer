@@ -18,9 +18,9 @@ use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::l1::partition::{decode_evm_advance_input, get_input_added_events};
+use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
 use crate::runtime::shutdown::ShutdownSignal;
-use crate::storage::{Storage, StorageOpenError, StoredSafeInput};
+use crate::storage::{FrontierMode, Storage, StorageOpenError, StoredSafeInput};
 use sequencer_core::protocol::ProtocolTiming;
 
 #[derive(Debug, Clone)]
@@ -30,12 +30,22 @@ pub struct InputReaderConfig {
     pub poll_interval: Duration,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
     pub long_block_range_error_codes: Vec<String>,
+    /// The chain id `setup` pinned (`run`) / is pinning (`setup`). The reader
+    /// verifies the provider actually serves this chain on its first successful
+    /// contact — the RPC URL is an operator CLI/env arg that may be repointed
+    /// across restarts (token rotation, provider swap), so `run` cannot assume
+    /// it still matches the pinned identity. This backstops the boot-time check
+    /// ([`crate::runtime::validate_rpc_chain_id`]), which is skipped when L1 is
+    /// unreachable at boot.
+    pub expected_chain_id: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum InputReaderError {
     #[error("provider/transport: {0}")]
     Provider(String),
+    #[error("RPC chain id {rpc} does not match the pinned chain id {expected}")]
+    ChainIdMismatch { rpc: u64, expected: u64 },
     #[error("bootstrap: {0}")]
     Bootstrap(String),
     #[error(transparent)]
@@ -58,6 +68,15 @@ pub struct InputReader {
     /// Protocol timing used to keep `safe_accepted_batches` consistent with
     /// every `append_safe_inputs` write.
     timing: ProtocolTiming,
+    /// Whether each sync also populates the scheduler-accepted frontier
+    /// ([`FrontierMode::Populate`] normally; `setup --recovery` defers it — see
+    /// [`Self::set_frontier_mode`]).
+    frontier_mode: FrontierMode,
+    /// Set once the provider's chain id has been verified against
+    /// [`InputReaderConfig::expected_chain_id`] on a successful RPC contact.
+    /// Until then every `advance_once` re-attempts the check, so an unreachable
+    /// L1 keeps retrying and the verification fires the moment L1 returns.
+    chain_id_verified: bool,
 }
 
 impl InputReader {
@@ -115,7 +134,17 @@ impl InputReader {
             db_path,
             batch_submitter,
             timing,
+            frontier_mode: FrontierMode::Populate,
+            chain_id_verified: false,
         }
+    }
+
+    /// Set whether subsequent syncs populate the scheduler-accepted frontier.
+    /// `setup --recovery` sets [`FrontierMode::DeferUntilAnchorSet`] for the
+    /// syncs that feed the fold (the frontier is populated by `run`'s first
+    /// sync, once the anchor = `N'`).
+    pub fn set_frontier_mode(&mut self, mode: FrontierMode) {
+        self.frontier_mode = mode;
     }
 
     pub fn input_box_address(&self) -> Address {
@@ -182,6 +211,11 @@ impl InputReader {
         &mut self,
         provider: &impl Provider,
     ) -> Result<(), InputReaderError> {
+        // Verify the provider serves the pinned chain before reading anything
+        // from it — a wrong-chain RPC's address-filtered logs would otherwise
+        // flow into `safe_inputs`.
+        self.verify_chain_id(provider).await?;
+
         let current_safe_head = latest_safe_head(provider).await?;
         let current_safe_block = current_safe_head.block_number;
         let previous_safe_block = self.current_safe_block().await?;
@@ -201,7 +235,12 @@ impl InputReader {
         }
 
         let start_block = scan_floor + 1;
-        let events = get_input_added_events(
+        // L1-01: the dense-index contiguity witness below requires L1 event
+        // order. `get_input_added_events_ordered` guarantees it — a raw
+        // `eth_getLogs` reorder would otherwise turn the check into a permanent
+        // retry loop. The InputBox `index` is monotonic with L1 order, so the
+        // sorted stream aligns `onchain_indices` with `expected_start + i`.
+        let events = get_input_added_events_ordered(
             provider,
             self.config.app_address,
             &self.input_box_address,
@@ -220,8 +259,22 @@ impl InputReader {
             ))
         })?;
 
+        // F5: the InputBox assigns every input a per-app, gap-free `index`. We
+        // ingest every event for this app from genesis, so each input's on-chain
+        // index must equal the dense local `safe_input_index` it is assigned
+        // (= the running count of already-stored inputs). Collect the on-chain
+        // indices and verify contiguity below, *before* persisting — a gap means
+        // the provider returned an incomplete `get_logs` set (a clamped or
+        // lagging-replica response), and advancing the safe head past a missing
+        // input would let the scheduler force-drain it while we never saw it.
+        let expected_start = self.safe_input_end_exclusive().await?;
         let mut batch = Vec::with_capacity(events.len());
+        let mut onchain_indices = Vec::with_capacity(events.len());
         for (event, log) in events {
+            onchain_indices.push(u64::try_from(event.index).map_err(|_| {
+                InputReaderError::Provider("InputAdded index exceeds u64".to_string())
+            })?);
+
             let block_number = log.block_number.ok_or_else(|| {
                 InputReaderError::Provider("InputAdded log missing block_number".to_string())
             })?;
@@ -241,6 +294,29 @@ impl InputReader {
             });
         }
 
+        // Fail loud on a hole rather than persist a partial set (retryable: a
+        // consistent provider returns the full set on the next tick).
+        check_input_index_contiguity(expected_start, &onchain_indices)?;
+
+        // Completeness witness. Contiguity above proves the returned rows are the
+        // right *prefix*; this proves the prefix is *complete*. A truncated
+        // `get_logs` (still a contiguous prefix) shows up as an InputBox input
+        // count — pinned at the scanned safe block — that exceeds what we
+        // received. Without it, a dropped tail deposit `≤` the safe head would be
+        // persisted as complete and only caught on the *next* input, after the
+        // lane may have stamped frames past it (divergence). Pinning the count to
+        // `current_safe_block` (not latest) keeps it consistent with the scanned
+        // range and forces the serving node to actually have that block's state.
+        let onchain_count = input_count_at_block(
+            provider,
+            &self.input_box_address,
+            self.config.app_address,
+            current_safe_block,
+        )
+        .await?;
+        let received_total = expected_start.saturating_add(batch.len() as u64);
+        check_input_count_complete(current_safe_block, received_total, onchain_count)?;
+
         info!(
             block_range = %format!("{}..={}", start_block, current_safe_block),
             count = batch.len(),
@@ -250,11 +326,51 @@ impl InputReader {
         self.append_safe_inputs(current_safe_head, batch).await
     }
 
+    /// Verify the provider serves the pinned chain id, once per reader instance,
+    /// on the first successful contact. A transport failure is retryable
+    /// (`Provider`) and leaves the flag unset, so the check re-fires on the next
+    /// tick until L1 is reachable; a value mismatch is fatal (`ChainIdMismatch`)
+    /// and propagates out of the run loop / aborts a recovery sync. This is the
+    /// backstop for `run`'s boot-time check, which is skipped when L1 is
+    /// unreachable at boot — without it, an RPC reconnecting on the wrong chain
+    /// would ingest address-filtered foreign logs unnoticed.
+    async fn verify_chain_id(&mut self, provider: &impl Provider) -> Result<(), InputReaderError> {
+        if self.chain_id_verified {
+            return Ok(());
+        }
+        let rpc_chain_id = provider
+            .get_chain_id()
+            .await
+            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        if rpc_chain_id != self.config.expected_chain_id {
+            return Err(InputReaderError::ChainIdMismatch {
+                rpc: rpc_chain_id,
+                expected: self.config.expected_chain_id,
+            });
+        }
+        self.chain_id_verified = true;
+        Ok(())
+    }
+
     async fn current_safe_block(&self) -> Result<Option<u64>, InputReaderError> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path)?;
             storage.current_safe_block().map_err(InputReaderError::from)
+        })
+        .await
+        .map_err(|err| InputReaderError::Join(err.to_string()))?
+    }
+
+    /// Count of already-stored safe inputs (= the next local `safe_input_index`).
+    /// Used as the expected on-chain index of the next ingested input (F5).
+    async fn safe_input_end_exclusive(&self) -> Result<u64, InputReaderError> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&db_path)?;
+            storage
+                .safe_input_end_exclusive()
+                .map_err(InputReaderError::from)
         })
         .await
         .map_err(|err| InputReaderError::Join(err.to_string()))?
@@ -268,6 +384,7 @@ impl InputReader {
         let db_path = self.db_path.clone();
         let batch_submitter = self.batch_submitter;
         let timing = self.timing;
+        let frontier_mode = self.frontier_mode;
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path)?;
             storage
@@ -277,6 +394,7 @@ impl InputReader {
                     &batch,
                     batch_submitter,
                     &timing,
+                    frontier_mode,
                 )
                 .map_err(InputReaderError::from)
         })
@@ -315,6 +433,76 @@ fn map_contract_bootstrap_error(err: alloy::contract::Error) -> InputReaderError
 struct SafeHead {
     block_number: u64,
     block_timestamp: u64,
+}
+
+/// Verify the ingested InputBox indices continue contiguously from
+/// `expected_start` (the running count of stored inputs). The InputBox assigns
+/// every input a per-app, gap-free index, and we ingest every event for this app
+/// from genesis, so the indices must be `expected_start, expected_start+1, …`. A
+/// gap means the provider returned an incomplete `get_logs` set (a clamped or
+/// lagging-replica response, review F5); returning a retryable [`Provider`] error
+/// refuses to persist the hole — a consistent provider returns the full set on
+/// the next tick.
+///
+/// [`Provider`]: InputReaderError::Provider
+fn check_input_index_contiguity(
+    expected_start: u64,
+    onchain_indices: &[u64],
+) -> Result<(), InputReaderError> {
+    for (offset, &index) in onchain_indices.iter().enumerate() {
+        let expected = expected_start.saturating_add(offset as u64);
+        if index != expected {
+            return Err(InputReaderError::Provider(format!(
+                "non-contiguous InputBox index: expected {expected}, got {index} — \
+                 provider returned an incomplete InputAdded set (review F5)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Verify the InputBox's own input count at the scanned safe block matches the
+/// number of inputs we now hold (`received_total` = previously stored + just
+/// received). A mismatch means the `get_logs` response was an incomplete prefix
+/// — typically a truncated tail a contiguity check alone cannot see (review F5).
+/// Retryable [`Provider`] error: a consistent provider returns the full set, and
+/// the matching count, on the next tick.
+///
+/// [`Provider`]: InputReaderError::Provider
+fn check_input_count_complete(
+    safe_block: u64,
+    received_total: u64,
+    onchain_count: u64,
+) -> Result<(), InputReaderError> {
+    if onchain_count != received_total {
+        return Err(InputReaderError::Provider(format!(
+            "InputBox input count at block {safe_block} is {onchain_count}, expected \
+             {received_total} — provider returned an incomplete get_logs set (review F5)"
+        )));
+    }
+    Ok(())
+}
+
+/// The InputBox's per-app input count, pinned at `block`. Used as the F5
+/// completeness witness — see [`check_input_count_complete`]. Pinning to the
+/// scanned safe block (not `latest`) keeps it consistent with the `get_logs`
+/// range and forces the serving node to have that block's state.
+async fn input_count_at_block(
+    provider: &impl Provider,
+    input_box_address: &Address,
+    app_address: Address,
+    block: u64,
+) -> Result<u64, InputReaderError> {
+    let input_box = InputBox::new(*input_box_address, provider);
+    let count = input_box
+        .getNumberOfInputs(app_address)
+        .block(alloy::eips::BlockId::number(block))
+        .call()
+        .await
+        .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+    u64::try_from(count).map_err(|_| {
+        InputReaderError::Provider("InputBox getNumberOfInputs exceeds u64".to_string())
+    })
 }
 
 async fn latest_safe_head(provider: &impl Provider) -> Result<SafeHead, InputReaderError> {
@@ -357,6 +545,9 @@ mod tests {
                 app_address: Address::ZERO,
                 poll_interval,
                 long_block_range_error_codes: Vec::new(),
+                // Anvil's default chain id — tests that drive a real provider go
+                // through the chain-id check in `advance_once`.
+                expected_chain_id: 31337,
             },
             Address::ZERO,
             genesis_block,
@@ -460,6 +651,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advance_once_refuses_wrong_chain_id() {
+        require_anvil();
+
+        let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
+        let db_file = NamedTempFile::new().expect("temp file");
+        // Reader pinned to a chain id the Anvil provider does not serve.
+        let mut reader = InputReader::from_parts(
+            InputReaderConfig {
+                rpc_url: anvil.endpoint_url().to_string(),
+                app_address: Address::ZERO,
+                poll_interval: Duration::from_secs(1),
+                long_block_range_error_codes: Vec::new(),
+                expected_chain_id: 999_999,
+            },
+            Address::ZERO,
+            0,
+            db_file.path().to_string_lossy().into_owned(),
+            Address::ZERO,
+            test_timing(),
+        );
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect(anvil.endpoint_url().to_string().as_str())
+            .await
+            .expect("connect provider");
+
+        let result = reader.advance_once(&provider).await;
+        assert!(
+            matches!(
+                result,
+                Err(InputReaderError::ChainIdMismatch { rpc, expected })
+                    if rpc == 31337 && expected == 999_999
+            ),
+            "expected ChainIdMismatch, got {result:?}"
+        );
+
+        // The check runs before any read/persist, so a wrong-chain provider
+        // must not have written a safe-head row.
+        let mut storage =
+            Storage::open(db_file.path().to_string_lossy().as_ref()).expect("open storage");
+        assert_eq!(
+            storage.current_safe_block().expect("read safe block"),
+            None,
+            "a chain-id mismatch must abort before persisting any L1 view"
+        );
+    }
+
+    #[tokio::test]
     async fn current_safe_block_is_unknown_before_first_observation() {
         let db_file = NamedTempFile::new().expect("temp file");
         let genesis_block = 2_u64;
@@ -509,6 +747,7 @@ mod tests {
                 app_address: Address::ZERO,
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: Vec::new(),
+                expected_chain_id: 31337,
             },
             Address::ZERO,
             test_timing(),
@@ -608,5 +847,66 @@ mod tests {
             err.to_string()
                 .contains("unsupported DataAvailability.InputBoxAndEspresso")
         );
+    }
+
+    #[test]
+    fn input_index_contiguity_accepts_a_gap_free_run() {
+        assert!(check_input_index_contiguity(0, &[0, 1, 2]).is_ok());
+        // Continues contiguously from a non-zero count of already-stored inputs.
+        assert!(check_input_index_contiguity(7, &[7, 8, 9]).is_ok());
+        // An empty batch (no new inputs) is trivially contiguous.
+        assert!(check_input_index_contiguity(5, &[]).is_ok());
+    }
+
+    #[test]
+    fn input_index_contiguity_rejects_a_dropped_middle_input() {
+        // Provider returned 7,9 — input 8 was dropped (clamped/lagging get_logs).
+        let err = check_input_index_contiguity(7, &[7, 9])
+            .expect_err("a dropped middle input must be rejected");
+        assert!(
+            matches!(&err, InputReaderError::Provider(m) if m.contains("expected 8, got 9")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_index_contiguity_rejects_a_truncated_tail_on_the_next_tick() {
+        // A tail truncation on a prior tick (input 8 missing) surfaces here: the
+        // next ingested input is 9 while the stored count is still 8. (The count
+        // witness catches the same truncation on the *same* tick — see below.)
+        let err = check_input_index_contiguity(8, &[9])
+            .expect_err("a tail-truncated input must be caught on the next tick");
+        assert!(
+            matches!(&err, InputReaderError::Provider(m) if m.contains("expected 8, got 9")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_count_complete_accepts_a_matching_count() {
+        // Stored 7, received 3 more → 10 total; chain agrees → complete.
+        assert!(check_input_count_complete(100, 10, 10).is_ok());
+        // No new inputs and the chain has none beyond what we hold.
+        assert!(check_input_count_complete(100, 7, 7).is_ok());
+    }
+
+    #[test]
+    fn input_count_complete_rejects_a_truncated_tail_same_tick() {
+        // We received 7..=8 (received_total 9) but the chain has 10 inputs through
+        // this safe block — the tail (index 9) was dropped. Caught immediately,
+        // before the safe head is persisted.
+        let err = check_input_count_complete(100, 9, 10)
+            .expect_err("a truncated tail must fail the completeness witness");
+        assert!(
+            matches!(&err, InputReaderError::Provider(m)
+                if m.contains("count at block 100 is 10, expected 9")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_count_complete_rejects_an_impossible_overcount() {
+        // We somehow hold more than the chain reports — also fail loud.
+        assert!(check_input_count_complete(100, 11, 10).is_err());
     }
 }

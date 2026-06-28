@@ -17,6 +17,7 @@
 //! invariant the storage layer relies on.
 
 pub mod egress;
+pub mod harness;
 pub mod http;
 pub mod ingress;
 pub mod l1;
@@ -24,6 +25,7 @@ pub mod recovery;
 pub mod runtime;
 pub mod storage;
 
+pub use harness::{Cli, Command, dispatch, run_main};
 pub use http::{ApiConfig, ApiError, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
-pub use runtime::config::RunConfig;
+pub use runtime::config::{FlushConfig, RunConfig, SetupConfig};
 pub use runtime::{RunError, run};

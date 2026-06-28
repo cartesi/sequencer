@@ -87,16 +87,36 @@ Three SQLite tables back it (`storage/migrations/0001_schema.sql`):
 | `pending_snapshots`  | `(nonce, dump_id, l2_tx_index)` — snapshots of closed-but-not-yet-L1-confirmed batches |
 | `finalized_snapshot` | single row `(dump_id, inclusion_block, l2_tx_index)` — the latest L1-confirmed state |
 
-`prefix` is an opaque directory the `Application` owns (see [`format.md`](format.md));
-the lifecycle code never looks inside it except through the trait. The split
-between **pending** and **finalized** mirrors the sequencer's optimism: a batch
-closes off-chain (soft) → its snapshot is *pending*; the batch lands safe on L1
-→ its snapshot is *promoted* to finalized.
+`prefix` is the **dump directory** — a structured dir the sequencer owns
+(`ingress/inclusion_lane/dump_info.rs`):
+
+```text
+dumps/<id>/
+  state       app-owned subtree — the prefix handed to
+              Application::{create_dump, from_dump, delete_dump}
+              (opaque to the sequencer; see format.md)
+  info.toml   sequencer-owned checkpoint metadata:
+              format_version, next_batch_nonce (N), l2_tx_index,
+              promoted_inclusion_block (B)
+```
+
+`info.toml` makes a finalized dump a **self-contained checkpoint** for the
+recovery handoff: `N` and the replay cursor are known at batch
+close and written then; `B` is known at promotion and stamped **in place**
+afterwards (and re-stamped from the authoritative DB row at every startup,
+closing the commit-then-stamp crash window). An in-place update of a file
+*inside* the dir changes no path, so the no-dangling-row invariant, leases,
+and GC — all keyed on the immutable directory path — are untouched. The dir
+name itself stays opaque; metadata lives only in `info.toml`.
+
+The split between **pending** and **finalized** mirrors the sequencer's
+optimism: a batch closes off-chain (soft) → its snapshot is *pending*; the
+batch lands safe on L1 → its snapshot is *promoted* to finalized.
 
 The storage half lives in `storage/snapshot_dumps.rs` (SQLite only — no
-filesystem); the lane half in `ingress/inclusion_lane/snapshot.rs` (drives the
-trait and FS cleanup). That split is load-bearing for the GC crash-ordering
-(§7).
+filesystem); the lane half in `ingress/inclusion_lane/snapshot.rs` +
+`dump_info.rs` (drives the trait and FS work). That split is load-bearing for
+the GC crash-ordering (§7).
 
 ## 2. The always-load invariant
 
@@ -113,9 +133,13 @@ fail-loud as `CatchUpError::NoSnapshot`, never a branch the happy path handles.
 When the lane closes a batch (`close_batch_with_snapshot`), ordering is chosen
 for crash/error safety:
 
-1. **`create_dump` first, outside any transaction.** The `Application` writes
-   and `fsync`s the dump. On failure nothing is sealed — the batch stays the
-   open Tip and the lane retries next pass.
+1. **The dump directory first, outside any transaction**
+   (`dump_info::create_dump_dir_with_info`): the dir, its `info.toml`
+   (`next_batch_nonce` = closing nonce + 1, the replay head; `B` left for
+   promotion), then the `Application`'s dump under `state` — all written and
+   `fsync`ed. On failure nothing is sealed — the batch stays the open Tip; the
+   error propagates per the lane's fail-loud policy (the process exits, and the
+   retry happens on the next boot after catch-up).
 2. **One transaction seals the batch, opens the next, and inserts the
    `pending_snapshots` row** (`close_frame_and_batch_with_pending_dump`). A
    committed close therefore *always* has a promotable pending row; a tx failure
@@ -334,13 +358,28 @@ in `dumps`; runs *after* (2) so the genesis prefix is registered and not swept).
 
 Danger-zone recovery (`storage/recovery.rs`, see
 [`../recovery/README.md`](../recovery/README.md)) cascade-invalidates batches
-that the canonical stream will never reach. When it does (`!invalidated
-.is_empty()`), it clears `pending_snapshots` **in the same transaction** as the
-cascade — those pendings represent states catch-up must never load. `finalized`
-is untouched (its bytes are for an L1-confirmed batch, which survives any
-cascade). A **no-op** recovery (closed batches gold, Tip fresh) deliberately
-preserves in-flight pendings the lane is still working with. This conditional
-clear is why catch-up can safely resume from a surviving pending (§4).
+that the canonical stream will never reach. In the same transaction as the
+cascade it clears `pending_snapshots` **scoped to the cascade**: only rows
+with `nonce >= pivot.nonce` — exactly the cascaded batches' pendings, which
+catch-up must never load. (Review F9; implemented in `cascade_and_reopen`,
+the shared tail of both recovery paths.)
+
+Pendings of *gold but not-yet-promoted* batches (landed and accepted while
+the process was down) carry lower nonces and **survive**: catch-up resumes
+from the freshest surviving checkpoint, and the rows are cleaned up by the
+next promotion's `DELETE <= max_nonce`. The scoping makes the §6
+promote-wedge **unrepresentable** rather than unreachable: any nonce the lane
+can later observe as accepted either has its pending row intact or belongs
+to a post-recovery batch with a fresh row. (The earlier blanket clear was
+safe only through a chain of cross-file couplings — same-tx full-backlog
+reopen drain, `check_danger` arm ordering, frame-safe-block monotonicity —
+documented in the 2026-06-10 review, F9.) In the `RecoverTip` path the
+scope deletes nothing: the Tip never has a pending row.
+
+`finalized` is untouched (its bytes are for an L1-confirmed batch, which
+survives any cascade). A **no-op** recovery (closed batches gold, Tip fresh)
+deliberately preserves in-flight pendings the lane is still working with.
+This is why catch-up can safely resume from a surviving pending (§4).
 
 ## 9. Where the code lives
 

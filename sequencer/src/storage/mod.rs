@@ -60,6 +60,24 @@ pub struct StoredSafeInput {
     pub block_number: u64,
 }
 
+/// Whether a sync also maintains the scheduler-accepted gold frontier
+/// (`safe_accepted_batches`).
+///
+/// Every normal sync uses [`FrontierMode::Populate`]. `setup --recovery` uses
+/// [`FrontierMode::DeferUntilAnchorSet`] for its interim syncs: the local batch
+/// tree is rebuilt from the checkpoint *after* the sync, so populating the
+/// frontier against the empty tree would mark every L1 batch `Foreign` and
+/// falsely freeze it. `run`'s first sync populates it once the anchor is `N'`.
+/// See `docs/recovery/cockroach.md` and the anchor-aware-frontier note on I15.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontierMode {
+    /// Maintain `safe_accepted_batches` as part of the sync (the default).
+    Populate,
+    /// Skip frontier maintenance — the tree is rebuilt and the anchor set
+    /// afterwards, and the next normal sync will populate it correctly.
+    DeferUntilAnchorSet,
+}
+
 /// Half-open range `[start, end)` over `safe_input_index` values. Used to
 /// describe which safe inputs a frame drained.
 ///

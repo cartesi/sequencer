@@ -19,15 +19,27 @@
 -- identity; reused across recovery cascades (new Tip forks from last valid
 -- ancestor, inheriting nonce via the +1 rule).
 -- ---------------------------------------------------------------------------
+-- `sealed_at_ms` / `invalidated_at_ms` are observability stamps from the
+-- wall clock — write-once (triggers below), but deliberately NOT
+-- cross-checked against `created_at_ms`: wall-clock monotonicity is an
+-- environmental assumption, not an invariant (NTP steps, VM resume), and a
+-- CHECK on it wedged batch close and the recovery cascade in a clock
+-- regression (review F8). No production code reads these as values; every
+-- reader is an IS NULL / IS NOT NULL predicate.
+-- `payload_hash` is the keccak256 of the batch's SSZ wire bytes, stamped at
+-- seal time by the same encode path the submitter uses (review R2,
+-- hash-at-seal). It is what the content-identity check compares an accepted
+-- L1 landing against — and because it is computed by the code that sealed
+-- the batch, it survives wire-format upgrades. NULL only while the batch is
+-- the open Tip (and on recovery sentinels, which carry no payload).
 CREATE TABLE IF NOT EXISTS batches (
     batch_index        INTEGER PRIMARY KEY,
     parent_batch_index INTEGER REFERENCES batches(batch_index),  -- NULL only for genesis
     nonce              INTEGER NOT NULL CHECK (nonce >= 0),
     created_at_ms      INTEGER NOT NULL,
-    sealed_at_ms       INTEGER
-        CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= created_at_ms),
-    invalidated_at_ms  INTEGER
-        CHECK (invalidated_at_ms IS NULL OR invalidated_at_ms >= created_at_ms)
+    sealed_at_ms       INTEGER CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= 0),
+    invalidated_at_ms  INTEGER CHECK (invalidated_at_ms IS NULL OR invalidated_at_ms >= 0),
+    payload_hash       BLOB CHECK (payload_hash IS NULL OR length(payload_hash) = 32)
 );
 
 -- "At most one valid Tip" — structural via partial unique index. The predicate
@@ -57,6 +69,26 @@ CREATE VIEW IF NOT EXISTS valid_closed_batches AS
 CREATE VIEW IF NOT EXISTS valid_open_batch AS
     SELECT * FROM valid_batches WHERE sealed_at_ms IS NULL;
 
+-- Batch-tree anchor: the nonce the single (valid) parentless root carries.
+--
+-- A genesis deployment is anchored at 0; a cockroach-recovered one is anchored
+-- at N' (the post-checkpoint resume nonce), so `run`'s first tip roots at N'
+-- without replaying history — there is no separate "sentinel" batch row, the
+-- root tip *is* the anchor. The value generalizes the rule the tree already
+-- has ("a parentless root carries nonce 0") from a hard-coded 0 to this
+-- singleton; it is read by `trg_enforce_nonce_contiguity` (below) and by
+-- `compute_next_nonce(parent = None)`.
+--
+-- Default 0, so a normal deployment is byte-identical to before this table
+-- existed. Written exactly once — by `setup` (recovery sets N' before the
+-- `setup_complete` marker); `trg_batch_tree_anchor_write_once` freezes it
+-- thereafter, since re-anchoring a live deployment would strand its spine.
+CREATE TABLE IF NOT EXISTS batch_tree_anchor (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    nonce        INTEGER NOT NULL CHECK (nonce >= 0)
+);
+INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
+
 -- ── Triggers ───────────────────────────────────────────────────────────────
 --
 -- These enforce invariants the writer could otherwise violate with a bug.
@@ -65,14 +97,29 @@ CREATE VIEW IF NOT EXISTS valid_open_batch AS
 -- transition sequence — triggers just ensure the DB never reaches an
 -- inconsistent state if the writer misbehaves.
 
--- Nonce contiguity: `nonce = parent.nonce + 1`, or 0 for genesis.
+-- Nonce contiguity: `nonce = parent.nonce + 1`, or the batch-tree anchor nonce
+-- (0 for a genesis deployment, N' for a recovered one) for the parentless root.
 CREATE TRIGGER IF NOT EXISTS trg_enforce_nonce_contiguity
 AFTER INSERT ON batches
 FOR EACH ROW
 BEGIN
     SELECT CASE
-        WHEN NEW.parent_batch_index IS NULL AND NEW.nonce != 0
-            THEN RAISE(ABORT, 'genesis batch must have nonce 0')
+        -- A parentless root must carry the deployment's anchor nonce. This is
+        -- an *exact* match — tighter than the old "must be 0": a buggy root at
+        -- any other nonce still ABORTs, including a re-root at 0 on a recovered
+        -- (anchor = N') deployment.
+        WHEN NEW.parent_batch_index IS NULL
+         AND NEW.nonce != (SELECT nonce FROM batch_tree_anchor WHERE singleton_id = 0)
+            THEN RAISE(ABORT, 'parentless root must carry the batch-tree anchor nonce')
+        -- At most one *valid* parentless root. A fully-torn cascade invalidates
+        -- the old root, then re-roots parentless at the anchor (the documented
+        -- `open_fresh_tip_in_tx` parent=None path) — leaving exactly one valid
+        -- root again, with the invalidated old root(s) coexisting. (Counts the
+        -- just-inserted row, hence `> 1`.)
+        WHEN NEW.parent_batch_index IS NULL
+         AND (SELECT COUNT(*) FROM batches
+              WHERE parent_batch_index IS NULL AND invalidated_at_ms IS NULL) > 1
+            THEN RAISE(ABORT, 'at most one valid parentless root per deployment')
         WHEN NEW.parent_batch_index IS NOT NULL
          AND NEW.nonce != (SELECT nonce + 1 FROM batches WHERE batch_index = NEW.parent_batch_index)
             THEN RAISE(ABORT, 'batch nonce must equal parent.nonce + 1')
@@ -95,6 +142,16 @@ FOR EACH ROW
 WHEN OLD.invalidated_at_ms IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'invalidated_at_ms is write-once');
+END;
+
+-- Write-once: payload_hash transitions only NULL → non-NULL (stamped in the
+-- same UPDATE that seals the batch).
+CREATE TRIGGER IF NOT EXISTS trg_payload_hash_write_once
+BEFORE UPDATE OF payload_hash ON batches
+FOR EACH ROW
+WHEN OLD.payload_hash IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'payload_hash is write-once');
 END;
 
 -- parent_batch_index is immutable after insert.
@@ -263,7 +320,7 @@ WHERE batch_index NOT IN (SELECT batch_index FROM batches WHERE invalidated_at_m
 -- Unlike a raw log of all safe submissions, this only contains the accepted
 -- prefix: batches whose nonce matched the expected sequence and were not stale.
 -- Maintained atomically by Storage::append_safe_inputs (via
--- populate_safe_accepted_batches_inner), which simulates the scheduler's
+-- populate_safe_accepted_batches), which simulates the scheduler's
 -- acceptance logic over new safe_inputs rows.
 CREATE TABLE IF NOT EXISTS safe_accepted_batches (
     safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),
@@ -283,6 +340,38 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
     synced_at_ms INTEGER NOT NULL CHECK (synced_at_ms >= 0)
 );
 
+-- Highest wallet nonce ever broadcast by this deployment's batch-submitter
+-- key (review R1a — the durable realization of the TLA+ spec's
+-- `walletNonce`). Write-before-broadcast: any component about to send a tx
+-- at wallet nonce n first commits watermark = max(watermark, n) — power-loss
+-- durable under synchronous=FULL — then sends. Uniform for batch txs and
+-- flush no-ops alike, so the flush's slot coverage never depends on the
+-- local node's volatile mempool memory (the F1 zombie). Absent row =
+-- nothing ever broadcast. Never reset, never lowered.
+CREATE TABLE IF NOT EXISTS wallet_nonce_watermark (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    watermark    INTEGER NOT NULL CHECK (watermark >= 0)
+);
+
+-- Canonical-divergence poison marker (review R2). Written by the input
+-- reader's acceptance simulation — atomically with the sync that detected
+-- it — when a fully-accepted L1 landing fails the content-identity check:
+-- either no valid closed local batch exists at the accepted nonce
+-- (kind = 'foreign': a zombie or foreign batch from our key) or the landed
+-- bytes hash differently from ours (kind = 'mismatch'). Once present, the
+-- acceptance frontier freezes, `check_danger` reports `CanonicalDivergence`
+-- ahead of every other arm, startup refuses, and the runtime detector exits.
+-- The remedy is cockroach recovery (wipe + rebuild from L1), never standard
+-- recovery — canonical state contains executed effects with no reliable
+-- local source. Keep-first: only the earliest detection is recorded.
+CREATE TABLE IF NOT EXISTS canonical_divergence (
+    singleton_id     INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    nonce            INTEGER NOT NULL CHECK (nonce >= 0),
+    safe_input_index INTEGER NOT NULL CHECK (safe_input_index >= 0),
+    kind             TEXT    NOT NULL CHECK (kind IN ('foreign', 'mismatch')),
+    detected_at_ms   INTEGER NOT NULL CHECK (detected_at_ms >= 0)
+);
+
 -- Deployment identity: the persisted DB is only valid for this deployment.
 -- Allows L1-unreachable startup after first boot, and prevents interpreting
 -- historical sequencer state under a different app or batch-submitter address.
@@ -294,6 +383,32 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
     input_box_genesis_block   INTEGER NOT NULL CHECK (input_box_genesis_block >= 0),
     batch_submitter_address   BLOB    NOT NULL CHECK (length(batch_submitter_address) = 20)
 );
+
+-- setup-complete marker. The `setup` subcommand
+-- pins deployment identity, does the initial L1 sync, and registers the
+-- genesis finalized snapshot; it inserts this singleton row as its LAST
+-- write. `run` refuses to boot unless the row is present. Presence is the
+-- single linearization point for "setup finished": it distinguishes a clean
+-- setup from one that crashed midway (identity pinned and/or genesis
+-- snapshot registered, but the marker absent), which every prior setup step
+-- is individually idempotent enough to let `setup` re-run and complete.
+CREATE TABLE IF NOT EXISTS setup_complete (
+    singleton_id    INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0)
+);
+
+-- The batch-tree anchor is frozen once setup completes. `setup` writes it (0
+-- by default, N' on recovery) before inserting the `setup_complete` marker;
+-- after the marker exists, re-anchoring a live deployment would strand the
+-- existing batch spine, so any further UPDATE aborts. Defense-in-depth: the
+-- `setup --recovery` path is already a strict one-shot on a fresh DB.
+CREATE TRIGGER IF NOT EXISTS trg_batch_tree_anchor_write_once
+BEFORE UPDATE OF nonce ON batch_tree_anchor
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM setup_complete WHERE singleton_id = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'batch-tree anchor is frozen after setup completes');
+END;
 
 
 -- ---------------------------------------------------------------------------

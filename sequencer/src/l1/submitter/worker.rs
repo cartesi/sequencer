@@ -78,7 +78,7 @@ fn decide_submit_start(frontier: SubmitterFrontier, recently_observed_nonces: &[
     // unresolved nonce. The scan starts at `safe_block + 1` (the submitter
     // asks the poster for that), so wallet-nonce ordering guarantees the
     // observed list mirrors our submission order.
-    advance_expected_batch_nonce(
+    sequencer_core::protocol::advance_expected_batch_nonce(
         frontier.accepted_next_nonce,
         recently_observed_nonces.iter().copied(),
     )
@@ -88,12 +88,17 @@ pub struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
     poster: Arc<P>,
     idle_poll_interval: Duration,
+    /// Write-before-broadcast hook (review R1a): the poster raises the
+    /// persisted wallet-nonce watermark through this before every send.
+    watermark_sink: crate::l1::watermark::StorageWatermarkSink,
 }
 
 impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     pub fn new(db_path: impl Into<String>, poster: Arc<P>, config: BatchSubmitterConfig) -> Self {
+        let db_path = db_path.into();
         Self {
-            db_path: db_path.into(),
+            watermark_sink: crate::l1::watermark::StorageWatermarkSink::new(db_path.clone()),
+            db_path,
             poster,
             idle_poll_interval: config.idle_poll_interval(),
         }
@@ -137,6 +142,12 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         loop {
             let outcome = match self.tick_once().await {
                 Ok(o) => o,
+                // A wrong-chain RPC is terminal — never retry-loop signing onto
+                // it. Lift it out of the transient `Poster` bucket below.
+                Err(e @ BatchSubmitterError::Poster(BatchPosterError::ChainIdMismatch { .. })) => {
+                    error!(error = %e, "RPC serves the wrong chain — refusing to submit");
+                    return Err(e);
+                }
                 Err(BatchSubmitterError::Poster(source)) => {
                     error!(error = %source, "L1 provider error — will retry");
                     TickOutcome::Transient
@@ -180,7 +191,10 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
         let submitted_count = pending.len();
         let payloads: Vec<Vec<u8>> = pending.into_iter().map(|b| b.encoded).collect();
-        let tx_hashes = self.poster.submit_batches(payloads).await?;
+        let tx_hashes = self
+            .poster
+            .submit_batches(payloads, &self.watermark_sink)
+            .await?;
         if tx_hashes.len() != submitted_count {
             return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
                 format!(
@@ -219,38 +233,6 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         .await
         .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
     }
-}
-
-/// Advance `expected` by greedily consuming any matching observed nonce.
-///
-/// `observed_nonces` is the stream of **batch nonces** (from the SSZ payload)
-/// decoded from `InputAdded` events sent by our batch-submitter EOA, in L1
-/// event order. Because L1 mines txs from a single EOA in strict wallet-nonce
-/// order, this stream is naturally gap-less at the wallet-nonce level:
-/// tx[k]'s event cannot appear on-chain without tx[k-1]'s event, and the
-/// observed batch nonce sequence therefore mirrors our submission order.
-///
-/// Batch nonces themselves (unlike wallet nonces) CAN repeat across recovery
-/// generations — e.g., after a cascade, a fresh batch reuses its invalidated
-/// predecessor's nonce. That's why we still match on equality rather than
-/// trusting a sort: in a post-recovery window, the same batch nonce can be
-/// observed twice (once from the invalidated generation, once from the new
-/// one), and we only want to advance once.
-///
-/// Under the wallet-nonce ordering above, once the next `expected` doesn't
-/// appear in the stream the frontier naturally stops advancing — the gap
-/// means the scheduler hasn't seen that nonce on-chain yet (or observed it at
-/// a different wallet nonce from an earlier generation).
-fn advance_expected_batch_nonce(
-    mut expected: u64,
-    observed_nonces: impl IntoIterator<Item = u64>,
-) -> u64 {
-    for nonce in observed_nonces {
-        if nonce == expected {
-            expected = expected.saturating_add(1);
-        }
-    }
-    expected
 }
 
 #[cfg(test)]
@@ -306,14 +288,13 @@ mod tests {
 
     fn seed_safe_submitted_batches(db_path: &str, safe_block: u64, nonces: &[u64]) {
         let mut storage = Storage::open(db_path).expect("open storage");
+        // Landings carry the local batch's real wire bytes so the
+        // content-identity check (review R2) accepts them.
         let inputs: Vec<_> = nonces
             .iter()
             .map(|nonce| StoredSafeInput {
                 sender: BATCH_SUBMITTER_ADDRESS,
-                payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-                    nonce: *nonce,
-                    frames: Vec::new(),
-                }),
+                payload: crate::storage::test_helpers::local_batch_payload(&mut storage, *nonce),
                 block_number: safe_block,
             })
             .collect();
@@ -494,20 +475,5 @@ mod tests {
         // 2 matches expected=2 → advance to 3. Second 2 doesn't match
         // expected=3, skip. 3 matches → advance to 4.
         assert_eq!(from_nonce, 4);
-    }
-
-    #[test]
-    fn advance_expected_batch_nonce_matches_scheduler_nonce_rule() {
-        assert_eq!(super::advance_expected_batch_nonce(0, Vec::<u64>::new()), 0);
-        assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 1, 2]), 3);
-        assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 2, 3]), 1);
-        assert_eq!(super::advance_expected_batch_nonce(0, vec![1, 2, 3]), 0);
-        assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 1, 1, 2]), 3);
-        assert_eq!(
-            super::advance_expected_batch_nonce(0, vec![6, 4, 3, 2, 2, 0, 1]),
-            2
-        );
-        assert_eq!(super::advance_expected_batch_nonce(0, vec![0, 2, 1]), 2);
-        assert_eq!(super::advance_expected_batch_nonce(2, vec![2, 3]), 4);
     }
 }

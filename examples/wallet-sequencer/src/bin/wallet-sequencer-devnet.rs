@@ -2,18 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use app_core::application::{WalletApp, WalletConfig};
-use clap::Parser;
-use sequencer::{RunConfig, run};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), sequencer::RunError> {
+async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let config = RunConfig::parse();
-    run(WalletApp::new(WalletConfig::default()), config).await
+    // `setup` is the only subcommand that constructs a genesis app; the
+    // closure runs only on that path.
+    sequencer::run_main(|| WalletApp::new(WalletConfig::devnet())).await
 }

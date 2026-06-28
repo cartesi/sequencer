@@ -55,4 +55,12 @@ impl InclusionLaneConfig {
             frontier_min_interval: DEFAULT_FRONTIER_MIN_INTERVAL,
         }
     }
+
+    /// Override the force-close deadline (the operator-tunable
+    /// `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS`). Builder so callers that only need the
+    /// defaults keep using [`InclusionLaneConfig::new`].
+    pub fn with_max_batch_open(mut self, max_batch_open: Duration) -> Self {
+        self.max_batch_open = max_batch_open;
+        self
+    }
 }

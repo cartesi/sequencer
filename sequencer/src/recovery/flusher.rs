@@ -19,6 +19,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
+use crate::l1::watermark::{StorageWatermarkSink, WalletNonceWatermarkSink};
+
 #[derive(Debug, Error)]
 pub enum FlushError {
     #[error("provider/transport: {0}")]
@@ -92,6 +94,28 @@ fn map_watch_error(err: PendingTransactionError) -> Result<bool, FlushError> {
 }
 
 impl MempoolFlusher {
+    /// Build a flusher over `provider` plus the DB-backed watermark sink, run
+    /// the watermark-anchored flush, and return the observed safe block `C`.
+    ///
+    /// This is the flush-acquire core shared by all three keyed-flush sites
+    /// (`setup --recovery`, the runtime danger path, and `flush-mempool`). They
+    /// differ only in where the signing key, submitter address, and watermark
+    /// come from, and in the surrounding error type — so callers resolve those
+    /// (provider creation keeps each site's own error mapping; the returned
+    /// [`FlushError`] maps into `RunError`/`RecoveryError` via the existing
+    /// `From` impls) and this owns the sink build + `flush_and_wait`.
+    pub(crate) async fn flush_to_safe(
+        provider: DynProvider,
+        submitter_address: Address,
+        seconds_per_block: u64,
+        db_path: impl Into<String>,
+        watermark: Option<u64>,
+    ) -> Result<u64, FlushError> {
+        let flusher = Self::new(provider, submitter_address, seconds_per_block);
+        let sink = StorageWatermarkSink::new(db_path);
+        flusher.flush_and_wait(watermark, &sink).await
+    }
+
     pub fn new(provider: DynProvider, address: Address, seconds_per_block: u64) -> Self {
         let (confirmation_timeout, safe_poll_interval) = derive_timeouts(seconds_per_block);
         Self {
@@ -102,40 +126,73 @@ impl MempoolFlusher {
         }
     }
 
-    /// Flush the mempool by submitting no-op transactions for pending nonce
-    /// slots, then waiting until every slot is safe.
+    /// Flush the mempool by submitting no-op transactions for unresolved
+    /// nonce slots, then waiting until every slot we ever used is safe.
     ///
-    /// The loop runs until `get_transaction_count(Pending) <= get_transaction_count(Safe)`,
-    /// meaning every slot has reached safe finality.
+    /// `watermark` is the persisted wallet-nonce watermark — the highest
+    /// nonce this deployment ever broadcast (review R1a), or `None` if
+    /// nothing was ever broadcast (or no DB survives, the cockroach-recovery
+    /// best-effort case, R1b). The loop runs until
+    ///
+    /// ```text
+    /// pending <= safe  &&  safe >= watermark + 1
+    /// ```
+    ///
+    /// The first conjunct resolves every slot the local node remembers; the
+    /// second is the durable anchor — it refuses to declare victory until
+    /// slot `watermark` is consumed at safe depth, covering zombie txs the
+    /// local node has forgotten but the network may still hold (the F1
+    /// counterexample). It doubles as the post-flush assert from R1a: the
+    /// function cannot return success without it.
     ///
     /// At each iteration:
-    /// 1. Submit 0-ETH self-transfers for nonces between `Latest` and `Pending`.
-    ///    These compete with any batch transactions still in the mempool. If
-    ///    an original batch wins, that is also success: the slot advanced.
+    /// 1. Submit 0-ETH self-transfers for nonces in
+    ///    `[Latest, max(Pending, watermark + 1))` — every slot not yet
+    ///    mined that we might ever have used. The sink raises the persisted
+    ///    watermark before the broadcast (uniform write-before-broadcast,
+    ///    though no-ops never exceed the existing watermark under the
+    ///    invariant). These compete with any of our txs still in the
+    ///    network; whichever wins, the slot advances.
     /// 2. Watch each submitted no-op for L1 inclusion.
     /// 3. Sleep to let the safe head advance, then re-check the loop condition.
     /// 4. If any watch times out, retry the outer loop (tx may have been dropped,
     ///    or the original batch may be making progress instead).
-    pub async fn flush_and_wait(&self) -> Result<(), FlushError> {
+    ///
+    /// Returns the L1 **safe block number** at which resolution was observed
+    /// (review F2): the caller must not cascade until its own re-synced view
+    /// reaches at least this block.
+    pub async fn flush_and_wait(
+        &self,
+        watermark: Option<u64>,
+        sink: &dyn WalletNonceWatermarkSink,
+    ) -> Result<u64, FlushError> {
         let mut attempt = 0u32;
         loop {
             let safe_nonce = self.nonce_at(BlockNumberOrTag::Safe).await?;
             let pending_nonce = self.nonce_at(BlockNumberOrTag::Pending).await?;
+            // The durable anchor: every slot we ever used must be consumed
+            // at safe depth, regardless of what the local pool remembers.
+            let required_safe_nonce = watermark.map_or(0, |w| w.saturating_add(1));
 
-            if pending_nonce <= safe_nonce {
+            if pending_nonce <= safe_nonce && safe_nonce >= required_safe_nonce {
+                let safe_block = self.safe_block_number().await?;
                 info!(
                     safe_nonce,
+                    required_safe_nonce,
+                    safe_block,
                     "mempool flush complete — all slots reached safe finality"
                 );
-                return Ok(());
+                return Ok(safe_block);
             }
 
-            let unresolved = pending_nonce - safe_nonce;
+            let flush_end = pending_nonce.max(required_safe_nonce);
+            let unresolved = flush_end.saturating_sub(safe_nonce);
 
             if attempt == 0 {
                 info!(
                     safe_nonce,
                     pending_nonce,
+                    required_safe_nonce,
                     unresolved,
                     "flushing mempool: submitting no-ops for unresolved w_nonce slots"
                 );
@@ -146,17 +203,26 @@ impl MempoolFlusher {
                     attempt,
                     safe_nonce,
                     pending_nonce,
+                    required_safe_nonce,
                     unresolved,
                     "flush retry: previous attempt timed out, resubmitting"
                 );
             }
             attempt += 1;
 
-            // Submit no-ops for nonces between Latest and Pending. We submit
-            // the full range before watching any tx, so every unresolved slot
-            // gets a competing no-op attempt in this pass.
+            // Submit no-ops for every not-yet-mined slot up to the flush end.
+            // The full range goes out before watching any tx, so every
+            // unresolved slot gets a competing no-op attempt in this pass.
             let latest_nonce = self.nonce_at(BlockNumberOrTag::Latest).await?;
-            let tx_hashes = self.submit_noops(latest_nonce, pending_nonce).await?;
+            if latest_nonce < flush_end {
+                // Uniform write-before-broadcast; covers the no-ops we are
+                // about to send (a no-op above the current watermark can only
+                // happen if someone else used our key — over-covering then is
+                // exactly right).
+                sink.raise_to(flush_end.saturating_sub(1))
+                    .map_err(FlushError::Provider)?;
+            }
+            let tx_hashes = self.submit_noops(latest_nonce, flush_end).await?;
 
             // Watch each submitted tx for L1 inclusion.
             if !self.watch_txs(&tx_hashes).await? {
@@ -166,6 +232,17 @@ impl MempoolFlusher {
             // Sleep to let the safe head catch up before re-checking.
             tokio::time::sleep(self.safe_poll_interval).await;
         }
+    }
+
+    /// Block number of the current L1 safe head.
+    async fn safe_block_number(&self) -> Result<u64, FlushError> {
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Safe)
+            .await
+            .map_err(|e| FlushError::Provider(e.to_string()))?
+            .ok_or_else(|| FlushError::Provider("no safe block available".to_string()))?;
+        Ok(block.header.number)
     }
 
     /// Submit 0-ETH self-transfers for nonces `from_nonce..to_nonce`.
@@ -282,6 +359,14 @@ mod tests {
     use alloy::network::TransactionBuilder;
     use alloy::node_bindings::Anvil;
     use alloy::providers::Provider;
+
+    /// Sink for tests that don't assert on watermark raises.
+    struct NoopWatermarkSink;
+    impl WalletNonceWatermarkSink for NoopWatermarkSink {
+        fn raise_to(&self, _highest: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     // ── H5: replacement-fee bump keeps no-ops competitive ─────────
 
@@ -469,7 +554,10 @@ mod tests {
 
         let flusher = MempoolFlusher::new(provider, addr, 12);
         // No pending txs — should return immediately.
-        flusher.flush_and_wait().await.expect("flush");
+        flusher
+            .flush_and_wait(None, &NoopWatermarkSink)
+            .await
+            .expect("flush");
     }
 
     #[tokio::test]
@@ -506,10 +594,13 @@ mod tests {
         // Run the flusher — it should resolve all 3 nonces to safe.
         let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
-        tokio::time::timeout(Duration::from_secs(10), flusher.flush_and_wait())
-            .await
-            .expect("flush should complete within timeout")
-            .expect("flush should succeed");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            flusher.flush_and_wait(None, &NoopWatermarkSink),
+        )
+        .await
+        .expect("flush should complete within timeout")
+        .expect("flush should succeed");
 
         // Verify: safe nonce caught up.
         let safe_after = provider
@@ -520,6 +611,46 @@ mod tests {
         assert!(
             safe_after >= 3,
             "safe nonce should be >= 3 after flush, got {safe_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_covers_watermark_slots_the_pool_forgot() {
+        require_anvil();
+
+        let anvil = spawn_anvil();
+        let provider = signer_provider(&anvil);
+        let addr = anvil.addresses()[0];
+
+        // Models the F1 zombie: the persisted watermark says slot 0 was
+        // broadcast, but the local pool has no memory of it
+        // (pending == safe == 0). The pre-R1a `pending <= safe` early
+        // return would declare victory immediately and leave the slot to
+        // a zombie; the anchored flush must consume slot 0 with a no-op
+        // and wait for it to reach safe depth.
+        let _miner = start_miner(provider.clone(), Duration::from_millis(100));
+        let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
+            .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
+        let observed_safe_block = tokio::time::timeout(
+            Duration::from_secs(10),
+            flusher.flush_and_wait(Some(0), &NoopWatermarkSink),
+        )
+        .await
+        .expect("anchored flush should complete within timeout")
+        .expect("anchored flush should succeed");
+
+        let safe_after = provider
+            .get_transaction_count(addr)
+            .block_id(BlockNumberOrTag::Safe.into())
+            .await
+            .expect("safe nonce after flush");
+        assert!(
+            safe_after >= 1,
+            "watermark slot 0 must be consumed at safe depth, got {safe_after}"
+        );
+        assert!(
+            observed_safe_block > 0,
+            "flush must report the safe block it observed resolution at (F2)"
         );
     }
 
@@ -560,10 +691,13 @@ mod tests {
         // Flusher should wait for safe finality (no new txs to submit).
         let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
-        tokio::time::timeout(Duration::from_secs(10), flusher.flush_and_wait())
-            .await
-            .expect("flush should complete within timeout")
-            .expect("flush should succeed");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            flusher.flush_and_wait(None, &NoopWatermarkSink),
+        )
+        .await
+        .expect("flush should complete within timeout")
+        .expect("flush should succeed");
 
         let safe_after = provider
             .get_transaction_count(addr)
@@ -638,10 +772,13 @@ mod tests {
         // `flush_and_wait` must fail fast (no internal retry loop). Wrap in
         // a generous outer timeout just to bound test flakiness if alloy's
         // HTTP client has small internal retries.
-        let err = tokio::time::timeout(Duration::from_secs(5), flusher.flush_and_wait())
-            .await
-            .expect("flush_and_wait must not hang under disconnect")
-            .expect_err("flush_and_wait must surface a Provider error under disconnect");
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            flusher.flush_and_wait(None, &NoopWatermarkSink),
+        )
+        .await
+        .expect("flush_and_wait must not hang under disconnect")
+        .expect_err("flush_and_wait must surface a Provider error under disconnect");
         assert!(
             matches!(err, FlushError::Provider(_)),
             "expected FlushError::Provider, got: {err:?}",
@@ -658,10 +795,13 @@ mod tests {
         // fee no-op (or let the original land), wait for safe, and return.
         let flusher_after = MempoolFlusher::new(proxied_provider, addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
-        tokio::time::timeout(Duration::from_secs(15), flusher_after.flush_and_wait())
-            .await
-            .expect("flush_and_wait should complete after reconnect")
-            .expect("flush should succeed once the provider is reachable");
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            flusher_after.flush_and_wait(None, &NoopWatermarkSink),
+        )
+        .await
+        .expect("flush_and_wait should complete after reconnect")
+        .expect("flush should succeed once the provider is reachable");
 
         // Forward progress: the nonce-0 slot was consumed (either by the
         // flusher's no-op or by the original tx landing). `safe_nonce` is

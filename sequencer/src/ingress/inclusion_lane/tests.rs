@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use alloy_primitives::{Address, Signature, U256};
+use alloy_primitives::{Address, Signature};
 use app_core::application::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
 use rusqlite::params;
 use tokio::sync::{mpsc, oneshot};
@@ -31,14 +31,6 @@ struct TestApp {
 impl Application for TestApp {
     const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
 
-    fn current_user_nonce(&self, sender: Address) -> u32 {
-        self.nonces.get(&sender).copied().unwrap_or(0)
-    }
-
-    fn current_user_balance(&self, _sender: Address) -> U256 {
-        U256::MAX
-    }
-
     fn validate_user_op(
         &self,
         _sender: Address,
@@ -48,8 +40,13 @@ impl Application for TestApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
-        let next_nonce = self.current_user_nonce(user_op.sender).wrapping_add(1);
+    fn execute_valid_user_op(
+        &mut self,
+        user_op: &ValidUserOp,
+        _safe_block: u64,
+    ) -> Result<AppOutputs, AppError> {
+        let current = self.nonces.get(&user_op.sender).copied().unwrap_or(0);
+        let next_nonce = current.wrapping_add(1);
         self.nonces.insert(user_op.sender, next_nonce);
         self.executed_input_count = self.executed_input_count.saturating_add(1);
         Ok(Vec::new())
@@ -62,6 +59,10 @@ impl Application for TestApp {
 
     fn executed_input_count(&self) -> u64 {
         self.executed_input_count
+    }
+
+    fn last_executed_safe_block(&self) -> u64 {
+        0
     }
 
     // The lane loads its app via `from_dump` after the runtime
@@ -94,14 +95,6 @@ struct InternalUserOpApp;
 impl Application for InternalUserOpApp {
     const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
 
-    fn current_user_nonce(&self, _sender: Address) -> u32 {
-        0
-    }
-
-    fn current_user_balance(&self, _sender: Address) -> U256 {
-        U256::MAX
-    }
-
     fn validate_user_op(
         &self,
         _sender: Address,
@@ -111,10 +104,26 @@ impl Application for InternalUserOpApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, _user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
+    fn execute_valid_user_op(
+        &mut self,
+        _user_op: &ValidUserOp,
+        _safe_block: u64,
+    ) -> Result<AppOutputs, AppError> {
         Err(AppError::Internal {
             reason: "app invariant failed".to_string(),
         })
+    }
+
+    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
+        unimplemented!("not used in these tests")
+    }
+
+    fn executed_input_count(&self) -> u64 {
+        0
+    }
+
+    fn last_executed_safe_block(&self) -> u64 {
+        0
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
@@ -176,14 +185,6 @@ impl SharedCountingApp {
 impl Application for SharedCountingApp {
     const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
 
-    fn current_user_nonce(&self, _sender: Address) -> u32 {
-        0
-    }
-
-    fn current_user_balance(&self, _sender: Address) -> U256 {
-        U256::MAX
-    }
-
     fn validate_user_op(
         &self,
         _sender: Address,
@@ -193,13 +194,25 @@ impl Application for SharedCountingApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, _user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
+    fn execute_valid_user_op(
+        &mut self,
+        _user_op: &ValidUserOp,
+        _safe_block: u64,
+    ) -> Result<AppOutputs, AppError> {
         Ok(Vec::new())
     }
 
     fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
         self.executed_direct_inputs = self.executed_direct_inputs.saturating_add(1);
         Ok(Vec::new())
+    }
+
+    fn executed_input_count(&self) -> u64 {
+        self.executed_direct_inputs
+    }
+
+    fn last_executed_safe_block(&self) -> u64 {
+        0
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
@@ -255,14 +268,6 @@ impl Default for ReplayRecordingApp {
 impl Application for ReplayRecordingApp {
     const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
 
-    fn current_user_nonce(&self, _sender: Address) -> u32 {
-        0
-    }
-
-    fn current_user_balance(&self, _sender: Address) -> U256 {
-        U256::MAX
-    }
-
     fn validate_user_op(
         &self,
         _sender: Address,
@@ -272,7 +277,11 @@ impl Application for ReplayRecordingApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
+    fn execute_valid_user_op(
+        &mut self,
+        user_op: &ValidUserOp,
+        _safe_block: u64,
+    ) -> Result<AppOutputs, AppError> {
         self.replayed.push(ReplayEvent::UserOp {
             sender: user_op.sender,
             data: user_op.data.clone(),
@@ -293,6 +302,10 @@ impl Application for ReplayRecordingApp {
 
     fn executed_input_count(&self) -> u64 {
         self.executed_input_count
+    }
+
+    fn last_executed_safe_block(&self) -> u64 {
+        0
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
@@ -344,10 +357,20 @@ fn register_genesis_snapshot<A: Application>(app: &A, storage: &mut Storage, dum
     // tests that re-seed storage), so reuse-free naming matters.
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let prefix = dumps_dir.join(format!("genesis-{counter}"));
-    app.create_dump(&prefix).expect("create genesis dump");
+    let dump_dir = dumps_dir.join(format!("genesis-{counter}"));
+    super::dump_info::create_dump_dir_with_info(
+        app,
+        &dump_dir,
+        &super::dump_info::DumpInfo {
+            format_version: super::dump_info::FORMAT_VERSION,
+            next_batch_nonce: 0,
+            l2_tx_index: 0,
+            promoted_inclusion_block: Some(0),
+        },
+    )
+    .expect("create genesis dump");
     storage
-        .insert_finalized_dump(&prefix, 0, 0)
+        .insert_finalized_dump(&dump_dir, 0, 0)
         .expect("insert finalized snapshot");
 }
 
@@ -735,7 +758,7 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
             .ordered_l2_txs_page_from(0, 1_000_000)
             .expect("load ordered replay")
             .into_iter()
-            .map(|(_offset, tx)| tx)
+            .map(|(_offset, tx, _frame_safe_block)| tx)
             .collect()
     };
     shutdown_lane(&shutdown, lane_handle).await;
@@ -972,14 +995,6 @@ impl UserOpCounterApp {
 impl Application for UserOpCounterApp {
     const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
 
-    fn current_user_nonce(&self, _sender: Address) -> u32 {
-        0
-    }
-
-    fn current_user_balance(&self, _sender: Address) -> U256 {
-        U256::MAX
-    }
-
     fn validate_user_op(
         &self,
         _sender: Address,
@@ -989,13 +1004,25 @@ impl Application for UserOpCounterApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(&mut self, _user_op: &ValidUserOp) -> Result<AppOutputs, AppError> {
+    fn execute_valid_user_op(
+        &mut self,
+        _user_op: &ValidUserOp,
+        _safe_block: u64,
+    ) -> Result<AppOutputs, AppError> {
         self.executed_user_ops = self.executed_user_ops.saturating_add(1);
         Ok(Vec::new())
     }
 
+    fn execute_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
+        unimplemented!("not used in these tests")
+    }
+
     fn executed_input_count(&self) -> u64 {
         self.executed_user_ops
+    }
+
+    fn last_executed_safe_block(&self) -> u64 {
+        0
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
@@ -1033,8 +1060,9 @@ impl Application for UserOpCounterApp {
     }
 }
 
-fn read_dump_counter(prefix: &Path) -> u64 {
-    let bytes = std::fs::read(prefix.join("state")).expect("read dump state file");
+fn read_dump_counter(dump_dir: &Path) -> u64 {
+    let state_file = UserOpCounterApp::state_file_in_dump(&super::dump_info::app_prefix(dump_dir));
+    let bytes = std::fs::read(state_file).expect("read dump state file");
     u64::from_le_bytes(
         bytes
             .as_slice()
