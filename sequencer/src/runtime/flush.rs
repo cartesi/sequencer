@@ -45,6 +45,7 @@ pub async fn flush_mempool(config: FlushConfig) -> Result<(), RunError> {
         &config.eth_rpc_url,
         &key,
         identity.chain_id,
+        config.allow_insecure_rpc,
     )
     .await
     .map_err(|e| match e {

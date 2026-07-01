@@ -39,6 +39,11 @@ pub struct L1Config {
     /// the preemptive-recovery flush) can re-confirm the RPC's chain id right
     /// before signing via [`crate::l1::provider::create_verified_signer_provider`].
     pub chain_id: u64,
+    /// Opt into plaintext (`http://`) RPC against a non-loopback host — a
+    /// trusted private network (Docker/K8s service, private-VPC IP). Off by
+    /// default: the provider layer refuses remote plaintext otherwise. See
+    /// [`crate::l1::provider`].
+    pub allow_insecure_rpc: bool,
 }
 
 /// Full path to the SQLite database file inside `data_dir`.
@@ -201,6 +206,17 @@ pub struct SetupConfig {
     pub data_dir: String,
     #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
+    /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
+    /// private network (Docker/K8s service name, `host.docker.internal`, a
+    /// private-VPC IP) where anvil-style plaintext is normal. Off by default:
+    /// the provider refuses remote plaintext otherwise, guarding against
+    /// accidentally sending L1 traffic over the public internet in the clear.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_ALLOW_INSECURE_RPC",
+        default_value_t = false
+    )]
+    pub allow_insecure_rpc: bool,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
     #[arg(long, env = "CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::l1::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
     pub long_block_range_error_codes: Vec<String>,
@@ -316,6 +332,17 @@ pub struct RunConfig {
     pub data_dir: String,
     #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
+    /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
+    /// private network (Docker/K8s service name, `host.docker.internal`, a
+    /// private-VPC IP) where anvil-style plaintext is normal. Off by default:
+    /// the provider refuses remote plaintext otherwise, guarding against
+    /// accidentally sending L1 traffic over the public internet in the clear.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_ALLOW_INSECURE_RPC",
+        default_value_t = false
+    )]
+    pub allow_insecure_rpc: bool,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
     #[arg(long, env = "CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::l1::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
     pub long_block_range_error_codes: Vec<String>,
@@ -386,6 +413,17 @@ pub struct FlushConfig {
     pub data_dir: String,
     #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
+    /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
+    /// private network (Docker/K8s service name, `host.docker.internal`, a
+    /// private-VPC IP) where anvil-style plaintext is normal. Off by default:
+    /// the provider refuses remote plaintext otherwise, guarding against
+    /// accidentally sending L1 traffic over the public internet in the clear.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_ALLOW_INSECURE_RPC",
+        default_value_t = false
+    )]
+    pub allow_insecure_rpc: bool,
     #[command(flatten)]
     key: KeyArgs,
     /// Assumed L1 block time in seconds; sets the flusher's confirmation /

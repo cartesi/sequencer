@@ -75,6 +75,7 @@ where
     // ── L1 discovery (required) ──────────────────────────────
     let input_reader_config = InputReaderConfig {
         rpc_url: config.eth_rpc_url.clone(),
+        allow_insecure_rpc: config.allow_insecure_rpc,
         app_address: config.app_address,
         poll_interval: super::INPUT_READER_POLL_INTERVAL,
         long_block_range_error_codes: config.long_block_range_error_codes.clone(),
@@ -104,7 +105,12 @@ where
         }
     };
 
-    validate_rpc_chain_id(&config.eth_rpc_url, config.chain_id).await?;
+    validate_rpc_chain_id(
+        &config.eth_rpc_url,
+        config.chain_id,
+        config.allow_insecure_rpc,
+    )
+    .await?;
 
     // ── Pin identity ─────────────────────────────────────────
     // INVARIANT: identity is pinned (this step) BEFORE the initial sync
@@ -199,6 +205,7 @@ where
             &config.eth_rpc_url,
             config.batch_submitter_address,
             synced_safe_block,
+            config.allow_insecure_rpc,
         )
         .await?;
         run_detection_gate(
@@ -439,6 +446,7 @@ async fn flush_wallet_nonce(
         &config.eth_rpc_url,
         &key,
         config.chain_id,
+        config.allow_insecure_rpc,
     )
     .await
     .map_err(|e| match e {
@@ -539,11 +547,12 @@ async fn read_submitter_nonce_views(
     eth_rpc_url: &str,
     batch_submitter: Address,
     safe_block: Option<u64>,
+    allow_insecure: bool,
 ) -> Result<(u64, u64), BootstrapError> {
     use alloy::providers::Provider;
     use alloy::rpc::types::BlockNumberOrTag;
 
-    let provider = crate::l1::provider::create_provider(eth_rpc_url)
+    let provider = crate::l1::provider::create_provider(eth_rpc_url, allow_insecure)
         .map_err(|message| BootstrapError::DetectionNonceRead { message })?;
     let pending = provider
         .get_transaction_count(batch_submitter)
