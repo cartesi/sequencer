@@ -26,6 +26,11 @@ use sequencer_core::protocol::ProtocolTiming;
 #[derive(Debug, Clone)]
 pub struct InputReaderConfig {
     pub rpc_url: String,
+    /// Opt into plaintext (`http://`) RPC against a non-loopback host — a
+    /// trusted private network (Docker/K8s service, private-VPC IP). Off by
+    /// default: the provider layer refuses remote plaintext otherwise. See
+    /// [`crate::l1::provider`].
+    pub allow_insecure_rpc: bool,
     pub app_address: Address,
     pub poll_interval: Duration,
     /// Error codes that trigger `get_logs` retries with a shorter block range.
@@ -86,8 +91,9 @@ impl InputReader {
         batch_submitter: Address,
         timing: ProtocolTiming,
     ) -> Result<Self, InputReaderError> {
-        let provider = crate::l1::provider::create_provider(&config.rpc_url)
-            .map_err(InputReaderError::Bootstrap)?;
+        let provider =
+            crate::l1::provider::create_provider(&config.rpc_url, config.allow_insecure_rpc)
+                .map_err(InputReaderError::Bootstrap)?;
         let application = Application::new(config.app_address, &provider);
         let data_availability = application
             .getDataAvailability()
@@ -170,8 +176,11 @@ impl InputReader {
     }
 
     pub async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
-        let provider = crate::l1::provider::create_provider(&self.config.rpc_url)
-            .map_err(InputReaderError::Bootstrap)?;
+        let provider = crate::l1::provider::create_provider(
+            &self.config.rpc_url,
+            self.config.allow_insecure_rpc,
+        )
+        .map_err(InputReaderError::Bootstrap)?;
         self.advance_once(&provider).await
     }
 
@@ -193,8 +202,11 @@ impl InputReader {
     /// errors propagate. Shutdown is handled by the outer `run_forever`
     /// select, so this loop has no shutdown concerns.
     async fn run_loop(mut self) -> Result<(), InputReaderError> {
-        let provider = crate::l1::provider::create_provider(&self.config.rpc_url)
-            .map_err(InputReaderError::Bootstrap)?;
+        let provider = crate::l1::provider::create_provider(
+            &self.config.rpc_url,
+            self.config.allow_insecure_rpc,
+        )
+        .map_err(InputReaderError::Bootstrap)?;
         loop {
             match self.advance_once(&provider).await {
                 Ok(()) => {}
@@ -542,6 +554,7 @@ mod tests {
         InputReader::from_parts(
             InputReaderConfig {
                 rpc_url,
+                allow_insecure_rpc: false,
                 app_address: Address::ZERO,
                 poll_interval,
                 long_block_range_error_codes: Vec::new(),
@@ -660,6 +673,7 @@ mod tests {
         let mut reader = InputReader::from_parts(
             InputReaderConfig {
                 rpc_url: anvil.endpoint_url().to_string(),
+                allow_insecure_rpc: false,
                 app_address: Address::ZERO,
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: Vec::new(),
@@ -744,6 +758,7 @@ mod tests {
             db_file.path().to_string_lossy().into_owned(),
             InputReaderConfig {
                 rpc_url: "not-a-valid-url".to_string(),
+                allow_insecure_rpc: false,
                 app_address: Address::ZERO,
                 poll_interval: Duration::from_secs(1),
                 long_block_range_error_codes: Vec::new(),

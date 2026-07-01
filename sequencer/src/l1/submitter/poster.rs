@@ -456,7 +456,7 @@ mod tests {
         // Anvil account 0 — the submitter; its key signs the (never-sent) txs.
         let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
         let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key)
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key, false)
             .expect("signer provider");
 
         let config = BatchPosterConfig {
@@ -513,7 +513,7 @@ mod tests {
         let anvil = Anvil::default().spawn();
         let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
         let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key)
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key, false)
             .expect("signer provider");
 
         let wrong_chain_id = anvil.chain_id() + 1;

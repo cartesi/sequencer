@@ -370,6 +370,7 @@ async fn run_flush_and_cascade(
         &l1_config.eth_rpc_url,
         &l1_config.batch_submitter_private_key,
         l1_config.chain_id,
+        l1_config.allow_insecure_rpc,
     )
     .await
     .map_err(|e| match e {

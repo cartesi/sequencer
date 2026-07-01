@@ -11,6 +11,7 @@ use alloy::{
     transports::http::{Http, reqwest, reqwest::Url},
 };
 use alloy_transport::layers::RetryBackoffLayer;
+use url::Host;
 
 // Public Ethereum providers (Infura, Alchemy) commonly take 30–60s on heavy
 // `eth_getLogs` queries under load. The partition-retry helper in
@@ -23,16 +24,29 @@ const MAX_RATE_LIMIT_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 200;
 const COMPUTE_UNITS_PER_SEC: u64 = 500;
 
-fn create_client(url: &str) -> Result<RpcClient, String> {
+fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
     let url = Url::parse(url).map_err(|e| format!("invalid RPC URL: {e}"))?;
 
-    // Reject non-HTTPS for remote hosts to prevent accidental plaintext RPC.
-    // `url::Url::host_str` returns bracket-wrapped IPv6 literals (e.g. "[::1]").
-    if url.scheme() != "https" && !is_loopback_host(url.host_str().unwrap_or("")) {
+    // Reject non-HTTPS for remote hosts to prevent accidental plaintext RPC to a
+    // public endpoint (eavesdropping / MITM of signed L1 traffic). Loopback is
+    // always allowed; any other host requires `allow_insecure` — the explicit
+    // operator opt-in for trusted private networks (a Docker/K8s service name,
+    // `host.docker.internal`, a private-VPC IP) where anvil-style plaintext is
+    // normal and safe. The opt-out is loud, never silent.
+    let remote_plaintext = url.scheme() != "https" && !is_loopback_host(url.host());
+    if remote_plaintext && !allow_insecure {
         return Err(format!(
-            "remote RPC must use https, got {}://",
+            "remote RPC must use https, got {}:// (set \
+             CARTESI_SEQUENCER_ALLOW_INSECURE_RPC=true / --allow-insecure-rpc if \
+             this host is on a trusted private network, e.g. a Docker/K8s service)",
             url.scheme()
         ));
+    }
+    if remote_plaintext {
+        tracing::warn!(
+            url = %url,
+            "insecure plaintext RPC to a non-loopback host — explicitly allowed via allow-insecure-rpc"
+        );
     }
 
     let http_client = reqwest::Client::builder()
@@ -54,24 +68,39 @@ fn create_client(url: &str) -> Result<RpcClient, String> {
         .transport(transport, is_local))
 }
 
-/// Check whether a URL host string refers to a loopback address.
+/// Whether a parsed URL host refers to a loopback address.
 ///
-/// `url::Url::host_str` wraps IPv6 literals in brackets (e.g. `[::1]`), which
-/// this helper normalizes alongside the IPv4 and DNS forms.
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+/// Uses the already-parsed [`url::Host`] rather than the raw host string, so IP
+/// literals are classified by [`std::net::Ipv4Addr::is_loopback`] /
+/// [`std::net::Ipv6Addr::is_loopback`] (covering the whole `127.0.0.0/8` block
+/// and canonical `::1`, with no bracket-stripping). `localhost` is the reserved
+/// loopback name (RFC 6761) — a convention no library computes offline, so it
+/// stays the one explicit string.
+fn is_loopback_host(host: Option<Host<&str>>) -> bool {
+    match host {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
-/// Create a read-only provider with retry and timeout.
-pub fn create_provider(url: &str) -> Result<DynProvider, String> {
-    let client = create_client(url)?;
+/// Create a read-only provider with retry and timeout. `allow_insecure` opts
+/// into plaintext RPC against a non-loopback host — see [`create_client`].
+pub fn create_provider(url: &str, allow_insecure: bool) -> Result<DynProvider, String> {
+    let client = create_client(url, allow_insecure)?;
     let provider = ProviderBuilder::new().connect_client(client);
     Ok(provider.erased())
 }
 
-/// Create a provider with a wallet signer, retry, and timeout.
-pub fn create_signer_provider(url: &str, private_key: &str) -> Result<DynProvider, String> {
-    let client = create_client(url)?;
+/// Create a provider with a wallet signer, retry, and timeout. `allow_insecure`
+/// opts into plaintext RPC against a non-loopback host — see [`create_client`].
+pub fn create_signer_provider(
+    url: &str,
+    private_key: &str,
+    allow_insecure: bool,
+) -> Result<DynProvider, String> {
+    let client = create_client(url, allow_insecure)?;
     let signer =
         PrivateKeySigner::from_str(private_key).map_err(|_| "invalid private key".to_string())?;
     let provider = ProviderBuilder::new().wallet(signer).connect_client(client);
@@ -107,9 +136,10 @@ pub async fn create_verified_signer_provider(
     url: &str,
     private_key: &str,
     expected_chain_id: u64,
+    allow_insecure: bool,
 ) -> Result<DynProvider, VerifiedSignerProviderError> {
-    let provider =
-        create_signer_provider(url, private_key).map_err(VerifiedSignerProviderError::Create)?;
+    let provider = create_signer_provider(url, private_key, allow_insecure)
+        .map_err(VerifiedSignerProviderError::Create)?;
     let rpc_chain_id = provider
         .get_chain_id()
         .await
@@ -131,7 +161,7 @@ mod tests {
 
     #[test]
     fn create_client_rejects_http_for_remote_host() {
-        let err = create_client("http://mainnet.infura.io/v3/abc123")
+        let err = create_client("http://mainnet.infura.io/v3/abc123", false)
             .expect_err("http:// for remote host must be rejected");
         assert!(
             err.contains("https"),
@@ -141,22 +171,64 @@ mod tests {
 
     #[test]
     fn create_client_accepts_http_for_127_0_0_1() {
-        create_client("http://127.0.0.1:8545").expect("loopback http:// must be accepted");
+        create_client("http://127.0.0.1:8545", false).expect("loopback http:// must be accepted");
     }
 
     #[test]
     fn create_client_accepts_http_for_localhost() {
-        create_client("http://localhost:8545").expect("localhost http:// must be accepted");
+        create_client("http://localhost:8545", false).expect("localhost http:// must be accepted");
     }
 
     #[test]
     fn create_client_accepts_http_for_ipv6_loopback() {
-        create_client("http://[::1]:8545").expect("IPv6 loopback http:// must be accepted");
+        create_client("http://[::1]:8545", false).expect("IPv6 loopback http:// must be accepted");
+    }
+
+    #[test]
+    fn create_client_accepts_http_for_127_0_0_0_8_block() {
+        // The whole 127.0.0.0/8 range is loopback — `is_loopback()` covers it,
+        // whereas the old literal `== "127.0.0.1"` match rejected these.
+        create_client("http://127.0.0.2:8545", false).expect("127.0.0.2 is loopback");
+        create_client("http://127.1.2.3:8545", false).expect("127.1.2.3 is loopback");
     }
 
     #[test]
     fn create_client_accepts_https_for_remote_host() {
-        create_client("https://mainnet.infura.io/v3/abc123").expect("https:// must be accepted");
+        create_client("https://mainnet.infura.io/v3/abc123", false)
+            .expect("https:// must be accepted");
+    }
+
+    // ── Option A: explicit opt-in for plaintext to a trusted private host ──
+
+    #[test]
+    fn create_client_rejects_http_for_docker_service_name_by_default() {
+        // A Docker Compose / K8s service name is not loopback; default-secure
+        // rejects it, and the error points the operator at the opt-in.
+        let err = create_client("http://anvil:8545", false)
+            .expect_err("http:// to a bare service name must be rejected by default");
+        assert!(
+            err.contains("https") && err.contains("ALLOW_INSECURE_RPC"),
+            "error should explain https requirement and the opt-in, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_client_allows_insecure_rpc_when_opted_in() {
+        // The explicit operator opt-in permits plaintext to a non-loopback host
+        // (Docker service name, private IP, host.docker.internal).
+        create_client("http://anvil:8545", true)
+            .expect("service name http:// allowed when opted in");
+        create_client("http://10.0.1.5:8545", true)
+            .expect("private IP http:// allowed when opted in");
+        create_client("http://host.docker.internal:8545", true)
+            .expect("host.docker.internal http:// allowed when opted in");
+    }
+
+    #[test]
+    fn create_client_still_allows_loopback_without_the_opt_in() {
+        // The opt-in is not required for loopback — that stays a zero-config
+        // safe default even with allow_insecure = false.
+        create_client("http://127.0.0.1:8545", false).expect("loopback needs no opt-in");
     }
 
     // ── H3 regression: private-key parse error must not echo bytes ─
@@ -169,7 +241,7 @@ mod tests {
         // match — so a future change that re-adds interpolation is caught.
         let bad_key =
             "0xZZZZ_zzzz_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff";
-        let err = create_signer_provider("http://127.0.0.1:8545", bad_key)
+        let err = create_signer_provider("http://127.0.0.1:8545", bad_key, false)
             .expect_err("malformed hex key must be rejected");
         assert_eq!(
             err, "invalid private key",
@@ -187,7 +259,7 @@ mod tests {
         // Odd-length hex would trigger a different error variant. Same
         // invariant: fixed error message, no key bytes leaked.
         let bad_key = "0xabc";
-        let err = create_signer_provider("http://127.0.0.1:8545", bad_key)
+        let err = create_signer_provider("http://127.0.0.1:8545", bad_key, false)
             .expect_err("odd-length hex key must be rejected");
         assert_eq!(err, "invalid private key");
     }
@@ -195,7 +267,7 @@ mod tests {
     #[test]
     fn create_signer_provider_accepts_valid_key() {
         let good_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        create_signer_provider("http://127.0.0.1:8545", good_key)
+        create_signer_provider("http://127.0.0.1:8545", good_key, false)
             .expect("valid key must be accepted");
     }
 
@@ -226,15 +298,16 @@ mod tests {
         let chain_id = anvil.chain_id();
 
         // Matching chain id → a usable signing provider.
-        create_verified_signer_provider(&anvil.endpoint(), ANVIL_KEY_0, chain_id)
+        create_verified_signer_provider(&anvil.endpoint(), ANVIL_KEY_0, chain_id, false)
             .await
             .expect("matching chain id yields a verified signer provider");
 
         // Wrong pinned chain id → terminal ChainIdMismatch, before any signing,
         // surfacing the served id vs the pinned one.
-        let err = create_verified_signer_provider(&anvil.endpoint(), ANVIL_KEY_0, chain_id + 1)
-            .await
-            .expect_err("a mismatched pinned chain id must be rejected before signing");
+        let err =
+            create_verified_signer_provider(&anvil.endpoint(), ANVIL_KEY_0, chain_id + 1, false)
+                .await
+                .expect_err("a mismatched pinned chain id must be rejected before signing");
         assert!(
             matches!(
                 err,

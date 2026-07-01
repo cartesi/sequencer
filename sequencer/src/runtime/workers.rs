@@ -488,8 +488,12 @@ fn log_cleanup_result(component: &str, result: Result<(), WorkerExit>) {
 // keyed-write guard instead lives in `EthereumBatchPoster::submit_batches`,
 // which re-confirms the chain id immediately before every productive send.
 fn build_batch_submitter_provider(l1: &L1Config) -> Result<DynProvider, std::io::Error> {
-    crate::l1::provider::create_signer_provider(&l1.eth_rpc_url, &l1.batch_submitter_private_key)
-        .map_err(std::io::Error::other)
+    crate::l1::provider::create_signer_provider(
+        &l1.eth_rpc_url,
+        &l1.batch_submitter_private_key,
+        l1.allow_insecure_rpc,
+    )
+    .map_err(std::io::Error::other)
 }
 
 /// Require the finalized snapshot the lane will `from_dump` against. `setup`

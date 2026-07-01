@@ -80,7 +80,13 @@ where
     // chain id on its first successful contact (`InputReaderConfig::expected_chain_id`),
     // so a provider that reconnects on the wrong chain fails loud before
     // ingesting any address-filtered foreign logs.
-    match validate_rpc_chain_id(&config.eth_rpc_url, identity.chain_id).await {
+    match validate_rpc_chain_id(
+        &config.eth_rpc_url,
+        identity.chain_id,
+        config.allow_insecure_rpc,
+    )
+    .await
+    {
         Ok(()) => {}
         Err(RunError::Bootstrap(BootstrapError::ChainIdRpc { message })) => {
             tracing::warn!(
@@ -98,6 +104,7 @@ where
         batch_submitter_private_key: key,
         batch_submitter_address: identity.batch_submitter_address,
         chain_id: identity.chain_id,
+        allow_insecure_rpc: config.allow_insecure_rpc,
     };
 
     // `run` never re-discovers identity from L1 — it builds the reader from
@@ -105,6 +112,7 @@ where
     let mut input_reader = InputReader::from_parts(
         InputReaderConfig {
             rpc_url: config.eth_rpc_url.clone(),
+            allow_insecure_rpc: config.allow_insecure_rpc,
             app_address: identity.app_address,
             poll_interval: INPUT_READER_POLL_INTERVAL,
             long_block_range_error_codes: config.long_block_range_error_codes.clone(),
@@ -200,9 +208,10 @@ pub(crate) fn load_setup_identity(db_path: &str) -> Result<DeploymentIdentity, R
 pub(crate) async fn validate_rpc_chain_id(
     eth_rpc_url: &str,
     expected: u64,
+    allow_insecure: bool,
 ) -> Result<(), RunError> {
     use alloy::providers::Provider;
-    let check_provider = crate::l1::provider::create_provider(eth_rpc_url)
+    let check_provider = crate::l1::provider::create_provider(eth_rpc_url, allow_insecure)
         .map_err(|e| RunError::Io(std::io::Error::other(e)))?;
     match check_provider.get_chain_id().await {
         Ok(rpc_chain_id) if rpc_chain_id != expected => {

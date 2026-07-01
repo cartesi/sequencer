@@ -500,6 +500,7 @@ mod tests {
         crate::l1::provider::create_signer_provider(
             anvil.endpoint_url().as_str(),
             &format!("0x{key_hex}"),
+            false,
         )
         .expect("create signer provider")
     }
@@ -750,6 +751,7 @@ mod tests {
         let proxied_provider = crate::l1::provider::create_signer_provider(
             proxy.endpoint().as_str(),
             &format!("0x{key_hex}"),
+            false,
         )
         .expect("create signer provider through proxy");
 
