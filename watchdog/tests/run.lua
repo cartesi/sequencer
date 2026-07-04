@@ -10,6 +10,7 @@ local config = require("watchdog.config")
 local jsonrpc = require("watchdog.jsonrpc")
 local l1_reader = require("watchdog.l1_reader")
 local main_mod = require("watchdog.main")
+local metrics = require("watchdog.metrics")
 local retry = require("watchdog.retry")
 local runner = require("watchdog.runner")
 local sequencer_reader = require("watchdog.sequencer_reader")
@@ -25,6 +26,26 @@ local function assert_eq(actual, expected)
     if actual ~= expected then
         error(string.format("expected %q, got %q", tostring(expected), tostring(actual)), 2)
     end
+end
+
+local TEST_OS_EXIT = "__TEST_OS_EXIT__"
+
+local function capture_os_exit(fn)
+    local captured = nil
+    local original_exit = os.exit
+    os.exit = function(code)
+        captured = code or 0
+        error(TEST_OS_EXIT)
+    end
+    local ok, err = pcall(fn)
+    os.exit = original_exit
+    if not ok then
+        if tostring(err):find(TEST_OS_EXIT, 1, true) then
+            return captured, nil
+        end
+        return nil, err
+    end
+    return captured, nil
 end
 
 test("raw compare fails byte-different JSON", function()
@@ -466,6 +487,7 @@ local function fake_cfg()
         cm_snapshot_safe_block = 0,
         input_box_address = "0xinputbox",
         app_address = "0x1111111111111111111111111111111111111111",
+        blockchain_id = "31337",
         input_added_topic = "0xtopic",
         long_block_range_error_codes = l1_reader.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
         retry_attempts = 1,
@@ -514,6 +536,255 @@ local function fake_machine(inspect_state)
     return machine
 end
 
+local function load_fixture(path)
+    local file, err = io.open(path, "rb")
+    if not file then
+        error("open " .. path .. ": " .. tostring(err))
+    end
+    local body = file:read("*a")
+    file:close()
+    return body
+end
+
+test("main tick writes status.prom through exit path", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+    local init_result, init_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert(init_result, init_err)
+
+    local tick_env = {
+        CARTESI_WATCHDOG_STATE_DIR = dir,
+        CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT = "http://tick-rpc",
+    }
+    local tick_deps = {
+        checkpoint = {
+            load = function(_state_dir)
+                return { snapshot_dir = "/tmp/snapshot", safe_block = 5 }
+            end,
+        },
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 5, l2_tx_index = 0 }
+            end,
+        },
+        machine = fake_machine("{}"),
+    }
+
+    local exit_code, run_err = capture_os_exit(function()
+        main_mod.main({ "tick" }, { deps = tick_deps, env = tick_env })
+    end)
+    assert(run_err == nil, tostring(run_err))
+    assert_eq(exit_code, main_mod.EXIT_OK)
+
+    local file = assert(io.open(dir .. "/status.prom", "rb"))
+    local body = file:read("*a")
+    file:close()
+    assert(body:find('state="ok"} 1', 1, true) ~= nil, body)
+    assert(body:find('cartesi_watchdog_exit_code{app_address="0x1111111111111111111111111111111111111111",chain="31337"} 0', 1, true) ~= nil, body)
+end)
+
+test("metrics prom matches golden ok fixture", function()
+    local body = metrics.build_prom({
+        exit_code = 0,
+        chain_id = "11155111",
+        app_address = "0x4CE633CA71071818cD73187765ee60F696dae083",
+        timestamp = 1710000000,
+    })
+    assert_eq(body, load_fixture("tests/fixtures/watchdog_status_ok.prom"))
+end)
+
+test("metrics prom matches golden failed fixture", function()
+    local body = metrics.build_prom({
+        exit_code = 2,
+        chain_id = "31337",
+        app_address = "0xdeadbeef",
+        divergence_kind = "state_mismatch",
+        timestamp = 1710000000,
+    })
+    assert_eq(body, load_fixture("tests/fixtures/watchdog_status_failed.prom"))
+end)
+
+test("metrics prom marks warning state without divergence info", function()
+    local body = metrics.build_prom({
+        exit_code = 1,
+        chain_id = "31337",
+        app_address = "0xdeadbeef",
+        timestamp = 1710000000,
+    })
+
+    assert(body:find('state="warning"} 1', 1, true) ~= nil, body)
+    assert(body:find("cartesi_watchdog_divergence_info", 1, true) == nil, body)
+end)
+
+test("metrics resolve_path honors custom metrics file env", function()
+    local path = metrics.resolve_path({ state_dir = "/var/lib/watchdog" }, {
+        CARTESI_WATCHDOG_METRICS_FILE = "/tmp/custom.prom",
+    })
+    assert_eq(path, "/tmp/custom.prom")
+end)
+
+test("metrics resolve_path defaults to state dir status prom", function()
+    local path = metrics.resolve_path({ state_dir = "/var/lib/watchdog" }, {})
+    assert_eq(path, "/var/lib/watchdog/status.prom")
+end)
+
+test("metrics prom uses unknown labels when chain and app are missing", function()
+    local body = metrics.build_prom({
+        exit_code = 0,
+        timestamp = 1710000000,
+    })
+    assert(body:find('chain="unknown"', 1, true) ~= nil, body)
+    assert(body:find('app_address="unknown"', 1, true) ~= nil, body)
+end)
+
+test("metrics prom escapes label special characters", function()
+    local body = metrics.build_prom({
+        exit_code = 2,
+        chain_id = '31"337',
+        app_address = '0x\\addr',
+        divergence_kind = "state_mismatch",
+        timestamp = 1710000000,
+    })
+    assert(body:find('chain="31\\"337"', 1, true) ~= nil, body)
+    assert(body:find('app_address="0x\\\\addr"', 1, true) ~= nil, body)
+end)
+
+test("metrics write is atomic and leaves no tmp file", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local prom_path = dir .. "/status.prom"
+    local ok, err = metrics.write_tick_status({
+        cfg = { state_dir = dir, app_address = "0xabc", blockchain_id = "1" },
+        exit_code = 0,
+        timestamp = 1710000000,
+    })
+    assert(ok, err)
+
+    local tmp = io.open(prom_path .. ".tmp", "rb")
+    assert_eq(tmp, nil)
+    local file = assert(io.open(prom_path, "rb"))
+    local body = file:read("*a")
+    file:close()
+    assert(body:find('state="ok"} 1', 1, true) ~= nil, body)
+end)
+
+test("successful idle compare writes ok status prom", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+
+    local result, err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert(result, err)
+
+    local exit_code, payload = main_mod.run_compare_cycle(cfg, {
+        checkpoint = {
+            load = function(_state_dir)
+                return { snapshot_dir = "/tmp/snapshot", safe_block = 5 }
+            end,
+        },
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 5, l2_tx_index = 0 }
+            end,
+        },
+        machine = fake_machine("{}"),
+    })
+    assert_eq(exit_code, main_mod.EXIT_OK)
+    assert(payload.skipped, "expected idle skip")
+
+    main_mod.write_tick_metrics(cfg, exit_code, payload, {
+        CARTESI_WATCHDOG_STATE_DIR = dir,
+    })
+
+    local file = assert(io.open(dir .. "/status.prom", "rb"))
+    local body = file:read("*a")
+    file:close()
+    assert(body:find('state="ok"} 1', 1, true) ~= nil, body)
+    assert(body:find("cartesi_watchdog_divergence_info", 1, true) == nil, body)
+end)
+
+test("metrics maps exit codes to status states", function()
+    assert_eq(metrics.state_for_exit_code(0), "ok")
+    assert_eq(metrics.state_for_exit_code(1), "warning")
+    assert_eq(metrics.state_for_exit_code(2), "failed")
+end)
+
+test("metrics prom file marks failed state on divergence", function()
+    local body = metrics.build_prom({
+        exit_code = 2,
+        chain_id = "31337",
+        app_address = "0xdeadbeef",
+        divergence_kind = "state_mismatch",
+        timestamp = 1710000000,
+    })
+
+    assert(body:find('cartesi_watchdog_status{app_address="0xdeadbeef",chain="31337",state="failed"} 1', 1, true) ~= nil, body)
+    assert(body:find('cartesi_watchdog_status{app_address="0xdeadbeef",chain="31337",state="ok"} 0', 1, true) ~= nil, body)
+    assert(body:find('cartesi_watchdog_last_tick_unix_seconds{app_address="0xdeadbeef",chain="31337"} 1710000000', 1, true) ~= nil, body)
+    assert(body:find('cartesi_watchdog_exit_code{app_address="0xdeadbeef",chain="31337"} 2', 1, true) ~= nil, body)
+    assert(body:find('cartesi_watchdog_divergence_info{app_address="0xdeadbeef",chain="31337",kind="state_mismatch"} 1', 1, true) ~= nil, body)
+end)
+
+test("tick writes status.prom into watchdog state dir", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+    cfg.blockchain_id = "31337"
+
+    local result, err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert(result, err)
+
+    local exit_code, payload = main_mod.run_compare_cycle(cfg, {
+        checkpoint = {
+            load = function(_state_dir)
+                return { snapshot_dir = "/tmp/snapshot", safe_block = 1 }
+            end,
+        },
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                return { inclusion_block = 2, l2_tx_index = 0 }
+            end,
+            get_finalized_state = function()
+                return {
+                    inclusion_block = 2,
+                    l2_tx_index = 0,
+                    state = '{"a":1}',
+                }
+            end,
+        },
+        fetch_inputs = function(from_block, to_block)
+            assert_eq(from_block, 2)
+            assert_eq(to_block, 2)
+            return {}
+        end,
+        machine = fake_machine('{ "a": 1 }'),
+    })
+    assert_eq(exit_code, main_mod.EXIT_DIVERGENCE)
+    assert(type(payload) == "table", "expected divergence payload")
+    assert_eq(payload.kind, "state_mismatch")
+
+    main_mod.write_tick_metrics(cfg, exit_code, payload, {
+        CARTESI_WATCHDOG_STATE_DIR = dir,
+    })
+
+    local prom_path = dir .. "/status.prom"
+    local file, open_err = io.open(prom_path, "rb")
+    assert(file, open_err)
+    local body = file:read("*a")
+    file:close()
+
+    assert(body:find('state="failed"} 1', 1, true) ~= nil, body)
+    assert(body:find('kind="state_mismatch"} 1', 1, true) ~= nil, body)
+end)
+
 test("init stores bootstrap snapshot as watchdog head", function()
     local dir = os.tmpname()
     os.remove(dir)
@@ -539,6 +810,7 @@ test("init stores bootstrap snapshot as watchdog head", function()
     assert(persisted, cfg_err)
     assert_eq(persisted.sequencer_url, "http://sequencer")
     assert_eq(persisted.l1_rpc_url, nil)
+    assert_eq(persisted.blockchain_id, "31337")
 
     local tick_cfg = main_mod.load_tick_config({
         CARTESI_WATCHDOG_STATE_DIR = dir,
@@ -547,6 +819,8 @@ test("init stores bootstrap snapshot as watchdog head", function()
     assert_eq(tick_cfg.state_dir, dir)
     assert_eq(tick_cfg.sequencer_url, "http://sequencer")
     assert_eq(tick_cfg.l1_rpc_url, "http://tick-rpc")
+    assert_eq(tick_cfg.blockchain_id, "31337")
+    assert_eq(tick_cfg.app_address, "0x1111111111111111111111111111111111111111")
 end)
 
 test("tick config requires current RPC URL outside persisted state", function()

@@ -108,12 +108,13 @@ Lua modules:
 - `sequencer_reader.lua`: sequencer HTTP client (`GET /finalized_state/inclusion_block`, `GET /finalized_state`).
 - `compare.lua`: raw byte comparison.
 - `checkpoint.lua`: manifest-backed checkpoint persistence (`head.json` pointer).
-- `state.lua`: persisted `config.json` and single-run state lock.
+- `state.lua`: persisted `config.json`, atomic file writes, single-run state lock.
+- `metrics.lua`: Prometheus textfile (`status.prom`) built and written each tick.
 - `retry.lua`: bounded retry helper used by the runtime.
 - `runner.lua`: one compare cycle — cheap `/finalized_state/inclusion_block`
   poll, then (when finalized advanced) L1 fetch, CM replay, SSZ compare,
   checkpoint write.
-- `main.lua`: dispatches `init` and `tick`; `tick` exits `0`/`1`/`2`.
+- `main.lua`: dispatches `init` and `tick`; `tick` exits `0`/`1`/`2` and writes `status.prom`.
 
 The L1 reader follows the Rust partition strategy from
 `sequencer/src/l1/partition.rs`: if an RPC provider rejects a large range, the
@@ -152,6 +153,7 @@ inputs.
 state_dir/
   config.json
   head.json
+  status.prom    # Prometheus textfile from the last tick (see Metrics below)
   run.lock       # advisory lock handle; file existence is not lock state
   checkpoints/
     00000000000001234567/
@@ -195,18 +197,64 @@ host scheduling should provide the same non-overlap guarantee. Each tick:
    then inspects with query `state`.
 5. Byte-compares the SSZ report against `GET /finalized_state`; on match writes a
    new checkpoint, on mismatch emits a `watchdog_event` and exits `2`.
+6. Atomically writes `$CARTESI_WATCHDOG_STATE_DIR/status.prom` (or
+   `CARTESI_WATCHDOG_METRICS_FILE`) before exit.
 
 Runtime knobs:
 
 - `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`: current L1 JSON-RPC endpoint for tick.
+- `CARTESI_WATCHDOG_BLOCKCHAIN_ID`: optional chain id label persisted at `init` for `status.prom`.
+- `CARTESI_WATCHDOG_METRICS_FILE`: optional override for the Prometheus textfile path (default `$CARTESI_WATCHDOG_STATE_DIR/status.prom`).
 - `CARTESI_WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
 - `CARTESI_WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.
+
+## Metrics (`status.prom`)
+
+Each `tick` writes a [Prometheus textfile](https://github.com/prometheus/node_exporter#textfile-collector)
+before exiting. Operators scrape or push it from their side — the watchdog does
+not run an HTTP server.
+
+| Exit code | `state` label | Meaning |
+|-----------|---------------|---------|
+| `0` | `ok` | Compare passed, or idle (finalized unchanged) |
+| `1` | `warning` | Transient failure after retries |
+| `2` | `failed` | Deterministic divergence |
+
+Gauges (labels `chain`, `app_address` on every series):
+
+- `cartesi_watchdog_status{state="ok|warning|failed"}` — exactly one series is `1`
+- `cartesi_watchdog_last_tick_unix_seconds`
+- `cartesi_watchdog_exit_code`
+- `cartesi_watchdog_divergence_info{kind}` — only on exit `2`
+
+Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label (defaults to
+`unknown`). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../tests/fixtures/watchdog_status_ok.prom),
+[`tests/fixtures/watchdog_status_failed.prom`](../tests/fixtures/watchdog_status_failed.prom).
+
+Example after a clean tick:
+
+```prometheus
+cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="ok"} 1
+cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="warning"} 0
+cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="failed"} 0
+cartesi_watchdog_last_tick_unix_seconds{chain="11155111",app_address="0x4CE..."} 1717420800
+cartesi_watchdog_exit_code{chain="11155111",app_address="0x4CE..."} 0
+```
+
+Example Prometheus alert (pull or push gateway — operator choice):
+
+```promql
+cartesi_watchdog_status{state="failed"} == 1
+```
+
+Divergence playbook: **notify only**; manual intervention (see
+[`operator-deployment.md`](operator-deployment.md)).
 
 ## Local Tests
 
 | Command | What it exercises |
 |---------|-------------------|
-| `just test-watchdog` | Lua unit tests (fake HTTP/RPC/CM; no live chain) |
+| `just test-watchdog` | Lua unit tests (fake HTTP/RPC/CM; includes `status.prom` golden fixtures) |
 | `just test-watchdog-e2e` | Real CM: advance, inspect; optional live compare if `CARTESI_WATCHDOG_E2E_SEQUENCER_URL` set |
 | `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua `init`/`tick` |
 | `just test-rollups-e2e` | All rollups e2e scenarios; includes watchdog genesis/non-genesis compare plus `watchdog_non_genesis_divergence_test` (needs Sepolia CM image) |

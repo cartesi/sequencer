@@ -9,6 +9,7 @@ local http_mod = require("watchdog.http")
 local json_mod = require("watchdog.json")
 local jsonrpc = require("watchdog.jsonrpc")
 local machine_cartesi = require("watchdog.machine_cartesi")
+local metrics = require("watchdog.metrics")
 local retry = require("watchdog.retry")
 local runner = require("watchdog.runner")
 local sequencer_reader = require("watchdog.sequencer_reader")
@@ -50,6 +51,28 @@ local function emit_watchdog_event(json, payload, deps)
         deps.on_watchdog_event(payload)
     end
     io.stderr:write("watchdog_event " .. json.encode(payload) .. "\n")
+end
+
+local function divergence_kind_from_payload(payload)
+    if type(payload) == "table" and type(payload.kind) == "string" then
+        return payload.kind
+    end
+    return nil
+end
+
+local function write_tick_metrics(cfg, exit_code, payload, env)
+    local ok, err = metrics.write_tick_status({
+        cfg = cfg,
+        env = env or os.getenv,
+        exit_code = exit_code,
+        chain_id = cfg and cfg.blockchain_id or nil,
+        app_address = cfg and cfg.app_address or nil,
+        divergence_kind = divergence_kind_from_payload(payload),
+        timestamp = os.time(),
+    })
+    if not ok then
+        io.stderr:write("watchdog metrics write failed: " .. tostring(err) .. "\n")
+    end
 end
 
 local function default_machine_deps(cfg)
@@ -166,7 +189,10 @@ local function load_or_error(loader)
     return value
 end
 
-local function exit_for_result(command, exit_code, err)
+local function exit_for_result(command, exit_code, err, cfg, env)
+    if command == "tick" then
+        write_tick_metrics(cfg, exit_code, err, env)
+    end
     if exit_code == EXIT_DIVERGENCE then
         os.exit(EXIT_DIVERGENCE)
     end
@@ -178,9 +204,13 @@ local function exit_for_result(command, exit_code, err)
 end
 
 -- One compare cycle per `tick` process. Infra (systemd timer / k8s CronJob)
--- schedules re-runs and reacts to the exit code; the watchdog itself does not loop.
-local function main(argv)
+-- schedules re-runs and reacts to status.prom / the exit code; the watchdog
+-- itself does not loop.
+local function main(argv, opts)
     argv = argv or arg or {}
+    opts = opts or {}
+    local injected_env = opts.env
+    local injected_deps = opts.deps
     prepend_deps_cpath()
 
     local command = argv[1]
@@ -206,21 +236,23 @@ local function main(argv)
 
     if command == "tick" then
         local cfg, cfg_err = load_or_error(function()
-            return load_tick_config()
+            return load_tick_config(injected_env)
         end)
         if not cfg then
             io.stderr:write("watchdog tick failed: " .. tostring(cfg_err) .. "\n")
+            write_tick_metrics(nil, EXIT_TRANSIENT, cfg_err, injected_env)
             os.exit(EXIT_TRANSIENT)
         end
-        local ok, exit_code, err = pcall(run_tick, cfg)
+        local ok, exit_code, err = pcall(run_tick, cfg, injected_deps)
         if not ok then
             io.stderr:write("watchdog tick failed: " .. tostring(exit_code) .. "\n")
+            write_tick_metrics(cfg, EXIT_TRANSIENT, exit_code, injected_env)
             os.exit(EXIT_TRANSIENT)
         end
         if not exit_code then
             exit_code = EXIT_TRANSIENT
         end
-        exit_for_result(command, exit_code, err)
+        exit_for_result(command, exit_code, err, cfg, injected_env)
     end
 
     io.stderr:write(usage() .. "\n")
@@ -246,4 +278,5 @@ return {
     EXIT_OK = EXIT_OK,
     EXIT_TRANSIENT = EXIT_TRANSIENT,
     EXIT_DIVERGENCE = EXIT_DIVERGENCE,
+    write_tick_metrics = write_tick_metrics,
 }

@@ -16,7 +16,7 @@ This document covers staging and manual verification beyond the devnet tutorial.
 - JSON is pure Lua (`watchdog/third_party/json.lua`); no cjson compile step
 - Staging or local sequencer reachable at `CARTESI_WATCHDOG_SEQUENCER_URL`
 - L1 RPC + InputBox + app addresses matching that deployment
-- Log collection for `watchdog_event` lines and process exit codes
+- Log collection for `watchdog_event` lines, process exit codes, and `status.prom`
 
 ## Drill 1 — Divergence signal (synthetic mismatch, no CM)
 
@@ -30,7 +30,8 @@ CARTESI_WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua   # 
 ```
 
 Expected: `main.lua` emits a structured `watchdog_event` with `kind=state_mismatch` and
-non-zero `mismatch_offset`, then the drill process exits with code `2`.
+non-zero `mismatch_offset`, then the drill process exits with code `2` and writes
+`status.prom` with `state="failed"`.
 
 Unit coverage: `just test-watchdog` (`runner returns state mismatch payload`).
 
@@ -64,6 +65,8 @@ export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ```
 
 Expected: exit **0**; the tick may exit idle if the finalized block is unchanged.
+`$CARTESI_WATCHDOG_STATE_DIR/status.prom` should show `state="ok"` and
+`cartesi_watchdog_exit_code ... 0`.
 The harness path also proves byte-identical **devnet** genesis SSZ on sequencer `/finalized_state` and CM inspect
 (same bytes as `wallet_snapshot::encode(WalletConfig::devnet())`; the `.hex` fixture
 is for Sepolia `default()` — do not use it as the devnet golden).
@@ -86,7 +89,35 @@ Exit codes from `sequencer-watchdog tick`:
 |------|---------|
 | `0` | Compare cycle completed — clean, or idle when finalized is unchanged |
 | `1` | Transient error after retries (RPC, CM, network) |
-| `2` | Deterministic divergence — `watchdog_event` on stderr with `{kind, previous_safe_block, sequencer_inclusion_block, mismatch_offset?}` |
+| `2` | Deterministic divergence — `watchdog_event` on stderr with `{kind, previous_safe_block, sequencer_inclusion_block, mismatch_offset?}`; `status.prom` has `state="failed"` |
+
+Each tick also writes `$CARTESI_WATCHDOG_STATE_DIR/status.prom` before exit. See
+[`README.md` — Metrics](README.md#metrics-statusprom) for gauge names and alert
+examples.
+
+## Drill 4 — Metrics file (synthetic divergence)
+
+Verifies `status.prom` is written on divergence without a live sequencer.
+
+```bash
+just watchdog-lua-deps
+dir=$(mktemp -d)
+export CARTESI_WATCHDOG_STATE_DIR="$dir"
+export CARTESI_WATCHDOG_BLOCKCHAIN_ID=31337
+# init once (needs CM snapshot env — reuse Drill 2 exports), then:
+CARTESI_WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua || true
+cat "$dir/status.prom"
+```
+
+Or run the unit tests (includes golden fixture checks):
+
+```bash
+just test-watchdog
+```
+
+Expected after Drill 1: `cartesi_watchdog_status{...,state="failed"} 1` and
+`cartesi_watchdog_divergence_info{...,kind="state_mismatch"} 1` in
+`$CARTESI_WATCHDOG_STATE_DIR/status.prom`.
 
 ## Triage checklist
 

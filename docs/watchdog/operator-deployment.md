@@ -157,6 +157,8 @@ Today `WalletApp::default()` / `WalletConfig::sepolia()` align with Sepolia stag
 | `CARTESI_WATCHDOG_STATE_DIR` | Persistent volume on watchdog host |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | Bootstrap CM snapshot (`init` only) |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block that bootstrap snapshot represents (= finalized `inclusion_block` at bootstrap) |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | Chain id label for `status.prom` metrics (optional; defaults to `unknown`) |
+| `CARTESI_WATCHDOG_METRICS_FILE` | Override path for the Prometheus textfile written by each `tick` |
 | `CARTESI_WATCHDOG_LUA_DEPS` | `.deps/lua` |
 
 The sequencer discovers and pins `input_box_address` at startup; use the same values as `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT` / `CARTESI_SEQUENCER_APP_ADDRESS` configuration.
@@ -181,11 +183,53 @@ sequencer-watchdog init
 
 After init, schedule `tick`; tick will fail if `head.json` is missing.
 
+Each `tick` atomically writes a Prometheus textfile to
+`$CARTESI_WATCHDOG_STATE_DIR/status.prom` (override with
+`CARTESI_WATCHDOG_METRICS_FILE`). Operators can scrape or push it from their
+side. Gauges:
+
+- `cartesi_watchdog_status{chain,app_address,state="ok|warning|failed"}` — `1` on the active state
+- `cartesi_watchdog_last_tick_unix_seconds{chain,app_address}`
+- `cartesi_watchdog_exit_code{chain,app_address}`
+- `cartesi_watchdog_divergence_info{chain,app_address,kind}` — present on exit `2`
+
+Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` so `chain` is labeled (defaults to
+`unknown` when omitted). Divergence playbook: notify only; manual intervention.
+
+Example `status.prom` after a successful tick:
+
+```prometheus
+cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="ok"} 1
+cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="warning"} 0
+cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="failed"} 0
+cartesi_watchdog_last_tick_unix_seconds{chain="11155111",app_address="0x4CE..."} 1717420800
+cartesi_watchdog_exit_code{chain="11155111",app_address="0x4CE..."} 0
+```
+
+On divergence (exit `2`), `state="failed"` is `1` and
+`cartesi_watchdog_divergence_info{kind="state_mismatch"}` (or
+`inclusion_block_regressed`) is present. Example alert:
+
+```promql
+cartesi_watchdog_status{state="failed"} == 1
+```
+
+Cron + push pattern (operator pushes to Prometheus after each tick):
+
+```bash
+#!/bin/sh
+set -eu
+sequencer-watchdog tick || true    # exit code still written to status.prom
+# push $CARTESI_WATCHDOG_STATE_DIR/status.prom via your exporter
+```
+
 ### 6. Run tick
 
 The watchdog runs **one tick per process, then exits** — there is no daemon
-loop. Run it once as a smoke check, then schedule it (systemd timer / k8s
-CronJob) and alert on the exit code:
+loop. Run it once as a smoke check, then schedule it (cron, systemd timer, k8s
+CronJob). Alert on `$CARTESI_WATCHDOG_STATE_DIR/status.prom` (preferred for
+Prometheus push/pull) or on the process exit code. If the process is killed
+mid-tick, `status.prom` keeps the last completed value until the next run.
 
 ```bash
 sequencer-watchdog tick   # exit 0 = clean/idle, 1 = transient, 2 = divergence

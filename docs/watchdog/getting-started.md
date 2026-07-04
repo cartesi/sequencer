@@ -132,7 +132,7 @@ export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 
 Success: exit **0**. If finalized has advanced, stderr ends in `compare pass complete`; if it has not, the tick exits idle after the cheap poll.
 
-Exit codes from `sequencer-watchdog tick`: **0** clean (or idle — finalized unchanged), **1** transient failure (RPC/CM/network after retries), **2** deterministic divergence (`watchdog_event` emitted on stderr before exit).
+Exit codes from `sequencer-watchdog tick`: **0** clean (or idle — finalized unchanged), **1** transient failure (RPC/CM/network after retries), **2** deterministic divergence (`watchdog_event` emitted on stderr before exit). Each tick writes `$CARTESI_WATCHDOG_STATE_DIR/status.prom` — see [`README.md` — Metrics](README.md#metrics-statusprom).
 
 The watchdog tick runs **one cycle per process and exits** — re-run it on a timer/cron for continuous monitoring. When `inclusion_block` has not advanced since the watchdog checkpoint, the cycle **skips** L1/CM work (idle-cheap) and exits 0.
 `sequencer-watchdog` takes a non-blocking `flock`; production schedulers should
@@ -164,6 +164,8 @@ Full operator runbook: **[`operator-deployment.md`](operator-deployment.md)**.
 |----------|----------|-------------|
 | `CARTESI_WATCHDOG_SEQUENCER_URL` | yes | e.g. `http://127.0.0.1:54321` |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | tick | Current L1 JSON-RPC; not persisted by `init` |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | init | Optional chain id label for `status.prom` |
+| `CARTESI_WATCHDOG_METRICS_FILE` | tick | Optional override for Prometheus textfile path |
 | `CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS` | yes | InputBox contract |
 | `CARTESI_WATCHDOG_APP_ADDRESS` | yes | Rollup application contract |
 | `CARTESI_WATCHDOG_STATE_DIR` | yes | Persistent watchdog state (`config.json`, `head.json`, checkpoints) |

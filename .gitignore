@@ -16,6 +16,10 @@ __pycache__/
 /benchmarks/
 /.watchdog-cm-work/
 
+# Watchdog runtime metrics written by tick (not test golden fixtures)
+**/status.prom
+**/status.prom.tmp
+
 # Local CM / demo scratch (not part of the repo)
 /input-*-output-*.bin
 docs/live-demo.md

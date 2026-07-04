@@ -18,12 +18,14 @@ local main_mod = require("watchdog.main")
 local log = dofile("watchdog/tests/e2e_log.lua")
 
 local function fake_cfg()
+    local state_dir = os.getenv("CARTESI_WATCHDOG_STATE_DIR") or "/tmp/watchdog-drill"
     return {
-        state_dir = "/tmp/watchdog-drill",
+        state_dir = state_dir,
         cm_snapshot_dir = "/tmp/genesis-snapshot",
         cm_snapshot_safe_block = 0,
         input_box_address = "0xinputbox",
         app_address = "0x1111111111111111111111111111111111111111",
+        blockchain_id = os.getenv("CARTESI_WATCHDOG_BLOCKCHAIN_ID") or "31337",
         input_added_topic = "0xtopic",
         long_block_range_error_codes = require("watchdog.l1_reader").DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
         retry_attempts = 1,
@@ -105,4 +107,27 @@ log.pass(
     "divergence-signal-drill",
     string.format("main.lua emitted state_mismatch; mismatch_offset=%s", tostring(captured_event.mismatch_offset))
 )
+
+local cfg = fake_cfg()
+main_mod.write_tick_metrics(cfg, exit_code, err, {
+    CARTESI_WATCHDOG_STATE_DIR = cfg.state_dir,
+})
+local prom_path = cfg.state_dir .. "/status.prom"
+local prom_file = io.open(prom_path, "rb")
+if not prom_file then
+    log.fail("divergence-signal-drill", "expected status.prom at " .. prom_path)
+    os.exit(1)
+end
+local prom_body = prom_file:read("*a")
+prom_file:close()
+if prom_body:find('state="failed"} 1', 1, true) == nil then
+    log.fail("divergence-signal-drill", "status.prom missing failed state")
+    os.exit(1)
+end
+if prom_body:find('kind="state_mismatch"} 1', 1, true) == nil then
+    log.fail("divergence-signal-drill", "status.prom missing divergence kind")
+    os.exit(1)
+end
+log.pass("divergence-signal-drill", "status.prom written with failed state")
+
 os.exit(main_mod.EXIT_DIVERGENCE)

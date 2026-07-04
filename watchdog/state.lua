@@ -53,6 +53,30 @@ function state.ensure_dir(dir)
     return mkdir_p(dir)
 end
 
+function state.write_file_atomic(path, data)
+    assert(type(path) == "string" and path ~= "", "path is required")
+    assert(type(data) == "string", "data must be a string")
+
+    local dir = path:match("^(.*)/[^/]+$")
+    if dir and dir ~= "" then
+        local ok, err = state.ensure_dir(dir)
+        if not ok then
+            return nil, err
+        end
+    end
+
+    local tmp = path .. ".tmp"
+    local ok, err = write_all(tmp, data)
+    if not ok then
+        return nil, err
+    end
+    ok, err = os.rename(tmp, path)
+    if not ok then
+        return nil, err
+    end
+    return true
+end
+
 function state.write_json_atomic(dir, name, value, json)
     assert(type(dir) == "string" and dir ~= "", "state dir is required")
     assert(type(name) == "string" and name ~= "", "file name is required")
