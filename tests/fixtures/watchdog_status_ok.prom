@@ -1,0 +1,11 @@
+# HELP cartesi_watchdog_status Current watchdog compare state (1 = active).
+# TYPE cartesi_watchdog_status gauge
+cartesi_watchdog_status{app_address="0x4CE633CA71071818cD73187765ee60F696dae083",chain="11155111",state="ok"} 1
+cartesi_watchdog_status{app_address="0x4CE633CA71071818cD73187765ee60F696dae083",chain="11155111",state="warning"} 0
+cartesi_watchdog_status{app_address="0x4CE633CA71071818cD73187765ee60F696dae083",chain="11155111",state="failed"} 0
+# HELP cartesi_watchdog_last_tick_unix_seconds Unix time of the last completed tick.
+# TYPE cartesi_watchdog_last_tick_unix_seconds gauge
+cartesi_watchdog_last_tick_unix_seconds{app_address="0x4CE633CA71071818cD73187765ee60F696dae083",chain="11155111"} 1710000000
+# HELP cartesi_watchdog_exit_code Process exit code from the last tick.
+# TYPE cartesi_watchdog_exit_code gauge
+cartesi_watchdog_exit_code{app_address="0x4CE633CA71071818cD73187765ee60F696dae083",chain="11155111"} 0

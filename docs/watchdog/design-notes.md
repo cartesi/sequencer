@@ -81,6 +81,7 @@ fsync support.
 state/
   config.json
   head.json
+  status.prom    # last tick metrics (Prometheus textfile)
   run.lock       # advisory lock handle in the production container
   checkpoints/
     00000000000000000042/

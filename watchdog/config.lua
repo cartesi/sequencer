@@ -81,6 +81,8 @@ function config.load_init(env)
             env
         ),
         cm_image_hash = env.CARTESI_WATCHDOG_CM_IMAGE_HASH,
+        blockchain_id = env.CARTESI_WATCHDOG_BLOCKCHAIN_ID,
+        metrics_file = env.CARTESI_WATCHDOG_METRICS_FILE,
         retry_attempts = optional_number("CARTESI_WATCHDOG_RETRY_ATTEMPTS", 3, env),
         retry_delay_sec = optional_number("CARTESI_WATCHDOG_RETRY_DELAY_SEC", 5, env),
         long_block_range_error_codes = split_csv(
@@ -116,6 +118,7 @@ function config.persisted(cfg)
         app_address = cfg.app_address,
         input_added_topic = cfg.input_added_topic,
         cm_image_hash = cfg.cm_image_hash,
+        blockchain_id = cfg.blockchain_id,
         retry_attempts = cfg.retry_attempts,
         retry_delay_sec = cfg.retry_delay_sec,
         long_block_range_error_codes = cfg.long_block_range_error_codes,
@@ -136,6 +139,8 @@ function config.from_persisted(state_dir, data, env)
         app_address = required_field(data, "app_address"),
         input_added_topic = data.input_added_topic,
         cm_image_hash = data.cm_image_hash,
+        blockchain_id = data.blockchain_id,
+        metrics_file = env.CARTESI_WATCHDOG_METRICS_FILE,
         retry_attempts = optional_field_number(data, "retry_attempts", 3),
         retry_delay_sec = optional_field_number(data, "retry_delay_sec", 5),
         long_block_range_error_codes = data.long_block_range_error_codes or {},
