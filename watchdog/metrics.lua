@@ -74,6 +74,47 @@ function metrics.state_for_exit_code(exit_code)
     return "ok"
 end
 
+local function resolve_chain_id_from_opts(opts)
+    if opts.chain_id ~= nil and opts.chain_id ~= "" then
+        return tostring(opts.chain_id)
+    end
+
+    local cfg = opts.cfg
+    if cfg and cfg.blockchain_id ~= nil and cfg.blockchain_id ~= "" then
+        return tostring(cfg.blockchain_id)
+    end
+
+    local getenv = normalize_env(opts.env)
+    local from_env = getenv("CARTESI_WATCHDOG_BLOCKCHAIN_ID")
+    if from_env ~= nil and from_env ~= "" then
+        return tostring(from_env)
+    end
+
+    if cfg and cfg.l1_rpc_url and cfg.l1_rpc_url ~= "" then
+        local ok, chain = pcall(function()
+            local rpc
+            if type(opts.rpc_factory) == "function" then
+                rpc = opts.rpc_factory(cfg.l1_rpc_url)
+            else
+                local http_mod = require("watchdog.http")
+                local json_mod = require("watchdog.json")
+                local jsonrpc = require("watchdog.jsonrpc")
+                rpc = jsonrpc.new(http_mod.new(), json_mod.new(), cfg.l1_rpc_url)
+            end
+            return rpc:get_chain_id()
+        end)
+        if ok and chain ~= nil then
+            return tostring(chain)
+        end
+    end
+
+    return nil
+end
+
+function metrics.resolve_chain_id(opts)
+    return resolve_chain_id_from_opts(opts)
+end
+
 function metrics.resolve_path(cfg, env)
     local getenv = normalize_env(env)
     local configured = getenv("CARTESI_WATCHDOG_METRICS_FILE")
@@ -148,7 +189,15 @@ end
 
 function metrics.write_tick_status(opts)
     local path = metrics.resolve_path(opts.cfg, opts.env)
-    local body = metrics.build_prom(opts)
+    local chain_id = resolve_chain_id_from_opts(opts)
+    local prom_opts = {
+        exit_code = opts.exit_code,
+        chain_id = chain_id,
+        app_address = opts.app_address or (opts.cfg and opts.cfg.app_address) or nil,
+        divergence_kind = opts.divergence_kind,
+        timestamp = opts.timestamp,
+    }
+    local body = metrics.build_prom(prom_opts)
     return state.write_file_atomic(path, body)
 end
 

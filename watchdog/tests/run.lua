@@ -536,6 +536,73 @@ local function fake_machine(inspect_state)
     return machine
 end
 
+test("tick config prefers blockchain id env over persisted config", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+    cfg.blockchain_id = nil
+
+    local result, err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert(result, err)
+
+    local tick_cfg = main_mod.load_tick_config({
+        CARTESI_WATCHDOG_STATE_DIR = dir,
+        CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT = "http://tick-rpc",
+        CARTESI_WATCHDOG_BLOCKCHAIN_ID = "31337",
+    })
+    assert_eq(tick_cfg.blockchain_id, "31337")
+end)
+
+test("metrics resolves chain id from eth_chainId when unset", function()
+    local chain_id = metrics.resolve_chain_id({
+        cfg = {
+            l1_rpc_url = "http://l1-rpc",
+        },
+        rpc_factory = function(url)
+            assert_eq(url, "http://l1-rpc")
+            return {
+                get_chain_id = function()
+                    return 31337
+                end,
+            }
+        end,
+    })
+    assert_eq(chain_id, "31337")
+end)
+
+test("http request errors include method and url", function()
+    local http_mod = require("watchdog.http")
+    local message = http_mod.format_request_error(
+        "GET",
+        "http://127.0.0.1:54321/finalized_state/inclusion_block",
+        "[CURL-EASY][COULDNT_CONNECT] Could not connect to server (7)"
+    )
+    assert(
+        message:find("GET http://127.0.0.1:54321/finalized_state/inclusion_block failed:", 1, true) ~= nil,
+        message
+    )
+end)
+
+test("jsonrpc reads eth_chainId", function()
+    local http = {}
+    function http.post(_self, url, body, _headers)
+        assert_eq(url, "http://l1-rpc")
+        assert(body:find('"eth_chainId"', 1, true) ~= nil, body)
+        return {
+            status = 200,
+            body = '{"jsonrpc":"2.0","id":1,"result":"0x7a69"}',
+            headers = {},
+        }
+    end
+    local json = require("watchdog.json").new()
+    local client = jsonrpc.new(http, json, "http://l1-rpc")
+    local chain, err = client:get_chain_id()
+    assert(chain, err)
+    assert_eq(chain, 31337)
+end)
+
 local function load_fixture(path)
     local file, err = io.open(path, "rb")
     if not file then

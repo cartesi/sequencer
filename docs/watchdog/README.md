@@ -227,8 +227,10 @@ Gauges (labels `chain`, `app_address` on every series):
 - `cartesi_watchdog_exit_code`
 - `cartesi_watchdog_divergence_info{kind}` — only on exit `2`
 
-Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label (defaults to
-`unknown`). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../tests/fixtures/watchdog_status_ok.prom),
+Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label. At `tick`,
+the watchdog also accepts that env var or queries `eth_chainId` from
+`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` when unset (defaults to `unknown`
+only when the RPC is unavailable). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../tests/fixtures/watchdog_status_ok.prom),
 [`tests/fixtures/watchdog_status_failed.prom`](../tests/fixtures/watchdog_status_failed.prom).
 
 Example after a clean tick:

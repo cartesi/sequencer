@@ -193,8 +193,10 @@ side. Gauges:
 - `cartesi_watchdog_exit_code{chain,app_address}`
 - `cartesi_watchdog_divergence_info{chain,app_address,kind}` — present on exit `2`
 
-Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` so `chain` is labeled (defaults to
-`unknown` when omitted). Divergence playbook: notify only; manual intervention.
+Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` so `chain` is labeled. At `tick`,
+the env var overrides a missing persisted value; otherwise the watchdog queries
+`eth_chainId` from `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` (falls back to
+`unknown` only when the RPC is unavailable).
 
 Example `status.prom` after a successful tick:
 
