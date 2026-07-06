@@ -6,7 +6,7 @@
 //! Prints `CARTESI_WATCHDOG_*` exports, then blocks until Ctrl+C.
 
 use rollups_harness::{
-    HarnessResult, ManagedSequencer, devnet_sequencer_config_no_faketime, paths,
+    DEVNET_CHAIN_ID, HarnessResult, ManagedSequencer, devnet_sequencer_config_no_faketime, paths,
 };
 
 #[tokio::main]
@@ -42,6 +42,7 @@ async fn main() -> HarnessResult<()> {
         "export CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT={}",
         runtime.l1_endpoint()
     );
+    eprintln!("export CARTESI_WATCHDOG_BLOCKCHAIN_ID={DEVNET_CHAIN_ID}");
     eprintln!(
         "export CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS={}",
         runtime.input_box_address()

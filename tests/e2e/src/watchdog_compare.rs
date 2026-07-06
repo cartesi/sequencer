@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use app_core::application::{WalletApp, WalletConfig};
 use app_core::wallet_snapshot;
-use rollups_harness::ManagedSequencer;
-use rollups_harness::paths;
+use rollups_harness::{DEVNET_CHAIN_ID, ManagedSequencer, paths};
 use sequencer_core::application::Application;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -290,6 +289,10 @@ fn compare_env(
         (
             "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT".into(),
             runtime.l1_endpoint().to_string(),
+        ),
+        (
+            "CARTESI_WATCHDOG_BLOCKCHAIN_ID".into(),
+            DEVNET_CHAIN_ID.to_string(),
         ),
         (
             "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS".into(),

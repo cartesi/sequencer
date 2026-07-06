@@ -90,6 +90,21 @@ function jsonrpc.new(http, json, url)
         })
     end
 
+    function client:get_chain_id()
+        local result, err = self:call("eth_chainId", {})
+        if not result then
+            return nil, err
+        end
+        if type(result) ~= "string" then
+            return nil, "eth_chainId result must be a hex string"
+        end
+        local value = tonumber(strip_0x(result), 16)
+        if not value then
+            return nil, "invalid eth_chainId: " .. tostring(result)
+        end
+        return value
+    end
+
     function client:get_block_number_by_tag(tag)
         local block, err = self:call("eth_getBlockByNumber", { tag, false })
         if not block then

@@ -16,6 +16,20 @@ local function parse_response_headers(header_lines)
     return headers
 end
 
+function http.format_request_error(method, url, err)
+    return string.format("%s %s failed: %s", method, url, tostring(err))
+end
+
+local function request_method(opts)
+    if opts.method then
+        return opts.method
+    end
+    if opts.post then
+        return "POST"
+    end
+    return "GET"
+end
+
 function http.new_curl()
     local ok, curl = pcall(require, "cURL")
     if not ok then
@@ -62,7 +76,7 @@ function http.new_curl()
         end)
         if not ok_perform then
             easy:close()
-            return nil, tostring(err)
+            return nil, http.format_request_error(request_method(opts), opts.url, err)
         end
 
         local status = easy:getinfo_response_code()

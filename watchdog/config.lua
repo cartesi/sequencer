@@ -139,7 +139,9 @@ function config.from_persisted(state_dir, data, env)
         app_address = required_field(data, "app_address"),
         input_added_topic = data.input_added_topic,
         cm_image_hash = data.cm_image_hash,
-        blockchain_id = data.blockchain_id,
+        blockchain_id = (env.CARTESI_WATCHDOG_BLOCKCHAIN_ID ~= nil and env.CARTESI_WATCHDOG_BLOCKCHAIN_ID ~= "")
+            and env.CARTESI_WATCHDOG_BLOCKCHAIN_ID
+            or data.blockchain_id,
         metrics_file = env.CARTESI_WATCHDOG_METRICS_FILE,
         retry_attempts = optional_field_number(data, "retry_attempts", 3),
         retry_delay_sec = optional_field_number(data, "retry_delay_sec", 5),
