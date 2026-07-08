@@ -7,8 +7,6 @@ local metrics = {}
 
 metrics.STATUS_FILE = "status.prom"
 metrics.METRIC_STATUS = "cartesi_watchdog_status"
-metrics.METRIC_LAST_TICK = "cartesi_watchdog_last_tick_unix_seconds"
-metrics.METRIC_EXIT_CODE = "cartesi_watchdog_exit_code"
 
 local function normalize_env(env)
     if env == nil then
@@ -140,7 +138,6 @@ function metrics.build_prom(opts)
 
     local labels = base_labels(opts)
     local active_state = metrics.state_for_exit_code(opts.exit_code)
-    local timestamp = opts.timestamp or os.time()
 
     local lines = {
         "# HELP " .. metrics.METRIC_STATUS .. " Current watchdog compare state (1 = active).",
@@ -160,18 +157,6 @@ function metrics.build_prom(opts)
             app_address = labels.app_address,
             state = "failed",
         }, active_state == "failed" and 1 or 0),
-        "# HELP " .. metrics.METRIC_LAST_TICK .. " Unix time of the last completed tick.",
-        "# TYPE " .. metrics.METRIC_LAST_TICK .. " gauge",
-        gauge_line(metrics.METRIC_LAST_TICK, {
-            chain = labels.chain,
-            app_address = labels.app_address,
-        }, timestamp),
-        "# HELP " .. metrics.METRIC_EXIT_CODE .. " Process exit code from the last tick.",
-        "# TYPE " .. metrics.METRIC_EXIT_CODE .. " gauge",
-        gauge_line(metrics.METRIC_EXIT_CODE, {
-            chain = labels.chain,
-            app_address = labels.app_address,
-        }, opts.exit_code),
     }
 
     if opts.divergence_kind and opts.divergence_kind ~= "" then
@@ -189,15 +174,12 @@ end
 
 function metrics.write_tick_status(opts)
     local path = metrics.resolve_path(opts.cfg, opts.env)
-    local chain_id = resolve_chain_id_from_opts(opts)
-    local prom_opts = {
+    local body = metrics.build_prom({
         exit_code = opts.exit_code,
-        chain_id = chain_id,
+        chain_id = resolve_chain_id_from_opts(opts),
         app_address = opts.app_address or (opts.cfg and opts.cfg.app_address) or nil,
         divergence_kind = opts.divergence_kind,
-        timestamp = opts.timestamp,
-    }
-    local body = metrics.build_prom(prom_opts)
+    })
     return state.write_file_atomic(path, body)
 end
 

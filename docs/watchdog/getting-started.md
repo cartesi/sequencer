@@ -97,6 +97,17 @@ just devnet-for-watchdog
 This starts Anvil and `sequencer-devnet` on **ephemeral local ports** (not fixed 8545/3000) and prints a block of `export CARTESI_WATCHDOG_*=...` lines. **Copy those exports** into Terminal 2.
 
 Leave Terminal 1 running until you are done; Ctrl+C stops Anvil and the sequencer.
+The process also polls the sequencer child: if it exits on its own, Terminal 1
+prints the exit status, the sequencer log path under `tests/e2e/results/`, and a
+log tail — it should not go quiet with no explanation.
+
+**Ephemeral ports / lunch leave:** restarting `just devnet-for-watchdog` picks
+new ports and a fresh Anvil chain. Re-copy the printed exports. Tick honors
+`CARTESI_WATCHDOG_SEQUENCER_URL` / `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`
+from the environment even after `init` (so you don't need to edit `config.json`).
+A brand-new Anvil history still needs a **fresh** `$CARTESI_WATCHDOG_STATE_DIR`
+(e.g. `rm -rf /tmp/watchdog-state-devnet`) and a new `init` — old checkpoints
+won't match.
 
 ### Wait for finalized snapshot
 
@@ -162,7 +173,7 @@ Full operator runbook: **[`operator-deployment.md`](operator-deployment.md)**.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CARTESI_WATCHDOG_SEQUENCER_URL` | yes | e.g. `http://127.0.0.1:54321` |
+| `CARTESI_WATCHDOG_SEQUENCER_URL` | yes (also tick override) | e.g. `http://127.0.0.1:54321`; tick-time env overrides persisted URL |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | tick | Current L1 JSON-RPC; not persisted by `init` |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | init / tick | Chain id label for `status.prom`; also read at tick from env or `eth_chainId` when unset |
 | `CARTESI_WATCHDOG_METRICS_FILE` | tick | Optional override for Prometheus textfile path |

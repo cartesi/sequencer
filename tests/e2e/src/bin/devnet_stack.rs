@@ -3,11 +3,17 @@
 
 //! Local Anvil + rollups devnet + `wallet-sequencer-devnet` for manual watchdog runs.
 //!
-//! Prints `CARTESI_WATCHDOG_*` exports, then blocks until Ctrl+C.
+//! Prints `CARTESI_WATCHDOG_*` exports, then blocks until Ctrl+C or a child exits.
+
+use std::process::ExitStatus;
+use std::time::Duration;
 
 use rollups_harness::{
     DEVNET_CHAIN_ID, HarnessResult, ManagedSequencer, devnet_sequencer_config_no_faketime, paths,
 };
+
+const CHILD_POLL: Duration = Duration::from_secs(5);
+const HEARTBEAT_EVERY: u32 = 12; // 12 * 5s = 60s
 
 #[tokio::main]
 async fn main() -> HarnessResult<()> {
@@ -18,11 +24,12 @@ async fn main() -> HarnessResult<()> {
         )
         .init();
 
-    let runtime =
+    let mut runtime =
         ManagedSequencer::spawn(devnet_sequencer_config_no_faketime("devnet-stack")).await?;
 
     let machine_image = paths::devnet_machine_image_path();
     let state_dir = std::env::temp_dir().join("watchdog-state-devnet");
+    let logs_glob = paths::resolve_from_workspace(std::path::Path::new("tests/e2e/results"));
 
     eprintln!();
     eprintln!("=== Devnet stack is up ===");
@@ -30,6 +37,8 @@ async fn main() -> HarnessResult<()> {
     eprintln!("L1 RPC:          {}", runtime.l1_endpoint());
     eprintln!("App address:     {}", runtime.app_address());
     eprintln!("InputBox:        {}", runtime.input_box_address());
+    eprintln!("Sequencer logs:  {}", runtime.log_path().display());
+    eprintln!("Anvil/other logs: {}/devnet-stack-*", logs_glob.display());
     eprintln!();
     eprintln!(
         "--- export these, then run: ./watchdog/sequencer-watchdog init && ./watchdog/sequencer-watchdog tick ---"
@@ -74,10 +83,81 @@ async fn main() -> HarnessResult<()> {
     eprintln!("  ./watchdog/sequencer-watchdog init");
     eprintln!("  ./watchdog/sequencer-watchdog tick");
     eprintln!();
-    eprintln!("Press Ctrl+C here to stop Anvil + sequencer.");
+    eprintln!(
+        "Note: ports are ephemeral. After restarting this stack, re-export the printed URLs."
+    );
+    eprintln!(
+        "Tick can override a stale persisted sequencer URL with CARTESI_WATCHDOG_SEQUENCER_URL;"
+    );
+    eprintln!("a new Anvil history still needs a fresh state dir + init.");
+    eprintln!();
+    eprintln!("Leave this terminal running. Ctrl+C stops Anvil + sequencer.");
+    eprintln!("If a child exits on its own, this process prints status + log paths and exits.");
+    eprintln!(
+        "[devnet-stack] ready at {}; waiting for Ctrl+C or child exit",
+        runtime.endpoint()
+    );
 
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    runtime.shutdown().await
+    let mut polls_since_heartbeat = 0u32;
+    loop {
+        tokio::select! {
+            ctrl = tokio::signal::ctrl_c() => {
+                ctrl.map_err(|err| std::io::Error::other(err.to_string()))?;
+                eprintln!("Shutting down Anvil + sequencer...");
+                return runtime.shutdown().await;
+            }
+            observed = runtime.observe_for(CHILD_POLL) => {
+                match observed? {
+                    Some(status) => {
+                        report_child_exit(&runtime, status);
+                        let _ = runtime.shutdown().await;
+                        return Err(std::io::Error::other(format!(
+                            "sequencer exited unexpectedly ({status}); see logs above"
+                        ))
+                        .into());
+                    }
+                    None => {
+                        polls_since_heartbeat += 1;
+                        if polls_since_heartbeat >= HEARTBEAT_EVERY {
+                            polls_since_heartbeat = 0;
+                            eprintln!(
+                                "[devnet-stack] still running ({})",
+                                runtime.endpoint()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn report_child_exit(runtime: &ManagedSequencer, status: ExitStatus) {
+    let log_path = runtime.log_path();
+    eprintln!();
+    eprintln!("=== sequencer exited unexpectedly ({status}) ===");
+    eprintln!("Sequencer log: {}", log_path.display());
+    eprintln!(
+        "Other logs under: {}/devnet-stack-*",
+        paths::resolve_from_workspace(std::path::Path::new("tests/e2e/results")).display()
+    );
+    eprintln!("Tail last lines:");
+    match std::fs::read_to_string(log_path) {
+        Ok(contents) => {
+            for line in contents
+                .lines()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                eprintln!("  {line}");
+            }
+        }
+        Err(err) => {
+            eprintln!("  (could not read log: {err})");
+        }
+    }
+    eprintln!();
 }
