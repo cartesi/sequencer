@@ -203,6 +203,7 @@ host scheduling should provide the same non-overlap guarantee. Each tick:
 Runtime knobs:
 
 - `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`: current L1 JSON-RPC endpoint for tick.
+- `CARTESI_WATCHDOG_SEQUENCER_URL`: optional tick-time override of the URL persisted at `init` (useful when ephemeral ports change).
 - `CARTESI_WATCHDOG_BLOCKCHAIN_ID`: optional chain id label persisted at `init` for `status.prom`.
 - `CARTESI_WATCHDOG_METRICS_FILE`: optional override for the Prometheus textfile path (default `$CARTESI_WATCHDOG_STATE_DIR/status.prom`).
 - `CARTESI_WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
@@ -223,15 +224,17 @@ not run an HTTP server.
 Gauges (labels `chain`, `app_address` on every series):
 
 - `cartesi_watchdog_status{state="ok|warning|failed"}` — exactly one series is `1`
-- `cartesi_watchdog_last_tick_unix_seconds`
-- `cartesi_watchdog_exit_code`
 - `cartesi_watchdog_divergence_info{kind}` — only on exit `2`
+
+Exit codes map to `state` only (`0→ok`, `1→warning`, `2→failed`); we do not
+export a separate exit-code or last-tick gauge — Prometheus scrape/push already
+carries a sample timestamp.
 
 Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label. At `tick`,
 the watchdog also accepts that env var or queries `eth_chainId` from
 `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` when unset (defaults to `unknown`
-only when the RPC is unavailable). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../tests/fixtures/watchdog_status_ok.prom),
-[`tests/fixtures/watchdog_status_failed.prom`](../tests/fixtures/watchdog_status_failed.prom).
+only when the RPC is unavailable). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../../tests/fixtures/watchdog_status_ok.prom),
+[`tests/fixtures/watchdog_status_failed.prom`](../../tests/fixtures/watchdog_status_failed.prom).
 
 Example after a clean tick:
 
@@ -239,8 +242,6 @@ Example after a clean tick:
 cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="ok"} 1
 cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="warning"} 0
 cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="failed"} 0
-cartesi_watchdog_last_tick_unix_seconds{chain="11155111",app_address="0x4CE..."} 1717420800
-cartesi_watchdog_exit_code{chain="11155111",app_address="0x4CE..."} 0
 ```
 
 Example Prometheus alert (pull or push gateway — operator choice):

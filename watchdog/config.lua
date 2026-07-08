@@ -133,7 +133,9 @@ function config.from_persisted(state_dir, data, env)
     return {
         version = config.VERSION,
         state_dir = state_dir,
-        sequencer_url = required_field(data, "sequencer_url"),
+        sequencer_url = (env.CARTESI_WATCHDOG_SEQUENCER_URL ~= nil and env.CARTESI_WATCHDOG_SEQUENCER_URL ~= "")
+            and env.CARTESI_WATCHDOG_SEQUENCER_URL
+            or required_field(data, "sequencer_url"),
         l1_rpc_url = required("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT", env),
         input_box_address = required_field(data, "input_box_address"),
         app_address = required_field(data, "app_address"),

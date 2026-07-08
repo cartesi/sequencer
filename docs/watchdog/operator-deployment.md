@@ -189,9 +189,10 @@ Each `tick` atomically writes a Prometheus textfile to
 side. Gauges:
 
 - `cartesi_watchdog_status{chain,app_address,state="ok|warning|failed"}` — `1` on the active state
-- `cartesi_watchdog_last_tick_unix_seconds{chain,app_address}`
-- `cartesi_watchdog_exit_code{chain,app_address}`
 - `cartesi_watchdog_divergence_info{chain,app_address,kind}` — present on exit `2`
+
+Exit mapping is `0→ok`, `1→warning`, `2→failed` (no separate exit-code /
+last-tick gauges — Prom already timestamps samples).
 
 Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` so `chain` is labeled. At `tick`,
 the env var overrides a missing persisted value; otherwise the watchdog queries
@@ -204,8 +205,6 @@ Example `status.prom` after a successful tick:
 cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="ok"} 1
 cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="warning"} 0
 cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="failed"} 0
-cartesi_watchdog_last_tick_unix_seconds{chain="11155111",app_address="0x4CE..."} 1717420800
-cartesi_watchdog_exit_code{chain="11155111",app_address="0x4CE..."} 0
 ```
 
 On divergence (exit `2`), `state="failed"` is `1` and

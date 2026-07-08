@@ -65,8 +65,7 @@ export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ```
 
 Expected: exit **0**; the tick may exit idle if the finalized block is unchanged.
-`$CARTESI_WATCHDOG_STATE_DIR/status.prom` should show `state="ok"` and
-`cartesi_watchdog_exit_code ... 0`.
+`$CARTESI_WATCHDOG_STATE_DIR/status.prom` should show `state="ok"`.
 The harness path also proves byte-identical **devnet** genesis SSZ on sequencer `/finalized_state` and CM inspect
 (same bytes as `wallet_snapshot::encode(WalletConfig::devnet())`; the `.hex` fixture
 is for Sepolia `default()` — do not use it as the devnet golden).

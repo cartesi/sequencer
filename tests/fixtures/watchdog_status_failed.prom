@@ -3,12 +3,6 @@
 cartesi_watchdog_status{app_address="0xdeadbeef",chain="31337",state="ok"} 0
 cartesi_watchdog_status{app_address="0xdeadbeef",chain="31337",state="warning"} 0
 cartesi_watchdog_status{app_address="0xdeadbeef",chain="31337",state="failed"} 1
-# HELP cartesi_watchdog_last_tick_unix_seconds Unix time of the last completed tick.
-# TYPE cartesi_watchdog_last_tick_unix_seconds gauge
-cartesi_watchdog_last_tick_unix_seconds{app_address="0xdeadbeef",chain="31337"} 1710000000
-# HELP cartesi_watchdog_exit_code Process exit code from the last tick.
-# TYPE cartesi_watchdog_exit_code gauge
-cartesi_watchdog_exit_code{app_address="0xdeadbeef",chain="31337"} 2
 # HELP cartesi_watchdog_divergence_info Divergence kind from the last tick (1 = present).
 # TYPE cartesi_watchdog_divergence_info gauge
 cartesi_watchdog_divergence_info{app_address="0xdeadbeef",chain="31337",kind="state_mismatch"} 1
