@@ -330,7 +330,7 @@ async fn run_lua_main(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.env("CARTESI_WATCHDOG_LUA_ROOT", workspace);
-    command.env("CARTESI_WATCHDOG_LUA_BIN", "lua");
+    command.env("CARTESI_WATCHDOG_LUA_BIN", "lua5.4");
     for (key, value) in compare_env(runtime, state_dir, machine_image, lua_deps.as_path()) {
         command.env(key, value);
     }

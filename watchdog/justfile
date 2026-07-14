@@ -5,10 +5,10 @@ default:
     @just --list --justfile {{source_file()}}
 
 test:
-    lua watchdog/tests/run.lua
+    lua5.4 watchdog/tests/run.lua
 
 test-e2e:
-    lua watchdog/tests/e2e.lua
+    lua5.4 watchdog/tests/e2e.lua
 
 test-divergence-drill: lua-deps
     @bash scripts/test-watchdog-divergence-drill.sh
@@ -30,6 +30,6 @@ doctor:
         echo "doctor: missing .deps/lua/lcurl.so; run: just watchdog-lua-deps"; \
         exit 1; \
     }
-    @lua -e "package.cpath = '.deps/lua/?.so;' .. package.cpath; require('lcurl'); print('doctor: lcurl ok')"
-    @lua -e "package.path = './?.lua;./?/init.lua;' .. package.path; local m=require('watchdog.machine_cartesi').new(); local inst,err=m:load('examples/canonical-app/out/canonical-machine-image'); if not inst then error('doctor: machine_cartesi cannot load devnet image: '..tostring(err)) end; print('doctor: machine_cartesi load ok')"
+    @lua5.4 -e "package.cpath = '.deps/lua/?.so;' .. package.cpath; require('lcurl'); print('doctor: lcurl ok')"
+    @lua5.4 -e "package.path = './?.lua;./?/init.lua;' .. package.path; local m=require('watchdog.machine_cartesi').new(); local inst,err=m:load('examples/canonical-app/out/canonical-machine-image'); if not inst then error('doctor: machine_cartesi cannot load devnet image: '..tostring(err)) end; print('doctor: machine_cartesi load ok')"
     @echo "doctor: watchdog toolchain ok"

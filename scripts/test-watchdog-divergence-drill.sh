@@ -6,7 +6,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export CARTESI_WATCHDOG_LUA_DEPS="${CARTESI_WATCHDOG_LUA_DEPS:-${root}/.deps/lua}"
 
 set +e
-lua "${root}/watchdog/tests/drill_divergence.lua"
+lua5.4 "${root}/watchdog/tests/drill_divergence.lua"
 code=$?
 set -e
 
