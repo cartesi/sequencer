@@ -194,17 +194,18 @@ side. Gauges:
 Exit mapping is `0→ok`, `1→warning`, `2→failed` (no separate exit-code /
 last-tick gauges — Prom already timestamps samples).
 
-Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` so `chain` is labeled. At `tick`,
-the env var overrides a missing persisted value; otherwise the watchdog queries
-`eth_chainId` from `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` (falls back to
-`unknown` only when the RPC is unavailable).
+Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` so `chain` is labeled. If unset,
+`init` queries `eth_chainId` from `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` and
+persists the result. At `tick`, the env var overrides a missing persisted value;
+the exit path never blocks on RPC (falls back to `unknown` only when neither
+source is set).
 
 Example `status.prom` after a successful tick:
 
 ```prometheus
-cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="ok"} 1
-cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="warning"} 0
-cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="failed"} 0
+cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="ok"} 1
+cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="warning"} 0
+cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="failed"} 0
 ```
 
 On divergence (exit `2`), `state="failed"` is `1` and

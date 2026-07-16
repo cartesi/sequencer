@@ -60,6 +60,30 @@ local function divergence_kind_from_payload(payload)
     return nil
 end
 
+local function resolve_init_blockchain_id(cfg, env, deps)
+    if cfg.blockchain_id ~= nil and cfg.blockchain_id ~= "" then
+        return cfg.blockchain_id
+    end
+
+    env = env or os.getenv
+    local l1_rpc_url = env("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT")
+    if l1_rpc_url == nil or l1_rpc_url == "" then
+        return nil
+    end
+
+    local rpc_factory = deps and deps.rpc_factory or nil
+    if type(deps) == "table" and type(deps.rpc) == "table" and type(deps.rpc.get_chain_id) == "function" then
+        local ok, chain = pcall(function()
+            return deps.rpc:get_chain_id()
+        end)
+        if ok and chain ~= nil then
+            return tostring(chain)
+        end
+    end
+
+    return metrics.query_chain_id_from_rpc(l1_rpc_url, rpc_factory)
+end
+
 local function write_tick_metrics(cfg, exit_code, payload, env)
     local ok, err = metrics.write_tick_status({
         cfg = cfg,
@@ -68,7 +92,6 @@ local function write_tick_metrics(cfg, exit_code, payload, env)
         chain_id = cfg and cfg.blockchain_id or nil,
         app_address = cfg and cfg.app_address or nil,
         divergence_kind = divergence_kind_from_payload(payload),
-        timestamp = os.time(),
     })
     if not ok then
         io.stderr:write("watchdog metrics write failed: " .. tostring(err) .. "\n")
@@ -102,6 +125,12 @@ local function run_init(cfg, deps)
     end
     if load_err ~= "missing " .. checkpoint.HEAD_FILE then
         return nil, "failed to load watchdog head: " .. tostring(load_err)
+    end
+
+    local init_env = deps and deps.env or os.getenv
+    local resolved_chain = resolve_init_blockchain_id(cfg, init_env, deps)
+    if resolved_chain ~= nil and resolved_chain ~= "" then
+        cfg.blockchain_id = resolved_chain
     end
 
     local ok, err = state.write_json_atomic(cfg.state_dir, "config.json", config.persisted(cfg), json)

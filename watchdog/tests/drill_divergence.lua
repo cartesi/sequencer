@@ -109,6 +109,7 @@ log.pass(
 )
 
 local cfg = fake_cfg()
+os.remove(cfg.state_dir .. "/status.prom")
 main_mod.write_tick_metrics(cfg, exit_code, err, {
     CARTESI_WATCHDOG_STATE_DIR = cfg.state_dir,
 })

@@ -88,29 +88,34 @@ local function resolve_chain_id_from_opts(opts)
         return tostring(from_env)
     end
 
-    if cfg and cfg.l1_rpc_url and cfg.l1_rpc_url ~= "" then
-        local ok, chain = pcall(function()
-            local rpc
-            if type(opts.rpc_factory) == "function" then
-                rpc = opts.rpc_factory(cfg.l1_rpc_url)
-            else
-                local http_mod = require("watchdog.http")
-                local json_mod = require("watchdog.json")
-                local jsonrpc = require("watchdog.jsonrpc")
-                rpc = jsonrpc.new(http_mod.new(), json_mod.new(), cfg.l1_rpc_url)
-            end
-            return rpc:get_chain_id()
-        end)
-        if ok and chain ~= nil then
-            return tostring(chain)
-        end
-    end
-
     return nil
 end
 
 function metrics.resolve_chain_id(opts)
     return resolve_chain_id_from_opts(opts)
+end
+
+function metrics.query_chain_id_from_rpc(l1_rpc_url, rpc_factory)
+    if l1_rpc_url == nil or l1_rpc_url == "" then
+        return nil
+    end
+
+    local ok, chain = pcall(function()
+        local rpc
+        if type(rpc_factory) == "function" then
+            rpc = rpc_factory(l1_rpc_url)
+        else
+            local http_mod = require("watchdog.http")
+            local json_mod = require("watchdog.json")
+            local jsonrpc = require("watchdog.jsonrpc")
+            rpc = jsonrpc.new(http_mod.new(), json_mod.new(), l1_rpc_url)
+        end
+        return rpc:get_chain_id()
+    end)
+    if ok and chain ~= nil then
+        return tostring(chain)
+    end
+    return nil
 end
 
 function metrics.resolve_path(cfg, env)
@@ -127,7 +132,7 @@ function metrics.resolve_path(cfg, env)
     end
     local state_dir = getenv("CARTESI_WATCHDOG_STATE_DIR")
     if state_dir == nil or state_dir == "" then
-        error("CARTESI_WATCHDOG_STATE_DIR is required")
+        return nil, "CARTESI_WATCHDOG_STATE_DIR is required"
     end
     return state_dir .. "/" .. metrics.STATUS_FILE
 end
@@ -173,7 +178,10 @@ function metrics.build_prom(opts)
 end
 
 function metrics.write_tick_status(opts)
-    local path = metrics.resolve_path(opts.cfg, opts.env)
+    local path, path_err = metrics.resolve_path(opts.cfg, opts.env)
+    if not path then
+        return nil, path_err
+    end
     local body = metrics.build_prom({
         exit_code = opts.exit_code,
         chain_id = resolve_chain_id_from_opts(opts),
