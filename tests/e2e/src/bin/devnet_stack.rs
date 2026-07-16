@@ -5,15 +5,21 @@
 //!
 //! Prints `CARTESI_WATCHDOG_*` exports, then blocks until Ctrl+C or a child exits.
 
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Duration;
 
 use rollups_harness::{
-    DEVNET_CHAIN_ID, HarnessResult, ManagedSequencer, devnet_sequencer_config_no_faketime, paths,
+    DEVNET_CHAIN_ID, HarnessResult, ManagedSequencer, StackChildExit,
+    devnet_sequencer_config_no_faketime, paths,
 };
 
 const CHILD_POLL: Duration = Duration::from_secs(5);
 const HEARTBEAT_EVERY: u32 = 12; // 12 * 5s = 60s
+const LOG_TAIL_LINES: usize = 40;
 
 #[tokio::main]
 async fn main() -> HarnessResult<()> {
@@ -92,7 +98,9 @@ async fn main() -> HarnessResult<()> {
     eprintln!("a new Anvil history still needs a fresh state dir + init.");
     eprintln!();
     eprintln!("Leave this terminal running. Ctrl+C stops Anvil + sequencer.");
-    eprintln!("If a child exits on its own, this process prints status + log paths and exits.");
+    eprintln!(
+        "If Anvil or the sequencer exits on its own, this process prints status + log paths and exits."
+    );
     eprintln!(
         "[devnet-stack] ready at {}; waiting for Ctrl+C or child exit",
         runtime.endpoint()
@@ -106,13 +114,17 @@ async fn main() -> HarnessResult<()> {
                 eprintln!("Shutting down Anvil + sequencer...");
                 return runtime.shutdown().await;
             }
-            observed = runtime.observe_for(CHILD_POLL) => {
+            observed = runtime.observe_stack_for(CHILD_POLL) => {
                 match observed? {
-                    Some(status) => {
-                        report_child_exit(&runtime, status);
+                    Some((which, status)) => {
+                        report_child_exit(&runtime, which, status);
                         let _ = runtime.shutdown().await;
+                        let label = match which {
+                            StackChildExit::Sequencer => "sequencer",
+                            StackChildExit::Anvil => "anvil",
+                        };
                         return Err(std::io::Error::other(format!(
-                            "sequencer exited unexpectedly ({status}); see logs above"
+                            "{label} exited unexpectedly ({status}); see logs above"
                         ))
                         .into());
                     }
@@ -132,26 +144,23 @@ async fn main() -> HarnessResult<()> {
     }
 }
 
-fn report_child_exit(runtime: &ManagedSequencer, status: ExitStatus) {
+fn report_child_exit(runtime: &ManagedSequencer, which: StackChildExit, status: ExitStatus) {
     let log_path = runtime.log_path();
+    let label = match which {
+        StackChildExit::Sequencer => "sequencer",
+        StackChildExit::Anvil => "anvil",
+    };
     eprintln!();
-    eprintln!("=== sequencer exited unexpectedly ({status}) ===");
+    eprintln!("=== {label} exited unexpectedly ({status}) ===");
     eprintln!("Sequencer log: {}", log_path.display());
     eprintln!(
         "Other logs under: {}/devnet-stack-*",
         paths::resolve_from_workspace(std::path::Path::new("tests/e2e/results")).display()
     );
     eprintln!("Tail last lines:");
-    match std::fs::read_to_string(log_path) {
-        Ok(contents) => {
-            for line in contents
-                .lines()
-                .rev()
-                .take(40)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-            {
+    match tail_last_lines(log_path, LOG_TAIL_LINES) {
+        Ok(lines) => {
+            for line in lines {
                 eprintln!("  {line}");
             }
         }
@@ -160,4 +169,18 @@ fn report_child_exit(runtime: &ManagedSequencer, status: ExitStatus) {
         }
     }
     eprintln!();
+}
+
+fn tail_last_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut lines = VecDeque::with_capacity(max_lines);
+    for line in reader.lines() {
+        let line = line?;
+        if lines.len() == max_lines {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+    Ok(lines.into_iter().collect())
 }

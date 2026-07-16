@@ -116,6 +116,13 @@ pub struct RespawnPolicy {
     pub advance_per_retry: Option<Duration>,
 }
 
+/// Which child in the devnet stack exited during [`ManagedSequencer::observe_stack_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackChildExit {
+    Sequencer,
+    Anvil,
+}
+
 pub struct ManagedSequencer {
     rollups: DevnetRollupsStack,
     child: Child,
@@ -826,6 +833,38 @@ impl ManagedSequencer {
                 Ok(Some(status))
             }
             _ = tokio::time::sleep(grace) => Ok(None),
+        }
+    }
+
+    /// Like [`Self::observe_for`], but also watches the Anvil child. Returns
+    /// which process exited when one dies inside `grace`.
+    pub async fn observe_stack_for(
+        &mut self,
+        grace: Duration,
+    ) -> HarnessResult<Option<(StackChildExit, std::process::ExitStatus)>> {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|err| io_other(format!("sequencer.try_wait(): {err}")))?
+            {
+                return Ok(Some((StackChildExit::Sequencer, status)));
+            }
+            if let Some(status) = self
+                .rollups
+                .try_wait_anvil()
+                .map_err(|err| io_other(format!("anvil.try_wait(): {err}")))?
+            {
+                return Ok(Some((StackChildExit::Anvil, status)));
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let remaining = deadline - now;
+            tokio::time::sleep(std::cmp::min(remaining, Duration::from_millis(200))).await;
         }
     }
 

@@ -106,6 +106,10 @@ impl DevnetRollupsStack {
     pub async fn shutdown(self) -> HarnessResult<()> {
         self.anvil.shutdown().await
     }
+
+    pub fn try_wait_anvil(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.anvil.try_wait()
+    }
 }
 struct ManagedAnvil {
     child: Child,
@@ -205,6 +209,10 @@ impl ManagedAnvil {
                 Ok(())
             }
         }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
     }
 
     async fn mine_blocks(&self, block_count: u64) -> HarnessResult<()> {

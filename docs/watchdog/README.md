@@ -230,18 +230,19 @@ Exit codes map to `state` only (`0→ok`, `1→warning`, `2→failed`); we do no
 export a separate exit-code or last-tick gauge — Prometheus scrape/push already
 carries a sample timestamp.
 
-Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label. At `tick`,
-the watchdog also accepts that env var or queries `eth_chainId` from
-`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` when unset (defaults to `unknown`
-only when the RPC is unavailable). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../../tests/fixtures/watchdog_status_ok.prom),
+Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label. If unset,
+`init` queries `eth_chainId` from `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` and
+persists the result. At `tick`, the env var overrides a missing persisted value;
+the exit path never blocks on RPC (defaults to `unknown` only when neither source
+is set). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../../tests/fixtures/watchdog_status_ok.prom),
 [`tests/fixtures/watchdog_status_failed.prom`](../../tests/fixtures/watchdog_status_failed.prom).
 
 Example after a clean tick:
 
 ```prometheus
-cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="ok"} 1
-cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="warning"} 0
-cartesi_watchdog_status{chain="11155111",app_address="0x4CE...",state="failed"} 0
+cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="ok"} 1
+cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="warning"} 0
+cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="failed"} 0
 ```
 
 Example Prometheus alert (pull or push gateway — operator choice):

@@ -555,13 +555,36 @@ test("tick config prefers blockchain id env over persisted config", function()
     assert_eq(tick_cfg.blockchain_id, "31337")
 end)
 
-test("metrics resolves chain id from eth_chainId when unset", function()
-    local chain_id = metrics.resolve_chain_id({
-        cfg = {
-            l1_rpc_url = "http://l1-rpc",
-        },
+test("metrics queries chain id from eth_chainId when unset", function()
+    local chain_id = metrics.query_chain_id_from_rpc("http://l1-rpc", function(url)
+        assert_eq(url, "http://l1-rpc")
+        return {
+            get_chain_id = function()
+                return 31337
+            end,
+        }
+    end)
+    assert_eq(chain_id, "31337")
+end)
+
+test("init persists blockchain id from eth_chainId when env unset", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+    cfg.blockchain_id = nil
+
+    local result, err = main_mod.run_init(cfg, {
+        machine = fake_machine("{}"),
+        env = function(name)
+            if name == "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT" then
+                return "http://init-rpc"
+            end
+            return nil
+        end,
         rpc_factory = function(url)
-            assert_eq(url, "http://l1-rpc")
+            assert_eq(url, "http://init-rpc")
             return {
                 get_chain_id = function()
                     return 31337
@@ -569,7 +592,13 @@ test("metrics resolves chain id from eth_chainId when unset", function()
             }
         end,
     })
-    assert_eq(chain_id, "31337")
+    assert(result, err)
+
+    local tick_cfg = main_mod.load_tick_config({
+        CARTESI_WATCHDOG_STATE_DIR = dir,
+        CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT = "http://tick-rpc",
+    })
+    assert_eq(tick_cfg.blockchain_id, "31337")
 end)
 
 test("http request errors include method and url", function()
@@ -696,6 +725,12 @@ end)
 test("metrics resolve_path defaults to state dir status prom", function()
     local path = metrics.resolve_path({ state_dir = "/var/lib/watchdog" }, {})
     assert_eq(path, "/var/lib/watchdog/status.prom")
+end)
+
+test("metrics resolve_path returns error when state dir env missing", function()
+    local path, err = metrics.resolve_path({}, {})
+    assert_eq(path, nil)
+    assert(err:find("CARTESI_WATCHDOG_STATE_DIR is required", 1, true) ~= nil, err)
 end)
 
 test("metrics prom uses unknown labels when chain and app are missing", function()
