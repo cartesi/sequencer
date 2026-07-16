@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::fs::{self, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -110,11 +110,16 @@ impl DevnetRollupsStack {
     pub fn try_wait_anvil(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.anvil.try_wait()
     }
+
+    pub fn anvil_log_path(&self) -> &Path {
+        self.anvil.log_path()
+    }
 }
 struct ManagedAnvil {
     child: Child,
     shutdown_timeout: Duration,
     endpoint: String,
+    log_path: PathBuf,
     input_box_address: Address,
     application_factory_address: Address,
     erc20_portal_address: Address,
@@ -190,10 +195,15 @@ impl ManagedAnvil {
             child,
             shutdown_timeout: DEFAULT_ANVIL_SHUTDOWN_TIMEOUT,
             endpoint,
+            log_path,
             input_box_address,
             application_factory_address,
             erc20_portal_address,
         })
+    }
+
+    fn log_path(&self) -> &Path {
+        self.log_path.as_path()
     }
 
     async fn shutdown(mut self) -> HarnessResult<()> {

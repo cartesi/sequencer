@@ -174,8 +174,8 @@ Full operator runbook: **[`operator-deployment.md`](operator-deployment.md)**.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `CARTESI_WATCHDOG_SEQUENCER_URL` | yes (also tick override) | e.g. `http://127.0.0.1:54321`; tick-time env overrides persisted URL |
-| `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | tick | Current L1 JSON-RPC; not persisted by `init` |
-| `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | init / tick | Chain id label for `status.prom`; also read at tick from env or `eth_chainId` when unset |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | tick (also init for chain auto-detect) | Current L1 JSON-RPC; not persisted by `init`. Optional at `init` only when auto-detecting `BLOCKCHAIN_ID` via `eth_chainId` |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | init / tick | Chain id label for `status.prom`. Prefer setting at `init` (persisted). Tick may override from env; never queries `eth_chainId` |
 | `CARTESI_WATCHDOG_METRICS_FILE` | tick | Optional override for Prometheus textfile path |
 | `CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS` | yes | InputBox contract |
 | `CARTESI_WATCHDOG_APP_ADDRESS` | yes | Rollup application contract |
@@ -196,7 +196,7 @@ See `watchdog/config.lua` for the full list.
 | `lua.h: No such file or directory` when building lcurl | Install `liblua5.4-dev` (Debian/WSL), or set `LUA_INC` to your Lua headers directory (Homebrew/nix) before `just watchdog-lua-deps` |
 | `lcurl` / `cURL` not found at runtime | Run `just watchdog-lua-deps`, set `CARTESI_WATCHDOG_LUA_DEPS=.deps/lua` |
 | Connection errors on `tick` | Sequencer not reachable at `CARTESI_WATCHDOG_SEQUENCER_URL` (stack stopped or wrong port); error includes the URL |
-| `chain="unknown"` in `status.prom` | Export `CARTESI_WATCHDOG_BLOCKCHAIN_ID` before `init`, or rely on tick-time `eth_chainId` from the L1 RPC |
+| `chain="unknown"` in `status.prom` | Export `CARTESI_WATCHDOG_BLOCKCHAIN_ID` before `init` (reliable), or also export `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` at `init` so auto-detect can query `eth_chainId`. Tick never queries RPC for the chain label |
 | `cartesi Lua module is required` | Install Cartesi Machine; use nix/direnv shell; ensure `cartesi-machine` on `PATH` |
 | `inspect endpoint not implemented` | Rebuild CM image: `just canonical-build-machine-image` |
 | CM inspect ~27 bytes / JSON in error | Stale image (old JSON inspect); rebuild: `just canonical-build-machine-image` |
