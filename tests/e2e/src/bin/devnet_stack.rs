@@ -145,14 +145,13 @@ async fn main() -> HarnessResult<()> {
 }
 
 fn report_child_exit(runtime: &ManagedSequencer, which: StackChildExit, status: ExitStatus) {
-    let log_path = runtime.log_path();
-    let label = match which {
-        StackChildExit::Sequencer => "sequencer",
-        StackChildExit::Anvil => "anvil",
+    let (label, log_label, log_path) = match which {
+        StackChildExit::Sequencer => ("sequencer", "Sequencer log", runtime.log_path()),
+        StackChildExit::Anvil => ("anvil", "Anvil log", runtime.anvil_log_path()),
     };
     eprintln!();
     eprintln!("=== {label} exited unexpectedly ({status}) ===");
-    eprintln!("Sequencer log: {}", log_path.display());
+    eprintln!("{log_label}: {}", log_path.display());
     eprintln!(
         "Other logs under: {}/devnet-stack-*",
         paths::resolve_from_workspace(std::path::Path::new("tests/e2e/results")).display()

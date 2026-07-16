@@ -168,9 +168,11 @@ then `head.json` is atomically replaced to point at it.
 
 `init` stores the operator-provided bootstrap CM snapshot into this layout. `tick`
 requires both `config.json` and `head.json`; it never bootstraps from env.
-`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` is intentionally read at tick time, not persisted in
-`config.json`, so operators can rotate RPC endpoints without rewriting watchdog
-state.
+`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` is not persisted in `config.json`, so
+operators can rotate RPC endpoints without rewriting watchdog state. It is
+required at `tick` for L1 reads, and optionally present at `init` when
+auto-detecting `CARTESI_WATCHDOG_BLOCKCHAIN_ID` via `eth_chainId` (prefer setting
+the chain id explicitly).
 
 - `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR`
 - `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
@@ -202,9 +204,9 @@ host scheduling should provide the same non-overlap guarantee. Each tick:
 
 Runtime knobs:
 
-- `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`: current L1 JSON-RPC endpoint for tick.
+- `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`: current L1 JSON-RPC endpoint for tick (and optional at `init` for chain-id auto-detect).
 - `CARTESI_WATCHDOG_SEQUENCER_URL`: optional tick-time override of the URL persisted at `init` (useful when ephemeral ports change).
-- `CARTESI_WATCHDOG_BLOCKCHAIN_ID`: optional chain id label persisted at `init` for `status.prom`.
+- `CARTESI_WATCHDOG_BLOCKCHAIN_ID`: optional chain id label persisted at `init` for `status.prom` (prefer explicit; tick never queries `eth_chainId`).
 - `CARTESI_WATCHDOG_METRICS_FILE`: optional override for the Prometheus textfile path (default `$CARTESI_WATCHDOG_STATE_DIR/status.prom`).
 - `CARTESI_WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
 - `CARTESI_WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.

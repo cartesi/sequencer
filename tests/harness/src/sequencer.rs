@@ -714,6 +714,10 @@ impl ManagedSequencer {
         self.log_path.as_path()
     }
 
+    pub fn anvil_log_path(&self) -> &Path {
+        self.rollups.anvil_log_path()
+    }
+
     pub fn data_dir(&self) -> &Path {
         self.data_dir_path.as_path()
     }

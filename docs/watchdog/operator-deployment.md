@@ -151,13 +151,13 @@ Today `WalletApp::default()` / `WalletConfig::sepolia()` align with Sepolia stag
 | Variable | Where it comes from |
 |----------|---------------------|
 | `CARTESI_WATCHDOG_SEQUENCER_URL` | Ops: internal HTTP base (see network diagram) |
-| `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | Ops: current chain RPC for `tick` (archive for historical `getLogs`; not persisted by `init`) |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | Ops: current chain RPC for `tick` (archive for historical `getLogs`; not persisted by `init`). Also needed at `init` if auto-detecting `BLOCKCHAIN_ID` via `eth_chainId` |
 | `CARTESI_WATCHDOG_APP_ADDRESS` | This rollup’s Cartesi **application** contract |
 | `CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS` | InputBox on that L1 ([Cartesi deployed contracts](https://docs.cartesi.io/cartesi-rollups/2.0/deployment/self-hosted.md)) |
 | `CARTESI_WATCHDOG_STATE_DIR` | Persistent volume on watchdog host |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | Bootstrap CM snapshot (`init` only) |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block that bootstrap snapshot represents (= finalized `inclusion_block` at bootstrap) |
-| `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | Chain id label for `status.prom` metrics (optional; defaults to `unknown`) |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | Chain id label for `status.prom` metrics (prefer set at `init`; optional auto-detect via `eth_chainId` when L1 endpoint is present at `init`) |
 | `CARTESI_WATCHDOG_METRICS_FILE` | Override path for the Prometheus textfile written by each `tick` |
 | `CARTESI_WATCHDOG_LUA_DEPS` | `.deps/lua` |
 
@@ -174,8 +174,10 @@ Pick one:
 3. **Replay from genesis** (only for new rollups / low block height — slow).
 
 Run `init` once to store the bootstrap CM snapshot into the watchdog state
-layout. `init` does not need `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`; the RPC URL is read by
-each `tick` so it can rotate without editing state:
+layout. The L1 RPC URL is not persisted — each `tick` reads
+`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` so it can rotate without editing
+state. If `CARTESI_WATCHDOG_BLOCKCHAIN_ID` is unset at `init`, auto-detect also
+needs that endpoint present then (prefer setting the chain id explicitly):
 
 ```bash
 sequencer-watchdog init

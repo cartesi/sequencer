@@ -72,15 +72,6 @@ local function resolve_init_blockchain_id(cfg, env, deps)
     end
 
     local rpc_factory = deps and deps.rpc_factory or nil
-    if type(deps) == "table" and type(deps.rpc) == "table" and type(deps.rpc.get_chain_id) == "function" then
-        local ok, chain = pcall(function()
-            return deps.rpc:get_chain_id()
-        end)
-        if ok and chain ~= nil then
-            return tostring(chain)
-        end
-    end
-
     return metrics.query_chain_id_from_rpc(l1_rpc_url, rpc_factory)
 end
 
