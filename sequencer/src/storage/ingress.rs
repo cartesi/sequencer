@@ -828,11 +828,11 @@ mod tests {
             .ordered_l2_txs_page_from(0, 100)
             .expect("load replay");
         assert_eq!(replay.len(), 2);
-        match &replay[0].1 {
+        match &replay[0].tx {
             SequencedL2Tx::Direct(value) => assert_eq!(value.payload.as_slice(), &[0xaa]),
             _ => panic!("expected direct input at position 0"),
         }
-        match &replay[1].1 {
+        match &replay[1].tx {
             SequencedL2Tx::Direct(value) => assert_eq!(value.payload.as_slice(), &[0xbb]),
             _ => panic!("expected direct input at position 1"),
         }

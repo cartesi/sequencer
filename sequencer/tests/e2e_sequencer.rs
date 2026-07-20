@@ -259,6 +259,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
             sender: ws_sender,
             fee,
             data,
+            ..
         } => {
             assert_eq!(offset, 2);
             assert_eq!(ws_sender, sender.to_string());
@@ -1351,7 +1352,7 @@ fn all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
         .ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load ordered l2 txs")
         .into_iter()
-        .map(|(_offset, tx, _frame_safe_block)| tx)
+        .map(|row| row.tx)
         .collect()
 }
 
@@ -1367,6 +1368,7 @@ fn assert_ws_message_matches_tx(
                 sender,
                 fee,
                 data,
+                ..
             },
             SequencedL2Tx::UserOp(expected),
         ) => {
@@ -1384,6 +1386,7 @@ fn assert_ws_message_matches_tx(
                 sender,
                 block_number,
                 payload,
+                ..
             },
             SequencedL2Tx::Direct(expected),
         ) => {

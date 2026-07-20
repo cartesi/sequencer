@@ -128,7 +128,7 @@ pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
         .ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load all ordered l2 txs")
         .into_iter()
-        .map(|(_offset, tx, _frame_safe_block)| tx)
+        .map(|row| row.tx)
         .collect()
 }
 

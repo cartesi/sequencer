@@ -96,9 +96,9 @@ pub(super) fn catch_up_application_paged(
             return Ok(());
         }
 
-        for (db_offset, item, frame_safe_block) in replay {
-            replay_sequenced_l2_tx(app, batch_submitter_address, item, frame_safe_block)?;
-            next_offset = db_offset;
+        for row in replay {
+            replay_sequenced_l2_tx(app, batch_submitter_address, row.tx, row.safe_block)?;
+            next_offset = row.offset;
         }
     }
 }

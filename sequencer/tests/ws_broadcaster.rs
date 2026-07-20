@@ -237,7 +237,17 @@ async fn ws_subscribe_closes_when_catchup_window_exceeds_limit() {
                 close_frame.code,
                 tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
             );
-            assert_eq!(close_frame.reason, WS_CATCHUP_WINDOW_EXCEEDED_REASON);
+            // The reason carries the live start offset so a subscriber that fell
+            // behind the window can rejoin from a valid offset.
+            assert!(
+                close_frame
+                    .reason
+                    .as_str()
+                    .starts_with(WS_CATCHUP_WINDOW_EXCEEDED_REASON),
+                "unexpected close reason {:?}",
+                close_frame.reason
+            );
+            assert!(close_frame.reason.as_str().contains("live_start_offset="));
         }
         other => panic!("expected close frame for catch-up limit, got {other:?}"),
     }
@@ -546,7 +556,7 @@ fn load_ordered_l2_txs_page(db_path: &str, from_offset: u64, limit: usize) -> Ve
         .ordered_l2_txs_page_from(from_offset, limit)
         .expect("load ordered l2 tx page")
         .into_iter()
-        .map(|(_offset, tx, _frame_safe_block)| tx)
+        .map(|row| row.tx)
         .collect()
 }
 
@@ -562,6 +572,7 @@ fn assert_ws_message_matches_tx(
                 sender,
                 fee,
                 data,
+                ..
             },
             SequencedL2Tx::UserOp(expected),
         ) => {
@@ -579,6 +590,7 @@ fn assert_ws_message_matches_tx(
                 sender,
                 block_number,
                 payload,
+                ..
             },
             SequencedL2Tx::Direct(expected),
         ) => {

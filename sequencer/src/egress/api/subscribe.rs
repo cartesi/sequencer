@@ -72,10 +72,15 @@ async fn run_ws_session(
                 max_catchup_events,
                 "ws catch-up window exceeded; closing subscriber"
             );
+            // The live start offset is appended so a subscriber that fell behind
+            // the window can rejoin from a valid offset instead of guessing.
             close_with_frame(
                 &mut socket,
                 close_code::POLICY,
-                WS_CATCHUP_WINDOW_EXCEEDED_REASON,
+                format!(
+                    "{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset={live_start_offset}"
+                )
+                .as_str(),
             )
             .await;
             return;

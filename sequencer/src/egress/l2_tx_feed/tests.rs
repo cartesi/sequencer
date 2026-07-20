@@ -23,12 +23,19 @@ fn broadcast_user_op_serializes_with_hex_data() {
             fee: 3,
             data: vec![0xaa, 0xbb],
         }),
+        1234,
+        5,
+        None,
+        Some(11),
     );
     let json = serde_json::to_string(&msg).expect("serialize");
     assert!(json.contains("\"kind\":\"user_op\""));
     assert!(json.contains("\"offset\":7"));
+    assert!(json.contains("\"nonce\":11"));
     assert!(json.contains("\"fee\":3"));
     assert!(json.contains("\"data\":\"0xaabb\""));
+    assert!(json.contains("\"safe_block\":1234"));
+    assert!(json.contains("\"batch_nonce\":5"));
 }
 
 #[test]
@@ -40,6 +47,10 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
             block_number: 42,
             payload: vec![0xcc, 0xdd],
         }),
+        1234,
+        5,
+        Some(3),
+        None,
     );
     let json = serde_json::to_string(&msg).expect("serialize");
     assert!(json.contains("\"kind\":\"direct_input\""));
@@ -47,6 +58,7 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
     assert!(json.contains("\"sender\":\"0x0000000000000000000000000000000000000000\""));
     assert!(json.contains("\"block_number\":42"));
     assert!(json.contains("\"payload\":\"0xccdd\""));
+    assert!(json.contains("\"input_index\":3"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

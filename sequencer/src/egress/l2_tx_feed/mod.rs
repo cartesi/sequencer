@@ -193,21 +193,25 @@ fn run_subscription(
             continue;
         }
 
-        // The frame safe_block (third element) is a replay-only concern;
-        // the WS message shape doesn't carry it (review F7/WP5 owns any
-        // feed-protocol extension).
-        for (db_offset, tx, _frame_safe_block) in txs {
+        for row in txs {
             if shutdown.is_shutdown_requested() || events_tx.is_closed() {
                 return Ok(());
             }
 
-            next_offset = db_offset;
+            next_offset = row.offset;
 
-            if should_filter_from_broadcast(&tx, batch_submitter_address) {
+            if should_filter_from_broadcast(&row.tx, batch_submitter_address) {
                 continue;
             }
 
-            let event = BroadcastTxMessage::from_offset_and_tx(db_offset, tx);
+            let event = BroadcastTxMessage::from_offset_and_tx(
+                row.offset,
+                row.tx,
+                row.safe_block,
+                row.batch_nonce,
+                row.input_index,
+                row.op_nonce,
+            );
             if events_tx.blocking_send(event).is_err() {
                 return Ok(());
             }
