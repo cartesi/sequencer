@@ -446,6 +446,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             }],
             SENDER_A,
             &default_protocol_timing(),
@@ -466,6 +467,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 sender: Address::ZERO,
                 payload: vec![0xbb],
                 block_number: 20,
+                ..Default::default()
             }],
             SENDER_A,
             &default_protocol_timing(),
@@ -482,6 +484,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 sender: Address::ZERO,
                 payload: vec![0xcc],
                 block_number: 30,
+                ..Default::default()
             }],
             SENDER_A,
             &default_protocol_timing(),
@@ -601,6 +604,7 @@ async fn direct_inputs_close_frame_and_persist_drain() {
                 sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             }],
             SENDER_A,
             &default_protocol_timing(),
@@ -653,6 +657,7 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
                 sender: batch_submitter_address,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             }],
             SENDER_A,
             &default_protocol_timing(),
@@ -700,6 +705,7 @@ async fn direct_inputs_are_paginated_by_buffer_capacity() {
             sender: Address::ZERO,
             payload: vec![0x10 + index as u8],
             block_number: 10,
+            ..Default::default()
         });
     }
     feeder_storage
@@ -730,6 +736,7 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
                 sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             }],
             SENDER_A,
             &default_protocol_timing(),
@@ -1282,6 +1289,7 @@ fn promotion_advances_drain_atomically_so_restart_cannot_re_promote() {
             frames: Vec::new(),
         }),
         block_number: 100,
+        ..Default::default()
     };
     storage
         .append_safe_inputs(
@@ -1347,6 +1355,7 @@ fn close_frame_only_promoting_rolls_back_the_drain_when_promotion_fails() {
             frames: Vec::new(),
         }),
         block_number: 100,
+        ..Default::default()
     };
     storage
         .append_safe_inputs(

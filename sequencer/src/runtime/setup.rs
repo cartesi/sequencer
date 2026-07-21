@@ -593,6 +593,7 @@ mod tests {
                 sender: SENDER_A,
                 payload: vec![0x01],
                 block_number,
+                ..Default::default()
             })
             .collect();
         let safe_block = blocks.iter().copied().max().unwrap_or(0);
@@ -735,6 +736,7 @@ mod tests {
             sender,
             payload: vec![marker],
             block_number: block,
+            ..Default::default()
         };
         let inputs = vec![
             mk(direct, 10, 0x10),    // (A,B] direct  → seed
@@ -786,6 +788,7 @@ mod tests {
             sender: direct,
             payload: vec![marker],
             block_number: block,
+            ..Default::default()
         };
         // A=5, B=20, C=40, H1=50: a direct at block 50 is in the (C, H1] overshoot.
         let inputs = vec![

@@ -214,6 +214,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,
@@ -270,6 +271,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 200,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,

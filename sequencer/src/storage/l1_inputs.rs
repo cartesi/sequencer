@@ -88,9 +88,10 @@ impl Storage {
         after_block: u64,
         through_block: u64,
     ) -> Result<Vec<StoredSafeInput>> {
-        const SQL: &str = "SELECT sender, payload, block_number FROM safe_inputs \
-                           WHERE block_number > ?1 AND block_number <= ?2 \
-                           ORDER BY safe_input_index ASC";
+        const SQL: &str = "SELECT sender, payload, block_number, block_timestamp, transaction_hash \
+             FROM safe_inputs \
+             WHERE block_number > ?1 AND block_number <= ?2 \
+             ORDER BY safe_input_index ASC";
         let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(
             params![u64_to_i64(after_block), u64_to_i64(through_block)],
@@ -99,16 +100,20 @@ impl Storage {
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
                 ))
             },
         )?;
         let mut out = Vec::new();
         for row in rows {
-            let (sender, payload, block_number) = row?;
+            let (sender, payload, block_number, block_timestamp, transaction_hash) = row?;
             out.push(StoredSafeInput {
                 sender: Address::from_slice(sender.as_slice()),
                 payload,
                 block_number: i64_to_u64(block_number),
+                block_timestamp: i64_to_u64(block_timestamp),
+                transaction_hash: alloy_primitives::B256::from_slice(transaction_hash.as_slice()),
             });
         }
         Ok(out)
@@ -321,8 +326,9 @@ fn insert_safe_inputs_batch(
         return Ok(());
     }
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO safe_inputs (safe_input_index, sender, payload, block_number) \
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO safe_inputs \
+         (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for (offset, input) in inputs.iter().enumerate() {
         stmt.execute(params![
@@ -330,6 +336,8 @@ fn insert_safe_inputs_batch(
             input.sender.as_slice(),
             input.payload.as_slice(),
             u64_to_i64(input.block_number),
+            u64_to_i64(input.block_timestamp),
+            input.transaction_hash.as_slice(),
         ])?;
     }
     Ok(())
@@ -371,11 +379,13 @@ mod tests {
                 sender: Address::ZERO,
                 payload: vec![0xa0],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: Address::ZERO,
                 payload: vec![0xb1],
                 block_number: 10,
+                ..Default::default()
             },
         ];
         storage
@@ -410,16 +420,19 @@ mod tests {
                 sender: SENDER_A,
                 payload: vec![0x01],
                 block_number: 5,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_B,
                 payload: vec![0x02],
                 block_number: 12,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: vec![0x03],
                 block_number: 18,
+                ..Default::default()
             },
         ];
         storage
@@ -470,21 +483,25 @@ mod tests {
                 sender: SENDER_B,
                 payload: vec![0x05],
                 block_number: 5,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: vec![0x10],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_B,
                 payload: vec![0x11],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_B,
                 payload: vec![0x15],
                 block_number: 15,
+                ..Default::default()
             },
         ];
         storage

@@ -42,6 +42,7 @@ mod invalid_batches {
             sender: Address::ZERO,
             payload: vec![0xaa],
             block_number: 10,
+            ..Default::default()
         }];
         storage
             .append_safe_inputs(
@@ -62,6 +63,7 @@ mod invalid_batches {
             sender: Address::ZERO,
             payload: vec![0xbb],
             block_number: 20,
+            ..Default::default()
         }];
         storage
             .append_safe_inputs(
@@ -100,6 +102,7 @@ mod invalid_batches {
             sender: Address::ZERO,
             payload: vec![0xaa],
             block_number: 10,
+            ..Default::default()
         }];
         storage
             .append_safe_inputs(10, directs.as_slice(), SENDER_A, &default_protocol_timing())
@@ -134,11 +137,13 @@ mod invalid_batches {
                 sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: Address::ZERO,
                 payload: vec![0xbb],
                 block_number: 10,
+                ..Default::default()
             },
         ];
         storage
@@ -195,6 +200,7 @@ mod recover_post_flush {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -230,6 +236,7 @@ mod recover_post_flush {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -269,6 +276,7 @@ mod recover_post_flush {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -292,6 +300,7 @@ mod recover_post_flush {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 1310,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -331,6 +340,7 @@ mod recover_post_flush {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -351,6 +361,7 @@ mod recover_post_flush {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 100),
                     block_number: 2410,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -401,6 +412,7 @@ mod recover_post_flush {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 200,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -456,6 +468,7 @@ mod recover_post_flush {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 200,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -745,11 +758,13 @@ mod tip_staleness {
                 sender: Address::ZERO,
                 payload: vec![0xd1],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: Address::ZERO,
                 payload: vec![0xd2],
                 block_number: 10,
+                ..Default::default()
             },
         ];
         storage
@@ -778,6 +793,7 @@ mod tip_staleness {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -842,6 +858,7 @@ mod tip_staleness {
                     sender: non_submitter,
                     payload: vec![0xde, 0xad],
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -864,6 +881,7 @@ mod tip_staleness {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -914,6 +932,7 @@ mod tip_staleness {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -962,6 +981,7 @@ mod tip_staleness {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1034,6 +1054,7 @@ mod tip_staleness {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1104,6 +1125,7 @@ mod check_danger_zone {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1233,6 +1255,7 @@ mod check_any_unresolved {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1271,6 +1294,7 @@ mod check_any_unresolved {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1321,6 +1345,7 @@ mod check_any_unresolved {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1374,6 +1399,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: make_stale_batch_payload(0, 100),
                     block_number: 1300,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1404,6 +1430,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 1299,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1435,6 +1462,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1462,6 +1490,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1482,6 +1511,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: make_stale_batch_payload(0, 1210),
                     block_number: 2410,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1508,6 +1538,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1526,6 +1557,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: make_stale_batch_payload(0, 1210),
                     block_number: 2410,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1545,6 +1577,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 2420,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1573,6 +1606,7 @@ mod boundary {
                     sender: SENDER_A,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -1994,6 +2028,7 @@ mod schema_invariants {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -2302,6 +2337,7 @@ mod tree_invariants {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -2367,6 +2403,7 @@ mod tree_invariants {
                     sender: batch_submitter,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),
@@ -2501,6 +2538,7 @@ mod recovery_clears_pending_snapshots {
                     sender: batch_submitter,
                     payload: make_stale_batch_payload(0, 10),
                     block_number: 1210,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &default_protocol_timing(),

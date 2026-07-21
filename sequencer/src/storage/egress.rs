@@ -29,6 +29,10 @@ pub struct OrderedL2TxRow {
     pub input_index: Option<u64>,
     /// The user op's own signed nonce, `None` for directs.
     pub op_nonce: Option<u32>,
+    /// The direct input's L1 block timestamp, `None` for user ops.
+    pub block_timestamp: Option<u64>,
+    /// The direct input's L1 transaction hash, `None` for user ops.
+    pub transaction_hash: Option<alloy_primitives::B256>,
 }
 
 impl Storage {
@@ -63,7 +67,9 @@ impl Storage {
                 f.safe_block,
                 b.nonce,
                 s.safe_input_index,
-                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.nonce ELSE NULL END AS op_nonce
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.nonce ELSE NULL END AS op_nonce,
+                CASE WHEN s.safe_input_index IS NOT NULL THEN d.block_timestamp   ELSE NULL END AS block_timestamp,
+                CASE WHEN s.safe_input_index IS NOT NULL THEN d.transaction_hash  ELSE NULL END AS transaction_hash
             FROM valid_sequenced_l2_txs s
             LEFT JOIN user_ops u
               ON u.batch_index    = s.batch_index
@@ -98,6 +104,8 @@ impl Storage {
             let batch_nonce: i64 = row.get(8)?;
             let input_index: Option<i64> = row.get(9)?;
             let op_nonce: Option<i64> = row.get(10)?;
+            let block_timestamp: Option<i64> = row.get(11)?;
+            let transaction_hash: Option<Vec<u8>> = row.get(12)?;
             Ok(OrderedL2TxRow {
                 offset: i64_to_u64(db_offset),
                 tx,
@@ -107,6 +115,9 @@ impl Storage {
                 op_nonce: op_nonce.map(|value| {
                     u32::try_from(value).expect("user op nonces are u32-checked at insert")
                 }),
+                block_timestamp: block_timestamp.map(i64_to_u64),
+                transaction_hash: transaction_hash
+                    .map(|bytes| alloy_primitives::B256::from_slice(bytes.as_slice())),
             })
         })?;
         rows.collect::<Result<Vec<_>>>()

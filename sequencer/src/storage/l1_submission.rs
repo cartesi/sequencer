@@ -526,6 +526,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,
@@ -566,6 +567,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 200,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,
@@ -658,6 +660,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,
@@ -759,16 +762,19 @@ mod tests {
                     frames: Vec::new(),
                 }),
                 block_number: 11,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: local_batch_payload(&mut storage, 2),
                 block_number: 11,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: local_batch_payload(&mut storage, 3),
                 block_number: 11,
+                ..Default::default()
             },
         ];
         storage
@@ -821,16 +827,19 @@ mod tests {
                 sender: SENDER_A,
                 payload: non_stale_payload,
                 block_number: 200,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: stale_payload,
                 block_number: 2000,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: non_stale_payload_2,
                 block_number: 2000,
+                ..Default::default()
             },
         ];
         storage
@@ -897,6 +906,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: imposter,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,
@@ -925,6 +935,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: genuine,
                     block_number: 21,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,
@@ -968,6 +979,7 @@ mod tests {
             sender: batch_submitter,
             payload: future_safe_block_payload,
             block_number: 100,
+            ..Default::default()
         }];
         storage
             .append_safe_inputs(200, inputs.as_slice(), batch_submitter, &protocol)
@@ -1025,6 +1037,7 @@ mod tests {
                     sender: submitter,
                     payload: genuine,
                     block_number: 20,
+                    ..Default::default()
                 }],
                 submitter,
                 &protocol,
@@ -1081,6 +1094,7 @@ mod tests {
                 sender: submitter,
                 payload: mk(n),
                 block_number: 20 + n,
+                ..Default::default()
             })
             .collect();
         storage
@@ -1202,11 +1216,13 @@ mod tests {
                         sender: SENDER_A,
                         payload: landed.clone(),
                         block_number: 20,
+                        ..Default::default()
                     },
                     StoredSafeInput {
                         sender: SENDER_A,
                         payload: landed,
                         block_number: 20,
+                        ..Default::default()
                     },
                 ],
                 SENDER_A,
@@ -1239,6 +1255,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: super::super::test_helpers::make_stale_batch_payload(5, 10),
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,
@@ -1270,6 +1287,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: super::super::test_helpers::make_stale_batch_payload(1, 10),
                     block_number: 20,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,
@@ -1290,6 +1308,7 @@ mod tests {
                     sender: SENDER_A,
                     payload: landed,
                     block_number: 21,
+                    ..Default::default()
                 }],
                 SENDER_A,
                 &protocol,

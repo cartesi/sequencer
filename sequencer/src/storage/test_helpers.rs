@@ -95,6 +95,7 @@ pub(crate) fn seed_safe_inputs_with_batch_nonces(
                 sender,
                 payload,
                 block_number: safe_block,
+                ..Default::default()
             }
         })
         .collect();

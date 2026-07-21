@@ -146,7 +146,7 @@ impl Storage {
         }
 
         const SQL: &str = "
-            SELECT safe_input_index, sender, payload, block_number
+            SELECT safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash
             FROM safe_inputs
             WHERE safe_input_index >= ?1 AND safe_input_index < ?2
             ORDER BY safe_input_index ASC
@@ -160,13 +160,15 @@ impl Storage {
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
                 ))
             },
         )?;
 
         let mut fetched_count = 0_u64;
         for (offset, row) in rows.enumerate() {
-            let (index_i64, sender, payload, block_number_i64) = row?;
+            let (index_i64, sender, payload, block_number_i64, block_timestamp_i64, tx_hash) = row?;
             let index = i64_to_u64(index_i64);
             let expected = range.start().saturating_add(offset as u64);
 
@@ -179,6 +181,8 @@ impl Storage {
                 sender: Address::from_slice(sender.as_slice()),
                 payload,
                 block_number: i64_to_u64(block_number_i64),
+                block_timestamp: i64_to_u64(block_timestamp_i64),
+                transaction_hash: alloy_primitives::B256::from_slice(tx_hash.as_slice()),
             });
             fetched_count = fetched_count.saturating_add(1);
         }
@@ -751,11 +755,13 @@ mod tests {
                 sender: Address::ZERO,
                 payload: vec![0x00],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: Address::ZERO,
                 payload: vec![0x02],
                 block_number: 10,
+                ..Default::default()
             },
         ];
         storage
@@ -809,11 +815,13 @@ mod tests {
                 sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: Address::ZERO,
                 payload: vec![0xbb],
                 block_number: 10,
+                ..Default::default()
             },
         ];
         storage
@@ -850,11 +858,13 @@ mod tests {
                 sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: Address::ZERO,
                 payload: vec![0xbb],
                 block_number: 10,
+                ..Default::default()
             },
         ];
         storage

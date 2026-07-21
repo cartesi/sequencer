@@ -1277,6 +1277,7 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
                 sender: config.erc20_portal_address,
                 payload,
                 block_number: 1,
+                ..Default::default()
             }
         })
         .collect();
@@ -1334,6 +1335,7 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 sender: Address::ZERO,
                 payload,
                 block_number: safe_block,
+                ..Default::default()
             }],
             Address::ZERO,
             &sequencer_core::protocol::ProtocolTiming {

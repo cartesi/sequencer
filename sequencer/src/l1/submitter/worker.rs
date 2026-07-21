@@ -296,6 +296,7 @@ mod tests {
                 sender: BATCH_SUBMITTER_ADDRESS,
                 payload: crate::storage::test_helpers::local_batch_payload(&mut storage, *nonce),
                 block_number: safe_block,
+                ..Default::default()
             })
             .collect();
         storage

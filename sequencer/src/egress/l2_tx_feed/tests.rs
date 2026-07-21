@@ -27,6 +27,8 @@ fn broadcast_user_op_serializes_with_hex_data() {
         5,
         None,
         Some(11),
+        None,
+        None,
     );
     let json = serde_json::to_string(&msg).expect("serialize");
     assert!(json.contains("\"kind\":\"user_op\""));
@@ -51,6 +53,8 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
         5,
         Some(3),
         None,
+        Some(1700000000),
+        Some(alloy_primitives::B256::from_slice(&[0xab; 32])),
     );
     let json = serde_json::to_string(&msg).expect("serialize");
     assert!(json.contains("\"kind\":\"direct_input\""));
@@ -59,6 +63,8 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
     assert!(json.contains("\"block_number\":42"));
     assert!(json.contains("\"payload\":\"0xccdd\""));
     assert!(json.contains("\"input_index\":3"));
+    assert!(json.contains("\"block_timestamp\":1700000000"));
+    assert!(json.contains(&format!("\"transaction_hash\":\"0x{}\"", "ab".repeat(32))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -193,6 +199,7 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
                 sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             }],
             Address::ZERO,
             &sequencer_core::protocol::ProtocolTiming {
@@ -217,6 +224,7 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
                 sender: Address::ZERO,
                 payload: vec![0xbb],
                 block_number: 20,
+                ..Default::default()
             }],
             Address::ZERO,
             &sequencer_core::protocol::ProtocolTiming {
@@ -278,11 +286,13 @@ async fn catchup_window_excludes_batch_submitter_direct_inputs() {
                     sender: batch_submitter,
                     payload: vec![0xaa],
                     block_number: 10,
+                    ..Default::default()
                 },
                 StoredSafeInput {
                     sender: user_address,
                     payload: vec![0xbb],
                     block_number: 10,
+                    ..Default::default()
                 },
             ],
             Address::ZERO,
@@ -375,6 +385,7 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
                 sender: direct_sender,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             }],
             Address::ZERO,
             &sequencer_core::protocol::ProtocolTiming {

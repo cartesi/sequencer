@@ -348,6 +348,7 @@ fn seed_ordered_txs(db_path: &str) {
                 sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 10,
+                ..Default::default()
             }],
             Address::ZERO,
             &sequencer_core::protocol::ProtocolTiming {
@@ -384,6 +385,7 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
                 sender: Address::ZERO,
                 payload,
                 block_number: safe_block,
+                ..Default::default()
             }],
             Address::ZERO,
             &sequencer_core::protocol::ProtocolTiming {

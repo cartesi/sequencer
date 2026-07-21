@@ -290,6 +290,9 @@ impl InputReader {
             let block_number = log.block_number.ok_or_else(|| {
                 InputReaderError::Provider("InputAdded log missing block_number".to_string())
             })?;
+            let transaction_hash = log.transaction_hash.ok_or_else(|| {
+                InputReaderError::Provider("InputAdded log missing transaction_hash".to_string())
+            })?;
             let evm_advance = decode_evm_advance_input(event.input.as_ref())
                 .map_err(InputReaderError::Provider)?;
             assert_eq!(
@@ -298,11 +301,16 @@ impl InputReader {
                 "InputAdded block number mismatch: log={block_number}, payload={}",
                 evm_advance.blockNumber
             );
+            let block_timestamp = u64::try_from(evm_advance.blockTimestamp).map_err(|_| {
+                InputReaderError::Provider("EvmAdvance block timestamp exceeds u64".to_string())
+            })?;
 
             batch.push(StoredSafeInput {
                 sender: evm_advance.msgSender,
                 payload: evm_advance.payload.into(),
                 block_number,
+                block_timestamp,
+                transaction_hash,
             });
         }
 

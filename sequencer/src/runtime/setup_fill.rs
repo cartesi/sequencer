@@ -202,16 +202,19 @@ mod tests {
                 sender: submitter,
                 payload: vec![0x00],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: direct,
                 payload: vec![0xAA],
                 block_number: 20,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: direct,
                 payload: vec![0xBB],
                 block_number: 30,
+                ..Default::default()
             },
         ];
         storage
@@ -286,21 +289,25 @@ mod tests {
                 sender: direct,
                 payload: vec![0x01],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: direct,
                 payload: vec![0x02],
                 block_number: 20,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: direct,
                 payload: vec![0x03],
                 block_number: 30,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: direct,
                 payload: vec![0x04],
                 block_number: 120,
+                ..Default::default()
             },
         ];
         storage
@@ -351,16 +358,19 @@ mod tests {
                 sender: direct,
                 payload: vec![0x01],
                 block_number: 99,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: direct,
                 payload: vec![0x02],
                 block_number: 100,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: direct,
                 payload: vec![0x03],
                 block_number: 101,
+                ..Default::default()
             },
         ];
         storage
@@ -401,6 +411,7 @@ mod tests {
             sender: alloy_primitives::Address::repeat_byte(0x22),
             payload: vec![0xAA],
             block_number: 10,
+            ..Default::default()
         }];
         storage
             .append_safe_inputs(100, &inputs, submitter, &timing)
@@ -461,6 +472,7 @@ mod tests {
                     sender: direct,
                     payload: vec![0xAA],
                     block_number: 20,
+                    ..Default::default()
                 }],
                 submitter,
                 &timing,
@@ -483,6 +495,7 @@ mod tests {
                     sender: direct,
                     payload: vec![0xBB],
                     block_number: 120,
+                    ..Default::default()
                 }],
                 submitter,
                 &timing,
@@ -589,21 +602,25 @@ mod tests {
                 sender: pre_c_direct,
                 payload: vec![0x01],
                 block_number: 10,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: pre_c_direct,
                 payload: vec![0x02],
                 block_number: 20,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: pre_c_direct,
                 payload: vec![0x03],
                 block_number: 30,
+                ..Default::default()
             },
             StoredSafeInput {
                 sender: portal,
                 payload: deposit_payload,
                 block_number: 120,
+                ..Default::default()
             },
         ];
         {

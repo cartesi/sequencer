@@ -211,6 +211,8 @@ fn run_subscription(
                 row.batch_nonce,
                 row.input_index,
                 row.op_nonce,
+                row.block_timestamp,
+                row.transaction_hash,
             );
             if events_tx.blocking_send(event).is_err() {
                 return Ok(());

@@ -41,6 +41,10 @@ pub enum BroadcastTxMessage {
         /// distinguish a direct already executed by the settled chain from one
         /// still parked in its scheduler fridge (both have settled L1 inputs).
         batch_nonce: u64,
+        /// Timestamp of the L1 block that included the direct input.
+        block_timestamp: u64,
+        /// Hash of the L1 transaction that carried the direct input.
+        transaction_hash: String,
     },
 }
 
@@ -54,8 +58,10 @@ impl BroadcastTxMessage {
 
     /// Build a broadcast message from a sequenced row and its execution context.
     ///
-    /// `input_index` is the direct input's L1 input index; it must be `Some` for direct
-    /// rows (the storage row always carries it) and is ignored for user ops.
+    /// `input_index`, `block_timestamp`, and `transaction_hash` are the direct input's L1
+    /// provenance; they must be `Some` for direct rows (the storage row always carries
+    /// them) and are ignored for user ops.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_offset_and_tx(
         offset: u64,
         tx: SequencedL2Tx,
@@ -63,6 +69,8 @@ impl BroadcastTxMessage {
         batch_nonce: u64,
         input_index: Option<u64>,
         op_nonce: Option<u32>,
+        block_timestamp: Option<u64>,
+        transaction_hash: Option<alloy_primitives::B256>,
     ) -> Self {
         match tx {
             SequencedL2Tx::UserOp(user_op) => Self::UserOp {
@@ -82,6 +90,12 @@ impl BroadcastTxMessage {
                 input_index: input_index
                     .expect("direct sequenced rows always carry their L1 input index"),
                 batch_nonce,
+                block_timestamp: block_timestamp
+                    .expect("direct sequenced rows always carry their L1 block timestamp"),
+                transaction_hash: alloy_primitives::hex::encode_prefixed(
+                    transaction_hash
+                        .expect("direct sequenced rows always carry their L1 transaction hash"),
+                ),
             },
         }
     }

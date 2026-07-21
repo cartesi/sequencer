@@ -51,13 +51,17 @@ pub use snapshot_dumps::{
 };
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
-/// the L1 block where it was included.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the L1 inclusion provenance (block, block timestamp, carrying transaction).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StoredSafeInput {
     pub sender: alloy_primitives::Address,
     pub payload: Vec<u8>,
     /// Chain block number where this input was included (e.g. InputAdded event block).
     pub block_number: u64,
+    /// Timestamp of the chain block where this input was included.
+    pub block_timestamp: u64,
+    /// Hash of the chain transaction that carried this input.
+    pub transaction_hash: alloy_primitives::B256,
 }
 
 /// Whether a sync also maintains the scheduler-accepted gold frontier

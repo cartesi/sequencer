@@ -12,6 +12,8 @@ use rusqlite_migration::{M, Migrations};
 use super::StorageOpenError;
 
 const MIGRATION_0001_SCHEMA: &str = include_str!("migrations/0001_schema.sql");
+const MIGRATION_0002_SAFE_INPUT_PROVENANCE: &str =
+    include_str!("migrations/0002_safe_input_provenance.sql");
 
 /// SQLite `synchronous` pragma used by every production writer connection.
 /// `FULL` under WAL fsyncs on every commit, so commits survive power loss /
@@ -154,6 +156,10 @@ fn open_reader_connection(path: &str) -> Result<Connection, StorageOpenError> {
 /// Apply all migrations. Package-private — callers use [`Storage::open`]
 /// which runs this automatically.
 pub(super) fn run_migrations(conn: &mut Connection) -> Result<(), StorageOpenError> {
-    Migrations::from_slice(&[M::up(MIGRATION_0001_SCHEMA)]).to_latest(conn)?;
+    Migrations::from_slice(&[
+        M::up(MIGRATION_0001_SCHEMA),
+        M::up(MIGRATION_0002_SAFE_INPUT_PROVENANCE),
+    ])
+    .to_latest(conn)?;
     Ok(())
 }
