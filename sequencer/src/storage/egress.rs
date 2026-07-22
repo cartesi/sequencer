@@ -13,21 +13,79 @@ use rusqlite::{Result, params};
 use super::Storage;
 use super::convert::{i64_to_u64, u64_to_i64, usize_to_i64};
 use super::queries::decode_l2_tx_row;
-use sequencer_core::l2_tx::SequencedL2Tx;
+use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
+
+/// One persisted L2 transaction and the ordering context of its covering frame.
+#[derive(Debug, Clone)]
+pub(crate) enum OrderedL2TxRow {
+    UserOp {
+        offset: u64,
+        tx: ValidUserOp,
+        nonce: u32,
+        safe_block: u64,
+        batch_nonce: u64,
+    },
+    DirectInput {
+        offset: u64,
+        tx: DirectInput,
+        input_index: u64,
+        safe_block: u64,
+        batch_nonce: u64,
+    },
+}
+
+impl OrderedL2TxRow {
+    pub(crate) fn offset(&self) -> u64 {
+        match self {
+            Self::UserOp { offset, .. } | Self::DirectInput { offset, .. } => *offset,
+        }
+    }
+
+    fn into_replay_parts(self) -> (u64, SequencedL2Tx, u64) {
+        match self {
+            Self::UserOp {
+                offset,
+                tx,
+                safe_block,
+                ..
+            } => (offset, SequencedL2Tx::UserOp(tx), safe_block),
+            Self::DirectInput {
+                offset,
+                tx,
+                safe_block,
+                ..
+            } => (offset, SequencedL2Tx::Direct(tx), safe_block),
+        }
+    }
+}
 
 impl Storage {
     /// Load a page of ordered L2 transactions starting after the given offset.
     /// Returns `(db_offset, tx, frame_safe_block)` triples — the third element
     /// is the covering frame's `safe_block`. Catch-up replay feeds it to
     /// `execute_valid_user_op` so the app's safe-block clock advances exactly
-    /// as it did live (directs use their own `block_number` instead; the feed
-    /// ignores it). Callers should track `db_offset` of the last item as their
-    /// cursor, not increment a counter.
+    /// as it did live (directs use their own `block_number` instead). Callers
+    /// should track `db_offset` of the last item as their cursor, not increment
+    /// a counter.
     pub fn ordered_l2_txs_page_from(
         &mut self,
         offset: u64,
         limit: usize,
     ) -> Result<Vec<(u64, SequencedL2Tx, u64)>> {
+        self.ordered_l2_tx_rows_page_from(offset, limit)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(OrderedL2TxRow::into_replay_parts)
+                    .collect()
+            })
+    }
+
+    /// Load feed rows with all persisted execution and settlement context.
+    pub(crate) fn ordered_l2_tx_rows_page_from(
+        &mut self,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<OrderedL2TxRow>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -45,7 +103,10 @@ impl Storage {
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN f.fee  ELSE NULL END AS fee,
                 CASE WHEN s.safe_input_index   IS NOT NULL THEN d.payload      ELSE NULL END AS payload,
                 CASE WHEN s.safe_input_index   IS NOT NULL THEN d.block_number ELSE NULL END AS block_number,
-                f.safe_block
+                f.safe_block,
+                b.nonce,
+                s.safe_input_index,
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.nonce ELSE NULL END AS op_nonce
             FROM valid_sequenced_l2_txs s
             LEFT JOIN user_ops u
               ON u.batch_index    = s.batch_index
@@ -56,6 +117,8 @@ impl Storage {
              AND f.frame_in_batch = s.frame_in_batch
             LEFT JOIN safe_inputs d
               ON d.safe_input_index = s.safe_input_index
+            LEFT JOIN batches b
+              ON b.batch_index = s.batch_index
             WHERE s.offset > ?1
             ORDER BY s.offset ASC
             LIMIT ?2
@@ -71,10 +134,27 @@ impl Storage {
                 row.get(5)?,
                 row.get(6)?,
             );
-            // Non-NULL for every sequenced row: the frames row is inserted
-            // when the frame opens, before anything is sequenced into it.
-            let frame_safe_block: i64 = row.get(7)?;
-            Ok((i64_to_u64(db_offset), tx, i64_to_u64(frame_safe_block)))
+            // Non-NULL for every sequenced row: batches and frames exist before
+            // anything can be sequenced into them.
+            let safe_block = i64_to_u64(row.get(7)?);
+            let batch_nonce = i64_to_u64(row.get(8)?);
+            match tx {
+                SequencedL2Tx::UserOp(tx) => Ok(OrderedL2TxRow::UserOp {
+                    offset: i64_to_u64(db_offset),
+                    tx,
+                    nonce: u32::try_from(row.get::<_, i64>(10)?)
+                        .expect("persisted user op nonce must fit u32"),
+                    safe_block,
+                    batch_nonce,
+                }),
+                SequencedL2Tx::Direct(tx) => Ok(OrderedL2TxRow::DirectInput {
+                    offset: i64_to_u64(db_offset),
+                    tx,
+                    input_index: i64_to_u64(row.get(9)?),
+                    safe_block,
+                    batch_nonce,
+                }),
+            }
         })?;
         rows.collect::<Result<Vec<_>>>()
     }

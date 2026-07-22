@@ -11,35 +11,43 @@ use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::test_helpers::temp_db;
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
-use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
+use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
 use sequencer_core::user_op::UserOp;
 
 #[test]
 fn broadcast_user_op_serializes_with_hex_data() {
-    let msg = BroadcastTxMessage::from_offset_and_tx(
+    let msg = BroadcastTxMessage::from_user_op(
         7,
-        SequencedL2Tx::UserOp(ValidUserOp {
+        ValidUserOp {
             sender: Address::from_slice(&[0x11; 20]),
             fee: 3,
             data: vec![0xaa, 0xbb],
-        }),
+        },
+        11,
+        1_234,
+        5,
     );
     let json = serde_json::to_string(&msg).expect("serialize");
     assert!(json.contains("\"kind\":\"user_op\""));
     assert!(json.contains("\"offset\":7"));
+    assert!(json.contains("\"nonce\":11"));
     assert!(json.contains("\"fee\":3"));
     assert!(json.contains("\"data\":\"0xaabb\""));
+    assert!(json.contains("\"safe_block\":1234"));
+    assert!(json.contains("\"batch_nonce\":5"));
 }
 
 #[test]
 fn broadcast_direct_input_serializes_with_hex_payload() {
-    let msg = BroadcastTxMessage::from_offset_and_tx(
+    let msg = BroadcastTxMessage::from_direct_input(
         9,
-        SequencedL2Tx::Direct(DirectInput {
+        DirectInput {
             sender: Address::ZERO,
             block_number: 42,
             payload: vec![0xcc, 0xdd],
-        }),
+        },
+        3,
+        5,
     );
     let json = serde_json::to_string(&msg).expect("serialize");
     assert!(json.contains("\"kind\":\"direct_input\""));
@@ -47,6 +55,8 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
     assert!(json.contains("\"sender\":\"0x0000000000000000000000000000000000000000\""));
     assert!(json.contains("\"block_number\":42"));
     assert!(json.contains("\"payload\":\"0xccdd\""));
+    assert!(json.contains("\"input_index\":3"));
+    assert!(json.contains("\"batch_nonce\":5"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -98,9 +108,25 @@ async fn subscription_replays_existing_rows_in_order() {
         .expect("wait second event")
         .expect("second event");
 
-    // DB offsets (SQLite rowid) start at 1.
-    assert_eq!(first.offset(), 1);
-    assert_eq!(second.offset(), 2);
+    assert!(matches!(
+        first,
+        BroadcastTxMessage::UserOp {
+            offset: 1,
+            nonce: 0,
+            safe_block: 0,
+            batch_nonce: 0,
+            ..
+        }
+    ));
+    assert!(matches!(
+        second,
+        BroadcastTxMessage::DirectInput {
+            offset: 2,
+            input_index: 0,
+            batch_nonce: 0,
+            ..
+        }
+    ));
 
     subscription.finish().await.expect("finish subscription");
 }

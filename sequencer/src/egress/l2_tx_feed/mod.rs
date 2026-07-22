@@ -14,11 +14,10 @@ pub use sequencer_core::broadcast::BroadcastTxMessage;
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use sequencer_core::l2_tx::SequencedL2Tx;
 use tokio::sync::mpsc;
 
 use crate::runtime::shutdown::ShutdownSignal;
-use crate::storage::Storage;
+use crate::storage::{OrderedL2TxRow, Storage};
 
 #[derive(Debug, Clone, Copy)]
 pub struct L2TxFeedConfig {
@@ -182,7 +181,7 @@ fn run_subscription(
         }
 
         let txs = storage
-            .ordered_l2_txs_page_from(next_offset, page_size)
+            .ordered_l2_tx_rows_page_from(next_offset, page_size)
             .map_err(|source| SubscriptionError::LoadReplay {
                 offset: next_offset,
                 source,
@@ -193,35 +192,36 @@ fn run_subscription(
             continue;
         }
 
-        // The frame safe_block (third element) is a replay-only concern;
-        // the WS message shape doesn't carry it (review F7/WP5 owns any
-        // feed-protocol extension).
-        for (db_offset, tx, _frame_safe_block) in txs {
+        for row in txs {
             if shutdown.is_shutdown_requested() || events_tx.is_closed() {
                 return Ok(());
             }
 
-            next_offset = db_offset;
-
-            if should_filter_from_broadcast(&tx, batch_submitter_address) {
-                continue;
-            }
-
-            let event = BroadcastTxMessage::from_offset_and_tx(db_offset, tx);
+            next_offset = row.offset();
+            let event = match row {
+                OrderedL2TxRow::UserOp {
+                    offset,
+                    tx,
+                    nonce,
+                    safe_block,
+                    batch_nonce,
+                } => BroadcastTxMessage::from_user_op(offset, tx, nonce, safe_block, batch_nonce),
+                OrderedL2TxRow::DirectInput {
+                    offset,
+                    tx,
+                    input_index,
+                    batch_nonce,
+                    ..
+                } => {
+                    if batch_submitter_address == Some(tx.sender) {
+                        continue;
+                    }
+                    BroadcastTxMessage::from_direct_input(offset, tx, input_index, batch_nonce)
+                }
+            };
             if events_tx.blocking_send(event).is_err() {
                 return Ok(());
             }
         }
     }
-}
-
-fn should_filter_from_broadcast(
-    tx: &SequencedL2Tx,
-    batch_submitter_address: Option<Address>,
-) -> bool {
-    matches!(
-        (tx, batch_submitter_address),
-        (SequencedL2Tx::Direct(direct), Some(batch_submitter_address))
-            if direct.sender == batch_submitter_address
-    )
 }
