@@ -2039,8 +2039,9 @@ mod schema_invariants {
         let db = temp_db("schema-safe-input-sender-len");
         let storage = Storage::open(db.path.as_str()).expect("open storage");
         let err = storage.conn.execute(
-            "INSERT INTO safe_inputs (safe_input_index, sender, payload, block_number) \
-                 VALUES (0, X'DEADBEEF', X'00', 10)",
+            "INSERT INTO safe_inputs \
+                 (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+                 VALUES (0, X'DEADBEEF', X'00', 10, 0, zeroblob(32))",
             [],
         );
         assert!(
@@ -2152,13 +2153,48 @@ mod schema_invariants {
         let storage = Storage::open(db.path.as_str()).expect("open storage");
         let sender = vec![0u8; 20];
         let err = storage.conn.execute(
-            "INSERT INTO safe_inputs (safe_input_index, sender, payload, block_number) \
-                 VALUES (0, ?1, X'00', -1)",
+            "INSERT INTO safe_inputs \
+                 (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+                 VALUES (0, ?1, X'00', -1, 0, zeroblob(32))",
             params![sender],
         );
         assert!(
             format!("{err:?}").contains("CHECK constraint failed"),
             "expected CHECK constraint error on block_number >= 0, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn schema_rejects_safe_input_with_negative_block_timestamp() {
+        let db = temp_db("schema-safe-input-neg-block-timestamp");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        let sender = vec![0u8; 20];
+        let err = storage.conn.execute(
+            "INSERT INTO safe_inputs \
+                 (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+                 VALUES (0, ?1, X'00', 10, -1, zeroblob(32))",
+            params![sender],
+        );
+        assert!(
+            format!("{err:?}").contains("CHECK constraint failed"),
+            "expected CHECK constraint error on block_timestamp >= 0, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn schema_rejects_safe_input_with_wrong_transaction_hash_length() {
+        let db = temp_db("schema-safe-input-transaction-hash-len");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        let sender = vec![0u8; 20];
+        let err = storage.conn.execute(
+            "INSERT INTO safe_inputs \
+                 (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+                 VALUES (0, ?1, X'00', 10, 0, X'DEADBEEF')",
+            params![sender],
+        );
+        assert!(
+            format!("{err:?}").contains("CHECK constraint failed"),
+            "expected CHECK constraint error on transaction_hash length, got: {err:?}",
         );
     }
 }
