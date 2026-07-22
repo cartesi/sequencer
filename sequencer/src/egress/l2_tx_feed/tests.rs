@@ -3,14 +3,14 @@
 
 use std::time::{Duration, SystemTime};
 
-use alloy_primitives::{Address, Signature};
+use alloy_primitives::{Address, B256, Signature};
 use tokio::sync::oneshot;
 
 use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError};
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::test_helpers::temp_db;
-use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+use crate::storage::{FrontierMode, IngestedSafeInput, SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
 use sequencer_core::user_op::UserOp;
 
@@ -48,6 +48,8 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
         },
         3,
         5,
+        1_700_000_000,
+        B256::repeat_byte(0xab),
     );
     let json = serde_json::to_string(&msg).expect("serialize");
     assert!(json.contains("\"kind\":\"direct_input\""));
@@ -57,6 +59,8 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
     assert!(json.contains("\"payload\":\"0xccdd\""));
     assert!(json.contains("\"input_index\":3"));
     assert!(json.contains("\"batch_nonce\":5"));
+    assert!(json.contains("\"block_timestamp\":1700000000"));
+    assert!(json.contains(&format!("\"transaction_hash\":\"0x{}\"", "ab".repeat(32))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -124,8 +128,10 @@ async fn subscription_replays_existing_rows_in_order() {
             offset: 2,
             input_index: 0,
             batch_nonce: 0,
+            block_timestamp: 1_700_000_000,
+            transaction_hash,
             ..
-        }
+        } if transaction_hash == B256::repeat_byte(0xcd).to_string()
     ));
 
     subscription.finish().await.expect("finish subscription");
@@ -383,12 +389,15 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
         .append_user_ops_chunk(&mut head, &[pending])
         .expect("append user-op chunk");
     storage
-        .append_safe_inputs(
+        .append_ingested_safe_inputs_with_timestamp(
             10,
-            &[StoredSafeInput {
+            10,
+            &[IngestedSafeInput {
                 sender: direct_sender,
                 payload: vec![0xaa],
                 block_number: 10,
+                block_timestamp: 1_700_000_000,
+                transaction_hash: B256::repeat_byte(0xcd),
             }],
             Address::ZERO,
             &sequencer_core::protocol::ProtocolTiming {
@@ -397,6 +406,7 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
                 l1_read_stale_after_blocks: 900,
                 seconds_per_block: 12,
             },
+            FrontierMode::Populate,
         )
         .expect("append direct input");
     storage

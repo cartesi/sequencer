@@ -211,12 +211,21 @@ fn run_subscription(
                     tx,
                     input_index,
                     batch_nonce,
+                    block_timestamp,
+                    transaction_hash,
                     ..
                 } => {
                     if batch_submitter_address == Some(tx.sender) {
                         continue;
                     }
-                    BroadcastTxMessage::from_direct_input(offset, tx, input_index, batch_nonce)
+                    BroadcastTxMessage::from_direct_input(
+                        offset,
+                        tx,
+                        input_index,
+                        batch_nonce,
+                        block_timestamp,
+                        transaction_hash,
+                    )
                 }
             };
             if events_tx.blocking_send(event).is_err() {

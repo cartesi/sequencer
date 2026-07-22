@@ -61,6 +61,16 @@ pub struct StoredSafeInput {
     pub block_number: u64,
 }
 
+/// One InputBox event with the L1 provenance persisted for feed consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IngestedSafeInput {
+    pub sender: alloy_primitives::Address,
+    pub payload: Vec<u8>,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub transaction_hash: alloy_primitives::B256,
+}
+
 /// Whether a sync also maintains the scheduler-accepted gold frontier
 /// (`safe_accepted_batches`).
 ///

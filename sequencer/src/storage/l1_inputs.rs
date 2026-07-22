@@ -7,7 +7,7 @@
 //! Also exposes the read-side queries the input reader and other callers need
 //! (current safe block, safe-input bounds, last safe-progress timestamp).
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use rusqlite::{OptionalExtension, Result, Transaction, params};
 
 use super::Storage;
@@ -17,8 +17,61 @@ use super::queries::{
     query_latest_safe_input_index_exclusive,
 };
 use super::safe_accepted_batches::populate_safe_accepted_batches;
-use super::{DeploymentIdentity, FrontierMode, StoredSafeInput};
+use super::{DeploymentIdentity, FrontierMode, IngestedSafeInput, StoredSafeInput};
 use sequencer_core::protocol::ProtocolTiming;
+
+trait SafeInputRecord {
+    fn sender(&self) -> Address;
+    fn payload(&self) -> &[u8];
+    fn block_number(&self) -> u64;
+    fn block_timestamp(&self) -> u64;
+    fn transaction_hash(&self) -> B256;
+}
+
+impl SafeInputRecord for StoredSafeInput {
+    fn sender(&self) -> Address {
+        self.sender
+    }
+
+    fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
+
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    // Synthetic storage fixtures do not model L1 provenance.
+    fn block_timestamp(&self) -> u64 {
+        0
+    }
+
+    fn transaction_hash(&self) -> B256 {
+        B256::ZERO
+    }
+}
+
+impl SafeInputRecord for IngestedSafeInput {
+    fn sender(&self) -> Address {
+        self.sender
+    }
+
+    fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
+
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    fn block_timestamp(&self) -> u64 {
+        self.block_timestamp
+    }
+
+    fn transaction_hash(&self) -> B256 {
+        self.transaction_hash
+    }
+}
 
 impl Storage {
     /// `MAX(safe_input_index) + 1` (or 0 if empty). The exclusive bound on the
@@ -146,9 +199,8 @@ impl Storage {
     }
 
     /// Same as [`Storage::append_safe_inputs`], but records the L1 timestamp
-    /// of `safe_block`. Production input-reader code should use this path;
-    /// the shorter helper exists for tests that only need a fresh synthetic
-    /// safe head.
+    /// of `safe_block`. Synthetic inputs receive zero provenance; production
+    /// input-reader code uses [`Storage::append_ingested_safe_inputs_with_timestamp`].
     ///
     /// `frontier` gates the `safe_accepted_batches` update — see
     /// [`FrontierMode`]. Everything except `setup --recovery`'s interim syncs
@@ -158,6 +210,46 @@ impl Storage {
         safe_block: u64,
         safe_block_timestamp: u64,
         inputs: &[StoredSafeInput],
+        batch_submitter: Address,
+        timing: &ProtocolTiming,
+        frontier: FrontierMode,
+    ) -> Result<()> {
+        self.append_safe_input_records_with_timestamp(
+            safe_block,
+            safe_block_timestamp,
+            inputs,
+            batch_submitter,
+            timing,
+            frontier,
+        )
+    }
+
+    /// Production input-reader path. Persists per-input L1 provenance together
+    /// with the safe-input row and safe-head advance.
+    pub(crate) fn append_ingested_safe_inputs_with_timestamp(
+        &mut self,
+        safe_block: u64,
+        safe_block_timestamp: u64,
+        inputs: &[IngestedSafeInput],
+        batch_submitter: Address,
+        timing: &ProtocolTiming,
+        frontier: FrontierMode,
+    ) -> Result<()> {
+        self.append_safe_input_records_with_timestamp(
+            safe_block,
+            safe_block_timestamp,
+            inputs,
+            batch_submitter,
+            timing,
+            frontier,
+        )
+    }
+
+    fn append_safe_input_records_with_timestamp<T: SafeInputRecord>(
+        &mut self,
+        safe_block: u64,
+        safe_block_timestamp: u64,
+        inputs: &[T],
         batch_submitter: Address,
         timing: &ProtocolTiming,
         frontier: FrontierMode,
@@ -312,24 +404,27 @@ fn query_deployment_identity(conn: &rusqlite::Connection) -> Result<Option<Deplo
     .optional()
 }
 
-fn insert_safe_inputs_batch(
+fn insert_safe_inputs_batch<T: SafeInputRecord>(
     tx: &Transaction<'_>,
     start_index: u64,
-    inputs: &[StoredSafeInput],
+    inputs: &[T],
 ) -> Result<()> {
     if inputs.is_empty() {
         return Ok(());
     }
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO safe_inputs (safe_input_index, sender, payload, block_number) \
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO safe_inputs \
+            (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for (offset, input) in inputs.iter().enumerate() {
         stmt.execute(params![
             u64_to_i64(start_index.saturating_add(offset as u64)),
-            input.sender.as_slice(),
-            input.payload.as_slice(),
-            u64_to_i64(input.block_number),
+            input.sender().as_slice(),
+            input.payload(),
+            u64_to_i64(input.block_number()),
+            u64_to_i64(input.block_timestamp()),
+            input.transaction_hash().as_slice(),
         ])?;
     }
     Ok(())

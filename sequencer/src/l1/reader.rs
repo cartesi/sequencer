@@ -20,7 +20,7 @@ use tracing::info;
 
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
 use crate::runtime::shutdown::ShutdownSignal;
-use crate::storage::{FrontierMode, Storage, StorageOpenError, StoredSafeInput};
+use crate::storage::{FrontierMode, IngestedSafeInput, Storage, StorageOpenError};
 use sequencer_core::protocol::ProtocolTiming;
 
 #[derive(Debug, Clone)]
@@ -290,6 +290,9 @@ impl InputReader {
             let block_number = log.block_number.ok_or_else(|| {
                 InputReaderError::Provider("InputAdded log missing block_number".to_string())
             })?;
+            let transaction_hash = log.transaction_hash.ok_or_else(|| {
+                InputReaderError::Provider("InputAdded log missing transaction_hash".to_string())
+            })?;
             let evm_advance = decode_evm_advance_input(event.input.as_ref())
                 .map_err(InputReaderError::Provider)?;
             assert_eq!(
@@ -298,11 +301,16 @@ impl InputReader {
                 "InputAdded block number mismatch: log={block_number}, payload={}",
                 evm_advance.blockNumber
             );
+            let block_timestamp = u64::try_from(evm_advance.blockTimestamp).map_err(|_| {
+                InputReaderError::Provider("EvmAdvance block timestamp exceeds u64".to_string())
+            })?;
 
-            batch.push(StoredSafeInput {
+            batch.push(IngestedSafeInput {
                 sender: evm_advance.msgSender,
                 payload: evm_advance.payload.into(),
                 block_number,
+                block_timestamp,
+                transaction_hash,
             });
         }
 
@@ -391,7 +399,7 @@ impl InputReader {
     async fn append_safe_inputs(
         &self,
         current_safe_head: SafeHead,
-        batch: Vec<StoredSafeInput>,
+        batch: Vec<IngestedSafeInput>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
         let batch_submitter = self.batch_submitter;
@@ -400,7 +408,7 @@ impl InputReader {
         tokio::task::spawn_blocking(move || {
             let mut storage = Storage::open(&db_path)?;
             storage
-                .append_safe_inputs_with_timestamp(
+                .append_ingested_safe_inputs_with_timestamp(
                     current_safe_head.block_number,
                     current_safe_head.block_timestamp,
                     &batch,

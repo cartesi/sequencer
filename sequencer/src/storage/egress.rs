@@ -7,7 +7,7 @@
 //! or counts over it. The view encapsulates the exclusion of invalidated batches
 //! so callers don't repeat the filter.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use rusqlite::{Result, params};
 
 use super::Storage;
@@ -31,6 +31,8 @@ pub(crate) enum OrderedL2TxRow {
         input_index: u64,
         safe_block: u64,
         batch_nonce: u64,
+        block_timestamp: u64,
+        transaction_hash: B256,
     },
 }
 
@@ -106,7 +108,9 @@ impl Storage {
                 f.safe_block,
                 b.nonce,
                 s.safe_input_index,
-                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.nonce ELSE NULL END AS op_nonce
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.nonce ELSE NULL END AS op_nonce,
+                CASE WHEN s.safe_input_index IS NOT NULL THEN d.block_timestamp  ELSE NULL END AS block_timestamp,
+                CASE WHEN s.safe_input_index IS NOT NULL THEN d.transaction_hash ELSE NULL END AS transaction_hash
             FROM valid_sequenced_l2_txs s
             LEFT JOIN user_ops u
               ON u.batch_index    = s.batch_index
@@ -153,6 +157,8 @@ impl Storage {
                     input_index: i64_to_u64(row.get(9)?),
                     safe_block,
                     batch_nonce,
+                    block_timestamp: i64_to_u64(row.get(11)?),
+                    transaction_hash: B256::from_slice(row.get::<_, Vec<u8>>(12)?.as_slice()),
                 }),
             }
         })?;
