@@ -251,7 +251,11 @@ CREATE TABLE IF NOT EXISTS safe_inputs (
     sender             BLOB NOT NULL CHECK (length(sender) = 20),
     payload            BLOB NOT NULL,
     -- Block number of the chain block where this direct input was included (e.g. InputAdded event block).
-    block_number       INTEGER NOT NULL CHECK (block_number >= 0)
+    block_number       INTEGER NOT NULL CHECK (block_number >= 0),
+    -- Timestamp of the carrying L1 block.
+    block_timestamp    INTEGER NOT NULL CHECK (block_timestamp >= 0),
+    -- Hash of the L1 transaction that carried this input.
+    transaction_hash   BLOB NOT NULL CHECK (length(transaction_hash) = 32)
 );
 
 CREATE INDEX IF NOT EXISTS idx_safe_inputs_sender

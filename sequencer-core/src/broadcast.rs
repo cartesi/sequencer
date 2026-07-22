@@ -34,6 +34,10 @@ pub enum BroadcastTxMessage {
         input_index: u64,
         /// Nonce of the batch that drained this direct input.
         batch_nonce: u64,
+        /// Unix timestamp, in seconds, of the L1 block containing this direct input.
+        block_timestamp: u64,
+        /// Hash of the L1 transaction that carried this direct input.
+        transaction_hash: String,
     },
 }
 
@@ -68,6 +72,8 @@ impl BroadcastTxMessage {
         direct: DirectInput,
         input_index: u64,
         batch_nonce: u64,
+        block_timestamp: u64,
+        transaction_hash: alloy_primitives::B256,
     ) -> Self {
         Self::DirectInput {
             offset,
@@ -76,6 +82,8 @@ impl BroadcastTxMessage {
             payload: alloy_primitives::hex::encode_prefixed(direct.payload.as_slice()),
             input_index,
             batch_nonce,
+            block_timestamp,
+            transaction_hash: alloy_primitives::hex::encode_prefixed(transaction_hash),
         }
     }
 }

@@ -156,6 +156,7 @@ Notes:
 - `from_offset` is optional and defaults to `0`.
 - messages are JSON text frames.
 - binary fields are hex-encoded (`0x`-prefixed).
+- direct-input `block_timestamp` values are Unix seconds.
 - the current runtime enforces a subscriber cap of `64` and a catch-up cap of `50000` events.
 - if the requested catch-up window exceeds that cap, the server upgrades and then immediately closes the socket with close code `1008` (`POLICY`) and reason `catch-up window exceeded: live_start_offset=<u64>`; reconnecting at that offset starts from the current live head.
 
@@ -166,7 +167,7 @@ Message shapes:
 ```
 
 ```json
-{ "kind": "direct_input", "offset": 11, "sender": "0x...", "block_number": 123, "payload": "0x...", "input_index": 42, "batch_nonce": 4 }
+{ "kind": "direct_input", "offset": 11, "sender": "0x...", "block_number": 123, "block_timestamp": 1700000000, "transaction_hash": "0x...", "payload": "0x...", "input_index": 42, "batch_nonce": 4 }
 ```
 
 Success response:
