@@ -55,19 +55,19 @@ pub(crate) fn apply_ws_message<A: Application>(
             })?;
         }
         WsTxMessage::UserOp {
-            sender, fee, data, ..
+            sender,
+            fee,
+            data,
+            safe_block,
+            ..
         } => {
-            // The WS feed does not carry the covering frame's safe_block
-            // yet (feed-protocol work, review F7/WP5), so the replayed
-            // app's safe-block clock lags the live one. Fine here: these
-            // replays assert balances/nonces, never the clock.
             app.execute_valid_user_op(
                 &ValidUserOp {
                     sender: decode_address(sender.as_str()),
                     fee,
                     data: decode_hex_prefixed(data.as_str()),
                 },
-                0,
+                safe_block,
             )?;
         }
     }

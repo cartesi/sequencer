@@ -44,6 +44,7 @@ pub(crate) mod test_helpers;
 use std::time::SystemTime;
 use thiserror::Error;
 
+pub(crate) use egress::OrderedL2TxRow;
 pub use open::Storage;
 pub use recovery::DangerStatus;
 pub use snapshot_dumps::{

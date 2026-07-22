@@ -237,7 +237,10 @@ async fn ws_subscribe_closes_when_catchup_window_exceeds_limit() {
                 close_frame.code,
                 tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
             );
-            assert_eq!(close_frame.reason, WS_CATCHUP_WINDOW_EXCEEDED_REASON);
+            assert_eq!(
+                close_frame.reason,
+                format!("{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset=2")
+            );
         }
         other => panic!("expected close frame for catch-up limit, got {other:?}"),
     }
@@ -562,6 +565,7 @@ fn assert_ws_message_matches_tx(
                 sender,
                 fee,
                 data,
+                ..
             },
             SequencedL2Tx::UserOp(expected),
         ) => {
@@ -579,6 +583,7 @@ fn assert_ws_message_matches_tx(
                 sender,
                 block_number,
                 payload,
+                ..
             },
             SequencedL2Tx::Direct(expected),
         ) => {

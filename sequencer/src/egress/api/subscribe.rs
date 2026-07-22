@@ -72,12 +72,10 @@ async fn run_ws_session(
                 max_catchup_events,
                 "ws catch-up window exceeded; closing subscriber"
             );
-            close_with_frame(
-                &mut socket,
-                close_code::POLICY,
-                WS_CATCHUP_WINDOW_EXCEEDED_REASON,
-            )
-            .await;
+            let reason = format!(
+                "{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset={live_start_offset}"
+            );
+            close_with_frame(&mut socket, close_code::POLICY, reason.as_str()).await;
             return;
         }
         Err(SubscribeError::OpenStorage { source }) => {
