@@ -38,6 +38,13 @@ const PROMOTION_POLL_ATTEMPTS: usize = 40;
 /// tick and the promoter room to run between mines.
 const PROMOTION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Poll budget for waiting until a landed batch reaches the reader's
+/// `safe_accepted_batches` frontier.
+const ACCEPTANCE_POLL_ATTEMPTS: usize = 40;
+
+/// Per-attempt pause while waiting for batch submission and safe-head ingestion.
+const ACCEPTANCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 // ── Zone-math constants for the outage-matrix and recovery tests ─────────
 //
 // These derive from the sequencer's default config so a change to
@@ -427,6 +434,20 @@ async fn mine_until_finalized_advances(
         format!("timed out waiting for finalized snapshot to advance past inclusion_block {floor}")
             .into(),
     )
+}
+
+async fn mine_until_batch_is_safe_accepted(
+    runtime: &ManagedSequencer,
+) -> ScenarioResult<(u64, Option<u64>)> {
+    for _ in 0..ACCEPTANCE_POLL_ATTEMPTS {
+        runtime.mine_l1_blocks(2).await?;
+        tokio::time::sleep(ACCEPTANCE_POLL_INTERVAL).await;
+        let accepted = runtime.count_safe_accepted_batches()?;
+        if accepted.0 > 0 {
+            return Ok(accepted);
+        }
+    }
+    Err("timed out waiting for a batch to reach safe_accepted_batches".into())
 }
 
 /// Close the open batch, land it on L1, and wait for snapshot promotion so
@@ -3576,21 +3597,9 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
         replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
     }
 
-    // Wait for the submitter to fire a tick + submit the batch. Anvil's
-    // instamine puts the submission at 1 confirmation; the submitter's
-    // `wait_for_confirmations` needs `confirmation_depth + 1 = 3`. We
-    // explicitly mine the remaining 2 blocks below to unblock it without
-    // having to wait the full 72s timeout.
-    tokio::time::sleep(Duration::from_secs(7)).await;
-    runtime.mine_l1_blocks(2).await?;
-
-    // After confirmations land, the submitter's tick loop continues:
-    // next iteration runs `refresh_recovery_metadata` →
-    // `populate_safe_accepted_batches`, which appends the batch
-    // to `safe_accepted_batches` at its expected nonce (0, reused).
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
-    let (accepted_count, min_accepted_nonce) = runtime.count_safe_accepted_batches()?;
+    // Mine and poll until submission, confirmation, and the input-reader sync
+    // have all completed. Fixed sleeps made this assertion race under CI load.
+    let (accepted_count, min_accepted_nonce) = mine_until_batch_is_safe_accepted(runtime).await?;
     assert!(
         accepted_count >= 1,
         "expected at least one batch to land in safe_accepted_batches \
