@@ -144,8 +144,10 @@ const DEFAULT_WS_MAX_SUBSCRIBERS: usize = 64;
 const DEFAULT_WS_MAX_CATCHUP_EVENTS: u64 = 50_000;
 const DEFAULT_MAX_BODY_BYTES: usize = TxRequest::MAX_JSON_BYTES_RECOMMENDED;
 
-/// Reason returned in the WS Close frame when the subscriber's requested
+/// Stable prefix of the WS Close-frame reason when the subscriber's requested
 /// `from_offset` is too old for the catch-up window to bridge.
+///
+/// The full reason is `{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset=<u64>`.
 pub const WS_CATCHUP_WINDOW_EXCEEDED_REASON: &str = "catch-up window exceeded";
 
 pub type ApiServerTask = tokio::task::JoinHandle<std::io::Result<()>>;

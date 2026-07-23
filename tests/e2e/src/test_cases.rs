@@ -715,6 +715,11 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
         },
         3,
     );
+    assert_eq!(
+        replay_after_restart.last_executed_safe_block(),
+        replay_before_restart.last_executed_safe_block(),
+        "mirror safe-block clock must match the pre-restart live replay clock",
+    );
     Ok(())
 }
 
@@ -3266,6 +3271,11 @@ async fn run_replay_matches_live_for_mixed_workload_test(
     assert_eq!(
         replay_post.executed_input_count(),
         replay_live.executed_input_count(),
+    );
+    assert_eq!(
+        replay_post.last_executed_safe_block(),
+        replay_live.last_executed_safe_block(),
+        "mirror safe-block clock must match the live replay clock",
     );
 
     Ok(())

@@ -21,6 +21,16 @@ impl ReplayWalletApp {
     }
 
     pub fn apply(&mut self, message: WsTxMessage) -> HarnessResult<()> {
+        if let WsTxMessage::UserOp { sender, nonce, .. } = &message {
+            let sender = decode_address(sender.as_str());
+            let expected = self.app.current_user_nonce(sender);
+            if *nonce != expected {
+                return Err(std::io::Error::other(format!(
+                    "WS user-op nonce mismatch for {sender}: expected {expected}, got {nonce}"
+                ))
+                .into());
+            }
+        }
         apply_ws_message(&mut self.app, message)
     }
 
@@ -34,6 +44,10 @@ impl ReplayWalletApp {
 
     pub fn executed_input_count(&self) -> u64 {
         self.app.executed_input_count()
+    }
+
+    pub fn last_executed_safe_block(&self) -> u64 {
+        self.app.last_executed_safe_block()
     }
 }
 

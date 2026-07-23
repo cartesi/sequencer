@@ -67,15 +67,16 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
 async fn subscribe_from_rejects_catchup_window() {
     let db = temp_db("catchup-window");
     seed_ordered_txs(db.path.as_str());
+    append_direct_input(db.path.as_str());
     let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
 
-    let result = feed.subscribe_from(0, 1);
+    let result = feed.subscribe_from(1, 1);
 
     assert!(matches!(
         result,
         Err(SubscribeError::CatchUpWindowExceeded {
-            requested_offset: 0,
-            live_start_offset: 2,
+            requested_offset: 1,
+            live_start_offset: 3,
             max_catchup_events: 1,
         })
     ));
@@ -116,9 +117,9 @@ async fn subscription_replays_existing_rows_in_order() {
         first,
         BroadcastTxMessage::UserOp {
             offset: 1,
-            nonce: 0,
-            safe_block: 0,
-            batch_nonce: 0,
+            nonce: 7,
+            safe_block: 123,
+            batch_nonce: 1,
             ..
         }
     ));
@@ -127,7 +128,7 @@ async fn subscription_replays_existing_rows_in_order() {
         BroadcastTxMessage::DirectInput {
             offset: 2,
             input_index: 0,
-            batch_nonce: 0,
+            batch_nonce: 1,
             block_timestamp: 1_700_000_000,
             transaction_hash,
             ..
@@ -367,8 +368,11 @@ fn seed_ordered_txs(db_path: &str) {
 fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
     let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .initialize_open_state(123, SafeInputRange::empty_at(0))
         .expect("initialize open state");
+    storage
+        .close_frame_and_batch(&mut head, 123)
+        .expect("advance to batch nonce 1");
 
     let (respond_to, _recv) = oneshot::channel::<Result<(), SequencerError>>();
     let pending = PendingUserOp {
@@ -376,7 +380,7 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
             sender: Address::from_slice(&[0x11; 20]),
             signature: Signature::test_signature(),
             user_op: UserOp {
-                nonce: 0,
+                nonce: 7,
                 max_fee: 3,
                 data: vec![0x42].into(),
             },
@@ -390,12 +394,12 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
         .expect("append user-op chunk");
     storage
         .append_ingested_safe_inputs_with_timestamp(
-            10,
-            10,
+            456,
+            456,
             &[IngestedSafeInput {
                 sender: direct_sender,
                 payload: vec![0xaa],
-                block_number: 10,
+                block_number: 456,
                 block_timestamp: 1_700_000_000,
                 transaction_hash: B256::repeat_byte(0xcd),
             }],
@@ -410,6 +414,38 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
         )
         .expect("append direct input");
     storage
-        .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
+        .close_frame_only(&mut head, 456, SafeInputRange::new(0, 1))
         .expect("close frame with one drained direct input");
+}
+
+fn append_direct_input(db_path: &str) {
+    let mut storage = Storage::open(db_path).expect("open storage");
+    let mut head = storage
+        .open_state()
+        .expect("load open state")
+        .expect("open state exists");
+    storage
+        .append_ingested_safe_inputs_with_timestamp(
+            789,
+            789,
+            &[IngestedSafeInput {
+                sender: Address::ZERO,
+                payload: vec![0xbb],
+                block_number: 789,
+                block_timestamp: 1_700_000_001,
+                transaction_hash: B256::repeat_byte(0xef),
+            }],
+            Address::ZERO,
+            &sequencer_core::protocol::ProtocolTiming {
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
+                seconds_per_block: 12,
+            },
+            FrontierMode::Populate,
+        )
+        .expect("append second direct input");
+    storage
+        .close_frame_only(&mut head, 789, SafeInputRange::new(1, 2))
+        .expect("close frame with second direct input");
 }
