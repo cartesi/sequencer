@@ -138,7 +138,7 @@ impl WalletApp {
         self.executed_input_count
     }
 
-    pub(crate) fn last_executed_safe_block(&self) -> u64 {
+    pub fn last_executed_safe_block(&self) -> u64 {
         self.last_executed_safe_block
     }
 

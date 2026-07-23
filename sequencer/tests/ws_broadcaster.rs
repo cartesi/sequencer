@@ -219,12 +219,13 @@ async fn ws_subscribe_rejects_when_subscriber_limit_is_reached() {
 async fn ws_subscribe_closes_when_catchup_window_exceeds_limit() {
     let db = temp_db("ws-catchup-limit");
     seed_ordered_txs(db.path.as_str());
+    append_drained_direct_input(db.path.as_str(), vec![0xbb]);
 
     let Some(runtime) = start_test_server_with_limits(db.path.as_str(), 64, 1).await else {
         return;
     };
 
-    let url = ws_subscribe_url(runtime.addr, 0);
+    let url = ws_subscribe_url(runtime.addr, 1);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
         .await
         .expect("timeout connecting websocket")
@@ -237,10 +238,18 @@ async fn ws_subscribe_closes_when_catchup_window_exceeds_limit() {
                 close_frame.code,
                 tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
             );
-            assert_eq!(
-                close_frame.reason,
-                format!("{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset=2")
+            let prefix = format!("{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset=");
+            let reason = close_frame.reason.as_str();
+            assert!(
+                reason.starts_with(WS_CATCHUP_WINDOW_EXCEEDED_REASON),
+                "close reason must retain the stable prefix: {reason}"
             );
+            let live_start_offset = reason
+                .strip_prefix(prefix.as_str())
+                .expect("close reason carries live_start_offset")
+                .parse::<u64>()
+                .expect("live_start_offset is a u64");
+            assert_eq!(live_start_offset, 3);
         }
         other => panic!("expected close frame for catch-up limit, got {other:?}"),
     }

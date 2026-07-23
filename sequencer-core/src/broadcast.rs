@@ -16,6 +16,8 @@ pub enum BroadcastTxMessage {
         offset: u64,
         sender: String,
         /// Signed replay-protection nonce of the user operation.
+        /// A mirror must apply the op under exactly this nonce; synthesizing
+        /// it from mirror state mis-executes ops across feed gaps.
         nonce: u32,
         /// Log-space fee exponent (base 129/128). See [`crate::fee`].
         fee: u16,
@@ -32,7 +34,9 @@ pub enum BroadcastTxMessage {
         payload: String,
         /// Per-application InputBox index of this direct input.
         input_index: u64,
-        /// Nonce of the batch that drained this direct input.
+        /// Nonce of the batch that drained this direct input. Lets a mirror
+        /// distinguish a direct already executed by the settled chain from one
+        /// still parked in its scheduler fridge (both have settled L1 inputs).
         batch_nonce: u64,
         /// Unix timestamp, in seconds, of the L1 block containing this direct input.
         block_timestamp: u64,
