@@ -116,6 +116,7 @@ pub struct KeyArgs {
     #[arg(
         long,
         env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
+        hide_env_values = true,
         group = "batch_submitter_key_source"
     )]
     batch_submitter_private_key: Option<String>,
@@ -123,6 +124,7 @@ pub struct KeyArgs {
     #[arg(
         long,
         env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
+        hide_env_values = true,
         group = "batch_submitter_key_source"
     )]
     batch_submitter_private_key_file: Option<String>,
@@ -167,10 +169,18 @@ fn resolve_key_source(
 #[derive(Debug, Clone, Args)]
 pub struct OptionalKeyArgs {
     /// Hex-encoded batch-submitter private key.
-    #[arg(long, env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY")]
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
+        hide_env_values = true
+    )]
     batch_submitter_private_key: Option<String>,
     /// Path to a file whose first line is the batch-submitter private key.
-    #[arg(long, env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE")]
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
+        hide_env_values = true
+    )]
     batch_submitter_private_key_file: Option<String>,
 }
 
@@ -204,7 +214,7 @@ impl OptionalKeyArgs {
 pub struct SetupConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
     pub data_dir: String,
-    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", value_parser = parse_non_empty_string)]
+    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", hide_env_values = true, value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
     /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
     /// private network (Docker/K8s service name, `host.docker.internal`, a
@@ -330,7 +340,7 @@ pub struct RunConfig {
     pub http_addr: String,
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
     pub data_dir: String,
-    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", value_parser = parse_non_empty_string)]
+    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", hide_env_values = true, value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
     /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
     /// private network (Docker/K8s service name, `host.docker.internal`, a
@@ -411,7 +421,7 @@ impl RunConfig {
 pub struct FlushConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
     pub data_dir: String,
-    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", value_parser = parse_non_empty_string)]
+    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", hide_env_values = true, value_parser = parse_non_empty_string)]
     pub eth_rpc_url: String,
     /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
     /// private network (Docker/K8s service name, `host.docker.internal`, a
@@ -664,6 +674,7 @@ mod tests {
             config.long_block_range_error_codes,
             vec![
                 "-32005".to_string(),
+                "-32012".to_string(),
                 "-32600".to_string(),
                 "-32602".to_string(),
                 "-32616".to_string()
@@ -725,6 +736,55 @@ mod tests {
                 || message.contains("l1_read_stale_after_blocks"),
             "error must name the offending field, got: {message}"
         );
+    }
+
+    /// Render the `--help` text for a subcommand and return it as a string.
+    fn render_help(args: &[&str]) -> String {
+        let err = Cli::try_parse_from(args).unwrap_err();
+        err.to_string()
+    }
+
+    #[test]
+    fn help_does_not_leak_private_key_value() {
+        let sentinel_key = "0xSENTINEL_PRIVATE_KEY_DEADBEEF1234567890abcdef";
+        let sentinel_rpc = "https://eth-mainnet.g.alchemy.com/v2/SECRET_TOKEN_XYZ";
+
+        unsafe {
+            std::env::set_var("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY", sentinel_key);
+            std::env::set_var(
+                "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
+                "/secret/path/key.pem",
+            );
+            std::env::set_var("CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", sentinel_rpc);
+        }
+
+        for subcmd in ["run", "setup", "flush-mempool"] {
+            let help = render_help(&["sequencer", subcmd, "--help"]);
+
+            assert!(
+                !help.contains(sentinel_key),
+                "{subcmd} --help must not print the private key value"
+            );
+            assert!(
+                !help.contains("/secret/path/key.pem"),
+                "{subcmd} --help must not print the key-file path"
+            );
+            assert!(
+                !help.contains("SECRET_TOKEN_XYZ"),
+                "{subcmd} --help must not print the RPC URL (may contain API tokens)"
+            );
+
+            assert!(
+                help.contains("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY"),
+                "{subcmd} --help should still mention the env var name"
+            );
+        }
+
+        unsafe {
+            std::env::remove_var("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY");
+            std::env::remove_var("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE");
+            std::env::remove_var("CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT");
+        }
     }
 
     #[test]

@@ -86,7 +86,7 @@ function config.load_init(env)
         retry_attempts = optional_number("CARTESI_WATCHDOG_RETRY_ATTEMPTS", 3, env),
         retry_delay_sec = optional_number("CARTESI_WATCHDOG_RETRY_DELAY_SEC", 5, env),
         long_block_range_error_codes = split_csv(
-            env.CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES or "-32005,-32600,-32602,-32616"
+            env.CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES or "-32005,-32012,-32600,-32602,-32616"
         ),
     }
 end
