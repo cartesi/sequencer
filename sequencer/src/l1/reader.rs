@@ -247,6 +247,45 @@ impl InputReader {
         }
 
         let start_block = scan_floor + 1;
+
+        // The F5 completeness witness, read *before* the scan rather than after
+        // it. The count is a historical read pinned to `current_safe_block`, so
+        // it is immutable for the rest of this tick and proves the same thing in
+        // either position — see `check_input_count_complete` below, which still
+        // consumes it.
+        //
+        // Reading it first buys the short-circuit underneath: when the InputBox
+        // says the app has exactly the inputs we already hold, no `InputAdded`
+        // for this app exists in `(scan_floor, current_safe_block]`, so the log
+        // query cannot return one. Skipping it is not an optimistic guess —
+        // `check_input_count_complete` would reject any event the scan produced
+        // in this state, so the two paths are equivalent by that invariant.
+        //
+        // What it saves is unbounded. `start_block` is the InputBox's own
+        // deployment block on the first sync, which on a chain forked for
+        // development sits far behind the fork point: 2.0M blocks on a Base
+        // Sepolia fork today, growing with the chain. Public RPCs cap
+        // `eth_getLogs` at a few thousand blocks, so the partition retry in
+        // `crate::l1::partition` bisects that range into ~1k leaves and issues
+        // them sequentially, spending minutes to prove an app deployed one block
+        // ago has no history. That is now one `eth_call`.
+        let expected_start = self.safe_input_end_exclusive().await?;
+        let onchain_count = input_count_at_block(
+            provider,
+            &self.input_box_address,
+            self.config.app_address,
+            current_safe_block,
+        )
+        .await?;
+        if onchain_count == expected_start {
+            info!(
+                block_range = %format!("{}..={}", start_block, current_safe_block),
+                count = 0,
+                "appending safe inputs (skipped scan, input count unchanged at safe block)"
+            );
+            return self.append_safe_inputs(current_safe_head, Vec::new()).await;
+        }
+
         // L1-01: the dense-index contiguity witness below requires L1 event
         // order. `get_input_added_events_ordered` guarantees it — a raw
         // `eth_getLogs` reorder would otherwise turn the check into a permanent
@@ -279,7 +318,7 @@ impl InputReader {
         // the provider returned an incomplete `get_logs` set (a clamped or
         // lagging-replica response), and advancing the safe head past a missing
         // input would let the scheduler force-drain it while we never saw it.
-        let expected_start = self.safe_input_end_exclusive().await?;
+        // `expected_start` is the one read above the scan.
         let mut batch = Vec::with_capacity(events.len());
         let mut onchain_indices = Vec::with_capacity(events.len());
         for (event, log) in events {
@@ -327,13 +366,7 @@ impl InputReader {
         // lane may have stamped frames past it (divergence). Pinning the count to
         // `current_safe_block` (not latest) keeps it consistent with the scanned
         // range and forces the serving node to actually have that block's state.
-        let onchain_count = input_count_at_block(
-            provider,
-            &self.input_box_address,
-            self.config.app_address,
-            current_safe_block,
-        )
-        .await?;
+        // `onchain_count` is the one read above the scan, at that same block.
         let received_total = expected_start.saturating_add(batch.len() as u64);
         check_input_count_complete(current_safe_block, received_total, onchain_count)?;
 
