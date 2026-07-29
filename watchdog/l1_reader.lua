@@ -9,6 +9,7 @@ l1_reader.INPUT_ADDED_TOPIC = "0xc05d337121a6e8605c6ec0b72aa29c4210ffe6e5b9cefdd
 
 l1_reader.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES = {
     "-32005",
+    "-32012",
     "-32600",
     "-32602",
     "-32616",

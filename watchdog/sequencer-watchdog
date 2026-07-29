@@ -11,15 +11,16 @@ fi
 lua_root="${CARTESI_WATCHDOG_LUA_ROOT:-/opt/watchdog/lua}"
 lua_bin="${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}"
 
-# Prefer deb-installed cartesi bindings under /usr/lib over stale /usr/local
-# copies left by an older manual install (same ordering as the cartesi-machine
-# wrapper shipped in machine-emulator_*.deb).
+# Append deb-installed cartesi bindings under /usr/lib as a fallback — they
+# must come *after* the container's own paths (set via Dockerfile ENV) so that
+# /opt/watchdog/lib/lcurl.so and other explicitly placed .so files are found
+# first. Prepending broke lcurl discovery in published container images.
 _cartesi_lua_cpath="/usr/lib/lua/5.4/?.so;/usr/lib/lua/5.4/?/init.so"
 _cartesi_lua_path="/usr/share/lua/5.4/?.lua;/usr/share/lua/5.4/?/init.lua"
-export LUA_CPATH="${_cartesi_lua_cpath};${LUA_CPATH:-;}"
-export LUA_PATH="${_cartesi_lua_path};${LUA_PATH:-;}"
-export LUA_CPATH_5_4="${_cartesi_lua_cpath};${LUA_CPATH_5_4:-;}"
-export LUA_PATH_5_4="${_cartesi_lua_path};${LUA_PATH_5_4:-;}"
+export LUA_CPATH="${LUA_CPATH:-;}${_cartesi_lua_cpath};;"
+export LUA_PATH="${LUA_PATH:-;}${_cartesi_lua_path};;"
+export LUA_CPATH_5_4="${LUA_CPATH_5_4:-;}${_cartesi_lua_cpath};;"
+export LUA_PATH_5_4="${LUA_PATH_5_4:-;}${_cartesi_lua_path};;"
 
 cd "${lua_root}"
 

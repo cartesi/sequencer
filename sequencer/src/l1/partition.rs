@@ -8,8 +8,10 @@
 //! This module is stateless: callers pass the retry error codes explicitly. There is no
 //! global mutable state; `RunConfig` owns the codes and passes them down via configs.
 
-/// Default RPC error codes that trigger partition retry (e.g. Infura -32005, Alchemy -32600/-32602, QuickNode -32616).
-pub const DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES: &[&str] = &["-32005", "-32600", "-32602", "-32616"];
+/// Default RPC error codes that trigger partition retry (e.g. Infura -32005,
+/// Alchemy -32600/-32602, QuickNode -32616, generic JSON-RPC proxies -32012).
+pub const DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES: &[&str] =
+    &["-32005", "-32012", "-32600", "-32602", "-32616"];
 
 use alloy::contract::Error as ContractError;
 use alloy::contract::Event;
@@ -371,6 +373,27 @@ mod tests {
             &["block range".to_string(), "timeout".to_string()]
         ));
         assert!(!error_message_matches_retry_codes("ok", &[]));
+    }
+
+    #[test]
+    fn default_codes_include_proxy_range_exceeded() {
+        assert!(
+            DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES.contains(&"-32012"),
+            "default codes must include -32012 (JSON-RPC proxy range limit)"
+        );
+    }
+
+    #[test]
+    fn proxy_range_exceeded_error_triggers_retry() {
+        let msg = r#"-32012: getLogs request exceeded max allowed range, data: {"code":"ErrGetLogsExceededMaxAllowedRange"}"#;
+        let codes: Vec<String> = DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect();
+        assert!(
+            error_message_matches_retry_codes(msg, &codes),
+            "proxy -32012 error must match retry codes"
+        );
     }
 
     #[test]

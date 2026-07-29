@@ -1,5 +1,5 @@
 {
-  "long_block_range_error_codes": ["-32005", "-32600", "-32602", "-32616"],
+  "long_block_range_error_codes": ["-32005", "-32012", "-32600", "-32602", "-32616"],
   "scenarios": [
     {
       "name": "bisect_on_default_infura_code",
@@ -63,6 +63,20 @@
         [3, 4],
         [5, 8]
       ],
+      "expect_ok": true
+    },
+    {
+      "name": "bisect_on_proxy_range_exceeded_code",
+      "start_block": 100,
+      "end_block": 200,
+      "fail_ranges": [
+        {
+          "from": 100,
+          "to": 200,
+          "message": "-32012: getLogs request exceeded max allowed range"
+        }
+      ],
+      "expect_calls": [[100, 200], [100, 150], [151, 200]],
       "expect_ok": true
     },
     {
