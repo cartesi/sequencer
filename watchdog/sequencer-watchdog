@@ -22,13 +22,18 @@ _cartesi_lua_path="/usr/share/lua/5.4/?.lua;/usr/share/lua/5.4/?/init.lua"
 
 # Strip trailing semicolons from $1, then append $2 with an explicit `;`,
 # and finish with `;;` so Lua still expands its defaults at the end.
+# Use `case` (not `[[ == *... ]]`) to trim - a semicolon inside `[[ ]]`
+# is a reserved `;;` token and is easy to mis-quote.
 join_lua_search_path() {
   local base="$1"
   local extra="$2"
-  while [[ "$base" == *'; ]]; do
-    base="${base%;}"
+  while true; do
+    case "$base" in
+      *";") base="${base%;}" ;;
+      *) break ;;
+    esac
   done
-  if [[ -z "$base" ]]; then
+  if [ -z "$base" ]; then
     printf '%s;;' "$extra"
   else
     printf '%s;%s;;' "$base" "$extra"
