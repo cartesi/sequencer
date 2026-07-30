@@ -3,7 +3,7 @@
 
 //! L1 client surface: reads InputBox events into storage (`reader`), submits
 //! batches back out (`submitter`), and shares L1 utilities (`provider`,
-//! `partition`).
+//! `partition` — range partition retry + count-guided scan).
 
 pub mod partition;
 pub mod provider;

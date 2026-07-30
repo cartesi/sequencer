@@ -1,9 +1,15 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Block-range partition retry: when a log query fails with a "long block range" RPC error,
-//! split the range in half and retry. Shared by the input reader (safe-head advancement)
-//! and the batch submitter (latest batch submitted scan).
+//! Block-range log fetch helpers for InputBox `InputAdded` events.
+//!
+//! - **Partition retry** — when a log query fails with a "long block range" RPC
+//!   error, split the range in half and retry. Shared by the input reader and
+//!   the batch submitter.
+//! - **Count-guided scan** — the reader's safe-head advancement path: use
+//!   `getNumberOfInputs` at range midpoints to skip empty spans before issuing
+//!   `eth_getLogs`, so a first sync over a multi-million-block fork does not
+//!   fan into thousands of empty leaf queries.
 //!
 //! This module is stateless: callers pass the retry error codes explicitly. There is no
 //! global mutable state; `RunConfig` owns the codes and passes them down via configs.
@@ -18,8 +24,15 @@ use alloy::sol_types::SolCall;
 use alloy::sol_types::SolEvent;
 use alloy_primitives::Address;
 use async_recursion::async_recursion;
+use cartesi_rollups_contracts::input_box::InputBox;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
+
+/// Max blocks per leaf `eth_getLogs` under the count-guided scanner.
+///
+/// Public RPCs typically cap far below 10k; 2048 keeps most leaves as a single
+/// query while the long-range partition retry still covers stricter providers.
+pub(crate) const COUNT_GUIDED_LOG_CHUNK_BLOCKS: u64 = 2_048;
 
 /// Fetch every `InputAdded` log for `app_address_filter`, splitting the range
 /// on RPC long-range errors. The result is in **RPC-return order** — partition
@@ -213,6 +226,195 @@ pub(crate) async fn get_input_added_events_ordered(
     Ok(events)
 }
 
+/// InputBox per-app input count pinned at `block` (historical `eth_call`).
+pub(crate) async fn get_number_of_inputs_at_block(
+    provider: &impl Provider,
+    input_box_address: &Address,
+    app_address: Address,
+    block: u64,
+) -> Result<u64, ContractError> {
+    let input_box = InputBox::new(*input_box_address, provider);
+    let count = input_box
+        .getNumberOfInputs(app_address)
+        .block(alloy::eips::BlockId::number(block))
+        .call()
+        .await?;
+    u64::try_from(count).map_err(|_| {
+        ContractError::TransportError(alloy::transports::RpcError::local_usage_str(
+            "InputBox getNumberOfInputs exceeds u64",
+        ))
+    })
+}
+
+/// Plan the `eth_getLogs` leaf ranges for a count-guided scan.
+///
+/// `count_before_start` is the app's input count at `start_block - 1` (the
+/// caller's already-ingested total). `count_at_end` is the count at
+/// `end_block`. Midpoint counts come from `count_at`. Empty spans
+/// (`count_at_end == count_before_start`) produce no ranges — the first-sync
+/// empty-history fast path. Spans larger than `chunk_blocks` bisect until each
+/// leaf either is empty or fits in one log query.
+///
+/// Returns `Err` if a count goes backwards (provider inconsistency).
+pub fn plan_count_guided_log_ranges<F>(
+    start_block: u64,
+    end_block: u64,
+    count_before_start: u64,
+    count_at_end: u64,
+    chunk_blocks: u64,
+    mut count_at: F,
+) -> Result<Vec<(u64, u64)>, String>
+where
+    F: FnMut(u64) -> u64,
+{
+    fn go<F>(
+        start_block: u64,
+        end_block: u64,
+        count_before_start: u64,
+        count_at_end: u64,
+        chunk_blocks: u64,
+        count_at: &mut F,
+    ) -> Result<Vec<(u64, u64)>, String>
+    where
+        F: FnMut(u64) -> u64,
+    {
+        if end_block < start_block {
+            return Ok(Vec::new());
+        }
+        if count_at_end < count_before_start {
+            return Err(format!(
+                "InputBox input count went backwards: count at {end_block} is {count_at_end}, \
+                 but count before {start_block} is {count_before_start}"
+            ));
+        }
+        if count_at_end == count_before_start {
+            return Ok(Vec::new());
+        }
+        let span = end_block - start_block + 1;
+        if span <= chunk_blocks {
+            return Ok(vec![(start_block, end_block)]);
+        }
+        let mid = start_block + (end_block - start_block) / 2;
+        let count_mid = count_at(mid);
+        let mut left = go(
+            start_block,
+            mid,
+            count_before_start,
+            count_mid,
+            chunk_blocks,
+            count_at,
+        )?;
+        let right = go(
+            mid + 1,
+            end_block,
+            count_mid,
+            count_at_end,
+            chunk_blocks,
+            count_at,
+        )?;
+        left.extend(right);
+        Ok(left)
+    }
+
+    go(
+        start_block,
+        end_block,
+        count_before_start,
+        count_at_end,
+        chunk_blocks.max(1),
+        &mut count_at,
+    )
+}
+
+/// Fetch `InputAdded` logs for `app_address_filter` over `[start_block, end_block]`,
+/// skipping empty subranges via count midpoints and issuing partitioned ordered
+/// log queries only on non-empty leaves (see [`plan_count_guided_log_ranges`]).
+///
+/// `count_before_start` / `count_at_end` are the InputBox counts at
+/// `start_block - 1` and `end_block`. Callers that already hold `count_at_end`
+/// (the F5 completeness witness) pass it through so the end-block read is not
+/// repeated.
+#[async_recursion]
+#[allow(clippy::too_many_arguments)] // mirrors get_input_added_events_ordered + count bounds
+pub(crate) async fn get_input_added_events_count_guided(
+    provider: &impl Provider,
+    app_address_filter: Address,
+    input_box_address: &Address,
+    start_block: u64,
+    end_block: u64,
+    count_before_start: u64,
+    count_at_end: u64,
+    long_block_range_error_codes: &[String],
+) -> Result<Vec<(InputAdded, alloy::rpc::types::Log)>, Vec<ContractError>> {
+    if end_block < start_block {
+        return Ok(Vec::new());
+    }
+    if count_at_end < count_before_start {
+        return Err(vec![ContractError::TransportError(
+            alloy::transports::RpcError::local_usage_str(&format!(
+                "InputBox input count went backwards: count at {end_block} is {count_at_end}, \
+                 but count before {start_block} is {count_before_start}"
+            )),
+        )]);
+    }
+    if count_at_end == count_before_start {
+        return Ok(Vec::new());
+    }
+    let span = end_block - start_block + 1;
+    if span <= COUNT_GUIDED_LOG_CHUNK_BLOCKS {
+        return get_input_added_events_ordered(
+            provider,
+            app_address_filter,
+            input_box_address,
+            start_block,
+            end_block,
+            long_block_range_error_codes,
+        )
+        .await;
+    }
+    let mid = start_block + (end_block - start_block) / 2;
+    let count_mid =
+        match get_number_of_inputs_at_block(provider, input_box_address, app_address_filter, mid)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return Err(vec![e]),
+        };
+    let first = get_input_added_events_count_guided(
+        provider,
+        app_address_filter,
+        input_box_address,
+        start_block,
+        mid,
+        count_before_start,
+        count_mid,
+        long_block_range_error_codes,
+    )
+    .await;
+    let second = get_input_added_events_count_guided(
+        provider,
+        app_address_filter,
+        input_box_address,
+        mid + 1,
+        end_block,
+        count_mid,
+        count_at_end,
+        long_block_range_error_codes,
+    )
+    .await;
+    match (first, second) {
+        (Ok(mut a), Ok(b)) => {
+            a.extend(b);
+            Ok(a)
+        }
+        (Err(mut a), Err(b)) => {
+            a.extend(b);
+            Err(a)
+        }
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
+}
+
 pub fn decode_evm_advance_input(input: &[u8]) -> Result<EvmAdvanceCall, String> {
     EvmAdvanceCall::abi_decode(input).map_err(|err| err.to_string())
 }
@@ -227,8 +429,9 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES, decode_evm_advance_input,
-        error_message_matches_retry_codes, simulate_partitioned_get_logs, sort_logs_by_l1_order,
+        COUNT_GUIDED_LOG_CHUNK_BLOCKS, DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
+        decode_evm_advance_input, error_message_matches_retry_codes, plan_count_guided_log_ranges,
+        simulate_partitioned_get_logs, sort_logs_by_l1_order,
     };
 
     const PARTITION_VECTOR: &str = include_str!(concat!(
@@ -394,5 +597,154 @@ mod tests {
         );
         assert_eq!(decoded.blockNumber, U256::from(99_u64));
         assert_eq!(decoded.payload.as_ref(), &[0xaa, 0xbb]);
+    }
+
+    /// Monotonic count oracle: `count(b)` = number of input blocks `≤ b`.
+    fn count_at_from_input_blocks(input_blocks: &[u64]) -> impl Fn(u64) -> u64 + '_ {
+        move |block| {
+            input_blocks
+                .iter()
+                .filter(|&&input_block| input_block <= block)
+                .count() as u64
+        }
+    }
+
+    fn assert_ranges_cover_inputs(ranges: &[(u64, u64)], input_blocks: &[u64]) {
+        for &input_block in input_blocks {
+            assert!(
+                ranges
+                    .iter()
+                    .any(|&(from, to)| from <= input_block && input_block <= to),
+                "input at block {input_block} not covered by ranges {ranges:?}"
+            );
+        }
+    }
+
+    fn assert_ranges_have_count_delta(ranges: &[(u64, u64)], input_blocks: &[u64]) {
+        let count_at = count_at_from_input_blocks(input_blocks);
+        for &(from, to) in ranges {
+            let before = if from == 0 { 0 } else { count_at(from - 1) };
+            assert!(
+                count_at(to) > before,
+                "range {from}..={to} has no count delta"
+            );
+        }
+    }
+
+    #[test]
+    fn count_guided_skips_empty_multi_million_block_range() {
+        let start = 1_u64;
+        let end = 2_000_000_u64;
+        let ranges =
+            plan_count_guided_log_ranges(start, end, 0, 0, COUNT_GUIDED_LOG_CHUNK_BLOCKS, |_| 0)
+                .expect("plan");
+        assert!(ranges.is_empty(), "empty history must issue no getLogs");
+    }
+
+    #[test]
+    fn count_guided_covers_single_sparse_input() {
+        let input_blocks = [1_000_000_u64];
+        let start = 1_u64;
+        let end = 2_000_000_u64;
+        let count_at = count_at_from_input_blocks(&input_blocks);
+        let ranges = plan_count_guided_log_ranges(
+            start,
+            end,
+            0,
+            count_at(end),
+            COUNT_GUIDED_LOG_CHUNK_BLOCKS,
+            count_at,
+        )
+        .expect("plan");
+        assert_eq!(ranges.len(), 1, "one sparse input → one leaf: {ranges:?}");
+        assert!(
+            ranges[0].1 - ranges[0].0 + 1 <= COUNT_GUIDED_LOG_CHUNK_BLOCKS,
+            "leaf must fit chunk"
+        );
+        assert_ranges_cover_inputs(&ranges, &input_blocks);
+        assert_ranges_have_count_delta(&ranges, &input_blocks);
+    }
+
+    #[test]
+    fn count_guided_covers_inputs_at_opposite_ends() {
+        let input_blocks = [10_u64, 1_900_000_u64];
+        let start = 1_u64;
+        let end = 2_000_000_u64;
+        let count_at = count_at_from_input_blocks(&input_blocks);
+        let ranges = plan_count_guided_log_ranges(
+            start,
+            end,
+            0,
+            count_at(end),
+            COUNT_GUIDED_LOG_CHUNK_BLOCKS,
+            count_at,
+        )
+        .expect("plan");
+        assert_eq!(
+            ranges.len(),
+            2,
+            "two distant inputs → two leaves: {ranges:?}"
+        );
+        assert_ranges_cover_inputs(&ranges, &input_blocks);
+        assert_ranges_have_count_delta(&ranges, &input_blocks);
+    }
+
+    #[test]
+    fn count_guided_same_block_cluster_is_one_leaf() {
+        // Three inputs in one block → count jumps by 3; still one leaf.
+        let input_blocks = [50_000_u64, 50_000, 50_000];
+        let start = 1_u64;
+        let end = 100_000_u64;
+        let count_at = count_at_from_input_blocks(&input_blocks);
+        // Distinct oracle blocks for coverage check:
+        let distinct = [50_000_u64];
+        let ranges =
+            plan_count_guided_log_ranges(start, end, 0, 3, COUNT_GUIDED_LOG_CHUNK_BLOCKS, count_at)
+                .expect("plan");
+        assert_eq!(ranges.len(), 1, "same-block cluster → one leaf: {ranges:?}");
+        assert_ranges_cover_inputs(&ranges, &distinct);
+    }
+
+    #[test]
+    fn count_guided_small_range_is_single_leaf_without_bisect() {
+        let input_blocks = [5_u64, 8];
+        let start = 1_u64;
+        let end = 10_u64;
+        let count_at = count_at_from_input_blocks(&input_blocks);
+        let ranges =
+            plan_count_guided_log_ranges(start, end, 0, 2, COUNT_GUIDED_LOG_CHUNK_BLOCKS, count_at)
+                .expect("plan");
+        assert_eq!(ranges, vec![(1, 10)]);
+    }
+
+    #[test]
+    fn count_guided_rejects_backwards_count() {
+        let err = plan_count_guided_log_ranges(1, 100, 5, 3, COUNT_GUIDED_LOG_CHUNK_BLOCKS, |_| 3)
+            .expect_err("backwards count");
+        assert!(err.contains("went backwards"), "{err}");
+    }
+
+    #[test]
+    fn count_guided_partial_catchup_skips_already_ingested_prefix() {
+        // Already hold 2 inputs (at blocks 10 and 20); a third lands at 90_000.
+        let all_inputs = [10_u64, 20, 90_000];
+        let start = 21_u64;
+        let end = 100_000_u64;
+        let count_at = count_at_from_input_blocks(&all_inputs);
+        let ranges = plan_count_guided_log_ranges(
+            start,
+            end,
+            2,
+            count_at(end),
+            COUNT_GUIDED_LOG_CHUNK_BLOCKS,
+            count_at,
+        )
+        .expect("plan");
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert_ranges_cover_inputs(&ranges, &[90_000]);
+        assert!(
+            ranges.iter().all(|&(from, _)| from >= start),
+            "must not re-scan before start: {ranges:?}"
+        );
     }
 }

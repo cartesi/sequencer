@@ -18,7 +18,9 @@ use cartesi_rollups_contracts::input_box::InputBox;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
+use crate::l1::partition::{
+    decode_evm_advance_input, get_input_added_events_count_guided, get_number_of_inputs_at_block,
+};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{FrontierMode, IngestedSafeInput, Storage, StorageOpenError};
 use sequencer_core::protocol::ProtocolTiming;
@@ -247,17 +249,38 @@ impl InputReader {
         }
 
         let start_block = scan_floor + 1;
+
+        // F5 completeness witness, read *before* the scan. The count is a
+        // historical read pinned to `current_safe_block`, so it is immutable for
+        // the rest of this tick. Reading it first feeds the count-guided scanner:
+        // when the InputBox says the app has exactly the inputs we already hold,
+        // the scan issues no `eth_getLogs` (empty-history first sync over a
+        // multi-million-block fork becomes one `eth_call`). Contiguity below
+        // still guards the non-empty path; this same count is the completeness
+        // witness after the scan.
+        let expected_start = self.safe_input_end_exclusive().await?;
+        let onchain_count = get_number_of_inputs_at_block(
+            provider,
+            &self.input_box_address,
+            self.config.app_address,
+            current_safe_block,
+        )
+        .await
+        .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+
         // L1-01: the dense-index contiguity witness below requires L1 event
-        // order. `get_input_added_events_ordered` guarantees it — a raw
-        // `eth_getLogs` reorder would otherwise turn the check into a permanent
-        // retry loop. The InputBox `index` is monotonic with L1 order, so the
-        // sorted stream aligns `onchain_indices` with `expected_start + i`.
-        let events = get_input_added_events_ordered(
+        // order. `get_input_added_events_count_guided` returns logs in L1 order
+        // (via the ordered partition leaf fetcher). The InputBox `index` is
+        // monotonic with L1 order, so the sorted stream aligns
+        // `onchain_indices` with `expected_start + i`.
+        let events = get_input_added_events_count_guided(
             provider,
             self.config.app_address,
             &self.input_box_address,
             start_block,
             current_safe_block,
+            expected_start,
+            onchain_count,
             self.config.long_block_range_error_codes.as_slice(),
         )
         .await
@@ -279,7 +302,7 @@ impl InputReader {
         // the provider returned an incomplete `get_logs` set (a clamped or
         // lagging-replica response), and advancing the safe head past a missing
         // input would let the scheduler force-drain it while we never saw it.
-        let expected_start = self.safe_input_end_exclusive().await?;
+        // `expected_start` is the one read above the scan.
         let mut batch = Vec::with_capacity(events.len());
         let mut onchain_indices = Vec::with_capacity(events.len());
         for (event, log) in events {
@@ -327,13 +350,7 @@ impl InputReader {
         // lane may have stamped frames past it (divergence). Pinning the count to
         // `current_safe_block` (not latest) keeps it consistent with the scanned
         // range and forces the serving node to actually have that block's state.
-        let onchain_count = input_count_at_block(
-            provider,
-            &self.input_box_address,
-            self.config.app_address,
-            current_safe_block,
-        )
-        .await?;
+        // `onchain_count` is the one read above the scan, at that same block.
         let received_total = expected_start.saturating_add(batch.len() as u64);
         check_input_count_complete(current_safe_block, received_total, onchain_count)?;
 
@@ -501,28 +518,6 @@ fn check_input_count_complete(
         )));
     }
     Ok(())
-}
-
-/// The InputBox's per-app input count, pinned at `block`. Used as the F5
-/// completeness witness — see [`check_input_count_complete`]. Pinning to the
-/// scanned safe block (not `latest`) keeps it consistent with the `get_logs`
-/// range and forces the serving node to have that block's state.
-async fn input_count_at_block(
-    provider: &impl Provider,
-    input_box_address: &Address,
-    app_address: Address,
-    block: u64,
-) -> Result<u64, InputReaderError> {
-    let input_box = InputBox::new(*input_box_address, provider);
-    let count = input_box
-        .getNumberOfInputs(app_address)
-        .block(alloy::eips::BlockId::number(block))
-        .call()
-        .await
-        .map_err(|e| InputReaderError::Provider(e.to_string()))?;
-    u64::try_from(count).map_err(|_| {
-        InputReaderError::Provider("InputBox getNumberOfInputs exceeds u64".to_string())
-    })
 }
 
 async fn latest_safe_head(provider: &impl Provider) -> Result<SafeHead, InputReaderError> {
