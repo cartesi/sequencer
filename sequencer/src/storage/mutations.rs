@@ -12,16 +12,16 @@ use rusqlite::{Connection, Result, Transaction, params};
 use super::SafeInputRange;
 use super::convert::{i64_to_u64, u64_to_i64};
 
-/// Insert a new batch. Nonce is derived from `parent_batch_index`:
-/// `parent.nonce + 1`, or 0 if `parent_batch_index` is None (genesis or
-/// post-cascade torn-state new Tip).
+/// Insert a new batch. Its nonce and executed-input boundary are derived from
+/// `parent_batch_index`, or from their deployment anchors for a parentless
+/// root.
 ///
 /// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
 /// The explicit form is used only by `initialize_open_state` to pin the
 /// very first genesis batch at `batch_index = 0`.
 ///
-/// The `trg_enforce_nonce_contiguity` trigger verifies the nonce matches
-/// `parent.nonce + 1`, so caller and schema agree.
+/// The `trg_enforce_nonce_contiguity` trigger verifies both structural values,
+/// so caller and schema agree.
 pub(super) fn insert_new_batch(
     tx: &Transaction<'_>,
     batch_index_opt: Option<u64>,
@@ -29,15 +29,20 @@ pub(super) fn insert_new_batch(
     created_at_ms: i64,
 ) -> Result<u64> {
     let nonce = compute_next_nonce(tx, parent_batch_index)?;
+    let executed_input_count_before =
+        compute_next_executed_input_count_before(tx, parent_batch_index)?;
     match batch_index_opt {
         Some(bi) => {
             tx.execute(
-                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO batches (
+                    batch_index, parent_batch_index, nonce,
+                    executed_input_count_before, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     u64_to_i64(bi),
                     parent_batch_index.map(u64_to_i64),
                     u64_to_i64(nonce),
+                    u64_to_i64(executed_input_count_before),
                     created_at_ms
                 ],
             )?;
@@ -45,17 +50,48 @@ pub(super) fn insert_new_batch(
         }
         None => {
             tx.execute(
-                "INSERT INTO batches (parent_batch_index, nonce, created_at_ms) \
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO batches (
+                    parent_batch_index, nonce,
+                    executed_input_count_before, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     parent_batch_index.map(u64_to_i64),
                     u64_to_i64(nonce),
+                    u64_to_i64(executed_input_count_before),
                     created_at_ms
                 ],
             )?;
             Ok(i64_to_u64(tx.last_insert_rowid()))
         }
     }
+}
+
+fn compute_next_executed_input_count_before(
+    tx: &Transaction<'_>,
+    parent_batch_index: Option<u64>,
+) -> Result<u64> {
+    let Some(parent_batch_index) = parent_batch_index else {
+        let value: i64 = tx.query_row(
+            "SELECT root_executed_input_count_before \
+             FROM l2_feed_anchor WHERE singleton_id = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        return Ok(i64_to_u64(value));
+    };
+
+    let (parent_start, parent_inputs): (i64, i64) = tx.query_row(
+        "SELECT b.executed_input_count_before, COUNT(app_tx.offset) \
+         FROM batches b \
+         LEFT JOIN valid_application_l2_txs app_tx \
+           ON app_tx.batch_index = b.batch_index \
+         WHERE b.batch_index = ?1",
+        params![u64_to_i64(parent_batch_index)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(i64_to_u64(parent_start)
+        .checked_add(i64_to_u64(parent_inputs))
+        .expect("executed input count overflow"))
 }
 
 fn compute_next_nonce(tx: &Transaction<'_>, parent_batch_index: Option<u64>) -> Result<u64> {
@@ -153,6 +189,30 @@ pub(super) fn batch_tree_anchor_in(conn: &Connection) -> Result<u64> {
         |row| row.get(0),
     )?;
     Ok(i64_to_u64(anchor))
+}
+
+pub(super) fn set_l2_feed_anchor_in(
+    tx: &Transaction<'_>,
+    minimum_executed_input_count: u64,
+    root_executed_input_count_before: u64,
+    l2_tx_offset: u64,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE l2_feed_anchor \
+         SET minimum_executed_input_count = ?1, \
+             root_executed_input_count_before = ?2, \
+             l2_tx_offset = ?3 \
+         WHERE singleton_id = 0",
+        params![
+            u64_to_i64(minimum_executed_input_count),
+            u64_to_i64(root_executed_input_count_before),
+            u64_to_i64(l2_tx_offset),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::StatementChangedRows(changed));
+    }
+    Ok(())
 }
 
 /// Insert one `sequenced_l2_txs` row per safe-input index in `range` for the

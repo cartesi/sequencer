@@ -32,10 +32,15 @@
 -- L1 landing against — and because it is computed by the code that sealed
 -- the batch, it survives wire-format upgrades. NULL only while the batch is
 -- the open Tip (and on recovery sentinels, which carry no payload).
+-- `executed_input_count_before` is the application's logical input count at
+-- the batch boundary. It is structural like `nonce`: children inherit their
+-- parent's boundary plus the application inputs in the parent, while a
+-- parentless root reads its boundary from `l2_feed_anchor`.
 CREATE TABLE IF NOT EXISTS batches (
     batch_index        INTEGER PRIMARY KEY,
     parent_batch_index INTEGER REFERENCES batches(batch_index),  -- NULL only for genesis
     nonce              INTEGER NOT NULL CHECK (nonce >= 0),
+    executed_input_count_before INTEGER NOT NULL CHECK (executed_input_count_before >= 0),
     created_at_ms      INTEGER NOT NULL,
     sealed_at_ms       INTEGER CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= 0),
     invalidated_at_ms  INTEGER CHECK (invalidated_at_ms IS NULL OR invalidated_at_ms >= 0),
@@ -57,6 +62,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_single_valid_tip
 CREATE INDEX IF NOT EXISTS idx_batches_valid_closed_by_nonce
     ON batches(nonce)
     WHERE invalidated_at_ms IS NULL AND sealed_at_ms IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_batches_valid_by_executed_input_count
+    ON batches(executed_input_count_before, batch_index)
+    WHERE invalidated_at_ms IS NULL;
 
 -- ── Views ──────────────────────────────────────────────────────────────────
 CREATE VIEW IF NOT EXISTS valid_batches AS
@@ -89,6 +98,28 @@ CREATE TABLE IF NOT EXISTS batch_tree_anchor (
 );
 INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
 
+-- Logical application-input anchor for the WS feed.
+--
+-- Normal deployments use (minimum=0, root-before=0, offset=0). Cockroach
+-- recovery collapses earlier history, so setup moves this anchor to S':
+-- `minimum_executed_input_count` is S'.executed_input_count,
+-- `root_executed_input_count_before` backs up over the visible directs used
+-- as recovery-root cursor padding, and `l2_tx_offset` points after that
+-- already-applied prefix. Requests below the minimum are unreplayable.
+CREATE TABLE IF NOT EXISTS l2_feed_anchor (
+    singleton_id                     INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    minimum_executed_input_count     INTEGER NOT NULL CHECK (minimum_executed_input_count >= 0),
+    root_executed_input_count_before INTEGER NOT NULL CHECK (root_executed_input_count_before >= 0),
+    l2_tx_offset                     INTEGER NOT NULL CHECK (l2_tx_offset >= 0),
+    CHECK (root_executed_input_count_before <= minimum_executed_input_count)
+);
+INSERT OR IGNORE INTO l2_feed_anchor(
+    singleton_id,
+    minimum_executed_input_count,
+    root_executed_input_count_before,
+    l2_tx_offset
+) VALUES (0, 0, 0, 0);
+
 -- ── Triggers ───────────────────────────────────────────────────────────────
 --
 -- These enforce invariants the writer could otherwise violate with a bug.
@@ -97,8 +128,10 @@ INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
 -- transition sequence — triggers just ensure the DB never reaches an
 -- inconsistent state if the writer misbehaves.
 
--- Nonce contiguity: `nonce = parent.nonce + 1`, or the batch-tree anchor nonce
--- (0 for a genesis deployment, N' for a recovered one) for the parentless root.
+-- Batch-tree contiguity: nonce and application-input boundaries both inherit
+-- structurally from the parent, or from their deployment anchors at the root.
+-- Keep the original trigger name: protocol/recovery documentation cites it as
+-- the schema tripwire for the valid batch spine.
 CREATE TRIGGER IF NOT EXISTS trg_enforce_nonce_contiguity
 AFTER INSERT ON batches
 FOR EACH ROW
@@ -123,6 +156,22 @@ BEGIN
         WHEN NEW.parent_batch_index IS NOT NULL
          AND NEW.nonce != (SELECT nonce + 1 FROM batches WHERE batch_index = NEW.parent_batch_index)
             THEN RAISE(ABORT, 'batch nonce must equal parent.nonce + 1')
+        WHEN NEW.parent_batch_index IS NULL
+         AND NEW.executed_input_count_before != (
+             SELECT root_executed_input_count_before
+             FROM l2_feed_anchor
+             WHERE singleton_id = 0
+         )
+            THEN RAISE(ABORT, 'parentless root must carry the L2-feed execution anchor')
+        WHEN NEW.parent_batch_index IS NOT NULL
+         AND NEW.executed_input_count_before != (
+             SELECT parent.executed_input_count_before + COUNT(app_tx.offset)
+             FROM batches parent
+             LEFT JOIN valid_application_l2_txs app_tx
+               ON app_tx.batch_index = parent.batch_index
+             WHERE parent.batch_index = NEW.parent_batch_index
+         )
+            THEN RAISE(ABORT, 'batch executed-input boundary must follow parent content')
     END;
 END;
 
@@ -172,6 +221,14 @@ FOR EACH ROW
 WHEN OLD.nonce != NEW.nonce
 BEGIN
     SELECT RAISE(ABORT, 'nonce is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_executed_input_count_before_immutable
+BEFORE UPDATE OF executed_input_count_before ON batches
+FOR EACH ROW
+WHEN OLD.executed_input_count_before != NEW.executed_input_count_before
+BEGIN
+    SELECT RAISE(ABORT, 'executed_input_count_before is immutable');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -384,6 +441,23 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
     batch_submitter_address   BLOB    NOT NULL CHECK (length(batch_submitter_address) = 20)
 );
 
+-- Application-executed subset of the valid flattened log. Inputs sent by the
+-- batch submitter are batch payloads, not directs (I11), and therefore do not
+-- advance Application::executed_input_count.
+CREATE VIEW IF NOT EXISTS valid_application_l2_txs AS
+SELECT s.*
+FROM valid_sequenced_l2_txs s
+WHERE NOT (
+    s.safe_input_index IS NOT NULL
+    AND EXISTS (
+        SELECT 1
+        FROM safe_inputs si
+        JOIN deployment_identity di ON di.singleton_id = 0
+        WHERE si.safe_input_index = s.safe_input_index
+          AND si.sender = di.batch_submitter_address
+    )
+);
+
 -- setup-complete marker. The `setup` subcommand
 -- pins deployment identity, does the initial L1 sync, and registers the
 -- genesis finalized snapshot; it inserts this singleton row as its LAST
@@ -408,6 +482,14 @@ FOR EACH ROW
 WHEN EXISTS (SELECT 1 FROM setup_complete WHERE singleton_id = 0)
 BEGIN
     SELECT RAISE(ABORT, 'batch-tree anchor is frozen after setup completes');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_l2_feed_anchor_frozen
+BEFORE UPDATE ON l2_feed_anchor
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM setup_complete WHERE singleton_id = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'L2-feed anchor is frozen after setup completes');
 END;
 
 

@@ -17,6 +17,18 @@ pub enum SubscribeError {
         #[source]
         source: rusqlite::Error,
     },
+    #[error("cannot resolve executed input count subscription cursor")]
+    LoadExecutedInputCountCursor {
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error(
+        "requested executed input count {requested_executed_input_count} predates feed anchor {minimum_executed_input_count}"
+    )]
+    ExecutedInputCountBeforeAnchor {
+        requested_executed_input_count: u64,
+        minimum_executed_input_count: u64,
+    },
     #[error(
         "catch-up window exceeded: requested offset {requested_offset}, live start {live_start_offset}, max {max_catchup_events}"
     )]

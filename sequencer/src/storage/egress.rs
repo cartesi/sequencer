@@ -35,6 +35,13 @@ pub struct OrderedL2TxRow {
     pub transaction_hash: Option<alloy_primitives::B256>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutedInputCountPosition {
+    pub minimum_executed_input_count: u64,
+    pub from_offset: u64,
+    pub remaining_to_skip: u64,
+}
+
 impl Storage {
     /// Load a page of ordered L2 transactions starting after the given offset.
     /// Catch-up replay feeds `safe_block` to `execute_valid_user_op` so the
@@ -129,6 +136,102 @@ impl Storage {
     /// so the feed cursor and the snapshot replay cursor can't drift.
     pub fn ordered_l2_tx_head_offset(&mut self) -> Result<u64> {
         super::queries::valid_ordered_l2_tx_head(&self.conn)
+    }
+
+    /// Resolve an application's already-executed input count to the feed's
+    /// sparse exclusive cursor.
+    ///
+    /// Batch boundaries carry absolute logical counts, so lookup touches only
+    /// the containing batch. Invalidated branches retain their rows but vanish
+    /// from `valid_*`; a recovery branch structurally reuses the same counts.
+    /// A future count resolves to the current head plus a number of future
+    /// application events for the subscriber worker to skip.
+    pub fn resolve_executed_input_count(
+        &mut self,
+        requested: u64,
+    ) -> Result<ExecutedInputCountPosition> {
+        self.read(|tx| {
+            let (minimum, root_start, anchor_offset): (i64, i64, i64) = tx.query_row(
+                "SELECT minimum_executed_input_count, \
+                        root_executed_input_count_before, \
+                        l2_tx_offset \
+                 FROM l2_feed_anchor WHERE singleton_id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let minimum = i64_to_u64(minimum);
+            let root_start = i64_to_u64(root_start);
+            let anchor_offset = i64_to_u64(anchor_offset);
+            if requested < minimum {
+                return Ok(ExecutedInputCountPosition {
+                    minimum_executed_input_count: minimum,
+                    from_offset: anchor_offset,
+                    remaining_to_skip: 0,
+                });
+            }
+
+            let (tip_start, tip_inputs): (i64, i64) = tx.query_row(
+                "SELECT b.executed_input_count_before, COUNT(app_tx.offset) \
+                 FROM valid_open_batch b \
+                 LEFT JOIN valid_application_l2_txs app_tx \
+                   ON app_tx.batch_index = b.batch_index",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let current = i64_to_u64(tip_start)
+                .checked_add(i64_to_u64(tip_inputs))
+                .expect("executed input count overflow");
+            let head = super::queries::valid_ordered_l2_tx_head(tx)?;
+
+            if requested >= current {
+                return Ok(ExecutedInputCountPosition {
+                    minimum_executed_input_count: minimum,
+                    from_offset: head,
+                    remaining_to_skip: requested - current,
+                });
+            }
+            if requested == minimum && root_start == minimum {
+                return Ok(ExecutedInputCountPosition {
+                    minimum_executed_input_count: minimum,
+                    from_offset: anchor_offset,
+                    remaining_to_skip: 0,
+                });
+            }
+
+            let (batch_index, batch_start): (i64, i64) = tx.query_row(
+                "SELECT batch_index, executed_input_count_before \
+                 FROM valid_batches \
+                 WHERE executed_input_count_before < ?1 \
+                 ORDER BY executed_input_count_before DESC, batch_index DESC \
+                 LIMIT 1",
+                params![u64_to_i64(requested)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let ordinal_in_batch = requested
+                .checked_sub(i64_to_u64(batch_start))
+                .expect("selected batch starts before requested input count");
+            let offset: i64 = tx.query_row(
+                "SELECT offset \
+                 FROM valid_application_l2_txs \
+                 WHERE batch_index = ?1 \
+                 ORDER BY offset ASC \
+                 LIMIT 1 OFFSET ?2",
+                params![
+                    batch_index,
+                    u64_to_i64(
+                        ordinal_in_batch
+                            .checked_sub(1)
+                            .expect("batch-local input ordinal is one-based")
+                    )
+                ],
+                |row| row.get(0),
+            )?;
+            Ok(ExecutedInputCountPosition {
+                minimum_executed_input_count: minimum,
+                from_offset: i64_to_u64(offset),
+                remaining_to_skip: 0,
+            })
+        })
     }
 
     /// Count broadcastable events with offset > `from_offset`, capped at `limit`.

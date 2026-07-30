@@ -178,9 +178,11 @@ don't.
 - **Holds:** batch-submitter-sent safe inputs enter `sequenced_l2_txs` like any
   drained input, but are skipped by sender at catch-up replay
   (`catch_up.rs`), at live execution (`execute_safe_inputs_chunk`), and at WS
-  delivery (feed filter).
-- **Enforced by:** sender checks at each consumer (three places — keep them in
-  sync).
+  delivery (feed filter). The `valid_application_l2_txs` view applies the same
+  classification when translating an app's `executed_input_count` to a feed
+  offset.
+- **Enforced by:** sender checks at each consumer plus
+  `valid_application_l2_txs` (four places — keep them in sync).
 - **Depended on by:** replay correctness (a batch payload must never execute as
   a deposit); feed consumers' state.
 - **Breaks:** batch bytes applied as a direct input — divergence.
@@ -280,3 +282,27 @@ don't.
   carries a nonce the scheduler rejects ⇒ the sequencer is wedged (never
   submits), or — worse, if defenses were absent — a recovered tree silently
   diverging from canonical L1 state.
+
+### I17. Executed-input boundaries follow the valid batch spine
+
+- **Holds:** every valid batch records the application's logical input count at
+  its start. A child starts at
+  `parent.executed_input_count_before + count(parent application inputs)`;
+  invalidated rows disappear through `valid_application_l2_txs`, so a recovery
+  child structurally reuses the invalidated suffix's first count. Empty batches
+  advance no count. Own batch-submitter safe inputs are excluded per I11.
+- **Enforced by:** `insert_new_batch` derives
+  `batches.executed_input_count_before`; `trg_enforce_nonce_contiguity`
+  independently rejects a mismatched boundary; the boundary is immutable.
+  `resolve_executed_input_count` finds the containing valid batch and scans only
+  within it.
+- **Cockroach anchor:** collapsed history has no rows to derive from.
+  `l2_feed_anchor` therefore stores `S'.executed_input_count` as the minimum
+  resumable count, the root's pre-padding count, and the physical offset after
+  recovery padding. `setup --recovery` writes it before opening the root and
+  `setup_complete` freezes it. Counts below the minimum are rejected.
+- **Depended on by:** `from_executed_input_count=C` meaning “the subscriber has
+  already applied exactly `C` application inputs; emit `C + 1` next,” across
+  empty batches, standard cascade recovery, and cockroach recovery.
+- **Breaks:** a boundary that is too low replays an input the dapp already
+  applied; one that is too high skips an unprocessed input.

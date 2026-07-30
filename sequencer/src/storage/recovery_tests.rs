@@ -1644,8 +1644,10 @@ mod schema_invariants {
 
         // Try to bypass the lane and insert a second valid Tip directly.
         let err = storage.conn.execute(
-            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-             VALUES (99, 0, 1, 1000)",
+            "INSERT INTO batches (
+                 batch_index, parent_batch_index, nonce,
+                 executed_input_count_before, created_at_ms
+             ) VALUES (99, 0, 1, 0, 1000)",
             [],
         );
         let msg = format!("{err:?}");
@@ -1670,8 +1672,10 @@ mod schema_invariants {
             .expect("close batch 0; batch 1 is now Tip");
         // Batch 1 has nonce 1 (0 + 1). Insert child with nonce 99 (should be 2).
         let err = storage.conn.execute(
-            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-             VALUES (999, 1, 99, \
+            "INSERT INTO batches (
+                 batch_index, parent_batch_index, nonce,
+                 executed_input_count_before, created_at_ms, sealed_at_ms
+             ) VALUES (999, 1, 99, 0, \
                      (SELECT created_at_ms FROM batches WHERE batch_index = 1), \
                      (SELECT created_at_ms FROM batches WHERE batch_index = 1))",
             [],
@@ -1683,14 +1687,37 @@ mod schema_invariants {
     }
 
     #[test]
+    fn schema_rejects_bad_executed_input_boundary() {
+        let db = temp_db("schema-bad-executed-input-boundary");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize root");
+
+        let err = storage.conn.execute(
+            "INSERT INTO batches (
+                 batch_index, parent_batch_index, nonce,
+                 executed_input_count_before, created_at_ms, sealed_at_ms
+             ) VALUES (999, 0, 1, 1, 100, 100)",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("batch executed-input boundary must follow parent content"),
+            "expected executed-input boundary trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn schema_rejects_genesis_with_nonzero_nonce() {
         // Default anchor is 0, so a parentless root at a non-zero nonce ABORTs
         // (genesis must be 0) — the exact-match form of the contiguity rule.
         let db = temp_db("schema-genesis-nonzero");
         let storage = Storage::open(db.path.as_str()).expect("open storage");
         let err = storage.conn.execute(
-            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-             VALUES (0, NULL, 7, 100)",
+            "INSERT INTO batches (
+                 batch_index, parent_batch_index, nonce,
+                 executed_input_count_before, created_at_ms
+             ) VALUES (0, NULL, 7, 0, 100)",
             [],
         );
         assert!(
@@ -1714,20 +1741,34 @@ mod schema_invariants {
                 [],
             )
             .expect("set anchor");
+        storage
+            .conn
+            .execute(
+                "UPDATE l2_feed_anchor \
+                 SET minimum_executed_input_count = 9, \
+                     root_executed_input_count_before = 9 \
+                 WHERE singleton_id = 0",
+                [],
+            )
+            .expect("set feed anchor");
         // A root at the anchor nonce (42) is accepted...
         storage
             .conn
             .execute(
-                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-                 VALUES (0, NULL, 42, 100, 100)",
+                "INSERT INTO batches (
+                     batch_index, parent_batch_index, nonce,
+                     executed_input_count_before, created_at_ms, sealed_at_ms
+                 ) VALUES (0, NULL, 42, 9, 100, 100)",
                 [],
             )
             .expect("parentless root at the anchor nonce is allowed");
         // ...but a root at 0 (the old hard-coded value) now ABORTs — the rule is
         // an exact match against the anchor, tighter than the old "must be 0".
         let err = storage.conn.execute(
-            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-             VALUES (1, NULL, 0, 100, 100)",
+            "INSERT INTO batches (
+                 batch_index, parent_batch_index, nonce,
+                 executed_input_count_before, created_at_ms, sealed_at_ms
+             ) VALUES (1, NULL, 0, 9, 100, 100)",
             [],
         );
         assert!(
@@ -1747,14 +1788,18 @@ mod schema_invariants {
         storage
             .conn
             .execute(
-                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-                 VALUES (0, NULL, 0, 100, 100)",
+                "INSERT INTO batches (
+                     batch_index, parent_batch_index, nonce,
+                     executed_input_count_before, created_at_ms, sealed_at_ms
+                 ) VALUES (0, NULL, 0, 0, 100, 100)",
                 [],
             )
             .expect("first root ok");
         let err = storage.conn.execute(
-            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-             VALUES (1, NULL, 0, 100, 100)",
+            "INSERT INTO batches (
+                 batch_index, parent_batch_index, nonce,
+                 executed_input_count_before, created_at_ms, sealed_at_ms
+             ) VALUES (1, NULL, 0, 0, 100, 100)",
             [],
         );
         assert!(
@@ -1773,8 +1818,10 @@ mod schema_invariants {
         storage
             .conn
             .execute(
-                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-                 VALUES (1, NULL, 0, 100, 100)",
+                "INSERT INTO batches (
+                     batch_index, parent_batch_index, nonce,
+                     executed_input_count_before, created_at_ms, sealed_at_ms
+                 ) VALUES (1, NULL, 0, 0, 100, 100)",
                 [],
             )
             .expect("re-root parentless after the old root is invalidated");
@@ -1782,7 +1829,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_freezes_anchor_after_setup_complete() {
-        // The anchor is write-once: once `setup_complete` exists, UPDATEs abort.
+        // Both deployment anchors are write-once once `setup_complete` exists.
         let db = temp_db("schema-anchor-frozen");
         let storage = Storage::open(db.path.as_str()).expect("open storage");
         // Pre-marker: UPDATE is allowed (this is what recovery setup does).
@@ -1793,6 +1840,17 @@ mod schema_invariants {
                 [],
             )
             .expect("anchor settable before setup_complete");
+        storage
+            .conn
+            .execute(
+                "UPDATE l2_feed_anchor \
+                 SET minimum_executed_input_count = 7, \
+                     root_executed_input_count_before = 7, \
+                     l2_tx_offset = 11 \
+                 WHERE singleton_id = 0",
+                [],
+            )
+            .expect("feed anchor settable before setup_complete");
         storage
             .conn
             .execute(
@@ -1807,6 +1865,16 @@ mod schema_invariants {
         assert!(
             format!("{err:?}").contains("batch-tree anchor is frozen after setup completes"),
             "expected anchor-freeze trigger, got: {err:?}"
+        );
+        let err = storage.conn.execute(
+            "UPDATE l2_feed_anchor \
+             SET minimum_executed_input_count = 8 \
+             WHERE singleton_id = 0",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("L2-feed anchor is frozen after setup completes"),
+            "expected feed-anchor-freeze trigger, got: {err:?}"
         );
     }
 
@@ -1848,6 +1916,25 @@ mod schema_invariants {
         assert!(
             format!("{err:?}").contains("invalidated_at_ms is write-once"),
             "expected write-once trigger, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_executed_input_boundary_mutation() {
+        let db = temp_db("schema-executed-input-boundary-immutable");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        let err = storage.conn.execute(
+            "UPDATE batches \
+             SET executed_input_count_before = executed_input_count_before + 1 \
+             WHERE batch_index = 0",
+            [],
+        );
+        assert!(
+            format!("{err:?}").contains("executed_input_count_before is immutable"),
+            "expected executed-input-boundary immutability trigger, got: {err:?}"
         );
     }
 

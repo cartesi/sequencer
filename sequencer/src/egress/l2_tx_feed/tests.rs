@@ -10,7 +10,7 @@ use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError};
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::test_helpers::temp_db;
-use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+use crate::storage::{DeploymentIdentity, SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 use sequencer_core::user_op::UserOp;
 
@@ -97,6 +97,386 @@ async fn subscribe_from_accepts_exact_catchup_window() {
         subscription.is_ok(),
         "exactly 2 replayable events should be allowed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscription_from_executed_input_count_skips_applied_prefix() {
+    let db = temp_db("executed-input-count-boundary");
+    seed_two_user_op_batches(db.path.as_str());
+    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+
+    let mut subscription = feed
+        .subscribe_from_executed_input_count(1, 1)
+        .expect("subscribe after one executed input");
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        .await
+        .expect("wait for batch 1 event")
+        .expect("batch 1 event");
+
+    assert!(matches!(
+        event,
+        BroadcastTxMessage::UserOp {
+            offset: 2,
+            batch_nonce: 1,
+            ..
+        }
+    ));
+
+    let no_second = tokio::time::timeout(Duration::from_millis(50), subscription.recv()).await;
+    assert!(
+        no_second.is_err(),
+        "the first executed input must not be replayed"
+    );
+    subscription.finish().await.expect("finish subscription");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executed_input_count_ignores_empty_batches() {
+    let db = temp_db("empty-batch-boundary");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize");
+    append_test_user_op(&mut storage, &mut head, 0x10);
+    storage
+        .close_frame_and_batch(&mut head, 0)
+        .expect("close batch 0");
+    storage
+        .close_frame_and_batch(&mut head, 0)
+        .expect("close empty batch 1");
+    append_test_user_op(&mut storage, &mut head, 0x12);
+    drop(storage);
+    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+
+    let mut subscription = feed
+        .subscribe_from_executed_input_count(1, 1)
+        .expect("subscribe after one executed input");
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        .await
+        .expect("wait for batch 2 event")
+        .expect("batch 2 event");
+
+    assert!(matches!(
+        event,
+        BroadcastTxMessage::UserOp {
+            offset: 2,
+            batch_nonce: 2,
+            ..
+        }
+    ));
+    subscription.finish().await.expect("finish subscription");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executed_input_count_excludes_batch_submission_rows() {
+    let db = temp_db("executed-input-count-excludes-batches");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let batch_submitter = Address::repeat_byte(0x99);
+    storage
+        .load_or_insert_deployment_identity(test_identity(batch_submitter))
+        .expect("pin identity");
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize");
+    storage
+        .append_safe_inputs(
+            10,
+            &[
+                StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: vec![0xBA],
+                    block_number: 10,
+                    ..Default::default()
+                },
+                StoredSafeInput {
+                    sender: Address::repeat_byte(0x22),
+                    payload: vec![0xDA],
+                    block_number: 10,
+                    ..Default::default()
+                },
+            ],
+            batch_submitter,
+            &crate::storage::test_helpers::default_protocol_timing(),
+        )
+        .expect("seed batch and direct");
+    storage
+        .close_frame_only(&mut head, 10, SafeInputRange::new(0, 2))
+        .expect("sequence safe inputs");
+    storage
+        .close_frame_and_batch(&mut head, 10)
+        .expect("close first batch");
+    append_test_user_op(&mut storage, &mut head, 0x12);
+    drop(storage);
+
+    let feed = L2TxFeed::new(
+        db.path.clone(),
+        ShutdownSignal::default(),
+        L2TxFeedConfig {
+            idle_poll_interval: Duration::from_millis(2),
+            page_size: 64,
+            batch_submitter_address: Some(batch_submitter),
+        },
+    );
+    let mut subscription = feed
+        .subscribe_from_executed_input_count(2, u64::MAX)
+        .expect("subscribe after direct and user op");
+    let no_event = tokio::time::timeout(Duration::from_millis(50), subscription.recv()).await;
+    assert!(
+        no_event.is_err(),
+        "the batch-submission row must not consume an executed-input count"
+    );
+    subscription.finish().await.expect("finish subscription");
+}
+
+#[test]
+fn executed_input_count_rejects_count_before_recovery_anchor() {
+    let db = temp_db("executed-input-count-before-anchor");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    storage
+        .append_safe_inputs(
+            0,
+            &[StoredSafeInput {
+                sender: Address::repeat_byte(0x22),
+                payload: vec![0xAA],
+                block_number: 0,
+                ..Default::default()
+            }],
+            Address::repeat_byte(0x99),
+            &crate::storage::test_helpers::default_protocol_timing(),
+        )
+        .expect("seed recovery direct");
+    storage.open_recovery_tip(0, 7).expect("open recovery root");
+    drop(storage);
+    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+
+    let result = feed.subscribe_from_executed_input_count(6, u64::MAX);
+
+    assert!(matches!(
+        result,
+        Err(SubscribeError::ExecutedInputCountBeforeAnchor {
+            requested_executed_input_count: 6,
+            minimum_executed_input_count: 7,
+        })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_anchor_skips_already_applied_padding_directs() {
+    let db = temp_db("executed-input-count-recovery-anchor");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let batch_submitter = Address::repeat_byte(0x99);
+    storage
+        .load_or_insert_deployment_identity(test_identity(batch_submitter))
+        .expect("pin identity");
+    storage
+        .append_safe_inputs(
+            0,
+            &[
+                StoredSafeInput {
+                    sender: batch_submitter,
+                    payload: vec![0xBA],
+                    block_number: 0,
+                    ..Default::default()
+                },
+                StoredSafeInput {
+                    sender: Address::repeat_byte(0x22),
+                    payload: vec![0xAA],
+                    block_number: 0,
+                    ..Default::default()
+                },
+            ],
+            batch_submitter,
+            &crate::storage::test_helpers::default_protocol_timing(),
+        )
+        .expect("seed recovery padding");
+    storage.open_recovery_tip(0, 7).expect("open recovery root");
+    let mut head = storage.open_state().expect("load").expect("root tip");
+    let feed = L2TxFeed::new(
+        db.path.clone(),
+        ShutdownSignal::default(),
+        L2TxFeedConfig {
+            idle_poll_interval: Duration::from_millis(2),
+            page_size: 64,
+            batch_submitter_address: Some(batch_submitter),
+        },
+    );
+    let mut subscription = feed
+        .subscribe_from_executed_input_count(7, u64::MAX)
+        .expect("subscribe at recovered state");
+
+    let no_padding = tokio::time::timeout(Duration::from_millis(50), subscription.recv()).await;
+    assert!(
+        no_padding.is_err(),
+        "recovery padding is already reflected in the recovered state"
+    );
+
+    append_test_user_op(&mut storage, &mut head, 0x12);
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        .await
+        .expect("wait for first post-recovery event")
+        .expect("post-recovery event");
+    assert!(matches!(
+        event,
+        BroadcastTxMessage::UserOp { offset: 3, .. }
+    ));
+    subscription.finish().await.expect("finish subscription");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_anchor_resolves_minimum_on_valid_root_after_cascade() {
+    let db = temp_db("executed-input-count-recovery-anchor-cascade");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let batch_submitter = Address::repeat_byte(0x99);
+    storage
+        .load_or_insert_deployment_identity(test_identity(batch_submitter))
+        .expect("pin identity");
+    storage
+        .append_safe_inputs(
+            0,
+            &[StoredSafeInput {
+                sender: Address::repeat_byte(0x22),
+                payload: vec![0xAA],
+                block_number: 0,
+                ..Default::default()
+            }],
+            batch_submitter,
+            &crate::storage::test_helpers::default_protocol_timing(),
+        )
+        .expect("seed recovery padding");
+    storage.open_recovery_tip(0, 7).expect("open recovery root");
+    storage
+        .append_safe_inputs(
+            1200,
+            &[],
+            batch_submitter,
+            &crate::storage::test_helpers::default_protocol_timing(),
+        )
+        .expect("advance safe head");
+
+    let invalidated = storage
+        .recover_aging_tip(1200)
+        .expect("cascade recovered root");
+    assert_eq!(invalidated, vec![0]);
+    let mut recovered_head = storage
+        .open_state()
+        .expect("load")
+        .expect("replacement recovery tip");
+    append_test_user_op(&mut storage, &mut recovered_head, 0x12);
+    drop(storage);
+
+    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+    let mut subscription = feed
+        .subscribe_from_executed_input_count(7, u64::MAX)
+        .expect("subscribe at recovered state");
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        .await
+        .expect("wait for first post-recovery event")
+        .expect("post-recovery event");
+
+    assert!(matches!(
+        event,
+        BroadcastTxMessage::UserOp { offset: 3, .. }
+    ));
+    let no_padding = tokio::time::timeout(Duration::from_millis(50), subscription.recv()).await;
+    assert!(
+        no_padding.is_err(),
+        "replacement recovery padding is already reflected in the recovered state"
+    );
+    subscription.finish().await.expect("finish subscription");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executed_input_count_reuses_boundary_after_tip_recovery() {
+    let db = temp_db("executed-input-count-tip-recovery");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut head = storage
+        .initialize_open_state(10, SafeInputRange::empty_at(0))
+        .expect("initialize");
+    append_test_user_op(&mut storage, &mut head, 0x10);
+    storage
+        .close_frame_and_batch(&mut head, 10)
+        .expect("close valid batch 0");
+    append_test_user_op(&mut storage, &mut head, 0x11);
+    storage
+        .append_safe_inputs(
+            1210,
+            &[],
+            Address::repeat_byte(0x99),
+            &crate::storage::test_helpers::default_protocol_timing(),
+        )
+        .expect("advance safe head");
+
+    let invalidated = storage.recover_aging_tip(1200).expect("recover aging tip");
+    assert_eq!(invalidated, vec![1]);
+    let mut recovered_head = storage
+        .open_state()
+        .expect("load recovered state")
+        .expect("recovery tip");
+    append_test_user_op(&mut storage, &mut recovered_head, 0x12);
+    drop(storage);
+
+    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+    let mut subscription = feed
+        .subscribe_from_executed_input_count(1, 1)
+        .expect("subscribe after the valid ancestor input");
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        .await
+        .expect("wait for recovery-branch event")
+        .expect("recovery-branch event");
+
+    assert!(matches!(
+        event,
+        BroadcastTxMessage::UserOp {
+            offset: 3,
+            batch_nonce: 1,
+            ..
+        }
+    ));
+    subscription.finish().await.expect("finish subscription");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn future_executed_input_count_skips_intermediate_live_inputs() {
+    let db = temp_db("future-executed-input-count");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize");
+    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+    let mut subscription = feed
+        .subscribe_from_executed_input_count(2, u64::MAX)
+        .expect("subscribe from future executed input count");
+
+    append_test_user_op(&mut storage, &mut head, 0x10);
+    storage
+        .close_frame_and_batch(&mut head, 0)
+        .expect("close batch 0");
+    append_test_user_op(&mut storage, &mut head, 0x11);
+    storage
+        .close_frame_and_batch(&mut head, 0)
+        .expect("close batch 1");
+
+    let no_early_event = tokio::time::timeout(Duration::from_millis(50), subscription.recv()).await;
+    assert!(
+        no_early_event.is_err(),
+        "the first two application inputs must stay filtered"
+    );
+
+    append_test_user_op(&mut storage, &mut head, 0x12);
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        .await
+        .expect("wait for batch 2 event")
+        .expect("batch 2 event");
+    assert!(matches!(
+        event,
+        BroadcastTxMessage::UserOp {
+            offset: 3,
+            batch_nonce: 2,
+            ..
+        }
+    ));
+
+    subscription.finish().await.expect("finish subscription");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,6 +730,16 @@ fn test_feed(db_path: &str, shutdown: ShutdownSignal) -> L2TxFeed {
     )
 }
 
+fn test_identity(batch_submitter_address: Address) -> DeploymentIdentity {
+    DeploymentIdentity {
+        chain_id: 1,
+        app_address: Address::repeat_byte(0x11),
+        input_box_address: Address::repeat_byte(0x22),
+        input_box_genesis_block: 0,
+        batch_submitter_address,
+    }
+}
+
 fn seed_ordered_txs(db_path: &str) {
     seed_ordered_txs_with_sender(db_path, Address::ZERO);
 }
@@ -399,4 +789,38 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
     storage
         .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
         .expect("close frame with one drained direct input");
+}
+
+fn seed_two_user_op_batches(db_path: &str) {
+    let mut storage = Storage::open(db_path).expect("open storage");
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize open state");
+    append_test_user_op(&mut storage, &mut head, 0x20);
+    storage
+        .close_frame_and_batch(&mut head, 0)
+        .expect("close batch 0");
+    append_test_user_op(&mut storage, &mut head, 0x21);
+}
+
+fn append_test_user_op(storage: &mut Storage, head: &mut WriteHead, data: u8) {
+    let (respond_to, _recv) = oneshot::channel::<Result<(), SequencerError>>();
+    storage
+        .append_user_ops_chunk(
+            head,
+            &[PendingUserOp {
+                signed: sequencer_core::user_op::SignedUserOp {
+                    sender: Address::from_slice(&[data; 20]),
+                    signature: Signature::test_signature(),
+                    user_op: UserOp {
+                        nonce: 0,
+                        max_fee: 3,
+                        data: vec![data].into(),
+                    },
+                },
+                respond_to,
+                received_at: SystemTime::now(),
+            }],
+        )
+        .expect("append test user op");
 }

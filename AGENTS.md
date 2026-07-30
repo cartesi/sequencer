@@ -234,7 +234,7 @@ Writer roles — one writer per table; reads over batch data go through the `val
 |---|---|
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `sequenced_l2_txs`, `dumps`/`pending_snapshots` (batch close), `finalized_snapshot` (promotion) |
 | input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `deployment_identity`, `canonical_divergence` (poison marker, review R2) |
-| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, scoped `pending_snapshots` clear, `wallet_nonce_watermark` (flush no-ops, write-before-broadcast) |
+| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, scoped `pending_snapshots` clear, `wallet_nonce_watermark` (flush no-ops, write-before-broadcast); `setup --recovery` also initializes `l2_feed_anchor` |
 | batch submitter | `wallet_nonce_watermark` (write-before-broadcast, review R1a — its only write) |
 | egress (HTTP) | `dumps.lease_count` (leases) |
 | admin | `batch_policy` |
@@ -245,6 +245,7 @@ Writer roles — one writer per table; reads over batch data go through the `val
 - Safe cursor/head values should be derived from persisted facts when possible, not duplicated as mutable fields.
 - Replay/catch-up uses persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics exactly.
 - Cursor pagination for ordered L2 txs uses **SQLite rowid**, not count-based offsets. Holes from invalidated batches would break count-based pagination.
+- `from_executed_input_count` is translated through immutable per-batch logical boundaries plus `valid_application_l2_txs`; it is not a count-based pagination cursor. Cockroach recovery roots it at the recovered app count through `l2_feed_anchor` (I17).
 - Included user-op identity is tracked by application nonce logic; no DB uniqueness constraint (removed to allow resubmission after recovery).
 - **Reads over batch data go through `valid_batches`, `valid_closed_batches`, `valid_open_batch`, and `valid_sequenced_l2_txs` views.** These encapsulate the "exclude invalidated rows" filter so individual queries don't repeat it. Writers go to the base tables.
 - **`batches` row columns partition cleanly by writer.** `sealed_at_ms` is owned by the inclusion lane (set when closing a batch); `invalidated_at_ms` is owned by recovery (set during cascade). Each is write-once (NULL → non-NULL, never back) and enforced by triggers. The partial unique index `ux_single_valid_tip` guarantees at most one row has both NULL — the Tip.

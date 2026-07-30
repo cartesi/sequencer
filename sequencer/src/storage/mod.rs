@@ -44,6 +44,7 @@ pub(crate) mod test_helpers;
 use std::time::SystemTime;
 use thiserror::Error;
 
+pub use egress::ExecutedInputCountPosition;
 pub use open::Storage;
 pub use recovery::DangerStatus;
 pub use snapshot_dumps::{

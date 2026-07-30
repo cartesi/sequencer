@@ -99,8 +99,16 @@ input this instance has executed** (frame `safe_block` for user ops, L1
   ([cockroach recovery](../recovery/cockroach.md)). A wrong clock mis-defines
   that range.
 
-`executed_input_count() -> u64` is a diagnostic seam — replay/catch-up and the
-snapshot byte-comparison compare a live instance against a replayed one with it.
+`executed_input_count() -> u64` is the app's logical input cursor. It starts at
+zero, advances exactly once after every successful
+`execute_valid_user_op`/`execute_direct_input` call, and changes nowhere else.
+Batch-submitter InputBox rows never reach either entry point and therefore do
+not count. The value must survive dump round-trips.
+
+Replay/catch-up and snapshot byte-comparison use the count as an equivalence
+check. `GET /ws/subscribe?from_executed_input_count=C` also uses it to resume
+after the first `C` application inputs without requiring the app to persist the
+sequencer's SQLite rowid cursor.
 
 ### 4. Dump lifecycle round-trip
 
@@ -141,6 +149,7 @@ lives on the concrete type, called by the runtime at bootstrap.
 | Purity / determinism | the [duality](scheduler-semantics.md) (off-chain prediction = canonical fold); recovery `fold_replay` |
 | Replay safety (`Internal` fatal) | catch-up on every restart |
 | Safe-block clock survives dumps | cockroach recovery's `A`; snapshot offset accounting |
+| Executed-input count is exact and survives dumps | WS logical resume cursor; replay/snapshot equivalence |
 | `create_dump` in-method fsync | crash-safety of the dump/row ordering ([I13](../invariants.md)) |
 | `state_file_in_dump` = canonical bytes | the watchdog / indexers reading finalized state |
 | One execution entry point | the `max_fee` protocol guard's non-bypassability |

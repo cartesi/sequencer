@@ -15,7 +15,9 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::warn;
 
 use crate::egress::l2_tx_feed::{BroadcastTxMessage, L2TxFeed, SubscribeError};
-use crate::http::WS_CATCHUP_WINDOW_EXCEEDED_REASON;
+use crate::http::{
+    ApiError, WS_CATCHUP_WINDOW_EXCEEDED_REASON, WS_EXECUTED_INPUT_COUNT_BEFORE_ANCHOR_REASON,
+};
 
 use super::SubscribeState;
 
@@ -25,6 +27,13 @@ const MAX_INBOUND_WS_FRAME_SIZE: usize = 8 * 1024;
 #[derive(Debug, Deserialize)]
 pub(crate) struct SubscribeQuery {
     from_offset: Option<u64>,
+    from_executed_input_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SubscribeStart {
+    Offset(u64),
+    ExecutedInputCount(u64),
 }
 
 pub(crate) async fn subscribe_l2_txs(
@@ -36,7 +45,19 @@ pub(crate) async fn subscribe_l2_txs(
         return err.into_response();
     }
 
-    let from_offset = query.from_offset.unwrap_or(0);
+    let start = match (query.from_offset, query.from_executed_input_count) {
+        (Some(_), Some(_)) => {
+            return ApiError::bad_request(
+                "from_offset and from_executed_input_count are mutually exclusive",
+            )
+            .into_response();
+        }
+        (Some(from_offset), None) => SubscribeStart::Offset(from_offset),
+        (None, Some(from_executed_input_count)) => {
+            SubscribeStart::ExecutedInputCount(from_executed_input_count)
+        }
+        (None, None) => SubscribeStart::Offset(0),
+    };
     let permit = match state.try_acquire_ws_subscriber_permit() {
         Ok(permit) => permit,
         Err(err) => return err.into_response(),
@@ -47,7 +68,7 @@ pub(crate) async fn subscribe_l2_txs(
     ws.max_message_size(MAX_INBOUND_WS_MESSAGE_SIZE)
         .max_frame_size(MAX_INBOUND_WS_FRAME_SIZE)
         .on_upgrade(move |socket| {
-            run_ws_session(tx_feed, socket, from_offset, permit, ws_max_catchup_events)
+            run_ws_session(tx_feed, socket, start, permit, ws_max_catchup_events)
         })
         .into_response()
 }
@@ -55,11 +76,18 @@ pub(crate) async fn subscribe_l2_txs(
 async fn run_ws_session(
     tx_feed: L2TxFeed,
     mut socket: WebSocket,
-    from_offset: u64,
+    start: SubscribeStart,
     _subscriber_permit: OwnedSemaphorePermit,
     ws_max_catchup_events: u64,
 ) {
-    let mut subscription = match tx_feed.subscribe_from(from_offset, ws_max_catchup_events) {
+    let subscription = match start {
+        SubscribeStart::Offset(from_offset) => {
+            tx_feed.subscribe_from(from_offset, ws_max_catchup_events)
+        }
+        SubscribeStart::ExecutedInputCount(from_executed_input_count) => tx_feed
+            .subscribe_from_executed_input_count(from_executed_input_count, ws_max_catchup_events),
+    };
+    let mut subscription = match subscription {
         Ok(subscription) => subscription,
         Err(SubscribeError::CatchUpWindowExceeded {
             requested_offset,
@@ -85,6 +113,27 @@ async fn run_ws_session(
             .await;
             return;
         }
+        Err(SubscribeError::ExecutedInputCountBeforeAnchor {
+            requested_executed_input_count,
+            minimum_executed_input_count,
+        }) => {
+            warn!(
+                requested_executed_input_count,
+                minimum_executed_input_count,
+                "ws executed-input-count subscription predates feed anchor"
+            );
+            close_with_frame(
+                &mut socket,
+                close_code::POLICY,
+                format!(
+                    "{WS_EXECUTED_INPUT_COUNT_BEFORE_ANCHOR_REASON}: \
+                     minimum_executed_input_count={minimum_executed_input_count}"
+                )
+                .as_str(),
+            )
+            .await;
+            return;
+        }
         Err(SubscribeError::OpenStorage { source }) => {
             warn!(error = %source, "ws subscription failed to open replay storage");
             close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
@@ -92,6 +141,11 @@ async fn run_ws_session(
         }
         Err(SubscribeError::LoadHeadOffset { source }) => {
             warn!(error = %source, "ws subscription failed to read replay head");
+            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
+            return;
+        }
+        Err(SubscribeError::LoadExecutedInputCountCursor { source }) => {
+            warn!(error = %source, "ws subscription failed to resolve executed input count cursor");
             close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
             return;
         }

@@ -128,10 +128,12 @@ pub trait Application: Send + Sized {
     /// `create_dump`/`from_dump` round-trips.
     fn last_executed_safe_block(&self) -> u64;
 
-    /// Count of executed inputs (user ops + direct inputs). Diagnostic
-    /// seam: replay/catch-up tests compare live vs replayed apps with it.
-    /// Required (no default) for the same reason as
-    /// [`Application::execute_direct_input`].
+    /// Count of successfully executed application inputs (included user ops +
+    /// non-batch direct inputs). Each successful execution entry point must
+    /// advance it exactly once, and no other operation may change it.
+    ///
+    /// Besides replay/snapshot equivalence checks, the WS feed accepts this as
+    /// a logical resume cursor. It must therefore survive dump round-trips.
     fn executed_input_count(&self) -> u64;
 
     // -------- snapshot / dump lifecycle --------

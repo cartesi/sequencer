@@ -16,6 +16,7 @@ use rusqlite::{Result, Transaction, params};
 use super::convert::{from_unix_ms, i64_to_u64, now_unix_ms, to_unix_ms, u64_to_i64};
 use super::mutations::{
     insert_new_batch, insert_open_frame, persist_frame_direct_sequence, seal_batch,
+    set_l2_feed_anchor_in,
 };
 use super::queries::{
     current_safe_block_required, load_current_write_head, query_batch_policy,
@@ -113,8 +114,16 @@ impl Storage {
     /// while the scheduler drains them on-chain (divergence). Capping the drain
     /// at `C` leaves `(C, H1]` undrained, so `run`'s lane leads and executes them
     /// exactly once as the safe frontier advances `C -> H1`.
-    pub fn open_recovery_tip(&mut self, stop_block: u64) -> Result<()> {
-        self.write(|tx| open_recovery_tip_in_tx(tx, stop_block))
+    ///
+    /// `recovered_executed_input_count` is `S'.executed_input_count()`. It
+    /// anchors the logical WS cursor after the recovery padding while the root's
+    /// structural boundary backs up over application-visible padding directs.
+    pub fn open_recovery_tip(
+        &mut self,
+        stop_block: u64,
+        recovered_executed_input_count: u64,
+    ) -> Result<()> {
+        self.write(|tx| open_recovery_tip_in_tx(tx, stop_block, recovered_executed_input_count))
     }
 
     /// Snapshot the current L1 view: safe block + exclusive safe-input cursor.
@@ -437,7 +446,11 @@ fn insert_draining_tip(
 /// frame's safe block is the checkpoint stop block `C` and the leading drain
 /// range is capped at the `<= C` directs (not the whole synced table), so the
 /// `(C, H1]` directs the resync pulled past `C` stay undrained for `run`.
-fn open_recovery_tip_in_tx(tx: &Transaction<'_>, stop_block: u64) -> Result<()> {
+fn open_recovery_tip_in_tx(
+    tx: &Transaction<'_>,
+    stop_block: u64,
+    recovered_executed_input_count: u64,
+) -> Result<()> {
     debug_assert!(
         load_current_write_head(tx)?.is_none(),
         "recovery tip opened over existing open state"
@@ -454,13 +467,51 @@ fn open_recovery_tip_in_tx(tx: &Transaction<'_>, stop_block: u64) -> Result<()> 
     // The `sender != batch_submitter` drop belongs to the *fold's* seed filter
     // (those batches were folded into `S'` as batches, not directs); it is not a
     // cursor concern, so it deliberately does not reappear here.
-    insert_draining_tip(
-        tx,
-        Some(0),
-        None,
-        stop_block,
+    let leading_direct_range = SafeInputRange::new(
+        next_undrained_safe_input_index_in(tx)?,
         safe_input_index_exclusive_through_block_in(tx, stop_block)?,
+    );
+    let visible_direct_count = application_direct_count_in_range(tx, leading_direct_range)?;
+    let root_executed_input_count_before = recovered_executed_input_count
+        .checked_sub(visible_direct_count)
+        .expect("recovered state count covers every recovery-root direct");
+
+    // The root boundary must be installed before `insert_new_batch`: both the
+    // Rust writer and the schema trigger derive parentless structure from it.
+    // The offset is completed after the padding rows are inserted; the whole
+    // sequence is one transaction, so no reader can observe the temporary 0.
+    set_l2_feed_anchor_in(
+        tx,
+        recovered_executed_input_count,
+        root_executed_input_count_before,
+        0,
+    )?;
+    insert_tip_rows(tx, Some(0), None, stop_block, leading_direct_range)?;
+    let l2_tx_offset = valid_ordered_l2_tx_head(tx)?;
+    set_l2_feed_anchor_in(
+        tx,
+        recovered_executed_input_count,
+        root_executed_input_count_before,
+        l2_tx_offset,
     )
+}
+
+fn application_direct_count_in_range(tx: &Transaction<'_>, range: SafeInputRange) -> Result<u64> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) \
+         FROM safe_inputs si \
+         WHERE si.safe_input_index >= ?1 \
+           AND si.safe_input_index < ?2 \
+           AND NOT EXISTS (
+               SELECT 1
+               FROM deployment_identity di
+               WHERE di.singleton_id = 0
+                 AND di.batch_submitter_address = si.sender
+           )",
+        params![u64_to_i64(range.start()), u64_to_i64(range.end())],
+        |row| row.get(0),
+    )?;
+    Ok(i64_to_u64(count))
 }
 
 /// Exclusive `safe_input_index` boundary separating directs at `block_number <=

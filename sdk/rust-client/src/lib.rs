@@ -65,9 +65,23 @@ impl SequencerClient {
     }
 
     pub fn ws_subscribe_url(&self, from_offset: u64) -> String {
-        with_from_offset(
+        with_subscribe_parameter(
             default_ws_subscribe_url_for_http(self.endpoint.as_str()).as_str(),
+            "from_offset",
             from_offset,
+        )
+    }
+
+    /// Build a WS URL starting after the application's already-executed input
+    /// count.
+    pub fn ws_subscribe_from_executed_input_count_url(
+        &self,
+        from_executed_input_count: u64,
+    ) -> String {
+        with_subscribe_parameter(
+            default_ws_subscribe_url_for_http(self.endpoint.as_str()).as_str(),
+            "from_executed_input_count",
+            from_executed_input_count,
         )
     }
 
@@ -104,6 +118,18 @@ impl SequencerClient {
 
     pub async fn subscribe(&self, from_offset: u64) -> Result<SubscribeStream, SubscribeError> {
         let url = self.ws_subscribe_url(from_offset);
+        let (stream, _response) = connect_async(url.as_str())
+            .await
+            .map_err(|e| SubscribeError::Connect(e.to_string()))?;
+        Ok(stream)
+    }
+
+    /// Subscribe after the application's already-executed input count.
+    pub async fn subscribe_from_executed_input_count(
+        &self,
+        from_executed_input_count: u64,
+    ) -> Result<SubscribeStream, SubscribeError> {
+        let url = self.ws_subscribe_from_executed_input_count_url(from_executed_input_count);
         let (stream, _response) = connect_async(url.as_str())
             .await
             .map_err(|e| SubscribeError::Connect(e.to_string()))?;
@@ -156,11 +182,11 @@ fn default_ws_subscribe_url_for_http(http_url: &str) -> String {
     format!("{}/ws/subscribe", scheme_replaced.trim_end_matches('/'))
 }
 
-fn with_from_offset(ws_subscribe_url: &str, from_offset: u64) -> String {
+fn with_subscribe_parameter(ws_subscribe_url: &str, name: &str, value: u64) -> String {
     let separator = if ws_subscribe_url.contains('?') {
         '&'
     } else {
         '?'
     };
-    format!("{ws_subscribe_url}{separator}from_offset={from_offset}")
+    format!("{ws_subscribe_url}{separator}{name}={value}")
 }

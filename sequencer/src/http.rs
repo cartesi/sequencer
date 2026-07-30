@@ -144,9 +144,13 @@ const DEFAULT_WS_MAX_SUBSCRIBERS: usize = 64;
 const DEFAULT_WS_MAX_CATCHUP_EVENTS: u64 = 50_000;
 const DEFAULT_MAX_BODY_BYTES: usize = TxRequest::MAX_JSON_BYTES_RECOMMENDED;
 
-/// Reason returned in the WS Close frame when the subscriber's requested
-/// `from_offset` is too old for the catch-up window to bridge.
+/// Reason returned in the WS Close frame when the requested subscription
+/// cursor is too old for the catch-up window to bridge.
 pub const WS_CATCHUP_WINDOW_EXCEEDED_REASON: &str = "catch-up window exceeded";
+/// Reason returned when `from_executed_input_count` predates the logical feed
+/// anchor of a recovery-rebuilt deployment.
+pub const WS_EXECUTED_INPUT_COUNT_BEFORE_ANCHOR_REASON: &str =
+    "executed input count before feed anchor";
 
 pub type ApiServerTask = tokio::task::JoinHandle<std::io::Result<()>>;
 

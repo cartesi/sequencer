@@ -65,7 +65,8 @@ pub(crate) fn register_genesis_finalized_snapshot<A: Application + 'static>(
 /// the folded application state `S'`, the resume batch nonce `N'`, and the
 /// post-flush stopping block `C`, it leaves the DB in exactly the shape `run`'s
 /// startup expects: a finalized snapshot of `S'`, a batch tree rooted at `N'`,
-/// and a replay cursor past every `≤ C` direct (already executed inside `S'`).
+/// a replay cursor past every `≤ C` direct (already executed inside `S'`), and
+/// a logical feed anchor at `S'.executed_input_count()`.
 ///
 /// Crash-before-marker re-entry is **fail-loud**, not blindly idempotent. Only a
 /// *completed* fill (finalized snapshot present — the last write) re-runs as a
@@ -145,8 +146,9 @@ pub(crate) fn fill_recovery_state<A: Application + 'static>(
     //    runs to the live safe head `H1`, normally `> C`) stay undrained: `run`'s
     //    lane leads and executes them exactly once as the frontier advances
     //    `C → H1`. (Draining them here would skip them on catch-up while `S'`
-    //    never executed them — a divergence.)
-    storage.open_recovery_tip(stop_block)?;
+    //    never executed them — a divergence.) The recovered execution count
+    //    simultaneously anchors `from_executed_input_count` after this padding.
+    storage.open_recovery_tip(stop_block, recovered_app.executed_input_count())?;
     // 3. The finalized snapshot's replay cursor = the global valid replay head
     //    AFTER step 2's sequencing.
     let head = storage.valid_ordered_l2_tx_head()?;
@@ -176,8 +178,8 @@ mod tests {
     use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
     use crate::runtime::shutdown::ShutdownSignal;
     use crate::runtime::test_support::SweepTestApp;
-    use crate::storage::Storage;
     use crate::storage::test_helpers::temp_db;
+    use crate::storage::{DeploymentIdentity, Storage};
     use alloy_primitives::{Address, U256};
     use app_core::application::{WalletApp, WalletConfig};
     use std::time::Duration;
@@ -193,6 +195,7 @@ mod tests {
         let submitter = alloy_primitives::Address::repeat_byte(0x99);
         let direct = alloy_primitives::Address::repeat_byte(0x22);
         let timing = default_protocol_timing();
+        pin_deployment_identity(&mut storage, submitter);
 
         // Sync a safe head at C = 100 with three `≤ C` inputs: a batch (from the
         // submitter) and two directs. These stand in for the (A, C] stream the
@@ -223,8 +226,14 @@ mod tests {
 
         // Fill at resume nonce N' = 3, C = 100.
         let n_prime = 3;
-        fill_recovery_state(SweepTestApp, n_prime, 100, &mut storage, dumps_dir.path())
-            .expect("recovery fill");
+        fill_recovery_state(
+            SweepTestApp::with_executed_input_count(2),
+            n_prime,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("recovery fill");
 
         // The tree is anchored at N' and the single root tip carries it.
         assert_eq!(storage.batch_tree_anchor().expect("anchor"), n_prime);
@@ -260,8 +269,14 @@ mod tests {
 
         // Idempotent: a re-run (crash before the setup marker) is a no-op, not a
         // duplicate-insert error.
-        fill_recovery_state(SweepTestApp, n_prime, 100, &mut storage, dumps_dir.path())
-            .expect("re-run is idempotent");
+        fill_recovery_state(
+            SweepTestApp::with_executed_input_count(2),
+            n_prime,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("re-run is idempotent");
         assert_eq!(storage.batch_tree_anchor().expect("anchor"), n_prime);
     }
 
@@ -314,7 +329,14 @@ mod tests {
             .append_safe_inputs(150, &inputs, submitter, &timing)
             .expect("sync through H1");
 
-        fill_recovery_state(SweepTestApp, 3, 100, &mut storage, dumps_dir.path()).expect("fill");
+        fill_recovery_state(
+            SweepTestApp::with_executed_input_count(3),
+            3,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("fill");
 
         // All four inputs are in safe_inputs ...
         assert_eq!(storage.safe_input_end_exclusive().expect("end"), 4);
@@ -377,7 +399,14 @@ mod tests {
             .append_safe_inputs(150, &inputs, submitter, &timing)
             .expect("sync through H1");
 
-        fill_recovery_state(SweepTestApp, 0, 100, &mut storage, dumps_dir.path()).expect("fill");
+        fill_recovery_state(
+            SweepTestApp::with_executed_input_count(2),
+            0,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("fill");
 
         // Blocks 99 and 100 (<= C) are drained; block 101 (> C) is not. Inclusive
         // at exactly C: cursor sits at index 2, not 1 (would drop the ==C direct)
@@ -418,13 +447,25 @@ mod tests {
             .expect("sync");
 
         // First attempt fills at N' = 3 (opens a root tip carrying nonce 3).
-        fill_recovery_state(SweepTestApp, 3, 100, &mut storage, dumps_dir.path())
-            .expect("first fill");
+        fill_recovery_state(
+            SweepTestApp::with_executed_input_count(1),
+            3,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("first fill");
 
         // Re-run with a DIFFERENT nonce (5): the existing root tip carries 3, so
         // the tip-nonce guard fires *before* the finalized short-circuit.
-        let err = fill_recovery_state(SweepTestApp, 5, 100, &mut storage, dumps_dir.path())
-            .expect_err("different-nonce re-run must fail loud");
+        let err = fill_recovery_state(
+            SweepTestApp::with_executed_input_count(1),
+            5,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect_err("different-nonce re-run must fail loud");
         assert!(
             matches!(
                 err,
@@ -480,7 +521,7 @@ mod tests {
             .expect("sync");
         storage.set_batch_tree_anchor(3).expect("anchor");
         storage
-            .open_recovery_tip(100)
+            .open_recovery_tip(100, 1)
             .expect("open recovery root tip");
         assert!(
             storage.finalized_dump().expect("read").is_none(),
@@ -504,8 +545,14 @@ mod tests {
 
         // Re-run at the SAME N' = 3 must refuse — resuming would leave the new
         // direct unsequenced → double-execution on `run`.
-        let err = fill_recovery_state(SweepTestApp, 3, 130, &mut storage, dumps_dir.path())
-            .expect_err("incomplete same-nonce re-run must fail loud");
+        let err = fill_recovery_state(
+            SweepTestApp::with_executed_input_count(2),
+            3,
+            130,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect_err("incomplete same-nonce re-run must fail loud");
         assert!(
             matches!(
                 err,
@@ -530,15 +577,25 @@ mod tests {
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
 
         // Plain-setup residue: genesis finalized snapshot, no root tip.
-        register_genesis_finalized_snapshot(SweepTestApp, &mut storage, dumps_dir.path())
-            .expect("genesis snapshot");
+        register_genesis_finalized_snapshot(
+            SweepTestApp::default(),
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("genesis snapshot");
         assert!(
             storage.latest_batch_index().expect("idx").is_none(),
             "precondition: no root tip"
         );
 
-        let err = fill_recovery_state(SweepTestApp, 3, 100, &mut storage, dumps_dir.path())
-            .expect_err("recovery over residual finalized snapshot must fail loud");
+        let err = fill_recovery_state(
+            SweepTestApp::default(),
+            3,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect_err("recovery over residual finalized snapshot must fail loud");
         assert!(
             matches!(
                 err,
@@ -580,7 +637,7 @@ mod tests {
         let cfg = WalletConfig::devnet();
         let portal = cfg.erc20_portal_address;
         let token = cfg.supported_erc20_token;
-        let recovered = WalletApp::new(cfg);
+        let mut recovered = WalletApp::new(cfg);
         let submitter = Address::repeat_byte(0x99); // ingest classifier (not the portal)
         let pre_c_direct = Address::repeat_byte(0x22); // non-portal => decode None => inert
         let nested_sender = Address::repeat_byte(0x77); // fresh account, zero balance in S'
@@ -623,8 +680,18 @@ mod tests {
                 ..Default::default()
             },
         ];
+        for input in &inputs[..3] {
+            recovered
+                .execute_direct_input(&sequencer_core::l2_tx::DirectInput {
+                    sender: input.sender,
+                    block_number: input.block_number,
+                    payload: input.payload.clone(),
+                })
+                .expect("fold pre-C direct into S'");
+        }
         {
             let mut storage = Storage::open(db.path.as_str()).expect("open");
+            pin_deployment_identity(&mut storage, submitter);
             storage
                 .append_safe_inputs(150, &inputs, submitter, &timing)
                 .expect("sync to H1 = 150");
@@ -745,5 +812,17 @@ mod tests {
             .expect("wait for lane shutdown");
         let result = joined.expect("join lane task");
         assert!(result.is_ok(), "lane should shut down cleanly: {result:?}");
+    }
+
+    fn pin_deployment_identity(storage: &mut Storage, batch_submitter_address: Address) {
+        storage
+            .load_or_insert_deployment_identity(DeploymentIdentity {
+                chain_id: 1,
+                app_address: Address::repeat_byte(0xA1),
+                input_box_address: Address::repeat_byte(0xB1),
+                input_box_genesis_block: 0,
+                batch_submitter_address,
+            })
+            .expect("pin deployment identity");
     }
 }

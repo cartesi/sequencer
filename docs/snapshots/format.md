@@ -90,7 +90,8 @@ and its canonical state coincide; one write per `create_dump`.
 - `nonces` (`Vec<SnapshotNonce>`)
   - `address` (`[u8; 20]`)
   - `nonce` (`u32`)
-- `executed_input_count` (`u64`)
+- `executed_input_count` (`u64`) — exact number of successfully executed
+  application inputs; also the logical WS resume cursor
 - `last_executed_safe_block` (`u64`) — the app's safe-block clock
   (`Application::last_executed_safe_block`): max block carried by any
   executed input. Recovery reads it as `A`, the safe block this state

@@ -63,7 +63,12 @@ Users submit signed operations via `POST /tx` (JSON). Operations are signed with
 
 ### Sequenced Transaction Feed
 
-Subscribers connect via `GET /ws/subscribe?from_offset=<u64>` (WebSocket). The feed delivers all sequenced transactions (user ops + direct inputs) in deterministic order, matching the on-chain execution order. This is the primary interface for downstream consumers (frontends, indexers). The endpoint is designed for a small number of indexer subscribers, which serve users directly.
+Subscribers connect via `GET /ws/subscribe?from_offset=<u64>` or
+`GET /ws/subscribe?from_executed_input_count=<u64>` (WebSocket). The feed
+delivers all sequenced transactions (user ops + direct inputs) in deterministic
+order, matching the on-chain execution order. This is the primary interface for
+downstream consumers (frontends, indexers). The endpoint is designed for a
+small number of indexer subscribers, which serve users directly.
 
 ### Batch Submission
 
@@ -147,13 +152,22 @@ Notes:
 - overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
 
-### `GET /ws/subscribe?from_offset=<u64>`
+### `GET /ws/subscribe`
 
 WebSocket stream of sequenced L2 transactions from persisted order.
 
 Notes:
 
 - `from_offset` is optional and defaults to `0`.
+- Alternatively, `from_executed_input_count=C` means the subscriber's
+  application state has already executed exactly `C` application inputs. The
+  feed starts with input `C + 1`; empty batches and the sequencer's own
+  batch-submission InputBox rows do not affect this count. Counts ahead of the
+  current feed wait until input `C + 1` exists.
+- `from_offset` and `from_executed_input_count` are mutually exclusive.
+- A count below the deployment's logical feed anchor closes the upgraded
+  socket with close code `1008` (`POLICY`); cockroach recovery has collapsed
+  that earlier history.
 - messages are JSON text frames.
 - binary fields are hex-encoded (`0x`-prefixed).
 - the current runtime enforces a subscriber cap of `64` and a catch-up cap of `50000` events.

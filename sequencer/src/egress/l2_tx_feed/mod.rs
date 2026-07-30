@@ -48,6 +48,18 @@ const DEFAULT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEFAULT_PAGE_SIZE: usize = 256;
 const SUBSCRIPTION_BUFFER_CAPACITY: usize = 1024;
 
+#[derive(Debug, Clone, Copy)]
+enum SubscriptionStart {
+    Offset(u64),
+    ExecutedInputCount(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedSubscriptionStart {
+    from_offset: u64,
+    remaining_to_skip: u64,
+}
+
 impl Default for L2TxFeedConfig {
     fn default() -> Self {
         Self {
@@ -74,15 +86,38 @@ impl L2TxFeed {
         from_offset: u64,
         max_catchup_events: u64,
     ) -> Result<Subscription, SubscribeError> {
-        let (head_offset, catchup_events) = load_catchup_info(
+        self.subscribe_from_start(SubscriptionStart::Offset(from_offset), max_catchup_events)
+    }
+
+    /// Subscribe after the given number of application inputs.
+    ///
+    /// `from_executed_input_count = C` means the consumer state has already
+    /// executed exactly `C` user ops/direct inputs.
+    pub fn subscribe_from_executed_input_count(
+        &self,
+        from_executed_input_count: u64,
+        max_catchup_events: u64,
+    ) -> Result<Subscription, SubscribeError> {
+        self.subscribe_from_start(
+            SubscriptionStart::ExecutedInputCount(from_executed_input_count),
+            max_catchup_events,
+        )
+    }
+
+    fn subscribe_from_start(
+        &self,
+        start: SubscriptionStart,
+        max_catchup_events: u64,
+    ) -> Result<Subscription, SubscribeError> {
+        let (head_offset, resolved, catchup_events) = load_catchup_info(
             self.db_path.as_str(),
-            from_offset,
+            start,
             max_catchup_events,
             self.batch_submitter_address,
         )?;
         if catchup_events > max_catchup_events {
             return Err(SubscribeError::CatchUpWindowExceeded {
-                requested_offset: from_offset,
+                requested_offset: resolved.from_offset,
                 live_start_offset: head_offset,
                 max_catchup_events,
             });
@@ -100,7 +135,7 @@ impl L2TxFeed {
                 page_size,
                 idle_poll_interval,
                 batch_submitter_address,
-                from_offset,
+                resolved,
                 shutdown,
                 events_tx,
             )
@@ -138,29 +173,53 @@ impl Subscription {
     }
 }
 
-/// Returns `(head_offset, broadcastable_event_count_after_from_offset)`.
+/// Returns the feed head, resolved cursor, and broadcastable catch-up count.
 ///
 /// Counts events the client will actually receive — excludes invalidated batches
 /// and batch-submitter direct inputs (which are filtered before WS delivery).
 fn load_catchup_info(
     db_path: &str,
-    from_offset: u64,
+    start: SubscriptionStart,
     max_catchup_events: u64,
     batch_submitter_address: Option<Address>,
-) -> Result<(u64, u64), SubscribeError> {
+) -> Result<(u64, ResolvedSubscriptionStart, u64), SubscribeError> {
     let mut storage = Storage::open_read_only(db_path)
         .map_err(|source| SubscribeError::OpenStorage { source })?;
+    let resolved = match start {
+        SubscriptionStart::Offset(from_offset) => ResolvedSubscriptionStart {
+            from_offset,
+            remaining_to_skip: 0,
+        },
+        SubscriptionStart::ExecutedInputCount(from_executed_input_count) => {
+            let position = storage
+                .resolve_executed_input_count(from_executed_input_count)
+                .map_err(|source| SubscribeError::LoadExecutedInputCountCursor { source })?;
+            if from_executed_input_count < position.minimum_executed_input_count {
+                return Err(SubscribeError::ExecutedInputCountBeforeAnchor {
+                    requested_executed_input_count: from_executed_input_count,
+                    minimum_executed_input_count: position.minimum_executed_input_count,
+                });
+            }
+            ResolvedSubscriptionStart {
+                from_offset: position.from_offset,
+                remaining_to_skip: position.remaining_to_skip,
+            }
+        }
+    };
     let head_offset = storage
         .ordered_l2_tx_head_offset()
         .map_err(|source| SubscribeError::LoadHeadOffset { source })?;
-    let catchup_count = storage
+    let catchup_count_before_skip = storage
         .count_broadcastable_events_after(
-            from_offset,
-            max_catchup_events.saturating_add(1),
+            resolved.from_offset,
+            max_catchup_events
+                .saturating_add(resolved.remaining_to_skip)
+                .saturating_add(1),
             batch_submitter_address,
         )
         .map_err(|source| SubscribeError::LoadHeadOffset { source })?;
-    Ok((head_offset, catchup_count))
+    let catchup_count = catchup_count_before_skip.saturating_sub(resolved.remaining_to_skip);
+    Ok((head_offset, resolved, catchup_count))
 }
 
 fn run_subscription(
@@ -168,13 +227,14 @@ fn run_subscription(
     page_size: usize,
     idle_poll_interval: Duration,
     batch_submitter_address: Option<Address>,
-    from_offset: u64,
+    start: ResolvedSubscriptionStart,
     shutdown: ShutdownSignal,
     events_tx: mpsc::Sender<BroadcastTxMessage>,
 ) -> Result<(), SubscriptionError> {
     let mut storage = Storage::open_read_only(db_path)
         .map_err(|source| SubscriptionError::OpenStorage { source })?;
-    let mut next_offset = from_offset;
+    let mut next_offset = start.from_offset;
+    let mut remaining_to_skip = start.remaining_to_skip;
 
     loop {
         if shutdown.is_shutdown_requested() || events_tx.is_closed() {
@@ -201,6 +261,10 @@ fn run_subscription(
             next_offset = row.offset;
 
             if should_filter_from_broadcast(&row.tx, batch_submitter_address) {
+                continue;
+            }
+            if remaining_to_skip > 0 {
+                remaining_to_skip -= 1;
                 continue;
             }
 

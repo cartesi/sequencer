@@ -80,8 +80,8 @@ symmetric:
               │   fold_replay(S, N, seeds, replay, C)  ──►  (S', N')
               │        │
               ▼        ▼
-        fill: anchor = N', root tip @ N', finalized snapshot of S',
-              replay cursor past the ≤C directs   ──►  run boots here
+        fill: anchors = (N', S'.executed_input_count), root tip @ N',
+              finalized snapshot of S', cursors past ≤C inputs ──► run
 ```
 
 1. **Load `S`; derive `A`, `N`; require `A < B`.** Read the dump
@@ -119,7 +119,11 @@ symmetric:
    (Draining them here instead would skip them on catch-up while `S'` never
    executed them — a vanished deposit / divergence; this is why the fill uses a
    `≤ C`-capped `open_recovery_tip`, not the generic whole-table drain.) `run`
-   boots from this state.
+   boots from this state. The fill also anchors the logical WS cursor at
+   `S'.executed_input_count`: the root's structural count backs up over the
+   non-batch padding directs, while the public minimum points after all padding.
+   Thus a subscriber resuming from `S'` neither replays those directs nor counts
+   batch-submitter rows as application inputs.
 
 ---
 
@@ -133,7 +137,7 @@ symmetric:
 | 3. re-sync + coherence | `recover()` step 3 — `set_frontier_mode(DeferUntilAnchorSet)` + `sync_to_current_safe_head` + `ResyncBehindFlushView` |
 | 4. source seeds/replay | `recover()` step 4 — `Storage::safe_inputs_in_block_range` + the `sender != submitter` filter + `to_fold_input` |
 | 5. fold | [`fold_replay`](../../sequencer-core/src/scheduler/fold.rs) |
-| 6. fill | [`fill_recovery_state`](../../sequencer/src/runtime/setup_fill.rs) — anchor + `open_recovery_tip` (`≤ C`-capped drain at frame `safe_block = C`) + finalized snapshot |
+| 6. fill | [`fill_recovery_state`](../../sequencer/src/runtime/setup_fill.rs) — batch + logical-feed anchors, `open_recovery_tip` (`≤ C`-capped drain at frame `safe_block = C`), finalized snapshot |
 | anchor mechanism | [`trg_enforce_nonce_contiguity`](../../sequencer/src/storage/migrations/0001_schema.sql) + `compute_next_nonce` + the anchor-aware frontier in [`safe_accepted_batches.rs`](../../sequencer/src/storage/safe_accepted_batches.rs) |
 
 ---
@@ -152,6 +156,10 @@ symmetric:
   [I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen).
 - **Anchored root** — the rebuilt tree has exactly one valid parentless root,
   carrying `N'` ([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)).
+- **Anchored logical feed** — the minimum resumable application count is
+  `S'.executed_input_count`; the recovery root backs up only across the
+  application-visible padding directs and the persisted offset skips the full
+  padding prefix ([I17](../invariants.md#i17-executed-input-boundaries-follow-the-valid-batch-spine)).
 - **No double-execution, no lost directs** — the `≤ C` directs are sequenced
   (cursor advances) but the finalized snapshot's `l2_tx_index` is set *after*
   sequencing, so `run`'s catch-up (`offset > l2_tx_index`) skips them; they are

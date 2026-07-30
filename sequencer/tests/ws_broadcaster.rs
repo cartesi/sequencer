@@ -9,7 +9,10 @@ use alloy_sol_types::Eip712Domain;
 use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
 use futures_util::{SinkExt, StreamExt};
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
-use sequencer::http::{self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
+use sequencer::http::{
+    self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON,
+    WS_EXECUTED_INPUT_COUNT_BEFORE_ANCHOR_REASON,
+};
 use sequencer::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use sequencer::runtime::shutdown::ShutdownSignal;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
@@ -78,6 +81,128 @@ async fn ws_subscribe_resumes_from_given_offset() {
     shutdown_runtime(runtime).await;
 
     assert_ws_message_matches_tx(first, &expected[0], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_starts_after_executed_input_count() {
+    let db = temp_db("ws-subscribe-executed-input-count");
+    seed_two_user_op_batches(db.path.as_str());
+    let expected = load_ordered_l2_txs_page(db.path.as_str(), 1, 1);
+    assert_eq!(expected.len(), 1, "batch 1 must contain one event");
+
+    let Some(runtime) = start_test_server(db.path.as_str()).await else {
+        return;
+    };
+    let url = ws_subscribe_from_executed_input_count_url(runtime.addr, 1);
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
+        .await
+        .expect("timeout connecting websocket")
+        .expect("connect websocket");
+
+    let event = recv_tx_message(&mut ws).await;
+    assert!(
+        matches!(
+            event,
+            WsTxMessage::UserOp {
+                offset: 2,
+                batch_nonce: 1,
+                ..
+            }
+        ),
+        "subscription must skip the first executed input, got {event:?}"
+    );
+    drop(ws);
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_rejects_offset_and_executed_input_count_together() {
+    let db = temp_db("ws-subscribe-ambiguous-cursor");
+    seed_ordered_txs(db.path.as_str());
+
+    let Some(runtime) = start_test_server(db.path.as_str()).await else {
+        return;
+    };
+    let url = format!(
+        "ws://{}/ws/subscribe?from_offset=0&from_executed_input_count=0",
+        runtime.addr
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
+        .await
+        .expect("timeout connecting websocket");
+
+    match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status().as_u16(), 400);
+        }
+        other => panic!("expected HTTP 400 handshake rejection, got {other:?}"),
+    }
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_subscribe_closes_when_executed_input_count_predates_recovery_anchor() {
+    let db = temp_db("ws-subscribe-executed-input-before-anchor");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    storage
+        .append_safe_inputs(
+            0,
+            &[StoredSafeInput {
+                sender: Address::repeat_byte(0x22),
+                payload: vec![0xAA],
+                block_number: 0,
+                ..Default::default()
+            }],
+            Address::repeat_byte(0x99),
+            &sequencer_core::protocol::ProtocolTiming {
+                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
+                preemptive_margin_blocks: 75,
+                l1_read_stale_after_blocks: 900,
+                seconds_per_block: 12,
+            },
+        )
+        .expect("seed recovery direct");
+    storage.open_recovery_tip(0, 7).expect("open recovery root");
+    drop(storage);
+
+    let Some(runtime) = start_test_server(db.path.as_str()).await else {
+        return;
+    };
+    let url = ws_subscribe_from_executed_input_count_url(runtime.addr, 6);
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
+        .await
+        .expect("timeout connecting websocket")
+        .expect("connect websocket");
+
+    let frame = recv_raw_message(&mut ws).await;
+    match frame {
+        Message::Close(Some(close_frame)) => {
+            assert_eq!(
+                close_frame.code,
+                tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+            );
+            assert!(
+                close_frame
+                    .reason
+                    .as_str()
+                    .starts_with(WS_EXECUTED_INPUT_COUNT_BEFORE_ANCHOR_REASON),
+                "unexpected close reason {:?}",
+                close_frame.reason
+            );
+            assert!(
+                close_frame
+                    .reason
+                    .as_str()
+                    .contains("minimum_executed_input_count=7")
+            );
+        }
+        other => panic!("expected close frame for old executed input count, got {other:?}"),
+    }
+
+    drop(ws);
+    shutdown_runtime(runtime).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -364,6 +489,40 @@ fn seed_ordered_txs(db_path: &str) {
         .expect("close frame with one drained direct input");
 }
 
+fn seed_two_user_op_batches(db_path: &str) {
+    let mut storage = Storage::open(db_path).expect("open storage");
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize open state");
+    append_test_user_op(&mut storage, &mut head, 0x20);
+    storage
+        .close_frame_and_batch(&mut head, 0)
+        .expect("close batch 0");
+    append_test_user_op(&mut storage, &mut head, 0x21);
+}
+
+fn append_test_user_op(storage: &mut Storage, head: &mut sequencer::storage::WriteHead, data: u8) {
+    let (respond_to, _recv) = oneshot::channel::<Result<(), SequencerError>>();
+    storage
+        .append_user_ops_chunk(
+            head,
+            &[PendingUserOp {
+                signed: SignedUserOp {
+                    sender: Address::from_slice(&[data; 20]),
+                    signature: Signature::test_signature(),
+                    user_op: UserOp {
+                        nonce: 0,
+                        max_fee: 3,
+                        data: vec![data].into(),
+                    },
+                },
+                respond_to,
+                received_at: SystemTime::now(),
+            }],
+        )
+        .expect("append test user op");
+}
+
 fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
     let mut storage = Storage::open(db_path).expect("open storage");
     let mut head = storage
@@ -543,6 +702,15 @@ fn ws_subscribe_url(addr: std::net::SocketAddr, from_offset: u64) -> String {
     let endpoint = format!("http://{addr}");
     let client = SequencerClient::new(endpoint).expect("build sequencer client");
     client.ws_subscribe_url(from_offset)
+}
+
+fn ws_subscribe_from_executed_input_count_url(
+    addr: std::net::SocketAddr,
+    from_executed_input_count: u64,
+) -> String {
+    let endpoint = format!("http://{addr}");
+    let client = SequencerClient::new(endpoint).expect("build sequencer client");
+    client.ws_subscribe_from_executed_input_count_url(from_executed_input_count)
 }
 
 fn ordered_l2_tx_count(db_path: &str) -> u64 {
