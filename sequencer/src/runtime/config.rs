@@ -738,52 +738,88 @@ mod tests {
         );
     }
 
-    /// Render the `--help` text for a subcommand and return it as a string.
-    fn render_help(args: &[&str]) -> String {
-        let err = Cli::try_parse_from(args).unwrap_err();
-        err.to_string()
+    /// Render `--help` for `subcmd` inside a child process whose env carries
+    /// the given secret values. Mutating this process's env is unsound under
+    /// parallel `cargo test` (and neighbouring Clap parses race on the same
+    /// vars), so the probe runs via `Command::env` on a re-exec of this
+    /// test binary.
+    fn help_text_with_secret_env(subcmd: &str, secrets: &[(&str, &str)]) -> String {
+        let out_path = std::env::temp_dir().join(format!(
+            "sequencer-help-leak-{}-{}-{}.txt",
+            subcmd,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args([
+            "--exact",
+            "runtime::config::tests::help_does_not_leak_private_key_value",
+            "--quiet",
+        ])
+        .env("SEQUENCER_HELP_LEAK_OUT", &out_path)
+        .env("SEQUENCER_HELP_LEAK_SUBCMD", subcmd);
+        for (key, value) in secrets {
+            cmd.env(key, value);
+        }
+
+        let status = cmd.status().expect("spawn help-leak child");
+        assert!(
+            status.success(),
+            "help-leak child failed for subcommand {subcmd}: {status}"
+        );
+        let help = std::fs::read_to_string(&out_path)
+            .unwrap_or_else(|err| panic!("read help output {}: {err}", out_path.display()));
+        let _ = std::fs::remove_file(&out_path);
+        help
     }
 
     #[test]
     fn help_does_not_leak_private_key_value() {
-        let sentinel_key = "0xSENTINEL_PRIVATE_KEY_DEADBEEF1234567890abcdef";
-        let sentinel_rpc = "https://eth-mainnet.g.alchemy.com/v2/SECRET_TOKEN_XYZ";
-
-        unsafe {
-            std::env::set_var("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY", sentinel_key);
-            std::env::set_var(
-                "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
-                "/secret/path/key.pem",
-            );
-            std::env::set_var("CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", sentinel_rpc);
+        // Child arm: render help under the caller's env and write it out.
+        // Exits the process so we never nest another spawn.
+        if let Ok(out_path) = std::env::var("SEQUENCER_HELP_LEAK_OUT") {
+            let subcmd = std::env::var("SEQUENCER_HELP_LEAK_SUBCMD")
+                .expect("SEQUENCER_HELP_LEAK_SUBCMD must be set in the child");
+            let help = Cli::try_parse_from(["sequencer", subcmd.as_str(), "--help"])
+                .expect_err("--help must short-circuit as a clap error")
+                .to_string();
+            std::fs::write(&out_path, help).expect("write help output");
+            std::process::exit(0);
         }
 
+        let sentinel_key = "0xSENTINEL_PRIVATE_KEY_DEADBEEF1234567890abcdef";
+        let sentinel_file = "/secret/path/key.pem";
+        let sentinel_rpc = "https://eth-mainnet.g.alchemy.com/v2/SECRET_TOKEN_XYZ";
+        let secrets = [
+            ("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY", sentinel_key),
+            ("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE", sentinel_file),
+            ("CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", sentinel_rpc),
+        ];
+
         for subcmd in ["run", "setup", "flush-mempool"] {
-            let help = render_help(&["sequencer", subcmd, "--help"]);
+            let help = help_text_with_secret_env(subcmd, &secrets);
 
             assert!(
                 !help.contains(sentinel_key),
                 "{subcmd} --help must not print the private key value"
             );
             assert!(
-                !help.contains("/secret/path/key.pem"),
+                !help.contains(sentinel_file),
                 "{subcmd} --help must not print the key-file path"
             );
             assert!(
                 !help.contains("SECRET_TOKEN_XYZ"),
                 "{subcmd} --help must not print the RPC URL (may contain API tokens)"
             );
-
             assert!(
                 help.contains("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY"),
                 "{subcmd} --help should still mention the env var name"
             );
-        }
-
-        unsafe {
-            std::env::remove_var("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY");
-            std::env::remove_var("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE");
-            std::env::remove_var("CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT");
         }
     }
 

@@ -11,16 +11,38 @@ fi
 lua_root="${CARTESI_WATCHDOG_LUA_ROOT:-/opt/watchdog/lua}"
 lua_bin="${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}"
 
-# Append deb-installed cartesi bindings under /usr/lib as a fallback — they
-# must come *after* the container's own paths (set via Dockerfile ENV) so that
-# /opt/watchdog/lib/lcurl.so and other explicitly placed .so files are found
-# first. Prepending broke lcurl discovery in published container images.
+# Deb-installed cartesi bindings under /usr/lib — appended *after* the
+# container's own paths (Dockerfile ENV / operator override) so
+# /opt/watchdog/lib/lcurl.so is found first. Prepending broke lcurl
+# discovery in published images. Lua 5.4 prefers the versioned
+# LUA_{C,}PATH_5_4 variables when set, so derive the effective base from
+# versioned-or-unversioned before composing.
 _cartesi_lua_cpath="/usr/lib/lua/5.4/?.so;/usr/lib/lua/5.4/?/init.so"
 _cartesi_lua_path="/usr/share/lua/5.4/?.lua;/usr/share/lua/5.4/?/init.lua"
-export LUA_CPATH="${LUA_CPATH:-;}${_cartesi_lua_cpath};;"
-export LUA_PATH="${LUA_PATH:-;}${_cartesi_lua_path};;"
-export LUA_CPATH_5_4="${LUA_CPATH_5_4:-;}${_cartesi_lua_cpath};;"
-export LUA_PATH_5_4="${LUA_PATH_5_4:-;}${_cartesi_lua_path};;"
+
+# Strip trailing semicolons from $1, then append $2 with an explicit `;`,
+# and finish with `;;` so Lua still expands its defaults at the end.
+join_lua_search_path() {
+  local base="$1"
+  local extra="$2"
+  while [[ "$base" == *'; ]]; do
+    base="${base%;}"
+  done
+  if [[ -z "$base" ]]; then
+    printf '%s;;' "$extra"
+  else
+    printf '%s;%s;;' "$base" "$extra"
+  fi
+}
+
+_cpath_base="${LUA_CPATH_5_4:-${LUA_CPATH:-}}"
+_path_base="${LUA_PATH_5_4:-${LUA_PATH:-}}"
+_new_cpath="$(join_lua_search_path "${_cpath_base}" "${_cartesi_lua_cpath}")"
+_new_path="$(join_lua_search_path "${_path_base}" "${_cartesi_lua_path}")"
+export LUA_CPATH="${_new_cpath}"
+export LUA_PATH="${_new_path}"
+export LUA_CPATH_5_4="${_new_cpath}"
+export LUA_PATH_5_4="${_new_path}"
 
 cd "${lua_root}"
 

@@ -7,6 +7,10 @@ local l1_reader = {}
 
 l1_reader.INPUT_ADDED_TOPIC = "0xc05d337121a6e8605c6ec0b72aa29c4210ffe6e5b9cefdd6a7058188a8f66f98"
 
+-- Bare codes, matching the sequencer's DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES.
+-- `-32005` / `-32012` are provider-overloaded (rate-limit vs range); we accept
+-- that the same way the Rust side does — see the comment on that constant.
+-- Operators can override via CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES.
 l1_reader.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES = {
     "-32005",
     "-32012",

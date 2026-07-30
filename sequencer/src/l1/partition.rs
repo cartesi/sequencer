@@ -9,7 +9,19 @@
 //! global mutable state; `RunConfig` owns the codes and passes them down via configs.
 
 /// Default RPC error codes that trigger partition retry (e.g. Infura -32005,
-/// Alchemy -32600/-32602, QuickNode -32616, generic JSON-RPC proxies -32012).
+/// Alchemy -32600/-32602, QuickNode -32616, Goldsky / some JSON-RPC proxies
+/// -32012).
+///
+/// **Overloaded codes (accepted).** `-32005` and `-32012` are not range-only
+/// across providers: Alloy's transport also treats bare `-32005` as Infura
+/// rate-limit, and `-32012` + `"credits"` as QuickNode credit rate-limit.
+/// We still match on the bare code — the same policy already used for
+/// `-32005` — because range-error messages are not stable across proxies
+/// (Goldsky vs custom gateways). A persistent QuickNode credits limit that
+/// survives Alloy's own retries can therefore fan an N-block scan into
+/// `2N−1` partition queries before failing; operators on QuickNode can drop
+/// `-32012` from `CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES` if that
+/// matters. We deliberately do **not** add message-marker heuristics here.
 pub const DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES: &[&str] =
     &["-32005", "-32012", "-32600", "-32602", "-32616"];
 
