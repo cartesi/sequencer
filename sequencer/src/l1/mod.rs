@@ -6,6 +6,7 @@
 //! `partition`).
 
 pub mod eip1559;
+pub mod fee_oracle;
 pub mod partition;
 pub mod provider;
 pub mod reader;
