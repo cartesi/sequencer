@@ -522,3 +522,33 @@ async fn latest_snapshot_falls_back_to_finalized_when_no_pending() {
 
     assert!(wait_for_lease(db.path.as_str(), fin_id, 0).await);
 }
+
+#[tokio::test]
+async fn cors_permits_browser_preflight_on_tx() {
+    let db = temp_db("cors-preflight");
+    let Some(server) = start_server(db.path.as_str()).await else {
+        return;
+    };
+
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, server.url("/tx"))
+        .header("Origin", "https://wallet.example")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "content-type")
+        .send()
+        .await
+        .expect("OPTIONS /tx");
+
+    assert!(
+        resp.status().is_success(),
+        "preflight status: {}",
+        resp.status()
+    );
+    let allow_origin = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .expect("Access-Control-Allow-Origin")
+        .to_str()
+        .expect("header utf8");
+    assert_eq!(allow_origin, "*");
+}

@@ -160,6 +160,7 @@ Today `WalletApp::default()` / `WalletConfig::sepolia()` align with Sepolia stag
 | `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | Chain id label for `status.prom` metrics (prefer set at `init`; optional auto-detect via `eth_chainId` when L1 endpoint is present at `init`) |
 | `CARTESI_WATCHDOG_METRICS_FILE` | Override path for the Prometheus textfile written by each `tick` |
 | `CARTESI_WATCHDOG_LUA_DEPS` | `.deps/lua` |
+| `CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES` | Optional CSV of RPC error codes that trigger `eth_getLogs` partition retry. **Evaluated only at `init` and persisted in `config.json`** — not a tick-time override; re-running idempotent `init` does not refresh it. Wipe state and re-init (or edit `config.json`) to change. Default matches the sequencer: `-32005,-32012,-32600,-32602,-32616`. |
 
 The sequencer discovers and pins `input_box_address` at startup; use the same values as `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT` / `CARTESI_SEQUENCER_APP_ADDRESS` configuration.
 
@@ -174,13 +175,15 @@ Pick one:
 3. **Replay from genesis** (only for new rollups / low block height — slow).
 
 Run `init` once to store the bootstrap CM snapshot into the watchdog state
-layout. Re-running `init` on an already-initialized state directory is a no-op
-success (exit `0`), matching `sequencer setup` — safe for process supervisors
-that always invoke init before tick. The L1 RPC URL is not persisted — each
-`tick` reads `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` so it can rotate
-without editing state. If `CARTESI_WATCHDOG_BLOCKCHAIN_ID` is unset at `init`,
-auto-detect also needs that endpoint present then (prefer setting the chain id
-explicitly):
+layout. Re-running `init` on a **complete** already-initialized state directory
+is a no-op success (exit `0`), matching `sequencer setup` — safe for process
+supervisors that always invoke init before tick. If `head.json` exists but
+`config.json` or the selected snapshot is missing/corrupt, `init` fails (exit
+`1`) and asks you to wipe `state_dir` and re-run — it will not certify an
+unusable state. The L1 RPC URL is not persisted — each `tick` reads
+`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` so it can rotate without editing
+state. If `CARTESI_WATCHDOG_BLOCKCHAIN_ID` is unset at `init`, auto-detect also
+needs that endpoint present then (prefer setting the chain id explicitly):
 
 ```bash
 sequencer-watchdog init
