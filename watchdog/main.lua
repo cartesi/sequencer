@@ -112,7 +112,14 @@ local function run_init(cfg, deps)
 
     local existing, load_err = checkpoint.load(cfg.state_dir)
     if existing then
-        return nil, "watchdog state already initialized"
+        -- Idempotent like `sequencer setup`: re-init on an already-set-up
+        -- state dir is a no-op success so process supervisors can run init
+        -- unconditionally without wrapping exit codes.
+        return {
+            ok = true,
+            already_initialized = true,
+            safe_block = existing.safe_block,
+        }
     end
     if load_err ~= "missing " .. checkpoint.HEAD_FILE then
         return nil, "failed to load watchdog head: " .. tostring(load_err)
@@ -250,6 +257,13 @@ local function main(argv, opts)
         if not result then
             io.stderr:write("watchdog init failed: " .. tostring(err) .. "\n")
             os.exit(EXIT_TRANSIENT)
+        end
+        if result.already_initialized then
+            io.stderr:write(
+                "watchdog init already complete — nothing to do state_dir="
+                    .. tostring(cfg.state_dir)
+                    .. "\n"
+            )
         end
         os.exit(EXIT_OK)
     end
