@@ -146,6 +146,7 @@ Notes:
 - payload size is bounded at ingress; oversized requests are rejected before entering the hot path.
 - overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
+- CORS is permissive: any origin, `POST` + preflight `OPTIONS`, any request header, credentials not allowed. Requests are authenticated by the EIP-712 signature in the body, never by cookies or an `Authorization` header, so a browser origin gains nothing a plain HTTP client does not already have. CORS is scoped to this endpoint — the egress routes below stay same-origin.
 
 ### `GET /ws/subscribe?from_offset=<u64>`
 

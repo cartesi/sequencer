@@ -6,15 +6,16 @@
 //! client's perspective: 200 means included.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use alloy_sol_types::Eip712Domain;
 use axum::Router;
 use axum::extract::{Json, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::routing::post;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 
 use crate::http::ApiError;
@@ -56,11 +57,38 @@ impl SubmitState {
     }
 }
 
+/// How long a browser may cache the `/tx` preflight response.
+const CORS_PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Permissive CORS for the public write path.
+///
+/// `/tx` carries no ambient authority: every request is authenticated by the
+/// EIP-712 signature inside the body, never by a cookie, `Authorization`
+/// header, or client certificate. A cross-origin caller therefore gains
+/// nothing it could not get from a plain non-browser client, which the threat
+/// model already treats as fully untrusted (`docs/threat-model/README.md`).
+/// `allow_credentials` stays off — with `Allow-Origin: *` the browser would
+/// reject the response anyway, and turning it on is what would make the wildcard
+/// dangerous if a session-bearing endpoint is ever added here.
+///
+/// Scoped to the ingress router on purpose: the egress side is the internal
+/// read path, so its routes stay same-origin. Browser WebSocket connections to
+/// `/ws/subscribe` are unaffected — the WebSocket handshake is not subject to
+/// CORS.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST])
+        .allow_headers(Any)
+        .max_age(CORS_PREFLIGHT_MAX_AGE)
+}
+
 /// Build the ingress router. Caller wires it into an `axum::serve` listener.
 pub(crate) fn router(state: Arc<SubmitState>) -> Router {
     Router::new()
         .route("/tx", post(submit_tx))
         .with_state(state)
+        .layer(cors_layer())
 }
 
 async fn submit_tx(
