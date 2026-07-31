@@ -209,7 +209,7 @@ released even on client disconnect.
 - `user_ops`: included user operations
 - `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`); inserting into `user_ops` also appends the corresponding replay row via trigger `trg_sequence_user_op`
 - `safe_inputs`: direct-input payload stream
-- `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` view exposes `recommended_fee` and `batch_size_target`
+- `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` view exposes `recommended_fee` and `batch_size_target`. `log_gas_price` is updated by the L1 fee oracle (Uniswap V3 WETH/fee-token TWAP on mainnet/Sepolia; fixed exponent on local Anvil). Fees are app-token smallest units — initially USDC (6 decimals) for the wallet prototype — not a protocol-level USDC invariant.
 
 ## Project Layout
 
@@ -219,7 +219,7 @@ released even on client disconnect.
 - `sequencer/src/runtime/`: process bootstrap, config parsing, EIP-712 domain, shutdown signal, shared clock
 - `sequencer/src/ingress/`: public write path — `POST /tx` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)
 - `sequencer/src/egress/`: internal read path — WS subscribe + health probes (`api/`) and the DB-backed ordered-L2Tx feed (`l2_tx_feed/`)
-- `sequencer/src/l1/`: L1 client surface — input reader, batch submitter, provider, partition helper
+- `sequencer/src/l1/`: L1 client surface — input reader, batch submitter, fee oracle, shared EIP-1559 estimation, provider, partition helper
 - `sequencer/src/recovery/`: preemptive recovery startup, runtime danger detector, mempool flusher
 - `sequencer/src/storage/`: schema, migrations, SQLite persistence (split per writer role), and replay reads
 - `sequencer-core/src/`: shared domain types and interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, feed message types)

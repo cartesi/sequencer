@@ -46,7 +46,7 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 - `runtime/` — bootstrap, config, shutdown, shared clock.
 - `ingress/` — public write path: `api.rs` (`POST /tx`) + `inclusion_lane/` (hot path).
 - `egress/` — internal read path: `api/` (WS subscribe + health) + `l2_tx_feed/`.
-- `l1/` — reader, submitter, provider, partition helper.
+- `l1/` — reader, submitter, fee oracle, provider, partition helper.
 - `recovery/` — startup preemptive-recovery procedure, runtime danger detector, mempool flusher.
 - `storage/` — SQLite persistence, split per writer role.
 - `http.rs` — shared HTTP error type + `axum::serve` orchestration.
