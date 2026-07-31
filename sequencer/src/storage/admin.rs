@@ -1,26 +1,13 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Operator/admin writes: tune fee policy parameters (`set_log_gas_price`,
-//! `set_alpha`). Used today by tests and ad-hoc operator commands; not on the
-//! hot path.
+//! Operator/admin writes: tune the alpha policy parameter.
 
 use rusqlite::{Result, params};
 
 use super::Storage;
 
 impl Storage {
-    pub fn set_log_gas_price(&mut self, log_gas_price: u16) -> Result<()> {
-        let changed = self.conn.execute(
-            "UPDATE batch_policy SET log_gas_price = ?1 WHERE singleton_id = 0",
-            params![i64::from(log_gas_price)],
-        )?;
-        if changed != 1 {
-            return Err(rusqlite::Error::StatementChangedRows(changed));
-        }
-        Ok(())
-    }
-
     /// Set the alpha knob from a `num/denom` rational. Computes both
     /// `log_alpha` and `log_one_plus_alpha` (the policy-derived view needs
     /// both). Panics if `num + denom` overflows `u64` — a misuse, not a
@@ -50,29 +37,6 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use crate::storage::{Storage, test_helpers::temp_db};
-
-    #[test]
-    fn high_gas_price_clamps_recommended_fee_to_max_exponent() {
-        let db = temp_db("clamp-fee");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-
-        // Set gas price high enough that log_recommended_fee > MAX_EXPONENT (17101).
-        // Default: log_recommended_fee = gas_price + 20 + 419 + 621.
-        // With gas_price = 17000: 17000 + 1060 = 18060 > 17101.
-        storage
-            .set_log_gas_price(17000)
-            .expect("set high gas price");
-
-        let policy = storage.batch_policy().expect("read policy");
-        assert_eq!(
-            policy.recommended_fee,
-            sequencer_core::fee::MAX_EXPONENT,
-            "recommended_fee should be clamped to MAX_EXPONENT"
-        );
-
-        // fee_to_linear must not panic with the clamped value.
-        let _ = sequencer_core::fee::fee_to_linear(policy.recommended_fee);
-    }
 
     #[test]
     #[should_panic(expected = "num + denom overflows u64")]

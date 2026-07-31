@@ -13,7 +13,8 @@
 //! - `l1_submission` — batch-aggregate reads (submitter frontier, pending
 //!   batches, per-batch replay) shared between the submitter and egress
 //! - `recovery` — cascade invalidation, recovery-batch open, danger checks
-//! - `admin` — operator policy tunables (gas price, alpha)
+//! - `admin` — operator policy alpha tuning
+//! - `fee_oracle` — L1 fee-oracle gas-price updates
 //! - `snapshot_dumps` — pending/finalized snapshot lifecycle, lease counts
 //!
 //! Cross-writer helpers are split by concern:
@@ -28,6 +29,7 @@
 mod admin;
 mod convert;
 mod egress;
+mod fee_oracle;
 mod ingress;
 mod l1_inputs;
 mod l1_submission;
