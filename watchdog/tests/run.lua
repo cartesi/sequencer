@@ -958,7 +958,7 @@ test("tick config requires current RPC URL outside persisted state", function()
     assert(tostring(load_err):find("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT", 1, true) ~= nil, tostring(load_err))
 end)
 
-test("init refuses an already initialized state directory", function()
+test("init is a no-op success when state is already initialized", function()
     local dir = os.tmpname()
     os.remove(dir)
 
@@ -967,10 +967,13 @@ test("init refuses an already initialized state directory", function()
 
     local first, first_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
     assert(first, first_err)
+    assert_eq(first.already_initialized, nil)
 
     local second, second_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
-    assert_eq(second, nil)
-    assert(tostring(second_err):find("already initialized", 1, true) ~= nil, tostring(second_err))
+    assert(second, second_err)
+    assert_eq(second.ok, true)
+    assert_eq(second.already_initialized, true)
+    assert_eq(second.safe_block, first.safe_block)
 end)
 
 test("runner happy path replays inputs and writes checkpoint", function()

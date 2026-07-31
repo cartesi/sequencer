@@ -182,7 +182,7 @@ the chain id explicitly).
 The watchdog has two subcommands:
 
 ```bash
-sequencer-watchdog init   # one-time setup: writes config.json + head.json
+sequencer-watchdog init   # setup: writes config.json + head.json (idempotent)
 sequencer-watchdog tick   # one compare cycle; schedule this
 ```
 

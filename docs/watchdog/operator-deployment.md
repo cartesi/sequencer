@@ -174,10 +174,13 @@ Pick one:
 3. **Replay from genesis** (only for new rollups / low block height — slow).
 
 Run `init` once to store the bootstrap CM snapshot into the watchdog state
-layout. The L1 RPC URL is not persisted — each `tick` reads
-`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` so it can rotate without editing
-state. If `CARTESI_WATCHDOG_BLOCKCHAIN_ID` is unset at `init`, auto-detect also
-needs that endpoint present then (prefer setting the chain id explicitly):
+layout. Re-running `init` on an already-initialized state directory is a no-op
+success (exit `0`), matching `sequencer setup` — safe for process supervisors
+that always invoke init before tick. The L1 RPC URL is not persisted — each
+`tick` reads `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` so it can rotate
+without editing state. If `CARTESI_WATCHDOG_BLOCKCHAIN_ID` is unset at `init`,
+auto-detect also needs that endpoint present then (prefer setting the chain id
+explicitly):
 
 ```bash
 sequencer-watchdog init
