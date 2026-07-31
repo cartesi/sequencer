@@ -5,6 +5,7 @@
 //! batches back out (`submitter`), and shares L1 utilities (`provider`,
 //! `partition`).
 
+pub mod eip1559;
 pub mod partition;
 pub mod provider;
 pub mod reader;

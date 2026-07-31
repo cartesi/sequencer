@@ -12,6 +12,7 @@ use sequencer_core::batch::Batch;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::l1::eip1559::{Eip1559Fees, estimate_fees};
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
 use crate::l1::watermark::WalletNonceWatermarkSink;
 
@@ -96,7 +97,7 @@ impl EthereumBatchPoster {
         &self,
         payload: Vec<u8>,
         nonce: u64,
-        fees: &alloy::providers::utils::Eip1559Estimation,
+        fees: &Eip1559Fees,
     ) -> Result<PendingTransactionBuilder<alloy::network::Ethereum>, BatchPosterError> {
         let input_box = InputBox::new(self.config.l1_submit_address, &self.provider);
         input_box
@@ -201,11 +202,9 @@ impl BatchPoster for EthereumBatchPoster {
             });
         }
 
-        let fees = self
-            .provider
-            .estimate_eip1559_fees()
+        let fees = estimate_fees(&self.provider)
             .await
-            .map_err(|err| BatchPosterError::Provider(err.to_string()))?;
+            .map_err(BatchPosterError::Provider)?;
         let mut next_nonce = self.latest_account_nonce().await?;
 
         // Write-before-broadcast (R1a): durably cover every nonce this
