@@ -106,15 +106,56 @@ local function default_deps(cfg)
     return deps, json
 end
 
+local function shell_quote(value)
+    value = tostring(value)
+    return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+--- True when `path` is a non-empty directory (CM snapshot must have content).
+local function directory_nonempty(path)
+    local quoted = shell_quote(path)
+    local ok = os.execute("test -d " .. quoted .. " && test -n \"$(ls -A " .. quoted .. " 2>/dev/null)\"")
+    return ok == true or ok == 0
+end
+
+--- Require a complete, tick-usable state before reporting idempotent init success.
+--- A valid head.json alone is not enough — config.json or the selected snapshot
+--- may be missing/corrupt after a partial wipe.
+local function validate_initialized_state(state_dir, existing, json)
+    local persisted, cfg_err = state.read_json(state_dir, "config.json", json)
+    if not persisted then
+        return nil,
+            "incomplete watchdog state: missing or unreadable config.json ("
+                .. tostring(cfg_err)
+                .. ")"
+    end
+    local ok, validate_err = pcall(config.validate_persisted, persisted)
+    if not ok then
+        return nil, "incomplete watchdog state: " .. tostring(validate_err)
+    end
+    if type(existing.snapshot_dir) ~= "string" or existing.snapshot_dir == "" then
+        return nil, "incomplete watchdog state: head has no snapshot_dir"
+    end
+    if not directory_nonempty(existing.snapshot_dir) then
+        return nil,
+            "incomplete watchdog state: missing or empty snapshot at "
+                .. tostring(existing.snapshot_dir)
+    end
+    return true
+end
+
 local function run_init(cfg, deps)
     deps = deps or default_machine_deps(cfg)
     local json = json_mod.new()
 
     local existing, load_err = checkpoint.load(cfg.state_dir)
     if existing then
-        -- Idempotent like `sequencer setup`: re-init on an already-set-up
-        -- state dir is a no-op success so process supervisors can run init
-        -- unconditionally without wrapping exit codes.
+        local usable, why = validate_initialized_state(cfg.state_dir, existing, json)
+        if not usable then
+            return nil, tostring(why) .. "; wipe state_dir and re-run init"
+        end
+        -- Idempotent like `sequencer setup`: complete state → no-op success so
+        -- process supervisors can run init unconditionally.
         return {
             ok = true,
             already_initialized = true,

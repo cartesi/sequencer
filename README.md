@@ -146,6 +146,7 @@ Notes:
 - payload size is bounded at ingress; oversized requests are rejected before entering the hot path.
 - overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
+- CORS is currently **permissive** (`Access-Control-Allow-Origin: *`, all methods/headers) so browser wallets can call `POST /tx`. Tighten once the planned ingress/egress port split lands.
 
 ### `GET /ws/subscribe?from_offset=<u64>`
 

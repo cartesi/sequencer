@@ -125,6 +125,21 @@ function config.persisted(cfg)
     }
 end
 
+--- Validate a persisted config.json object (no tick-time env required).
+--- Raises on missing/invalid fields; used by idempotent init before exit 0.
+function config.validate_persisted(data)
+    if type(data) ~= "table" then
+        error("config.json is not an object")
+    end
+    if data.version ~= config.VERSION then
+        error("unsupported config.json version: " .. tostring(data.version))
+    end
+    required_field(data, "sequencer_url")
+    required_field(data, "input_box_address")
+    required_field(data, "app_address")
+    return true
+end
+
 function config.from_persisted(state_dir, data, env)
     env = normalize_env(env)
     if data.version ~= config.VERSION then

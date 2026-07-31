@@ -521,6 +521,13 @@ local function fake_machine(inspect_state)
     function machine:dump(_instance, snapshot_dir, reference_block)
         self.saved_snapshot_dir = snapshot_dir
         _instance.reference_block = reference_block
+        -- Real CM dumps create a non-empty snapshot dir; mirror that so
+        -- idempotent-init usability checks see a complete state.
+        os.execute("mkdir -p " .. "'" .. tostring(snapshot_dir):gsub("'", "'\\''") .. "'")
+        local marker = io.open(snapshot_dir .. "/.dump", "w")
+        assert(marker, "write snapshot marker")
+        marker:write("ok")
+        marker:close()
         return true
     end
     function machine:feed_inputs(instance, inputs)
@@ -974,6 +981,41 @@ test("init is a no-op success when state is already initialized", function()
     assert_eq(second.ok, true)
     assert_eq(second.already_initialized, true)
     assert_eq(second.safe_block, first.safe_block)
+end)
+
+test("init fails when config.json is missing after head exists", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+    local first, first_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert(first, first_err)
+
+    assert(os.remove(dir .. "/config.json"))
+
+    local second, second_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert_eq(second, nil)
+    assert(tostring(second_err):find("config.json", 1, true), tostring(second_err))
+    assert(tostring(second_err):find("wipe state_dir", 1, true), tostring(second_err))
+end)
+
+test("init fails when checkpoint snapshot is missing after head exists", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+
+    local cfg = fake_cfg()
+    cfg.state_dir = dir
+    local first, first_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert(first, first_err)
+
+    local loaded = assert(checkpoint.load(dir))
+    assert(os.execute("rm -rf '" .. loaded.snapshot_dir:gsub("'", "'\\''") .. "'"))
+
+    local second, second_err = main_mod.run_init(cfg, { machine = fake_machine("{}") })
+    assert_eq(second, nil)
+    assert(tostring(second_err):find("snapshot", 1, true), tostring(second_err))
+    assert(tostring(second_err):find("wipe state_dir", 1, true), tostring(second_err))
 end)
 
 test("runner happy path replays inputs and writes checkpoint", function()
