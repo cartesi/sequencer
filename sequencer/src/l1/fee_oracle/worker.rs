@@ -216,6 +216,60 @@ impl From<PriceSourceError> for FeeOracleError {
 mod tests {
     use super::*;
     use crate::storage::test_helpers::temp_db;
+    use std::sync::Mutex;
+
+    struct StaticGas(Eip1559Fees);
+
+    #[async_trait]
+    impl GasPriceSource for StaticGas {
+        async fn estimate_gas_fees(&self) -> Result<Eip1559Fees, String> {
+            Ok(self.0)
+        }
+    }
+
+    struct StaticToken(U256);
+
+    #[async_trait]
+    impl TokenPriceSource for StaticToken {
+        async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
+            Ok(self.0)
+        }
+    }
+
+    struct FlakyGas {
+        calls: Mutex<usize>,
+        ok: Eip1559Fees,
+    }
+
+    #[async_trait]
+    impl GasPriceSource for FlakyGas {
+        async fn estimate_gas_fees(&self) -> Result<Eip1559Fees, String> {
+            let mut calls = self.calls.lock().expect("lock");
+            *calls += 1;
+            if *calls == 1 {
+                Ok(self.ok)
+            } else {
+                Err("rpc unavailable".into())
+            }
+        }
+    }
+
+    struct OverflowToken;
+
+    #[async_trait]
+    impl TokenPriceSource for OverflowToken {
+        async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
+            Ok(U256::MAX)
+        }
+    }
+
+    fn sample_fees() -> Eip1559Fees {
+        Eip1559Fees {
+            base_fee_per_gas: 19_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 39_000_000_000,
+        }
+    }
 
     #[tokio::test]
     async fn fixed_source_updates_only_when_log_price_changes() {
@@ -239,5 +293,92 @@ mod tests {
                 changed: false
             }
         );
+    }
+
+    #[tokio::test]
+    async fn live_source_updates_only_when_encoded_price_changes() {
+        let db = temp_db("live-fee-oracle");
+        let quote = U256::from(1_800_000_000u64);
+        let expected_linear =
+            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote, 10).unwrap();
+        let expected_log = encode_log_gas_price(expected_linear);
+
+        let oracle = FeeOracle::new(
+            db.path.clone(),
+            Duration::from_secs(1),
+            Arc::new(StaticGas(sample_fees())),
+            Arc::new(StaticToken(quote)),
+        );
+        assert_eq!(
+            oracle.refresh_once().await.unwrap(),
+            RefreshResult {
+                log_gas_price: expected_log,
+                changed: true
+            }
+        );
+        assert_eq!(
+            oracle.refresh_once().await.unwrap(),
+            RefreshResult {
+                log_gas_price: expected_log,
+                changed: false
+            }
+        );
+        let storage = Storage::open_read_only(&db.path).unwrap();
+        assert_eq!(storage.log_gas_price().unwrap(), expected_log);
+    }
+
+    #[tokio::test]
+    async fn transient_source_failure_retains_previous_price() {
+        let db = temp_db("retain-fee-oracle");
+        let quote = U256::from(1_800_000_000u64);
+        let expected_linear =
+            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote, 10).unwrap();
+        let expected_log = encode_log_gas_price(expected_linear);
+
+        let oracle = FeeOracle::new(
+            db.path.clone(),
+            Duration::from_secs(1),
+            Arc::new(FlakyGas {
+                calls: Mutex::new(0),
+                ok: sample_fees(),
+            }),
+            Arc::new(StaticToken(quote)),
+        );
+        assert_eq!(
+            oracle.refresh_once().await.unwrap().log_gas_price,
+            expected_log
+        );
+        let err = oracle.refresh_once().await.expect_err("second call fails");
+        assert!(matches!(err, FeeOracleError::Transient(_)));
+        let storage = Storage::open_read_only(&db.path).unwrap();
+        assert_eq!(storage.log_gas_price().unwrap(), expected_log);
+    }
+
+    #[tokio::test]
+    async fn arithmetic_overflow_is_fatal() {
+        let db = temp_db("fatal-fee-oracle");
+        // Ensure the schema exists so a later read would be meaningful; the
+        // overflow path must fail before any write.
+        let storage = Storage::open(&db.path).unwrap();
+        assert_eq!(storage.log_gas_price().unwrap(), 0);
+        drop(storage);
+
+        let oracle = FeeOracle::new(
+            db.path.clone(),
+            Duration::from_secs(1),
+            Arc::new(StaticGas(Eip1559Fees {
+                base_fee_per_gas: u128::MAX,
+                max_priority_fee_per_gas: u128::MAX,
+                max_fee_per_gas: u128::MAX,
+            })),
+            Arc::new(OverflowToken),
+        );
+        let err = oracle.refresh_once().await.expect_err("overflow is fatal");
+        assert!(matches!(
+            err,
+            FeeOracleError::FatalMath(MathError::Overflow)
+        ));
+        let storage = Storage::open_read_only(&db.path).unwrap();
+        assert_eq!(storage.log_gas_price().unwrap(), 0);
     }
 }

@@ -347,4 +347,29 @@ mod tests {
         assert_ne!(SEPOLIA_WETH, SEPOLIA_USDC);
         assert_ne!(MAINNET_USDC_WETH_005_POOL, SEPOLIA_USDC_WETH_005_POOL);
     }
+
+    #[test]
+    fn out_of_range_ticks_overflow() {
+        assert!(matches!(
+            quote_x_per_weth_from_tick(887_273, true),
+            Err(PriceSourceError::ArithmeticOverflow)
+        ));
+        assert!(matches!(
+            quote_x_per_weth_from_tick(-887_273, false),
+            Err(PriceSourceError::ArithmeticOverflow)
+        ));
+    }
+
+    #[test]
+    fn boundary_ticks_are_representable() {
+        assert!(quote_x_per_weth_from_tick(887_272, true).is_ok());
+        assert!(quote_x_per_weth_from_tick(-887_272, false).is_ok());
+    }
+
+    #[test]
+    fn positive_tick_directionality_matches_token_order() {
+        let one_weth = U256::from(1_000_000_000_000_000_000u128);
+        assert!(quote_x_per_weth_from_tick(1, true).unwrap() > one_weth);
+        assert!(quote_x_per_weth_from_tick(1, false).unwrap() < one_weth);
+    }
 }

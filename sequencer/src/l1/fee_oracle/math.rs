@@ -109,4 +109,38 @@ mod tests {
         assert_eq!(before, U256::from(1));
         assert_eq!(encode_log_gas_price(before), 0);
     }
+
+    #[test]
+    fn ceil_div_rejects_zero_denominator() {
+        assert_eq!(
+            ceil_div(U256::from(1), U256::ZERO),
+            Err(MathError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn encode_zero_and_saturate_at_max_exponent() {
+        assert_eq!(encode_log_gas_price(U256::ZERO), 0);
+        assert_eq!(encode_log_gas_price(U256::MAX), MAX_EXPONENT);
+        assert!(fee_to_linear(encode_log_gas_price(U256::MAX)) <= fee_to_linear(MAX_EXPONENT));
+    }
+
+    #[test]
+    fn compute_rounds_up_fractional_wei_quote() {
+        // 1 wei * 1 quote-unit * 10 = 10 — strictly less than 1e18, so ceil → 1.
+        assert_eq!(
+            compute_x_units_per_gas(1, 0, U256::from(1), 10).unwrap(),
+            U256::from(1)
+        );
+        // Exact multiple of 1e18 stays exact (no round-up).
+        assert_eq!(
+            compute_x_units_per_gas(1, 0, U256::from(1_000_000_000_000_000_000u128), 10).unwrap(),
+            U256::from(10)
+        );
+        // One extra quote unit pushes numerator over the next 1e18 boundary.
+        assert_eq!(
+            compute_x_units_per_gas(1, 0, U256::from(1_000_000_000_000_000_001u128), 10).unwrap(),
+            U256::from(11)
+        );
+    }
 }
