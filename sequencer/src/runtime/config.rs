@@ -101,6 +101,120 @@ impl TimingArgs {
     }
 }
 
+/// L1 fee-oracle source selection. A fixed logarithmic price is intended for
+/// local development; public chains use a validated Uniswap V3 TWAP source.
+#[derive(Debug, Clone, Args)]
+pub struct FeeOracleArgs {
+    /// Fixed logarithmic gas price for local/Anvil deployments.
+    #[arg(long, env = "CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE")]
+    pub fixed_log_gas_price: Option<u16>,
+    #[arg(long, env = "CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS", value_parser = parse_address)]
+    pub fee_token_address: Option<Address>,
+    #[arg(long, env = "CARTESI_SEQUENCER_FEE_TOKEN_DECIMALS")]
+    pub fee_token_decimals: Option<u8>,
+    #[arg(long, env = "CARTESI_SEQUENCER_WETH_ADDRESS", value_parser = parse_address)]
+    pub weth_address: Option<Address>,
+    #[arg(long, env = "CARTESI_SEQUENCER_UNISWAP_V3_POOL", value_parser = parse_address)]
+    pub uniswap_v3_pool: Option<Address>,
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS",
+        default_value_t = crate::l1::fee_oracle::UniswapConfig::DEFAULT_TWAP_WINDOW_SECS
+    )]
+    pub twap_window_secs: u32,
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS",
+        default_value = "12000",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub poll_interval_ms: u64,
+}
+
+/// Resolved fee-oracle source with all chain-specific defaults filled in.
+#[derive(Debug, Clone)]
+pub enum FeeOracleMode {
+    Fixed { log_gas_price: u16 },
+    Uniswap(crate::l1::fee_oracle::UniswapConfig),
+}
+
+impl FeeOracleArgs {
+    /// Resolve explicit overrides, public-chain presets, or the zero-price
+    /// local-development default. This is pure so invalid combinations fail
+    /// before the inclusion lane can sample a fee.
+    pub fn resolve(&self, chain_id: u64) -> Result<FeeOracleMode, String> {
+        let has_uniswap_override = self.fee_token_address.is_some()
+            || self.fee_token_decimals.is_some()
+            || self.weth_address.is_some()
+            || self.uniswap_v3_pool.is_some();
+        if let Some(log_gas_price) = self.fixed_log_gas_price {
+            if has_uniswap_override {
+                return Err(
+                    "fixed fee oracle cannot be combined with Uniswap address or decimals overrides"
+                        .to_string(),
+                );
+            }
+            return Ok(FeeOracleMode::Fixed { log_gas_price });
+        }
+        if has_uniswap_override {
+            let (fee_token, expected_decimals, weth, pool) = match (
+                self.fee_token_address,
+                self.fee_token_decimals,
+                self.weth_address,
+                self.uniswap_v3_pool,
+            ) {
+                (Some(fee_token), Some(expected_decimals), Some(weth), Some(pool)) => {
+                    (fee_token, expected_decimals, weth, pool)
+                }
+                _ => {
+                    return Err(
+                        "Uniswap fee-oracle overrides require fee token address, fee token decimals, WETH address, and Uniswap V3 pool"
+                            .to_string(),
+                    );
+                }
+            };
+            return Ok(FeeOracleMode::Uniswap(
+                crate::l1::fee_oracle::UniswapConfig {
+                    chain_id,
+                    weth,
+                    fee_token,
+                    expected_decimals,
+                    pool,
+                    twap_window_secs: self.twap_window_secs,
+                },
+            ));
+        }
+        let preset = match chain_id {
+            1 => Some((
+                crate::l1::fee_oracle::uniswap::MAINNET_WETH,
+                crate::l1::fee_oracle::uniswap::MAINNET_USDC,
+                6,
+                crate::l1::fee_oracle::uniswap::MAINNET_USDC_WETH_005_POOL,
+            )),
+            11_155_111 => Some((
+                crate::l1::fee_oracle::uniswap::SEPOLIA_WETH,
+                crate::l1::fee_oracle::uniswap::SEPOLIA_USDC,
+                6,
+                crate::l1::fee_oracle::uniswap::SEPOLIA_USDC_WETH_005_POOL,
+            )),
+            _ => None,
+        };
+        Ok(match preset {
+            Some((weth, fee_token, expected_decimals, pool)) => {
+                FeeOracleMode::Uniswap(crate::l1::fee_oracle::UniswapConfig {
+                    chain_id,
+                    weth,
+                    fee_token,
+                    expected_decimals,
+                    pool,
+                    twap_window_secs: self.twap_window_secs,
+                })
+            }
+            None => FeeOracleMode::Fixed { log_gas_price: 0 },
+        })
+    }
+}
+
 /// Batch-submitter signing-key source, shared by `run` and `flush-mempool`
 /// (both sign L1 transactions). `setup` does NOT use this — it takes the
 /// submitter address directly and never signs.
@@ -389,6 +503,8 @@ pub struct RunConfig {
 
     #[command(flatten)]
     pub timing: TimingArgs,
+    #[command(flatten)]
+    pub fee_oracle: FeeOracleArgs,
 }
 
 impl RunConfig {
@@ -685,6 +801,68 @@ mod tests {
     #[test]
     fn run_defaults_batch_submitter_confirmation_depth_to_two() {
         assert_eq!(run_config_from(&[]).batch_submitter_confirmation_depth, 2);
+    }
+
+    #[test]
+    fn fee_oracle_fixed_mode_rejects_uniswap_override() {
+        let config = run_config_from(&[
+            "--fixed-log-gas-price",
+            "7",
+            "--fee-token-address",
+            "0x1111111111111111111111111111111111111111",
+        ]);
+        assert!(
+            config
+                .fee_oracle
+                .resolve(31_337)
+                .expect_err("fixed and Uniswap config must not mix")
+                .contains("cannot be combined")
+        );
+    }
+
+    #[test]
+    fn fee_oracle_partial_uniswap_override_is_rejected() {
+        let config = run_config_from(&[
+            "--fee-token-address",
+            "0x1111111111111111111111111111111111111111",
+        ]);
+        assert!(
+            config
+                .fee_oracle
+                .resolve(31_337)
+                .expect_err("all Uniswap fields are required together")
+                .contains("require")
+        );
+    }
+
+    #[test]
+    fn fee_oracle_uses_public_chain_presets() {
+        let config = run_config_from(&["--twap-window-secs", "42"]);
+        let FeeOracleMode::Uniswap(mainnet) = config.fee_oracle.resolve(1).unwrap() else {
+            panic!("mainnet must use Uniswap preset");
+        };
+        assert_eq!(
+            mainnet.pool,
+            crate::l1::fee_oracle::uniswap::MAINNET_USDC_WETH_005_POOL
+        );
+        assert_eq!(mainnet.expected_decimals, 6);
+        assert_eq!(mainnet.twap_window_secs, 42);
+
+        let FeeOracleMode::Uniswap(sepolia) = config.fee_oracle.resolve(11_155_111).unwrap() else {
+            panic!("Sepolia must use Uniswap preset");
+        };
+        assert_eq!(
+            sepolia.pool,
+            crate::l1::fee_oracle::uniswap::SEPOLIA_USDC_WETH_005_POOL
+        );
+    }
+
+    #[test]
+    fn fee_oracle_defaults_to_zero_fixed_price_on_anvil() {
+        assert!(matches!(
+            run_config_from(&[]).fee_oracle.resolve(31_337).unwrap(),
+            FeeOracleMode::Fixed { log_gas_price: 0 }
+        ));
     }
 
     #[test]

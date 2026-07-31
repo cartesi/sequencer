@@ -3,8 +3,8 @@
 
 //! Runtime worker lifecycle: spawn → run-until-first-exit → orderly cleanup.
 //!
-//! [`Workers`] owns the five runtime worker handles (server, lane, input
-//! reader, batch submitter, danger detector) plus the shared shutdown signal.
+//! [`Workers`] owns the six runtime worker handles (server, lane, input
+//! reader, batch submitter, danger detector, fee oracle) plus the shared shutdown signal.
 //! Three methods describe its lifecycle:
 //!
 //! - [`Workers::spawn`]: build all configs, spawn workers, return owning struct.
@@ -13,8 +13,8 @@
 //! - [`Workers::finish`]: request shutdown, await each component (logging
 //!   cleanup-time errors), surface the primary failure.
 //!
-//! Worker plumbing is intentionally explicit per-worker (5 fields, 5 spawn
-//! statements, 5 select arms, 5 cleanup entries). Adding a sixth worker means
+//! Worker plumbing is intentionally explicit per-worker (6 fields, 6 spawn
+//! statements, 6 select arms, 6 cleanup entries). Adding a seventh worker means
 //! editing each of those four sites — but each edit is obvious and local.
 
 use std::future::Future;
@@ -31,16 +31,17 @@ use crate::http::{self, ApiConfig};
 use crate::ingress::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, InclusionLaneError, dump_info, dump_info::delete_dump_dir,
 };
+use crate::l1::fee_oracle::{FeeOracle, FixedPriceSource, UniswapV3PriceSource};
 use crate::l1::reader::{InputReader, InputReaderError};
 use crate::l1::submitter::{
     BatchPosterConfig, BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError,
     EthereumBatchPoster, SubmitterExit,
 };
 use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit};
-use crate::runtime::config::{L1Config, RunConfig};
+use crate::runtime::config::{FeeOracleMode, L1Config, RunConfig};
 use crate::runtime::error::{
-    BatchSubmitterExit, DangerDetectorExit, InputReaderExit, LaneExit, RunError, ServerExit,
-    WorkerExit,
+    BatchSubmitterExit, DangerDetectorExit, FeeOracleExit, InputReaderExit, LaneExit, RunError,
+    ServerExit, WorkerExit,
 };
 use crate::runtime::shutdown::ShutdownSignal;
 use sequencer_core::application::Application;
@@ -71,7 +72,7 @@ pub(crate) struct WorkersConfig {
     pub domain: alloy_sol_types::Eip712Domain,
 }
 
-/// Owns the five worker handles + the shutdown signal that drives all of them.
+/// Owns the six worker handles + the shutdown signal that drives all of them.
 /// Construction (`spawn`) and teardown (`finish`) bracket the worker
 /// lifecycle.
 pub(crate) struct Workers {
@@ -80,6 +81,7 @@ pub(crate) struct Workers {
     reader: JoinHandle<Result<(), InputReaderError>>,
     submitter: JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
     detector: JoinHandle<Result<DetectorExit, DangerDetectorError>>,
+    fee_oracle: JoinHandle<Result<(), crate::l1::fee_oracle::worker::FeeOracleError>>,
     shutdown: ShutdownSignal,
 }
 
@@ -145,6 +147,54 @@ impl Workers {
             "snapshot startup cleanup complete",
         );
 
+        // The first refresh is mandatory: the lane samples batch policy while
+        // opening its first frame, so it must never begin on a stale default.
+        // This provider is deliberately read-only; only the batch submitter
+        // holds the configured signing key.
+        let poll_interval = Duration::from_millis(run_config.fee_oracle.poll_interval_ms);
+        let oracle = match run_config
+            .fee_oracle
+            .resolve(l1_config.chain_id)
+            .map_err(|message| {
+                RunError::Bootstrap(crate::runtime::error::BootstrapError::FeeOracle { message })
+            })? {
+            FeeOracleMode::Fixed { log_gas_price } => FeeOracle::fixed(
+                db_path.clone(),
+                poll_interval,
+                FixedPriceSource::LogGasPrice(log_gas_price),
+            ),
+            FeeOracleMode::Uniswap(uniswap_config) => {
+                let provider = crate::l1::provider::create_provider(
+                    &l1_config.eth_rpc_url,
+                    l1_config.allow_insecure_rpc,
+                )
+                .map_err(|message| {
+                    RunError::Bootstrap(crate::runtime::error::BootstrapError::FeeOracle {
+                        message,
+                    })
+                })?;
+                let token = UniswapV3PriceSource::connect(provider.clone(), uniswap_config)
+                    .await
+                    .map_err(|error| {
+                        RunError::Bootstrap(crate::runtime::error::BootstrapError::FeeOracle {
+                            message: error.to_string(),
+                        })
+                    })?;
+                FeeOracle::new(
+                    db_path.clone(),
+                    poll_interval,
+                    Arc::new(provider),
+                    Arc::new(token),
+                )
+            }
+        };
+        let initial_fee = oracle.refresh_once().await?;
+        tracing::info!(
+            log_gas_price = initial_fee.log_gas_price,
+            changed = initial_fee.changed,
+            "initialized L1 fee oracle"
+        );
+
         let (tx, lane) = InclusionLane::<A>::start(
             QUEUE_CAPACITY,
             shutdown.clone(),
@@ -178,6 +228,8 @@ impl Workers {
         // Danger detector: trips startup recovery on bad DB/L1 state.
         let detector = DangerDetector::new(db_path.clone(), timing, DANGER_DETECTOR_POLL_INTERVAL)
             .start(shutdown.clone())?;
+
+        let fee_oracle = oracle.start(shutdown.clone())?;
 
         // HTTP server (ingress /tx + egress /ws/subscribe + /health, currently merged).
         let tx_feed = L2TxFeed::new(
@@ -216,6 +268,7 @@ impl Workers {
             reader,
             submitter,
             detector,
+            fee_oracle,
             shutdown,
         })
     }
@@ -232,6 +285,7 @@ impl Workers {
             reader_result = &mut self.reader => reader_result.into(),
             submitter_result = &mut self.submitter => submitter_result.into(),
             detector_result = &mut self.detector => detector_result.into(),
+            fee_oracle_result = &mut self.fee_oracle => fee_oracle_result.into(),
         }
     }
 
@@ -248,9 +302,10 @@ impl Workers {
             reader,
             submitter,
             detector,
+            fee_oracle,
             shutdown: _,
         } = self;
-        let components: [(WorkerId, ComponentShutdown); 5] = [
+        let components: [(WorkerId, ComponentShutdown); 6] = [
             (WorkerId::Server, Box::pin(wait_for_server_shutdown(server))),
             (WorkerId::Lane, Box::pin(wait_for_lane_shutdown(lane))),
             (
@@ -264,6 +319,10 @@ impl Workers {
             (
                 WorkerId::DangerDetector,
                 Box::pin(wait_for_danger_detector_shutdown(detector)),
+            ),
+            (
+                WorkerId::FeeOracle,
+                Box::pin(wait_for_fee_oracle_shutdown(fee_oracle)),
             ),
         ];
 
@@ -332,6 +391,7 @@ enum WorkerId {
     InputReader,
     BatchSubmitter,
     DangerDetector,
+    FeeOracle,
 }
 
 impl WorkerId {
@@ -343,6 +403,7 @@ impl WorkerId {
             WorkerId::InputReader => "input reader",
             WorkerId::BatchSubmitter => "batch submitter",
             WorkerId::DangerDetector => "danger detector",
+            WorkerId::FeeOracle => "fee oracle",
         }
     }
 }
@@ -356,6 +417,7 @@ impl WorkerExit {
             WorkerExit::InputReader(_) => WorkerId::InputReader,
             WorkerExit::BatchSubmitter(_) => WorkerId::BatchSubmitter,
             WorkerExit::DangerDetector(_) => WorkerId::DangerDetector,
+            WorkerExit::FeeOracle(_) => WorkerId::FeeOracle,
         }
     }
 }
@@ -439,6 +501,23 @@ impl From<Result<Result<DetectorExit, DangerDetectorError>, tokio::task::JoinErr
     }
 }
 
+impl From<Result<Result<(), crate::l1::fee_oracle::worker::FeeOracleError>, tokio::task::JoinError>>
+    for FirstExit
+{
+    fn from(
+        result: Result<
+            Result<(), crate::l1::fee_oracle::worker::FeeOracleError>,
+            tokio::task::JoinError,
+        >,
+    ) -> Self {
+        FirstExit::Worker(WorkerExit::FeeOracle(match result {
+            Ok(Ok(())) => FeeOracleExit::StoppedUnexpectedly,
+            Ok(Err(source)) => FeeOracleExit::Source(source),
+            Err(source) => FeeOracleExit::Join(source),
+        }))
+    }
+}
+
 // ── Shutdown waiters ───────────────────────────────────────────────────
 //
 // Each waiter awaits a worker's JoinHandle and converts via the per-worker
@@ -475,6 +554,12 @@ async fn wait_for_danger_detector_shutdown(
     handle: JoinHandle<Result<DetectorExit, DangerDetectorError>>,
 ) -> Result<(), WorkerExit> {
     DangerDetectorExit::from_shutdown(handle.await).map_err(Into::into)
+}
+
+async fn wait_for_fee_oracle_shutdown(
+    handle: JoinHandle<Result<(), crate::l1::fee_oracle::worker::FeeOracleError>>,
+) -> Result<(), WorkerExit> {
+    FeeOracleExit::from_shutdown(handle.await).map_err(Into::into)
 }
 
 fn log_cleanup_result(component: &str, result: Result<(), WorkerExit>) {
