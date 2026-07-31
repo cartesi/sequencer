@@ -159,10 +159,12 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
   - `api/` — `/ws/subscribe`, `/livez`, `/readyz`, `/healthz`.
   - `l2_tx_feed/` — DB-backed ordered-tx feed.
 - `sequencer/src/l1/` — L1 client surface.
-  - `reader.rs` — safe-input ingestion from InputBox into SQLite.
-  - `submitter/` — stateless batch submitter (`worker.rs` + `poster.rs`).
-  - `provider.rs` — alloy provider construction.
-  - `partition.rs` — long-block-range retry helper.
+ - `reader.rs` — safe-input ingestion from InputBox into SQLite.
+ - `submitter/` — stateless batch submitter (`worker.rs` + `poster.rs`).
+ - `fee_oracle/` — L1 Uniswap V3 TWAP → `batch_policy.log_gas_price` (fixed mode for Anvil).
+ - `eip1559.rs` — shared EIP-1559 fee estimation (poster + oracle).
+ - `provider.rs` — alloy provider construction.
+ - `partition.rs` — long-block-range retry helper.
 - `sequencer/src/recovery/` — preemptive recovery startup procedure (`mod.rs`), runtime danger detector (`detector.rs`), and mempool flusher (`flusher.rs`).
 - `sequencer/src/storage/` — SQLite persistence, split by writer role (`ingress`, `egress`, `l1_inputs`, `l1_submission`, `recovery`, `admin`, `safe_accepted_batches`, `snapshot_dumps`, plus shared `mod`, `open`, `convert`, `queries`, `mutations`, and `migrations/`).
 
@@ -174,6 +176,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Inclusion lane** — hot-path single-lane loop that dequeues, executes, persists, and rotates frame/batch boundaries. The only writer of open batch/frame state.
 - **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Nonces are assigned by storage (structural `parent.nonce + 1`) when batches are closed; the submitter just reads them.
 - **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `RecoveryRequired` when any non-`Safe` danger status fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery or refusal can run.
+- **Fee oracle** — background worker that converts L1 gas price (base + priority) into fee-token smallest units via a pinned Uniswap V3 WETH/X TWAP (or an explicit fixed exponent on Anvil), applies a 10× slack, and updates `batch_policy.log_gas_price`. Mandatory successful refresh before the inclusion lane starts; frame fees stay immutable until the next frame opens.
 - **Input reader** — ingests safe inputs from L1 InputBox into SQLite.
 - **L2 tx feed** — DB-backed ordered-tx stream used by WS subscribers.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
@@ -237,7 +240,8 @@ Writer roles — one writer per table; reads over batch data go through the `val
 | recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, scoped `pending_snapshots` clear, `wallet_nonce_watermark` (flush no-ops, write-before-broadcast) |
 | batch submitter | `wallet_nonce_watermark` (write-before-broadcast, review R1a — its only write) |
 | egress (HTTP) | `dumps.lease_count` (leases) |
-| admin | `batch_policy` |
+| admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
+| fee_oracle | `batch_policy.log_gas_price` |
 
 - Storage model is append-oriented; avoid mutable status flags for open/closed entities.
 - Open batch/frame are derived by "latest row" convention.
@@ -288,7 +292,13 @@ defaults list here drifted once already): `CARTESI_SEQUENCER_HTTP_ADDR`, `CARTES
 `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`, `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`,
 `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (fixed default, independent of the margin;
 must be strictly below the danger threshold or startup refuses),
-`CARTESI_SEQUENCER_SECONDS_PER_BLOCK`.
+`CARTESI_SEQUENCER_SECONDS_PER_BLOCK`, fee-oracle knobs
+(`CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE`,
+`CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS` / `_DECIMALS`,
+`CARTESI_SEQUENCER_WETH_ADDRESS`, `CARTESI_SEQUENCER_UNISWAP_V3_POOL`,
+`CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS`,
+`CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS` — mainnet/Sepolia default to
+pinned USDC pool presets; other chains default to fixed `log_gas_price = 0`).
 
 ## Coding Conventions
 

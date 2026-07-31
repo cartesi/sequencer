@@ -422,15 +422,17 @@ END;
 -- Exponent N represents a linear value of (129/128)^N.
 --
 -- Fee unit:
---   `gas_price` is denominated in "L2 smallest-token-unit per L1 gas unit".
---   The entity feeding this value (e.g. a scheduler/price-oracle) must
---   convert the L1 gas price in wei and the L1↔L2 exchange rate into this
---   single number.
+--   `gas_price` is denominated in "fee-token smallest units per L1 gas unit"
+--   (application-defined ERC-20 X; the wallet prototype starts with USDC).
+--   The L1 fee oracle converts base+priority gas (wei) via a pinned Uniswap V3
+--   WETH/X TWAP, multiplies by 10× slack, then encodes to log space. Local
+--   Anvil uses an explicit fixed exponent instead of Uniswap.
 --
 -- Fee derivation (view):
 --   log_recommended_fee = log_gas_price + log_one_plus_alpha + log_delta + log_user_op_bytes
 --   Pure addition — no overflow possible. The oracle feeds log_gas_price
---   directly in log space.
+--   directly in log space. Alpha amortizes batch fixed gas over expected
+--   target occupancy (not retrospective per-op settlement).
 --
 -- Batch sizing (view):
 --   log_batch_size_target = log_base_gas - log_alpha - log_delta
