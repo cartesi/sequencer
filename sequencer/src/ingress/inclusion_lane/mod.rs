@@ -210,7 +210,6 @@ impl<A: Application + 'static> InclusionLane<A> {
         let outcome = match dequeue_and_execute_user_op_chunk::<A>(
             &mut self.rx,
             &mut self.app,
-            head.frame_fee,
             self.config.max_user_ops_per_chunk.max(1),
             head,
             included,
@@ -429,16 +428,15 @@ fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) ->
 fn execute_user_op(
     app: &mut impl Application,
     item: PendingUserOp,
-    current_frame_fee: u16,
-    frame_safe_block: u64,
+    head: &WriteHead,
     included: &mut Vec<PendingUserOp>,
 ) -> Result<(), InclusionLaneError> {
     match validate_and_execute_user_op(
         app,
         item.signed.sender,
         &item.signed.user_op,
-        current_frame_fee,
-        frame_safe_block,
+        head.frame_fee,
+        head.safe_block,
     ) {
         Ok(ExecutionOutcome::Included { .. }) => included.push(item),
         Ok(ExecutionOutcome::Invalid(reason)) => {
@@ -476,7 +474,6 @@ fn execute_user_op(
 pub(super) fn dequeue_and_execute_user_op_chunk<A: Application>(
     rx: &mut mpsc::Receiver<PendingUserOp>,
     app: &mut A,
-    current_frame_fee: u16,
     max_chunk: usize,
     head: &WriteHead,
     included: &mut Vec<PendingUserOp>,
@@ -486,7 +483,7 @@ pub(super) fn dequeue_and_execute_user_op_chunk<A: Application>(
     while executed < max_chunk {
         match rx.try_recv() {
             Ok(item) => {
-                execute_user_op(app, item, current_frame_fee, head.safe_block, included)?;
+                execute_user_op(app, item, head, included)?;
                 executed = executed.saturating_add(1);
 
                 let projected = head

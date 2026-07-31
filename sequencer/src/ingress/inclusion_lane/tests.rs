@@ -875,8 +875,8 @@ fn dequeue_returns_channel_closed_when_disconnected() {
     let mut included = Vec::new();
     let head = unbounded_head();
 
-    let err = dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, 1, &head, &mut included)
-        .unwrap_err();
+    let err =
+        dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, &head, &mut included).unwrap_err();
     assert!(matches!(err, InclusionLaneError::ChannelClosed));
 }
 
@@ -890,7 +890,7 @@ fn dequeue_flushes_executed_ops_before_observing_disconnect() {
     let mut app = TestApp::default();
     let mut included = Vec::new();
     let head = unbounded_head();
-    dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, 16, &head, &mut included)
+    dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 16, &head, &mut included)
         .expect("should flush processed user ops before disconnect");
     assert_eq!(included.len(), 1);
 }
@@ -904,7 +904,7 @@ fn dequeue_returns_lane_error_when_app_reports_internal() {
     let mut app = InternalUserOpApp;
     let mut included = Vec::new();
     let head = unbounded_head();
-    let err = dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 1, 16, &head, &mut included)
+    let err = dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 16, &head, &mut included)
         .expect_err("internal application error should stop the lane");
 
     assert!(matches!(err, InclusionLaneError::ExecuteUserOp { .. }));
