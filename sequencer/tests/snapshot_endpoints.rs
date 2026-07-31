@@ -142,23 +142,39 @@ fn register_pending(
         .expect("register pending")
 }
 
-fn lease_count(db_path: &str, dump_id: i64) -> i64 {
-    Storage::open_read_only(db_path)
-        .expect("open ro")
+/// Read `dumps.lease_count`. Returns `None` on open/query failure (including
+/// the brief `SQLITE_BUSY` window while a stream's drop-guard release is
+/// committing under `synchronous=FULL`). Production RO opens use a 50ms
+/// `busy_timeout` by design; tests must not `.expect` through that race.
+fn try_lease_count(db_path: &str, dump_id: i64) -> Option<i64> {
+    let mut storage = Storage::open_read_only(db_path).ok()?;
+    storage
         .dump_lease_count(dump_id)
-        .expect("read lease")
-        .unwrap_or(0)
+        .ok()
+        .map(|n| n.unwrap_or(0))
+}
+
+fn lease_count(db_path: &str, dump_id: i64) -> i64 {
+    for _ in 0..50 {
+        if let Some(n) = try_lease_count(db_path, dump_id) {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    try_lease_count(db_path, dump_id).expect("read lease")
 }
 
 async fn wait_for_lease(db_path: &str, dump_id: i64, want: i64) -> bool {
     let started = tokio::time::Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
-        if lease_count(db_path, dump_id) == want {
+        // Treat open/read failures (transient busy against the release write)
+        // the same as "not yet" — keep polling.
+        if try_lease_count(db_path, dump_id) == Some(want) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    lease_count(db_path, dump_id) == want
+    try_lease_count(db_path, dump_id) == Some(want)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
