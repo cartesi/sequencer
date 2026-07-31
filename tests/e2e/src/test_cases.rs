@@ -165,6 +165,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ("fee_below_minimum_rejected_test", |runtime| {
             Box::pin(run_fee_below_minimum_rejected_test(runtime))
         }),
+        ("fixed_fee_oracle_sets_frame_fee_test", |runtime| {
+            Box::pin(run_fixed_fee_oracle_sets_frame_fee_test(runtime))
+        }),
         ("forged_signature_rejected_test", |runtime| {
             Box::pin(run_forged_signature_rejected_test(runtime))
         }),
@@ -805,6 +808,41 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
 
     assert_eq!(replay.current_user_balance(alice_address), deposit_amount);
     assert_eq!(replay.current_user_nonce(alice_address), 0);
+    Ok(())
+}
+
+/// Fixed fee-oracle exponent 100 → recommended frame fee 1160
+/// (`100 + 20 + 419 + 621`), still under the wallet client's default max fee.
+async fn run_fixed_fee_oracle_sets_frame_fee_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    const FIXED_LOG_GAS_PRICE: u16 = 100;
+    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE + 20 + 419 + 621;
+
+    let alice = TestSigner::from_default(1)?;
+    let alice_address = alice.address();
+
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice)?;
+    let mut replay = ReplayWalletApp::devnet();
+
+    let deposit_amount = U256::from(600_000_u64);
+    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
+
+    let transfer_amount = U256::from(100_u64);
+    alice_l2.transfer(alice_address, transfer_amount).await?;
+    let message = ws.expect_user_op_from(alice_address).await?;
+    match &message {
+        WsTxMessage::UserOp { fee, .. } => {
+            assert_eq!(
+                *fee, EXPECTED_FRAME_FEE,
+                "first frame must sample the fixed fee-oracle log_gas_price"
+            );
+        }
+        other => return Err(format!("expected user op, got {other:?}").into()),
+    }
+    replay.apply(message)?;
     Ok(())
 }
 

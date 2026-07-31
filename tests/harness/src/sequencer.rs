@@ -49,6 +49,10 @@ pub struct ManagedSequencerConfig {
     /// When false, the child runs without libfaketime (for tests that never
     /// manipulate wall clock). Requires libfaketime in PATH when true.
     pub faketime: bool,
+    /// When set, passes `CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE` to
+    /// the `run` phase so Anvil/devnet boots with an explicit fee-oracle
+    /// exponent instead of the default zero.
+    pub fee_oracle_fixed_log_gas_price: Option<u16>,
 }
 
 /// Snapshot of the `batches` table. Returned by
@@ -167,6 +171,9 @@ pub struct ManagedSequencer {
     /// Used by tests that need a batch to close + be promoted. Persists across
     /// respawns. See [`Self::set_max_batch_open_seconds`].
     max_batch_open_seconds: Option<u64>,
+    /// Fixed fee-oracle exponent forwarded to each `run` spawn. See
+    /// [`ManagedSequencerConfig::fee_oracle_fixed_log_gas_price`].
+    fee_oracle_fixed_log_gas_price: Option<u16>,
 }
 
 pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> ManagedSequencerConfig {
@@ -175,6 +182,7 @@ pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> Managed
         log_prefix: log_prefix.into(),
         logs_dir: PathBuf::from(DEFAULT_TEST_LOGS_DIR),
         faketime: true,
+        fee_oracle_fixed_log_gas_price: None,
     }
 }
 
@@ -235,6 +243,7 @@ impl ManagedSequencer {
             None,
             // Default batch-open deadline on first boot.
             None,
+            config.fee_oracle_fixed_log_gas_price,
         )
         .await?;
 
@@ -257,6 +266,7 @@ impl ManagedSequencer {
             mine_l1_during_boot: false,
             recovery_setup: None,
             max_batch_open_seconds: None,
+            fee_oracle_fixed_log_gas_price: config.fee_oracle_fixed_log_gas_price,
         })
     }
 
@@ -1000,6 +1010,7 @@ impl ManagedSequencer {
             self.mine_l1_during_boot,
             self.recovery_setup.as_ref(),
             self.max_batch_open_seconds,
+            self.fee_oracle_fixed_log_gas_price,
         )
         .await?;
         self.child = child;
@@ -1129,6 +1140,7 @@ async fn spawn_sequencer_process(
     mine_l1_during_boot: bool,
     recovery: Option<&RecoverySetupParams>,
     max_batch_open_seconds: Option<u64>,
+    fee_oracle_fixed_log_gas_price: Option<u16>,
 ) -> HarnessResult<SpawnedSequencerProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;
     let log_path = timestamped_log_path(logs_dir, log_prefix);
@@ -1303,8 +1315,14 @@ async fn spawn_sequencer_process(
             .arg("--max-batch-open-seconds")
             .arg(secs.to_string());
     }
+    run_cmd.env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG);
+    if let Some(log_gas_price) = fee_oracle_fixed_log_gas_price {
+        run_cmd.env(
+            "CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE",
+            log_gas_price.to_string(),
+        );
+    }
     run_cmd
-        .env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG)
         .stdout(Stdio::from(run_log))
         .stderr(Stdio::from(run_log_err));
     let mut child = run_cmd.spawn().map_err(|err| {
