@@ -14,6 +14,7 @@
 use thiserror::Error;
 
 use crate::ingress::inclusion_lane::InclusionLaneError;
+use crate::l1::fee_oracle::worker::FeeOracleError;
 use crate::l1::reader::InputReaderError;
 use crate::l1::submitter::{BatchPosterError, BatchSubmitterError};
 use crate::recovery::{DangerDetectorError, RecoveryError, RefuseReason};
@@ -26,7 +27,7 @@ use sequencer_core::protocol::ProtocolTimingError;
 ///
 /// - `Bootstrap`: startup failures before runtime workers come up.
 /// - `Worker`: one of the runtime workers exited (server, inclusion lane,
-///   input reader, batch submitter, danger detector).
+///   input reader, batch submitter, danger detector, fee oracle).
 /// - `Io` / `Storage`: generic catch-alls used widely; not worth nesting.
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -173,7 +174,9 @@ fn bootstrap_exit_code(err: &BootstrapError) -> u8 {
         BootstrapError::Recovery(RecoveryError::ChainIdMismatch { .. }) => EXIT_TERMINAL,
 
         // Other recovery / storage-open failures: unclassified, retry.
-        BootstrapError::Recovery(_) | BootstrapError::OpenStorage(_) => EXIT_UNCLASSIFIED,
+        BootstrapError::Recovery(_)
+        | BootstrapError::OpenStorage(_)
+        | BootstrapError::FeeOracle { .. } => EXIT_UNCLASSIFIED,
     }
 }
 
@@ -199,6 +202,10 @@ pub enum BootstrapError {
     /// See [`ProtocolTimingError`].
     #[error(transparent)]
     InvalidProtocolTiming(#[from] ProtocolTimingError),
+    /// Fee-oracle configuration, source validation, or mandatory initial
+    /// refresh failed before the inclusion lane opened.
+    #[error("fee oracle bootstrap failed: {message}")]
+    FeeOracle { message: String },
     /// Startup recovery (or refusal) failed before runtime workers started.
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
@@ -416,6 +423,8 @@ pub enum WorkerExit {
     BatchSubmitter(#[from] BatchSubmitterExit),
     #[error("danger detector: {0}")]
     DangerDetector(#[from] DangerDetectorExit),
+    #[error("fee oracle: {0}")]
+    FeeOracle(#[from] FeeOracleExit),
 }
 
 /// Generic worker exit shape: stopped without signal / errored / failed to join.
@@ -472,6 +481,16 @@ pub enum DangerDetectorExit {
     Join(tokio::task::JoinError),
     #[error("danger detected ({status:?}) — stopping for startup recovery")]
     DangerDetected { status: DangerStatus },
+}
+
+#[derive(Debug, Error)]
+pub enum FeeOracleExit {
+    #[error("stopped unexpectedly")]
+    StoppedUnexpectedly,
+    #[error("{0}")]
+    Source(FeeOracleError),
+    #[error("join error: {0}")]
+    Join(tokio::task::JoinError),
 }
 
 // ── Shutdown-time constructors ────────────────────────────────────────
@@ -551,6 +570,18 @@ impl DangerDetectorExit {
     }
 }
 
+impl FeeOracleExit {
+    pub fn from_shutdown(
+        result: Result<Result<(), FeeOracleError>, tokio::task::JoinError>,
+    ) -> Result<(), Self> {
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(source)) => Err(Self::Source(source)),
+            Err(source) => Err(Self::Join(source)),
+        }
+    }
+}
+
 // ── Chained `From` impls so `?` works at the top-level RunError ────────
 //
 // thiserror's `#[from]` is one-level; nested propagation needs manual
@@ -599,9 +630,21 @@ impl From<SetupRecoveryError> for RunError {
     }
 }
 
+impl From<FeeOracleError> for RunError {
+    fn from(error: FeeOracleError) -> Self {
+        match error {
+            FeeOracleError::OpenStorage(error) => RunError::from(error),
+            error => RunError::Bootstrap(BootstrapError::FeeOracle {
+                message: error.to_string(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::l1::fee_oracle::worker::FeeOracleError;
     use crate::recovery::{FlushError, RecoveryError};
     use crate::storage::DeploymentIdentity;
     use sequencer_core::protocol::ProtocolTimingError;
@@ -836,5 +879,15 @@ mod tests {
             RunError::Worker(WorkerExit::Server(ServerExit::StoppedUnexpectedly)).exit_code(),
             EXIT_UNCLASSIFIED
         );
+        assert_eq!(
+            RunError::from(FeeOracleError::Transient("RPC unavailable".into())).exit_code(),
+            EXIT_UNCLASSIFIED
+        );
+    }
+
+    #[test]
+    fn fee_oracle_shutdown_ok_is_graceful() {
+        let result: Result<Result<(), FeeOracleError>, tokio::task::JoinError> = Ok(Ok(()));
+        assert!(FeeOracleExit::from_shutdown(result).is_ok());
     }
 }
