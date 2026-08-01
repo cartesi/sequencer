@@ -142,39 +142,86 @@ fn register_pending(
         .expect("register pending")
 }
 
-/// Read `dumps.lease_count`. Returns `None` on open/query failure (including
-/// the brief `SQLITE_BUSY` window while a stream's drop-guard release is
-/// committing under `synchronous=FULL`). Production RO opens use a 50ms
-/// `busy_timeout` by design; tests must not `.expect` through that race.
-fn try_lease_count(db_path: &str, dump_id: i64) -> Option<i64> {
-    let mut storage = Storage::open_read_only(db_path).ok()?;
-    storage
-        .dump_lease_count(dump_id)
-        .ok()
-        .map(|n| n.unwrap_or(0))
+/// Transient WAL lock contention vs. a real read failure.
+///
+/// SQLite readers can see `SQLITE_BUSY` in WAL mode during last-connection
+/// cleanup / checkpoint (see
+/// <https://sqlite.org/wal.html#sometimes_queries_return_sqlite_busy_in_wal_mode>).
+/// Production RO opens use a 50ms `busy_timeout` by design; tests must retry
+/// that case rather than `.expect` through it. Non-lock failures are preserved
+/// so diagnostics are not swallowed.
+enum LeaseReadError {
+    Busy,
+    Other(String),
+}
+
+impl std::fmt::Display for LeaseReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(f, "database busy"),
+            Self::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+fn sqlite_is_lock_contention(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+fn open_is_lock_contention(err: &sequencer::storage::StorageOpenError) -> bool {
+    match err {
+        sequencer::storage::StorageOpenError::Sqlite(e) => sqlite_is_lock_contention(e),
+        _ => false,
+    }
+}
+
+fn try_lease_count(db_path: &str, dump_id: i64) -> Result<i64, LeaseReadError> {
+    let mut storage = match Storage::open_read_only(db_path) {
+        Ok(storage) => storage,
+        Err(err) if open_is_lock_contention(&err) => return Err(LeaseReadError::Busy),
+        Err(err) => return Err(LeaseReadError::Other(err.to_string())),
+    };
+    match storage.dump_lease_count(dump_id) {
+        Ok(n) => Ok(n.unwrap_or(0)),
+        Err(err) if sqlite_is_lock_contention(&err) => Err(LeaseReadError::Busy),
+        Err(err) => Err(LeaseReadError::Other(err.to_string())),
+    }
 }
 
 fn lease_count(db_path: &str, dump_id: i64) -> i64 {
     for _ in 0..50 {
-        if let Some(n) = try_lease_count(db_path, dump_id) {
-            return n;
+        match try_lease_count(db_path, dump_id) {
+            Ok(n) => return n,
+            Err(LeaseReadError::Busy) => std::thread::sleep(Duration::from_millis(10)),
+            Err(err) => panic!("read lease: {err}"),
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
-    try_lease_count(db_path, dump_id).expect("read lease")
+    match try_lease_count(db_path, dump_id) {
+        Ok(n) => n,
+        Err(err) => panic!("read lease: {err}"),
+    }
 }
 
 async fn wait_for_lease(db_path: &str, dump_id: i64, want: i64) -> bool {
     let started = tokio::time::Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
-        // Treat open/read failures (transient busy against the release write)
-        // the same as "not yet" — keep polling.
-        if try_lease_count(db_path, dump_id) == Some(want) {
-            return true;
+        match try_lease_count(db_path, dump_id) {
+            Ok(got) if got == want => return true,
+            // Still waiting for the drop-guard release, or transient WAL
+            // cleanup busy — keep polling.
+            Ok(_) | Err(LeaseReadError::Busy) => {}
+            Err(err) => panic!("read lease: {err}"),
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    try_lease_count(db_path, dump_id) == Some(want)
+    match try_lease_count(db_path, dump_id) {
+        Ok(got) => got == want,
+        Err(LeaseReadError::Busy) => false,
+        Err(err) => panic!("read lease: {err}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
