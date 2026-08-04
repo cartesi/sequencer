@@ -128,8 +128,14 @@ where
             .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
             crate::l1::fee_oracle::UniswapV3PriceSource::connect(provider, uniswap)
                 .await
-                .map_err(|error| BootstrapError::FeeOracleMisconfig {
-                    message: error.to_string(),
+                .map_err(|error| {
+                    let (transient, message) =
+                        crate::l1::fee_oracle::uniswap::bootstrap_price_source_error(error);
+                    if transient {
+                        BootstrapError::FeeOracleTransient { message }
+                    } else {
+                        BootstrapError::FeeOracleMisconfig { message }
+                    }
                 })?;
             FeeOracleIdentity::Uniswap {
                 weth: uniswap.weth,
