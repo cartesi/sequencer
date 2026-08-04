@@ -122,7 +122,32 @@ mod tests {
     fn encode_zero_and_saturate_at_max_exponent() {
         assert_eq!(encode_log_gas_price(U256::ZERO), 0);
         assert_eq!(encode_log_gas_price(U256::MAX), MAX_EXPONENT);
-        assert!(fee_to_linear(encode_log_gas_price(U256::MAX)) <= fee_to_linear(MAX_EXPONENT));
+        // Documented saturation gap: values above fee_to_linear(MAX_EXPONENT)
+        // collapse to MAX_EXPONENT even when that still undercharges the
+        // linear target. Fail-loud encoding is a follow-up.
+        let max_linear = fee_to_linear(MAX_EXPONENT);
+        assert!(max_linear < U256::MAX);
+        assert!(fee_to_linear(encode_log_gas_price(U256::MAX)) < U256::MAX);
+    }
+
+    #[test]
+    fn encode_bumps_when_fee_from_linear_rounds_down() {
+        // Pick a linear value that fee_from_linear maps strictly below the
+        // target so encode_log_gas_price must bump the exponent.
+        let mut target = U256::from(2u64);
+        let mut found = None;
+        for _ in 0..10_000 {
+            let rounded = fee_from_linear(target);
+            if fee_to_linear(rounded) < target && rounded < MAX_EXPONENT {
+                found = Some((target, rounded));
+                break;
+            }
+            target += U256::from(1u64);
+        }
+        let (target, rounded) = found.expect("find a rounding-down candidate");
+        let encoded = encode_log_gas_price(target);
+        assert_eq!(encoded, rounded + 1);
+        assert!(fee_to_linear(encoded) >= target);
     }
 
     #[test]

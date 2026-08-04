@@ -381,4 +381,84 @@ mod tests {
         let storage = Storage::open_read_only(&db.path).unwrap();
         assert_eq!(storage.log_gas_price().unwrap(), 0);
     }
+
+    #[tokio::test]
+    async fn run_forever_shuts_down_cleanly() {
+        let db = temp_db("fee-oracle-shutdown");
+        let _ = Storage::open(&db.path).unwrap();
+        let oracle = FeeOracle::fixed(
+            db.path.clone(),
+            Duration::from_millis(50),
+            FixedPriceSource::LogGasPrice(7),
+        );
+        let shutdown = ShutdownSignal::default();
+        let handle = oracle.start(shutdown.clone()).expect("start");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("fee oracle exits within timeout")
+            .expect("join")
+            .expect("fee oracle result");
+    }
+
+    #[tokio::test]
+    async fn run_forever_retains_price_across_transient_failures() {
+        let db = temp_db("fee-oracle-retain-loop");
+        let _ = Storage::open(&db.path).unwrap();
+        let quote = U256::from(1_800_000_000u64);
+        let expected_linear =
+            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote, 10).unwrap();
+        let expected_log = encode_log_gas_price(expected_linear);
+
+        let oracle = FeeOracle::new(
+            db.path.clone(),
+            Duration::from_millis(40),
+            Arc::new(FlakyGas {
+                calls: Mutex::new(0),
+                ok: sample_fees(),
+            }),
+            Arc::new(StaticToken(quote)),
+        );
+        let shutdown = ShutdownSignal::default();
+        let mut handle = oracle.start(shutdown.clone()).expect("start");
+
+        // First refresh succeeds; subsequent polls are transient. The worker
+        // must keep running and leave the last good price untouched.
+        tokio::select! {
+            biased;
+            result = &mut handle => panic!("fee oracle exited early: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        let storage = Storage::open_read_only(&db.path).unwrap();
+        assert_eq!(storage.log_gas_price().unwrap(), expected_log);
+        drop(storage);
+
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("fee oracle exits within timeout")
+            .expect("join")
+            .expect("fee oracle result");
+    }
+
+    #[tokio::test]
+    async fn fixed_linear_source_encodes_before_persist() {
+        let db = temp_db("fixed-linear-fee-oracle");
+        let linear = U256::from(360u64);
+        let expected = encode_log_gas_price(linear);
+        let oracle = FeeOracle::fixed(
+            db.path.clone(),
+            Duration::from_secs(1),
+            FixedPriceSource::LinearXUnitsPerGas(linear),
+        );
+        assert_eq!(
+            oracle.refresh_once().await.unwrap(),
+            RefreshResult {
+                log_gas_price: expected,
+                changed: true
+            }
+        );
+    }
 }
