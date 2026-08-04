@@ -1205,8 +1205,9 @@ async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> S
     let mut replay = ReplayWalletApp::devnet();
 
     // Build state: a deposit (direct) + a transfer (user-op). These land in the
-    // batch that will seal + promote into the checkpoint.
-    let deposit = U256::from(2_000_000_u64);
+    // batch that will seal + promote into the checkpoint. Size the deposit for
+    // the post-recovery gold-batch pump (~150 self-transfers × ~38k fee).
+    let deposit = U256::from(10_000_000_u64);
     let transfer1 = U256::from(100_000_u64);
     apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit).await?;
     alice_l2.transfer(bob_address, transfer1).await?;
