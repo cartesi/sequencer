@@ -17,11 +17,11 @@ use sequencer_rust_client::SequencerClient;
 
 const NO_WS_MESSAGE_WAIT: Duration = Duration::from_secs(1);
 
-/// Default log_recommended_fee exponent (0 + 20 + 419 + 621 = 1060).
-const DEFAULT_FRAME_FEE: u16 = 1060;
+/// Default log_recommended_fee exponent (0 + 296 + 20 + 419 + 621 = 1356).
+const DEFAULT_FRAME_FEE: u16 = 1356;
 
 /// Max fee used for raw TxRequest construction. Must be >= DEFAULT_FRAME_FEE.
-const DEFAULT_MAX_FEE: u16 = 1200;
+const DEFAULT_MAX_FEE: u16 = 2500;
 
 /// Self-transfers that force the inclusion lane to seal a batch by size, so a
 /// finalized "gold" snapshot promotes for a watchdog compare — independent of
@@ -785,7 +785,7 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
     let deposit_amount = U256::from(600_000_u64);
     apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
 
-    // Submit user-op with max_fee=0, which is below the default frame fee (1060).
+    // Submit user-op with max_fee=0, which is below the default frame fee (1356).
     let client = SequencerClient::new(runtime.endpoint())?;
     let domain = eip712_domain(runtime);
     let user_op = UserOp {
@@ -811,13 +811,19 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
     Ok(())
 }
 
-/// Fixed fee-oracle exponent 100 → recommended frame fee 1160
-/// (`100 + 20 + 419 + 621`), still under the wallet client's default max fee.
+/// Fixed fee-oracle exponent 100 → recommended frame fee 1456
+/// (`100 + 296 + 20 + 419 + 621`), sampled by the first frame.
 async fn run_fixed_fee_oracle_sets_frame_fee_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     const FIXED_LOG_GAS_PRICE: u16 = 100;
-    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE + 20 + 419 + 621;
+    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE + 296 + 20 + 419 + 621;
+
+    assert_eq!(
+        runtime.first_frame_fee()?,
+        EXPECTED_FRAME_FEE,
+        "the genesis frame must sample the setup-pinned fixed fee before any rotation"
+    );
 
     let alice = TestSigner::from_default(1)?;
     let alice_address = alice.address();
@@ -834,12 +840,7 @@ async fn run_fixed_fee_oracle_sets_frame_fee_test(
     alice_l2.transfer(alice_address, transfer_amount).await?;
     let message = ws.expect_user_op_from(alice_address).await?;
     match &message {
-        WsTxMessage::UserOp { fee, .. } => {
-            assert_eq!(
-                *fee, EXPECTED_FRAME_FEE,
-                "first frame must sample the fixed fee-oracle log_gas_price"
-            );
-        }
+        WsTxMessage::UserOp { .. } => {}
         other => return Err(format!("expected user op, got {other:?}").into()),
     }
     replay.apply(message)?;
@@ -1876,7 +1877,7 @@ async fn run_provider_outage_pre_danger_sequencer_continues_test(
     let bob_address = bob.address();
 
     // Step 1: Deposit big — Alice needs to cover 150+ transfers and their fees.
-    // Default fee per user-op ≈ 3873 units (log-fee 1060); reserve margin.
+    // Default fee per user-op ≈ 38276 units (log-fee 1356); reserve margin.
     let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
     let deposit_amount = U256::from(10_000_000_u64);
     let mut replay = ReplayWalletApp::devnet();

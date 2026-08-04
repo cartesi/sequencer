@@ -49,9 +49,7 @@ pub struct ManagedSequencerConfig {
     /// When false, the child runs without libfaketime (for tests that never
     /// manipulate wall clock). Requires libfaketime in PATH when true.
     pub faketime: bool,
-    /// When set, passes `CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE` to
-    /// the `run` phase so Anvil/devnet boots with an explicit fee-oracle
-    /// exponent instead of the default zero.
+    /// Fixed fee-oracle exponent pinned by the `setup` phase for Anvil/devnet.
     pub fee_oracle_fixed_log_gas_price: Option<u16>,
 }
 
@@ -171,7 +169,7 @@ pub struct ManagedSequencer {
     /// Used by tests that need a batch to close + be promoted. Persists across
     /// respawns. See [`Self::set_max_batch_open_seconds`].
     max_batch_open_seconds: Option<u64>,
-    /// Fixed fee-oracle exponent forwarded to each `run` spawn. See
+    /// Fixed fee-oracle exponent forwarded to each `setup` spawn. See
     /// [`ManagedSequencerConfig::fee_oracle_fixed_log_gas_price`].
     fee_oracle_fixed_log_gas_price: Option<u16>,
 }
@@ -419,6 +417,26 @@ impl ManagedSequencer {
             .map_err(|err| io_other(format!("read finalized_snapshot: {err}")))?;
         let resume_nonce = read_info_next_batch_nonce(Path::new(&prefix))?;
         Ok((inclusion_block as u64, resume_nonce))
+    }
+
+    /// Read the first frame's persisted fee. This observes startup directly,
+    /// before any deposit can rotate the frame.
+    pub fn first_frame_fee(&self) -> HarnessResult<u16> {
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path.as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+        let fee: i64 = conn
+            .query_row(
+                "SELECT fee FROM frames ORDER BY batch_index, frame_in_batch LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| io_other(format!("read first frame fee: {err}")))?;
+        u16::try_from(fee)
+            .map_err(|_| io_other(format!("first frame fee out of range: {fee}")).into())
     }
 
     /// Copy the current finalized snapshot dump to `<data_dir>/checkpoint` (which
@@ -1230,6 +1248,12 @@ async fn spawn_sequencer_process(
         .env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG)
         .stdout(Stdio::from(setup_log))
         .stderr(Stdio::from(setup_log_err));
+    // Unknown chains require an explicit setup-time source. Normal Anvil e2e
+    // pins zero; the dedicated fee test overrides it before identity exists.
+    setup_cmd.env(
+        "CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE",
+        fee_oracle_fixed_log_gas_price.unwrap_or(0).to_string(),
+    );
     let mut setup_child = setup_cmd
         .spawn()
         .map_err(|err| io_other(format!("failed to spawn `setup` for '{bin}': {err}")))?;
@@ -1316,12 +1340,6 @@ async fn spawn_sequencer_process(
             .arg(secs.to_string());
     }
     run_cmd.env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG);
-    if let Some(log_gas_price) = fee_oracle_fixed_log_gas_price {
-        run_cmd.env(
-            "CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE",
-            log_gas_price.to_string(),
-        );
-    }
     run_cmd
         .stdout(Stdio::from(run_log))
         .stderr(Stdio::from(run_log_err));
