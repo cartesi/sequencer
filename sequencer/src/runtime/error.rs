@@ -146,7 +146,7 @@ fn bootstrap_exit_code(err: &BootstrapError) -> u8 {
         BootstrapError::ChainIdMismatch { .. }
         | BootstrapError::InvalidProtocolTiming(_)
         | BootstrapError::SetupNotComplete
-        | BootstrapError::CheckpointBeforeGenesis { .. }
+        | BootstrapError::CheckpointBeforeAppDeployment { .. }
         | BootstrapError::SetupRecovery(_)
         | BootstrapError::Identity(IdentityError::Mismatch { .. } | IdentityError::OrphanedState) => {
             EXIT_TERMINAL
@@ -225,16 +225,16 @@ pub enum BootstrapError {
     /// (PR5) resolves it — a plain `setup` restart re-detects and re-refuses.
     #[error(transparent)]
     SetupRefuse(#[from] SetupRefuse),
-    /// `setup --checkpoint-block` predates the InputBox genesis block: a
-    /// promotion cannot have landed before the deployment's InputBox existed.
+    /// `setup --checkpoint-block` predates the application's deployment block:
+    /// a promotion cannot have landed before the application contract existed.
     /// Operator misconfig; restarting cannot self-heal.
     #[error(
-        "checkpoint block {checkpoint_block} predates InputBox genesis block \
-         {genesis_block}"
+        "checkpoint block {checkpoint_block} predates the application \
+         deployment block {app_deployment_block}"
     )]
-    CheckpointBeforeGenesis {
+    CheckpointBeforeAppDeployment {
         checkpoint_block: u64,
-        genesis_block: u64,
+        app_deployment_block: u64,
     },
     /// `setup --recovery` failed in a way only the operator can fix (bad config,
     /// a checkpoint that can't be loaded or doesn't fit the chain, or a DB that
@@ -370,7 +370,7 @@ pub enum SetupRefuse {
 }
 
 /// Deployment-identity failure modes. The sequencer pins itself to a specific
-/// (chain_id, app_address, input_box_address, input_box_genesis_block,
+/// (chain_id, app_address, input_box_address, app_deployment_block,
 /// batch_submitter_address) tuple on first successful boot, then refuses to
 /// run under a different identity to prevent silently associating state from
 /// one deployment with another.
@@ -618,7 +618,7 @@ mod tests {
             chain_id: 1,
             app_address: Address::repeat_byte(0x11),
             input_box_address: Address::repeat_byte(0x22),
-            input_box_genesis_block: 0,
+            app_deployment_block: 0,
             batch_submitter_address: Address::repeat_byte(0x33),
         }
     }
@@ -817,9 +817,9 @@ mod tests {
         // A checkpoint predating genesis is operator misconfig — terminal (30),
         // not a recovery trigger.
         assert_eq!(
-            RunError::Bootstrap(BootstrapError::CheckpointBeforeGenesis {
+            RunError::Bootstrap(BootstrapError::CheckpointBeforeAppDeployment {
                 checkpoint_block: 5,
-                genesis_block: 10,
+                app_deployment_block: 10,
             })
             .exit_code(),
             EXIT_TERMINAL

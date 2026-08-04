@@ -15,15 +15,15 @@ path = "src/bin/devnet_stack.rs"
 
 [dependencies]
 rollups-harness = { path = "../harness" }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { workspace = true }
 app-core = { path = "../../examples/app-core" }
 sequencer-core = { path = "../../sequencer-core" }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
-alloy-primitives = { version = "1.4.1", features = ["k256"] }
-alloy-sol-types = "1.4.1"
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
 futures = "0.3"
 libtest-mimic = "0.6.1"
-ssz = { package = "ethereum_ssz", version = "0.10" }
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net", "process", "io-util", "signal"] }
-serde_json = "1.0"
-tempfile = "3.10"
+ssz = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "process", "io-util", "signal"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

@@ -13,8 +13,8 @@ authors.workspace = true
 app-core = { path = "../app-core" }
 sequencer-core = { path = "../../sequencer-core" }
 trolley = { workspace = true }
-alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
+alloy-primitives = { workspace = true }
 types = { workspace = true }
 
 [dev-dependencies]
-k256 = "0.13"
+k256 = { workspace = true }

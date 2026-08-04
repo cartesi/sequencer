@@ -264,19 +264,16 @@ impl BatchPoster for EthereumBatchPoster {
             self.config.long_block_range_error_codes.as_slice(),
         )
         .await
-        .map_err(|errs| {
-            BatchPosterError::Provider(
-                errs.into_iter()
-                    .next()
-                    .map(|e| e.to_string())
-                    .unwrap_or_default(),
-            )
-        })?;
+        .map_err(|err| BatchPosterError::Provider(format!("get_input_added_events: {err}")))?;
 
         let mut observed_nonces = Vec::new();
         for (event, _log) in events {
-            let evm_advance = decode_evm_advance_input(event.input.as_ref())
-                .map_err(BatchPosterError::Provider)?;
+            let evm_advance = decode_evm_advance_input(event.input.as_ref()).map_err(|err| {
+                BatchPosterError::Provider(format!(
+                    "decode EvmAdvance for InputAdded index {}: {err}",
+                    event.index
+                ))
+            })?;
             if evm_advance.msgSender != self.config.batch_submitter_address {
                 continue;
             }

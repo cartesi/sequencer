@@ -64,7 +64,7 @@ where
     let timing = config.protocol_timing()?;
 
     // Refuse to boot unless `setup` completed; the identity it pinned
-    // supplies chain id / app address / InputBox address / genesis block /
+    // supplies chain id / app address / InputBox address / app deployment block /
     // submitter address — none of which are CLI args on `run`.
     let identity = load_setup_identity(&db_path)?;
 
@@ -108,7 +108,7 @@ where
     };
 
     // `run` never re-discovers identity from L1 — it builds the reader from
-    // the pinned InputBox address + genesis block and syncs incrementally.
+    // the pinned InputBox address + app deployment block and syncs incrementally.
     let mut input_reader = InputReader::from_parts(
         InputReaderConfig {
             rpc_url: config.eth_rpc_url.clone(),
@@ -119,7 +119,7 @@ where
             expected_chain_id: identity.chain_id,
         },
         identity.input_box_address,
-        identity.input_box_genesis_block,
+        identity.app_deployment_block,
         db_path.clone(),
         identity.batch_submitter_address,
         timing,
@@ -130,7 +130,7 @@ where
         data_dir = %config.data_dir,
         eth_rpc_url = %l1_config.eth_rpc_url,
         input_box_address = %l1_config.input_box_address,
-        input_reader_genesis_block = input_reader.genesis_block(),
+        app_deployment_block = input_reader.app_deployment_block(),
         chain_id = identity.chain_id,
         app_address = %l1_config.app_address,
         batch_submitter_address = %l1_config.batch_submitter_address,
@@ -292,8 +292,8 @@ fn deployment_identity_mismatch_fields(
     if stored.input_box_address != expected.input_box_address {
         fields.push("input_box_address");
     }
-    if stored.input_box_genesis_block != expected.input_box_genesis_block {
-        fields.push("input_box_genesis_block");
+    if stored.app_deployment_block != expected.app_deployment_block {
+        fields.push("app_deployment_block");
     }
     if stored.batch_submitter_address != expected.batch_submitter_address {
         fields.push("batch_submitter_address");
@@ -349,7 +349,7 @@ mod tests {
             chain_id: 31337,
             app_address: Address::repeat_byte(0x11),
             input_box_address: Address::repeat_byte(0x22),
-            input_box_genesis_block: 42,
+            app_deployment_block: 42,
             batch_submitter_address: Address::repeat_byte(0x33),
         }
     }

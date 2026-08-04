@@ -100,7 +100,7 @@ impl Workers {
         // Derived values — kept inside `spawn` so `WorkersConfig` stays
         // minimal and these aren't computed twice in the caller.
         let db_path = run_config.db_path();
-        let input_reader_genesis_block = input_reader.genesis_block();
+        let app_deployment_block = input_reader.app_deployment_block();
 
         let shutdown = ShutdownSignal::default();
 
@@ -161,7 +161,7 @@ impl Workers {
             l1_submit_address: l1_config.input_box_address,
             app_address: l1_config.app_address,
             batch_submitter_address: l1_config.batch_submitter_address,
-            start_block: input_reader_genesis_block,
+            start_block: app_deployment_block,
             confirmation_depth: run_config.batch_submitter_confirmation_depth,
             seconds_per_block: run_config.timing.seconds_per_block,
             long_block_range_error_codes: run_config.long_block_range_error_codes.clone(),

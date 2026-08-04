@@ -30,89 +30,90 @@ use alloy::contract::Event;
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use alloy::sol_types::SolEvent;
-use alloy_primitives::Address;
-use async_recursion::async_recursion;
+use alloy_primitives::{Address, B256};
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
+
+/// Failure of the partitioned `InputAdded` fetch.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GetLogsError {
+    /// The first RPC failure the bisect could not (or may not) split away.
+    /// The scan short-circuits on it — matching the watchdog — so sub-ranges
+    /// after the failing one are never queried.
+    #[error(transparent)]
+    Rpc(#[from] ContractError),
+    /// A returned log carried no block number. `eth_getLogs` over a mined
+    /// range cannot produce this from a consistent node, and the L1 order
+    /// every consumer depends on cannot be established without it (the
+    /// watchdog hard-errors on the same condition).
+    #[error(
+        "InputAdded log missing block_number (tx {transaction_hash:?}, log_index {log_index:?})"
+    )]
+    MissingBlockNumber {
+        transaction_hash: Option<B256>,
+        log_index: Option<u64>,
+    },
+}
 
 /// Fetch every `InputAdded` log for `app_address_filter`, splitting the range
 /// on RPC long-range errors. The result is in **RPC-return order** — partition
 /// sub-ranges are concatenated and a single `eth_getLogs` may itself reorder —
-/// so any consumer that relies on L1 order must sort. Prefer
-/// [`get_input_added_events_ordered`], which folds that sort in; this raw form
-/// is the partition primitive (and the recursion's own building block).
-#[async_recursion]
-pub(crate) async fn get_input_added_events(
+/// so consumers go through [`get_input_added_events_ordered`], which folds the
+/// L1-order sort in; this raw form is the partition primitive.
+///
+/// Depth-first, left-first worklist (push right, then push left): the query
+/// order and the concatenation order match the watchdog's recursive `go` and
+/// [`simulate_partitioned_get_logs`] exactly. A terminal error short-circuits
+/// — once one sub-range fails for good, the ranges after it are not queried.
+async fn get_input_added_events(
     provider: &impl Provider,
     app_address_filter: Address,
     input_box_address: &Address,
     start_block: u64,
     end_block: u64,
     long_block_range_error_codes: &[String],
-) -> Result<Vec<(InputAdded, alloy::rpc::types::Log)>, Vec<ContractError>> {
-    let event = Event::new_sol(provider, input_box_address)
-        .from_block(start_block)
-        .to_block(end_block)
-        .event(InputAdded::SIGNATURE)
-        .topic1(app_address_filter.into_word());
+) -> Result<Vec<(InputAdded, alloy::rpc::types::Log)>, ContractError> {
+    let mut logs = Vec::new();
+    let mut ranges = vec![(start_block, end_block)];
+    while let Some((from, to)) = ranges.pop() {
+        let event = Event::new_sol(provider, input_box_address)
+            .from_block(from)
+            .to_block(to)
+            .event(InputAdded::SIGNATURE)
+            .topic1(app_address_filter.into_word());
 
-    match event.query().await {
-        Ok(logs) => Ok(logs),
-        Err(e) => {
-            if should_retry_with_partition(&e, long_block_range_error_codes) {
-                if start_block >= end_block {
-                    return Err(vec![e]);
-                }
-                let middle = start_block + (end_block - start_block) / 2;
-                let first = get_input_added_events(
-                    provider,
-                    app_address_filter,
-                    input_box_address,
-                    start_block,
-                    middle,
-                    long_block_range_error_codes,
-                )
-                .await;
-                let second = get_input_added_events(
-                    provider,
-                    app_address_filter,
-                    input_box_address,
-                    middle + 1,
-                    end_block,
-                    long_block_range_error_codes,
-                )
-                .await;
-
-                match (first, second) {
-                    (Ok(mut a), Ok(b)) => {
-                        a.extend(b);
-                        Ok(a)
-                    }
-                    (Err(mut a), Err(b)) => {
-                        a.extend(b);
-                        Err(a)
-                    }
-                    (Err(e), _) | (_, Err(e)) => Err(e),
-                }
-            } else {
-                Err(vec![e])
+        match event.query().await {
+            Ok(chunk) => logs.extend(chunk),
+            Err(e)
+                if from < to && should_retry_with_partition(&e, long_block_range_error_codes) =>
+            {
+                let middle = from + (to - from) / 2;
+                ranges.push((middle + 1, to));
+                ranges.push((from, middle));
             }
+            Err(e) => return Err(e),
         }
     }
+    Ok(logs)
 }
 
 fn should_retry_with_partition(err: &ContractError, codes: &[String]) -> bool {
     error_message_matches_retry_codes(&format!("{err:?}"), codes)
 }
 
-pub fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) -> bool {
+fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) -> bool {
     codes.iter().any(|c| error_message.contains(c))
 }
 
 /// Simulates partitioned `eth_getLogs` bisect (same rules as `watchdog/l1_reader.lua`).
 /// `get_logs` returns `Ok` for a successful leaf query or `Err(message)` on RPC failure.
 /// Records every attempted `(from_block, to_block)` in call order.
-pub fn simulate_partitioned_get_logs<F>(
+///
+/// Test-only parity model of [`get_input_added_events`]: the fixture
+/// (`tests/fixtures/l1_partition_vector.json`) drives this model on the Rust
+/// side and the *production* `for_each_log_chunk_partitioned` on the Lua side.
+#[cfg(test)]
+fn simulate_partitioned_get_logs<F>(
     start_block: u64,
     end_block: u64,
     long_block_range_error_codes: &[String],
@@ -176,23 +177,10 @@ where
     (calls, result)
 }
 
-/// Total order for merged logs (block, tx index, log index) — matches Lua `sort_logs`.
-pub fn sort_logs_by_l1_order<T, FBlock, FTx, FLog>(
-    logs: &mut [T],
-    block: FBlock,
-    tx_index: FTx,
-    log_index: FLog,
-) where
-    FBlock: Fn(&T) -> u64,
-    FTx: Fn(&T) -> u64,
-    FLog: Fn(&T) -> u64,
-{
-    logs.sort_by(|a, b| {
-        block(a)
-            .cmp(&block(b))
-            .then_with(|| tx_index(a).cmp(&tx_index(b)))
-            .then_with(|| log_index(a).cmp(&log_index(b)))
-    });
+/// Total order for merged logs `(block, tx index, log index)` — matches Lua
+/// `sort_logs`.
+fn sort_logs_by_l1_order<T>(logs: &mut [T], key: impl FnMut(&T) -> (u64, u64, u64)) {
+    logs.sort_by_key(key);
 }
 
 /// [`get_input_added_events`] with the logs returned in canonical L1 order
@@ -208,7 +196,7 @@ pub(crate) async fn get_input_added_events_ordered(
     start_block: u64,
     end_block: u64,
     long_block_range_error_codes: &[String],
-) -> Result<Vec<(InputAdded, alloy::rpc::types::Log)>, Vec<ContractError>> {
+) -> Result<Vec<(InputAdded, alloy::rpc::types::Log)>, GetLogsError> {
     let mut events = get_input_added_events(
         provider,
         app_address_filter,
@@ -218,17 +206,35 @@ pub(crate) async fn get_input_added_events_ordered(
         long_block_range_error_codes,
     )
     .await?;
-    sort_logs_by_l1_order(
-        &mut events,
-        |(_, log)| log.block_number.unwrap_or(0),
-        |(_, log)| log.transaction_index.unwrap_or(0),
-        |(_, log)| log.log_index.unwrap_or(0),
-    );
+    // L1 order needs provenance: a mined log always carries its block number,
+    // so refuse to sort (and mis-place) one that lacks it. The tx/log indices
+    // may default to 0 — watchdog parity (Lua: `transactionIndex or "0x0"`,
+    // but a missing `blockNumber` hard-errors there too).
+    if let Some((_, log)) = events.iter().find(|(_, log)| log.block_number.is_none()) {
+        return Err(GetLogsError::MissingBlockNumber {
+            transaction_hash: log.transaction_hash,
+            log_index: log.log_index,
+        });
+    }
+    sort_logs_by_l1_order(&mut events, |(_, log)| {
+        (
+            log.block_number
+                .expect("guarded above: every log has a block number"),
+            log.transaction_index.unwrap_or(0),
+            log.log_index.unwrap_or(0),
+        )
+    });
     Ok(events)
 }
 
-pub fn decode_evm_advance_input(input: &[u8]) -> Result<EvmAdvanceCall, String> {
-    EvmAdvanceCall::abi_decode(input).map_err(|err| err.to_string())
+/// Decode the `EvmAdvance` calldata carried in `InputAdded.input` — the shared
+/// decode entry point (parity counterpart of the watchdog's
+/// `abi.decode_evm_advance_call`). Returns the typed decode error; callers
+/// attach the log context (tx hash, index) only they have.
+pub(crate) fn decode_evm_advance_input(
+    input: &[u8],
+) -> Result<EvmAdvanceCall, alloy::sol_types::Error> {
+    EvmAdvanceCall::abi_decode(input)
 }
 
 #[cfg(test)]
@@ -350,12 +356,13 @@ mod tests {
     fn log_sort_vector_matches_watchdog_order() {
         let vector = load_partition_vector();
         let mut logs = vector.log_sort.unsorted;
-        sort_logs_by_l1_order(
-            &mut logs,
-            |e| parse_hex_quantity(&e.block_number),
-            |e| parse_hex_quantity(&e.transaction_index),
-            |e| parse_hex_quantity(&e.log_index),
-        );
+        sort_logs_by_l1_order(&mut logs, |e| {
+            (
+                parse_hex_quantity(&e.block_number),
+                parse_hex_quantity(&e.transaction_index),
+                parse_hex_quantity(&e.log_index),
+            )
+        });
         let blocks: Vec<String> = logs.iter().map(|e| e.block_number.clone()).collect();
         let indices: Vec<String> = logs.iter().map(|e| e.log_index.clone()).collect();
         assert_eq!(blocks, vector.log_sort.expect_block_order);
@@ -405,6 +412,29 @@ mod tests {
         assert!(
             error_message_matches_retry_codes(msg, &codes),
             "proxy -32012 error must match retry codes"
+        );
+    }
+
+    #[test]
+    fn real_alloy_range_error_matches_retry_codes() {
+        // The bisect classifier reads the JSON-RPC code out of ContractError's
+        // *Debug* output — an unstable cross-crate coupling. This pins it
+        // against a real alloy error so an alloy Debug-format change fails
+        // here at upgrade time instead of silently disabling partition retry.
+        let payload = alloy::rpc::json_rpc::ErrorPayload {
+            code: -32005,
+            message: "query returned more than 10000 results".into(),
+            data: None,
+        };
+        let err =
+            super::ContractError::TransportError(alloy::transports::RpcError::ErrorResp(payload));
+        let codes: Vec<String> = DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect();
+        assert!(
+            super::should_retry_with_partition(&err, &codes),
+            "a real -32005 ErrorResp must classify as partition-retryable"
         );
     }
 

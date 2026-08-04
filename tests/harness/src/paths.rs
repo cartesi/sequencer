@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ANVIL_STATE_DIR: &str =
-    "tests/benchmarks/.deps/rollups-contracts-2.2.0-anvil-v1.4.3";
+    "tests/benchmarks/.deps/rollups-contracts-3.0.0-alpha.6-anvil-v1.4.3";
 pub const DEFAULT_MOCK_ERC20_ARTIFACT_PATH: &str =
     "tests/contracts/out/MockERC20.sol/MockERC20.json";
 pub const DEFAULT_DEVNET_MACHINE_IMAGE_PATH: &str =

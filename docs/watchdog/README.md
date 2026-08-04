@@ -126,6 +126,15 @@ submission remains scheduler logic inside the canonical machine.
 filters logs by `topic0 = InputAdded` and `topic1 = app address`, matching the
 Rust reader's app-filtered InputBox scan.
 
+**Deliberate divergence — scan floor.** The Rust reader anchors its first scan
+at the *application's deployment block*, sound only because it also witnesses
+(via `InputBox.version()`) that the InputBox is rollups-contracts v3+, whose
+`addInput` reverts for not-yet-deployed apps. The watchdog does **not** mirror
+this: its scan floor is the operator-supplied checkpoint
+(`CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`) or the last persisted `head.json`,
+and it performs no version witness. Do not copy the app-deployment floor into
+the Lua side without also porting the version witness that makes it sound.
+
 ## Runtime Contract
 
 The sequencer exposes operator-internal snapshot routes (see `sequencer/src/egress/api/snapshot.rs`):

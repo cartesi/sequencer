@@ -384,7 +384,7 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
     chain_id                  INTEGER NOT NULL CHECK (chain_id > 0),
     app_address               BLOB    NOT NULL CHECK (length(app_address) = 20),
     input_box_address         BLOB    NOT NULL CHECK (length(input_box_address) = 20),
-    input_box_genesis_block   INTEGER NOT NULL CHECK (input_box_genesis_block >= 0),
+    app_deployment_block   INTEGER NOT NULL CHECK (app_deployment_block >= 0),
     batch_submitter_address   BLOB    NOT NULL CHECK (length(batch_submitter_address) = 20)
 );
 

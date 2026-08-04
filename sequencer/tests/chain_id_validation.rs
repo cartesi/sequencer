@@ -79,7 +79,7 @@ fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
             chain_id,
             app_address: TEST_APP_ADDR,
             input_box_address: TEST_INPUT_BOX,
-            input_box_genesis_block: 100,
+            app_deployment_block: 100,
             batch_submitter_address: submitter,
         })
         .expect("seed deployment identity");

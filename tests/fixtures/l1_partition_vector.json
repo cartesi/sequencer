@@ -92,6 +92,25 @@
       ],
       "expect_calls": [[7, 7]],
       "expect_ok": false
+    },
+    {
+      "name": "terminal_error_in_left_half_aborts_before_right",
+      "start_block": 1,
+      "end_block": 8,
+      "fail_ranges": [
+        {
+          "from": 1,
+          "to": 8,
+          "message": "error -32600: block range too large"
+        },
+        {
+          "from": 1,
+          "to": 4,
+          "message": "connection refused"
+        }
+      ],
+      "expect_calls": [[1, 8], [1, 4]],
+      "expect_ok": false
     }
   ],
   "log_sort": {

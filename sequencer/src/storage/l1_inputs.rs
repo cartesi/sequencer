@@ -336,13 +336,13 @@ impl Storage {
             let changed = tx.execute(
                 "INSERT INTO deployment_identity \
                     (singleton_id, chain_id, app_address, input_box_address, \
-                     input_box_genesis_block, batch_submitter_address) \
+                     app_deployment_block, batch_submitter_address) \
                  VALUES (0, ?1, ?2, ?3, ?4, ?5)",
                 params![
                     u64_to_i64(identity.chain_id),
                     identity.app_address.as_slice(),
                     identity.input_box_address.as_slice(),
-                    u64_to_i64(identity.input_box_genesis_block),
+                    u64_to_i64(identity.app_deployment_block),
                     identity.batch_submitter_address.as_slice(),
                 ],
             )?;
@@ -388,7 +388,7 @@ impl Storage {
 fn query_deployment_identity(conn: &rusqlite::Connection) -> Result<Option<DeploymentIdentity>> {
     conn.query_row(
         "SELECT chain_id, app_address, input_box_address, \
-                input_box_genesis_block, batch_submitter_address \
+                app_deployment_block, batch_submitter_address \
          FROM deployment_identity WHERE singleton_id = 0",
         [],
         |row| {
@@ -396,7 +396,7 @@ fn query_deployment_identity(conn: &rusqlite::Connection) -> Result<Option<Deplo
                 chain_id: i64_to_u64(row.get::<_, i64>(0)?),
                 app_address: Address::from_slice(&row.get::<_, Vec<u8>>(1)?),
                 input_box_address: Address::from_slice(&row.get::<_, Vec<u8>>(2)?),
-                input_box_genesis_block: i64_to_u64(row.get::<_, i64>(3)?),
+                app_deployment_block: i64_to_u64(row.get::<_, i64>(3)?),
                 batch_submitter_address: Address::from_slice(&row.get::<_, Vec<u8>>(4)?),
             })
         },
@@ -443,7 +443,7 @@ mod tests {
             chain_id: 31337,
             app_address: Address::repeat_byte(0x11),
             input_box_address: Address::repeat_byte(0x22),
-            input_box_genesis_block: 42,
+            app_deployment_block: 42,
             batch_submitter_address: SENDER_A,
         }
     }

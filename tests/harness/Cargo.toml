@@ -11,18 +11,18 @@ authors.workspace = true
 
 [dependencies]
 app-core = { path = "../../examples/app-core" }
-alloy = { version = "1.0", features = ["contract", "network", "provider-anvil-api", "reqwest", "rpc-types", "signer-local"] }
-alloy-primitives = { version = "1.4.1", features = ["k256"] }
-alloy-sol-types = "1.4.1"
-cartesi-rollups-contracts = "=2.2.0"
-futures-util = "0.3"
-k256 = "0.13.4"
-rusqlite = { version = "0.38.0", features = ["bundled"] }
+alloy = { workspace = true, features = ["contract", "network", "provider-anvil-api", "reqwest", "rpc-types", "signer-local"] }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+cartesi-rollups-contracts = { workspace = true }
+futures-util = { workspace = true }
+k256 = { workspace = true }
+rusqlite = { workspace = true }
 sequencer-core = { path = "../../sequencer-core" }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ssz = { package = "ethereum_ssz", version = "0.10" }
-tokio = { version = "1.35", features = ["net", "io-util", "process", "time"] }
-tempfile = "3"
-tokio-tungstenite = "0.28"
+serde = { workspace = true }
+serde_json = { workspace = true }
+ssz = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "process", "time"] }
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
