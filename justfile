@@ -7,6 +7,22 @@ mod watchdog 'watchdog/justfile'
 mod canonical 'examples/canonical-app/justfile'
 mod bench 'tests/benchmarks/justfile'
 
+# ── Devnet dependency pins ───────────────────────────────────────────
+# The pre-deployed Anvil state published by the rollups-contracts release,
+# plus the forge-built MockERC20 fixture. Consumed by tests/harness — and
+# through it e2e, benchmarks, and the watchdog compare harness — so the
+# pins and the setup recipe live here at the root, not in any one consumer.
+rollups_contracts_version := "3.0.0-alpha.6"
+anvil_dump_name := "rollups-contracts-" + rollups_contracts_version + "-anvil-v1.4.3"
+anvil_dump_dir := "tests/.deps/" + anvil_dump_name
+anvil_dump_tar := "tests/.deps/" + anvil_dump_name + ".tar.gz"
+anvil_dump_url := "https://github.com/cartesi/rollups-contracts/releases/download/v" + rollups_contracts_version + "/" + anvil_dump_name + ".tar.gz"
+root_anvil_dump_tar := anvil_dump_name + ".tar.gz"
+# The release publishes no checksum file, so the hash is pinned here
+# (trust-on-first-use, same model as toolchain-pins.env) to catch a
+# replaced/corrupted release asset.
+anvil_dump_sha256 := "b140e31db2b04bb99c733fdf153718cd252335370f4b355849e2cbb3121fc30f"
+
 default:
     @just --list
 
@@ -61,9 +77,17 @@ ensure-machine-image:
 ensure-sepolia-machine-image:
     @test -d examples/canonical-app/out/canonical-machine-image-sepolia || just canonical build-machine-image-sepolia
 
+# Rollups-contracts anvil dump (SHA256-verified) + tests/contracts fixtures.
+setup-devnet-deps:
+    @mkdir -p tests/.deps
+    @if [[ ! -f {{anvil_dump_tar}} ]]; then if [[ -f {{root_anvil_dump_tar}} ]]; then cp {{root_anvil_dump_tar}} {{anvil_dump_tar}}; else wget {{anvil_dump_url}} -O {{anvil_dump_tar}}; fi; fi
+    @echo "{{anvil_dump_sha256}}  {{anvil_dump_tar}}" | shasum -a 256 -c - >/dev/null || { echo "SHA256 mismatch for {{anvil_dump_tar}} — delete it and re-run 'just setup'"; exit 1; }
+    @if [[ ! -f {{anvil_dump_dir}}/state.json ]]; then rm -rf {{anvil_dump_dir}}; mkdir -p {{anvil_dump_dir}}; tar -xzf {{anvil_dump_tar}} -C {{anvil_dump_dir}}; fi
+    forge build --root tests/contracts
+
 setup:
     just canonical download-deps
-    just bench setup
+    just setup-devnet-deps
     just watchdog-lua-deps
 
 doctor:
@@ -84,6 +108,8 @@ canonical-print-build-hashes:
 clean:
     cargo clean
     rm -rf sequencer-data
+    rm -rf tests/.deps
+    rm -rf tests/contracts/out tests/contracts/cache
     just canonical clean
     just bench clean
 
