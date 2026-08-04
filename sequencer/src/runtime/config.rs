@@ -866,6 +866,34 @@ mod tests {
     }
 
     #[test]
+    fn fee_oracle_full_uniswap_override_is_accepted() {
+        let fee_token = "0x1111111111111111111111111111111111111111";
+        let weth = "0x2222222222222222222222222222222222222222";
+        let pool = "0x3333333333333333333333333333333333333333";
+        let config = run_config_from(&[
+            "--fee-token-address",
+            fee_token,
+            "--fee-token-decimals",
+            "18",
+            "--weth-address",
+            weth,
+            "--uniswap-v3-pool",
+            pool,
+            "--twap-window-secs",
+            "900",
+        ]);
+        let FeeOracleMode::Uniswap(resolved) = config.fee_oracle.resolve(31_337).unwrap() else {
+            panic!("custom overrides must select Uniswap mode");
+        };
+        assert_eq!(resolved.chain_id, 31_337);
+        assert_eq!(resolved.fee_token.to_string().to_lowercase(), fee_token);
+        assert_eq!(resolved.weth.to_string().to_lowercase(), weth);
+        assert_eq!(resolved.pool.to_string().to_lowercase(), pool);
+        assert_eq!(resolved.expected_decimals, 18);
+        assert_eq!(resolved.twap_window_secs, 900);
+    }
+
+    #[test]
     fn timing_args_reject_zero_seconds_per_block() {
         let err = Cli::try_parse_from([
             "sequencer",

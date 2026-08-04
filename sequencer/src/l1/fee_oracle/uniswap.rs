@@ -372,4 +372,21 @@ mod tests {
         assert!(quote_x_per_weth_from_tick(1, true).unwrap() > one_weth);
         assert!(quote_x_per_weth_from_tick(1, false).unwrap() < one_weth);
     }
+
+    #[test]
+    fn tick_math_matches_uniswap_canonical_sqrt_ratios() {
+        // Canonical TickMath.getSqrtRatioAtTick vectors from Uniswap v3-core.
+        assert_eq!(
+            sqrt_ratio_at_tick(0).unwrap(),
+            U256::from(79_228_162_514_264_337_593_543_950_336u128)
+        );
+        assert_eq!(
+            sqrt_ratio_at_tick(-887_272).unwrap(),
+            U256::from(4_295_128_739u64)
+        );
+        assert_eq!(
+            sqrt_ratio_at_tick(887_272).unwrap(),
+            U256::from_str_radix("1461446703485210103287273052203988822378723970342", 10).unwrap()
+        );
+    }
 }
