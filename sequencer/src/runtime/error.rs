@@ -146,6 +146,7 @@ fn bootstrap_exit_code(err: &BootstrapError) -> u8 {
         // was never set up).
         BootstrapError::ChainIdMismatch { .. }
         | BootstrapError::InvalidProtocolTiming(_)
+        | BootstrapError::FeeOracleMisconfig { .. }
         | BootstrapError::SetupNotComplete
         | BootstrapError::CheckpointBeforeAppDeployment { .. }
         | BootstrapError::SetupRecovery(_)
@@ -176,7 +177,7 @@ fn bootstrap_exit_code(err: &BootstrapError) -> u8 {
         // Other recovery / storage-open failures: unclassified, retry.
         BootstrapError::Recovery(_)
         | BootstrapError::OpenStorage(_)
-        | BootstrapError::FeeOracle { .. } => EXIT_UNCLASSIFIED,
+        | BootstrapError::FeeOracleTransient { .. } => EXIT_UNCLASSIFIED,
     }
 }
 
@@ -202,10 +203,12 @@ pub enum BootstrapError {
     /// See [`ProtocolTimingError`].
     #[error(transparent)]
     InvalidProtocolTiming(#[from] ProtocolTimingError),
-    /// Fee-oracle configuration, source validation, or mandatory initial
-    /// refresh failed before the inclusion lane opened.
-    #[error("fee oracle bootstrap failed: {message}")]
-    FeeOracle { message: String },
+    /// Setup-pinned fee oracle configuration or validation is invalid.
+    #[error("fee oracle misconfiguration: {message}")]
+    FeeOracleMisconfig { message: String },
+    /// A live quote/transport failed while bootstrapping. It may self-heal.
+    #[error("fee oracle bootstrap transient failure: {message}")]
+    FeeOracleTransient { message: String },
     /// Startup recovery (or refusal) failed before runtime workers started.
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
@@ -634,7 +637,10 @@ impl From<FeeOracleError> for RunError {
     fn from(error: FeeOracleError) -> Self {
         match error {
             FeeOracleError::OpenStorage(error) => RunError::from(error),
-            error => RunError::Bootstrap(BootstrapError::FeeOracle {
+            FeeOracleError::Transient(message) => {
+                RunError::Bootstrap(BootstrapError::FeeOracleTransient { message })
+            }
+            error => RunError::Bootstrap(BootstrapError::FeeOracleMisconfig {
                 message: error.to_string(),
             }),
         }
@@ -663,6 +669,7 @@ mod tests {
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 0,
             batch_submitter_address: Address::repeat_byte(0x33),
+            fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }
 

@@ -21,14 +21,6 @@ sol! {
         );
         function token0() external view returns (address);
         function token1() external view returns (address);
-        function factory() external view returns (address);
-        function fee() external view returns (uint24);
-        function liquidity() external view returns (uint128);
-    }
-
-    #[sol(rpc)]
-    interface IERC20Decimals {
-        function decimals() external view returns (uint8);
     }
 }
 
@@ -46,12 +38,11 @@ pub const SEPOLIA_USDC: Address =
 pub const SEPOLIA_USDC_WETH_005_POOL: Address =
     alloy::primitives::address!("6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50");
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UniswapConfig {
     pub chain_id: u64,
     pub weth: Address,
     pub fee_token: Address,
-    pub expected_decimals: u8,
     pub pool: Address,
     pub twap_window_secs: u32,
 }
@@ -83,14 +74,8 @@ pub enum PriceSourceError {
     MissingPoolCode(Address),
     #[error("pool token pair is not configured WETH/fee token")]
     WrongTokenPair,
-    #[error("fee token decimals {actual} do not match configured {expected}")]
-    WrongDecimals { actual: u8, expected: u8 },
-    #[error("pool factory is the zero address")]
-    MissingFactory,
     #[error("pool has insufficient observations for the configured TWAP window")]
     InsufficientObservations,
-    #[error("pool has zero liquidity")]
-    ZeroLiquidity,
     #[error("invalid TWAP window of zero seconds")]
     ZeroTwapWindow,
     #[error("TWAP arithmetic overflow")]
@@ -133,39 +118,13 @@ impl UniswapV3PriceSource {
         } else {
             return Err(PriceSourceError::WrongTokenPair);
         };
-        if pool.factory().call().await.map_err(provider_error)? == Address::ZERO {
-            return Err(PriceSourceError::MissingFactory);
-        }
-        let decimals = IERC20Decimals::new(config.fee_token, &provider)
-            .decimals()
-            .call()
-            .await
-            .map_err(provider_error)?;
-        if decimals != config.expected_decimals {
-            return Err(PriceSourceError::WrongDecimals {
-                actual: decimals,
-                expected: config.expected_decimals,
-            });
-        }
-        let slot0 = pool.slot0().call().await.map_err(provider_error)?;
-        if slot0.observationCardinality < 2 || slot0.observationCardinalityNext < 2 {
-            return Err(PriceSourceError::InsufficientObservations);
-        }
-        if pool.liquidity().call().await.map_err(provider_error)? == 0 {
-            return Err(PriceSourceError::ZeroLiquidity);
-        }
-        let observations = pool
-            .observe(vec![config.twap_window_secs, 0])
+        // Probe the exact `observe` call used for quotes. Pool-specific
+        // observation-history reverts (including `OLD`) mean this TWAP window
+        // cannot yet be served; other RPC failures remain provider failures.
+        pool.observe(vec![config.twap_window_secs, 0])
             .call()
             .await
             .map_err(|_| PriceSourceError::InsufficientObservations)?;
-        // This is the denominator of Uniswap's harmonic-mean-liquidity
-        // calculation. A zero delta would make the liquidity quote invalid.
-        if observations.secondsPerLiquidityCumulativeX128s[1]
-            <= observations.secondsPerLiquidityCumulativeX128s[0]
-        {
-            return Err(PriceSourceError::ZeroLiquidity);
-        }
 
         Ok(Self {
             provider,
@@ -183,13 +142,13 @@ impl UniswapV3PriceSource {
             .map_err(provider_error)?;
         let start: i64 = observed.tickCumulatives[0]
             .try_into()
-            .map_err(|_| PriceSourceError::ArithmeticOverflow)?;
+            .expect("Uniswap int56 tick cumulative fits i64");
         let end: i64 = observed.tickCumulatives[1]
             .try_into()
-            .map_err(|_| PriceSourceError::ArithmeticOverflow)?;
+            .expect("Uniswap int56 tick cumulative fits i64");
         let delta = end
             .checked_sub(start)
-            .ok_or(PriceSourceError::ArithmeticOverflow)?;
+            .expect("difference of two int56 values fits i64");
         let window = i64::from(self.config.twap_window_secs);
         // Solidity integer division truncates toward zero; Uniswap rounds a
         // negative remainder down to preserve its canonical oracle semantics.
@@ -197,7 +156,7 @@ impl UniswapV3PriceSource {
         if delta < 0 && delta % window != 0 {
             tick -= 1;
         }
-        i32::try_from(tick).map_err(|_| PriceSourceError::ArithmeticOverflow)
+        Ok(i32::try_from(tick).expect("mean tick is within the Uniswap int24 range"))
     }
 }
 

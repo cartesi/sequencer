@@ -220,6 +220,22 @@ pub struct DeploymentIdentity {
     pub input_box_address: alloy_primitives::Address,
     pub app_deployment_block: u64,
     pub batch_submitter_address: alloy_primitives::Address,
+    pub fee_oracle: FeeOracleIdentity,
+}
+
+/// Fee-oracle configuration pinned at setup. Runtime reads this immutable
+/// identity rather than accepting address-bearing oracle configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeOracleIdentity {
+    Fixed {
+        log_gas_price: u16,
+    },
+    Uniswap {
+        weth: alloy_primitives::Address,
+        fee_token: alloy_primitives::Address,
+        pool: alloy_primitives::Address,
+        twap_window_secs: u32,
+    },
 }
 
 /// Returned by [`Storage::open`] and friends; either the SQLite handle failed

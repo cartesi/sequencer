@@ -81,6 +81,7 @@ fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
             input_box_address: TEST_INPUT_BOX,
             app_deployment_block: 100,
             batch_submitter_address: submitter,
+            fee_oracle: sequencer::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .expect("seed deployment identity");
     storage.mark_setup_complete().expect("mark setup complete");

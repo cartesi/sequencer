@@ -107,6 +107,47 @@ where
         allow_insecure_rpc: config.allow_insecure_rpc,
     };
 
+    // A live price must be persisted before recovery can reopen a Tip: both
+    // recovery and normal startup sample `recommended_fee` when opening frames.
+    // The source addresses are immutable setup identity, never runtime flags.
+    let fee_oracle = match identity.fee_oracle {
+        storage::FeeOracleIdentity::Fixed { .. } => None,
+        storage::FeeOracleIdentity::Uniswap {
+            weth,
+            fee_token,
+            pool,
+            twap_window_secs,
+        } => {
+            let provider = crate::l1::provider::create_provider(
+                &config.eth_rpc_url,
+                config.allow_insecure_rpc,
+            )
+            .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
+            let token = crate::l1::fee_oracle::UniswapV3PriceSource::connect(
+                provider.clone(),
+                crate::l1::fee_oracle::UniswapConfig {
+                    chain_id: identity.chain_id,
+                    weth,
+                    fee_token,
+                    pool,
+                    twap_window_secs,
+                },
+            )
+            .await
+            .map_err(|error| BootstrapError::FeeOracleMisconfig {
+                message: error.to_string(),
+            })?;
+            let oracle = crate::l1::fee_oracle::FeeOracle::new(
+                db_path.clone(),
+                Duration::from_millis(config.fee_oracle.poll_interval_ms),
+                provider,
+                Box::new(token),
+            );
+            oracle.refresh_once().await?;
+            Some(oracle)
+        }
+    };
+
     // `run` never re-discovers identity from L1 — it builds the reader from
     // the pinned InputBox address + app deployment block and syncs incrementally.
     let mut input_reader = InputReader::from_parts(
@@ -164,6 +205,7 @@ where
         timing,
         input_reader,
         domain,
+        fee_oracle,
     })
     .await?;
 
@@ -298,6 +340,9 @@ fn deployment_identity_mismatch_fields(
     if stored.batch_submitter_address != expected.batch_submitter_address {
         fields.push("batch_submitter_address");
     }
+    if stored.fee_oracle != expected.fee_oracle {
+        fields.push("fee_oracle");
+    }
     fields
 }
 
@@ -351,6 +396,7 @@ mod tests {
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 42,
             batch_submitter_address: Address::repeat_byte(0x33),
+            fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }
 

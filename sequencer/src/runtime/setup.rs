@@ -25,7 +25,7 @@ use alloy_primitives::Address;
 use sequencer_core::application::Application;
 use sequencer_core::scheduler::{FoldInput, SchedulerConfig, fold_replay};
 
-use super::config::SetupConfig;
+use super::config::{FeeOracleMode, SetupConfig};
 use super::{
     BootstrapError, IdentityError, InputReaderExit, RunError, SetupRecoveryError, SetupRefuse,
     WorkerExit, ensure_deployment_identity, setup_fill, validate_rpc_chain_id,
@@ -34,7 +34,7 @@ use crate::ingress::inclusion_lane::dump_info;
 use crate::l1::provider::VerifiedSignerProviderError;
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
 use crate::recovery::{MempoolFlusher, assert_resync_caught_up};
-use crate::storage::{self, DeploymentIdentity};
+use crate::storage::{self, DeploymentIdentity, FeeOracleIdentity};
 
 pub async fn setup<A>(config: SetupConfig, genesis_app: A) -> Result<(), RunError>
 where
@@ -112,6 +112,34 @@ where
     )
     .await?;
 
+    // Resolve and validate the complete fee source while setup still owns all
+    // address-bearing configuration. `run` later reads only this pinned tuple.
+    let fee_oracle = config
+        .fee_oracle
+        .resolve(config.chain_id)
+        .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
+    let pinned_fee_oracle = match fee_oracle {
+        FeeOracleMode::Fixed { log_gas_price } => FeeOracleIdentity::Fixed { log_gas_price },
+        FeeOracleMode::Uniswap(uniswap) => {
+            let provider = crate::l1::provider::create_provider(
+                &config.eth_rpc_url,
+                config.allow_insecure_rpc,
+            )
+            .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
+            crate::l1::fee_oracle::UniswapV3PriceSource::connect(provider, uniswap)
+                .await
+                .map_err(|error| BootstrapError::FeeOracleMisconfig {
+                    message: error.to_string(),
+                })?;
+            FeeOracleIdentity::Uniswap {
+                weth: uniswap.weth,
+                fee_token: uniswap.fee_token,
+                pool: uniswap.pool,
+                twap_window_secs: uniswap.twap_window_secs,
+            }
+        }
+    };
+
     // ── Pin identity ─────────────────────────────────────────
     // INVARIANT: identity is pinned (this step) BEFORE the initial sync
     // (next step). The sync is the first writer of `safe_inputs` /
@@ -125,8 +153,15 @@ where
         input_box_address: input_reader.input_box_address(),
         app_deployment_block: input_reader.app_deployment_block(),
         batch_submitter_address: config.batch_submitter_address,
+        fee_oracle: pinned_fee_oracle,
     };
     ensure_deployment_identity(&db_path, identity)?;
+
+    // Fixed pricing is a setup-time fact, so persist it once. Live pricing is
+    // refreshed by `run` before recovery opens or reopens a Tip.
+    if let FeeOracleIdentity::Fixed { log_gas_price } = pinned_fee_oracle {
+        storage::Storage::open(&db_path)?.set_log_gas_price(log_gas_price)?;
+    }
 
     // ── Detection gate, step 0: checkpoint sanity ────────────
     // A checkpoint promotion cannot predate the application's deployment
@@ -708,6 +743,7 @@ mod tests {
                 .unwrap(),
             app_deployment_block: 0,
             batch_submitter_address: pinned_submitter,
+            fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         };
         let db = temp_db("recovery-wrong-key");
         let mut storage = Storage::open(db.path.as_str()).expect("open");
