@@ -147,11 +147,10 @@ impl FeeOracle {
     pub fn start(
         self,
         shutdown: ShutdownSignal,
-    ) -> Result<tokio::task::JoinHandle<Result<(), FeeOracleError>>, StorageOpenError> {
-        let _ = Storage::open_read_only(self.db_path.as_str())?;
-        Ok(tokio::spawn(
-            async move { self.run_forever(shutdown).await },
-        ))
+    ) -> tokio::task::JoinHandle<Result<(), FeeOracleError>> {
+        // Path validity is already proven by the mandatory `refresh_once` before
+        // spawn; a read-only preflight here cannot catch writer-mode failures.
+        tokio::spawn(async move { self.run_forever(shutdown).await })
     }
 
     async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), FeeOracleError> {
@@ -397,7 +396,7 @@ mod tests {
             Box::new(StaticToken(sample_quote())),
         );
         let shutdown = ShutdownSignal::default();
-        let handle = oracle.start(shutdown.clone()).expect("start");
+        let handle = oracle.start(shutdown.clone());
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         shutdown.request_shutdown();
@@ -424,7 +423,7 @@ mod tests {
             Box::new(StaticToken(sample_quote())),
         );
         let shutdown = ShutdownSignal::default();
-        let mut handle = oracle.start(shutdown.clone()).expect("start");
+        let mut handle = oracle.start(shutdown.clone());
 
         // First refresh succeeds; subsequent polls are transient. The worker
         // must keep running and leave the last good price untouched.
