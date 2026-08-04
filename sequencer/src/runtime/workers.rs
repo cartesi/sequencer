@@ -186,9 +186,7 @@ impl Workers {
         let detector = DangerDetector::new(db_path.clone(), timing, DANGER_DETECTOR_POLL_INTERVAL)
             .start(shutdown.clone())?;
 
-        let fee_oracle = fee_oracle
-            .map(|oracle| oracle.start(shutdown.clone()))
-            .transpose()?;
+        let fee_oracle = fee_oracle.map(|oracle| oracle.start(shutdown.clone()));
 
         // HTTP server (ingress /tx + egress /ws/subscribe + /health, currently merged).
         let tx_feed = L2TxFeed::new(
