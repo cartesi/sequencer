@@ -92,6 +92,11 @@ impl RunError {
             RunError::Worker(WorkerExit::BatchSubmitter(BatchSubmitterExit::Source(
                 BatchSubmitterError::Poster(BatchPosterError::ChainIdMismatch { .. }),
             ))) => EXIT_TERMINAL,
+            // Fee-oracle arithmetic that cannot encode without undercharging is
+            // an invariant break — page an operator rather than restart-loop.
+            RunError::Worker(WorkerExit::FeeOracle(FeeOracleExit::Source(
+                FeeOracleError::FatalMath(_),
+            ))) => EXIT_TERMINAL,
             RunError::Bootstrap(b) => bootstrap_exit_code(b),
             // Worker crashes, provider errors, IO/storage/app catch-alls.
             RunError::Worker(_)
@@ -889,6 +894,36 @@ mod tests {
         assert_eq!(
             RunError::from(FeeOracleError::Transient("RPC unavailable".into())).exit_code(),
             EXIT_UNCLASSIFIED
+        );
+        assert_eq!(
+            RunError::Worker(WorkerExit::FeeOracle(FeeOracleExit::Source(
+                FeeOracleError::Transient("RPC unavailable".into()),
+            )))
+            .exit_code(),
+            EXIT_UNCLASSIFIED
+        );
+    }
+
+    #[test]
+    fn fee_oracle_fatal_math_is_terminal_on_bootstrap_and_worker() {
+        use crate::l1::fee_oracle::math::MathError;
+        assert_eq!(
+            RunError::from(FeeOracleError::FatalMath(MathError::Overflow)).exit_code(),
+            EXIT_TERMINAL
+        );
+        assert_eq!(
+            RunError::Worker(WorkerExit::FeeOracle(FeeOracleExit::Source(
+                FeeOracleError::FatalMath(MathError::Overflow),
+            )))
+            .exit_code(),
+            EXIT_TERMINAL
+        );
+        assert_eq!(
+            RunError::Worker(WorkerExit::FeeOracle(FeeOracleExit::Source(
+                FeeOracleError::FatalMath(MathError::ExceedsRepresentableRange),
+            )))
+            .exit_code(),
+            EXIT_TERMINAL
         );
     }
 
