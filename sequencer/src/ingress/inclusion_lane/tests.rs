@@ -409,7 +409,7 @@ fn make_pending_user_op(
     let (respond_to, recv) = oneshot::channel();
     let user_op = UserOp {
         nonce: 0,
-        // Must be >= the DB default recommended_fee (1060) to pass the
+        // Must be >= the DB default recommended_fee (1356) to pass the
         // protocol-level max_fee >= fee_price check in the trait default.
         max_fee: u16::MAX,
         data: vec![seed; 4].into(),

@@ -24,8 +24,8 @@ use crate::util::io_other;
 const DEFAULT_SEQUENCER_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default max_fee for harness-submitted transactions.
-/// Must be >= the default log_recommended_fee (1060).
-const DEFAULT_MAX_FEE: u16 = 1200;
+/// Must exceed the default log_recommended_fee (1356) and live oracle prices.
+const DEFAULT_MAX_FEE: u16 = 2500;
 
 sol! {
     #[sol(rpc)]

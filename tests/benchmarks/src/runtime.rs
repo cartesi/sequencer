@@ -66,7 +66,7 @@ pub async fn bootstrap_funded_workload(
     }
 
     // The funding signer will do one L2 transfer per plan. Each transfer costs gas
-    // at the frame fee (currently 1060), so we must deposit enough to cover both the
+    // at the frame fee (currently 1356), so we must deposit enough to cover both the
     // workload balances AND the funding transfers themselves.
     let transfer_count = plans
         .iter()

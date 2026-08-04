@@ -306,8 +306,8 @@ mod tests {
         let frame = &decoded.frames[0];
         assert!(frame.user_ops.is_empty());
         assert_eq!(frame.safe_block, 12);
-        // Default log_recommended_fee = 0+20+419+621 = 1060.
-        assert_eq!(frame.fee_price, 1060);
+        // Default log_recommended_fee = 0+296+20+419+621 = 1356.
+        assert_eq!(frame.fee_price, 1356);
     }
 
     #[test]

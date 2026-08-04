@@ -263,8 +263,8 @@ async fn e2e_submit_tx_ack_and_broadcast() {
         } => {
             assert_eq!(offset, 2);
             assert_eq!(ws_sender, sender.to_string());
-            // Frame fee is the default log_recommended_fee = 1060.
-            assert_eq!(fee, 1060);
+            // Frame fee includes the default tenfold log-space slack.
+            assert_eq!(fee, 1356);
             assert_eq!(
                 decode_hex_prefixed(data.as_str()),
                 ssz::Encode::as_ssz_bytes(&method)
@@ -808,9 +808,9 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
     // Fund with enough to cover gas at the frame fee.
     bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
 
-    // `bootstrap_open_frame` asserts frame_fee == 1060; use that exact value
+    // `bootstrap_open_frame` asserts frame_fee == 1356; use that exact value
     // for the boundary case.
-    const FRAME_FEE_BOUNDARY: u16 = 1060;
+    const FRAME_FEE_BOUNDARY: u16 = 1356;
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
@@ -852,7 +852,7 @@ async fn api_rejects_user_op_when_balance_below_fee_cost() {
     // user op must be rejected with 422 `InsufficientFeeBalance` and leave
     // state unchanged. Exercises the balance check in
     // `WalletApp::validate_user_op` (app-core). A fresh sender with no
-    // deposits has balance 0, well below `fee_to_linear(1060)` (the
+    // deposits has balance 0, well below `fee_to_linear(1356)` (the
     // bootstrapped frame fee).
     let db = temp_db("insufficient-fee-balance");
     let domain = test_domain();
@@ -1296,15 +1296,15 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
 
     let safe_input_count = deposits.len() as u64;
     let leading_range = SafeInputRange::new(0, safe_input_count);
-    // Default log_gas_price=0 → log_recommended_fee = 0+20+419+621 = 1060.
+    // Default log_gas_price=0 → 0+296+20+419+621 = 1356.
     let head = storage
         .initialize_open_state(1, leading_range)
         .expect("initialize open state");
-    assert_eq!(head.frame_fee, 1060);
+    assert_eq!(head.frame_fee, 1356);
 }
 
-/// Default max_fee for test fixtures: must be >= default log_recommended_fee (1060).
-const TEST_MAX_FEE: u16 = 1200;
+/// Default max_fee for test fixtures: must exceed default log_recommended_fee.
+const TEST_MAX_FEE: u16 = 2500;
 
 fn make_valid_request(domain: &Eip712Domain) -> TxRequest {
     let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
