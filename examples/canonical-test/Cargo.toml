@@ -17,7 +17,7 @@ path = "src/main.rs"
 app-core = { path = "../app-core" }
 canonical-app = { path = "../canonical-app" }
 sequencer-core = { path = "../../sequencer-core" }
-ssz = { package = "ethereum_ssz", version = "0.10" }
+ssz = { workspace = true }
 testsi = { workspace = true }
 types = { workspace = true }
-k256 = "0.13"
+k256 = { workspace = true }

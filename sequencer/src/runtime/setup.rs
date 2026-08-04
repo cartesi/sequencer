@@ -9,11 +9,11 @@
 //! linearization point for "A finished":
 //!
 //! 1. Validate protocol timing; create the data dir + `dumps/`.
-//! 2. Require L1: discover the InputBox address + genesis block from the app
+//! 2. Require L1: discover the InputBox address + app deployment block from the app
 //!    contract, validate the RPC chain id. (No cached-identity fallback —
 //!    this is first-boot; an unreachable L1 is a retryable refusal.)
 //! 3. Pin the deployment identity (chain id, app address, InputBox address,
-//!    genesis block, batch-submitter **address** — `setup` never signs).
+//!    app deployment block, batch-submitter **address** — `setup` never signs).
 //! 4. Initial L1 sync: read all direct inputs up to the current safe head.
 //! 5. Register the genesis application state as the finalized snapshot.
 //! 6. Write the `setup_complete` marker.
@@ -123,20 +123,22 @@ where
         chain_id: config.chain_id,
         app_address: config.app_address,
         input_box_address: input_reader.input_box_address(),
-        input_box_genesis_block: input_reader.genesis_block(),
+        app_deployment_block: input_reader.app_deployment_block(),
         batch_submitter_address: config.batch_submitter_address,
     };
     ensure_deployment_identity(&db_path, identity)?;
 
     // ── Detection gate, step 0: checkpoint sanity ────────────
-    // A checkpoint promotion cannot predate the InputBox's own genesis block.
+    // A checkpoint promotion cannot predate the application's deployment
+    // block (the scan genesis — no input exists before it).
     // `B = 0` is the genesis bootstrap (no checkpoint) and is always valid.
     // (PR3 detects only; loading a non-genesis checkpoint machine and the
     // `A < B` check are `setup --recovery` / PR5.)
-    if config.checkpoint_block != 0 && config.checkpoint_block < input_reader.genesis_block() {
-        return Err(BootstrapError::CheckpointBeforeGenesis {
+    if config.checkpoint_block != 0 && config.checkpoint_block < input_reader.app_deployment_block()
+    {
+        return Err(BootstrapError::CheckpointBeforeAppDeployment {
             checkpoint_block: config.checkpoint_block,
-            genesis_block: input_reader.genesis_block(),
+            app_deployment_block: input_reader.app_deployment_block(),
         }
         .into());
     }
@@ -243,7 +245,7 @@ where
         chain_id = identity.chain_id,
         app_address = %identity.app_address,
         input_box_address = %identity.input_box_address,
-        input_box_genesis_block = identity.input_box_genesis_block,
+        app_deployment_block = identity.app_deployment_block,
         batch_submitter_address = %identity.batch_submitter_address,
         "setup complete"
     );
@@ -704,7 +706,7 @@ mod tests {
             input_box_address: "0x2222222222222222222222222222222222222222"
                 .parse()
                 .unwrap(),
-            input_box_genesis_block: 0,
+            app_deployment_block: 0,
             batch_submitter_address: pinned_submitter,
         };
         let db = temp_db("recovery-wrong-key");

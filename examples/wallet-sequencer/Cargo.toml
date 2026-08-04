@@ -13,5 +13,5 @@ default-run = "wallet-sequencer"
 [dependencies]
 app-core = { path = "../app-core" }
 sequencer = { path = "../../sequencer" }
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }

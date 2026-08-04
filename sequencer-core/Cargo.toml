@@ -10,16 +10,16 @@ readme.workspace = true
 authors.workspace = true
 
 [dependencies]
-alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
-alloy-sol-types = "1.4.1"
-serde = { version = "1", features = ["derive"] }
-thiserror = "1"
-ssz = { package = "ethereum_ssz", version = "0.10" }
-ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ssz = { workspace = true }
+ssz_derive = { workspace = true }
 
 [dev-dependencies]
 # Scheduler unit tests sign EIP-712 user-ops to exercise signature recovery.
-k256 = "0.13"
+k256 = { workspace = true }
 
 [build-dependencies]
 ruint = "1.17"

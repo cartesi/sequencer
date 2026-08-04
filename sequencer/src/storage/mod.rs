@@ -208,13 +208,15 @@ pub struct PendingBatch {
 /// The persisted sequencer state is not portable across these fields:
 /// historical safe inputs are classified using the batch-submitter address,
 /// user-op signatures use the app/domain identity, and recovery/frontier logic
-/// depends on the InputBox stream that began at `input_box_genesis_block`.
+/// depends on the app's InputBox stream, which is empty before
+/// `app_deployment_block` (the v3 InputBox refuses inputs for apps that do
+/// not exist yet — the reader anchors its scan there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeploymentIdentity {
     pub chain_id: u64,
     pub app_address: alloy_primitives::Address,
     pub input_box_address: alloy_primitives::Address,
-    pub input_box_genesis_block: u64,
+    pub app_deployment_block: u64,
     pub batch_submitter_address: alloy_primitives::Address,
 }
 

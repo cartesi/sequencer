@@ -14,13 +14,13 @@ rollups-harness = { path = "../harness" }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
 sequencer-core = { path = "../../sequencer-core" }
 app-core = { path = "../../examples/app-core" }
-alloy-primitives = { version = "1.4.1", features = ["k256"] }
-alloy-sol-types = "1.4.1"
-futures-util = "0.3"
-k256 = "0.13.4"
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ssz = { package = "ethereum_ssz", version = "0.10" }
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "process", "sync"] }
-tokio-tungstenite = "0.28"
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+futures-util = { workspace = true }
+k256 = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ssz = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "process", "sync"] }
+tokio-tungstenite = { workspace = true }

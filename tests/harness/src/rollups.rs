@@ -14,7 +14,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolCall;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use app_core::application::{WalletConfig, default_private_keys};
-use cartesi_rollups_contracts::application_factory::ApplicationFactory;
+use cartesi_rollups_contracts::application_factory::ApplicationFactory::{self, WithdrawalConfig};
 use cartesi_rollups_contracts::data_availability::DataAvailability::InputBoxCall;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
@@ -501,8 +501,23 @@ async fn deploy_devnet_application(
     }
     .abi_encode()
     .into();
-    let create_application =
-        factory.newApplication_1(Address::ZERO, app_owner, template_hash, data_availability);
+    // Withdrawals disabled: a zero guardian can never `foreclose()`, so the
+    // InputBox's v3 `notForeclosed` gate on `addInput` stays permanently open,
+    // and no withdrawal output builder is needed for the placeholder wallet.
+    let withdrawal_config = WithdrawalConfig {
+        guardian: Address::ZERO,
+        log2LeavesPerAccount: 0,
+        log2MaxNumOfAccounts: 0,
+        accountsDriveStartIndex: 0,
+        withdrawalOutputBuilder: Address::ZERO,
+    };
+    let create_application = factory.newApplication_0(
+        Address::ZERO,
+        app_owner,
+        template_hash,
+        data_availability,
+        withdrawal_config,
+    );
     let application_address = create_application
         .clone()
         .call()

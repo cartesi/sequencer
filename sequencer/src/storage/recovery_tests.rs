@@ -2134,7 +2134,7 @@ mod schema_invariants {
         let err = storage.conn.execute(
             "INSERT INTO deployment_identity \
                  (singleton_id, chain_id, app_address, input_box_address, \
-                  input_box_genesis_block, batch_submitter_address) \
+                  app_deployment_block, batch_submitter_address) \
                  VALUES (0, 0, ?1, ?1, 0, ?1)",
             params![address],
         );

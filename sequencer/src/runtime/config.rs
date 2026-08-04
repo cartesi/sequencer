@@ -331,7 +331,7 @@ impl SetupConfig {
 }
 
 /// `run` — boot the sequencer from an already-set-up DB. Identity (chain id,
-/// app address, InputBox address, genesis block, submitter address) is read
+/// app address, InputBox address, app deployment block, submitter address) is read
 /// from the DB, so those are NOT CLI args here. Keeps the signing key (run
 /// submits) and the runtime tuning knobs.
 #[derive(Debug, Clone, Args)]

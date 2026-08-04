@@ -12,37 +12,38 @@ authors.workspace = true
 [dependencies]
 sequencer-core = { path = "../sequencer-core" }
 axum = { version = "0.8.8", features = ["ws"] }
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "fs", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 toml = "0.8"
-tracing = "0.1"
+tracing = { workspace = true }
 tower-http = { version = "0.6.8", features = ["trace", "cors"] }
-rusqlite = { version = "0.38.0", features = ["bundled"] }
-rusqlite_migration = "2.3.0"
-alloy-primitives = { version = "1.4.1", features = ["serde", "k256"] }
-alloy-sol-types = "1.4.1"
-alloy = { version = "1.0", features = ["contract", "network", "reqwest", "rpc-types", "sol-types", "node-bindings", "signer-local", "signers"] }
-alloy-network-primitives = "1.7"
-alloy-transport = "1.0"
+rusqlite = { workspace = true }
+rusqlite_migration = "2.6.0"
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+alloy = { workspace = true, features = ["contract", "network", "reqwest", "rpc-types", "sol-types", "json-rpc", "signer-local", "signers"] }
+alloy-network-primitives = "1.8"
+alloy-transport = "1.8"
 url = "2.5"
-thiserror = "1"
-ssz = { package = "ethereum_ssz", version = "0.10" }
-ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
-clap = { version = "4", features = ["derive", "env"] }
-async-recursion = "1"
-cartesi-rollups-contracts = "=2.2.0"
+thiserror = { workspace = true }
+ssz = { workspace = true }
+ssz_derive = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+cartesi-rollups-contracts = { workspace = true }
 async-trait = "0.1"
 
 [dev-dependencies]
 app-core = { path = "../examples/app-core" }
-futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["stream"] }
-rusqlite = { version = "0.38.0", features = ["bundled"] }
-tokio-tungstenite = "0.28"
-k256 = "0.13.4"
-tempfile = "3"
+# Anvil bindings are test-only: production builds must not carry the
+# node-spawning surface.
+alloy = { workspace = true, features = ["node-bindings"] }
+futures-util = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+tokio-tungstenite = { workspace = true }
+k256 = { workspace = true }
+tempfile = { workspace = true }
 sequencer-rust-client = { path = "../sdk/rust-client" }
 # Used for `TcpProxy` in inline tests that need to simulate provider disconnect
 # (e.g., flusher survives extended outage). The sequencer crate doesn't depend

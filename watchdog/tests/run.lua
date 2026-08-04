@@ -114,9 +114,11 @@ end
 test("wallet SSZ golden fixture loads for cross-stack parity", function()
     local bytes = load_wallet_snapshot_hex_fixture()
     assert(#bytes > 0, "golden fixture must not be empty")
-    -- Fixed prefix from WalletSnapshot default config (see wallet_snapshot.rs tests).
-    assert_eq(bytes:byte(1), 0xac)
-    assert_eq(bytes:byte(2), 0xa6)
+    -- Fixed prefix from WalletSnapshot default config (see wallet_snapshot.rs
+    -- tests): the first bytes are the ERC20 portal address
+    -- (rollups-contracts v3.0.0-alpha.6 deterministic deployment, 0x22E5…).
+    assert_eq(bytes:byte(1), 0x22)
+    assert_eq(bytes:byte(2), 0xe5)
 end)
 
 test("shared partition vector matches l1_reader bisect plan", function()
