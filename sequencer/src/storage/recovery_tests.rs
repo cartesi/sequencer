@@ -1832,7 +1832,7 @@ mod schema_invariants {
         // Batch 0 is sealed. Any direct insert into its frames must fail.
         let err = storage.conn.execute(
             "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
-             VALUES (0, 1, 100, 1060, 0)",
+             VALUES (0, 1, 100, 1356, 0)",
             [],
         );
         assert!(
@@ -1852,7 +1852,7 @@ mod schema_invariants {
         storage.insert_invalid_batch(0).expect("invalidate tip");
         let err = storage.conn.execute(
             "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
-             VALUES (0, 1, 100, 1060, 0)",
+             VALUES (0, 1, 100, 1356, 0)",
             [],
         );
         assert!(

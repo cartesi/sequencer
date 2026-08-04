@@ -120,7 +120,6 @@ impl FeeOracle {
                     fees.base_fee_per_gas,
                     fees.max_priority_fee_per_gas,
                     quote,
-                    10,
                 )?;
                 (encode_log_gas_price(linear), Some((fees, quote, linear)))
             }
@@ -300,7 +299,7 @@ mod tests {
         let db = temp_db("live-fee-oracle");
         let quote = U256::from(1_800_000_000u64);
         let expected_linear =
-            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote, 10).unwrap();
+            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote).unwrap();
         let expected_log = encode_log_gas_price(expected_linear);
 
         let oracle = FeeOracle::new(
@@ -332,7 +331,7 @@ mod tests {
         let db = temp_db("retain-fee-oracle");
         let quote = U256::from(1_800_000_000u64);
         let expected_linear =
-            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote, 10).unwrap();
+            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote).unwrap();
         let expected_log = encode_log_gas_price(expected_linear);
 
         let oracle = FeeOracle::new(
@@ -409,7 +408,7 @@ mod tests {
         let _ = Storage::open(&db.path).unwrap();
         let quote = U256::from(1_800_000_000u64);
         let expected_linear =
-            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote, 10).unwrap();
+            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, quote).unwrap();
         let expected_log = encode_log_gas_price(expected_linear);
 
         let oracle = FeeOracle::new(

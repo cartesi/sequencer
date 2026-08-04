@@ -126,6 +126,32 @@ pub fn fee_from_linear(value: U256) -> u16 {
     }
 }
 
+/// Convert a linear fee value to the smallest representable log-space fee
+/// that does not undercharge it.
+///
+/// Values at and above the representable maximum saturate to
+/// [`MAX_EXPONENT`], matching [`fee_from_linear`].
+pub fn fee_from_linear_ceil(value: U256) -> u16 {
+    if value <= U256::from(1u64) {
+        return 0;
+    }
+    if value >= fee_to_linear(MAX_EXPONENT) {
+        return MAX_EXPONENT;
+    }
+    let target = value << FRAC_BITS;
+    let mut lo: u32 = 0;
+    let mut hi: u32 = MAX_EXPONENT as u32 + 1;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fee_to_linear_fixed(mid as u16) < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo as u16
+}
+
 /// Compute `round(log_{129/128}(num / denom))` as a signed integer.
 ///
 /// Used by `set_alpha` to convert a rational value (like α = num/denom) to a
@@ -261,6 +287,11 @@ mod tests {
     }
 
     #[test]
+    fn tenfold_slack_exponent_is_pinned() {
+        assert_eq!(log_fee_ratio(10, 1), 296);
+    }
+
+    #[test]
     fn fee_from_linear_zero_and_one() {
         assert_eq!(fee_from_linear(U256::ZERO), 0);
         assert_eq!(fee_from_linear(U256::from(1u64)), 0);
@@ -285,6 +316,20 @@ mod tests {
         // A value well above the max representable fee should also saturate.
         let huge = fee_to_linear(MAX_EXPONENT) + U256::from(1u64);
         assert_eq!(fee_from_linear(huge), MAX_EXPONENT);
+    }
+
+    #[test]
+    fn fee_from_linear_ceil_never_undercharges() {
+        for value in [
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(2u64),
+            U256::from(123_456u64),
+        ] {
+            let encoded = fee_from_linear_ceil(value);
+            assert!(encoded == MAX_EXPONENT || fee_to_linear(encoded) >= value);
+            assert!(encoded == 0 || fee_to_linear(encoded - 1) < value);
+        }
     }
 
     #[test]

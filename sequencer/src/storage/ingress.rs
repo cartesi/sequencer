@@ -621,8 +621,8 @@ mod tests {
         assert_eq!(head_a.batch_index, head_b.batch_index);
         assert_eq!(head_a.frame_in_batch, head_b.frame_in_batch);
         assert_eq!(head_a.frame_fee, head_b.frame_fee);
-        // Default log_recommended_fee = 0+20+419+621 = 1060
-        assert_eq!(head_a.frame_fee, 1060);
+        // Default log_recommended_fee = 0+296+20+419+621 = 1356
+        assert_eq!(head_a.frame_fee, 1356);
 
         let mut head_c = head_b;
         let next_safe_block = head_c.safe_block;
@@ -646,8 +646,8 @@ mod tests {
         let db = temp_db("batch-policy-fee");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let policy = storage.batch_policy().expect("default policy");
-        // Default: log_gas_price=0, log_recommended_fee = 0+20+419+621 = 1060
-        assert_eq!(policy.recommended_fee, 1060);
+        // Default: log_gas_price=0, log_recommended_fee = 0+296+20+419+621 = 1356
+        assert_eq!(policy.recommended_fee, 1356);
 
         storage.set_log_gas_price(100).expect("set log gas price");
 
@@ -660,8 +660,8 @@ mod tests {
             .expect("rotate batch");
 
         let policy = storage.batch_policy().expect("read policy");
-        // log_recommended_fee = 100+20+419+621 = 1160
-        assert_eq!(head.frame_fee, 1160);
+        // log_recommended_fee = 100+296+20+419+621 = 1456
+        assert_eq!(head.frame_fee, 1456);
         assert_eq!(head.frame_fee, policy.recommended_fee);
         assert!(
             head.max_batch_user_op_bytes > 0,
@@ -685,8 +685,8 @@ mod tests {
             .expect("initialize open state");
         let original_batch_index = head.batch_index;
         let original_frame_in_batch = head.frame_in_batch;
-        // Default: log_gas_price=0 → log_recommended_fee = 0+20+419+621 = 1060
-        assert_eq!(head.frame_fee, 1060);
+        // Default: log_gas_price=0 → log_recommended_fee = 0+296+20+419+621 = 1356
+        assert_eq!(head.frame_fee, 1356);
 
         // Simulate an operator policy update mid-frame: fee oracle reports a
         // higher gas price. The derived view reflects the new fee immediately.
@@ -695,11 +695,11 @@ mod tests {
             .expect("set higher log gas price");
         let new_policy = storage.batch_policy().expect("read updated policy");
         assert_eq!(
-            new_policy.recommended_fee, 1160,
+            new_policy.recommended_fee, 1456,
             "policy-derived fee should reflect the new gas price",
         );
 
-        // Invariant: the already-open frame's persisted fee stays at 1060.
+        // Invariant: the already-open frame's persisted fee stays at 1356.
         let persisted_frame_fee: i64 = storage
             .conn
             .query_row(
@@ -709,25 +709,25 @@ mod tests {
             )
             .expect("query open frame fee");
         assert_eq!(
-            persisted_frame_fee, 1060,
+            persisted_frame_fee, 1356,
             "open frame's committed fee must not change across policy updates",
         );
 
         // And the in-memory WriteHead mirror must also be stable — the lane
         // submitting against this head should see a consistent fee.
         assert_eq!(
-            head.frame_fee, 1060,
+            head.frame_fee, 1356,
             "WriteHead.frame_fee must stay stable until advance_frame runs",
         );
 
         // Closing the frame picks up the new policy — the *next* frame opens
-        // at 1160. This is the expected policy-flow boundary.
+        // at 1456. This is the expected policy-flow boundary.
         let next_safe_block = head.safe_block;
         storage
             .close_frame_only(&mut head, next_safe_block, SafeInputRange::empty_at(0))
             .expect("rotate within same batch");
         assert_eq!(
-            head.frame_fee, 1160,
+            head.frame_fee, 1456,
             "the next frame must use the updated policy's fee (policy flows in at close)",
         );
     }

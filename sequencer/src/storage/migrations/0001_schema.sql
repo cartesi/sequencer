@@ -452,6 +452,9 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     log_one_plus_alpha       INTEGER NOT NULL CHECK (log_one_plus_alpha >= 0),
     -- Log-space fee exponent fed by the oracle.
     log_gas_price            INTEGER NOT NULL CHECK (log_gas_price >= 0),
+    -- log_{129/128}(10), rounded by log_fee_ratio(10, 1) = 296.
+    -- This tenfold price slack is applied in log space, not in the oracle.
+    log_slack                INTEGER NOT NULL CHECK (log_slack >= 0),
 
     -- Constants (log-space):
     log_base_gas             INTEGER NOT NULL CHECK (log_base_gas > 0),
@@ -471,19 +474,19 @@ CREATE TABLE IF NOT EXISTS batch_policy (
 --   log_max_batch_bytes  = log_{129/128}(32000)          = 1333
 --
 -- Derived by view:
---   log_recommended_fee  = 0 + 20 + 419 + 621            = 1060
+--   log_recommended_fee  = 0 + 296 + 20 + 419 + 621      = 1356
 --   log_batch_size_target = 1403 - (-229) - 419           = 1213
 INSERT OR IGNORE INTO batch_policy(
     singleton_id,
 
-    log_alpha, log_one_plus_alpha, log_gas_price,
+    log_alpha, log_one_plus_alpha, log_gas_price, log_slack,
 
     log_base_gas, log_delta, log_user_op_bytes, log_max_batch_bytes
 )
 VALUES (
     0,
 
-    -229, 20, 0,
+    -229, 20, 0, 296,
 
     1403, 419, 621, 1333
 );
@@ -492,7 +495,7 @@ VALUES (
 CREATE VIEW IF NOT EXISTS batch_policy_derived AS
 SELECT *,
     -- Fee per user-op byte.
-    log_gas_price + log_one_plus_alpha + log_delta + log_user_op_bytes
+    log_gas_price + log_slack + log_one_plus_alpha + log_delta + log_user_op_bytes
         AS log_recommended_fee,
     -- Batch size target in log-space (convert via fee_to_linear for bytes).
     log_base_gas - log_alpha - log_delta
