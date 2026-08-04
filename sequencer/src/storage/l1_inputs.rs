@@ -17,8 +17,19 @@ use super::queries::{
     query_latest_safe_input_index_exclusive,
 };
 use super::safe_accepted_batches::populate_safe_accepted_batches;
-use super::{DeploymentIdentity, FrontierMode, IngestedSafeInput, StoredSafeInput};
+use super::{
+    DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput, StoredSafeInput,
+};
 use sequencer_core::protocol::ProtocolTiming;
+
+type FeeOracleIdentitySql = (
+    &'static str,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i64>,
+);
 
 trait SafeInputRecord {
     fn sender(&self) -> Address;
@@ -333,17 +344,49 @@ impl Storage {
                 return Ok(existing);
             }
 
+            let (mode, fixed, weth, fee_token, pool, window): FeeOracleIdentitySql =
+                match identity.fee_oracle {
+                    FeeOracleIdentity::Fixed { log_gas_price } => (
+                        "fixed",
+                        Some(i64::from(log_gas_price)),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                    FeeOracleIdentity::Uniswap {
+                        weth,
+                        fee_token,
+                        pool,
+                        twap_window_secs,
+                    } => (
+                        "uniswap",
+                        None,
+                        Some(weth.as_slice().to_vec()),
+                        Some(fee_token.as_slice().to_vec()),
+                        Some(pool.as_slice().to_vec()),
+                        Some(i64::from(twap_window_secs)),
+                    ),
+                };
             let changed = tx.execute(
                 "INSERT INTO deployment_identity \
                     (singleton_id, chain_id, app_address, input_box_address, \
-                     app_deployment_block, batch_submitter_address) \
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5)",
+                     app_deployment_block, batch_submitter_address, fee_oracle_mode, \
+                     fixed_log_gas_price, fee_oracle_weth, fee_oracle_fee_token, \
+                     fee_oracle_pool, fee_oracle_twap_window_secs) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     u64_to_i64(identity.chain_id),
                     identity.app_address.as_slice(),
                     identity.input_box_address.as_slice(),
                     u64_to_i64(identity.app_deployment_block),
                     identity.batch_submitter_address.as_slice(),
+                    mode,
+                    fixed,
+                    weth,
+                    fee_token,
+                    pool,
+                    window,
                 ],
             )?;
             if changed != 1 {
@@ -388,16 +431,32 @@ impl Storage {
 fn query_deployment_identity(conn: &rusqlite::Connection) -> Result<Option<DeploymentIdentity>> {
     conn.query_row(
         "SELECT chain_id, app_address, input_box_address, \
-                app_deployment_block, batch_submitter_address \
+                app_deployment_block, batch_submitter_address, fee_oracle_mode, \
+                fixed_log_gas_price, fee_oracle_weth, fee_oracle_fee_token, \
+                fee_oracle_pool, fee_oracle_twap_window_secs \
          FROM deployment_identity WHERE singleton_id = 0",
         [],
         |row| {
+            let mode: String = row.get(5)?;
+            let fee_oracle = match mode.as_str() {
+                "fixed" => FeeOracleIdentity::Fixed {
+                    log_gas_price: row.get(6)?,
+                },
+                "uniswap" => FeeOracleIdentity::Uniswap {
+                    weth: Address::from_slice(&row.get::<_, Vec<u8>>(7)?),
+                    fee_token: Address::from_slice(&row.get::<_, Vec<u8>>(8)?),
+                    pool: Address::from_slice(&row.get::<_, Vec<u8>>(9)?),
+                    twap_window_secs: row.get(10)?,
+                },
+                _ => panic!("schema CHECK prevents unknown fee oracle mode"),
+            };
             Ok(DeploymentIdentity {
                 chain_id: i64_to_u64(row.get::<_, i64>(0)?),
                 app_address: Address::from_slice(&row.get::<_, Vec<u8>>(1)?),
                 input_box_address: Address::from_slice(&row.get::<_, Vec<u8>>(2)?),
                 app_deployment_block: i64_to_u64(row.get::<_, i64>(3)?),
                 batch_submitter_address: Address::from_slice(&row.get::<_, Vec<u8>>(4)?),
+                fee_oracle,
             })
         },
     )
@@ -433,7 +492,8 @@ fn insert_safe_inputs_batch<T: SafeInputRecord>(
 #[cfg(test)]
 mod tests {
     use crate::storage::{
-        DeploymentIdentity, FrontierMode, SafeInputRange, Storage, StoredSafeInput,
+        DeploymentIdentity, FeeOracleIdentity, FrontierMode, SafeInputRange, Storage,
+        StoredSafeInput,
         test_helpers::{SENDER_A, SENDER_B, default_protocol_timing, temp_db},
     };
     use alloy_primitives::Address;
@@ -445,6 +505,7 @@ mod tests {
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 42,
             batch_submitter_address: SENDER_A,
+            fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }
 

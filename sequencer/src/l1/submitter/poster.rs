@@ -124,7 +124,8 @@ impl EthereumBatchPoster {
     ///
     /// Timeouts return `Ok(())` rather than `Err` because the safe response is
     /// "re-enter `submit_batches` on the next tick" — which re-estimates fees
-    /// (natural replacement bump) and re-submits at the same wallet nonces. The
+    /// (possibly replacing a pending transaction if the node accepts it) and
+    /// re-submits at the same wallet nonces. The
     /// wallet-nonce ordering invariant above guarantees we cannot accidentally
     /// skip work by returning early here.
     async fn wait_for_confirmations(&self, tx_hashes: &[TxHash]) -> Result<(), BatchPosterError> {

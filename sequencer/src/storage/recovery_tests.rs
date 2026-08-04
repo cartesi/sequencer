@@ -2134,8 +2134,11 @@ mod schema_invariants {
         let err = storage.conn.execute(
             "INSERT INTO deployment_identity \
                  (singleton_id, chain_id, app_address, input_box_address, \
-                  app_deployment_block, batch_submitter_address) \
-                 VALUES (0, 0, ?1, ?1, 0, ?1)",
+                  app_deployment_block, batch_submitter_address, \
+                  fee_oracle_mode, fixed_log_gas_price, \
+                  fee_oracle_weth, fee_oracle_fee_token, fee_oracle_pool, \
+                  fee_oracle_twap_window_secs) \
+                 VALUES (0, 0, ?1, ?1, 0, ?1, 'fixed', 0, NULL, NULL, NULL, NULL)",
             params![address],
         );
         assert!(

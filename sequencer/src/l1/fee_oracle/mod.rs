@@ -8,4 +8,4 @@ pub mod uniswap;
 pub mod worker;
 
 pub use uniswap::{TokenPriceSource, UniswapConfig, UniswapV3PriceSource};
-pub use worker::{FeeOracle, FixedPriceSource, GasPriceSource};
+pub use worker::FeeOracle;

@@ -384,8 +384,25 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
     chain_id                  INTEGER NOT NULL CHECK (chain_id > 0),
     app_address               BLOB    NOT NULL CHECK (length(app_address) = 20),
     input_box_address         BLOB    NOT NULL CHECK (length(input_box_address) = 20),
-    app_deployment_block   INTEGER NOT NULL CHECK (app_deployment_block >= 0),
-    batch_submitter_address   BLOB    NOT NULL CHECK (length(batch_submitter_address) = 20)
+    app_deployment_block      INTEGER NOT NULL CHECK (app_deployment_block >= 0),
+    batch_submitter_address   BLOB    NOT NULL CHECK (length(batch_submitter_address) = 20),
+    -- Immutable setup-pinned fee source. Fixed has only fixed_log_gas_price;
+    -- Uniswap has the complete reviewed token/pool tuple.
+    fee_oracle_mode           TEXT    NOT NULL CHECK (fee_oracle_mode IN ('fixed', 'uniswap')),
+    fixed_log_gas_price       INTEGER CHECK (fixed_log_gas_price BETWEEN 0 AND 65535),
+    fee_oracle_weth           BLOB    CHECK (fee_oracle_weth IS NULL OR length(fee_oracle_weth) = 20),
+    fee_oracle_fee_token      BLOB    CHECK (fee_oracle_fee_token IS NULL OR length(fee_oracle_fee_token) = 20),
+    fee_oracle_pool           BLOB    CHECK (fee_oracle_pool IS NULL OR length(fee_oracle_pool) = 20),
+    fee_oracle_twap_window_secs INTEGER CHECK (fee_oracle_twap_window_secs > 0),
+    CHECK (
+        (fee_oracle_mode = 'fixed' AND fixed_log_gas_price IS NOT NULL
+            AND fee_oracle_weth IS NULL AND fee_oracle_fee_token IS NULL
+            AND fee_oracle_pool IS NULL AND fee_oracle_twap_window_secs IS NULL)
+        OR
+        (fee_oracle_mode = 'uniswap' AND fixed_log_gas_price IS NULL
+            AND fee_oracle_weth IS NOT NULL AND fee_oracle_fee_token IS NOT NULL
+            AND fee_oracle_pool IS NOT NULL AND fee_oracle_twap_window_secs IS NOT NULL)
+    )
 );
 
 -- setup-complete marker. The `setup` subcommand
