@@ -3,9 +3,11 @@
 
 //! Read-only Uniswap V3 WETH/fee-token TWAP source.
 
+use alloy::contract::Error as ContractError;
 use alloy::providers::{DynProvider, Provider};
 use alloy::sol;
 use alloy_primitives::{Address, U256, Uint};
+use alloy_sol_types::Revert;
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -14,11 +16,6 @@ sol! {
     interface IUniswapV3Pool {
         function observe(uint32[] calldata secondsAgos)
             external view returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
-        function slot0() external view returns (
-            uint160 sqrtPriceX96, int24 tick, uint16 observationIndex,
-            uint16 observationCardinality, uint16 observationCardinalityNext,
-            uint8 feeProtocol, bool unlocked
-        );
         function token0() external view returns (address);
         function token1() external view returns (address);
     }
@@ -173,15 +170,33 @@ fn provider_error(error: impl std::fmt::Display) -> PriceSourceError {
     PriceSourceError::Provider(error.to_string())
 }
 
-/// Classify an `observe` failure: Uniswap V3 reverts with the literal string
-/// `OLD` when `secondsAgo` exceeds available observation history. Everything
-/// else (timeouts, HTTP 5xx, decode errors) is a provider failure.
-fn classify_observe_error(error: impl std::fmt::Display) -> PriceSourceError {
-    let message = error.to_string();
-    if message.contains("OLD") {
-        PriceSourceError::InsufficientObservations
-    } else {
-        PriceSourceError::Provider(message)
+/// Exact Uniswap V3 Oracle reason for an `observe` window that exceeds history.
+/// Compare decoded `Error(string)` payloads only — never substring-match
+/// `Display` text (`"THRESHOLD"` contains `"OLD"`).
+fn is_old_observation_reason(reason: &str) -> bool {
+    reason == "OLD"
+}
+
+/// Classify an `observe` failure from revert data: decode `Error(string)` and
+/// require an exact `"OLD"` reason. Transport failures and unrelated reverts
+/// (including messages that merely *contain* the letters OLD) stay provider
+/// errors.
+fn classify_observe_error(error: ContractError) -> PriceSourceError {
+    classify_decoded_observe_revert(
+        error.as_decoded_error::<Revert>().as_ref(),
+        error.to_string(),
+    )
+}
+
+fn classify_decoded_observe_revert(
+    revert: Option<&Revert>,
+    fallback_message: String,
+) -> PriceSourceError {
+    match revert {
+        Some(revert) if is_old_observation_reason(&revert.reason) => {
+            PriceSourceError::InsufficientObservations
+        }
+        _ => PriceSourceError::Provider(fallback_message),
     }
 }
 
@@ -342,21 +357,48 @@ mod tests {
     }
 
     #[test]
+    fn old_observation_reason_is_exact_match() {
+        assert!(is_old_observation_reason("OLD"));
+        // Substring false positives that Display matching would hit.
+        assert!(!is_old_observation_reason("THRESHOLD"));
+        assert!(!is_old_observation_reason("BALANCE_THRESHOLD_EXCEEDED"));
+        assert!(!is_old_observation_reason("UPSTREAM_THRESHOLD"));
+        assert!(!is_old_observation_reason("execution reverted: OLD"));
+    }
+
+    #[test]
     fn observe_old_revert_is_insufficient_observations() {
+        let revert = Revert::from("OLD");
         assert!(matches!(
-            classify_observe_error("execution reverted: OLD"),
+            classify_decoded_observe_revert(Some(&revert), "unused".into()),
             PriceSourceError::InsufficientObservations
         ));
+    }
+
+    #[test]
+    fn observe_threshold_revert_is_provider_error() {
+        // `"THRESHOLD"` contains `"OLD"` as a substring — must not misclassify.
+        let revert = Revert::from("THRESHOLD");
         assert!(matches!(
-            classify_observe_error("server returned an error response: error code 3: OLD"),
-            PriceSourceError::InsufficientObservations
+            classify_decoded_observe_revert(Some(&revert), "gateway THRESHOLD".into()),
+            PriceSourceError::Provider(_)
+        ));
+        assert!(matches!(
+            classify_decoded_observe_revert(
+                None,
+                "error code -32000: BALANCE_THRESHOLD_EXCEEDED".into()
+            ),
+            PriceSourceError::Provider(_)
         ));
     }
 
     #[test]
     fn observe_transport_failure_is_provider_error() {
         assert!(matches!(
-            classify_observe_error("error sending request for url (http://127.0.0.1:8545/)"),
+            classify_decoded_observe_revert(
+                None,
+                "error sending request for url (http://127.0.0.1:8545/)".into()
+            ),
             PriceSourceError::Provider(_)
         ));
     }
