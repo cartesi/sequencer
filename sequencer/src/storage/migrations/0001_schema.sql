@@ -442,11 +442,13 @@ END;
 --   `gas_price` is denominated in "fee-token smallest units per L1 gas unit"
 --   (application-defined ERC-20 X; the wallet prototype starts with USDC).
 --   The L1 fee oracle converts base+priority gas (wei) via a pinned Uniswap V3
---   WETH/X TWAP, multiplies by 10× slack, then encodes to log space. Local
---   Anvil uses an explicit fixed exponent instead of Uniswap.
+--   WETH/X TWAP and encodes the exact quote to log space. The tenfold safety
+--   margin lives in `log_slack` (not in the oracle). Local Anvil uses an
+--   explicit fixed exponent instead of Uniswap.
 --
 -- Fee derivation (view):
---   log_recommended_fee = log_gas_price + log_one_plus_alpha + log_delta + log_user_op_bytes
+--   log_recommended_fee = log_gas_price + log_slack + log_one_plus_alpha
+--                       + log_delta + log_user_op_bytes
 --   Pure addition — no overflow possible. The oracle feeds log_gas_price
 --   directly in log space. Alpha amortizes batch fixed gas over expected
 --   target occupancy (not retrospective per-op settlement).

@@ -26,14 +26,16 @@ use ssz_derive::{Decode, Encode};
 //   Exponent 0 = 1 unit (minimum). No sentinel.
 //
 //   The DB computes `log_recommended_fee` via pure addition of log terms:
-//     log_recommended_fee = log_gas_price + log_one_plus_alpha + log_delta + log_user_op_bytes
+//     log_recommended_fee = log_gas_price + log_slack + log_one_plus_alpha
+//                         + log_delta + log_user_op_bytes
 //
 //   The L1 fee oracle feeds `log_gas_price` directly in log space after
 //   converting L1 gas (base + priority) into fee-token smallest units via a
-//   pinned Uniswap V3 WETH/X TWAP and a fixed 10× slack. Fee-token identity
-//   and decimals are application/deployment config (wallet prototype: USDC),
-//   not a sequencer-core invariant. Frame `fee_price` is sampled at frame
-//   open and stays immutable for that frame's lifetime.
+//   pinned Uniswap V3 WETH/X TWAP. The tenfold safety margin is
+//   `batch_policy.log_slack`, not part of the oracle quote. Fee-token
+//   identity and decimals are application/deployment config (wallet
+//   prototype: USDC), not a sequencer-core invariant. Frame `fee_price` is
+//   sampled at frame open and stays immutable for that frame's lifetime.
 // ---------------------------------------------------------------------------
 
 /// Batch submissions are sent as raw `ssz(Batch)` with no tag; classification is
