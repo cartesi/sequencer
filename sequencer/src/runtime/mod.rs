@@ -110,6 +110,13 @@ where
     // A live price must be persisted before recovery can reopen a Tip: both
     // recovery and normal startup sample `recommended_fee` when opening frames.
     // The source addresses are immutable setup identity, never runtime flags.
+    //
+    // Uniswap mode deliberately hard-requires L1 here (`connect` +
+    // `refresh_once`), unlike the warm-boot chain-id path above that tolerates
+    // an unreachable RPC once identity is pinned. A crash-restart during an
+    // RPC blip therefore cannot boot Uniswap mode even though the DB may
+    // already hold a usable price — classified `FeeOracleTransient` so the
+    // orchestrator respawns rather than paging. Fixed mode needs no refresh.
     let fee_oracle = match identity.fee_oracle {
         storage::FeeOracleIdentity::Fixed { .. } => None,
         storage::FeeOracleIdentity::Uniswap {
