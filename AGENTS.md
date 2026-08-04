@@ -161,7 +161,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - `sequencer/src/l1/` — L1 client surface.
  - `reader.rs` — safe-input ingestion from InputBox into SQLite.
  - `submitter/` — stateless batch submitter (`worker.rs` + `poster.rs`).
- - `fee_oracle/` — L1 Uniswap V3 TWAP → `batch_policy.log_gas_price` (fixed mode for Anvil).
+ - `fee_oracle/` — setup-pinned L1 Uniswap V3 TWAP → `batch_policy.log_gas_price`; fixed mode writes once at setup and has no worker.
  - `eip1559.rs` — shared EIP-1559 fee estimation (poster + oracle).
  - `provider.rs` — alloy provider construction.
  - `partition.rs` — long-block-range retry helper.
@@ -176,7 +176,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Inclusion lane** — hot-path single-lane loop that dequeues, executes, persists, and rotates frame/batch boundaries. The only writer of open batch/frame state.
 - **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Nonces are assigned by storage (structural `parent.nonce + 1`) when batches are closed; the submitter just reads them.
 - **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `RecoveryRequired` when any non-`Safe` danger status fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery or refusal can run.
-- **Fee oracle** — background worker that converts L1 gas price (base + priority) into fee-token smallest units via a pinned Uniswap V3 WETH/X TWAP (or an explicit fixed exponent on Anvil), applies a 10× slack, and updates `batch_policy.log_gas_price`. Mandatory successful refresh before the inclusion lane starts; frame fees stay immutable until the next frame opens.
+- **Fee oracle** — setup pins either a fixed exponent or a reviewed Uniswap V3 WETH/X TWAP tuple into deployment identity. Fixed mode writes once and has no worker; Uniswap refreshes before recovery can open a Tip and then updates `batch_policy.log_gas_price`. The 10× margin lives in `batch_policy.log_slack`; frame fees stay immutable until the next frame opens.
 - **Input reader** — ingests safe inputs from L1 InputBox into SQLite.
 - **L2 tx feed** — DB-backed ordered-tx stream used by WS subscribers.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
@@ -188,7 +188,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Deposits are direct-input-only** (L1 → L2) and must not be represented as user ops.
 - Rejections (`InvalidNonce`, `InvalidMaxFee`, `InsufficientFeeBalance`) produce no state mutation and are not persisted. These are protocol-level rejection semantics every app must implement: nonces prevent user-op replay, fees prevent spam against the sequencer's DA budget. ("Fee", not "gas" — the fee tracks DA; compute metering, if it ever exists, is a separate future concept.)
 - Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
-- Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is sampled from `batch_policy_derived.recommended_fee` at rotation.
+- Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is sampled from `batch_policy_derived.recommended_fee` at rotation; oracle bootstrap writes the price before any Tip can sample it, and `log_slack` applies the 10× margin in log space.
 - Wallet state (balances, nonces) is in-memory today — not persisted.
 - **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`. `chainId` and `verifyingContract` come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS` (validated against the RPC chain id at startup). All four fields must be present on both sides — both the sequencer and the on-chain scheduler construct the domain via `sequencer_core::build_input_domain`, the canonical shared constructor.
 
@@ -241,7 +241,7 @@ Writer roles — one writer per table; reads over batch data go through the `val
 | batch submitter | `wallet_nonce_watermark` (write-before-broadcast, review R1a — its only write) |
 | egress (HTTP) | `dumps.lease_count` (leases) |
 | admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
-| fee_oracle | `batch_policy.log_gas_price` |
+| fee_oracle | `batch_policy.log_gas_price` (Uniswap mode only) |
 
 - Storage model is append-oriented; avoid mutable status flags for open/closed entities.
 - Open batch/frame are derived by "latest row" convention.
@@ -292,13 +292,13 @@ defaults list here drifted once already): `CARTESI_SEQUENCER_HTTP_ADDR`, `CARTES
 `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`, `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`,
 `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (fixed default, independent of the margin;
 must be strictly below the danger threshold or startup refuses),
-`CARTESI_SEQUENCER_SECONDS_PER_BLOCK`, fee-oracle knobs
+`CARTESI_SEQUENCER_SECONDS_PER_BLOCK`, and the runtime-only
+`CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS`. Setup-only fee-oracle source knobs are
 (`CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE`,
-`CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS` / `_DECIMALS`,
+`CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS`,
 `CARTESI_SEQUENCER_WETH_ADDRESS`, `CARTESI_SEQUENCER_UNISWAP_V3_POOL`,
-`CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS`,
-`CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS` — mainnet/Sepolia default to
-pinned USDC pool presets; other chains default to fixed `log_gas_price = 0`).
+`CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS` — mainnet/Sepolia default to
+ pinned USDC pool presets; other chains require an explicit source).
 
 ## Coding Conventions
 

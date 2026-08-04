@@ -72,7 +72,7 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 ## Running
 
 The sequencer runs in two phases. **`setup`** pins the
-deployment identity, does the initial L1 sync, and registers the genesis
+deployment identity (including the reviewed fee-oracle source), does the initial L1 sync, and registers the genesis
 snapshot — run it once. It is L1-read-only: it takes the batch-submitter
 *address*, never the signing key. **`run`** boots the sequencer from the
 set-up DB, reading identity from it (so chain id / app address are not `run`
@@ -209,7 +209,7 @@ released even on client disconnect.
 - `user_ops`: included user operations
 - `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`); inserting into `user_ops` also appends the corresponding replay row via trigger `trg_sequence_user_op`
 - `safe_inputs`: direct-input payload stream
-- `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` view exposes `recommended_fee` and `batch_size_target`. `log_gas_price` is updated by the L1 fee oracle (Uniswap V3 WETH/fee-token TWAP on mainnet/Sepolia; fixed exponent on local Anvil). Fees are app-token smallest units — initially USDC (6 decimals) for the wallet prototype — not a protocol-level USDC invariant.
+- `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target`. `log_gas_price` is updated only by a setup-pinned Uniswap V3 WETH/fee-token TWAP source; `log_slack = log(10)` applies the 10× safety margin in log space. Fixed local pricing is written once during setup and has no oracle worker. Fees are app-token smallest units — initially USDC (6 decimals) for the wallet prototype — not a protocol-level USDC invariant.
 
 ## Project Layout
 
