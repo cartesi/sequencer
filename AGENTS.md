@@ -159,12 +159,12 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
   - `api/` — `/ws/subscribe`, `/livez`, `/readyz`, `/healthz`.
   - `l2_tx_feed/` — DB-backed ordered-tx feed.
 - `sequencer/src/l1/` — L1 client surface.
- - `reader.rs` — safe-input ingestion from InputBox into SQLite.
- - `submitter/` — stateless batch submitter (`worker.rs` + `poster.rs`).
- - `fee_oracle/` — setup-pinned L1 Uniswap V3 TWAP → `batch_policy.log_gas_price`; fixed mode writes once at setup and has no worker.
- - `eip1559.rs` — shared EIP-1559 fee estimation (poster + oracle).
- - `provider.rs` — alloy provider construction.
- - `partition.rs` — long-block-range retry helper.
+  - `reader.rs` — safe-input ingestion from InputBox into SQLite.
+  - `submitter/` — stateless batch submitter (`worker.rs` + `poster.rs`).
+  - `fee_oracle/` — setup-pinned L1 Uniswap V3 TWAP → `batch_policy.log_gas_price`; fixed mode writes once at setup and has no worker.
+  - `eip1559.rs` — shared EIP-1559 fee estimation (poster + oracle).
+  - `provider.rs` — alloy provider construction.
+  - `partition.rs` — long-block-range retry helper.
 - `sequencer/src/recovery/` — preemptive recovery startup procedure (`mod.rs`), runtime danger detector (`detector.rs`), and mempool flusher (`flusher.rs`).
 - `sequencer/src/storage/` — SQLite persistence, split by writer role (`ingress`, `egress`, `l1_inputs`, `l1_submission`, `recovery`, `admin`, `safe_accepted_batches`, `snapshot_dumps`, plus shared `mod`, `open`, `convert`, `queries`, `mutations`, and `migrations/`).
 
@@ -241,6 +241,7 @@ Writer roles — one writer per table; reads over batch data go through the `val
 | batch submitter | `wallet_nonce_watermark` (write-before-broadcast, review R1a — its only write) |
 | egress (HTTP) | `dumps.lease_count` (leases) |
 | admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
+| setup | `batch_policy.log_gas_price` (Fixed fee-oracle mode only, write-once) |
 | fee_oracle | `batch_policy.log_gas_price` (Uniswap mode only) |
 
 - Storage model is append-oriented; avoid mutable status flags for open/closed entities.
