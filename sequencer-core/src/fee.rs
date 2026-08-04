@@ -129,14 +129,22 @@ pub fn fee_from_linear(value: U256) -> u16 {
 /// Convert a linear fee value to the smallest representable log-space fee
 /// that does not undercharge it.
 ///
-/// Values at and above the representable maximum saturate to
-/// [`MAX_EXPONENT`], matching [`fee_from_linear`].
-pub fn fee_from_linear_ceil(value: U256) -> u16 {
+/// Exact equality with [`fee_to_linear`]`(`[`MAX_EXPONENT`]`)` encodes as
+/// [`MAX_EXPONENT`]. Values **above** that maximum cannot be represented
+/// without undercharging and return [`FeeEncodeError::ExceedsRepresentableRange`].
+pub fn fee_from_linear_ceil(value: U256) -> Result<u16, FeeEncodeError> {
     if value <= U256::from(1u64) {
-        return 0;
+        return Ok(0);
     }
-    if value >= fee_to_linear(MAX_EXPONENT) {
-        return MAX_EXPONENT;
+    let max_linear = fee_to_linear(MAX_EXPONENT);
+    if value > max_linear {
+        return Err(FeeEncodeError::ExceedsRepresentableRange {
+            max_exponent: MAX_EXPONENT,
+            max_linear,
+        });
+    }
+    if value == max_linear {
+        return Ok(MAX_EXPONENT);
     }
     let target = value << FRAC_BITS;
     let mut lo: u32 = 0;
@@ -149,7 +157,18 @@ pub fn fee_from_linear_ceil(value: U256) -> u16 {
             hi = mid;
         }
     }
-    lo as u16
+    Ok(lo as u16)
+}
+
+/// Error from [`fee_from_linear_ceil`] when the linear value lies outside the
+/// representable log-fee range.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FeeEncodeError {
+    #[error(
+        "linear fee exceeds fee_to_linear(MAX_EXPONENT={max_exponent})={max_linear}; \
+         cannot encode without undercharging"
+    )]
+    ExceedsRepresentableRange { max_exponent: u16, max_linear: U256 },
 }
 
 /// Compute `round(log_{129/128}(num / denom))` as a signed integer.
@@ -326,10 +345,27 @@ mod tests {
             U256::from(2u64),
             U256::from(123_456u64),
         ] {
-            let encoded = fee_from_linear_ceil(value);
+            let encoded = fee_from_linear_ceil(value).unwrap();
             assert!(encoded == MAX_EXPONENT || fee_to_linear(encoded) >= value);
             assert!(encoded == 0 || fee_to_linear(encoded - 1) < value);
         }
+        assert_eq!(
+            fee_from_linear_ceil(fee_to_linear(MAX_EXPONENT)).unwrap(),
+            MAX_EXPONENT
+        );
+    }
+
+    #[test]
+    fn fee_from_linear_ceil_rejects_unrepresentable_values() {
+        let huge = fee_to_linear(MAX_EXPONENT) + U256::from(1u64);
+        assert!(matches!(
+            fee_from_linear_ceil(huge),
+            Err(FeeEncodeError::ExceedsRepresentableRange { .. })
+        ));
+        assert!(matches!(
+            fee_from_linear_ceil(U256::MAX),
+            Err(FeeEncodeError::ExceedsRepresentableRange { .. })
+        ));
     }
 
     #[test]
