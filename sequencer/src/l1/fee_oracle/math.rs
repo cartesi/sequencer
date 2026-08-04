@@ -4,11 +4,14 @@
 //! Integer-only conversion from L1 gas prices to fee-token gas prices.
 
 use alloy_primitives::U256;
-use sequencer_core::fee::fee_from_linear_ceil;
+use sequencer_core::fee::{FeeEncodeError, fee_from_linear_ceil};
 
 /// Encode a linear price without ever rounding it down.
-pub fn encode_log_gas_price(linear: U256) -> u16 {
-    fee_from_linear_ceil(linear)
+///
+/// Values above [`sequencer_core::fee::fee_to_linear`]`(`[`sequencer_core::fee::MAX_EXPONENT`]`)`
+/// fail rather than undercharge.
+pub fn encode_log_gas_price(linear: U256) -> Result<u16, MathError> {
+    fee_from_linear_ceil(linear).map_err(MathError::from)
 }
 
 /// Compute fee-token smallest units charged per L1 gas.
@@ -41,6 +44,16 @@ pub fn compute_x_units_per_gas(
 pub enum MathError {
     #[error("integer arithmetic overflow")]
     Overflow,
+    #[error("linear gas price exceeds the representable log-fee range")]
+    ExceedsRepresentableRange,
+}
+
+impl From<FeeEncodeError> for MathError {
+    fn from(error: FeeEncodeError) -> Self {
+        match error {
+            FeeEncodeError::ExceedsRepresentableRange { .. } => Self::ExceedsRepresentableRange,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -70,21 +83,30 @@ mod tests {
     #[test]
     fn conservative_log_encoding_never_undercharges() {
         let target = U256::from(123_456_789u64);
-        let encoded = encode_log_gas_price(target);
+        let encoded = encode_log_gas_price(target).unwrap();
         assert!(fee_to_linear(encoded) >= target);
         assert!(encoded == 0 || fee_to_linear(encoded - 1) < target);
     }
 
     #[test]
-    fn encode_zero_and_saturate_at_max_exponent() {
-        assert_eq!(encode_log_gas_price(U256::ZERO), 0);
-        assert_eq!(encode_log_gas_price(U256::MAX), MAX_EXPONENT);
-        // Documented saturation gap: values above fee_to_linear(MAX_EXPONENT)
-        // collapse to MAX_EXPONENT even when that still undercharges the
-        // linear target. Fail-loud encoding is a follow-up.
-        let max_linear = fee_to_linear(MAX_EXPONENT);
-        assert!(max_linear < U256::MAX);
-        assert!(fee_to_linear(encode_log_gas_price(U256::MAX)) < U256::MAX);
+    fn encode_zero_and_exact_max_exponent() {
+        assert_eq!(encode_log_gas_price(U256::ZERO).unwrap(), 0);
+        assert_eq!(
+            encode_log_gas_price(fee_to_linear(MAX_EXPONENT)).unwrap(),
+            MAX_EXPONENT
+        );
+    }
+
+    #[test]
+    fn encode_rejects_values_above_max_representable() {
+        assert_eq!(
+            encode_log_gas_price(fee_to_linear(MAX_EXPONENT) + U256::from(1u64)),
+            Err(MathError::ExceedsRepresentableRange)
+        );
+        assert_eq!(
+            encode_log_gas_price(U256::MAX),
+            Err(MathError::ExceedsRepresentableRange)
+        );
     }
 
     #[test]
@@ -102,7 +124,7 @@ mod tests {
             target += U256::from(1u64);
         }
         let (target, rounded) = found.expect("find a rounding-down candidate");
-        let encoded = encode_log_gas_price(target);
+        let encoded = encode_log_gas_price(target).unwrap();
         assert_eq!(encoded, rounded + 1);
         assert!(fee_to_linear(encoded) >= target);
     }

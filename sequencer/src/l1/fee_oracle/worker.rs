@@ -102,7 +102,7 @@ impl FeeOracle {
             .map_err(|err| FeeOracleError::Transient(err.to_string()))?;
         let linear =
             compute_x_units_per_gas(fees.base_fee_per_gas, fees.max_priority_fee_per_gas, quote)?;
-        let log_gas_price = encode_log_gas_price(linear);
+        let log_gas_price = encode_log_gas_price(linear)?;
 
         let db_path = self.db_path.clone();
         let refresh =
@@ -274,6 +274,7 @@ mod tests {
         encode_log_gas_price(
             compute_x_units_per_gas(19_000_000_000, 1_000_000_000, sample_quote()).unwrap(),
         )
+        .unwrap()
     }
 
     fn initialize_db(path: &str) {
