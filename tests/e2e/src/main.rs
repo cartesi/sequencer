@@ -23,8 +23,8 @@ fn main() {
                     devnet_sequencer_config_no_faketime(log_prefix)
                 } else if name == "fixed_fee_oracle_sets_frame_fee_test" {
                     let mut config = default_devnet_sequencer_config(log_prefix);
-                    // 100 → recommended fee 1160, under the wallet client's
-                    // DEFAULT_MAX_FEE (1200) so transfers still admit.
+                    // 100 → recommended fee 1456, under the wallet client's
+                    // DEFAULT_MAX_FEE (2500) so transfers still admit.
                     config.fee_oracle_fixed_log_gas_price = Some(100);
                     config
                 } else {
