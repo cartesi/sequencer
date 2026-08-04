@@ -134,8 +134,14 @@ where
                 },
             )
             .await
-            .map_err(|error| BootstrapError::FeeOracleMisconfig {
-                message: error.to_string(),
+            .map_err(|error| {
+                let (transient, message) =
+                    crate::l1::fee_oracle::uniswap::bootstrap_price_source_error(error);
+                if transient {
+                    BootstrapError::FeeOracleTransient { message }
+                } else {
+                    BootstrapError::FeeOracleMisconfig { message }
+                }
             })?;
             let oracle = crate::l1::fee_oracle::FeeOracle::new(
                 db_path.clone(),

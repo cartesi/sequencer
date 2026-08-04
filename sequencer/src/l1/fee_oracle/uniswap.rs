@@ -118,13 +118,14 @@ impl UniswapV3PriceSource {
         } else {
             return Err(PriceSourceError::WrongTokenPair);
         };
-        // Probe the exact `observe` call used for quotes. Pool-specific
-        // observation-history reverts (including `OLD`) mean this TWAP window
-        // cannot yet be served; other RPC failures remain provider failures.
+        // Probe the exact `observe` call used for quotes. Uniswap's `OLD`
+        // revert means this TWAP window cannot yet be served (misconfig /
+        // immature pool). Transport and other RPC failures stay provider
+        // errors so a flaky gateway is not treated as a bad pool.
         pool.observe(vec![config.twap_window_secs, 0])
             .call()
             .await
-            .map_err(|_| PriceSourceError::InsufficientObservations)?;
+            .map_err(classify_observe_error)?;
 
         Ok(Self {
             provider,
@@ -139,7 +140,7 @@ impl UniswapV3PriceSource {
             .observe(vec![self.config.twap_window_secs, 0])
             .call()
             .await
-            .map_err(provider_error)?;
+            .map_err(classify_observe_error)?;
         let start: i64 = observed.tickCumulatives[0]
             .try_into()
             .expect("Uniswap int56 tick cumulative fits i64");
@@ -170,6 +171,27 @@ impl TokenPriceSource for UniswapV3PriceSource {
 
 fn provider_error(error: impl std::fmt::Display) -> PriceSourceError {
     PriceSourceError::Provider(error.to_string())
+}
+
+/// Classify an `observe` failure: Uniswap V3 reverts with the literal string
+/// `OLD` when `secondsAgo` exceeds available observation history. Everything
+/// else (timeouts, HTTP 5xx, decode errors) is a provider failure.
+fn classify_observe_error(error: impl std::fmt::Display) -> PriceSourceError {
+    let message = error.to_string();
+    if message.contains("OLD") {
+        PriceSourceError::InsufficientObservations
+    } else {
+        PriceSourceError::Provider(message)
+    }
+}
+
+/// Bootstrap mapping: provider/RPC failures may self-heal; pool/config
+/// failures need an operator.
+pub fn bootstrap_price_source_error(error: PriceSourceError) -> (bool, String) {
+    match error {
+        PriceSourceError::Provider(message) => (true, message),
+        other => (false, other.to_string()),
+    }
 }
 
 /// Convert a Uniswap tick to fee-token smallest units per WETH.
@@ -317,6 +339,38 @@ mod tests {
             quote_x_per_weth_from_tick(-887_273, false),
             Err(PriceSourceError::ArithmeticOverflow)
         ));
+    }
+
+    #[test]
+    fn observe_old_revert_is_insufficient_observations() {
+        assert!(matches!(
+            classify_observe_error("execution reverted: OLD"),
+            PriceSourceError::InsufficientObservations
+        ));
+        assert!(matches!(
+            classify_observe_error("server returned an error response: error code 3: OLD"),
+            PriceSourceError::InsufficientObservations
+        ));
+    }
+
+    #[test]
+    fn observe_transport_failure_is_provider_error() {
+        assert!(matches!(
+            classify_observe_error("error sending request for url (http://127.0.0.1:8545/)"),
+            PriceSourceError::Provider(_)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_maps_provider_as_transient() {
+        let (transient, _) =
+            bootstrap_price_source_error(PriceSourceError::Provider("timeout".into()));
+        assert!(transient);
+        let (transient, _) =
+            bootstrap_price_source_error(PriceSourceError::InsufficientObservations);
+        assert!(!transient);
+        let (transient, _) = bootstrap_price_source_error(PriceSourceError::WrongTokenPair);
+        assert!(!transient);
     }
 
     #[test]
