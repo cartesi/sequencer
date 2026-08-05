@@ -92,10 +92,11 @@ impl RunError {
             RunError::Worker(WorkerExit::BatchSubmitter(BatchSubmitterExit::Source(
                 BatchSubmitterError::Poster(BatchPosterError::ChainIdMismatch { .. }),
             ))) => EXIT_TERMINAL,
-            // Fee-oracle arithmetic that cannot encode without undercharging is
-            // an invariant break — page an operator rather than restart-loop.
+            // Fee-oracle arithmetic that cannot encode without undercharging, or
+            // a pool/config misconfig discovered at runtime, is terminal — page
+            // an operator rather than restart-loop.
             RunError::Worker(WorkerExit::FeeOracle(FeeOracleExit::Source(
-                FeeOracleError::FatalMath(_),
+                FeeOracleError::FatalMath(_) | FeeOracleError::Misconfig(_),
             ))) => EXIT_TERMINAL,
             RunError::Bootstrap(b) => bootstrap_exit_code(b),
             // Worker crashes, provider errors, IO/storage/app catch-alls.
@@ -921,6 +922,17 @@ mod tests {
         assert_eq!(
             RunError::Worker(WorkerExit::FeeOracle(FeeOracleExit::Source(
                 FeeOracleError::FatalMath(MathError::ExceedsRepresentableRange),
+            )))
+            .exit_code(),
+            EXIT_TERMINAL
+        );
+        assert_eq!(
+            RunError::from(FeeOracleError::Misconfig("wrong pair".into())).exit_code(),
+            EXIT_TERMINAL
+        );
+        assert_eq!(
+            RunError::Worker(WorkerExit::FeeOracle(FeeOracleExit::Source(
+                FeeOracleError::Misconfig("wrong pair".into()),
             )))
             .exit_code(),
             EXIT_TERMINAL

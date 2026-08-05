@@ -107,16 +107,13 @@ where
         allow_insecure_rpc: config.allow_insecure_rpc,
     };
 
-    // A live price must be persisted before recovery can reopen a Tip: both
-    // recovery and normal startup sample `recommended_fee` when opening frames.
-    // The source addresses are immutable setup identity, never runtime flags.
-    //
-    // Uniswap mode deliberately hard-requires L1 here (`connect` +
-    // `refresh_once`), unlike the warm-boot chain-id path above that tolerates
-    // an unreachable RPC once identity is pinned. A crash-restart during an
-    // RPC blip therefore cannot boot Uniswap mode even though the DB may
-    // already hold a usable price — classified `FeeOracleTransient` so the
-    // orchestrator respawns rather than paging. Fixed mode needs no refresh.
+    // Prefer a live refresh before recovery can reopen a Tip, but tolerate a
+    // transient L1/RPC failure the same way warm-boot tolerates unreachable
+    // chain-id checks: the price is already pinned by setup, and a single
+    // persisted max-age (`l1_read_stale_after`) bounds how long it may be
+    // retained at boot and in `run_forever`. Misconfig (wrong pool/pair/chain)
+    // stays terminal. Fixed mode needs no worker.
+    let max_price_age_ms = timing.l1_read_stale_after_secs().saturating_mul(1000);
     let fee_oracle = match identity.fee_oracle {
         storage::FeeOracleIdentity::Fixed { .. } => None,
         storage::FeeOracleIdentity::Uniswap {
@@ -130,33 +127,67 @@ where
                 config.allow_insecure_rpc,
             )
             .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
-            let token = crate::l1::fee_oracle::UniswapV3PriceSource::connect(
+            let uniswap = crate::l1::fee_oracle::UniswapConfig {
+                chain_id: identity.chain_id,
+                weth,
+                fee_token,
+                pool,
+                twap_window_secs,
+            };
+            let poll = Duration::from_millis(config.fee_oracle.poll_interval_ms);
+            let oracle = match crate::l1::fee_oracle::UniswapV3PriceSource::connect(
                 provider.clone(),
-                crate::l1::fee_oracle::UniswapConfig {
-                    chain_id: identity.chain_id,
-                    weth,
-                    fee_token,
-                    pool,
-                    twap_window_secs,
-                },
+                uniswap,
             )
             .await
-            .map_err(|error| {
-                let (transient, message) =
-                    crate::l1::fee_oracle::uniswap::bootstrap_price_source_error(error);
-                if transient {
-                    BootstrapError::FeeOracleTransient { message }
-                } else {
-                    BootstrapError::FeeOracleMisconfig { message }
+            {
+                Ok(token) => {
+                    let oracle = crate::l1::fee_oracle::FeeOracle::new(
+                        db_path.clone(),
+                        poll,
+                        max_price_age_ms,
+                        provider,
+                        Box::new(token),
+                    );
+                    match oracle.refresh_once().await {
+                        Ok(_) => oracle,
+                        Err(crate::l1::fee_oracle::worker::FeeOracleError::Transient(message)) => {
+                            tracing::warn!(
+                                error = %message,
+                                "fee oracle unreachable at boot — continuing from persisted price"
+                            );
+                            crate::l1::fee_oracle::FeeOracle::ensure_persisted_price_fresh(
+                                &db_path,
+                                max_price_age_ms,
+                            )?;
+                            oracle
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
-            })?;
-            let oracle = crate::l1::fee_oracle::FeeOracle::new(
-                db_path.clone(),
-                Duration::from_millis(config.fee_oracle.poll_interval_ms),
-                provider,
-                Box::new(token),
-            );
-            oracle.refresh_once().await?;
+                Err(error) => {
+                    let (transient, message) =
+                        crate::l1::fee_oracle::uniswap::bootstrap_price_source_error(error);
+                    if !transient {
+                        return Err(BootstrapError::FeeOracleMisconfig { message }.into());
+                    }
+                    tracing::warn!(
+                        error = %message,
+                        "fee oracle unreachable at boot — continuing from persisted price"
+                    );
+                    crate::l1::fee_oracle::FeeOracle::ensure_persisted_price_fresh(
+                        &db_path,
+                        max_price_age_ms,
+                    )?;
+                    crate::l1::fee_oracle::FeeOracle::reconnecting_uniswap(
+                        db_path.clone(),
+                        poll,
+                        max_price_age_ms,
+                        provider,
+                        uniswap,
+                    )
+                }
+            };
             Some(oracle)
         }
     };

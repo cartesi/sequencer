@@ -471,6 +471,9 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     log_one_plus_alpha       INTEGER NOT NULL CHECK (log_one_plus_alpha >= 0),
     -- Log-space fee exponent fed by the oracle.
     log_gas_price            INTEGER NOT NULL CHECK (log_gas_price >= 0),
+    -- Unix-ms of the last successful oracle (or Fixed setup) write.
+    -- 0 means never written; Uniswap treats that as stale.
+    log_gas_price_updated_at_ms INTEGER NOT NULL CHECK (log_gas_price_updated_at_ms >= 0),
     -- log_{129/128}(10), rounded by log_fee_ratio(10, 1) = 296.
     -- This tenfold price slack is applied in log space, not in the oracle.
     log_slack                INTEGER NOT NULL CHECK (log_slack >= 0),
@@ -498,14 +501,14 @@ CREATE TABLE IF NOT EXISTS batch_policy (
 INSERT OR IGNORE INTO batch_policy(
     singleton_id,
 
-    log_alpha, log_one_plus_alpha, log_gas_price, log_slack,
+    log_alpha, log_one_plus_alpha, log_gas_price, log_gas_price_updated_at_ms, log_slack,
 
     log_base_gas, log_delta, log_user_op_bytes, log_max_batch_bytes
 )
 VALUES (
     0,
 
-    -229, 20, 0, 296,
+    -229, 20, 0, 0, 296,
 
     1403, 419, 621, 1333
 );
