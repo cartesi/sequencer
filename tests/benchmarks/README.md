@@ -73,7 +73,7 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
 
 ## Notes
 
-- Self-contained variants launch `anvil --load-state` from the preloaded rollups dump under `tests/benchmarks/.deps/`; run `just setup` first.
+- Self-contained variants launch `anvil --load-state` from the preloaded rollups dump under `tests/.deps/`; run `just setup` first.
 - Self-contained variants also deploy a local `Application` through `ApplicationFactory`, so they require a canonical machine image at `examples/canonical-app/out/canonical-machine-image`; run `just canonical-build-machine-image` first.
 - Self-contained variants therefore require Foundry's `anvil` binary to be installed locally.
 - `--max-fee` must be at or above the placeholder app's base fee, or every tx is rejected (`422 EXECUTION_REJECTED`) and the run reports no accepted txs. The error message includes the rejection breakdown and the first rejection body, which names the base fee.

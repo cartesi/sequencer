@@ -496,17 +496,23 @@ fn decode_input_box_address(data_availability: &[u8]) -> Result<Address, InputRe
     }
 }
 
-/// Bootstrap-time `eth_call` classification. Retryable **only** when we could
-/// not reach the node; anything the node *answered* with — a revert, empty
-/// return data, undecodable output — is a deterministic deployment/config
-/// mismatch and terminal: re-running against the same address re-fails
-/// identically. (A contract revert arrives as
-/// `TransportError(RpcError::ErrorResp)`, so matching on the outer variant
-/// alone would misfile "wrong contract" as "L1 unreachable".)
+/// Bootstrap-time `eth_call` classification. Retryable when we could not
+/// reach the node, or when the node answered with a *transient* JSON-RPC
+/// error (rate limit / credit limit — alloy's own retry policy recognizes
+/// the provider-specific codes, e.g. 429, Infura `-32005`). Everything else
+/// the node answered with — a revert, empty return data, undecodable output
+/// — is a deterministic deployment/config mismatch and terminal: re-running
+/// against the same address re-fails identically. (A contract revert arrives
+/// as `TransportError(RpcError::ErrorResp)`, so matching on the outer
+/// variant alone would misfile "wrong contract" as "L1 unreachable".)
 fn map_contract_bootstrap_error(err: alloy::contract::Error) -> InputReaderError {
     use alloy::transports::RpcError;
+    use alloy::transports::layers::{RateLimitRetryPolicy, RetryPolicy};
     match &err {
-        alloy::contract::Error::TransportError(RpcError::Transport(_) | RpcError::NullResp) => {
+        alloy::contract::Error::TransportError(rpc)
+            if matches!(rpc, RpcError::Transport(_) | RpcError::NullResp)
+                || RateLimitRetryPolicy::default().should_retry(rpc) =>
+        {
             InputReaderError::Provider(err.to_string())
         }
         _ => InputReaderError::Bootstrap(err.to_string()),
@@ -1114,6 +1120,30 @@ mod tests {
     fn input_count_complete_rejects_an_impossible_overcount() {
         // We somehow hold more than the chain reports — also fail loud.
         assert!(check_input_count_complete(100, 11, 10).is_err());
+    }
+
+    #[test]
+    fn bootstrap_classification_rate_limit_is_retryable_revert_is_terminal() {
+        fn error_resp(code: i64, message: &str) -> alloy::contract::Error {
+            alloy::contract::Error::TransportError(alloy::transports::RpcError::ErrorResp(
+                alloy::rpc::json_rpc::ErrorPayload {
+                    code,
+                    message: message.to_string().into(),
+                    data: None,
+                },
+            ))
+        }
+
+        // A JSON-RPC-level rate limit (Infura -32005) is transient: setup must
+        // surface it as retryable (FirstBootRequiresL1), not as a terminal
+        // Bootstrap misconfig.
+        let err = map_contract_bootstrap_error(error_resp(-32005, "exceeded project rate limit"));
+        assert!(matches!(err, InputReaderError::Provider(_)), "got {err:?}");
+
+        // A contract revert also arrives as ErrorResp — that one IS terminal:
+        // re-running against the same (wrong) address re-fails identically.
+        let err = map_contract_bootstrap_error(error_resp(3, "execution reverted"));
+        assert!(matches!(err, InputReaderError::Bootstrap(_)), "got {err:?}");
     }
 
     #[test]
