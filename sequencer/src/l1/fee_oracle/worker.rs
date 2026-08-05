@@ -3,7 +3,7 @@
 
 //! Periodically refresh the fee-token price charged for L1 gas.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy::providers::DynProvider;
 use async_trait::async_trait;
@@ -12,7 +12,11 @@ use tracing::{debug, warn};
 
 use crate::l1::eip1559::{Eip1559Fees, estimate_fees};
 use crate::l1::fee_oracle::math::{MathError, compute_x_units_per_gas, encode_log_gas_price};
-use crate::l1::fee_oracle::uniswap::{PriceSourceError, TokenPriceSource};
+use crate::l1::fee_oracle::uniswap::{
+    PriceSourceError, TokenPriceSource, UniswapConfig, UniswapV3PriceSource,
+    bootstrap_price_source_error,
+};
+use crate::runtime::clock::unix_now_ms;
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{Storage, StorageOpenError};
 
@@ -32,6 +36,8 @@ pub enum FeeOracleError {
     Join(String),
     #[error("transient fee-oracle source failure: {0}")]
     Transient(String),
+    #[error("fee-oracle misconfiguration: {0}")]
+    Misconfig(String),
     #[error("fatal fee-oracle arithmetic failure: {0}")]
     FatalMath(#[from] MathError),
 }
@@ -48,11 +54,23 @@ impl GasFeeSource for DynProvider {
     }
 }
 
+enum TokenHandle {
+    Connected(Box<dyn TokenPriceSource>),
+    /// Re-runs `UniswapV3PriceSource::connect` on every quote. Used when boot
+    /// skipped a live connect because L1 was transiently unreachable.
+    Reconnecting {
+        provider: DynProvider,
+        config: UniswapConfig,
+    },
+}
+
 pub struct FeeOracle {
     db_path: String,
     poll_interval: Duration,
+    /// Shared with L1 read-staleness: `l1_read_stale_after_secs * 1000`.
+    max_price_age_ms: u64,
     gas: Box<dyn GasFeeSource>,
-    token: Box<dyn TokenPriceSource>,
+    token: TokenHandle,
 }
 
 impl FeeOracle {
@@ -61,14 +79,35 @@ impl FeeOracle {
     pub fn new(
         db_path: impl Into<String>,
         poll_interval: Duration,
+        max_price_age_ms: u64,
         provider: DynProvider,
         token: Box<dyn TokenPriceSource>,
     ) -> Self {
         Self {
             db_path: db_path.into(),
             poll_interval,
+            max_price_age_ms,
             gas: Box::new(provider),
-            token,
+            token: TokenHandle::Connected(token),
+        }
+    }
+
+    /// Uniswap worker that reconnects on each quote. Prefer [`Self::new`] when
+    /// boot already validated the pool; use this when boot tolerated a
+    /// transient connect failure and is running on a persisted price.
+    pub fn reconnecting_uniswap(
+        db_path: impl Into<String>,
+        poll_interval: Duration,
+        max_price_age_ms: u64,
+        provider: DynProvider,
+        config: UniswapConfig,
+    ) -> Self {
+        Self {
+            db_path: db_path.into(),
+            poll_interval,
+            max_price_age_ms,
+            gas: Box::new(provider.clone()),
+            token: TokenHandle::Reconnecting { provider, config },
         }
     }
 
@@ -76,30 +115,38 @@ impl FeeOracle {
     fn new_with_sources(
         db_path: impl Into<String>,
         poll_interval: Duration,
+        max_price_age_ms: u64,
         gas: Box<dyn GasFeeSource>,
         token: Box<dyn TokenPriceSource>,
     ) -> Self {
         Self {
             db_path: db_path.into(),
             poll_interval,
+            max_price_age_ms,
             gas,
-            token,
+            token: TokenHandle::Connected(token),
         }
     }
 
-    /// Mandatory startup refresh. Runtime must call this before opening the
-    /// inclusion lane so the first frame samples an L1-derived fee.
+    async fn quote_x_per_weth(&self) -> Result<alloy_primitives::U256, FeeOracleError> {
+        match &self.token {
+            TokenHandle::Connected(token) => token.quote_x_per_weth().await.map_err(Into::into),
+            TokenHandle::Reconnecting { provider, config } => {
+                let token = UniswapV3PriceSource::connect(provider.clone(), *config).await?;
+                token.quote_x_per_weth().await.map_err(Into::into)
+            }
+        }
+    }
+
+    /// Refresh from L1 and stamp `log_gas_price_updated_at_ms` even when the
+    /// encoded exponent is unchanged — the timestamp is the freshness signal.
     pub async fn refresh_once(&self) -> Result<RefreshResult, FeeOracleError> {
         let fees = self
             .gas
             .estimate_gas_fees()
             .await
             .map_err(FeeOracleError::Transient)?;
-        let quote = self
-            .token
-            .quote_x_per_weth()
-            .await
-            .map_err(|err| FeeOracleError::Transient(err.to_string()))?;
+        let quote = self.quote_x_per_weth().await?;
         let linear =
             compute_x_units_per_gas(fees.base_fee_per_gas, fees.max_priority_fee_per_gas, quote)?;
         let log_gas_price = encode_log_gas_price(linear)?;
@@ -109,9 +156,8 @@ impl FeeOracle {
             tokio::task::spawn_blocking(move || -> Result<RefreshResult, FeeOracleError> {
                 let mut storage = Storage::open_writer(&db_path)?;
                 let changed = storage.log_gas_price()? != log_gas_price;
-                if changed {
-                    storage.set_log_gas_price(log_gas_price)?;
-                }
+                // Always stamp: successful quote renews the staleness clock.
+                storage.set_log_gas_price(log_gas_price)?;
                 Ok(RefreshResult {
                     log_gas_price,
                     changed,
@@ -144,30 +190,64 @@ impl FeeOracle {
         Ok(refresh)
     }
 
+    /// Refuse when the persisted price is missing or older than `max_age_ms`.
+    pub fn ensure_persisted_price_fresh(
+        db_path: &str,
+        max_age_ms: u64,
+    ) -> Result<(), FeeOracleError> {
+        let storage = Storage::open_read_only(db_path)?;
+        let now = unix_now_ms();
+        if storage.log_gas_price_is_stale(now, max_age_ms)? {
+            let age = storage.log_gas_price_age_ms(now)?;
+            return Err(FeeOracleError::Transient(format!(
+                "persisted fee oracle price stale: age_ms={age}, max_age_ms={max_age_ms}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn start(
         self,
         shutdown: ShutdownSignal,
     ) -> tokio::task::JoinHandle<Result<(), FeeOracleError>> {
-        // Path validity is already proven by the mandatory `refresh_once` before
-        // spawn; a read-only preflight here cannot catch writer-mode failures.
         tokio::spawn(async move { self.run_forever(shutdown).await })
     }
 
     async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), FeeOracleError> {
-        let mut last_success = Instant::now();
         loop {
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for_shutdown() => return Ok(()),
                 result = self.refresh_once() => match result {
                     Ok(refresh) => {
-                        last_success = Instant::now();
                         if refresh.changed {
                             debug!(log_gas_price = refresh.log_gas_price, "updated L1 fee oracle price");
                         }
                     }
                     Err(FeeOracleError::Transient(error)) => {
-                        warn!(%error, retained_age_secs = last_success.elapsed().as_secs(), "retaining last L1 fee-oracle price after transient failure");
+                        let db_path = self.db_path.clone();
+                        let max_age_ms = self.max_price_age_ms;
+                        let (age_ms, stale) = tokio::task::spawn_blocking(move || {
+                            let storage = Storage::open_read_only(&db_path)?;
+                            let now = unix_now_ms();
+                            let age_ms = storage.log_gas_price_age_ms(now)?;
+                            let stale = storage.log_gas_price_is_stale(now, max_age_ms)?;
+                            Ok::<_, FeeOracleError>((age_ms, stale))
+                        })
+                        .await
+                        .map_err(|err| FeeOracleError::Join(err.to_string()))??;
+                        if stale {
+                            return Err(FeeOracleError::Transient(format!(
+                                "fee oracle price older than {max_age_ms}ms \
+                                 (age {age_ms}ms) after transient failure: {error}"
+                            )));
+                        }
+                        warn!(
+                            %error,
+                            retained_age_ms = age_ms,
+                            max_age_ms,
+                            "retaining last L1 fee-oracle price after transient failure"
+                        );
                     }
                     Err(error) => return Err(error),
                 },
@@ -183,7 +263,12 @@ impl FeeOracle {
 
 impl From<PriceSourceError> for FeeOracleError {
     fn from(error: PriceSourceError) -> Self {
-        Self::Transient(error.to_string())
+        let (transient, message) = bootstrap_price_source_error(error);
+        if transient {
+            Self::Transient(message)
+        } else {
+            Self::Misconfig(message)
+        }
     }
 }
 
@@ -193,6 +278,8 @@ mod tests {
     use crate::storage::test_helpers::temp_db;
     use alloy_primitives::U256;
     use std::sync::Mutex;
+
+    const TEST_MAX_AGE_MS: u64 = 60 * 60 * 1000;
 
     struct StaticGas(Eip1559Fees);
 
@@ -248,6 +335,15 @@ mod tests {
         }
     }
 
+    struct AlwaysFailToken;
+
+    #[async_trait]
+    impl TokenPriceSource for AlwaysFailToken {
+        async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
+            Err(PriceSourceError::Provider("pool unavailable".into()))
+        }
+    }
+
     struct OverflowToken;
 
     #[async_trait]
@@ -280,14 +376,29 @@ mod tests {
         let _ = Storage::open(path).expect("initialize storage schema");
     }
 
+    fn oracle_with(
+        path: &str,
+        max_age_ms: u64,
+        gas: Box<dyn GasFeeSource>,
+        token: Box<dyn TokenPriceSource>,
+    ) -> FeeOracle {
+        FeeOracle::new_with_sources(
+            path.to_owned(),
+            Duration::from_secs(1),
+            max_age_ms,
+            gas,
+            token,
+        )
+    }
+
     #[tokio::test]
     async fn live_source_updates_only_when_encoded_price_changes() {
         let db = temp_db("live-fee-oracle");
         initialize_db(&db.path);
         let expected_log = expected_log_price();
-        let oracle = FeeOracle::new_with_sources(
-            db.path.clone(),
-            Duration::from_secs(1),
+        let oracle = oracle_with(
+            &db.path,
+            TEST_MAX_AGE_MS,
             Box::new(StaticGas(sample_fees())),
             Box::new(StaticToken(sample_quote())),
         );
@@ -298,6 +409,14 @@ mod tests {
                 changed: true
             }
         );
+        let first_stamp = Storage::open_read_only(&db.path)
+            .unwrap()
+            .log_gas_price_updated_at_ms()
+            .unwrap();
+        assert!(first_stamp > 0);
+
+        // Unchanged exponent still renews the freshness stamp.
+        tokio::time::sleep(Duration::from_millis(2)).await;
         assert_eq!(
             oracle.refresh_once().await.unwrap(),
             RefreshResult {
@@ -307,6 +426,7 @@ mod tests {
         );
         let storage = Storage::open_read_only(&db.path).unwrap();
         assert_eq!(storage.log_gas_price().unwrap(), expected_log);
+        assert!(storage.log_gas_price_updated_at_ms().unwrap() >= first_stamp);
     }
 
     #[tokio::test]
@@ -314,9 +434,9 @@ mod tests {
         let db = temp_db("retain-gas-fee-oracle");
         initialize_db(&db.path);
         let expected_log = expected_log_price();
-        let oracle = FeeOracle::new_with_sources(
-            db.path.clone(),
-            Duration::from_secs(1),
+        let oracle = oracle_with(
+            &db.path,
+            TEST_MAX_AGE_MS,
             Box::new(FailsAfterFirstGas {
                 calls: Mutex::new(0),
                 ok: sample_fees(),
@@ -338,9 +458,9 @@ mod tests {
         let db = temp_db("retain-token-fee-oracle");
         initialize_db(&db.path);
         let expected_log = expected_log_price();
-        let oracle = FeeOracle::new_with_sources(
-            db.path.clone(),
-            Duration::from_secs(1),
+        let oracle = oracle_with(
+            &db.path,
+            TEST_MAX_AGE_MS,
             Box::new(StaticGas(sample_fees())),
             Box::new(FailsAfterFirstToken {
                 calls: Mutex::new(0),
@@ -360,15 +480,13 @@ mod tests {
     #[tokio::test]
     async fn arithmetic_overflow_is_fatal() {
         let db = temp_db("fatal-fee-oracle");
-        // Ensure the schema exists so a later read would be meaningful; the
-        // overflow path must fail before any write.
         let storage = Storage::open(&db.path).unwrap();
         assert_eq!(storage.log_gas_price().unwrap(), 0);
         drop(storage);
 
-        let oracle = FeeOracle::new_with_sources(
-            db.path.clone(),
-            Duration::from_secs(1),
+        let oracle = oracle_with(
+            &db.path,
+            TEST_MAX_AGE_MS,
             Box::new(StaticGas(Eip1559Fees {
                 base_fee_per_gas: u128::MAX,
                 max_priority_fee_per_gas: u128::MAX,
@@ -392,6 +510,7 @@ mod tests {
         let oracle = FeeOracle::new_with_sources(
             db.path.clone(),
             Duration::from_millis(50),
+            TEST_MAX_AGE_MS,
             Box::new(StaticGas(sample_fees())),
             Box::new(StaticToken(sample_quote())),
         );
@@ -416,6 +535,7 @@ mod tests {
         let oracle = FeeOracle::new_with_sources(
             db.path.clone(),
             Duration::from_millis(40),
+            TEST_MAX_AGE_MS,
             Box::new(FailsAfterFirstGas {
                 calls: Mutex::new(0),
                 ok: sample_fees(),
@@ -425,8 +545,6 @@ mod tests {
         let shutdown = ShutdownSignal::default();
         let mut handle = oracle.start(shutdown.clone());
 
-        // First refresh succeeds; subsequent polls are transient. The worker
-        // must keep running and leave the last good price untouched.
         tokio::select! {
             biased;
             result = &mut handle => panic!("fee oracle exited early: {result:?}"),
@@ -442,5 +560,54 @@ mod tests {
             .expect("fee oracle exits within timeout")
             .expect("join")
             .expect("fee oracle result");
+    }
+
+    #[tokio::test]
+    async fn run_forever_exits_when_persisted_price_is_stale() {
+        let db = temp_db("fee-oracle-stale-exit");
+        initialize_db(&db.path);
+        {
+            let mut storage = Storage::open_writer(&db.path).unwrap();
+            storage.set_log_gas_price(42).unwrap();
+            // Force an ancient stamp so the next transient fails the bound.
+            storage.set_log_gas_price_updated_at_ms_for_test(1).unwrap();
+        }
+
+        let oracle = FeeOracle::new_with_sources(
+            db.path.clone(),
+            Duration::from_millis(20),
+            100, // 100ms max age
+            Box::new(StaticGas(sample_fees())),
+            Box::new(AlwaysFailToken),
+        );
+        let shutdown = ShutdownSignal::default();
+        let handle = oracle.start(shutdown);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("fee oracle exits within timeout")
+            .expect("join");
+        let err = result.expect_err("stale price must stop the worker");
+        assert!(matches!(err, FeeOracleError::Transient(ref m) if m.contains("older than")));
+    }
+
+    #[test]
+    fn ensure_persisted_price_fresh_rejects_never_written() {
+        let db = temp_db("fee-oracle-never-written");
+        initialize_db(&db.path);
+        let err = FeeOracle::ensure_persisted_price_fresh(&db.path, TEST_MAX_AGE_MS)
+            .expect_err("default stamp 0 is stale");
+        assert!(matches!(err, FeeOracleError::Transient(_)));
+    }
+
+    #[test]
+    fn ensure_persisted_price_fresh_accepts_recent_write() {
+        let db = temp_db("fee-oracle-fresh-write");
+        initialize_db(&db.path);
+        Storage::open_writer(&db.path)
+            .unwrap()
+            .set_log_gas_price(7)
+            .unwrap();
+        FeeOracle::ensure_persisted_price_fresh(&db.path, TEST_MAX_AGE_MS).unwrap();
     }
 }

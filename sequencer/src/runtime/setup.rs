@@ -114,36 +114,59 @@ where
 
     // Resolve and validate the complete fee source while setup still owns all
     // address-bearing configuration. `run` later reads only this pinned tuple.
+    // Both modes write the first `log_gas_price` here so `run` can always assume
+    // a real price exists (Uniswap Tip never samples the migration default).
     let fee_oracle = config
         .fee_oracle
         .resolve(config.chain_id)
         .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
-    let pinned_fee_oracle = match fee_oracle {
-        FeeOracleMode::Fixed { log_gas_price } => FeeOracleIdentity::Fixed { log_gas_price },
+    enum PreparedFeeOracle {
+        Fixed {
+            log_gas_price: u16,
+        },
+        Uniswap {
+            identity: FeeOracleIdentity,
+            provider: alloy::providers::DynProvider,
+            token: crate::l1::fee_oracle::UniswapV3PriceSource,
+        },
+    }
+    let prepared_fee_oracle = match fee_oracle {
+        FeeOracleMode::Fixed { log_gas_price } => PreparedFeeOracle::Fixed { log_gas_price },
         FeeOracleMode::Uniswap(uniswap) => {
             let provider = crate::l1::provider::create_provider(
                 &config.eth_rpc_url,
                 config.allow_insecure_rpc,
             )
             .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
-            crate::l1::fee_oracle::UniswapV3PriceSource::connect(provider, uniswap)
-                .await
-                .map_err(|error| {
-                    let (transient, message) =
-                        crate::l1::fee_oracle::uniswap::bootstrap_price_source_error(error);
-                    if transient {
-                        BootstrapError::FeeOracleTransient { message }
-                    } else {
-                        BootstrapError::FeeOracleMisconfig { message }
-                    }
-                })?;
-            FeeOracleIdentity::Uniswap {
-                weth: uniswap.weth,
-                fee_token: uniswap.fee_token,
-                pool: uniswap.pool,
-                twap_window_secs: uniswap.twap_window_secs,
+            let token =
+                crate::l1::fee_oracle::UniswapV3PriceSource::connect(provider.clone(), uniswap)
+                    .await
+                    .map_err(|error| {
+                        let (transient, message) =
+                            crate::l1::fee_oracle::uniswap::bootstrap_price_source_error(error);
+                        if transient {
+                            BootstrapError::FeeOracleTransient { message }
+                        } else {
+                            BootstrapError::FeeOracleMisconfig { message }
+                        }
+                    })?;
+            PreparedFeeOracle::Uniswap {
+                identity: FeeOracleIdentity::Uniswap {
+                    weth: uniswap.weth,
+                    fee_token: uniswap.fee_token,
+                    pool: uniswap.pool,
+                    twap_window_secs: uniswap.twap_window_secs,
+                },
+                provider,
+                token,
             }
         }
+    };
+    let pinned_fee_oracle = match &prepared_fee_oracle {
+        PreparedFeeOracle::Fixed { log_gas_price } => FeeOracleIdentity::Fixed {
+            log_gas_price: *log_gas_price,
+        },
+        PreparedFeeOracle::Uniswap { identity, .. } => *identity,
     };
 
     // ── Pin identity ─────────────────────────────────────────
@@ -163,10 +186,25 @@ where
     };
     ensure_deployment_identity(&db_path, identity)?;
 
-    // Fixed pricing is a setup-time fact, so persist it once. Live pricing is
-    // refreshed by `run` before recovery opens or reopens a Tip.
-    if let FeeOracleIdentity::Fixed { log_gas_price } = pinned_fee_oracle {
-        storage::Storage::open(&db_path)?.set_log_gas_price(log_gas_price)?;
+    // Persist the first price under setup's hard L1 requirement. Fixed writes
+    // the configured exponent; Uniswap quotes once so Tip never samples empty.
+    match prepared_fee_oracle {
+        PreparedFeeOracle::Fixed { log_gas_price } => {
+            storage::Storage::open(&db_path)?.set_log_gas_price(log_gas_price)?;
+        }
+        PreparedFeeOracle::Uniswap {
+            provider, token, ..
+        } => {
+            let max_price_age_ms = timing.l1_read_stale_after_secs().saturating_mul(1000);
+            let oracle = crate::l1::fee_oracle::FeeOracle::new(
+                db_path.clone(),
+                crate::l1::fee_oracle::FeeOracle::DEFAULT_POLL_INTERVAL,
+                max_price_age_ms,
+                provider,
+                Box::new(token),
+            );
+            oracle.refresh_once().await?;
+        }
     }
 
     // ── Detection gate, step 0: checkpoint sanity ────────────
