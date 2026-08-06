@@ -13,6 +13,10 @@ Trait Contract" is the map. The placeholder wallet
 ([`examples/app-core/`](../../examples/app-core/)) is the reference impl; a
 production app will wrap a Cartesi Machine behind the same trait.
 
+An app that is not written in Rust implements the same contract through a C
+header instead. [`c-application-binding.md`](c-application-binding.md) describes
+that path; everything below binds it identically.
+
 ---
 
 ## The execution methods

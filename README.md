@@ -222,6 +222,10 @@ released even on client disconnect.
 - `sequencer/src/storage/`: schema, migrations, SQLite persistence (split per writer role), and replay reads
 - `sequencer-core/src/`: shared domain types and interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, feed message types)
 - `examples/app-core/src/`: wallet prototype implementing `Application`
+- `examples/c-app-engine/`: the C binding of `Application` — the header and the FFI shim over an engine archive implementing it
+- `examples/c-app-sequencer/`: host library for any C application, plus a generic binary for one supplying its engine as an archive
+- `examples/c-wallet-engine/`: the wallet app exported through that C API as a static library — the reference engine
+- `examples/c-wallet-sequencer/`: binary crate composing the C host with the wallet engine
 - `tests/benchmarks/`: benchmark harnesses and benchmark spec
 
 Related docs:
@@ -234,6 +238,24 @@ The watchdog ships as a multi-arch container image per release tag `vX`:
 docker pull ghcr.io/cartesi/sequencer-watchdog:vX
 # mirror: docker.io/cartesi/sequencer-watchdog:vX
 ```
+
+## Applications in C
+
+An application does not have to be written in Rust. `examples/c-app-engine/include/application-engine.h` is the C mirror of the `Application` trait: an application implements it into a static archive, and `examples/c-app-sequencer` links that archive into a ready-made sequencer host.
+
+```bash
+APPLICATION_ENGINE_LIB=/path/to/libmyapp-engine.a \
+APPLICATION_ENGINE_HEADER=/path/to/application-engine.h \
+APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT=1024 \
+  cargo build -p c-app-sequencer --release
+
+c-app-sequencer --state-file <genesis written by the app's own tool> setup ...
+c-app-sequencer --state-file <same file> run ...
+```
+
+Those three variables are the whole binding, and nothing else about the application reaches this repository — there is no create path on the seam, so the host cannot be told what application to be, and cannot ask. This matters when the application's canonical on-chain execution must stay free of Rust: the same compiled engine is linked by this host and by the application's own canonical binary, so the two agree by construction rather than by review.
+
+The seam is an ABI, not a language. `examples/c-wallet-engine` is the reference engine and is itself written in Rust: it exports the same `application_engine_*` symbols as `libc_wallet_engine.a` over the same `app-core::WalletApp` that `wallet-sequencer` uses directly. `examples/c-wallet-sequencer` links it, so the workspace builds the whole path without an archive path handed to it, and this repository maintains no C beyond the header. See [`docs/protocol/c-application-binding.md`](docs/protocol/c-application-binding.md) and `just c-wallet-genesis`.
 
 ## Prototype Limits
 
@@ -267,6 +289,7 @@ Some tests require [Foundry](https://getfoundry.sh) (`anvil` on PATH). They run 
 - [`docs/watchdog/README.md`](docs/watchdog/README.md) — watchdog architecture, modules, and test commands.
 - [`sequencer-core/`](sequencer-core/) — shared domain types (`Application`, `SignedUserOp`, `Batch`, `Frame`).
 - [`examples/app-core/`](examples/app-core/) — placeholder wallet app implementing the `Application` trait.
+- [`docs/protocol/c-application-binding.md`](docs/protocol/c-application-binding.md) — the same contract in C, for applications that are not written in Rust.
 
 ## License
 

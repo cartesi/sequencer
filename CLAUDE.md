@@ -34,6 +34,10 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 - `sequencer-core/` — shared domain types consumed by both sequencer and scheduler.
 - `examples/app-core/` — placeholder wallet app implementing `Application`.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library.
+- `examples/c-app-engine/` — C binding of the `Application` trait: the header and the FFI shim.
+- `examples/c-app-sequencer/` — host library for any C application, plus a generic binary.
+- `examples/c-wallet-engine/` — the wallet exported through the C API as a static library.
+- `examples/c-wallet-sequencer/` — binary crate: wallet engine + C host.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.
 - `examples/canonical-test/` — e2e test harness for the canonical app.
 - `sdk/rust-client/` — Rust client library for the sequencer API.

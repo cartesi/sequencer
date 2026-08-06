@@ -107,3 +107,9 @@ ci:
 run addr="127.0.0.1:3000" data_dir="sequencer-data":
     rm -rf {{data_dir}}
     CARTESI_SEQUENCER_HTTP_ADDR={{addr}} CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p wallet-sequencer --release
+
+# Genesis for the C-API wallet. Any C application starts with its own genesis tool, then
+# `c-wallet-sequencer --state-file <state> setup|run`, which needs a deployed app and an L1.
+c-wallet-genesis state="c-wallet-genesis-state" preset="devnet":
+    rm -rf {{state}}
+    cargo run -p c-wallet-engine --bin c-wallet-genesis -- {{state}} {{preset}}
