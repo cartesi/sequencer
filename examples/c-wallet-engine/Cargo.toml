@@ -1,0 +1,26 @@
+[package]
+name = "c-wallet-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The placeholder wallet app exported as an application-engine C API static library"
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+authors.workspace = true
+
+[lib]
+# `staticlib` is the artifact a C application's build would consume, and it is what proves this
+# crate really does export the C API. `rlib` is what an in-workspace binary links instead, so
+# `cargo build` resolves the symbols itself and needs no archive path handed to it.
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "c-wallet-genesis"
+path = "src/bin/c-wallet-genesis.rs"
+
+[dependencies]
+app-core = { path = "../app-core" }
+c-app-engine = { path = "../c-app-engine" }
+sequencer-core = { path = "../../sequencer-core" }
+alloy-primitives = "1.4.1"

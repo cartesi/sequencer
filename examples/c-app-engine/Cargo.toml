@@ -1,0 +1,19 @@
+[package]
+name = "c-app-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Application shim over a static engine library implementing the application-engine C API"
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+authors.workspace = true
+
+[build-dependencies]
+# Generates the FFI declarations from the engine header at build time. It decides how this host
+# reads every record crossing the seam, so a bump changes the ABI interpretation.
+bindgen = "0.72"
+
+[dependencies]
+sequencer-core = { path = "../../sequencer-core" }
+alloy-primitives = "1.4.1"
