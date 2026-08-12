@@ -12,9 +12,11 @@ use sequencer_core::batch::Batch;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::l1::eip1559::{Eip1559Fees, estimate_fees};
+use crate::l1::eip1559::{Eip1559Fees, estimate_fees, fees_for_nonce};
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
 use crate::l1::watermark::WalletNonceWatermarkSink;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 pub type TxHash = alloy_primitives::B256;
 
@@ -68,11 +70,20 @@ pub trait BatchPoster: Send + Sync {
 pub struct EthereumBatchPoster {
     provider: DynProvider,
     config: BatchPosterConfig,
+    /// Fees of the last successful broadcast per wallet nonce still ≥ Latest.
+    /// Same-nonce retries floor a fresh estimate against
+    /// [`crate::l1::eip1559::bumped_replacement_fees`] of this record so a
+    /// flat market cannot re-broadcast underpriced replacements.
+    in_flight_fees: Arc<Mutex<BTreeMap<u64, Eip1559Fees>>>,
 }
 
 impl EthereumBatchPoster {
     pub fn new(provider: DynProvider, config: BatchPosterConfig) -> Self {
-        Self { provider, config }
+        Self {
+            provider,
+            config,
+            in_flight_fees: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     /// Conservative upper-bound timeout for waiting on confirmations, derived
@@ -123,11 +134,11 @@ impl EthereumBatchPoster {
     ///   the time we start watching it.
     ///
     /// Timeouts return `Ok(())` rather than `Err` because the safe response is
-    /// "re-enter `submit_batches` on the next tick" — which re-estimates fees
-    /// (possibly replacing a pending transaction if the node accepts it) and
-    /// re-submits at the same wallet nonces. The
-    /// wallet-nonce ordering invariant above guarantees we cannot accidentally
-    /// skip work by returning early here.
+    /// "re-enter `submit_batches` on the next tick" — which re-estimates fees,
+    /// floors them to an explicit ≥10% replacement bump against any still
+    /// in-flight same-nonce submission, and re-submits at the same wallet
+    /// nonces. The wallet-nonce ordering invariant above guarantees we cannot
+    /// accidentally skip work by returning early here.
     async fn wait_for_confirmations(&self, tx_hashes: &[TxHash]) -> Result<(), BatchPosterError> {
         let timeout = self.confirmation_timeout();
         for tx_hash in tx_hashes {
@@ -203,10 +214,17 @@ impl BatchPoster for EthereumBatchPoster {
             });
         }
 
-        let fees = estimate_fees(&self.provider)
+        let estimate = estimate_fees(&self.provider)
             .await
             .map_err(BatchPosterError::Provider)?;
         let mut next_nonce = self.latest_account_nonce().await?;
+
+        // Drop fee floors for nonces Latest has advanced past — those slots
+        // are resolved and must not floor a later send.
+        {
+            let mut in_flight = self.in_flight_fees.lock().expect("in_flight_fees lock");
+            in_flight.retain(|&nonce, _| nonce >= next_nonce);
+        }
 
         // Write-before-broadcast (R1a): durably cover every nonce this
         // tick will use before the first send. One raise to the highest
@@ -219,11 +237,23 @@ impl BatchPoster for EthereumBatchPoster {
         let mut tx_hashes = Vec::with_capacity(payloads.len());
 
         for payload in payloads {
+            let fees = {
+                let in_flight = self.in_flight_fees.lock().expect("in_flight_fees lock");
+                fees_for_nonce(estimate, in_flight.get(&next_nonce).copied())
+            };
             let pending = self.send_batch_at_nonce(payload, next_nonce, &fees).await?;
+            // Record only after a successful broadcast — a failed send must
+            // not raise the replacement floor for the next tick.
+            self.in_flight_fees
+                .lock()
+                .expect("in_flight_fees lock")
+                .insert(next_nonce, fees);
             let tx_hash = *pending.tx_hash();
             debug!(
                 tx_nonce = next_nonce,
                 %tx_hash,
+                max_fee_per_gas = fees.max_fee_per_gas,
+                max_priority_fee_per_gas = fees.max_priority_fee_per_gas,
                 confirmation_depth = self.config.confirmation_depth,
                 "sent batch submission tx to L1"
             );
