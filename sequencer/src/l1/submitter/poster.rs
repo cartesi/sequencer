@@ -16,6 +16,8 @@ use crate::l1::eip1559::{Eip1559Fees, estimate_fees, fees_for_nonce};
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
 use crate::l1::watermark::WalletNonceWatermarkSink;
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub type TxHash = alloy_primitives::B256;
@@ -75,6 +77,10 @@ pub struct EthereumBatchPoster {
     /// [`crate::l1::eip1559::bumped_replacement_fees`] of this record so a
     /// flat market cannot re-broadcast underpriced replacements.
     in_flight_fees: Arc<Mutex<BTreeMap<u64, Eip1559Fees>>>,
+    /// Test-only: next `send_batch_at_nonce` returns Err without broadcasting,
+    /// so callers can assert the in-flight map is not updated on send failure.
+    #[cfg(test)]
+    fail_next_send: Arc<AtomicBool>,
 }
 
 impl EthereumBatchPoster {
@@ -83,7 +89,27 @@ impl EthereumBatchPoster {
             provider,
             config,
             in_flight_fees: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            fail_next_send: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_fees_for_test(&self) -> BTreeMap<u64, Eip1559Fees> {
+        self.in_flight_fees
+            .lock()
+            .expect("in_flight_fees lock")
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_in_flight_fees_for_test(&self, fees: BTreeMap<u64, Eip1559Fees>) {
+        *self.in_flight_fees.lock().expect("in_flight_fees lock") = fees;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_send_for_test(&self) {
+        self.fail_next_send.store(true, Ordering::SeqCst);
     }
 
     /// Conservative upper-bound timeout for waiting on confirmations, derived
@@ -110,6 +136,14 @@ impl EthereumBatchPoster {
         nonce: u64,
         fees: &Eip1559Fees,
     ) -> Result<PendingTransactionBuilder<alloy::network::Ethereum>, BatchPosterError> {
+        #[cfg(test)]
+        {
+            if self.fail_next_send.swap(false, Ordering::SeqCst) {
+                return Err(BatchPosterError::Provider(
+                    "test-injected send failure".to_string(),
+                ));
+            }
+        }
         let input_box = InputBox::new(self.config.l1_submit_address, &self.provider);
         input_box
             .addInput(self.config.app_address, payload.into())
@@ -404,6 +438,7 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -608,5 +643,167 @@ mod tests {
         assert_eq!(derive_confirmation_timeout(2, 12), Duration::from_secs(72));
         assert_eq!(derive_confirmation_timeout(2, 1), Duration::from_secs(6));
         assert_eq!(derive_confirmation_timeout(5, 3), Duration::from_secs(36));
+    }
+
+    fn poster_config(anvil: &alloy::node_bindings::AnvilInstance) -> BatchPosterConfig {
+        BatchPosterConfig {
+            l1_submit_address: alloy_primitives::Address::repeat_byte(0x11),
+            app_address: alloy_primitives::Address::repeat_byte(0x22),
+            batch_submitter_address: alloy_primitives::address!(
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            ),
+            start_block: 0,
+            // confirmation_depth 0 → watch timeout is 2 * seconds_per_block;
+            // keep it short so --no-mining ticks return promptly on timeout.
+            confirmation_depth: 0,
+            seconds_per_block: 1,
+            long_block_range_error_codes: vec![],
+            expected_chain_id: anvil.chain_id(),
+        }
+    }
+
+    /// Same-nonce retry floors a flat re-estimate against the in-flight record
+    /// (≥10% on both fields). Seeds the prior floor explicitly so the assertion
+    /// does not depend on Anvil keeping a tx pending across ticks.
+    #[tokio::test]
+    async fn submit_batches_replacement_clears_ten_percent_bump() {
+        require_anvil();
+        let anvil = Anvil::default().timeout(30_000).spawn();
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key, false)
+            .expect("signer provider");
+        let poster = EthereumBatchPoster::new(provider.clone(), poster_config(&anvil));
+        let sink = RecordingWatermarkSink::passing();
+
+        let base_nonce = provider
+            .get_transaction_count(submitter)
+            .await
+            .expect("base nonce");
+        // Prior fees high enough that a fresh Anvil estimate will not clear the
+        // ≥10% floor on its own — the poster must bump against this record.
+        let prior = crate::l1::eip1559::Eip1559Fees {
+            base_fee_per_gas: 1,
+            max_priority_fee_per_gas: 50_000_000, // 0.05 gwei
+            max_fee_per_gas: 100_000_000_000,     // 100 gwei
+        };
+        poster.seed_in_flight_fees_for_test(BTreeMap::from([(base_nonce, prior)]));
+
+        poster
+            .submit_batches(vec![vec![0u8; 4]], &sink)
+            .await
+            .expect("submit with in-flight floor");
+        let sent = poster
+            .in_flight_fees_for_test()
+            .get(&base_nonce)
+            .copied()
+            .expect("successful send must record fees");
+
+        let (bumped_max, bumped_prio) = crate::l1::eip1559::bumped_replacement_fees(
+            prior.max_fee_per_gas,
+            prior.max_priority_fee_per_gas,
+        );
+        assert!(
+            sent.max_fee_per_gas >= bumped_max,
+            "max_fee must clear replacement floor: sent={} floor={bumped_max}",
+            sent.max_fee_per_gas
+        );
+        assert!(
+            sent.max_priority_fee_per_gas >= bumped_prio,
+            "priority must clear replacement floor: sent={} floor={bumped_prio}",
+            sent.max_priority_fee_per_gas
+        );
+    }
+
+    /// When Latest advances past a nonce, that nonce's fee floor is dropped so a
+    /// later tip send is not incorrectly floored by stale in-flight state.
+    #[tokio::test]
+    async fn submit_batches_prunes_in_flight_fees_past_latest() {
+        require_anvil();
+        let anvil = Anvil::default().timeout(30_000).spawn(); // automine on
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key, false)
+            .expect("signer provider");
+        let poster = EthereumBatchPoster::new(provider.clone(), poster_config(&anvil));
+        let sink = RecordingWatermarkSink::passing();
+
+        let base_nonce = provider
+            .get_transaction_count(submitter)
+            .await
+            .expect("base nonce");
+
+        poster
+            .submit_batches(vec![vec![0u8; 4]], &sink)
+            .await
+            .expect("first submit mines under automine");
+        assert!(
+            poster.in_flight_fees_for_test().contains_key(&base_nonce),
+            "first send records fees for the mined nonce"
+        );
+
+        // Tip confirmed → Latest = base_nonce + 1. Re-seed a stale floor on the
+        // mined nonce (as if a previous tick left it) and confirm the next
+        // submit prunes it.
+        let stale = crate::l1::eip1559::Eip1559Fees {
+            base_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 1,
+        };
+        poster.seed_in_flight_fees_for_test(BTreeMap::from([(base_nonce, stale)]));
+
+        poster
+            .submit_batches(vec![vec![1u8; 4]], &sink)
+            .await
+            .expect("second submit");
+
+        let in_flight = poster.in_flight_fees_for_test();
+        assert!(
+            !in_flight.contains_key(&base_nonce),
+            "mined nonce must be pruned once Latest advances: {in_flight:?}"
+        );
+        let tip_nonce = base_nonce.saturating_add(1);
+        assert!(
+            in_flight.contains_key(&tip_nonce),
+            "current tip send must be recorded: {in_flight:?}"
+        );
+    }
+
+    /// A failed broadcast must not raise the replacement floor — otherwise a
+    /// blip would permanently overprice the next successful send, or worse,
+    /// record fees for a tx that never entered the mempool.
+    #[tokio::test]
+    async fn submit_batches_does_not_record_fees_when_send_fails() {
+        require_anvil();
+        let anvil = Anvil::default().arg("--no-mining").timeout(30_000).spawn();
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key, false)
+            .expect("signer provider");
+        let poster = EthereumBatchPoster::new(provider.clone(), poster_config(&anvil));
+        let sink = RecordingWatermarkSink::passing();
+
+        let base_nonce = provider
+            .get_transaction_count(submitter)
+            .await
+            .expect("base nonce");
+        let prior = crate::l1::eip1559::Eip1559Fees {
+            base_fee_per_gas: 42,
+            max_priority_fee_per_gas: 7,
+            max_fee_per_gas: 1_000,
+        };
+        poster.seed_in_flight_fees_for_test(BTreeMap::from([(base_nonce, prior)]));
+        poster.fail_next_send_for_test();
+
+        let result = poster.submit_batches(vec![vec![0u8; 4]], &sink).await;
+        assert!(
+            matches!(result, Err(BatchPosterError::Provider(ref msg)) if msg.contains("test-injected")),
+            "injected send failure must surface, got {result:?}"
+        );
+        assert_eq!(
+            poster.in_flight_fees_for_test(),
+            BTreeMap::from([(base_nonce, prior)]),
+            "failed send must leave the prior in-flight floor untouched"
+        );
     }
 }
