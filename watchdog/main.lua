@@ -46,6 +46,13 @@ local function is_terminal_error(value)
         or value.kind == "inclusion_block_regressed"
 end
 
+--- Missing/corrupt `head.json` (and similar load failures) are operator/state
+--- errors: retrying cannot create a checkpoint. Fail the tick once so
+--- `status.prom` is written promptly instead of burning retry budget.
+local function is_operator_state_error(value)
+    return tostring(value):find("failed to load watchdog head", 1, true) ~= nil
+end
+
 local function emit_watchdog_event(json, payload, deps)
     if deps and type(deps.on_watchdog_event) == "function" then
         deps.on_watchdog_event(payload)
@@ -228,7 +235,7 @@ local function run_compare_cycle(cfg, deps)
         attempts = cfg.retry_attempts,
         delay_sec = cfg.retry_delay_sec,
         should_retry = function(retry_err)
-            return not is_terminal_error(retry_err)
+            return not is_terminal_error(retry_err) and not is_operator_state_error(retry_err)
         end,
     })
     if result == nil then

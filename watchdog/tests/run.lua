@@ -1239,6 +1239,100 @@ test("runner refuses missing or corrupt watchdog head", function()
 
     assert_eq(ok, false)
     assert(tostring(err):find("failed to load watchdog head", 1, true) ~= nil, tostring(err))
+    assert(tostring(err):find("sequencer-watchdog init", 1, true) ~= nil, tostring(err))
+end)
+
+test("compare cycle does not retry missing watchdog head", function()
+    local loads = 0
+    local cfg = fake_cfg()
+    cfg.retry_attempts = 3
+    cfg.retry_delay_sec = 1
+
+    local exit_code, err = main_mod.run_compare_cycle(cfg, {
+        checkpoint = {
+            load = function(_dir)
+                loads = loads + 1
+                return nil, "missing head.json"
+            end,
+        },
+        sequencer = {
+            get_finalized_inclusion_block = function()
+                error("sequencer must not be queried after missing head")
+            end,
+        },
+        machine = fake_machine("{}"),
+        log_step = function() end,
+    })
+
+    assert_eq(exit_code, main_mod.EXIT_TRANSIENT)
+    assert_eq(loads, 1)
+    assert(tostring(err):find("failed to load watchdog head", 1, true) ~= nil, tostring(err))
+    assert(tostring(err):find("missing head.json", 1, true) ~= nil, tostring(err))
+end)
+
+test("tick missing head writes warning status.prom once", function()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(state_mod.ensure_dir(dir))
+
+    local json = require("watchdog.json").new()
+    local ok_write, write_err = state_mod.write_json_atomic(dir, "config.json", {
+        version = 1,
+        sequencer_url = "http://sequencer",
+        input_box_address = "0xinputbox",
+        app_address = "0x1111111111111111111111111111111111111111",
+        blockchain_id = "31337",
+        retry_attempts = 3,
+        retry_delay_sec = 0,
+        long_block_range_error_codes = {},
+    }, json)
+    assert(ok_write, write_err)
+
+    -- Pre-seed a stale ok file so we can assert the tick rewrites it.
+    local seed_ok, seed_err = metrics.write_tick_status({
+        cfg = {
+            state_dir = dir,
+            app_address = "0x1111111111111111111111111111111111111111",
+            blockchain_id = "31337",
+        },
+        exit_code = 0,
+    })
+    assert(seed_ok, seed_err)
+
+    local loads = 0
+    local exit_code, run_err = capture_os_exit(function()
+        main_mod.main({ "tick" }, {
+            env = {
+                CARTESI_WATCHDOG_STATE_DIR = dir,
+                CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT = "http://tick-rpc",
+            },
+            deps = {
+                checkpoint = {
+                    load = function(state_dir)
+                        loads = loads + 1
+                        assert_eq(state_dir, dir)
+                        return nil, "missing head.json"
+                    end,
+                },
+                sequencer = {
+                    get_finalized_inclusion_block = function()
+                        error("sequencer must not be queried after missing head")
+                    end,
+                },
+                machine = fake_machine("{}"),
+                log_step = function() end,
+            },
+        })
+    end)
+    assert(run_err == nil, tostring(run_err))
+    assert_eq(exit_code, main_mod.EXIT_TRANSIENT)
+    assert_eq(loads, 1)
+
+    local file = assert(io.open(dir .. "/status.prom", "rb"))
+    local body = file:read("*a")
+    file:close()
+    assert(body:find('state="warning"} 1', 1, true) ~= nil, body)
+    assert(body:find('state="ok"} 1', 1, true) == nil, body)
 end)
 
 test("runner returns transient error when L1 RPC head lags target block", function()
