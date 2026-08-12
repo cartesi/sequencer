@@ -181,4 +181,40 @@ mod tests {
         let fees = fees_for_nonce(estimate, Some(prior));
         assert_eq!(fees, estimate);
     }
+
+    #[test]
+    fn fees_for_nonce_clears_both_fields_when_estimate_is_mixed() {
+        // Market moved up on max_fee but not on priority (or the reverse):
+        // each component must still clear the ≥10% floor vs the in-flight tx.
+        let prior = Eip1559Fees {
+            base_fee_per_gas: 100,
+            max_priority_fee_per_gas: 100,
+            max_fee_per_gas: 1_000,
+        };
+        let (bumped_max, bumped_prio) =
+            bumped_replacement_fees(prior.max_fee_per_gas, prior.max_priority_fee_per_gas);
+
+        // High max_fee estimate, priority still below the replacement floor.
+        let estimate_high_max = Eip1559Fees {
+            base_fee_per_gas: 100,
+            max_priority_fee_per_gas: prior.max_priority_fee_per_gas + 1, // < 10% bump
+            max_fee_per_gas: bumped_max + 5_000,
+        };
+        let fees = fees_for_nonce(estimate_high_max, Some(prior));
+        assert_eq!(fees.max_fee_per_gas, estimate_high_max.max_fee_per_gas);
+        assert_eq!(fees.max_priority_fee_per_gas, bumped_prio);
+
+        // High priority estimate, max_fee still below the replacement floor.
+        let estimate_high_prio = Eip1559Fees {
+            base_fee_per_gas: 100,
+            max_priority_fee_per_gas: bumped_prio + 50,
+            max_fee_per_gas: prior.max_fee_per_gas + 1, // < 10% bump
+        };
+        let fees = fees_for_nonce(estimate_high_prio, Some(prior));
+        assert_eq!(fees.max_fee_per_gas, bumped_max);
+        assert_eq!(
+            fees.max_priority_fee_per_gas,
+            estimate_high_prio.max_priority_fee_per_gas
+        );
+    }
 }
