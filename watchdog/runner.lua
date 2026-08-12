@@ -18,7 +18,13 @@ local function load_checkpoint(cfg, checkpoint_mod)
     if loaded then
         return loaded
     end
-    error("failed to load watchdog head: " .. tostring(load_err))
+    -- Operator/state error, not a transient RPC blip: tick never bootstraps a
+    -- head from env. Point at init so the failure is actionable in logs.
+    error(
+        "failed to load watchdog head: "
+            .. tostring(load_err)
+            .. "; run `sequencer-watchdog init` (wipe state_dir and re-init if state is incomplete)"
+    )
 end
 
 local function ensure_rpc_head_covers_target(deps, target_block)
