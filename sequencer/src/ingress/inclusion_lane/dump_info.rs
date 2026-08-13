@@ -166,8 +166,21 @@ pub fn write_info(dump_dir: &Path, info: &DumpInfo) -> io::Result<()> {
 /// metadata is not silently usable. The `format_version` gate runs after the
 /// parse; there is a single frozen schema (`FORMAT_VERSION`), so a
 /// forward-version dump is rejected outright rather than partially read.
+///
+/// Missing/`ENOENT` paths get an operator-facing diagnosis via
+/// [`diagnose_missing_dump`] so a watchdog CM checkpoint (or any other
+/// non-dump directory) is not reported as a bare "No such file or directory".
 pub fn read_info(dump_dir: &Path) -> io::Result<DumpInfo> {
-    let content = std::fs::read_to_string(dump_dir.join(INFO_FILE))?;
+    let content = match std::fs::read_to_string(dump_dir.join(INFO_FILE)) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                diagnose_missing_dump(dump_dir),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     let bad = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
 
     let info: DumpInfo = toml::from_str(&content).map_err(|e| bad(format!("info.toml: {e}")))?;
@@ -178,6 +191,53 @@ pub fn read_info(dump_dir: &Path) -> io::Result<DumpInfo> {
         )));
     }
     Ok(info)
+}
+
+/// Explain why `dump_dir` is not a usable sequencer checkpoint dump.
+///
+/// Called when `info.toml` is missing. Distinguishes the common operator
+/// mistake of pointing `--checkpoint-dump-dir` at a **watchdog** CM checkpoint
+/// (`manifest.json` + `snapshot/`) from a merely empty/wrong path.
+pub fn diagnose_missing_dump(dump_dir: &Path) -> String {
+    let expected = format!(
+        "expected a finalized sequencer dump at {} with `info.toml` and a `state/` \
+         app subtree (usually `$CARTESI_SEQUENCER_DATA_DIR/dumps/<id>/`). \
+         See docs/snapshots/lifecycle.md and docs/recovery/cockroach.md.",
+        dump_dir.display()
+    );
+
+    if !dump_dir.exists() {
+        return format!("path does not exist — {expected}");
+    }
+    if !dump_dir.is_dir() {
+        return format!("path is not a directory — {expected}");
+    }
+
+    let has_manifest = dump_dir.join("manifest.json").is_file();
+    let has_snapshot = dump_dir.join("snapshot").is_dir();
+    if has_manifest || has_snapshot {
+        let found = match (has_manifest, has_snapshot) {
+            (true, true) => "manifest.json and snapshot/",
+            (true, false) => "manifest.json",
+            (false, true) => "snapshot/",
+            (false, false) => unreachable!(),
+        };
+        return format!(
+            "this looks like a watchdog Cartesi Machine checkpoint (found {found}), \
+             not a sequencer dump. `setup --recovery --checkpoint-dump-dir` cannot \
+             use watchdog state under .../checkpoints/<block>/ — those are CM \
+             snapshots for the watchdog compare loop. {expected}"
+        );
+    }
+
+    let has_state = dump_dir.join(APP_STATE_SUBDIR).exists();
+    if has_state {
+        return format!(
+            "missing `info.toml` (found `state/` but no checkpoint metadata) — {expected}"
+        );
+    }
+
+    format!("missing `info.toml` — {expected}")
 }
 
 /// Stamp `B` (the promotion's inclusion block) into an existing
@@ -276,6 +336,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_info(dir.path()).unwrap(), sample());
+    }
+
+    #[test]
+    fn diagnose_missing_dump_flags_watchdog_checkpoint_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), "{\"safe_block\":1}\n").unwrap();
+        std::fs::create_dir(dir.path().join("snapshot")).unwrap();
+
+        let msg = diagnose_missing_dump(dir.path());
+        assert!(
+            msg.contains("watchdog Cartesi Machine checkpoint"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("manifest.json and snapshot/"), "got: {msg}");
+        assert!(msg.contains("dumps/<id>/"), "got: {msg}");
+
+        let err = read_info(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("watchdog Cartesi Machine checkpoint"),
+            "got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("os error 2"),
+            "must not surface raw ENOENT alone, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn diagnose_missing_dump_when_path_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let msg = diagnose_missing_dump(&missing);
+        assert!(msg.contains("path does not exist"), "got: {msg}");
+        assert!(msg.contains("info.toml"), "got: {msg}");
+    }
+
+    #[test]
+    fn diagnose_missing_dump_when_state_present_without_info() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(APP_STATE_SUBDIR)).unwrap();
+        let msg = diagnose_missing_dump(dir.path());
+        assert!(msg.contains("missing `info.toml`"), "got: {msg}");
+        assert!(msg.contains("found `state/`"), "got: {msg}");
     }
 
     #[test]
