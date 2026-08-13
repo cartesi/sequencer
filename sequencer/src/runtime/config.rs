@@ -373,8 +373,10 @@ pub struct SetupConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_RECOVERY", default_value_t = false)]
     pub recovery: bool,
     /// Directory of the trusted checkpoint dump (a finalized `dumps/<id>/` with
-    /// `state` + `info.toml`) that `setup --recovery` boots the machine `S`
-    /// from. Required with `--recovery`; rejected without it.
+    /// `state/` + `info.toml`) that `setup --recovery` boots the machine `S`
+    /// from. Required with `--recovery`; rejected without it. This is a
+    /// **sequencer** dump from `$CARTESI_SEQUENCER_DATA_DIR/dumps/`, not a
+    /// watchdog CM checkpoint under `.../checkpoints/<block>/`.
     #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR", value_parser = parse_non_empty_string)]
     pub checkpoint_dump_dir: Option<String>,
     /// Batch-submitter signing key, recovery-only (for the wallet-nonce flush).

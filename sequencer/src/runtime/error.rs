@@ -280,7 +280,8 @@ pub enum SetupRecoveryError {
     )]
     AlreadySetUp,
     /// The checkpoint dump could not be loaded (missing/corrupt `info.toml`, or
-    /// the app's `from_dump` failed). Operator must supply a valid dump dir.
+    /// the app's `from_dump` failed). Operator must supply a valid **sequencer**
+    /// dump dir (`info.toml` + `state/`), not a watchdog CM checkpoint.
     #[error("failed to load checkpoint dump at {path}: {message}")]
     CheckpointLoad { path: String, message: String },
     /// The checkpoint's last-executed safe block `A` is not strictly before the
