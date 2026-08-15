@@ -251,9 +251,9 @@ is set). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../../tests
 Example after a clean tick:
 
 ```prometheus
-cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="ok"} 1
-cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="warning"} 0
-cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="failed"} 0
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="ok"} 1
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="warning"} 0
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="failed"} 0
 ```
 
 Example Prometheus alert (pull or push gateway — operator choice):

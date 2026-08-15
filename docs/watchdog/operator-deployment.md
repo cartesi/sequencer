@@ -152,9 +152,9 @@ Today `WalletApp::default()` / `WalletConfig::sepolia()` align with Sepolia stag
 |----------|---------------------|
 | `CARTESI_WATCHDOG_SEQUENCER_URL` | Ops: internal HTTP base (see network diagram) |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | Ops: current chain RPC for `tick` (archive for historical `getLogs`; not persisted by `init`). Also needed at `init` if auto-detecting `BLOCKCHAIN_ID` via `eth_chainId` |
-| `CARTESI_WATCHDOG_APP_ADDRESS` | This rollup’s Cartesi **application** contract |
-| `CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS` | InputBox on that L1 ([Cartesi deployed contracts](https://docs.cartesi.io/cartesi-rollups/2.0/deployment/self-hosted.md)) |
-| `CARTESI_WATCHDOG_STATE_DIR` | Persistent volume on watchdog host |
+| `CARTESI_WATCHDOG_APP_ADDRESS` | This rollup’s Cartesi **application** contract (normalized to lowercase `0x`+hex at load) |
+| `CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS` | InputBox on that L1 ([Cartesi deployed contracts](https://docs.cartesi.io/cartesi-rollups/2.0/deployment/self-hosted.md); same lowercase normalization) |
+| `CARTESI_WATCHDOG_STATE_DIR` | Persistent volume on watchdog host. If the path embeds an address, use **lowercase** — Linux paths are case-sensitive and EIP-55 vs lowercase create sibling dirs |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | Bootstrap CM snapshot (`init` only) |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block that bootstrap snapshot represents (= finalized `inclusion_block` at bootstrap) |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | Chain id label for `status.prom` metrics (prefer set at `init`; optional auto-detect via `eth_chainId` when L1 endpoint is present at `init`) |
@@ -191,6 +191,26 @@ sequencer-watchdog init
 
 After init, schedule `tick`; tick will fail if `head.json` is missing.
 
+### Missing or corrupt `head.json` (tick exit `1`)
+
+`tick` never bootstraps a checkpoint from env. A missing/corrupt head is an
+operator/state error (not a transient RPC/L1 failure): the compare cycle fails
+fast, writes `status.prom` with `state="warning"`, and does not burn the retry
+budget.
+
+1. `ls $CARTESI_WATCHDOG_STATE_DIR` — expect `config.json`, `head.json`, and
+   `checkpoints/<safe_block>/`.
+2. If `head.json` is missing: run `sequencer-watchdog init` with
+   `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` and `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
+   set to a CM snapshot whose safe block equals the sequencer's current
+   finalized `inclusion_block`, then run `tick`.
+3. Schedule `sequencer-watchdog init && sequencer-watchdog tick` (init is a
+   no-op when state is already complete).
+4. If `head.json` exists but `config.json` or the selected snapshot is
+   missing/corrupt: wipe `state_dir` and re-init.
+5. Ensure `CARTESI_WATCHDOG_STATE_DIR` is a persistent volume (empty/ephemeral
+   dirs lose `head.json` across restarts).
+
 Each `tick` atomically writes a Prometheus textfile to
 `$CARTESI_WATCHDOG_STATE_DIR/status.prom` (override with
 `CARTESI_WATCHDOG_METRICS_FILE`). Operators can scrape or push it from their
@@ -211,9 +231,9 @@ source is set).
 Example `status.prom` after a successful tick:
 
 ```prometheus
-cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="ok"} 1
-cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="warning"} 0
-cartesi_watchdog_status{app_address="0x4CE...",chain="11155111",state="failed"} 0
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="ok"} 1
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="warning"} 0
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="failed"} 0
 ```
 
 On divergence (exit `2`), `state="failed"` is `1` and
@@ -348,6 +368,7 @@ snapshot back through the watchdog/sequencer recovery workflow.
 | Symptom | Likely cause |
 |---------|----------------|
 | `/finalized_state` missing on public URL | Wrong tier — use internal `CARTESI_WATCHDOG_SEQUENCER_URL` |
+| `failed to load watchdog head` / missing `head.json` | Uninitialized or wiped `STATE_DIR` — see [Missing or corrupt head.json](#missing-or-corrupt-headjson-tick-exit-1) |
 | `state_mismatch` | CM image / wallet constants ≠ sequencer build; or wrong bootstrap block |
 | `inclusion_block_regressed` | Stale watchdog state vs sequencer finalized head |
 | Slow or failing `getLogs` | RPC range limits — watchdog uses same partition strategy as sequencer |

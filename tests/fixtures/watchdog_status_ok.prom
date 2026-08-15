@@ -1,5 +1,5 @@
 # HELP cartesi_watchdog_status Current watchdog compare state (1 = active).
 # TYPE cartesi_watchdog_status gauge
-cartesi_watchdog_status{app_address="0x4CE633CA71071818cD73187765ee60F696dae083",chain="11155111",state="ok"} 1
-cartesi_watchdog_status{app_address="0x4CE633CA71071818cD73187765ee60F696dae083",chain="11155111",state="warning"} 0
-cartesi_watchdog_status{app_address="0x4CE633CA71071818cD73187765ee60F696dae083",chain="11155111",state="failed"} 0
+cartesi_watchdog_status{app_address="0x4ce633ca71071818cd73187765ee60f696dae083",chain="11155111",state="ok"} 1
+cartesi_watchdog_status{app_address="0x4ce633ca71071818cd73187765ee60f696dae083",chain="11155111",state="warning"} 0
+cartesi_watchdog_status{app_address="0x4ce633ca71071818cd73187765ee60f696dae083",chain="11155111",state="failed"} 0
