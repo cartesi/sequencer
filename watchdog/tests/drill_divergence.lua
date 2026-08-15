@@ -23,7 +23,7 @@ local function fake_cfg()
         state_dir = state_dir,
         cm_snapshot_dir = "/tmp/genesis-snapshot",
         cm_snapshot_safe_block = 0,
-        input_box_address = "0xinputbox",
+        input_box_address = "0x9999999999999999999999999999999999999999",
         app_address = "0x1111111111111111111111111111111111111111",
         blockchain_id = os.getenv("CARTESI_WATCHDOG_BLOCKCHAIN_ID") or "31337",
         input_added_topic = "0xtopic",

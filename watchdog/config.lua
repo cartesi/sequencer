@@ -57,6 +57,20 @@ local function normalize_env(env)
     return env
 end
 
+--- Canonicalize an Ethereum address to `0x` + lowercase hex (no EIP-55).
+--- Mixed checksum / lowercase forms of the same address must compare equal.
+function config.normalize_address(value, name)
+    name = name or "address"
+    if type(value) ~= "string" or value == "" then
+        error(name .. " must be a non-empty address string")
+    end
+    local raw = value:gsub("^0[xX]", ""):lower()
+    if #raw ~= 40 or raw:match("^[0-9a-f]+$") == nil then
+        error(name .. " must be a 20-byte hex address")
+    end
+    return "0x" .. raw
+end
+
 function config.load_state_dir(env)
     env = normalize_env(env)
     return required("CARTESI_WATCHDOG_STATE_DIR", env)
@@ -70,8 +84,14 @@ function config.load_init(env)
     return {
         version = config.VERSION,
         sequencer_url = required("CARTESI_WATCHDOG_SEQUENCER_URL", env),
-        input_box_address = required("CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS", env),
-        app_address = required("CARTESI_WATCHDOG_APP_ADDRESS", env),
+        input_box_address = config.normalize_address(
+            required("CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS", env),
+            "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS"
+        ),
+        app_address = config.normalize_address(
+            required("CARTESI_WATCHDOG_APP_ADDRESS", env),
+            "CARTESI_WATCHDOG_APP_ADDRESS"
+        ),
         input_added_topic = env.CARTESI_WATCHDOG_INPUT_ADDED_TOPIC,
         state_dir = required("CARTESI_WATCHDOG_STATE_DIR", env),
         cm_snapshot_dir = required("CARTESI_WATCHDOG_CM_SNAPSHOT_DIR", env),
@@ -152,8 +172,14 @@ function config.from_persisted(state_dir, data, env)
             and env.CARTESI_WATCHDOG_SEQUENCER_URL
             or required_field(data, "sequencer_url"),
         l1_rpc_url = required("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT", env),
-        input_box_address = required_field(data, "input_box_address"),
-        app_address = required_field(data, "app_address"),
+        input_box_address = config.normalize_address(
+            required_field(data, "input_box_address"),
+            "config.json input_box_address"
+        ),
+        app_address = config.normalize_address(
+            required_field(data, "app_address"),
+            "config.json app_address"
+        ),
         input_added_topic = data.input_added_topic,
         cm_image_hash = data.cm_image_hash,
         blockchain_id = (env.CARTESI_WATCHDOG_BLOCKCHAIN_ID ~= nil and env.CARTESI_WATCHDOG_BLOCKCHAIN_ID ~= "")

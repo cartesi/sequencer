@@ -147,7 +147,7 @@ test("shared partition vector matches l1_reader bisect plan", function()
         local logs, err = l1_reader.fetch_logs_partitioned(rpc, {
             start_block = scenario.start_block,
             end_block = scenario.end_block,
-            input_box_address = "0xinputbox",
+            input_box_address = "0x9999999999999999999999999999999999999999",
             app_address = "0x1111111111111111111111111111111111111111",
             long_block_range_error_codes = codes,
         })
@@ -193,7 +193,7 @@ test("l1_reader streams successful partitions in L1 order", function()
     local count, err = l1_reader.for_each_log_chunk_partitioned(rpc, {
         start_block = 1,
         end_block = 4,
-        input_box_address = "0xinputbox",
+        input_box_address = "0x9999999999999999999999999999999999999999",
         app_address = "0x1111111111111111111111111111111111111111",
         long_block_range_error_codes = { "-32005" },
     }, function(logs, range)
@@ -319,6 +319,35 @@ test("config loads snapshot directory safe block and optional topic", function()
     assert_eq(cfg.cm_snapshot_dir, "/tmp/snapshot")
     assert_eq(cfg.cm_snapshot_safe_block, 42)
     assert_eq(cfg.l1_rpc_url, nil)
+end)
+
+test("config normalizes addresses to lowercase", function()
+    local mixed = "0x8cD07E9089bbB734f667F5AdaD318299c0A90437"
+    local lower = "0x8cd07e9089bbb734f667f5adad318299c0a90437"
+    assert_eq(config.normalize_address(mixed, "app"), lower)
+    assert_eq(config.normalize_address(lower, "app"), lower)
+
+    local cfg = config.load({
+        CARTESI_WATCHDOG_SEQUENCER_URL = "http://seq",
+        CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS = "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa",
+        CARTESI_WATCHDOG_APP_ADDRESS = mixed,
+        CARTESI_WATCHDOG_STATE_DIR = "/tmp/watchdog-state",
+        CARTESI_WATCHDOG_CM_SNAPSHOT_DIR = "/tmp/snapshot",
+        CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK = "1",
+    })
+    assert_eq(cfg.app_address, lower)
+    assert_eq(cfg.input_box_address, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+    local tick = config.from_persisted("/tmp/watchdog-state", {
+        version = config.VERSION,
+        sequencer_url = "http://seq",
+        input_box_address = "0xBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBb",
+        app_address = mixed,
+    }, {
+        CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT = "http://l1",
+    })
+    assert_eq(tick.app_address, lower)
+    assert_eq(tick.input_box_address, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 end)
 
 test("config requires a sequencer URL", function()
@@ -487,7 +516,7 @@ local function fake_cfg()
         l1_rpc_url = "http://rpc",
         cm_snapshot_dir = "/tmp/genesis-snapshot",
         cm_snapshot_safe_block = 0,
-        input_box_address = "0xinputbox",
+        input_box_address = "0x9999999999999999999999999999999999999999",
         app_address = "0x1111111111111111111111111111111111111111",
         blockchain_id = "31337",
         input_added_topic = "0xtopic",
@@ -1242,8 +1271,7 @@ test("runner refuses missing or corrupt watchdog head", function()
     assert(msg:find("failed to load watchdog head", 1, true) ~= nil, msg)
     assert(msg:find("sequencer-watchdog init", 1, true) ~= nil, msg)
     assert(msg:find("state_dir=", 1, true) ~= nil, msg)
-    assert(msg:find("persistent volume", 1, true) ~= nil, msg)
-    assert(msg:find("init && sequencer-watchdog tick", 1, true) ~= nil, msg)
+    assert(msg:find("docs/watchdog/operator-deployment.md", 1, true) ~= nil, msg)
 end)
 
 test("compare cycle does not retry missing watchdog head", function()
@@ -1274,7 +1302,7 @@ test("compare cycle does not retry missing watchdog head", function()
     assert(msg:find("failed to load watchdog head", 1, true) ~= nil, msg)
     assert(msg:find("missing head.json", 1, true) ~= nil, msg)
     assert(msg:find("state_dir=", 1, true) ~= nil, msg)
-    assert(msg:find("troubleshoot:", 1, true) ~= nil, msg)
+    assert(msg:find("docs/watchdog/operator-deployment.md", 1, true) ~= nil, msg)
 end)
 
 test("tick missing head writes warning status.prom once", function()
@@ -1286,7 +1314,7 @@ test("tick missing head writes warning status.prom once", function()
     local ok_write, write_err = state_mod.write_json_atomic(dir, "config.json", {
         version = 1,
         sequencer_url = "http://sequencer",
-        input_box_address = "0xinputbox",
+        input_box_address = "0x9999999999999999999999999999999999999999",
         app_address = "0x1111111111111111111111111111111111111111",
         blockchain_id = "31337",
         retry_attempts = 3,

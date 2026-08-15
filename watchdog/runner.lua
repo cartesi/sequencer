@@ -19,24 +19,17 @@ local function load_checkpoint(cfg, checkpoint_mod)
         return loaded
     end
     -- Operator/state error, not a transient RPC blip: tick never bootstraps a
-    -- head from env. Spell out repair so logs are enough without the runbook.
+    -- head from env. Keep the log short (paths + cause); repair steps live in
+    -- docs/watchdog/operator-deployment.md.
     local state_dir = tostring(cfg.state_dir)
-    error(table.concat({
-        string.format(
-            "failed to load watchdog head: %s (state_dir=%s)",
-            tostring(load_err),
-            state_dir
-        ),
-        "tick never bootstraps a checkpoint — this is an operator/state error, not a transient RPC/L1 failure.",
-        "troubleshoot:",
-        "  1. ls "
-            .. state_dir
-            .. " — expect config.json, head.json, and checkpoints/<safe_block>/",
-        "  2. if head.json is missing: run `sequencer-watchdog init` with CARTESI_WATCHDOG_CM_SNAPSHOT_DIR and CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK set to a CM snapshot whose safe block equals the sequencer's current finalized inclusion_block, then run `tick`",
-        "  3. schedule `sequencer-watchdog init && sequencer-watchdog tick` (init is a no-op when state is already complete)",
-        "  4. if head.json exists but config.json or the selected snapshot is missing/corrupt: wipe state_dir and re-init",
-        "  5. ensure CARTESI_WATCHDOG_STATE_DIR is a persistent volume (empty/ephemeral dirs lose head.json across restarts)",
-    }, "\n"))
+    error(string.format(
+        "failed to load watchdog head: %s (state_dir=%s; expect config.json, head.json, and checkpoints/<safe_block>/). "
+            .. "tick never bootstraps a checkpoint — operator/state error, not transient RPC/L1. "
+            .. "Run `sequencer-watchdog init` then `tick` (or wipe state_dir and re-init if corrupt). "
+            .. "See docs/watchdog/operator-deployment.md.",
+        tostring(load_err),
+        state_dir
+    ))
 end
 
 local function ensure_rpc_head_covers_target(deps, target_block)

@@ -39,8 +39,11 @@ local function base_labels(opts)
     local app_address = opts.app_address
     if app_address == nil or app_address == "" then
         app_address = "unknown"
+    else
+        -- Match config.normalize_address: labels must not depend on EIP-55 casing.
+        app_address = tostring(app_address):lower()
     end
-    labels.app_address = tostring(app_address)
+    labels.app_address = app_address
     return labels
 end
 
