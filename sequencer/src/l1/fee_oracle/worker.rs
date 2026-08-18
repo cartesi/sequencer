@@ -277,7 +277,8 @@ mod tests {
     use super::*;
     use crate::storage::test_helpers::temp_db;
     use alloy_primitives::U256;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     const TEST_MAX_AGE_MS: u64 = 60 * 60 * 1000;
 
@@ -300,16 +301,15 @@ mod tests {
     }
 
     struct FailsAfterFirstGas {
-        calls: Mutex<usize>,
+        calls: Arc<AtomicUsize>,
         ok: Eip1559Fees,
     }
 
     #[async_trait]
     impl GasFeeSource for FailsAfterFirstGas {
         async fn estimate_gas_fees(&self) -> Result<Eip1559Fees, String> {
-            let mut calls = self.calls.lock().expect("lock");
-            *calls += 1;
-            if *calls == 1 {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
                 Ok(self.ok)
             } else {
                 Err("rpc unavailable".into())
@@ -438,7 +438,7 @@ mod tests {
             &db.path,
             TEST_MAX_AGE_MS,
             Box::new(FailsAfterFirstGas {
-                calls: Mutex::new(0),
+                calls: Arc::new(AtomicUsize::new(0)),
                 ok: sample_fees(),
             }),
             Box::new(StaticToken(sample_quote())),
@@ -532,12 +532,13 @@ mod tests {
         initialize_db(&db.path);
         let expected_log = expected_log_price();
 
+        let gas_calls = Arc::new(AtomicUsize::new(0));
         let oracle = FeeOracle::new_with_sources(
             db.path.clone(),
             Duration::from_millis(40),
             TEST_MAX_AGE_MS,
             Box::new(FailsAfterFirstGas {
-                calls: Mutex::new(0),
+                calls: Arc::clone(&gas_calls),
                 ok: sample_fees(),
             }),
             Box::new(StaticToken(sample_quote())),
@@ -545,10 +546,30 @@ mod tests {
         let shutdown = ShutdownSignal::default();
         let mut handle = oracle.start(shutdown.clone());
 
-        tokio::select! {
-            biased;
-            result = &mut handle => panic!("fee oracle exited early: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        // First refresh is a spawn_blocking SQLite write; a fixed sleep flakes
+        // when the blocking pool is busy. Wait until the price is persisted
+        // *and* a later tick has failed, so retain-on-transient is covered.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut handle => panic!("fee oracle exited early: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            let price = Storage::open_read_only(&db.path)
+                .unwrap()
+                .log_gas_price()
+                .unwrap();
+            let calls = gas_calls.load(Ordering::SeqCst);
+            if price == expected_log && calls >= 2 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for retained fee-oracle price \
+                     (expected {expected_log}, last read {price}, gas_calls={calls})"
+                );
+            }
         }
         let storage = Storage::open_read_only(&db.path).unwrap();
         assert_eq!(storage.log_gas_price().unwrap(), expected_log);
