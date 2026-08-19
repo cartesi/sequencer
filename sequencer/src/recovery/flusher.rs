@@ -246,9 +246,18 @@ impl MempoolFlusher {
             .map_err(|e| FlushError::Provider(e.to_string()))?;
 
         // Bump the absolute estimate so no-ops can compete with pending batch
-        // txs at the same wallet nonces (shared ≥10% replacement rule). Safety
+        // txs at the same wallet nonces (shared ≥10% replacement rule). Both
+        // components grow equally; the helper also clamps tip ≤ cap so a
+        // near-zero-base estimate cannot produce ErrTipAboveFeeCap. Safety
         // does not depend on the no-op winning — `flush_and_wait` only returns
         // once Pending ≤ Safe.
+        //
+        // Residual gap: this is a one-shot bump of a *fresh* estimate, not of
+        // the pending tx's fees, so a replacement can still be underpriced
+        // when the two EIP-1559 components have moved independently. A
+        // rejected no-op hard-errors `flush_and_wait`; the orchestrator
+        // respawn retries. Tightening that needs the pending tx's fees (or a
+        // raise-on-underpriced-error loop), not a bigger one-shot multiplier.
         let (bumped_max_fee, bumped_priority_fee) =
             bumped_replacement_fees(fees.max_fee_per_gas, fees.max_priority_fee_per_gas);
 
@@ -362,7 +371,8 @@ mod tests {
     // ── H5: replacement-fee bump keeps no-ops competitive ─────────
     // Rule itself lives in `l1::eip1559` (shared with the poster); the
     // flusher's use site is the `bumped_replacement_fees(...)` call in
-    // `submit_noops`.
+    // `submit_noops`. Equal ×1.1 growth plus the tip≤cap clamp are what
+    // keep a one-shot bump of a near-zero-base estimate valid.
 
     #[test]
     fn send_failure_error_summarizes_failed_slots() {
