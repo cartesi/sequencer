@@ -22,6 +22,16 @@ use std::sync::{Arc, Mutex};
 
 pub type TxHash = alloy_primitives::B256;
 
+/// Last successful broadcast at a wallet nonce: fees we actually sent, and
+/// the hash the next tick can keep watching if this nonce is no longer the
+/// blocking head (so we do not replace it). `tx_hash` is `None` only in tests
+/// that seed a fee floor without a prior send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InFlightTx {
+    fees: Eip1559Fees,
+    tx_hash: Option<TxHash>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BatchPosterConfig {
     pub l1_submit_address: alloy_primitives::Address,
@@ -72,11 +82,21 @@ pub trait BatchPoster: Send + Sync {
 pub struct EthereumBatchPoster {
     provider: DynProvider,
     config: BatchPosterConfig,
-    /// Fees of the last successful broadcast per wallet nonce still ≥ Latest.
-    /// Same-nonce retries floor a fresh estimate against
-    /// [`crate::l1::eip1559::bumped_replacement_fees`] of this record so a
-    /// flat market cannot re-broadcast underpriced replacements.
-    in_flight_fees: Arc<Mutex<BTreeMap<u64, Eip1559Fees>>>,
+    /// Fees + tx hash of the last successful broadcast per wallet nonce still
+    /// ≥ Latest.
+    ///
+    /// Same-nonce retries of the **head** (Latest) nonce floor a fresh
+    /// estimate against [`crate::l1::eip1559::bumped_replacement_fees`] of
+    /// this record so a flat market cannot re-broadcast underpriced
+    /// replacements. Suffix nonces already in the map are left in the mempool:
+    /// only the head can be blocking, and re-escalating the whole unconfirmed
+    /// suffix compounds fees for txs that cannot mine until the head does.
+    ///
+    /// Process-local, so the floor is best-effort, not an invariant. A restart
+    /// (or a send whose response is lost after the node accepted) re-opens the
+    /// underpriced-retry window for a cycle. A future hardening is to also
+    /// raise the floor on a "replacement transaction underpriced" send error.
+    in_flight: Arc<Mutex<BTreeMap<u64, InFlightTx>>>,
     /// Test-only: next `send_batch_at_nonce` returns Err without broadcasting,
     /// so callers can assert the in-flight map is not updated on send failure.
     #[cfg(test)]
@@ -88,7 +108,7 @@ impl EthereumBatchPoster {
         Self {
             provider,
             config,
-            in_flight_fees: Arc::new(Mutex::new(BTreeMap::new())),
+            in_flight: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             fail_next_send: Arc::new(AtomicBool::new(false)),
         }
@@ -96,15 +116,30 @@ impl EthereumBatchPoster {
 
     #[cfg(test)]
     pub(crate) fn in_flight_fees_for_test(&self) -> BTreeMap<u64, Eip1559Fees> {
-        self.in_flight_fees
+        self.in_flight
             .lock()
-            .expect("in_flight_fees lock")
-            .clone()
+            .expect("in_flight lock")
+            .iter()
+            .map(|(&nonce, tx)| (nonce, tx.fees))
+            .collect()
     }
 
     #[cfg(test)]
     pub(crate) fn seed_in_flight_fees_for_test(&self, fees: BTreeMap<u64, Eip1559Fees>) {
-        *self.in_flight_fees.lock().expect("in_flight_fees lock") = fees;
+        let mut in_flight = self.in_flight.lock().expect("in_flight lock");
+        in_flight.clear();
+        for (nonce, fees) in fees {
+            in_flight.insert(
+                nonce,
+                InFlightTx {
+                    fees,
+                    // Tests that seed a floor then submit are replacing the
+                    // head nonce; the hash is only used to skip suffix
+                    // re-broadcast, which those tests do not exercise.
+                    tx_hash: None,
+                },
+            );
+        }
     }
 
     #[cfg(test)]
@@ -169,10 +204,11 @@ impl EthereumBatchPoster {
     ///
     /// Timeouts return `Ok(())` rather than `Err` because the safe response is
     /// "re-enter `submit_batches` on the next tick" — which re-estimates fees,
-    /// floors them to an explicit ≥10% replacement bump against any still
-    /// in-flight same-nonce submission, and re-submits at the same wallet
-    /// nonces. The wallet-nonce ordering invariant above guarantees we cannot
-    /// accidentally skip work by returning early here.
+    /// floors the **head** nonce to an explicit ≥10% replacement bump against
+    /// any still in-flight same-nonce submission, leaves already-broadcast
+    /// suffix txs in the mempool, and re-submits only what still needs a
+    /// replacement. The wallet-nonce ordering invariant above guarantees we
+    /// cannot accidentally skip work by returning early here.
     async fn wait_for_confirmations(&self, tx_hashes: &[TxHash]) -> Result<(), BatchPosterError> {
         let timeout = self.confirmation_timeout();
         for tx_hash in tx_hashes {
@@ -206,6 +242,15 @@ impl EthereumBatchPoster {
 
         Ok(())
     }
+}
+
+/// If this nonce is behind the blocking head and already in the mempool, keep
+/// watching the original hash instead of replacing it.
+fn suffix_watch_hash(head_nonce: u64, nonce: u64, existing: Option<InFlightTx>) -> Option<TxHash> {
+    if nonce == head_nonce {
+        return None;
+    }
+    existing.and_then(|tx| tx.tx_hash)
 }
 
 fn derive_confirmation_timeout(
@@ -256,7 +301,7 @@ impl BatchPoster for EthereumBatchPoster {
         // Drop fee floors for nonces Latest has advanced past — those slots
         // are resolved and must not floor a later send.
         {
-            let mut in_flight = self.in_flight_fees.lock().expect("in_flight_fees lock");
+            let mut in_flight = self.in_flight.lock().expect("in_flight lock");
             in_flight.retain(|&nonce, _| nonce >= next_nonce);
         }
 
@@ -269,20 +314,37 @@ impl BatchPoster for EthereumBatchPoster {
             .map_err(BatchPosterError::Provider)?;
 
         let mut tx_hashes = Vec::with_capacity(payloads.len());
+        let head_nonce = next_nonce;
 
         for payload in payloads {
-            let fees = {
-                let in_flight = self.in_flight_fees.lock().expect("in_flight_fees lock");
-                fees_for_nonce(estimate, in_flight.get(&next_nonce).copied())
+            let existing = {
+                let in_flight = self.in_flight.lock().expect("in_flight lock");
+                in_flight.get(&next_nonce).copied()
             };
+
+            if let Some(tx_hash) = suffix_watch_hash(head_nonce, next_nonce, existing) {
+                tx_hashes.push(tx_hash);
+                next_nonce = next_nonce.saturating_add(1);
+                continue;
+            }
+
+            let prior = if next_nonce == head_nonce {
+                existing.map(|tx| tx.fees)
+            } else {
+                None
+            };
+            let fees = fees_for_nonce(estimate, prior);
             let pending = self.send_batch_at_nonce(payload, next_nonce, &fees).await?;
             // Record only after a successful broadcast — a failed send must
             // not raise the replacement floor for the next tick.
-            self.in_flight_fees
-                .lock()
-                .expect("in_flight_fees lock")
-                .insert(next_nonce, fees);
             let tx_hash = *pending.tx_hash();
+            self.in_flight.lock().expect("in_flight lock").insert(
+                next_nonce,
+                InFlightTx {
+                    fees,
+                    tx_hash: Some(tx_hash),
+                },
+            );
             debug!(
                 tx_nonce = next_nonce,
                 %tx_hash,
@@ -443,8 +505,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster,
-        derive_confirmation_timeout, mock::MockBatchPoster,
+        BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster, InFlightTx, TxHash,
+        derive_confirmation_timeout, mock::MockBatchPoster, suffix_watch_hash,
     };
     use crate::l1::watermark::WalletNonceWatermarkSink;
     use alloy::node_bindings::Anvil;
@@ -643,6 +705,28 @@ mod tests {
         assert_eq!(derive_confirmation_timeout(2, 12), Duration::from_secs(72));
         assert_eq!(derive_confirmation_timeout(2, 1), Duration::from_secs(6));
         assert_eq!(derive_confirmation_timeout(5, 3), Duration::from_secs(36));
+    }
+
+    #[test]
+    fn suffix_watch_hash_skips_only_non_head_with_a_stored_hash() {
+        let hash = TxHash::repeat_byte(0xab);
+        let with_hash = InFlightTx {
+            fees: crate::l1::eip1559::Eip1559Fees {
+                base_fee_per_gas: 1,
+                max_priority_fee_per_gas: 1,
+                max_fee_per_gas: 2,
+            },
+            tx_hash: Some(hash),
+        };
+        let fees_only = InFlightTx {
+            fees: with_hash.fees,
+            tx_hash: None,
+        };
+
+        assert_eq!(suffix_watch_hash(10, 10, Some(with_hash)), None);
+        assert_eq!(suffix_watch_hash(10, 11, Some(with_hash)), Some(hash));
+        assert_eq!(suffix_watch_hash(10, 11, Some(fees_only)), None);
+        assert_eq!(suffix_watch_hash(10, 11, None), None);
     }
 
     fn poster_config(anvil: &alloy::node_bindings::AnvilInstance) -> BatchPosterConfig {
