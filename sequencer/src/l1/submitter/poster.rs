@@ -94,8 +94,9 @@ pub struct EthereumBatchPoster {
     ///
     /// Process-local, so the floor is best-effort, not an invariant. A restart
     /// (or a send whose response is lost after the node accepted) re-opens the
-    /// underpriced-retry window for a cycle. A future hardening is to also
-    /// raise the floor on a "replacement transaction underpriced" send error.
+    /// underpriced-retry window for a cycle. A rejected "replacement transaction
+    /// underpriced" still raises the stored floor so the next tick self-corrects
+    /// without waiting for a confirmation timeout.
     in_flight: Arc<Mutex<BTreeMap<u64, InFlightTx>>>,
     /// Test-only: next `send_batch_at_nonce` returns Err without broadcasting,
     /// so callers can assert the in-flight map is not updated on send failure.
@@ -253,6 +254,11 @@ fn suffix_watch_hash(head_nonce: u64, nonce: u64, existing: Option<InFlightTx>) 
     existing.and_then(|tx| tx.tx_hash)
 }
 
+/// geth rejects same-nonce replacements below the ≥10% bump threshold.
+fn is_replacement_underpriced(err: &str) -> bool {
+    err.contains("replacement transaction underpriced")
+}
+
 fn derive_confirmation_timeout(
     confirmation_depth: u64,
     seconds_per_block: u64,
@@ -334,9 +340,28 @@ impl BatchPoster for EthereumBatchPoster {
                 None
             };
             let fees = fees_for_nonce(estimate, prior);
-            let pending = self.send_batch_at_nonce(payload, next_nonce, &fees).await?;
+            let pending = match self.send_batch_at_nonce(payload, next_nonce, &fees).await {
+                Ok(pending) => pending,
+                Err(BatchPosterError::Provider(ref msg)) if is_replacement_underpriced(msg) => {
+                    // Node rejected the replacement fee — raise the floor from
+                    // what we just tried so the next tick clears the threshold
+                    // without waiting for a confirmation timeout.
+                    let raised = fees_for_nonce(fees, Some(fees));
+                    self.in_flight.lock().expect("in_flight lock").insert(
+                        next_nonce,
+                        InFlightTx {
+                            fees: raised,
+                            tx_hash: existing.and_then(|tx| tx.tx_hash),
+                        },
+                    );
+                    return Err(BatchPosterError::Provider(msg.clone()));
+                }
+                Err(err) => return Err(err),
+            };
             // Record only after a successful broadcast — a failed send must
-            // not raise the replacement floor for the next tick.
+            // not raise the replacement floor for the next tick (except the
+            // underpriced path above, which self-corrects against a live pending
+            // tx the node already holds).
             let tx_hash = *pending.tx_hash();
             self.in_flight.lock().expect("in_flight lock").insert(
                 next_nonce,
@@ -506,7 +531,8 @@ mod tests {
 
     use super::{
         BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster, InFlightTx, TxHash,
-        derive_confirmation_timeout, mock::MockBatchPoster, suffix_watch_hash,
+        derive_confirmation_timeout, is_replacement_underpriced, mock::MockBatchPoster,
+        suffix_watch_hash,
     };
     use crate::l1::watermark::WalletNonceWatermarkSink;
     use alloy::node_bindings::Anvil;
@@ -727,6 +753,30 @@ mod tests {
         assert_eq!(suffix_watch_hash(10, 11, Some(with_hash)), Some(hash));
         assert_eq!(suffix_watch_hash(10, 11, Some(fees_only)), None);
         assert_eq!(suffix_watch_hash(10, 11, None), None);
+    }
+
+    #[test]
+    fn is_replacement_underpriced_matches_geth_message() {
+        assert!(is_replacement_underpriced(
+            "server returned an error response: error code -32000: replacement transaction underpriced"
+        ));
+        assert!(!is_replacement_underpriced("nonce too low"));
+        assert!(!is_replacement_underpriced(
+            "max priority fee per gas higher than max fee per gas"
+        ));
+    }
+
+    #[test]
+    fn underpriced_send_raises_floor_from_attempted_fees() {
+        let attempted = crate::l1::eip1559::Eip1559Fees {
+            base_fee_per_gas: 20_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 41_000_000_000,
+        };
+        let raised = crate::l1::eip1559::fees_for_nonce(attempted, Some(attempted));
+        assert!(raised.max_fee_per_gas > attempted.max_fee_per_gas);
+        assert!(raised.max_priority_fee_per_gas > attempted.max_priority_fee_per_gas);
+        assert!(raised.max_priority_fee_per_gas <= raised.max_fee_per_gas);
     }
 
     fn poster_config(anvil: &alloy::node_bindings::AnvilInstance) -> BatchPosterConfig {
