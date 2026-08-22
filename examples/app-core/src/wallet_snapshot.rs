@@ -17,7 +17,7 @@ use ssz::{Decode, Encode};
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 
 use crate::application::{WalletApp, WalletConfig};
-use sequencer_core::application::AppError;
+use sequencer_core::application::{AppError, Application};
 
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
 pub struct SnapshotBalance {
@@ -68,7 +68,7 @@ pub fn encode(app: &WalletApp) -> Vec<u8> {
         sequencer_address: app.config().sequencer_address.into_array(),
         balances,
         nonces,
-        executed_input_count: app.executed_input_count(),
+        executed_input_count: app.executed_input_count().get(),
         last_executed_safe_block: app.last_executed_safe_block(),
     }
     .as_ssz_bytes()
@@ -101,7 +101,7 @@ pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
         }
     }
 
-    Ok(WalletApp::from_snapshot_parts(
+    WalletApp::from_snapshot_parts(
         WalletConfig {
             erc20_portal_address: Address::from(decoded.erc20_portal_address),
             supported_erc20_token: Address::from(decoded.supported_erc20_token),
@@ -111,7 +111,7 @@ pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
         nonces,
         decoded.executed_input_count,
         decoded.last_executed_safe_block,
-    ))
+    )
 }
 
 #[cfg(test)]

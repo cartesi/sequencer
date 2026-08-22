@@ -10,14 +10,15 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use crate::clock::unix_now_ms;
 use crate::l1::eip1559::{Eip1559Fees, estimate_fees};
 use crate::l1::fee_oracle::math::{MathError, compute_x_units_per_gas, encode_log_gas_price};
 use crate::l1::fee_oracle::uniswap::{
     PriceSourceError, TokenPriceSource, UniswapConfig, UniswapV3PriceSource,
     bootstrap_price_source_error,
 };
-use crate::runtime::clock::unix_now_ms;
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
+use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{Storage, StorageOpenError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,23 @@ pub enum FeeOracleError {
     Misconfig(String),
     #[error("fatal fee-oracle arithmetic failure: {0}")]
     FatalMath(#[from] MathError),
+}
+
+impl FeeOracleError {
+    /// Whether this error poisons the run rather than restarting. Named
+    /// arms, no wildcard: a new variant must classify itself here (D1/H1).
+    pub(crate) fn is_terminal_invariant(&self) -> bool {
+        match self {
+            Self::Storage(source) => crate::storage::is_persistent_storage_error(source),
+            Self::OpenStorage(source) => crate::storage::is_persistent_storage_open_error(source),
+            // The oracle's `Join` wraps its internal blocking storage task.
+            // During a live worker exit that task can only have panicked;
+            // ordinary shutdown cancels the enclosing refresh future instead.
+            Self::FatalMath(_) | Self::Misconfig(_) | Self::Join(_) => true,
+            // A transient quote/transport failure self-heals.
+            Self::Transient(_) => false,
+        }
+    }
 }
 
 #[async_trait]
@@ -71,17 +89,22 @@ pub struct FeeOracle {
     max_price_age_ms: u64,
     gas: Box<dyn GasFeeSource>,
     token: TokenHandle,
+    /// Retains data-directory exclusivity inside detached-capable blocking DB
+    /// work if the async setup/runtime task awaiting it is cancelled.
+    /// Required at construction (H14).
+    process_lock: ProcessLock,
 }
 
 impl FeeOracle {
     pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(12);
 
-    pub fn new(
+    pub(super) fn new(
         db_path: impl Into<String>,
         poll_interval: Duration,
         max_price_age_ms: u64,
         provider: DynProvider,
         token: Box<dyn TokenPriceSource>,
+        process_lock: ProcessLock,
     ) -> Self {
         Self {
             db_path: db_path.into(),
@@ -89,18 +112,20 @@ impl FeeOracle {
             max_price_age_ms,
             gas: Box::new(provider),
             token: TokenHandle::Connected(token),
+            process_lock,
         }
     }
 
     /// Uniswap worker that reconnects on each quote. Prefer [`Self::new`] when
     /// boot already validated the pool; use this when boot tolerated a
     /// transient connect failure and is running on a persisted price.
-    pub fn reconnecting_uniswap(
+    pub(super) fn reconnecting_uniswap(
         db_path: impl Into<String>,
         poll_interval: Duration,
         max_price_age_ms: u64,
         provider: DynProvider,
         config: UniswapConfig,
+        process_lock: ProcessLock,
     ) -> Self {
         Self {
             db_path: db_path.into(),
@@ -108,6 +133,7 @@ impl FeeOracle {
             max_price_age_ms,
             gas: Box::new(provider.clone()),
             token: TokenHandle::Reconnecting { provider, config },
+            process_lock,
         }
     }
 
@@ -125,6 +151,7 @@ impl FeeOracle {
             max_price_age_ms,
             gas,
             token: TokenHandle::Connected(token),
+            process_lock: ProcessLock::test(),
         }
     }
 
@@ -140,7 +167,7 @@ impl FeeOracle {
 
     /// Refresh from L1 and stamp `log_gas_price_updated_at_ms` even when the
     /// encoded exponent is unchanged — the timestamp is the freshness signal.
-    pub async fn refresh_once(&self) -> Result<RefreshResult, FeeOracleError> {
+    pub(super) async fn refresh_once(&self) -> Result<RefreshResult, FeeOracleError> {
         let fees = self
             .gas
             .estimate_gas_fees()
@@ -152,8 +179,10 @@ impl FeeOracle {
         let log_gas_price = encode_log_gas_price(linear)?;
 
         let db_path = self.db_path.clone();
-        let refresh =
-            tokio::task::spawn_blocking(move || -> Result<RefreshResult, FeeOracleError> {
+        let process_lock = self.process_lock.clone();
+        let refresh = spawn_blocking_with_lock(
+            process_lock,
+            move || -> Result<RefreshResult, FeeOracleError> {
                 let mut storage = Storage::open_writer(&db_path)?;
                 let changed = storage.log_gas_price()? != log_gas_price;
                 // Always stamp: successful quote renews the staleness clock.
@@ -162,9 +191,10 @@ impl FeeOracle {
                     log_gas_price,
                     changed,
                 })
-            })
-            .await
-            .map_err(|err| FeeOracleError::Join(err.to_string()))??;
+            },
+        )
+        .await
+        .map_err(|err| FeeOracleError::Join(err.to_string()))??;
 
         if refresh.changed {
             tracing::info!(
@@ -191,7 +221,7 @@ impl FeeOracle {
     }
 
     /// Refuse when the persisted price is missing or older than `max_age_ms`.
-    pub fn ensure_persisted_price_fresh(
+    pub(super) fn ensure_persisted_price_fresh(
         db_path: &str,
         max_age_ms: u64,
     ) -> Result<(), FeeOracleError> {
@@ -206,14 +236,14 @@ impl FeeOracle {
         Ok(())
     }
 
-    pub fn start(
+    pub(crate) fn start(
         self,
-        shutdown: ShutdownSignal,
+        shutdown: RuntimeScope,
     ) -> tokio::task::JoinHandle<Result<(), FeeOracleError>> {
         tokio::spawn(async move { self.run_forever(shutdown).await })
     }
 
-    async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), FeeOracleError> {
+    async fn run_forever(self, shutdown: RuntimeScope) -> Result<(), FeeOracleError> {
         loop {
             tokio::select! {
                 biased;
@@ -227,7 +257,8 @@ impl FeeOracle {
                     Err(FeeOracleError::Transient(error)) => {
                         let db_path = self.db_path.clone();
                         let max_age_ms = self.max_price_age_ms;
-                        let (age_ms, stale) = tokio::task::spawn_blocking(move || {
+                        let process_lock = self.process_lock.clone();
+                        let (age_ms, stale) = spawn_blocking_with_lock(process_lock, move || {
                             let storage = Storage::open_read_only(&db_path)?;
                             let now = unix_now_ms();
                             let age_ms = storage.log_gas_price_age_ms(now)?;
@@ -514,7 +545,7 @@ mod tests {
             Box::new(StaticGas(sample_fees())),
             Box::new(StaticToken(sample_quote())),
         );
-        let shutdown = ShutdownSignal::default();
+        let shutdown = RuntimeScope::default();
         let handle = oracle.start(shutdown.clone());
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -542,7 +573,7 @@ mod tests {
             }),
             Box::new(StaticToken(sample_quote())),
         );
-        let shutdown = ShutdownSignal::default();
+        let shutdown = RuntimeScope::default();
         let mut handle = oracle.start(shutdown.clone());
 
         tokio::select! {
@@ -580,7 +611,7 @@ mod tests {
             Box::new(StaticGas(sample_fees())),
             Box::new(AlwaysFailToken),
         );
-        let shutdown = ShutdownSignal::default();
+        let shutdown = RuntimeScope::default();
         let handle = oracle.start(shutdown);
 
         let result = tokio::time::timeout(Duration::from_secs(2), handle)

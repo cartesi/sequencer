@@ -8,9 +8,11 @@
 //! acceptance rules (see [`sequencer_core::protocol::ProtocolTiming`]).
 //!
 //! Maintenance contract: the view is advanced atomically with each
-//! [`super::Storage::append_safe_inputs`] write, so any reader that sees
-//! `l1_safe_head` at block B also sees every acceptance decision up to B. No
-//! caller should populate this view directly.
+//! [`super::Storage::append_safe_inputs`] write while no divergence exists. A
+//! foreign/mismatched accepted landing atomically commits the terminal marker
+//! and freezes this projection; later safe-head advances remain paired with
+//! that marker rather than further acceptance rows. No caller should populate
+//! this view directly.
 //!
 //! Readers:
 //! - batch submitter frontier / danger reads (`submitter_frontier`,
@@ -63,7 +65,7 @@ pub(super) fn query_latest_safe_accepted_batch(
 /// valid path (`trg_enforce_nonce_contiguity`).
 pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
     match query_latest_safe_accepted_batch(conn)? {
-        Some(row) => Ok(i64_to_u64(row.nonce).saturating_add(1)),
+        Some(row) => Ok(next_expected_nonce(i64_to_u64(row.nonce))),
         // Empty accepted table ⇒ the frontier sits at the batch-tree anchor: 0
         // for a genesis deployment, N' for a cockroach-recovered one. Reading
         // the anchor (not a hard-coded 0) keeps this in step with
@@ -79,8 +81,20 @@ pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
     }
 }
 
+fn next_expected_nonce(nonce: u64) -> u64 {
+    nonce
+        .checked_add(1)
+        .expect("accepted batch nonce overflow: contract-impossible")
+}
+
 /// Simulate the scheduler's acceptance logic over new safe inputs and append
 /// matches to `safe_accepted_batches`.
+///
+/// R2 is complete for this mirrored predicate: every at/above-anchor accepted
+/// landing is a byte-identical local match, foreign, or mismatched. It is not
+/// an independent oracle for the canonical scheduler, application state, or
+/// collapsed checkpoint history; foreign/mismatch requires manual cockroach
+/// recovery.
 ///
 /// Paginates through `safe_inputs` rows newer than the latest accepted row,
 /// pre-filtered at SQL to `batch_submitter` as the sender. For each row,
@@ -122,7 +136,7 @@ pub(super) fn populate_safe_accepted_batches(
                               FROM safe_inputs \
                               WHERE sender = ?1 AND safe_input_index > ?2 \
                               ORDER BY safe_input_index ASC LIMIT ?3";
-    const INSERT_SQL: &str = "INSERT OR IGNORE INTO safe_accepted_batches \
+    const INSERT_SQL: &str = "INSERT INTO safe_accepted_batches \
                               (safe_input_index, nonce, first_frame_safe_block, inclusion_block) \
                               VALUES (?1, ?2, ?3, ?4)";
 
@@ -152,7 +166,7 @@ pub(super) fn populate_safe_accepted_batches(
         .map(|row| row.safe_input_index)
         .unwrap_or(-1);
     let mut expected = latest_accepted
-        .map(|row| i64_to_u64(row.nonce).saturating_add(1))
+        .map(|row| next_expected_nonce(i64_to_u64(row.nonce)))
         .unwrap_or(anchor);
 
     loop {
@@ -203,17 +217,22 @@ pub(super) fn populate_safe_accepted_batches(
                 );
                 // Stop scanning; the marker (committed with this sync)
                 // freezes the frontier and routes every subsequent boot and
-                // detector tick to refusal.
+                // detector tick to refusal. The accepted lane-reconciliation
+                // cutover will also make this the lane's next slow-turn
+                // terminal result.
                 return Ok(());
             }
 
-            insert_stmt.execute(params![
+            let changed = insert_stmt.execute(params![
                 u64_to_i64(accepted.safe_input_index),
                 u64_to_i64(accepted.nonce),
                 u64_to_i64(accepted.first_frame_safe_block),
                 u64_to_i64(accepted.inclusion_block),
             ])?;
-            expected = expected.saturating_add(1);
+            if changed != 1 {
+                return Err(rusqlite::Error::StatementChangedRows(changed));
+            }
+            expected = next_expected_nonce(expected);
         }
 
         if page_len < PAGE_SIZE {
@@ -330,4 +349,99 @@ fn record_canonical_divergence_in(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{Storage, test_helpers::temp_db};
+
+    fn insert_safe_input_zero(storage: &Storage) {
+        storage
+            .conn
+            .execute(
+                "INSERT INTO safe_inputs \
+                 (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+                 VALUES (0, ?1, X'', 0, 0, ?2)",
+                params![Address::ZERO.as_slice(), [0_u8; 32].as_slice()],
+            )
+            .expect("insert parent safe input");
+    }
+
+    #[test]
+    fn safe_accepted_batch_nonce_constraint_rejects_negative_values() {
+        let db = temp_db("safe-accepted-negative-nonce");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        insert_safe_input_zero(&storage);
+
+        let err = storage
+            .conn
+            .execute(
+                "INSERT INTO safe_accepted_batches \
+                 (safe_input_index, nonce, first_frame_safe_block, inclusion_block) \
+                 VALUES (0, -1, 0, 0)",
+                [],
+            )
+            .expect_err("negative accepted-batch nonce must violate the schema");
+
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::ConstraintViolation,
+                        ..
+                    },
+                    _
+                )
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepted_batch_insert_conflicts_fail_loud() {
+        let db = temp_db("safe-accepted-duplicate");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        insert_safe_input_zero(&storage);
+        storage
+            .conn
+            .execute(
+                "INSERT INTO safe_accepted_batches \
+                 (safe_input_index, nonce, first_frame_safe_block, inclusion_block) \
+                 VALUES (0, 0, 0, 0)",
+                [],
+            )
+            .expect("insert accepted row");
+
+        let err = storage
+            .conn
+            .execute(
+                "INSERT INTO safe_accepted_batches \
+                 (safe_input_index, nonce, first_frame_safe_block, inclusion_block) \
+                 VALUES (0, 0, 0, 0)",
+                [],
+            )
+            .expect_err("duplicate accepted row must not be ignored");
+
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::ConstraintViolation,
+                        ..
+                    },
+                    _
+                )
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "accepted batch nonce overflow: contract-impossible")]
+    fn accepted_batch_nonce_advance_fails_loud_on_overflow() {
+        let _ = next_expected_nonce(u64::MAX);
+    }
 }

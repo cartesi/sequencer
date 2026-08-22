@@ -1,6 +1,6 @@
 # Batch Recovery
 
-This document describes the recovery design for the sequencer: how the system detects that batches are failing to land on L1, and how it recovers to a consistent state. The design is verified with bounded TLA+ model checking ([`preemptive.tla`](preemptive.tla)).
+This document describes the recovery design for the sequencer: how the system detects that batches are failing to land on L1, how startup recovers to a consistent state, and where runtime authority begins. Two complementary bounded TLA+ models cover the design: [`preemptive.tla`](preemptive.tla) for batch/slot safety and [`admission.tla`](admission.tla) for startup phase ordering and admission. They do not currently model the external era/generation/base metadata or the derived canonical `executed_inputs` projection; their crash atomicity is enforced by the SQLite transaction boundaries and schema triggers described below.
 
 See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and function names.
 
@@ -8,21 +8,23 @@ See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and fu
 
 The sequencer's recovery loop spans two process lifetimes:
 
-1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`CanonicalDivergence`, `L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `DangerDetectorExit::DangerDetected` under `RunError::Worker` and the process exits with non-zero status.
+1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`CanonicalDivergence`, `L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `DangerDetectorExit::DangerDetected` under `CommandError::Worker`, closes intake, and drains the workers before returning a non-zero status. Canonical divergence is terminal and arms the independent two-second abort bound; expected-recovery and retryable arms remain cooperatively graceful.
 2. **External respawn.** An orchestrator (systemd, k8s, …) restarts the process.
-3. **Startup dispatch.** The fresh boot runs `run_preemptive_recovery` before any writers come online: sync L1, re-run `check_danger`, then `decide_startup_action` routes to one of `Proceed`, `RecoverTip`, `FlushAndCascade`, or `Refuse`. Recovery actions run their DB mutations as single SQLite transactions; `Proceed` intentionally does no DB writes.
+3. **Startup reducer.** The fresh boot reads divergence, danger, finalized-snapshot presence, Tip presence, and the safe head in one local transaction. The pure reducer selects at most one phase. Every completed phase returns to local inspection before another phase or admission. Initial Sync is itself a phase, so an already-persisted divergence refuses before the first provider call.
+4. **Prepare, admit, launch.** A clean decision permits task-free, fallible runtime preparation. Startup then invokes the same reducer once more over one consistent fact set, constructs the single-use `AdmittedRuntime`, and consumes it in an infallible, non-yielding worker launch.
 
 The detector trip and the startup dispatch share the same `check_danger` function; the detector cares only that *some* arm fired, while the startup dispatch examines *which* arm fired to pick the right action.
 
 Key abstractions, by responsibility:
 
-- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::RecoveryRequired` when any non-`Safe` status fires. The runtime converts that into a `DangerDetectorExit::DangerDetected` worker exit and the process exits. The dispatch difference between statuses only matters at the next startup, where `decide_startup_action` re-runs `check_danger` and routes accordingly.
+- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::RecoveryRequired` when any non-`Safe` status fires. The runtime converts that into a `DangerDetectorExit::DangerDetected` worker exit, requests process-wide drain, and returns non-zero after cleanup. A terminal classification gets the hard two-second abort fallback; ordinary recovery does not. The reducer re-derives the authoritative response from fresh facts on the next boot.
 - **`BatchSubmitter`** ([`l1/submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs)): makes L1 progress only — never checks danger. Productive ticks re-enter immediately; idle/transient ticks sleep `idle_poll_interval`. A pure `decide_submit_start` function folds observed L1 nonces over the scheduler-accepted frontier.
-- **`decide_startup_action`** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): pure function. Takes `danger` and returns `Proceed | RecoverTip { batch_index } | FlushAndCascade { batch_index } | Refuse(reason)`. L1 reachability is an execution concern: if the flush path cannot reach L1, startup fails and the orchestrator retries.
+- **Startup recovery reducer** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): pure policy over one `RecoveryInspection` plus boot-local phase progress. It selects `Admit`, one phase, `Retry`, or `Refuse`. The production driver owns exhaustive error classification; raw provider/storage/flush errors do not escape to a second recovery classifier.
+- **Guarded recovery storage** ([`storage/recovery.rs`](../../sequencer/src/storage/recovery.rs)): reads the reducer facts in one transaction and reasserts the selected mutation's durable preconditions in its write transaction. Divergence is checked before F2 and before every batch-tree mutation.
 - **`MempoolFlusher`** ([`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs)): submits no-op transactions to consume all pending wallet-nonce slots and waits for safe finality. Does **not** retry internally on provider errors — the orchestrator's respawn loop is the retry mechanism.
 - **`ProtocolTiming`** ([`sequencer-core/src/protocol.rs`](../../sequencer-core/src/protocol.rs)): single source of truth for scheduler timing (`max_wait_blocks`) plus the sequencer-local tuning knobs (`preemptive_margin_blocks`, `l1_read_stale_after_blocks`, `seconds_per_block`). The batch-submitter address is deployment identity and is passed separately to `scheduler_accepts`.
 
-All five pieces are replaceable at the abstraction boundary: the tick decision is a pure function; the storage surface returns structs, not ad-hoc tuples; the danger detector and submitter are independently testable.
+These pieces remain independently testable: the decision is pure, the phase driver has a discriminating trace, storage returns a fact struct rather than ad-hoc tuples, and the detector/submitter remain separate workers.
 
 ## The Batch Tree
 
@@ -235,28 +237,29 @@ A **fourth shape** sits outside this taxonomy: a closed batch that was **never s
 
 Cascading from the first non-gold catches all four. **No per-batch age check is needed for the cascade pivot itself** — every closed batch past gold is either doomed by construction or sacrificed by the convergence policy.
 
-#### Path A — `recover_post_flush(danger_threshold)` (called from FlushAndCascade)
+#### Path A — guarded post-flush Cascade
 
 After step 3 (flush) and step 4 (re-sync), the gold frontier is fresh. Run the atomic recovery transaction:
 
 1. **Find the cascade pivot.** First try the closed pivot: first valid closed batch with `nonce >= frontier_nonce`. By the contiguity invariant, this batch's nonce is exactly `frontier_nonce`. If one exists, cascade from it.
 2. **No closed pivot? Check the Tip.** When all closed batches landed fresh and were accepted (the "everything worked" aftermath), there's no closed pivot — but the Tip can still be in the danger zone. When the lane rotates without a safe-block advance between frames (e.g. immediately after init, both frames share the bootstrap `safe_block`), `S_tip = S_closed`. The closed batch can become gold by inclusion-staleness while the Tip's age — measured against `current_safe_block` after the flush wait — has crossed the danger zone. Pure monotonicity (`S_tip ≥ S_closed`) doesn't rule this out: equality is allowed. So fall through to `find_tip_batch_in_danger(danger_threshold)`. If the Tip's age clears `danger_threshold`, cascade it.
-3. **Cascade-invalidate the suffix**: set `invalidated_at_ms` on every valid batch with `batch_index >= pivot.batch_index`. This catches all non-gold batches in cases (2)/(3) above, and the Tip alone in the no-pivot-but-Tip-aging case.
-4. **Open recovery batch**: parent is the last valid ancestor (`MAX(batch_index) FROM valid_batches` after the cascade). Nonce is structurally `parent.nonce + 1`, which equals `frontier_nonce` — the scheduler's `expected_nonce`. Re-drain direct inputs from the invalidated batches via the `MAX(safe_input_index) + 1` query over `valid_sequenced_l2_txs`.
+3. **Cascade-invalidate the suffix**: set `invalidated_at_ms` on every valid batch with `batch_index >= pivot.batch_index`. This catches all non-gold batches in cases (2)/(3) above, and the Tip alone in the no-pivot-but-Tip-aging case. The invalidation trigger retains physical replay rows but deletes their derived `executed_inputs` mappings, rewinding canonical head `H` to the surviving prefix.
+4. **Advance external history reality**: iff step 3 invalidated at least one valid batch, increment `RecoveryGeneration` exactly once in this same SQLite transaction. A no-invalidation repair does not bump it. Mapping rewind and generation change are therefore one visible transition.
+5. **Open recovery batch**: parent is the last valid ancestor (`MAX(batch_index) FROM valid_batches` after the cascade). Nonce is structurally `parent.nonce + 1`, which equals `frontier_nonce` — the scheduler's `expected_nonce`. Re-drain direct inputs from the invalidated batches starting at `max(base_safe_input_index, MAX(valid safe_input_index) + 1)`. Their new physical rows reuse the rewound logical offsets under the incremented generation.
 
 **Threshold = `danger_threshold`, not `MAX_WAIT_BLOCKS`**. We're already committed to recovery; the Tip is past gold; if it's also past the threshold that would have triggered recovery had it been a closed batch, cascade it. Otherwise the next danger detector tick after resume would re-trip on the Tip's eventual close + submission anyway (the closed batch would inherit its first frame's safe_block).
 
-#### Path B — `recover_aging_tip(danger_threshold)` (called from RecoverTip)
+#### Path B — guarded `RecoverTip`
 
 The `RecoverTip` action is dispatched when `check_danger` returns `TipInDanger(idx)`: no closed batch is past the gold frontier in the danger zone, but the open Tip's first frame has aged past `danger_threshold`. **No flush ran** — the Tip has no L1 footprint, so there's nothing to flush.
 
 Closed batches past gold (if any) are still in their natural lifecycle — pending in the mempool, recently included, awaiting safe finality. Cascading them would prematurely abort their progression. We act only on the Tip:
 
-1. Run `find_tip_batch_in_danger(danger_threshold)`. If `Some(tip_index)`, cascade-invalidate from there (which only touches the Tip — no closed batches have `batch_index >= tip_index`).
-2. Open a fresh recovery batch.
+1. Run `find_tip_batch_in_danger(danger_threshold)`. If `Some(tip_index)`, cascade-invalidate from there (which only touches the Tip — no closed batches have `batch_index >= tip_index`) and increment `RecoveryGeneration` exactly once in that same transaction.
+2. Open a fresh recovery batch in the same transaction.
 3. If no Tip in danger and no Tip exists at all (torn-state crash recovery), open a Tip anyway.
 
-The `Proceed` path does not call this function. Under that dispatch, no danger arm fired and the persisted state is left untouched; genesis Tip creation is handled by the structural `Storage::ensure_open_tip` step in `Workers::spawn` (after recovery, before the lane), not by recovery and not by the lane.
+The `Safe` decision with no open Tip selects `EnsureOpenTip` as its own reducer phase. That phase rechecks `Safe`, finalized-snapshot presence, and Tip absence in the write transaction, then uses the shared `open_fresh_tip_in_tx` mechanism. Tip creation is therefore inside the same inspect → one phase → inspect discipline, never a worker-construction side effect.
 
 #### Why `danger_threshold`, not `MAX_WAIT_BLOCKS`, for the Tip threshold
 
@@ -270,7 +273,10 @@ We invalidate at `danger_threshold` because:
 
 ### Step 6: Resume
 
-Restart the batch submitter and user-op acceptance. The sequencer is back online.
+Restart the batch submitter and user-op acceptance. If this recovery invalidated
+any valid batch, the generation bump already committed atomically with that
+invalidation; otherwise the history version is unchanged. The sequencer is
+back online.
 
 ### Why post-flush cascade is unconditional (and not threshold-based)
 
@@ -281,7 +287,10 @@ An earlier design considered using `MAX_WAIT_BLOCKS` as the cascade threshold ev
 1. Frontier batch has `current_staleness ∈ [danger_threshold, MAX_WAIT)`. Detector trips, flush runs.
 2. `recover_post_flush` (with hypothetical threshold) sees age below MAX_WAIT, declines to cascade. Resume.
 3. Submitter wakes up, resubmits the Pending frontier (and any non-gold closed batches) at fresh wallet-nonce slots. They enter the mempool.
-4. Detector polls again. Frontier age has barely moved (or not at all — safe head advances at ~1 block per 12s); still above `danger_threshold`. Detector trips again.
+4. Detector polls again. Frontier age has barely moved or the published safe
+   head is unchanged; providers may later expose several newly-safe blocks as
+   one jump, but no cadence assumption makes the frontier clean again. It is
+   still above `danger_threshold`, so the detector trips again.
 5. Recovery 2 starts. Flush submits no-ops at the slots the submitter just used for resubs. Bumped fees on no-ops typically out-bid resubs. Resubs killed.
 6. Goto step 2. Loop converges only when `current_staleness` finally crosses `MAX_WAIT_BLOCKS` and the threshold check fires.
 
@@ -289,44 +298,49 @@ Each loop iteration burns gas (no-ops + doomed resubs), takes ~12 minutes (the f
 
 ### Startup behavior summary
 
-The startup flow is dispatched by `decide_startup_action(danger)`:
+The first local inspection always ranks `CanonicalDivergence` and missing finalized state ahead of phase progress. If neither terminal fact exists, `NeedInitialSync` selects the initial Sync phase. A provider failure during that one phase may still admit a warm database whose persisted view remains fresh; every non-provider reader failure is classified terminal or retryable by its typed provenance.
 
-| `check_danger` result | Action | Recovery primitive | Why this dispatch |
-|---|---|---|---|
-| `Safe` | `Proceed` | none | Nothing crossed danger; leave persisted state alone. The structural `ensure_open_tip` step opens the genesis Tip if the DB is fresh. |
-| `L1ViewStale` | `Refuse(L1ViewStale)` | — | The L1 view is too old to support honest recovery or new soft confirmations. |
-| `TipInDanger(N)` | `RecoverTip { N }` | `recover_aging_tip(danger_threshold)` (no flush — Tip has no L1 slot) | Tip has no L1 footprint; cascade and reopen directly. |
-| `ClosedBatchInDanger(N)` | `FlushAndCascade { N }` | flush + `recover_post_flush(danger_threshold)` | Closed batch has L1 transactions whose fate must be resolved before cascading. |
-| `EstimatedBatchInDanger(N)` | `Refuse(EstimatedBatchInDanger { N })` | — | Observed safe-state did not cross danger; only batch-relative wall-clock extrapolation did, and we don't recover from estimated state. |
+After the initial Sync attempt, ordinary inspection maps facts as follows:
 
-**L1 view freshness gates recovery.** `check_danger` first checks the L1 safe block timestamp against `l1_read_stale_after_blocks`. If the timestamp is missing or too old, startup refuses: the sequencer has no trustworthy L1 view from which to recover or issue new soft confirmations. With a fresh L1 view, observed-safe checks decide concrete recovery: `ClosedBatchInDanger` runs flush + cascade, while `TipInDanger` invalidates the open Tip directly. `EstimatedBatchInDanger` is the final batch-relative wall-clock fallback: observed safe-state has not crossed the threshold, but elapsed time since the last safe-head advance says the batch consumed its remaining runway, so startup refuses instead of recovering from estimated state.
+| Local fact | Reducer decision | Why |
+|---|---|---|
+| `Safe` + open Tip | `Admit` | The local prediction is clean and structurally resumable. |
+| `Safe` + no Tip | `EnsureOpenTip` | Open the genesis/torn-state Tip under the phase guard, then re-inspect. |
+| `L1ViewStale` | `Retry` | The persisted view cannot honestly authorize new soft confirmations. |
+| `TipInDanger(N)` | `RecoverTip { N }` | The Tip has no L1 footprint; invalidate and reopen directly, then re-inspect. |
+| `ClosedBatchInDanger(N)` | `Flush` | Closed batches have uncertain L1 slots that must be resolved before tree mutation. |
+| `EstimatedBatchInDanger(N)` | `Retry` | Observed safe state did not cross danger; recovery never mutates from an estimate alone. |
+| `CanonicalDivergence(N)` | `Refuse` | Standard recovery assumes content identity and is forbidden. |
 
-The Refuse variants block boot and surface to the operator. `Proceed` performs no recovery writes; the genesis Tip (fresh DB) is opened by the structural `Storage::ensure_open_tip` step that runs after recovery and before the lane. The mutating recovery actions each commit atomically: `RecoverTip` invalidates the aging Tip and opens a fresh one, while `FlushAndCascade` cascades the post-flush non-gold suffix and opens a fresh Tip when needed. So the tip-existence invariant holds at every commit boundary — recovery maintains it across cascades (reopening atomically via the shared `open_fresh_tip_in_tx` mechanism), `ensure_open_tip` closes the genesis gap with the same mechanism, and the inclusion lane loads the resulting head from storage (fail-loud if absent) rather than branching on tip existence.
+Closed recovery is structurally `Flush → inspect → post-flush Sync → inspect → Cascade → inspect`. Flush produces a non-clone, boot-local witness carrying its observed safe block. The post-flush Sync preserves that witness, and Cascade is selected only if the persisted safe head caught up through it. A crash drops the witness, so the next boot repeats the idempotent flush instead of trusting a half-remembered phase. The guarded Cascade transaction checks divergence first, then the required finalized-state fact and F2 floor, then mutates.
 
-**What TLA+ proves here**: the model still abstracts away the full startup cutover/flush decision. It proves ZombieSafety once wallet-nonce slots resolve, and separately models direct recovery of an aging open Tip. The claim that past `MAX_WAIT`, closed-batch staleness self-resolves is external reasoning from L1 monotonicity. The post-flush "cascade everything past gold" choice is also external reasoning (the "everything past gold is doomed" mental model above).
+**Observed repair still outranks clock refusal.** `check_danger` evaluates observed closed/Tip danger before local-clock faults. Once an observed danger selected a repair, the reducer finishes that repair even if the clock arm is also active; the next mandatory inspection returns `Retry` rather than admitting. A successful repair is never itself an admission fact.
+
+After the first clean decision, runtime preparation launches zero tasks. The same reducer is invoked again after preparation, over one transactionally consistent fact set — the process lock plus the task-free prepare phase make that read the decision's linearization. Only another `Admit` decision is converted into the single-use `AdmittedRuntime` capability; launch consumes that capability synchronously. Raw component launch functions are crate-private, so external app crates can enter the runtime only through `run`/`run_main`. Runtime mutation and output authorization remains role-local at the durable boundaries in the authority ADR; step 3 establishes admission, not a new global authority service.
+
+The two formal models split responsibility deliberately: `preemptive.tla` proves slot/batch safety, while `admission.tla` proves local-first terminal dominance, one-phase-per-inspection ordering, witness requirements, crash/restart soundness (a crashed attempt leaves nothing behind that gates the next boot — L2/L3), and capability soundness. The “everything past gold is doomed” policy argument remains external to both bounded models.
 
 ### Startup observability
 
-Startup recovery logs the decision and outcome with stable structured fields:
+Startup recovery logs each reducer decision and repair outcome with stable structured fields:
 
 - `danger_status` — `safe`, `l1_view_stale`, `closed_batch_in_danger`, `tip_in_danger`, or `estimated_batch_in_danger`.
 - `danger_batch_index` — set for batch-specific danger statuses.
-- `startup_action` — `proceed`, `recover_tip`, `flush_and_cascade`, or `refuse`.
-- `refuse_reason` — present on refusal.
-- `l1_reachable`, `danger_threshold`, `max_wait_blocks`, and `l1_read_stale_after_blocks` on the decision log.
+- `recovery_progress` — initial sync, ordinary inspection, flushed, post-flush synced, or repaired.
+- `recovery_decision` — `admit`, a single phase label, `retry`, or `refuse`.
 - `invalidated_count` on the completion log, plus `batches` when any batch was invalidated.
 
-The orchestrator should still be the source of restart-loop policy and alert routing, but it should not need to parse free-form messages to distinguish "refused because the L1 view is stale" from "recovering a Tip" or "running flush + cascade."
+The orchestrator remains the source of restart-loop policy and alert routing. Exit projection consumes the controller's already-classified `Retry`/`Refuse` result instead of reclassifying raw recovery errors.
 
 ### L1 view freshness
 
-The safety policy does not branch directly on a provider-reachability boolean. Reachability is an execution concern: startup tries to sync the safe head, and if `FlushAndCascade` later cannot reach L1, the flusher errors and the orchestrator retries. The decision primitive is the freshness of the L1 view recorded in SQLite.
+The safety policy does not branch directly on a provider-reachability boolean. Reachability is an execution concern: the initial Sync may fail while a warm persisted view remains usable, whereas a post-flush Sync failure must retry because Cascade requires a newly caught-up view. The decision primitive is the freshness of the L1 view recorded in SQLite plus the post-flush witness floor when one exists.
 
 The most common real-world trigger for `L1ViewStale` is a stalled RPC gateway: the provider answers, but its safe-head response stops advancing (a degraded upstream node, a load-balancer routing to a lagging replica, or a temporary indexing pause). The sequencer can't distinguish "fresh answer from a stalled view" from "L1 itself is unhealthy" without a second source of truth, so it treats both the same way: refuse to commit to soft confirmations until the recorded safe block is fresh again.
 
-**At startup**: the sequencer attempts to sync the safe head from L1. Whether that succeeds or fails, it then checks the persisted safe block timestamp. If the timestamp is missing or older than `l1_read_stale_after_blocks * seconds_per_block`, `check_danger` returns `L1ViewStale` and startup refuses. If the view is fresh, observed-safe checks can route to recovery, and the batch-relative wall-clock estimate remains as a final refusal guard for unresolved batches whose safe-block age has effectively crossed the danger threshold.
+**At startup**: the sequencer first inspects local terminal facts, then attempts the initial safe-head Sync, then inspects the persisted safe-block and progress timestamps. If the L1 timestamp is missing or older than `l1_read_stale_after_blocks * seconds_per_block`, `check_danger` returns `L1ViewStale` and startup retries. A baseline a full block-time or more ahead of `now` also yields `L1ViewStale`, but only after observed-safe checks have run. If those checks selected a repair, the repair completes and its mandatory next inspection applies the clock refusal. If the view is usable and fresh, observed-safe checks can route to recovery, and the batch-relative wall-clock estimate remains the final retry guard.
 
-**At runtime**: the `DangerDetector` polls `Storage::check_danger` on its cadence. The input reader records both the observed safe block timestamp and the local time at which the safe head last advanced. If safe-head observations stop advancing, either the global safe block timestamp crosses the read-staleness threshold (`L1ViewStale`) or a specific unresolved batch crosses the batch-relative adjusted threshold (`EstimatedBatchInDanger`). The detector then exits with `RecoveryRequired`, the orchestrator respawns, and startup re-runs the same check. The batch submitter never observes danger; this responsibility lives entirely with the detector.
+**At runtime**: the `DangerDetector` polls `Storage::check_danger` on its cadence. The input reader records both the observed safe block timestamp and the local time at which the safe head last advanced. If safe-head observations stop advancing, either the global safe block timestamp crosses the read-staleness threshold (`L1ViewStale`) or a specific unresolved batch crosses the batch-relative adjusted threshold (`EstimatedBatchInDanger`). A backward clock step of a full block-time or more against either persisted baseline also produces `L1ViewStale` — evaluated after the observed arms — and saturation must never reinterpret such a regression as zero elapsed time; sub-block steps are quantization noise for the block-granular estimate and are tolerated. The detector then exits with `RecoveryRequired`, the orchestrator respawns, and startup re-runs the same check. The batch submitter never observes danger; this responsibility lives entirely with the detector.
 
 **Other workers during L1 outages**: the inclusion lane and API are purely local (SQLite) and continue operating. The input reader retries L1 polling with error logging. All L1-dependent workers log errors at the `error` level to alert operators.
 
@@ -347,32 +361,70 @@ Dead batches occupy `w_nonce` slots strictly below `walletNonce`. Recovery batch
 
 ## Cockroach recovery (`setup --recovery`)
 
-Everything above is **standard recovery**: the running sequencer's own bookkeeping (the batch tree, pending dumps) lets it cascade a doomed suffix and resume. It is automatic and in-process.
+Everything above is **standard recovery**: the sequencer's own bookkeeping
+(the batch tree, pending dumps) lets startup cascade a doomed suffix and
+resume. The repair decision is automatic, not an operator-designed reconstruction:
+recovery crosses a process boundary, and the next boot inspects fresh facts
+through the reducer regardless of how the prior process died (L2,
+2026-08-19 — an unclean exit leaves no gate behind; there is no operator
+acknowledgement step. A terminal death best-effort records its cause in
+the `terminal_faults` black box, which nothing reads for decisions — L3).
 
-**Cockroach recovery** is the catastrophe path — the local DB is lost or has diverged (`CanonicalDivergence`, [I15](../invariants.md)). There is no tree to cascade; the operator wipes the DB and rebuilds canonical logical state from a trusted checkpoint plus L1. It is an operator-driven, one-shot `setup` mode, not a runtime action. The summary:
+**Cockroach recovery** is the catastrophe path — the local DB is lost or has diverged (`CanonicalDivergence`, [I15](../invariants.md)). There is no tree to cascade; the operator supplies a fresh or explicitly wiped data directory and rebuilds canonical logical state from a trusted checkpoint plus L1. It is an operator-driven, one-shot `setup` mode, not a runtime action. There is no automated DB replacement, clone detection, distributed fencing, or partial-fill resume state machine. The summary:
 
 Given a trusted checkpoint machine `S` at block `B` (a finalized `dumps/<id>/` dir, carrying `N` = its resume nonce and `A` = its last-executed safe block), `setup --recovery --checkpoint-block B --checkpoint-dump-dir <dir>` runs **flush → fold → fill**:
 
 1. **Flush** the wallet nonce (keyed — recovery, unlike plain `setup`, signs) so every previous-instance batch resolves at safe depth `≤ C`, the post-flush safe head. Re-sync `safe_inputs` through `C`.
 2. **Fold** (the pure `sequencer-core` engine, shared with the on-chain scheduler so it is consistent by construction): seed the fridge from the `(A, B]` directs (drop batches — already in `S`), replay the `(B, C]` stream, drain the leftover fridge at `C`. Yields `(S', N')` = the advanced app state and the resume nonce.
-3. **Fill** a consistent DB: snapshot `S'` as finalized at `C`; **anchor the batch tree at `N'`** ([I16](../invariants.md) — the root tip *is* `N'`, no sentinel batch); sequence the `≤ C` directs so the replay cursor starts past them (they're already in `S'`, while `run`'s first on-chain batch re-drains them by `safe_block`). `run` boots from this state.
+3. **Fill** a consistent DB: the baseline transaction has already minted a UUIDv4 `EraId` and initialized `RecoveryGeneration = 0`, while leaving the rebuild's `base_executed_input_count` and `base_safe_input_index` NULL. Derive `K = S'.executed_input_count()`. **Anchor the batch tree at `N'`** ([I16](../invariants.md) — the root tip *is* `N'`, no sentinel batch); sequence the `≤ C` inputs so the replay cursor starts past them (they're already in `S'`, while `run`'s first on-chain batch re-drains them by `safe_block`). Capture that root's exclusive safe-input cursor as the durable drain floor, then bind it with `K` in the same transaction that registers `S'` as the initial finalized snapshot at `C`; setup completion requires both non-NULL bases and the snapshot. Later standard recovery uses `max(base_safe_input_index, max valid attribution + 1)`, so invalidating the root cannot re-sequence those inputs. Physical `l2_tx_index` includes unmapped cursor padding and is deliberately distinct from application-history base `K`; the first executable input above the floor is mapped at `K`. `run` boots from this state.
 
-During recovery the gold frontier (`safe_accepted_batches`) population is **deferred** (`FrontierMode::DeferUntilAnchorSet`): the tree is empty until fill, so simulating acceptance against it would flag every L1 batch as foreign and freeze the frontier ([I15](../invariants.md)). It is populated on `run`'s first sync — once the anchor `N'` is set — so the folded `< N'` history is skipped as trusted collapsed history. `N` is **trusted checkpoint metadata**, not re-verified at recovery time: a wrong-low `N` surfaces at `run` via the content-identity check, but a wrong-high `N` does not — sound because a sequencer-produced finalized dump cannot carry a wrong `N` by construction (see [`cockroach.md`](cockroach.md#data-dictionary) for the full trust boundary). Recovery is a **strict one-shot**: it refuses (terminal) on a DB that is already set up — the model is "wipe and re-run", and a crash before the `setup_complete` marker re-runs cleanly (the fill is idempotent).
+During recovery the gold frontier (`safe_accepted_batches`) population is **deferred** (`FrontierMode::DeferUntilAnchorSet`): the tree is empty until fill, so simulating acceptance against it would flag every L1 batch as foreign and freeze the frontier ([I15](../invariants.md)). It is populated on `run`'s first sync — once the anchor `N'` is set — so the folded `< N'` history is skipped as trusted collapsed history. `N` is **trusted checkpoint metadata**, not re-verified at recovery time: a wrong-low `N` surfaces at `run` via the content-identity check, but a wrong-high `N` does not — sound because a sequencer-produced finalized dump cannot carry a wrong `N` by construction (see [`cockroach.md`](cockroach.md#data-dictionary) for the full trust boundary). Recovery is a **strict one-shot**: it refuses (terminal) on a DB that is already set up. A retained incomplete DB reuses the still-unexposed era minted by its baseline transaction. Once matching root Tip plus the atomically bound finalized snapshot/`K` exist, that durable fill is authoritative and retry is a no-op; it does not compare stored `K` against a later fold at a newer `C`. A fail-loud partial fill instead requires the operator to wipe and retry, minting another unexposed era. This is not general resume machinery.
 
 The detect-and-refuse gate is the *trigger*: a fresh `setup` that finds a previous instance's batches past the checkpoint refuses with exit `40` (`EXIT_SETUP_NEEDS_RECOVERY`), pointing the operator here.
 
 ## Canonical divergence (terminal, outranks every arm)
 
 Independent of the staleness machinery, the input reader's acceptance
-simulation cross-checks every **accepted** landing against the local batch at
-that nonce (content-identity check, review R2: `keccak256` of the landed wire
-bytes vs the hash stamped at seal). On mismatch — or on an accepted landing
-with no valid closed local batch at all — it persists the
-`canonical_divergence` marker atomically with the sync, freezes the
-acceptance frontier, and `check_danger` reports `CanonicalDivergence`
-**ahead of every other arm**, so a respawn loop can never route a diverged
-node into `Proceed` or `FlushAndCascade`. The startup dispatch maps it to a
-terminal `Refuse`.
+simulation cross-checks every at/above-anchor **accepted** landing against the
+local valid closed batch at that nonce (content-identity check, review R2:
+`keccak256` of the landed wire bytes vs the hash stamped at seal). The complete
+outcome set for that predicate is `Match`, `Foreign` (no local batch), or
+`Mismatch` (different bytes). `Foreign`/`Mismatch` persist the
+`canonical_divergence` marker in the same transaction as `safe_inputs`, the L1
+safe head, and accepted-frontier projection, and freeze the acceptance
+frontier immediately.
+
+This automatic detection starts only when the landing reaches L1 safe and the
+reader successfully ingests it. `check_danger` reports
+`CanonicalDivergence` **ahead of every other arm**, so a respawn loop can never
+route a diverged node into a provider call, recovery phase, or admission. Every
+reducer iteration begins with local inspection; mutating phase transactions
+reassert the marker's absence. The controller maps it to terminal `Refuse`.
+At runtime, `DangerDetector` owns prompt process-wide reaction on its two-second
+cadence. The inclusion lane's existing time-gated SQLite read independently
+returns a typed divergence instead of a usable frontier, so a turn that
+observes the marker closes intake and terminates before direct execution,
+promotion, or the five-block frame-clock decision. This is opportunistic
+refusal, not another polling schedule or reaction-time guarantee. A turn that
+already read an open frontier may finish if the reader commits the marker
+concurrently, and a user-op chunk committed before either runtime observation
+may acknowledge; no cross-worker lock or per-chunk marker query is added.
+
+The operator watchdog does not replace R2. The marker freezes finalized
+promotion, so the offending landing normally leaves the watchdog's checkpoint
+endpoint unchanged and its idle optimization skips replay/comparison. R2 is a
+wire-identity predicate; the watchdog is the broader independent
+application-state comparison once a newer finalized checkpoint exists.
+
+The distinction from standard recovery is important. The danger classifier
+and reducer exhaustively handle the modeled automatic-recovery states on this
+page. R2 is complete only for accepted-batch content identity. It is not an
+independent oracle for checkpoint/application correctness, trusted collapsed
+history below the anchor, the mirrored scheduler predicate, or arbitrary
+direct/user execution bugs. In particular, the known wrong-high checkpoint
+nonce case is outside its detection boundary (see
+[`cockroach.md`](cockroach.md#data-dictionary)). Absence of the marker does not
+prove general canonical agreement.
 
 The remedy is **cockroach recovery (wipe + rebuild from L1), never the
 standard recovery on this page**: the cascade reconciles the batch tree's
@@ -391,21 +443,21 @@ These constraints were discovered during TLA+ model checking and are required fo
 
 3. **`SubmitBatch` must assign ALL pending batches at once, in spine-position order.** If batches are submitted individually, a flush-win can bump one batch's `w_nonce` past a later batch's, violating the spine ordering invariant.
 
-4. **Wall-clock freshness when the L1 view stops advancing.** The input reader records the L1 safe block timestamp and the local last-safe-head-progress time. `Storage::check_danger` first refuses on an old or missing safe block timestamp, then uses the local progress timestamp to estimate unresolved-batch age (`elapsed / seconds_per_block`). Without these checks, an L1 outage can silently push batches past the danger zone while the DB-based safe-block number remains frozen.
+4. **Wall-clock freshness when the L1 view stops advancing.** The input reader records the L1 safe block timestamp and the local last-safe-head-progress time. `Storage::check_danger` first refuses on an old or missing safe block timestamp; a clock a full block-time or more out of step with either persisted baseline also refuses, but only after the observed-safe checks (sub-block skew is tolerated as quantization noise). Only a usable clock reaches the unresolved-batch estimate (`elapsed / seconds_per_block`). Without these checks, an L1 outage or a large backward clock step can silently push batches past the danger zone while the DB-based safe-block number remains frozen.
 
 5. **The accepted-frontier cache persists acceptances, not scan progress.** `safe_accepted_batches` stores the scheduler-accepted prefix and resumes from the latest accepted safe input. Rejected batch-submitter inputs after that frontier can be rescanned on later safe-head syncs until a later batch is accepted. This is a performance tradeoff, not a correctness bug: recovery batches can reuse a scheduler nonce after earlier rejected rows, so a separate persistent scan cursor would need careful nonce-reuse tests before being introduced.
 
 ## Formal Verification
 
-The recovery design is verified with bounded TLA+ model checking. The canonical spec is [`preemptive.tla`](preemptive.tla). An alternative optimistic design is preserved in [`history/optimistic.tla`](history/optimistic.tla).
+The recovery design is verified with two complementary bounded TLA+ models. [`preemptive.tla`](preemptive.tla) owns slot/batch safety; [`admission.tla`](admission.tla) owns startup reduction and runtime admission. An alternative optimistic batch design is preserved in [`history/optimistic.tla`](history/optimistic.tla).
 
-**Scope and limitations**: these are bounded safety models. They exhaustively check all reachable states within the configured bounds, but do not prove liveness (eventual progress), do not model the danger threshold trigger or timing margins, and do not model crash/restart (the implementation relies on SQLite atomic transactions for crash safety).
+**Scope and limitations**: these are bounded safety models. They exhaustively check all reachable states within the configured bounds but do not prove liveness or model concrete timing margins. The admission model includes abstract owner loss/crash with fresh-attempt restart (there is no admission state machine to model — L2, 2026-08-19); the slot model does not model crash/restart and relies on SQLite atomicity for its implementation mapping.
 
 ### `preemptive.tla` -- Slot-level safety under adversarial flush
 
 Models the core slot-level mechanics of preemptive recovery. At every `w_nonce` slot, L1 non-deterministically includes the spine batch OR a flush no-op (killing the batch). This covers the case where the frontier batch itself is killed during flush. The model also treats the open Tip's `safe_block` as meaningful, so it can explicitly recover an aging Tip that has no L1 footprint yet.
 
-The model is a **safety over-approximation for the actions it shares with the implementation**: it allows `AdvanceTip` and `SubmitBatch` to interleave freely with recovery, which the real protocol prevents (the sequencer goes offline). This makes the proof stronger -- if `ZombieSafety` holds under more interleavings, it holds under fewer. However, the over-approximation claim does **not** hold action-for-action — two implementation actions sit *outside* the model's transition set: (1) the model discards an aging Tip only at `MAX_WAIT_BLOCKS`, while the implementation invalidates at `danger_threshold` (= `MAX_WAIT − MARGIN`); (2) the model's `Resolve` has no case for a killed-Pending frontier (it relies on resubmission until the frontier is Silver), while `recover_post_flush` cascades killed Pendings unconditionally. For those actions the implementation's enabled transitions are a *superset* of the model's, so TLC has not explored them; their safety rests on external arguments (an open Tip and a killed Pending have no L1/scheduler state to disagree with). The model also does not verify the full sequential protocol phases (cutover, flush, wait, recover, resume) described above; in particular, the startup decision of whether a closed unresolved batch must flush before recovery remains an external argument layered on top of the slot-level proof.
+The model is a **safety over-approximation for the actions it shares with the implementation**: it allows `AdvanceTip` and `SubmitBatch` to interleave freely with recovery, which the real protocol prevents (the sequencer goes offline). This makes the proof stronger -- if `ZombieSafety` holds under more interleavings, it holds under fewer. However, the over-approximation claim does **not** hold action-for-action — two implementation actions sit *outside* the model's transition set: (1) the model discards an aging Tip only at `MAX_WAIT_BLOCKS`, while the implementation invalidates at `danger_threshold` (= `MAX_WAIT − MARGIN`); (2) the model's `Resolve` has no case for a killed-Pending frontier (it relies on resubmission until the frontier is Silver), while guarded post-flush Cascade invalidates killed Pendings unconditionally. Their safety rests on the external arguments above. Sequential startup ordering is intentionally delegated to `admission.tla` rather than cross-producting this already-large slot model.
 
 **Verified**: 157M states, 0 violations.
 
@@ -419,10 +471,32 @@ The model is a **safety over-approximation for the actions it shares with the im
 | SchedulerBehindL1 | Scheduler cursor doesn't pass L1 cursor |
 | DeadNotYetIncluded | Dead batches have `w_nonce >= nextL1Slot` |
 
+### `admission.tla` -- Startup reduction and authority
+
+Models local-first inspection, typed Retry/Refuse, InitialSync, EnsureTip,
+RecoverTip, Flush/Sync/Cascade with ephemeral witnesses, Sync-discovered
+divergence, mandatory reinspection after every completed phase,
+crash-and-restart as a fresh attempt over surviving durable facts (nothing
+durable gates the next boot — L2/L3; the terminal-fault black box is
+write-only telemetry outside the model, and there is no acknowledgement
+action), and atomic construction of `AdmittedRuntime` from the final clean
+decision. It abstracts away the batch spine and delegates every phase's
+batch mechanics to `preemptive.tla`.
+
+**Verified**: 860 generated states, 266 distinct states, depth 13, 0 violations.
+
+Key invariants include capability soundness, reducer/phase control while an
+attempt is begun, completed-phase reinspection, terminal dominance, Cascade
+witness preconditions, and Retry never being interpreted as clean. Concrete SQLite
+mutation guards and transaction atomicity are tested in Rust rather than
+modeled as database actions here.
+
 ### Running the spec
 
 ```bash
+tlc -workers auto -deadlock docs/recovery/admission.tla
 tlc -workers auto -deadlock docs/recovery/preemptive.tla    # ~90s
+just -f docs/recovery/justfile check-all
 ```
 
-Bounds are in `preemptive.cfg`. The `MaxWalletNonce` bound keeps the state space finite (kill/resubmit cycles generate new `w_nonce` values). Increase bounds for higher confidence at the cost of longer runtime.
+Bounds are in `admission.cfg` and `preemptive.cfg`. The `MaxWalletNonce` bound keeps the slot model finite (kill/resubmit cycles generate new `w_nonce` values). Increase bounds for higher confidence at the cost of longer runtime.

@@ -5,8 +5,9 @@ pub mod fold;
 
 pub use fold::{FoldInput, fold_replay};
 
-use crate::application::{AppOutputs, Application};
+use crate::application::{AppError, AppOutputs, Application, ExecutionOutcome};
 use crate::batch::{Batch, Frame, WireUserOp};
+use crate::history::ExecutedInputCount;
 use crate::l2_tx::DirectInput;
 use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
@@ -69,12 +70,17 @@ impl ProcessResult {
     }
 }
 
+// Test-assertion sugar only: asymmetric cross-type equality in a public
+// consensus API makes `a == b` type-directed and non-obvious, so it stays out
+// of the production surface (H6).
+#[cfg(test)]
 impl PartialEq<ProcessOutcome> for ProcessResult {
     fn eq(&self, other: &ProcessOutcome) -> bool {
         self.outcome == *other
     }
 }
 
+#[cfg(test)]
 impl PartialEq<ProcessResult> for ProcessOutcome {
     fn eq(&self, other: &ProcessResult) -> bool {
         *self == other.outcome
@@ -130,6 +136,11 @@ impl<A: Application> Scheduler<A> {
     }
 
     pub fn new(app: A, config: SchedulerConfig) -> Self {
+        assert_eq!(
+            app.executed_input_count(),
+            ExecutedInputCount::ZERO,
+            "a genesis scheduler application must start at executed_input_count = 0"
+        );
         Self::resume_at(app, config, 0)
     }
 
@@ -166,10 +177,10 @@ impl<A: Application> Scheduler<A> {
     /// still-queued direct has `inclusion_block <= C`, so this drains them all —
     /// exactly what the booting run's first frame at a safe block `>= C` would
     /// do, except the booting run (bare-metal, no fridge) never sees them.
-    pub fn drain_covered_at(&mut self, safe_block: u64) -> AppOutputs {
+    pub fn drain_covered_at(&mut self, safe_block: u64) -> Result<AppOutputs, AppError> {
         let mut outputs = Vec::new();
-        self.drain_directs_safe_at(safe_block, &mut outputs);
-        outputs
+        self.drain_directs_safe_at(safe_block, &mut outputs)?;
+        Ok(outputs)
     }
 
     /// Consume the scheduler, returning the advanced application state `S'` and
@@ -192,10 +203,10 @@ impl<A: Application> Scheduler<A> {
             .map_err(|err| InspectError::Application(err.to_string()))
     }
 
-    pub fn process_input(&mut self, input: SchedulerInput) -> ProcessResult {
+    pub fn process_input(&mut self, input: SchedulerInput) -> Result<ProcessResult, AppError> {
         // Execute overdue directs before any input to keep backstop semantics explicit.
         let mut outputs = Vec::new();
-        self.force_execute_overdue(input.inclusion_block, &mut outputs);
+        self.force_execute_overdue(input.inclusion_block, &mut outputs)?;
 
         if input.sender != self.config.sequencer_address {
             self.direct_q.push_back(QueuedDirectInput {
@@ -203,12 +214,12 @@ impl<A: Application> Scheduler<A> {
                 payload: input.payload,
                 inclusion_block: input.inclusion_block,
             });
-            ProcessResult::new(ProcessOutcome::DirectEnqueued, outputs)
+            Ok(ProcessResult::new(ProcessOutcome::DirectEnqueued, outputs))
         } else {
             let batch_result =
-                self.process_batch_payload(input.inclusion_block, &input.domain, &input.payload);
+                self.process_batch_payload(input.inclusion_block, &input.domain, &input.payload)?;
             outputs.extend(batch_result.outputs);
-            ProcessResult::new(batch_result.outcome, outputs)
+            Ok(ProcessResult::new(batch_result.outcome, outputs))
         }
     }
 
@@ -217,31 +228,36 @@ impl<A: Application> Scheduler<A> {
         inclusion_block: u64,
         domain: &Eip712Domain,
         payload: &[u8],
-    ) -> ProcessResult {
+    ) -> Result<ProcessResult, AppError> {
         let Ok(batch): Result<Batch, _> = ssz::Decode::from_ssz_bytes(payload) else {
-            return ProcessResult::without_outputs(ProcessOutcome::BatchRejected(
-                BatchRejectReason::DecodeFailed,
+            return Ok(ProcessResult::without_outputs(
+                ProcessOutcome::BatchRejected(BatchRejectReason::DecodeFailed),
             ));
         };
 
         if batch.nonce != self.next_expected_batch_nonce {
-            return ProcessResult::without_outputs(ProcessOutcome::BatchRejected(
-                BatchRejectReason::WrongNonce {
+            return Ok(ProcessResult::without_outputs(
+                ProcessOutcome::BatchRejected(BatchRejectReason::WrongNonce {
                     expected: self.next_expected_batch_nonce,
                     got: batch.nonce,
-                },
+                }),
             ));
         }
 
         let Some((frame_head, frame_tail)) = batch.frames.split_first() else {
-            self.advance_expected_batch_nonce();
-            return ProcessResult::without_outputs(ProcessOutcome::BatchExecuted);
+            let next_nonce = self.checked_next_batch_nonce();
+            self.next_expected_batch_nonce = next_nonce;
+            return Ok(ProcessResult::without_outputs(
+                ProcessOutcome::BatchExecuted,
+            ));
         };
 
         if let Some(reason) =
             self.batch_reject_reason_for_block(inclusion_block, frame_head, frame_tail)
         {
-            return ProcessResult::without_outputs(ProcessOutcome::BatchRejected(reason));
+            return Ok(ProcessResult::without_outputs(
+                ProcessOutcome::BatchRejected(reason),
+            ));
         }
 
         if has_elapsed_since(
@@ -249,24 +265,28 @@ impl<A: Application> Scheduler<A> {
             self.config.max_wait_blocks,
             inclusion_block,
         ) {
-            return ProcessResult::without_outputs(ProcessOutcome::BatchSkippedStale);
+            return Ok(ProcessResult::without_outputs(
+                ProcessOutcome::BatchSkippedStale,
+            ));
         }
 
+        // Preflight nonce exhaustion before any frame can mutate application
+        // state. A batch at `u64::MAX` has no canonical successor.
+        let next_nonce = self.checked_next_batch_nonce();
         let mut outputs = Vec::new();
         for frame in &batch.frames {
-            self.drain_directs_safe_at(frame.safe_block, &mut outputs);
-            self.execute_frame_user_ops(domain, frame, &mut outputs);
+            self.drain_directs_safe_at(frame.safe_block, &mut outputs)?;
+            self.execute_frame_user_ops(domain, frame, &mut outputs)?;
         }
 
-        self.advance_expected_batch_nonce();
-        ProcessResult::new(ProcessOutcome::BatchExecuted, outputs)
+        self.next_expected_batch_nonce = next_nonce;
+        Ok(ProcessResult::new(ProcessOutcome::BatchExecuted, outputs))
     }
 
-    fn advance_expected_batch_nonce(&mut self) {
-        self.next_expected_batch_nonce = self
-            .next_expected_batch_nonce
+    fn checked_next_batch_nonce(&self) -> u64 {
+        self.next_expected_batch_nonce
             .checked_add(1)
-            .expect("batch nonce overflow");
+            .expect("batch nonce overflow: no canonical successor")
     }
 
     fn batch_reject_reason_for_block(
@@ -302,7 +322,7 @@ impl<A: Application> Scheduler<A> {
         domain: &Eip712Domain,
         frame: &Frame,
         outputs: &mut AppOutputs,
-    ) {
+    ) -> Result<(), AppError> {
         for user_op in &frame.user_ops {
             // An unrecoverable signature is dropped silently (the scheduler is a
             // pure deterministic fold; diagnostics would be a nondeterministic
@@ -315,27 +335,13 @@ impl<A: Application> Scheduler<A> {
                     &plain,
                     frame.fee_price,
                     frame.safe_block,
-                ) {
-                    Ok(crate::application::ExecutionOutcome::Included {
-                        outputs: user_op_outputs,
-                    }) => outputs.extend(user_op_outputs),
-                    // Invalid op or app error: skip it (no state change, no output).
-                    //
-                    // The `Err(AppError)` arm is the canonical (fold) half of an
-                    // asymmetry with the inclusion lane (`execute_user_op` in
-                    // `inclusion_lane/mod.rs`), which fails *loud* on the same
-                    // error. Duality (I1) still holds: an `Err` excludes the op
-                    // from state on *both* sides (neither extends `outputs`), so
-                    // the canonical state agrees — the lane merely additionally
-                    // aborts, treating the error as the internal-invariant breach
-                    // it is. Dead by construction today: the wallet app's
-                    // `execute_valid_user_op` errors only on a fee/balance check
-                    // it already passed in `validate_user_op`, which cannot change
-                    // between the two calls within one fold step.
-                    Ok(crate::application::ExecutionOutcome::Invalid(_)) | Err(_) => {}
+                )? {
+                    ExecutionOutcome::Included(executed) => outputs.extend(executed.outputs),
+                    ExecutionOutcome::Invalid(_) => {}
                 }
             }
         }
+        Ok(())
     }
 
     fn recover_sender(&self, domain: &Eip712Domain, wire_user_op: &WireUserOp) -> Option<Address> {
@@ -348,25 +354,32 @@ impl<A: Application> Scheduler<A> {
         signature.recover_address_from_prehash(&signing_hash).ok()
     }
 
-    fn drain_directs_safe_at(&mut self, safe_block: u64, outputs: &mut AppOutputs) {
+    fn drain_directs_safe_at(
+        &mut self,
+        safe_block: u64,
+        outputs: &mut AppOutputs,
+    ) -> Result<(), AppError> {
         while let Some(front) = self.direct_q.front() {
             if front.inclusion_block > safe_block {
                 break;
             }
-            let queued = self.direct_q.pop_front().expect("queue front must exist");
             let input = DirectInput {
-                sender: queued.sender,
-                block_number: queued.inclusion_block,
-                payload: queued.payload,
+                sender: front.sender,
+                block_number: front.inclusion_block,
+                payload: front.payload.clone(),
             };
-            // A failing direct is skipped (deterministic fold; no diagnostics).
-            if let Ok(direct_outputs) = self.app.execute_direct_input(&input) {
-                outputs.extend(direct_outputs);
-            }
+            let executed = crate::application::execute_direct_input(&mut self.app, &input)?;
+            outputs.extend(executed.outputs);
+            self.direct_q.pop_front().expect("queue front must exist");
         }
+        Ok(())
     }
 
-    fn force_execute_overdue(&mut self, current_block: u64, outputs: &mut AppOutputs) {
+    fn force_execute_overdue(
+        &mut self,
+        current_block: u64,
+        outputs: &mut AppOutputs,
+    ) -> Result<(), AppError> {
         while let Some(front) = self.direct_q.front() {
             if has_elapsed_since(
                 front.inclusion_block,
@@ -378,21 +391,24 @@ impl<A: Application> Scheduler<A> {
                     block_number: front.inclusion_block,
                     payload: front.payload.clone(),
                 };
-                // A failing overdue direct is skipped (deterministic fold).
-                if let Ok(direct_outputs) = self.app.execute_direct_input(&input) {
-                    outputs.extend(direct_outputs);
-                }
+                let executed = crate::application::execute_direct_input(&mut self.app, &input)?;
+                outputs.extend(executed.outputs);
 
                 self.direct_q.pop_front().expect("queue front must exist");
             } else {
                 break;
             }
         }
+        Ok(())
     }
 }
 
+/// Scheduler-local spelling of the one staleness predicate. Delegates to
+/// [`crate::protocol::age_exceeds`] so the fold and the off-chain protocol
+/// module cannot drift (H8). Note the argument order differs:
+/// `has_elapsed_since(start, wait, current) == age_exceeds(current, start, wait)`.
 fn has_elapsed_since(start_block: u64, wait_blocks: u64, current_block: u64) -> bool {
-    current_block.saturating_sub(start_block) >= wait_blocks
+    crate::protocol::age_exceeds(current_block, start_block, wait_blocks)
 }
 
 pub fn input_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
@@ -402,6 +418,7 @@ pub fn input_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::{ApplicationProgress, ApplyInputCapability, ProgressCommitCapability};
     use crate::user_op::UserOp;
     use alloy_primitives::{U256, address};
     use k256::ecdsa::SigningKey;
@@ -413,7 +430,8 @@ mod tests {
         executed: Vec<RecordedTx>,
         balances: std::collections::HashMap<Address, U256>,
         nonces: std::collections::HashMap<Address, u32>,
-        last_executed_safe_block: u64,
+        progress: ApplicationProgress,
+        fail_on: Option<RecordedTx>,
     }
 
     #[cfg(test)]
@@ -441,6 +459,16 @@ mod tests {
             let current = self.balance_of(sender);
             self.balances
                 .insert(sender, current.saturating_add(U256::from(amount)));
+        }
+
+        fn with_progress(executed_input_count: u64, last_executed_safe_block: u64) -> Self {
+            Self {
+                progress: ApplicationProgress::new(
+                    ExecutedInputCount::new(executed_input_count),
+                    last_executed_safe_block,
+                ),
+                ..Self::default()
+            }
         }
     }
 
@@ -481,12 +509,20 @@ mod tests {
             Ok(())
         }
 
-        fn execute_valid_user_op(
+        fn apply_valid_user_op(
             &mut self,
+            _capability: ApplyInputCapability<'_>,
             user_op: &crate::l2_tx::ValidUserOp,
-            safe_block: u64,
+            _safe_block: u64,
         ) -> Result<crate::application::AppOutputs, crate::application::AppError> {
-            self.last_executed_safe_block = self.last_executed_safe_block.max(safe_block);
+            let marker = user_op.data.first().copied().unwrap_or_default();
+            let event = RecordedTx::UserOp(marker);
+            if self.fail_on.as_ref() == Some(&event) {
+                return Err(AppError::Internal {
+                    reason: format!("refusing {event:?}"),
+                });
+            }
+
             let sender = user_op.sender;
             let fee = crate::fee::fee_to_linear(user_op.fee);
             let balance = self.balance_of(sender);
@@ -499,27 +535,35 @@ mod tests {
             let next_nonce = self.nonce_of(sender).wrapping_add(1);
             self.nonces.insert(sender, next_nonce);
 
-            let marker = user_op.data.first().copied().unwrap_or_default();
-            self.executed.push(RecordedTx::UserOp(marker));
+            self.executed.push(event);
             Ok(Vec::new())
         }
 
-        fn execute_direct_input(
+        fn apply_direct_input(
             &mut self,
+            _capability: ApplyInputCapability<'_>,
             input: &DirectInput,
         ) -> Result<crate::application::AppOutputs, crate::application::AppError> {
             let marker = input.payload.first().copied().unwrap_or(0);
-            self.executed.push(RecordedTx::Direct(marker));
-            self.last_executed_safe_block = self.last_executed_safe_block.max(input.block_number);
+            let event = RecordedTx::Direct(marker);
+            if self.fail_on.as_ref() == Some(&event) {
+                return Err(AppError::Internal {
+                    reason: format!("refusing {event:?}"),
+                });
+            }
+            self.executed.push(event);
             Ok(Vec::new())
         }
 
-        fn executed_input_count(&self) -> u64 {
-            self.executed.len() as u64
+        fn execution_progress(&self) -> &ApplicationProgress {
+            &self.progress
         }
 
-        fn last_executed_safe_block(&self) -> u64 {
-            self.last_executed_safe_block
+        fn execution_progress_mut(
+            &mut self,
+            _capability: ProgressCommitCapability<'_>,
+        ) -> &mut ApplicationProgress {
+            &mut self.progress
         }
 
         fn from_dump(_prefix: &std::path::Path) -> Result<Self, crate::application::AppError> {
@@ -571,6 +615,15 @@ mod tests {
             domain: test_domain(),
             payload: ssz::Encode::as_ssz_bytes(&batch),
         }
+    }
+
+    fn process_ok<A: Application>(
+        scheduler: &mut Scheduler<A>,
+        input: SchedulerInput,
+    ) -> ProcessResult {
+        scheduler
+            .process_input(input)
+            .expect("test application execution must succeed")
     }
 
     fn address_from_signing_key(signing_key: &SigningKey) -> Address {
@@ -627,7 +680,7 @@ mod tests {
         );
 
         assert_eq!(
-            scheduler.process_input(direct_input(10, 1)),
+            process_ok(&mut scheduler, direct_input(10, 1)),
             ProcessOutcome::DirectEnqueued
         );
 
@@ -651,7 +704,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(batch_input(20, batch)),
+            process_ok(&mut scheduler, batch_input(20, batch)),
             ProcessOutcome::BatchExecuted
         );
         assert_eq!(
@@ -671,7 +724,7 @@ mod tests {
             },
         );
 
-        scheduler.process_input(direct_input(1, 1));
+        process_ok(&mut scheduler, direct_input(1, 1));
         let signing_key = SigningKey::from_bytes((&[2_u8; 32]).into()).expect("signing key");
         let sender = address_from_signing_key(&signing_key);
         scheduler.app.credit(sender, 1);
@@ -690,7 +743,7 @@ mod tests {
             }],
         };
 
-        scheduler.process_input(batch_input(6, batch));
+        process_ok(&mut scheduler, batch_input(6, batch));
         assert_eq!(
             scheduler.app.events(),
             [RecordedTx::Direct(1), RecordedTx::UserOp(2)]
@@ -707,7 +760,7 @@ mod tests {
             },
         );
 
-        scheduler.process_input(direct_input(1, 9));
+        process_ok(&mut scheduler, direct_input(1, 9));
         let signing_key = SigningKey::from_bytes((&[3_u8; 32]).into()).expect("signing key");
         let stale_batch = Batch {
             nonce: 0,
@@ -724,7 +777,7 @@ mod tests {
             }],
         };
 
-        let outcome = scheduler.process_input(batch_input(10, stale_batch));
+        let outcome = process_ok(&mut scheduler, batch_input(10, stale_batch));
         assert_eq!(outcome, ProcessOutcome::BatchSkippedStale);
         assert_eq!(scheduler.app.events(), [RecordedTx::Direct(9)]);
         // Stale batches do NOT consume the nonce — they are true no-ops in nonce space.
@@ -751,7 +804,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(batch_input(10, fresh_batch)),
+            process_ok(&mut scheduler, batch_input(10, fresh_batch)),
             ProcessOutcome::BatchExecuted
         );
     }
@@ -797,7 +850,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(batch_input(10, invalid)),
+            process_ok(&mut scheduler, batch_input(10, invalid)),
             ProcessOutcome::BatchRejected(BatchRejectReason::NonMonotonicSafeBlocks)
         );
         assert!(scheduler.app.events().is_empty());
@@ -831,7 +884,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(batch_input(10, invalid)),
+            process_ok(&mut scheduler, batch_input(10, invalid)),
             ProcessOutcome::BatchRejected(BatchRejectReason::SafeBlockAboveInclusionBlock)
         );
         assert!(scheduler.app.events().is_empty());
@@ -848,8 +901,8 @@ mod tests {
             },
         );
 
-        scheduler.process_input(direct_input(10, 1));
-        scheduler.process_input(direct_input(11, 2));
+        process_ok(&mut scheduler, direct_input(10, 1));
+        process_ok(&mut scheduler, direct_input(11, 2));
         let batch = Batch {
             nonce: 0,
             frames: vec![Frame {
@@ -859,7 +912,7 @@ mod tests {
             }],
         };
 
-        scheduler.process_input(batch_input(12, batch));
+        process_ok(&mut scheduler, batch_input(12, batch));
         assert_eq!(scheduler.app.events(), [RecordedTx::Direct(1)]);
         assert_eq!(scheduler.queued_direct_len(), 1);
     }
@@ -881,13 +934,13 @@ mod tests {
             payload: vec![0xFF, 0xEE, 0xDD],
         };
         assert_eq!(
-            scheduler.process_input(bad_batch),
+            process_ok(&mut scheduler, bad_batch),
             ProcessOutcome::BatchRejected(BatchRejectReason::DecodeFailed)
         );
         assert_eq!(scheduler.next_expected_batch_nonce(), 0);
 
         assert_eq!(
-            scheduler.process_input(direct_input(11, 3)),
+            process_ok(&mut scheduler, direct_input(11, 3)),
             ProcessOutcome::DirectEnqueued
         );
         assert_eq!(scheduler.queued_direct_len(), 1);
@@ -903,9 +956,9 @@ mod tests {
             },
         );
 
-        scheduler.process_input(direct_input(1, 1));
-        scheduler.process_input(direct_input(2, 2));
-        scheduler.process_input(direct_input(8, 3));
+        process_ok(&mut scheduler, direct_input(1, 1));
+        process_ok(&mut scheduler, direct_input(2, 2));
+        process_ok(&mut scheduler, direct_input(8, 3));
 
         assert_eq!(
             scheduler.app.events(),
@@ -939,7 +992,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(batch_input(1, batch)),
+            process_ok(&mut scheduler, batch_input(1, batch)),
             ProcessOutcome::BatchExecuted
         );
         assert!(scheduler.app.events().is_empty());
@@ -993,7 +1046,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(batch_input(1, batch)),
+            process_ok(&mut scheduler, batch_input(1, batch)),
             ProcessOutcome::BatchExecuted
         );
         assert_eq!(scheduler.app.events(), [RecordedTx::UserOp(4)]);
@@ -1015,7 +1068,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(batch_input(10, batch)),
+            process_ok(&mut scheduler, batch_input(10, batch)),
             ProcessOutcome::BatchExecuted
         );
         assert!(scheduler.app.events().is_empty());
@@ -1061,7 +1114,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(input),
+            process_ok(&mut scheduler, input),
             ProcessOutcome::BatchExecuted
         );
         assert_eq!(scheduler.app.events(), [RecordedTx::UserOp(9)]);
@@ -1077,7 +1130,7 @@ mod tests {
             },
         );
         assert_eq!(
-            scheduler.process_input(direct_input(1, 7)),
+            process_ok(&mut scheduler, direct_input(1, 7)),
             ProcessOutcome::DirectEnqueued
         );
         // Inspect reflects executed app state, not the direct-input queue.
@@ -1095,7 +1148,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            scheduler.process_input(batch_input(2, batch)),
+            process_ok(&mut scheduler, batch_input(2, batch)),
             ProcessOutcome::BatchExecuted
         );
 
@@ -1141,7 +1194,7 @@ mod tests {
         };
 
         assert_eq!(
-            scheduler.process_input(batch_input(1, batch)),
+            process_ok(&mut scheduler, batch_input(1, batch)),
             ProcessOutcome::BatchRejected(BatchRejectReason::WrongNonce {
                 expected: 0,
                 got: 1,
@@ -1160,6 +1213,164 @@ mod tests {
     // now. The one *documented* divergence is the predicate's structural-reject
     // omission (it trusts the sequencer to emit well-formed batches), pinned
     // explicitly at the end so any *other* drift fails this test.
+
+    #[test]
+    #[should_panic(
+        expected = "a genesis scheduler application must start at executed_input_count = 0"
+    )]
+    fn genesis_scheduler_rejects_nonzero_application_progress() {
+        let _ = Scheduler::new(
+            RecordingApp::with_progress(1, 0),
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 100,
+            },
+        );
+    }
+
+    #[test]
+    fn application_error_is_fatal_before_later_user_ops_and_nonce_commit() {
+        let app = RecordingApp {
+            fail_on: Some(RecordedTx::UserOp(1)),
+            ..RecordingApp::default()
+        };
+        let mut scheduler = Scheduler::new(
+            app,
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 100,
+            },
+        );
+
+        let signing_key = SigningKey::from_bytes((&[17_u8; 32]).into()).expect("signing key");
+        let sender = address_from_signing_key(&signing_key);
+        scheduler.app.credit(sender, 2);
+        let batch = Batch {
+            nonce: 0,
+            frames: vec![Frame {
+                user_ops: vec![
+                    sign_wire_user_op(&test_domain(), &signing_key, 0, 1, vec![1]),
+                    sign_wire_user_op(&test_domain(), &signing_key, 1, 1, vec![2]),
+                ],
+                safe_block: 1,
+                fee_price: 0,
+            }],
+        };
+
+        let error = scheduler
+            .process_input(batch_input(1, batch))
+            .expect_err("application error must abort scheduler processing");
+        let AppError::Internal { reason } = error else {
+            panic!("unexpected application error: {error}");
+        };
+        assert_eq!(reason, "refusing UserOp(1)");
+        assert!(scheduler.app.events().is_empty());
+        assert_eq!(
+            scheduler.app.executed_input_count(),
+            ExecutedInputCount::ZERO
+        );
+        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
+    }
+
+    #[test]
+    fn overdue_direct_error_is_fatal_before_current_input_is_classified() {
+        let app = RecordingApp {
+            fail_on: Some(RecordedTx::Direct(1)),
+            ..RecordingApp::default()
+        };
+        let mut scheduler = Scheduler::new(
+            app,
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 5,
+            },
+        );
+
+        assert_eq!(
+            process_ok(&mut scheduler, direct_input(1, 1)),
+            ProcessOutcome::DirectEnqueued
+        );
+        let error = scheduler
+            .process_input(direct_input(6, 2))
+            .expect_err("overdue direct failure must abort scheduler processing");
+        let AppError::Internal { reason } = error else {
+            panic!("unexpected application error: {error}");
+        };
+        assert_eq!(reason, "refusing Direct(1)");
+        assert!(scheduler.app.events().is_empty());
+        assert_eq!(
+            scheduler.app.executed_input_count(),
+            ExecutedInputCount::ZERO
+        );
+        assert_eq!(scheduler.queued_direct_len(), 1);
+    }
+
+    #[test]
+    fn batch_nonce_overflow_panics_before_application_mutation() {
+        let mut scheduler = Scheduler::resume_at(
+            RecordingApp::default(),
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 100,
+            },
+            u64::MAX,
+        );
+        let signing_key = SigningKey::from_bytes((&[18_u8; 32]).into()).expect("signing key");
+        let sender = address_from_signing_key(&signing_key);
+        scheduler.app.credit(sender, 1);
+        let batch = Batch {
+            nonce: u64::MAX,
+            frames: vec![Frame {
+                user_ops: vec![sign_wire_user_op(
+                    &test_domain(),
+                    &signing_key,
+                    0,
+                    1,
+                    vec![7],
+                )],
+                safe_block: 1,
+                fee_price: 0,
+            }],
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = scheduler.process_input(batch_input(1, batch));
+        }));
+        assert!(panic.is_err(), "nonce exhaustion must fail loud");
+        assert!(scheduler.app.events().is_empty());
+        assert_eq!(
+            scheduler.app.executed_input_count(),
+            ExecutedInputCount::ZERO
+        );
+        assert_eq!(scheduler.next_expected_batch_nonce(), u64::MAX);
+    }
+
+    #[test]
+    fn executed_input_count_overflow_panics_before_application_mutation() {
+        let mut scheduler = Scheduler::resume_at(
+            RecordingApp::with_progress(u64::MAX, 0),
+            SchedulerConfig {
+                sequencer_address: SEQUENCER,
+                max_wait_blocks: 100,
+            },
+            0,
+        );
+        assert_eq!(
+            process_ok(&mut scheduler, direct_input(1, 9)),
+            ProcessOutcome::DirectEnqueued
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = scheduler.drain_covered_at(1);
+        }));
+        assert!(panic.is_err(), "input-count exhaustion must fail loud");
+        assert!(scheduler.app.events().is_empty());
+        assert_eq!(
+            scheduler.app.executed_input_count(),
+            ExecutedInputCount::new(u64::MAX)
+        );
+        assert_eq!(scheduler.queued_direct_len(), 1);
+    }
 
     const DUALITY_MAX_WAIT: u64 = 5;
 
@@ -1199,12 +1410,15 @@ mod tests {
             },
             expected_nonce,
         );
-        let canonical_executed = scheduler.process_input(SchedulerInput {
-            sender,
-            inclusion_block: inclusion,
-            domain: test_domain(),
-            payload: payload.to_vec(),
-        }) == ProcessOutcome::BatchExecuted;
+        let canonical_executed = process_ok(
+            &mut scheduler,
+            SchedulerInput {
+                sender,
+                inclusion_block: inclusion,
+                domain: test_domain(),
+                payload: payload.to_vec(),
+            },
+        ) == ProcessOutcome::BatchExecuted;
         let offchain_accepted = duality_timing()
             .scheduler_accepts(
                 SEQUENCER,
@@ -1338,7 +1552,7 @@ mod tests {
                 },
             );
             // A direct at block 1; by inclusion block 8 it is overdue (age 7 >= 5).
-            scheduler.process_input(direct_input(1, 1));
+            process_ok(&mut scheduler, direct_input(1, 1));
 
             let batch = if label == "wrong-nonce" {
                 // expected 0, got 9 → BatchRejected(WrongNonce).
@@ -1362,7 +1576,7 @@ mod tests {
                 }
             };
 
-            let outcome = scheduler.process_input(batch_input(8, batch)).outcome;
+            let outcome = process_ok(&mut scheduler, batch_input(8, batch)).outcome;
             assert!(
                 matches!(
                     outcome,
@@ -1413,7 +1627,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            scheduler.process_input(batch_input(10, batch)),
+            process_ok(&mut scheduler, batch_input(10, batch)),
             ProcessOutcome::BatchRejected(BatchRejectReason::SafeBlockAboveInclusionBlock)
         );
         assert_eq!(scheduler.next_expected_batch_nonce(), 0);

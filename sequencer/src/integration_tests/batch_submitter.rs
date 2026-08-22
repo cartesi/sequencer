@@ -11,13 +11,12 @@ use async_trait::async_trait;
 use sequencer::l1::submitter::{BatchPoster, BatchPosterError, TxHash};
 use sequencer::l1::submitter::{BatchSubmitter, BatchSubmitterConfig};
 use sequencer::l1::watermark::WalletNonceWatermarkSink;
-use sequencer::runtime::shutdown::ShutdownSignal;
+use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
 use sequencer_core::protocol::ProtocolTiming;
 
-mod common;
-use common::{TestDb, temp_db};
+use super::common::{TestDb, temp_db};
 
 /// Minimal mock for integration tests.
 ///
@@ -60,6 +59,7 @@ impl TestMock {
 impl BatchPoster for TestMock {
     async fn submit_batches(
         &self,
+        _auth: crate::runtime::shutdown::Authorized<'_>,
         payloads: Vec<Vec<u8>>,
         _watermark: &dyn WalletNonceWatermarkSink,
     ) -> Result<Vec<TxHash>, BatchPosterError> {
@@ -109,7 +109,7 @@ impl BatchPoster for TestMock {
     }
 }
 
-/// Mirrors what `run_preemptive_recovery` does in production: persist a real
+/// Mirrors what the startup recovery reducer establishes in production: persist a real
 /// safe-head observation so `submitter_frontier` has a row to read. Without
 /// this, the submitter's first tick errors out on `current_safe_block_required`
 /// and the loop exits before submitting anything.
@@ -172,11 +172,16 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
     seed_two_closed_batches(&path);
 
     let mock = TestMock::new();
-    let shutdown = ShutdownSignal::default();
+    let shutdown = RuntimeScope::default();
     let config = BatchSubmitterConfig {
         idle_poll_interval_ms: 5000,
     };
-    let submitter = BatchSubmitter::new(path, mock.clone(), config);
+    let submitter = BatchSubmitter::new(
+        path,
+        mock.clone(),
+        config,
+        crate::runtime::process_lock::ProcessLock::test(),
+    );
     let handle = submitter
         .start(shutdown.clone())
         .expect("start batch submitter");
@@ -226,13 +231,18 @@ async fn submitter_re_enters_immediately_after_productive_tick() {
 
     let mock = TestMock::new();
     mock.set_submit_delay(Duration::from_millis(400));
-    let shutdown = ShutdownSignal::default();
+    let shutdown = RuntimeScope::default();
     let config = BatchSubmitterConfig {
         // Ten seconds — anything above ~2s would be enough to fail if the
         // immediate-retry cadence regressed to always-sleep.
         idle_poll_interval_ms: 10_000,
     };
-    let submitter = BatchSubmitter::new(path.clone(), mock.clone(), config);
+    let submitter = BatchSubmitter::new(
+        path.clone(),
+        mock.clone(),
+        config,
+        crate::runtime::process_lock::ProcessLock::test(),
+    );
     let handle = submitter
         .start(shutdown.clone())
         .expect("start batch submitter");
@@ -280,14 +290,19 @@ async fn submitter_recovers_from_transient_poster_error_without_exiting() {
 
     let mock = TestMock::new();
     mock.fail_next_n_submits(1);
-    let shutdown = ShutdownSignal::default();
+    let shutdown = RuntimeScope::default();
     let config = BatchSubmitterConfig {
         // Short poll interval so the retry sleep completes well within the
         // test window. Still long enough that accidentally always-sleeping
         // would delay the single submission past the assertion.
         idle_poll_interval_ms: 50,
     };
-    let submitter = BatchSubmitter::new(path.clone(), mock.clone(), config);
+    let submitter = BatchSubmitter::new(
+        path.clone(),
+        mock.clone(),
+        config,
+        crate::runtime::process_lock::ProcessLock::test(),
+    );
     let handle = submitter
         .start(shutdown.clone())
         .expect("start batch submitter");

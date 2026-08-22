@@ -8,7 +8,7 @@ sequencer.db-shm
 sequencer.db-wal
 /out/
 examples/canonical-app/out/
-/.DS_Store
+.DS_Store
 .vscode/
 soljson-latest.js
 **/states/

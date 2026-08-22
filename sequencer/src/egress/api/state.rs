@@ -9,11 +9,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::egress::l2_tx_feed::L2TxFeed;
 use crate::http::ApiError;
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::runtime::shutdown::RuntimeScope;
 
 #[derive(Clone)]
 pub(crate) struct SubscribeState {
-    pub shutdown: ShutdownSignal,
+    pub shutdown: RuntimeScope,
     pub ws_subscriber_limit: Arc<Semaphore>,
     pub ws_max_catchup_events: u64,
     pub tx_feed: L2TxFeed,
@@ -21,7 +21,7 @@ pub(crate) struct SubscribeState {
 
 impl SubscribeState {
     pub(crate) fn new(
-        shutdown: ShutdownSignal,
+        shutdown: RuntimeScope,
         tx_feed: L2TxFeed,
         ws_max_subscribers: usize,
         ws_max_catchup_events: u64,

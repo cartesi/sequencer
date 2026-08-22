@@ -15,10 +15,10 @@
 //! never by a runtime worker — hence their own module, distinct from the
 //! worker lifecycle in [`super::workers`].
 
+use crate::commands::error::{CommandError, SetupRecoveryError};
 use crate::ingress::inclusion_lane::dump_info::{
     self, CreateDumpDirError, create_dump_dir_with_info,
 };
-use crate::runtime::error::{RunError, SetupRecoveryError};
 use sequencer_core::application::Application;
 
 /// Register the genesis application state as the finalized snapshot. Called
@@ -33,9 +33,23 @@ pub(crate) fn register_genesis_finalized_snapshot<A: Application + 'static>(
     initial_app: A,
     storage: &mut crate::storage::Storage,
     dumps_dir: &std::path::Path,
-) -> Result<(), RunError> {
+) -> Result<(), CommandError> {
     if storage.finalized_dump()?.is_some() {
         return Ok(());
+    }
+    // The violator here is a foreign `Application` impl supplied by the app
+    // crate, so a nonzero genesis boundary is a typed refusal with a
+    // diagnosis, not a panic across the crate boundary (D11). It still runs
+    // first, before any write; nothing to unwind.
+    let genesis_count = initial_app.executed_input_count().get();
+    if genesis_count != 0 {
+        return Err(CommandError::AppBootstrap(
+            sequencer_core::application::AppError::Internal {
+                reason: format!(
+                    "a genesis application must start at executed_input_count = 0, got {genesis_count}"
+                ),
+            },
+        ));
     }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,10 +67,10 @@ pub(crate) fn register_genesis_finalized_snapshot<A: Application + 'static>(
         },
     )
     .map_err(|err| match err {
-        CreateDumpDirError::App(e) => RunError::from(e),
-        CreateDumpDirError::Io(e) => RunError::from(e),
+        CreateDumpDirError::App(e) => CommandError::from(e),
+        CreateDumpDirError::Io(e) => CommandError::from(e),
     })?;
-    storage.insert_finalized_dump(&genesis_dir, 0, 0)?;
+    storage.insert_initial_finalized_dump(&genesis_dir, 0, 0, 0, 0)?;
     Ok(())
 }
 
@@ -67,9 +81,11 @@ pub(crate) fn register_genesis_finalized_snapshot<A: Application + 'static>(
 /// startup expects: a finalized snapshot of `S'`, a batch tree rooted at `N'`,
 /// and a replay cursor past every `≤ C` direct (already executed inside `S'`).
 ///
-/// Crash-before-marker re-entry is **fail-loud**, not blindly idempotent. Only a
+/// Pre-completion re-entry is **fail-loud**, not blindly idempotent. Only a
 /// *completed* fill (finalized snapshot present — the last write) re-runs as a
-/// safe no-op. Any other existing root tip is a crashed mid-fill and is refused:
+/// safe no-op: its atomically bound snapshot and history base remain
+/// authoritative even if the retry's newer fold reached a later count. Any
+/// other existing root tip is a crashed mid-fill and is refused:
 ///   * a *different* `N'` (a different checkpoint, or the same one after `C`
 ///     advanced with more accepted `(B, C]` **batches**) would re-anchor the
 ///     tree while leaving the old root tip in place, silently breaking I16 —
@@ -96,7 +112,12 @@ pub(crate) fn fill_recovery_state<A: Application + 'static>(
     stop_block: u64,
     storage: &mut crate::storage::Storage,
     dumps_dir: &std::path::Path,
-) -> Result<(), RunError> {
+) -> Result<(), CommandError> {
+    // `K`: the absolute application boundary recovered by the canonical fold.
+    // It is deliberately independent of the replacement DB's physical replay
+    // cursor, which includes cursor-padding rows that must not execute again.
+    let base_executed_input_count = recovered_app.executed_input_count().get();
+
     // Re-entry guard (rationale + the strict one-shot model are in the
     // docstring). The tip is opened before the snapshot, so an existing root tip
     // means a prior attempt: only a *completed* fill (finalized snapshot present)
@@ -124,7 +145,7 @@ pub(crate) fn fill_recovery_state<A: Application + 'static>(
     // proceeds below (re-anchoring + opening the tip completes it). But a
     // finalized snapshot with *no* root tip is residue from a different
     // deployment mode: a plain `setup` that wrote the genesis snapshot and
-    // crashed before its marker. A completed cockroach fill always has both
+    // crashed before completion. A completed cockroach fill always has both
     // (caught above), so reaching here with a snapshot means recovery is running
     // over an un-wiped data dir — silently keeping it would mark setup complete
     // over genesis instead of the folded `(S', N')`. Refuse (same fail-loud
@@ -150,6 +171,11 @@ pub(crate) fn fill_recovery_state<A: Application + 'static>(
     // 3. The finalized snapshot's replay cursor = the global valid replay head
     //    AFTER step 2's sequencing.
     let head = storage.valid_ordered_l2_tx_head()?;
+    // The root's exclusive safe-input cursor is a separate durable floor. Its
+    // padding rows may later disappear from the valid view when standard
+    // recovery invalidates this root, but inputs already represented by S'
+    // must never become drainable again.
+    let base_safe_input_index = storage.next_undrained_safe_input_index()?;
     // 4. Register S' as the finalized snapshot at block C (file-first). Unique
     //    per attempt so a crash before the DB row leaves only a swept orphan.
     let nanos = std::time::SystemTime::now()
@@ -163,24 +189,401 @@ pub(crate) fn fill_recovery_state<A: Application + 'static>(
         &dump_info::DumpInfo::at_recovery(resume_nonce, head, stop_block),
     )
     .map_err(|err| match err {
-        CreateDumpDirError::App(e) => RunError::from(e),
-        CreateDumpDirError::Io(e) => RunError::from(e),
+        CreateDumpDirError::App(e) => CommandError::from(e),
+        CreateDumpDirError::Io(e) => CommandError::from(e),
     })?;
-    storage.insert_finalized_dump(&recovery_dir, stop_block, head)?;
+    storage.insert_initial_finalized_dump(
+        &recovery_dir,
+        stop_block,
+        head,
+        base_executed_input_count,
+        base_safe_input_index,
+    )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::test_support::SweepTestApp;
     use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
-    use crate::runtime::shutdown::ShutdownSignal;
-    use crate::runtime::test_support::SweepTestApp;
-    use crate::storage::Storage;
-    use crate::storage::test_helpers::temp_db;
+    use crate::runtime::shutdown::RuntimeScope;
+    use crate::storage::test_helpers::{pin_test_deployment_identity, temp_db};
+    use crate::storage::{LifecycleCommand, Storage};
     use alloy_primitives::{Address, U256};
     use app_core::application::{WalletApp, WalletConfig};
+    use sequencer_core::application::{
+        AppError, AppOutputs, ApplicationProgress, ApplyInputCapability, InvalidReason,
+        ProgressCommitCapability,
+    };
+    use sequencer_core::history::ExecutedInputCount;
+    use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
+    use sequencer_core::user_op::UserOp;
+    use std::path::Path;
     use std::time::Duration;
+
+    #[derive(Clone)]
+    struct CountedSweepTestApp(ApplicationProgress);
+
+    impl CountedSweepTestApp {
+        fn new(executed_input_count: u64) -> Self {
+            Self(ApplicationProgress::new(
+                ExecutedInputCount::new(executed_input_count),
+                0,
+            ))
+        }
+    }
+
+    impl Application for CountedSweepTestApp {
+        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+
+        fn validate_user_op(
+            &self,
+            _sender: Address,
+            _user_op: &UserOp,
+            _current_fee: u16,
+        ) -> Result<(), InvalidReason> {
+            Ok(())
+        }
+
+        fn apply_valid_user_op(
+            &mut self,
+            _capability: ApplyInputCapability<'_>,
+            _user_op: &ValidUserOp,
+            _safe_block: u64,
+        ) -> Result<AppOutputs, AppError> {
+            unreachable!("not used by setup-fill tests")
+        }
+
+        fn apply_direct_input(
+            &mut self,
+            _capability: ApplyInputCapability<'_>,
+            _input: &DirectInput,
+        ) -> Result<AppOutputs, AppError> {
+            Ok(Vec::new())
+        }
+
+        fn execution_progress(&self) -> &ApplicationProgress {
+            &self.0
+        }
+
+        fn execution_progress_mut(
+            &mut self,
+            _capability: ProgressCommitCapability<'_>,
+        ) -> &mut ApplicationProgress {
+            &mut self.0
+        }
+
+        fn from_dump(prefix: &Path) -> Result<Self, AppError> {
+            let bytes = std::fs::read(prefix.join("state"))?;
+            let bytes: [u8; 16] = bytes.try_into().map_err(|_| AppError::Internal {
+                reason: "invalid counted test dump".to_string(),
+            })?;
+            let count = u64::from_le_bytes(bytes[..8].try_into().expect("eight-byte count"));
+            let safe_block =
+                u64::from_le_bytes(bytes[8..].try_into().expect("eight-byte safe block"));
+            Ok(Self(ApplicationProgress::new(
+                ExecutedInputCount::new(count),
+                safe_block,
+            )))
+        }
+
+        fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+            std::fs::create_dir(prefix)?;
+            let mut bytes = Vec::with_capacity(16);
+            bytes.extend_from_slice(&self.0.executed_input_count().get().to_le_bytes());
+            bytes.extend_from_slice(&self.0.last_executed_safe_block().to_le_bytes());
+            std::fs::write(prefix.join("state"), bytes)?;
+            Ok(())
+        }
+
+        fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+            <SweepTestApp as Application>::delete_dump(prefix)
+        }
+
+        fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {
+            <SweepTestApp as Application>::state_file_in_dump(prefix)
+        }
+    }
+
+    #[test]
+    fn recovery_binds_absolute_application_base_not_physical_cursor() {
+        use crate::storage::StoredSafeInput;
+        use crate::storage::test_helpers::default_protocol_timing;
+
+        let db = temp_db("fill-recovery-history-base");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
+        let dumps_dir = tempfile::tempdir().expect("dumps dir");
+        let submitter = Address::repeat_byte(0x99);
+        let direct = Address::repeat_byte(0x22);
+        storage
+            .append_safe_inputs(
+                100,
+                &[
+                    StoredSafeInput {
+                        sender: direct,
+                        payload: vec![0x01],
+                        block_number: 20,
+                    },
+                    StoredSafeInput {
+                        sender: direct,
+                        payload: vec![0x02],
+                        block_number: 30,
+                    },
+                ],
+                submitter,
+                &default_protocol_timing(),
+            )
+            .expect("sync recovered inputs");
+
+        fill_recovery_state(
+            CountedSweepTestApp::new(41),
+            3,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("fill recovered state");
+
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history")
+                .base_executed_input_count,
+            Some(41),
+            "K comes from the recovered Application state"
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history")
+                .base_safe_input_index,
+            Some(2),
+            "the recovery root's exclusive safe-input cursor becomes the durable drain floor"
+        );
+        let finalized = storage
+            .finalized_dump()
+            .expect("read finalized")
+            .expect("finalized snapshot");
+        assert_eq!(
+            finalized.l2_tx_index, 2,
+            "the replacement DB cursor can differ from absolute application count K"
+        );
+        assert_eq!(
+            CountedSweepTestApp::from_dump(&dump_info::app_prefix(&finalized.dump.prefix))
+                .expect("reload counted snapshot")
+                .executed_input_count()
+                .get(),
+            41,
+            "the snapshot bytes and durable K establish the same application boundary"
+        );
+
+        // Model a retry whose re-sync/fold advanced through more direct inputs
+        // without changing N'. The completed snapshot/base pair is already the
+        // durable boundary; the later fold must not reinterpret this era.
+        fill_recovery_state(
+            CountedSweepTestApp::new(42),
+            3,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("a completed fill remains authoritative across a later fold");
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("preserved history")
+                .base_executed_input_count,
+            Some(41),
+            "a completed retry preserves the snapshot-bound K"
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("preserved history")
+                .base_safe_input_index,
+            Some(2),
+            "a completed retry preserves the snapshot-bound drain floor"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_recovery_never_redrains_below_cockroach_floor() {
+        use crate::storage::StoredSafeInput;
+        use crate::storage::test_helpers::default_protocol_timing;
+
+        let db = temp_db("cockroach-drain-floor");
+        let dumps_dir = tempfile::tempdir().expect("dumps dir");
+        let timing = default_protocol_timing();
+        let submitter = Address::repeat_byte(0x99);
+        let direct = Address::repeat_byte(0x22);
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
+        pin_test_deployment_identity(&mut storage, submitter);
+        storage
+            .append_safe_inputs(
+                100,
+                &[
+                    StoredSafeInput {
+                        sender: direct,
+                        payload: vec![0x01],
+                        block_number: 20,
+                    },
+                    StoredSafeInput {
+                        sender: direct,
+                        payload: vec![0x02],
+                        block_number: 30,
+                    },
+                ],
+                submitter,
+                &timing,
+            )
+            .expect("sync recovered inputs");
+
+        // S' already includes these two directs. The root sequences them only
+        // as physical replay padding, and binds their exclusive cursor as the
+        // durable floor beside the snapshot.
+        fill_recovery_state(
+            CountedSweepTestApp::new(41),
+            3,
+            100,
+            &mut storage,
+            dumps_dir.path(),
+        )
+        .expect("fill recovered state");
+        storage.complete_setup().expect("complete rebuild");
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history")
+                .base_safe_input_index,
+            Some(2)
+        );
+
+        // Age the recovery root into standard recovery. Invalidating it removes
+        // its padding rows from the valid view; the replacement Tip must still
+        // begin at the durable floor rather than re-sequencing indices 0 and 1.
+        storage
+            .append_safe_inputs(
+                1_500,
+                &[StoredSafeInput {
+                    sender: direct,
+                    payload: vec![0x03],
+                    block_number: 1_400,
+                }],
+                submitter,
+                &timing,
+            )
+            .expect("advance safe head with one post-floor direct");
+        assert_eq!(
+            storage.recover_post_flush(1_200).expect("recover root"),
+            vec![0]
+        );
+        assert_eq!(
+            storage
+                .next_undrained_safe_input_index()
+                .expect("post-recovery cursor"),
+            3
+        );
+        let replay = storage
+            .ordered_l2_txs_page_from(0, 16)
+            .expect("valid replay");
+        assert_eq!(
+            replay.len(),
+            1,
+            "only the post-floor direct belongs to replacement history"
+        );
+        let row = &replay[0];
+        assert_eq!(
+            row.executed_input_offset,
+            Some(ExecutedInputCount::new(41)),
+            "the first post-floor direct must reuse the recovered application boundary K"
+        );
+        match &row.tx {
+            SequencedL2Tx::Direct(input) => assert_eq!(input.payload, [0x03]),
+            SequencedL2Tx::UserOp(_) => panic!("expected the post-floor direct"),
+        }
+        drop(storage);
+
+        // Restart the real lane from S'. Catch-up must execute only the
+        // post-floor direct at offset 41, advancing the application to 42. If
+        // the invalidated padding were re-sequenced, the count would be larger.
+        // Force an empty batch close so the post-catch-up state is visible.
+        let storage = Storage::open(db.path.as_str()).expect("reopen for lane");
+        let config = InclusionLaneConfig {
+            batch_submitter_address: submitter,
+            dumps_dir: dumps_dir.path().to_path_buf(),
+            max_user_ops_per_chunk: 16,
+            safe_input_buffer_capacity: 16,
+            max_batch_open: Duration::from_millis(10),
+            idle_poll_interval: Duration::from_millis(2),
+            frontier_min_interval: Duration::ZERO,
+        };
+        let shutdown = RuntimeScope::default();
+        let (_tx, handle) =
+            InclusionLane::<CountedSweepTestApp>::start(16, shutdown.clone(), storage, config);
+
+        let advanced_once = wait_until(Duration::from_secs(5), || {
+            let mut observer = Storage::open(db.path.as_str()).expect("open observer");
+            let Some(pending) = observer.latest_pending_dump().expect("read pending") else {
+                return false;
+            };
+            CountedSweepTestApp::from_dump(&dump_info::app_prefix(&pending.dump.prefix))
+                .expect("load post-catch-up snapshot")
+                .executed_input_count()
+                .get()
+                == 42
+        })
+        .await;
+        assert!(
+            advanced_once,
+            "lane catch-up must execute the post-floor direct exactly once"
+        );
+
+        shutdown_lane(&shutdown, handle).await;
+    }
+
+    #[test]
+    fn plain_setup_refuses_a_nonzero_genesis_application_boundary() {
+        let db = temp_db("genesis-history-base");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Setup)
+                .expect("initialize setup");
+        let dumps_dir = tempfile::tempdir().expect("dumps dir");
+
+        let result = register_genesis_finalized_snapshot(
+            CountedSweepTestApp::new(1),
+            &mut storage,
+            dumps_dir.path(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CommandError::AppBootstrap(
+                    sequencer_core::application::AppError::Internal { .. }
+                ))
+            ),
+            "genesis must begin at application count zero, got: {result:?}"
+        );
+        assert!(storage.finalized_dump().expect("read finalized").is_none());
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history")
+                .base_executed_input_count,
+            Some(0)
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history")
+                .base_safe_input_index,
+            Some(0)
+        );
+    }
 
     #[test]
     fn fill_recovery_state_roots_tree_at_n_prime_and_skips_pre_executed_directs() {
@@ -188,7 +591,9 @@ mod tests {
         use crate::storage::test_helpers::default_protocol_timing;
 
         let db = temp_db("fill-recovery");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
         let submitter = alloy_primitives::Address::repeat_byte(0x99);
         let direct = alloy_primitives::Address::repeat_byte(0x22);
@@ -255,7 +660,7 @@ mod tests {
             "catch-up starts past the pre-executed (≤C) directs"
         );
 
-        // Idempotent: a re-run (crash before the setup marker) is a no-op, not a
+        // Idempotent: a re-run (crash before setup completion) is a no-op, not a
         // duplicate-insert error.
         fill_recovery_state(SweepTestApp, n_prime, 100, &mut storage, dumps_dir.path())
             .expect("re-run is idempotent");
@@ -273,7 +678,9 @@ mod tests {
         use crate::storage::test_helpers::default_protocol_timing;
 
         let db = temp_db("fill-recovery-post-c");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
         let submitter = alloy_primitives::Address::repeat_byte(0x99);
         let direct = alloy_primitives::Address::repeat_byte(0x22);
@@ -338,7 +745,9 @@ mod tests {
         use crate::storage::test_helpers::default_protocol_timing;
 
         let db = temp_db("fill-recovery-boundary");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
         let submitter = alloy_primitives::Address::repeat_byte(0x99);
         let direct = alloy_primitives::Address::repeat_byte(0x22);
@@ -393,7 +802,9 @@ mod tests {
         use crate::storage::test_helpers::default_protocol_timing;
 
         let db = temp_db("fill-recovery-nonce-mismatch");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
         let submitter = alloy_primitives::Address::repeat_byte(0x99);
         let timing = default_protocol_timing();
@@ -417,7 +828,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                RunError::Bootstrap(crate::runtime::error::BootstrapError::SetupRecovery(
+                CommandError::Bootstrap(crate::commands::error::BootstrapError::SetupRecovery(
                     SetupRecoveryError::PartialRecoveryMismatch {
                         existing_root_nonce: 3,
                         requested_nonce: 5,
@@ -445,7 +856,9 @@ mod tests {
         use crate::storage::test_helpers::default_protocol_timing;
 
         let db = temp_db("fill-recovery-incomplete");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
         let submitter = alloy_primitives::Address::repeat_byte(0x99);
         let direct = alloy_primitives::Address::repeat_byte(0x22);
@@ -496,7 +909,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                RunError::Bootstrap(crate::runtime::error::BootstrapError::SetupRecovery(
+                CommandError::Bootstrap(crate::commands::error::BootstrapError::SetupRecovery(
                     SetupRecoveryError::PartialRecoveryIncomplete { root_nonce: 3 }
                 ))
             ),
@@ -508,12 +921,14 @@ mod tests {
     fn fill_recovery_state_refuses_over_residual_finalized_snapshot() {
         // P2: `setup --recovery` over an un-wiped data dir left by a plain
         // `setup` that wrote the genesis finalized snapshot and crashed before
-        // its marker (finalized snapshot present, NO root tip). A completed
+        // completion (finalized snapshot present, NO root tip). A completed
         // cockroach fill always has both, so this residue must fail loud —
         // silently keeping it would mark setup complete over genesis instead of
         // the folded `(S', N')`.
         let db = temp_db("fill-recovery-residue");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Setup)
+                .expect("initialize plain setup residue");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
 
         // Plain-setup residue: genesis finalized snapshot, no root tip.
@@ -529,7 +944,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                RunError::Bootstrap(crate::runtime::error::BootstrapError::SetupRecovery(
+                CommandError::Bootstrap(crate::commands::error::BootstrapError::SetupRecovery(
                     SetupRecoveryError::RecoveryOverResidualSnapshot {
                         existing_finalized_block: 0,
                     }
@@ -607,7 +1022,10 @@ mod tests {
             },
         ];
         {
-            let mut storage = Storage::open(db.path.as_str()).expect("open");
+            let mut storage =
+                Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                    .expect("initialize rebuild");
+            pin_test_deployment_identity(&mut storage, submitter);
             storage
                 .append_safe_inputs(150, &inputs, submitter, &timing)
                 .expect("sync to H1 = 150");
@@ -648,7 +1066,7 @@ mod tests {
         // input; the short `max_batch_open` forces a batch-close snapshot.
         let storage = Storage::open(db.path.as_str()).expect("reopen for lane");
         let config = InclusionLaneConfig {
-            batch_submitter_address: Address::repeat_byte(0xff),
+            batch_submitter_address: submitter,
             dumps_dir: dumps_dir.path().to_path_buf(),
             max_user_ops_per_chunk: 16,
             safe_input_buffer_capacity: 16,
@@ -656,7 +1074,7 @@ mod tests {
             idle_poll_interval: Duration::from_millis(2),
             frontier_min_interval: Duration::ZERO,
         };
-        let shutdown = ShutdownSignal::default();
+        let shutdown = RuntimeScope::default();
         let (_tx, handle) =
             InclusionLane::<WalletApp>::start(128, shutdown.clone(), storage, config);
 
@@ -719,7 +1137,7 @@ mod tests {
     }
 
     async fn shutdown_lane(
-        shutdown: &ShutdownSignal,
+        shutdown: &RuntimeScope,
         handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
     ) {
         shutdown.request_shutdown();

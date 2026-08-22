@@ -20,13 +20,12 @@ use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::http::{self, ApiConfig};
 use sequencer::ingress::inclusion_lane::PendingUserOp;
 use sequencer::ingress::inclusion_lane::dump_info;
-use sequencer::runtime::shutdown::ShutdownSignal;
+use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::Storage;
 use sequencer_core::application::Application;
 use tokio::sync::mpsc;
 
-mod common;
-use common::temp_db;
+use super::common::temp_db;
 
 fn dummy_domain() -> Eip712Domain {
     Eip712Domain {
@@ -42,7 +41,7 @@ fn dummy_domain() -> Eip712Domain {
 struct TestServer {
     addr: SocketAddr,
     _rx: mpsc::Receiver<PendingUserOp>,
-    _shutdown: ShutdownSignal,
+    _shutdown: RuntimeScope,
     _task: http::ApiServerTask,
 }
 
@@ -63,7 +62,7 @@ async fn start_server(db_path: &str) -> Option<TestServer> {
     };
     let addr = listener.local_addr().expect("listener addr");
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
-    let shutdown = ShutdownSignal::default();
+    let shutdown = RuntimeScope::default();
     let tx_feed = L2TxFeed::new(
         db_path.to_string(),
         shutdown.clone(),

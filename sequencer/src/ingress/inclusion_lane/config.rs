@@ -14,8 +14,8 @@ const DEFAULT_SAFE_INPUT_BUFFER_CAPACITY: usize = 2048;
 const DEFAULT_MAX_BATCH_OPEN: Duration = Duration::from_secs(2 * 60 * 60);
 const DEFAULT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Minimum gap between L1 safe-frontier polls. Bounds the SQL load when the
-/// lane is otherwise idle. L1 safe head advances at ~12s cadence, so 1s is
-/// well inside the responsiveness budget.
+/// lane is otherwise idle. Safe-head observations advance materially less
+/// often than user-op chunks, so 1s is inside the reconciliation budget.
 const DEFAULT_FRONTIER_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
@@ -31,8 +31,9 @@ pub struct InclusionLaneConfig {
     /// Cap on user ops dequeued per chunk. Bounds per-chunk SQL transaction
     /// size and (more importantly) ack latency for the first op in each chunk.
     pub max_user_ops_per_chunk: usize,
-    /// Reusable buffer size for safe-input loading. Doesn't bound work; just
-    /// the memory ceiling for the read-and-execute scratch buffer.
+    /// Reusable buffer size for safe-input loading. It bounds scratch memory,
+    /// not work or time: one reconciliation turn consumes the complete
+    /// newly-safe range without timeout/resume state.
     pub safe_input_buffer_capacity: usize,
     /// Force a batch close after this much wall time, regardless of size.
     pub max_batch_open: Duration,

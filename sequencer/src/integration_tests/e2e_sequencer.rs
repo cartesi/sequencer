@@ -17,8 +17,8 @@ use sequencer::http::{self, ApiConfig};
 use sequencer::ingress::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, InclusionLaneError, PendingUserOp, dump_info,
 };
-use sequencer::runtime::shutdown::ShutdownSignal;
-use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
+use sequencer::runtime::shutdown::RuntimeScope;
+use sequencer::storage::{DeploymentIdentity, FeeOracleIdentity, Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::application::Application;
 use sequencer_core::l2_tx::SequencedL2Tx;
@@ -29,8 +29,9 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-mod common;
-use common::temp_db;
+use super::common::temp_db;
+
+const TEST_BATCH_SUBMITTER: Address = Address::repeat_byte(0xff);
 
 // ── V1 regression: cross-boundary signature domain consistency ────────
 //
@@ -202,7 +203,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
     // Fund the sender so the user-op passes the balance check.
     bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+    let Some(mut runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
     };
 
@@ -241,6 +242,20 @@ async fn e2e_submit_tx_ack_and_broadcast() {
         .submit_tx_with_status(&request_body)
         .await
         .expect("submit tx");
+    if status != 200
+        && runtime
+            .lane_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    {
+        let lane = runtime
+            .lane_handle
+            .take()
+            .expect("finished lane handle")
+            .await
+            .expect("join failed lane");
+        panic!("lane stopped before acknowledgement: {lane:?}; body={response_body}");
+    }
     assert_eq!(
         status, 200,
         "submit tx should succeed: body={response_body}"
@@ -1044,7 +1059,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
 
 struct FullServerRuntime {
     addr: std::net::SocketAddr,
-    shutdown: ShutdownSignal,
+    shutdown: RuntimeScope,
     server_task: Option<http::ApiServerTask>,
     lane_handle: Option<
         tokio::task::JoinHandle<Result<(), sequencer::ingress::inclusion_lane::InclusionLaneError>>,
@@ -1086,7 +1101,7 @@ async fn start_full_server_with_max_body(
     let addr = listener.local_addr().expect("read listener addr");
 
     let mut storage = Storage::open(db_path).expect("open storage");
-    let shutdown = ShutdownSignal::default();
+    let shutdown = RuntimeScope::default();
 
     let dumps_dir = tempfile::tempdir().expect("e2e dumps dir").keep();
     // Always-load invariant: ensure a finalized snapshot exists
@@ -1112,17 +1127,24 @@ async fn start_full_server_with_max_body(
             .expect("register genesis");
     }
 
-    // Tip-existence invariant: open the genesis Tip if the DB is fresh
-    // (no-op on warm restart), mirroring the runtime's structural startup.
-    // The lane loads the head itself after catch-up.
+    // Tip-existence invariant: open the genesis Tip only after the genesis
+    // snapshot exists. Opening the Tip may attribute already-ingested direct
+    // inputs, so doing this first would give the fresh application dump the
+    // wrong executed-input count.
     storage.ensure_open_tip().expect("establish open tip");
+    let head = storage
+        .open_state()
+        .expect("load open state")
+        .expect("open state exists");
+    // Default log_gas_price=0 -> 0+296+20+419+621 = 1356.
+    assert_eq!(head.frame_fee, 1356);
 
     let (tx, lane_handle) = InclusionLane::<WalletApp>::start(
         128,
         shutdown.clone(),
         storage,
         InclusionLaneConfig {
-            batch_submitter_address: Address::from([0xff; 20]),
+            batch_submitter_address: TEST_BATCH_SUBMITTER,
             dumps_dir,
             max_user_ops_per_chunk: 32,
             safe_input_buffer_capacity: 32,
@@ -1188,7 +1210,7 @@ async fn start_api_only_server(
 
     let _storage = Storage::open(db_path).expect("open storage");
     let (tx, rx) = mpsc::channel::<PendingUserOp>(queue_capacity);
-    let shutdown = ShutdownSignal::default();
+    let shutdown = RuntimeScope::default();
     let tx_feed = L2TxFeed::new(
         db_path.to_string(),
         shutdown.clone(),
@@ -1256,14 +1278,24 @@ fn bootstrap_open_frame(db_path: &str) {
     bootstrap_open_frame_with_deposits(db_path, &[]);
 }
 
-/// Bootstrap open frame, optionally seeding ERC-20 deposits for the given senders.
-/// Each sender receives `amount` tokens before the frame is opened.
+/// Seed the safe L1 head and optional ERC-20 deposits before runtime startup.
+/// Each sender receives `amount` tokens when startup opens the first frame.
 fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)]) {
     let mut storage = Storage::open(db_path).expect("open storage");
     let config = WalletConfig::default();
+    storage
+        .load_or_insert_deployment_identity(DeploymentIdentity {
+            chain_id: 1,
+            app_address: Address::repeat_byte(0x11),
+            input_box_address: Address::repeat_byte(0x22),
+            app_deployment_block: 0,
+            batch_submitter_address: TEST_BATCH_SUBMITTER,
+            fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
+        })
+        .expect("pin test deployment identity");
 
     // Always record a safe-head observation: production callers are gated by
-    // `run_preemptive_recovery`, so storage paths like `safe_input_frontier`
+    // the startup recovery reducer, so storage paths like `safe_input_frontier`
     // assume a row exists. With no deposits we still write an empty advance
     // so the lane can start without `current_safe_block_required` failing.
     let safe_inputs: Vec<StoredSafeInput> = deposits
@@ -1284,7 +1316,7 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
         .append_safe_inputs(
             1,
             &safe_inputs,
-            Address::ZERO,
+            TEST_BATCH_SUBMITTER,
             &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
@@ -1293,14 +1325,6 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
             },
         )
         .expect("seed safe head (and any deposits)");
-
-    let safe_input_count = deposits.len() as u64;
-    let leading_range = SafeInputRange::new(0, safe_input_count);
-    // Default log_gas_price=0 → 0+296+20+419+621 = 1356.
-    let head = storage
-        .initialize_open_state(1, leading_range)
-        .expect("initialize open state");
-    assert_eq!(head.frame_fee, 1356);
 }
 
 /// Default max_fee for test fixtures: must exceed default log_recommended_fee.
@@ -1352,7 +1376,7 @@ fn all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
         .ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load ordered l2 txs")
         .into_iter()
-        .map(|(_offset, tx, _frame_safe_block)| tx)
+        .map(|row| row.tx)
         .collect()
 }
 

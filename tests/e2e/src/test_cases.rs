@@ -199,6 +199,12 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ("provider_outage_wall_clock_refuses_boot_test", |runtime| {
             Box::pin(run_provider_outage_wall_clock_refuses_boot_test(runtime))
         }),
+        (
+            "warm_restart_from_fresh_persisted_facts_with_l1_down_test",
+            |runtime| {
+                Box::pin(run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(runtime))
+            },
+        ),
         ("wall_clock_backward_jump_no_panic_test", |runtime| {
             Box::pin(run_wall_clock_backward_jump_no_panic_test(runtime))
         }),
@@ -1404,7 +1410,7 @@ async fn run_sequencer_outage_pre_danger_no_recovery_test(
 //   - `check_danger` returns `TipInDanger(idx)` — the closed-frontier check finds
 //     nothing past gold, but the open Tip's first frame has aged past
 //     `danger_threshold`.
-//   - `decide_startup_action` returns `RecoverTip` (no flush — the Tip has
+//   - the startup reducer selects `RecoverTip` (no flush — the Tip has
 //     no L1 footprint).
 //   - `recover_aging_tip` cascades the Tip; pre-outage soft-confirmed user
 //     ops are rolled back (this is the documented "soft confirmations may
@@ -1575,9 +1581,9 @@ async fn run_provider_outage_past_stale_cascades_test(
 
     // Step 4: Respawn. The sequencer dials the proxy, the proxy forwards
     // to Anvil, `sync_to_current_safe_head` returns 1250+ blocks past the
-    // open Tip's first frame. `check_danger` fires `TipInDanger(idx)`,
-    // `decide_startup_action` returns `RecoverTip`, `recover_aging_tip`
-    // cascades the Tip and opens a fresh one.
+    // open Tip's first frame. `check_danger` fires `TipInDanger(idx)`, and
+    // the reducer's guarded `RecoverTip` phase cascades the Tip and opens a
+    // fresh one.
     runtime.respawn().await?;
 
     // Step 5: Verify via WS replay.
@@ -1673,7 +1679,8 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     //   - dials the proxy → sync_to_current_safe_head fails (L1 unreachable).
     //   - sees the persisted safe block timestamp is older than the L1
     //     read-staleness threshold.
-    //   - decide_startup_action returns Refuse(L1ViewStale) → process exits with failure.
+    //   - the startup reducer returns Retry(L1ViewStale), so the process exits
+    //     without runtime admission.
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -1703,6 +1710,101 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     assert_eq!(replay_after.current_user_balance(bob_address), U256::ZERO,);
     assert_eq!(replay_after.current_user_nonce(alice_address), 0);
 
+    proxy.shutdown().await?;
+    Ok(())
+}
+
+// Warm restart from a fresh persisted L1 view while the RPC is unreachable.
+//
+// This is the production-shaped discriminator for startup admission: an
+// initial refresh attempt may fail, but a recent persisted view that still
+// reduces to `Admit` is sufficient authority to prepare and launch the
+// runtime. The test keeps the proxy disconnected through readiness, one full
+// background-worker retry cadence, POST /tx, and WS broadcast. A boot path
+// that makes provider reachability an unconditional admission gate fails at
+// `respawn`; a runtime that launches without a usable inclusion lane fails the
+// transaction or WS assertion.
+async fn run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    const STABILITY_WINDOW: Duration = Duration::from_secs(3);
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(100_000_u64);
+    let fee = fee_to_linear(DEFAULT_FRAME_FEE);
+
+    // Persist a recent safe-head observation plus replayable wallet state,
+    // then stop cleanly so the next run boots over fresh facts without a
+    // recovery phase.
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut ws = runtime.ws(0).await?;
+    let mut replay = ReplayWalletApp::devnet();
+    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
+    drop(ws);
+    runtime.stop().await?;
+
+    // Route the next process through an already-disconnected gateway. The
+    // proxy stays down until after the admitted runtime serves the write and
+    // its corresponding ordered-tx feed event.
+    let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
+    runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
+    proxy.disconnect();
+    runtime.respawn().await?;
+    assert!(
+        !proxy.is_connected(),
+        "warm restart must reach readiness without reconnecting the L1 proxy",
+    );
+
+    // Cross the 2s input-reader/danger-detector cadence before submitting, so
+    // this proves more than racing a request ahead of the first failed RPC
+    // retry. Fresh local facts must keep the process admitted and live.
+    let exit = runtime.observe_for(STABILITY_WINDOW).await?;
+    assert!(
+        exit.is_none(),
+        "warm runtime must remain live while the fresh persisted L1 view is valid; got {exit:?}",
+    );
+
+    let mut ws_after = runtime.ws(0).await?;
+    let mut replay_after = ReplayWalletApp::devnet();
+    replay_after.apply(
+        ws_after
+            .expect_direct_input_from(runtime.erc20_portal_address())
+            .await?,
+    )?;
+    let mut alice_l2 = runtime.wallet_l2(alice)?;
+    alice_l2.transfer(bob_address, transfer_amount).await?;
+    replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
+
+    assert_wallet_state(
+        &replay_after,
+        ExpectedWalletState {
+            address: alice_address,
+            balance: deposit_amount - transfer_amount - fee,
+            nonce: 1,
+        },
+        ExpectedWalletState {
+            address: bob_address,
+            balance: transfer_amount,
+            nonce: 0,
+        },
+        2,
+    );
+    assert!(
+        !proxy.is_connected(),
+        "POST /tx and WS must succeed before L1 connectivity is restored",
+    );
+    assert_eq!(
+        runtime.count_batches()?.invalidated,
+        0,
+        "a fresh-view warm restart must not invalidate the batch tree",
+    );
+
+    proxy.reconnect();
+    runtime.set_l1_endpoint_override(None);
     proxy.shutdown().await?;
     Ok(())
 }
@@ -2039,9 +2141,9 @@ async fn run_provider_outage_danger_zone_sequencer_self_exits_test(
         "sequencer must self-exit with non-zero status on danger detection, got {exit_status:?}",
     );
 
-    // Step 5: Try to respawn while proxy is still disconnected. Startup
-    // runs the same wall-clock fallback via `run_preemptive_recovery` and
-    // should refuse to boot (`decide_startup_action → Refuse(...)`).
+    // Step 5: Try to respawn while proxy is still disconnected. The startup
+    // reducer runs the same wall-clock fallback and must return
+    // `Retry(L1ViewStale)` without runtime admission.
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -2235,8 +2337,8 @@ async fn run_both_down_danger_zone_sequencer_first_refuses_boot_test(
 // Complement to  (sequencer first): here L1 comes back before the
 // sequencer does. Once the sequencer restarts, startup recovery sees L1
 // reachable and the Tip aged past `danger_threshold`, so `check_danger`
-// returns `TipInDanger(idx)` → `decide_startup_action` returns `RecoverTip` →
-// `recover_aging_tip` cascades the Tip and opens a fresh one. Convergence
+// returns `TipInDanger(idx)` and the guarded `RecoverTip` phase cascades the
+// Tip and opens a fresh one. Convergence
 // typically happens on the first respawn.
 //
 // Other paths can fire under different timings — e.g., the lane might
@@ -2363,8 +2465,8 @@ async fn run_both_down_danger_zone_proxy_first_restart_cycle_recovers_test(
 // Other paths can fire depending on timing — e.g., the lane might close the
 // Tip into a nonced batch before the detector trips, the submitter might
 // get the batch onto L1 fresh, and convergence happens by the next respawn
-// seeing it in `safe_inputs`. Or the closed batch lands stale, routes
-// through `FlushAndCascade`, and converges after a flush cycle.
+// seeing it in `safe_inputs`. Or the closed batch lands stale, routes through
+// the guarded Flush → Sync → Cascade phases, and converges after a flush cycle.
 //
 // The test's load-bearing assertion is restart-loop convergence under a
 // realistic coupled outage, not which specific recovery path fires nor how
@@ -2418,7 +2520,7 @@ async fn run_sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test(
 
     // Convergence is the load-bearing claim. The number of attempts depends
     // on which recovery path fires (`RecoverTip` typically converges on the
-    // first respawn; `FlushAndCascade` may take more), so we don't pin a
+    // first respawn; Flush → Sync → Cascade may take more), so we don't pin a
     // minimum here.
     assert!(
         !outcomes.is_empty(),
@@ -2586,9 +2688,9 @@ async fn run_provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recover
 // first boot (needs L1 reachable to deploy contracts and pin the deployment
 // identity). We stop, rewrite the recorded L1 safe-head observation to
 // unknown, then respawn with the proxy disconnected. The deployment identity
-// is still populated — so the sequencer gets past the contract-discovery
-// phase — but `check_danger` sees the missing safe-head row and
-// `decide_startup_action` returns `Refuse(L1ViewStale)`.
+// is still populated — so the sequencer gets past the identity gate — but
+// `check_danger` sees the missing safe-head row and the reducer returns
+// `Retry(L1ViewStale)`.
 //
 // Scope note: a "truly" first-ever boot would fail even earlier (no
 // deployment identity, can't discover contracts). That's a separate test; this
@@ -3419,9 +3521,9 @@ async fn run_provider_outage_input_reader_retries_after_reconnect_test(
 // recovery logic runs.
 //
 // Distinct from `run_first_boot_l1_unreachable_never_synced_refuses_boot_test`
-// (already covered): that test exercises the wall-clock fallback inside
-// `run_preemptive_recovery`, which only fires AFTER bootstrap discovery has
-// succeeded once (so the deployment identity is pinned). This test targets
+// (already covered): that test exercises the run reducer's wall-clock fallback,
+// which only runs after setup has succeeded once (so deployment identity is
+// pinned). This test targets
 // the earlier failure: the
 // `InputReader::new` discovery step where the sequencer asks L1 for the
 // InputBox address. With no deployment identity, that call has no

@@ -23,29 +23,6 @@ const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_DATA_DIR: &str = "sequencer-data";
 const DB_FILENAME: &str = "sequencer.db";
 
-/// Shared L1 / InputBox configuration used by both the input reader and the batch submitter.
-///
-/// Built once at startup from the pinned deployment identity plus the runtime
-/// `RunConfig`, so RPC URL, InputBox address, and app address are defined in a
-/// single place and not duplicated across component configs.
-#[derive(Debug, Clone)]
-pub struct L1Config {
-    pub eth_rpc_url: String,
-    pub input_box_address: Address,
-    pub app_address: Address,
-    pub batch_submitter_private_key: String,
-    pub batch_submitter_address: Address,
-    /// The pinned deployment chain id. Carried here so keyed-write paths (e.g.
-    /// the preemptive-recovery flush) can re-confirm the RPC's chain id right
-    /// before signing via [`crate::l1::provider::create_verified_signer_provider`].
-    pub chain_id: u64,
-    /// Opt into plaintext (`http://`) RPC against a non-loopback host — a
-    /// trusted private network (Docker/K8s service, private-VPC IP). Off by
-    /// default: the provider layer refuses remote plaintext otherwise. See
-    /// [`crate::l1::provider`].
-    pub allow_insecure_rpc: bool,
-}
-
 /// Full path to the SQLite database file inside `data_dir`.
 pub fn db_path_in(data_dir: &str) -> String {
     std::path::Path::new(data_dir)
@@ -321,9 +298,9 @@ impl OptionalKeyArgs {
 }
 
 /// `setup` — establish the deployment's timeless state: pin identity, do the
-/// initial L1 sync, register the genesis finalized snapshot, write the
-/// setup-complete marker. L1-read-only: takes the batch-submitter address, not
-/// the signing key.
+/// initial L1 sync, register the genesis finalized snapshot, and atomically
+/// complete setup. L1-read-only: takes the batch-submitter address, not the
+/// signing key.
 #[derive(Debug, Clone, Args)]
 pub struct SetupConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
@@ -534,9 +511,9 @@ impl RunConfig {
     }
 }
 
-/// `flush-mempool` — settle the batch-submitter wallet nonce on demand
-///. Reads the submitter address + watermark from the DB; signs
-/// no-op transactions, so it needs the key.
+/// `flush-mempool` — settle the batch-submitter wallet nonce on demand.
+/// Reads the submitter address + watermark from the DB and signs no-op
+/// transactions, so it needs the key.
 #[derive(Debug, Clone, Args)]
 pub struct FlushConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
@@ -967,7 +944,7 @@ mod tests {
         let mut cmd = std::process::Command::new(&exe);
         cmd.args([
             "--exact",
-            "runtime::config::tests::help_does_not_leak_private_key_value",
+            "commands::config::tests::help_does_not_leak_private_key_value",
             "--quiet",
         ])
         .env("SEQUENCER_HELP_LEAK_OUT", &out_path)

@@ -11,7 +11,9 @@ This document **owns** that algorithm. [`AGENTS.md`](../../AGENTS.md) §"Sequenc
 Scheduler Duality" is the map; this is the detail. The reference implementation
 is [`Scheduler<A>`](../../sequencer-core/src/scheduler/mod.rs) — the same source
 compiled into the on-chain canonical machine and run bare-metal by the recovery
-fold, so the two targets agree *by construction*.
+fold, so those two targets agree *by construction*. This prose is the intended
+protocol contract; the reference implementation embodies it but remains code
+that can contain bugs and require hardening.
 
 ---
 
@@ -27,7 +29,8 @@ address, never by a tag byte** ([`process_input`](../../sequencer-core/src/sched
 | anything else | a **direct input** (deposit) | appended to the *fridge* (the direct-input FIFO), drained later |
 
 The payload is opaque to classification; app-specific decoding happens inside
-`Application::execute_direct_input` (see the
+the capability-gated `Application::apply_direct_input` hook, reached through
+the shared `execute_direct_input` boundary (see the
 [application contract](application-contract.md)).
 
 ---
@@ -106,10 +109,76 @@ For each frame, in order ([`process_batch_payload`](../../sequencer-core/src/sch
    guard fails — the fold is a pure deterministic function and emits no
    diagnostics at the library seam.
 
+An `AppError` from either execution path is fatal: there is no canonical
+successor to the partially evaluated input, so the canonical harness,
+inclusion lane, catch-up, and recovery fold all stop rather than continue.
+
 This ordering — directs ≤ `S_K` then ops validated on top of them — is exactly
 what the inclusion lane writes into frame K's wire content
-([I2](../invariants.md#i2-drain-attribution-drained-directs-land-in-the-new-frame)),
+([I2](../invariants.md#i2-drain-attribution-accumulated-directs-land-in-the-clock-advanced-frame)),
 which is what keeps the off-chain prediction faithful.
+
+### Sequencer frame-clock policy
+
+The scheduler constrains frame clocks to be non-decreasing and no later than
+the batch inclusion block; it does not require a frame for every L1 block.
+During an admitted live run, the sequencer advances logical frame time when the
+latest persisted safe head `H` is at least five blocks beyond the open frame
+clock `S`. It then opens exactly one frame at `H`, drains the complete
+newly-covered direct range, and uses `H` for subsequent user ops. An observation
+jump from 100 to 132 therefore creates one frame at 132, not synthetic frames at
+each missed five-block boundary. Intermediate empty frames would execute
+nothing, so their omission is scheduler-equivalent. Bootstrap and recovery are
+anchoring transitions rather than live clock ticks: they may open a fresh Tip
+at their proven checkpoint/current safe head without applying the five-block
+delta.
+
+Direct-input presence is not another rotation condition: the five-block tick
+may have an empty direct prefix, while directs observed below the threshold
+wait for the next tick and retain their own inclusion-block clock when
+executed. Batch closure is orthogonal and necessarily creates the successor
+batch's first frame at the unchanged `safe_block`; equal adjacent frame clocks
+are valid. Thus block distance is the only reason logical frame time advances,
+not the only reason a frame row exists.
+
+---
+
+## The application-history offset
+
+The feed offset is semantically
+[`Application::executed_input_count()`](application-contract.md#4-canonical-history-cursor-executed_input_count).
+It starts at zero and names the next application input to execute. An
+application at count `X` is ready for history entry `X`; successfully executing
+that entry advances the application to `X + 1`.
+
+The scheduler determines which InputBox material becomes an executed
+application input. Its count transitions are therefore:
+
+| Scheduler event | Application execution | Count effect |
+|---|---|---|
+| Direct arrives and is appended to the fridge | none yet | unchanged |
+| Covered or overdue direct is successfully executed | `execute_direct_input` returns `Ok` | exactly `+1` |
+| User op passes signature, protocol, and app validation and is successfully executed | `execute_valid_user_op` returns `Ok` | exactly `+1` |
+| User op has an unrecoverable signature or is rejected by protocol/app validation | none | unchanged |
+| Batch envelope is decoded, accepted, skipped, or rejected | none for the envelope itself; contained executions are counted by the rows above | unchanged for the envelope |
+| Empty batch | none | unchanged |
+| Either execution method returns `AppError` | fatal invariant failure | no canonical successor is defined |
+
+The censorship backstop still runs before classification, so a malformed,
+stale, or otherwise rejected batch can indirectly advance the count by causing
+overdue directs to execute first. The batch itself never contributes an entry.
+
+This coordinate must agree across the canonical fold, the inclusion lane,
+catch-up/replay, and recovery. Standard recovery may replace an invalidated
+suffix at the same application offsets; cockroach recovery resumes from the
+absolute count persisted in the recovered application state even when older
+history is no longer locally available.
+
+> **Cutover status:** the typed execution boundary, scheduler count
+> transitions, and durable per-input mapping are landed. Physical
+> `sequenced_l2_txs.offset` remains SQLite rowid and the existing WebSocket
+> still exposes that cursor; changing the public protocol to canonical offsets
+> and `HistoryVersion` remains Track 3 work.
 
 ---
 
@@ -138,6 +207,16 @@ I1 names three places this algorithm lives. They are not three rewrites; two are
   self-bug (a fault state to crash on), not an adversarial input to predict.
   This document is the cross-reference home for the omission — the asymmetry is
   intentional, not a missing check.
+- **R2 is complete relative to #2, not an independent oracle for #1.** For
+  every at/above-anchor landing that `scheduler_accepts` accepts, the frontier
+  builder exhaustively finds a byte-identical valid local closed batch
+  (`Match`), no local batch (`Foreign`), or different bytes (`Mismatch`); the
+  latter two durably freeze the frontier. Because the check shares #2 and its
+  structural omissions, it cannot prove that #1, application state, or trusted
+  collapsed history is correct. A structurally malformed foreign landing may
+  conservatively record divergence even if #1 would reject it; that false
+  positive is accepted under the sequencer self-trust model. See I9/I15 for the
+  runtime and recovery boundary.
 - **The expected-nonce fold** is homed once, next to `scheduler_accepts`, as
   [`advance_expected_batch_nonce`](../../sequencer-core/src/protocol.rs). The
   submitter's `decide_submit_start` consumes it directly. The frontier builder
@@ -161,12 +240,15 @@ the agreement — only review and the duality tests. **Change one, check all.**
 
 - [I1](../invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)
   — the three implementations agree (this document is its prose).
-- [I2](../invariants.md#i2-drain-attribution-drained-directs-land-in-the-new-frame)
+- [I2](../invariants.md#i2-drain-attribution-accumulated-directs-land-in-the-clock-advanced-frame)
   — drained directs land in the new frame, so the lane's wire content matches
   the fold's drain-before-ops order.
 - [I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)
   — frame `safe_block`s are non-decreasing, the lane-side mirror of gate d's
   monotonicity rule.
+- [I19](../invariants.md#i19-application-progress-advances-only-at-the-shared-execution-boundary)
+  — every successful application input advances one typed count/clock pair;
+  rejected inputs do not, and `AppError` is terminal.
 
 ## Test-pinned properties
 
@@ -191,3 +273,28 @@ The duality's load-bearing edge cases each have at least one test
   (`non_monotonic_safe_blocks_invalidate_batch`,
   `frame_safe_block_above_inclusion_block_invalidates_batch`,
   `wrong_batch_nonce_is_rejected_without_consuming_nonce`).
+
+---
+
+## Reference-scheduler count audit and hardening
+
+**Status: landed.** Every canonical input now crosses the same typed execution
+boundary in the scheduler, live lane, catch-up, and recovery fold:
+
+1. Successful directs and validated user ops return their pre-execution
+   `ExecutedInputCount` and advance exactly once with checked arithmetic.
+   Rejection, bad signatures, envelopes, empty batches, and stale/structural
+   skips leave it unchanged.
+2. `AppError` is fatal everywhere. Continuing after a possibly partial hook
+   failure no longer defines a parallel scheduler-only transition.
+3. Distinct opaque capabilities let application hooks mutate application state
+   without granting them authority to overwrite scheduler-owned progress. The
+   shared boundary checks progress before/after both successful and failing
+   hooks and asserts getter coherence after commit.
+4. Tests pin direct/user advancement, every skip/reject family, pre-batch
+   overdue-drain ordering, overflow, dump round-trips, nonzero recovery bases,
+   and live/replay mapping agreement.
+
+Additional scheduler changes may still be batched separately, but they must
+preserve the transition table above and the shared boundary rather than
+reintroducing a scheduler-local count.

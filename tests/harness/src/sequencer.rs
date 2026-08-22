@@ -1094,7 +1094,11 @@ impl ManagedSequencer {
             Err(_) => {
                 self.child.start_kill()?;
                 let _ = self.child.wait().await;
-                Ok(())
+                Err(io_other(format!(
+                    "sequencer did not drain within {:?}; forced kill was required",
+                    self.shutdown_timeout
+                ))
+                .into())
             }
         }
     }

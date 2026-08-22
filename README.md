@@ -8,7 +8,10 @@ A sequencer for Cartesi app-specific rollups. Provides low-latency soft confirma
 
 Rollup applications need fast transaction confirmations. Waiting for L1 finality on every user action (minutes) makes interactive applications impractical. The sequencer bridges this gap: it accepts signed user operations, immediately confirms them (soft confirmation), and asynchronously posts batches to L1. The application sees these batches posted on chain.
 
-The core guarantee: **the off-chain sequencer and the rollup's on-chain scheduler produce identical execution order.** Users get instant feedback while the system converges to L1 truth.
+The protocol objective is that, under supported honest operation, **the
+off-chain sequencer predicts the same execution order the rollup's on-chain
+scheduler later produces.** Soft confirmations are optimistic and may be
+invalidated by the recovery cases below; L1 remains canonical truth.
 
 ## Two Chains Synchronizing
 
@@ -22,7 +25,10 @@ Sequencer (off-chain)              Scheduler (on-chain)
          user_ops=[D]                 execute D
 ```
 
-When things go well, the sequencer's chain and the scheduler's view converge. When they don't — batches arrive stale on L1 — the sequencer detects the divergence and recovers.
+When things go well, the sequencer's chain and the scheduler's view converge.
+When batches are becoming stale on L1, the sequencer detects the doomed suffix
+and runs standard recovery. Terminal canonical divergence is the distinct
+content-identity case below.
 
 ## Trust Model
 
@@ -34,13 +40,28 @@ The sequencer is a **centralized, single-writer** system. It cannot steal funds 
 
 **Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it.
 
+During normal operation the sequencer advances logical frame time after five
+newly-safe blocks have accumulated. That clock tick drains every covered direct
+before later user ops and may also create an empty-direct frame to improve the
+application-visible clock. Safe-head publication is best effort: if the node
+exposes a multi-block jump, the sequencer creates one frame at the observed tip
+and never fabricates intermediate frames.
+
 Soft confirmations are an **optimistic prediction**: the sequencer also
-cross-checks every batch the scheduler accepts on L1 against the batch it
-sealed locally (a content-identity check), and refuses to operate further the
-moment they differ. Detection happens when the divergent batch reaches L1
-*safe* finality, so soft confirmations issued inside that window (~2 L1
-epochs) can be built on already-diverged state — an inherent, bounded
-property of the optimistic model.
+cross-checks every at/above-anchor batch its off-chain scheduler simulation
+accepts on L1 against the batch it sealed locally (a content-identity check).
+When a foreign or byte-different landing reaches L1 *safe* finality and the
+input reader ingests it, the same transaction records canonical divergence and
+freezes the accepted frontier. The runtime stops when it next observes that
+fact: the danger detector owns prompt process-wide reaction, while the
+inclusion lane also refuses a poisoned projection if its existing time-gated
+frontier read wins first. Every later boot refuses until an operator performs
+cockroach recovery. User-op chunks committed before runtime observation may
+still acknowledge and be rolled back. This check is a narrow
+zombie/foreign-batch backstop, not proof that arbitrary application or
+scheduler divergence cannot exist. It is not subsumed by the watchdog: the
+marker freezes finalized-snapshot promotion, so the watchdog can legitimately
+observe an unchanged finalized head and skip its state comparison.
 
 The third case is handled by the recovery subsystem. Batches that are too old when they reach L1 (`inclusion_block − safe_block ≥ MAX_WAIT_BLOCKS`) are skipped by the scheduler. This "staleness" poisons the nonce counter: all subsequent batches become unreachable regardless of their individual freshness. The sequencer detects this via a danger-zone threshold, preemptively goes offline, flushes the L1 mempool, and cascade-invalidates the doomed chain. See [`docs/recovery/`](docs/recovery/) for the full design, TLA+ formal verification, and design history.
 
@@ -51,8 +72,8 @@ The sequencer trusts its own code is bug-free. Recovery means recovery from live
 The sequencer is designed to handle:
 
 - **L1 provider outages** — workers retry with exponential backoff. The inclusion lane and API continue operating locally. A wall-clock fallback detects when an outage pushes batches into the danger zone.
-- **Process crashes** — recovery runs at startup. All recovery state is derived from SQLite (atomic transactions) and L1 safe state. No external coordination needed.
-- **Extended downtime** — on restart, the sequencer syncs to the current L1 safe head, flushes if needed, and recovers.
+- **Process crashes** — no operator action is needed: every boot derives any required recovery from SQLite and L1 safe state through the startup reducer, never assuming the previous exit was clean. A terminal death best-effort records its cause in the `terminal_faults` black box, which travels with the data directory for postmortems.
+- **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission; restart policy is the exit-code contract (a terminal exit means: do not restart, page an operator — the one manual remedy is a fresh-directory `setup --recovery` after canonical divergence).
 - **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. The recovery flusher consumes every pending nonce slot with a no-op so delayed "zombie" submissions cannot land later.
 
 ## Interfaces
@@ -93,7 +114,9 @@ cargo run -p wallet-sequencer -- run
 ```
 
 A third subcommand, **`flush-mempool`**, settles the batch-submitter wallet
-nonce on demand (keyed operator tool).
+nonce on demand (keyed operator tool). It is flush-only: it requires a
+completed setup and no canonical divergence, and it never performs
+Sync/Cascade or launches runtime workers.
 
 `setup` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS`.
 `run` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `_FILE`); it refuses to boot until `setup` has completed.
@@ -110,7 +133,7 @@ environment:
   CARTESI_SEQUENCER_ALLOW_INSECURE_RPC: "true"
 ```
 
-Process exit codes follow the R4 orchestrator contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal (operator required — e.g. setup not complete, identity mismatch, canonical divergence), `1`/`101` unclassified/panic.
+Process exit codes follow the R4 orchestrator contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), and `1` for an unclassified operational failure. Panics inside the command harness or supervised workers are projected to `30` under the fail-loud self-trust policy; `101` remains possible only before the harness can contain the command (for example, process/runtime initialization).
 
 Fixed protocol identity (EIP-712):
 

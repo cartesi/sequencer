@@ -5,9 +5,9 @@
 //! exported once from the library so every app binary inherits them.
 //!
 //! An app's `main` is ~5 lines: init tracing, then [`run_main`] with a
-//! genesis-app factory closure. The factory is only invoked by `setup` (to
-//! write the genesis finalized snapshot); `run` and `flush-mempool` never
-//! construct an app value.
+//! genesis-app factory closure. The factory is invoked only when plain `setup`
+//! reaches genesis-snapshot registration; completed setup no-ops, recovery,
+//! `run`, and `flush-mempool` never construct an app value.
 //!
 //! ```ignore
 //! #[tokio::main]
@@ -26,7 +26,7 @@
 use clap::{Parser, Subcommand};
 use sequencer_core::application::Application;
 
-use crate::runtime::config::{FlushConfig, RunConfig, SetupConfig};
+use crate::commands::config::{FlushConfig, RunConfig, SetupConfig};
 
 /// Top-level CLI. Apps parse this (via [`run_main`]) and dispatch.
 #[derive(Debug, Parser)]
@@ -64,26 +64,51 @@ pub enum Command {
 pub async fn run_main<A, F>(genesis_app: F) -> std::process::ExitCode
 where
     A: Application + Clone + Sync + 'static,
-    F: FnOnce() -> A,
+    F: FnOnce() -> A + Send + 'static,
 {
     let cli = Cli::parse();
-    dispatch(cli.command, genesis_app).await
+    project_dispatch_join(tokio::spawn(dispatch(cli.command, genesis_app)).await)
+}
+
+fn project_dispatch_join(
+    result: Result<std::process::ExitCode, tokio::task::JoinError>,
+) -> std::process::ExitCode {
+    match result {
+        Ok(code) => code,
+        Err(join) if join.is_panic() => {
+            tracing::error!(
+                error = %join,
+                exit_code = crate::commands::error::EXIT_TERMINAL,
+                "sequencer command panicked — trusted-code invariant failure"
+            );
+            std::process::ExitCode::from(crate::commands::error::EXIT_TERMINAL)
+        }
+        Err(join) => {
+            tracing::error!(
+                error = %join,
+                exit_code = crate::commands::error::EXIT_UNCLASSIFIED,
+                "sequencer command task failed"
+            );
+            std::process::ExitCode::from(crate::commands::error::EXIT_UNCLASSIFIED)
+        }
+    }
 }
 
 /// Dispatch a parsed [`Command`], projecting the result onto the R4 exit-code
-/// contract (see [`crate::runtime::error`]). Clean completion is exit 0; every
-/// `RunError` maps through `RunError::exit_code`.
+/// contract (see [`crate::commands::error`]). Clean completion is exit 0; every
+/// `CommandError` maps through `CommandError::exit_code`.
 ///
-/// `genesis_app` is called at most once — only by `setup`.
+/// `genesis_app` is called at most once — only when plain `setup` needs to
+/// register the genesis snapshot.
 pub async fn dispatch<A, F>(command: Command, genesis_app: F) -> std::process::ExitCode
 where
     A: Application + Clone + Sync + 'static,
     F: FnOnce() -> A,
 {
     let result = match command {
-        Command::Setup(config) => crate::runtime::setup::setup(*config, genesis_app()).await,
-        Command::Run(config) => crate::runtime::run::<A>(*config).await,
-        Command::FlushMempool(config) => crate::runtime::flush::flush_mempool(*config).await,
+        Command::Setup(config) => crate::commands::setup::setup(*config, genesis_app).await,
+        Command::Run(config) => crate::commands::run::run::<A>(*config).await,
+        Command::FlushMempool(config) => crate::commands::flush::flush_mempool(*config).await,
     };
 
     match result {
@@ -93,5 +118,80 @@ where
             tracing::error!(error = %err, exit_code = code, "sequencer exiting");
             std::process::ExitCode::from(code)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_setup_does_not_construct_genesis_app() {
+        use crate::commands::test_support::SweepTestApp;
+        use crate::storage::{LifecycleCommand, Storage};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let data_dir = tempfile::tempdir().expect("create data dir");
+        let data_dir = data_dir.path().to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "sequencer",
+            "setup",
+            "--data-dir",
+            data_dir.as_str(),
+            "--eth-rpc-url",
+            "http://127.0.0.1:1",
+            "--chain-id",
+            "31337",
+            "--app-address",
+            "0x1111111111111111111111111111111111111111",
+            "--batch-submitter-address",
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        ])
+        .expect("parse setup");
+        let db_path = match &cli.command {
+            Command::Setup(config) => config.db_path(),
+            other => panic!("expected setup subcommand, got {other:?}"),
+        };
+
+        let mut storage = Storage::initialize_for_command(&db_path, LifecycleCommand::Setup)
+            .expect("initialize setup");
+        storage
+            .insert_initial_finalized_dump(
+                &std::path::Path::new(&data_dir).join("finalized"),
+                0,
+                0,
+                0,
+                0,
+            )
+            .expect("register finalized snapshot");
+        storage.complete_setup().expect("complete setup");
+        drop(storage);
+
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&constructions);
+        let exit = dispatch::<SweepTestApp, _>(cli.command, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            SweepTestApp
+        })
+        .await;
+
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert_eq!(constructions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn top_level_command_panic_maps_to_terminal_exit() {
+        let result = tokio::spawn(async {
+            panic!("trusted-code invariant failure");
+            #[allow(unreachable_code)]
+            std::process::ExitCode::SUCCESS
+        })
+        .await;
+
+        assert_eq!(
+            project_dispatch_join(result),
+            std::process::ExitCode::from(crate::commands::error::EXIT_TERMINAL)
+        );
     }
 }

@@ -19,12 +19,27 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
-use crate::l1::watermark::{StorageWatermarkSink, WalletNonceWatermarkSink};
+use crate::l1::watermark::{
+    StorageWatermarkSink, WalletNonceWatermarkError, WalletNonceWatermarkSink,
+};
 
 #[derive(Debug, Error)]
 pub enum FlushError {
     #[error("provider/transport: {0}")]
     Provider(String),
+    #[error(transparent)]
+    Watermark(#[from] WalletNonceWatermarkError),
+}
+
+impl FlushError {
+    pub(crate) fn is_terminal_invariant(&self) -> bool {
+        // Exhaustive on purpose: a new variant must decide its terminality
+        // here, not silently default to restartable.
+        match self {
+            Self::Watermark(source) => source.is_persistent_invariant(),
+            Self::Provider(_) => false,
+        }
+    }
 }
 
 pub struct MempoolFlusher {
@@ -102,7 +117,7 @@ impl MempoolFlusher {
     /// differ only in where the signing key, submitter address, and watermark
     /// come from, and in the surrounding error type — so callers resolve those
     /// (provider creation keeps each site's own error mapping; the returned
-    /// [`FlushError`] maps into `RunError`/`RecoveryError` via the existing
+    /// [`FlushError`] maps into `CommandError`/`RecoveryError` via the existing
     /// `From` impls) and this owns the sink build + `flush_and_wait`.
     pub(crate) async fn flush_to_safe(
         provider: DynProvider,
@@ -172,7 +187,10 @@ impl MempoolFlusher {
             let pending_nonce = self.nonce_at(BlockNumberOrTag::Pending).await?;
             // The durable anchor: every slot we ever used must be consumed
             // at safe depth, regardless of what the local pool remembers.
-            let required_safe_nonce = watermark.map_or(0, |w| w.saturating_add(1));
+            let required_safe_nonce = watermark.map_or(0, |w| {
+                w.checked_add(1)
+                    .expect("persisted wallet nonce watermark must leave room for the next nonce")
+            });
 
             if pending_nonce <= safe_nonce && safe_nonce >= required_safe_nonce {
                 let safe_block = self.safe_block_number().await?;
@@ -186,7 +204,12 @@ impl MempoolFlusher {
             }
 
             let flush_end = pending_nonce.max(required_safe_nonce);
-            let unresolved = flush_end.saturating_sub(safe_nonce);
+            // The completion predicate failed, so either pending > safe or
+            // required_safe > safe. Therefore their maximum is strictly above
+            // safe; clamping here would hide a broken loop invariant.
+            let unresolved = flush_end
+                .checked_sub(safe_nonce)
+                .expect("incomplete flush must have at least one unresolved nonce");
 
             if attempt == 0 {
                 info!(
@@ -219,8 +242,10 @@ impl MempoolFlusher {
                 // about to send (a no-op above the current watermark can only
                 // happen if someone else used our key — over-covering then is
                 // exactly right).
-                sink.raise_to(flush_end.saturating_sub(1))
-                    .map_err(FlushError::Provider)?;
+                let highest_nonce = flush_end
+                    .checked_sub(1)
+                    .expect("a non-empty flush range must have a highest nonce");
+                sink.raise_to(highest_nonce)?;
             }
             let tx_hashes = self.submit_noops(latest_nonce, flush_end).await?;
 
@@ -363,7 +388,7 @@ mod tests {
     /// Sink for tests that don't assert on watermark raises.
     struct NoopWatermarkSink;
     impl WalletNonceWatermarkSink for NoopWatermarkSink {
-        fn raise_to(&self, _highest: u64) -> Result<(), String> {
+        fn raise_to(&self, _highest: u64) -> Result<(), WalletNonceWatermarkError> {
             Ok(())
         }
     }

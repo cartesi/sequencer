@@ -97,7 +97,9 @@ pub(super) fn query_latest_safe_input_index_exclusive(conn: &Connection) -> Resu
             row.get(0)
         })?;
     Ok(match value {
-        Some(last_index) => i64_to_u64(last_index).saturating_add(1),
+        Some(last_index) => i64_to_u64(last_index)
+            .checked_add(1)
+            .expect("next safe-input index overflow: contract-impossible"),
         None => 0,
     })
 }
@@ -156,10 +158,34 @@ pub(super) fn query_batch_policy(conn: &Connection) -> Result<BatchPolicy> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let max_exp = sequencer_core::fee::MAX_EXPONENT;
+    // The two policy outputs have deliberately asymmetric legal ranges.
+    // Operator writes may push the recommended fee above the representable
+    // exponent (cap it), or the batch-size target below zero (floor it).
+    // Their opposite directions are contract-impossible and must fail loud.
+    let recommended_fee = if log_recommended_fee > i64::from(max_exp) {
+        max_exp
+    } else {
+        u16::try_from(log_recommended_fee).unwrap_or_else(|_| {
+            panic!(
+                "batch policy derived recommended fee {log_recommended_fee} is negative: \
+                 contract-impossible"
+            )
+        })
+    };
+    let batch_size_target = if log_batch_size_target < 0 {
+        0
+    } else {
+        assert!(
+            log_batch_size_target <= i64::from(max_exp),
+            "batch policy derived batch size target {log_batch_size_target} exceeds \
+             MAX_EXPONENT {max_exp}: contract-impossible"
+        );
+        u16::try_from(log_batch_size_target)
+            .expect("batch size target checked within the u16 exponent range")
+    };
     Ok(BatchPolicy {
-        // Clamp to MAX_EXPONENT to prevent panics in fee_to_linear.
-        recommended_fee: i64_to_u16(log_recommended_fee).min(max_exp),
-        batch_size_target: i64_to_u16(log_batch_size_target).min(max_exp),
+        recommended_fee,
+        batch_size_target,
     })
 }
 

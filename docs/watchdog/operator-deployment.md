@@ -363,6 +363,34 @@ with its store or prune, and omitting `--delete` **accumulates a per-block
 history in S3** while local disk stays at one snapshot. Restore feeds a chosen
 snapshot back through the watchdog/sequencer recovery workflow.
 
+## Sequencer restart policy
+
+The sequencer's exit codes are the restart contract (R4): 10
+restart-expect-recovery, 20 restart-transient, 30 terminal — **page an
+operator, do not auto-restart**, 40 wipe + `setup --recovery`, 1
+unclassified restart-with-backoff. Operational notes:
+
+- **The exit code is the whole restart contract.** There is no database
+  gate and no acknowledgement command (removed 2026-08-19, review L2):
+  standard recovery is automatic on every boot, and a persistent terminal
+  fault re-detects fail-loud when the faulty state is next read. Configure
+  the supervisor to honor 30 (stop and page) — that configuration is what
+  bounds a crash loop.
+- **A terminal containment that cannot drain within two seconds exits via
+  `abort()` (SIGABRT, status 134), not code 30.** Treat 134 from the
+  sequencer as terminal-class; the cause is in the logs and in the
+  `terminal_faults` black box when the write got through.
+- **After an unclean death (OOM, node reboot, SIGKILL) no action is
+  needed**: the next start re-derives everything from facts. For
+  postmortems, the `terminal_faults` table records every terminal cause
+  (best-effort, append-only, traveling with the data directory —
+  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`); an unclean
+  death that never reached containment leaves only the process logs.
+- **Canonical divergence is the one manual path**: the sequencer freezes
+  the acceptance frontier, refuses all commands, and the remedy is a
+  fresh-directory `setup --recovery` (cockroach). You will typically learn
+  of it from the watchdog before the sequencer tells you.
+
 ## Troubleshooting (live deployments)
 
 | Symptom | Likely cause |
