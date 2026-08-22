@@ -16,6 +16,8 @@
 //! - `admin` — operator policy alpha tuning
 //! - `fee_oracle` — L1 fee-oracle gas-price updates
 //! - `snapshot_dumps` — pending/finalized snapshot lifecycle, lease counts
+//! - `history` — write-once era/base metadata and recovery generation
+//! - `lifecycle` — command-admission facts + the terminal-fault black box
 //!
 //! Cross-writer helpers are split by concern:
 //!
@@ -30,9 +32,11 @@ mod admin;
 mod convert;
 mod egress;
 mod fee_oracle;
+mod history;
 mod ingress;
 mod l1_inputs;
 mod l1_submission;
+mod lifecycle;
 mod mutations;
 mod open;
 mod queries;
@@ -43,14 +47,21 @@ mod snapshot_dumps;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
+pub(crate) use convert::is_persistent_storage_error;
+
 use std::time::SystemTime;
 use thiserror::Error;
 
 pub(crate) use egress::OrderedL2TxRow;
+pub use history::{DirectInputExecution, HistoryState};
+pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
 pub use open::Storage;
 pub use recovery::DangerStatus;
+pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
+pub use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
 pub use snapshot_dumps::{
-    DumpRow, FinalizedDump, LeaseGuard, LeasedDump, PendingDump, ReleaseScheduler,
+    DumpRow, FinalizedDump, LeaseGuard, LeasedDump, PendingDump, PersistentReleaseFailureReporter,
+    ReleaseScheduler,
 };
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
@@ -178,6 +189,14 @@ pub struct SafeInputFrontier {
     pub end_exclusive: u64,
 }
 
+/// Whether the inclusion lane may reconcile the persisted L1 projection.
+/// A poisoned projection never yields a usable frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeFrontierState {
+    Open(SafeInputFrontier),
+    CanonicalDivergence { nonce: u64, safe_input_index: u64 },
+}
+
 /// Snapshot of the scheduler-accepted frontier: current safe block plus the
 /// next nonce the scheduler is expected to accept. Read by the batch submitter
 /// each tick to derive the next unresolved nonce.
@@ -246,6 +265,28 @@ pub enum StorageOpenError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Migration(#[from] rusqlite_migration::Error),
+    /// No database file at the given path. Databases are only created by an
+    /// owning command (`setup` / `rebuild`); a missing file at `open` time is
+    /// a deployment mistake, never a cue to create one (D6).
+    #[error(
+        "no database at {path} — this data directory was never initialized; run `setup` (or check --data-dir)"
+    )]
+    NeverInitialized { path: String },
+}
+
+pub(crate) fn is_persistent_storage_open_error(error: &StorageOpenError) -> bool {
+    match error {
+        StorageOpenError::Sqlite(source) => is_persistent_storage_error(source),
+        StorageOpenError::Migration(rusqlite_migration::Error::RusqliteError { err, .. }) => {
+            is_persistent_storage_error(err)
+        }
+        // Invalid schema versions/definitions and failed FK checks cannot be
+        // repaired by retrying the same durable database.
+        StorageOpenError::Migration(_) => true,
+        // A missing database is a deterministic deployment mistake; retrying
+        // the same configuration re-fails identically.
+        StorageOpenError::NeverInitialized { .. } => true,
+    }
 }
 
 /// Derived batch policy read from the `batch_policy_derived` view.
@@ -258,9 +299,11 @@ pub struct BatchPolicy {
     pub batch_size_target: u16,
 }
 
-/// In-memory mirror of the latest open batch + frame. Mutated by `Storage`
-/// methods that change the open state (`append_user_ops_chunk`, `close_*`).
-/// The lane keeps one `WriteHead` and threads it through every call.
+/// Trusted, reconstructible in-memory cache of the latest durable open batch +
+/// frame. Mutated by `Storage` methods that change the open state
+/// (`append_executed_user_ops_chunk`, attributed `close_*`). The sole-writer
+/// lane loads one from SQLite and threads it through every call; failed
+/// writes/restarts discard it. Physical-only siblings are test fixtures.
 #[derive(Debug, Clone, Copy)]
 pub struct WriteHead {
     pub batch_index: u64,
@@ -277,8 +320,20 @@ pub struct WriteHead {
 
 impl WriteHead {
     pub fn increment_batch_user_op_count(&mut self, count: usize) {
-        self.batch_user_op_count = self.batch_user_op_count.saturating_add(count as u64);
-        self.open_frame_user_op_count = self.open_frame_user_op_count.saturating_add(count as u32);
+        let count_u64 =
+            u64::try_from(count).expect("user-op chunk length exceeds u64: contract-impossible");
+        let count_u32 =
+            u32::try_from(count).expect("user-op chunk length exceeds u32: contract-impossible");
+        let next_batch_count = self
+            .batch_user_op_count
+            .checked_add(count_u64)
+            .expect("batch user-op count overflow: contract-impossible");
+        let next_frame_count = self
+            .open_frame_user_op_count
+            .checked_add(count_u32)
+            .expect("frame user-op count overflow: contract-impossible");
+        self.batch_user_op_count = next_batch_count;
+        self.open_frame_user_op_count = next_frame_count;
     }
 
     pub fn open_frame_has_user_ops(&self) -> bool {
@@ -286,7 +341,10 @@ impl WriteHead {
     }
 
     pub fn advance_frame(&mut self, policy: BatchPolicy, safe_block: u64) {
-        self.frame_in_batch = self.frame_in_batch.saturating_add(1);
+        self.frame_in_batch = self
+            .frame_in_batch
+            .checked_add(1)
+            .expect("frame index overflow: contract-impossible");
         self.frame_fee = policy.recommended_fee;
         self.safe_block = safe_block;
         self.open_frame_user_op_count = 0;
@@ -314,6 +372,74 @@ impl WriteHead {
 /// Convert the log-space `batch_size_target` to a linear byte count for the inclusion lane.
 fn batch_size_target_bytes(policy: BatchPolicy) -> u64 {
     let linear = sequencer_core::fee::fee_to_linear(policy.batch_size_target);
-    // batch_size_target is always a reasonable byte count; clamp to u64.
-    linear.try_into().unwrap_or(u64::MAX)
+    linear.try_into().unwrap_or_else(|_| {
+        panic!(
+            "batch size target exponent {} does not fit u64 bytes: contract-impossible",
+            policy.batch_size_target
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use std::time::UNIX_EPOCH;
+
+    fn write_head() -> WriteHead {
+        WriteHead {
+            batch_index: 0,
+            batch_created_at: UNIX_EPOCH,
+            frame_fee: 0,
+            safe_block: 0,
+            batch_user_op_count: 0,
+            open_frame_user_op_count: 0,
+            frame_in_batch: 0,
+            max_batch_user_op_bytes: 1,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "batch user-op count overflow: contract-impossible")]
+    fn write_head_batch_count_fails_loud_on_overflow() {
+        let mut head = write_head();
+        head.batch_user_op_count = u64::MAX;
+        head.increment_batch_user_op_count(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "frame user-op count overflow: contract-impossible")]
+    fn write_head_frame_count_fails_loud_on_overflow() {
+        let mut head = write_head();
+        head.open_frame_user_op_count = u32::MAX;
+        head.increment_batch_user_op_count(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "frame index overflow: contract-impossible")]
+    fn write_head_frame_index_fails_loud_on_overflow() {
+        let mut head = write_head();
+        head.frame_in_batch = u32::MAX;
+        head.advance_frame(
+            BatchPolicy {
+                recommended_fee: 0,
+                batch_size_target: 0,
+            },
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit u64 bytes: contract-impossible")]
+    fn batch_size_target_fails_loud_when_linear_value_exceeds_u64() {
+        let exponent = 6000;
+        assert!(
+            sequencer_core::fee::fee_to_linear(exponent) > U256::from(u64::MAX),
+            "test exponent must exceed the byte-counter representation"
+        );
+        let _ = batch_size_target_bytes(BatchPolicy {
+            recommended_fee: 0,
+            batch_size_target: exponent,
+        });
+    }
 }

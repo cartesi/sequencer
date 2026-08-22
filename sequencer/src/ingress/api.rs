@@ -12,6 +12,7 @@ use alloy_sol_types::Eip712Domain;
 use axum::Router;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
@@ -19,7 +20,7 @@ use tracing::debug;
 
 use crate::http::ApiError;
 use crate::ingress::inclusion_lane::PendingUserOp;
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::runtime::shutdown::RuntimeScope;
 use sequencer_core::api::{TxRequest, TxResponse};
 use sequencer_core::user_op::SignedUserOp;
 
@@ -29,7 +30,7 @@ pub(crate) struct SubmitState {
     pub tx_sender: mpsc::Sender<PendingUserOp>,
     pub domain: Eip712Domain,
     pub max_user_op_data_bytes: usize,
-    pub shutdown: ShutdownSignal,
+    pub shutdown: RuntimeScope,
 }
 
 impl SubmitState {
@@ -37,7 +38,7 @@ impl SubmitState {
         tx_sender: mpsc::Sender<PendingUserOp>,
         domain: Eip712Domain,
         max_user_op_data_bytes: usize,
-        shutdown: ShutdownSignal,
+        shutdown: RuntimeScope,
     ) -> Self {
         Self {
             tx_sender,
@@ -66,7 +67,7 @@ pub(crate) fn router(state: Arc<SubmitState>) -> Router {
 async fn submit_tx(
     State(state): State<Arc<SubmitState>>,
     req: Result<Json<TxRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<TxResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let Json(req) = req.map_err(map_json_rejection)?;
 
     let signed = req
@@ -80,13 +81,20 @@ async fn submit_tx(
         .await
         .map_err(|_| ApiError::internal_error("inclusion lane dropped response"))?;
     commit_result.map_err(ApiError::from)?;
+    // Publication gate: the lane's acknowledgement already required the
+    // token; the success body after a post-commit containment is suppressed
+    // by the same consult (S-A).
+    if state.shutdown.authorize().is_none() {
+        return Err(ApiError::unavailable("sequencer shutting down"));
+    }
     debug!(sender = %sender, nonce, "tx committed");
 
     Ok(Json(TxResponse {
         ok: true,
         sender: sender.to_string(),
         nonce,
-    }))
+    })
+    .into_response())
 }
 
 /// Normalize JSON-extractor failures into fixed client-facing messages.
@@ -126,7 +134,7 @@ fn enqueue_verified_tx(
     match state.tx_sender.try_send(pending) {
         Ok(()) => Ok(recv),
         Err(TrySendError::Full(_)) => Err(ApiError::overloaded("queue full")),
-        Err(TrySendError::Closed(_)) => Err(ApiError::internal_error("inclusion lane unavailable")),
+        Err(TrySendError::Closed(_)) => Err(ApiError::unavailable("inclusion lane unavailable")),
     }
 }
 
@@ -147,12 +155,40 @@ mod tests {
     use crate::storage::Storage;
     use sequencer_core::user_op::UserOp;
 
+    #[test]
+    fn closed_lane_is_service_unavailable() {
+        let (tx_sender, rx) = mpsc::channel::<PendingUserOp>(1);
+        drop(rx);
+        let state = SubmitState::new(
+            tx_sender,
+            Eip712Domain::default(),
+            128,
+            RuntimeScope::default(),
+        );
+        let signed = SignedUserOp {
+            sender: Address::ZERO,
+            signature: Signature::test_signature(),
+            user_op: UserOp {
+                nonce: 0,
+                max_fee: 0,
+                data: Vec::new().into(),
+            },
+        };
+
+        let err = match enqueue_verified_tx(&state, signed) {
+            Ok(_) => panic!("closed lane must reject admission"),
+            Err(err) => err,
+        };
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), "UNAVAILABLE");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn submit_tx_rejects_when_shutdown_has_started() {
         let db = TempDir::new().expect("create temp dir");
         let db_path = db.path().join("sequencer.db");
         let _storage = Storage::open(&db_path.to_string_lossy()).expect("create db");
-        let shutdown = ShutdownSignal::default();
+        let shutdown = RuntimeScope::default();
         shutdown.request_shutdown();
 
         let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
@@ -185,6 +221,54 @@ mod tests {
         let result = submit_tx(State(state), Ok(Json(request))).await;
 
         let err = result.expect_err("submit should be rejected during shutdown");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), "UNAVAILABLE");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_fault_after_enqueue_prevents_success_response() {
+        let db = TempDir::new().expect("create temp dir");
+        let db_path = db.path().join("sequencer.db");
+        let _storage = Storage::open(&db_path.to_string_lossy()).expect("create db");
+        let shutdown = RuntimeScope::default();
+        let (tx_sender, mut rx) = mpsc::channel::<PendingUserOp>(1);
+        let state = Arc::new(SubmitState::new(
+            tx_sender,
+            Eip712Domain {
+                name: None,
+                version: None,
+                chain_id: None,
+                verifying_contract: None,
+                salt: None,
+            },
+            128,
+            shutdown.clone(),
+        ));
+        let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
+        let sender = address_from_signing_key(&signing_key);
+        let user_op = UserOp {
+            nonce: 0,
+            max_fee: 0,
+            data: Vec::new().into(),
+        };
+        let request = TxRequest {
+            message: user_op.clone(),
+            signature: sign_user_op_hex(&state.domain, &user_op, &signing_key),
+            sender: sender.to_string(),
+        };
+        let response = tokio::spawn(submit_tx(State(state), Ok(Json(request))));
+        let pending = rx.recv().await.expect("request reached the lane");
+
+        shutdown.contain_storage_invariant_failure("test fault");
+        pending
+            .respond_to
+            .send(Ok(()))
+            .expect("simulate a stale post-fault lane acknowledgement");
+
+        let err = response
+            .await
+            .expect("handler task")
+            .expect_err("terminal publication must prevent HTTP 200");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.code(), "UNAVAILABLE");
     }

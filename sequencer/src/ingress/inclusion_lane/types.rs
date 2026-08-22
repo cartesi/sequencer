@@ -6,6 +6,7 @@
 
 use std::time::SystemTime;
 
+use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::user_op::SignedUserOp;
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -17,6 +18,16 @@ pub struct PendingUserOp {
     pub signed: SignedUserOp,
     pub respond_to: oneshot::Sender<Result<(), SequencerError>>,
     pub received_at: SystemTime,
+}
+
+/// A user op whose application mutation has succeeded but whose SQLite chunk
+/// transaction has not committed yet. Keeping the receipt offset attached to
+/// the request prevents the lane from persisting an included op without its
+/// canonical application-history coordinate.
+#[derive(Debug)]
+pub(crate) struct IncludedUserOp {
+    pub pending: PendingUserOp,
+    pub executed_input_offset: ExecutedInputCount,
 }
 
 /// Per-op outcome reported back to the API caller via the response channel.

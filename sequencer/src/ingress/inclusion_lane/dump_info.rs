@@ -43,6 +43,20 @@ pub fn app_prefix(dump_dir: &Path) -> PathBuf {
     dump_dir.join(APP_STATE_SUBDIR)
 }
 
+/// Whether an I/O error proves that a DB-referenced snapshot artifact is
+/// missing or structurally corrupt. Other filesystem failures remain
+/// operational: they may clear when the device, mount, or permissions recover.
+pub(crate) fn referenced_artifact_io_is_terminal(source: &io::Error) -> bool {
+    matches!(
+        source.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::IsADirectory
+    )
+}
+
 /// Sequencer-owned checkpoint metadata for one dump.
 ///
 /// Serialized as real TOML (`#[serde(deny_unknown_fields)]` keeps the parse
@@ -269,6 +283,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_info(dir.path(), &sample()).unwrap();
         assert_eq!(read_info(dir.path()).unwrap(), sample());
+    }
+
+    #[test]
+    fn referenced_artifact_classifier_separates_corruption_from_operational_io() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::NotADirectory,
+            io::ErrorKind::IsADirectory,
+        ] {
+            assert!(
+                referenced_artifact_io_is_terminal(&io::Error::from(kind)),
+                "{kind:?} proves a referenced artifact is unusable"
+            );
+        }
+        assert!(
+            !referenced_artifact_io_is_terminal(&io::Error::other("filesystem unavailable")),
+            "unclassified filesystem failures remain operational"
+        );
     }
 
     #[test]

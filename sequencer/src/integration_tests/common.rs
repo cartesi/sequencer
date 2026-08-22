@@ -1,11 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Shared fixtures for `sequencer/tests/*.rs` integration tests.
-//!
-//! Integration tests compile as separate crates and cannot reach the
-//! `#[cfg(test)]` helpers inside `sequencer/src/`. This module keeps the same
-//! `TestDb` shape so callers work identically on both sides.
+//! Shared fixtures for crate-internal integration-style tests.
 
 use tempfile::TempDir;
 

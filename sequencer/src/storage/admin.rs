@@ -39,6 +39,75 @@ mod tests {
     use crate::storage::{Storage, test_helpers::temp_db};
 
     #[test]
+    fn negative_batch_size_target_floors_to_zero() {
+        let db = temp_db("floor-batch-target");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        // This row satisfies every schema constraint while deriving a negative
+        // target: 1403 - 2000 - 419 = -1016.
+        storage
+            .conn
+            .execute(
+                "UPDATE batch_policy SET log_alpha = 2000 WHERE singleton_id = 0",
+                [],
+            )
+            .expect("set high alpha");
+
+        let policy = storage.batch_policy().expect("read policy");
+        assert_eq!(
+            policy.batch_size_target, 0,
+            "negative batch-size target should be floored to zero"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "batch policy derived recommended fee")]
+    fn negative_recommended_fee_fails_loud() {
+        let db = temp_db("negative-recommended-fee");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        // A negative derived fee is ruled out by the column constraints. Model
+        // corruption/tampering that bypassed them and ensure the read cannot
+        // launder the impossible value into a plausible zero fee.
+        storage
+            .conn
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE batch_policy SET log_delta = -10000 WHERE singleton_id = 0;",
+            )
+            .expect("inject impossible policy row");
+
+        let _ = storage.batch_policy();
+    }
+
+    #[test]
+    #[should_panic(expected = "batch policy derived batch size target")]
+    fn oversized_batch_size_target_fails_loud() {
+        let db = temp_db("oversized-batch-target");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        // This is schema-valid: the derived target is 17984, which remains
+        // below the row's configured log_max_batch_bytes of 20000. It is still
+        // outside the core fee exponent domain and must not become u64::MAX.
+        storage
+            .conn
+            .execute(
+                "UPDATE batch_policy
+                 SET log_alpha = -17000, log_max_batch_bytes = 20000
+                 WHERE singleton_id = 0",
+                [],
+            )
+            .expect("set schema-valid oversized target");
+        let integrity: String = storage
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("check database integrity");
+        assert_eq!(integrity, "ok");
+
+        let _ = storage.batch_policy();
+    }
+
+    #[test]
     #[should_panic(expected = "num + denom overflows u64")]
     fn set_alpha_rejects_overflow() {
         let db = temp_db("alpha-overflow");

@@ -218,6 +218,6 @@ just doctor                           # toolchain sanity before CM-backed tests
 just test-watchdog                    # Lua unit tests (no live chain)
 just test-watchdog-e2e                # CM advance/inspect (optional live sequencer URL)
 just test-watchdog-compare-harness    # Full stack smoke
-cargo test -p sequencer --test snapshot_endpoints
+cargo test -p sequencer --lib integration_tests::snapshot_endpoints
 cargo test -p app-core wallet_snapshot
 ```

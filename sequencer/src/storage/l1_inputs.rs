@@ -7,11 +7,15 @@
 //! Also exposes the read-side queries the input reader and other callers need
 //! (current safe block, safe-input bounds, last safe-progress timestamp).
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
+#[cfg(test)]
+use alloy_primitives::B256;
 use rusqlite::{OptionalExtension, Result, Transaction, params};
 
 use super::Storage;
-use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
+use super::convert::{
+    external_u64_to_i64, i64_to_u64, now_unix_ms, saturating_query_bound, u64_to_i64,
+};
 use super::queries::{
     current_safe_block, current_safe_block_timestamp, last_safe_progress_ms,
     query_latest_safe_input_index_exclusive,
@@ -31,56 +35,19 @@ type FeeOracleIdentitySql = (
     Option<i64>,
 );
 
-trait SafeInputRecord {
-    fn sender(&self) -> Address;
-    fn payload(&self) -> &[u8];
-    fn block_number(&self) -> u64;
-    fn block_timestamp(&self) -> u64;
-    fn transaction_hash(&self) -> B256;
-}
-
-impl SafeInputRecord for StoredSafeInput {
-    fn sender(&self) -> Address {
-        self.sender
-    }
-
-    fn payload(&self) -> &[u8] {
-        self.payload.as_slice()
-    }
-
-    fn block_number(&self) -> u64 {
-        self.block_number
-    }
-
-    // Synthetic storage fixtures do not model L1 provenance.
-    fn block_timestamp(&self) -> u64 {
-        0
-    }
-
-    fn transaction_hash(&self) -> B256 {
-        B256::ZERO
-    }
-}
-
-impl SafeInputRecord for IngestedSafeInput {
-    fn sender(&self) -> Address {
-        self.sender
-    }
-
-    fn payload(&self) -> &[u8] {
-        self.payload.as_slice()
-    }
-
-    fn block_number(&self) -> u64 {
-        self.block_number
-    }
-
-    fn block_timestamp(&self) -> u64 {
-        self.block_timestamp
-    }
-
-    fn transaction_hash(&self) -> B256 {
-        self.transaction_hash
+/// Test-fixture conversion: a provenance-free [`StoredSafeInput`] becomes a
+/// row with explicit zero provenance. Production writes go through
+/// [`Storage::append_ingested_safe_inputs_with_timestamp`] with real
+/// provenance only — one honest row model, no trait shim (H6; the Track 6
+/// inventory recorded the old `SafeInputRecord` shim as churn-avoidance).
+#[cfg(test)]
+fn synthetic_row(input: &StoredSafeInput) -> IngestedSafeInput {
+    IngestedSafeInput {
+        sender: input.sender,
+        payload: input.payload.clone(),
+        block_number: input.block_number,
+        block_timestamp: 0,
+        transaction_hash: B256::ZERO,
     }
 }
 
@@ -125,7 +92,10 @@ impl Storage {
                 "SELECT safe_input_index, block_number FROM safe_inputs \
                  WHERE sender = ?1 AND block_number > ?2 \
                  ORDER BY safe_input_index ASC LIMIT 1",
-                params![batch_submitter.as_slice(), u64_to_i64(after_block)],
+                params![
+                    batch_submitter.as_slice(),
+                    saturating_query_bound(after_block)
+                ],
                 |row| {
                     let index: i64 = row.get(0)?;
                     let block: i64 = row.get(1)?;
@@ -157,7 +127,10 @@ impl Storage {
                            ORDER BY safe_input_index ASC";
         let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(
-            params![u64_to_i64(after_block), u64_to_i64(through_block)],
+            params![
+                saturating_query_bound(after_block),
+                saturating_query_bound(through_block)
+            ],
             |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -178,21 +151,12 @@ impl Storage {
         Ok(out)
     }
 
-    /// Atomically: insert `inputs` (assigned contiguous indexes starting from
-    /// the current MAX+1), advance `l1_safe_head.block_number` to `safe_block`,
-    /// stamp `synced_at_ms` as the wall-clock time when the safe frontier
-    /// advanced, and update `safe_accepted_batches` via `protocol` so the
-    /// scheduler-accepted frontier view stays consistent with the safe head.
-    ///
-    /// The materialized `safe_accepted_batches` view is an invariant of this
-    /// operation: after a successful `append_safe_inputs`, every safe input up
-    /// to `safe_block` has been evaluated against the scheduler's acceptance
-    /// rules and recorded in `safe_accepted_batches`. Readers (submitter,
-    /// recovery, danger checks) never need to populate separately.
-    ///
-    /// Asserts `safe_block` is monotonic and that it strictly advances when
-    /// `inputs` is non-empty.
-    pub fn append_safe_inputs(
+    /// Test seed: [`Storage::append_safe_inputs_with_timestamp`] at the
+    /// current wall clock. See
+    /// [`Storage::append_ingested_safe_inputs_with_timestamp`] for the
+    /// operation's contract.
+    #[cfg(test)]
+    pub(crate) fn append_safe_inputs(
         &mut self,
         safe_block: u64,
         inputs: &[StoredSafeInput],
@@ -210,13 +174,15 @@ impl Storage {
     }
 
     /// Same as [`Storage::append_safe_inputs`], but records the L1 timestamp
-    /// of `safe_block`. Synthetic inputs receive zero provenance; production
-    /// input-reader code uses [`Storage::append_ingested_safe_inputs_with_timestamp`].
+    /// of `safe_block`. Test seed only: synthetic inputs receive explicit zero
+    /// provenance via [`synthetic_row`]; the production write path is
+    /// [`Storage::append_ingested_safe_inputs_with_timestamp`].
     ///
     /// `frontier` gates the `safe_accepted_batches` update — see
     /// [`FrontierMode`]. Everything except `setup --recovery`'s interim syncs
     /// uses [`FrontierMode::Populate`].
-    pub fn append_safe_inputs_with_timestamp(
+    #[cfg(test)]
+    pub(crate) fn append_safe_inputs_with_timestamp(
         &mut self,
         safe_block: u64,
         safe_block_timestamp: u64,
@@ -225,42 +191,41 @@ impl Storage {
         timing: &ProtocolTiming,
         frontier: FrontierMode,
     ) -> Result<()> {
-        self.append_safe_input_records_with_timestamp(
+        let rows: Vec<IngestedSafeInput> = inputs.iter().map(synthetic_row).collect();
+        self.append_ingested_safe_inputs_with_timestamp(
             safe_block,
             safe_block_timestamp,
-            inputs,
+            rows.as_slice(),
             batch_submitter,
             timing,
             frontier,
         )
     }
 
-    /// Production input-reader path. Persists per-input L1 provenance together
-    /// with the safe-input row and safe-head advance.
+    /// Production input-reader path — the one write of the safe-input stream.
+    ///
+    /// Atomically: insert `inputs` (assigned contiguous indexes starting from
+    /// the current MAX+1) with their per-input L1 provenance, advance
+    /// `l1_safe_head.block_number` to `safe_block`, stamp `synced_at_ms` as
+    /// the wall-clock time when the safe frontier advanced, and update
+    /// `safe_accepted_batches` via `timing` so the scheduler-accepted
+    /// frontier view stays consistent with the safe head.
+    ///
+    /// The materialized `safe_accepted_batches` view is an invariant of this
+    /// operation while no divergence exists: every safe input up to
+    /// `safe_block` has been evaluated against the scheduler's acceptance
+    /// rules. A foreign/mismatched accepted landing instead commits the
+    /// `canonical_divergence` fact with this head and freezes the projection;
+    /// later head advances remain paired with that terminal fact. Readers
+    /// (submitter, recovery, danger checks) never populate separately.
+    ///
+    /// Asserts `safe_block` is monotonic and that it strictly advances when
+    /// `inputs` is non-empty.
     pub(crate) fn append_ingested_safe_inputs_with_timestamp(
         &mut self,
         safe_block: u64,
         safe_block_timestamp: u64,
         inputs: &[IngestedSafeInput],
-        batch_submitter: Address,
-        timing: &ProtocolTiming,
-        frontier: FrontierMode,
-    ) -> Result<()> {
-        self.append_safe_input_records_with_timestamp(
-            safe_block,
-            safe_block_timestamp,
-            inputs,
-            batch_submitter,
-            timing,
-            frontier,
-        )
-    }
-
-    fn append_safe_input_records_with_timestamp<T: SafeInputRecord>(
-        &mut self,
-        safe_block: u64,
-        safe_block_timestamp: u64,
-        inputs: &[T],
         batch_submitter: Address,
         timing: &ProtocolTiming,
         frontier: FrontierMode,
@@ -289,8 +254,8 @@ impl Storage {
                     block_timestamp = excluded.block_timestamp, \
                     synced_at_ms = excluded.synced_at_ms",
                 params![
-                    u64_to_i64(safe_block),
-                    u64_to_i64(safe_block_timestamp),
+                    external_u64_to_i64(safe_block, "L1 safe block")?,
+                    external_u64_to_i64(safe_block_timestamp, "L1 safe block timestamp")?,
                     now_unix_ms()
                 ],
             )?;
@@ -376,10 +341,13 @@ impl Storage {
                      fee_oracle_pool, fee_oracle_twap_window_secs) \
                  VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
-                    u64_to_i64(identity.chain_id),
+                    external_u64_to_i64(identity.chain_id, "deployment chain ID")?,
                     identity.app_address.as_slice(),
                     identity.input_box_address.as_slice(),
-                    u64_to_i64(identity.app_deployment_block),
+                    external_u64_to_i64(
+                        identity.app_deployment_block,
+                        "application deployment block"
+                    )?,
                     identity.batch_submitter_address.as_slice(),
                     mode,
                     fixed,
@@ -396,28 +364,9 @@ impl Storage {
         })
     }
 
-    /// Record that `setup` finished. This is `setup`'s LAST write — after
-    /// identity is pinned, the initial L1 sync is durable, and the genesis
-    /// finalized snapshot is registered.
-    /// Idempotent: re-running `setup` on an already-complete DB leaves the
-    /// original `completed_at_ms` untouched.
-    pub fn mark_setup_complete(&mut self) -> Result<()> {
-        self.write(|tx| {
-            // Deliberate idempotency (re-running `setup` is legitimate), not
-            // silent absorption: keep the first completion timestamp.
-            tx.execute(
-                "INSERT INTO setup_complete (singleton_id, completed_at_ms) \
-                 VALUES (0, ?1) \
-                 ON CONFLICT(singleton_id) DO NOTHING",
-                params![now_unix_ms()],
-            )?;
-            Ok(())
-        })
-    }
-
     /// Whether `setup` has completed on this DB. `run` refuses to boot when
-    /// this is `false` — the marker absent means either setup never ran or it
-    /// crashed midway, both of which require `setup` (re-)run, not `run`.
+    /// this is `false`: setup either never ran or crashed midway, both of
+    /// which require `setup` (re-)run, not `run`.
     pub fn is_setup_complete(&self) -> Result<bool> {
         let present: i64 = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM setup_complete WHERE singleton_id = 0)",
@@ -428,7 +377,9 @@ impl Storage {
     }
 }
 
-fn query_deployment_identity(conn: &rusqlite::Connection) -> Result<Option<DeploymentIdentity>> {
+pub(super) fn query_deployment_identity(
+    conn: &rusqlite::Connection,
+) -> Result<Option<DeploymentIdentity>> {
     conn.query_row(
         "SELECT chain_id, app_address, input_box_address, \
                 app_deployment_block, batch_submitter_address, fee_oracle_mode, \
@@ -463,10 +414,10 @@ fn query_deployment_identity(conn: &rusqlite::Connection) -> Result<Option<Deplo
     .optional()
 }
 
-fn insert_safe_inputs_batch<T: SafeInputRecord>(
+fn insert_safe_inputs_batch(
     tx: &Transaction<'_>,
     start_index: u64,
-    inputs: &[T],
+    inputs: &[IngestedSafeInput],
 ) -> Result<()> {
     if inputs.is_empty() {
         return Ok(());
@@ -477,13 +428,19 @@ fn insert_safe_inputs_batch<T: SafeInputRecord>(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for (offset, input) in inputs.iter().enumerate() {
+        let offset = u64::try_from(offset)
+            .expect("safe-input batch offset exceeds u64: contract-impossible");
         stmt.execute(params![
-            u64_to_i64(start_index.saturating_add(offset as u64)),
-            input.sender().as_slice(),
-            input.payload(),
-            u64_to_i64(input.block_number()),
-            u64_to_i64(input.block_timestamp()),
-            input.transaction_hash().as_slice(),
+            u64_to_i64(
+                start_index
+                    .checked_add(offset)
+                    .expect("safe-input index overflow: contract-impossible"),
+            ),
+            input.sender.as_slice(),
+            input.payload.as_slice(),
+            external_u64_to_i64(input.block_number, "safe-input L1 block")?,
+            external_u64_to_i64(input.block_timestamp, "safe-input L1 timestamp")?,
+            input.transaction_hash.as_slice(),
         ])?;
     }
     Ok(())
@@ -492,11 +449,11 @@ fn insert_safe_inputs_batch<T: SafeInputRecord>(
 #[cfg(test)]
 mod tests {
     use crate::storage::{
-        DeploymentIdentity, FeeOracleIdentity, FrontierMode, SafeInputRange, Storage,
-        StoredSafeInput,
+        DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput, SafeInputRange,
+        Storage, StoredSafeInput,
         test_helpers::{SENDER_A, SENDER_B, default_protocol_timing, temp_db},
     };
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, B256};
 
     fn identity() -> DeploymentIdentity {
         DeploymentIdentity {
@@ -611,6 +568,14 @@ mod tests {
                 .expect("scan"),
             None
         );
+        // Config accepts the full u64 range. Bounds above SQLite's INTEGER
+        // range are past every representable block and must not panic.
+        assert_eq!(
+            storage
+                .first_batch_submitter_input_after_block(SENDER_A, u64::MAX)
+                .expect("scan past SQLite range"),
+            None
+        );
     }
 
     #[test]
@@ -682,6 +647,21 @@ mod tests {
                 .len(),
             4
         );
+        assert_eq!(
+            storage
+                .safe_inputs_in_block_range(0, u64::MAX)
+                .expect("all through saturated upper bound")
+                .len(),
+            4,
+            "an upper bound above SQLite's range includes every stored row"
+        );
+        assert!(
+            storage
+                .safe_inputs_in_block_range(u64::MAX, u64::MAX)
+                .expect("empty past SQLite range")
+                .is_empty(),
+            "a lower bound above SQLite's range excludes every stored row"
+        );
     }
 
     #[test]
@@ -691,8 +671,13 @@ mod tests {
         assert_eq!(storage.batch_tree_anchor().expect("default"), 0);
         storage.set_batch_tree_anchor(1200).expect("set anchor");
         assert_eq!(storage.batch_tree_anchor().expect("read back"), 1200);
-        // Once setup is complete, the public setter aborts too (write-once).
-        storage.mark_setup_complete().expect("mark complete");
+        storage
+            .conn
+            .execute(
+                "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, 1)",
+                [],
+            )
+            .expect("seed setup completion fact");
         assert!(
             storage.set_batch_tree_anchor(1300).is_err(),
             "anchor must be frozen after setup_complete"
@@ -724,6 +709,110 @@ mod tests {
             None,
             "fresh storage should not have a safe-progress timestamp"
         );
+    }
+
+    #[test]
+    fn external_values_outside_sqlite_integer_range_are_typed_refusals() {
+        let db = temp_db("external-integer-range");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_protocol_timing();
+
+        let safe_head_err = storage
+            .append_safe_inputs_with_timestamp(
+                u64::MAX,
+                1,
+                &[],
+                SENDER_A,
+                &protocol,
+                FrontierMode::Populate,
+            )
+            .expect_err("unrepresentable provider safe block must be refused");
+        assert!(matches!(
+            safe_head_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        let safe_timestamp_err = storage
+            .append_safe_inputs_with_timestamp(
+                10,
+                u64::MAX,
+                &[],
+                SENDER_A,
+                &protocol,
+                FrontierMode::Populate,
+            )
+            .expect_err("unrepresentable provider safe timestamp must be refused");
+        assert!(matches!(
+            safe_timestamp_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+
+        let input_err = storage
+            .append_safe_inputs(
+                10,
+                &[StoredSafeInput {
+                    sender: SENDER_B,
+                    payload: vec![],
+                    block_number: u64::MAX,
+                }],
+                SENDER_A,
+                &protocol,
+            )
+            .expect_err("unrepresentable provider input block must be refused");
+        assert!(matches!(
+            input_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        let input_timestamp_err = storage
+            .append_ingested_safe_inputs_with_timestamp(
+                10,
+                1,
+                &[IngestedSafeInput {
+                    sender: SENDER_B,
+                    payload: vec![],
+                    block_number: 10,
+                    block_timestamp: u64::MAX,
+                    transaction_hash: B256::ZERO,
+                }],
+                SENDER_A,
+                &protocol,
+                FrontierMode::Populate,
+            )
+            .expect_err("unrepresentable provider input timestamp must be refused");
+        assert!(matches!(
+            input_timestamp_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        assert_eq!(
+            storage.current_safe_block().expect("read safe head"),
+            None,
+            "failed external writes must roll back atomically"
+        );
+        assert_eq!(
+            storage.safe_input_end_exclusive().expect("read input head"),
+            0
+        );
+
+        let identity_err = storage
+            .load_or_insert_deployment_identity(DeploymentIdentity {
+                chain_id: u64::MAX,
+                ..identity()
+            })
+            .expect_err("unrepresentable configured chain ID must be refused");
+        assert!(matches!(
+            identity_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        let deployment_block_err = storage
+            .load_or_insert_deployment_identity(DeploymentIdentity {
+                app_deployment_block: u64::MAX,
+                ..identity()
+            })
+            .expect_err("unrepresentable configured application deployment block must be refused");
+        assert!(matches!(
+            deployment_block_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        assert_eq!(storage.deployment_identity().expect("read identity"), None);
     }
 
     #[test]
@@ -766,48 +855,6 @@ mod tests {
                 .expect("read persisted identity"),
             Some(first)
         );
-    }
-
-    #[test]
-    fn setup_complete_marker_absent_until_marked_then_idempotent() {
-        let db = temp_db("setup-complete-marker");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-
-        assert!(
-            !storage
-                .is_setup_complete()
-                .expect("read marker on fresh DB"),
-            "fresh DB has no setup-complete marker"
-        );
-
-        storage.mark_setup_complete().expect("mark complete");
-        assert!(
-            storage.is_setup_complete().expect("read marker"),
-            "marker present after mark_setup_complete"
-        );
-
-        let first_ts: i64 = storage
-            .conn
-            .query_row(
-                "SELECT completed_at_ms FROM setup_complete WHERE singleton_id = 0",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read completed_at_ms");
-
-        // Re-running setup is legitimate and must not error or move the
-        // original timestamp.
-        storage.mark_setup_complete().expect("mark complete again");
-        let second_ts: i64 = storage
-            .conn
-            .query_row(
-                "SELECT completed_at_ms FROM setup_complete WHERE singleton_id = 0",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read completed_at_ms");
-        assert_eq!(first_ts, second_ts, "idempotent: first timestamp kept");
-        assert!(storage.is_setup_complete().expect("read marker"));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::http::{self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
 use sequencer::ingress::inclusion_lane::{PendingUserOp, SequencerError};
-use sequencer::runtime::shutdown::ShutdownSignal;
+use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::WsTxMessage;
 use sequencer_core::l2_tx::SequencedL2Tx;
@@ -21,8 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-mod common;
-use common::temp_db;
+use super::common::temp_db;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
@@ -407,7 +406,7 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
 
 struct WsServerRuntime {
     addr: std::net::SocketAddr,
-    shutdown: ShutdownSignal,
+    shutdown: RuntimeScope,
     server_task: Option<http::ApiServerTask>,
 }
 
@@ -448,7 +447,7 @@ async fn start_test_server_with_limits(
     let addr = listener.local_addr().expect("read listener addr");
 
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
-    let shutdown = ShutdownSignal::default();
+    let shutdown = RuntimeScope::default();
     let tx_feed = L2TxFeed::new(
         db_path.to_string(),
         shutdown.clone(),
@@ -558,7 +557,7 @@ fn load_ordered_l2_txs_page(db_path: &str, from_offset: u64, limit: usize) -> Ve
         .ordered_l2_txs_page_from(from_offset, limit)
         .expect("load ordered l2 tx page")
         .into_iter()
-        .map(|(_offset, tx, _frame_safe_block)| tx)
+        .map(|row| row.tx)
         .collect()
 }
 

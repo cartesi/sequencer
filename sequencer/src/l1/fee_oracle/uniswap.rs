@@ -202,7 +202,7 @@ fn classify_decoded_observe_revert(
 
 /// Bootstrap mapping: provider/RPC failures may self-heal; pool/config
 /// failures need an operator.
-pub fn bootstrap_price_source_error(error: PriceSourceError) -> (bool, String) {
+pub(super) fn bootstrap_price_source_error(error: PriceSourceError) -> (bool, String) {
     match error {
         PriceSourceError::Provider(message) => (true, message),
         other => (false, other.to_string()),

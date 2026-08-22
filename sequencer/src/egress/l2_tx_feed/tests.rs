@@ -6,9 +6,9 @@ use std::time::{Duration, SystemTime};
 use alloy_primitives::{Address, B256, Signature};
 use tokio::sync::oneshot;
 
-use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError};
+use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError, SubscriptionError};
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::temp_db;
 use crate::storage::{FrontierMode, IngestedSafeInput, SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
@@ -68,9 +68,9 @@ async fn subscribe_from_rejects_catchup_window() {
     let db = temp_db("catchup-window");
     seed_ordered_txs(db.path.as_str());
     append_direct_input(db.path.as_str());
-    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
 
-    let result = feed.subscribe_from(1, 1);
+    let result = feed.subscribe_from(1, 1).await;
 
     assert!(matches!(
         result,
@@ -86,9 +86,9 @@ async fn subscribe_from_rejects_catchup_window() {
 async fn subscribe_from_accepts_exact_catchup_window() {
     let db = temp_db("catchup-window-exact");
     seed_ordered_txs(db.path.as_str());
-    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
 
-    let subscription = feed.subscribe_from(0, 2);
+    let subscription = feed.subscribe_from(0, 2).await;
 
     assert!(
         subscription.is_ok(),
@@ -100,9 +100,9 @@ async fn subscribe_from_accepts_exact_catchup_window() {
 async fn subscription_replays_existing_rows_in_order() {
     let db = temp_db("replay-existing");
     seed_ordered_txs(db.path.as_str());
-    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
 
-    let mut subscription = feed.subscribe_from(0, u64::MAX).expect("subscribe");
+    let mut subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
 
     let first = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
         .await
@@ -145,7 +145,7 @@ async fn subscription_filters_batch_submitter_safe_inputs() {
     seed_ordered_txs_with_sender(db.path.as_str(), batch_submitter_address);
     let feed = L2TxFeed::new(
         db.path.clone(),
-        ShutdownSignal::default(),
+        RuntimeScope::default(),
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
@@ -153,7 +153,7 @@ async fn subscription_filters_batch_submitter_safe_inputs() {
         },
     );
 
-    let mut subscription = feed.subscribe_from(0, u64::MAX).expect("subscribe");
+    let mut subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
     let first = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
         .await
         .expect("wait first event")
@@ -179,10 +179,13 @@ async fn subscription_filters_batch_submitter_safe_inputs() {
 async fn shutdown_signal_closes_subscription() {
     let db = temp_db("shutdown-closes");
     seed_ordered_txs(db.path.as_str());
-    let shutdown = ShutdownSignal::default();
+    let shutdown = RuntimeScope::default();
     let feed = test_feed(db.path.as_str(), shutdown.clone());
 
-    let mut subscription = feed.subscribe_from(u64::MAX, u64::MAX).expect("subscribe");
+    let mut subscription = feed
+        .subscribe_from(u64::MAX, u64::MAX)
+        .await
+        .expect("subscribe");
 
     shutdown.request_shutdown();
 
@@ -193,6 +196,71 @@ async fn shutdown_signal_closes_subscription() {
             .is_none()
     );
     subscription.finish().await.expect("clean shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_fault_discards_already_queued_subscription_events() {
+    let db = temp_db("terminal-discards-queued-feed");
+    seed_ordered_txs(db.path.as_str());
+    let shutdown = RuntimeScope::default();
+    let feed = test_feed(db.path.as_str(), shutdown.clone());
+    let mut subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    shutdown.contain_storage_invariant_failure("test fault");
+
+    assert!(
+        subscription.recv().await.is_none(),
+        "biased shutdown must outrank a replay event queued before terminal publication"
+    );
+    subscription
+        .finish()
+        .await
+        .expect("clean terminal shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_feed_head_trips_terminal_storage_fault() {
+    let db = temp_db("corrupt-feed-head");
+    seed_ordered_txs(db.path.as_str());
+    let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
+    conn.execute("UPDATE sequenced_l2_txs SET offset = -offset", [])
+        .expect("corrupt offsets");
+    drop(conn);
+
+    let shutdown = RuntimeScope::default();
+    let feed = test_feed(db.path.as_str(), shutdown.clone());
+
+    assert!(matches!(
+        feed.subscribe_from(0, u64::MAX).await,
+        Err(SubscribeError::StorageInvariantViolation)
+    ));
+    assert!(shutdown.is_storage_invariant_contained());
+    assert!(shutdown.is_shutdown_requested());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_feed_page_trips_terminal_storage_fault() {
+    let db = temp_db("corrupt-feed-page");
+    seed_ordered_txs(db.path.as_str());
+    let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
+    conn.execute("UPDATE frames SET safe_block = 'not-an-integer'", [])
+        .expect("corrupt safe-block storage type");
+    drop(conn);
+
+    let shutdown = RuntimeScope::default();
+    let feed = test_feed(db.path.as_str(), shutdown.clone());
+    let subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
+
+    tokio::time::timeout(Duration::from_secs(1), shutdown.wait_for_shutdown())
+        .await
+        .expect("terminal fault containment requests shutdown");
+    assert!(shutdown.is_storage_invariant_contained());
+    assert!(shutdown.is_shutdown_requested());
+    assert!(matches!(
+        subscription.finish().await,
+        Err(SubscriptionError::StorageInvariantViolation)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -255,9 +323,9 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
 
     // Before invalidation: 2 valid events.
     // With max_catchup_events=1, subscribing from 0 should fail.
-    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
     assert!(
-        feed.subscribe_from(0, 1).is_err(),
+        feed.subscribe_from(0, 1).await.is_err(),
         "should reject: 2 valid events > max 1"
     );
 
@@ -268,9 +336,9 @@ async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
     drop(storage);
 
     // After invalidation: only 1 valid event, so max_catchup_events=1 should succeed.
-    let feed = test_feed(db.path.as_str(), ShutdownSignal::default());
+    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
     assert!(
-        feed.subscribe_from(0, 1).is_ok(),
+        feed.subscribe_from(0, 1).await.is_ok(),
         "should accept: only 1 valid event after invalidation, despite rowid hole"
     );
 }
@@ -323,33 +391,33 @@ async fn catchup_window_excludes_batch_submitter_direct_inputs() {
     // Without batch_submitter_address filtering: 2 events, max=1 should reject.
     let feed_no_filter = L2TxFeed::new(
         db.path.clone(),
-        ShutdownSignal::default(),
+        RuntimeScope::default(),
         L2TxFeedConfig {
             batch_submitter_address: None,
             ..L2TxFeedConfig::default()
         },
     );
     assert!(
-        feed_no_filter.subscribe_from(0, 1).is_err(),
+        feed_no_filter.subscribe_from(0, 1).await.is_err(),
         "without filter: 2 events > max 1"
     );
 
     // With batch_submitter_address filtering: only the user's event counts.
     let feed_filtered = L2TxFeed::new(
         db.path.clone(),
-        ShutdownSignal::default(),
+        RuntimeScope::default(),
         L2TxFeedConfig {
             batch_submitter_address: Some(batch_submitter),
             ..L2TxFeedConfig::default()
         },
     );
     assert!(
-        feed_filtered.subscribe_from(0, 1).is_ok(),
+        feed_filtered.subscribe_from(0, 1).await.is_ok(),
         "with filter: only 1 broadcastable event, should accept"
     );
 }
 
-fn test_feed(db_path: &str, shutdown: ShutdownSignal) -> L2TxFeed {
+fn test_feed(db_path: &str, shutdown: RuntimeScope) -> L2TxFeed {
     L2TxFeed::new(
         db_path.to_string(),
         shutdown,

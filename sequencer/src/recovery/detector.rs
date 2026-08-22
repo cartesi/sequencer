@@ -6,8 +6,8 @@
 //! A tiny background task that, every `poll_interval`, asks [`Storage::check_danger`]
 //! whether recovery or refusal is needed. If so, the task exits with
 //! [`DetectorExit::RecoveryRequired`] — the runtime turns that into a
-//! deliberate non-error process shutdown, the orchestrator respawns, and
-//! `run_preemptive_recovery` takes over on startup.
+//! deliberate non-error process shutdown, the orchestrator respawns, and the
+//! local-first startup reducer takes over.
 //!
 //! This is its own worker (not part of the batch submitter) because the two
 //! concerns are orthogonal: the submitter makes progress on L1, which involves
@@ -24,22 +24,23 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::debug;
 
-use crate::runtime::clock::unix_now_ms;
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::clock::unix_now_ms;
+use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
+use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{DangerStatus, Storage, StorageOpenError};
 use sequencer_core::protocol::ProtocolTiming;
 
 /// How the detector's loop exited.
 ///
 /// `RecoveryRequired` is a *deliberate* exit — not an error. The runtime maps
-/// it to a distinct `RunError` variant so operators can tell "time to recover
+/// it to a distinct `CommandError` variant so operators can tell "time to recover
 /// or refuse startup" apart from "something crashed".
 #[derive(Debug)]
 pub enum DetectorExit {
     /// Shutdown signal fired before any danger was detected.
     Shutdown,
-    /// A non-safe danger status was observed. Stop and let startup dispatch
-    /// the recovery/refusal path from a fresh read.
+    /// A non-safe danger status was observed. Stop and let startup re-derive
+    /// the recovery/refusal path from fresh facts.
     RecoveryRequired { status: DangerStatus },
 }
 
@@ -49,52 +50,83 @@ pub enum DangerDetectorError {
     OpenStorage(#[from] StorageOpenError),
     #[error(transparent)]
     Storage(#[from] rusqlite::Error),
+    #[error("storage task panicked while checking danger: persistent invariant failure")]
+    StorageTaskPanicked,
     #[error("danger detector join error: {0}")]
     Join(String),
+}
+
+impl DangerDetectorError {
+    /// Whether this error poisons the run rather than restarting. Named
+    /// arms, no wildcard: a new variant must classify itself here (D1/H1).
+    pub(crate) fn is_terminal_invariant(&self) -> bool {
+        match self {
+            Self::Storage(source) => crate::storage::is_persistent_storage_error(source),
+            Self::OpenStorage(source) => crate::storage::is_persistent_storage_open_error(source),
+            Self::StorageTaskPanicked => true,
+            // A non-panic inner-task join is shutdown-path cancellation.
+            Self::Join(_) => false,
+        }
+    }
 }
 
 pub struct DangerDetector {
     db_path: String,
     protocol: ProtocolTiming,
     poll_interval: Duration,
+    /// Retains data-directory exclusivity in detached blocking checks.
+    /// Required at construction (H14).
+    process_lock: ProcessLock,
 }
 
 impl DangerDetector {
-    pub fn new(
+    pub(crate) fn new(
         db_path: impl Into<String>,
         protocol: ProtocolTiming,
         poll_interval: Duration,
+        process_lock: ProcessLock,
     ) -> Self {
         Self {
             db_path: db_path.into(),
             protocol,
             poll_interval,
+            process_lock,
         }
     }
 
     /// Spawn the detector loop. The `shutdown` signal is what the loop
     /// respects; passing it at start time (instead of construction time) keeps
     /// the construction phase pure.
-    pub fn start(
+    #[cfg(test)]
+    pub(crate) fn start(
         self,
-        shutdown: ShutdownSignal,
+        shutdown: RuntimeScope,
     ) -> Result<tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>, StorageOpenError>
     {
-        let _ = Storage::open_read_only(self.db_path.as_str())?;
-        Ok(tokio::spawn(
-            async move { self.run_forever(shutdown).await },
-        ))
+        self.preflight_storage()?;
+        Ok(self.start_preflighted(shutdown))
     }
 
-    /// Top-level driver. Races the work loop against the shutdown signal.
-    ///
-    /// `biased;` polls the shutdown arm first on every wakeup so a concurrent
-    /// shutdown wins over an in-flight `run_loop` step. Without `biased`,
-    /// `select!` would pick randomly between two ready branches and could
-    /// process one more iteration before shutting down.
+    /// Validate the storage dependency without starting a task.
+    pub(crate) fn preflight_storage(&self) -> Result<(), StorageOpenError> {
+        let _ = Storage::open_read_only(self.db_path.as_str())?;
+        Ok(())
+    }
+
+    /// Spawn after [`Self::preflight_storage`] succeeded. Infallible so the
+    /// runtime can launch all workers in one non-yielding ownership step.
+    pub(crate) fn start_preflighted(
+        self,
+        shutdown: RuntimeScope,
+    ) -> tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>> {
+        tokio::spawn(async move { self.run_forever(shutdown).await })
+    }
+
+    /// Top-level driver. The biased shutdown arm returns promptly; an in-flight
+    /// blocking check retains its own process-lock clone until it stops.
     async fn run_forever(
         self,
-        shutdown: ShutdownSignal,
+        shutdown: RuntimeScope,
     ) -> Result<DetectorExit, DangerDetectorError> {
         tokio::select! {
             biased;
@@ -104,8 +136,7 @@ impl DangerDetector {
     }
 
     /// Tick → sleep → tick. Returns `RecoveryRequired` when a non-Safe danger
-    /// status fires. Shutdown is handled by the outer `run_forever` select,
-    /// so this loop has no shutdown concerns.
+    /// status fires.
     async fn run_loop(self) -> Result<DetectorExit, DangerDetectorError> {
         loop {
             match self.check_once().await? {
@@ -113,11 +144,9 @@ impl DangerDetector {
                     debug!("danger check: safe");
                 }
                 status => {
-                    // All non-Safe variants exit for recovery/refusal. The
-                    // dispatch difference (flush vs no-flush vs refuse)
-                    // only matters at the next startup — `decide_startup_action`
-                    // re-runs `check_danger` and routes based on which variant
-                    // fires this time.
+                    // All non-Safe variants exit. The reducer re-inspects on
+                    // the next startup and selects one phase, Retry, or Refuse
+                    // from the then-current facts.
                     tracing::error!(
                         ?status,
                         danger_threshold = self.protocol.danger_threshold(),
@@ -135,14 +164,23 @@ impl DangerDetector {
         let db_path = self.db_path.clone();
         let protocol = self.protocol;
         let now_ms = unix_now_ms();
-        tokio::task::spawn_blocking(move || {
+        let process_lock = self.process_lock.clone();
+        spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open_read_only(&db_path)?;
             storage
                 .check_danger(&protocol, now_ms)
                 .map_err(DangerDetectorError::from)
         })
         .await
-        .map_err(|err| DangerDetectorError::Join(err.to_string()))?
+        .map_err(map_storage_task_join)?
+    }
+}
+
+fn map_storage_task_join(err: tokio::task::JoinError) -> DangerDetectorError {
+    if err.is_panic() {
+        DangerDetectorError::StorageTaskPanicked
+    } else {
+        DangerDetectorError::Join(err.to_string())
     }
 }
 
@@ -174,9 +212,13 @@ mod tests {
             .expect("record fresh safe-head observation");
         drop(storage);
 
-        let shutdown = ShutdownSignal::default();
-        let detector =
-            DangerDetector::new(db.path.clone(), test_protocol(), Duration::from_millis(50));
+        let shutdown = RuntimeScope::default();
+        let detector = DangerDetector::new(
+            db.path.clone(),
+            test_protocol(),
+            Duration::from_millis(50),
+            ProcessLock::test(),
+        );
         let handle = detector.start(shutdown.clone()).expect("start detector");
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -221,8 +263,13 @@ mod tests {
             .expect("append");
         drop(storage);
 
-        let shutdown = ShutdownSignal::default();
-        let detector = DangerDetector::new(db.path.clone(), protocol, Duration::from_millis(50));
+        let shutdown = RuntimeScope::default();
+        let detector = DangerDetector::new(
+            db.path.clone(),
+            protocol,
+            Duration::from_millis(50),
+            ProcessLock::test(),
+        );
         let handle = detector.start(shutdown).expect("start detector");
 
         let exit = tokio::time::timeout(Duration::from_secs(2), handle)
@@ -283,7 +330,7 @@ mod tests {
         // Rewind synced_at_ms by 25 blocks' worth of wall-clock time so the
         // wall-clock arm shaves 25 off the threshold (1125 → 1100). At 1100,
         // batch 1's age = 1100 trips `>=`. Estimated batch danger fires.
-        let now_ms = crate::runtime::clock::unix_now_ms();
+        let now_ms = crate::clock::unix_now_ms();
         drop(storage);
         let rewind_conn =
             Storage::open_connection(&db.path).expect("open raw connection to rewind synced_at_ms");
@@ -295,8 +342,13 @@ mod tests {
             .expect("rewind safe-progress timestamp");
         drop(rewind_conn);
 
-        let shutdown = ShutdownSignal::default();
-        let detector = DangerDetector::new(db.path.clone(), protocol, Duration::from_millis(50));
+        let shutdown = RuntimeScope::default();
+        let detector = DangerDetector::new(
+            db.path.clone(),
+            protocol,
+            Duration::from_millis(50),
+            ProcessLock::test(),
+        );
         let handle = detector.start(shutdown).expect("start detector");
 
         let exit = tokio::time::timeout(Duration::from_secs(2), handle)

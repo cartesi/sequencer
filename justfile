@@ -61,10 +61,7 @@ test-watchdog-compare-harness: setup watchdog-lua-deps ensure-machine-image
 
 # Run sequencer tests sequentially so partition static config (init) is not shared across parallel tests.
 test-sequencer:
-    cargo test -p sequencer --lib -- --test-threads=1
-    cargo test -p sequencer --test e2e_sequencer -- --test-threads=1
-    cargo test -p sequencer --test ws_broadcaster -- --test-threads=1
-    cargo test -p sequencer --test batch_submitter_integration -- --test-threads=1
+    cargo test -p sequencer -- --test-threads=1
 
 test-rollups-e2e: setup ensure-machine-image ensure-sepolia-machine-image
     just watchdog-lua-deps

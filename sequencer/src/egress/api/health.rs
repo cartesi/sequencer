@@ -21,7 +21,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::ingress::inclusion_lane::PendingUserOp;
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::runtime::shutdown::RuntimeScope;
 
 /// Narrow health-check state. Holds only the signals the probes inspect; the
 /// `tx_sender` is a clone of the inclusion-lane channel and is closed iff the
@@ -29,7 +29,7 @@ use crate::runtime::shutdown::ShutdownSignal;
 #[derive(Clone)]
 pub(crate) struct HealthState {
     pub tx_sender: mpsc::Sender<PendingUserOp>,
-    pub shutdown: ShutdownSignal,
+    pub shutdown: RuntimeScope,
 }
 
 #[derive(Serialize)]
@@ -76,7 +76,7 @@ mod tests {
         let (tx_sender, rx) = mpsc::channel::<PendingUserOp>(1);
         let state = Arc::new(HealthState {
             tx_sender,
-            shutdown: ShutdownSignal::default(),
+            shutdown: RuntimeScope::default(),
         });
         (state, rx)
     }
@@ -96,6 +96,15 @@ mod tests {
     async fn readyz_is_unavailable_when_shutdown_requested() {
         let (state, _rx) = fresh_state();
         state.shutdown.request_shutdown();
+        assert_eq!(readyz(State(state)).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_unavailable_after_storage_invariant_failure() {
+        let (state, _rx) = fresh_state();
+        state
+            .shutdown
+            .contain_storage_invariant_failure("test fault");
         assert_eq!(readyz(State(state)).await, StatusCode::SERVICE_UNAVAILABLE);
     }
 
