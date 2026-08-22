@@ -2,11 +2,12 @@
 
 The FFI seam. An app plugs into the sequencer by implementing
 [`Application`](../../sequencer-core/src/application/mod.rs). The sequencer
-assumes the contracts below **without runtime enforcement** — it links the app,
-calls it on the hot path and during catch-up, and trusts it to be a pure
-deterministic state machine. A violation is not caught; it surfaces as
-scheduler/sequencer divergence, which under rollup semantics is
-theft-equivalent ([threat model](../threat-model/README.md), "Self-trust").
+links the app on the hot path and during catch-up, and trusts it to be a pure
+deterministic state machine. The shared execution boundary enforces the
+scheduler-owned progress transition; application-specific determinism and
+mutation semantics remain self-trusted. A violation is fatal because silent
+scheduler/sequencer divergence is theft-equivalent under rollup semantics
+([threat model](../threat-model/README.md), "Self-trust").
 
 This document **owns** the contract. [`AGENTS.md`](../../AGENTS.md) §"Application
 Trait Contract" is the map. The placeholder wallet
@@ -17,11 +18,11 @@ production app will wrap a Cartesi Machine behind the same trait.
 
 ## The execution methods
 
-| Method | Mutates? | Clock advance | Failure contract |
+| Method | Mutates? | Progress effect | Failure contract |
 |---|---|---|---|
-| `validate_user_op(sender, op, current_fee) -> Result<(), InvalidReason>` | **No** — pure, read-only | — | `Err(InvalidReason)` ⇒ op skipped, no state change |
-| `execute_valid_user_op(valid, safe_block) -> Result<AppOutputs, AppError>` | Yes | `clock = max(clock, safe_block)` | `Internal` is **fatal** (see *Replay safety*) |
-| `execute_direct_input(input) -> Result<AppOutputs, AppError>` | Yes | `clock = max(clock, input.block_number)` | `Internal` is **fatal** |
+| `validate_user_op(sender, op, current_fee) -> Result<(), InvalidReason>` | **No** — pure, read-only | unchanged | `Err(InvalidReason)` ⇒ op skipped, no state change |
+| `apply_valid_user_op(capability, valid, safe_block) -> Result<AppOutputs, AppError>` | application state only | the shared `execute_valid_user_op` commits count `+1` and `clock = max(clock, safe_block)` after `Ok` | any `AppError` is **fatal** (see *Replay safety*) |
+| `apply_direct_input(capability, input) -> Result<AppOutputs, AppError>` | application state only | the shared `execute_direct_input` commits count `+1` and `clock = max(clock, input.block_number)` after `Ok` | any `AppError` is **fatal** |
 
 `MAX_METHOD_PAYLOAD_BYTES` is the app's declared upper bound on a method
 payload's encoded size (selector + args). The sequencer treats it as a sizing
@@ -33,16 +34,26 @@ payload larger than it declares.
 
 ### One execution entry point
 
-User ops are **never** executed by calling `execute_valid_user_op` directly.
-They go through the free function
+Application hooks are never called directly. User ops go through the free
+function
 [`validate_and_execute_user_op`](../../sequencer-core/src/application/mod.rs),
 which enforces the protocol guard `max_fee ≥ current_fee` *before* app
-validation, then calls `validate_user_op`, then `execute_valid_user_op`. It is a
-free function — not an overridable trait method — precisely so no impl can skip
-the guard. Both consumers (the inclusion lane and the canonical scheduler) call
-it; that shared call path is half of the
+validation, then calls the shared `execute_valid_user_op`; directs go through
+the shared `execute_direct_input`. Those two functions stage and commit
+`ApplicationProgress` around the app's `apply_*` hook. The raw hooks require a
+borrowed opaque apply capability, and mutable progress access requires a
+separate borrowed opaque commit capability; only the shared boundary can
+construct either one. A caller therefore cannot invoke a raw hook or mutate
+count/clock directly. The inclusion lane, catch-up, recovery fold, and
+canonical scheduler all use these paths; that shared boundary is half of the
 [duality](scheduler-semantics.md#the-three-implementations-and-why-they-agree)
 agreement.
+
+The boundary checks that progress remains unchanged after validation and after
+an application hook, on both `Ok` and `Err`. After a successful hook it commits
+the precomputed successor and re-reads the immutable getter to assert that the
+application's getter/mutator pair is coherent. Count exhaustion is checked
+before the hook runs.
 
 Consequently `validate_user_op` must **not** re-implement the `max_fee` guard as
 its contract (the free function already owns it); it checks only app-level
@@ -62,7 +73,7 @@ Execution must be a pure function of `(input, current state)`:
   point, threads, or any other nondeterminism in a consensus path.
 - `validate_user_op` is **pure and read-only** — no mutation, no time
   dependence, no randomness. State changes flow *exclusively* through the two
-  execute methods. Mutating from `validate_user_op` breaks replay (validation
+  `apply_*` hooks. Mutating from `validate_user_op` breaks replay (validation
   runs on a different schedule than execution).
 - The same bytes against the same state must always produce the same outcome and
   the same `AppOutputs`. This is what lets the off-chain mirror predict the
@@ -75,23 +86,39 @@ The sequencer persists every executed input and, on restart, replays them in
 order against a fresh instance to rebuild state (catch-up). Therefore:
 
 - **Any input that executed successfully live must execute successfully on
-  replay.** Catch-up treats `AppError::Internal` as **fatal** — it aborts
-  startup and the sequencer cannot resume. Never return `Internal` for a byte
-  sequence that previously succeeded.
+  replay.** Catch-up treats every `AppError` as **fatal** — `Internal` and
+  `Io` alike (every caller propagates both identically) — it aborts startup
+  and the sequencer cannot resume. Never return an error for a byte sequence
+  that previously succeeded.
 - Prefer `ExecutionOutcome::Invalid` for malformed or ill-typed input caught at
   the app level — `Invalid` is replay-safe (it deterministically skips, live and
   on replay). Reserve `AppError::Internal` for genuine invariant violations
   ("validated user op cannot pay fee") — real bugs, deliberately fatal, not
   adversarial inputs.
+- `AppError` defines no canonical successor. Application-specific mutation is
+  not rolled back when a hook fails; every production caller terminates that
+  execution path and discards the instance rather than continuing from it.
 
 ### 3. The safe-block clock — `last_executed_safe_block`
 
-`last_executed_safe_block() -> u64` returns the **maximum block carried by any
-input this instance has executed** (frame `safe_block` for user ops, L1
+`last_executed_safe_block() -> u64` reads the safe-block field of the embedded
+`ApplicationProgress`: the **maximum block carried by any input this instance
+has executed** (frame `safe_block` for user ops, L1
 `inclusion_block` for directs), or 0 if nothing has executed.
 
-- It is **carried in execution, not a setter** — every execute method advances
-  it via `max`, so an app cannot execute an input and forget to move the clock.
+The live sequencer advances its frame clock on a best-effort safe-block policy:
+once the observed safe head is at least five blocks beyond the open frame, it
+opens exactly one frame at the observed tip. A delayed or epoch-sized head jump
+is not interpolated. All user ops in that frame execute sequentially with the
+same logical block value; newly covered directs execute first but retain their
+own exact L1 inclusion blocks. A clock-only empty frame does not call the
+application or autonomously advance this method—it supplies a newer clock to a
+later executed user op.
+
+- It is **scheduler-owned, not a setter** — the shared execution boundary
+  advances it via `max` only after the application hook returns `Ok`.
+- Count zero implies clock zero: no input has executed from which a non-zero
+  clock could have been derived.
 - It **must survive `create_dump`/`from_dump` round-trips** (it is part of the
   logical state a dump captures).
 - Recovery reads it as `A`, the safe block a checkpoint state reflects, and the
@@ -99,10 +126,57 @@ input this instance has executed** (frame `safe_block` for user ops, L1
   ([cockroach recovery](../recovery/cockroach.md)). A wrong clock mis-defines
   that range.
 
-`executed_input_count() -> u64` is a diagnostic seam — replay/catch-up and the
-snapshot byte-comparison compare a live instance against a replayed one with it.
+### 4. Canonical history cursor: `executed_input_count`
 
-### 4. Dump lifecycle round-trip
+`executed_input_count() -> ExecutedInputCount` is the authoritative boundary
+coordinate of application execution, not a diagnostic counter. It starts at
+zero. Each successful shared `execute_valid_user_op` or `execute_direct_input`
+call advances it by **exactly one**; validation failures, rejected user ops,
+inputs merely queued for later execution, and any other unexecuted input leave
+it unchanged. An `AppError` is fatal and does not define a canonical successor
+state. The boundary checks the `u64` successor before calling the application,
+so exhaustion fails before application mutation; wrapping and saturating
+arithmetic are unavailable on the newtype.
+
+The count names the next history entry the application is ready to execute. If
+an application is at count `X`, history input `X` is the input that must move it
+to count `X + 1`. A subscriber holding that application state therefore resumes
+from offset `X`; it must not translate between an application count and a
+separate feed position.
+
+The count is logical application state and **must survive
+`create_dump`/`from_dump` round-trips**. Replay and both recovery procedures
+must reconstruct the value implied by the resulting application state: a
+standard recovery may roll it back to the retained prefix and advance it over
+replacement canonical inputs, while a cockroach-recovered dump supplies the
+absolute count from which the newly available history continues.
+
+> **Cutover status:** the typed `ApplicationProgress` execution boundary,
+> scheduler transition audit, placeholder application's durable count,
+> per-input SQLite attribution, and snapshot/catch-up agreement checks are
+> landed. The current feed still exposes a SQLite-rowid `from_offset`; the
+> history-version and canonical-offset HTTP/WS projection remain Track 3 work.
+> Until that API cutover, clients must follow the README.
+
+### 5. Operational capacity for L1 reconciliation
+
+A supported production application must promptly execute the complete
+accumulated input range the persisted frontier can expose in one L1
+reconciliation turn, including catch-up/backlog within the supported operating
+envelope. Once the lane enters that turn, it processes the whole range before
+returning to user-op work. The sequencer deliberately provides no elapsed-time
+cutoff, preemption, or durable timeout-and-resume cursor for application
+execution. Scratch paging may bound memory or read-query size; the
+drain/promotion commit remains atomic and the logical turn is not resumable.
+
+This is an explicit deployment assumption, not a deterministic state-transition
+rule. A request that overlaps reconciliation may see additional acknowledgement
+latency. Revisit the scheduling design only if application cost, L1
+capacity/finality/catch-up behavior, or measurements show that the complete
+newly-safe range is not promptly digestible. Do not add a second scheduler
+speculatively.
+
+### 6. Dump lifecycle round-trip
 
 The snapshot lifecycle ([snapshots](../snapshots/lifecycle.md)) drives four
 dump methods. `Self`-typed methods load/construct; the associated functions are
@@ -141,9 +215,10 @@ lives on the concrete type, called by the runtime at bootstrap.
 | Purity / determinism | the [duality](scheduler-semantics.md) (off-chain prediction = canonical fold); recovery `fold_replay` |
 | Replay safety (`Internal` fatal) | catch-up on every restart |
 | Safe-block clock survives dumps | cockroach recovery's `A`; snapshot offset accounting |
+| Executed-input count survives dumps | canonical history offsets; replay; standard and cockroach recovery; planned Track 3 subscription continuity |
 | `create_dump` in-method fsync | crash-safety of the dump/row ordering ([I13](../invariants.md)) |
 | `state_file_in_dump` = canonical bytes | the watchdog / indexers reading finalized state |
-| One execution entry point | the `max_fee` protocol guard's non-bypassability |
+| One execution entry point | non-bypassable `max_fee` and count/clock transitions |
 
 ## Rejection semantics every app implements
 
@@ -157,5 +232,5 @@ mutation and are not persisted**:
   it tracks DA, not compute.
 
 Deposits are **direct-input-only** (L1 → L2) and must never be represented as
-user ops; that is why `execute_direct_input` is required (no default) — a no-op
-default would silently strand every deposit.
+user ops; that is why the `apply_direct_input` hook is required (no default) —
+a no-op default would silently strand every deposit.

@@ -11,13 +11,23 @@ mod tests;
 pub use error::{SubscribeError, SubscriptionError};
 pub use sequencer_core::broadcast::BroadcastTxMessage;
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use alloy_primitives::Address;
 use tokio::sync::mpsc;
 
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{OrderedL2TxRow, Storage};
+
+/// Best-effort extraction of a panic payload's message for fault causes.
+fn panic_message(payload: &dyn std::any::Any) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct L2TxFeedConfig {
@@ -32,13 +42,15 @@ pub struct L2TxFeed {
     page_size: usize,
     idle_poll_interval: Duration,
     batch_submitter_address: Option<Address>,
-    shutdown: ShutdownSignal,
+    shutdown: RuntimeScope,
 }
 
 pub struct Subscription {
     receiver: mpsc::Receiver<BroadcastTxMessage>,
     task: Option<SubscriptionTask>,
-    shutdown: ShutdownSignal,
+    /// Pure notification half: the subscription only waits for stop. The
+    /// streaming task holds the scope (and with it the lock) itself.
+    shutdown: crate::runtime::shutdown::ShutdownSignal,
 }
 
 type SubscriptionTask = tokio::task::JoinHandle<Result<(), SubscriptionError>>;
@@ -58,7 +70,7 @@ impl Default for L2TxFeedConfig {
 }
 
 impl L2TxFeed {
-    pub fn new(db_path: String, shutdown: ShutdownSignal, config: L2TxFeedConfig) -> Self {
+    pub fn new(db_path: String, shutdown: RuntimeScope, config: L2TxFeedConfig) -> Self {
         Self {
             db_path,
             page_size: config.page_size.max(1),
@@ -68,17 +80,63 @@ impl L2TxFeed {
         }
     }
 
-    pub fn subscribe_from(
+    pub async fn subscribe_from(
         &self,
         from_offset: u64,
         max_catchup_events: u64,
     ) -> Result<Subscription, SubscribeError> {
-        let (head_offset, catchup_events) = load_catchup_info(
-            self.db_path.as_str(),
-            from_offset,
-            max_catchup_events,
-            self.batch_submitter_address,
-        )?;
+        // Blocking SQLite (an open plus a COUNT over up to
+        // `max_catchup_events` rows) runs on the blocking pool, making this
+        // signature's `async` honest; the join classifies a decoder panic, so
+        // the prepare phase needs no inline `catch_unwind` (H7). The
+        // streaming task below keeps its `catch_unwind` deliberately: its
+        // only join point is `Subscription::finish`, and containment must
+        // fire at the fault, not when the socket unwinds.
+        let prepare = {
+            let db_path = self.db_path.clone();
+            let batch_submitter_address = self.batch_submitter_address;
+            tokio::task::spawn_blocking(move || {
+                load_catchup_info(
+                    db_path.as_str(),
+                    from_offset,
+                    max_catchup_events,
+                    batch_submitter_address,
+                )
+            })
+            .await
+        };
+        let (head_offset, catchup_events) = match prepare {
+            Ok(Ok(info)) => info,
+            Ok(Err(error)) if error.is_persistent_storage_invariant() => {
+                tracing::error!(
+                    error = %error,
+                    "persistent storage invariant violation while preparing tx-feed subscription"
+                );
+                self.shutdown.contain_storage_invariant_failure(format!(
+                    "preparing tx-feed subscription: {error}"
+                ));
+                return Err(SubscribeError::StorageInvariantViolation);
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(join) if join.is_panic() => {
+                let payload = join.into_panic();
+                let message = panic_message(&*payload);
+                tracing::error!(
+                    panic = message,
+                    "storage invariant violation while preparing tx-feed subscription"
+                );
+                self.shutdown.contain_storage_invariant_failure(format!(
+                    "panic preparing tx-feed subscription: {message}"
+                ));
+                return Err(SubscribeError::StorageInvariantViolation);
+            }
+            // Not a panic: the runtime is tearing down and cancelled the
+            // blocking task before it started. Nothing to contain.
+            Err(join) => {
+                tracing::warn!(error = %join, "tx-feed prepare task did not run");
+                return Err(SubscribeError::StorageInvariantViolation);
+            }
+        };
         if catchup_events > max_catchup_events {
             return Err(SubscribeError::CatchUpWindowExceeded {
                 requested_offset: from_offset,
@@ -94,28 +152,58 @@ impl L2TxFeed {
         let batch_submitter_address = self.batch_submitter_address;
         let shutdown = self.shutdown.clone();
         let task = tokio::task::spawn_blocking(move || {
-            run_subscription(
-                db_path.as_str(),
-                page_size,
-                idle_poll_interval,
-                batch_submitter_address,
-                from_offset,
-                shutdown,
-                events_tx,
-            )
+            match catch_unwind(AssertUnwindSafe(|| {
+                run_subscription(
+                    db_path.as_str(),
+                    page_size,
+                    idle_poll_interval,
+                    batch_submitter_address,
+                    from_offset,
+                    shutdown.clone(),
+                    events_tx,
+                )
+            })) {
+                Ok(Err(error)) if error.is_persistent_storage_invariant() => {
+                    tracing::error!(
+                        error = %error,
+                        "persistent storage invariant violation while reading tx-feed subscription"
+                    );
+                    shutdown.contain_storage_invariant_failure(format!(
+                        "reading tx-feed subscription: {error}"
+                    ));
+                    Err(SubscriptionError::StorageInvariantViolation)
+                }
+                Ok(result) => result,
+                Err(payload) => {
+                    let message = panic_message(&*payload);
+                    tracing::error!(
+                        panic = message,
+                        "storage invariant violation while reading tx-feed subscription"
+                    );
+                    shutdown.contain_storage_invariant_failure(format!(
+                        "panic reading tx-feed subscription: {message}"
+                    ));
+                    Err(SubscriptionError::StorageInvariantViolation)
+                }
+            }
         });
 
         Ok(Subscription {
             receiver: events_rx,
             task: Some(task),
-            shutdown: self.shutdown.clone(),
+            shutdown: self.shutdown.signal(),
         })
+    }
+
+    pub(crate) fn runtime_scope(&self) -> RuntimeScope {
+        self.shutdown.clone()
     }
 }
 
 impl Subscription {
     pub async fn recv(&mut self) -> Option<BroadcastTxMessage> {
         tokio::select! {
+            biased;
             _ = self.shutdown.wait_for_shutdown() => None,
             maybe_event = self.receiver.recv() => maybe_event,
         }
@@ -168,7 +256,7 @@ fn run_subscription(
     idle_poll_interval: Duration,
     batch_submitter_address: Option<Address>,
     from_offset: u64,
-    shutdown: ShutdownSignal,
+    shutdown: RuntimeScope,
     events_tx: mpsc::Sender<BroadcastTxMessage>,
 ) -> Result<(), SubscriptionError> {
     let mut storage = Storage::open_read_only(db_path)
@@ -205,6 +293,7 @@ fn run_subscription(
                     nonce,
                     safe_block,
                     batch_nonce,
+                    ..
                 } => BroadcastTxMessage::from_user_op(offset, tx, nonce, safe_block, batch_nonce),
                 OrderedL2TxRow::DirectInput {
                     offset,

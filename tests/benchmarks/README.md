@@ -74,6 +74,7 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
 ## Notes
 
 - Self-contained variants launch `anvil --load-state` from the preloaded rollups dump under `tests/.deps/`; run `just setup` first.
+- Self-contained sweeps run the load clients and sequencer on the same machine. At high concurrency the clients can starve the sequencer, producing a throughput plateau and rising latency without offering more usable server load. Treat this as host-level regression evidence, not the sequencer's capacity ceiling; use a separate-machine load generator for capacity measurement.
 - Self-contained variants also deploy a local `Application` through `ApplicationFactory`, so they require a canonical machine image at `examples/canonical-app/out/canonical-machine-image`; run `just canonical-build-machine-image` first.
 - Self-contained variants therefore require Foundry's `anvil` binary to be installed locally.
 - `--max-fee` must be at or above the placeholder app's base fee, or every tx is rejected (`422 EXECUTION_REJECTED`) and the run reports no accepted txs. The error message includes the rejection breakdown and the first rejection body, which names the base fee.

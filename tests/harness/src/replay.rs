@@ -4,7 +4,7 @@
 use alloy_primitives::{Address, U256};
 use app_core::application::{WalletApp, WalletConfig};
 use sequencer_core::api::WsTxMessage;
-use sequencer_core::application::Application;
+use sequencer_core::application::{Application, execute_direct_input, execute_valid_user_op};
 use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
 
 use crate::HarnessResult;
@@ -43,7 +43,7 @@ impl ReplayWalletApp {
     }
 
     pub fn executed_input_count(&self) -> u64 {
-        self.app.executed_input_count()
+        self.app.executed_input_count().get()
     }
 
     pub fn last_executed_safe_block(&self) -> u64 {
@@ -62,11 +62,14 @@ pub(crate) fn apply_ws_message<A: Application>(
             payload,
             ..
         } => {
-            app.execute_direct_input(&DirectInput {
-                sender: decode_address(sender.as_str()),
-                block_number,
-                payload: decode_hex_prefixed(payload.as_str()),
-            })?;
+            execute_direct_input(
+                app,
+                &DirectInput {
+                    sender: decode_address(sender.as_str()),
+                    block_number,
+                    payload: decode_hex_prefixed(payload.as_str()),
+                },
+            )?;
         }
         WsTxMessage::UserOp {
             sender,
@@ -75,7 +78,8 @@ pub(crate) fn apply_ws_message<A: Application>(
             safe_block,
             ..
         } => {
-            app.execute_valid_user_op(
+            execute_valid_user_op(
+                app,
                 &ValidUserOp {
                     sender: decode_address(sender.as_str()),
                     fee,

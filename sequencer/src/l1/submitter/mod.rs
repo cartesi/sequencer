@@ -15,8 +15,9 @@ mod poster;
 mod worker;
 
 pub use config::BatchSubmitterConfig;
+pub(crate) use poster::BatchPoster;
 pub use poster::{
-    BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster, SubmitBatchesOutcome,
-    TxHash,
+    BatchPosterConfig, BatchPosterError, EthereumBatchPoster, SubmitBatchesOutcome, TxHash,
 };
-pub use worker::{BatchSubmitter, BatchSubmitterError, SubmitterExit};
+pub(crate) use worker::BatchSubmitter;
+pub use worker::{BatchSubmitterError, SubmitterExit};

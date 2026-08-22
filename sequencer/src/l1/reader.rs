@@ -22,7 +22,8 @@ use tracing::{debug, info};
 use crate::l1::partition::{
     GetLogsError, decode_evm_advance_input, get_input_added_events_ordered,
 };
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
+use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{FrontierMode, IngestedSafeInput, Storage, StorageOpenError};
 use sequencer_core::protocol::ProtocolTiming;
 
@@ -42,9 +43,9 @@ pub struct InputReaderConfig {
     /// verifies the provider actually serves this chain on its first successful
     /// contact — the RPC URL is an operator CLI/env arg that may be repointed
     /// across restarts (token rotation, provider swap), so `run` cannot assume
-    /// it still matches the pinned identity. This backstops the boot-time check
-    /// ([`crate::runtime::validate_rpc_chain_id`]), which is skipped when L1 is
-    /// unreachable at boot.
+    /// it still matches the pinned identity. The check lives on the reader so
+    /// both startup recovery and the long-lived worker verify identity before
+    /// ingesting from the first successful provider contact.
     pub expected_chain_id: u64,
 }
 
@@ -75,8 +76,33 @@ pub enum InputReaderError {
     OpenStorage(#[from] StorageOpenError),
     #[error(transparent)]
     Storage(#[from] rusqlite::Error),
+    #[error("storage task panicked while {operation}: persistent invariant failure")]
+    StorageTaskPanicked { operation: &'static str },
     #[error("input reader join error: {0}")]
     Join(String),
+}
+
+impl InputReaderError {
+    /// Whether this error poisons the run rather than restarting. Named
+    /// arms, no wildcard: a new variant must classify itself here (D1/H1).
+    pub(crate) fn is_terminal_invariant(&self) -> bool {
+        match self {
+            Self::Storage(source) => crate::storage::is_persistent_storage_error(source),
+            Self::OpenStorage(source) => crate::storage::is_persistent_storage_open_error(source),
+            // A wrong-chain RPC caught after boot is a persistent operator
+            // misconfiguration; an inner storage-task panic preserves its
+            // provenance.
+            Self::ChainIdMismatch { .. } | Self::StorageTaskPanicked { .. } => true,
+            // Transport/L1-consistency errors self-heal on a healthy
+            // endpoint; `Bootstrap` is a preflight-phase fact (a live-worker
+            // appearance restarts unclassified rather than poisoning); a
+            // non-panic inner-task join is shutdown-path cancellation.
+            Self::Provider(_)
+            | Self::InconsistentL1Response(_)
+            | Self::Bootstrap(_)
+            | Self::Join(_) => false,
+        }
+    }
 }
 
 impl InputReaderError {
@@ -90,6 +116,7 @@ impl InputReaderError {
             | Self::Bootstrap(_)
             | Self::OpenStorage(_)
             | Self::Storage(_)
+            | Self::StorageTaskPanicked { .. }
             | Self::Join(_) => false,
         }
     }
@@ -121,14 +148,19 @@ pub struct InputReader {
     /// Until then every `advance_once` re-attempts the check, so an unreachable
     /// L1 keeps retrying and the verification fires the moment L1 returns.
     chain_id_verified: bool,
+    /// Retains exclusive data-directory ownership inside nested blocking DB
+    /// jobs if the async command/worker awaiting them is cancelled. Required
+    /// at construction: a reader without ownership is unrepresentable (H14).
+    process_lock: ProcessLock,
 }
 
 impl InputReader {
-    pub async fn new(
+    pub(crate) async fn new(
         db_path: impl Into<String>,
         config: InputReaderConfig,
         batch_submitter: Address,
         timing: ProtocolTiming,
+        process_lock: ProcessLock,
     ) -> Result<Self, InputReaderError> {
         let provider =
             crate::l1::provider::create_provider(&config.rpc_url, config.allow_insecure_rpc)
@@ -169,16 +201,18 @@ impl InputReader {
             db_path.into(),
             batch_submitter,
             timing,
+            process_lock,
         ))
     }
 
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         config: InputReaderConfig,
         input_box_address: Address,
         app_deployment_block: u64,
         db_path: String,
         batch_submitter: Address,
         timing: ProtocolTiming,
+        process_lock: ProcessLock,
     ) -> Self {
         Self {
             config,
@@ -189,6 +223,7 @@ impl InputReader {
             timing,
             frontier_mode: FrontierMode::Populate,
             chain_id_verified: false,
+            process_lock,
         }
     }
 
@@ -212,17 +247,32 @@ impl InputReader {
     /// passing it at start time (instead of construction time) keeps the
     /// construction phase pure and ensures the same instance can't accidentally
     /// be started under two different shutdown signals.
-    pub fn start(
+    #[cfg(test)]
+    pub(crate) fn start(
         self,
-        shutdown: ShutdownSignal,
+        shutdown: RuntimeScope,
     ) -> Result<JoinHandle<Result<(), InputReaderError>>, StorageOpenError> {
-        let _ = Storage::open(self.db_path.as_str())?;
-        Ok(tokio::spawn(
-            async move { self.run_forever(shutdown).await },
-        ))
+        self.preflight_storage()?;
+        Ok(self.start_preflighted(shutdown))
     }
 
-    pub async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
+    /// Validate the storage dependency without starting a task. Runtime
+    /// startup calls this for every worker before launching any of them.
+    pub(crate) fn preflight_storage(&self) -> Result<(), StorageOpenError> {
+        let _ = Storage::open(self.db_path.as_str())?;
+        Ok(())
+    }
+
+    /// Spawn after [`Self::preflight_storage`] succeeded. Infallible so the
+    /// runtime can launch all workers in one non-yielding ownership step.
+    pub(crate) fn start_preflighted(
+        self,
+        shutdown: RuntimeScope,
+    ) -> JoinHandle<Result<(), InputReaderError>> {
+        tokio::spawn(async move { self.run_forever(shutdown).await })
+    }
+
+    pub(crate) async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
         let provider = crate::l1::provider::create_provider(
             &self.config.rpc_url,
             self.config.allow_insecure_rpc,
@@ -232,12 +282,9 @@ impl InputReader {
     }
 
     /// Top-level driver. Races the work loop against the shutdown signal.
-    ///
-    /// `biased;` polls the shutdown arm first on every wakeup so a concurrent
-    /// shutdown wins over an in-flight `run_loop` step. Without `biased`,
-    /// `select!` would pick randomly between two ready branches and could
-    /// process one more iteration before shutting down.
-    async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), InputReaderError> {
+    /// Nested blocking DB jobs retain their own process-lock clone, so prompt
+    /// cancellation cannot release data-directory exclusivity under them.
+    async fn run_forever(self, shutdown: RuntimeScope) -> Result<(), InputReaderError> {
         tokio::select! {
             biased;
             _ = shutdown.wait_for_shutdown() => Ok(()),
@@ -246,8 +293,7 @@ impl InputReader {
     }
 
     /// Tick → sleep → tick. Provider errors are logged and retried; other
-    /// errors propagate. Shutdown is handled by the outer `run_forever`
-    /// select, so this loop has no shutdown concerns.
+    /// errors propagate. Shutdown is handled by the outer biased select.
     async fn run_loop(mut self) -> Result<(), InputReaderError> {
         let provider = crate::l1::provider::create_provider(
             &self.config.rpc_url,
@@ -381,7 +427,14 @@ impl InputReader {
         // deposit `≤` the safe head would be persisted as complete and only
         // caught on the *next* input, after the lane may have stamped frames
         // past it (divergence).
-        let received_total = expected_start.saturating_add(batch.len() as u64);
+        let received_count = u64::try_from(batch.len()).map_err(|_| {
+            InputReaderError::Provider("InputAdded result count exceeds u64".to_string())
+        })?;
+        let received_total = expected_start.checked_add(received_count).ok_or_else(|| {
+            InputReaderError::Provider(
+                "InputAdded result count overflows the safe-input index space".to_string(),
+            )
+        })?;
         check_input_count_complete(current_safe_block, received_total, onchain_count)?;
 
         info!(
@@ -397,10 +450,10 @@ impl InputReader {
     /// on the first successful contact. A transport failure is retryable
     /// (`Provider`) and leaves the flag unset, so the check re-fires on the next
     /// tick until L1 is reachable; a value mismatch is fatal (`ChainIdMismatch`)
-    /// and propagates out of the run loop / aborts a recovery sync. This is the
-    /// backstop for `run`'s boot-time check, which is skipped when L1 is
-    /// unreachable at boot — without it, an RPC reconnecting on the wrong chain
-    /// would ingest address-filtered foreign logs unnoticed.
+    /// and propagates out of the run loop / aborts a recovery sync. Keeping the
+    /// check on the reader itself also covers a warm boot whose initial refresh
+    /// tolerated an unreachable provider: a later reconnect to the wrong chain
+    /// cannot ingest address-filtered foreign logs unnoticed.
     async fn verify_chain_id(&mut self, provider: &impl Provider) -> Result<(), InputReaderError> {
         if self.chain_id_verified {
             return Ok(());
@@ -423,12 +476,13 @@ impl InputReader {
     #[cfg(test)]
     async fn current_safe_block(&self) -> Result<Option<u64>, InputReaderError> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
+        let process_lock = self.process_lock.clone();
+        spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open(&db_path)?;
             storage.current_safe_block().map_err(InputReaderError::from)
         })
         .await
-        .map_err(|err| InputReaderError::Join(err.to_string()))?
+        .map_err(|err| map_storage_task_join(err, "loading the current safe block"))?
     }
 
     /// Both scan-cursor reads in one connection: the persisted safe head
@@ -439,7 +493,8 @@ impl InputReader {
     /// `&mut self` on a single-task loop.
     async fn scan_cursor(&self) -> Result<(Option<u64>, u64), InputReaderError> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
+        let process_lock = self.process_lock.clone();
+        spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open(&db_path)?;
             Ok((
                 storage.current_safe_block()?,
@@ -447,7 +502,7 @@ impl InputReader {
             ))
         })
         .await
-        .map_err(|err| InputReaderError::Join(err.to_string()))?
+        .map_err(|err| map_storage_task_join(err, "loading the safe-input cursor"))?
     }
 
     async fn append_safe_inputs(
@@ -459,7 +514,8 @@ impl InputReader {
         let batch_submitter = self.batch_submitter;
         let timing = self.timing;
         let frontier_mode = self.frontier_mode;
-        tokio::task::spawn_blocking(move || {
+        let process_lock = self.process_lock.clone();
+        spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open(&db_path)?;
             storage
                 .append_ingested_safe_inputs_with_timestamp(
@@ -473,7 +529,18 @@ impl InputReader {
                 .map_err(InputReaderError::from)
         })
         .await
-        .map_err(|err| InputReaderError::Join(err.to_string()))?
+        .map_err(|err| map_storage_task_join(err, "appending safe inputs"))?
+    }
+}
+
+/// Deliberately per-worker, not shared with the snapshot endpoint's
+/// `storage_task` (H9): this worker carries a typed error to the supervisor
+/// through its exit channel, while an HTTP handler must contain immediately.
+fn map_storage_task_join(err: tokio::task::JoinError, operation: &'static str) -> InputReaderError {
+    if err.is_panic() {
+        InputReaderError::StorageTaskPanicked { operation }
+    } else {
+        InputReaderError::Join(err.to_string())
     }
 }
 
@@ -654,7 +721,14 @@ fn check_input_index_contiguity(
     onchain_indices: &[u64],
 ) -> Result<(), InputReaderError> {
     for (offset, &index) in onchain_indices.iter().enumerate() {
-        let expected = expected_start.saturating_add(offset as u64);
+        let offset = u64::try_from(offset).map_err(|_| {
+            InputReaderError::Provider("InputAdded result offset exceeds u64".to_string())
+        })?;
+        let expected = expected_start.checked_add(offset).ok_or_else(|| {
+            InputReaderError::Provider(
+                "InputAdded indices overflow the safe-input index space".to_string(),
+            )
+        })?;
         if index != expected {
             return Err(InputReaderError::InconsistentL1Response(format!(
                 "non-contiguous InputBox index: expected {expected}, got {index} — \
@@ -758,6 +832,7 @@ mod tests {
             db_path,
             Address::ZERO,
             test_timing(),
+            ProcessLock::test(),
         )
     }
 
@@ -777,7 +852,7 @@ mod tests {
     #[tokio::test]
     async fn start_then_request_shutdown_joins_with_ok() {
         let db_file = NamedTempFile::new().expect("temp file");
-        let shutdown = ShutdownSignal::default();
+        let shutdown = RuntimeScope::default();
         let reader = test_reader(
             db_file.path().to_string_lossy().into_owned(),
             "http://127.0.0.1:0".to_string(),
@@ -801,7 +876,7 @@ mod tests {
         require_anvil();
 
         let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
-        let shutdown = ShutdownSignal::default();
+        let shutdown = RuntimeScope::default();
         let db_file = NamedTempFile::new().expect("temp file");
         let reader = test_reader(
             db_file.path().to_string_lossy().into_owned(),
@@ -881,6 +956,7 @@ mod tests {
             db_file.path().to_string_lossy().into_owned(),
             Address::ZERO,
             test_timing(),
+            ProcessLock::test(),
         );
         let provider = alloy::providers::ProviderBuilder::new()
             .connect(anvil.endpoint_url().to_string().as_str())
@@ -963,6 +1039,7 @@ mod tests {
             },
             Address::ZERO,
             test_timing(),
+            ProcessLock::test(),
         )
         .await;
 
@@ -1090,6 +1167,16 @@ mod tests {
             .expect_err("a tail-truncated input must be caught on the next tick");
         assert!(
             matches!(&err, InputReaderError::InconsistentL1Response(m) if m.contains("expected 8, got 9")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_index_contiguity_rejects_index_space_overflow() {
+        let err = check_input_index_contiguity(u64::MAX, &[u64::MAX, u64::MAX])
+            .expect_err("the expected index must not saturate at u64::MAX");
+        assert!(
+            matches!(&err, InputReaderError::Provider(m) if m.contains("overflow")),
             "got {err:?}"
         );
     }

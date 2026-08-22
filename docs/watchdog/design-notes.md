@@ -36,6 +36,31 @@ Each tick:
 There is no advance-only mode. Advancing the CM is just an implementation step
 inside a compare cycle.
 
+## Detection boundary: watchdog versus R2
+
+The watchdog is the broad independent detector for application-state
+divergence at a finalized checkpoint. It is not the sequencer's R2
+accepted-batch wire-identity detector, and neither mechanism subsumes the
+other.
+
+R2 runs inside the input reader's atomic safe-input sync. For every
+at/above-anchor landing the mirrored scheduler accepts, it requires a
+byte-identical valid local sealed batch at that nonce. A foreign or mismatched
+landing persists `canonical_divergence` and structurally freezes the accepted
+frontier and finalized-snapshot promotion. The offending landing therefore
+normally never produces a newer `/finalized_state/inclusion_block` for the
+watchdog to compare. Under the unchanged-head optimization above, a watchdog
+tick legitimately exits idle. Distinct wire bytes can also be application-state
+equivalent, which a byte comparison of resulting snapshots would not expose.
+
+Conversely, R2 shares the sequencer's off-chain acceptance predicate and does
+not independently replay application execution. The watchdog can catch
+direct-input, user-op, scheduler, or application-state divergence outside R2's
+narrow predicate once a comparable finalized checkpoint is published.
+`DangerDetector`, not the watchdog, owns prompt process-wide reaction to the
+durable R2 marker; the inclusion lane also refuses the poisoned projection
+opportunistically if its existing frontier read wins first.
+
 ## Watchdog State
 
 The watchdog state is canonical from the watchdog's point of view. The

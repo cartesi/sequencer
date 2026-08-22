@@ -16,17 +16,18 @@
 //!    batch of ours that landed in the range. At range close the lane
 //!    promotes that one `(nonce, block)` target, folded into the same
 //!    transaction that advances the drain
-//!    ([`crate::storage::Storage::close_frame_only_promoting`]) — so a
-//!    promotion and its drain commit atomically. Promotion is **per-range,
-//!    not per-block**: the range's max nonce supersedes every lower one,
-//!    and the skipped intermediate checkpoints were never observable.
+//!    ([`crate::storage::Storage::close_frame_only_promoting_with_executions`])
+//!    — so promotion, drain, and canonical execution attributions commit
+//!    atomically. Promotion is **per-range, not per-block**: the range's max
+//!    nonce supersedes every lower one, and the skipped intermediate
+//!    checkpoints were never observable.
 //!
 //! 3. **After a promotion**, the lane runs [`run_gc`] to reclaim the
 //!    now-superseded dump(s). GC tracks garbage creation, not idleness.
 //!
-//! The observer's working state is one `Option<(nonce, block)>`; the lane
-//! creates one per `execute_safe_inputs_range` call on the stack. No
-//! allocation in the hot loop.
+//! The observer holds one `Option<(nonce, block)>` plus direct-execution
+//! receipts for the complete range. That allocation is confined to the slow
+//! L1-reconciliation regime, not the user-op hot path.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sequencer_core::application::Application;
 
 use super::dump_info::{self, DumpInfo};
-use crate::storage::{SafeInputRange, Storage, WriteHead};
+use crate::storage::{DirectInputExecution, SafeInputRange, Storage, WriteHead};
 
 /// Errors from snapshot-taking at batch close.
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +147,7 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
         &dump_dir,
         nonce,
         l2_tx_index,
+        app.executed_input_count(),
     )?;
     Ok(())
 }
@@ -183,8 +185,8 @@ pub(super) fn take_dump_at_batch_close<A: Application>(
 /// block it landed in, then **commits itself once** at range close (via
 /// [`BlockObservation::commit`]): the promotion, if any, folds into the same
 /// transaction that advances the drain
-/// ([`Storage::close_frame_only_promoting`]) — so a promotion and the drain it
-/// derives from commit atomically.
+/// ([`Storage::close_frame_only_promoting_with_executions`]) — so promotion,
+/// drain, and canonical execution mappings commit atomically.
 ///
 /// Per-range (not per-block) promotion is sound because nonces land in
 /// monotonic order: the range's max nonce sits in its latest
@@ -193,17 +195,23 @@ pub(super) fn take_dump_at_batch_close<A: Application>(
 /// observable anyway — `finalized` is a single async-polled row — so collapsing
 /// to one promotion loses nothing.
 ///
-/// Constant memory: one `Option<(u64, u64)>`, no allocation, and infallible to
-/// update (no storage on the hot path).
+/// The accepted-batch observation is constant-sized. Direct execution receipts
+/// are retained for the range so the eventual frame transaction can attach
+/// their canonical offsets atomically; this allocation is confined to the
+/// slow L1-reconciliation regime.
 pub(super) struct BlockObservation {
     /// `(nonce, inclusion_block)` of the highest accepted batch seen, or
     /// `None` if the range observed none of our batches.
     max: Option<(u64, u64)>,
+    direct_executions: Vec<DirectInputExecution>,
 }
 
 impl BlockObservation {
     pub(super) fn new() -> Self {
-        Self { max: None }
+        Self {
+            max: None,
+            direct_executions: Vec::new(),
+        }
     }
 
     /// Record a safe input belonging to L1 block `block`; if it was one of our
@@ -218,9 +226,14 @@ impl BlockObservation {
         }
     }
 
+    pub(super) fn observe_direct_execution(&mut self, execution: DirectInputExecution) {
+        self.direct_executions.push(execution);
+    }
+
     /// Close the frame for this safe-frontier advance, folding the observed
     /// promotion — if any — into the **same transaction** as the drain
-    /// ([`Storage::close_frame_only_promoting`]); otherwise a plain frame close.
+    /// ([`Storage::close_frame_only_promoting_with_executions`]); otherwise an
+    /// attributed plain frame close.
     /// Returns whether a batch was promoted, so the caller can collect the dumps
     /// it superseded. Consumes the observation — it is spent once committed.
     pub(super) fn commit(
@@ -232,17 +245,23 @@ impl BlockObservation {
     ) -> Result<bool, rusqlite::Error> {
         match self.max {
             Some((max_nonce, inclusion_block)) => {
-                storage.close_frame_only_promoting(
+                storage.close_frame_only_promoting_with_executions(
                     head,
                     next_safe_block,
                     drained,
+                    &self.direct_executions,
                     max_nonce,
                     inclusion_block,
                 )?;
                 Ok(true)
             }
             None => {
-                storage.close_frame_only(head, next_safe_block, drained)?;
+                storage.close_frame_only_with_executions(
+                    head,
+                    next_safe_block,
+                    drained,
+                    &self.direct_executions,
+                )?;
                 Ok(false)
             }
         }
@@ -277,7 +296,10 @@ mod tests {
     use std::sync::Mutex;
 
     use alloy_primitives::Address;
-    use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
+    use sequencer_core::application::{
+        AppError, AppOutputs, Application, ApplicationProgress, ApplyInputCapability,
+        InvalidReason, ProgressCommitCapability,
+    };
     use sequencer_core::l2_tx::ValidUserOp;
     use sequencer_core::user_op::UserOp;
 
@@ -291,12 +313,14 @@ mod tests {
     /// other trait methods aren't exercised in these tests.
     struct RecordingDumpApp {
         dumps: Mutex<Vec<PathBuf>>,
+        progress: ApplicationProgress,
     }
 
     impl RecordingDumpApp {
         fn new() -> Self {
             Self {
                 dumps: Mutex::new(Vec::new()),
+                progress: ApplicationProgress::default(),
             }
         }
 
@@ -317,27 +341,32 @@ mod tests {
             Ok(())
         }
 
-        fn execute_valid_user_op(
+        fn apply_valid_user_op(
             &mut self,
+            _capability: ApplyInputCapability<'_>,
             _user_op: &ValidUserOp,
             _safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
             Ok(Vec::new())
         }
 
-        fn execute_direct_input(
+        fn apply_direct_input(
             &mut self,
+            _capability: ApplyInputCapability<'_>,
             _input: &sequencer_core::l2_tx::DirectInput,
         ) -> Result<AppOutputs, AppError> {
             unimplemented!("not used in these tests")
         }
 
-        fn executed_input_count(&self) -> u64 {
-            0
+        fn execution_progress(&self) -> &ApplicationProgress {
+            &self.progress
         }
 
-        fn last_executed_safe_block(&self) -> u64 {
-            0
+        fn execution_progress_mut(
+            &mut self,
+            _capability: ProgressCommitCapability<'_>,
+        ) -> &mut ApplicationProgress {
+            &mut self.progress
         }
 
         fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
@@ -484,7 +513,10 @@ mod tests {
 
     /// Application whose `create_dump` always fails — used to exercise
     /// the atomic-close failure path.
-    struct FailingDumpApp;
+    #[derive(Default)]
+    struct FailingDumpApp {
+        progress: ApplicationProgress,
+    }
 
     impl Application for FailingDumpApp {
         const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
@@ -498,31 +530,36 @@ mod tests {
             Ok(())
         }
 
-        fn execute_valid_user_op(
+        fn apply_valid_user_op(
             &mut self,
+            _capability: ApplyInputCapability<'_>,
             _user_op: &ValidUserOp,
             _safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
             Ok(Vec::new())
         }
 
-        fn execute_direct_input(
+        fn apply_direct_input(
             &mut self,
+            _capability: ApplyInputCapability<'_>,
             _input: &sequencer_core::l2_tx::DirectInput,
         ) -> Result<AppOutputs, AppError> {
             unimplemented!("not used in these tests")
         }
 
-        fn executed_input_count(&self) -> u64 {
-            0
+        fn execution_progress(&self) -> &ApplicationProgress {
+            &self.progress
         }
 
-        fn last_executed_safe_block(&self) -> u64 {
-            0
+        fn execution_progress_mut(
+            &mut self,
+            _capability: ProgressCommitCapability<'_>,
+        ) -> &mut ApplicationProgress {
+            &mut self.progress
         }
 
         fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-            Ok(FailingDumpApp)
+            Ok(Self::default())
         }
 
         fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
@@ -550,7 +587,7 @@ mod tests {
         let open_before = head.batch_index;
 
         let dumps_dir = tempfile::tempdir().unwrap();
-        let app = FailingDumpApp;
+        let app = FailingDumpApp::default();
         let err =
             super::close_batch_with_snapshot(&app, &mut storage, &mut head, 0, dumps_dir.path())
                 .expect_err("create_dump failure must abort the close");

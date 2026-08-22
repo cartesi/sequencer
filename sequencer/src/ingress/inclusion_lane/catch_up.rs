@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use alloy_primitives::Address;
 
 use crate::storage::Storage;
-use sequencer_core::application::Application;
+use sequencer_core::application::{Application, execute_direct_input, execute_valid_user_op};
+use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 use super::error::CatchUpError;
@@ -27,6 +28,7 @@ const DEFAULT_CATCH_UP_PAGE_SIZE: usize = 256;
 pub(super) struct CatchUpSnapshot {
     pub(super) dump_dir: PathBuf,
     pub(super) l2_tx_index: u64,
+    pub(super) executed_input_count: ExecutedInputCount,
 }
 
 /// Select the resume checkpoint. Prefers the latest pending snapshot
@@ -36,20 +38,21 @@ pub(super) struct CatchUpSnapshot {
 /// back to the finalized snapshot.
 ///
 /// Returns the checkpoint directly rather than an `Option`: the
-/// always-load invariant — `setup` registers the genesis finalized
-/// snapshot, `run` gates on it (`require_finalized_snapshot` in
-/// `Workers::spawn`, plus the boot-gate check) before `InclusionLane::start`
-/// — guarantees at least the genesis finalized snapshot exists by the time
+/// always-load invariant — `setup` registers the genesis finalized snapshot,
+/// and `run` checks it in reducer inspection plus task-free runtime
+/// preparation before `InclusionLane::start` — guarantees at least the
+/// genesis finalized snapshot exists by the time
 /// the lane resumes. Absence is a violated invariant (runtime/setup bug),
 /// surfaced fail-loud as [`CatchUpError::NoSnapshot`].
 pub(super) fn catch_up_snapshot(storage: &mut Storage) -> Result<CatchUpSnapshot, CatchUpError> {
-    let (dump, l2_tx_index) = storage
+    let (dump, l2_tx_index, executed_input_count) = storage
         .latest_snapshot()
         .map_err(|source| CatchUpError::LoadSnapshot { source })?
         .ok_or(CatchUpError::NoSnapshot)?;
     Ok(CatchUpSnapshot {
         dump_dir: dump.prefix,
         l2_tx_index,
+        executed_input_count,
     })
 }
 
@@ -96,8 +99,16 @@ pub(super) fn catch_up_application_paged(
             return Ok(());
         }
 
-        for (db_offset, item, frame_safe_block) in replay {
-            replay_sequenced_l2_tx(app, batch_submitter_address, item, frame_safe_block)?;
+        for row in replay {
+            let db_offset = row.db_offset;
+            replay_sequenced_l2_tx(
+                app,
+                batch_submitter_address,
+                db_offset,
+                row.tx,
+                row.frame_safe_block,
+                row.executed_input_offset,
+            )?;
             next_offset = db_offset;
         }
     }
@@ -106,30 +117,63 @@ pub(super) fn catch_up_application_paged(
 fn replay_sequenced_l2_tx(
     app: &mut impl Application,
     batch_submitter_address: Address,
+    db_offset: u64,
     item: SequencedL2Tx,
     frame_safe_block: u64,
+    executed_input_offset: Option<ExecutedInputCount>,
 ) -> Result<(), CatchUpError> {
     match item {
         SequencedL2Tx::UserOp(value) => {
+            assert_replay_mapping(
+                db_offset,
+                "user op",
+                Some(app.executed_input_count()),
+                executed_input_offset,
+            )?;
             // The persisted covering frame's safe_block mirrors what the
             // lane passed live, so the replayed app's safe-block clock
             // lands on the same value.
-            app.execute_valid_user_op(&value, frame_safe_block)
+            execute_valid_user_op(app, &value, frame_safe_block)
                 .map(|_| ())
-                .map_err(|err| CatchUpError::ReplayUserOpInternal {
-                    reason: err.to_string(),
-                })
+                .map_err(|source| CatchUpError::ReplayUserOp { source })
         }
         SequencedL2Tx::Direct(direct) => {
             if direct.sender == batch_submitter_address {
+                assert_replay_mapping(
+                    db_offset,
+                    "batch-submitter input",
+                    None,
+                    executed_input_offset,
+                )?;
                 return Ok(());
             }
 
-            app.execute_direct_input(&direct)
+            assert_replay_mapping(
+                db_offset,
+                "direct input",
+                Some(app.executed_input_count()),
+                executed_input_offset,
+            )?;
+            execute_direct_input(app, &direct)
                 .map(|_| ())
-                .map_err(|err| CatchUpError::ReplayDirectInputInternal {
-                    reason: err.to_string(),
-                })
+                .map_err(|source| CatchUpError::ReplayDirectInput { source })
         }
     }
+}
+
+fn assert_replay_mapping(
+    db_offset: u64,
+    kind: &'static str,
+    expected: Option<ExecutedInputCount>,
+    stored: Option<ExecutedInputCount>,
+) -> Result<(), CatchUpError> {
+    if expected == stored {
+        return Ok(());
+    }
+    Err(CatchUpError::ExecutionOffsetMismatch {
+        db_offset,
+        kind,
+        expected: expected.map(ExecutedInputCount::get),
+        stored: stored.map(ExecutedInputCount::get),
+    })
 }
