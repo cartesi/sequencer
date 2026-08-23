@@ -72,7 +72,7 @@ impl ProcessResult {
 
 // Test-assertion sugar only: asymmetric cross-type equality in a public
 // consensus API makes `a == b` type-directed and non-obvious, so it stays out
-// of the production surface (H6).
+// of the production surface.
 #[cfg(test)]
 impl PartialEq<ProcessOutcome> for ProcessResult {
     fn eq(&self, other: &ProcessOutcome) -> bool {
@@ -405,7 +405,7 @@ impl<A: Application> Scheduler<A> {
 
 /// Scheduler-local spelling of the one staleness predicate. Delegates to
 /// [`crate::protocol::age_exceeds`] so the fold and the off-chain protocol
-/// module cannot drift (H8). Note the argument order differs:
+/// module cannot drift. Note the argument order differs:
 /// `has_elapsed_since(start, wait, current) == age_exceeds(current, start, wait)`.
 fn has_elapsed_since(start_block: u64, wait_blocks: u64, current_block: u64) -> bool {
     crate::protocol::age_exceeds(current_block, start_block, wait_blocks)

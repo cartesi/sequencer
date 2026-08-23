@@ -90,8 +90,9 @@ fn next_expected_nonce(nonce: u64) -> u64 {
 /// Simulate the scheduler's acceptance logic over new safe inputs and append
 /// matches to `safe_accepted_batches`.
 ///
-/// R2 is complete for this mirrored predicate: every at/above-anchor accepted
-/// landing is a byte-identical local match, foreign, or mismatched. It is not
+/// The content-identity check (I9/I15) is complete for this mirrored
+/// predicate: every at/above-anchor accepted landing is a byte-identical
+/// local match, foreign, or mismatched. It is not
 /// an independent oracle for the canonical scheduler, application state, or
 /// collapsed checkpoint history; foreign/mismatch requires manual cockroach
 /// recovery.
@@ -122,7 +123,7 @@ fn next_expected_nonce(nonce: u64) -> u64 {
 /// nonce-advance fold in `protocol::advance_expected_batch_nonce`.
 /// This loop deliberately keeps its own inline `expected` advance rather than
 /// reusing that fold: the advance is interleaved with two storage-only side
-/// effects that cannot move below the protocol layer — the R2 content-identity
+/// effects that cannot move below the protocol layer — the content-identity
 /// check ([`content_identity_violation`]) and the `canonical_divergence` freeze.
 /// Sharing a fold here would force a callback contract for those (a refactor,
 /// not the no-behavior-change library move).
@@ -145,7 +146,7 @@ pub(super) fn populate_safe_accepted_batches(
     // and advancing it (or promoting on it) would compound the divergence.
     // `check_danger` reports `CanonicalDivergence` ahead of every other arm,
     // so the detector exits / startup refuses; the remedy is cockroach
-    // recovery, never standard recovery (review R2).
+    // recovery, never standard recovery.
     if canonical_divergence_in(conn)?.is_some() {
         return Ok(());
     }
@@ -201,7 +202,7 @@ pub(super) fn populate_safe_accepted_batches(
                 continue;
             };
 
-            // Content-identity check (review R2), gated on full acceptance —
+            // Content-identity check, gated on full acceptance —
             // exactly here, where the simulated scheduler accepted the
             // landing. Rejected/stale/undecodable copies are scheduler
             // no-ops; their content is irrelevant by construction.
@@ -264,8 +265,9 @@ impl DivergenceKind {
     }
 }
 
-/// R2 check proper: compare a fully-accepted landing against our valid
-/// closed batch at the same nonce. `None` = identical (the normal case).
+/// Content-identity check proper: compare a fully-accepted landing against
+/// our valid closed batch at the same nonce. `None` = identical (the normal
+/// case).
 ///
 /// Why content (not identity) suffices: accepted content-equal copies are
 /// effect-equal — which physical tx landed carries no semantic weight. The

@@ -3,9 +3,7 @@
 
 //! The command-admission facts and the terminal-fault black box.
 //!
-//! Admission is governed by facts, each with one owner (2026-08-19 review
-//! L2; the write-only attempt journal was narrowed to the black box on
-//! 2026-08-22, L3):
+//! Admission is governed by facts, each with one owner:
 //!
 //! - concurrent owners: the kernel process lock (`crate::runtime`);
 //! - command ordering: `setup_complete`, checked two-sided here at every
@@ -13,7 +11,7 @@
 //!   maintenance never start before one);
 //! - the one absorbing refusal: `canonical_divergence`, checked at every
 //!   entry — its only exit is cockroach rebuild;
-//! - restart policy after a terminal fault: the R4 exit-code contract
+//! - restart policy after a terminal fault: the exit-code contract
 //!   (30 = do not restart, page an operator), enforced by the supervisor,
 //!   not by a database gate. Standard recovery needs no intervention at
 //!   all: every run boots through the fact-derived recovery reducer.
@@ -145,7 +143,7 @@ impl Storage {
     /// Best-effort terminal-cause record. Deliberately gated on nothing —
     /// not even divergence — because the recorder runs inside containment and
     /// must never be the reason a cause goes unrecorded. Restart policy is
-    /// the R4 exit-code contract, not this row.
+    /// the exit-code contract, not this row.
     pub(crate) fn record_terminal_fault(
         &mut self,
         command: LifecycleCommand,

@@ -69,7 +69,7 @@ where
     // refusal), and the detector's poll cadence leaves a window where a
     // clean shutdown outruns re-detection.
     let result = result.and_then(|()| refuse_divergence_on_clean_exit(&db_path));
-    // Verdict-neutral black-box settlement (L3): a terminal failure records
+    // Verdict-neutral black-box settlement: a terminal failure records
     // its cause best-effort — never changing the verdict — while a
     // panic/cancellation/SIGKILL writes nothing; the next boot proceeds and
     // re-derives everything from facts.
@@ -170,7 +170,7 @@ where
         // Bootstrap syncs use nested blocking SQLite jobs. The reader takes
         // its retained lock clone at construction—not only after worker
         // admission—so cancellation of this async command cannot release
-        // exclusivity beneath an orphaned DB write (H14).
+        // exclusivity beneath an orphaned DB write.
         process_lock.clone(),
     );
 

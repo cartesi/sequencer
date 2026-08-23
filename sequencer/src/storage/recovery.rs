@@ -58,8 +58,8 @@ use super::snapshot_dumps::{batch_nonce_in, clear_pending_dumps_from_nonce_in};
 pub enum DangerStatus {
     /// No danger detected — none of the checks tripped.
     Safe,
-    /// A fully-accepted L1 landing failed the content-identity check
-    /// (review R2): canonical state contains executed effects with no
+    /// A fully-accepted L1 landing failed the content-identity check:
+    /// canonical state contains executed effects with no
     /// reliable local source. Carries the diverged batch nonce. Ranked
     /// ahead of every other arm so the respawn loop can never route a
     /// diverged node into a provider call, mutation, or admission. The remedy
@@ -155,8 +155,8 @@ impl DangerStatus {
 }
 
 impl Storage {
-    /// Whether the canonical-divergence marker (review R2, invariant I15) is
-    /// present, and the recorded `(nonce, safe_input_index)` if so. Standard
+    /// Whether the canonical-divergence marker (I15) is present, and the
+    /// recorded `(nonce, safe_input_index)` if so. Standard
     /// recovery is forbidden while the marker exists; callers on the recovery
     /// path must check this before any batch-tree mutation.
     pub fn canonical_divergence(&mut self) -> Result<Option<(u64, u64)>> {
@@ -187,7 +187,7 @@ impl Storage {
     ///    observed arms (3, 4) are pure block arithmetic, and a wall-clock
     ///    fault must never suppress a danger verdict that stands on L1
     ///    observation alone. Sub-block skew in either direction is
-    ///    quantization noise, not a fault (F8).
+    ///    quantization noise, not a fault.
     /// 6. **Batch-relative wall-clock estimate**: if a correction applies
     ///    ([`ProtocolTiming::wall_clock_adjusted_danger_threshold`] returns
     ///    `Some`), widens to `find_first_batch_in_danger` against
@@ -208,7 +208,7 @@ impl Storage {
     /// - **Clock faults yield to observed danger.** A local clock a full
     ///   block-time or more out of step with either persisted baseline
     ///   refuses only when no observed danger stands; sub-block skew is
-    ///   tolerated (F8).
+    ///   tolerated.
     /// - **Closed observed danger beats Tip.** When a closed batch is in danger,
     ///   we need a flush (to resolve its L1 transaction's fate) regardless
     ///   of the Tip's state. The cascade naturally catches the Tip via
@@ -292,7 +292,8 @@ impl Storage {
 
     /// Execute the reducer's `Cascade` phase. The ephemeral flush witness is
     /// represented by its observed safe-block floor; this transaction
-    /// reasserts both I15 and F2 immediately before changing the batch tree.
+    /// reasserts both I15 and the post-flush resync coherence check
+    /// immediately before changing the batch tree.
     pub(crate) fn recover_post_flush_for_recovery(
         &mut self,
         flush_observed_safe_block: u64,
@@ -430,7 +431,7 @@ fn refuse_divergence(danger: DangerStatus) -> std::result::Result<(), RecoveryMu
 /// body behind [`Storage::recover_post_flush_for_recovery`], which the
 /// reducer reaches after carrying a Flush witness through a caught-up
 /// Sync). Homed here, not on the test wrapper, so rustdoc builds it and a
-/// wrapper cleanup cannot delete the design record (H13).
+/// wrapper cleanup cannot delete the design record.
 ///
 /// # The "everything past gold is doomed" rule
 ///
@@ -516,7 +517,7 @@ fn recover_post_flush_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resu
 /// `danger_threshold` (the shared body behind
 /// [`Storage::recover_aging_tip_for_recovery`]). Homed here, not on the
 /// test wrapper, so rustdoc builds it and a wrapper cleanup cannot delete
-/// the design record (H13).
+/// the design record.
 ///
 /// # Why a threshold here, but no closed-frontier check
 ///
@@ -565,8 +566,8 @@ fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resul
 ///    Gold-but-unpromoted pendings (batches that landed while the process
 ///    was down) carry lower nonces and *survive*: catch-up resumes from a
 ///    fresher checkpoint, and the rows are cleaned up by the next
-///    promotion's `DELETE <= max_nonce`. Scoping is load-bearing (review
-///    F9): a blanket clear would arm a promote-wedge crash-loop whenever a
+///    promotion's `DELETE <= max_nonce`. Scoping is load-bearing: a
+///    blanket clear would arm a promote-wedge crash-loop whenever a
 ///    *valid in-flight* closed batch existed at clear time — its pending
 ///    row would be deleted while the batch stayed valid, and the lane's
 ///    later promotion of its landing would hit the deleted row with no

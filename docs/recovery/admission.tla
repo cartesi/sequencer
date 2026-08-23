@@ -12,9 +12,9 @@
  * Prepare, whose successful completion also returns to local inspection. Only
  * a second clean decision creates AdmittedRuntime.
  *
- * Admission gating is fact-derived (review L2, 2026-08-19): there is no
+ * Admission gating is fact-derived: there is no
  * lifecycle admission state machine and no acknowledgement step, and no
- * durable per-attempt record gates anything (L3, 2026-08-22 — the
+ * durable per-attempt record gates anything (the
  * terminal-fault black box is write-only telemetry outside this model).
  * Settlement and crash both end the attempt, and the next boot begins fresh
  * over whatever facts persist. Divergence and danger facts are durable and
@@ -150,7 +150,7 @@ Settle ==
 
 ---------------------------------------------------------------------------
 (* Attempt begin and the single local inspection step. Begin has no
- * lifecycle-state precondition (L2): the fact gates the code checks here —
+ * lifecycle-state precondition: the fact gates the code checks here —
  * two-sided setup completion — are outside this model's scope, and the
  * kernel process lock excludes a concurrent owner. *)
 
@@ -283,7 +283,7 @@ EnsureOpenTipCompleted ==
  * current safe block, and no repair phase contacts L1 — so ClosedDanger /
  * TipDanger cannot reappear and only the retryable observations remain.
  * Widening either action would model states the implementation cannot
- * produce (2026-08-18 review, D8). *)
+ * produce. *)
 RecoverTipCompleted ==
     /\ controller = RecoverTip
     /\ \E nextDanger \in {Safe, RetryDanger}:
@@ -361,7 +361,7 @@ PrepareRefuse ==
 
 ---------------------------------------------------------------------------
 (* Crash destroys PreparedRuntime, AdmittedRuntime, and session witnesses.
- * Nothing durable gates the next boot (L2/L3 — the terminal-fault black box
+ * Nothing durable gates the next boot (the terminal-fault black box
  * is write-only telemetry), so a restart is simply a fresh attempt over the
  * surviving durable facts. Modeled as returning directly to the pre-begin
  * shape with facts unchanged. *)

@@ -15,26 +15,26 @@ const MIGRATION_0001_SCHEMA: &str = include_str!("migrations/0001_schema.sql");
 
 /// SQLite `synchronous` pragma used by every production writer connection.
 /// `FULL` under WAL fsyncs on every commit, so commits survive power loss /
-/// OS crash — not just process crash. Load-bearing (review R3/F3): the
-/// sequencer externalizes effects on commits (acks `POST /tx` after the
+/// OS crash — not just process crash. Load-bearing: the sequencer
+/// externalizes effects on commits (acks `POST /tx` after the
 /// chunk commit; the submitter broadcasts sealed batches), and a rewound
 /// commit after externalization is silent divergence — e.g. a re-sealed
 /// batch at the same nonce with different content than the one the
 /// scheduler executed. The dump side already pays the same cost
 /// (`create_dump` fsyncs); this closes the DB half. Also a precondition
-/// for the wallet-nonce watermark's write-before-broadcast guarantee
-/// (review R1a). And it is what makes the setup completion transaction a valid
+/// for the wallet-nonce watermark's write-before-broadcast guarantee.
+/// And it is what makes the setup completion transaction a valid
 /// linearization point: it commits after the genesis-snapshot row's
 /// transaction, so "completion durable ⇒
 /// snapshot row durable ⇒ dump dir durable" only holds because FULL fsyncs
 /// every commit — under NORMAL the completion WAL frame could survive while
 /// the snapshot row's frames are lost, and `run` would boot a half-set-up
 /// DB. Benchmarked at the flip: round-trip/ack deltas were noise-level on
-/// NVMe (see review ledger WP1).
+/// NVMe.
 ///
-/// Do not relax to NORMAL without revisiting all three (R3/F3 externalized
-/// commits, R1a watermark, the setup-completion/lifecycle linearization in
-/// `runtime/setup.rs` + `storage/migrations/0001_schema.sql`).
+/// Do not relax to NORMAL without revisiting all three (externalized
+/// commits, the write-before-broadcast watermark, and the setup-completion
+/// linearization in `commands/setup/` + `storage/migrations/0001_schema.sql`).
 const SYNCHRONOUS_PRAGMA: &str = "FULL";
 
 /// Sequencer storage backed by a single SQLite database.
@@ -58,9 +58,9 @@ impl Storage {
     /// database is created by an owning command through
     /// [`Storage::initialize_for_command`], so a missing file here is a
     /// deployment mistake (mistyped `--data-dir`, wrong mount). Creating one
-    /// on the fly would mint an ownerless era with no creating command — the
-    /// fourth state the ADR rules out ("database absence is Uninitialized",
-    /// D6). Crate tests keep create-on-open as their fixture idiom; the
+    /// on the fly would mint an ownerless era with no creating command —
+    /// database absence means uninitialized, never create-and-proceed.
+    /// Crate tests keep create-on-open as their fixture idiom; the
     /// command-less baseline in [`baseline_migration`] exists for them.
     pub(crate) fn open(path: &str) -> Result<Self, StorageOpenError> {
         #[cfg(not(test))]
@@ -205,7 +205,7 @@ type PostInitialMetadataHook = fn(&Transaction<'_>) -> HookResult;
 ///
 /// `initial_command: None` is the crate-test fixture path (create-on-open
 /// with genesis history bases); production cannot reach it because
-/// [`Storage::open`] refuses paths with no database file (D6).
+/// [`Storage::open`] refuses paths with no database file.
 fn baseline_migration(
     initial_command: Option<LifecycleCommand>,
     post_initial_metadata: Option<PostInitialMetadataHook>,

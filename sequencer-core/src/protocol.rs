@@ -128,7 +128,7 @@ impl ProtocolTiming {
     /// Protocol-visible, deliberately not configurable: user ops validate at
     /// their frame's safe block, so this value is the application-clock
     /// granularity (about a minute on mainnet), a product semantics decision
-    /// — not a lane implementation detail (P6; prose owner:
+    /// — not a lane implementation detail (prose owner:
     /// `docs/protocol/scheduler-semantics.md`, frame-clock policy). The
     /// observed tip is used directly, so delayed or epoch-sized observations
     /// create one frame and never synthesize missed intermediate ticks.
@@ -240,7 +240,7 @@ impl ProtocolTiming {
     /// Whether the local clock is a full block-time or more behind the
     /// persisted L1 safe-block timestamp — i.e. it cannot age the view at
     /// all. Sub-block ahead-ness is ordinary NTP-scale skew against a
-    /// block-granular timestamp (usable, age 0) and is tolerated (F8).
+    /// block-granular timestamp (usable, age 0) and is tolerated.
     ///
     /// This is a clock fault, not a view fault: `check_danger` evaluates it
     /// only after the observed danger arms, which are pure block arithmetic
@@ -286,7 +286,7 @@ impl ProtocolTiming {
     /// saturating at 0. A `now_ms` less than one block-time behind the
     /// baseline is treated as elapsed 0 — the estimate quantizes elapsed time
     /// into whole blocks, so a sub-block regression cannot change it and is
-    /// ordinary clock-step noise (F8). Returns [`WallClockRegression`] only
+    /// ordinary clock-step noise. Returns [`WallClockRegression`] only
     /// for larger regressions, which genuinely invalidate the extrapolation;
     /// callers must treat that environment as unusable rather than silently
     /// reporting no elapsed time.
@@ -584,7 +584,7 @@ mod tests {
     fn wall_clock_adjusted_threshold_rejects_regression() {
         let last = 1_000_000;
         // Sub-block regressions are quantization noise: identical outcome to
-        // elapsed = 0 for a block-granular estimate (F8: clock steps are
+        // elapsed = 0 for a block-granular estimate (clock steps are
         // legitimate).
         assert_eq!(
             timing().wall_clock_adjusted_danger_threshold(Some(last), last - 1),

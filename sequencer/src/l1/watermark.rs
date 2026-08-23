@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Write-before-broadcast hook for the wallet-nonce watermark (review R1a).
+//! Write-before-broadcast hook for the wallet-nonce watermark.
 //!
 //! Every component that broadcasts a transaction from the batch-submitter key
 //! — the batch poster and the mempool flusher's no-ops alike — must first
@@ -9,7 +9,7 @@
 //! and only then send. One uniform rule, no case analysis: the invariant is
 //! simply "the watermark covers the nonce of everything we ever sent", which
 //! is what lets the flush consume every slot we ever used without trusting
-//! the local node's volatile mempool memory (the F1 zombie counterexample).
+//! the local node's volatile mempool memory (the zombie counterexample).
 //!
 //! A crash between the commit and the send only over-covers: the flush later
 //! no-ops a never-used slot — one wasted no-op, harmless.

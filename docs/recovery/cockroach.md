@@ -33,7 +33,7 @@ Knowing where each is *born* is the key to reading the code.
 | **`A`** | `S`'s last-executed safe block. The fridge is reconstructed from directs in `(A, B]`. | App query: `S.last_executed_safe_block()`. (Persisted in the dump — see `docs/snapshots/format.md`.) |
 | **`B`** | The checkpoint's L1 inclusion block. `S` reflects every **batch** with inclusion `≤ B` and **no direct** in `(A, B]`. | Operator arg: `--checkpoint-block`. |
 | **`N`** | The checkpoint's resume batch nonce (the scheduler counter at `B`). The bare-metal app *cannot* recompute it, so it rides as checkpoint metadata. | `info.toml`'s `next_batch_nonce` in the dump. |
-| **`C`** | The post-flush safe head — the stopping block. The flush guarantees every previous-instance batch is settled at safe depth `≤ C`. | Return of `flusher.flush_and_wait(...)`. |
+| **`C`** | The post-flush safe head — the stopping block. The flush resolves every slot the provider remembers at safe depth `≤ C` (best-effort — see step 2). | Return of `flusher.flush_and_wait(...)`. |
 | **`N'`** | The resume nonce the new sequencer submits at — `N` advanced by the accepted batches in `(B, C]`. Becomes the **batch-tree anchor**. | Output of `fold_replay(...)`. |
 | **`E`, `g`** | The new history era and its recovery generation. `E` is UUIDv4; `g = 0`. | Minted with the baseline schema in one transaction, before external recovery work. |
 | **`K`** | The first application-history offset available in `E`: `S'.executed_input_count()`. It is not the replacement DB's physical replay cursor. | Derived after the fold and bound atomically with the initial finalized snapshot row. |
@@ -67,7 +67,7 @@ symmetric:
   against itself while the real scheduler ignores it. This is why the checkpoint
   must be a trustworthy finalized dump, not merely "some app bytes".
 
-This is a concrete boundary of R2: it is complete for at/above-anchor accepted
+This is a concrete boundary of the content-identity check: it is complete for at/above-anchor accepted
 batch content identity, not checkpoint/application correctness or arbitrary
 canonical divergence. Absence of `canonical_divergence` is not a proof that a
 checkpoint outside the trust boundary was valid.
@@ -105,10 +105,23 @@ NULL. That era remains externally unexposed until setup completes.
 1. **Load `S`; derive `A`, `N`; require `A < B`.** Read the dump
    (`from_dump` + `info.toml`); `A = S.last_executed_safe_block()`.
 2. **Flush → `C`.** Settle the wallet nonce (keyed L1 no-ops; this is where
-   cockroach recovery composes with the standard flush). On completion every
-   previous-instance batch is resolved at safe depth `≤ C`. `C` is the stopping
+   cockroach recovery composes with the standard flush). `C` is the stopping
    point: directs beyond `C` are `run`'s job, not the fold's.
-3. **Re-sync `safe_inputs`; F2 coherence.** The reader syncs to the *live* safe
+   **This flush is best-effort by construction:** the wiped DB carries no
+   wallet-nonce watermark, so the durable-anchor half of the completion test
+   is vacuous — the flush resolves only the slots the provider remembers,
+   and a zombie tx the local node forgot but the network still holds is
+   unresolvable here (plain `setup`'s detection gate shares the same false
+   negative). The content-identity check is what makes this acceptable: such
+   a zombie landing at/above `N'` is detected and freezes the frontier
+   instead of silently diverging, and the repair is another wipe-and-rerun —
+   cockroach recovery recovers from the failure of its own flush. If ever
+   needed, an operator-supplied flush floor taken from the old DB's
+   watermark is a sound option: the value is fail-safe under corruption
+   (too high wastes a few no-ops; too low degrades to exactly best-effort),
+   so reading it from an untrusted half-destroyed DB does not violate the
+   don't-trust-local-state premise.
+3. **Re-sync `safe_inputs`; flush-view coherence.** The reader syncs to the *live* safe
    head `H1` (normally `> C` — real time passed while the flush awaited safe
    finality); refuse only if it *lags* `C` (a load-balanced RPC replica could
    serve a stale view). So `safe_inputs` ends up holding directs through `H1`,
@@ -152,14 +165,14 @@ NULL. That era remains externally unexposed until setup completes.
 
 | Step | Code |
 |---|---|
-| entry / branch | [`setup.rs` `setup()`](../../sequencer/src/runtime/setup.rs) branches on `config.recovery` after the shared prefix (identity pin + initial sync) |
-| 1. load + `A < B` | [`recover()` step 1](../../sequencer/src/runtime/setup.rs) — `from_dump`, `read_info`, `CheckpointNotBeforeBlock` |
-| 2. flush → `C` | `recover()` step 2 — `MempoolFlusher::flush_and_wait` (see [`runtime/flush.rs`](../../sequencer/src/runtime/flush.rs)) |
+| entry / branch | [`setup()`](../../sequencer/src/commands/setup/mod.rs) branches on `config.recovery` after the shared prefix (identity pin + initial sync) |
+| 1. load + `A < B` | [`recover()` step 1](../../sequencer/src/commands/setup/mod.rs) — `from_dump`, `read_info`, `CheckpointNotBeforeBlock` |
+| 2. flush → `C` | `recover()` step 2 — `MempoolFlusher::flush_and_wait` (see [`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs)) |
 | 3. re-sync + coherence | `recover()` step 3 — `set_frontier_mode(DeferUntilAnchorSet)` + `sync_to_current_safe_head` + `ResyncBehindFlushView` |
 | 4. source seeds/replay | `recover()` step 4 — `Storage::safe_inputs_in_block_range` + the `sender != submitter` filter + `to_fold_input` |
 | 5. fold | [`fold_replay`](../../sequencer-core/src/scheduler/fold.rs) |
-| baseline history | [`baseline_migration`](../../sequencer/src/storage/open.rs) — UUIDv4 era + generation zero + NULL rebuild base in the same transaction as initial lifecycle `Active` |
-| 6. fill | [`fill_recovery_state`](../../sequencer/src/runtime/setup_fill.rs) — anchor + `open_recovery_tip` (`≤ C`-capped drain at frame `safe_block = C`) + atomic finalized-snapshot/`K` bind |
+| baseline history | [`baseline_migration`](../../sequencer/src/storage/open.rs) — UUIDv4 era + generation zero + NULL rebuild base in one baseline transaction |
+| 6. fill | [`fill_recovery_state`](../../sequencer/src/commands/setup/fill.rs) — anchor + `open_recovery_tip` (`≤ C`-capped drain at frame `safe_block = C`) + atomic finalized-snapshot/`K` bind |
 | anchor mechanism | [`trg_enforce_nonce_contiguity`](../../sequencer/src/storage/migrations/0001_schema.sql) + `compute_next_nonce` + the anchor-aware frontier in [`safe_accepted_batches.rs`](../../sequencer/src/storage/safe_accepted_batches.rs) |
 
 ---
