@@ -72,7 +72,7 @@ pub(crate) fn temp_db_with_default_deployment_identity(name: &str) -> TestDb {
 
 /// Wire bytes of the local valid closed batch at `nonce` — the
 /// production-faithful "our batch landed on L1" payload. Hash-matches the
-/// seal-time stamp, so the content-identity check (review R2) accepts it.
+/// seal-time stamp, so the content-identity check accepts it.
 /// Panics if no valid closed local batch carries `nonce` (test bug: an
 /// accepted landing without a matching local batch is, by design, a
 /// canonical divergence).
@@ -172,8 +172,8 @@ pub(crate) fn make_stale_batch_payload(nonce: u64, safe_block: u64) -> Vec<u8> {
     })
 }
 
-/// Plant the canonical-divergence marker (review R2). Test-only lever for
-/// I15 scenarios; production writes it only inside the R2 content-identity
+/// Plant the canonical-divergence marker. Test-only lever for
+/// I15 scenarios; production writes it only inside the content-identity
 /// check's sync transaction.
 pub(crate) fn record_canonical_divergence(
     storage: &mut Storage,

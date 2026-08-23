@@ -23,12 +23,11 @@
 -- wall clock — write-once (triggers below), but deliberately NOT
 -- cross-checked against `created_at_ms`: wall-clock monotonicity is an
 -- environmental assumption, not an invariant (NTP steps, VM resume), and a
--- CHECK on it wedged batch close and the recovery cascade in a clock
--- regression (review F8). No production code reads these as values; every
+-- CHECK on it once wedged batch close and the recovery cascade in a clock
+-- regression. No production code reads these as values; every
 -- reader is an IS NULL / IS NOT NULL predicate.
 -- `payload_hash` is the keccak256 of the batch's SSZ wire bytes, stamped at
--- seal time by the same encode path the submitter uses (review R2,
--- hash-at-seal). It is what the content-identity check compares an accepted
+-- seal time by the same encode path the submitter uses (hash-at-seal). It is what the content-identity check compares an accepted
 -- L1 landing against — and because it is computed by the code that sealed
 -- the batch, it survives wire-format upgrades. NULL only while the batch is
 -- the open Tip (and on recovery sentinels, which carry no payload).
@@ -102,7 +101,7 @@ INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
 -- Columns that feed SQL-level arithmetic or comparisons (trigger math,
 -- frontier folds, lease counts) therefore carry an explicit
 -- typeof(x) = 'integer' guard: a mis-bound positional parameter must refuse,
--- not coerce to 0 inside a trigger (H13).
+-- not coerce to 0 inside a trigger.
 
 -- Nonce contiguity: `nonce = parent.nonce + 1`, or the batch-tree anchor nonce
 -- (0 for a genesis deployment, N' for a recovered one) for the parentless root.
@@ -355,19 +354,19 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
 );
 
 -- Highest wallet nonce ever broadcast by this deployment's batch-submitter
--- key (review R1a — the durable realization of the TLA+ spec's
--- `walletNonce`). Write-before-broadcast: any component about to send a tx
+-- key (the durable realization of the TLA+ spec's `walletNonce`). Write-before-broadcast: any component about to send a tx
 -- at wallet nonce n first commits watermark = max(watermark, n) — power-loss
 -- durable under synchronous=FULL — then sends. Uniform for batch txs and
 -- flush no-ops alike, so the flush's slot coverage never depends on the
--- local node's volatile mempool memory (the F1 zombie). Absent row =
+-- local node's volatile mempool memory (which a dropped-locally but
+-- network-alive zombie tx evades). Absent row =
 -- nothing ever broadcast. Never reset, never lowered.
 CREATE TABLE IF NOT EXISTS wallet_nonce_watermark (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     watermark    INTEGER NOT NULL CHECK (watermark >= 0)
 );
 
--- Canonical-divergence poison marker (review R2). Written by the input
+-- Canonical-divergence poison marker. Written by the input
 -- reader's acceptance simulation — atomically with the sync that detected
 -- it — when a fully-accepted L1 landing fails the content-identity check:
 -- either no valid closed local batch exists at the accepted nonce
@@ -611,12 +610,12 @@ BEGIN
 END;
 
 -- Terminal-fault black box: an append-only trail of terminal causes,
--- best-effort recorded before death. DELIBERATELY NOT AN ADMISSION GATE
--- (2026-08-19 review L2; narrowed to this table 2026-08-22, L3): admission
+-- best-effort recorded before death. DELIBERATELY NOT AN ADMISSION GATE:
+-- admission
 -- is governed by facts — the kernel process lock excludes concurrent
 -- owners, `setup_complete` orders commands (two-sided), and
 -- `canonical_divergence` is the one absorbing refusal (cockroach rebuild is
--- the only exit). Restart policy after a terminal fault is the R4 exit-code
+-- the only exit). Restart policy after a terminal fault is the exit-code
 -- contract (30 = do not restart, page), not a database gate. Nothing reads
 -- this table for decisions; it exists so the cause of death travels with
 -- the data directory for operator postmortems, surviving log rotation.

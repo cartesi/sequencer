@@ -13,7 +13,7 @@
 //!     must run `setup`). Fires before any L1 contact.
 //!   - **Wrong signing key** → `IdentityError::Mismatch { batch_submitter_address }`
 //!     (the key's address must match the pinned submitter). Fires before L1.
-//!   - **Wrong-chain RPC** (review F6) → `ChainIdMismatch`: a reachable RPC
+//!   - **Wrong-chain RPC** → `ChainIdMismatch`: a reachable RPC
 //!     whose `eth_chainId` differs from the pinned chain id is refused. Needs
 //!     a live RPC, so it uses Anvil.
 //!   - **Matching-chain RPC** positive control: a matching chain must NOT
@@ -77,7 +77,7 @@ fn run_config(data_dir: &str, eth_rpc_url: &str, key: &str) -> sequencer::RunCon
 /// `setup`'s on-chain discovery. Uses the same typed controller path `setup`
 /// itself records through (admission → facts → completion), so this seed
 /// cannot drift from the lifecycle schema or encode a state the controller
-/// would never write (H12 — previously raw SQL from outside the crate).
+/// would never write (previously raw SQL from outside the crate).
 fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
     use sequencer::storage::LifecycleCommand;
 
@@ -152,7 +152,7 @@ async fn run_refuses_on_submitter_key_mismatch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_refuses_on_wrong_chain_rpc() {
     // Pinned chain id 31337, but the (reachable) RPC reports a different
-    // chain id — review F6: a wrong-chain RPC after setup must be refused.
+    // chain id: a wrong-chain RPC after setup must be refused.
     require_anvil();
     let anvil = alloy::node_bindings::Anvil::default().chain_id(99).spawn();
     let dir = TempDir::new().expect("tempdir");

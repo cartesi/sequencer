@@ -35,7 +35,7 @@ pub async fn flush_mempool(config: FlushConfig) -> Result<(), CommandError> {
     let key = super::verify_submitter_key(config.resolve_private_key()?, &identity)?;
 
     let result = flush_mempool_admitted(config, identity, key).await;
-    // Verdict-neutral black-box settlement (L3).
+    // Verdict-neutral black-box settlement.
     super::record_terminal_fault_best_effort(&db_path, LifecycleCommand::MaintenanceFlush, &result);
     result
 }
@@ -47,14 +47,14 @@ async fn flush_mempool_admitted(
 ) -> Result<(), CommandError> {
     let db_path = config.db_path();
 
-    // The durable flush anchor (review R1a): every slot we ever broadcast
+    // The durable flush anchor: every slot we ever broadcast
     // must resolve at safe depth, regardless of the local pool's memory.
     let watermark = {
         let mut storage = storage::Storage::open_writer(&db_path)?;
         storage.wallet_nonce_watermark()?
     };
 
-    // Wrong-chain RPC guard (review F6): flush broadcasts keyed L1 txs, so —
+    // Wrong-chain RPC guard: flush broadcasts keyed L1 txs, so —
     // like `setup` and `run` — it must confirm the RPC's chain id matches the
     // pinned one before signing, or it would burn submitter nonce slots on the
     // wrong chain. `create_verified_signer_provider` folds that check into the

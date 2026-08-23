@@ -72,7 +72,7 @@ impl Storage {
     /// to find any previous-instance batch past the checkpoint block.
     ///
     /// Queries the reader-synced `safe_inputs` table rather than issuing its own
-    /// `get_logs`, so it inherits the reader's F5 completeness guarantees (a
+    /// `get_logs`, so it inherits the reader's input-completeness witness (a
     /// per-app index contiguity check plus a `getNumberOfInputs` count witness):
     /// the reader refuses to persist an incomplete `get_logs` response, so the
     /// synced table is complete through the safe head. Do **not** replace this
@@ -115,7 +115,7 @@ impl Storage {
     /// Returns both senders and directs; the caller classifies (a batch iff
     /// `sender == batch_submitter`) and drops batches from the `(A, B]` seed set.
     /// Read-only; queries the reader-synced table rather than a fresh log scan,
-    /// inheriting the reader's F5 completeness guarantees (see
+    /// inheriting the reader's input-completeness witness (see
     /// [`Storage::first_batch_submitter_input_after_block`]).
     pub fn safe_inputs_in_block_range(
         &mut self,

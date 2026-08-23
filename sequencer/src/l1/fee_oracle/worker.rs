@@ -45,7 +45,7 @@ pub enum FeeOracleError {
 
 impl FeeOracleError {
     /// Whether this error poisons the run rather than restarting. Named
-    /// arms, no wildcard: a new variant must classify itself here (D1/H1).
+    /// arms, no wildcard: a new variant must classify itself here.
     pub(crate) fn is_terminal_invariant(&self) -> bool {
         match self {
             Self::Storage(source) => crate::storage::is_persistent_storage_error(source),
@@ -91,7 +91,7 @@ pub struct FeeOracle {
     token: TokenHandle,
     /// Retains data-directory exclusivity inside detached-capable blocking DB
     /// work if the async setup/runtime task awaiting it is cancelled.
-    /// Required at construction (H14).
+    /// Required at construction.
     process_lock: ProcessLock,
 }
 

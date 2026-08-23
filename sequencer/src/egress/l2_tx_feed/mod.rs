@@ -88,7 +88,7 @@ impl L2TxFeed {
         // Blocking SQLite (an open plus a COUNT over up to
         // `max_catchup_events` rows) runs on the blocking pool, making this
         // signature's `async` honest; the join classifies a decoder panic, so
-        // the prepare phase needs no inline `catch_unwind` (H7). The
+        // the prepare phase needs no inline `catch_unwind`. The
         // streaming task below keeps its `catch_unwind` deliberately: its
         // only join point is `Subscription::finish`, and containment must
         // fire at the fault, not when the socket unwinds.

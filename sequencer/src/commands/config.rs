@@ -337,7 +337,7 @@ pub struct SetupConfig {
     /// bound of `setup`'s read-only detection scan: if a previous instance
     /// left any batch-submitter tx past `B` (or its wallet nonce is unsettled),
     /// `setup` refuses and points the operator at recovery. PR3 does not yet
-    /// load a non-genesis checkpoint machine — that is `setup --recovery` (PR5);
+    /// load a non-genesis checkpoint machine — that is `setup --recovery`;
     /// here `B` only scopes detection, so `B > 0` against a genesis-style setup
     /// merely narrows the scan.
     #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_BLOCK", default_value_t = 0)]

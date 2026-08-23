@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! CLI harness: the subcommand parser, dispatch, and R4 exit-code projection,
+//! CLI harness: the subcommand parser, dispatch, and exit-code projection,
 //! exported once from the library so every app binary inherits them.
 //!
 //! An app's `main` is ~5 lines: init tracing, then [`run_main`] with a
@@ -60,7 +60,7 @@ pub enum Command {
     FlushMempool(Box<FlushConfig>),
 }
 
-/// Parse argv and dispatch. Returns the R4 process exit code.
+/// Parse argv and dispatch. Returns the process exit code.
 pub async fn run_main<A, F>(genesis_app: F) -> std::process::ExitCode
 where
     A: Application + Clone + Sync + 'static,
@@ -94,7 +94,7 @@ fn project_dispatch_join(
     }
 }
 
-/// Dispatch a parsed [`Command`], projecting the result onto the R4 exit-code
+/// Dispatch a parsed [`Command`], projecting the result onto the exit-code
 /// contract (see [`crate::commands::error`]). Clean completion is exit 0; every
 /// `CommandError` maps through `CommandError::exit_code`.
 ///

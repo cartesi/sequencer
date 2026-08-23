@@ -365,17 +365,24 @@ snapshot back through the watchdog/sequencer recovery workflow.
 
 ## Sequencer restart policy
 
-The sequencer's exit codes are the restart contract (R4): 10
+The sequencer's exit codes are the restart contract: 10
 restart-expect-recovery, 20 restart-transient, 30 terminal — **page an
 operator, do not auto-restart**, 40 wipe + `setup --recovery`, 1
 unclassified restart-with-backoff. Operational notes:
 
 - **The exit code is the whole restart contract.** There is no database
-  gate and no acknowledgement command (removed 2026-08-19, review L2):
+  gate and no acknowledgement command:
   standard recovery is automatic on every boot, and a persistent terminal
   fault re-detects fail-loud when the faulty state is next read. Configure
   the supervisor to honor 30 (stop and page) — that configuration is what
   bounds a crash loop.
+- **Supervisor recipes.** systemd can act on the code directly:
+  `RestartPreventExitStatus=30 ABRT` (SIGABRT/134 is terminal-class too).
+  Kubernetes Deployments restart regardless of exit code, and there is no
+  boot gate — so on k8s a terminal exit will restart-loop through
+  re-detection windows, serving traffic in between. There, the crash-loop
+  bound is your alerting, not the restart policy: page immediately on
+  `lastState.terminated.exitCode == 30` (and on signal exits / 134).
 - **A terminal containment that cannot drain within two seconds exits via
   `abort()` (SIGABRT, status 134), not code 30.** Treat 134 from the
   sequencer as terminal-class; the cause is in the logs and in the

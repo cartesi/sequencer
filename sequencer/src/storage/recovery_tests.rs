@@ -1747,7 +1747,7 @@ mod check_any_unresolved {
         // When BOTH the closed frontier batch and the open Tip are aged past the
         // threshold, find_first_batch_in_danger must return the CLOSED frontier:
         // cascading from it covers the Tip (batch_index >= pivot), and the scoped
-        // pending-snapshot clear keys on the pivot's nonce (F9). Both existing
+        // pending-snapshot clear keys on the pivot's nonce. Both existing
         // find_*_in_danger tests use open-batch-only scenarios; the closed-over-Tip
         // preference (the helper's whole point) was unasserted.
         let db = temp_db("danger-prefers-closed-frontier");
@@ -2387,7 +2387,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_payload_hash_rewrite() {
-        // payload_hash is the content-identity anchor for the R2 canonical-
+        // payload_hash is the content-identity anchor for the canonical-
         // divergence check; a rewrite would let a foreign/zombie L1 landing
         // false-match a local batch. Write-once once stamped at seal.
         let db = temp_db("schema-payload-hash-write-once");
@@ -3168,7 +3168,7 @@ mod recovery_clears_pending_snapshots {
         );
     }
 
-    /// Review F9 regression: the cascade's pending clear is scoped to
+    /// Regression test: the cascade's pending clear is scoped to
     /// `nonce >= pivot.nonce`. A gold-but-unpromoted pending (its batch
     /// landed accepted while the process was down, the lane never
     /// promoted it) sits *below* the pivot and must survive — deleting

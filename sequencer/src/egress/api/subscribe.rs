@@ -186,7 +186,7 @@ async fn send_ws_event(
 }
 
 /// The WS externalization primitive: emitting requires the token, so a new
-/// frame-sending site cannot skip the containment consult (S-A).
+/// frame-sending site cannot skip the containment consult.
 async fn send_ws_message(
     socket: &mut WebSocket,
     message: Message,

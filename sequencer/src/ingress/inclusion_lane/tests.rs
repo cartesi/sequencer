@@ -670,14 +670,13 @@ async fn sustained_rejected_queue_cannot_starve_poisoned_frontier() {
 
 #[test]
 fn reconciliation_digests_an_epoch_sized_outage_backlog_in_one_turn() {
-    // P3 seed (2026-08-18 review): the ADR's digestibility assumption — the
-    // complete accumulated newly-safe range is consumed in ONE reconciliation
-    // turn, with no timeout/resume protocol — exercised at L1-outage scale
-    // rather than the unit-sized ranges the clock tests use. Functional
-    // assertions only (everything drains, one frame at the observed tip);
-    // the printed wall time is developer evidence. The full
-    // ACK-latency-during-catch-up measurement stays with the benchmark
-    // harness (ledger P3).
+    // The ADR's digestibility assumption — the complete accumulated
+    // newly-safe range is consumed in ONE reconciliation turn, with no
+    // timeout/resume protocol — exercised at L1-outage scale rather than
+    // the unit-sized ranges the clock tests use. Functional assertions only
+    // (everything drains, one frame at the observed tip); the printed wall
+    // time is developer evidence. The full ACK-latency-during-catch-up
+    // measurement stays with the benchmark harness.
     const BACKLOG_DIRECTS: u64 = 5_000;
     const JUMP_TARGET_BLOCK: u64 = 7_200; // ~a day of 12s safe blocks
 
@@ -2206,9 +2205,9 @@ fn promotion_advances_drain_atomically_so_restart_cannot_re_promote() {
     };
     // DeferUntilAnchorSet skips acceptance simulation: this test's subject is
     // promote/drain atomicity, and a hand-built landing payload cannot
-    // content-match an unsealed local batch — running the R2 check here would
-    // record a divergence marker and (correctly) freeze the batch tree via
-    // the I15 triggers.
+    // content-match an unsealed local batch — running the content-identity
+    // check here would record a divergence marker and (correctly) freeze the
+    // batch tree via the I15 triggers.
     storage
         .append_safe_inputs_with_timestamp(
             100,

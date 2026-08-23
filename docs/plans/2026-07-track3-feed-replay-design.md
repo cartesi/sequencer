@@ -10,8 +10,9 @@ application-execution boundary, per-input canonical attribution, and
 snapshot/catch-up agreement are
 landed. `GET /history-version`, replay routes, and the WS projection remain
 open. The consumer bootstrap and `/inputs` questions remain decision gates.
-The completed protocol will supersede the ad-hoc WS protocol and close review
-F7/WP5 only when the ordered handoff in §7 is complete. At that point, the
+The completed protocol will supersede the ad-hoc WS protocol and close the
+open WS invalidation-contract finding (see the review register) only
+when the ordered handoff in §7 is complete. At that point, the
 normative parts graduate into `docs/protocol/` and the README is rewritten.
 
 ## 1. Motivation
@@ -20,7 +21,8 @@ The current protocol is an unframed infinite stream of a two-variant enum over
 a WS socket, with every session-level signal smuggled into transport close
 frames. Three defects drive the redesign:
 
-- **F7 (high, open):** no invalidation/rollback signal. Today, recovery
+- **The open invalidation-contract finding (register):** no
+  invalidation/rollback signal. Today, recovery
   cascades hide already-streamed rowid-addressed rows and re-sequence
   replacements at higher rowids under a reused batch nonce. A cursor-resumed
   mirror can silently diverge.
@@ -287,7 +289,7 @@ exhaustive SDK/server type.
 
 ## 7. Ordered implementation handoff
 
-> **At-risk dependency (flagged 2026-08-18, P5):** Bart's 2026-07-28
+> **At-risk dependency:** Bart's 2026-07-28
 > confirmation covers the scalar generation contract only. The `EraId` leg —
 > changed-era rejection and current-era bootstrap behavior — is explicitly
 > unconfirmed by the consumer. The durable schema slice is cheap to carry,
@@ -327,7 +329,7 @@ protocol boundary.
    stale-generation, era-change, below-base, logical-suffix-reuse,
    pagination-hole, and replay-to-live race cases; rewrite the README; graduate
    the normative protocol text; remeasure submit-to-matching-WS-event latency;
-   then mark F7/WP5 fixed.
+   then mark the WS invalidation-contract finding fixed in the register.
 
 Steps 2 and the internal part of 3 can begin before the consumer questions
 close. Do not freeze the public below-`K` recovery recipe or `/inputs` response

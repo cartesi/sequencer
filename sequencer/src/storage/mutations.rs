@@ -88,7 +88,7 @@ fn compute_next_nonce(tx: &Transaction<'_>, parent_batch_index: Option<u64>) -> 
 /// `trg_sealed_at_ms_write_once` / `trg_payload_hash_write_once` triggers.
 /// The payload hash is stamped in the same UPDATE: a sealed batch always
 /// carries the hash the content-identity check compares accepted L1
-/// landings against (review R2, hash-at-seal).
+/// landings against (hash-at-seal).
 pub(super) fn seal_batch(
     tx: &Transaction<'_>,
     batch_index: u64,

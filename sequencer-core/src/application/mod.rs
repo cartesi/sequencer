@@ -63,7 +63,7 @@ impl ApplicationProgress {
     /// Panics when `executed_input_count` is zero and
     /// `last_executed_safe_block` is nonzero. Use [`Self::try_new`] on
     /// deserialization paths, where the pair comes from untrusted bytes and
-    /// the caller owes a typed error, not a panic (D10).
+    /// the caller owes a typed error, not a panic.
     pub const fn new(
         executed_input_count: ExecutedInputCount,
         last_executed_safe_block: u64,

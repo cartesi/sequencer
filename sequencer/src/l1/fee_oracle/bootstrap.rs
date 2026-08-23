@@ -3,7 +3,7 @@
 
 //! Boot-time construction of the Uniswap fee oracle — the one home for the
 //! connect / classify / tolerate policy that `setup` and `run` previously
-//! each hand-rolled by reaching past this module's boundary (H3).
+//! each hand-rolled by reaching past this module's boundary.
 //!
 //! The two commands share the connect-and-classify core but deliberately
 //! keep different tolerance postures:

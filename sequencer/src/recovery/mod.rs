@@ -119,8 +119,10 @@ impl RecoveryError {
     }
 }
 
-/// F2 coherence guard shared with `setup --recovery`. Runtime recovery also
-/// enforces this inside the guarded cascade transaction.
+/// The post-flush resync coherence check — the resynced safe block must
+/// reach the flush observation before cascade — shared with
+/// `setup --recovery`. Runtime recovery also enforces this inside the
+/// guarded cascade transaction.
 pub(crate) fn assert_resync_caught_up(
     resynced_safe_block: u64,
     flush_observed_safe_block: u64,
@@ -141,10 +143,11 @@ pub(crate) fn assert_resync_caught_up(
 /// memory-only witness: `drive_recovery` is its only writer, phases are its
 /// only source, and it never persists — a restarted attempt has no witness
 /// and must flush again. Cascade is therefore reachable only through
-/// Flush → Sync *in this process* (ADR §3). This one enum is both the
+/// Flush → Sync *in this process* (the ADR's recovery-reducer mechanism).
+/// This one enum is both the
 /// reducer's input and the driver's completion type; the previous
 /// `RecoveryState`/witness-struct/`PhaseCompletion` triple encoded the same
-/// five variants three times (H4).
+/// five variants three times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryProgress {
     NeedInitialSync,

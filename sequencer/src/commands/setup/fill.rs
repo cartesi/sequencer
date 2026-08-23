@@ -39,7 +39,7 @@ pub(crate) fn register_genesis_finalized_snapshot<A: Application + 'static>(
     }
     // The violator here is a foreign `Application` impl supplied by the app
     // crate, so a nonzero genesis boundary is a typed refusal with a
-    // diagnosis, not a panic across the crate boundary (D11). It still runs
+    // diagnosis, not a panic across the crate boundary. It still runs
     // first, before any write; nothing to unwind.
     let genesis_count = initial_app.executed_input_count().get();
     if genesis_count != 0 {
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn fill_recovery_state_leaves_post_c_directs_undrained() {
-        // P1: the post-flush resync runs to the live safe head H1, normally > the
+        // The post-flush resync runs to the live safe head H1, normally > the
         // checkpoint stop block C. The fold folds only `<= C` into S'; directs in
         // (C, H1] must stay UNDRAINED so run leads + executes them exactly once.
         // Draining them here (the old behavior) would skip them on catch-up while
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn fill_recovery_state_refuses_re_run_with_a_different_nonce() {
-        // B1: a re-run with a *different* resume nonce (e.g. a different
+        // A re-run with a *different* resume nonce (e.g. a different
         // checkpoint, or the same one after C advanced) would move the anchor
         // while leaving the old root tip — a silent I16 break. It must fail loud.
         use crate::storage::StoredSafeInput;
@@ -841,7 +841,7 @@ mod tests {
 
     #[test]
     fn fill_recovery_state_refuses_incomplete_same_nonce_re_run() {
-        // P1: a crash between opening the recovery root tip (fill step 2) and
+        // A crash between opening the recovery root tip (fill step 2) and
         // writing the finalized snapshot (step 4) leaves "tip exists, no
         // finalized". A same-N' re-run must NOT resume — directs that landed
         // since would be left unsequenced, leaving the snapshot cursor behind
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn fill_recovery_state_refuses_over_residual_finalized_snapshot() {
-        // P2: `setup --recovery` over an un-wiped data dir left by a plain
+        // `setup --recovery` over an un-wiped data dir left by a plain
         // `setup` that wrote the genesis finalized snapshot and crashed before
         // completion (finalized snapshot present, NO root tip). A completed
         // cockroach fill always has both, so this residue must fail loud —

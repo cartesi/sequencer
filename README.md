@@ -133,7 +133,7 @@ environment:
   CARTESI_SEQUENCER_ALLOW_INSECURE_RPC: "true"
 ```
 
-Process exit codes follow the R4 orchestrator contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), and `1` for an unclassified operational failure. Panics inside the command harness or supervised workers are projected to `30` under the fail-loud self-trust policy; `101` remains possible only before the harness can contain the command (for example, process/runtime initialization).
+Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), and `1` for an unclassified operational failure. Panics inside the command harness or supervised workers are projected to `30` under the fail-loud self-trust policy; `101` remains possible only before the harness can contain the command (for example, process/runtime initialization).
 
 Fixed protocol identity (EIP-712):
 

@@ -13,12 +13,12 @@
 //! - [`ShutdownSignal::is_storage_invariant_contained`]: checked by
 //!   externalization sites (acks, L1 sends, WS frames, snapshot stream
 //!   starts) before emitting; set only by containment, so a missed check is
-//!   bounded by the R4 exit contract (terminal exits are not restarted) and
+//!   bounded by the exit contract (terminal exits are not restarted) and
 //!   by the I15 freeze triggers on the tables they cover — partial
 //!   backstops, not a barrier.
 //!
 //! Honest bounds: the black box's terminal-cause row is best-effort
-//! telemetry (L2/L3: restart policy is the R4 exit contract, and a persistent fault
+//! telemetry (restart policy is the exit contract, and a persistent fault
 //! re-detects fail-loud on the next boot that reads it — there is no
 //! database boot gate to keep durable).
 //! In a process-lock-backed runtime, terminal containment gives the complete
@@ -84,7 +84,7 @@ impl TerminalAbortWatchdog {
 }
 
 /// Cooperative shutdown notification — exactly what the name says, and
-/// nothing else (H2). Freely `Default`-constructible; carries no authority.
+/// nothing else. Freely `Default`-constructible; carries no authority.
 #[derive(Clone, Default)]
 pub struct ShutdownSignal {
     is_shutting_down: Arc<AtomicBool>,
@@ -95,7 +95,7 @@ pub struct ShutdownSignal {
 /// exclusive data-directory ownership plus terminal-fault containment. Only
 /// constructible from a held [`ProcessLock`] — installed at lock
 /// acquisition, before any signal or worker exists — so a watchdog-less or
-/// lock-less containment object is unrepresentable in production (D2/H2).
+/// lock-less containment object is unrepresentable in production.
 /// Workers that touch the data directory or externalize take a scope;
 /// pure-notification consumers take its [`ShutdownSignal`].
 #[derive(Clone)]
@@ -103,7 +103,7 @@ pub struct RuntimeScope {
     signal: ShutdownSignal,
     /// Single containment authority: winning this `OnceLock` *is* the sticky
     /// containment bit, so the bit and its cause become visible together —
-    /// there is no window where containment reads true with no cause (D5).
+    /// there is no window where containment reads true with no cause.
     first_containment_cause: Arc<std::sync::OnceLock<String>>,
     /// Durable fault recorder (the black box's terminal-cause row), installed
     /// once during runtime preparation. Invoked only after the containment
@@ -111,7 +111,7 @@ pub struct RuntimeScope {
     /// externalization may be authorized while it runs. Best-effort
     /// telemetry: when it fails, the cause is still in the logs, the process
     /// still exits terminal, and a persistent fault re-detects on the next
-    /// boot that reads it (L2).
+    /// boot that reads it.
     fault_recorder: Arc<std::sync::OnceLock<FaultRecorder>>,
     terminal_abort_watchdog: TerminalAbortWatchdog,
     /// Runtime-lifetime ownership. Every scope clone retains the lock;
@@ -185,7 +185,7 @@ impl RuntimeScope {
     /// This is containment, not recovery: the supervisor maps the contained
     /// state to the terminal exit class (30 — do not restart, page). A
     /// persistent fault re-detects fail-loud on any boot that reads it; the
-    /// black-box row is the cause's telemetry, not a boot gate (L2/L3).
+    /// black-box row is the cause's telemetry, not a boot gate.
     pub(crate) fn contain_storage_invariant_failure(&self, cause: impl Into<String>) {
         // First-winner election: setting the cause is the containment bit,
         // so exactly one reporter proceeds and echoes return immediately
@@ -228,7 +228,7 @@ impl RuntimeScope {
     /// terminal fault is contained. The authority-bearing effect functions
     /// (acknowledge, L1 send, WS emit, snapshot-stream start) take an
     /// [`Authorized`], so a new externalization site cannot forget the check
-    /// — the compile error replaces the convention (S-A). This is the honest
+    /// — the compile error replaces the convention. This is the honest
     /// bounded-lag consult, not a fence: a token minted before a concurrent
     /// containment may finish its already-authorized effect (ADR).
     pub(crate) fn authorize(&self) -> Option<Authorized<'_>> {

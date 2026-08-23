@@ -83,7 +83,7 @@ async fn submit_tx(
     commit_result.map_err(ApiError::from)?;
     // Publication gate: the lane's acknowledgement already required the
     // token; the success body after a post-commit containment is suppressed
-    // by the same consult (S-A).
+    // by the same consult.
     if state.shutdown.authorize().is_none() {
         return Err(ApiError::unavailable("sequencer shutting down"));
     }

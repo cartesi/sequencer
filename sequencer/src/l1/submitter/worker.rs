@@ -51,7 +51,7 @@ pub enum BatchSubmitterError {
 
 impl BatchSubmitterError {
     /// Whether this error poisons the run rather than restarting. Named
-    /// arms, no wildcard: a new variant must classify itself here (D1/H1).
+    /// arms, no wildcard: a new variant must classify itself here.
     pub(crate) fn is_terminal_invariant(&self) -> bool {
         match self {
             Self::Storage(source) => crate::storage::is_persistent_storage_error(source),
@@ -106,12 +106,12 @@ pub(crate) struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
     poster: Arc<P>,
     idle_poll_interval: Duration,
-    /// Write-before-broadcast hook (review R1a): the poster raises the
+    /// Write-before-broadcast hook: the poster raises the
     /// persisted wallet-nonce watermark through this before every send.
     watermark_sink: crate::l1::watermark::StorageWatermarkSink,
     /// Retains data-directory exclusivity in detached blocking reads.
     /// Required at construction: a submitter without data-dir ownership is
-    /// unrepresentable (H14).
+    /// unrepresentable.
     process_lock: ProcessLock,
 }
 
@@ -239,7 +239,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         let submitted_count = pending.len();
         let payloads: Vec<Vec<u8>> = pending.into_iter().map(|b| b.encoded).collect();
         // The L1 send requires the externalization token; the poster's own
-        // per-send gate stays as the bounded-lag re-check inside (S-A).
+        // per-send gate stays as the bounded-lag re-check inside.
         let Some(auth) = scope.authorize() else {
             return Err(BatchSubmitterError::Poster(
                 BatchPosterError::StorageInvariantViolation,
@@ -292,7 +292,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
 }
 
 /// Deliberately per-worker, not shared with the snapshot endpoint's
-/// `storage_task` (H9): this worker carries a typed error to the supervisor
+/// `storage_task`: this worker carries a typed error to the supervisor
 /// through its exit channel, while an HTTP handler must contain immediately.
 fn map_storage_task_join(
     err: tokio::task::JoinError,
@@ -365,7 +365,7 @@ mod tests {
     fn seed_safe_submitted_batches(db_path: &str, safe_block: u64, nonces: &[u64]) {
         let mut storage = Storage::open(db_path).expect("open storage");
         // Landings carry the local batch's real wire bytes so the
-        // content-identity check (review R2) accepts them.
+        // content-identity check accepts them.
         let inputs: Vec<_> = nonces
             .iter()
             .map(|nonce| StoredSafeInput {

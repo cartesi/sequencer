@@ -98,7 +98,7 @@ impl ProcessLock {
 
     /// Test lock on a leaked temp dir (bounded by test count): component
     /// tests need a held lock now that data-dir workers require one at
-    /// construction (H14).
+    /// construction.
     #[cfg(test)]
     pub(crate) fn test() -> Self {
         let dir = tempfile::tempdir().expect("test lock tempdir");
@@ -121,7 +121,7 @@ impl ProcessLock {
 /// closure's real lifetime. Dropping the async join handle detaches Tokio
 /// blocking work; this wrapper prevents that detach from releasing exclusive
 /// data-directory ownership prematurely. The lock is required: a data-dir
-/// blocking task without ownership is unrepresentable (H14).
+/// blocking task without ownership is unrepresentable.
 pub(crate) fn spawn_blocking_with_lock<F, R>(
     process_lock: ProcessLock,
     work: F,

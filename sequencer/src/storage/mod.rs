@@ -267,7 +267,7 @@ pub enum StorageOpenError {
     Migration(#[from] rusqlite_migration::Error),
     /// No database file at the given path. Databases are only created by an
     /// owning command (`setup` / `rebuild`); a missing file at `open` time is
-    /// a deployment mistake, never a cue to create one (D6).
+    /// a deployment mistake, never a cue to create one.
     #[error(
         "no database at {path} — this data directory was never initialized; run `setup` (or check --data-dir)"
     )]

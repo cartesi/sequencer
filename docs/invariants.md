@@ -15,18 +15,6 @@ When you change anything listed under *enforced by*, re-check every line under
 
 **Impossible states fail loud; they are never handled.**
 
-> **Authority-cutover status:** steps 1–5 are landed, with the L2 amendment
-> (2026-08-19): lifecycle admission gating was removed — admission is
-> fact-derived (process lock, two-sided `setup_complete`, divergence) — and
-> the L3 amendment (2026-08-22): the write-only attempt journal was narrowed
-> to a terminal-fault black box (`terminal_faults`), and every black-box
-> write is verdict-neutral. The normal-`run` reducer and
-> `AdmittedRuntime` boundary are authoritative for run startup; setup,
-> rebuild, and maintenance remain separate typed command protocols. Step 6's durable era/generation/base
-> metadata, typed application-progress boundary, per-input offset projection,
-> and snapshot/catch-up checks are landed. Public history-version, replay, and
-> WebSocket projection remain deferred.
-
 - An invariant violation gets exactly one response: abort the operation loudly
   (assert, trigger `RAISE`, typed error). Cheap cross-module assertions at
   boundaries are *encouraged*. Failing loud is safety-preserving, not
@@ -51,15 +39,15 @@ When you change anything listed under *enforced by*, re-check every line under
   restart over a completed setup, run/flush never start before one), and
   `canonical_divergence` (the one absorbing refusal — only a
   fresh-directory cockroach rebuild proceeds). There is no lifecycle
-  admission state machine and no operator acknowledgement (2026-08-19
-  review, L2): standard recovery is automatic — every run boots through the
-  fact-derived reducer — and restart policy after a terminal fault is the
-  R4 exit contract (30 = do not restart, page), enforced by the
-  supervisor; a persistent fault re-detects fail-loud on any boot that
-  reads it. The only durable telemetry is the `terminal_faults` black box
-  (L3, 2026-08-22): append-only terminal-cause rows, written best-effort
-  and verdict-neutrally — telemetry never changes a command's verdict, and
-  nothing reads the black box for decisions. Runtime admission re-runs the
+  admission state machine and no operator acknowledgement: standard
+  recovery is automatic — every run boots through the fact-derived
+  reducer — and restart policy after a terminal fault is the exit-code
+  contract (30 = do not restart, page), enforced by the supervisor; a
+  persistent fault re-detects fail-loud on any boot that reads it. The
+  only durable telemetry is the `terminal_faults` black box: append-only
+  terminal-cause rows, written best-effort and verdict-neutrally —
+  telemetry never changes a command's verdict, and nothing reads the
+  black box for decisions. Runtime admission re-runs the
   reducer over one transactionally consistent fact set immediately before
   the non-yielding launch block; the process lock plus the task-free
   prepare phase make that read the decision's linearization. Baseline
@@ -77,7 +65,7 @@ When you change anything listed under *enforced by*, re-check every line under
   operator/recovery shutdown has no hard deadline. Externalization sites
   (acks, L1 sends, WS frames) check the containment bit before emitting;
   snapshot streams check it only at stream start today. A missed check is
-  bounded by the R4 exit contract and by the I15 freeze triggers on the
+  bounded by the exit-code contract and by the I15 freeze triggers on the
   tables they cover — partial structural backstops, not a barrier.
 - **Maintenance is flush-only.** `flush-mempool` is an operator command,
   not a run-reducer alias: it settles the wallet nonce and never acquires
@@ -99,13 +87,12 @@ When you change anything listed under *enforced by*, re-check every line under
   crate-private; production app crates enter through `run`/`run_main`. No
   refusal or retry can construct the capability. Mutation and output
   authorization remains role-local at the durable boundaries documented
-  below; step 3 does not claim that public low-level storage helpers are an
-  authority API.
+  below; public low-level storage helpers are not an authority API.
 - An assertion must check a **real invariant** — true in every legitimate
   execution, including crash-recovery, replays, and clock steps — never an
   environmental assumption. (Cautionary tale: `sealed_at_ms >= created_at_ms`
-  was CHECK-enforced, wall-clock regression is legitimate, and the constraint
-  wedged recovery — review F8.)
+  was once CHECK-enforced; wall-clock regression is legitimate, and the
+  constraint wedged recovery before it was dropped.)
 
 Decision test for any proposed check: (a) real invariant? (b) near-zero cost?
 (c) fails loud with no alternative code path? Three yeses → write it. Any no →
@@ -178,11 +165,10 @@ don't.
 - **Enforced by:** the arm order in `Storage::check_danger`
   (`storage/recovery.rs`) + I3.
 - **Depended on by:** the dispatch table's meaning (a `RecoverTip` boot may
-  skip the flush *because* nothing closed is doomed). **No longer load-bearing
-  for the pending clear**: since the F9 fix (2026-06-11) the clear is scoped
-  to `nonce >= pivot.nonce` in `cascade_and_reopen`, so a valid in-flight
-  closed batch's pending survives any cascade by construction, regardless of
-  arm order.
+  skip the flush *because* nothing closed is doomed). **Not load-bearing for
+  the pending clear**: the clear is scoped to `nonce >= pivot.nonce` in
+  `cascade_and_reopen`, so a valid in-flight closed batch's pending survives
+  any cascade by construction, regardless of arm order.
 - **Breaks:** a Tip-only cascade while a closed batch is doomed would leave
   the doomed batch un-cascaded until the next detector cycle (liveness lag,
   not the old crash-loop).
@@ -238,13 +224,19 @@ don't.
 
 ### I9. Acceptance identity: "accepted nonce N" means "our valid batch N"
 
-- **Holds:** by nonce **and content** since WP3 (review R2, 2026-06-12): every
+- **Holds:** by nonce **and content** — the **content-identity check**: every
   landing at/above the batch-tree anchor that the off-chain
   `scheduler_accepts` simulation accepts is compared against the local valid
   closed batch at that nonce — `keccak256(landed bytes)` vs the hash stamped at
   seal by the same encode path the submitter broadcasts. The exhaustive local
   outcomes are `Match`, `Foreign` (no local valid closed batch), and `Mismatch`
   (different bytes); the last two record divergence.
+- **Why content, not identity, suffices:** batches deliberately carry no
+  identifier because content-equal copies are *effect-equal* — an accepted
+  batch's application effects depend on its inclusion block only through the
+  overdue force-drain, and for any fresh copy that force-executed prefix is
+  a subset of the first frame's drain, in the same queue order. Which
+  physical L1 transaction landed carries no semantic weight.
 - **Enforced by:** prevention — the flush resolving every wallet-nonce slot
   before a cascade reuses a nonce, anchored by the persisted watermark (I14);
   detection — the content-identity check in
@@ -252,11 +244,12 @@ don't.
   `canonical_divergence` marker and freezes the frontier (I15).
 - **Depended on by:** the gold frontier, cascade pivot selection, promotion,
   local-state ↔ canonical-state agreement.
-- **Breaks:** was silent divergence (review F1's zombie, F3's power-loss
-  re-seal); now a detected `CanonicalDivergence` refusal whose remedy is
-  cockroach recovery.
-- **Completeness boundary:** R2 completely enforces the accepted-batch identity
-  predicate above; it is intentionally not a general canonical/application
+- **Breaks:** would be silent divergence (a zombie replay of our own stale tx
+  winning a nonce slot; a power-loss re-seal at the same nonce with different
+  content); instead it is a detected `CanonicalDivergence` refusal whose
+  remedy is cockroach recovery.
+- **Completeness boundary:** the check completely enforces the accepted-batch
+  identity predicate above; it is intentionally not a general canonical/application
   divergence oracle. It trusts collapsed history below the anchor and the
   checkpoint application state, shares `scheduler_accepts` (including its
   documented self-trust omissions), and does not independently detect bugs in
@@ -264,7 +257,10 @@ don't.
   known example that can escape it. Absence of the marker therefore does not
   prove global agreement. Detection is automatic once the landing is safe and
   successfully ingested; repair is manual cockroach recovery, never standard
-  recovery.
+  recovery. Detection latency is inherent to the optimistic model: the check
+  fires when the divergent landing reaches safe depth and is ingested, so
+  soft confirmations issued inside that window are built on already-diverged
+  state — bounded, and those confirmations are rollbackable by design.
 
 ### I10. Replay-offset sentinel: `0` means "from genesis"
 
@@ -321,20 +317,23 @@ don't.
 
 ### I14. Watermark ≥ wallet nonce of every tx ever broadcast
 
-- **Holds:** since WP2 (review R1a, 2026-06-11) — the watermark commits
+- **Holds:** the **write-before-broadcast rule** — the watermark commits
   durably (`synchronous=FULL`) before any broadcast at a new nonce,
-  uniformly for batch txs and flush no-ops.
+  uniformly for batch txs and flush no-ops. A crash between commit and send
+  only over-covers (the flush later no-ops a never-used slot — harmless).
 - **Enforced by:** write-before-broadcast — `EthereumBatchPoster::submit_batches`
   raises through `WalletNonceWatermarkSink` before its first send;
   `MempoolFlusher::flush_and_wait` likewise before its no-ops, and refuses to
   complete until `safe >= watermark + 1`.
 - **Depended on by:** flush completeness, TLA+ Implementation Constraint 1,
   cascade soundness (I9).
-- **Breaks:** zombie txs evade the flush — review F1.
+- **Breaks:** zombie txs evade the flush — a dropped-locally but
+  network-surviving batch tx re-lands at a slot the recovery batch reuses,
+  and the scheduler executes invalidated content.
 
 ### I15. Divergence marker present ⇒ acceptance frontier frozen
 
-- **Holds:** since WP3 (review R2, 2026-06-12). A fully-accepted landing that
+- **Holds:** a fully-accepted landing that
   fails the content-identity check writes the `canonical_divergence`
   singleton **in the same transaction** as the sync that detected it, and
   `populate_safe_accepted_batches` returns early whenever the marker exists —
@@ -347,7 +346,7 @@ don't.
   user-op hot-path barrier. The typed error surface also includes the marker
   guard at the top of
   `populate_safe_accepted_batches` and `check_danger`'s first arm
-  (`CanonicalDivergence`, ranked ahead of every other arm). The step-3 run
+  (`CanonicalDivergence`, ranked ahead of every other arm). The run
   reducer makes that ordering structural at boot: local inspection refuses
   before any provider query, every completed phase re-enters inspection, and
   each mutating phase transaction reasserts both its durable preconditions and
@@ -369,17 +368,18 @@ don't.
   conflicting batch-tree/promotion writes; the detector and next typed read
   stop the process. A chunk committed before either runtime observation may
   acknowledge and later roll back.
-- **Watchdog boundary:** R2 freezes finalized promotion before the offending
-  landing becomes a comparable sequencer checkpoint. Because the watchdog
-  skips replay when the finalized inclusion block is unchanged, it does not
-  subsume this wire-identity detector. Conversely, R2 does not subsume the
-  watchdog's broader independent application-state comparison.
+- **Watchdog boundary:** the freeze stops finalized promotion before the
+  offending landing becomes a comparable sequencer checkpoint. Because the
+  watchdog skips replay when the finalized inclusion block is unchanged, it
+  does not subsume this wire-identity detector. Conversely, the check does
+  not subsume the watchdog's broader independent application-state
+  comparison.
 - **Depended on by:** standard recovery never running on a diverged frontier
   (a flush+cascade there would compound the divergence); the lane never
   promoting a diverged landing; the remedy being cockroach recovery only.
 - **Breaks:** silent permanent scheduler/sequencer divergence — the
-  theft-equivalent failure the whole review centered on (F1/F3 residuals).
-- **Anchor-aware frontier (PR5, 2026-06-26):** the content-identity check fires
+  theft-equivalent failure.
+- **Anchor-aware frontier:** the content-identity check fires
   only at/above the batch-tree **anchor** ([I16](#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)).
   `populate_safe_accepted_batches` seeds its initial expected nonce from the
   anchor (0 for genesis — unchanged; `N'` for a cockroach-recovered deployment),
@@ -394,7 +394,7 @@ don't.
 
 ### I16. The batch tree has exactly one valid parentless root, carrying the deployment's anchor nonce
 
-- **Holds:** since PR5 (cockroach recovery, 2026-06-25). Every batch's nonce is
+- **Holds:** every batch's nonce is
   `parent.nonce + 1`, except the single parentless root, which carries the
   `batch_tree_anchor` nonce — `0` for a genesis deployment, `N'` for a
   cockroach-recovered one (`setup --recovery` writes the anchor before the
@@ -404,12 +404,11 @@ don't.
   invalidating the old root — so only one *valid* parentless root ever exists,
   invalidated ones coexisting.
 - **Enforced by:** `trg_enforce_nonce_contiguity` — its parentless arm is an
-  *exact* match `nonce == (SELECT nonce FROM batch_tree_anchor)` (tighter than
-  the pre-PR5 "must be 0"), plus an at-most-one-valid-parentless-root guard
+  *exact* match `nonce == (SELECT nonce FROM batch_tree_anchor)` (tighter
+  than a bare "must be 0"), plus an at-most-one-valid-parentless-root guard
   scoped to `invalidated_at_ms IS NULL`; `compute_next_nonce(None)` reads the
   same anchor; `trg_batch_tree_anchor_write_once` freezes the anchor once
-  `setup_complete` exists. Normal (anchor 0) deployments are byte-identical to
-  pre-PR5.
+  `setup_complete` exists.
 - **Depended on by:** the submitter resuming at the right nonce — `run` submits
   `valid_closed_batches` with `nonce >= frontier_nonce`, where `frontier_nonce`
   defaults to the anchor (`= N'`) while `safe_accepted_batches` is still empty
@@ -476,8 +475,7 @@ don't.
   drainable or executable again. NULL is interpreted as zero only while
   setup has not completed (only a pre-completion rebuild fill can present a
   NULL floor: plain setup binds base 0 in its baseline transaction, and
-  completion refuses while the base is NULL — L2 simplified the old
-  rebuild-active-starting predicate to this completion fact).
+  completion refuses while the base is NULL).
 - **Coordinate separation:** `K` is an application-history boundary. It is
   deliberately independent of snapshot `l2_tx_index` and the current rowid
   feed cursor, which may include sequenced-but-not-executed cursor-padding
@@ -500,6 +498,35 @@ don't.
   wipe/retry and therefore a new unexposed era. No automated replacement,
   clone detection, distributed fencing, or general resume state machine is
   implied.
+
+### Do-not-simplify (deliberate shapes that look like cleanup targets)
+
+The refactorer-facing mirror of the register above — each of these *looks*
+like a simplification and would break a registered invariant:
+
+- **Don't move filesystem work into `storage/snapshot_dumps.rs`** — the
+  module boundary *is* the GC crash-ordering guarantee (I13).
+- **Don't reorder `check_danger`'s arms** or merge its two `find_*` helpers
+  into one that consults the Tip first — the closed-frontier-first order is
+  the dispatch table's meaning (I4).
+- **Don't "deduplicate" promotion out of the drain transaction** — a
+  standalone promotion re-opens the promote-wedge crash loop (I6).
+- **Don't filter own-batch rows out of `valid_sequenced_l2_txs`** — the
+  drain cursor is `MAX(safe_input_index)+1` over those very rows; a view
+  filter would rewind it and re-drain. Sender filtering stays at the
+  consumers (I11).
+- **Don't replace the rowid offset with count-based pagination** —
+  invalidated-batch holes and the 0-sentinel depend on current physical
+  behavior (I10).
+- **Don't move snapshot GC off the promotion path** to an idle loop or a
+  dedicated worker — promotion-coupled GC is starvation-proof and
+  single-writer by design (`docs/snapshots/lifecycle.md`).
+- **Don't add internal retry loops to the flusher/submitter for provider
+  errors** — the orchestrator respawn is the retry mechanism; internal
+  retries mask exactly the failures the danger machinery routes on.
+- **Don't unify the two staleness references** (inclusion-relative vs
+  current-relative) — deliberately different formulas for different
+  questions.
 
 ### I19. Application progress advances only at the shared execution boundary
 

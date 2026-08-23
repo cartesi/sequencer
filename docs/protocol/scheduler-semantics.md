@@ -207,7 +207,7 @@ I1 names three places this algorithm lives. They are not three rewrites; two are
   self-bug (a fault state to crash on), not an adversarial input to predict.
   This document is the cross-reference home for the omission — the asymmetry is
   intentional, not a missing check.
-- **R2 is complete relative to #2, not an independent oracle for #1.** For
+- **The content-identity check is complete relative to #2, not an independent oracle for #1.** For
   every at/above-anchor landing that `scheduler_accepts` accepts, the frontier
   builder exhaustively finds a byte-identical valid local closed batch
   (`Match`), no local batch (`Foreign`), or different bytes (`Mismatch`); the
@@ -222,7 +222,7 @@ I1 names three places this algorithm lives. They are not three rewrites; two are
   submitter's `decide_submit_start` consumes it directly. The frontier builder
   `populate_safe_accepted_batches` keeps a deliberate inline copy of the same
   advance — its loop interleaves the advance with two storage-only side effects
-  (the R2 content-identity check and the `canonical_divergence` freeze) that
+  (the content-identity check and the `canonical_divergence` freeze) that
   cannot move below the protocol layer; sharing the fold there would force a
   callback contract. The duplication is intentional and documented at the call
   site.
@@ -276,17 +276,17 @@ The duality's load-bearing edge cases each have at least one test
 
 ---
 
-## Reference-scheduler count audit and hardening
+## Reference-scheduler count discipline
 
-**Status: landed.** Every canonical input now crosses the same typed execution
+Every canonical input crosses the same typed execution
 boundary in the scheduler, live lane, catch-up, and recovery fold:
 
 1. Successful directs and validated user ops return their pre-execution
    `ExecutedInputCount` and advance exactly once with checked arithmetic.
    Rejection, bad signatures, envelopes, empty batches, and stale/structural
    skips leave it unchanged.
-2. `AppError` is fatal everywhere. Continuing after a possibly partial hook
-   failure no longer defines a parallel scheduler-only transition.
+2. `AppError` is fatal everywhere; there is no parallel scheduler-only
+   transition after a possibly partial hook failure.
 3. Distinct opaque capabilities let application hooks mutate application state
    without granting them authority to overwrite scheduler-owned progress. The
    shared boundary checks progress before/after both successful and failing

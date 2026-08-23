@@ -156,7 +156,7 @@ where
         FeeOracleMode::Fixed { log_gas_price } => PreparedFeeOracle::Fixed { log_gas_price },
         FeeOracleMode::Uniswap(uniswap) => {
             // Setup requires L1: transient and misconfig both abort, before
-            // anything pins (H3 — one connect/classify home).
+            // anything pins (one connect/classify home).
             let (provider, token) = crate::l1::fee_oracle::connect_uniswap(
                 &config.eth_rpc_url,
                 config.allow_insecure_rpc,
@@ -232,8 +232,8 @@ where
     // A checkpoint promotion cannot predate the application's deployment
     // block (the scan genesis — no input exists before it).
     // `B = 0` is the genesis bootstrap (no checkpoint) and is always valid.
-    // (PR3 detects only; loading a non-genesis checkpoint machine and the
-    // `A < B` check are `setup --recovery` / PR5.)
+    // (plain setup detects only; loading a non-genesis checkpoint machine and
+    // the `A < B` check are `setup --recovery`'s job.)
     if config.checkpoint_block != 0 && config.checkpoint_block < input_reader.app_deployment_block()
     {
         return Err(BootstrapError::CheckpointBeforeAppDeployment {
@@ -302,7 +302,7 @@ where
         // be missing from the not-yet-resynced scan. `pending` stays live, so any
         // submitter activity past the synced head still trips `pending > safe`.
         //
-        // F1: step 1 reads the LOCAL provider's pool view — a zombie tx dropped
+        // Step 1 reads the LOCAL provider's pool view — a zombie tx dropped
         // from this pool but alive elsewhere evades it, bounded at runtime by the
         // content-identity check (CanonicalDivergence → cockroach recovery).
         let synced_safe_block = storage.current_safe_block()?;
@@ -372,7 +372,7 @@ fn admit_setup_lifecycle(
         return Ok(SetupAdmission::Proceed);
     }
 
-    // Admission facts only (L2): divergence is absorbing; a completed setup
+    // Admission facts only: divergence is absorbing; a completed setup
     // is once-per-database (already-complete plain setup is a no-op, an
     // already-complete rebuild is an error); a crashed prior attempt left
     // only idempotent residue behind — the retry proceeds fresh over it.
@@ -403,7 +403,7 @@ fn settle_setup_lifecycle(
             Ok(())
         }
         Err(_) => {
-            // Verdict-neutral black-box settlement (L3): the recorder never
+            // Verdict-neutral black-box settlement: the recorder never
             // replaces the command's own error.
             crate::commands::record_terminal_fault_best_effort(db_path, command, result);
             Ok(())
@@ -528,7 +528,8 @@ where
     let stop_block =
         flush_wallet_nonce(config, identity, timing.seconds_per_block, storage).await?;
 
-    // 3. Re-sync through C; F2 coherence. Frontier population stays OFF (the
+    // 3. Re-sync through C, then verify the resynced safe block reaches the
+    //    flush observation before cascade. Frontier population stays OFF (the
     //    caller disabled it before the initial sync): the tree is rebuilt in
     //    step 6, so a frontier built here against an empty tree would falsely
     //    diverge. `run`'s first sync populates it correctly once anchor = N'.
@@ -669,8 +670,8 @@ fn run_detection_gate(
     // `safe_inputs` already reflect every previous batch (scanning them is
     // equivalent to scanning `(B, safe]`). Refuse if any batch-submitter tx
     // landed strictly past the checkpoint block. The query reads the
-    // reader-synced table, inheriting the reader's range-completeness hardening
-    // (F5) — see `first_batch_submitter_input_after_block`.
+    // reader-synced table, inheriting the reader's range-completeness
+    // hardening — see `first_batch_submitter_input_after_block`.
     if let Some((safe_input_index, found_block)) =
         storage.first_batch_submitter_input_after_block(batch_submitter, checkpoint_block)?
     {

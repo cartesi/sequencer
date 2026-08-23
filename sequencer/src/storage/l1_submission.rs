@@ -4,7 +4,7 @@
 //! The submitter's storage half: frontier lookup, per-batch frames + user
 //! ops, the catch-up / per-batch replay reader, the SSZ-encoded pending-batch
 //! list the submitter pulls each tick — and the one submission-side write,
-//! the wallet-nonce watermark (raised before every broadcast, review R1a).
+//! the wallet-nonce watermark (raised before every broadcast).
 //!
 //! Structural nonces are assigned by the `batches.nonce` trigger at close
 //! time (see `ingress`), and `safe_accepted_batches` is maintained by
@@ -59,7 +59,7 @@ impl Storage {
 
     /// The highest wallet nonce ever broadcast by this deployment's
     /// batch-submitter key, or `None` if nothing was ever broadcast
-    /// (review R1a — the durable realization of the TLA+ `walletNonce`).
+    /// (the durable realization of the TLA+ `walletNonce`).
     /// The flush reads this as its coverage floor; it never resets.
     pub fn wallet_nonce_watermark(&mut self) -> Result<Option<u64>> {
         use rusqlite::OptionalExtension;
@@ -74,7 +74,7 @@ impl Storage {
         })
     }
 
-    /// Write-before-broadcast (review R1a): durably raise the watermark to
+    /// Write-before-broadcast: durably raise the watermark to
     /// cover `nonce` *before* any tx at a nonce `<= nonce` is sent. The
     /// commit is power-loss durable (`synchronous=FULL`); a crash between
     /// commit and send only over-covers — the flush later no-ops a
@@ -225,7 +225,7 @@ fn frames_for_batch_in(conn: &rusqlite::Connection, batch_index: u64) -> Result<
 
 /// Free-function form so the seal path can encode the closing batch inside
 /// its own transaction — the content-identity check's hash-at-seal must come
-/// from **the same encode path the submitter uses** (review R2); this
+/// from **the same encode path the submitter uses**; this
 /// function being that single path is load-bearing.
 pub(super) fn load_batch_frames_in(
     conn: &rusqlite::Connection,
@@ -816,7 +816,7 @@ mod tests {
             crate::storage::DangerStatus::L1ViewStale
         );
 
-        // A 1 ms step is quantization noise for a block-granular estimate (F8).
+        // A 1 ms step is quantization noise for a block-granular estimate.
         storage
             .conn
             .execute(
@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn seal_stamps_payload_hash_of_the_submitter_encode_path() {
-        // Hash-at-seal (review R2): the hash stamped on the sealed row must
+        // Hash-at-seal: the hash stamped on the sealed row must
         // be the keccak256 of exactly the bytes the submitter will broadcast
         // (`pending_batches`'s encoding) — same code path, by construction.
         let db = temp_db("seal-stamps-payload-hash");
@@ -1069,7 +1069,7 @@ mod tests {
 
     #[test]
     fn accepted_landing_with_mismatched_content_freezes_frontier() {
-        // The F1-zombie / F3-re-seal shape: a landing at the expected nonce
+        // The zombie / re-seal shape: a landing at the expected nonce
         // whose bytes differ from the batch we sealed. The check records a
         // 'mismatch' marker atomically with the sync and freezes the
         // frontier; later syncs stay frozen.
@@ -1135,7 +1135,7 @@ mod tests {
         // `scheduler_accepts` deliberately omits the two structural
         // rejections (future safe_block, non-monotonic frames) under
         // self-trust — the sequencer never produces them. Before the
-        // content-identity check (review R2), such a foreign batch at the
+        // content-identity check, such a foreign batch at the
         // expected nonce would be sim-accepted and silently desync the
         // frontier forever. With the check, it fails the local-batch lookup
         // (kind = foreign), the poison marker persists atomically with the

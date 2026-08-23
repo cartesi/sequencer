@@ -60,7 +60,7 @@ pub enum CommandError {
     AppBootstrap(#[from] AppError),
 }
 
-// ── R4 exit-code projection (WP10) ─────────────────────────────────────
+// ── Exit-code projection ────────────────────────────────────────────────
 //
 // One exhaustive semantic verdict owns failure classification. The
 // terminal-fault black box and the orchestrator-facing exit code both derive
@@ -86,7 +86,7 @@ pub const EXIT_TERMINAL: u8 = 30;
 /// uncompleted data dir and run `setup --recovery`. The recovery sibling of
 /// [`EXIT_RESTART_EXPECT_RECOVERY`] (10), but *operator-initiated*: 10 means
 /// "restart and `run()` auto-recovers"; 40 means "a previous instance left work
-/// past the checkpoint, and only an explicit fresh `setup --recovery` (PR5)
+/// past the checkpoint, and only an explicit fresh `setup --recovery`
 /// can resolve it" — a plain restart of `setup` would re-detect and re-refuse
 /// forever. Distinct from terminal (30) in that a known recovery procedure
 /// *does* fix it.
@@ -180,7 +180,7 @@ impl CommandError {
         }
     }
 
-    /// Project this error onto the R4 exit-code contract. Clean shutdown
+    /// Project this error onto the exit-code contract. Clean shutdown
     /// (exit 0) is handled by the caller — a `CommandError` is always a failure.
     pub fn exit_code(&self) -> u8 {
         self.failure_verdict().exit_code()
@@ -188,7 +188,7 @@ impl CommandError {
 }
 
 // Per-worker terminality lives as `is_terminal_invariant` on each worker's
-// own error type, beside its enum (D1/H1); `WorkerExit::is_terminal` above
+// own error type, beside its enum; `WorkerExit::is_terminal` above
 // composes them.
 
 fn danger_failure_verdict(status: &DangerStatus) -> CommandFailureVerdict {
@@ -202,7 +202,7 @@ fn danger_failure_verdict(status: &DangerStatus) -> CommandFailureVerdict {
         DangerStatus::L1ViewStale | DangerStatus::EstimatedBatchInDanger(_) => {
             CommandFailureVerdict::Retryable
         }
-        // The only genuinely terminal danger: canonical divergence (R2).
+        // The only genuinely terminal danger: canonical divergence.
         DangerStatus::CanonicalDivergence(_) => CommandFailureVerdict::Terminal,
         // `Safe` is never a detector exit. If it ever reaches here the danger
         // classification is self-contradicting — page an operator (EXIT_TERMINAL)
@@ -237,7 +237,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         // Transient: self-heal when the L1 view / provider recovers — or,
         // for the data-dir lock, when the previous owner finishes dying.
         // `FeeOracleTransient` is documented "may self-heal", which is this
-        // class's definition (D9).
+        // class's definition.
         BootstrapError::ChainIdRpc { .. }
         | BootstrapError::Identity(IdentityError::FirstBootRequiresL1)
         | BootstrapError::DetectionNonceRead { .. }
@@ -260,7 +260,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
 
         // Sticky setup refusal: a previous instance left work past the
         // checkpoint. Distinct from the auto-recovery class (10) — a plain
-        // restart re-refuses; only wipe + `setup --recovery` (PR5) resolves it.
+        // restart re-refuses; only wipe + `setup --recovery` resolves it.
         BootstrapError::SetupRefuse(_) => CommandFailureVerdict::SetupRecoveryRequired,
         BootstrapError::OpenStorage(_) => CommandFailureVerdict::Unclassified,
     }
@@ -298,7 +298,7 @@ pub enum BootstrapError {
     /// private key). Deterministic operator misconfiguration: re-running the
     /// same configuration re-fails identically, so it classifies terminal
     /// like [`Self::ChainIdMismatch`] — the same semantic every command must
-    /// share (D4: recovery, setup, and flush previously disagreed).
+    /// share (recovery, setup, and flush previously disagreed).
     #[error("signer provider misconfiguration: {message}")]
     SignerMisconfig { message: String },
     /// Startup recovery (or refusal) failed before runtime workers started.
@@ -334,7 +334,7 @@ pub enum BootstrapError {
     DetectionNonceRead { message: String },
     /// `setup`'s read-only detection gate found a previous instance left work
     /// this checkpoint cannot account for. Sticky: only wiping the uncompleted
-    /// data dir and running `setup --recovery` (PR5) resolves it — a plain
+    /// data dir and running `setup --recovery` resolves it — a plain
     /// `setup` restart re-detects and re-refuses.
     #[error(transparent)]
     SetupRefuse(#[from] SetupRefuse),
@@ -458,7 +458,7 @@ pub enum SetupRecoveryError {
 /// fresh `setup` refuses because a *previous* instance left work past the
 /// checkpoint. Because plain setup has already initialized a genesis baseline,
 /// the remedy is to wipe that uncompleted data dir and run `setup --recovery`
-/// (PR5), which flushes/folds the outstanding batches; a plain `setup` restart
+/// which flushes/folds the outstanding batches; a plain `setup` restart
 /// re-detects and re-refuses (hence [`EXIT_SETUP_NEEDS_RECOVERY`], not the
 /// auto-recovery class 10).
 ///
@@ -467,7 +467,7 @@ pub enum SetupRecoveryError {
 pub enum SetupRefuse {
     /// Step 1: the batch-submitter wallet nonce is not settled
     /// (`pending > safe`) on the local provider — a previous instance left
-    /// pending or mined-but-unsafe batch txs. Local-view only (review F1): a
+    /// pending or mined-but-unsafe batch txs. Local-view only: a
     /// zombie tx dropped from this provider's pool but alive elsewhere evades
     /// this check; bounded at runtime by the content-identity check.
     #[error(
@@ -526,7 +526,7 @@ pub enum IdentityError {
 // ── Worker exits ───────────────────────────────────────────────────────
 
 /// Which runtime worker exited, and why. One generic stop shape per worker
-/// (H1 — this replaced six hand-copied per-worker enums), plus the danger
+/// (this replaced six hand-copied per-worker enums), plus the danger
 /// detector's deliberate `RecoveryRequired` trip as its own first-class arm:
 /// not an error, but causes the runtime to exit so the orchestrator can
 /// respawn into startup recovery.
@@ -552,7 +552,7 @@ impl WorkerExit {
     /// Whether this exit poisons the run (terminal, exit 30) rather than
     /// restarting. Terminality is a method on each worker's own error type,
     /// beside its enum — so adding a variant fails to compile there, not
-    /// silently classifying non-terminal through a distant wildcard (D1).
+    /// silently classifying non-terminal through a distant wildcard.
     /// An outer join failure is terminal exactly when it was a panic:
     /// trusted sequencer/application code violated its execution contract
     /// (fail-loud self-trust policy).
@@ -658,8 +658,8 @@ impl From<crate::runtime::process_lock::ProcessLockError> for CommandError {
 }
 
 /// One shared classification for the keyed signer-provider constructor, so
-/// `setup`, `flush-mempool`, and any future keyed command cannot drift (D4:
-/// the three sites previously classified `Create` three different ways). The
+/// `setup`, `flush-mempool`, and any future keyed command cannot drift (the
+/// three sites previously classified `Create` three different ways). The
 /// run-recovery reducer keeps its own explicit Retry/Refuse polarity map —
 /// that polarity is the reducer's to own — but its terminal/transient split
 /// must agree with this one.
@@ -854,7 +854,7 @@ mod tests {
             CommandError::from(FlushError::Provider("x".into())).exit_code(),
             EXIT_RESTART_TRANSIENT
         );
-        // Documented "may self-heal" — the definition of this class (D9; it
+        // Documented "may self-heal" — the definition of this class (it
         // previously projected to unclassified/1, misleading restart policy).
         assert_eq!(
             CommandError::from(FeeOracleError::Transient("RPC unavailable".into())).exit_code(),
@@ -904,7 +904,7 @@ mod tests {
             .exit_code(),
             EXIT_TERMINAL
         );
-        // D4: a deterministic signer-construction misconfig (bad RPC URL or
+        // A deterministic signer-construction misconfig (bad RPC URL or
         // private key) classifies terminal in every command, matching the
         // ChainIdMismatch precedent; setup/flush previously projected it
         // unclassified while recovery refused it.
@@ -1056,7 +1056,7 @@ mod tests {
             .exit_code(),
             EXIT_TERMINAL
         );
-        // Partial-recovery residue (B1/B2): operator must wipe — terminal.
+        // Partial-recovery residue: operator must wipe — terminal.
         assert_eq!(
             CommandError::from(SetupRecoveryError::PartialRecoveryMismatch {
                 existing_root_nonce: 3,
@@ -1212,8 +1212,8 @@ mod tests {
             EXIT_UNCLASSIFIED,
             "transient storage contention remains restartable"
         );
-        // Lifecycle classifies by variant, not wholesale (L3 defect fix):
-        // fact refusals page; a busy black-box write must not.
+        // Lifecycle classifies by variant, not wholesale: fact refusals
+        // page; a busy black-box write must not.
         assert_eq!(
             CommandError::Lifecycle(LifecycleError::Storage(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error {
