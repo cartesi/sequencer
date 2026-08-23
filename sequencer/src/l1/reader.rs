@@ -56,9 +56,9 @@ pub enum InputReaderError {
     #[error("provider/transport: {0}")]
     Provider(String),
     /// The provider answered, but with data that contradicts itself or the
-    /// InputBox's own accounting: an index gap or count mismatch (the F5
-    /// witnesses), missing log provenance, an undecodable or self-inconsistent
-    /// `EvmAdvance` payload. Retryable — a consistent node returns a coherent
+    /// InputBox's own accounting: an index gap or count mismatch, missing log
+    /// provenance, an undecodable or self-inconsistent `EvmAdvance` payload.
+    /// Retryable — a consistent node returns a coherent
     /// set on the next tick — but logged as its own alarm: a *persistent* one
     /// means the endpoint is broken or lying, not slow.
     #[error("inconsistent L1 response: {0}")]
@@ -84,7 +84,7 @@ pub enum InputReaderError {
 
 impl InputReaderError {
     /// Whether this error poisons the run rather than restarting. Named
-    /// arms, no wildcard: a new variant must classify itself here (D1/H1).
+    /// arms, no wildcard: a new variant must classify itself here.
     pub(crate) fn is_terminal_invariant(&self) -> bool {
         match self {
             Self::Storage(source) => crate::storage::is_persistent_storage_error(source),
@@ -150,7 +150,7 @@ pub struct InputReader {
     chain_id_verified: bool,
     /// Retains exclusive data-directory ownership inside nested blocking DB
     /// jobs if the async command/worker awaiting them is cancelled. Required
-    /// at construction: a reader without ownership is unrepresentable (H14).
+    /// at construction: a reader without ownership is unrepresentable.
     process_lock: ProcessLock,
 }
 
@@ -347,7 +347,7 @@ impl InputReader {
             };
         }
 
-        // F5 completeness witness, fetched *before* the scan. Pinning the count
+        // The input-completeness witness, fetched *before* the scan. Pinning the count
         // to `current_safe_block` (not latest) keeps it consistent with the
         // scanned range and forces the serving node to actually have that
         // block's state. Fetching it up front (rather than after `get_logs`,
@@ -399,7 +399,7 @@ impl InputReader {
             }
         })?;
 
-        // F5: the InputBox assigns every input a per-app, gap-free `index`. We
+        // The InputBox assigns every input a per-app, gap-free `index`. We
         // ingest every event for this app from genesis, so each input's on-chain
         // index must equal the dense local `safe_input_index` it is assigned
         // (= the running count of already-stored inputs). Collect the on-chain
@@ -488,7 +488,7 @@ impl InputReader {
     /// Both scan-cursor reads in one connection: the persisted safe head
     /// (`None` before the first observation) and the count of already-stored
     /// safe inputs (= the next local `safe_input_index`, the expected on-chain
-    /// index of the next ingested input — F5). Reading them together is safe:
+    /// index of the next ingested input). Reading them together is safe:
     /// this reader is the sole writer of both, and `advance_once` holds
     /// `&mut self` on a single-task loop.
     async fn scan_cursor(&self) -> Result<(Option<u64>, u64), InputReaderError> {
@@ -534,7 +534,7 @@ impl InputReader {
 }
 
 /// Deliberately per-worker, not shared with the snapshot endpoint's
-/// `storage_task` (H9): this worker carries a typed error to the supervisor
+/// `storage_task`: this worker carries a typed error to the supervisor
 /// through its exit channel, while an HTTP handler must contain immediately.
 fn map_storage_task_join(err: tokio::task::JoinError, operation: &'static str) -> InputReaderError {
     if err.is_panic() {
@@ -652,7 +652,7 @@ fn u256_to_u64(value: U256, what: &str) -> Result<u64, InputReaderError> {
 }
 
 /// Decode one `InputAdded` log into the row we persist, plus the on-chain
-/// index the F5 contiguity witness checks. Pure — unit tests drive it with
+/// index the contiguity witness checks. Pure — unit tests drive it with
 /// synthetic `(InputAdded, Log)` pairs, no provider required. Mirrors the
 /// watchdog's `decode_and_validate_log`: the row mixes provenances (block
 /// number and tx hash from the log, everything else from the `EvmAdvance`
@@ -711,7 +711,7 @@ fn ingest_input_added(
 /// every input a per-app, gap-free index, and we ingest every event for this app
 /// from genesis, so the indices must be `expected_start, expected_start+1, …`. A
 /// gap means the provider returned an incomplete `get_logs` set (a clamped or
-/// lagging-replica response — F5, see `docs/threat-model/README.md`); the
+/// lagging-replica response — see `docs/threat-model/README.md`); the
 /// retryable [`InconsistentL1Response`] refuses to persist the hole — a
 /// consistent provider returns the full set on the next tick.
 ///
@@ -732,7 +732,7 @@ fn check_input_index_contiguity(
         if index != expected {
             return Err(InputReaderError::InconsistentL1Response(format!(
                 "non-contiguous InputBox index: expected {expected}, got {index} — \
-                 provider returned an incomplete InputAdded set (F5)"
+                 provider returned an incomplete InputAdded set"
             )));
         }
     }
@@ -742,7 +742,7 @@ fn check_input_index_contiguity(
 /// Verify the InputBox's own input count at the scanned safe block matches the
 /// number of inputs we now hold (`received_total` = previously stored + just
 /// received). A mismatch means the `get_logs` response was an incomplete prefix
-/// — typically a truncated tail a contiguity check alone cannot see (F5, see
+/// — typically a truncated tail a contiguity check alone cannot see (see
 /// `docs/threat-model/README.md`). Retryable [`InconsistentL1Response`]: a
 /// consistent provider returns the full set, and the matching count, on the
 /// next tick.
@@ -756,14 +756,14 @@ fn check_input_count_complete(
     if onchain_count != received_total {
         return Err(InputReaderError::InconsistentL1Response(format!(
             "InputBox input count at block {safe_block} is {onchain_count}, expected \
-             {received_total} — provider returned an incomplete get_logs set (F5)"
+             {received_total} — provider returned an incomplete get_logs set"
         )));
     }
     Ok(())
 }
 
-/// The InputBox's per-app input count, pinned at `block`. Used as the F5
-/// completeness witness — see [`check_input_count_complete`]. Pinning to the
+/// The InputBox's per-app input count, pinned at `block`. Used as the
+/// input-completeness witness — see [`check_input_count_complete`]. Pinning to the
 /// scanned safe block (not `latest`) keeps it consistent with the `get_logs`
 /// range and forces the serving node to have that block's state.
 async fn input_count_at_block(
@@ -1346,7 +1346,7 @@ mod tests {
     #[test]
     fn ingest_input_added_rejects_topic_payload_index_mismatch() {
         let tx = alloy_primitives::B256::repeat_byte(0xcc);
-        // The F5 witness reads the index from the topic; the watchdog reads it
+        // The input-completeness witness reads the index from the topic; the watchdog reads it
         // from the payload. The cross-check keeps the two provably aligned.
         let (event, log) = input_added_pair(5, evm_advance_payload(90, 6), Some(90), Some(tx));
         let err = ingest_input_added(&event, &log).expect_err("index mismatch");

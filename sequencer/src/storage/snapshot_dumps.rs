@@ -144,7 +144,7 @@ impl Storage {
     /// to pass fresh, unique prefixes per call, and reuse is a bug
     /// worth surfacing loudly.
     /// Test seed only: production stages pending rows exclusively through
-    /// the lane's atomic `close_batch_with_snapshot` path (H6).
+    /// the lane's atomic `close_batch_with_snapshot` path.
     #[cfg(test)]
     pub(crate) fn insert_pending_dump(
         &mut self,
@@ -291,8 +291,8 @@ impl Storage {
     /// then fails: the lease is held from the moment of the read. `None` if no
     /// finalized snapshot exists. `schedule` controls where the (blocking)
     /// release runs on drop — see [`ReleaseScheduler`]. The reporter is
-    /// required — an unreported persistent release failure must be impossible
-    /// (H10); it is called only for persistent row/schema failures, never
+    /// required — an unreported persistent release failure must be impossible;
+    /// it is called only for persistent row/schema failures, never
     /// BUSY/I/O. Tests pass a no-op closure.
     pub fn acquire_finalized_lease(
         &mut self,
@@ -380,7 +380,7 @@ impl Storage {
 
     /// Delete every row from `pending_snapshots`. Test-only convenience wrapper
     /// for the *unscoped* clear: production danger-zone recovery instead composes
-    /// the pivot-scoped `clear_pending_dumps_from_nonce_in` (F9) into the same
+    /// the pivot-scoped `clear_pending_dumps_from_nonce_in` into the same
     /// transaction as the cascade invalidation (see `storage/recovery.rs`), so
     /// only the cascade-doomed batches' pending rows are cleared, atomically with
     /// them.
@@ -395,7 +395,7 @@ impl Storage {
     /// row already exists (the singleton constraint).
     /// Test seed only: production registers the genesis/recovery snapshot
     /// through `insert_initial_finalized_dump`, which binds the canonical
-    /// coordinates atomically (H6; this branch replaced both former
+    /// coordinates atomically (this branch replaced both former
     /// production callers).
     #[cfg(test)]
     pub(crate) fn insert_finalized_dump(
@@ -726,7 +726,7 @@ pub(super) fn clear_pending_dumps_in(tx: &Transaction<'_>) -> Result<usize> {
 /// Scoped pending-snapshot clear for the recovery cascade: delete only the
 /// rows whose `nonce >= from_nonce` (the cascade pivot's nonce) — exactly
 /// the cascaded batches' pendings. Lower-nonce rows are gold-but-unpromoted
-/// pendings that must survive (review F9: deleting them arms a
+/// pendings that must survive (deleting them arms a
 /// promote-wedge crash-loop when their landing is later observed). Same
 /// same-transaction composition rationale as [`clear_pending_dumps_in`].
 pub(super) fn clear_pending_dumps_from_nonce_in(

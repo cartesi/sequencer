@@ -417,8 +417,8 @@ Danger-zone recovery (`storage/recovery.rs`, see
 that the canonical stream will never reach. In the same transaction as the
 cascade it clears `pending_snapshots` **scoped to the cascade**: only rows
 with `nonce >= pivot.nonce` — exactly the cascaded batches' pendings, which
-catch-up must never load. (Review F9; implemented in `cascade_and_reopen`,
-the shared tail of both recovery paths.)
+catch-up must never load (`cascade_and_reopen`, the shared tail of both
+recovery paths).
 
 The same cascade retains the physical `sequenced_l2_txs` audit rows but deletes
 their derived `executed_inputs` mappings, advances `RecoveryGeneration` once,
@@ -435,8 +435,8 @@ promote-wedge **unrepresentable** rather than unreachable: any nonce the lane
 can later observe as accepted either has its pending row intact or belongs
 to a post-recovery batch with a fresh row. (The earlier blanket clear was
 safe only through a chain of cross-file couplings — same-tx full-backlog
-reopen drain, `check_danger` arm ordering, frame-safe-block monotonicity —
-documented in the 2026-06-10 review, F9.) In the `RecoverTip` path the
+reopen drain, `check_danger` arm ordering, frame-safe-block
+monotonicity.) In the `RecoverTip` path the
 scope deletes nothing: the Tip never has a pending row.
 
 `finalized` is untouched (its bytes are for an L1-confirmed batch, which

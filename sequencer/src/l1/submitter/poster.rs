@@ -105,12 +105,11 @@ pub enum SubmitBatchesOutcome {
 pub(crate) trait BatchPoster: Send + Sync {
     /// Broadcast the payloads as L1 txs at consecutive wallet nonces.
     /// Implementations must raise `watermark` to the highest nonce they
-    /// are about to use *before* the first send (write-before-broadcast,
-    /// review R1a).
+    /// are about to use *before* the first send (write-before-broadcast).
     /// Requires the externalization token: the caller consulted containment
     /// this tick. Implementations may re-check at finer grain (the Ethereum
     /// poster gates each send); a mock ignoring `_auth` is correct — the
-    /// token is the caller's proof, not the implementation's (S-A).
+    /// token is the caller's proof, not the implementation's.
     async fn submit_batches(
         &self,
         auth: crate::runtime::shutdown::Authorized<'_>,
@@ -169,7 +168,7 @@ pub struct EthereumBatchPoster {
     fail_next_send: Arc<Mutex<Option<String>>>,
     /// Externalization gate for keyed L1 sends. A construction-time field,
     /// not a trait parameter: the gate is this implementation's posture, and
-    /// mocks were ignoring the parameter anyway (H11).
+    /// mocks were ignoring the parameter anyway.
     shutdown: RuntimeScope,
 }
 
@@ -441,7 +440,7 @@ impl BatchPoster for EthereumBatchPoster {
         let first_nonce = self.latest_account_nonce().await?;
         self.prune_pending_below(first_nonce);
 
-        // Write-before-broadcast (R1a): durably cover every nonce this
+        // Write-before-broadcast: durably cover every nonce this
         // tick will use before the first send. One raise to the highest
         // covers the whole consecutive range.
         let highest_nonce = checked_highest_wallet_nonce(first_nonce, payloads.len())?;
@@ -846,12 +845,12 @@ mod tests {
         }
     }
 
-    /// R1a write-before-broadcast: `submit_batches` must raise the watermark to
+    /// Write-before-broadcast: `submit_batches` must raise the watermark to
     /// cover the whole consecutive nonce range *before* the first send. We lock
     /// it with a sink that fails on `raise_to`: a correct poster aborts the tick
     /// before broadcasting anything, so the submitter's pending nonce is
     /// unchanged. If `raise_to` were moved after the first `addInput` send
-    /// (re-opening the F1 zombie-tx hole), that send would bump the pending
+    /// (re-opening the zombie-tx hole), that send would bump the pending
     /// nonce and this test would go red. Also pins the raise count (once) and
     /// value (`base + payloads.len() - 1`). (Mutation-checked: moving the raise
     /// after the send loop fails this test.)

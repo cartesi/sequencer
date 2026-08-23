@@ -31,6 +31,7 @@ In order of importance:
 - **App UX may depend on the sequencer.** Without the sequencer, user experience may degrade substantially. This is an acceptable tradeoff: the on-chain scheduler remains the canonical source of truth; the sequencer only accelerates the UX.
 - **SQLite-centered local coordination.** Components publish and consume durable local facts through their owned SQLite tables. The on-chain scheduler remains canonical authority; SQLite is the sequencer's local coordination plane. HTTP ingress ↔ inclusion lane MPSC/oneshot is the deliberate exception because low-latency request/response over the lane's in-memory application is unwieldy through SQLite. Do not turn that exception into a general in-memory component bus.
 - **Assumption-driven robustness.** Every hardening mechanism must name the invariant it protects, the assumptions under which it is needed, and a trigger for revisiting them. Machinery for failures outside the supported model enlarges the state surface developers must audit and can make the system less robust rather than more.
+- **The complexity budget belongs to concurrency, mutual exclusion, durability, and hostile-L1 robustness.** This sequencer is not algorithmically complex. A large file is a smell: an invariant we're not seeing, a reasonable assumption we're not taking, or plain over-engineering. Judge every mechanism — current or proposed — against its weight.
 
 ## Sequencer / Scheduler Duality
 
@@ -70,7 +71,7 @@ Scheduler-acceptance semantics exist in exactly three implementations that must 
 2. the off-chain acceptance predicate — `ProtocolTiming::scheduler_accepts` ([`sequencer-core/src/protocol.rs`](sequencer-core/src/protocol.rs)), which feeds `safe_accepted_batches`;
 3. the inclusion lane's live prediction (drain + execution order).
 
-The expected-nonce fold is homed next to `scheduler_accepts` as `advance_expected_batch_nonce` (same file); the submitter's `decide_submit_start` consumes it, and `populate_safe_accepted_batches` keeps a deliberate inline copy (its advance is interleaved with storage-only side effects — the R2 content-identity check and the divergence freeze — that can't move below the protocol layer). Touching any of these means re-checking the others — their agreement is the system's most load-bearing invariant (see [`docs/invariants.md`](docs/invariants.md)).
+The expected-nonce fold is homed next to `scheduler_accepts` as `advance_expected_batch_nonce` (same file); the submitter's `decide_submit_start` consumes it, and `populate_safe_accepted_batches` keeps a deliberate inline copy (its advance is interleaved with storage-only side effects — the content-identity check and the divergence freeze — that can't move below the protocol layer). Touching any of these means re-checking the others — their agreement is the system's most load-bearing invariant (see [`docs/invariants.md`](docs/invariants.md)).
 
 Two mechanical facts the agreement rests on:
 
@@ -159,7 +160,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 ### Sequencer module layout
 
 - `sequencer/src/lib.rs` — public sequencer API. The thin binary entrypoints live in `examples/wallet-sequencer/`.
-- `sequencer/src/harness.rs` — CLI harness: the `setup`/`run`/`flush-mempool` subcommand parser, `dispatch`, and the R4 exit-code projection. An app's `main` is ~5 lines (`run_main` + a genesis-app closure).
+- `sequencer/src/harness.rs` — CLI harness: the `setup`/`run`/`flush-mempool` subcommand parser, `dispatch`, and the exit-code projection. An app's `main` is ~5 lines (`run_main` + a genesis-app closure).
 - `sequencer/src/http.rs` — shared HTTP error type, JSON `ErrorResponse`, `ApiConfig`, and `axum::serve` orchestration.
 - `sequencer/src/commands/` — the operator command brackets: `setup` (phase A — pin identity, initial sync, genesis snapshot, atomic `setup_complete` fact), `run` (phase B — recover, prepare, admit, and boot workers; its `workers` supervisor lives beside it), and `flush` (`flush-mempool`). `sequencer/src/commands/` also owns the command-scoped `config` and `error` taxonomy (incl. the exit-code projection); `sequencer/src/runtime/` is exactly the runtime authority capabilities — the process lock and `shutdown` (runtime scope/containment) — consumed crate-wide. `L1Config` lives in `sequencer/src/l1/`; the crate-wide wall clock is `sequencer/src/clock.rs`.
 - `sequencer/src/ingress/` — public write path.
@@ -187,7 +188,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Nonces are assigned by storage (structural `parent.nonce + 1`) when batches are closed; the submitter just reads them.
 - **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `RecoveryRequired` when any non-`Safe` danger status fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery or refusal can run.
 - **Fee oracle** — setup pins either a fixed exponent or a reviewed Uniswap V3 WETH/X TWAP tuple into deployment identity, and writes the first `log_gas_price` (+ freshness stamp) in both modes. Fixed mode has no worker; Uniswap refreshes `batch_policy.log_gas_price` on a poll loop. Transient L1 failures at `run` boot and at runtime retain the persisted price until `log_gas_price_updated_at_ms` exceeds the L1 read-staleness window; misconfig stays terminal. The 10× margin lives in `batch_policy.log_slack`; frame fees stay immutable until the next frame opens.
-- **Input reader** — ingests safe inputs from L1 InputBox and atomically maintains the durable safe head, accepted-batch projection, and narrow R2 content-identity marker in SQLite. It does not hand an in-memory cursor to the inclusion lane.
+- **Input reader** — ingests safe inputs from L1 InputBox and atomically maintains the durable safe head, accepted-batch projection, and content-identity divergence marker in SQLite. It does not hand an in-memory cursor to the inclusion lane.
 - **L2 tx feed** — DB-backed ordered-tx stream used by WS subscribers. The
   existing endpoint still paginates by the physical SQLite rowid cursor.
   SQLite now also stores the canonical `ExecutedInputCount` attribution for
@@ -253,12 +254,12 @@ User ops are executed only through `sequencer_core::application::validate_and_ex
 
 ## Hot-Path Invariants
 
-- API ack is tied to chunk durability, not frame/batch closure. "Durable" means power-loss-durable: WAL with `synchronous=FULL`, so every commit fsyncs before anything externalizes on it (review R3).
-- Command admission is fact-derived (L2, 2026-08-19): the kernel process lock excludes concurrent owners, `setup_complete` orders commands two-sided, and `canonical_divergence` is the one absorbing refusal (cockroach rebuild only). There is no lifecycle admission state machine and no operator acknowledgement — standard recovery is automatic, and restart policy after a terminal fault is the R4 exit contract (30 = do not restart, page). The only durable telemetry is the `terminal_faults` black box (L3, 2026-08-22): append-only terminal-cause rows, written best-effort and verdict-neutrally — telemetry never changes a command's verdict, and nothing reads the black box for decisions. `run` admits only after fallible preparation, by re-running the reducer over one consistent fact set immediately before non-yielding worker launch; SIGKILL/OOM/cancellation writes nothing (the next boot proceeds and re-derives from facts). In-process terminal containment sets the bit, arms an independent two-second process-abort watchdog, requests cooperative shutdown, and only then appends the black box's terminal-cause row (best-effort telemetry). The watchdog holds a weak process-lock witness and aborts only if a controller, worker, or nested blocking task has not drained by the deadline; ordinary operator/recovery shutdown stays graceful. If the terminal-cause write fails, the exit code and logs still carry the verdict, and a persistent fault re-detects fail-loud on the next boot that reads it. One process per data dir is kernel-enforced by an exclusive lock (`sequencer/src/runtime/process_lock.rs`); the controller retains it through black-box settlement and nested work retains clones until it actually stops. Cleanup polls all workers concurrently so a hung drain cannot hide a terminal exit. An already-authorized effect may complete, and snapshot streams check containment only at start (they are non-authority-bearing immutable reads; per-chunk stream cancellation is not a containment guarantee).
-- Setup/rebuild, normal-run recovery, and maintenance flush deliberately retain distinct typed controllers; do not combine their unrelated facts into a generic command state machine. `flush-mempool` is flush-only and requires a completed setup and no divergence — there is no admission state for it to restore or erase (L2), and a successful wallet flush is never treated as proof the runtime is clean.
+- API ack is tied to chunk durability, not frame/batch closure. "Durable" means power-loss-durable: WAL with `synchronous=FULL`, so every commit fsyncs before anything externalizes on it.
+- Command admission is fact-derived: the kernel process lock excludes concurrent owners, `setup_complete` orders commands two-sided, and `canonical_divergence` is the one absorbing refusal (cockroach rebuild only). There is no lifecycle admission state machine and no operator acknowledgement — standard recovery is automatic, and restart policy after a terminal fault is the exit-code contract (30 = do not restart, page). The only durable telemetry is the `terminal_faults` black box: append-only terminal-cause rows, written best-effort and verdict-neutrally — telemetry never changes a command's verdict, and nothing reads the black box for decisions. `run` admits only after fallible preparation, by re-running the reducer over one consistent fact set immediately before non-yielding worker launch; SIGKILL/OOM/cancellation writes nothing (the next boot proceeds and re-derives from facts). In-process terminal containment sets the bit, arms an independent two-second process-abort watchdog, requests cooperative shutdown, and only then appends the black box's terminal-cause row (best-effort telemetry). The watchdog holds a weak process-lock witness and aborts only if a controller, worker, or nested blocking task has not drained by the deadline; ordinary operator/recovery shutdown stays graceful. If the terminal-cause write fails, the exit code and logs still carry the verdict, and a persistent fault re-detects fail-loud on the next boot that reads it. One process per data dir is kernel-enforced by an exclusive lock (`sequencer/src/runtime/process_lock.rs`); the controller retains it through black-box settlement and nested work retains clones until it actually stops. Cleanup polls all workers concurrently so a hung drain cannot hide a terminal exit. An already-authorized effect may complete, and snapshot streams check containment only at start (they are non-authority-bearing immutable reads; per-chunk stream cancellation is not a containment guarantee).
+- Setup/rebuild, normal-run recovery, and maintenance flush deliberately retain distinct typed controllers; do not combine their unrelated facts into a generic command state machine. `flush-mempool` is flush-only and requires a completed setup and no divergence — there is no admission state for it to restore or erase, and a successful wallet flush is never treated as proof the runtime is clean.
 - Initial setup/rebuild creates the baseline schema, UUIDv4 `EraId`, and generation zero in one transaction. A rebuild leaves `base_executed_input_count` and `base_safe_input_index` NULL until cockroach fill derives `K = recovered_app.executed_input_count()` and the recovery root's exclusive safe-input cursor, then binds both atomically with the initial finalized snapshot; setup completion requires both non-NULL bases and the snapshot. `K` is application history, not physical `l2_tx_index` cursor padding. The safe-input base is a durable drain floor: standard recovery derives the next cursor as `max(base_safe_input_index, max valid attribution + 1)`, so invalidating the cockroach root cannot re-execute inputs already represented by `S'`. Cockroach recovery deliberately remains an explicit fresh/wiped-directory operator flow—no automated DB replacement, clone detection, distributed fencing, or partial-fill resume state machine. A retained early incomplete DB reuses its unexposed era; a fail-loud partial fill requires wipe/retry and therefore a new unexposed era.
-- Chunk commit and ack remain low-latency; frame closure is orthogonal and can happen less frequently. The product contract is under 500 ms. The 2026-08-02 same-host release benchmark (30 s/load, funded transfers, concurrency 1/64/128/256) found no material step-4 regression against `02fabb0`: current ACK p99 peaked at 49.253 ms, and concurrency 128 sustained 7,984 accepted tx/s at 29.920-ms ACK p99 with zero rejections. Under this harness the concurrency-1 HTTP ACK p50 was 13.231 ms, while submit-to-matching-WS-event p50 was 25.313 ms; always name which metric “round-trip” means. Method and full comparison: [`docs/plans/2026-08-authority-boundary-adr.md`](docs/plans/2026-08-authority-boundary-adr.md#step-4-latency-and-capacity-measurement-2026-08-02).
-- Never add an R2 marker query, provider call, or reader mailbox to every user-op chunk. R2 is complete for at/above-anchor, simulated-accepted batch content identity, not arbitrary canonical/application divergence. The danger detector owns prompt process-wide reaction; the lane's existing time-gated frontier read opportunistically returns a typed divergence instead of a usable frontier. No extra poll or reaction deadline exists.
+- Chunk commit and ack remain low-latency; frame closure is orthogonal and can happen less frequently. The product contract is under 500 ms; same-host release sweeps across the authority cutover found ACK p99 at or below ~50 ms through concurrency 256 with zero rejections, and concurrency-1 HTTP ACK p50 around 13 ms while submit-to-matching-WS-event p50 was roughly double — always name which metric "round-trip" means. Same-host numbers are method-specific regression evidence, never portable capacity claims (the load clients contend with the sequencer at high concurrency).
+- Never add a divergence-marker query, provider call, or reader mailbox to every user-op chunk. The content-identity check is complete for at/above-anchor, simulated-accepted batch content identity, not arbitrary canonical/application divergence (its scope boundary is [I9](docs/invariants.md)). The danger detector owns prompt process-wide reaction; the lane's existing time-gated frontier read opportunistically returns a typed divergence instead of a usable frontier. No extra poll or reaction deadline exists.
 - Entry to reconciliation is bounded by dequeued attempts, not only included bytes: rejected requests do not advance the batch target. One existing `max_user_ops_per_chunk` dequeue chunk is the fast-turn boundary before the outer frontier check. This adds no timer, cursor, or fairness knob and prevents sustained rejected traffic from starving the slow turn. Returning to the outer loop normally performs only cheap time-gate bookkeeping; it does not fsync or query SQLite after every chunk.
 - Once reconciliation starts, process the complete accumulated newly-safe range, including supported catch-up/backlog conditions, before returning to user ops. Supported applications are assumed to digest that range promptly; paging bounds scratch memory/read-query size, not the atomic drain transaction or logical work. Add preemption or a durable partial cursor only if production measurements disprove that assumption.
 - During an admitted live run, L1 reconciliation has no tight acknowledgement SLA. Its semantic clock trigger is block-only: if the latest persisted safe head `H` is at least five blocks beyond the open frame's `safe_block` `S`, reconcile once and open exactly one frame at `H`. Never synthesize intermediary frames after a jump; `H` becomes the new anchor. Bootstrap and recovery instead anchor a fresh Tip at their proven checkpoint/current safe head; they are not live clock ticks. The time gate controls SQLite observation load, not clock semantics. Direct-input presence is work discovered at the turn, never another trigger.
@@ -275,10 +276,10 @@ Writer roles — one writer per table; reads over batch data go through the `val
 | Writer | Writes |
 |---|---|
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `sequenced_l2_txs`, `executed_inputs`, `dumps`/`pending_snapshots` (batch close), `finalized_snapshot` (promotion) |
-| input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `deployment_identity`, `canonical_divergence` (poison marker, review R2) |
+| input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `deployment_identity`, `canonical_divergence` (the divergence poison marker) |
 | recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, scoped `pending_snapshots` clear, derived `executed_inputs` suffix deletion, `wallet_nonce_watermark` (flush no-ops, write-before-broadcast) |
 | history metadata (setup/recovery) | `history_state` — era/generation at baseline, generation bump in a non-empty standard-recovery cascade, rebuild application base + safe-input drain floor at initial finalized-snapshot registration |
-| batch submitter | `wallet_nonce_watermark` (write-before-broadcast, review R1a — its only write) |
+| batch submitter | `wallet_nonce_watermark` (write-before-broadcast — its only write) |
 | egress (HTTP) | `dumps.lease_count` (leases) |
 | admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
 | setup | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
@@ -330,7 +331,7 @@ Split by subcommand (the phase split). **`setup`** (required):
 - `CARTESI_SEQUENCER_BLOCKCHAIN_ID`
 - `CARTESI_SEQUENCER_APP_ADDRESS`
 - `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS` (the submitter address — `setup` is L1-read-only and never signs). **Must be a dedicated address**: `setup`'s detection gate refuses if the submitter's wallet nonce is unsettled, so reusing a busy address (e.g. the contract deployer, whose deploy-tx tail isn't safe at setup time) false-positives. The devnet uses anvil account 9 (`DEVNET_SEQUENCER_ADDRESS`), distinct from the account-0 deployer.
-- `CARTESI_SEQUENCER_CHECKPOINT_BLOCK` (optional, default `0` = genesis) — the trusted checkpoint machine's L1 inclusion block. `setup` refuses (typed `SetupRefuse`, exit 40 = run `setup --recovery`) if a previous instance left work past it. PR3 detects only; loading a non-genesis checkpoint machine is `setup --recovery` (PR5).
+- `CARTESI_SEQUENCER_CHECKPOINT_BLOCK` (optional, default `0` = genesis) — the trusted checkpoint machine's L1 inclusion block. `setup` refuses (typed `SetupRefuse`, exit 40 = run `setup --recovery`) if a previous instance left work past it; plain `setup` detects only, and loading a non-genesis checkpoint machine is `setup --recovery`.
 
 **`run`** (required) — chain id / app address / submitter address are read from the DB `setup` pinned, not from args:
 
@@ -358,8 +359,30 @@ must be strictly below the danger threshold or startup refuses),
 - Keep application validation and execution deterministic for a given input/state. No `SystemTime::now()`, `HashMap` iteration order, or floating-point in consensus paths.
 - Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe.
 - Avoid introducing heavy dependencies without strong reason.
-- Documentation style: lean. Module headers (1–4 lines) + docs on public methods only when the contract isn't obvious from name+signature. Use inline comments for **why**, never for **what**.
+- Documentation style: lean. Module headers (1–4 lines) + docs on public methods only when the contract isn't obvious from name+signature.
+- **Comment the non-obvious, not the self-evident.** Keep comments concise; avoid redundant and excessive inline commentary. Do not restate what the code already expresses. Explain the why, edge cases, invariants, and subtle behaviors that cannot be inferred from reading the code alone.
+- Review-item codenames (finding/decision ids from past review ledgers) never appear in code comments or living docs — state the reason itself, or point at the invariant register entry that owns it. Invariant ids (`I1`–`I20`) are stable register references and are fine.
 - **Impossible states fail loud; they are never handled.** Cheap cross-module assertions of *real invariants* are encouraged (assert, trigger `RAISE`, typed error). Failing loud is safety-preserving, not necessarily self-healing: transient failures may clear on restart, while a persistent invariant violation is terminal and may require inspection or cockroach recovery. Silent divergence is never acceptable. Never add graceful fallbacks, neighbor re-validation, or silent absorbers (`INSERT OR IGNORE`, saturating decode of impossible data) for states the contracts rule out; and an assertion must check a real invariant, never an environmental assumption (clock monotonicity is the cautionary tale). Decision test and rationale: [`docs/invariants.md`](docs/invariants.md); trust boundaries: "Self-trust" in [`docs/threat-model/README.md`](docs/threat-model/README.md).
+
+## Documentation Practice
+
+The corpus has two tenses, kept strictly apart:
+
+- **Living docs are timeless.** This file, `README.md`, `docs/protocol/`,
+  `docs/invariants.md`, `docs/recovery/`, `docs/snapshots/`,
+  `docs/threat-model/`, `docs/watchdog/`, and `docs/plans/` describe what is
+  true now and why — present tense, reasoning inline, no dates, no amendment
+  banners, no review codenames, no "previously/no longer". Each doc owns its
+  topic; others point at it rather than restating it.
+- **History lives only in `docs/review/` and commit messages.** A review
+  ledger is append-only while its review is open. When it closes, distill it:
+  promote conclusions into the living docs, record settled decisions and
+  refuted proposals in [`docs/review/register.md`](docs/review/register.md),
+  and delete the process narration. Conclusions with reasoning outlive the
+  path taken to them.
+- **Record deliberate absence once**, at the seam where someone would re-add
+  the mechanism, phrased as a positive design statement with its reason —
+  never as removal notices scattered across documents.
 
 ## Testing Guidance
 
@@ -412,7 +435,7 @@ cargo run -p wallet-sequencer -- run
 - Add or update tests when logic changes.
 - Run at least `cargo check` before finishing.
 - Read `docs/recovery/` before touching recovery code, and `docs/threat-model/` before touching trust-boundary code.
-- Check [`docs/invariants.md`](docs/invariants.md) before changing anything it lists as load-bearing, and the latest review ledger under [`docs/review/`](docs/review/) for known-open findings in the code you're about to touch.
+- Check [`docs/invariants.md`](docs/invariants.md) before changing anything it lists as load-bearing, and [`docs/review/register.md`](docs/review/register.md) for open findings in the code you're about to touch and for decisions already settled or refuted.
 
 ### Ask First
 
@@ -450,8 +473,8 @@ Before finishing a change, ensure:
 - [`CLAUDE.md`](CLAUDE.md) — shell setup, quick reference, pointer back here.
 - [`docs/protocol/`](docs/protocol/) — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (the canonical acceptance algorithm, I1) and [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` FFI trait contract).
 - [`docs/invariants.md`](docs/invariants.md) — register of cross-module invariants (what's load-bearing across files) + the fail-loud check policy.
-- [`docs/review/`](docs/review/) — dated correctness-review ledgers; open findings, settled designs, work packages.
-- [`docs/plans/`](docs/plans/) — active coordination tracks; agreed work split, design directions, open decisions.
+- [`docs/review/register.md`](docs/review/register.md) — the review register: open findings, settled decisions, and refuted proposals (do-not-re-propose), distilled from the dated ledgers beside it.
+- [`docs/plans/`](docs/plans/) — the architecture decision record ([`2026-08-authority-boundary-adr.md`](docs/plans/2026-08-authority-boundary-adr.md)), active coordination tracks, and in-flight design handoffs.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
 - [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.
 - [`docs/snapshots/`](docs/snapshots/) — app snapshots: [`format.md`](docs/snapshots/format.md) (dump trait + wire format) and [`lifecycle.md`](docs/snapshots/lifecycle.md) (take/promote/GC/lease design + crash-safety).

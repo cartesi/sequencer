@@ -71,7 +71,7 @@ pub(crate) enum FirstExit {
     Worker(WorkerExit),
     /// A terminal fault was contained by a runtime component. The black-box
     /// terminal-cause row was attempted but is best-effort telemetry; the
-    /// exit code and logs carry the verdict if it failed (L2).
+    /// exit code and logs carry the verdict if it failed.
     Contained,
 }
 
@@ -182,7 +182,7 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
         // panic unwind, or cancellation of the owning `run` future.
         let shutdown = RuntimeScope::new(process_lock);
         let shutdown_on_drop = ShutdownOnDrop(shutdown.clone());
-        // Durable terminal-fault recorder: best-effort telemetry (L2/L3). A
+        // Durable terminal-fault recorder: best-effort telemetry. A
         // successful write appends the black-box terminal-cause row; a
         // failed write loses only the black-box copy — the exit code and
         // logs still carry the verdict, and a persistent fault re-detects
@@ -640,7 +640,7 @@ impl WorkerExit {
 //
 // Named constructors, not `From` impls keyed on the worker's result type:
 // two workers sharing a result type would silently misroute through blanket
-// dispatch, and the select arms should say which worker they map (H1).
+// dispatch, and the select arms should say which worker they map.
 
 impl FirstExit {
     fn worker(exit: WorkerExit) -> Self {
@@ -768,7 +768,7 @@ async fn wait_for_fee_oracle_shutdown(
 // which re-confirms the chain id immediately before every productive send.
 // The key was already verified against the pinned submitter, so a build
 // failure here is a bad RPC URL / client misconfiguration — the same
-// deterministic terminal class as every signer misconfig (D4).
+// deterministic terminal class as every signer misconfig.
 fn build_batch_submitter_provider(l1: &L1Config) -> Result<DynProvider, CommandError> {
     crate::l1::provider::create_signer_provider(
         &l1.eth_rpc_url,

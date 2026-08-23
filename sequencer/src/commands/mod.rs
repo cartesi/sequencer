@@ -50,7 +50,7 @@ fn preflight_lifecycle_command(
 /// Verdict-neutral black-box settlement: when the command ended terminal,
 /// record its cause best-effort. Telemetry must never change a verdict — a
 /// failed record loses only the black-box copy, and the exit code and logs
-/// still carry it (L3).
+/// still carry it.
 pub(crate) fn record_terminal_fault_best_effort(
     db_path: &str,
     command: LifecycleCommand,
@@ -84,7 +84,7 @@ pub(crate) fn batch_submitter_address_from_private_key(
     use std::str::FromStr;
 
     // Deterministic operator misconfig — terminal, like every signer
-    // misconfiguration (D4). The message never echoes key material.
+    // misconfiguration. The message never echoes key material.
     Ok(PrivateKeySigner::from_str(private_key)
         .map_err(|_| {
             CommandError::Bootstrap(BootstrapError::SignerMisconfig {

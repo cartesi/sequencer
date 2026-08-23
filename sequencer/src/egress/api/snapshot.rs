@@ -64,7 +64,7 @@ impl SnapshotApiState {
     /// Streaming an already-immutable operator snapshot is not
     /// authority-bearing (ADR), so ordinary graceful shutdown does NOT gate
     /// these routes — the watchdog's byte-compare poll and indexer fetches
-    /// keep working through an operator drain (D7). Containment is checked
+    /// keep working through an operator drain. Containment is checked
     /// at stream start; the state a contained fault may have poisoned must
     /// not be served.
     fn authorize_stream(&self) -> Option<crate::runtime::shutdown::Authorized<'_>> {
@@ -221,7 +221,7 @@ fn stream_body(file: File, guard: LeaseGuard) -> Body {
 // ── Blocking storage tasks ─────────────────────────────────────────────────
 
 /// One spawn/join/classify shape for this endpoint's blocking storage work.
-/// The posture is deliberate and stays local (H9): an HTTP handler has no
+/// The posture is deliberate and stays local: an HTTP handler has no
 /// worker-exit channel to carry a typed error to the supervisor, so a
 /// persistent row/schema failure or a storage-task panic contains
 /// immediately.
@@ -243,7 +243,7 @@ where
         // argument. The lease closures consume theirs early (the reporter
         // Arc can die inside storage on the None/Err paths), which is
         // exactly the coupling this binding exists to break (ADR §1; found
-        // by the post-S-A adversarial review).
+        // by adversarial review).
         let _runtime_lifetime = scope.clone();
         work(scope)
     })
@@ -423,7 +423,7 @@ mod tests {
         });
 
         // Immutable operator reads are not authority-bearing (ADR): an
-        // ordinary graceful drain keeps serving the watchdog's poll (D7).
+        // ordinary graceful drain keeps serving the watchdog's poll.
         shutdown.request_shutdown();
         let response = finalized_inclusion_block(State(state.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);

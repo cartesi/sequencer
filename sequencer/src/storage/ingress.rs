@@ -610,7 +610,7 @@ fn seal_and_open_next_batch(
     // Batch policy is sampled here: the derived fee is committed to the newly
     // opened frame, and the batch size target is stored on the write head.
     let policy = query_batch_policy(tx)?;
-    // Hash-at-seal (review R2): encode the closing batch's wire bytes via
+    // Hash-at-seal: encode the closing batch's wire bytes via
     // the same path the submitter uses and stamp their keccak256 on the row,
     // atomically with the seal. The content-identity check later compares
     // accepted L1 landings against this hash.

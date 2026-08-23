@@ -17,13 +17,14 @@
 //!   repaired by restart and may require inspection or cockroach recovery;
 //!   fail-loud is a safety property, not a self-healing claim.
 //! - **Clock and query-bound conversions saturate.** Wall-clock time is
-//!   environmental, not an invariant (review F8): a far-future clock clamps to
+//!   environmental, not an invariant: a far-future clock clamps to
 //!   `i64::MAX` rather than aborting. Untrusted or config-sourced SQL bounds
 //!   go through [`saturating_query_bound`], where clamping preserves the
 //!   comparison semantics exactly. Sign remains contract-bound even for clock
 //!   *columns*: every timestamp writer is u64-clock-sourced (floored at 0), so
 //!   [`from_unix_ms`] fail-louds on a negative stored value — a sign check is
-//!   a real invariant, unlike the ordering checks F8 warns about.
+//!   a real invariant, unlike cross-column timestamp ordering checks, which
+//!   once wedged recovery and are deliberately left unenforced.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,7 +38,7 @@ struct ExternalIntegerRangeError {
 // ── Time helpers ──────────────────────────────────────────────────────────
 
 /// Saturating: a pre-epoch clock clamps to 0, a far-future clock to
-/// `i64::MAX`. Wall-clock state is environmental (F8), never an invariant.
+/// `i64::MAX`. Wall-clock state is environmental, never an invariant.
 pub(super) fn to_unix_ms(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -48,8 +49,8 @@ pub(super) fn to_unix_ms(time: SystemTime) -> i64 {
 
 /// Fail-loud on sign: every timestamp writer is u64-clock-sourced, so a
 /// negative stored Unix-ms value is contract-impossible. Ordering and
-/// monotonicity are deliberately NOT checked here (review F8: wall-clock
-/// regression is legitimate).
+/// monotonicity are deliberately NOT checked here (wall-clock regression is
+/// legitimate).
 pub(super) fn from_unix_ms(ms: i64) -> SystemTime {
     let ms = u64::try_from(ms).unwrap_or_else(|_| {
         panic!("stored unix-ms timestamp {ms} is negative: contract-impossible")

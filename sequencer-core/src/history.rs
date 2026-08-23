@@ -47,7 +47,7 @@ impl ExecutedInputCount {
 /// The bytes must carry the RFC 4122 UUIDv4 version and variant bits. Display
 /// uses the canonical lowercase hyphenated representation. The wire (text /
 /// JSON) codec deliberately does not exist yet: Track 3 owns the wire
-/// projection and adds it beside its consumer when that lands (H6).
+/// projection and adds it beside its consumer when that lands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EraId([u8; 16]);
 

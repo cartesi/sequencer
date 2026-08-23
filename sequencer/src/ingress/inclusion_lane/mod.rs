@@ -156,7 +156,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             // the batch-close branch below checks before its commit, and the
             // reconciliation turn checks before its commit. Adjacent re-reads
             // of the same bit buy a nanoseconds-narrower window in a design
-            // that already accepts the honest TOCTOU bound (H5).
+            // that already accepts the honest TOCTOU bound.
             self.maybe_advance_safe_frontier(&mut lane_state, &mut safe_inputs)?;
             let turn = self.run_fast_turn(&mut lane_state.head, &mut included)?;
 
@@ -244,7 +244,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         // Field-disjoint borrows: the token borrows `self.shutdown` while the
         // commit mutably borrows `self.storage`; the acknowledgement function
         // requires the token, so the FULL-committed-chunk-authorizes-ack
-        // boundary is a signature, not a convention (S-A).
+        // boundary is a signature, not a convention.
         let Some(auth) = self.shutdown.authorize() else {
             return Err(refuse_externalization_parts(&mut self.rx, included));
         };
@@ -447,7 +447,7 @@ fn persist_included_user_ops(
 }
 
 /// Acknowledge the FULL-committed chunk. Requires the externalization token:
-/// a new acknowledgement site cannot skip the containment consult (S-A).
+/// a new acknowledgement site cannot skip the containment consult.
 fn acknowledge_included(
     _auth: crate::runtime::shutdown::Authorized<'_>,
     included: &mut Vec<IncludedUserOp>,
@@ -512,7 +512,7 @@ pub(super) enum ChunkOutcome {
 fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) -> bool {
     // A backwards clock step makes `duration_since` err; `unwrap_or_default`
     // then reads as age 0, silently stalling the time-based close trigger
-    // until the clock catches up (review F8). Acceptable: the size trigger
+    // until the clock catches up. Acceptable: the size trigger
     // is unaffected, and a wedge here is liveness-only, never correctness.
     let age = SystemTime::now()
         .duration_since(head.batch_created_at)

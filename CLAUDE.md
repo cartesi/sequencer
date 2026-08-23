@@ -60,8 +60,8 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 - **[`AGENTS.md`](AGENTS.md)** — mission, requirements, invariants, duality, recovery, conventions, rules.
 - **[`docs/protocol/`](docs/protocol/)** — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (canonical acceptance algorithm) and [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` FFI trait). Read before touching the scheduler, the gold frontier, the fold, or an `Application` impl.
 - **[`docs/invariants.md`](docs/invariants.md)** — cross-module invariants register + the fail-loud check policy. Check it before changing anything it lists as load-bearing.
-- **[`docs/review/`](docs/review/)** — dated correctness-review ledgers: known-open findings, settled designs, work packages. Check for open findings in code you're about to touch.
-- **[`docs/plans/`](docs/plans/)** — active coordination tracks: agreed work split, design directions, and open decisions across in-flight efforts. Check before starting work that might belong to a track.
+- **[`docs/review/register.md`](docs/review/register.md)** — the review register: open findings, settled decisions, refuted proposals (do-not-re-propose). Check it for open findings in code you're about to touch, and before proposing a mechanism or simplification.
+- **[`docs/plans/`](docs/plans/)** — the [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md), active coordination tracks, and in-flight design handoffs. Check before starting work that might belong to a track.
 - **[`docs/threat-model/README.md`](docs/threat-model/README.md)** — trust boundaries and in-scope threats.
 - **[`docs/recovery/README.md`](docs/recovery/README.md)** — preemptive recovery design + TLA+ proofs.
 - **[`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md)** — snapshot lifecycle design + invariants (take/promote/GC, crash-safety). Read before touching the inclusion lane's safe-frontier/snapshot path.

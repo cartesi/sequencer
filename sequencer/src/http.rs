@@ -190,7 +190,7 @@ fn supervise_snapshot_releases(shutdown: RuntimeScope) -> (ReleaseScheduler, Sna
             // supervisor failed. Containment is sync and callable from any
             // thread — the old `tokio::spawn` wrapper was residue of the
             // deleted async containment API and would have panicked on a
-            // non-runtime thread (H7). `SnapshotReleaseDrain` also
+            // non-runtime thread. `SnapshotReleaseDrain` also
             // classifies its join before the HTTP worker can finish.
             schedule_shutdown.contain_storage_invariant_failure(
                 "snapshot lease release supervisor is unavailable",
