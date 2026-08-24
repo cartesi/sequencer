@@ -219,58 +219,38 @@ impl Storage {
 
     /// Count broadcastable events with offset > `from_offset`, capped at `limit`.
     ///
-    /// Used for catch-up window checks. Excludes batch-submitter direct inputs
-    /// (which are filtered before WS delivery) so the count reflects what the
-    /// client actually receives.
+    /// Used for catch-up window checks. Excludes batch-submitter direct
+    /// inputs — they are filtered before WS delivery, so the count reflects
+    /// what the client actually receives.
     pub fn count_broadcastable_events_after(
         &mut self,
         from_offset: u64,
         limit: u64,
-        batch_submitter_address: Option<Address>,
+        batch_submitter_address: Address,
     ) -> Result<u64> {
         if limit == 0 {
             return Ok(0);
         }
 
-        let value: i64 = match batch_submitter_address {
-            Some(addr) => {
-                const SQL: &str = "
-                    SELECT COUNT(*) FROM (
-                        SELECT 1 FROM valid_sequenced_l2_txs s
-                        WHERE s.offset > ?1
-                          AND NOT (s.safe_input_index IS NOT NULL
-                              AND EXISTS (SELECT 1 FROM safe_inputs si
-                                  WHERE si.safe_input_index = s.safe_input_index
-                                    AND si.sender = ?2))
-                        LIMIT ?3
-                    )";
-                self.conn.query_row(
-                    SQL,
-                    params![
-                        saturating_query_bound(from_offset),
-                        addr.as_slice(),
-                        saturating_query_bound(limit)
-                    ],
-                    |row| row.get(0),
-                )?
-            }
-            None => {
-                const SQL: &str = "
-                    SELECT COUNT(*) FROM (
-                        SELECT 1 FROM valid_sequenced_l2_txs
-                        WHERE offset > ?1
-                        LIMIT ?2
-                    )";
-                self.conn.query_row(
-                    SQL,
-                    params![
-                        saturating_query_bound(from_offset),
-                        saturating_query_bound(limit)
-                    ],
-                    |row| row.get(0),
-                )?
-            }
-        };
+        const SQL: &str = "
+            SELECT COUNT(*) FROM (
+                SELECT 1 FROM valid_sequenced_l2_txs s
+                WHERE s.offset > ?1
+                  AND NOT (s.safe_input_index IS NOT NULL
+                      AND EXISTS (SELECT 1 FROM safe_inputs si
+                          WHERE si.safe_input_index = s.safe_input_index
+                            AND si.sender = ?2))
+                LIMIT ?3
+            )";
+        let value: i64 = self.conn.query_row(
+            SQL,
+            params![
+                saturating_query_bound(from_offset),
+                batch_submitter_address.as_slice(),
+                saturating_query_bound(limit)
+            ],
+            |row| row.get(0),
+        )?;
         Ok(i64_to_u64(value))
     }
 }

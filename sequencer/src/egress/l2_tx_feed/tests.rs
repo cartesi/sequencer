@@ -149,7 +149,7 @@ async fn subscription_filters_batch_submitter_safe_inputs() {
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            batch_submitter_address: Some(batch_submitter_address),
+            ..L2TxFeedConfig::new(batch_submitter_address)
         },
     );
 
@@ -388,14 +388,12 @@ async fn catchup_window_excludes_batch_submitter_direct_inputs() {
         .expect("close frame");
     drop(storage);
 
-    // Without batch_submitter_address filtering: 2 events, max=1 should reject.
+    // With a submitter address that matches no seeded sender: 2 events,
+    // max=1 should reject.
     let feed_no_filter = L2TxFeed::new(
         db.path.clone(),
         RuntimeScope::default(),
-        L2TxFeedConfig {
-            batch_submitter_address: None,
-            ..L2TxFeedConfig::default()
-        },
+        L2TxFeedConfig::new(NO_OWN_BATCHES),
     );
     assert!(
         feed_no_filter.subscribe_from(0, 1).await.is_err(),
@@ -406,16 +404,17 @@ async fn catchup_window_excludes_batch_submitter_direct_inputs() {
     let feed_filtered = L2TxFeed::new(
         db.path.clone(),
         RuntimeScope::default(),
-        L2TxFeedConfig {
-            batch_submitter_address: Some(batch_submitter),
-            ..L2TxFeedConfig::default()
-        },
+        L2TxFeedConfig::new(batch_submitter),
     );
     assert!(
         feed_filtered.subscribe_from(0, 1).await.is_ok(),
         "with filter: only 1 broadcastable event, should accept"
     );
 }
+
+/// Sentinel submitter for fixtures that seed no own-batch rows. Must not
+/// collide with any seeded sender (`seed_ordered_txs` uses `Address::ZERO`).
+const NO_OWN_BATCHES: Address = Address::repeat_byte(0x7f);
 
 fn test_feed(db_path: &str, shutdown: RuntimeScope) -> L2TxFeed {
     L2TxFeed::new(
@@ -424,7 +423,7 @@ fn test_feed(db_path: &str, shutdown: RuntimeScope) -> L2TxFeed {
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            batch_submitter_address: None,
+            ..L2TxFeedConfig::new(NO_OWN_BATCHES)
         },
     )
 }

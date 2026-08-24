@@ -264,10 +264,7 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
         let tx_feed = L2TxFeed::new(
             db_path.clone(),
             shutdown.clone(),
-            L2TxFeedConfig {
-                batch_submitter_address: Some(l1_config.batch_submitter_address),
-                ..L2TxFeedConfig::default()
-            },
+            L2TxFeedConfig::new(l1_config.batch_submitter_address),
         );
         let listener = tokio::net::TcpListener::bind(&run_config.http_addr).await?;
 
