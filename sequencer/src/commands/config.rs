@@ -17,6 +17,8 @@
 
 use alloy_primitives::Address;
 use clap::{ArgGroup, Args};
+
+use crate::l1::SubmitterKey;
 use sequencer_core::protocol::{ProtocolTiming, ProtocolTimingError};
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
@@ -208,9 +210,10 @@ pub struct KeyArgs {
         long,
         env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
         hide_env_values = true,
-        group = "batch_submitter_key_source"
+        group = "batch_submitter_key_source",
+        value_parser = parse_submitter_key
     )]
-    batch_submitter_private_key: Option<String>,
+    batch_submitter_private_key: Option<SubmitterKey>,
     /// Path to a file whose first line contains the batch submitter private key.
     #[arg(
         long,
@@ -223,7 +226,7 @@ pub struct KeyArgs {
 
 impl KeyArgs {
     /// Resolve the batch submitter private key from either the inline value or a key file.
-    pub fn resolve(&self) -> Result<String, std::io::Error> {
+    pub fn resolve(&self) -> Result<SubmitterKey, std::io::Error> {
         resolve_key_source(
             &self.batch_submitter_private_key,
             &self.batch_submitter_private_key_file,
@@ -238,14 +241,14 @@ impl KeyArgs {
 /// "exactly one source" rule in code (the group can't be conditionally required
 /// at the clap level), so it needs the `None` case.
 fn resolve_key_source(
-    inline: &Option<String>,
+    inline: &Option<SubmitterKey>,
     file: &Option<String>,
-) -> Result<Option<String>, std::io::Error> {
+) -> Result<Option<SubmitterKey>, std::io::Error> {
     if let Some(file) = file {
         let contents = std::fs::read_to_string(file)?;
-        Ok(Some(
+        Ok(Some(SubmitterKey::new(
             contents.lines().next().unwrap_or("").trim().to_string(),
-        ))
+        )))
     } else {
         Ok(inline.clone())
     }
@@ -263,9 +266,10 @@ pub struct OptionalKeyArgs {
     #[arg(
         long,
         env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
-        hide_env_values = true
+        hide_env_values = true,
+        value_parser = parse_submitter_key
     )]
-    batch_submitter_private_key: Option<String>,
+    batch_submitter_private_key: Option<SubmitterKey>,
     /// Path to a file whose first line is the batch-submitter private key.
     #[arg(
         long,
@@ -289,7 +293,7 @@ impl OptionalKeyArgs {
     }
 
     /// Resolve the key if either source is set; `Ok(None)` when neither is.
-    fn resolve_if_present(&self) -> Result<Option<String>, std::io::Error> {
+    fn resolve_if_present(&self) -> Result<Option<SubmitterKey>, std::io::Error> {
         resolve_key_source(
             &self.batch_submitter_private_key,
             &self.batch_submitter_private_key_file,
@@ -418,7 +422,7 @@ impl SetupConfig {
 
     /// Resolve the recovery signing key. Precondition: [`SetupConfig::validate`]
     /// passed with `recovery == true` (so exactly one source is set).
-    pub fn resolve_recovery_key(&self) -> Result<String, std::io::Error> {
+    pub fn resolve_recovery_key(&self) -> Result<SubmitterKey, std::io::Error> {
         self.key
             .resolve_if_present()
             .map(|opt| opt.expect("recovery key presence is validated before resolve"))
@@ -506,7 +510,7 @@ impl RunConfig {
     }
 
     /// Resolve the batch submitter private key from either the inline value or a key file.
-    pub fn resolve_private_key(&self) -> Result<String, std::io::Error> {
+    pub fn resolve_private_key(&self) -> Result<SubmitterKey, std::io::Error> {
         self.key.resolve()
     }
 }
@@ -544,7 +548,7 @@ impl FlushConfig {
         db_path_in(&self.data_dir)
     }
 
-    pub fn resolve_private_key(&self) -> Result<String, std::io::Error> {
+    pub fn resolve_private_key(&self) -> Result<SubmitterKey, std::io::Error> {
         self.key.resolve()
     }
 }
@@ -555,6 +559,12 @@ fn parse_non_empty_string(raw: &str) -> Result<String, String> {
         return Err("value cannot be empty".to_string());
     }
     Ok(value.to_string())
+}
+
+/// Wrap the inline key value at the clap edge so the secret is redacted the
+/// moment it enters the process (env or flag).
+fn parse_submitter_key(raw: &str) -> Result<SubmitterKey, String> {
+    Ok(SubmitterKey::new(raw.to_string()))
 }
 
 fn parse_address(raw: &str) -> Result<Address, String> {
@@ -726,7 +736,12 @@ mod tests {
         assert!(cfg.recovery);
         assert_eq!(cfg.checkpoint_block, 1200);
         assert_eq!(cfg.checkpoint_dump_dir.as_deref(), Some("/tmp/ckpt"));
-        assert_eq!(cfg.resolve_recovery_key().expect("resolve key"), TEST_KEY);
+        assert_eq!(
+            cfg.resolve_recovery_key()
+                .expect("resolve key")
+                .expose_secret(),
+            TEST_KEY
+        );
     }
 
     #[test]

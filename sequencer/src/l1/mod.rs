@@ -35,10 +35,63 @@ pub struct L1Config {
     /// [`crate::l1::provider::create_verified_signer_provider`].
     pub identity: crate::storage::DeploymentIdentity,
     pub eth_rpc_url: String,
-    pub batch_submitter_private_key: String,
+    pub batch_submitter_private_key: SubmitterKey,
     /// Opt into plaintext (`http://`) RPC against a non-loopback host — a
     /// trusted private network (Docker/K8s service, private-VPC IP). Off by
     /// default: the provider layer refuses remote plaintext otherwise. See
     /// [`crate::l1::provider`].
     pub allow_insecure_rpc: bool,
+}
+
+/// Hex-encoded batch-submitter signing key. `Debug` redacts and no `Display`
+/// exists, so the secret cannot reach logs through formatting; the raw hex
+/// is reachable only via [`Self::expose_secret`], keeping every consumer of
+/// the secret greppable. The key's *public* identity needs no accessor — it
+/// is the pinned `identity.batch_submitter_address` beside it in
+/// [`L1Config`], verified against this key at the command gate.
+#[derive(Clone)]
+pub struct SubmitterKey(String);
+
+impl SubmitterKey {
+    pub fn new(hex: String) -> Self {
+        Self(hex)
+    }
+
+    /// The raw hex. Every caller handles secret material — keep the call
+    /// sites few and auditable.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SubmitterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SubmitterKey([redacted])")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubmitterKey;
+
+    #[test]
+    fn submitter_key_debug_never_prints_the_secret() {
+        let key = SubmitterKey::new("0xdeadbeef_sentinel".to_string());
+        let debug = format!("{key:?}");
+        assert!(!debug.contains("sentinel"), "got: {debug}");
+        assert_eq!(debug, "SubmitterKey([redacted])");
+        // The derived Debug of a carrier struct inherits the redaction.
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Carrier {
+            key: SubmitterKey,
+        }
+        let carried = format!(
+            "{:?}",
+            Carrier {
+                key: SubmitterKey::new("0xdeadbeef_sentinel".to_string())
+            }
+        );
+        assert!(!carried.contains("sentinel"), "got: {carried}");
+    }
 }

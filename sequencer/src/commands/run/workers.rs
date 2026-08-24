@@ -745,7 +745,7 @@ async fn wait_for_fee_oracle_shutdown(
 fn build_batch_submitter_provider(l1: &L1Config) -> Result<DynProvider, CommandError> {
     crate::l1::provider::create_signer_provider(
         &l1.eth_rpc_url,
-        &l1.batch_submitter_private_key,
+        l1.batch_submitter_private_key.expose_secret(),
         l1.allow_insecure_rpc,
     )
     .map_err(|message| {
@@ -1082,7 +1082,7 @@ mod tests {
         let l1_config = L1Config {
             identity,
             eth_rpc_url: run_config.eth_rpc_url.clone(),
-            batch_submitter_private_key: KEY.to_string(),
+            batch_submitter_private_key: crate::l1::SubmitterKey::new(KEY.to_string()),
             allow_insecure_rpc: false,
         };
         let process_lock = ProcessLock::acquire(&data_dir).expect("acquire runtime lock");
