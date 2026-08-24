@@ -1160,7 +1160,9 @@ async fn start_full_server_with_max_body(
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            batch_submitter_address: None,
+            // Sentinel submitter: the WS assertions here observe the
+            // unfiltered stream, so pass an address no fixture seeds.
+            ..L2TxFeedConfig::new(alloy_primitives::Address::repeat_byte(0x7f))
         },
     );
 
@@ -1217,7 +1219,9 @@ async fn start_api_only_server(
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            batch_submitter_address: None,
+            // Sentinel submitter: the WS assertions here observe the
+            // unfiltered stream, so pass an address no fixture seeds.
+            ..L2TxFeedConfig::new(alloy_primitives::Address::repeat_byte(0x7f))
         },
     );
     let server_task = http::start_on_listener(

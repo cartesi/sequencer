@@ -33,7 +33,10 @@ fn panic_message(payload: &dyn std::any::Any) -> &str {
 pub struct L2TxFeedConfig {
     pub idle_poll_interval: Duration,
     pub page_size: usize,
-    pub batch_submitter_address: Option<Address>,
+    /// Address of the batch submitter wallet. Direct inputs from this sender
+    /// are skipped before WS delivery (they're our own batch submissions).
+    /// One of I11's three consumer-side sender checks — keep them in sync.
+    pub batch_submitter_address: Address,
 }
 
 #[derive(Clone)]
@@ -41,7 +44,7 @@ pub struct L2TxFeed {
     db_path: String,
     page_size: usize,
     idle_poll_interval: Duration,
-    batch_submitter_address: Option<Address>,
+    batch_submitter_address: Address,
     shutdown: RuntimeScope,
 }
 
@@ -59,12 +62,14 @@ const DEFAULT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEFAULT_PAGE_SIZE: usize = 256;
 const SUBSCRIPTION_BUFFER_CAPACITY: usize = 1024;
 
-impl Default for L2TxFeedConfig {
-    fn default() -> Self {
+impl L2TxFeedConfig {
+    /// The only constructor: the submitter address is mandatory, so a feed
+    /// that fans out our own batch envelopes is unconstructible.
+    pub fn new(batch_submitter_address: Address) -> Self {
         Self {
             idle_poll_interval: DEFAULT_IDLE_POLL_INTERVAL,
             page_size: DEFAULT_PAGE_SIZE,
-            batch_submitter_address: None,
+            batch_submitter_address,
         }
     }
 }
@@ -233,7 +238,7 @@ fn load_catchup_info(
     db_path: &str,
     from_offset: u64,
     max_catchup_events: u64,
-    batch_submitter_address: Option<Address>,
+    batch_submitter_address: Address,
 ) -> Result<(u64, u64), SubscribeError> {
     let mut storage = Storage::open_read_only(db_path)
         .map_err(|source| SubscribeError::OpenStorage { source })?;
@@ -254,7 +259,7 @@ fn run_subscription(
     db_path: &str,
     page_size: usize,
     idle_poll_interval: Duration,
-    batch_submitter_address: Option<Address>,
+    batch_submitter_address: Address,
     from_offset: u64,
     shutdown: RuntimeScope,
     events_tx: mpsc::Sender<BroadcastTxMessage>,
@@ -304,7 +309,7 @@ fn run_subscription(
                     transaction_hash,
                     ..
                 } => {
-                    if batch_submitter_address == Some(tx.sender) {
+                    if tx.sender == batch_submitter_address {
                         continue;
                     }
                     BroadcastTxMessage::from_direct_input(
