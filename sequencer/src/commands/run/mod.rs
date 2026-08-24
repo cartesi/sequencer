@@ -14,13 +14,18 @@
 //! 3. **Prepare + admit + launch**: prepare every fallible runtime resource,
 //!    re-run the reducer over one consistent fact set, then consume the
 //!    single-use admission in one non-yielding worker launch (`workers`).
+//!
+//! Two senses of "admitted": phase 1 is the *lifecycle* gate (the
+//! `_admitted` suffix all three command brackets share); the *runtime*
+//! admission witness is minted later, in phase 3.
 
+mod startup_hygiene;
 mod workers;
 
 use std::time::Duration;
 
 use crate::commands::config::RunConfig;
-use crate::commands::error::{BootstrapError, CommandError};
+use crate::commands::error::CommandError;
 use crate::commands::{
     INPUT_READER_POLL_INTERVAL, load_setup_identity, preflight_lifecycle_command,
     record_terminal_fault_best_effort, verify_submitter_key,
@@ -28,7 +33,7 @@ use crate::commands::{
 use crate::l1::L1Config;
 use crate::l1::reader::{InputReader, InputReaderConfig};
 use crate::runtime::process_lock;
-use crate::storage::{self, DeploymentIdentity, LifecycleCommand};
+use crate::storage::{self, LifecycleCommand};
 use sequencer_core::application::Application;
 
 use workers::{PreparedRuntime, WorkersConfig};
@@ -61,7 +66,16 @@ where
     // pinned to another submitter is a fail-loud identity mismatch.
     let key = verify_submitter_key(config.resolve_private_key()?, &identity)?;
 
-    let result = run_admitted::<A>(config, timing, identity, key, process_lock.clone()).await;
+    // The identity travels verbatim inside the L1 bundle from here on, so
+    // exactly one route to the pinned values exists below this gate.
+    let l1_config = L1Config {
+        identity,
+        eth_rpc_url: config.eth_rpc_url.clone(),
+        batch_submitter_private_key: key,
+        allow_insecure_rpc: config.allow_insecure_rpc,
+    };
+
+    let result = run_admitted::<A>(config, timing, l1_config, process_lock.clone()).await;
     // The Ok-path divergence fact check (run's counterpart of the one
     // `complete_setup` keeps): divergence persisted during this run must
     // exit terminal even through a clean drain — exit 0 is the one code
@@ -88,24 +102,13 @@ fn refuse_divergence_on_clean_exit(db_path: &str) -> Result<(), CommandError> {
 async fn run_admitted<A>(
     config: RunConfig,
     timing: sequencer_core::protocol::ProtocolTiming,
-    identity: DeploymentIdentity,
-    key: String,
+    l1_config: L1Config,
     process_lock: process_lock::ProcessLock,
 ) -> Result<(), CommandError>
 where
     A: Application + Clone + Sync + 'static,
 {
     let db_path = config.db_path();
-
-    let l1_config = L1Config {
-        eth_rpc_url: config.eth_rpc_url.clone(),
-        input_box_address: identity.input_box_address,
-        app_address: identity.app_address,
-        batch_submitter_private_key: key,
-        batch_submitter_address: identity.batch_submitter_address,
-        chain_id: identity.chain_id,
-        allow_insecure_rpc: config.allow_insecure_rpc,
-    };
 
     // Prefer a live refresh before recovery can reopen a Tip, but tolerate a
     // transient L1/RPC failure the same way warm-boot tolerates unreachable
@@ -114,7 +117,9 @@ where
     // retained at boot and in `run_forever`. Misconfig (wrong pool/pair/chain)
     // stays terminal. Fixed mode needs no worker.
     let max_price_age_ms = timing.l1_read_stale_after_secs().saturating_mul(1000);
-    let fee_oracle = match identity.fee_oracle {
+    let fee_oracle = match l1_config.identity.fee_oracle {
+        // Fixed: setup pinned the exponent and nothing consults its freshness
+        // stamp outside the uniswap worker, so there is nothing to refresh.
         storage::FeeOracleIdentity::Fixed { .. } => None,
         storage::FeeOracleIdentity::Uniswap {
             weth,
@@ -123,7 +128,7 @@ where
             twap_window_secs,
         } => {
             let uniswap = crate::l1::fee_oracle::UniswapConfig {
-                chain_id: identity.chain_id,
+                chain_id: l1_config.identity.chain_id,
                 weth,
                 fee_token,
                 pool,
@@ -138,15 +143,7 @@ where
                 max_price_age_ms,
                 process_lock.clone(),
             )
-            .await
-            .map_err(|error| match error {
-                crate::l1::fee_oracle::RunFeeOracleBootstrapError::Misconfig(message) => {
-                    CommandError::from(BootstrapError::FeeOracleMisconfig { message })
-                }
-                crate::l1::fee_oracle::RunFeeOracleBootstrapError::Oracle(error) => {
-                    CommandError::from(error)
-                }
-            })?;
+            .await?;
             Some(oracle)
         }
     };
@@ -157,15 +154,15 @@ where
         InputReaderConfig {
             rpc_url: config.eth_rpc_url.clone(),
             allow_insecure_rpc: config.allow_insecure_rpc,
-            app_address: identity.app_address,
+            app_address: l1_config.identity.app_address,
             poll_interval: INPUT_READER_POLL_INTERVAL,
             long_block_range_error_codes: config.long_block_range_error_codes.clone(),
-            expected_chain_id: identity.chain_id,
+            expected_chain_id: l1_config.identity.chain_id,
         },
-        identity.input_box_address,
-        identity.app_deployment_block,
+        l1_config.identity.input_box_address,
+        l1_config.identity.app_deployment_block,
         db_path.clone(),
-        identity.batch_submitter_address,
+        l1_config.identity.batch_submitter_address,
         timing,
         // Bootstrap syncs use nested blocking SQLite jobs. The reader takes
         // its retained lock clone at construction—not only after worker
@@ -178,11 +175,11 @@ where
         http_addr = %config.http_addr,
         data_dir = %config.data_dir,
         eth_rpc_url = %l1_config.eth_rpc_url,
-        input_box_address = %l1_config.input_box_address,
-        app_deployment_block = input_reader.app_deployment_block(),
-        chain_id = identity.chain_id,
-        app_address = %l1_config.app_address,
-        batch_submitter_address = %l1_config.batch_submitter_address,
+        input_box_address = %l1_config.identity.input_box_address,
+        app_deployment_block = l1_config.identity.app_deployment_block,
+        chain_id = l1_config.identity.chain_id,
+        app_address = %l1_config.identity.app_address,
+        batch_submitter_address = %l1_config.identity.batch_submitter_address,
         max_wait_blocks = timing.max_wait_blocks,
         preemptive_margin_blocks = timing.preemptive_margin_blocks,
         danger_threshold = timing.danger_threshold(),
@@ -196,13 +193,11 @@ where
     crate::recovery::run_startup_recovery(&db_path, &mut input_reader, &l1_config, &timing).await?;
 
     // ── Prepare → admit → launch ─────────────────────────────
-    let domain = sequencer_core::build_input_domain(identity.chain_id, identity.app_address);
     let prepared = PreparedRuntime::<A>::prepare(WorkersConfig {
         run_config: config,
         l1_config,
         timing,
         input_reader,
-        domain,
         fee_oracle,
         process_lock,
     })
@@ -212,7 +207,7 @@ where
     // Reinvoke the same reducer over one consistent fact set; workers are
     // never launched from an aged decision.
     let admission = crate::recovery::admit_runtime(&db_path, &timing)?;
-    let mut workers = prepared.admit(admission).launch();
+    let mut workers = prepared.launch(admission);
 
     let first_exit = workers.select_first_exit().await;
     workers.finish(first_exit).await

@@ -9,10 +9,9 @@
 //!
 //! - [`PreparedRuntime::prepare`]: prepare every fallible or awaited
 //!   dependency while launching zero workers.
-//! - [`PreparedRuntime::admit`]: consume the controller's single-use durable
-//!   admission witness.
-//! - [`AdmittedRuntime::launch`]: launch all workers in one infallible,
-//!   non-yielding step and return the owning struct.
+//! - [`PreparedRuntime::launch`]: consume the controller's single-use durable
+//!   admission witness and launch all workers in one infallible,
+//!   non-yielding step, returning the owning struct.
 //! - [`Workers::select_first_exit`]: race the workers + OS shutdown signal,
 //!   return whichever fired first.
 //! - [`Workers::finish`]: request shutdown, race all remaining components to
@@ -20,12 +19,15 @@
 //!   primary failure.
 //!
 //! Worker plumbing is intentionally explicit per-worker (6 fields, 6 spawn
-//! statements, 6 select arms, 6 cleanup entries). Adding a seventh worker means
-//! editing each of those four sites — but each edit is obvious and local.
+//! statements, 6 select arms, 6 cleanup entries). Adding a seventh worker
+//! means editing each of those four sites, and each is compile-forced: the
+//! `Workers` literal in `launch`, and the exhaustive `let Self { .. }`
+//! destructures in `select_first_exit` and `finish` — where a bound-but-
+//! unused field fails CI under `-D warnings`. Keep those destructures
+//! exhaustive (no `..`): they are the enforcement, not style.
 
 use std::future::Future;
 use std::marker::PhantomData;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -40,7 +42,7 @@ use crate::commands::error::{CommandError, WorkerExit, WorkerStop};
 use crate::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use crate::http::{self, ApiConfig};
 use crate::ingress::inclusion_lane::{
-    InclusionLane, InclusionLaneConfig, InclusionLaneError, dump_info, dump_info::delete_dump_dir,
+    InclusionLane, InclusionLaneConfig, InclusionLaneError, dump_info,
 };
 use crate::l1::L1Config;
 use crate::l1::fee_oracle::FeeOracle;
@@ -60,13 +62,8 @@ const QUEUE_CAPACITY: usize = 8192;
 /// lag on entering the danger zone. The preemptive margin absorbs bounded lag.
 const DANGER_DETECTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-#[cfg(test)]
-static WORKER_LAUNCH_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static WORKER_LAUNCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Which event ended the `select!` race in [`Workers::select_first_exit`].
-pub(crate) enum FirstExit {
+pub(super) enum FirstExit {
     Signal(Option<CommandError>),
     Worker(WorkerExit),
     /// A terminal fault was contained by a runtime component. The black-box
@@ -78,15 +75,23 @@ pub(crate) enum FirstExit {
 /// Inputs to [`PreparedRuntime::prepare`]. Consumed entirely; the caller has
 /// nothing further to do with these after the call.
 ///
+/// Everything here is built by `run` because the recovery reducer consumes
+/// it or must run after it; anything the workers alone need is derived
+/// inside `prepare`.
+///
 /// No genesis app instance: `setup` already registered the finalized genesis
-/// snapshot, so the lane reloads via `A::from_dump`. The `domain` is built by
-/// `run` from the pinned deployment identity.
-pub(crate) struct WorkersConfig {
+/// snapshot, so the lane reloads via `A::from_dump`. No EIP-712 domain
+/// either: `prepare` derives it from the pinned deployment identity that
+/// `l1_config` carries verbatim.
+pub(super) struct WorkersConfig {
     pub run_config: RunConfig,
     pub l1_config: L1Config,
     pub timing: ProtocolTiming,
     pub input_reader: InputReader,
-    pub domain: alloy_sol_types::Eip712Domain,
+    /// Already bootstrapped by the caller: the first live refresh must
+    /// precede startup recovery, which can reopen a Tip that stamps its
+    /// frame fee from `batch_policy`. Only the spawn is deferred to
+    /// `launch`. Fixed pricing has no worker (`None`).
     pub fee_oracle: Option<FeeOracle>,
     /// Exclusive data-directory ownership, acquired before bootstrap and
     /// transferred into the runtime lifetime at worker admission.
@@ -115,38 +120,34 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
-/// Fully prepared runtime state. Owning this value launches no tasks and
-/// grants no sequencing authority.
+/// Fully prepared runtime state: exactly the arguments `launch` hands to
+/// the workers. Configuration is consumed by `prepare`; only launch-ready
+/// values cross the authority boundary. Owning this value launches no tasks
+/// and grants no sequencing authority.
 pub(super) struct PreparedRuntime<A> {
-    run_config: RunConfig,
-    l1_config: L1Config,
     input_reader: InputReader,
-    domain: alloy_sol_types::Eip712Domain,
+    api_config: ApiConfig,
     fee_oracle: Option<FeeOracle>,
     storage: crate::storage::Storage,
-    dumps_dir: PathBuf,
+    lane_config: InclusionLaneConfig,
     submitter: BatchSubmitter<EthereumBatchPoster>,
     detector: DangerDetector,
     tx_feed: L2TxFeed,
     listener: tokio::net::TcpListener,
+    bound_addr: std::net::SocketAddr,
+    snapshot_state: http::SnapshotState,
     shutdown: RuntimeScope,
     shutdown_on_drop: ShutdownOnDrop,
-    db_path: String,
+    /// No `A` *value* is ever held — `setup` registered the genesis snapshot
+    /// and the lane reloads via `A::from_dump`. The parameter feeds the
+    /// lane's `start`, the payload bound, and the snapshot path hook.
     _application: PhantomData<fn() -> A>,
 }
 
-/// Single-use launch capability. Only a prepared runtime plus the
-/// controller's durable-admission witness can construct it.
-#[must_use = "an admitted runtime must be launched without yielding"]
-pub(super) struct AdmittedRuntime<A> {
-    prepared: PreparedRuntime<A>,
-    _admission: crate::recovery::RuntimeAdmission,
-}
-
 /// Owns the runtime worker handles + the shutdown signal that drives them.
-/// [`AdmittedRuntime::launch`] and teardown ([`Workers::finish`]) bracket the
+/// [`PreparedRuntime::launch`] and teardown ([`Workers::finish`]) bracket the
 /// worker lifecycle.
-pub(crate) struct Workers {
+pub(super) struct Workers {
     server: JoinHandle<std::io::Result<()>>,
     lane: JoinHandle<Result<(), InclusionLaneError>>,
     reader: JoinHandle<Result<(), InputReaderError>>,
@@ -166,7 +167,6 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
             l1_config,
             timing,
             input_reader,
-            domain,
             fee_oracle,
             process_lock,
         } = cfg;
@@ -174,7 +174,13 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
         // Derived values — kept inside `prepare` so `WorkersConfig` stays
         // minimal and these aren't computed twice in the caller.
         let db_path = run_config.db_path();
-        let app_deployment_block = input_reader.app_deployment_block();
+        // The EIP-712 domain is the signature-verification boundary, so it
+        // is derived from exactly one source: the pinned deployment identity
+        // that `l1_config` carries verbatim out of `load_setup_identity`.
+        let domain = sequencer_core::build_input_domain(
+            l1_config.identity.chain_id,
+            l1_config.identity.app_address,
+        );
 
         // The scope is the runtime-lifetime capability: every worker
         // receives a clone, and every clone keeps the process lock alive.
@@ -189,52 +195,27 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
         // fail-loud on the next boot that reads it.
         install_terminal_fault_recorder(&shutdown, db_path.clone());
 
-        // Inclusion lane: takes the app, returns the tx-sender the HTTP
-        // ingress route will publish to.
         let mut storage = crate::storage::Storage::open(&db_path)?;
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
         std::fs::create_dir_all(&dumps_dir)?;
 
-        // Authority-neutral runtime preparation, in this order:
-        //
-        // 1. Reset stale leases. A crashed previous run may have left
-        //    `lease_count > 0` on dumps that aren't being read by
-        //    anyone now; without this, GC would skip them forever.
-        // 2. Require the finalized snapshot (always-load invariant). `setup`
-        //    registered the genesis snapshot and `run` gated on atomic setup
-        //    completion, so it must be present — a missing one
-        //    is a terminal incomplete-setup, not a cold-start to paper over
-        //    (run holds no genesis app instance).
-        // 3. GC SQLite-side: drop any rows now unreferenced after
-        //    promotions or invalidations that finalized just before
-        //    the previous shutdown.
-        // 4. Orphan FS sweep: remove directories under `dumps_dir`
-        //    that aren't tracked by SQLite (crash-during-create_dump
-        //    or crash-during-GC-after-row-delete artifacts).
-        storage.reset_dump_leases()?;
-        require_finalized_snapshot(&mut storage)?;
-        restamp_finalized_promotion(&mut storage)?;
-        let gc_removed = snapshot_gc_at_startup::<A>(&mut storage)?;
-        let sweep_removed = sweep_orphan_dumps::<A>(&mut storage, &dumps_dir)?;
-        tracing::debug!(
-            gc_removed,
-            sweep_removed,
-            "snapshot startup cleanup complete",
-        );
+        // Authority-neutral snapshot repair before the boundary; the five
+        // order-critical steps are documented in `startup_hygiene`.
+        super::startup_hygiene::run_snapshot_hygiene::<A>(&mut storage, &dumps_dir)?;
 
         // Prepare every remaining fallible or awaited dependency before the
         // authority boundary. Cancellation observes zero workers.
         input_reader.preflight_storage()?;
 
         let poster_config = BatchPosterConfig {
-            l1_submit_address: l1_config.input_box_address,
-            app_address: l1_config.app_address,
-            batch_submitter_address: l1_config.batch_submitter_address,
-            start_block: app_deployment_block,
+            l1_submit_address: l1_config.identity.input_box_address,
+            app_address: l1_config.identity.app_address,
+            batch_submitter_address: l1_config.identity.batch_submitter_address,
+            start_block: l1_config.identity.app_deployment_block,
             confirmation_depth: run_config.batch_submitter_confirmation_depth,
-            seconds_per_block: run_config.timing.seconds_per_block,
+            seconds_per_block: timing.seconds_per_block,
             long_block_range_error_codes: run_config.long_block_range_error_codes.clone(),
-            expected_chain_id: l1_config.chain_id,
+            expected_chain_id: l1_config.identity.chain_id,
         };
         let provider = build_batch_submitter_provider(&l1_config)?;
         let poster = Arc::new(EthereumBatchPoster::new(
@@ -264,73 +245,67 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
         let tx_feed = L2TxFeed::new(
             db_path.clone(),
             shutdown.clone(),
-            L2TxFeedConfig::new(l1_config.batch_submitter_address),
+            L2TxFeedConfig::new(l1_config.identity.batch_submitter_address),
         );
+
+        // Configuration ends here: the remaining values are exactly what
+        // `launch` hands to the workers, so the config structs never cross
+        // the authority boundary.
+        let lane_config =
+            InclusionLaneConfig::new(l1_config.identity.batch_submitter_address, dumps_dir)
+                .with_max_batch_open(run_config.max_batch_open());
+        let api_config = ApiConfig::new(domain, A::MAX_METHOD_PAYLOAD_BYTES);
         let listener = tokio::net::TcpListener::bind(&run_config.http_addr).await?;
+        let bound_addr = listener.local_addr()?;
+        let snapshot_state = http::SnapshotState {
+            db_path,
+            // The DB row stores the dump *directory*; the app's state
+            // file lives under its `state` subtree.
+            state_file_in_dump: |dump_dir| A::state_file_in_dump(&dump_info::app_prefix(dump_dir)),
+        };
 
         Ok(Self {
-            run_config,
-            l1_config,
             input_reader,
-            domain,
+            api_config,
             fee_oracle,
             storage,
-            dumps_dir,
+            lane_config,
             submitter,
             detector,
             tx_feed,
             listener,
+            bound_addr,
+            snapshot_state,
             shutdown,
             shutdown_on_drop,
-            db_path,
             _application: PhantomData,
         })
     }
 
-    /// Consume the admission witness and seal the prepared state into the
-    /// only capability from which workers can be launched.
-    pub(super) fn admit(self, admission: crate::recovery::RuntimeAdmission) -> AdmittedRuntime<A> {
-        AdmittedRuntime {
-            prepared: self,
-            _admission: admission,
-        }
-    }
-}
-
-impl<A: Application + Clone + Sync + 'static> AdmittedRuntime<A> {
     /// Launch all workers in one infallible, non-async, non-yielding step.
-    pub(super) fn launch(self) -> Workers {
+    /// Consuming the [`crate::recovery::RuntimeAdmission`] witness here is
+    /// what gates launching on the reducer's fresh clean decision — the
+    /// witness's sole constructor is `admit_runtime`, and launch uses it up.
+    pub(super) fn launch(self, _admission: crate::recovery::RuntimeAdmission) -> Workers {
         let Self {
-            prepared:
-                PreparedRuntime {
-                    run_config,
-                    l1_config,
-                    input_reader,
-                    domain,
-                    fee_oracle,
-                    storage,
-                    dumps_dir,
-                    submitter,
-                    detector,
-                    tx_feed,
-                    listener,
-                    shutdown,
-                    shutdown_on_drop,
-                    db_path,
-                    _application: _,
-                },
-            _admission: _,
+            input_reader,
+            api_config,
+            fee_oracle,
+            storage,
+            lane_config,
+            submitter,
+            detector,
+            tx_feed,
+            listener,
+            bound_addr,
+            snapshot_state,
+            shutdown,
+            shutdown_on_drop,
+            _application: _,
         } = self;
 
-        #[cfg(test)]
-        WORKER_LAUNCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (tx, lane) = InclusionLane::<A>::start(
-            QUEUE_CAPACITY,
-            shutdown.clone(),
-            storage,
-            InclusionLaneConfig::new(l1_config.batch_submitter_address, dumps_dir)
-                .with_max_batch_open(run_config.max_batch_open()),
-        );
+        let (tx, lane) =
+            InclusionLane::<A>::start(QUEUE_CAPACITY, shutdown.clone(), storage, lane_config);
         let reader = input_reader.start_preflighted(shutdown.clone());
         let submitter = submitter.start_preflighted(shutdown.clone());
         let detector = detector.start_preflighted(shutdown.clone());
@@ -339,23 +314,12 @@ impl<A: Application + Clone + Sync + 'static> AdmittedRuntime<A> {
         let server = http::start_on_listener(
             listener,
             tx,
-            domain,
-            A::MAX_METHOD_PAYLOAD_BYTES,
             shutdown.clone(),
             tx_feed,
-            ApiConfig::default(),
-            http::SnapshotState {
-                db_path: db_path.clone(),
-                // The DB row stores the dump *directory*; the app's state
-                // file lives under its `state` subtree.
-                state_file_in_dump: |dump_dir| {
-                    A::state_file_in_dump(&crate::ingress::inclusion_lane::dump_info::app_prefix(
-                        dump_dir,
-                    ))
-                },
-            },
+            api_config,
+            snapshot_state,
         );
-        tracing::info!(address = %run_config.http_addr, "listening");
+        tracing::info!(address = %bound_addr, "listening");
 
         Workers {
             server,
@@ -373,13 +337,26 @@ impl<A: Application + Clone + Sync + 'static> AdmittedRuntime<A> {
 impl Workers {
     /// Race an OS shutdown signal against each worker's join handle. The first to complete
     /// produces the [`FirstExit`].
-    pub(crate) async fn select_first_exit(&mut self) -> FirstExit {
+    pub(super) async fn select_first_exit(&mut self) -> FirstExit {
+        // Exhaustive destructure (no `..`): a new worker field fails to
+        // compile here, so it cannot be forgotten in the race below — the
+        // same forcing `finish`'s destructure provides for cleanup.
+        let Self {
+            server,
+            lane,
+            reader,
+            submitter,
+            detector,
+            fee_oracle,
+            shutdown,
+            _shutdown_on_drop: _,
+        } = self;
         let shutdown_signal = os_shutdown_signal();
         tokio::pin!(shutdown_signal);
         tokio::select! {
             biased;
-            _ = self.shutdown.wait_for_shutdown() => {
-                if self.shutdown.is_storage_invariant_contained() {
+            _ = shutdown.wait_for_shutdown() => {
+                if shutdown.is_storage_invariant_contained() {
                     FirstExit::Contained
                 } else {
                     // Externally requested shutdown without a contained
@@ -388,26 +365,27 @@ impl Workers {
                 }
             }
             signal_result = &mut shutdown_signal => FirstExit::signal(signal_result),
-            server_result = &mut self.server =>
-                FirstExit::worker(WorkerExit::Server(WorkerStop::from_select(server_result))),
-            lane_result = &mut self.lane =>
-                FirstExit::worker(WorkerExit::Lane(WorkerStop::from_select(lane_result))),
-            reader_result = &mut self.reader =>
-                FirstExit::worker(WorkerExit::InputReader(WorkerStop::from_select(reader_result))),
-            submitter_result = &mut self.submitter =>
-                FirstExit::worker(WorkerExit::BatchSubmitter(WorkerStop::from_select(
+            server_result = &mut *server =>
+                FirstExit::Worker(WorkerExit::Server(WorkerStop::from_select(server_result))),
+            lane_result = &mut *lane =>
+                FirstExit::Worker(WorkerExit::Lane(WorkerStop::from_select(lane_result))),
+            reader_result = &mut *reader =>
+                FirstExit::Worker(WorkerExit::InputReader(WorkerStop::from_select(reader_result))),
+            submitter_result = &mut *submitter =>
+                FirstExit::Worker(WorkerExit::BatchSubmitter(WorkerStop::from_select(
                     // A worker returning `Shutdown` outside a real shutdown
                     // means it stopped on its own — the unexpected case.
                     submitter_result.map(|r| r.map(|SubmitterExit::Shutdown| ())),
                 ))),
-            detector_result = &mut self.detector => FirstExit::detector(detector_result),
+            detector_result = &mut *detector => FirstExit::detector(detector_result),
             fee_oracle_result = async {
-                match self.fee_oracle.as_mut() {
-                    Some(handle) => Some(handle.await),
+                match fee_oracle.as_mut() {
+                    Some(handle) => handle.await,
+                    // Fixed mode: no oracle worker, so this arm never resolves.
                     None => std::future::pending().await,
                 }
-            } => FirstExit::worker(WorkerExit::FeeOracle(WorkerStop::from_select(
-                fee_oracle_result.expect("fixed mode does not select an oracle exit"),
+            } => FirstExit::Worker(WorkerExit::FeeOracle(WorkerStop::from_select(
+                fee_oracle_result,
             ))),
         }
     }
@@ -417,7 +395,7 @@ impl Workers {
     /// invariant fault or terminal cleanup error always takes precedence over
     /// an earlier nonterminal worker/signal result. Concurrent polling matters:
     /// a hung drain must not hide a terminal exit that arms the hard watchdog.
-    pub(crate) async fn finish(self, first_exit: FirstExit) -> Result<(), CommandError> {
+    pub(super) async fn finish(self, first_exit: FirstExit) -> Result<(), CommandError> {
         match &first_exit {
             // Already contained by the raising component; its best-effort
             // terminal-cause journal append was attempted there.
@@ -474,13 +452,11 @@ impl Workers {
             ));
         }
 
-        // Two completion modes:
-        // - Worker-failure: we already have the primary; await the OTHER
-        //   components for orderly cleanup, log any cleanup errors, surface
-        //   the primary (wrapped to CommandError).
-        // - Signal-driven shutdown: an OS signal triggered shutdown. Wait for
-        //   everything to drain; the signal handler's own error (if any)
-        //   takes priority over any subsequent component shutdown error.
+        // One drain, two phases:
+        // - "cleanup-time" (worker failure): the primary is already in hand;
+        //   every OTHER component is awaited for orderly cleanup.
+        // - "shutdown-time" (signal or already-contained): everything drains;
+        //   the signal handler's own error outranks any later component error.
         let (worker_failure, signal_error): (Option<(WorkerId, WorkerExit)>, Option<CommandError>) =
             match first_exit {
                 FirstExit::Signal(err) => (None, err),
@@ -491,68 +467,67 @@ impl Workers {
                 FirstExit::Contained => (None, None),
             };
 
-        if let Some((failed, primary_exit)) = worker_failure {
+        if let Some((failed, _)) = &worker_failure {
             let failed_index = components
                 .iter()
-                .position(|(id, _)| *id == failed)
+                .position(|(id, _)| id == failed)
                 .expect("primary worker must be present in the cleanup set");
             // Drop the primary's future without awaiting — its task is
-            // already done (it tripped the select), and its typed exit is
-            // surfaced directly below.
+            // already done (it tripped the select) and re-polling a completed
+            // JoinHandle panics. Its typed exit is surfaced by the precedence
+            // match below.
             drop(components.swap_remove(failed_index));
-
-            while let Some((id, result)) = next_component_shutdown(&mut components).await {
-                if let Err(exit) = result {
-                    warn!(
-                        component = id.label(),
-                        error = %exit,
-                        "component shutdown after primary failure also errored"
-                    );
-                    if exit.is_terminal() {
-                        shutdown.contain_storage_invariant_failure(format!(
-                            "cleanup-time {} worker exit: {exit}",
-                            id.label()
-                        ));
-                    }
-                }
-            }
-            if let Some(err) = contained_verdict(&shutdown) {
-                return Err(err);
-            }
-            return Err(CommandError::Worker(primary_exit));
         }
 
-        // Signal path: await EVERY component so each worker's JoinHandle is
-        // joined and its task fully drains. A `break` here would drop the
-        // remaining components' futures un-awaited, which DETACHES those tasks
-        // (only `JoinHandle::abort()` cancels a dropped handle) — they'd be
-        // killed mid-drain at runtime teardown, the exact abrupt-write case the
-        // startup snapshot hygiene (sweep/gc/re-stamp) exists to clean up after.
-        // Keep the first ordinary error to surface and separately retain the
-        // first terminal error; log every failure.
-        let mut shutdown_error: Option<WorkerExit> = None;
+        let phase = if worker_failure.is_some() {
+            "cleanup-time"
+        } else {
+            "shutdown-time"
+        };
+
+        // Await EVERY remaining component — in both phases — so each worker's
+        // JoinHandle is joined and its task fully drains. A `break` here would
+        // drop the remaining components' futures un-awaited, which DETACHES
+        // those tasks (only `JoinHandle::abort()` cancels a dropped handle) —
+        // they'd be killed mid-drain at runtime teardown, the exact
+        // abrupt-write case the startup snapshot hygiene (sweep/gc/re-stamp)
+        // exists to clean up after. The primary removed above is the one
+        // deliberate exception: its task already completed, so awaiting it
+        // would panic rather than drain anything. Keep the first ordinary
+        // error to surface; terminal errors contain instead.
+        let mut drain_error: Option<WorkerExit> = None;
         while let Some((id, result)) = next_component_shutdown(&mut components).await {
             if let Err(e) = result {
-                warn!(component = id.label(), error = %e, "component errored during signal-driven shutdown");
+                warn!(
+                    component = id.label(),
+                    phase,
+                    error = %e,
+                    "component errored during runtime drain"
+                );
                 if e.is_terminal() {
                     shutdown.contain_storage_invariant_failure(format!(
-                        "shutdown-time {} worker exit: {e}",
+                        "{phase} {} worker exit: {e}",
                         id.label()
                     ));
-                    continue;
-                }
-                if shutdown_error.is_none() {
-                    shutdown_error = Some(e);
+                } else if drain_error.is_none() {
+                    drain_error = Some(e);
                 }
             }
         }
-        if let Some(err) = contained_verdict(&shutdown) {
-            return Err(err);
-        }
-        match (signal_error, shutdown_error) {
-            (Some(err), _) => Err(err),
-            (None, Some(exit)) => Err(CommandError::Worker(exit)),
-            (None, None) => Ok(()),
+
+        // The single precedence site: contained > primary > signal > first
+        // drain error.
+        match (
+            contained_verdict(&shutdown),
+            worker_failure,
+            signal_error,
+            drain_error,
+        ) {
+            (Some(contained), ..) => Err(contained),
+            (None, Some((_, primary_exit)), _, _) => Err(CommandError::Worker(primary_exit)),
+            (None, None, Some(signal_err), _) => Err(signal_err),
+            (None, None, None, Some(exit)) => Err(CommandError::Worker(exit)),
+            (None, None, None, None) => Ok(()),
         }
     }
 }
@@ -640,10 +615,6 @@ impl WorkerExit {
 // dispatch, and the select arms should say which worker they map.
 
 impl FirstExit {
-    fn worker(exit: WorkerExit) -> Self {
-        FirstExit::Worker(exit)
-    }
-
     /// ctrl_c shutdown signal: `Ok(())` = clean signal, `Err(io)` =
     /// signal-handler installation failed.
     fn signal(result: Result<(), std::io::Error>) -> Self {
@@ -678,6 +649,12 @@ type ComponentShutdown = Pin<Box<dyn Future<Output = Result<(), WorkerExit>> + S
 /// workers concurrently: otherwise one hung component can hide a terminal
 /// panic/invariant exit from a later slot forever, preventing containment and
 /// its hard abort bound from ever arming.
+///
+/// No `.await` may separate the inner `Poll::Ready` from the `swap_remove` —
+/// a cancellation in that window would leave a completed future in the set,
+/// and the next poll of it panics. `swap_remove` also reorders the set, so
+/// completion order among concurrently-ready components is unspecified; only
+/// terminal exits carry precedence.
 async fn next_component_shutdown(
     components: &mut Vec<(WorkerId, ComponentShutdown)>,
 ) -> Option<(WorkerId, Result<(), WorkerExit>)> {
@@ -694,8 +671,7 @@ async fn next_component_shutdown(
         Poll::Pending
     })
     .await;
-    let (id, completed) = components.swap_remove(ready_index);
-    drop(completed);
+    let (id, _) = components.swap_remove(ready_index);
     Some((id, result))
 }
 
@@ -775,95 +751,6 @@ fn build_batch_submitter_provider(l1: &L1Config) -> Result<DynProvider, CommandE
     .map_err(|message| {
         CommandError::Bootstrap(crate::commands::error::BootstrapError::SignerMisconfig { message })
     })
-}
-
-/// Require the finalized snapshot the lane will `from_dump` against. `setup`
-/// registers the genesis snapshot and `run` gates on atomic setup completion,
-/// so by the time the lane starts the snapshot must exist. A missing
-/// one means the DB's setup is incomplete/corrupt — terminal
-/// `SetupNotComplete` (re-run `setup`), not a cold-start to silently heal.
-fn require_finalized_snapshot(storage: &mut crate::storage::Storage) -> Result<(), CommandError> {
-    if storage.finalized_dump()?.is_none() {
-        return Err(CommandError::Bootstrap(
-            crate::commands::error::BootstrapError::SetupNotComplete,
-        ));
-    }
-    Ok(())
-}
-
-/// Re-stamp `B` into the finalized dump's `info.toml` from the
-/// authoritative DB row. Idempotent; closes the crash window between a
-/// promotion's commit and the lane's in-place stamp.
-fn restamp_finalized_promotion(storage: &mut crate::storage::Storage) -> Result<(), CommandError> {
-    if let Some(finalized) = storage.finalized_dump()? {
-        let path = finalized.dump.prefix;
-        dump_info::stamp_promoted_inclusion_block(&path, finalized.inclusion_block)
-            .map_err(|source| CommandError::ReferencedSnapshotArtifact { path, source })?;
-    }
-    Ok(())
-}
-
-/// Drop any dump rows that are now unreferenced (no pending, no
-/// finalized, no leases). The companion `sweep_orphan_dumps` then
-/// catches anything on disk that this leaves behind, plus
-/// crash-during-create_dump orphans the SQLite layer never saw.
-fn snapshot_gc_at_startup<A: Application + 'static>(
-    storage: &mut crate::storage::Storage,
-) -> Result<usize, CommandError> {
-    let removed = storage.gc_unreferenced_dumps()?;
-    for row in &removed {
-        if let Err(err) = delete_dump_dir::<A>(&row.prefix) {
-            tracing::warn!(
-                error = %err,
-                prefix = ?row.prefix,
-                "startup GC: filesystem delete failed; orphan left for sweep",
-            );
-        }
-    }
-    Ok(removed.len())
-}
-
-/// Walk `dumps_dir` and delete any dump directory that isn't in
-/// `Storage::list_dump_rows`. Catches:
-///
-/// - **crash-during-create**: a dump dir exists on disk (possibly
-///   without its app subtree or `info.toml`) but no SQLite row was
-///   ever written for it.
-/// - **crash-during-GC**: SQLite row was deleted but the filesystem
-///   delete either wasn't reached or failed.
-///
-/// Filesystem-only — no SQLite writes here. Failures log and
-/// continue (the next startup retries). The post-`ensure_finalized`
-/// ordering matters: the genesis dump's dir is in
-/// `list_dump_rows` by the time this runs, so we never delete it.
-fn sweep_orphan_dumps<A: Application + 'static>(
-    storage: &mut crate::storage::Storage,
-    dumps_dir: &std::path::Path,
-) -> Result<usize, CommandError> {
-    let known: std::collections::HashSet<std::path::PathBuf> = storage
-        .list_dump_rows()?
-        .into_iter()
-        .map(|row| row.prefix)
-        .collect();
-    let mut removed = 0;
-    for entry in std::fs::read_dir(dumps_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if known.contains(&path) {
-            continue;
-        }
-        match delete_dump_dir::<A>(&path) {
-            Ok(()) => removed += 1,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    ?path,
-                    "orphan dump sweep: delete failed; will retry next startup",
-                );
-            }
-        }
-    }
-    Ok(removed)
 }
 
 #[cfg(test)]
@@ -1162,39 +1049,42 @@ mod tests {
         storage.complete_setup().expect("complete setup");
         drop(storage);
 
-        let app_address: alloy_primitives::Address = "0x1111111111111111111111111111111111111111"
-            .parse()
-            .expect("app address");
-        let input_box_address: alloy_primitives::Address =
-            "0x2222222222222222222222222222222222222222"
+        // One identity literal feeds both the reader and the L1 bundle, so
+        // the fixture cannot drift the way hand-copied fields could.
+        let identity = crate::storage::DeploymentIdentity {
+            chain_id: 31337,
+            app_address: "0x1111111111111111111111111111111111111111"
                 .parse()
-                .expect("input box address");
+                .expect("app address"),
+            input_box_address: "0x2222222222222222222222222222222222222222"
+                .parse()
+                .expect("input box address"),
+            app_deployment_block: 0,
+            batch_submitter_address: submitter_address,
+            fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
+        };
         let input_reader = InputReader::from_parts(
             crate::l1::reader::InputReaderConfig {
                 rpc_url: run_config.eth_rpc_url.clone(),
                 allow_insecure_rpc: false,
-                app_address,
+                app_address: identity.app_address,
                 poll_interval: crate::commands::INPUT_READER_POLL_INTERVAL,
                 long_block_range_error_codes: run_config.long_block_range_error_codes.clone(),
-                expected_chain_id: 31337,
+                expected_chain_id: identity.chain_id,
             },
-            input_box_address,
-            0,
+            identity.input_box_address,
+            identity.app_deployment_block,
             db_path.clone(),
-            submitter_address,
+            identity.batch_submitter_address,
             timing,
             ProcessLock::test(),
         );
         let l1_config = L1Config {
+            identity,
             eth_rpc_url: run_config.eth_rpc_url.clone(),
-            input_box_address,
-            app_address,
             batch_submitter_private_key: KEY.to_string(),
-            batch_submitter_address: submitter_address,
-            chain_id: 31337,
             allow_insecure_rpc: false,
         };
-        let domain = sequencer_core::build_input_domain(31337, app_address);
         let process_lock = ProcessLock::acquire(&data_dir).expect("acquire runtime lock");
 
         (
@@ -1206,7 +1096,6 @@ mod tests {
                 l1_config,
                 timing,
                 input_reader,
-                domain,
                 fee_oracle: None,
                 process_lock,
             },
@@ -1215,14 +1104,12 @@ mod tests {
 
     #[tokio::test]
     async fn occupied_http_port_fails_before_any_worker_launches() {
-        let _launch_test = WORKER_LAUNCH_TEST_LOCK.lock().await;
         let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind occupied listener");
         let http_addr = occupied.local_addr().expect("listener address").to_string();
         let (_dir, data_dir, _db_path, workers_config) = startup_workers_config(http_addr);
 
-        WORKER_LAUNCH_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         let result = PreparedRuntime::<StartupProbeApp>::prepare(workers_config).await;
         let err = match result {
             Ok(_) => panic!("occupied listener must refuse preparation"),
@@ -1232,39 +1119,25 @@ mod tests {
             matches!(&err, CommandError::Io(source) if source.kind() == std::io::ErrorKind::AddrInUse),
             "expected AddrInUse, got {err:?}"
         );
-        assert_eq!(
-            WORKER_LAUNCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "worker launch began before preparation completed"
-        );
+        // The boundary check: a worker spawned during preparation would
+        // retain a `RuntimeScope` clone and keep the process lock held, so
+        // this acquire succeeding proves zero workers launched.
         ProcessLock::acquire(&data_dir)
             .expect("failed preparation must release ownership with zero live workers");
     }
 
     #[tokio::test]
     async fn launch_requires_a_fresh_admission_after_preparation() {
-        let _launch_test = WORKER_LAUNCH_TEST_LOCK.lock().await;
         let (_dir, data_dir, db_path, workers_config) =
             startup_workers_config("127.0.0.1:0".to_string());
 
-        WORKER_LAUNCH_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         let timing = workers_config.timing;
         let prepared = PreparedRuntime::<StartupProbeApp>::prepare(workers_config)
             .await
             .expect("runtime prepares");
-        assert_eq!(
-            WORKER_LAUNCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "preparation must launch zero workers"
-        );
         let admission = crate::recovery::admit_runtime(&db_path, &timing)
             .expect("the reducer admits over clean facts and returns its witness");
-        let workers = prepared.admit(admission).launch();
-        assert_eq!(
-            WORKER_LAUNCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "launch must cross the worker boundary exactly once"
-        );
+        let workers = prepared.launch(admission);
 
         workers
             .finish(FirstExit::Signal(None))
@@ -1287,12 +1160,10 @@ mod tests {
 
     #[tokio::test]
     async fn preparation_outliving_clean_facts_cannot_launch() {
-        let _launch_test = WORKER_LAUNCH_TEST_LOCK.lock().await;
         let (_dir, _data_dir, db_path, workers_config) =
             startup_workers_config("127.0.0.1:0".to_string());
         let timing = workers_config.timing;
 
-        WORKER_LAUNCH_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         let prepared = PreparedRuntime::<StartupProbeApp>::prepare(workers_config)
             .await
             .expect("runtime prepares");
@@ -1313,10 +1184,6 @@ mod tests {
         let error = crate::recovery::admit_runtime(&db_path, &timing)
             .expect_err("aged clean decision must not admit");
         assert!(matches!(error, crate::recovery::RecoveryError::Retry(_)));
-        assert_eq!(
-            WORKER_LAUNCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
         drop(prepared);
     }
 
@@ -1431,6 +1298,34 @@ mod tests {
         assert!(!shutdown.is_storage_invariant_contained());
     }
 
+    /// The oracle's cleanup entry exists only when the worker does, and the
+    /// primary-removal expect relies on that coupling — pin the `Some` limb,
+    /// which no production-path test exercises (every fixture is fixed-mode).
+    #[tokio::test]
+    async fn fee_oracle_primary_exit_drains_through_its_conditional_entry() {
+        let shutdown = RuntimeScope::default();
+        let (mut workers, _dir) = waiting_workers(&shutdown);
+        workers.fee_oracle = Some(tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                shutdown.wait_for_shutdown().await;
+                Ok(())
+            }
+        }));
+
+        let err = workers
+            .finish(FirstExit::Worker(WorkerExit::FeeOracle(
+                WorkerStop::StoppedUnexpectedly,
+            )))
+            .await
+            .expect_err("unexpected oracle stop must fail run");
+        assert!(matches!(
+            err,
+            CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::StoppedUnexpectedly))
+        ));
+        assert!(!shutdown.is_storage_invariant_contained());
+    }
+
     #[tokio::test]
     async fn terminal_cleanup_error_overrides_nonterminal_primary_exit() {
         let shutdown = RuntimeScope::default();
@@ -1516,118 +1411,9 @@ mod tests {
         assert!(shutdown.is_storage_invariant_contained());
     }
 
-    use crate::commands::test_support::{SweepTestApp, create_structured_dump};
+    use crate::commands::test_support::create_structured_dump;
     use crate::storage::Storage;
     use crate::storage::test_helpers::temp_db;
-
-    #[test]
-    fn startup_restamp_rejects_missing_referenced_snapshot_as_terminal() {
-        let db = temp_db("restamp-missing-snapshot");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-        let root = tempfile::tempdir().expect("snapshot parent");
-        let missing = root.path().join("missing");
-        storage
-            .insert_finalized_dump(&missing, 7, 0)
-            .expect("register missing fixture");
-
-        let err = restamp_finalized_promotion(&mut storage)
-            .expect_err("a durable DB reference cannot point at a missing artifact");
-
-        assert!(matches!(
-            &err,
-            CommandError::ReferencedSnapshotArtifact { .. }
-        ));
-        assert_eq!(err.exit_code(), crate::commands::error::EXIT_TERMINAL);
-    }
-
-    #[test]
-    fn startup_restamp_rejects_corrupt_referenced_snapshot_as_terminal() {
-        let db = temp_db("restamp-corrupt-snapshot");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-        let root = tempfile::tempdir().expect("snapshot parent");
-        let corrupt = root.path().join("corrupt");
-        std::fs::create_dir(&corrupt).expect("create snapshot directory");
-        std::fs::write(corrupt.join("info.toml"), "not = valid = toml")
-            .expect("write corrupt metadata");
-        storage
-            .insert_finalized_dump(&corrupt, 7, 0)
-            .expect("register corrupt fixture");
-
-        let err = restamp_finalized_promotion(&mut storage)
-            .expect_err("corrupt durable metadata cannot be retried as operational I/O");
-
-        assert!(matches!(
-            &err,
-            CommandError::ReferencedSnapshotArtifact { .. }
-        ));
-        assert_eq!(err.exit_code(), crate::commands::error::EXIT_TERMINAL);
-    }
-
-    #[test]
-    fn sweep_orphan_dumps_removes_directories_not_in_storage() {
-        let db = temp_db("sweep-orphans");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-        let dumps_dir = tempfile::tempdir().expect("dumps dir");
-
-        // Tracked dump (in SQLite).
-        let tracked = dumps_dir.path().join("tracked");
-        create_structured_dump(&tracked);
-        storage
-            .insert_finalized_dump(&tracked, 0, 0)
-            .expect("register tracked");
-
-        // Two orphans (NOT in SQLite). One is fully formed; the other
-        // mimics a crash between dir creation and the app dump (no
-        // `state` subtree) — the sweep must remove both.
-        let orphan_a = dumps_dir.path().join("orphan-a");
-        let orphan_b = dumps_dir.path().join("orphan-b");
-        create_structured_dump(&orphan_a);
-        std::fs::create_dir(&orphan_b).expect("orphan b dir");
-
-        let removed = sweep_orphan_dumps::<SweepTestApp>(&mut storage, dumps_dir.path()).unwrap();
-        assert_eq!(removed, 2);
-        assert!(tracked.exists(), "tracked dump must survive");
-        assert!(!orphan_a.exists());
-        assert!(!orphan_b.exists());
-    }
-
-    #[test]
-    fn sweep_orphan_dumps_on_empty_directory_is_noop() {
-        let db = temp_db("sweep-empty");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-        let dumps_dir = tempfile::tempdir().expect("dumps dir");
-
-        let removed = sweep_orphan_dumps::<SweepTestApp>(&mut storage, dumps_dir.path()).unwrap();
-        assert_eq!(removed, 0);
-    }
-
-    #[test]
-    fn snapshot_gc_at_startup_removes_unreferenced_rows() {
-        let db = temp_db("gc-startup");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-        let dumps_dir = tempfile::tempdir().expect("dumps dir");
-
-        // Two dumps: superseded + finalized.
-        let superseded = dumps_dir.path().join("superseded");
-        let finalized = dumps_dir.path().join("finalized");
-        create_structured_dump(&superseded);
-        create_structured_dump(&finalized);
-        storage
-            .insert_pending_dump(&superseded, 0, 0)
-            .expect("pending 0");
-        storage.promote_finalized(0, 0).expect("promote 0");
-        storage
-            .insert_pending_dump(&finalized, 1, 0)
-            .expect("pending 1");
-        storage.promote_finalized(1, 0).expect("promote 1");
-        // `superseded`'s row is now unreferenced (replaced by
-        // finalized's promotion), but the directory is still on disk.
-
-        let removed = snapshot_gc_at_startup::<SweepTestApp>(&mut storage).unwrap();
-        assert_eq!(removed, 1);
-        assert!(!superseded.exists(), "GC removed the superseded directory");
-        assert!(finalized.exists(), "current finalized survived");
-    }
 
     #[test]
     fn detector_inner_error_maps_to_source_variant() {

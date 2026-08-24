@@ -726,6 +726,11 @@ impl From<FeeOracleError> for CommandError {
             FeeOracleError::Transient(message) => {
                 CommandError::Bootstrap(BootstrapError::FeeOracleTransient { message })
             }
+            // Named arm so the message isn't double-prefixed through the
+            // variant's own Display ("fee-oracle misconfiguration: ...").
+            FeeOracleError::Misconfig(message) => {
+                CommandError::Bootstrap(BootstrapError::FeeOracleMisconfig { message })
+            }
             error => CommandError::Bootstrap(BootstrapError::FeeOracleMisconfig {
                 message: error.to_string(),
             }),

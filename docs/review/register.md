@@ -108,6 +108,13 @@ Open maintainer decisions:
   `!success()`) and a process-level SIGTERM→0 assertion.
 - **Full-tear cascade on a recovered (anchor = `N'`) tree** re-rooting at
   `N'` (anchor unit mechanics are covered; this end-to-end shape is not).
+- **Uniswap-mode fee oracle end-to-end**: every fixture and e2e pins fixed
+  mode, so `bootstrap_for_run`'s tolerance policy (connect-transient vs
+  refresh-transient vs misconfig) is unpinned and no uniswap-mode sequencer
+  ever boots in tests. (The glue's `Some`-limb drain path is pinned
+  in-crate as of 2026-08-23; the bootstrap policy needs a
+  `TokenPriceSource`-boundary mock, and a real uniswap e2e needs a mock
+  pool — decide whether either is worth the harness.)
 - **Verify-then-write-or-strike** (status uncertain on 2026-08-22): the
   encoded-wire-frame stamp at an advanced safe head; the wallet
   insufficient-balance silent no-op and replay-determinism pins; the
@@ -237,9 +244,16 @@ From the ADR re-evaluation (2026-08-01/02):
 
 From the 2026-08-18 adversarial pass:
 
-- **Merging `Workers::finish`'s two drain modes** — the winning select arm
-  consumes its `JoinHandle`; the naive merge turns a benign stop into a
-  poisoned data directory.
+- **Merging `Workers::finish`'s two drain modes by re-awaiting the primary**
+  — the winning select arm consumed the handle's completion (the select
+  borrows `&mut self.server` etc., so the handle is still in the cleanup
+  set); re-polling it panics ("JoinHandle polled after completion"),
+  unwinding through `ShutdownOnDrop` into containment — a benign stop
+  becomes a poisoned data directory. Scope-narrowed 2026-08-23: the 2026-08
+  source read "as sketched" / "the naive merge"; distillation dropped the
+  qualifier. A merge that removes the primary from the cleanup set before
+  draining — keeping the `expect` that it was present — is settled, not
+  refuted (landed as `finish`'s one-loop/two-phase shape).
 - **Removing the post-commit accessor-coherence assertion** — it is the
   only guard in the two contexts with no database backstop (canonical
   RISC-V fold, `fold_replay`).
@@ -248,6 +262,26 @@ From the 2026-08-18 adversarial pass:
   way to write a frame.
 - **`FuturesUnordered` for cleanup polling** — not worth promoting a
   dev-only dependency tree to delete one small hand-written future.
+
+From the 2026-08-23 run-glue simplification pass:
+
+- **`Workers` as a homogeneous component list** (a `Vec<(WorkerId,
+  ComponentShutdown)>` built at launch, one select arm racing the list) —
+  it makes the "no `.await` between `Poll::Ready` and `swap_remove`"
+  property `select!`-load-bearing and untested (violation loses a worker
+  exit *and* panics on re-poll); converts the asserted primary-in-set
+  precondition into an unchecked cross-function assumption whose failure is
+  the benign-stop-to-exit-30 outcome; deletes the composed detector
+  select-mapping tests; and makes a zero-component race representable. The
+  real hole it targeted (select arms were the one per-worker site not
+  compile-forced) is closed by the exhaustive `let Self { .. }` destructure
+  in `select_first_exit` instead.
+- **`UniswapConfig::pinned(&identity)`** — the exhaustive
+  `FeeOracleIdentity` match in the run bracket IS the launch decision for
+  the optional oracle worker; moving it behind an `Option<UniswapConfig>`
+  constructor makes a future identity variant compile while silently
+  launching no worker, and the chain-id-pairing guarantee it claimed is
+  already structural now that the identity travels whole inside `L1Config`.
 
 From the L3 review (2026-08-22):
 

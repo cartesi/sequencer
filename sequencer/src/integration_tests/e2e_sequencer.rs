@@ -1169,13 +1169,11 @@ async fn start_full_server_with_max_body(
     let server_task = http::start_on_listener(
         listener,
         tx,
-        domain,
-        MAX_METHOD_PAYLOAD_BYTES,
         shutdown.clone(),
         tx_feed,
         ApiConfig {
             max_body_bytes,
-            ..ApiConfig::default()
+            ..ApiConfig::new(domain, MAX_METHOD_PAYLOAD_BYTES)
         },
         http::SnapshotState {
             db_path: db_path.to_string(),
@@ -1227,13 +1225,11 @@ async fn start_api_only_server(
     let server_task = http::start_on_listener(
         listener,
         tx,
-        domain,
-        MAX_METHOD_PAYLOAD_BYTES,
         shutdown.clone(),
         tx_feed,
         ApiConfig {
             max_body_bytes,
-            ..ApiConfig::default()
+            ..ApiConfig::new(domain, MAX_METHOD_PAYLOAD_BYTES)
         },
         http::SnapshotState {
             db_path: db_path.to_string(),

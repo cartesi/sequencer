@@ -11,7 +11,7 @@ The sequencer's recovery loop spans two process lifetimes:
 1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`CanonicalDivergence`, `L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `DangerDetectorExit::DangerDetected` under `CommandError::Worker`, closes intake, and drains the workers before returning a non-zero status. Canonical divergence is terminal and arms the independent two-second abort bound; expected-recovery and retryable arms remain cooperatively graceful.
 2. **External respawn.** An orchestrator (systemd, k8s, …) restarts the process.
 3. **Startup reducer.** The fresh boot reads divergence, danger, finalized-snapshot presence, Tip presence, and the safe head in one local transaction. The pure reducer selects at most one phase. Every completed phase returns to local inspection before another phase or admission. Initial Sync is itself a phase, so an already-persisted divergence refuses before the first provider call.
-4. **Prepare, admit, launch.** A clean decision permits task-free, fallible runtime preparation. Startup then invokes the same reducer once more over one consistent fact set, constructs the single-use `AdmittedRuntime`, and consumes it in an infallible, non-yielding worker launch.
+4. **Prepare, admit, launch.** A clean decision permits task-free, fallible runtime preparation. Startup then invokes the same reducer once more over one consistent fact set, mints the single-use `RuntimeAdmission` witness, and consumes it in an infallible, non-yielding worker launch.
 
 The detector trip and the startup dispatch share the same `check_danger` function; the detector cares only that *some* arm fired, while the startup dispatch examines *which* arm fired to pick the right action.
 
@@ -316,7 +316,7 @@ Closed recovery is structurally `Flush → inspect → post-flush Sync → inspe
 
 **Observed repair still outranks clock refusal.** `check_danger` evaluates observed closed/Tip danger before local-clock faults. Once an observed danger selected a repair, the reducer finishes that repair even if the clock arm is also active; the next mandatory inspection returns `Retry` rather than admitting. A successful repair is never itself an admission fact.
 
-After the first clean decision, runtime preparation launches zero tasks. The same reducer is invoked again after preparation, over one transactionally consistent fact set — the process lock plus the task-free prepare phase make that read the decision's linearization. Only another `Admit` decision is converted into the single-use `AdmittedRuntime` capability; launch consumes that capability synchronously. Raw component launch functions are crate-private, so external app crates can enter the runtime only through `run`/`run_main`. Runtime mutation and output authorization remains role-local at the durable boundaries in the authority ADR; the reducer establishes admission, not a new global authority service.
+After the first clean decision, runtime preparation launches zero tasks. The same reducer is invoked again after preparation, over one transactionally consistent fact set — the process lock plus the task-free prepare phase make that read the decision's linearization. Only another `Admit` decision mints the single-use `RuntimeAdmission` witness; launch consumes it synchronously. Raw component launch functions are crate-private, so external app crates can enter the runtime only through `run`/`run_main`. Runtime mutation and output authorization remains role-local at the durable boundaries in the authority ADR; the reducer establishes admission, not a new global authority service.
 
 The two formal models split responsibility deliberately: `preemptive.tla` proves slot/batch safety, while `admission.tla` proves local-first terminal dominance, one-phase-per-inspection ordering, witness requirements, crash/restart soundness (a crashed attempt leaves nothing behind that gates the next boot), and capability soundness. The “everything past gold is doomed” policy argument remains external to both bounded models.
 
@@ -479,8 +479,8 @@ divergence, mandatory reinspection after every completed phase,
 crash-and-restart as a fresh attempt over surviving durable facts (nothing
 durable gates the next boot; the terminal-fault black box is
 write-only telemetry outside the model, and there is no acknowledgement
-action), and atomic construction of `AdmittedRuntime` from the final clean
-decision. It abstracts away the batch spine and delegates every phase's
+action), and atomic minting of the `RuntimeAdmission` witness from the
+final clean decision. It abstracts away the batch spine and delegates every phase's
 batch mechanics to `preemptive.tla`.
 
 **Verified**: 860 generated states, 266 distinct states, depth 13, 0 violations.

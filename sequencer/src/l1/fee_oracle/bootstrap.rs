@@ -32,18 +32,14 @@ pub(crate) enum UniswapConnectError {
     /// Wrong pool/pair/chain or a bad RPC URL: deterministic; retrying the
     /// same configuration re-fails identically.
     Misconfig(String),
-    /// The pool is unreachable right now; retrying may succeed.
-    Transient(String),
-}
-
-/// Failure of `run`'s warm bootstrap. Transient connect failures never
-/// surface here — [`bootstrap_for_run`] absorbs them by design.
-#[derive(Debug)]
-pub(crate) enum RunFeeOracleBootstrapError {
-    Misconfig(String),
-    /// The oracle failed after construction (a non-transient refresh error,
-    /// or the persisted-price freshness bound was exceeded).
-    Oracle(FeeOracleError),
+    /// The pool is unreachable right now; retrying may succeed. Carries the
+    /// provider that was already built, so a caller that continues (`run`'s
+    /// warm boot) need not rebuild it. `Misconfig` carries none — it can
+    /// originate in `create_provider`, before any provider exists.
+    Transient {
+        provider: DynProvider,
+        message: String,
+    },
 }
 
 /// Connect to the configured pool and classify any failure. `setup` calls
@@ -61,7 +57,7 @@ pub(crate) async fn connect_uniswap(
         Err(error) => {
             let (transient, message) = bootstrap_price_source_error(error);
             Err(if transient {
-                UniswapConnectError::Transient(message)
+                UniswapConnectError::Transient { provider, message }
             } else {
                 UniswapConnectError::Misconfig(message)
             })
@@ -95,7 +91,15 @@ pub(crate) async fn persist_first_price(
 /// `run`'s warm bootstrap: prefer a live connect and refresh; tolerate a
 /// transient failure by verifying the persisted price is fresher than
 /// `max_price_age_ms` and (for a failed connect) running on a reconnecting
-/// source. Misconfig stays terminal.
+/// source.
+///
+/// Error contract: `Misconfig` and every non-transient oracle failure
+/// classify terminal. A stale persisted price surfaces as
+/// [`FeeOracleError::Transient`] and classifies retryable. The freshness
+/// check also opens storage, so [`FeeOracleError::OpenStorage`] can escape
+/// here: it keeps `BootstrapError::OpenStorage`'s own split — terminal when
+/// the open error is persistent, otherwise unclassified. Transient
+/// *connect* failures are absorbed here, not surfaced.
 pub(crate) async fn bootstrap_for_run(
     db_path: String,
     rpc_url: &str,
@@ -104,7 +108,7 @@ pub(crate) async fn bootstrap_for_run(
     poll_interval: Duration,
     max_price_age_ms: u64,
     process_lock: ProcessLock,
-) -> Result<FeeOracle, RunFeeOracleBootstrapError> {
+) -> Result<FeeOracle, FeeOracleError> {
     let oracle = match connect_uniswap(rpc_url, allow_insecure_rpc, uniswap).await {
         Ok((provider, token)) => FeeOracle::new(
             db_path.clone(),
@@ -115,16 +119,13 @@ pub(crate) async fn bootstrap_for_run(
             process_lock,
         ),
         Err(UniswapConnectError::Misconfig(message)) => {
-            return Err(RunFeeOracleBootstrapError::Misconfig(message));
+            return Err(FeeOracleError::Misconfig(message));
         }
-        Err(UniswapConnectError::Transient(message)) => {
+        Err(UniswapConnectError::Transient { provider, message }) => {
             warn_boot_fallback(&message);
-            FeeOracle::ensure_persisted_price_fresh(&db_path, max_price_age_ms)
-                .map_err(RunFeeOracleBootstrapError::Oracle)?;
+            FeeOracle::ensure_persisted_price_fresh(&db_path, max_price_age_ms)?;
             // The connect itself failed, so the worker starts on a source
             // that re-runs the connect on every quote.
-            let provider = crate::l1::provider::create_provider(rpc_url, allow_insecure_rpc)
-                .map_err(RunFeeOracleBootstrapError::Misconfig)?;
             return Ok(FeeOracle::reconnecting_uniswap(
                 db_path,
                 poll_interval,
@@ -139,11 +140,10 @@ pub(crate) async fn bootstrap_for_run(
         Ok(_) => Ok(oracle),
         Err(FeeOracleError::Transient(message)) => {
             warn_boot_fallback(&message);
-            FeeOracle::ensure_persisted_price_fresh(&db_path, max_price_age_ms)
-                .map_err(RunFeeOracleBootstrapError::Oracle)?;
+            FeeOracle::ensure_persisted_price_fresh(&db_path, max_price_age_ms)?;
             Ok(oracle)
         }
-        Err(error) => Err(RunFeeOracleBootstrapError::Oracle(error)),
+        Err(error) => Err(error),
     }
 }
 

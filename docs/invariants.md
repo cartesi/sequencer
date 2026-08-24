@@ -82,8 +82,8 @@ When you change anything listed under *enforced by*, re-check every line under
   establish a fresh witness by flushing again. After the reducer decides to
   admit, runtime preparation remains fallible and task-free; final
   admission then re-runs the same reducer over one consistent fact set and
-  yields the single-use `AdmittedRuntime` consumed by the infallible,
-  non-yielding launch block. Raw worker and HTTP launch surfaces are
+  yields the single-use `RuntimeAdmission` witness consumed by the
+  infallible, non-yielding launch. Raw worker and HTTP launch surfaces are
   crate-private; production app crates enter through `run`/`run_main`. No
   refusal or retry can construct the capability. Mutation and output
   authorization remains role-local at the durable boundaries documented
@@ -306,10 +306,12 @@ don't.
 - **Holds:** file create (fsync'd) before row insert; row delete before file
   delete; orphan *files* are acceptable and swept at startup.
 - **Enforced by:** ordering split between `storage/snapshot_dumps.rs`
-  (SQLite-only) and the lane's FS half (`inclusion_lane/snapshot.rs`) — the
-  module boundary *is* the ordering guarantee. Startup and egress classify a
-  missing or structurally corrupt DB-referenced artifact as terminal; generic
-  filesystem availability errors remain operational.
+  (SQLite-only) and the FS halves outside it (the lane's
+  `inclusion_lane/snapshot.rs`; the startup sweep in
+  `commands/run/startup_hygiene.rs`) — the module boundary *is* the ordering
+  guarantee. Startup and egress classify a missing or structurally corrupt
+  DB-referenced artifact as terminal; generic filesystem availability errors
+  remain operational.
 - **Depended on by:** `from_dump` at catch-up; the serving endpoints.
 - **Breaks:** terminal startup refusal (or a terminal egress fault if detected
   while serving), requiring inspection or cockroach recovery rather than an
