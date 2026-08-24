@@ -43,7 +43,7 @@ pub async fn flush_mempool(config: FlushConfig) -> Result<(), CommandError> {
 async fn flush_mempool_admitted(
     config: FlushConfig,
     identity: storage::DeploymentIdentity,
-    key: String,
+    key: crate::l1::SubmitterKey,
 ) -> Result<(), CommandError> {
     let db_path = config.db_path();
 
@@ -63,7 +63,7 @@ async fn flush_mempool_admitted(
     // reachable anyway).
     let provider = crate::l1::provider::create_verified_signer_provider(
         &config.eth_rpc_url,
-        &key,
+        key.expose_secret(),
         identity.chain_id,
         config.allow_insecure_rpc,
     )

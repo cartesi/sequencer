@@ -421,7 +421,7 @@ impl ProductionRecoveryDriver<'_> {
 
         let provider = crate::l1::provider::create_verified_signer_provider(
             &self.l1_config.eth_rpc_url,
-            &self.l1_config.batch_submitter_private_key,
+            self.l1_config.batch_submitter_private_key.expose_secret(),
             self.l1_config.identity.chain_id,
             self.l1_config.allow_insecure_rpc,
         )
