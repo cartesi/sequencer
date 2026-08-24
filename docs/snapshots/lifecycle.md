@@ -401,8 +401,9 @@ crash backstop for releases that never ran. (Endpoint shapes:
 
 Before this sequence, the startup reducer has already required a finalized
 snapshot fact and established a Tip through either guarded `EnsureOpenTip` or
-an atomic recovery reopen. `PreparedRuntime::prepare` then runs five
-order-critical steps before runtime admission, while no task
+an atomic recovery reopen. `PreparedRuntime::prepare` then calls
+`startup_hygiene::run_snapshot_hygiene`, which runs five order-critical
+steps before runtime admission, while no task
 exists: (1) `reset_dump_leases` (clear stale leases from a crashed run),
 (2) `require_finalized_snapshot`, (3) `restamp_finalized_promotion`,
 (4) `snapshot_gc_at_startup`, and (5) `sweep_orphan_dumps` (remove on-disk dirs
@@ -451,7 +452,7 @@ This is why catch-up can safely resume from a surviving pending (§4).
 | Dump trait + wire format        | [`format.md`](format.md); `sequencer-core/src/application/`, `examples/app-core/` |
 | Storage (SQLite only)           | `sequencer/src/storage/snapshot_dumps.rs`; atomic close + promote in `storage/ingress.rs` |
 | Lane integration (take/observe/GC) | `sequencer/src/ingress/inclusion_lane/snapshot.rs`, `mod.rs`, `catch_up.rs` |
-| Runtime startup sequence        | `sequencer/src/commands/run/workers.rs` |
+| Runtime startup sequence        | `sequencer/src/commands/run/startup_hygiene.rs` (called from `commands/run/workers.rs`) |
 | HTTP serving + leases           | `sequencer/src/egress/api/snapshot.rs` |
 | Recovery clear                  | `sequencer/src/storage/recovery.rs` |
 

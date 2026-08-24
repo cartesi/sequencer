@@ -10,7 +10,7 @@
  *
  * The first clean decision grants no authority. It starts fallible, task-free
  * Prepare, whose successful completion also returns to local inspection. Only
- * a second clean decision creates AdmittedRuntime.
+ * a second clean decision mints the single-use RuntimeAdmission witness.
  *
  * Admission gating is fact-derived: there is no
  * lifecycle admission state machine and no acknowledgement step, and no
@@ -231,8 +231,9 @@ PreparedDecisionChanged ==
     /\ decision \in PhasePC
     /\ Settle
 
-(* The capability boundary: the final clean decision and AdmittedRuntime are
- * one atomic action; launch consumes the capability without yielding. *)
+(* The capability boundary: the final clean decision and the RuntimeAdmission
+ * witness are one atomic action; launch consumes the witness without
+ * yielding. *)
 AdmitRuntime ==
     /\ controller = Decide
     /\ prepared
@@ -360,7 +361,8 @@ PrepareRefuse ==
     /\ Settle
 
 ---------------------------------------------------------------------------
-(* Crash destroys PreparedRuntime, AdmittedRuntime, and session witnesses.
+(* Crash destroys PreparedRuntime, the RuntimeAdmission witness, and session
+ * witnesses.
  * Nothing durable gates the next boot (the terminal-fault black box
  * is write-only telemetry), so a restart is simply a fresh attempt over the
  * surviving durable facts. Modeled as returning directly to the pre-begin

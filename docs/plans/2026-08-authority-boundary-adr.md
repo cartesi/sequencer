@@ -72,8 +72,8 @@ Runtime construction is prepare → admit → launch: every fallible or awaited
 operation happens while zero tasks exist; final admission re-runs the
 recovery reducer over one consistent fact set; launch spawns every worker in
 one infallible, non-yielding block, consuming the single-use
-`AdmittedRuntime`. A preparation failure cannot leave a partially launched
-runtime, and no refusal or retry can construct the launch capability.
+`RuntimeAdmission` witness. A preparation failure cannot leave a partially
+launched runtime, and no refusal or retry can mint the witness.
 
 ### 2. Fact-derived admission and the terminal-fault black box
 

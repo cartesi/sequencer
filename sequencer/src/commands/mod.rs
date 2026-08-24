@@ -231,7 +231,7 @@ mod tests {
     // `sequencer-core/src/protocol.rs`. The runtime tests below only cover
     // the typed `From` conversions into `CommandError` and the bootstrap-time
     // identity guards. Worker `From<JoinResult>` conversions live in
-    // `runtime/workers.rs`.
+    // `run::workers`.
 
     #[test]
     fn invalid_protocol_config_propagates_through_run_error() {

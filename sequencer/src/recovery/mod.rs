@@ -99,7 +99,7 @@ pub enum RecoveryRefusalReason {
 /// after all fallible preparation completed. Its private field makes
 /// construction exclusive to [`admit_runtime`]; runtime code may consume the
 /// proof but cannot mint one.
-#[must_use = "runtime admission must be consumed by PreparedRuntime::admit"]
+#[must_use = "runtime admission must be consumed by PreparedRuntime::launch"]
 #[derive(Debug)]
 pub(crate) struct RuntimeAdmission {
     _private: (),
@@ -422,7 +422,7 @@ impl ProductionRecoveryDriver<'_> {
         let provider = crate::l1::provider::create_verified_signer_provider(
             &self.l1_config.eth_rpc_url,
             &self.l1_config.batch_submitter_private_key,
-            self.l1_config.chain_id,
+            self.l1_config.identity.chain_id,
             self.l1_config.allow_insecure_rpc,
         )
         .await
@@ -444,7 +444,7 @@ impl ProductionRecoveryDriver<'_> {
         };
         MempoolFlusher::flush_to_safe(
             provider,
-            self.l1_config.batch_submitter_address,
+            self.l1_config.identity.batch_submitter_address,
             self.protocol.seconds_per_block,
             self.db_path,
             watermark,

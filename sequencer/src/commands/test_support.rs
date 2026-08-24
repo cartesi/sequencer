@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Shared `#[cfg(test)]` fixtures for the runtime modules: a minimal
-//! [`Application`] stub plus a dump-layout helper, used by both the worker
-//! lifecycle tests ([`super::workers`]) and the setup-fill tests
-//! ([`super::setup_fill`]).
+//! [`Application`] stub plus a dump-layout helper, used by the worker
+//! lifecycle tests (`run::workers`), the startup-hygiene tests
+//! (`run::startup_hygiene`), and the setup-fill tests (`setup::fill`).
 
 use std::path::Path;
 
