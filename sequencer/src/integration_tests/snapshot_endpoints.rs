@@ -72,11 +72,9 @@ async fn start_server(db_path: &str) -> Option<TestServer> {
     let task = http::start_on_listener(
         listener,
         tx_sender,
-        dummy_domain(),
-        MAX_METHOD_PAYLOAD_BYTES,
         shutdown.clone(),
         tx_feed,
-        ApiConfig::default(),
+        ApiConfig::new(dummy_domain(), MAX_METHOD_PAYLOAD_BYTES),
         http::SnapshotState {
             db_path: db_path.to_string(),
             state_file_in_dump: |dump_dir| {

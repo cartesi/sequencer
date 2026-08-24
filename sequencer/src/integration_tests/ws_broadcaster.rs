@@ -461,20 +461,21 @@ async fn start_test_server_with_limits(
     let task = http::start_on_listener(
         listener,
         tx_sender,
-        Eip712Domain {
-            name: None,
-            version: None,
-            chain_id: None,
-            verifying_contract: None,
-            salt: None,
-        },
-        MAX_METHOD_PAYLOAD_BYTES,
         shutdown.clone(),
         tx_feed,
         ApiConfig {
             ws_max_subscribers,
             ws_max_catchup_events,
-            ..ApiConfig::default()
+            ..ApiConfig::new(
+                Eip712Domain {
+                    name: None,
+                    version: None,
+                    chain_id: None,
+                    verifying_contract: None,
+                    salt: None,
+                },
+                MAX_METHOD_PAYLOAD_BYTES,
+            )
         },
         http::SnapshotState {
             db_path: db_path.to_string(),

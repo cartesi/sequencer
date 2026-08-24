@@ -243,16 +243,29 @@ async fn run_snapshot_release_supervisor(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// The API's per-deployment configuration: the two ingress values that vary
+/// (the EIP-712 verification domain and the app's payload bound) plus three
+/// service limits. The limits are module constants by design — not
+/// operator-tunable, no CLI flags owed; they are fields only so tests can
+/// narrow them.
+#[derive(Debug, Clone)]
 pub struct ApiConfig {
+    /// EIP-712 domain user-op signatures are verified against.
+    pub domain: Eip712Domain,
+    /// The app's `MAX_METHOD_PAYLOAD_BYTES` bound on user-op payloads.
+    pub max_user_op_data_bytes: usize,
     pub max_body_bytes: usize,
     pub ws_max_subscribers: usize,
     pub ws_max_catchup_events: u64,
 }
 
-impl Default for ApiConfig {
-    fn default() -> Self {
+impl ApiConfig {
+    /// The only constructor: the deployment-varying values are mandatory,
+    /// the service limits take the module defaults.
+    pub fn new(domain: Eip712Domain, max_user_op_data_bytes: usize) -> Self {
         Self {
+            domain,
+            max_user_op_data_bytes,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             ws_max_subscribers: DEFAULT_WS_MAX_SUBSCRIBERS,
             ws_max_catchup_events: DEFAULT_WS_MAX_CATCHUP_EVENTS,
@@ -260,12 +273,9 @@ impl Default for ApiConfig {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_on_listener(
     listener: tokio::net::TcpListener,
     tx_sender: mpsc::Sender<PendingUserOp>,
-    domain: Eip712Domain,
-    max_user_op_data_bytes: usize,
     shutdown: RuntimeScope,
     tx_feed: L2TxFeed,
     config: ApiConfig,
@@ -279,8 +289,8 @@ pub(crate) fn start_on_listener(
     });
     let submit_state = Arc::new(SubmitState::new(
         tx_sender,
-        domain,
-        max_user_op_data_bytes,
+        config.domain,
+        config.max_user_op_data_bytes,
         shutdown.clone(),
     ));
     let subscribe_state = Arc::new(SubscribeState::new(

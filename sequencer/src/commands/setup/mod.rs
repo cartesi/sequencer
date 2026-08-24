@@ -164,7 +164,7 @@ where
             )
             .await
             .map_err(|error| match error {
-                crate::l1::fee_oracle::UniswapConnectError::Transient(message) => {
+                crate::l1::fee_oracle::UniswapConnectError::Transient { message, .. } => {
                     BootstrapError::FeeOracleTransient { message }
                 }
                 crate::l1::fee_oracle::UniswapConnectError::Misconfig(message) => {

@@ -109,8 +109,8 @@ one phase, and re-inspects after every completed phase. Closed recovery is
 structurally `Flush → inspect → Sync → inspect → Cascade → inspect`, with an
 ephemeral safe-block witness carried only by that boot attempt. A clean
 decision permits task-free runtime preparation; the same reducer is invoked
-again over one consistent fact set before the single-use `AdmittedRuntime`
-capability is created, then worker launch is infallible and non-yielding.
+again over one consistent fact set before the single-use `RuntimeAdmission`
+witness is minted, then worker launch is infallible and non-yielding.
 
 The authoritative dispatch table, the "everything past gold is doomed" model,
 and the per-path rationale live in
