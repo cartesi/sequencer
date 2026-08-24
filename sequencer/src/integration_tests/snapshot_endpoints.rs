@@ -63,10 +63,11 @@ async fn start_server(db_path: &str) -> Option<TestServer> {
     let addr = listener.local_addr().expect("listener addr");
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
     let shutdown = RuntimeScope::default();
+    // Sentinel submitter: this fixture seeds no own-batch rows.
     let tx_feed = L2TxFeed::new(
         db_path.to_string(),
         shutdown.clone(),
-        L2TxFeedConfig::default(),
+        L2TxFeedConfig::new(alloy_primitives::Address::repeat_byte(0x7f)),
     );
     let task = http::start_on_listener(
         listener,

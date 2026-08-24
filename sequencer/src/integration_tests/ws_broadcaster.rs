@@ -454,7 +454,8 @@ async fn start_test_server_with_limits(
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            batch_submitter_address: None,
+            // Sentinel submitter: this fixture seeds no own-batch rows.
+            ..L2TxFeedConfig::new(alloy_primitives::Address::repeat_byte(0x7f))
         },
     );
     let task = http::start_on_listener(
