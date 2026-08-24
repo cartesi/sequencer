@@ -174,10 +174,10 @@ fn require_deployment_identity_match(
 /// L1 txs, so signing under the wrong key would consume the wrong wallet's
 /// nonce slots — a fail-loud identity mismatch, not a recoverable condition.
 pub(crate) fn verify_submitter_key(
-    key: String,
+    key: crate::l1::SubmitterKey,
     identity: &DeploymentIdentity,
-) -> Result<String, CommandError> {
-    let key_address = batch_submitter_address_from_private_key(&key)?;
+) -> Result<crate::l1::SubmitterKey, CommandError> {
+    let key_address = batch_submitter_address_from_private_key(key.expose_secret())?;
     if key_address != identity.batch_submitter_address {
         let expected = DeploymentIdentity {
             batch_submitter_address: key_address,

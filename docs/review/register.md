@@ -29,57 +29,54 @@ lines):
    skip-and-continue, so an operator's manual tx from the submitter EOA
    wedges ticks until the block passes the safe head. Skip undecodable
    own-sender payloads.
-4. **`Debug` derives on key-bearing configs** (`L1Config`, `RunConfig`,
-   `FlushConfig` via `KeyArgs`) — one future `?config` log leaks the
-   submitter key. Latent (no such log site today); redacting newtype owed.
-5. **Flusher logs `error!("flush retry: previous attempt timed out")` on
+4. **Flusher logs `error!("flush retry: previous attempt timed out")` on
    every healthy finality-wait pass** (`recovery/flusher.rs`).
-6. **One `POST /tx` 500 path still echoes internals** — `AppError::Internal
+5. **One `POST /tx` 500 path still echoes internals** — `AppError::Internal
    { reason }` / `AppError::Io` strings pass verbatim into the 500 body
    (`ingress/inclusion_lane/mod.rs` error mapping); the storage path is
    already generic.
-7. **WS session hygiene** — a mid-session transient read error tears down
+6. **WS session hygiene** — a mid-session transient read error tears down
    with no close frame; a beyond-head `from_offset` idles forever (currently
    e2e-pinned as intended — decide the contract, then re-pin).
-8. **WS invalidation/rollback contract** — `/ws/subscribe` still pages by
+7. **WS invalidation/rollback contract** — `/ws/subscribe` still pages by
    physical rowid with no `HistoryVersion` claim, so a cursor-resumed
    subscriber silently keeps invalidated rows across recovery. Interim
    consumer rule: treat any socket drop as a potential discontinuity.
    Closure is exclusively owned by the
    [Track 3 handoff](../plans/2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff).
-9. **Fee-determinism contract under-specified** — `fixed_mul`'s comment
+8. **Fee-determinism contract under-specified** — `fixed_mul`'s comment
    claims a `debug_assert` that does not exist (high limbs silently drop),
    and the LSB-first floor-after-each-multiply order is implemented but not
    stated as contract (`sequencer-core/src/fee.rs`). Load-bearing for the
    C++ scheduler port; interacts with the deferred fee-LUT track.
-10. **`trg_enforce_nonce_contiguity` NULL hole** — a dangling parent makes
+9. **`trg_enforce_nonce_contiguity` NULL hole** — a dangling parent makes
     the comparison NULL and the trigger silent; mitigated by `foreign_keys=ON`
     on every writer connection, but the trigger itself is not NULL-safe.
-11. **`seal_and_open_next_batch` takes an unchecked `next_safe_block`**
+10. **`seal_and_open_next_batch` takes an unchecked `next_safe_block`**
     (assert equality with the head or drop the parameter), and the bare
     `close_frame_and_batch` remains ungated with test-only callers —
     integration tests are in-crate now, so plain `#[cfg(test)]` suffices.
-12. **Write-only columns** `safe_accepted_batches.{first_frame_safe_block,
+11. **Write-only columns** `safe_accepted_batches.{first_frame_safe_block,
     inclusion_block}` have no production reader — drop or mark audit-only.
-13. **`direct_q` is unbounded in the shared scheduler** — an adversarial
+12. **`direct_q` is unbounded in the shared scheduler** — an adversarial
     deposit flood is bounded in time (force-drain) but not bytes; a
     per-input cap or byte budget closes a (very expensive) guest-OOM vector.
-14. **`MAX_BATCH_METADATA_BYTES` (71) understates real SSZ per-op overhead**
+13. **`MAX_BATCH_METADATA_BYTES` (71) understates real SSZ per-op overhead**
     (~83+ with offsets) — byte budgeting undercounts ~15% for max-payload
     ops (`sequencer-core/src/user_op.rs`).
-15. **Wallet snapshot decode accepts unsorted entries** while encode sorts —
+14. **Wallet snapshot decode accepts unsorted entries** while encode sorts —
     enforce strictly-ascending addresses (subsumes the duplicate check) or
     drop the canonical-decode pretense (`app-core/src/wallet_snapshot.rs`).
-16. **Reader and submitter re-open `Storage` per tick** — a held connection
+15. **Reader and submitter re-open `Storage` per tick** — a held connection
     per worker drops per-tick overhead. Low priority.
-17. **`should_retry_with_partition` substring-matches the Debug format** —
+16. **`should_retry_with_partition` substring-matches the Debug format** —
     consciously accepted and regression-pinned against alloy's format;
     revisit with structured JSON-RPC codes.
-18. **Test-only surface still presenting as production API** — delete
+17. **Test-only surface still presenting as production API** — delete
     `latest_batch_index` and `ordered_l2_txs_for_batch` (only their own
     tests call them); gate `promote_finalized` behind `#[cfg(test)]`
     (`safe_input_end_exclusive` has a live reader-path caller and stays).
-19. **`frames` lacks the immutability triggers `batches` got** — `fee` and
+18. **`frames` lacks the immutability triggers `batches` got** — `fee` and
     `safe_block` are documented immutable but convention-protected only.
 
 Open maintainer decisions:
@@ -211,6 +208,14 @@ Each entry: the decision, its reason, and where the reasoning now lives.
 - **Misconfig-poison taxonomy** (opened 2026-08-18, closed by L3): there is
   no poison; misconfig is terminal by exit code only, and a fixed config
   boots cleanly.
+- **Submitter-key redaction** (2026-08-24): the key enters the process as
+  `SubmitterKey` at the clap edge — `Debug` redacts, no `Display` exists,
+  and the raw hex is reachable only through `expose_secret`, so every
+  consumer of the secret is greppable. The key's public identity is the
+  pinned `batch_submitter_address` beside it. Closes the former
+  Debug-derive open finding → `l1/mod.rs`. Deferred separately: the startup
+  log prints the full RPC URL, which the help-leak test treats as
+  token-bearing.
 
 ## Refuted — do not re-propose without new evidence
 
@@ -317,7 +322,7 @@ these codes; their concepts now live here:
 | R3 | `synchronous=FULL` decision | `storage/open.rs` |
 | R4 | exit-code contract | `commands/error.rs`, runbook |
 | R5 | fail-loud check policy | invariants check policy |
-| F1–F10 | 2026-06 correctness findings | settled above; F7 = open item 8 |
+| F1–F10 | 2026-06 correctness findings | settled above; F7 = the open "WS invalidation/rollback contract" finding |
 | I1–I20 | invariants (stable, still in use) | `docs/invariants.md` |
 | D1–D11, H1–H14, S-A, P1–P8 | 2026-08-18 defects / harvest / structural fix / premise items | settled above + ADR |
 | WP1–WP11 | 2026-06 work packages (all landed) | settled above |

@@ -614,7 +614,7 @@ async fn flush_wallet_nonce(
     // guarded constructor the runtime flush and `flush-mempool` use.
     let provider = crate::l1::provider::create_verified_signer_provider(
         &config.eth_rpc_url,
-        &key,
+        key.expose_secret(),
         config.chain_id,
         config.allow_insecure_rpc,
     )
