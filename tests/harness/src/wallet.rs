@@ -156,17 +156,17 @@ impl WalletL1Client {
         &self,
         token_address: Address,
         amount: U256,
-    ) -> HarnessResult<()> {
+    ) -> HarnessResult<u64> {
         self.mint_token(token_address, amount).await?;
         self.deposit_token(token_address, amount).await
     }
 
-    pub async fn mint_and_deposit_supported_token(&self, amount: U256) -> HarnessResult<()> {
+    pub async fn mint_and_deposit_supported_token(&self, amount: U256) -> HarnessResult<u64> {
         self.mint_supported_token(amount).await?;
         self.deposit_supported_token(amount).await
     }
 
-    pub async fn deposit_token(&self, token_address: Address, amount: U256) -> HarnessResult<()> {
+    pub async fn deposit_token(&self, token_address: Address, amount: U256) -> HarnessResult<u64> {
         let token = MockERC20::new(token_address, &self.provider);
         let approve_receipt = token
             .approve(self.erc20_portal_address, amount)
@@ -208,10 +208,13 @@ impl WalletL1Client {
                     "failed to confirm ERC20 portal deposit transaction: {err}"
                 ))
             })?;
-        ensure_success(deposit_receipt.status(), "ERC20 portal deposit")
+        ensure_success(deposit_receipt.status(), "ERC20 portal deposit")?;
+        deposit_receipt
+            .block_number
+            .ok_or_else(|| io_other("ERC20 portal deposit receipt has no block number").into())
     }
 
-    pub async fn deposit_supported_token(&self, amount: U256) -> HarnessResult<()> {
+    pub async fn deposit_supported_token(&self, amount: U256) -> HarnessResult<u64> {
         self.deposit_token(self.supported_erc20_token, amount).await
     }
 }

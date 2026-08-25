@@ -8,7 +8,7 @@ section before proposing a simplification or a new mechanism. The dated
 ledgers beside this file are stubs preserving each review's scope and
 verdict; process detail beyond that lives in git history.
 
-Statuses below were verified against the tree on 2026-08-22.
+Statuses below were verified against the tree on 2026-08-25.
 
 ## Open findings
 
@@ -106,12 +106,16 @@ Open maintainer decisions:
 - **Full-tear cascade on a recovered (anchor = `N'`) tree** re-rooting at
   `N'` (anchor unit mechanics are covered; this end-to-end shape is not).
 - **Uniswap-mode fee oracle end-to-end**: every fixture and e2e pins fixed
-  mode, so `bootstrap_for_run`'s tolerance policy (connect-transient vs
-  refresh-transient vs misconfig) is unpinned and no uniswap-mode sequencer
-  ever boots in tests. (The glue's `Some`-limb drain path is pinned
-  in-crate as of 2026-08-23; the bootstrap policy needs a
-  `TokenPriceSource`-boundary mock, and a real uniswap e2e needs a mock
-  pool — decide whether either is worth the harness.)
+  mode, so no Uniswap-mode sequencer boots in tests. Setup validation,
+  RPC-free runtime source construction, transient quote retention, and
+  terminal misconfiguration are source-boundary-pinned in-crate as of
+  2026-08-25; a real E2E still needs a mock pool — decide whether that extra
+  harness is worth its weight.
+- **True same-block direct-input ordering end-to-end**: the renamed
+  `multi_deposit_reconciliation_test` covers multiple accumulated directs, but
+  default Anvil automining puts its portal deposits in distinct blocks. A real
+  same-block test needs queued portal sends, one explicit mine, equal receipt
+  block assertions, and WS order/block attribution.
 - **Verify-then-write-or-strike** (status uncertain on 2026-08-22): the
   encoded-wire-frame stamp at an advanced safe head; the wallet
   insufficient-balance silent no-op and replay-determinism pins; the
@@ -246,6 +250,12 @@ From the ADR re-evaluation (2026-08-01/02):
   unrelated facts; a larger state machine closing no hole.
 - **A per-chunk divergence query / reader mailbox** on the hot path — the
   check is not a divergence oracle; the cost buys no complete boundary.
+- **Fee-price age as a runtime lifecycle gate** — setup owns the required
+  live quote; run starts from the persisted price and refreshes it best-effort.
+  Shared-endpoint staleness is already detected from safe-head progress, while
+  a pool-only outage is an explicitly accepted economic residual. Reintroduce
+  an expiry gate only with an independently derived economic bound and action,
+  not by borrowing the L1 liveness threshold.
 
 From the 2026-08-18 adversarial pass:
 

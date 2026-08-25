@@ -250,6 +250,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         BootstrapError::ChainIdMismatch { .. }
         | BootstrapError::InvalidProtocolTiming(_)
         | BootstrapError::FeeOracleMisconfig { .. }
+        | BootstrapError::FeeOracleFatal { .. }
         | BootstrapError::SignerMisconfig { .. }
         | BootstrapError::SetupNotComplete
         | BootstrapError::CheckpointBeforeAppDeployment { .. }
@@ -294,6 +295,10 @@ pub enum BootstrapError {
     /// A live quote/transport failed while bootstrapping. It may self-heal.
     #[error("fee oracle bootstrap transient failure: {message}")]
     FeeOracleTransient { message: String },
+    /// Trusted-code join/arithmetic failures while setup persists the first
+    /// quote. These need operator attention but are not source misconfiguration.
+    #[error("fatal fee oracle bootstrap failure: {message}")]
+    FeeOracleFatal { message: String },
     /// The keyed signer provider could not be constructed (bad RPC URL or
     /// private key). Deterministic operator misconfiguration: re-running the
     /// same configuration re-fails identically, so it classifies terminal
@@ -723,6 +728,7 @@ impl From<FeeOracleError> for CommandError {
     fn from(error: FeeOracleError) -> Self {
         match error {
             FeeOracleError::OpenStorage(error) => CommandError::from(error),
+            FeeOracleError::Storage(error) => CommandError::Storage(error),
             FeeOracleError::Transient(message) => {
                 CommandError::Bootstrap(BootstrapError::FeeOracleTransient { message })
             }
@@ -731,9 +737,16 @@ impl From<FeeOracleError> for CommandError {
             FeeOracleError::Misconfig(message) => {
                 CommandError::Bootstrap(BootstrapError::FeeOracleMisconfig { message })
             }
-            error => CommandError::Bootstrap(BootstrapError::FeeOracleMisconfig {
-                message: error.to_string(),
-            }),
+            FeeOracleError::Join(message) => {
+                CommandError::Bootstrap(BootstrapError::FeeOracleFatal {
+                    message: FeeOracleError::Join(message).to_string(),
+                })
+            }
+            FeeOracleError::FatalMath(error) => {
+                CommandError::Bootstrap(BootstrapError::FeeOracleFatal {
+                    message: FeeOracleError::FatalMath(error).to_string(),
+                })
+            }
         }
     }
 }
@@ -1278,6 +1291,29 @@ mod tests {
             EXIT_UNCLASSIFIED,
             "fee-oracle storage contention remains restartable"
         );
+    }
+
+    #[test]
+    fn fee_oracle_bootstrap_preserves_operational_storage_classification() {
+        for code in [
+            rusqlite::ffi::ErrorCode::DatabaseBusy,
+            rusqlite::ffi::ErrorCode::DatabaseLocked,
+        ] {
+            let error = FeeOracleError::Storage(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 5,
+                },
+                None,
+            ));
+            let mapped = CommandError::from(error);
+            assert!(matches!(&mapped, CommandError::Storage(_)));
+            assert_eq!(
+                mapped.exit_code(),
+                EXIT_UNCLASSIFIED,
+                "SQLite contention remains restartable during setup's first quote"
+            );
+        }
     }
 
     #[test]

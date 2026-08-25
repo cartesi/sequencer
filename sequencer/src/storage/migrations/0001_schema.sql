@@ -742,7 +742,7 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     -- Log-space fee exponent fed by the oracle.
     log_gas_price            INTEGER NOT NULL CHECK (log_gas_price >= 0),
     -- Unix-ms of the last successful oracle (or Fixed setup) write.
-    -- 0 means never written; Uniswap treats that as stale.
+    -- 0 means never written; completed setup guarantees a nonzero observation.
     log_gas_price_updated_at_ms INTEGER NOT NULL CHECK (log_gas_price_updated_at_ms >= 0),
     -- log_{129/128}(10), rounded by log_fee_ratio(10, 1) = 296.
     -- This tenfold price slack is applied in log space, not in the oracle.

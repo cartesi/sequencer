@@ -88,10 +88,9 @@ pub(super) struct WorkersConfig {
     pub l1_config: L1Config,
     pub timing: ProtocolTiming,
     pub input_reader: InputReader,
-    /// Already bootstrapped by the caller: the first live refresh must
-    /// precede startup recovery, which can reopen a Tip that stamps its
-    /// frame fee from `batch_policy`. Only the spawn is deferred to
-    /// `launch`. Fixed pricing has no worker (`None`).
+    /// Launch-ready without source I/O: setup supplied the persisted price,
+    /// and a Uniswap worker quotes on its first supervised iteration. Fixed
+    /// pricing has no worker (`None`).
     pub fee_oracle: Option<FeeOracle>,
     /// Exclusive data-directory ownership, acquired before bootstrap and
     /// transferred into the runtime lifetime at worker admission.

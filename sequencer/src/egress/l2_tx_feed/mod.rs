@@ -17,6 +17,7 @@ use std::time::Duration;
 use alloy_primitives::Address;
 use tokio::sync::mpsc;
 
+use crate::runtime::process_lock::spawn_blocking_with_lock;
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{OrderedL2TxRow, Storage};
 
@@ -96,11 +97,14 @@ impl L2TxFeed {
         // the prepare phase needs no inline `catch_unwind`. The
         // streaming task below keeps its `catch_unwind` deliberately: its
         // only join point is `Subscription::finish`, and containment must
-        // fire at the fault, not when the socket unwinds.
+        // fire at the fault, not when the socket unwinds. Cancelling the
+        // awaiting WS task detaches started blocking work, so the prepare
+        // closure independently retains the process lock until its SQLite
+        // work ends.
         let prepare = {
             let db_path = self.db_path.clone();
             let batch_submitter_address = self.batch_submitter_address;
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking_with_lock(self.shutdown.process_lock(), move || {
                 load_catchup_info(
                     db_path.as_str(),
                     from_offset,

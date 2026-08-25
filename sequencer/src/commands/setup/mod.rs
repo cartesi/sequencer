@@ -216,12 +216,10 @@ where
         PreparedFeeOracle::Uniswap {
             provider, token, ..
         } => {
-            let max_price_age_ms = timing.l1_read_stale_after_secs().saturating_mul(1000);
             crate::l1::fee_oracle::persist_first_price(
                 db_path.clone(),
                 provider,
                 token,
-                max_price_age_ms,
                 process_lock.clone(),
             )
             .await?;

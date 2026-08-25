@@ -26,9 +26,10 @@ const DEFAULT_SEQUENCER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Cadence at which the harness mines an L1 block during a recovery boot's
 /// readiness wait when [`ManagedSequencer::set_mine_l1_during_boot`] is on.
-/// Fast enough that Anvil's `safe` tag advances past the flushed nonce within
-/// the readiness window; the exact value is a harness detail, not test-visible.
-const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_millis(200);
+/// One block per wall-clock second keeps the ordinary live-chain timestamp
+/// coupled while still advancing Anvil's `safe` tag well within the recovery
+/// readiness window.
+const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_secs(1);
 /// Readiness budget for a *recovery* boot (mining-during-boot enabled). The WP2
 /// mempool flush polls `get_transaction_count(Safe)` once per L1 block time
 /// (`safe_poll_interval = seconds_per_block`, 12 s here), so it cannot resolve
@@ -439,6 +440,41 @@ impl ManagedSequencer {
             .map_err(|_| io_other(format!("first frame fee out of range: {fee}")).into())
     }
 
+    /// Return `(open_frame_safe_block, persisted_l1_safe_head)` from one
+    /// read-only SQLite snapshot. This observes the two sides of the live
+    /// frame-clock condition without relying on incidental Anvil transaction
+    /// counts.
+    pub fn frame_clock_observation(&self) -> HarnessResult<(u64, u64)> {
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path.as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+        let (frame_safe_block, persisted_safe_head): (i64, i64) = conn
+            .query_row(
+                "SELECT f.safe_block, h.block_number \
+                 FROM valid_open_batch b \
+                 JOIN frames f ON f.batch_index = b.batch_index \
+                 JOIN l1_safe_head h ON h.singleton_id = 0 \
+                 ORDER BY f.frame_in_batch DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|err| io_other(format!("read frame-clock observation: {err}")))?;
+        let frame_safe_block = u64::try_from(frame_safe_block).map_err(|_| {
+            io_other(format!(
+                "open-frame safe block is negative: {frame_safe_block}"
+            ))
+        })?;
+        let persisted_safe_head = u64::try_from(persisted_safe_head).map_err(|_| {
+            io_other(format!(
+                "persisted L1 safe head is negative: {persisted_safe_head}"
+            ))
+        })?;
+        Ok((frame_safe_block, persisted_safe_head))
+    }
+
     /// Copy the current finalized snapshot dump to `<data_dir>/checkpoint` (which
     /// survives [`Self::reset_database`], since that only clears `sequencer.db*`
     /// and `dumps/`), returning the captured checkpoint. Call after a batch has
@@ -782,8 +818,20 @@ impl ManagedSequencer {
         self.rollups.deploy_extra_mock_erc20().await
     }
 
+    /// Mine outage-style L1 progress at 12 seconds per block. Pair large
+    /// advances with faketime, or use [`Self::mine_live_l1_blocks`] for
+    /// ordinary liveness and finality polling.
     pub async fn mine_l1_blocks(&self, block_count: u64) -> HarnessResult<()> {
         self.rollups.mine_l1_blocks(block_count).await
+    }
+
+    /// Mine ordinary live-chain progress at one second per block.
+    pub async fn mine_live_l1_blocks(&self, block_count: u64) -> HarnessResult<()> {
+        self.rollups.mine_live_l1_blocks(block_count).await
+    }
+
+    pub async fn l1_safe_block_number(&self) -> HarnessResult<u64> {
+        self.rollups.l1_safe_block_number().await
     }
 
     /// Toggle Anvil's auto-mining mode. When disabled, txs accumulate in
@@ -1285,7 +1333,7 @@ async fn spawn_sequencer_process(
                 ))
                 .into());
             }
-            let _ = rollups.mine_l1_blocks(1).await;
+            let _ = rollups.mine_live_l1_blocks(1).await;
             tokio::time::sleep(BOOT_L1_MINE_INTERVAL).await;
         }
     } else {
@@ -1367,7 +1415,7 @@ async fn spawn_sequencer_process(
                 // Transient RPC hiccups mid-boot are non-fatal — the next tick
                 // retries. A genuine mining failure manifests as the boot
                 // timing out, reported by the readiness arm.
-                let _ = rollups.mine_l1_blocks(1).await;
+                let _ = rollups.mine_live_l1_blocks(1).await;
             }
         };
         tokio::select! {

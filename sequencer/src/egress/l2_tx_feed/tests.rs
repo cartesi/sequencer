@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 
 use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError, SubscriptionError};
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
+use crate::runtime::process_lock::{ProcessLock, ProcessLockError};
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::temp_db;
 use crate::storage::{FrontierMode, IngestedSafeInput, SafeInputRange, Storage, StoredSafeInput};
@@ -94,6 +95,73 @@ async fn subscribe_from_accepts_exact_catchup_window() {
         subscription.is_ok(),
         "exactly 2 replayable events should be allowed"
     );
+}
+
+#[test]
+fn cancelled_catchup_prepare_retains_process_lock_until_blocking_read_finishes() {
+    let db = temp_db("cancelled-catchup-prepare-lock");
+    seed_ordered_txs(db.path.as_str());
+    let data_dir = db._dir.path().to_str().expect("utf8 data dir").to_string();
+    let db_path = db.path.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build test runtime");
+
+    runtime.block_on(async move {
+        let process_lock = ProcessLock::acquire(&data_dir).expect("acquire process lock");
+        let feed = test_feed(&db_path, RuntimeScope::new(process_lock));
+
+        // Occupy the only blocking thread so subscription preparation is
+        // deterministically queued, then cancel the async task awaiting it.
+        let (blocker_started_tx, blocker_started_rx) = oneshot::channel();
+        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = blocker_started_tx.send(());
+            release_blocker_rx.recv().expect("release blocking pool");
+        });
+        blocker_started_rx.await.expect("blocking pool occupied");
+
+        let (subscribe_entered_tx, subscribe_entered_rx) = oneshot::channel();
+        let subscribe = tokio::spawn(async move {
+            let _ = subscribe_entered_tx.send(());
+            feed.subscribe_from(0, u64::MAX).await
+        });
+        subscribe_entered_rx
+            .await
+            .expect("subscription preparation entered");
+        subscribe.abort();
+        let join = match subscribe.await {
+            Ok(_) => panic!("subscription task should be cancelled"),
+            Err(join) => join,
+        };
+        assert!(join.is_cancelled());
+
+        assert!(
+            matches!(
+                ProcessLock::acquire(&data_dir),
+                Err(ProcessLockError::Locked { .. })
+            ),
+            "detached catch-up preparation must retain process ownership"
+        );
+
+        release_blocker_tx.send(()).expect("release blocking pool");
+        blocker.await.expect("join blocking-pool occupant");
+
+        let reacquired = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match ProcessLock::acquire(&data_dir) {
+                    Ok(lock) => break lock,
+                    Err(ProcessLockError::Locked { .. }) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected lock acquisition failure: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("detached catch-up preparation should release ownership");
+        drop(reacquired);
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
