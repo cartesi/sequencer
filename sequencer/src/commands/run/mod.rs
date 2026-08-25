@@ -110,44 +110,6 @@ where
 {
     let db_path = config.db_path();
 
-    // Prefer a live refresh before recovery can reopen a Tip, but tolerate a
-    // transient L1/RPC failure the same way warm-boot tolerates unreachable
-    // chain-id checks: the price is already pinned by setup, and a single
-    // persisted max-age (`l1_read_stale_after`) bounds how long it may be
-    // retained at boot and in `run_forever`. Misconfig (wrong pool/pair/chain)
-    // stays terminal. Fixed mode needs no worker.
-    let max_price_age_ms = timing.l1_read_stale_after_secs().saturating_mul(1000);
-    let fee_oracle = match l1_config.identity.fee_oracle {
-        // Fixed: setup pinned the exponent and nothing consults its freshness
-        // stamp outside the uniswap worker, so there is nothing to refresh.
-        storage::FeeOracleIdentity::Fixed { .. } => None,
-        storage::FeeOracleIdentity::Uniswap {
-            weth,
-            fee_token,
-            pool,
-            twap_window_secs,
-        } => {
-            let uniswap = crate::l1::fee_oracle::UniswapConfig {
-                chain_id: l1_config.identity.chain_id,
-                weth,
-                fee_token,
-                pool,
-                twap_window_secs,
-            };
-            let oracle = crate::l1::fee_oracle::bootstrap_for_run(
-                db_path.clone(),
-                &config.eth_rpc_url,
-                config.allow_insecure_rpc,
-                uniswap,
-                Duration::from_millis(config.fee_oracle.poll_interval_ms),
-                max_price_age_ms,
-                process_lock.clone(),
-            )
-            .await?;
-            Some(oracle)
-        }
-    };
-
     // `run` never re-discovers identity from L1 — it builds the reader from
     // the pinned InputBox address + app deployment block and syncs incrementally.
     let mut input_reader = InputReader::from_parts(
@@ -191,6 +153,45 @@ where
     // completed phase always returns through the same reducer before another
     // phase or admission.
     crate::recovery::run_startup_recovery(&db_path, &mut input_reader, &l1_config, &timing).await?;
+
+    // Setup persisted a real first price, so run performs no synchronous
+    // fee-source I/O and fee availability never precedes the reducer's local
+    // terminal-fact inspection. The exhaustive identity match is the worker
+    // launch decision: fixed mode has no task; Uniswap's supervised worker
+    // performs the first runtime quote after admission.
+    let fee_oracle = match l1_config.identity.fee_oracle {
+        storage::FeeOracleIdentity::Fixed { .. } => None,
+        storage::FeeOracleIdentity::Uniswap {
+            weth,
+            fee_token,
+            pool,
+            twap_window_secs,
+        } => {
+            let uniswap = crate::l1::fee_oracle::UniswapConfig {
+                chain_id: l1_config.identity.chain_id,
+                weth,
+                fee_token,
+                pool,
+                twap_window_secs,
+            };
+            let provider = crate::l1::provider::create_provider(
+                &config.eth_rpc_url,
+                config.allow_insecure_rpc,
+            )
+            .map_err(crate::l1::fee_oracle::worker::FeeOracleError::Misconfig)?;
+            let token = crate::l1::fee_oracle::UniswapV3PriceSource::from_setup_validated(
+                provider.clone(),
+                uniswap,
+            );
+            Some(crate::l1::fee_oracle::FeeOracle::new(
+                db_path.clone(),
+                Duration::from_millis(config.fee_oracle.poll_interval_ms),
+                provider,
+                Box::new(token),
+                process_lock.clone(),
+            ))
+        }
+    };
 
     // ── Prepare → admit → launch ─────────────────────────────
     let prepared = PreparedRuntime::<A>::prepare(WorkersConfig {
