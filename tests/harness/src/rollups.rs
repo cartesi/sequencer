@@ -9,7 +9,7 @@ use std::time::Duration;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::providers::ext::AnvilApi;
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{BlockNumberOrTag, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolCall;
 use alloy_primitives::{Address, B256, Bytes, U256};
@@ -31,6 +31,7 @@ pub const DEVNET_CHAIN_ID: u64 = 31_337;
 const DEFAULT_ANVIL_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_ANVIL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_ANVIL_SLOTS_IN_EPOCH: u64 = 1;
+const LIVE_L1_BLOCK_INTERVAL_SECONDS: u64 = 1;
 const DEVNET_MOCK_ERC20_DEPLOYER_PRIVATE_KEY: &str =
     "0x59c6995e998f97a5a0044976f1d86dbce6c5bb4f80a8b5148f7f4f6d0d0c0abc";
 const DEVNET_MOCK_ERC20_DEPLOYER_FUNDING_WEI: u64 = 1_000_000_000_000_000;
@@ -87,8 +88,33 @@ impl DevnetRollupsStack {
         deploy_mock_erc20_from_default_funder(self.anvil.endpoint.as_str()).await
     }
 
+    /// Mine outage-style L1 progress at the configured 12-second block time.
+    /// Tests that model ordinary live progress should use
+    /// [`Self::mine_live_l1_blocks`] instead.
     pub async fn mine_l1_blocks(&self, block_count: u64) -> HarnessResult<()> {
         self.anvil.mine_blocks(block_count).await
+    }
+
+    /// Mine ordinary live-chain progress without simulating a 12-second outage
+    /// per block. The one-second interval keeps Anvil timestamps monotone while
+    /// wall-clock-paced polling avoids tripping the clock-usability guard.
+    pub async fn mine_live_l1_blocks(&self, block_count: u64) -> HarnessResult<()> {
+        self.anvil
+            .mine_blocks_with_interval(block_count, LIVE_L1_BLOCK_INTERVAL_SECONDS)
+            .await
+    }
+
+    pub async fn l1_safe_block_number(&self) -> HarnessResult<u64> {
+        let provider = ProviderBuilder::new()
+            .connect(self.anvil.endpoint.as_str())
+            .await
+            .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Safe)
+            .await
+            .map_err(|err| io_other(format!("failed to read Anvil safe head: {err}")))?
+            .ok_or_else(|| io_other("Anvil returned no safe block"))?;
+        Ok(block.header.number)
     }
 
     /// Toggle Anvil's auto-mining mode. When disabled, txs accumulate in
@@ -236,7 +262,15 @@ impl ManagedAnvil {
         // spurious `L1ViewStale` even when wall clock and L1 should move
         // together. See `ManagedSequencer::advance_wall_and_mine`.
         const SECONDS_PER_BLOCK: u64 = 12;
+        self.mine_blocks_with_interval(block_count, SECONDS_PER_BLOCK)
+            .await
+    }
 
+    async fn mine_blocks_with_interval(
+        &self,
+        block_count: u64,
+        interval_seconds: u64,
+    ) -> HarnessResult<()> {
         if block_count == 0 {
             return Ok(());
         }
@@ -246,7 +280,7 @@ impl ManagedAnvil {
             .await
             .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
         provider
-            .anvil_mine(Some(block_count), Some(SECONDS_PER_BLOCK))
+            .anvil_mine(Some(block_count), Some(interval_seconds))
             .await
             .map_err(|err| {
                 io_other(format!(

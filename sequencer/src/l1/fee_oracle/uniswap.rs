@@ -115,10 +115,16 @@ impl UniswapV3PriceSource {
         } else {
             return Err(PriceSourceError::WrongTokenPair);
         };
+        // Uniswap V3 pools canonically order token0/token1 by address. Enforce
+        // that setup validated a real pool with the same ordering runtime later
+        // derives without another RPC round-trip.
+        if weth_is_token0 != (config.weth < config.fee_token) {
+            return Err(PriceSourceError::WrongTokenPair);
+        }
         // Probe the exact `observe` call used for quotes. Uniswap's `OLD`
-        // revert means this TWAP window cannot yet be served (misconfig /
-        // immature pool). Transport and other RPC failures stay provider
-        // errors so a flaky gateway is not treated as a bad pool.
+        // revert means this TWAP window cannot currently be served. Transport
+        // and `OLD` are availability failures; the remaining validation errors
+        // are deterministic configuration failures.
         pool.observe(vec![config.twap_window_secs, 0])
             .call()
             .await
@@ -129,6 +135,18 @@ impl UniswapV3PriceSource {
             config,
             weth_is_token0,
         })
+    }
+
+    /// Construct the runtime source from setup-pinned, setup-validated
+    /// identity without touching L1. Uniswap V3's canonical address ordering
+    /// supplies the only fact `connect` discovered that is needed to quote;
+    /// the input reader independently verifies the pinned chain on contact.
+    pub(crate) fn from_setup_validated(provider: DynProvider, config: UniswapConfig) -> Self {
+        Self {
+            provider,
+            config,
+            weth_is_token0: config.weth < config.fee_token,
+        }
     }
 
     async fn mean_tick(&self) -> Result<i32, PriceSourceError> {
@@ -200,12 +218,14 @@ fn classify_decoded_observe_revert(
     }
 }
 
-/// Bootstrap mapping: provider/RPC failures may self-heal; pool/config
-/// failures need an operator.
+/// Setup-time mapping: provider/RPC failures and an unavailable observation
+/// window may self-heal. Both still fail setup's hard first-read requirement;
+/// only their restart classification differs from deterministic misconfig.
 pub(super) fn bootstrap_price_source_error(error: PriceSourceError) -> (bool, String) {
     match error {
         PriceSourceError::Provider(message) => (true, message),
-        other => (false, other.to_string()),
+        error @ PriceSourceError::InsufficientObservations => (true, error.to_string()),
+        error => (false, error.to_string()),
     }
 }
 
@@ -404,15 +424,32 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_maps_provider_as_transient() {
+    fn bootstrap_maps_source_availability_as_transient() {
         let (transient, _) =
             bootstrap_price_source_error(PriceSourceError::Provider("timeout".into()));
         assert!(transient);
         let (transient, _) =
             bootstrap_price_source_error(PriceSourceError::InsufficientObservations);
-        assert!(!transient);
+        assert!(transient);
         let (transient, _) = bootstrap_price_source_error(PriceSourceError::WrongTokenPair);
         assert!(!transient);
+    }
+
+    #[test]
+    fn runtime_source_derives_canonical_token_order_without_rpc() {
+        let provider = crate::l1::provider::create_provider("http://127.0.0.1:1", false)
+            .expect("provider construction is local");
+        let source = UniswapV3PriceSource::from_setup_validated(
+            provider,
+            UniswapConfig {
+                chain_id: 1,
+                weth: MAINNET_WETH,
+                fee_token: MAINNET_USDC,
+                pool: MAINNET_USDC_WETH_005_POOL,
+                twap_window_secs: UniswapConfig::DEFAULT_TWAP_WINDOW_SECS,
+            },
+        );
+        assert_eq!(source.weth_is_token0, MAINNET_WETH < MAINNET_USDC);
     }
 
     #[test]
