@@ -213,9 +213,14 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 Box::pin(run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(runtime))
             },
         ),
-        ("wall_clock_backward_jump_no_panic_test", |runtime| {
-            Box::pin(run_wall_clock_backward_jump_no_panic_test(runtime))
-        }),
+        (
+            "wall_clock_backward_jump_retries_then_recovers_test",
+            |runtime| {
+                Box::pin(run_wall_clock_backward_jump_retries_then_recovers_test(
+                    runtime,
+                ))
+            },
+        ),
         ("stalled_safe_head_startup_refuses_boot_test", |runtime| {
             Box::pin(run_stalled_safe_head_startup_refuses_boot_test(runtime))
         }),
@@ -1591,10 +1596,10 @@ async fn run_sequencer_outage_pre_danger_no_recovery_test(
 async fn run_sequencer_outage_danger_zone_tip_cascade_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    // Pick advance in the danger zone: > danger_threshold (900) but < MAX_WAIT (1200).
-    // Decoupled from wall clock on purpose: this test exercises the
-    // block-based danger check in isolation. Uses module-level
-    // `DANGER_ZONE_BLOCKS` (see top-of-file zone constants).
+    // Pick an advance in the danger zone: > danger_threshold (900) but <
+    // MAX_WAIT (1200). L1 block time and process time advance together so the
+    // observed Tip age selects `RecoverTip` without leaving the repaired L1
+    // view future-dated during the mandatory post-recovery inspection.
 
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
@@ -1632,11 +1637,19 @@ async fn run_sequencer_outage_danger_zone_tip_cascade_test(
     // so the startup `RecoverTip` path cascades it (no flush — the Tip
     // has no L1 footprint). Alice's pre-outage transfer was a soft
     // confirmation against the Tip; it's rolled back.
-    runtime.mine_l1_blocks(DANGER_ZONE_BLOCKS).await?;
+    runtime
+        .advance_wall_and_mine(blocks_as_duration(DANGER_ZONE_BLOCKS))
+        .await?;
     let _ = expected_alice_balance;
     let _ = expected_bob_balance;
 
     runtime.respawn().await?;
+
+    let counts = runtime.count_batches()?;
+    assert!(
+        counts.invalidated >= 1,
+        "RecoverTip must invalidate the aged Tip before admission: {counts:?}",
+    );
 
     // After Tip cascade: balances roll back to the post-deposit / pre-transfer
     // state, nonces reset, and the WS feed should not replay the invalidated
@@ -1975,19 +1988,13 @@ async fn run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(
     Ok(())
 }
 
-// `SystemTime::now()` backward jump → `saturating_sub` handles
-// cleanly, no panic.
-//
-// Scenario: normal setup creates DB state at real time T. Stop, disconnect
-// proxy, backward-jump the clock via faketime, respawn with L1 unreachable.
-// The wall-clock fallback runs:
-//
-//     elapsed = now(T-1h).saturating_sub(last_sync_at_ms(≈T)) = 0
-//
-// No danger → boot proceeds. After reconnect, normal operation resumes.
-// If `saturating_sub` ever regresses to a plain subtraction (underflow
-// panic on u64), this test panics at respawn.
-async fn run_wall_clock_backward_jump_no_panic_test(
+// A wall-clock regression of at least one configured block interval makes a
+// persisted L1-progress timestamp unusable. With L1 unreachable, startup must
+// return the retryable `L1ViewStale` verdict (exit 20) without mutating the
+// batch tree. Restoring both time and connectivity must make the next boot
+// healthy. Sub-block regressions remain tolerated and are pinned by protocol
+// unit tests.
+async fn run_wall_clock_backward_jump_retries_then_recovers_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     let alice = TestSigner::from_default(1)?;
@@ -2005,22 +2012,46 @@ async fn run_wall_clock_backward_jump_no_panic_test(
     .await?;
     drop(ws);
 
+    let counts_before = runtime.count_batches()?;
     runtime.stop().await?;
     let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
     runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
     proxy.disconnect();
     runtime.set_faketime_offset(Some("-1h".to_string()))?;
 
-    // Respawn must NOT panic. With L1 unreachable, the wall-clock fallback
-    // is the only path that sees `now - last_sync_ms` — if the subtraction
-    // ever became non-saturating, this call would panic via u64 underflow.
+    let respawn_error = runtime
+        .respawn()
+        .await
+        .expect_err("a one-hour clock regression with L1 unreachable must refuse admission");
+    let respawn_error = respawn_error.to_string();
+    assert!(
+        respawn_error.contains("status=exit status: 20"),
+        "backward-clock refusal must use the retryable exit class, not panic: {respawn_error}",
+    );
+
+    let counts_after_retry = runtime.count_batches()?;
+    assert_eq!(
+        counts_after_retry, counts_before,
+        "retryable clock refusal must not mutate the batch tree",
+    );
+
+    // Restore the usable clock and L1 connection. The same persisted facts
+    // are now ageable again, so startup admits and the runtime remains healthy
+    // past the danger detector's two-second cadence.
+    runtime.set_faketime_offset(None)?;
+    proxy.reconnect();
     runtime.respawn().await?;
 
-    // Clean up: reconnect and let the sequencer catch up normally.
-    proxy.reconnect();
-    // Clear the offset for subsequent respawns (not used here, but keeps the
-    // teardown deterministic if future cleanup code respawns).
-    runtime.set_faketime_offset(None)?;
+    let exit = runtime.observe_for(Duration::from_secs(3)).await?;
+    assert!(
+        exit.is_none(),
+        "restoring time and L1 connectivity must produce a stable runtime; got {exit:?}",
+    );
+    assert_eq!(
+        runtime.count_batches()?,
+        counts_before,
+        "recovering from a retryable clock refusal must not invalidate batches",
+    );
 
     proxy.shutdown().await?;
     Ok(())
@@ -3067,15 +3098,17 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
 //
 // Staging:
 //   1. Baseline: deposit + transfer → Tip at first_frame_safe_block X.
-//   2. `mine_l1_blocks(DANGER_ZONE_BLOCKS)` — current_safe_block jumps
-//      ~1150 past X, so the Tip's age clears `danger_threshold`. Wall
-//      clock untouched (decoupled advance).
+//   2. Advance only L1 by `DANGER_ZONE_BLOCKS` — current_safe_block jumps
+//      ~1150 past X before the wall-clock batch deadline can close the Tip.
+//      Once the reader persists that head, observed Tip age outranks the
+//      deliberately future-dated L1 clock and clears `danger_threshold`.
 //   3. `wait_for_exit` — input reader catches up; detector ticks; sees
 //      `DangerStatus::TipInDanger(_)`; process exits non-zero.
-//   4. Respawn — startup `check_danger` again sees Tip in danger →
+//   4. Align wall time with the already-mined L1 time, then respawn. Startup
+//      can now age the persisted head normally and sees Tip in danger →
 //      `RecoverTip` → `recover_aging_tip` cascades the Tip + opens a fresh
-//      one. Alice's pre-outage transfer was a soft confirmation against
-//      the cascaded Tip; it's rolled back.
+//      one. Alice's pre-outage transfer was a soft confirmation against the
+//      cascaded Tip; it's rolled back.
 async fn run_aging_open_tip_runtime_danger_zone_exit_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
@@ -3101,7 +3134,9 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
         replay.apply(ws.expect_user_op_from(alice_address).await?)?;
     }
 
-    // L1 jumps into the danger window; wall clock stays put.
+    // Advance L1 atomically while leaving wall time still: this injects the
+    // "lane failed to close its Tip" condition without letting the normal
+    // wall-clock batch deadline repair it first.
     runtime.mine_l1_blocks(DANGER_ZONE_BLOCKS).await?;
 
     // The detector must trip on `DangerStatus::TipInDanger` once the input reader
@@ -3112,6 +3147,12 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
         !exit.success(),
         "sequencer must exit non-zero on `DangerStatus::TipInDanger` once the Tip's \
          first frame ages past `danger_threshold`, got {exit:?}",
+    );
+    let detector_log = runtime.read_log_contents()?;
+    assert!(
+        detector_log.contains("status=TipInDanger("),
+        "runtime detector must report observed TipInDanger, not a clock fallback; log:\n\
+         {detector_log}",
     );
 
     // No cascade fires on detector exit alone. The recovery happens at
@@ -3124,6 +3165,14 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
         "detector exit alone must not invalidate batches; that happens at startup: {counts_before:?}",
     );
 
+    // The reader's persisted L1 head is future-dated because Anvil advanced
+    // atomically. Add ordinary live progress, then align process time before
+    // restart: initial sync observes a strictly newer safe head and refreshes
+    // the wall-progress witness, so the mandatory post-repair inspection can
+    // admit the fresh Tip rather than correctly retaining a stale-view retry.
+    runtime.mine_live_l1_blocks(1).await?;
+    let aligned_offset_secs = blocks_as_duration(DANGER_ZONE_BLOCKS).as_secs() + 1;
+    runtime.set_faketime_offset(Some(format!("+{aligned_offset_secs}s")))?;
     runtime.respawn().await?;
 
     let mut ws_after = runtime.ws(0).await?;
