@@ -870,10 +870,15 @@ mod tests {
         );
     }
 
-    /// Same-nonce replacement must reach `eth_sendRawTransaction` while the
-    /// original is still pending. Without pinning gas from a nonce-free
-    /// estimate, Anvil rejects `eth_estimateGas(..., nonce=N, block=pending)`
-    /// with "nonce too low" and the replacement never broadcasts.
+    /// Review E2E (jplgarcia): Anvil `--no-mining` → original poster tx →
+    /// confirmation timeout → real same-nonce replacement → resume mining →
+    /// assert receipt / nonce progression.
+    ///
+    /// Pins the gas-estimation hole that blocked the replacement path: with the
+    /// original still pending, Anvil rejects `eth_estimateGas(..., nonce=N,
+    /// block=pending)` as "nonce too low", so the filler never reaches
+    /// `eth_sendRawTransaction`. The poster must estimate without that nonce
+    /// and pin gas on the replacement.
     #[tokio::test]
     async fn submit_batches_replaces_pending_tx_after_confirmation_timeout() {
         require_anvil();
@@ -890,6 +895,7 @@ mod tests {
             .await
             .expect("base nonce");
 
+        // 1) Original poster tx parks in the mempool (mining disabled).
         let first_hashes = poster
             .submit_batches(vec![vec![0u8; 4]], &sink)
             .await
@@ -923,8 +929,8 @@ mod tests {
             .copied()
             .expect("first send records in-flight fees");
 
-        // Confirmation watch timed out inside the first submit; the next tick
-        // must bump fees and broadcast a same-nonce replacement.
+        // 2) Confirmation watch timed out; next tick must bump fees and
+        //    broadcast a same-nonce replacement (the gas-estimate fix).
         let second_hashes = poster
             .submit_batches(vec![vec![0u8; 4]], &sink)
             .await
@@ -956,7 +962,7 @@ mod tests {
             sent.max_priority_fee_per_gas
         );
 
-        // Pending still one slot ahead of latest until we mine.
+        // Still one pending slot until mining resumes.
         let pending_after_replace = provider
             .get_transaction_count(submitter)
             .block_id(BlockNumberOrTag::Pending.into())
@@ -968,6 +974,7 @@ mod tests {
             "replacement keeps a single pending nonce slot"
         );
 
+        // 3) Resume mining and assert receipt / nonce progression.
         let _: serde_json::Value = provider
             .raw_request("evm_mine".into(), ())
             .await
@@ -992,6 +999,34 @@ mod tests {
         assert_eq!(
             receipt.transaction_hash, replacement_hash,
             "mined receipt must belong to the replacement tx"
+        );
+        assert!(
+            provider
+                .get_transaction_receipt(first_hash)
+                .await
+                .expect("original receipt rpc")
+                .is_none(),
+            "original pending tx must be evicted by the replacement"
+        );
+
+        // On-wire fees must clear the ≥10% floor (not just the in-memory record).
+        use alloy::consensus::Transaction as _;
+        let mined = provider
+            .get_transaction_by_hash(replacement_hash)
+            .await
+            .expect("get replacement tx")
+            .expect("replacement tx must be fetchable after mining");
+        assert!(
+            mined.max_fee_per_gas() >= bumped_max,
+            "mined max_fee must clear floor: on_wire={} floor={bumped_max}",
+            mined.max_fee_per_gas()
+        );
+        let on_wire_prio = mined
+            .max_priority_fee_per_gas()
+            .expect("replacement must be EIP-1559");
+        assert!(
+            on_wire_prio >= bumped_prio,
+            "mined priority must clear floor: on_wire={on_wire_prio} floor={bumped_prio}"
         );
     }
 
