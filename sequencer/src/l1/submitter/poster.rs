@@ -171,6 +171,8 @@ impl EthereumBatchPoster {
         payload: Vec<u8>,
         nonce: u64,
         fees: &Eip1559Fees,
+        // True when this nonce already has a pending broadcast we are replacing.
+        replace_pending: bool,
     ) -> Result<PendingTransactionBuilder<alloy::network::Ethereum>, BatchPosterError> {
         #[cfg(test)]
         {
@@ -181,12 +183,28 @@ impl EthereumBatchPoster {
             }
         }
         let input_box = InputBox::new(self.config.l1_submit_address, &self.provider);
-        input_box
+        let call = input_box
             .addInput(self.config.app_address, payload.into())
-            .nonce(nonce)
             .max_fee_per_gas(fees.max_fee_per_gas)
-            .max_priority_fee_per_gas(fees.max_priority_fee_per_gas)
-            .send()
+            .max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+
+        // Same-nonce replacement: estimate gas *without* the pending nonce.
+        // Anvil (and geth's pending simulation) apply mempool nonce policy to
+        // `eth_estimateGas` and reject with "nonce too low" when that nonce is
+        // already pending — so the filler's estimate-with-nonce never reaches
+        // `eth_sendRawTransaction`. Pin the gas limit first so the filler
+        // skips a second estimate that would include the nonce.
+        let call = if replace_pending {
+            let gas = call
+                .estimate_gas()
+                .await
+                .map_err(|err| BatchPosterError::Provider(err.to_string()))?;
+            call.gas(gas).nonce(nonce)
+        } else {
+            call.nonce(nonce)
+        };
+
+        call.send()
             .await
             .map_err(|err| BatchPosterError::Provider(err.to_string()))
     }
@@ -340,7 +358,10 @@ impl BatchPoster for EthereumBatchPoster {
                 None
             };
             let fees = fees_for_nonce(estimate, prior);
-            let pending = match self.send_batch_at_nonce(payload, next_nonce, &fees).await {
+            let pending = match self
+                .send_batch_at_nonce(payload, next_nonce, &fees, prior.is_some())
+                .await
+            {
                 Ok(pending) => pending,
                 Err(BatchPosterError::Provider(ref msg)) if is_replacement_underpriced(msg) => {
                     // Node rejected the replacement fee — raise the floor from
@@ -846,6 +867,131 @@ mod tests {
             sent.max_priority_fee_per_gas >= bumped_prio,
             "priority must clear replacement floor: sent={} floor={bumped_prio}",
             sent.max_priority_fee_per_gas
+        );
+    }
+
+    /// Same-nonce replacement must reach `eth_sendRawTransaction` while the
+    /// original is still pending. Without pinning gas from a nonce-free
+    /// estimate, Anvil rejects `eth_estimateGas(..., nonce=N, block=pending)`
+    /// with "nonce too low" and the replacement never broadcasts.
+    #[tokio::test]
+    async fn submit_batches_replaces_pending_tx_after_confirmation_timeout() {
+        require_anvil();
+        let anvil = Anvil::default().arg("--no-mining").timeout(30_000).spawn();
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key, false)
+            .expect("signer provider");
+        let poster = EthereumBatchPoster::new(provider.clone(), poster_config(&anvil));
+        let sink = RecordingWatermarkSink::passing();
+
+        let base_nonce = provider
+            .get_transaction_count(submitter)
+            .await
+            .expect("base nonce");
+
+        let first_hashes = poster
+            .submit_batches(vec![vec![0u8; 4]], &sink)
+            .await
+            .expect("first submit parks a pending tx");
+        assert_eq!(first_hashes.len(), 1);
+        let first_hash = first_hashes[0];
+
+        let pending_after_first = provider
+            .get_transaction_count(submitter)
+            .block_id(BlockNumberOrTag::Pending.into())
+            .await
+            .expect("pending nonce");
+        let latest_after_first = provider
+            .get_transaction_count(submitter)
+            .block_id(BlockNumberOrTag::Latest.into())
+            .await
+            .expect("latest nonce");
+        assert_eq!(
+            pending_after_first,
+            base_nonce + 1,
+            "first send must occupy the mempool slot"
+        );
+        assert_eq!(
+            latest_after_first, base_nonce,
+            "mining is disabled; latest must not advance"
+        );
+
+        let prior_fees = poster
+            .in_flight_fees_for_test()
+            .get(&base_nonce)
+            .copied()
+            .expect("first send records in-flight fees");
+
+        // Confirmation watch timed out inside the first submit; the next tick
+        // must bump fees and broadcast a same-nonce replacement.
+        let second_hashes = poster
+            .submit_batches(vec![vec![0u8; 4]], &sink)
+            .await
+            .expect("replacement must clear gas estimation and broadcast");
+        assert_eq!(second_hashes.len(), 1);
+        let replacement_hash = second_hashes[0];
+        assert_ne!(
+            replacement_hash, first_hash,
+            "replacement must be a distinct tx hash"
+        );
+
+        let sent = poster
+            .in_flight_fees_for_test()
+            .get(&base_nonce)
+            .copied()
+            .expect("replacement records bumped fees");
+        let (bumped_max, bumped_prio) = crate::l1::eip1559::bumped_replacement_fees(
+            prior_fees.max_fee_per_gas,
+            prior_fees.max_priority_fee_per_gas,
+        );
+        assert!(
+            sent.max_fee_per_gas >= bumped_max,
+            "replacement max_fee must clear floor: sent={} floor={bumped_max}",
+            sent.max_fee_per_gas
+        );
+        assert!(
+            sent.max_priority_fee_per_gas >= bumped_prio,
+            "replacement priority must clear floor: sent={} floor={bumped_prio}",
+            sent.max_priority_fee_per_gas
+        );
+
+        // Pending still one slot ahead of latest until we mine.
+        let pending_after_replace = provider
+            .get_transaction_count(submitter)
+            .block_id(BlockNumberOrTag::Pending.into())
+            .await
+            .expect("pending after replace");
+        assert_eq!(
+            pending_after_replace,
+            base_nonce + 1,
+            "replacement keeps a single pending nonce slot"
+        );
+
+        let _: serde_json::Value = provider
+            .raw_request("evm_mine".into(), ())
+            .await
+            .expect("mine replacement");
+
+        let latest_after_mine = provider
+            .get_transaction_count(submitter)
+            .block_id(BlockNumberOrTag::Latest.into())
+            .await
+            .expect("latest after mine");
+        assert_eq!(
+            latest_after_mine,
+            base_nonce + 1,
+            "mined replacement must advance the account nonce"
+        );
+
+        let receipt = provider
+            .get_transaction_receipt(replacement_hash)
+            .await
+            .expect("receipt rpc")
+            .expect("replacement must have a receipt after mining");
+        assert_eq!(
+            receipt.transaction_hash, replacement_hash,
+            "mined receipt must belong to the replacement tx"
         );
     }
 
