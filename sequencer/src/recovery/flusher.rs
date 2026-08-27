@@ -246,11 +246,10 @@ impl MempoolFlusher {
             .map_err(|e| FlushError::Provider(e.to_string()))?;
 
         // Bump the absolute estimate so no-ops can compete with pending batch
-        // txs at the same wallet nonces (shared ≥10% replacement rule). Both
-        // components grow equally; the helper also clamps tip ≤ cap so a
-        // near-zero-base estimate cannot produce ErrTipAboveFeeCap. Safety
-        // does not depend on the no-op winning — `flush_and_wait` only returns
-        // once Pending ≤ Safe.
+        // txs at the same wallet nonces (shared ≥10% replacement helper —
+        // symmetric ×1.1+1 on both EIP-1559 components). Safety does not
+        // depend on the no-op winning — `flush_and_wait` only returns once
+        // Pending ≤ Safe.
         //
         // Residual gap: this is a one-shot bump of a *fresh* estimate, not of
         // the pending tx's fees, so a replacement can still be underpriced
@@ -273,17 +272,29 @@ impl MempoolFlusher {
         let mut tx_hashes = Vec::new();
         let mut send_failures = Vec::new();
         for nonce in from_nonce..to_nonce {
-            let tx = alloy::rpc::types::TransactionRequest::default()
+            // Estimate without the pending nonce and pin gas (+10% pad) —
+            // same Anvil "nonce too low" hole as the batch poster. With gas
+            // + both fee fields set, the GasFiller skips a second estimate.
+            let tx_base = alloy::rpc::types::TransactionRequest::default()
                 .with_to(self.address)
                 .with_value(U256::ZERO)
-                .with_nonce(nonce)
                 .with_max_fee_per_gas(bumped_max_fee)
                 .with_max_priority_fee_per_gas(bumped_priority_fee);
+            let gas = match self.provider.estimate_gas(tx_base.clone()).await {
+                Ok(gas) => gas.saturating_add(gas / 10),
+                Err(e) => {
+                    let message = e.to_string();
+                    error!(nonce, error = %message, "flush no-op gas estimate failed");
+                    send_failures.push((nonce, message));
+                    continue;
+                }
+            };
+            let tx = tx_base.with_gas_limit(gas).with_nonce(nonce);
 
             match self.provider.send_transaction(tx).await {
                 Ok(pending) => {
                     let tx_hash = *pending.tx_hash();
-                    debug!(nonce, %tx_hash, "flush no-op submitted");
+                    debug!(nonce, %tx_hash, gas, "flush no-op submitted");
                     tx_hashes.push(tx_hash);
                 }
                 Err(e) => {
