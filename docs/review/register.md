@@ -8,7 +8,10 @@ section before proposing a simplification or a new mechanism. The dated
 ledgers beside this file are stubs preserving each review's scope and
 verdict; process detail beyond that lives in git history.
 
-Statuses below were verified against the tree on 2026-08-25.
+Statuses of findings 1–18 were verified against the tree on 2026-08-25.
+Findings 19–31 and the 2026-09-03 refuted block come from the
+[branch stock-take](2026-09-03-branch-stocktake.md), which records every
+proposal that review raised, including the ones no jury examined.
 
 ## Open findings
 
@@ -78,6 +81,80 @@ lines):
     (`safe_input_end_exclusive` has a live reader-path caller and stays).
 18. **`frames` lacks the immutability triggers `batches` got** — `fee` and
     `safe_block` are documented immutable but convention-protected only.
+19. **A missing or unreadable key file exits 1 and restart-loops** —
+    `resolve_key_source` (`commands/config.rs`) returns a bare `io::Error`
+    that lands in `CommandError::Io`, while bad key *content* in the same file
+    exits 30. Kind-filter into a distinct `KeySourceUnreadable { path, kind }`
+    (NotFound/PermissionDenied/InvalidData/IsADirectory/NotADirectory
+    terminal; EIO and friends operational); never echo contents.
+    Jury-confirmed.
+20. **`StaleDecision` cannot name the tip-present cause** —
+    `ensure_open_tip_for_recovery` raises `{ expected: Safe, actual: Safe }`
+    when the Tip already exists, and `recovery_tests.rs` pins that line. Add
+    `TipAlreadyOpen` plus a paired retry reason so `classify_mutation` carries
+    it to the operator. Jury-confirmed; production-unreachable.
+21. **`Storage::ensure_open_tip` is `pub` with zero production callers** — a
+    new instance of 17 created by this branch, beside its guarded replacement.
+    Gate `#[cfg(test)] pub(crate)`; fix the two intra-doc links and
+    `docs/snapshots/lifecycle.md`'s genesis-Tip claim. Jury-confirmed.
+22. **Detector and reader take `RuntimeScope` where `ShutdownSignal`
+    suffices** — each uses the scope only for `wait_for_shutdown` and already
+    holds a construction-required `ProcessLock`. Narrow, and restate the three
+    doc comments (`commands/run/workers.rs`, `runtime/shutdown.rs`) that claim
+    lock retention through scope clones. Jury-confirmed 2–1.
+23. **`drive_recovery`'s one cycle has no enforced postcondition** —
+    `Repaired` + `Safe` + no Tip → `EnsureOpenTip` → `Repaired`, with no
+    watchdog on the boot path; `admission.tla` hardcodes `hasOpenTip' = TRUE`.
+    Return a typed `refuse` (exit 30 — not a `debug_assert`, not
+    `StaleDecision`) after `open_fresh_tip_in_tx` in the guarded phase, or make
+    the reducer arm a terminal `Refuse`. Jury-confirmed 2–1.
+24. **A contained run writes two `terminal_faults` rows** — the in-scope
+    recorder's raw cause, then the bracket's prefixed cause;
+    `latest_terminal_fault` returns the second. Document the shape (recorder,
+    ADR, runbook); do not dedupe by variant — the recorder swallows its own
+    failures, so the bracket write is a genuine retry. Jury-confirmed.
+25. **Prose claims more than the types enforce** — `authorize()`'s doc names
+    four compile-forced primitives (three are; the HTTP 200 publication gate in
+    `ingress/api.rs` and the two lane mutation commits are hand-placed
+    consults); `RecoveryProgress` is called "non-clone" in the recovery README,
+    `admission.tla`, and `recovery/mod.rs` but derives `Copy`;
+    `process_lock.rs`'s witness comment is narrower than the predicate;
+    "journal" survives in `storage/history.rs` and `commands/run/workers.rs`;
+    `commands/error.rs:11` names an "acknowledge" command; the recovery README
+    names a `DangerDetectorExit` type that does not exist. Verified first-hand.
+26. **`finalized_state` handles an impossible `None`** — `LeasedDump` is
+    shared between the finalized and latest lease queries, so the `NOT NULL`
+    `inclusion_block` arrives as an `Option` and a `None` escalates to
+    containment (`egress/api/snapshot.rs`). Give the finalized lease its own
+    non-optional type and delete the branch. Verified first-hand; no jury.
+27. **`RecoveryFailure::Provider(String)` carries two verdicts** — the
+    startup flush maps `ChainIdRpc` → retry and `Create` → refuse into one
+    variant, and nothing pins either arm; `classify_input_reader` has no doc
+    comment and its `Bootstrap`/`Join` refusals are unpinned; a pre-v3
+    InputBox exits 1 under `setup` and 30 under `run`. Surfaced by the
+    refuters; split the variant and pin both polarities.
+28. **Setup admission is implemented twice with different semantics** —
+    `preflight_lifecycle_command` (used by `run`/`flush`) and
+    `admit_setup_lifecycle` (`commands/setup/mod.rs`) each check the same two
+    facts; an already-complete plain setup is a no-op in one and
+    `NotAdmissible` in the other, and `load_setup_identity` re-checks
+    completion with a third error type. Unverified.
+29. **`http.rs` hosts a runtime component** — the ~175-line supervised
+    lease-release queue with two containment sites belongs in the egress
+    snapshot module that owns leases; its queue is unbounded and capped only by
+    concurrent snapshot requests. Unverified; weight, not safety.
+30. **Harness block-time notions are unreconciled** — four constants with an
+    unasserted relationship; `advance_live_frame_until_covers` can drive L1
+    ~20× ahead of the process clock; `aging_open_tip_runtime_danger_zone_exit_test`
+    stages an impossible chain and greps the rendered log (the CI red). One
+    `ChainClock` authority plus a post-mining drift check; assert exit 10
+    instead of the log. The log grep is verified first-hand; the rest is
+    unverified.
+31. **`log_gas_price_updated_at_ms` is production-write-only** — written on
+    every refresh, read only by tests, yet the threat model cites it as the
+    telemetry that justifies having no expiry gate. Surface it (health field
+    or the transient-refresh warn) or drop it and fix the sentence.
+    Unverified.
 
 Open maintainer decisions:
 
@@ -102,7 +179,14 @@ Open maintainer decisions:
 - **Process-level divergence scenario** via `respawn_until_stable` (storage
   and reducer coverage exists; the end-to-end freeze/refuse loop does not).
 - **Per-variant exit-code e2e assertions** (failure-path e2es assert only
-  `!success()`) and a process-level SIGTERM→0 assertion.
+  `!success()`) and a process-level SIGTERM→0 assertion. Assert integer
+  literals: the `EXIT_*` values appear only at their declarations, so
+  renumbering `EXIT_TERMINAL` passes the suite today. Cheapest 30-class case:
+  `run` on a never-set-up data directory.
+- **Polarity pins for `classify_input_reader`'s `Bootstrap`/`Join` refusals**,
+  and a unit test of the production phase→progress mapping in
+  `ProductionRecoveryDriver::perform` (the scripted-driver traces exercise the
+  test double's copy of it).
 - **Full-tear cascade on a recovered (anchor = `N'`) tree** re-rooting at
   `N'` (anchor unit mechanics are covered; this end-to-end shape is not).
 - **Uniswap-mode fee oracle end-to-end**: every fixture and e2e pins fixed
@@ -250,13 +334,6 @@ From the ADR re-evaluation (2026-08-01/02):
   unrelated facts; a larger state machine closing no hole.
 - **A per-chunk divergence query / reader mailbox** on the hot path — the
   check is not a divergence oracle; the cost buys no complete boundary.
-- **Fee-price age as a runtime lifecycle gate** — setup owns the required
-  live quote; run starts from the persisted price and refreshes it best-effort.
-  Shared-endpoint staleness is already detected from safe-head progress, while
-  a pool-only outage is an explicitly accepted economic residual. Reintroduce
-  an expiry gate only with an independently derived economic bound and action,
-  not by borrowing the L1 liveness threshold.
-
 From the 2026-08-18 adversarial pass:
 
 - **Merging `Workers::finish`'s two drain modes by re-awaiting the primary**
@@ -300,14 +377,88 @@ From the 2026-08-23 run-glue simplification pass:
 
 From the L3 review (2026-08-22):
 
-- **A durable boot gate on terminal verdicts** (in any form) — it needs an
-  acknowledgement to exit, and the acknowledgement carries no information
-  the fact-derived reducer doesn't re-derive.
+- **A durable boot gate on terminal verdicts** (a gate on a *verdict*, i.e.
+  a non-fact) — it needs an acknowledgement to exit, and the acknowledgement
+  carries no information the fact-derived reducer doesn't re-derive. A
+  verdict-neutral startup *read* of the black box is not covered by this
+  entry.
 - **A boot-time full-integrity sweep** — expensive machinery that still
   cannot catch semantic violations outside its read set; the residual
   window is recorded and bounded instead.
 - **A boot assert on `finalized_snapshot.inclusion_block`** — the column is
-  `NOT NULL` at the engine; the claimed gap does not exist.
+  `NOT NULL` at the engine; the claimed gap does not exist. (The runtime
+  `Option` branch on the same column is finding 26.)
+
+From the 2026-08-25 fee-oracle lifecycle pass (143a290; a single-pass
+decision, not an adversarial review):
+
+- **Fee-price age as a runtime lifecycle gate** — setup owns the required
+  live quote; run starts from the persisted price and refreshes it best-effort.
+  Shared-endpoint staleness is already detected from safe-head progress, while
+  a pool-only outage is an explicitly accepted economic residual. Reintroduce
+  an expiry gate only with an independently derived economic bound and action,
+  not by borrowing the L1 liveness threshold. The telemetry this entry leans
+  on is production-write-only (finding 31).
+
+From the 2026-09-03 branch stock-take (three refuters per proposal; full
+reasoning in the [ledger](2026-09-03-branch-stocktake.md)):
+
+- **`Workers` on a `JoinSet` fed by the shutdown waiters** — `from_select`
+  and `from_shutdown` deliberately read a worker's clean `Ok(())` two ways
+  (live: stopped unexpectedly; drain: graceful); one set collapses them and a
+  silently dead lane becomes exit 0. Evidence: `commands/error.rs:606-627`,
+  `commands/run/workers.rs:339-390`. The `swap_remove` hazard is real; a
+  cleanup-only set built inside `finish`, with the live race untouched, was
+  not examined.
+- **Collapsing `PreparedRuntime` into an `async fn boot`** —
+  `fn launch(self, RuntimeAdmission) -> Workers` is non-async and non-`Result`,
+  so `?` and `.await` after admission are compile errors today; `boot` makes
+  them legal and the witness degenerates. Evidence: `workers.rs:288`,
+  `recovery/mod.rs:477-483`; 02a2b34 stopped here deliberately.
+- **Making the `Authorized` token "uniform" by demoting the `/tx` 200 gate
+  to a bool** — the 200 body is the acknowledgement leaving the process;
+  `LeasedDumpBody` does not exist and `finalized_inclusion_block` has no
+  streaming primitive. Evidence: `ingress/api.rs:84-92`,
+  `egress/api/snapshot.rs:101-120,214`. The doc tightening survives (finding
+  25).
+- **Deleting the `#[from]` impls so a refusal reason cannot be typed into a
+  retry** — the enums are public with public variants; the longer spelling
+  still compiles and is the dominant idiom at all 15 sites. Evidence:
+  `recovery/mod.rs:45-49,109-115`.
+- **One `is_terminal()` on `VerifiedSignerProviderError` read by both
+  tables** — the `From` impl performs no classification; the verdict is taken
+  later over `BootstrapError`, whose variants have four other producers.
+  Evidence: `commands/error.rs:671-683,216-260`; `l1/reader.rs:96-104`
+  already documents the phase pair.
+- **Flattening `RecoveryError` into one enum with `is_retryable()`** —
+  `RecoveryFailure::Provider(String)` carries two verdicts, so a total
+  function over the value does not exist. Evidence: `recovery/mod.rs:429-438`.
+  Splitting the variant is a separate, sound fix (finding 27).
+- **Moving the phase→progress mapping into `drive_recovery`** — `(Flush,
+  Done)` has no target without the observed block; this is
+  `PhaseCompletion`/`transition_after_phase`, deleted by ed41f9b. Deleting
+  `RecoveryDriver::admitted` survives.
+- **Merging `FeeOracleMisconfig`/`FeeOracleFatal` and
+  `ChainIdRpc`/`DetectionNonceRead`** — bare-string producers at
+  `commands/setup/mod.rs:144,171` would misattribute an operator mistake in
+  the black box; the second merge demotes a compile-forced classification to a
+  string discriminant (refuted twice on 2026-08-23).
+- **A `TerminalityOf` trait for `WorkerStop`** — admits the same wrong
+  classification as `|_| false`, installs a crate-wide answer for `io::Error`
+  that `dump_info.rs:49-58` contradicts, trips `private_bounds` under
+  `-D warnings`, and splits an inherent convention across eight types.
+- **Wiring `check-admission` into CI as one line, and pruning three
+  "duplicate" settle actions** — no Nix or `.envrc` is tracked and `just` is
+  absent from the `rust` job; TLC checks the spec against itself; the actions
+  are state-neutral but `InspectRetry` encodes a recorded commitment. A
+  properly pinned standalone `formal` job survives as a proposal.
+- **A sequencer-owned `AppWithProgress<A>` wrapper replacing the progress
+  capabilities** — the pair lives inside the canonical SSZ bytes the watchdog
+  byte-compares and the canonical machine advances it inside its own
+  transition; cockroach recovery reads the clock from a dump into a wiped
+  database. Evidence: `examples/app-core/src/wallet_snapshot.rs:41-42`,
+  `commands/setup/mod.rs:433-451`. Record the composition in the application
+  contract (jury-confirmed as a do-not-adopt).
 
 Also standing, from the same reviews: the **do-not-simplify list** now
 lives beside the invariants it protects
