@@ -271,6 +271,9 @@ InitialSyncCompleted ==
         CompletePhase(Inspecting, nextDanger, hasOpenTip,
                       NoPostFlushView, FALSE)
 
+(* `hasOpenTip' = TRUE` is an enforced postcondition, not an assumption:
+ * `ensure_open_tip_for_recovery` re-reads the Tip inside its own transaction
+ * and refuses rather than commit without one (storage/recovery.rs). *)
 EnsureOpenTipCompleted ==
     /\ controller = EnsureOpenTip
     /\ CompletePhase(Repaired, Safe, TRUE, NoPostFlushView, FALSE)
