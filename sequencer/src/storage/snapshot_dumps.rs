@@ -121,17 +121,23 @@ impl Drop for LeaseGuard {
 }
 
 /// A leased dump: the data the egress handler needs, plus an armed release.
-/// Returned by [`Storage::acquire_finalized_lease`] /
-/// [`Storage::acquire_latest_snapshot_lease`] — you cannot obtain the data
-/// without the guard, so there is no code path with a held lease and no armed
-/// release. `inclusion_block` is `Some` for the finalized snapshot, `None` for
-/// the latest pending.
+/// Returned by [`Storage::acquire_finalized_lease`] (inside a
+/// [`FinalizedLease`]) and [`Storage::acquire_latest_snapshot_lease`] — you
+/// cannot obtain the data without the guard, so there is no code path with a
+/// held lease and no armed release.
 pub struct LeasedDump {
     pub prefix: PathBuf,
     pub l2_tx_index: u64,
     pub executed_input_count: ExecutedInputCount,
-    pub inclusion_block: Option<u64>,
     pub guard: LeaseGuard,
+}
+
+/// The finalized snapshot's lease: the leased dump plus the inclusion block
+/// its row carries. The column is `NOT NULL` at the engine, so the value is
+/// never optional here; the latest-snapshot lease carries no block.
+pub struct FinalizedLease {
+    pub inclusion_block: u64,
+    pub dump: LeasedDump,
 }
 
 impl Storage {
@@ -299,36 +305,38 @@ impl Storage {
         &mut self,
         schedule: ReleaseScheduler,
         report_persistent_failure: PersistentReleaseFailureReporter,
-    ) -> Result<Option<LeasedDump>> {
+    ) -> Result<Option<FinalizedLease>> {
         let path = self.path.clone();
         let acquired = self.write(|tx| {
-            let Some(f) = finalized_dump_in(tx)? else {
+            let Some(finalized) = finalized_dump_in(tx)? else {
                 return Ok(None);
             };
-            let dump_id = f.dump.id;
-            acquire_dump_lease_in(tx, dump_id)?;
-            Ok(Some((
-                f.dump,
-                f.l2_tx_index,
-                f.executed_input_count,
-                Some(f.inclusion_block),
-            )))
+            acquire_dump_lease_in(tx, finalized.dump.id)?;
+            Ok(Some(finalized))
         })?;
 
         Ok(acquired.map(
-            |(dump, l2_tx_index, executed_input_count, inclusion_block)| LeasedDump {
-                prefix: dump.prefix,
-                l2_tx_index,
-                executed_input_count,
+            |FinalizedDump {
+                 dump,
+                 inclusion_block,
+                 l2_tx_index,
+                 executed_input_count,
+             }| FinalizedLease {
                 inclusion_block,
-                // Arm the release only after `Storage::write` has committed the
-                // increment. A failed COMMIT rolls back the lease and must not
-                // schedule a decrement for a lease that never existed.
-                guard: LeaseGuard {
-                    path,
-                    dump_id: dump.id,
-                    schedule,
-                    report_persistent_failure,
+                dump: LeasedDump {
+                    prefix: dump.prefix,
+                    l2_tx_index,
+                    executed_input_count,
+                    // Arm the release only after `Storage::write` has committed
+                    // the increment. A failed COMMIT rolls back the lease and
+                    // must not schedule a decrement for a lease that never
+                    // existed.
+                    guard: LeaseGuard {
+                        path,
+                        dump_id: dump.id,
+                        schedule,
+                        report_persistent_failure,
+                    },
                 },
             },
         ))
@@ -336,8 +344,8 @@ impl Storage {
 
     /// Atomically read the snapshot to serve (latest pending, else finalized)
     /// AND lease its dump, returning it bundled with an armed release. Same
-    /// contract as [`Storage::acquire_finalized_lease`]; `inclusion_block` is
-    /// `None` (the `/latest_snapshot` consumer doesn't use it).
+    /// contract as [`Storage::acquire_finalized_lease`], without the
+    /// inclusion block (the `/latest_snapshot` consumer has no use for it).
     pub fn acquire_latest_snapshot_lease(
         &mut self,
         schedule: ReleaseScheduler,
@@ -358,7 +366,6 @@ impl Storage {
                 prefix: dump.prefix,
                 l2_tx_index,
                 executed_input_count,
-                inclusion_block: None,
                 // See `acquire_finalized_lease`: the guard owns a release only
                 // after the matching increment is durable.
                 guard: LeaseGuard {
@@ -778,7 +785,7 @@ mod tests {
 
     use crate::storage::{ExecutedInputCount, LifecycleCommand, Storage, test_helpers::temp_db};
 
-    use super::{DumpRow, FinalizedDump, LeaseGuard, PendingDump};
+    use super::{DumpRow, FinalizedDump, FinalizedLease, LeaseGuard, PendingDump};
 
     fn prefix(n: u64) -> PathBuf {
         PathBuf::from(format!("/data/dumps/{n}"))
@@ -1365,8 +1372,12 @@ mod tests {
             .acquire_finalized_lease(Arc::new(inline), noop_reporter())
             .unwrap()
             .expect("a finalized snapshot exists");
+        let FinalizedLease {
+            inclusion_block,
+            dump: leased,
+        } = leased;
         assert_eq!(leased.prefix, prefix(0));
-        assert_eq!(leased.inclusion_block, Some(100));
+        assert_eq!(inclusion_block, 100);
         assert_eq!(leased.l2_tx_index, 5);
         assert_eq!(
             storage.dump_lease_count(id_a).unwrap(),
@@ -1451,7 +1462,6 @@ mod tests {
             .expect("a snapshot exists");
         assert_eq!(leased.prefix, prefix(1), "prefers the latest pending");
         assert_eq!(leased.l2_tx_index, 9);
-        assert_eq!(leased.inclusion_block, None, "latest carries no block");
 
         // Clear pending so the leased dump is unreferenced; the held lease
         // still blocks GC.
