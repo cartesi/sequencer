@@ -13,6 +13,7 @@
 
 use thiserror::Error;
 
+use crate::commands::config::key_file_io_is_terminal;
 use crate::ingress::inclusion_lane::{
     InclusionLaneError, dump_info::referenced_artifact_io_is_terminal,
 };
@@ -221,6 +222,9 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         BootstrapError::OpenStorage(source) if is_persistent_storage_open_error(source) => {
             CommandFailureVerdict::Terminal
         }
+        BootstrapError::KeyFile { source, .. } if key_file_io_is_terminal(source) => {
+            CommandFailureVerdict::Terminal
+        }
         BootstrapError::Flush(source) if source.is_terminal_invariant() => {
             CommandFailureVerdict::Terminal
         }
@@ -262,7 +266,9 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         // checkpoint. Distinct from the auto-recovery class (10) — a plain
         // restart re-refuses; only wipe + `setup --recovery` resolves it.
         BootstrapError::SetupRefuse(_) => CommandFailureVerdict::SetupRecoveryRequired,
-        BootstrapError::OpenStorage(_) => CommandFailureVerdict::Unclassified,
+        BootstrapError::OpenStorage(_) | BootstrapError::KeyFile { .. } => {
+            CommandFailureVerdict::Unclassified
+        }
     }
 }
 
@@ -305,6 +311,18 @@ pub enum BootstrapError {
     /// share (recovery, setup, and flush previously disagreed).
     #[error("signer provider misconfiguration: {message}")]
     SignerMisconfig { message: String },
+    /// The batch-submitter key file could not be read. Classified by kind
+    /// (`config::key_file_io_is_terminal`): a missing, unreadable, or
+    /// malformed file is deterministic operator misconfiguration — terminal,
+    /// like [`Self::SignerMisconfig`] for bad key *content* — while an
+    /// environmental I/O failure stays operational. The message names the
+    /// path and never the contents.
+    #[error("batch-submitter key file {path:?} could not be read: {source}")]
+    KeyFile {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// Startup recovery (or refusal) failed before runtime workers started.
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
@@ -921,6 +939,26 @@ mod tests {
             .exit_code(),
             EXIT_TERMINAL
         );
+        // A key file that is missing, unreadable, not a file, or not text is
+        // the same operator mistake as bad key content one call later, and
+        // must not differ from it by 29 in the exit code.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::IsADirectory,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            assert_eq!(
+                CommandError::Bootstrap(BootstrapError::KeyFile {
+                    path: "/etc/sequencer/submitter.key".into(),
+                    source: std::io::Error::from(kind),
+                })
+                .exit_code(),
+                EXIT_TERMINAL,
+                "{kind:?} on the key file is deterministic misconfiguration"
+            );
+        }
         // A deterministic signer-construction misconfig (bad RPC URL or
         // private key) classifies terminal in every command, matching the
         // ChainIdMismatch precedent; setup/flush previously projected it
@@ -1208,6 +1246,24 @@ mod tests {
             CommandError::Io(std::io::Error::other("boom")).exit_code(),
             EXIT_UNCLASSIFIED
         );
+        // An environmental read failure on the key file (a device or memory
+        // error, not a wrong path) may clear on restart, so it must not
+        // consume the do-not-restart code. EIO is the kind the OS actually
+        // returns (decoded as `Uncategorized`); `other` is the synthetic one.
+        for source in [
+            std::io::Error::from_raw_os_error(5),
+            std::io::Error::other("input/output error"),
+        ] {
+            assert_eq!(
+                CommandError::Bootstrap(BootstrapError::KeyFile {
+                    path: "/etc/sequencer/submitter.key".into(),
+                    source,
+                })
+                .exit_code(),
+                EXIT_UNCLASSIFIED,
+                "a device error on the key file may clear on restart"
+            );
+        }
         assert_eq!(
             CommandError::ReferencedSnapshotArtifact {
                 path: "/durable/snapshot".into(),

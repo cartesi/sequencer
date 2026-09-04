@@ -50,7 +50,9 @@ fn preflight_lifecycle_command(
 /// Verdict-neutral black-box settlement: when the command ended terminal,
 /// record its cause best-effort. Telemetry must never change a verdict — a
 /// failed record loses only the black-box copy, and the exit code and logs
-/// still carry it.
+/// still carry it. Failures raised before a command's bracket (the
+/// admission preflight, identity, the key file) return before this write
+/// and leave only the exit code and logs.
 pub(crate) fn record_terminal_fault_best_effort(
     db_path: &str,
     command: LifecycleCommand,
