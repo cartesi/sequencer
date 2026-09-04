@@ -17,10 +17,13 @@ use rusqlite::{Result, params};
 use super::Storage;
 use super::convert::{external_u64_to_i64, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
 use super::mutations::{batch_tree_anchor_in, set_batch_tree_anchor_in};
-use super::queries::{current_safe_block_required, decode_l2_tx_row};
+use super::queries::current_safe_block_required;
+#[cfg(test)]
+use super::queries::decode_l2_tx_row;
 use super::safe_accepted_batches::frontier_nonce;
 use super::{FrameHeader, PendingBatch, SubmitterFrontier};
 use sequencer_core::batch::{Batch, Frame as BatchFrame, WireUserOp};
+#[cfg(test)]
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
@@ -93,8 +96,9 @@ impl Storage {
     }
 
     /// Highest valid (non-invalidated) `batch_index`, or `None` if no valid
-    /// batches exist. The open batch is included.
-    pub fn latest_batch_index(&mut self) -> Result<Option<u64>> {
+    /// batches exist. The open batch is included. Test-only.
+    #[cfg(test)]
+    pub(crate) fn latest_batch_index(&mut self) -> Result<Option<u64>> {
         let value: Option<i64> =
             self.conn
                 .query_row("SELECT MAX(batch_index) FROM valid_batches", [], |row| {
@@ -124,9 +128,14 @@ impl Storage {
         frames_for_batch_in(&self.conn, batch_index)
     }
 
-    /// Materialize all sequenced L2 txs in one batch (used by the catch-up /
-    /// per-batch replay paths). Returns `[]` for invalidated batches.
-    pub fn ordered_l2_txs_for_batch(&mut self, batch_index: u64) -> Result<Vec<SequencedL2Tx>> {
+    /// Materialize all sequenced L2 txs in one batch. Returns `[]` for
+    /// invalidated batches. Test-only: production replay pages the valid
+    /// stream by offset, never per batch.
+    #[cfg(test)]
+    pub(crate) fn ordered_l2_txs_for_batch(
+        &mut self,
+        batch_index: u64,
+    ) -> Result<Vec<SequencedL2Tx>> {
         const SQL: &str = "
             SELECT
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END AS kind,

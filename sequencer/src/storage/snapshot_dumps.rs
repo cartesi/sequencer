@@ -179,7 +179,8 @@ impl Storage {
     /// drain, and canonical attribution commit atomically. A separate
     /// promotion could commit ahead of the drain and wedge a restart on a
     /// deleted pending row.
-    pub fn promote_finalized(&mut self, max_nonce: u64, inclusion_block: u64) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn promote_finalized(&mut self, max_nonce: u64, inclusion_block: u64) -> Result<()> {
         self.write(|tx| promote_finalized_in(tx, max_nonce, inclusion_block))
     }
 

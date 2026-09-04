@@ -25,8 +25,9 @@ aren't. Section references point to the full reasoning below.
   at cold start). Absence is a bug, surfaced fail-loud as
   `CatchUpError::NoSnapshot` — never a branch the happy path handles. (§2)
 - **Tip exists before the lane.** A valid open Tip exists when the lane starts:
-  `ensure_open_tip` opens the genesis Tip on a fresh DB (after recovery's safe-head
-  sync, before the lane); recovery reopens it atomically across cascades. The lane
+  the reducer's guarded `EnsureOpenTip` phase opens the genesis Tip on a fresh
+  DB (after the initial safe-head sync, before the lane); recovery reopens it
+  atomically across cascades. The lane
   loads the resulting head from storage (fail-loud if absent), so it only ever
   *loads* — it never branches on tip existence or initializes one. (§7)
 - **A committed promotion implies an advanced drain.** Promotion is folded into
