@@ -109,21 +109,24 @@ valid.
     Return a typed `refuse` (exit 30 — not a `debug_assert`, not
     `StaleDecision`) after `open_fresh_tip_in_tx` in the guarded phase, or make
     the reducer arm a terminal `Refuse`. Jury-confirmed 2–1.
-24. **A contained run writes two `terminal_faults` rows** — the in-scope
-    recorder's raw cause, then the bracket's prefixed cause;
-    `latest_terminal_fault` returns the second. Document the shape (recorder,
-    ADR, runbook); do not dedupe by variant — the recorder swallows its own
-    failures, so the bracket write is a genuine retry. Jury-confirmed.
+24. **Closed** (2026-09-04): the in-scope recorder is deleted, so a
+    contained run writes exactly one `terminal_faults` row — the command
+    bracket's, at settlement. Containment writes nothing durable. The
+    accepted loss, stated in the runbook: any death before settlement (an
+    abort at the two-second deadline, a controller panic, SIGKILL) leaves
+    only the process logs, and the single write has no second attempt. The
+    row is telemetry; restart policy is the exit code.
 25. **Closed** (2026-09-03): the token's doc, the ADR, and the settled
     entry state its true scope (three compile-forced primitives; the rest
     hand-placed); "non-clone" became "boot-local"; the witness comment names
     every holder; the "journal", "acknowledge", and `DangerDetectorExit`
     remnants are gone.
-26. **`finalized_state` handles an impossible `None`** — `LeasedDump` is
-    shared between the finalized and latest lease queries, so the `NOT NULL`
-    `inclusion_block` arrives as an `Option` and a `None` escalates to
-    containment (`egress/api/snapshot.rs`). Give the finalized lease its own
-    non-optional type and delete the branch. Verified first-hand; no jury.
+26. **Closed** (2026-09-04): `acquire_finalized_lease` returns its own
+    `FinalizedLease { inclusion_block: u64, dump: LeasedDump }`, so the
+    `NOT NULL` column is no longer an `Option` and the impossible-`None`
+    containment branch in `finalized_state` is gone. Corrupt-row containment
+    is unchanged (the persistent-storage classifier and the decode panic, as
+    `corrupt_finalized_snapshot_trips_terminal_storage_fault` pins).
 27. **`RecoveryFailure::Provider(String)` carries two verdicts** — the
     startup flush maps `ChainIdRpc` → retry and `Create` → refuse into one
     variant, and nothing pins either arm; `classify_input_reader` has no doc

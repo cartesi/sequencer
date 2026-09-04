@@ -140,10 +140,10 @@ impl Storage {
         Ok(())
     }
 
-    /// Best-effort terminal-cause record. Deliberately gated on nothing —
-    /// not even divergence — because the recorder runs inside containment and
-    /// must never be the reason a cause goes unrecorded. Restart policy is
-    /// the exit-code contract, not this row.
+    /// Best-effort terminal-cause record, written by the command bracket at
+    /// settlement. Deliberately gated on nothing — not even divergence —
+    /// because a refused write must never be the reason a cause goes
+    /// unrecorded. Restart policy is the exit-code contract, not this row.
     pub(crate) fn record_terminal_fault(
         &mut self,
         command: LifecycleCommand,
@@ -163,7 +163,8 @@ impl Storage {
     }
 
     /// The most recent black-box row, or `None` when no terminal fault was
-    /// ever recorded. Operator/postmortem surface; nothing branches on it.
+    /// ever recorded. Read once at `run` startup for a warning line and by
+    /// operators for postmortems; nothing branches on it.
     pub fn latest_terminal_fault(&self) -> Result<Option<TerminalFault>, LifecycleError> {
         let row = self
             .conn
@@ -351,7 +352,7 @@ mod tests {
                 LifecycleCommand::Run,
                 "persistent storage invariant violation",
             )
-            .expect("the containment recorder must always be able to write");
+            .expect("the settlement write must never be refused");
         let fault = storage
             .latest_terminal_fault()
             .expect("read")

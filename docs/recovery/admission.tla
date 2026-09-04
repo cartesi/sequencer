@@ -15,7 +15,8 @@
  * Admission gating is fact-derived: there is no
  * lifecycle admission state machine and no acknowledgement step, and no
  * durable per-attempt record gates anything (the
- * terminal-fault black box is write-only telemetry outside this model).
+ * terminal-fault black box is non-gating telemetry outside this model,
+ * written at settlement and read only for a boot warning).
  * Settlement and crash both end the attempt, and the next boot begins fresh
  * over whatever facts persist. Divergence and danger facts are durable and
  * survive attempts; everything else is boot-local.
@@ -364,7 +365,7 @@ PrepareRefuse ==
 (* Crash destroys PreparedRuntime, the RuntimeAdmission witness, and session
  * witnesses.
  * Nothing durable gates the next boot (the terminal-fault black box
- * is write-only telemetry), so a restart is simply a fresh attempt over the
+ * is non-gating telemetry), so a restart is simply a fresh attempt over the
  * surviving durable facts. Modeled as returning directly to the pre-begin
  * shape with facts unchanged. *)
 

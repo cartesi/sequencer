@@ -127,7 +127,7 @@ impl CommandFailureVerdict {
 }
 
 impl CommandError {
-    /// Classify this failure once for both the black-box recorder and the
+    /// Classify this failure once for both the black-box settlement write and the
     /// supervisor-facing projection.
     pub(crate) fn failure_verdict(&self) -> CommandFailureVerdict {
         match self {

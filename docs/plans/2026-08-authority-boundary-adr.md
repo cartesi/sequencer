@@ -55,8 +55,8 @@ Four mechanisms, each solving a different problem:
 Every command acquires the OS-held exclusive data-directory lock before
 inspection (`runtime/process_lock.rs`). For `run`, ownership transfers into a
 `RuntimeScope` shared by all runtime-owned data-directory work: the lock,
-terminal abort watchdog, containment authority, and fault recorder in one
-capability, constructible only from a held lock. The pure notification half
+terminal abort watchdog, and containment authority in one capability,
+constructible only from a held lock. The pure notification half
 is the slim `ShutdownSignal`. `RuntimeScope::authorize()` mints the
 borrow-scoped `Authorized` token that three effect functions require in
 their signatures — the user-op acknowledgement, the L1 send, and the WS

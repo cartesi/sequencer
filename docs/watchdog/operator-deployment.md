@@ -385,14 +385,18 @@ unclassified restart-with-backoff. Operational notes:
   `lastState.terminated.exitCode == 30` (and on signal exits / 134).
 - **A terminal containment that cannot drain within two seconds exits via
   `abort()` (SIGABRT, status 134), not code 30.** Treat 134 from the
-  sequencer as terminal-class; the cause is in the logs and in the
-  `terminal_faults` black box when the write got through.
+  sequencer as terminal-class. The cause is in the process logs only:
+  containment writes nothing durable, and the black box's row is written at
+  settlement, after the drain — which the abort pre-empts by definition.
 - **After an unclean death (OOM, node reboot, SIGKILL) no action is
   needed**: the next start re-derives everything from facts. For
-  postmortems, the `terminal_faults` table records every terminal cause
+  postmortems, the `terminal_faults` table records the cause of every
+  command that returned through its bracket with a terminal verdict
   (best-effort, append-only, traveling with the data directory —
-  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`); an unclean
-  death that never reached containment leaves only the process logs.
+  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`; the next `run`
+  also logs the latest row once at startup). Any death that did not return
+  through the bracket — SIGKILL, OOM, a node reboot, the two-second abort,
+  a controller panic — leaves only the process logs.
 - **Canonical divergence is the one manual path**: the sequencer freezes
   the acceptance frontier, refuses all commands, and the remedy is a
   fresh-directory `setup --recovery` (cockroach). You will typically learn

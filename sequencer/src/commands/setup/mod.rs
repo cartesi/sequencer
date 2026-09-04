@@ -401,7 +401,7 @@ fn settle_setup_lifecycle(
             Ok(())
         }
         Err(_) => {
-            // Verdict-neutral black-box settlement: the recorder never
+            // Verdict-neutral black-box settlement: the write never
             // replaces the command's own error.
             crate::commands::record_terminal_fault_best_effort(db_path, command, result);
             Ok(())

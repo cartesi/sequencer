@@ -477,9 +477,9 @@ Models local-first inspection, typed Retry/Refuse, InitialSync, EnsureTip,
 RecoverTip, Flush/Sync/Cascade with ephemeral witnesses, Sync-discovered
 divergence, mandatory reinspection after every completed phase,
 crash-and-restart as a fresh attempt over surviving durable facts (nothing
-durable gates the next boot; the terminal-fault black box is
-write-only telemetry outside the model, and there is no acknowledgement
-action), and atomic minting of the `RuntimeAdmission` witness from the
+durable gates the next boot; the terminal-fault black box is non-gating
+telemetry outside the model — written at settlement, read only for a boot
+warning — and there is no acknowledgement action), and atomic minting of the `RuntimeAdmission` witness from the
 final clean decision. It abstracts away the batch spine and delegates every phase's
 batch mechanics to `preemptive.tla`.
 

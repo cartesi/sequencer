@@ -28,7 +28,7 @@ use crate::commands::config::RunConfig;
 use crate::commands::error::CommandError;
 use crate::commands::{
     INPUT_READER_POLL_INTERVAL, load_setup_identity, preflight_lifecycle_command,
-    record_terminal_fault_best_effort, verify_submitter_key,
+    record_terminal_fault_best_effort, verify_submitter_key, warn_on_previous_terminal_fault,
 };
 use crate::l1::L1Config;
 use crate::l1::reader::{InputReader, InputReaderConfig};
@@ -58,6 +58,7 @@ where
     // Local absorbing facts are inspected before identity/key checks and any
     // RPC: canonical divergence and the two-sided setup-completion rule.
     // Divergence is never reinterpreted as a provider failure.
+    warn_on_previous_terminal_fault(&db_path);
     preflight_lifecycle_command(&db_path, LifecycleCommand::Run)?;
     let identity = load_setup_identity(&db_path)?;
 
