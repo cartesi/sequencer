@@ -17,7 +17,7 @@ use alloy::rpc::types::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, U256};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::l1::eip1559::{estimate_fees, pad_gas_estimate};
 use crate::l1::watermark::{
@@ -234,8 +234,10 @@ impl MempoolFlusher {
                 );
             } else {
                 // Retry after a previous timeout — re-print status so operators
-                // see the current state without scrolling back.
-                error!(
+                // see the current state without scrolling back. A warning: the
+                // finality wait timing out and resubmitting is the flush's
+                // ordinary rhythm, not a fault.
+                warn!(
                     attempt,
                     safe_nonce,
                     pending_nonce,
