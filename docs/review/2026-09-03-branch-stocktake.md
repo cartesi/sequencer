@@ -71,6 +71,11 @@ read-only reviewers before landing:
   refuses inside its own transaction rather than commit without a Tip
   (`TipMissingAfterOpen`, exit 30); `drive_recovery`'s doc records the
   ≤5-phase bound. Closes findings 20 and 23.
+- **Workers that only need to stop take the notification half**: the
+  detector, reader, and fee oracle take `ShutdownSignal` and hold their
+  own `ProcessLock`; the lane, server, and submitter keep the scope. Their
+  tests use a bare signal instead of a leaked-tempdir scope. The doc claims
+  that every worker held a scope clone are restated. Closes finding 22.
 
 Not yet landed from the recommended split: the PR title/body, which come
 last.
