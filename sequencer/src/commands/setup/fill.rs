@@ -227,10 +227,10 @@ mod tests {
 
     impl CountedSweepTestApp {
         fn new(executed_input_count: u64) -> Self {
-            Self(ApplicationProgress::new(
-                ExecutedInputCount::new(executed_input_count),
-                0,
-            ))
+            Self(
+                ApplicationProgress::try_new(ExecutedInputCount::new(executed_input_count), 0)
+                    .expect("coherent progress"),
+            )
         }
     }
 
@@ -282,10 +282,10 @@ mod tests {
             let count = u64::from_le_bytes(bytes[..8].try_into().expect("eight-byte count"));
             let safe_block =
                 u64::from_le_bytes(bytes[8..].try_into().expect("eight-byte safe block"));
-            Ok(Self(ApplicationProgress::new(
-                ExecutedInputCount::new(count),
-                safe_block,
-            )))
+            Ok(Self(
+                ApplicationProgress::try_new(ExecutedInputCount::new(count), safe_block)
+                    .expect("coherent progress"),
+            ))
         }
 
         fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
