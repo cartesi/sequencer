@@ -98,7 +98,7 @@ impl WalletApp {
     ///
     /// The progress pair comes from untrusted dump bytes, so an incoherent
     /// pair is a typed decode error like every other corrupt-snapshot case —
-    /// not a panic escaping `from_dump`'s `Result` (D10).
+    /// not a panic escaping `from_dump`'s `Result`.
     pub(crate) fn from_snapshot_parts(
         config: WalletConfig,
         balances: HashMap<Address, U256>,

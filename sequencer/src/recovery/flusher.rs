@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(
             derive_timeouts(1),
             (Duration::from_secs(10), Duration::from_secs(1)),
-            "minimum accepted block time (H8: CARTESI_SEQUENCER_SECONDS_PER_BLOCK >= 1)",
+            "minimum accepted block time (CARTESI_SEQUENCER_SECONDS_PER_BLOCK >= 1)",
         );
     }
 

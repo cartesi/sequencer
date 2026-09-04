@@ -408,7 +408,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
         "expected bad-request error code, got: {body}"
     );
 
-    //  / H2 regression: the message must come from the fixed taxonomy
+    // Regression: the message must come from the fixed taxonomy
     // ("invalid JSON"), NOT reflect serde's line/column/token excerpt. The
     // malformed input contains the token `0x1234` — assert it doesn't appear
     // in the response body so no attacker-submitted bytes are echoed.
@@ -426,7 +426,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_missing_content_type_with_fixed_message() {
-    //  / H2 regression: missing Content-Type must produce a fixed
+    // Regression: missing Content-Type must produce a fixed
     // `"missing content type"` message, not reflect any part of the request.
     let db = temp_db("missing-content-type");
     let domain = test_domain();
@@ -534,7 +534,7 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
-    //  / H2 regression: a body that is valid JSON but missing required
+    // Regression: a body that is valid JSON but missing required
     // fields must respond with the fixed `"invalid JSON"` envelope. The
     // response must not echo serde's deserialization error text — that would
     // leak our internal field names and parser internals to callers.

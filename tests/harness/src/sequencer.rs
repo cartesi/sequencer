@@ -30,13 +30,13 @@ const DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// coupled while still advancing Anvil's `safe` tag well within the recovery
 /// readiness window.
 const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_secs(1);
-/// Readiness budget for a *recovery* boot (mining-during-boot enabled). The WP2
+/// Readiness budget for a *recovery* boot (mining-during-boot enabled). The startup
 /// mempool flush polls `get_transaction_count(Safe)` once per L1 block time
 /// (`safe_poll_interval = seconds_per_block`, 12 s here), so it cannot resolve
 /// the stranded slot in under one poll cycle — well past the 10 s normal-boot
 /// budget. Allow several cycles of slack so a recovery boot has room to flush,
-/// cascade, and come up. Recovery boots are legitimately slow (review R4 class
-/// 10); this is the harness counterpart to that.
+/// cascade, and come up. Recovery boots are legitimately slow (exit-code class
+/// 10: restart and expect recovery); this is the harness counterpart to that.
 const RECOVERY_BOOT_START_TIMEOUT: Duration = Duration::from_secs(45);
 const DEFAULT_SEQUENCER_RUST_LOG: &str = "info";
 pub const DEFAULT_DEVNET_SEQUENCER_BIN: &str = "target/debug/wallet-sequencer-devnet";
@@ -299,10 +299,10 @@ impl ManagedSequencer {
     ///
     /// Why this exists: a *recovery* boot whose persisted state names a wallet
     /// nonce that L1 never accepted — e.g. a batch-submission tx was dropped
-    /// from the mempool ([`Self::drop_all_pending_txs`]) — runs the WP2 mempool
+    /// from the mempool ([`Self::drop_all_pending_txs`]) — runs the mempool
     /// flush during startup. The flush submits a no-op at the stranded nonce
     /// slot and blocks until that slot becomes *safe* (`safe_nonce >=
-    /// watermark + 1`, review R1a). Re-enabling auto-mining is not enough:
+    /// watermark + 1`, I14). Re-enabling auto-mining is not enough:
     /// auto-mining lands the no-op tx but mints no *further* blocks, so Anvil's
     /// `safe` tag never advances past it and the flush waits until the boot
     /// hits the readiness timeout. In production the chain keeps producing
@@ -580,7 +580,7 @@ impl ManagedSequencer {
         Ok(anchor as u64)
     }
 
-    /// The canonical-divergence marker (review R2/I15) from the run DB, or `None`
+    /// The canonical-divergence marker (I9/I15) from the run DB, or `None`
     /// when the frontier is healthy. A recovery/resync e2e asserts this is `None`
     /// to prove the content-identity check did NOT spuriously freeze the frontier
     /// (e.g. a false-positive against below-anchor collapsed history) — otherwise
@@ -1403,7 +1403,7 @@ async fn spawn_sequencer_process(
     })?;
 
     if mine_l1_during_boot {
-        // A recovery boot blocks in the WP2 mempool flush until the stranded
+        // A recovery boot blocks in the mempool flush until the stranded
         // wallet-nonce slot becomes safe, which needs L1 to keep producing
         // blocks. On an on-demand-mining devnet nothing produces them, so mine
         // a trickle concurrently with the readiness wait — mirroring a live

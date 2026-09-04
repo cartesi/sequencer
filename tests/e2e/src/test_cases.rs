@@ -3036,7 +3036,7 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
     runtime.advance_wall_and_mine(PAST_STALE).await?;
 
     // Re-enable auto-mining AND mine L1 throughout the recovery boot. Startup
-    // recovery's WP2 flush submits a no-op at the stranded wallet-nonce slot
+    // recovery's mempool flush submits a no-op at the stranded wallet-nonce slot
     // and blocks until that slot is *safe* (`safe_nonce >= watermark + 1`).
     // Auto-mining alone lands the no-op but mints no further blocks, so Anvil's
     // `safe` tag never advances past it and the boot would hang; the boot miner
@@ -3922,7 +3922,7 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
     runtime.drop_all_pending_txs().await?;
 
     runtime.advance_wall_and_mine(PAST_STALE).await?;
-    // Re-enable auto-mining AND mine L1 throughout the recovery boot: the WP2
+    // Re-enable auto-mining AND mine L1 throughout the recovery boot: the mempool
     // flush submits a no-op at the stranded nonce-0 slot and waits for it to
     // become safe. Auto-mining lands the no-op but mints no further blocks, so
     // the boot miner supplies the steady block production needed to advance
