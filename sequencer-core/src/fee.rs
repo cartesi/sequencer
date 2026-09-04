@@ -225,7 +225,10 @@ pub fn log_fee_ratio(num: u64, denom: u64) -> i32 {
 fn fixed_mul(a: U256, b: U256) -> U256 {
     let product: U512 = a.widening_mul(b);
     let shifted = product >> FRAC_BITS;
-    // Truncate to U256 — panics via debug_assert if the result overflows.
+    // Truncate to U256: the high limbs are dropped without a check. Every
+    // caller's inputs are table entries or partial products for an exponent
+    // already bounded by `MAX_EXPONENT` in `fee_to_linear_fixed`, and partial
+    // products never exceed the final value, so the shifted product fits.
     U256::from_limbs_slice(&shifted.into_limbs()[..4])
 }
 
