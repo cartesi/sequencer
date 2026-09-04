@@ -3143,16 +3143,17 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
     // catches up. Allow a window for input-reader poll (~2 s) plus
     // detector poll (2 s) plus margin.
     let exit = runtime.wait_for_exit(Duration::from_secs(15)).await?;
-    assert!(
-        !exit.success(),
-        "sequencer must exit non-zero on `DangerStatus::TipInDanger` once the Tip's \
-         first frame ages past `danger_threshold`, got {exit:?}",
-    );
-    let detector_log = runtime.read_log_contents()?;
-    assert!(
-        detector_log.contains("status=TipInDanger("),
-        "runtime detector must report observed TipInDanger, not a clock fallback; log:\n\
-         {detector_log}",
+    // Exit 10 (`EXIT_RESTART_EXPECT_RECOVERY`) is the observed-danger class
+    // (`TipInDanger` / `ClosedBatchInDanger`); a clock fallback (`L1ViewStale`,
+    // `EstimatedBatchInDanger`) would exit 20. The scenario has no closed
+    // batch, so 10 here means the detector saw the aging Tip, not the
+    // future-dated L1 clock. The exit code is the contract; the rendered log
+    // line is not.
+    assert_eq!(
+        exit.code(),
+        Some(10),
+        "runtime detector must exit with the observed-danger class on \
+         `DangerStatus::TipInDanger`, not a clock fallback; got {exit:?}",
     );
 
     // No cascade fires on detector exit alone. The recovery happens at
