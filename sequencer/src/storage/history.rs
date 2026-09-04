@@ -198,8 +198,8 @@ pub(super) fn safe_input_floor_in(conn: &Connection) -> Result<u64> {
             // A NULL floor exists only during a pre-completion rebuild
             // fill: plain setup binds base 0 in its baseline transaction, and
             // completion refuses while the base is NULL — so the completion
-            // fact alone decides legality (the journal is never read for
-            // decisions; L2).
+            // fact alone decides legality (the black box is never read for
+            // decisions).
             let setup_complete: bool = conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM setup_complete WHERE singleton_id = 0)",
                 [],

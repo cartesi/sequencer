@@ -58,9 +58,12 @@ inspection (`runtime/process_lock.rs`). For `run`, ownership transfers into a
 terminal abort watchdog, containment authority, and fault recorder in one
 capability, constructible only from a held lock. The pure notification half
 is the slim `ShutdownSignal`. `RuntimeScope::authorize()` mints the
-borrow-scoped `Authorized` token that the externalization primitives (ack,
-L1 send, WS emit, snapshot-stream start) require — forgetting the
-containment consult is a compile error, not a convention.
+borrow-scoped `Authorized` token that three effect functions require in
+their signatures — the user-op acknowledgement, the L1 send, and the WS
+emit — so at those sites forgetting the containment consult is a compile
+error, not a convention. The snapshot-stream start, the `POST /tx` success
+body, and the lane's batch-close and reconciliation commits consult the same
+bit by hand, bounded by the exit contract.
 
 The lock is released only after every runtime-owned child has actually
 stopped; a dropped `JoinHandle` detaches rather than stops, so each worker

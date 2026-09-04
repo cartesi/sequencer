@@ -20,7 +20,7 @@
  * over whatever facts persist. Divergence and danger facts are durable and
  * survive attempts; everything else is boot-local.
  *
- * Flushed and PostFlushSynced abstract the non-clone session witnesses carried
+ * Flushed and PostFlushSynced abstract the boot-local session witnesses carried
  * by the Rust controller. They are ephemeral: crash, Retry, and Refuse erase
  * them, so another attempt must flush again before it can cascade.
  *)

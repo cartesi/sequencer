@@ -24,7 +24,7 @@
 //! `Workers` literal in `launch`, and the exhaustive `let Self { .. }`
 //! destructures in `select_first_exit` and `finish` — where a bound-but-
 //! unused field fails CI under `-D warnings`. Keep those destructures
-//! exhaustive (no `..`): they are the enforcement, not style.
+//! exhaustive (no `..`): they are the enforcement.
 
 use std::future::Future;
 use std::marker::PhantomData;
@@ -397,7 +397,7 @@ impl Workers {
     pub(super) async fn finish(self, first_exit: FirstExit) -> Result<(), CommandError> {
         match &first_exit {
             // Already contained by the raising component; its best-effort
-            // terminal-cause journal append was attempted there.
+            // terminal-cause black-box append was attempted there.
             FirstExit::Contained => {}
             FirstExit::Worker(exit) if exit.is_terminal() => {
                 // Log the typed exit here: the terminal return path below
@@ -677,7 +677,7 @@ async fn next_component_shutdown(
 /// The single post-cleanup containment check: if a terminal fault was
 /// contained anywhere (primary, cleanup, or a non-worker component), surface
 /// the terminal class. The cause is present whenever containment reads true
-/// (they are one `OnceLock`); recorder failure loses only the journal's
+/// (they are one `OnceLock`); recorder failure loses only the black box's
 /// telemetry copy of the cause, never the sticky in-process verdict or the
 /// terminal exit class.
 fn contained_verdict(shutdown: &RuntimeScope) -> Option<CommandError> {
@@ -1158,7 +1158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preparation_outliving_clean_facts_cannot_launch() {
+    async fn admission_refuses_when_facts_age_during_preparation() {
         let (_dir, _data_dir, db_path, workers_config) =
             startup_workers_config("127.0.0.1:0".to_string());
         let timing = workers_config.timing;
