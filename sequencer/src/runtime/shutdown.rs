@@ -7,9 +7,10 @@
 //!
 //! - [`RuntimeScope::contain_storage_invariant_failure`]: elect the first
 //!   reporter (CAS), set the sticky containment bit, arm the terminal abort
-//!   watchdog, request shutdown, then invoke the durable recorder (the
-//!   black box's terminal-cause row, installed at worker spawn). The watchdog
-//!   precedes both cancellation and recording because either may block.
+//!   watchdog, then request shutdown. The watchdog precedes cancellation
+//!   because a drain may block. Containment writes nothing durable: the
+//!   black box's terminal-cause row is written once, by the command bracket
+//!   at settlement, from the verdict `finish` returns.
 //! - [`ShutdownSignal::is_storage_invariant_contained`]: checked by
 //!   externalization sites (acks, L1 sends, WS frames, snapshot stream
 //!   starts) before emitting; set only by containment, so a missed check is
@@ -33,10 +34,6 @@ use tokio::sync::Notify;
 use super::process_lock::{ProcessLock, ProcessLockWitness};
 
 const TERMINAL_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Durable terminal-fault recorder installed at worker spawn (appends the
-/// black box's terminal-cause row).
-pub(crate) type FaultRecorder = Arc<dyn Fn(&str) + Send + Sync>;
 
 type AbortAction = Arc<dyn Fn() + Send + Sync>;
 
@@ -104,14 +101,6 @@ pub struct RuntimeScope {
     /// containment bit, so the bit and its cause become visible together —
     /// there is no window where containment reads true with no cause.
     first_containment_cause: Arc<std::sync::OnceLock<String>>,
-    /// Durable fault recorder (the black box's terminal-cause row), installed
-    /// once during runtime preparation. Invoked only after the containment
-    /// bit, watchdog, and shutdown request — recording can block, and no new
-    /// externalization may be authorized while it runs. Best-effort
-    /// telemetry: when it fails, the cause is still in the logs, the process
-    /// still exits terminal, and a persistent fault re-detects on the next
-    /// boot that reads it.
-    fault_recorder: Arc<std::sync::OnceLock<FaultRecorder>>,
     terminal_abort_watchdog: TerminalAbortWatchdog,
     /// Runtime-lifetime ownership. Every scope clone retains the lock;
     /// nested blocking tasks retain their own clone through
@@ -128,7 +117,6 @@ impl RuntimeScope {
         Self {
             signal: ShutdownSignal::default(),
             first_containment_cause: Arc::default(),
-            fault_recorder: Arc::default(),
             terminal_abort_watchdog: TerminalAbortWatchdog::production(process_lock.witness()),
             process_lock,
         }
@@ -143,7 +131,6 @@ impl RuntimeScope {
         Self {
             signal: ShutdownSignal::default(),
             first_containment_cause: Arc::default(),
-            fault_recorder: Arc::default(),
             terminal_abort_watchdog: TerminalAbortWatchdog {
                 runtime_lifetime: process_lock.witness(),
                 timeout,
@@ -177,9 +164,9 @@ impl RuntimeScope {
 
     /// Contain a persistent storage invariant failure: CAS-elect the first
     /// reporter, set the sticky containment bit, arm the terminal watchdog,
-    /// request shutdown, then invoke the durable recorder (the black box's
-    /// terminal-cause row, best-effort). Sync — callable from any thread,
-    /// async or blocking.
+    /// then request shutdown. Sync — callable from any thread, async or
+    /// blocking — and it touches no storage: the cause reaches the black box
+    /// through the command bracket's settlement write, not from here.
     ///
     /// This is containment, not recovery: the supervisor maps the contained
     /// state to the terminal exit class (30 — do not restart, page). A
@@ -192,23 +179,11 @@ impl RuntimeScope {
         if self.first_containment_cause.set(cause.into()).is_err() {
             return;
         }
-        // The independent watchdog must precede both cooperative cancellation
-        // and audit recording: either may block while runtime work retains the
-        // process-lifetime capability.
+        // The independent watchdog must precede cooperative cancellation: a
+        // drain may block while runtime work retains the process-lifetime
+        // capability.
         self.terminal_abort_watchdog.arm();
         self.request_shutdown();
-        if let Some(recorder) = self.fault_recorder.get() {
-            recorder(
-                self.first_containment_cause
-                    .get()
-                    .expect("cause was just installed by the elected reporter"),
-            );
-        }
-    }
-
-    /// Install the durable recorder (once; later installs are ignored).
-    pub(crate) fn set_fault_recorder(&self, recorder: FaultRecorder) {
-        let _ = self.fault_recorder.set(recorder);
     }
 
     /// Whether a terminal fault has been contained. Externalization sites
@@ -304,7 +279,6 @@ impl ShutdownSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     const TEST_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(25);
 
@@ -317,29 +291,20 @@ mod tests {
     }
 
     #[test]
-    fn containment_elects_first_reporter_and_closes_before_recording() {
+    fn containment_elects_first_reporter_and_requests_shutdown() {
         let signal = RuntimeScope::default();
-        let recorded: Arc<Mutex<Vec<String>>> = Arc::default();
-        signal.set_fault_recorder({
-            let signal_view = signal.clone();
-            let recorded = recorded.clone();
-            Arc::new(move |cause| {
-                // The bit must already be visible while the (possibly slow)
-                // durable recording runs: no new externalization is
-                // authorized during the lifecycle recorder write.
-                assert!(signal_view.is_storage_invariant_contained());
-                assert!(signal_view.is_shutdown_requested());
-                recorded.lock().unwrap().push(cause.to_string());
-            })
-        });
 
         assert!(!signal.is_storage_invariant_contained());
+        assert!(signal.authorize().is_some());
         signal.contain_storage_invariant_failure("first cause");
         signal.contain_storage_invariant_failure("second cause (echo)");
 
+        // The CAS elects exactly one reporter; echoes return immediately,
+        // and the bit, its cause, and the shutdown request are one step.
         assert!(signal.is_storage_invariant_contained());
-        // The CAS elects exactly one reporter; echoes return immediately.
-        assert_eq!(*recorded.lock().unwrap(), vec!["first cause".to_string()]);
+        assert!(signal.is_shutdown_requested());
+        assert!(signal.authorize().is_none());
+        assert_eq!(signal.containment_cause(), Some("first cause"));
     }
 
     #[test]
@@ -348,36 +313,6 @@ mod tests {
         signal.request_shutdown();
         assert!(signal.is_shutdown_requested());
         assert!(!signal.is_storage_invariant_contained());
-    }
-
-    #[test]
-    fn watchdog_fires_while_the_fault_recorder_is_blocked() {
-        let (abort_tx, abort_rx) = std::sync::mpsc::channel();
-        let signal = signal_with_test_watchdog(Arc::new(move || {
-            let _ = abort_tx.send(());
-        }));
-        let recorder_entered = Arc::new(std::sync::Barrier::new(2));
-        let release_recorder = Arc::new(std::sync::Barrier::new(2));
-        let recorder_entered_for_callback = recorder_entered.clone();
-        let release_recorder_for_callback = release_recorder.clone();
-        signal.set_fault_recorder(Arc::new(move |_| {
-            recorder_entered_for_callback.wait();
-            release_recorder_for_callback.wait();
-        }));
-
-        let reporter = {
-            let signal = signal.clone();
-            std::thread::spawn(move || signal.contain_storage_invariant_failure("terminal fault"))
-        };
-        recorder_entered.wait();
-        abort_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("watchdog must fire while recorder remains blocked");
-        assert!(signal.is_storage_invariant_contained());
-        assert!(signal.is_shutdown_requested());
-
-        release_recorder.wait();
-        reporter.join().expect("reporter thread");
     }
 
     #[test]

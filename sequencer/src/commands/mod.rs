@@ -77,6 +77,39 @@ pub(crate) fn record_terminal_fault_best_effort(
     }
 }
 
+/// Verdict-neutral startup read of the black box: if a previous command on
+/// this data directory died terminal, say so once at boot, so the cause is in
+/// this process's log even when the last process's final lines were lost.
+/// Nothing branches on the value. Bounded by the settlement writer: a death
+/// that never returned through its command bracket (an abort at the
+/// two-second deadline, a controller panic, SIGKILL) left no row, so there
+/// is nothing to report. It runs ahead of the admission preflight so that a
+/// boot the preflight refuses still logs why the last one died; a data
+/// directory with no database yet is the ordinary case, not a warning.
+pub(crate) fn warn_on_previous_terminal_fault(db_path: &str) {
+    let read = storage::Storage::open_read_only(db_path)
+        .map_err(|open_error| open_error.to_string())
+        .and_then(|storage| {
+            storage
+                .latest_terminal_fault()
+                .map_err(|read_error| read_error.to_string())
+        });
+    match read {
+        Ok(Some(fault)) => tracing::warn!(
+            command = %fault.command,
+            cause = %fault.cause,
+            recorded_at_ms = fault.recorded_at_ms,
+            "a previous command on this data directory ended in a terminal fault"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::debug!(
+            error = %error,
+            "no readable black box at startup (fresh data directory, or the \
+             preflight is about to report why); continuing"
+        ),
+    }
+}
+
 pub(crate) fn batch_submitter_address_from_private_key(
     private_key: &str,
 ) -> Result<Address, CommandError> {
@@ -232,6 +265,69 @@ mod tests {
     // the typed `From` conversions into `CommandError` and the bootstrap-time
     // identity guards. Worker `From<JoinResult>` conversions live in
     // `run::workers`.
+
+    #[test]
+    fn previous_terminal_fault_read_is_verdict_neutral() {
+        use super::warn_on_previous_terminal_fault;
+        use crate::storage::LifecycleCommand;
+
+        // No database at all: a warning, never an error or a panic.
+        warn_on_previous_terminal_fault("/nonexistent/sequencer.db");
+
+        let db = temp_db("previous-terminal-fault");
+        let mut storage =
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).expect("initialize");
+        warn_on_previous_terminal_fault(&db.path); // empty black box
+        storage
+            .record_terminal_fault(LifecycleCommand::Run, "prior terminal death")
+            .expect("record");
+        warn_on_previous_terminal_fault(&db.path); // a row to report
+        // (An unknown command or an empty cause cannot be seeded: the engine's
+        // CHECK constraints refuse them, so the reader's malformed arm is
+        // unreachable from a real database.)
+    }
+
+    #[test]
+    fn settlement_write_records_terminal_verdicts_only() {
+        use super::record_terminal_fault_best_effort;
+        use crate::storage::LifecycleCommand;
+
+        let db = temp_db("settlement-write");
+        let storage =
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).expect("initialize");
+        drop(storage);
+
+        // A non-terminal failure (transient class) leaves the black box empty.
+        let transient: Result<(), CommandError> =
+            Err(CommandError::Bootstrap(BootstrapError::ChainIdRpc {
+                message: "provider unavailable".into(),
+            }));
+        record_terminal_fault_best_effort(&db.path, LifecycleCommand::Run, &transient);
+        assert_eq!(
+            Storage::open_read_only(&db.path)
+                .expect("reopen")
+                .latest_terminal_fault()
+                .expect("read"),
+            None
+        );
+
+        // A terminal verdict — the shape `finish` returns for a contained
+        // fault — lands as one row carrying the error's Display form.
+        let terminal: Result<(), CommandError> = Err(CommandError::StorageInvariantViolation {
+            cause: "lane invariant broke".into(),
+        });
+        record_terminal_fault_best_effort(&db.path, LifecycleCommand::Run, &terminal);
+        let fault = Storage::open_read_only(&db.path)
+            .expect("reopen")
+            .latest_terminal_fault()
+            .expect("read")
+            .expect("terminal verdict recorded");
+        assert_eq!(fault.command, LifecycleCommand::Run);
+        assert_eq!(
+            fault.cause,
+            "persistent storage invariant violation: lane invariant broke"
+        );
+    }
 
     #[test]
     fn invalid_protocol_config_propagates_through_run_error() {

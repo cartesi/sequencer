@@ -7,7 +7,7 @@
 //! - [`process_lock`] — the exclusive kernel-enforced data-directory lock
 //!   every command and nested blocking task retains until it truly stops.
 //! - [`shutdown`] — `RuntimeScope` (lock + terminal-abort watchdog +
-//!   containment authority + fault recorder) and the slim cooperative
+//!   containment authority) and the slim cooperative
 //!   `ShutdownSignal`.
 //!
 //! Everything here is consumed crate-wide (workers, egress, l1, recovery);

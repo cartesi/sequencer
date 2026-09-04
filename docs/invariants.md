@@ -55,9 +55,11 @@ When you change anything listed under *enforced by*, re-check every line under
   `synchronous=FULL` transaction. Runtime
   containment remains classification-at-birth: detection CAS-elects one
   reporter, sets the sticky containment bit, arms the independent
-  two-second abort watchdog, requests cooperative shutdown, and only then
-  appends the black box's terminal-cause row (best-effort telemetry — the
-  exit code and logs carry the verdict if it fails). The watchdog holds only a
+  two-second abort watchdog, and requests cooperative shutdown; it writes
+  nothing durable. The black box's terminal-cause row is written once, by
+  the command bracket at settlement, from the verdict the drain returns
+  (best-effort telemetry — the exit code and logs carry the verdict if it
+  fails). The watchdog holds only a
   weak process-lifetime witness; it aborts at the deadline exactly when a
   controller, worker, or nested blocking operation still retains the
   process lock. Cleanup polls all workers concurrently so one hung drain
