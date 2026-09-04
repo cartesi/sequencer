@@ -47,10 +47,10 @@ fn decode_progress(bytes: &[u8], app_name: &str) -> Result<ApplicationProgress, 
     }
     let count = u64::from_le_bytes(bytes[..8].try_into().expect("checked slice length"));
     let safe_block = u64::from_le_bytes(bytes[8..].try_into().expect("checked slice length"));
-    Ok(ApplicationProgress::new(
-        ExecutedInputCount::new(count),
-        safe_block,
-    ))
+    Ok(
+        ApplicationProgress::try_new(ExecutedInputCount::new(count), safe_block)
+            .expect("coherent progress"),
+    )
 }
 
 #[derive(Default)]
@@ -308,7 +308,11 @@ impl Application for SharedCountingApp {
 impl ReplayRecordingApp {
     fn with_executed_input_count(executed_input_count: u64) -> Self {
         Self {
-            progress: ApplicationProgress::new(ExecutedInputCount::new(executed_input_count), 0),
+            progress: ApplicationProgress::try_new(
+                ExecutedInputCount::new(executed_input_count),
+                0,
+            )
+            .expect("coherent progress"),
             replayed: Vec::new(),
         }
     }
@@ -1882,7 +1886,8 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
         .expect("seed observed safe head");
 
     let app = SharedCountingApp {
-        progress: ApplicationProgress::new(ExecutedInputCount::new(1), 0),
+        progress: ApplicationProgress::try_new(ExecutedInputCount::new(1), 0)
+            .expect("coherent progress"),
     };
     register_genesis_snapshot(&app, &mut storage, &config.dumps_dir);
     storage.ensure_open_tip().expect("establish genesis tip");

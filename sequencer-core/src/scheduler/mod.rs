@@ -463,10 +463,11 @@ mod tests {
 
         fn with_progress(executed_input_count: u64, last_executed_safe_block: u64) -> Self {
             Self {
-                progress: ApplicationProgress::new(
+                progress: ApplicationProgress::try_new(
                     ExecutedInputCount::new(executed_input_count),
                     last_executed_safe_block,
-                ),
+                )
+                .expect("coherent progress"),
                 ..Self::default()
             }
         }

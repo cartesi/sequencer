@@ -149,10 +149,11 @@ impl WalletApp {
 
     #[cfg(test)]
     pub(crate) fn set_executed_input_count(&mut self, count: u64) {
-        self.execution_progress = ApplicationProgress::new(
+        self.execution_progress = ApplicationProgress::try_new(
             ExecutedInputCount::new(count),
             self.execution_progress.last_executed_safe_block(),
-        );
+        )
+        .expect("coherent progress");
     }
 
     pub fn last_executed_safe_block(&self) -> u64 {
@@ -862,7 +863,8 @@ mod tests {
         app.balances.insert(bob, U256::from(5678_u64));
         app.nonces.insert(alice, 4);
         app.nonces.insert(bob, 9);
-        app.execution_progress = ApplicationProgress::new(ExecutedInputCount::new(42), 777);
+        app.execution_progress = ApplicationProgress::try_new(ExecutedInputCount::new(42), 777)
+            .expect("coherent progress");
 
         let prefix = temp_dump_prefix();
         app.create_dump(&prefix).expect("create dump");
