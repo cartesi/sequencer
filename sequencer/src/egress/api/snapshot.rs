@@ -39,7 +39,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::{LeaseGuard, LeasedDump, ReleaseScheduler, Storage};
+use crate::storage::{FinalizedLease, LeaseGuard, LeasedDump, ReleaseScheduler, Storage};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -129,21 +129,15 @@ async fn finalized_state(
     let Some(_auth) = state.authorize_stream() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let leased = match acquire_finalized(&state).await {
+    let FinalizedLease {
+        inclusion_block,
+        dump: leased,
+    } = match acquire_finalized(&state).await {
         Ok(Some(leased)) => leased,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => return internal_error("acquire finalized lease", err),
     };
 
-    let Some(inclusion_block) = leased.inclusion_block else {
-        state
-            .shutdown
-            .contain_storage_invariant_failure("finalized snapshot carried no inclusion block");
-        return internal_error(
-            "read finalized snapshot",
-            "finalized snapshot carried no inclusion block",
-        );
-    };
     let etag = format!("\"block-{inclusion_block}\"");
     if if_none_match(&headers, &etag) {
         // 304: dropping `leased` here releases the lease via its guard.
@@ -271,7 +265,7 @@ where
 
 // ── Lease acquisition (storage returns the dump bundled with its release) ──
 
-async fn acquire_finalized(state: &SnapshotApiState) -> Result<Option<LeasedDump>, BoxError> {
+async fn acquire_finalized(state: &SnapshotApiState) -> Result<Option<FinalizedLease>, BoxError> {
     let db_path = state.snapshot.db_path.clone();
     let release_scheduler = state.release_scheduler.clone();
     storage_task(state, "acquire finalized snapshot lease", move |scope| {
