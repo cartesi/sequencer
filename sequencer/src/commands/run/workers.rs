@@ -99,9 +99,11 @@ pub(super) struct WorkersConfig {
 
 /// Requests shutdown if construction or runtime ownership is dropped; a panic
 /// instead enters terminal containment before unwind can strand runtime work.
-/// Every spawned worker retains a [`RuntimeScope`] clone, which also retains
-/// the process lock, so exclusivity remains held until the workers finish even
-/// though Drop cannot join asynchronously.
+/// Data-directory exclusivity does not depend on this guard: every worker
+/// holds a construction-required [`ProcessLock`] clone — the lane and
+/// server through their [`RuntimeScope`], the submitter both ways, the
+/// reader, detector, and fee oracle directly — so the lock stays held until
+/// the workers finish even though Drop cannot join asynchronously.
 struct ShutdownOnDrop(RuntimeScope);
 
 impl Drop for ShutdownOnDrop {
@@ -181,8 +183,10 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
             l1_config.identity.app_address,
         );
 
-        // The scope is the runtime-lifetime capability: every worker
-        // receives a clone, and every clone keeps the process lock alive.
+        // The scope is the runtime-lifetime capability: the workers that
+        // externalize or contain receive a clone, and every clone keeps the
+        // process lock alive; the others take its signal and hold the lock
+        // directly.
         // The drop guard requests shutdown on any partial-construction `?`,
         // panic unwind, or cancellation of the owning `run` future.
         let shutdown = RuntimeScope::new(process_lock);
@@ -298,10 +302,14 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
 
         let (tx, lane) =
             InclusionLane::<A>::start(QUEUE_CAPACITY, shutdown.clone(), storage, lane_config);
-        let reader = input_reader.start_preflighted(shutdown.clone());
+        // The reader, detector, and fee oracle only need to stop: they take
+        // the notification half and hold the process lock directly. The
+        // lane, server, and submitter externalize or contain, so they take
+        // the scope.
+        let reader = input_reader.start_preflighted(shutdown.signal());
         let submitter = submitter.start_preflighted(shutdown.clone());
-        let detector = detector.start_preflighted(shutdown.clone());
-        let fee_oracle = fee_oracle.map(|oracle| oracle.start(shutdown.clone()));
+        let detector = detector.start_preflighted(shutdown.signal());
+        let fee_oracle = fee_oracle.map(|oracle| oracle.start(shutdown.signal()));
         // HTTP server (ingress /tx + egress /ws/subscribe + /health, currently merged).
         let server = http::start_on_listener(
             listener,
@@ -901,9 +909,10 @@ mod tests {
         let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
-        // Model a worker spawned before a later startup step fails. Its join
-        // handle is dropped (Tokio detaches it), but its signal clone keeps
-        // process ownership until it has observed shutdown and finished.
+        // Model a scope-holding worker spawned before a later startup step
+        // fails. Its join handle is dropped (Tokio detaches it), but its
+        // scope clone keeps process ownership until it has observed shutdown
+        // and finished.
         let worker_shutdown = shutdown.clone();
         let worker = tokio::spawn(async move {
             worker_shutdown.wait_for_shutdown().await;
@@ -1065,8 +1074,9 @@ mod tests {
             matches!(&err, CommandError::Io(source) if source.kind() == std::io::ErrorKind::AddrInUse),
             "expected AddrInUse, got {err:?}"
         );
-        // The boundary check: a worker spawned during preparation would
-        // retain a `RuntimeScope` clone and keep the process lock held, so
+        // The boundary check: a worker spawned during preparation would keep
+        // the process lock held — through its `RuntimeScope` clone or, for
+        // the reader, detector, and fee oracle, its own `ProcessLock` — so
         // this acquire succeeding proves zero workers launched.
         ProcessLock::acquire(&data_dir)
             .expect("failed preparation must release ownership with zero live workers");

@@ -14,7 +14,7 @@ use crate::l1::eip1559::{Eip1559Fees, estimate_fees};
 use crate::l1::fee_oracle::math::{MathError, compute_x_units_per_gas, encode_log_gas_price};
 use crate::l1::fee_oracle::uniswap::{PriceSourceError, TokenPriceSource};
 use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
-use crate::runtime::shutdown::RuntimeScope;
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{Storage, StorageOpenError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,12 +187,12 @@ impl FeeOracle {
 
     pub(crate) fn start(
         self,
-        shutdown: RuntimeScope,
+        shutdown: ShutdownSignal,
     ) -> tokio::task::JoinHandle<Result<(), FeeOracleError>> {
         tokio::spawn(async move { self.run_forever(shutdown).await })
     }
 
-    async fn run_forever(self, shutdown: RuntimeScope) -> Result<(), FeeOracleError> {
+    async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), FeeOracleError> {
         loop {
             tokio::select! {
                 biased;
@@ -501,7 +501,7 @@ mod tests {
             Box::new(StaticGas(sample_fees())),
             Box::new(PendingToken(Mutex::new(Some(entered_tx)))),
         );
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let handle = oracle.start(shutdown.clone());
 
         tokio::time::timeout(Duration::from_secs(2), entered_rx)
@@ -531,7 +531,7 @@ mod tests {
             }),
             Box::new(StaticToken(sample_quote())),
         );
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let mut handle = oracle.start(shutdown.clone());
 
         tokio::select! {
@@ -565,7 +565,7 @@ mod tests {
             }),
             Box::new(StaticToken(sample_quote())),
         );
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let mut handle = oracle.start(shutdown.clone());
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -609,7 +609,7 @@ mod tests {
             Box::new(StaticGas(sample_fees())),
             Box::new(AlwaysFailToken),
         );
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let mut handle = oracle.start(shutdown.clone());
 
         tokio::select! {

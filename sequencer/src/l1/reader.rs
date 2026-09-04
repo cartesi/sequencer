@@ -23,7 +23,7 @@ use crate::l1::partition::{
     GetLogsError, decode_evm_advance_input, get_input_added_events_ordered,
 };
 use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
-use crate::runtime::shutdown::RuntimeScope;
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{FrontierMode, IngestedSafeInput, Storage, StorageOpenError};
 use sequencer_core::protocol::ProtocolTiming;
 
@@ -246,11 +246,14 @@ impl InputReader {
     /// Spawn the worker loop. The `shutdown` signal is what the loop respects;
     /// passing it at start time (instead of construction time) keeps the
     /// construction phase pure and ensures the same instance can't accidentally
-    /// be started under two different shutdown signals.
+    /// be started under two different shutdown signals. The notification half
+    /// suffices: the reader externalizes nothing and contains nothing (its
+    /// terminal exits are classified by the supervisor), and it holds its
+    /// data-directory ownership as the construction-required `ProcessLock`.
     #[cfg(test)]
     pub(crate) fn start(
         self,
-        shutdown: RuntimeScope,
+        shutdown: ShutdownSignal,
     ) -> Result<JoinHandle<Result<(), InputReaderError>>, StorageOpenError> {
         self.preflight_storage()?;
         Ok(self.start_preflighted(shutdown))
@@ -267,7 +270,7 @@ impl InputReader {
     /// runtime can launch all workers in one non-yielding ownership step.
     pub(crate) fn start_preflighted(
         self,
-        shutdown: RuntimeScope,
+        shutdown: ShutdownSignal,
     ) -> JoinHandle<Result<(), InputReaderError>> {
         tokio::spawn(async move { self.run_forever(shutdown).await })
     }
@@ -284,7 +287,7 @@ impl InputReader {
     /// Top-level driver. Races the work loop against the shutdown signal.
     /// Nested blocking DB jobs retain their own process-lock clone, so prompt
     /// cancellation cannot release data-directory exclusivity under them.
-    async fn run_forever(self, shutdown: RuntimeScope) -> Result<(), InputReaderError> {
+    async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), InputReaderError> {
         tokio::select! {
             biased;
             _ = shutdown.wait_for_shutdown() => Ok(()),
@@ -852,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn start_then_request_shutdown_joins_with_ok() {
         let db_file = NamedTempFile::new().expect("temp file");
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let reader = test_reader(
             db_file.path().to_string_lossy().into_owned(),
             "http://127.0.0.1:0".to_string(),
@@ -876,7 +879,7 @@ mod tests {
         require_anvil();
 
         let anvil = Anvil::default().block_time(1).timeout(30_000).spawn();
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let db_file = NamedTempFile::new().expect("temp file");
         let reader = test_reader(
             db_file.path().to_string_lossy().into_owned(),
