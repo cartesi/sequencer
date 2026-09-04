@@ -30,7 +30,7 @@ pub(crate) struct SweepTestApp {
 // while carrying the scheduler-owned progress required by `Application`.
 #[allow(non_upper_case_globals)]
 pub(crate) const SweepTestApp: SweepTestApp = SweepTestApp {
-    progress: ApplicationProgress::new(ExecutedInputCount::ZERO, 0),
+    progress: ApplicationProgress::try_new(ExecutedInputCount::ZERO, 0).expect("coherent progress"),
 };
 
 impl Application for SweepTestApp {

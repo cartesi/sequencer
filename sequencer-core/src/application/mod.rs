@@ -53,29 +53,11 @@ pub struct ApplicationProgress {
 }
 
 impl ApplicationProgress {
-    /// Construct a coherent application-history boundary.
-    ///
-    /// A nonzero clock proves that at least one input executed, so it cannot
-    /// accompany the zero history boundary.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `executed_input_count` is zero and
-    /// `last_executed_safe_block` is nonzero. Use [`Self::try_new`] on
-    /// deserialization paths, where the pair comes from untrusted bytes and
-    /// the caller owes a typed error, not a panic.
-    pub const fn new(
-        executed_input_count: ExecutedInputCount,
-        last_executed_safe_block: u64,
-    ) -> Self {
-        match Self::try_new(executed_input_count, last_executed_safe_block) {
-            Some(progress) => progress,
-            None => panic!("zero executed inputs require a zero safe-block clock"),
-        }
-    }
-
-    /// Fallible sibling of [`Self::new`] for decode paths: `None` when the
-    /// pair is incoherent (zero executed inputs with a nonzero clock).
+    /// Construct a coherent application-history boundary: `None` when the
+    /// pair is incoherent (zero executed inputs with a nonzero clock), since
+    /// a nonzero clock proves that at least one input executed. The only
+    /// production constructor is a decode path, which owes a typed error, not
+    /// a panic; a genesis instance starts from `Default`.
     pub const fn try_new(
         executed_input_count: ExecutedInputCount,
         last_executed_safe_block: u64,
@@ -437,7 +419,8 @@ mod tests {
     impl ProgressApp {
         fn new(count: u64) -> Self {
             Self {
-                progress: ApplicationProgress::new(ExecutedInputCount::new(count), 0),
+                progress: ApplicationProgress::try_new(ExecutedInputCount::new(count), 0)
+                    .expect("coherent progress"),
                 commit_target: ApplicationProgress::default(),
                 applied: 0,
                 reject: false,
@@ -475,13 +458,14 @@ mod tests {
         ) -> Result<AppOutputs, AppError> {
             self.applied += 1;
             if self.mutate_progress_in_hook {
-                self.progress = ApplicationProgress::new(
+                self.progress = ApplicationProgress::try_new(
                     self.progress
                         .executed_input_count()
                         .checked_next()
                         .expect("test count"),
                     99,
-                );
+                )
+                .expect("coherent progress");
             }
             if self.fail {
                 Err(AppError::Internal {
@@ -499,13 +483,14 @@ mod tests {
         ) -> Result<AppOutputs, AppError> {
             self.applied += 1;
             if self.mutate_progress_in_hook {
-                self.progress = ApplicationProgress::new(
+                self.progress = ApplicationProgress::try_new(
                     self.progress
                         .executed_input_count()
                         .checked_next()
                         .expect("test count"),
                     99,
-                );
+                )
+                .expect("coherent progress");
             }
             if self.fail {
                 Err(AppError::Internal {
@@ -633,9 +618,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "zero executed inputs require a zero safe-block clock")]
     fn zero_count_rejects_nonzero_safe_block_clock() {
-        let _ = ApplicationProgress::new(ExecutedInputCount::ZERO, 1);
+        assert!(ApplicationProgress::try_new(ExecutedInputCount::ZERO, 1).is_none());
+        assert!(ApplicationProgress::try_new(ExecutedInputCount::ZERO, 0).is_some());
+        assert!(ApplicationProgress::try_new(ExecutedInputCount::new(1), 7).is_some());
     }
 
     #[test]
