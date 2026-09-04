@@ -1375,6 +1375,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "c-app-engine"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bindgen",
+ "sequencer-core",
+]
+
+[[package]]
+name = "c-app-sequencer"
+version = "0.1.0"
+dependencies = [
+ "c-app-engine",
+ "clap",
+ "sequencer",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "c-kzg"
 version = "2.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1387,6 +1408,25 @@ dependencies = [
  "libc",
  "once_cell",
  "serde",
+]
+
+[[package]]
+name = "c-wallet-engine"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "app-core",
+ "c-app-engine",
+ "sequencer-core",
+]
+
+[[package]]
+name = "c-wallet-sequencer"
+version = "0.1.0"
+dependencies = [
+ "c-app-sequencer",
+ "c-wallet-engine",
+ "tokio",
 ]
 
 [[package]]

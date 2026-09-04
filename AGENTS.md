@@ -141,6 +141,10 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - `sequencer-core/` — shared domain types (`Application`, `SignedUserOp`, `SequencedL2Tx`, `Batch`, `Frame`).
 - `examples/app-core/` — placeholder wallet app implementing the `Application` trait.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library. The model for what an app author builds (their `Application` impl ≙ `app-core`; their binary crate ≙ this).
+- `examples/c-app-engine/` — the same seam for applications that are not Rust. `include/application-engine.h` is the C mirror of the `Application` trait, and the crate is the shim that turns an engine archive implementing it into an `Application`. See [`docs/protocol/c-application-binding.md`](docs/protocol/c-application-binding.md).
+- `examples/c-app-sequencer/` — host library for any C application, plus a generic binary for one that supplies its engine as an archive. Application-agnostic: its only application argument is the state file to open.
+- `examples/c-wallet-engine/` — `app-core`'s wallet exported through that C API as `libc_wallet_engine.a`. The reference engine, written in Rust because the seam is an ABI and not a language.
+- `examples/c-wallet-sequencer/` — binary crate: `c-wallet-engine` + `c-app-sequencer`. The C-path twin of `wallet-sequencer`, same wallet reached over the seam.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.
 - `examples/canonical-test/` — e2e test harness for the canonical app.
 - `sdk/rust-client/` — Rust client library for the sequencer API.

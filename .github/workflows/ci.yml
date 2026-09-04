@@ -19,6 +19,7 @@ jobs:
       - name: Verify toolchain pin alignment
         run: bash scripts/verify-toolchain-pins.sh
 
+      # libclang-dev is what bindgen needs; several crates run it, c-app-engine among them
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -27,7 +28,8 @@ jobs:
             libfaketime \
             lua5.4 \
             liblua5.4-dev \
-            libslirp-dev
+            libslirp-dev \
+            libclang-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -53,7 +55,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Watchdog Lua tests
-        run: lua watchdog/tests/run.lua
+        run: lua5.4 watchdog/tests/run.lua
 
       - name: Watchdog divergence drill
         run: bash scripts/test-watchdog-divergence-drill.sh
@@ -61,6 +63,19 @@ jobs:
       - name: Test
         timeout-minutes: 15
         run: cargo test --workspace --all-targets --all-features --locked
+
+      # The rest of the job only builds the C seam the way an in-workspace crate uses it. This is
+      # the other way, the one an application outside this repository takes: hand the engine over
+      # as an archive and link it through the three binding variables. c-wallet-engine's staticlib
+      # stands in for that archive.
+      - name: C application archive path
+        run: |
+          cargo build --locked -p c-wallet-engine
+          APPLICATION_ENGINE_LIB="$PWD/target/debug/libc_wallet_engine.a" \
+          APPLICATION_ENGINE_HEADER="$PWD/examples/c-app-engine/include/application-engine.h" \
+          APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT=53 \
+            cargo build --locked -p c-app-sequencer
+          ./target/debug/c-app-sequencer --help > /dev/null
 
   canonical-guest:
     runs-on: ubuntu-latest
