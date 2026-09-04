@@ -8,8 +8,7 @@
 //!   guards, startup recovery, initial DB open.
 //! - [`WorkerExit`] + per-worker `*Exit`: how each runtime worker exited.
 //! - [`CommandError`]: the top-level error every command returns (run,
-//!   setup, flush, acknowledge — it was misleadingly named `RunError` until
-//!   the 2026-08-19 homing pass), with generic [`std::io::Error`] /
+//!   setup, flush), with generic [`std::io::Error`] /
 //!   [`rusqlite::Error`] catch-alls that are used widely enough not to nest.
 
 use thiserror::Error;
