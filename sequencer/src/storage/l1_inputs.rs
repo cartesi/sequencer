@@ -38,8 +38,8 @@ type FeeOracleIdentitySql = (
 /// Test-fixture conversion: a provenance-free [`StoredSafeInput`] becomes a
 /// row with explicit zero provenance. Production writes go through
 /// [`Storage::append_ingested_safe_inputs_with_timestamp`] with real
-/// provenance only — one honest row model, no trait shim (H6; the Track 6
-/// inventory recorded the old `SafeInputRecord` shim as churn-avoidance).
+/// provenance only — one honest row model, no trait shim (the old
+/// `SafeInputRecord` shim was churn-avoidance, not a contract).
 #[cfg(test)]
 fn synthetic_row(input: &StoredSafeInput) -> IngestedSafeInput {
     IngestedSafeInput {
