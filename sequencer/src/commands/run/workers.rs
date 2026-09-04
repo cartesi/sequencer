@@ -66,9 +66,9 @@ const DANGER_DETECTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub(super) enum FirstExit {
     Signal(Option<CommandError>),
     Worker(WorkerExit),
-    /// A terminal fault was contained by a runtime component. The black-box
-    /// terminal-cause row was attempted but is best-effort telemetry; the
-    /// exit code and logs carry the verdict if it failed.
+    /// A terminal fault was contained by a runtime component; `finish`
+    /// surfaces its cause as the terminal verdict, and the command bracket
+    /// records that verdict in the black box at settlement.
     Contained,
 }
 
@@ -187,13 +187,6 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
         // panic unwind, or cancellation of the owning `run` future.
         let shutdown = RuntimeScope::new(process_lock);
         let shutdown_on_drop = ShutdownOnDrop(shutdown.clone());
-        // Durable terminal-fault recorder: best-effort telemetry. A
-        // successful write appends the black-box terminal-cause row; a
-        // failed write loses only the black-box copy — the exit code and
-        // logs still carry the verdict, and a persistent fault re-detects
-        // fail-loud on the next boot that reads it.
-        install_terminal_fault_recorder(&shutdown, db_path.clone());
-
         let mut storage = crate::storage::Storage::open(&db_path)?;
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
         std::fs::create_dir_all(&dumps_dir)?;
@@ -396,8 +389,7 @@ impl Workers {
     /// a hung drain must not hide a terminal exit that arms the hard watchdog.
     pub(super) async fn finish(self, first_exit: FirstExit) -> Result<(), CommandError> {
         match &first_exit {
-            // Already contained by the raising component; its best-effort
-            // terminal-cause black-box append was attempted there.
+            // Already contained by the raising component.
             FirstExit::Contained => {}
             FirstExit::Worker(exit) if exit.is_terminal() => {
                 // Log the typed exit here: the terminal return path below
@@ -531,23 +523,6 @@ impl Workers {
     }
 }
 
-fn install_terminal_fault_recorder(shutdown: &RuntimeScope, db_path: String) {
-    shutdown.set_fault_recorder(Arc::new(move |cause: &str| {
-        match crate::storage::Storage::open_writer(&db_path) {
-            Ok(mut storage) => {
-                if let Err(err) =
-                    storage.record_terminal_fault(crate::storage::LifecycleCommand::Run, cause)
-                {
-                    tracing::warn!(error = %err, "terminal cause not recorded in the black box; the exit code and this log carry the verdict");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "terminal cause not recorded in the black box (storage open failed); the exit code and this log carry the verdict");
-            }
-        }
-    }));
-}
-
 async fn os_shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -677,9 +652,7 @@ async fn next_component_shutdown(
 /// The single post-cleanup containment check: if a terminal fault was
 /// contained anywhere (primary, cleanup, or a non-worker component), surface
 /// the terminal class. The cause is present whenever containment reads true
-/// (they are one `OnceLock`); recorder failure loses only the black box's
-/// telemetry copy of the cause, never the sticky in-process verdict or the
-/// terminal exit class.
+/// (they are one `OnceLock`).
 fn contained_verdict(shutdown: &RuntimeScope) -> Option<CommandError> {
     shutdown
         .containment_cause()
@@ -864,34 +837,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn production_recorder_poison_is_durable_and_first_writer_wins() {
-        let db = temp_db("runtime-lifecycle-recorder");
-        let mut storage =
-            Storage::initialize_for_command(&db.path, crate::storage::LifecycleCommand::Setup)
-                .expect("initialize setup");
-        storage
-            .insert_initial_finalized_dump(&db._dir.path().join("finalized"), 0, 0, 0, 0)
-            .expect("register finalized snapshot");
-        storage.complete_setup().expect("complete setup");
-        drop(storage);
-        let shutdown = RuntimeScope::default();
-        install_terminal_fault_recorder(&shutdown, db.path.clone());
-
-        shutdown.contain_storage_invariant_failure("first terminal cause");
-        shutdown.contain_storage_invariant_failure("echo");
-
-        let fault = Storage::open_read_only(&db.path)
-            .expect("reopen")
-            .latest_terminal_fault()
-            .expect("read")
-            .expect("recorded fault");
-        assert_eq!(fault.command, crate::storage::LifecycleCommand::Run);
-        assert_eq!(fault.cause, "first terminal cause");
-    }
-
-    /// Workers whose tasks idle until shutdown. The shared signal retains the
-    /// first cause independently of the best-effort durable recorder.
+    /// Workers whose tasks idle until shutdown. The shared scope retains the
+    /// first containment cause for `finish` to surface.
     fn waiting_workers(shutdown: &RuntimeScope) -> (Workers, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("workers tempdir");
         let server = tokio::spawn({
@@ -1411,8 +1358,6 @@ mod tests {
     }
 
     use crate::commands::test_support::create_structured_dump;
-    use crate::storage::Storage;
-    use crate::storage::test_helpers::temp_db;
 
     #[test]
     fn detector_inner_error_maps_to_source_variant() {
