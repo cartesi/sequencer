@@ -114,6 +114,17 @@ pub(crate) enum RecoveryMutationError {
     },
     #[error("cannot open the Tip without a finalized snapshot")]
     MissingFinalizedSnapshot,
+    /// The `EnsureOpenTip` phase found a valid open Tip already present. A
+    /// stale no-Tip decision, not a danger change; unreachable under the
+    /// process lock, and retryable if it ever fires.
+    #[error("the Tip was already open when the EnsureOpenTip phase ran")]
+    TipAlreadyOpen,
+    /// The `EnsureOpenTip` phase's own transaction left no valid open Tip
+    /// after opening one. Impossible by construction; refused rather than
+    /// committed, so the reducer's one cycle (Repaired → EnsureOpenTip →
+    /// Repaired) cannot spin on it.
+    #[error("the EnsureOpenTip phase left no valid open Tip in its own transaction")]
+    TipMissingAfterOpen,
     #[error(
         "post-flush re-sync reached safe block {resynced_safe_block}, behind the flush observation at {flush_observed_safe_block}"
     )]
@@ -251,13 +262,24 @@ impl Storage {
         if !facts.has_finalized_snapshot {
             return Err(RecoveryMutationError::MissingFinalizedSnapshot);
         }
-        if facts.danger != DangerStatus::Safe || facts.has_open_tip {
+        if facts.danger != DangerStatus::Safe {
             return Err(RecoveryMutationError::StaleDecision {
                 expected: DangerStatus::Safe,
                 actual: facts.danger,
             });
         }
+        if facts.has_open_tip {
+            return Err(RecoveryMutationError::TipAlreadyOpen);
+        }
         open_fresh_tip_in_tx(&tx)?;
+        // Postcondition, enforced where it can be violated: this phase is the
+        // only edge back into `Repaired` without a Tip, so it must never
+        // commit without one. A violation is a typed refuse (exit 30), never
+        // a retry that would spin the reducer, and never a `debug_assert`
+        // that compiles out.
+        if !has_valid_open_batch(&tx)? {
+            return Err(RecoveryMutationError::TipMissingAfterOpen);
+        }
         tx.commit()?;
         Ok(())
     }

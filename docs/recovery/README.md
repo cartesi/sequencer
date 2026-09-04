@@ -259,7 +259,7 @@ Closed batches past gold (if any) are still in their natural lifecycle — pendi
 2. Open a fresh recovery batch in the same transaction.
 3. If no Tip in danger and no Tip exists at all (torn-state crash recovery), open a Tip anyway.
 
-The `Safe` decision with no open Tip selects `EnsureOpenTip` as its own reducer phase. That phase rechecks `Safe`, finalized-snapshot presence, and Tip absence in the write transaction, then uses the shared `open_fresh_tip_in_tx` mechanism. Tip creation is therefore inside the same inspect → one phase → inspect discipline, never a worker-construction side effect.
+The `Safe` decision with no open Tip selects `EnsureOpenTip` as its own reducer phase. That phase rechecks `Safe`, finalized-snapshot presence, and Tip absence in the write transaction, then uses the shared `open_fresh_tip_in_tx` mechanism, and re-reads the Tip inside that transaction after opening: it refuses (terminal) rather than commit without one, so the reducer's single `Repaired` → `EnsureOpenTip` → `Repaired` edge cannot cycle. Tip creation is therefore inside the same inspect → one phase → inspect discipline, never a worker-construction side effect.
 
 #### Why `danger_threshold`, not `MAX_WAIT_BLOCKS`, for the Tip threshold
 

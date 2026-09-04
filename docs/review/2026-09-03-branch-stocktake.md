@@ -54,8 +54,25 @@ Wave 1 (2026-09-03), one theme per commit, on top of the CI fix:
   had only test callers; `try_new` is the one constructor, tests use it with
   `expect`.
 
-Not yet landed from the recommended split: the two-row black-box note (moot
-if wave 2 deletes the in-scope recorder) and the PR title/body, which come
+Wave 2 (2026-09-04), the containment diet, each commit refuted by three
+read-only reviewers before landing:
+
+- **Containment writes nothing durable**: the in-scope fault recorder is
+  deleted; the command bracket's settlement write is the black box's one
+  writer, so a contained run records one row. The accepted loss (any death
+  before settlement leaves only the process logs) is stated in the runbook.
+  `run` logs the last black-box row once at startup, ahead of the preflight,
+  so the table has its first in-product reader. Closes finding 24.
+- **Finalized lease is non-optional**: `acquire_finalized_lease` returns
+  `FinalizedLease { inclusion_block, dump }`; the impossible-`None`
+  containment branch in `finalized_state` is gone. Closes finding 26.
+- **The reducer's one cycle is cut at the storage boundary**: the
+  `EnsureOpenTip` phase splits its guard (`TipAlreadyOpen`, retry) and
+  refuses inside its own transaction rather than commit without a Tip
+  (`TipMissingAfterOpen`, exit 30); `drive_recovery`'s doc records the
+  ≤5-phase bound. Closes findings 20 and 23.
+
+Not yet landed from the recommended split: the PR title/body, which come
 last.
 
 ## Verdict

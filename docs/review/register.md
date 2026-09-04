@@ -90,11 +90,10 @@ valid.
     (NotFound/PermissionDenied/InvalidData/IsADirectory/NotADirectory
     terminal; EIO and friends operational); never echo contents.
     Jury-confirmed.
-20. **`StaleDecision` cannot name the tip-present cause** —
-    `ensure_open_tip_for_recovery` raises `{ expected: Safe, actual: Safe }`
-    when the Tip already exists, and `recovery_tests.rs` pins that line. Add
-    `TipAlreadyOpen` plus a paired retry reason so `classify_mutation` carries
-    it to the operator. Jury-confirmed; production-unreachable.
+20. **Closed** (2026-09-04): `ensure_open_tip_for_recovery` splits its
+    disjunction — a non-`Safe` danger raises `StaleDecision`, an already-open
+    Tip raises the payload-free `TipAlreadyOpen`, paired with a retry reason
+    so the operator sees it; the guard test and the polarity pin assert it.
 21. **Closed** (2026-09-03): `Storage::ensure_open_tip` is
     `#[cfg(test)] pub(crate)`; the two intra-doc links and the snapshot
     lifecycle doc now name the reducer's guarded `EnsureOpenTip` phase.
@@ -103,12 +102,11 @@ valid.
     holds a construction-required `ProcessLock`. Narrow, and restate the three
     doc comments (`commands/run/workers.rs`, `runtime/shutdown.rs`) that claim
     lock retention through scope clones. Jury-confirmed 2–1.
-23. **`drive_recovery`'s one cycle has no enforced postcondition** —
-    `Repaired` + `Safe` + no Tip → `EnsureOpenTip` → `Repaired`, with no
-    watchdog on the boot path; `admission.tla` hardcodes `hasOpenTip' = TRUE`.
-    Return a typed `refuse` (exit 30 — not a `debug_assert`, not
-    `StaleDecision`) after `open_fresh_tip_in_tx` in the guarded phase, or make
-    the reducer arm a terminal `Refuse`. Jury-confirmed 2–1.
+23. **Closed** (2026-09-04): the guarded `EnsureOpenTip` phase re-reads
+    `has_valid_open_batch` inside its own transaction and returns
+    `TipMissingAfterOpen` (classified `refuse`, exit 30) rather than commit
+    without a Tip; `drive_recovery`'s doc records the ≤5-phase bound and
+    `admission.tla`'s comment names the enforced postcondition.
 24. **Closed** (2026-09-04): the in-scope recorder is deleted, so a
     contained run writes exactly one `terminal_faults` row — the command
     bracket's, at settlement. Containment writes nothing durable. The

@@ -121,14 +121,50 @@ mod guarded_phases {
         let error = storage
             .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
             .expect_err("stale no-Tip decision must be rejected");
-        assert!(matches!(
-            error,
-            RecoveryMutationError::StaleDecision {
-                expected: crate::storage::DangerStatus::Safe,
-                actual: crate::storage::DangerStatus::Safe,
-            }
-        ));
+        assert!(matches!(error, RecoveryMutationError::TipAlreadyOpen));
         assert_eq!(open_tip_count(&storage), 1);
+    }
+
+    #[test]
+    fn ensure_tip_refuses_and_rolls_back_if_its_transaction_leaves_no_tip() {
+        // The fixture seeds no safe inputs on purpose: with a non-empty drain
+        // range the invalidated Tip would trip the sequenced-rows trigger
+        // first and the opener would fail with a storage error instead of
+        // returning `Ok` — which is the exact shape this test needs.
+        let (db, storage, protocol) = ensure_tip_fixture("guarded-ensure-tip-postcondition", true);
+        // Fault injection: invalidate the new Tip the moment its first frame
+        // lands, so `open_fresh_tip_in_tx` returns `Ok` having left no valid
+        // open Tip. (Invalidating on the batch insert itself is caught one
+        // step earlier by the schema — "frames can only be inserted into the
+        // current Tip" — so the injection must fire after the frame.
+        // `open.rs` documents failure triggers as the sanctioned way past the
+        // typed API in tests.)
+        drop(storage);
+        Storage::open_connection(db.path.as_str())
+            .expect("raw connection")
+            .execute_batch(
+                "CREATE TRIGGER test_invalidate_new_tip AFTER INSERT ON frames \
+                 BEGIN \
+                   UPDATE batches SET invalidated_at_ms = 1 \
+                   WHERE batch_index = NEW.batch_index; \
+                 END",
+            )
+            .expect("install failure trigger");
+        let mut storage = Storage::open(db.path.as_str()).expect("reopen");
+
+        let error = storage
+            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .expect_err("a phase that leaves no Tip must refuse, not commit");
+        assert!(
+            matches!(error, RecoveryMutationError::TipMissingAfterOpen),
+            "expected the postcondition refuse, got {error:?}"
+        );
+        assert_eq!(open_tip_count(&storage), 0);
+        // Refused inside the transaction: nothing of the attempt persisted.
+        let batches: i64 = storage
+            .read(|tx| tx.query_row("SELECT COUNT(*) FROM batches", [], |row| row.get(0)))
+            .expect("count batches");
+        assert_eq!(batches, 0, "the refused phase must roll back its insert");
     }
 
     fn cascade_fixture(name: &str) -> (crate::storage::test_helpers::TestDb, Storage) {

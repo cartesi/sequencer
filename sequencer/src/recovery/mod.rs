@@ -78,6 +78,8 @@ pub enum RecoveryRetryReason {
     },
     #[error("local recovery facts changed before phase execution: {status:?}")]
     StaleDecision { status: DangerStatus },
+    #[error("the Tip was already open when the EnsureOpenTip phase ran")]
+    TipAlreadyOpen,
     #[error("runtime preparation outlived its clean admission decision ({decision})")]
     AdmissionChanged { decision: &'static str },
 }
@@ -92,6 +94,10 @@ pub enum RecoveryRefusalReason {
     MissingFinalizedSnapshot,
     #[error("post-sync recovery has no persisted safe head")]
     MissingSafeHead,
+    /// The `EnsureOpenTip` phase's transaction left no valid open Tip — a
+    /// storage self-invariant failure, refused so the boot cannot spin.
+    #[error("the EnsureOpenTip phase left no valid open Tip")]
+    TipMissingAfterOpen,
 }
 
 /// Single-use proof that the run's final admission decision — the same pure
@@ -235,8 +241,10 @@ fn reduce_recovery(progress: RecoveryProgress, facts: RecoveryInspection) -> Rec
             DangerStatus::Safe if facts.has_open_tip => RecoveryDecision::Admit,
             // Unreachable in production — every repair phase ends with a
             // valid open tip in its own transaction (the admission model
-            // encodes that postcondition). Kept so the `Repaired` and
-            // `Inspecting` arms stay structurally parallel and total.
+            // encodes that postcondition, and `ensure_open_tip_for_recovery`
+            // refuses rather than commits without one, so this edge cannot
+            // cycle). Kept so the `Repaired` and `Inspecting` arms stay
+            // structurally parallel and total.
             DangerStatus::Safe => RecoveryDecision::Act(RecoveryPhase::EnsureOpenTip),
             // Named, not a wildcard: a new `DangerStatus` variant must be
             // classified here explicitly instead of silently defaulting to
@@ -285,6 +293,16 @@ trait RecoveryDriver {
 
 /// Drive one phase per inspection. There is intentionally no edge from a
 /// completed phase directly to another phase or admission.
+///
+/// The loop is unbounded by design and terminates by construction: every
+/// phase edge advances `progress` except `Repaired` + `Safe` + no Tip →
+/// `EnsureOpenTip` → `Repaired`, and that phase refuses inside its own
+/// transaction if it would leave no Tip; between phases the Tip cannot
+/// disappear, because the kernel process lock makes this process the only
+/// writer. One attempt therefore performs at
+/// most five phases (`InitialSync`, then `Flush` → `PostFlushSync` →
+/// `Cascade`, then at most one `EnsureOpenTip`) before admitting, retrying,
+/// or refusing.
 async fn drive_recovery(driver: &mut impl RecoveryDriver) -> Result<(), RecoveryError> {
     let mut progress = RecoveryProgress::NeedInitialSync;
     loop {
@@ -569,6 +587,12 @@ fn classify_mutation(error: RecoveryMutationError) -> RecoveryError {
         RecoveryMutationError::StaleDecision { actual, .. } => {
             RecoveryError::retry(RecoveryRetryReason::StaleDecision { status: actual })
         }
+        RecoveryMutationError::TipAlreadyOpen => {
+            RecoveryError::retry(RecoveryRetryReason::TipAlreadyOpen)
+        }
+        RecoveryMutationError::TipMissingAfterOpen => {
+            RecoveryError::refuse(RecoveryRefusalReason::TipMissingAfterOpen)
+        }
     }
 }
 
@@ -627,6 +651,10 @@ mod tests {
             WalletNonceWatermarkError::Storage(rusqlite::Error::QueryReturnedNoRows),
         )));
 
+        assert_retry(classify_mutation(RecoveryMutationError::TipAlreadyOpen));
+        assert_refuse(classify_mutation(
+            RecoveryMutationError::TipMissingAfterOpen,
+        ));
         assert_retry(classify_mutation(RecoveryMutationError::StaleDecision {
             expected: DangerStatus::Safe,
             actual: DangerStatus::L1ViewStale,
