@@ -60,8 +60,8 @@ pub use recovery::DangerStatus;
 pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
 pub use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
 pub use snapshot_dumps::{
-    DumpRow, FinalizedDump, LeaseGuard, LeasedDump, PendingDump, PersistentReleaseFailureReporter,
-    ReleaseScheduler,
+    DumpRow, FinalizedDump, FinalizedLease, LeaseGuard, LeasedDump, PendingDump,
+    PersistentReleaseFailureReporter, ReleaseScheduler,
 };
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and

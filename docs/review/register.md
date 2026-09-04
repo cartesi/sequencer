@@ -390,7 +390,7 @@ From the L3 review (2026-08-22):
   window is recorded and bounded instead.
 - **A boot assert on `finalized_snapshot.inclusion_block`** — the column is
   `NOT NULL` at the engine; the claimed gap does not exist. (The runtime
-  `Option` branch on the same column is finding 26.)
+  `Option` branch on the same column was finding 26, closed 2026-09-04.)
 
 From the 2026-08-25 fee-oracle lifecycle pass (143a290; a single-pass
 decision, not an adversarial review):
