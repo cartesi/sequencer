@@ -6,9 +6,11 @@
 //! Every subcommand that touches a data directory (`run`, `setup`,
 //! `flush-mempool`) acquires an OS-held advisory
 //! lock on `<data_dir>/sequencer.lock` before reading or mutating anything
-//! there. `run` transfers it into the structured runtime scope, which retains
-//! it until every runtime-owned data-dir task has stopped; nested blocking
-//! work retains a clone, including during pre-worker setup/recovery. The other
+//! there. `run` clones it into the structured runtime scope and into each
+//! data-directory worker, and keeps one itself through settlement; the lock
+//! is released only after the last clone — controller, scope, worker, or
+//! nested blocking closure — drops, including during pre-worker
+//! setup/recovery. The other
 //! commands hold it until they and any detached blocking work return.
 //! Persisted lifecycle rows cannot distinguish a live owner from a stale one;
 //! a kernel-held lock can — it vanishes with the process, however the process

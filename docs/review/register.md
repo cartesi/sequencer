@@ -97,11 +97,13 @@ valid.
 21. **Closed** (2026-09-03): `Storage::ensure_open_tip` is
     `#[cfg(test)] pub(crate)`; the two intra-doc links and the snapshot
     lifecycle doc now name the reducer's guarded `EnsureOpenTip` phase.
-22. **Detector and reader take `RuntimeScope` where `ShutdownSignal`
-    suffices** — each uses the scope only for `wait_for_shutdown` and already
-    holds a construction-required `ProcessLock`. Narrow, and restate the three
-    doc comments (`commands/run/workers.rs`, `runtime/shutdown.rs`) that claim
-    lock retention through scope clones. Jury-confirmed 2–1.
+22. **Closed** (2026-09-04): `DangerDetector`, `InputReader`, and the
+    fee-oracle worker (narrowed with them: same single use, same
+    construction-required lock) take `ShutdownSignal`; `launch` passes
+    `shutdown.signal()` for the three and the scope to the lane, server, and
+    submitter. Data-directory ownership is each worker's own `ProcessLock`,
+    so the watchdog's weak witness is unaffected; the doc comments now say
+    workers that externalize or contain take a scope.
 23. **Closed** (2026-09-04): the guarded `EnsureOpenTip` phase re-reads
     `has_valid_open_batch` inside its own transaction and returns
     `TipMissingAfterOpen` (classified `refuse`, exit 30) rather than commit

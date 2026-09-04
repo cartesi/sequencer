@@ -11,7 +11,7 @@
 //!   because a drain may block. Containment writes nothing durable: the
 //!   black box's terminal-cause row is written once, by the command bracket
 //!   at settlement, from the verdict `finish` returns.
-//! - [`ShutdownSignal::is_storage_invariant_contained`]: checked by
+//! - [`RuntimeScope::is_storage_invariant_contained`]: checked by
 //!   externalization sites (acks, L1 sends, WS frames, snapshot stream
 //!   starts) before emitting; set only by containment, so a missed check is
 //!   bounded by the exit contract (terminal exits are not restarted) and
@@ -92,8 +92,11 @@ pub struct ShutdownSignal {
 /// constructible from a held [`ProcessLock`] — installed at lock
 /// acquisition, before any signal or worker exists — so a watchdog-less or
 /// lock-less containment object is unrepresentable in production.
-/// Workers that touch the data directory or externalize take a scope;
-/// pure-notification consumers take its [`ShutdownSignal`].
+/// Workers that externalize or contain faults take a scope (the lane, the
+/// HTTP server, the submitter); workers that only need to stop take its
+/// [`ShutdownSignal`] (the reader, the detector, the fee oracle) and hold
+/// their data-directory ownership as a construction-required
+/// [`ProcessLock`] instead.
 #[derive(Clone)]
 pub struct RuntimeScope {
     signal: ShutdownSignal,

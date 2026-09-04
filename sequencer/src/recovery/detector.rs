@@ -26,7 +26,7 @@ use tracing::debug;
 
 use crate::clock::unix_now_ms;
 use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
-use crate::runtime::shutdown::RuntimeScope;
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{DangerStatus, Storage, StorageOpenError};
 use sequencer_core::protocol::ProtocolTiming;
 
@@ -96,11 +96,13 @@ impl DangerDetector {
 
     /// Spawn the detector loop. The `shutdown` signal is what the loop
     /// respects; passing it at start time (instead of construction time) keeps
-    /// the construction phase pure.
+    /// the construction phase pure. The notification half suffices: the
+    /// detector externalizes nothing and contains nothing, and it holds its
+    /// data-directory ownership as the construction-required `ProcessLock`.
     #[cfg(test)]
     pub(crate) fn start(
         self,
-        shutdown: RuntimeScope,
+        shutdown: ShutdownSignal,
     ) -> Result<tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>>, StorageOpenError>
     {
         self.preflight_storage()?;
@@ -117,7 +119,7 @@ impl DangerDetector {
     /// runtime can launch all workers in one non-yielding ownership step.
     pub(crate) fn start_preflighted(
         self,
-        shutdown: RuntimeScope,
+        shutdown: ShutdownSignal,
     ) -> tokio::task::JoinHandle<Result<DetectorExit, DangerDetectorError>> {
         tokio::spawn(async move { self.run_forever(shutdown).await })
     }
@@ -126,7 +128,7 @@ impl DangerDetector {
     /// blocking check retains its own process-lock clone until it stops.
     async fn run_forever(
         self,
-        shutdown: RuntimeScope,
+        shutdown: ShutdownSignal,
     ) -> Result<DetectorExit, DangerDetectorError> {
         tokio::select! {
             biased;
@@ -212,7 +214,7 @@ mod tests {
             .expect("record fresh safe-head observation");
         drop(storage);
 
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let detector = DangerDetector::new(
             db.path.clone(),
             test_protocol(),
@@ -263,7 +265,7 @@ mod tests {
             .expect("append");
         drop(storage);
 
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let detector = DangerDetector::new(
             db.path.clone(),
             protocol,
@@ -342,7 +344,7 @@ mod tests {
             .expect("rewind safe-progress timestamp");
         drop(rewind_conn);
 
-        let shutdown = RuntimeScope::default();
+        let shutdown = ShutdownSignal::default();
         let detector = DangerDetector::new(
             db.path.clone(),
             protocol,

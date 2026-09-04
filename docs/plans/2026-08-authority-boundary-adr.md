@@ -54,10 +54,12 @@ Four mechanisms, each solving a different problem:
 
 Every command acquires the OS-held exclusive data-directory lock before
 inspection (`runtime/process_lock.rs`). For `run`, ownership transfers into a
-`RuntimeScope` shared by all runtime-owned data-directory work: the lock,
-terminal abort watchdog, and containment authority in one capability,
-constructible only from a held lock. The pure notification half
-is the slim `ShutdownSignal`. `RuntimeScope::authorize()` mints the
+`RuntimeScope` — the lock, terminal abort watchdog, and containment
+authority in one capability, constructible only from a held lock — shared
+by the workers that externalize or contain faults (the lane, the HTTP
+server, the submitter); the workers that only need to stop (the reader, the
+detector, the fee oracle) take its pure notification half, the slim
+`ShutdownSignal`, and hold the lock directly. `RuntimeScope::authorize()` mints the
 borrow-scoped `Authorized` token that three effect functions require in
 their signatures — the user-op acknowledgement, the L1 send, and the WS
 emit — so at those sites forgetting the containment consult is a compile
@@ -67,8 +69,8 @@ bit by hand, bounded by the exit contract.
 
 The lock is released only after every runtime-owned child has actually
 stopped; a dropped `JoinHandle` detaches rather than stops, so each worker
-and nested blocking task retains its own capability clone until its closure
-really ends. This is a cheap local foot-gun guard, not distributed fencing:
+and nested blocking task retains its own lock clone — through the scope or
+directly — until its closure really ends. This is a cheap local foot-gun guard, not distributed fencing:
 it prevents two processes on one data directory and nothing more.
 
 Runtime construction is prepare → admit → launch: every fallible or awaited
