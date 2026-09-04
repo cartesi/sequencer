@@ -1465,18 +1465,24 @@ fn dequeue_returns_lane_error_when_app_reports_internal() {
     let err = dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 16, &head, &mut included)
         .expect_err("internal application error should stop the lane");
 
-    assert!(matches!(err, InclusionLaneError::ExecuteUserOp { .. }));
+    // The application's reason travels on the lane error (and the log) ...
+    assert!(matches!(
+        &err,
+        InclusionLaneError::ExecuteUserOp { source }
+            if source.to_string().contains("app invariant failed")
+    ));
     assert!(
         included.is_empty(),
         "internal errors must not leave an op ready to persist"
     );
+    // ... never into the client's 500 body, which is fixed text.
     let response = recv
         .blocking_recv()
         .expect("lane should respond to triggering op")
         .expect_err("triggering op should receive internal error");
     assert!(matches!(
         response,
-        super::SequencerError::Internal(message) if message == "app invariant failed"
+        super::SequencerError::Internal(message) if message == "application internal error"
     ));
 }
 

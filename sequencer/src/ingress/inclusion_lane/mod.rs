@@ -46,7 +46,7 @@ use tokio::task::JoinHandle;
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{SafeFrontierState, SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::application::{
-    AppError, Application, ExecutionOutcome, execute_direct_input, validate_and_execute_user_op,
+    Application, ExecutionOutcome, execute_direct_input, validate_and_execute_user_op,
 };
 use sequencer_core::l2_tx::DirectInput;
 use sequencer_core::user_op::SignedUserOp;
@@ -548,11 +548,12 @@ fn execute_user_op(
         // does not advance scheduler-owned progress, and this op is never
         // persisted or acknowledged.
         Err(err) => {
-            let reason = match &err {
-                AppError::Internal { reason } => reason.clone(),
-                AppError::Io(io) => io.to_string(),
-            };
-            let _ = item.respond_to.send(Err(SequencerError::internal(reason)));
+            // The client gets a fixed message: the application's reason and
+            // any I/O detail travel on the lane error and the log, never
+            // into the public 500 body.
+            let _ = item.respond_to.send(Err(SequencerError::internal(
+                "application internal error".to_string(),
+            )));
             return Err(InclusionLaneError::ExecuteUserOp { source: err });
         }
     }
