@@ -280,7 +280,10 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   concurrency, durability, and hostile-L1 robustness → AGENTS.md design
   principles.
 - **The `Authorized` externalization token** (2026-08-18): the containment
-  consult is a compile-time obligation of the effect functions →
+  consult is a compile-time obligation of the three effect functions that
+  take the token (ack, L1 send, WS emit); the snapshot-stream start, the
+  `POST /tx` success body, and the lane's mutation commits are hand-placed
+  consults bounded by the exit contract →
   `runtime/shutdown.rs`, ADR mechanism 1.
 - **Module homing** (2026-08-19): command brackets in `commands/` (with
   config + the `CommandError` taxonomy), the capability substrate alone in

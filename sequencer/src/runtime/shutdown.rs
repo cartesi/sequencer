@@ -19,8 +19,7 @@
 //!
 //! Honest bounds: the black box's terminal-cause row is best-effort
 //! telemetry (restart policy is the exit contract, and a persistent fault
-//! re-detects fail-loud on the next boot that reads it — there is no
-//! database boot gate to keep durable).
+//! re-detects fail-loud on the next boot that reads it).
 //! In a process-lock-backed runtime, terminal containment gives the complete
 //! runtime lifetime two seconds to drain before aborting the process. Ordinary
 //! operator/recovery shutdown remains cooperatively unbounded.
@@ -225,12 +224,15 @@ impl RuntimeScope {
     }
 
     /// Consult containment and mint the externalization token: `None` once a
-    /// terminal fault is contained. The authority-bearing effect functions
-    /// (acknowledge, L1 send, WS emit, snapshot-stream start) take an
-    /// [`Authorized`], so a new externalization site cannot forget the check
-    /// — the compile error replaces the convention. This is the honest
-    /// bounded-lag consult, not a fence: a token minted before a concurrent
-    /// containment may finish its already-authorized effect (ADR).
+    /// terminal fault is contained. Three effect functions require an
+    /// [`Authorized`] in their signature — the user-op acknowledgement, the
+    /// L1 send, and the WS emit — so at those sites forgetting the check is
+    /// a compile error, not a convention. The remaining consults are
+    /// hand-placed and bounded by the exit contract: the snapshot-stream
+    /// start, the `POST /tx` success body, and the lane's batch-close and
+    /// reconciliation commits. This is the honest bounded-lag consult, not a
+    /// fence: a token minted before a concurrent containment may finish its
+    /// already-authorized effect (ADR).
     pub(crate) fn authorize(&self) -> Option<Authorized<'_>> {
         if self.is_storage_invariant_contained() {
             None
@@ -243,7 +245,10 @@ impl RuntimeScope {
 }
 
 /// Zero-sized, borrow-scoped proof that terminal containment was consulted
-/// and found clear at this effect boundary. Obtainable only from
+/// and found clear at some point in this borrow — not at the instant of the
+/// effect: the token is `Copy` and lives as long as the scope borrow, so a
+/// consumer that awaits between minting and effect carries the ADR's
+/// bounded lag. Obtainable only from
 /// [`RuntimeScope::authorize`]; carries no runtime state — this is the
 /// type-level obligation the ADR's rejected `EffectGate` was not (no mutex,
 /// no actor, no second state machine).

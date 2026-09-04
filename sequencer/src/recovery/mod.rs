@@ -890,7 +890,7 @@ mod tests {
         );
 
         // Reconstructing the Rust controller is the restart boundary: its
-        // non-clone witnesses are gone. Even though durable facts still show
+        // boot-local witnesses are gone. Even though durable facts still show
         // the same closed danger, the new attempt must InitialSync and Flush;
         // it cannot jump straight to Cascade using the previous attempt's
         // PostFlushSync witness.
