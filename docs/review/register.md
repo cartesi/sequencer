@@ -13,10 +13,12 @@ Findings 19–31 and the 2026-09-03 refuted block come from the
 [branch stock-take](2026-09-03-branch-stocktake.md), which records every
 proposal that review raised, including the ones no jury examined.
 
-## Open findings
+## Findings
 
 Code findings, oldest first (file references are starting points, not exact
-lines):
+lines). Numbers are stable identifiers: a closed finding keeps its number and
+is reduced to a one-line closure note, so citations in the dated ledgers stay
+valid.
 
 1. **Submitter confirmation-timeout defeats pacing** — a watch timeout maps
    to a successful `Submitted` tick, so the next tick immediately re-sends
@@ -32,12 +34,11 @@ lines):
    skip-and-continue, so an operator's manual tx from the submitter EOA
    wedges ticks until the block passes the safe head. Skip undecodable
    own-sender payloads.
-4. **Flusher logs `error!("flush retry: previous attempt timed out")` on
-   every healthy finality-wait pass** (`recovery/flusher.rs`).
-5. **One `POST /tx` 500 path still echoes internals** — `AppError::Internal
-   { reason }` / `AppError::Io` strings pass verbatim into the 500 body
-   (`ingress/inclusion_lane/mod.rs` error mapping); the storage path is
-   already generic.
+4. **Closed** (2026-09-03): the flusher's healthy retry pass logs at
+   `warn!`, not `error!`.
+5. **Closed** (2026-09-03): the application-error 500 body is the fixed
+   "application internal error"; the reason stays on the lane error and the
+   log.
 6. **WS session hygiene** — a mid-session transient read error tears down
    with no close frame; a beyond-head `from_offset` idles forever (currently
    e2e-pinned as intended — decide the contract, then re-pin).
@@ -47,18 +48,18 @@ lines):
    consumer rule: treat any socket drop as a potential discontinuity.
    Closure is exclusively owned by the
    [Track 3 handoff](../plans/2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff).
-8. **Fee-determinism contract under-specified** — `fixed_mul`'s comment
-   claims a `debug_assert` that does not exist (high limbs silently drop),
-   and the LSB-first floor-after-each-multiply order is implemented but not
-   stated as contract (`sequencer-core/src/fee.rs`). Load-bearing for the
-   C++ scheduler port; interacts with the deferred fee-LUT track.
+8. **Fee-determinism contract under-specified** — the LSB-first
+   floor-after-each-multiply order is implemented but not stated as contract
+   (`sequencer-core/src/fee.rs`). Load-bearing for the C++ scheduler port;
+   interacts with the deferred fee-LUT track. (The `fixed_mul` comment that
+   claimed a nonexistent `debug_assert` now states what the truncation
+   relies on: the `MAX_EXPONENT` bound upstream — closed 2026-09-03.)
 9. **`trg_enforce_nonce_contiguity` NULL hole** — a dangling parent makes
     the comparison NULL and the trigger silent; mitigated by `foreign_keys=ON`
     on every writer connection, but the trigger itself is not NULL-safe.
 10. **`seal_and_open_next_batch` takes an unchecked `next_safe_block`**
-    (assert equality with the head or drop the parameter), and the bare
-    `close_frame_and_batch` remains ungated with test-only callers —
-    integration tests are in-crate now, so plain `#[cfg(test)]` suffices.
+    (assert equality with the head or drop the parameter). (The bare
+    `close_frame_and_batch` is `#[cfg(test)]` as of 2026-09-03.)
 11. **Write-only columns** `safe_accepted_batches.{first_frame_safe_block,
     inclusion_block}` have no production reader — drop or mark audit-only.
 12. **`direct_q` is unbounded in the shared scheduler** — an adversarial
@@ -75,10 +76,11 @@ lines):
 16. **`should_retry_with_partition` substring-matches the Debug format** —
     consciously accepted and regression-pinned against alloy's format;
     revisit with structured JSON-RPC codes.
-17. **Test-only surface still presenting as production API** — delete
-    `latest_batch_index` and `ordered_l2_txs_for_batch` (only their own
-    tests call them); gate `promote_finalized` behind `#[cfg(test)]`
-    (`safe_input_end_exclusive` has a live reader-path caller and stays).
+17. **Closed** (2026-09-03): `latest_batch_index`,
+    `ordered_l2_txs_for_batch`, and `promote_finalized` are `#[cfg(test)]`
+    (gated rather than deleted — the first two have callers across three test
+    modules). `safe_input_end_exclusive` has a live reader-path caller and
+    stays.
 18. **`frames` lacks the immutability triggers `batches` got** — `fee` and
     `safe_block` are documented immutable but convention-protected only.
 19. **A missing or unreadable key file exits 1 and restart-loops** —
@@ -93,10 +95,9 @@ lines):
     when the Tip already exists, and `recovery_tests.rs` pins that line. Add
     `TipAlreadyOpen` plus a paired retry reason so `classify_mutation` carries
     it to the operator. Jury-confirmed; production-unreachable.
-21. **`Storage::ensure_open_tip` is `pub` with zero production callers** — a
-    new instance of 17 created by this branch, beside its guarded replacement.
-    Gate `#[cfg(test)] pub(crate)`; fix the two intra-doc links and
-    `docs/snapshots/lifecycle.md`'s genesis-Tip claim. Jury-confirmed.
+21. **Closed** (2026-09-03): `Storage::ensure_open_tip` is
+    `#[cfg(test)] pub(crate)`; the two intra-doc links and the snapshot
+    lifecycle doc now name the reducer's guarded `EnsureOpenTip` phase.
 22. **Detector and reader take `RuntimeScope` where `ShutdownSignal`
     suffices** — each uses the scope only for `wait_for_shutdown` and already
     holds a construction-required `ProcessLock`. Narrow, and restate the three
@@ -113,15 +114,11 @@ lines):
     `latest_terminal_fault` returns the second. Document the shape (recorder,
     ADR, runbook); do not dedupe by variant — the recorder swallows its own
     failures, so the bracket write is a genuine retry. Jury-confirmed.
-25. **Prose claims more than the types enforce** — `authorize()`'s doc names
-    four compile-forced primitives (three are; the HTTP 200 publication gate in
-    `ingress/api.rs` and the two lane mutation commits are hand-placed
-    consults); `RecoveryProgress` is called "non-clone" in the recovery README,
-    `admission.tla`, and `recovery/mod.rs` but derives `Copy`;
-    `process_lock.rs`'s witness comment is narrower than the predicate;
-    "journal" survives in `storage/history.rs` and `commands/run/workers.rs`;
-    `commands/error.rs:11` names an "acknowledge" command; the recovery README
-    names a `DangerDetectorExit` type that does not exist. Verified first-hand.
+25. **Closed** (2026-09-03): the token's doc, the ADR, and the settled
+    entry state its true scope (three compile-forced primitives; the rest
+    hand-placed); "non-clone" became "boot-local"; the witness comment names
+    every holder; the "journal", "acknowledge", and `DangerDetectorExit`
+    remnants are gone.
 26. **`finalized_state` handles an impossible `None`** — `LeasedDump` is
     shared between the finalized and latest lease queries, so the `NOT NULL`
     `inclusion_block` arrives as an `Option` and a `None` escalates to

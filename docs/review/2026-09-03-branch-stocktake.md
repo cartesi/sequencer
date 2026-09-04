@@ -9,7 +9,7 @@ refuted-list audit, CI root cause, roadmap); then three adversarial refuters
 per proposal for the eighteen highest-ranked proposals. Every proposal the
 fleet raised is recorded here, including the ones that were not put to a
 jury. Per-item dispositions that are actionable now live in
-[`register.md`](register.md) (open findings 19–30 and the 2026-09-03 refuted
+[`register.md`](register.md) (findings 19–31 and the 2026-09-03 refuted
 block); this ledger is the full record and will be distilled when it closes.
 
 **How to read the status tags.**
@@ -23,6 +23,40 @@ block); this ledger is the full record and will be distilled when it closes.
   Treat as a reviewer's claim: re-verify the cited lines before acting.
 - **verified first-hand** — checked directly against the tree during the
   stock-take, independent of the fleet.
+
+## Landed
+
+Wave 1 (2026-09-03), one theme per commit, on top of the CI fix:
+
+- **CI red**: both wallet-sequencer binaries style logs only when stdout is
+  a terminal; the aging-tip scenario asserts exit code 10 instead of grepping
+  the rendered log (verified: the scenario passes and its log carries no
+  escape bytes).
+- **Prose matches the types**: the token's true scope in `authorize()`, the
+  ADR, and the register; "boot-local" for the flush witness; the lock
+  witness's real predicate; three "journal" remnants; the error module's
+  dated history and removed command; a module doc that argued instead of
+  instructing; the recovery README's nonexistent type name; a test renamed to
+  what it asserts. Closes finding 25.
+- **Codename sweep finished**: fifteen residual review codes replaced by
+  the reason or the invariant id.
+- **Test-only storage surface gated**: `ensure_open_tip`,
+  `close_frame_and_batch`, `latest_batch_index`, `ordered_l2_txs_for_batch`,
+  `promote_finalized` are `#[cfg(test)] pub(crate)`, with their doc links and
+  the snapshot lifecycle doc pointed at the production paths. Closes findings
+  17 and 21 and the second half of 10.
+- **Two register nits**: the flusher's healthy retry logs at `warn!`
+  (finding 4); `fixed_mul`'s comment states what the truncation relies on
+  (finding 8's comment half).
+- **`/tx` 500 body is fixed text**: the application's reason stays on the
+  lane error and the log (finding 5).
+- **Panicking progress constructor deleted**: `ApplicationProgress::new`
+  had only test callers; `try_new` is the one constructor, tests use it with
+  `expect`.
+
+Not yet landed from the recommended split: the two-row black-box note (moot
+if wave 2 deletes the in-scope recorder) and the PR title/body, which come
+last.
 
 ## Verdict
 
