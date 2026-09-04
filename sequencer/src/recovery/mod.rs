@@ -55,8 +55,16 @@ pub enum RecoveryFailure {
     Flush(#[source] FlushError),
     #[error("input reader: {0}")]
     InputReader(#[source] InputReaderError),
-    #[error("provider: {0}")]
-    Provider(String),
+    /// The chain-id read on the flush's signer provider failed: transport,
+    /// so retry.
+    #[error("provider unreachable: {0}")]
+    ProviderUnreachable(String),
+    /// The flush's signer provider could not be constructed (bad RPC URL or
+    /// key): deterministic misconfiguration, so refuse. Kept distinct from
+    /// [`Self::ProviderUnreachable`] so the verdict is a function of the
+    /// value, never of the construction site.
+    #[error("signer provider misconfiguration: {0}")]
+    SignerMisconfig(String),
     #[error("recovery flush chain-id mismatch: rpc {rpc} != pinned {expected}")]
     ChainIdMismatch { rpc: u64, expected: u64 },
 }
@@ -435,8 +443,6 @@ impl RecoveryDriver for ProductionRecoveryDriver<'_> {
 
 impl ProductionRecoveryDriver<'_> {
     async fn flush(&mut self) -> Result<u64, RecoveryError> {
-        use crate::l1::provider::VerifiedSignerProviderError;
-
         let provider = crate::l1::provider::create_verified_signer_provider(
             &self.l1_config.eth_rpc_url,
             self.l1_config.batch_submitter_private_key.expose_secret(),
@@ -444,17 +450,7 @@ impl ProductionRecoveryDriver<'_> {
             self.l1_config.allow_insecure_rpc,
         )
         .await
-        .map_err(|error| match error {
-            VerifiedSignerProviderError::ChainIdMismatch { rpc, expected } => {
-                RecoveryError::refuse(RecoveryFailure::ChainIdMismatch { rpc, expected })
-            }
-            VerifiedSignerProviderError::ChainIdRpc(message) => {
-                RecoveryError::retry(RecoveryFailure::Provider(message))
-            }
-            VerifiedSignerProviderError::Create(message) => {
-                RecoveryError::refuse(RecoveryFailure::Provider(message))
-            }
-        })?;
+        .map_err(classify_signer_provider)?;
 
         let watermark = {
             let mut storage = storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
@@ -541,6 +537,49 @@ fn classify_storage(error: rusqlite::Error) -> RecoveryError {
     }
 }
 
+/// The flush's signer-provider errors, classified at birth. The
+/// terminal/transient split must agree with `From<VerifiedSignerProviderError>
+/// for BootstrapError` in `commands/error.rs` (mismatch and construction are
+/// terminal; the chain-id read is transient); this is the reducer's own
+/// retry/refuse polarity over the same facts, pinned beside the others.
+fn classify_signer_provider(
+    error: crate::l1::provider::VerifiedSignerProviderError,
+) -> RecoveryError {
+    use crate::l1::provider::VerifiedSignerProviderError;
+    match error {
+        VerifiedSignerProviderError::ChainIdMismatch { rpc, expected } => {
+            RecoveryError::refuse(RecoveryFailure::ChainIdMismatch { rpc, expected })
+        }
+        VerifiedSignerProviderError::ChainIdRpc(message) => {
+            RecoveryError::retry(RecoveryFailure::ProviderUnreachable(message))
+        }
+        VerifiedSignerProviderError::Create(message) => {
+            RecoveryError::refuse(RecoveryFailure::SignerMisconfig(message))
+        }
+    }
+}
+
+/// Input-reader errors met during the startup phases (`InitialSync` and
+/// `PostFlushSync`, both through `sync_to_current_safe_head`), classified
+/// at birth. `ChainIdMismatch` and `StorageTaskPanicked` are refused here
+/// and terminal in the live worker alike. Two variants are phase-dependent
+/// by design and differ from `InputReaderError::is_terminal_invariant`:
+///
+/// - `Bootstrap` here can only be the sync's `create_provider` failing on
+///   the configured RPC URL (parse, the plaintext-remote rule, client
+///   build), refused because re-running the same boot re-fails
+///   identically. The discovery-time facts (wrong contract, pre-v3
+///   InputBox) never reach this function: they arise in `InputReader::new`,
+///   which only `setup` calls and projects as a worker exit (register
+///   finding 32). In the live loop the same URL was already proven by this
+///   boot's initial sync, so a live `Bootstrap` restarts unclassified
+///   rather than poisoning the data directory.
+/// - `Join` (a non-panic loss of a storage task) is shutdown-path
+///   cancellation in the live loop. During startup the runtime that would
+///   cancel it is the one driving this boot, so an unexplained loss is
+///   refused rather than retried blind.
+///
+/// Both halves are pinned.
 fn classify_input_reader(error: InputReaderError) -> RecoveryError {
     match error {
         error @ (InputReaderError::Provider(_) | InputReaderError::InconsistentL1Response(_)) => {
@@ -641,10 +680,69 @@ mod tests {
         assert_retry(classify_input_reader(InputReaderError::Provider(
             "offline".into(),
         )));
+        assert_retry(classify_input_reader(
+            InputReaderError::InconsistentL1Response("gap".into()),
+        ));
         assert_refuse(classify_input_reader(InputReaderError::ChainIdMismatch {
             rpc: 1,
             expected: 2,
         }));
+        // Phase-dependent: refused at startup, non-terminal in the live
+        // worker (`InputReaderError::is_terminal_invariant`).
+        assert_refuse(classify_input_reader(InputReaderError::Bootstrap(
+            "plaintext rpc url".into(),
+        )));
+        assert_refuse(classify_input_reader(InputReaderError::Join(
+            "sync task lost".into(),
+        )));
+        assert!(!InputReaderError::Bootstrap("x".into()).is_terminal_invariant());
+        assert!(!InputReaderError::Join("x".into()).is_terminal_invariant());
+
+        {
+            use crate::commands::error::BootstrapError;
+            use crate::l1::provider::VerifiedSignerProviderError as Signer;
+            // The split's payloads are load-bearing, not only its polarity:
+            // swapping the two provider variants must go red.
+            assert!(matches!(
+                classify_signer_provider(Signer::ChainIdRpc("timeout".into())),
+                RecoveryError::Retry(f) if matches!(*f, RecoveryFailure::ProviderUnreachable(_))
+            ));
+            assert!(matches!(
+                classify_signer_provider(Signer::Create("bad url".into())),
+                RecoveryError::Refuse(f) if matches!(*f, RecoveryFailure::SignerMisconfig(_))
+            ));
+            assert!(matches!(
+                classify_signer_provider(Signer::ChainIdMismatch {
+                    rpc: 1,
+                    expected: 2,
+                }),
+                RecoveryError::Refuse(f) if matches!(*f, RecoveryFailure::ChainIdMismatch { .. })
+            ));
+            // The doc's "must agree with the `BootstrapError` projection":
+            // the reducer retries exactly the arm that projection calls
+            // transient.
+            let mint = || {
+                [
+                    Signer::ChainIdRpc("timeout".into()),
+                    Signer::Create("bad url".into()),
+                    Signer::ChainIdMismatch {
+                        rpc: 1,
+                        expected: 2,
+                    },
+                ]
+            };
+            for (reducer_side, projection_side) in mint().into_iter().zip(mint()) {
+                let retried = matches!(
+                    classify_signer_provider(reducer_side),
+                    RecoveryError::Retry(_)
+                );
+                let transient = matches!(
+                    BootstrapError::from(projection_side),
+                    BootstrapError::ChainIdRpc { .. }
+                );
+                assert_eq!(retried, transient);
+            }
+        }
 
         assert_retry(classify_flush(FlushError::Provider("offline".into())));
         assert_refuse(classify_flush(FlushError::Watermark(

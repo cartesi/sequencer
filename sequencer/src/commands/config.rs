@@ -18,6 +18,7 @@
 use alloy_primitives::Address;
 use clap::{ArgGroup, Args};
 
+use crate::commands::error::BootstrapError;
 use crate::l1::SubmitterKey;
 use sequencer_core::protocol::{ProtocolTiming, ProtocolTimingError};
 
@@ -226,7 +227,7 @@ pub struct KeyArgs {
 
 impl KeyArgs {
     /// Resolve the batch submitter private key from either the inline value or a key file.
-    pub fn resolve(&self) -> Result<SubmitterKey, std::io::Error> {
+    pub fn resolve(&self) -> Result<SubmitterKey, BootstrapError> {
         resolve_key_source(
             &self.batch_submitter_private_key,
             &self.batch_submitter_private_key_file,
@@ -243,15 +244,43 @@ impl KeyArgs {
 fn resolve_key_source(
     inline: &Option<SubmitterKey>,
     file: &Option<String>,
-) -> Result<Option<SubmitterKey>, std::io::Error> {
+) -> Result<Option<SubmitterKey>, BootstrapError> {
     if let Some(file) = file {
-        let contents = std::fs::read_to_string(file)?;
+        // The error carries the path, never the contents: a key file's
+        // bytes must not reach a log line even when the read fails.
+        let contents = std::fs::read_to_string(file).map_err(|source| BootstrapError::KeyFile {
+            path: std::path::PathBuf::from(file),
+            source,
+        })?;
         Ok(Some(SubmitterKey::new(
             contents.lines().next().unwrap_or("").trim().to_string(),
         )))
     } else {
         Ok(inline.clone())
     }
+}
+
+/// Whether a key-file read failure is deterministic operator
+/// misconfiguration — the file is missing, unreadable by this user, not a
+/// file, or not text — as opposed to an environmental failure that may clear
+/// on restart (a device or memory error). The same kind of split
+/// `referenced_artifact_io_is_terminal` draws for snapshot artifacts, over a
+/// different set: a whole-file read cannot produce `UnexpectedEof`, and a
+/// permission denial on the operator-named key path is the operator's own
+/// mount or mode mistake, where a snapshot artifact's mode can be repaired
+/// underneath a running process. `NotFound` is deliberately terminal even
+/// though a secret populated after the process starts hits it: the
+/// orchestrator must mount the key before start, and a typo'd path
+/// restart-looping unpaged is the failure this replaces.
+pub(crate) fn key_file_io_is_terminal(source: &std::io::Error) -> bool {
+    matches!(
+        source.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::IsADirectory
+            | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Batch-submitter signing-key source for a context where the key is
@@ -293,7 +322,7 @@ impl OptionalKeyArgs {
     }
 
     /// Resolve the key if either source is set; `Ok(None)` when neither is.
-    fn resolve_if_present(&self) -> Result<Option<SubmitterKey>, std::io::Error> {
+    fn resolve_if_present(&self) -> Result<Option<SubmitterKey>, BootstrapError> {
         resolve_key_source(
             &self.batch_submitter_private_key,
             &self.batch_submitter_private_key_file,
@@ -422,7 +451,7 @@ impl SetupConfig {
 
     /// Resolve the recovery signing key. Precondition: [`SetupConfig::validate`]
     /// passed with `recovery == true` (so exactly one source is set).
-    pub fn resolve_recovery_key(&self) -> Result<SubmitterKey, std::io::Error> {
+    pub fn resolve_recovery_key(&self) -> Result<SubmitterKey, BootstrapError> {
         self.key
             .resolve_if_present()
             .map(|opt| opt.expect("recovery key presence is validated before resolve"))
@@ -510,7 +539,7 @@ impl RunConfig {
     }
 
     /// Resolve the batch submitter private key from either the inline value or a key file.
-    pub fn resolve_private_key(&self) -> Result<SubmitterKey, std::io::Error> {
+    pub fn resolve_private_key(&self) -> Result<SubmitterKey, BootstrapError> {
         self.key.resolve()
     }
 }
@@ -548,7 +577,7 @@ impl FlushConfig {
         db_path_in(&self.data_dir)
     }
 
-    pub fn resolve_private_key(&self) -> Result<SubmitterKey, std::io::Error> {
+    pub fn resolve_private_key(&self) -> Result<SubmitterKey, BootstrapError> {
         self.key.resolve()
     }
 }
@@ -741,6 +770,36 @@ mod tests {
                 .expect("resolve key")
                 .expose_secret(),
             TEST_KEY
+        );
+    }
+
+    #[test]
+    fn missing_key_file_is_terminal_and_names_the_path_not_the_contents() {
+        let cfg = setup_config_from(&[
+            "--recovery",
+            "--checkpoint-dump-dir",
+            "/tmp/ckpt",
+            "--checkpoint-block",
+            "1200",
+            "--batch-submitter-private-key-file",
+            "/nonexistent/dir/submitter.key",
+        ]);
+        cfg.validate().expect("one key source is valid");
+        let err = cfg
+            .resolve_recovery_key()
+            .expect_err("a missing key file must not resolve");
+        assert!(
+            matches!(&err, BootstrapError::KeyFile { path, source }
+                if path.to_string_lossy() == "/nonexistent/dir/submitter.key"
+                    && source.kind() == std::io::ErrorKind::NotFound),
+            "expected a typed key-file error, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("/nonexistent/dir/submitter.key"));
+        // Deterministic misconfiguration pages rather than restart-loops.
+        assert_eq!(
+            crate::commands::error::CommandError::from(err).exit_code(),
+            crate::commands::error::EXIT_TERMINAL
         );
     }
 

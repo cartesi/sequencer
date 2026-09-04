@@ -83,13 +83,14 @@ valid.
     stays.
 18. **`frames` lacks the immutability triggers `batches` got** — `fee` and
     `safe_block` are documented immutable but convention-protected only.
-19. **A missing or unreadable key file exits 1 and restart-loops** —
-    `resolve_key_source` (`commands/config.rs`) returns a bare `io::Error`
-    that lands in `CommandError::Io`, while bad key *content* in the same file
-    exits 30. Kind-filter into a distinct `KeySourceUnreadable { path, kind }`
-    (NotFound/PermissionDenied/InvalidData/IsADirectory/NotADirectory
-    terminal; EIO and friends operational); never echo contents.
-    Jury-confirmed.
+19. **Closed** (2026-09-04): the key-file read returns
+    `BootstrapError::KeyFile { path, source }`, classified by kind
+    (`config::key_file_io_is_terminal`: missing, unreadable, not a file, or
+    not text → 30; environmental I/O → 1); the message names the path, never
+    the contents; both halves pinned. The sibling `create_dir_all` at each
+    command's start keeps `CommandError::Io` → 1: it creates rather than
+    reads, so a missing path is not an operator mistake there; a read-only or
+    wrong-type parent is, and is not yet separated.
 20. **Closed** (2026-09-04): `ensure_open_tip_for_recovery` splits its
     disjunction — a non-`Safe` danger raises `StaleDecision`, an already-open
     Tip raises the payload-free `TipAlreadyOpen`, paired with a retry reason
@@ -127,12 +128,12 @@ valid.
     containment branch in `finalized_state` is gone. Corrupt-row containment
     is unchanged (the persistent-storage classifier and the decode panic, as
     `corrupt_finalized_snapshot_trips_terminal_storage_fault` pins).
-27. **`RecoveryFailure::Provider(String)` carries two verdicts** — the
-    startup flush maps `ChainIdRpc` → retry and `Create` → refuse into one
-    variant, and nothing pins either arm; `classify_input_reader` has no doc
-    comment and its `Bootstrap`/`Join` refusals are unpinned; a pre-v3
-    InputBox exits 1 under `setup` and 30 under `run`. Surfaced by the
-    refuters; split the variant and pin both polarities.
+27. **Closed** (2026-09-04): the two-verdict `RecoveryFailure::Provider`
+    is split into `ProviderUnreachable` (retry) and `SignerMisconfig`
+    (refuse), constructed by a pure `classify_signer_provider` pinned on all
+    three arms; `classify_input_reader` documents its phase-dependent
+    polarity and pins `Bootstrap`/`Join` refused at startup, non-terminal
+    live. The setup-versus-run asymmetry it exposed is finding 32.
 28. **Setup admission is implemented twice with different semantics** —
     `preflight_lifecycle_command` (used by `run`/`flush`) and
     `admit_setup_lifecycle` (`commands/setup/mod.rs`) each check the same two
@@ -155,6 +156,20 @@ valid.
     telemetry that justifies having no expiry gate. Surface it (health field
     or the transient-refresh warn) or drop it and fix the sentence.
     Unverified.
+32. **A deterministic L1 misconfiguration exits 1 under `setup` but 30
+    under `run`** — `setup` wraps every non-`Provider` input-reader failure
+    — from `InputReader::new` (`setup/mod.rs:107-127`) and from both
+    `sync_to_current_safe_head` calls (`setup/mod.rs:260-267,535-542`) — as
+    a worker exit, whose `InputReaderError::is_terminal_invariant` treats
+    `Bootstrap` as the live-worker case (non-terminal), so it projects to 1.
+    `run` meets the bad-RPC-URL half through `classify_input_reader` and
+    refuses at 30; the discovery-time half (wrong contract, pre-v3 InputBox)
+    has no `run` counterpart, because `run` builds its reader with
+    `from_parts` and never re-runs discovery. `setup` is an
+    operator-run one-shot, so the harm is a wrong hint, not a restart loop.
+    Candidate fixes: classify `setup`'s bootstrap failure through the same
+    phase table as `run`, or give `setup` its own terminal variant for L1
+    misconfiguration. Surfaced by the 2026-09-04 refuters; not yet decided.
 
 Open maintainer decisions:
 
@@ -427,16 +442,22 @@ reasoning in the [ledger](2026-09-03-branch-stocktake.md)):
 - **Deleting the `#[from]` impls so a refusal reason cannot be typed into a
   retry** — the enums are public with public variants; the longer spelling
   still compiles and is the dominant idiom at all 15 sites. Evidence:
-  `recovery/mod.rs:45-49,109-115`.
+  `recovery/mod.rs:45-49,122-128`.
 - **One `is_terminal()` on `VerifiedSignerProviderError` read by both
   tables** — the `From` impl performs no classification; the verdict is taken
   later over `BootstrapError`, whose variants have four other producers.
-  Evidence: `commands/error.rs:671-683,216-260`; `l1/reader.rs:96-104`
+  Evidence: `commands/error.rs:688-700,220-273`; `l1/reader.rs:96-104`
   already documents the phase pair.
 - **Flattening `RecoveryError` into one enum with `is_retryable()`** —
-  `RecoveryFailure::Provider(String)` carries two verdicts, so a total
-  function over the value does not exist. Evidence: `recovery/mod.rs:429-438`.
-  Splitting the variant is a separate, sound fix (finding 27).
+  refuted 2026-09-03 because `RecoveryFailure::Provider(String)` carried two
+  verdicts, so no total function over the value existed. That premise was
+  retired 2026-09-04 when finding 27 split the variant; every
+  `RecoveryFailure` now determines its verdict from its value. The entry
+  keeps its place on its remaining ground: the `Retry`/`Refuse` wrapper is
+  the reducer's verdict at birth, not a predicate a consumer recomputes, and
+  dropping its `Box` grows the `CommandError` footprint managed against
+  clippy's `result_large_err` (`commands/error.rs:537`). Re-propose only
+  against those. Evidence: `recovery/mod.rs:122-128,545-583`.
 - **Moving the phase→progress mapping into `drive_recovery`** — `(Flush,
   Done)` has no target without the observed block; this is
   `PhaseCompletion`/`transition_after_phase`, deleted by ed41f9b. Deleting
