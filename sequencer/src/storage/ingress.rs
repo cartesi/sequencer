@@ -92,7 +92,7 @@ impl Storage {
     /// Those directs are executed by the lane's catch-up replay (the same path
     /// warm resume and recovery batches use), so there is no cold-start drain.
     ///
-    /// This unguarded public form exists for test harnesses. Production uses
+    /// This unguarded form exists for test harnesses only. Production uses
     /// `ensure_open_tip_for_recovery`, which reasserts the reducer facts in its
     /// write transaction. The lane only ever *loads* a Tip (fail-loud if
     /// absent); Cascade owns its own atomic reopen using the same mechanism.
@@ -101,7 +101,8 @@ impl Storage {
     /// exist. A fresh DB requires L1 at bootstrap plus a successful recovery
     /// sync, else startup refuses before reaching here; the warm-DB early
     /// return fires before any safe-head read.
-    pub fn ensure_open_tip(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn ensure_open_tip(&mut self) -> Result<()> {
         self.write(|tx| {
             if load_current_write_head(tx)?.is_some() {
                 return Ok(());
@@ -115,8 +116,9 @@ impl Storage {
     /// at the checkpoint stop block `C` and leads exactly the directs the fold
     /// folded into `S'` — those with `block_number <= C`.
     ///
-    /// Distinct from [`Storage::ensure_open_tip`] / [`open_fresh_tip_in_tx`],
-    /// which drain the **whole** synced table at the live safe head. That is
+    /// Distinct from [`open_fresh_tip_in_tx`] (reached in production through
+    /// the reducer's guarded `EnsureOpenTip` phase), which drains the **whole**
+    /// synced table at the live safe head. That is
     /// correct for genesis, but wrong here: `setup --recovery` resyncs to the
     /// live safe head `H1`, which is normally **past** `C`, and the fold only
     /// folded `<= C` into `S'`. Draining `(C, H1]` into this tip would sequence
@@ -368,14 +370,17 @@ impl Storage {
         Ok(())
     }
 
-    /// Close the current batch and open a fresh one with its first frame.
-    /// Used when batch policy (size/deadline) triggers a batch close.
+    /// Close the current batch and open a fresh one with its first frame,
+    /// without registering a pending snapshot. Test-only: production closes
+    /// through [`Storage::close_frame_and_batch_with_pending_dump`], which
+    /// registers the snapshot row in the same transaction (I7).
     ///
     /// Atomically: seal the current Tip (sets `sealed_at_ms`), insert the new
     /// Tip with `parent_batch_index = head.batch_index`, open its first frame.
     /// Order matters: sealing first removes the old row from the
     /// `ux_single_valid_tip` partial index, making room for the new Tip.
-    pub fn close_frame_and_batch(
+    #[cfg(test)]
+    pub(crate) fn close_frame_and_batch(
         &mut self,
         head: &mut WriteHead,
         next_safe_block: u64,
@@ -391,9 +396,9 @@ impl Storage {
         Ok(())
     }
 
-    /// Like [`Storage::close_frame_and_batch`], but in the same
-    /// transaction also registers the pending snapshot for the batch
-    /// being sealed.
+    /// Close the current batch, open a fresh one with its first frame, and
+    /// in the same transaction register the pending snapshot for the batch
+    /// being sealed. The production batch close.
     ///
     /// The caller must have already created the dump on disk at
     /// `dump_prefix` (filesystem-first, outside this tx). That ordering
@@ -483,7 +488,7 @@ fn insert_tip_rows(
 /// draining all currently-undrained safe inputs into its first frame.
 ///
 /// One mechanism, two callers with distinct intents (each keeps its own guard):
-/// the runtime's [`Storage::ensure_open_tip`] (genesis / first startup) and
+/// the reducer's guarded `EnsureOpenTip` phase (genesis / first startup) and
 /// recovery's cascade (reopening the Tip it just invalidated, atomically — see
 /// `storage/recovery.rs`). Lineage is derived from the tree: `parent` is the
 /// highest-indexed valid batch — `None` when the valid path is empty (genesis,
