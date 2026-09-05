@@ -17,8 +17,8 @@
 //!
 //! The outer loop is uniform: tick, maybe sleep, repeat. A tick that produced
 //! submissions re-enters immediately (no sleep) so the suffix drains quickly;
-//! an idle or transient-error tick sleeps `idle_poll_interval` before the next
-//! attempt.
+//! an idle or transient-error tick sleeps `idle_poll_interval`, while a
+//! fee-ceiling hold sleeps the confirmation cadence before the next probe.
 //!
 //! Mid-tick cancellation is crash-safe: storage transactions either commit or
 //! auto-roll-back on drop, and any already-sent L1 transaction is picked up by
@@ -30,7 +30,9 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error};
 
-use crate::l1::submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig};
+use crate::l1::submitter::{
+    BatchPoster, BatchPosterError, BatchSubmitterConfig, SubmitBatchesOutcome,
+};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{PendingBatch, Storage, StorageOpenError, SubmitterFrontier};
 
@@ -65,6 +67,9 @@ pub(crate) enum TickOutcome {
     /// Submitted one or more batches; re-enter immediately so the suffix
     /// drains without idle-sleep.
     Submitted(usize),
+    /// Fee ceiling prevented a valid replacement floor. This is not an
+    /// internal retry loop; the outer loop waits on confirmation cadence.
+    Held,
     /// Transient provider error; log and sleep before retrying.
     Transient,
 }
@@ -88,6 +93,7 @@ pub struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
     poster: Arc<P>,
     idle_poll_interval: Duration,
+    confirmation_cadence: Duration,
     /// Write-before-broadcast hook (review R1a): the poster raises the
     /// persisted wallet-nonce watermark through this before every send.
     watermark_sink: crate::l1::watermark::StorageWatermarkSink,
@@ -101,6 +107,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             db_path,
             poster,
             idle_poll_interval: config.idle_poll_interval(),
+            confirmation_cadence: config.confirmation_cadence(),
         }
     }
 
@@ -136,8 +143,8 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 
     /// Tick → sleep-if-idle → tick. Productive ticks re-enter immediately;
-    /// idle or transient-error ticks wait `idle_poll_interval`. Fatal errors
-    /// propagate.
+    /// idle or transient-error ticks wait `idle_poll_interval`; held ticks
+    /// wait the confirmation cadence. Fatal errors propagate.
     async fn run_loop(&self) -> Result<SubmitterExit, BatchSubmitterError> {
         loop {
             let outcome = match self.tick_once().await {
@@ -156,6 +163,9 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             };
             match outcome {
                 TickOutcome::Submitted(_) => continue,
+                TickOutcome::Held => {
+                    tokio::time::sleep(self.confirmation_cadence).await;
+                }
                 TickOutcome::Idle | TickOutcome::Transient => {
                     tokio::time::sleep(self.idle_poll_interval).await;
                 }
@@ -191,20 +201,34 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
         let submitted_count = pending.len();
         let payloads: Vec<Vec<u8>> = pending.into_iter().map(|b| b.encoded).collect();
-        let tx_hashes = self
+        let outcome = self
             .poster
             .submit_batches(payloads, &self.watermark_sink)
             .await?;
-        if tx_hashes.len() != submitted_count {
-            return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
-                format!(
-                    "poster returned {} tx hashes for {submitted_count} submitted batches",
-                    tx_hashes.len(),
-                ),
-            )));
+        match outcome {
+            SubmitBatchesOutcome::Submitted(tx_hashes) => {
+                if tx_hashes.len() != submitted_count {
+                    return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
+                        format!(
+                            "poster returned {} tx hashes for {submitted_count} submitted batches",
+                            tx_hashes.len(),
+                        ),
+                    )));
+                }
+                Ok(TickOutcome::Submitted(submitted_count))
+            }
+            SubmitBatchesOutcome::Held(tx_hashes) => {
+                if tx_hashes.len() > submitted_count {
+                    return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
+                        format!(
+                            "held poster returned {} tx hashes for {submitted_count} submitted batches",
+                            tx_hashes.len(),
+                        ),
+                    )));
+                }
+                Ok(TickOutcome::Held)
+            }
         }
-
-        Ok(TickOutcome::Submitted(submitted_count))
     }
 
     async fn load_frontier(&self) -> Result<SubmitterFrontier, BatchSubmitterError> {
@@ -263,6 +287,8 @@ mod tests {
     fn default_test_config() -> BatchSubmitterConfig {
         BatchSubmitterConfig {
             idle_poll_interval_ms: 1000,
+            confirmation_depth: 0,
+            seconds_per_block: 1,
         }
     }
 
@@ -325,6 +351,21 @@ mod tests {
         assert_eq!(submissions[0].0, 0);
         assert_eq!(submissions[1].0, 1);
         assert_eq!(submissions[2].0, 2);
+    }
+
+    #[tokio::test]
+    async fn tick_once_surfaces_fee_ceiling_hold() {
+        let TestDb { _dir, path } = temp_db("tick-held");
+        seed_two_closed_batches(&path);
+
+        let mock = Arc::new(MockBatchPoster::new());
+        mock.set_held(true);
+        let submitter =
+            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
+
+        let outcome = submitter.tick_once().await.expect("tick once");
+        assert_eq!(outcome, TickOutcome::Held);
+        assert_eq!(mock.submissions().len(), 3);
     }
 
     #[tokio::test]

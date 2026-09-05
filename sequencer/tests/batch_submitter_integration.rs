@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sequencer::l1::submitter::{BatchPoster, BatchPosterError, TxHash};
+use sequencer::l1::submitter::{BatchPoster, BatchPosterError, SubmitBatchesOutcome, TxHash};
 use sequencer::l1::submitter::{BatchSubmitter, BatchSubmitterConfig};
 use sequencer::l1::watermark::WalletNonceWatermarkSink;
 use sequencer::runtime::shutdown::ShutdownSignal;
@@ -62,7 +62,7 @@ impl BatchPoster for TestMock {
         &self,
         payloads: Vec<Vec<u8>>,
         _watermark: &dyn WalletNonceWatermarkSink,
-    ) -> Result<Vec<TxHash>, BatchPosterError> {
+    ) -> Result<SubmitBatchesOutcome, BatchPosterError> {
         // Transient-failure hook: consume one of the configured failures
         // before anything else, so the tick outcome maps to `Transient` and
         // the loop must sleep + retry.
@@ -92,7 +92,7 @@ impl BatchPoster for TestMock {
                 .push((batch_index, payload.len()));
             tx_hashes.push(TxHash::ZERO);
         }
-        Ok(tx_hashes)
+        Ok(SubmitBatchesOutcome::Submitted(tx_hashes))
     }
 
     async fn observed_submitted_batch_nonces(
@@ -175,6 +175,8 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
     let shutdown = ShutdownSignal::default();
     let config = BatchSubmitterConfig {
         idle_poll_interval_ms: 5000,
+        confirmation_depth: 0,
+        seconds_per_block: 1,
     };
     let submitter = BatchSubmitter::new(path, mock.clone(), config);
     let handle = submitter
@@ -231,6 +233,8 @@ async fn submitter_re_enters_immediately_after_productive_tick() {
         // Ten seconds — anything above ~2s would be enough to fail if the
         // immediate-retry cadence regressed to always-sleep.
         idle_poll_interval_ms: 10_000,
+        confirmation_depth: 0,
+        seconds_per_block: 1,
     };
     let submitter = BatchSubmitter::new(path.clone(), mock.clone(), config);
     let handle = submitter
@@ -286,6 +290,8 @@ async fn submitter_recovers_from_transient_poster_error_without_exiting() {
         // test window. Still long enough that accidentally always-sleeping
         // would delay the single submission past the assertion.
         idle_poll_interval_ms: 50,
+        confirmation_depth: 0,
+        seconds_per_block: 1,
     };
     let submitter = BatchSubmitter::new(path.clone(), mock.clone(), config);
     let handle = submitter

@@ -178,6 +178,8 @@ impl Workers {
         let poster = Arc::new(EthereumBatchPoster::new(provider, poster_config));
         let submitter_config = BatchSubmitterConfig {
             idle_poll_interval_ms: run_config.batch_submitter_idle_poll_interval_ms,
+            confirmation_depth: run_config.batch_submitter_confirmation_depth,
+            seconds_per_block: run_config.timing.seconds_per_block,
         };
         let submitter = BatchSubmitter::new(db_path.clone(), poster, submitter_config)
             .start(shutdown.clone())?;
