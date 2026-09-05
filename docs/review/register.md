@@ -345,14 +345,63 @@ From the 2026-06 reviews:
   warm start, snapshot bytes history-dependent — each verified as
   deliberate/out-of-scope (see the threat model's scoping).
 
-From the ADR re-evaluation (2026-08-01/02):
+From the ADR's rejected list (opened by the 2026-08-01/02 re-evaluation);
+the 2026-08-18 premise challenge found these alternatives left no residue in
+code:
 
-- **`RunEpoch`**, **`EffectGate`**, **`LiveKernel`** — see the ADR's
-  rejected-alternatives section for each argument.
+- **`RunEpoch`** (a globally threaded internal fencing epoch) — the OS lock
+  plus structured task lifetime plus fresh per-scope channels already make
+  an old sender unable to reach a new receiver, and there is no in-process
+  hot restart to fence against; persisted rows cannot distinguish a live
+  owner from a stale one, a kernel-held lock can. Revisit only if in-process
+  restart or multiple admitted runtimes under one lock are introduced.
+  Evidence: `runtime/process_lock.rs` (module doc); no epoch type exists in
+  `sequencer/src`.
+- **`EffectGate` / `LiveKernel`** (a universal effect mutex or actor, with a
+  reader mailbox) — would duplicate the role-local linearization points the
+  system already needs and force the reader and the latency-critical lane
+  through a new in-memory authority protocol, adding a second state machine
+  without making the narrow content-identity check a complete divergence
+  oracle; SQLite stays the durable coordination plane. The `Authorized`
+  token is not this — see
+  [ADR mechanism 1](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership).
+  Evidence:
+  `runtime/shutdown.rs` (`Authorized`); [I9](../invariants.md)'s
+  completeness boundary.
 - **A generic command controller** over setup/rebuild/run/maintenance —
-  unrelated facts; a larger state machine closing no hole.
-- **A per-chunk divergence query / reader mailbox** on the hot path — the
-  check is not a divergence oracle; the cost buys no complete boundary.
+  their facts are unrelated; combining them enlarges the cross-product state
+  machine without closing an enforcement hole, and a flush has no admission
+  state to restore or erase. Evidence: the per-command controllers are
+  separate — `recovery/mod.rs` (`drive_recovery`), `commands/setup/mod.rs`
+  (`admit_setup_lifecycle`), `commands/flush.rs` (the flush body); the one
+  shared piece is a *fact* gate, `commands/mod.rs`'s
+  `preflight_lifecycle_command` (used by `run` and `flush`; `setup` reads
+  its own two facts inline), which checks admission facts and reduces
+  nothing.
+- **A per-chunk divergence query, provider call, or reader mailbox** on the
+  hot path (formerly proposed per user-op) — the content-identity check is
+  complete only for at/above-anchor accepted-batch content identity
+  ([I9](../invariants.md)), so a query paid on every user-op chunk would buy
+  no complete safety boundary. Cost is not the argument: the `POST /tx`
+  round trip that carries a chunk is about 13 ms at concurrency 1
+  (concurrency-1 HTTP ACK p50 13.231 ms against submit-to-matching-WS-event
+  p50 25.313 ms in the same harness session — the ADR's
+  [performance posture](../plans/2026-08-authority-boundary-adr.md#performance-posture)
+  carries the surviving figures; the maintainer's earlier informal "roughly
+  14 ms" localhost round-trip observation carried no metric qualifier), so
+  the query would be cheap and still incomplete; a provider call on the same
+  path would put L1 liveness inside the acknowledgement path. Evidence:
+  `ingress/inclusion_lane/mod.rs` (the bounded chunk and the time-gated
+  frontier read); I15's runtime reaction.
+- **A durable recovery-phase ledger** — the flush and post-flush-sync
+  witnesses are boot-local by design; persisting them would re-create a
+  state machine whose only effect is skipping an idempotent flush, and would
+  let a restarted attempt trust a half-remembered phase. Evidence:
+  `recovery/mod.rs` (`RecoveryProgress` is memory-only and `drive_recovery`
+  its only writer; the pin
+  `reconstructed_controller_cannot_reuse_a_post_flush_sync_witness`);
+  `admission.tla` (no durable per-attempt record gates anything).
+
 From the 2026-08-18 adversarial pass:
 
 - **Merging `Workers::finish`'s two drain modes by re-awaiting the primary**
@@ -400,7 +449,8 @@ From the L3 review (2026-08-22):
   a non-fact) — it needs an acknowledgement to exit, and the acknowledgement
   carries no information the fact-derived reducer doesn't re-derive. A
   verdict-neutral startup *read* of the black box is not covered by this
-  entry.
+  entry, and is now exercised: `run` logs the latest row once at startup and
+  branches on nothing (`warn_on_previous_terminal_fault`, 2026-09-04).
 - **A boot-time full-integrity sweep** — expensive machinery that still
   cannot catch semantic violations outside its read set; the residual
   window is recorded and bounded instead.

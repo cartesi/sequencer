@@ -10,7 +10,7 @@ The sequencer's recovery loop spans two process lifetimes:
 
 1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`CanonicalDivergence`, `L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `WorkerExit::DangerDetected` under `CommandError::Worker`, closes intake, and drains the workers before returning a non-zero status. Canonical divergence is terminal and arms the independent two-second abort bound; expected-recovery and retryable arms remain cooperatively graceful.
 2. **External respawn.** An orchestrator (systemd, k8s, …) restarts the process.
-3. **Startup reducer.** The fresh boot reads divergence, danger, finalized-snapshot presence, Tip presence, and the safe head in one local transaction. The pure reducer selects at most one phase. Every completed phase returns to local inspection before another phase or admission. Initial Sync is itself a phase, so an already-persisted divergence refuses before the first provider call.
+3. **Startup reducer.** The fresh boot reads danger (with canonical divergence ranked first), finalized-snapshot presence, Tip presence, and the safe head in one local transaction (`RecoveryInspection`, so no decision mixes facts from two SQLite snapshots). The pure reducer selects at most one phase. Every completed phase returns to local inspection before another phase or admission. Initial Sync is itself a phase, so an already-persisted divergence refuses before the first provider call.
 4. **Prepare, admit, launch.** A clean decision permits task-free, fallible runtime preparation. Startup then invokes the same reducer once more over one consistent fact set, mints the single-use `RuntimeAdmission` witness, and consumes it in an infallible, non-yielding worker launch.
 
 The detector trip and the startup dispatch share the same `check_danger` function; the detector cares only that *some* arm fired, while the startup dispatch examines *which* arm fired to pick the right action.
@@ -298,7 +298,7 @@ Each loop iteration burns gas (no-ops + doomed resubs), takes ~12 minutes (the f
 
 ### Startup behavior summary
 
-The first local inspection always ranks `CanonicalDivergence` and missing finalized state ahead of phase progress. If neither terminal fact exists, `NeedInitialSync` selects the initial Sync phase. A provider failure during that one phase may still admit a warm database whose persisted view remains fresh; every non-provider reader failure is classified terminal or retryable by its typed provenance.
+Every boot runs one unconditional loop — `inspect → classify once → decide → perform at most one phase → inspect again` — over the pure `reduce_recovery`. The first local inspection always ranks `CanonicalDivergence` and missing finalized state ahead of phase progress. If neither terminal fact exists, `NeedInitialSync` selects the initial Sync phase. A provider failure during that one phase may still admit a warm database whose persisted view remains fresh; every non-provider reader failure is classified terminal or retryable by its typed provenance.
 
 After the initial Sync attempt, ordinary inspection maps facts as follows:
 
@@ -312,7 +312,9 @@ After the initial Sync attempt, ordinary inspection maps facts as follows:
 | `EstimatedBatchInDanger(N)` | `Retry` | Observed safe state did not cross danger; recovery never mutates from an estimate alone. |
 | `CanonicalDivergence(N)` | `Refuse` | Standard recovery assumes content identity and is forbidden. |
 
-Closed recovery is structurally `Flush → inspect → post-flush Sync → inspect → Cascade → inspect`. Flush produces a boot-local witness carrying its observed safe block. The post-flush Sync preserves that witness, and Cascade is selected only if the persisted safe head caught up through it. A crash drops the witness, so the next boot repeats the idempotent flush instead of trusting a half-remembered phase. The guarded Cascade transaction checks divergence first, then the required finalized-state fact and the flush-view floor, then mutates.
+Closed recovery is structurally `Flush → inspect → post-flush Sync → inspect → Cascade → inspect`. Flush produces a boot-local witness carrying its observed safe block. The post-flush Sync preserves that witness, and Cascade is selected only if the persisted safe head caught up through it. A crash drops the witness, so the next boot repeats the idempotent flush instead of trusting a half-remembered phase; a `Retry` or `Refuse` erases the witnesses the same way.
+
+There is deliberately no durable recovery-phase state machine. Local inspection comes before any provider call or mutation, so neither a transient RPC error nor a phase's own write can mask a persisted divergence or a missing finalized state. The guarded Cascade transaction checks divergence first, then the required finalized-state fact and the flush-view floor, then mutates. The loop is unbounded by design and terminates by construction — at most five phases per attempt (the initial Sync, then either `RecoverTip` or Flush → post-flush Sync → Cascade, plus at most one guarded `EnsureOpenTip`), because the one cycling edge refuses inside its own transaction; the argument lives on `drive_recovery`.
 
 **Observed repair still outranks clock refusal.** `check_danger` evaluates observed closed/Tip danger before local-clock faults. Once an observed danger selected a repair, the reducer finishes that repair even if the clock arm is also active; the next mandatory inspection returns `Retry` rather than admitting. A successful repair is never itself an admission fact.
 

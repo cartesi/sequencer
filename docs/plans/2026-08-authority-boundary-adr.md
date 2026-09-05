@@ -22,13 +22,11 @@ The policy separates into three guarantees:
    inspection on the next boot. This is carried by the unconditional recovery
    reducer: every boot re-derives its decisions from durable facts, never
    from the previous process's verdict.
-3. **G3 — scoped divergence freeze:** once the canonical-divergence fact is
-   committed, the accepted frontier, batch tree, and snapshot promotion are
-   frozen immediately ([I15](../invariants.md)). `DangerDetector` owns prompt
-   process shutdown; the running inclusion lane also refuses
-   opportunistically when its existing frontier read observes the poison.
-   User-op work authorized before runtime observation may still commit and
-   acknowledge.
+3. **G3 — scoped divergence freeze:** a committed canonical-divergence fact
+   freezes its persisted acceptance domain immediately. The mechanism, its
+   runtime reaction, its race bound, and the watchdog boundary are stated
+   in full at
+   [I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen).
 
 The enforceable unified policy:
 
@@ -63,7 +61,10 @@ detector, the fee oracle) take its pure notification half, the slim
 borrow-scoped `Authorized` token that three effect functions require in
 their signatures — the user-op acknowledgement, the L1 send, and the WS
 emit — so at those sites forgetting the containment consult is a compile
-error, not a convention. The remaining externalization consults are
+error, not a convention. The token is not an effect gate (the rejected
+`EffectGate`, below): no mutex, no actor, no runtime state — the same
+predicate moved into the signatures of the operations it guards. The
+remaining externalization consults are
 hand-placed and bounded by the exit contract: the three snapshot routes at
 request start, the `POST /tx` success body, and the lane's fast-turn entry
 and its batch-close and reconciliation commits. Inside the token-covered L1
@@ -71,7 +72,17 @@ send, the poster re-consults the same bit before each keyed send and before
 the write-before-broadcast watermark raise; the tick's chain-id gate, fee
 estimate, nonce read, and confirmation watch are not re-gated. Those
 re-checks narrow the bounded lag within an effect already authorized and
-are not separate boundaries.
+are not separate boundaries. The lane consults once per effect boundary,
+not per line: adjacent re-reads of the bit would narrow the window by
+nanoseconds in a design that already accepts the honest TOCTOU bound.
+
+Containment is classification-at-birth. The first reporter is elected by
+compare-and-swap, the sticky bit and its cause become visible together, the
+abort watchdog is armed before cooperative shutdown is requested (a drain
+may block), and nothing durable is written. A token proves the bit was
+consulted and found clear at some point in its borrow, not at the instant
+of the effect: a consumer that awaits between minting and effect carries
+that bounded lag.
 
 The lock is released only after every runtime-owned child has actually
 stopped; a dropped `JoinHandle` detaches rather than stops, so each worker
@@ -108,26 +119,16 @@ freeze) never depended on a boot gate.
 
 ### 3. Recovery as a pure run reducer
 
-Normal `run` startup is one unconditional loop:
-
-```text
-inspect -> classify once -> decide -> perform at most one phase -> inspect again
-```
-
-`reduce_recovery` is pure policy over one transactionally consistent
-`RecoveryInspection` plus boot-local phase progress. Local absorbing facts
-are inspected before any provider call, so a transient RPC error can never
-mask a persisted divergence. Closed recovery is phase-granular —
-`Flush → inspect → Sync → inspect → Cascade → inspect` — with the flush's
-safe-block observation carried as an ephemeral, memory-only witness: a crash
-loses it and the next boot repeats the idempotent flush. There is
-deliberately no durable recovery-phase state machine. The
-[`admission.tla`](../recovery/admission.tla) model verifies the controller
-ordering; [`docs/recovery/README.md`](../recovery/README.md) owns the design.
-
-Setup/rebuild, maintenance flush, and normal-run recovery retain distinct
-typed controllers: their facts are unrelated, and a generic command reducer
-would enlarge the state machine without closing an enforcement hole.
+Normal `run` startup is one unconditional loop over a pure decision
+function — inspect, classify once, decide, perform at most one phase,
+inspect again — with no durable recovery-phase state machine.
+Setup/rebuild, maintenance flush, and normal-run recovery
+retain distinct typed controllers. The design, the dispatch table, the
+boot-local witnesses, and the phase bound are owned by
+[`docs/recovery/README.md`](../recovery/README.md);
+[`admission.tla`](../recovery/admission.tla) verifies the controller
+ordering; the arguments against a generic command controller and a durable
+phase ledger are in the [register](../review/register.md).
 
 ### 4. SQLite-centered runtime and the two-regime inclusion lane
 
@@ -161,33 +162,17 @@ valid rows plus their canonical `executed_inputs` attribution authorize feed
 output. An already-authorized effect may finish after a later terminal
 transition.
 
-## Rejected alternatives (do not re-propose without new evidence)
+## Rejected alternatives
 
-- **`RunEpoch`** (a globally threaded internal fencing epoch): the OS lock
-  plus structured task lifetime plus fresh per-scope channels already make
-  an old sender unable to reach a new receiver, and there is no in-process
-  hot restart to fence against. Revisit only if in-process restart or
-  multiple admitted runtimes under one lock are introduced.
-- **`EffectGate` / `LiveKernel`** (a universal effect mutex or actor): would
-  duplicate the role-local linearization points the system already needs and
-  force the reader and latency-critical lane through a new in-memory
-  authority protocol, adding a second state machine without making the
-  narrow content-identity check a complete divergence oracle. The
-  `Authorized` token is not this: no mutex, no actor, no runtime state —
-  the same predicate moved into the signatures of the operations it guards.
-- **A generic command controller** over setup/rebuild/run/maintenance:
-  their facts are unrelated; combining them enlarges the cross-product state
-  machine without closing an enforcement hole.
-- **A per-user-op divergence query** (or reader mailbox) on the hot path:
-  the content-identity check is complete only for accepted-batch content
-  identity ([I9](../invariants.md)); paying a per-chunk query would not buy
-  a complete safety boundary.
-- **A durable recovery-phase ledger**: the flush witness is boot-local by
-  design; persisting it would re-create a state machine whose only effect is
-  skipping an idempotent flush.
-- **A durable boot gate on terminal verdicts**: a gate on a non-fact needs
-  an operator acknowledgement to exit, and the acknowledgement carries no
-  information the fact-derived reducer doesn't already re-derive.
+`RunEpoch` (an internal fencing epoch); `EffectGate` / `LiveKernel` (a
+universal effect mutex or actor); a generic command controller (one reducer
+over setup/rebuild/run/maintenance); a
+per-chunk divergence query, provider call, or reader mailbox on the hot
+path; a durable recovery-phase ledger; a durable boot gate on terminal
+verdicts. Each argument, its evidence, and its revisit trigger live in the
+review register's refuted list
+([`../review/register.md`](../review/register.md#refuted--do-not-re-propose-without-new-evidence));
+do not re-propose without new evidence.
 
 ## External history
 
