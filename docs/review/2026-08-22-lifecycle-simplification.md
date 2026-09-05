@@ -49,9 +49,9 @@ Ok-path divergence refusal had been dropped with `settle_clean`, letting a
 clean drain over freshly persisted divergence exit 0 (the one code that
 breaks the supervisor's restart-then-refuse rediscovery chain); restored as
 an explicit fact check and test-pinned. One missing test pin added; six
-doc-staleness items fixed. A claimed re-detection gap
-(`finalized_snapshot.inclusion_block` NULL at boot) was refuted — the column
-is `NOT NULL` at the engine; no boot assert was added. Lesson recorded: when
+doc-staleness items fixed. A claimed re-detection gap at
+`finalized_snapshot.inclusion_block` was refuted (the register's L3 block
+has the entry). Lesson recorded: when
 deleting a mechanism, sweep for its *vocabulary* with review agents, not a
 bare grep — one grep pipeline silently returned empty on files that
 contained the pattern.

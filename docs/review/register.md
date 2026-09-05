@@ -4,9 +4,11 @@ The distilled outcome of every dated review ledger in this directory: what
 is still **open**, what was **settled** (with its reasoning's current home),
 and what was **refuted** and must not be re-proposed without new evidence.
 Check the open section before touching related code; check the refuted
-section before proposing a simplification or a new mechanism. The dated
-ledgers beside this file are stubs preserving each review's scope and
-verdict; process detail beyond that lives in git history.
+section before proposing a simplification or a new mechanism. Every
+review's date, scope, and verdict is in the Review history table at the end
+of this file; the two August 2026 ledgers and the 2026-09-03 stock-take stay
+as separate files because they carry measurements and refutation evidence
+recorded nowhere else. Process detail beyond that lives in git history.
 
 Statuses of findings 1–18 were verified against the tree on 2026-08-25.
 Findings 19–31 and the 2026-09-03 refuted block come from the
@@ -17,8 +19,8 @@ proposal that review raised, including the ones no jury examined.
 
 Code findings, oldest first (file references are starting points, not exact
 lines). Numbers are stable identifiers: a closed finding keeps its number and
-is reduced to a one-line closure note, so citations in the dated ledgers stay
-valid.
+is reduced to a one-line closure note, so citations in git history and the
+remaining dated ledgers stay valid.
 
 1. **Submitter confirmation-timeout defeats pacing** — a watch timeout maps
    to a successful `Submitted` tick, so the next tick immediately re-sends
@@ -114,7 +116,7 @@ valid.
     contained run writes exactly one `terminal_faults` row — the command
     bracket's, at settlement. Containment writes nothing durable. The
     accepted loss, stated in the runbook: any death before settlement (an
-    abort at the two-second deadline, a controller panic, SIGKILL) leaves
+    abort at the terminal abort deadline, a controller panic, SIGKILL) leaves
     only the process logs, and the single write has no second attempt. The
     row is telemetry; restart policy is the exit code.
 25. **Closed** (2026-09-03): the token's doc, the ADR, and the settled
@@ -184,6 +186,8 @@ Open maintainer decisions:
 
 ## Owed tests
 
+Statuses swept 2026-08-22 and updated through 2026-09-04.
+
 - **Arm-ordering discriminating test**: both `ClosedBatchInDanger` and
   `TipInDanger` genuinely in danger; assert Closed wins (today pinned only
   incidentally by an equally-aged fixture).
@@ -247,6 +251,12 @@ Open maintainer decisions:
 
 Each entry: the decision, its reason, and where the reasoning now lives.
 
+- **No architectural restructure** (2026-06-10): one file per writer role,
+  `*_in(tx)` free functions composing into larger transactions,
+  storage-owns-SQLite / lane-owns-filesystem — the layout is sound and is
+  defended, not redesigned → AGENTS.md "Sequencer module layout", the
+  storage module docs (`storage/recovery.rs`), `docs/snapshots/lifecycle.md`,
+  and the do-not-simplify list in `docs/invariants.md`.
 - **Write-before-broadcast watermark** (2026-06): the flush's completion
   anchor is durable, not the local pool's memory → I14.
 - **Content-identity check, gated on full acceptance** (2026-06): accepted
@@ -401,6 +411,14 @@ code:
   its only writer; the pin
   `reconstructed_controller_cannot_reuse_a_post_flush_sync_witness`);
   `admission.tla` (no durable per-attempt record gates anything).
+- **A marker-file containment protocol** (2026-08-01; hardened by that
+  review, then deleted wholesale — git history) — a filesystem side-channel
+  for containment state, superseded by the in-process containment bit and
+  the settlement-written black-box row for containment state (ADR
+  mechanism 1) and by fact re-detection at boot for the durable verdict
+  (ADR mechanism 2); the kernel process lock guarded it and outlived it. Do
+  not reintroduce one: SQLite is the durable coordination plane and the
+  process lock is the exclusivity primitive.
 
 From the 2026-08-18 adversarial pass:
 
@@ -564,3 +582,29 @@ these codes; their concepts now live here:
 | WP1–WP11 | 2026-06 work packages (all landed) | settled above |
 | L1, L2, L3 | the lifecycle decisions (not Layer 1/2) | ADR mechanism 2 + the two August ledgers |
 | S1–S7, A1–A12, B1–B5 | 2026-06 simplification queue / owed tests | open remnants above |
+
+## Review history
+
+One row per dated review ledger, oldest first. Single-pass decisions that
+produced refuted entries without a ledger (the 2026-08-23 run-glue pass, the
+2026-08-25 fee-oracle pass) carry their own dated blocks under Refuted. The
+rows without a file were stubs whose every fact already lived here or in a
+living doc; their originals are in git history, in the parent of the
+distillation commit ("docs: distill the corpus — living docs timeless,
+history in the register", f1b4b07): `git show f1b4b07^:docs/review/<file>`
+for `2026-06-10-correctness-review.md`, `2026-06-10-simplification.md`,
+`2026-06-10-test-coverage.md`, `2026-06-25-cockroach-recovery-rooting.md`,
+`2026-06-26-branch-deep-review.md`, and
+`2026-08-01-containment-adr-review.md`.
+
+| Date | Scope | Verdict | Where its content lives |
+|---|---|---|---|
+| 2026-06-10 | Whole-project correctness review: twelve parallel module reviews plus line-by-line passes, every medium/high concern adversarially verified | The sequencer/scheduler duality was sound; the confirmed problems clustered at the boundary with the infrastructure underneath (fsync semantics, the local node's mempool memory, RPC fleet coherence, the subscriber protocol). Ten findings (F1–F10) and five design resolutions (R1–R5); every F-finding fixed except F7, the WS invalidation contract | R1–R5 → Settled decisions and the codename map; F7 → the open WS invalidation/rollback finding (Track 3); the robustness and hygiene backlog the review left → findings 1, 2, 3, and 6 |
+| 2026-06-10 | Simplification and refactoring review (companion) | No architectural restructure: the layout is sound and is defended, not redesigned; the weight was unpinned cross-file invariants, test-only surface presenting as production API, and duplicated semantics | Created `docs/invariants.md`; the settled entry above; open remnants and declines above |
+| 2026-06-10 | Test-coverage review (companion): what the suite pins, what it misses, which harness levers exist | Recovery is the best-tested subsystem (the full dispatch matrix at unit and e2e level, libfaketime clock jumps, respawn loops, TCP-proxy outage injection, Anvil mempool control); the one structural hole, the duality having no direct mechanism, is closed by the watchdog non-genesis byte-compare e2e and the I1 agreement table | Owed tests and harness levers still to build above; do not resurrect a TEST_PLAN scenario matrix |
+| 2026-06-25 (follow-ups closed 2026-06-26) | Design session with an adversarial panel: how `setup --recovery` roots the rebuilt batch tree at the resume nonce | The `batch_tree_anchor` singleton: the parentless root carries the anchor nonce, exact-matched by the contiguity trigger and frozen once setup completes; no sentinel batch row | I16 and `docs/recovery/cockroach.md`; the sealed sentinel and the circular recovery-time cross-check → Refuted; the follow-up e2e's self-divergence against the empty rebuilt tree → the anchor-aware frontier on I15 |
+| 2026-06-26 | Deep branch review: the setup/run split, the scheduler-library extraction, the fold engine, `setup --recovery`, plus a multi-agent adversarial sweep | Eight findings confirmed and fixed; three refuted | The two protocol contracts (`docs/protocol/scheduler-semantics.md`, `docs/protocol/application-contract.md`) were written during this review; the recovery spec is `docs/recovery/cockroach.md`; per-finding dispositions and the declined `FoldInputSource` above |
+| 2026-08-01/02 | Containment ADR review: two rounds on the terminal-containment cutover, then re-evaluation with the maintainer | The architectural turn accepted; the unimplemented `LiveKernel`/reader-mailbox design rejected on the completeness/cost boundary: the content-identity check is a narrow backstop, not a divergence oracle, and SQLite remains the durable coordination plane | Every mechanism it shaped → the [authority-boundary ADR](../plans/2026-08-authority-boundary-adr.md); the divergence race bound → I15; `RunEpoch`/`EffectGate`/`LiveKernel` and the marker-file protocol → Refuted |
+| 2026-08-18 | Over-engineering review: the full branch, seven parallel subsystem reviews plus an independent premise challenge of the ADR | Not over-engineered, unevenly engineered; 141 mechanisms inventoried (98 keep, 25 simplify, 6 cut, 12 question) | [`2026-08-18-over-engineering-review.md`](2026-08-18-over-engineering-review.md), kept for the inventory, the ~700-line harvest, and the eleven defects |
+| 2026-08-22 | Lifecycle simplification, decision L3 | The attempt journal bought only what tracing already provided; it narrowed to the `terminal_faults` black box, and telemetry writes became verdict-neutral | [`2026-08-22-lifecycle-simplification.md`](2026-08-22-lifecycle-simplification.md), kept for the journal weight audit, the `admission.tla` ghost-variable result, and the verdict-integrity defects |
+| 2026-09-03 | Branch stock-take of the authority-boundary PR: first-hand reads, then a read-only fleet of seven subsystem lenses and five premise challengers, then three refuters over the eighteen highest-ranked proposals | Proportionate overall, with three residue pockets; every proposal recorded, the jury-refuted ones listed above | [`2026-09-03-branch-stocktake.md`](2026-09-03-branch-stocktake.md), the ledger of the current branch, with its "Landed" section |

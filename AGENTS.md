@@ -455,7 +455,7 @@ Before finishing a change, ensure:
 - [`CLAUDE.md`](CLAUDE.md) — shell setup, quick reference, pointer back here.
 - [`docs/protocol/`](docs/protocol/) — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (the canonical acceptance algorithm, I1) and [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` FFI trait contract).
 - [`docs/invariants.md`](docs/invariants.md) — register of cross-module invariants (what's load-bearing across files) + the fail-loud check policy.
-- [`docs/review/register.md`](docs/review/register.md) — the review register: open findings, settled decisions, and refuted proposals (do-not-re-propose), distilled from the dated ledgers beside it.
+- [`docs/review/register.md`](docs/review/register.md) — the review register: open findings, settled decisions, refuted proposals (do-not-re-propose), and the review history table; the dated ledgers beside it carry the evidence the table points at.
 - [`docs/plans/`](docs/plans/) — the architecture decision record ([`2026-08-authority-boundary-adr.md`](docs/plans/2026-08-authority-boundary-adr.md)), active coordination tracks, and in-flight design handoffs.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
 - [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.

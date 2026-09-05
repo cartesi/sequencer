@@ -4,8 +4,8 @@ The architecture decision record for how authority — over speculative state,
 promises, process lifetime, and recovery admission — is owned in the
 sequencer. The mechanisms below are landed; the decision history and the
 review trail that shaped them live in
-[`../review/register.md`](../review/register.md) and the dated ledgers beside
-it.
+[`../review/register.md`](../review/register.md) and the review history it
+records.
 
 ## Context
 
