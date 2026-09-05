@@ -218,9 +218,9 @@ pub(super) fn populate_safe_accepted_batches(
                 );
                 // Stop scanning; the marker (committed with this sync)
                 // freezes the frontier and routes every subsequent boot and
-                // detector tick to refusal. The accepted lane-reconciliation
-                // cutover will also make this the lane's next slow-turn
-                // terminal result.
+                // detector tick to refusal, and the lane's next time-gated
+                // frontier read (`Storage::safe_frontier_state`) returns
+                // `CanonicalDivergence` instead of an open frontier (I15).
                 return Ok(());
             }
 

@@ -84,8 +84,9 @@ pub(crate) fn record_terminal_fault_best_effort(
 /// this process's log even when the last process's final lines were lost.
 /// Nothing branches on the value. Bounded by the settlement writer: a death
 /// that never returned through its command bracket (an abort at the
-/// two-second deadline, a controller panic, SIGKILL) left no row, so there
-/// is nothing to report. It runs ahead of the admission preflight so that a
+/// terminal abort deadline in `crate::runtime::shutdown`, a controller
+/// panic, SIGKILL) left no row, so there is nothing to report. It runs
+/// ahead of the admission preflight so that a
 /// boot the preflight refuses still logs why the last one died; a data
 /// directory with no database yet is the ordinary case, not a warning.
 pub(crate) fn warn_on_previous_terminal_fault(db_path: &str) {

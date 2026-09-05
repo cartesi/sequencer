@@ -4,9 +4,11 @@ The distilled outcome of every dated review ledger in this directory: what
 is still **open**, what was **settled** (with its reasoning's current home),
 and what was **refuted** and must not be re-proposed without new evidence.
 Check the open section before touching related code; check the refuted
-section before proposing a simplification or a new mechanism. The dated
-ledgers beside this file are stubs preserving each review's scope and
-verdict; process detail beyond that lives in git history.
+section before proposing a simplification or a new mechanism. Every
+review's date, scope, and verdict is in the Review history table at the end
+of this file; the two August 2026 ledgers and the 2026-09-03 stock-take stay
+as separate files because they carry measurements and refutation evidence
+recorded nowhere else. Process detail beyond that lives in git history.
 
 Statuses of findings 1–18 were verified against the tree on 2026-08-25.
 Findings 19–31 and the 2026-09-03 refuted block come from the
@@ -17,8 +19,8 @@ proposal that review raised, including the ones no jury examined.
 
 Code findings, oldest first (file references are starting points, not exact
 lines). Numbers are stable identifiers: a closed finding keeps its number and
-is reduced to a one-line closure note, so citations in the dated ledgers stay
-valid.
+is reduced to a one-line closure note, so citations in git history and the
+remaining dated ledgers stay valid.
 
 1. **Submitter confirmation-timeout defeats pacing** — a watch timeout maps
    to a successful `Submitted` tick, so the next tick immediately re-sends
@@ -114,7 +116,7 @@ valid.
     contained run writes exactly one `terminal_faults` row — the command
     bracket's, at settlement. Containment writes nothing durable. The
     accepted loss, stated in the runbook: any death before settlement (an
-    abort at the two-second deadline, a controller panic, SIGKILL) leaves
+    abort at the terminal abort deadline, a controller panic, SIGKILL) leaves
     only the process logs, and the single write has no second attempt. The
     row is telemetry; restart policy is the exit code.
 25. **Closed** (2026-09-03): the token's doc, the ADR, and the settled
@@ -184,6 +186,8 @@ Open maintainer decisions:
 
 ## Owed tests
 
+Statuses swept 2026-08-22 and updated through 2026-09-04.
+
 - **Arm-ordering discriminating test**: both `ClosedBatchInDanger` and
   `TipInDanger` genuinely in danger; assert Closed wins (today pinned only
   incidentally by an equally-aged fixture).
@@ -247,6 +251,12 @@ Open maintainer decisions:
 
 Each entry: the decision, its reason, and where the reasoning now lives.
 
+- **No architectural restructure** (2026-06-10): one file per writer role,
+  `*_in(tx)` free functions composing into larger transactions,
+  storage-owns-SQLite / lane-owns-filesystem — the layout is sound and is
+  defended, not redesigned → AGENTS.md "Sequencer module layout", the
+  storage module docs (`storage/recovery.rs`), `docs/snapshots/lifecycle.md`,
+  and the do-not-simplify list in `docs/invariants.md`.
 - **Write-before-broadcast watermark** (2026-06): the flush's completion
   anchor is durable, not the local pool's memory → I14.
 - **Content-identity check, gated on full acceptance** (2026-06): accepted
@@ -294,14 +304,13 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   values; the named `saturating_query_bound` only where clamping preserves
   the predicate → `storage/convert.rs` + the check policy.
 - **The calibration rule** (2026-08-18): the complexity budget belongs to
-  concurrency, durability, and hostile-L1 robustness → AGENTS.md design
-  principles.
+  concurrency, mutual exclusion, durability, and hostile-L1 robustness →
+  AGENTS.md design principles.
 - **The `Authorized` externalization token** (2026-08-18): the containment
   consult is a compile-time obligation of the three effect functions that
-  take the token (ack, L1 send, WS emit); the snapshot-stream start, the
-  `POST /tx` success body, and the lane's mutation commits are hand-placed
-  consults bounded by the exit contract →
-  `runtime/shutdown.rs`, ADR mechanism 1.
+  take the token (ack, L1 send, WS emit); the remaining consults are
+  hand-placed and bounded by the exit contract → `runtime/shutdown.rs` (the
+  token) and ADR mechanism 1 (the consult inventory).
 - **Module homing** (2026-08-19): command brackets in `commands/` (with
   config + the `CommandError` taxonomy), the capability substrate alone in
   `runtime/`, `L1Config` in `l1/`; a full merge was refused because the
@@ -324,6 +333,26 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   Debug-derive open finding → `l1/mod.rs`. Deferred separately: the startup
   log prints the full RPC URL, which the help-leak test treats as
   token-bearing.
+- **One home per mechanism** (2026-09-05): every mechanism has one canonical
+  statement, and every other site is a pointer or an explicitly scoped
+  partial. The homes: the authority-boundary ADR for `RuntimeScope`, the
+  token, and containment (mechanism 1), fact-derived admission and the black
+  box (2), and the SQLite-centered runtime and the two-regime lane (4);
+  `docs/recovery/README.md` for the reducer; `docs/invariants.md` for the
+  cross-module invariants, the check policy, the writer roles, and the
+  divergence freeze (I15) with the check's completeness scope (I9);
+  `docs/protocol/scheduler-semantics.md` for the frame clock;
+  `docs/protocol/application-contract.md` §5 for the digestibility
+  assumption; `README.md` for the API contract and the storage model; the
+  schema for the write-once batch lifecycle; `commands/error.rs` for the
+  exit-code contract, with the operator runbook and README carrying the
+  operator- and user-facing lists; `runtime/shutdown.rs` and the runbook for
+  the abort bound; this register for refuted proposals and the review
+  history. Code-side exceptions, where the argument is falsifiable
+  only at the code: the memory-only witness (`RecoveryProgress`), the
+  admission linearization (`admit_runtime`), the one-transaction inspection
+  (`RecoveryInspection`), and the ≤5-phase bound (`drive_recovery`) →
+  AGENTS.md "Documentation Practice".
 
 ## Refuted — do not re-propose without new evidence
 
@@ -346,14 +375,71 @@ From the 2026-06 reviews:
   warm start, snapshot bytes history-dependent — each verified as
   deliberate/out-of-scope (see the threat model's scoping).
 
-From the ADR re-evaluation (2026-08-01/02):
+From the ADR's rejected list (opened by the 2026-08-01/02 re-evaluation);
+the 2026-08-18 premise challenge found these alternatives left no residue in
+code:
 
-- **`RunEpoch`**, **`EffectGate`**, **`LiveKernel`** — see the ADR's
-  rejected-alternatives section for each argument.
+- **`RunEpoch`** (a globally threaded internal fencing epoch) — the OS lock
+  plus structured task lifetime plus fresh per-scope channels already make
+  an old sender unable to reach a new receiver, and there is no in-process
+  hot restart to fence against; persisted rows cannot distinguish a live
+  owner from a stale one, a kernel-held lock can. Revisit only if in-process
+  restart or multiple admitted runtimes under one lock are introduced.
+  Evidence: `runtime/process_lock.rs` (module doc); no epoch type exists in
+  `sequencer/src`.
+- **`EffectGate` / `LiveKernel`** (a universal effect mutex or actor, with a
+  reader mailbox) — would duplicate the role-local linearization points the
+  system already needs and force the reader and the latency-critical lane
+  through a new in-memory authority protocol, adding a second state machine
+  without making the narrow content-identity check a complete divergence
+  oracle; SQLite stays the durable coordination plane. The `Authorized`
+  token is not this — see
+  [ADR mechanism 1](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership).
+  Evidence:
+  `runtime/shutdown.rs` (`Authorized`); [I9](../invariants.md)'s
+  completeness boundary.
 - **A generic command controller** over setup/rebuild/run/maintenance —
-  unrelated facts; a larger state machine closing no hole.
-- **A per-chunk divergence query / reader mailbox** on the hot path — the
-  check is not a divergence oracle; the cost buys no complete boundary.
+  their facts are unrelated; combining them enlarges the cross-product state
+  machine without closing an enforcement hole, and a flush has no admission
+  state to restore or erase. Evidence: the per-command controllers are
+  separate — `recovery/mod.rs` (`drive_recovery`), `commands/setup/mod.rs`
+  (`admit_setup_lifecycle`), `commands/flush.rs` (the flush body); the one
+  shared piece is a *fact* gate, `commands/mod.rs`'s
+  `preflight_lifecycle_command` (used by `run` and `flush`; `setup` reads
+  its own two facts inline), which checks admission facts and reduces
+  nothing.
+- **A per-chunk divergence query, provider call, or reader mailbox** on the
+  hot path (formerly proposed per user-op) — the content-identity check is
+  complete only for at/above-anchor accepted-batch content identity
+  ([I9](../invariants.md)), so a query paid on every user-op chunk would buy
+  no complete safety boundary. Cost is not the argument: the `POST /tx`
+  round trip that carries a chunk is about 13 ms at concurrency 1
+  (concurrency-1 HTTP ACK p50 13.231 ms against submit-to-matching-WS-event
+  p50 25.313 ms in the same harness session — the ADR's
+  [performance posture](../plans/2026-08-authority-boundary-adr.md#performance-posture)
+  carries the surviving figures; the maintainer's earlier informal "roughly
+  14 ms" localhost round-trip observation carried no metric qualifier), so
+  the query would be cheap and still incomplete; a provider call on the same
+  path would put L1 liveness inside the acknowledgement path. Evidence:
+  `ingress/inclusion_lane/mod.rs` (the bounded chunk and the time-gated
+  frontier read); I15's runtime reaction.
+- **A durable recovery-phase ledger** — the flush and post-flush-sync
+  witnesses are boot-local by design; persisting them would re-create a
+  state machine whose only effect is skipping an idempotent flush, and would
+  let a restarted attempt trust a half-remembered phase. Evidence:
+  `recovery/mod.rs` (`RecoveryProgress` is memory-only and `drive_recovery`
+  its only writer; the pin
+  `reconstructed_controller_cannot_reuse_a_post_flush_sync_witness`);
+  `admission.tla` (no durable per-attempt record gates anything).
+- **A marker-file containment protocol** (2026-08-01; hardened by that
+  review, then deleted wholesale — git history) — a filesystem side-channel
+  for containment state, superseded by the in-process containment bit and
+  the settlement-written black-box row for containment state (ADR
+  mechanism 1) and by fact re-detection at boot for the durable verdict
+  (ADR mechanism 2); the kernel process lock guarded it and outlived it. Do
+  not reintroduce one: SQLite is the durable coordination plane and the
+  process lock is the exclusivity primitive.
+
 From the 2026-08-18 adversarial pass:
 
 - **Merging `Workers::finish`'s two drain modes by re-awaiting the primary**
@@ -401,7 +487,8 @@ From the L3 review (2026-08-22):
   a non-fact) — it needs an acknowledgement to exit, and the acknowledgement
   carries no information the fact-derived reducer doesn't re-derive. A
   verdict-neutral startup *read* of the black box is not covered by this
-  entry.
+  entry, and is now exercised: `run` logs the latest row once at startup and
+  branches on nothing (`warn_on_previous_terminal_fault`, 2026-09-04).
 - **A boot-time full-integrity sweep** — expensive machinery that still
   cannot catch semantic violations outside its read set; the residual
   window is recorded and bounded instead.
@@ -439,7 +526,7 @@ reasoning in the [ledger](2026-09-03-branch-stocktake.md)):
   to a bool** — the 200 body is the acknowledgement leaving the process;
   `LeasedDumpBody` does not exist and `finalized_inclusion_block` has no
   streaming primitive. Evidence: `ingress/api.rs:84-92`,
-  `egress/api/snapshot.rs:101-120,214`. The doc tightening survives (finding
+  `egress/api/snapshot.rs:102-121,209-214`. The doc tightening survives (finding
   25).
 - **Deleting the `#[from]` impls so a refusal reason cannot be typed into a
   retry** — the enums are public with public variants; the longer spelling
@@ -515,3 +602,29 @@ these codes; their concepts now live here:
 | WP1–WP11 | 2026-06 work packages (all landed) | settled above |
 | L1, L2, L3 | the lifecycle decisions (not Layer 1/2) | ADR mechanism 2 + the two August ledgers |
 | S1–S7, A1–A12, B1–B5 | 2026-06 simplification queue / owed tests | open remnants above |
+
+## Review history
+
+One row per dated review ledger, oldest first. Single-pass decisions that
+produced refuted entries without a ledger (the 2026-08-23 run-glue pass, the
+2026-08-25 fee-oracle pass) carry their own dated blocks under Refuted. The
+rows without a file were stubs whose every fact already lived here or in a
+living doc; their originals are in git history, in the parent of the
+distillation commit ("docs: distill the corpus — living docs timeless,
+history in the register", f1b4b07): `git show f1b4b07^:docs/review/<file>`
+for `2026-06-10-correctness-review.md`, `2026-06-10-simplification.md`,
+`2026-06-10-test-coverage.md`, `2026-06-25-cockroach-recovery-rooting.md`,
+`2026-06-26-branch-deep-review.md`, and
+`2026-08-01-containment-adr-review.md`.
+
+| Date | Scope | Verdict | Where its content lives |
+|---|---|---|---|
+| 2026-06-10 | Whole-project correctness review: twelve parallel module reviews plus line-by-line passes, every medium/high concern adversarially verified | The sequencer/scheduler duality was sound; the confirmed problems clustered at the boundary with the infrastructure underneath (fsync semantics, the local node's mempool memory, RPC fleet coherence, the subscriber protocol). Ten findings (F1–F10) and five design resolutions (R1–R5); every F-finding fixed except F7, the WS invalidation contract | R1–R5 → Settled decisions and the codename map; F7 → the open WS invalidation/rollback finding (Track 3); the robustness and hygiene backlog the review left → findings 1, 2, 3, and 6 |
+| 2026-06-10 | Simplification and refactoring review (companion) | No architectural restructure: the layout is sound and is defended, not redesigned; the weight was unpinned cross-file invariants, test-only surface presenting as production API, and duplicated semantics | Created `docs/invariants.md`; the settled entry above; open remnants and declines above |
+| 2026-06-10 | Test-coverage review (companion): what the suite pins, what it misses, which harness levers exist | Recovery is the best-tested subsystem (the full dispatch matrix at unit and e2e level, libfaketime clock jumps, respawn loops, TCP-proxy outage injection, Anvil mempool control); the one structural hole, the duality having no direct mechanism, is closed by the watchdog non-genesis byte-compare e2e and the I1 agreement table | Owed tests and harness levers still to build above; do not resurrect a TEST_PLAN scenario matrix |
+| 2026-06-25 (follow-ups closed 2026-06-26) | Design session with an adversarial panel: how `setup --recovery` roots the rebuilt batch tree at the resume nonce | The `batch_tree_anchor` singleton: the parentless root carries the anchor nonce, exact-matched by the contiguity trigger and frozen once setup completes; no sentinel batch row | I16 and `docs/recovery/cockroach.md`; the sealed sentinel and the circular recovery-time cross-check → Refuted; the follow-up e2e's self-divergence against the empty rebuilt tree → the anchor-aware frontier on I15 |
+| 2026-06-26 | Deep branch review: the setup/run split, the scheduler-library extraction, the fold engine, `setup --recovery`, plus a multi-agent adversarial sweep | Eight findings confirmed and fixed; three refuted | The two protocol contracts (`docs/protocol/scheduler-semantics.md`, `docs/protocol/application-contract.md`) were written during this review; the recovery spec is `docs/recovery/cockroach.md`; per-finding dispositions and the declined `FoldInputSource` above |
+| 2026-08-01/02 | Containment ADR review: two rounds on the terminal-containment cutover, then re-evaluation with the maintainer | The architectural turn accepted; the unimplemented `LiveKernel`/reader-mailbox design rejected on the completeness/cost boundary: the content-identity check is a narrow backstop, not a divergence oracle, and SQLite remains the durable coordination plane | Every mechanism it shaped → the [authority-boundary ADR](../plans/2026-08-authority-boundary-adr.md); the divergence race bound → I15; `RunEpoch`/`EffectGate`/`LiveKernel` and the marker-file protocol → Refuted |
+| 2026-08-18 | Over-engineering review: the full branch, seven parallel subsystem reviews plus an independent premise challenge of the ADR | Not over-engineered, unevenly engineered; 141 mechanisms inventoried (98 keep, 25 simplify, 6 cut, 12 question) | [`2026-08-18-over-engineering-review.md`](2026-08-18-over-engineering-review.md), kept for the inventory, the ~700-line harvest, and the eleven defects |
+| 2026-08-22 | Lifecycle simplification, decision L3 | The attempt journal bought only what tracing already provided; it narrowed to the `terminal_faults` black box, and telemetry writes became verdict-neutral | [`2026-08-22-lifecycle-simplification.md`](2026-08-22-lifecycle-simplification.md), kept for the journal weight audit, the `admission.tla` ghost-variable result, and the verdict-integrity defects |
+| 2026-09-03 | Branch stock-take of the authority-boundary PR: first-hand reads, then a read-only fleet of seven subsystem lenses and five premise challengers, then three refuters over the eighteen highest-ranked proposals | Proportionate overall, with three residue pockets; every proposal recorded, the jury-refuted ones listed above | [`2026-09-03-branch-stocktake.md`](2026-09-03-branch-stocktake.md), the ledger of the current branch, with its "Landed" section |
