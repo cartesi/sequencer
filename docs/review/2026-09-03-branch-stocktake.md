@@ -104,8 +104,55 @@ reviewers before landing:
   `recovery_after_stale_batches`. Closes the SIGTERM→0 and 30-class halves
   of the owed exit-code test.
 
-Not yet landed from the recommended split: wave 4 (the documentation
-single-home passes) and the PR title/body, which come last.
+Wave 4 (2026-09-04/05), the documentation single-home passes. An
+eight-topic read-only mapping fleet first found that the corpus already
+elects its homes — the ADR for mechanisms 1, 2, and 4, the recovery README
+for the reducer, I15 for the divergence freeze, the register for refuted
+proposals, scheduler-semantics for the frame clock — so "the ADR becomes
+pointers" was the wrong cut; the fan-out was in AGENTS.md, the check policy,
+and the recovery README. Each batch refuted by three read-only reviewers
+before landing:
+
+- **Only what the code enforces**: README's exit-code list gains 40 and
+  the SIGABRT class; the supervisor is "expected to honor" the contract, not
+  enforcing it; the lifecycle module doc says which commands preflight
+  `setup_complete` here and which admit through `commands::setup`; the
+  frontier writer's cutover forecast, the lane's vacuous "no L1 query", the
+  reducer's "exactly one phase", the watchdog notes' "structurally frozen"
+  frontier, the threat model's dangling "non-goals" pointer, and the check
+  policy's "today" all corrected; I15 gains the clean-exit re-check and
+  `LocalDivergenceFirst`; I9 owns the accepted false positive; ADR
+  mechanism 1 owns the hand-placed consult inventory, site by site, with
+  `runtime/shutdown.rs` and the register pointing at it. Three refuter
+  passes: the last two amendments of the consult wording were themselves
+  wrong until checked against a grep of every production consult site.
+- **The register owns the rejected alternatives**: the ADR's list is six
+  names and a pointer; the register's block carries each argument, revisit
+  trigger, and Evidence line, gains the durable-phase-ledger entry it never
+  had and the cost datum the distillation dropped (stated as its source
+  states it, after two passes caught it overreaching), and records that the
+  boot-gate carve-out is now exercised. Mechanism 3 and G3 reduce to
+  pointers; the recovery README absorbs the loop, the four-fact inspection,
+  the witness erasure on Retry and Refuse, and the ≤5-phase bound.
+- **AGENTS.md becomes a map**: the hot-path and storage sections are pointer
+  bullets plus the one rule nothing else owns; every clause only AGENTS.md
+  carried moved first (into ADR mechanism 4, I2, I3, I20,
+  scheduler-semantics' revisit trigger, the schema's identity and views
+  rules, README's closure rule, the design principles); the writer-role
+  table moves into `docs/invariants.md` corrected — one writer role per
+  fact, `deployment_identity` and the initial snapshot registration and the
+  anchor belong to setup, the watermark is shared under I14, startup
+  hygiene resets leases and collects dumps, the brackets write the black
+  box. The check policy's admission bullet and the recovery README's
+  divergence section keep what they own and point for the rest.
+- **Six stub ledgers collapse** into the register's Review history table;
+  the two August ledgers and this stock-take stay for their evidence. The
+  marker-file containment protocol gets its refuted entry and the 2026-06
+  "no architectural restructure" verdict its settled entry.
+- **Module docs explain, they do not defend**; the abort bound's number
+  lives in `runtime/shutdown.rs` and the operator runbook only.
+
+Not yet landed: the PR title/body, which come last.
 
 ## Verdict
 
@@ -677,46 +724,61 @@ Re-verify the cited lines before acting on any item below.
   pre-distillation ADR read "every roughly 14-ms user-op chunk"; "14 ms"
   appears in zero markdown files now). Name the select arm in the
   homogeneous-list entry's title, since the `Vec<(WorkerId, ComponentShutdown)>`
-  shape now exists in the tree for cleanup.
+  shape now exists in the tree for cleanup. *(Partly landed 2026-09-05:
+  the ADR-list block carries Evidence lines and the cost datum is restored
+  as its source states it; the other refuted blocks and the select-arm
+  title remain.)*
 - **collapse-six-stubs** (Δ−110, −6 files). Six of the eight dated ledgers are
   15–20 line stubs carrying a verdict plus a pointer; collapse them into a
   "Review history" table at the bottom of the register. Keep the two August
   ledgers (they carry the only re-verifiable evidence in the corpus).
+  *(Landed 2026-09-05; this stock-take stays too, as the branch's ledger.
+  The six files totalled 106 lines, not 110.)*
 - **adr-dedupe-vs-register-and-invariants** (208 → ~70 lines). Each ADR
   mechanism is also described in the invariants check policy, AGENTS.md, the
   recovery README, the threat model, the runbook, and module docs; five of six
   rejected alternatives are also in the register's refuted list, and the two
   point at each other circularly. Cut the ADR to context, the policy statement,
   and four mechanism names with pointers; move the rejected-alternatives
-  arguments into the register so there is one home.
+  arguments into the register so there is one home. *(Landed 2026-09-05
+  with a correction: the mapping pass found the corpus already elects the
+  ADR as the home for mechanisms 1, 2, and 4, so the ADR keeps those and
+  points for mechanism 3, G3, and the rejected list; the register owns the
+  arguments.)*
 - **single-home-divergence-freeze** (Δ−60). `docs/invariants.md:353-372` and
   `docs/recovery/README.md:398-415` are the same four sentences; the ADR's G3
   and `AGENTS.md:264` are third and fourth compressions. I15 owns the runtime
-  reaction and race bound; the others link.
+  reaction and race bound; the others link. *(Landed 2026-09-05.)*
 - **agents-hotpath-to-pointers** (50 → ~20 lines). `AGENTS.md:255-304`
   restates I2, I3, I9/I15, I17, I18, and the admission policy in fifteen
   paragraph-length bullets, violating its own line-475 rule; the good pattern
-  is already used at `AGENTS.md:118-121` and `:324`.
+  is already used at `AGENTS.md:118-121` and `:324`. *(Landed 2026-09-05,
+  with the storage section and the writer table, which moved to
+  `docs/invariants.md` corrected.)*
 - **module-docs-explain-not-defend** (Δ−15). Strike the four defensive
   clauses (`workers.rs:21-27` "they are the enforcement, not style";
   `error.rs:10-13`'s dated `RunError` history and stale "acknowledge";
   `shutdown.rs:20-23`; `storage/recovery.rs:15-23`), and fix the three "journal"
-  usages.
+  usages. *(Landed 2026-09-05; the "journal" usages went in wave 1.)*
 - **finish-the-codename-sweep** (~14 one-line edits). Residue: `history.rs:202`
   ("L2"), `l1_inputs.rs:41` ("H6"), `wallet.rs:101` ("D10") added by this
   branch; `provider.rs:160,234`, `e2e_sequencer.rs:411,429,537`,
   `tests/harness/src/sequencer.rs:33,38,302,305,583`, `test_cases.rs:3039,3924`
   predate it. Track 6's requirement labels R1–R5 collide with the codename
-  map's R1–R5.
+  map's R1–R5. *(Landed in wave 1; a 2026-09-04 re-check of the residue
+  list found only interval notation left.)*
 - **proportionality-measured**. Measured: ~8,026 lines of standalone doc/spec,
   ~6,792 comment lines, ~21,200 lines of production Rust, roughly 0.7 prose
   lines per code line; the branch's own margin is one doc line per six code
   lines. Volume is defensible; the unstated fan-out is not. Either adopt a
   single-home rule with a named canonical copy per mechanism, or write down
-  that redundancy is deliberate and name the canonical copy.
+  that redundancy is deliberate and name the canonical copy. *(Decided
+  2026-09-05: the single-home rule, with the homes named, is a settled
+  register entry.)*
 - Also open: `docs/plans/` is listed as timeless in AGENTS.md but the tracks
   board is a dated status board; the deleted terminal-containment plan's
-  marker-file protocol has no refuted entry anywhere.
+  marker-file protocol has no refuted entry anywhere. *(The marker-file
+  entry landed 2026-09-05; the `docs/plans/` question stays open.)*
 
 ### CI
 

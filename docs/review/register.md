@@ -333,6 +333,26 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   Debug-derive open finding → `l1/mod.rs`. Deferred separately: the startup
   log prints the full RPC URL, which the help-leak test treats as
   token-bearing.
+- **One home per mechanism** (2026-09-05): every mechanism has one canonical
+  statement, and every other site is a pointer or an explicitly scoped
+  partial. The homes: the authority-boundary ADR for `RuntimeScope`, the
+  token, and containment (mechanism 1), fact-derived admission and the black
+  box (2), and the SQLite-centered runtime and the two-regime lane (4);
+  `docs/recovery/README.md` for the reducer; `docs/invariants.md` for the
+  cross-module invariants, the check policy, the writer roles, and the
+  divergence freeze (I15) with the check's completeness scope (I9);
+  `docs/protocol/scheduler-semantics.md` for the frame clock;
+  `docs/protocol/application-contract.md` §5 for the digestibility
+  assumption; `README.md` for the API contract and the storage model; the
+  schema for the write-once batch lifecycle; `commands/error.rs` for the
+  exit-code contract, with the operator runbook and README carrying the
+  operator- and user-facing lists; `runtime/shutdown.rs` and the runbook for
+  the abort bound; this register for refuted proposals and the review
+  history. Code-side exceptions, where the argument is falsifiable
+  only at the code: the memory-only witness (`RecoveryProgress`), the
+  admission linearization (`admit_runtime`), the one-transaction inspection
+  (`RecoveryInspection`), and the ≤5-phase bound (`drive_recovery`) →
+  AGENTS.md "Documentation Practice".
 
 ## Refuted — do not re-propose without new evidence
 
