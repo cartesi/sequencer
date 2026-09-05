@@ -10,22 +10,18 @@ use async_trait::async_trait;
 use cartesi_rollups_contracts::input_box::InputBox;
 use sequencer_core::batch::Batch;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::l1::eip1559::{Eip1559Fees, estimate_fees, fees_for_nonce};
+use crate::l1::eip1559::{
+    Eip1559Fees, FeesForNonce, estimate_fees, fees_for_nonce, pad_gas_estimate,
+};
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
 use crate::l1::watermark::WalletNonceWatermarkSink;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub type TxHash = alloy_primitives::B256;
-
-/// Pad an `eth_estimateGas` result so a tight estimate cannot mine as an
-/// out-of-gas revert (which would burn the wallet-nonce slot with no
-/// `InputAdded` and desynchronize payload↔nonce assignment).
-fn pad_gas_estimate(gas: u64) -> u64 {
-    gas.saturating_add(gas / 10)
-}
 
 #[derive(Debug, Clone)]
 pub struct BatchPosterConfig {
@@ -55,6 +51,16 @@ pub enum BatchPosterError {
     ChainIdMismatch { rpc: u64, expected: u64 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitBatchesOutcome {
+    /// All sends progressed normally.
+    Submitted(Vec<TxHash>),
+    /// At least one nonce is in fee-ceiling hold: still broadcast as a mempool
+    /// probe and wrote no floor. This is not an internal retry loop; the outer
+    /// tick sleeps on the confirmation cadence.
+    Held(Vec<TxHash>),
+}
+
 #[async_trait]
 pub trait BatchPoster: Send + Sync {
     /// Broadcast the payloads as L1 txs at consecutive wallet nonces.
@@ -65,7 +71,7 @@ pub trait BatchPoster: Send + Sync {
         &self,
         payloads: Vec<Vec<u8>>,
         watermark: &dyn WalletNonceWatermarkSink,
-    ) -> Result<Vec<TxHash>, BatchPosterError>;
+    ) -> Result<SubmitBatchesOutcome, BatchPosterError>;
 
     async fn observed_submitted_batch_nonces(
         &self,
@@ -93,6 +99,13 @@ pub struct EthereumBatchPoster {
     /// underpriced" still raises the stored floor so the next tick self-corrects
     /// without waiting for a confirmation timeout.
     in_flight: Arc<Mutex<BTreeMap<u64, Eip1559Fees>>>,
+    /// Nonces already reported as entering ceiling hold. Cleared when Latest
+    /// advances or the nonce leaves hold, so operators see transitions rather
+    /// than one warning per tick.
+    ceiling_holds: Arc<Mutex<BTreeSet<u64>>>,
+    /// Last insufficient-funds operator alert. Provider failures still return
+    /// every time; only the duplicate log is rate-limited.
+    last_insufficient_funds_log: Arc<Mutex<Option<Instant>>>,
     /// Test-only: next `send_batch_at_nonce` returns this error string without
     /// broadcasting (so callers can assert map updates / underpriced handling).
     #[cfg(test)]
@@ -105,6 +118,8 @@ impl EthereumBatchPoster {
             provider,
             config,
             in_flight: Arc::new(Mutex::new(BTreeMap::new())),
+            ceiling_holds: Arc::new(Mutex::new(BTreeSet::new())),
+            last_insufficient_funds_log: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             fail_next_send: Arc::new(Mutex::new(None)),
         }
@@ -139,6 +154,45 @@ impl EthereumBatchPoster {
             self.config.confirmation_depth,
             self.config.seconds_per_block,
         )
+    }
+
+    fn note_ceiling_hold(&self, nonce: u64, fees: Eip1559Fees) {
+        let first = self
+            .ceiling_holds
+            .lock()
+            .expect("ceiling_holds lock")
+            .insert(nonce);
+        if first {
+            warn!(
+                tx_nonce = nonce,
+                max_fee_per_gas = fees.max_fee_per_gas,
+                max_priority_fee_per_gas = fees.max_priority_fee_per_gas,
+                "batch submission entered fee-ceiling hold; probing again on confirmation cadence"
+            );
+        }
+    }
+
+    fn clear_ceiling_hold(&self, nonce: u64) {
+        self.ceiling_holds
+            .lock()
+            .expect("ceiling_holds lock")
+            .remove(&nonce);
+    }
+
+    fn log_insufficient_funds(&self) {
+        let now = Instant::now();
+        let mut last = self
+            .last_insufficient_funds_log
+            .lock()
+            .expect("last_insufficient_funds_log lock");
+        if last.is_some_and(|then| now.duration_since(then) < self.confirmation_timeout()) {
+            return;
+        }
+        *last = Some(now);
+        error!(
+            submitter_address = %self.config.batch_submitter_address,
+            "batch submitter has insufficient funds; top up the batch-submitter wallet"
+        );
     }
 
     async fn latest_account_nonce(&self) -> Result<u64, BatchPosterError> {
@@ -198,22 +252,10 @@ impl EthereumBatchPoster {
 
     /// Wait serially for each tx to reach `confirmation_depth + 1` confirmations.
     ///
-    /// **Serial is not a performance concession; it's correct.** Ethereum mines
-    /// transactions from a single EOA in strict wallet-nonce order: tx[k] cannot
-    /// land on-chain until tx[k-1] has landed. So:
-    ///
-    /// - If tx[0] times out, tx[1..] cannot have been mined either; watching
-    ///   them is provably pointless. We return `Ok(())` early and let the next
-    ///   tick retry the whole sequence.
-    /// - If tx[0] confirms, tx[1] was blocked only on tx[0] and is unblocked by
-    ///   the time we start watching it.
-    ///
     /// Timeouts return `Ok(())` rather than `Err` because the safe response is
-    /// "re-enter `submit_batches` on the next tick" — which re-estimates fees,
-    /// floors **every** still-pending nonce against its in-flight record, and
-    /// at-least-once re-broadcasts the whole unconfirmed suffix. The
-    /// wallet-nonce ordering invariant above guarantees we cannot accidentally
-    /// skip work by returning early here.
+    /// "re-enter `submit_batches` on the next tick." That tick re-derives the
+    /// unresolved suffix from Latest, so returning after the first timeout is
+    /// safe even if a replacement caused a later watched hash to mine.
     async fn wait_for_confirmations(&self, tx_hashes: &[TxHash]) -> Result<(), BatchPosterError> {
         let timeout = self.confirmation_timeout();
         for tx_hash in tx_hashes {
@@ -258,6 +300,18 @@ fn is_replacement_underpriced(err: &str) -> bool {
         .contains("replacement transaction underpriced")
 }
 
+fn is_already_known(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("already known")
+        || err.contains("already imported")
+        || err.contains("known transaction")
+}
+
+fn is_insufficient_funds(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("insufficient funds") || err.contains("gas required exceeds allowance")
+}
+
 fn derive_confirmation_timeout(
     confirmation_depth: u64,
     seconds_per_block: u64,
@@ -272,9 +326,9 @@ impl BatchPoster for EthereumBatchPoster {
         &self,
         payloads: Vec<Vec<u8>>,
         watermark: &dyn WalletNonceWatermarkSink,
-    ) -> Result<Vec<TxHash>, BatchPosterError> {
+    ) -> Result<SubmitBatchesOutcome, BatchPosterError> {
         if payloads.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SubmitBatchesOutcome::Submitted(Vec::new()));
         }
 
         // Keyed-write chain-id gate (review): re-confirm the RPC still serves the
@@ -309,6 +363,10 @@ impl BatchPoster for EthereumBatchPoster {
             let mut in_flight = self.in_flight.lock().expect("in_flight lock");
             in_flight.retain(|&nonce, _| nonce >= next_nonce);
         }
+        self.ceiling_holds
+            .lock()
+            .expect("ceiling_holds lock")
+            .retain(|&nonce| nonce >= next_nonce);
 
         // Write-before-broadcast (R1a): durably cover every nonce this
         // tick will use before the first send. One raise to the highest
@@ -319,24 +377,56 @@ impl BatchPoster for EthereumBatchPoster {
             .map_err(BatchPosterError::Provider)?;
 
         let mut tx_hashes = Vec::with_capacity(payloads.len());
+        let mut any_held = false;
 
         for payload in payloads {
             let prior = {
                 let in_flight = self.in_flight.lock().expect("in_flight lock");
                 in_flight.get(&next_nonce).copied()
             };
-            let fees = fees_for_nonce(estimate, prior);
+            let FeesForNonce { fees, hold } = fees_for_nonce(estimate, prior);
             let pending = match self.send_batch_at_nonce(payload, next_nonce, &fees).await {
-                Ok(pending) => pending,
-                Err(BatchPosterError::Provider(ref msg)) if is_replacement_underpriced(msg) => {
-                    // Node rejected the replacement fee — raise the floor from
-                    // what we just tried so the next tick clears the threshold
-                    // without waiting for a confirmation timeout.
-                    let raised = fees_for_nonce(fees, Some(fees));
+                Ok(pending) => {
+                    if hold {
+                        any_held = true;
+                        self.note_ceiling_hold(next_nonce, fees);
+                    } else {
+                        self.clear_ceiling_hold(next_nonce);
+                        self.in_flight
+                            .lock()
+                            .expect("in_flight lock")
+                            .insert(next_nonce, fees);
+                    }
+                    pending
+                }
+                Err(BatchPosterError::Provider(ref msg)) if is_already_known(msg) => {
+                    self.clear_ceiling_hold(next_nonce);
                     self.in_flight
                         .lock()
                         .expect("in_flight lock")
-                        .insert(next_nonce, raised);
+                        .insert(next_nonce, fees);
+                    next_nonce = next_nonce.saturating_add(1);
+                    continue;
+                }
+                Err(BatchPosterError::Provider(ref msg)) if is_replacement_underpriced(msg) => {
+                    if hold {
+                        any_held = true;
+                        self.note_ceiling_hold(next_nonce, fees);
+                        next_nonce = next_nonce.saturating_add(1);
+                        continue;
+                    }
+                    // Node rejected the replacement fee — raise the floor from
+                    // what we just tried so the next tick clears the threshold
+                    // without waiting for a confirmation timeout.
+                    let raised = fees_for_nonce(estimate, Some(fees));
+                    self.in_flight
+                        .lock()
+                        .expect("in_flight lock")
+                        .insert(next_nonce, raised.fees);
+                    return Err(BatchPosterError::Provider(msg.clone()));
+                }
+                Err(BatchPosterError::Provider(ref msg)) if is_insufficient_funds(msg) => {
+                    self.log_insufficient_funds();
                     return Err(BatchPosterError::Provider(msg.clone()));
                 }
                 Err(err) => return Err(err),
@@ -346,10 +436,6 @@ impl BatchPoster for EthereumBatchPoster {
             // underpriced path above, which self-corrects against a live pending
             // tx the node already holds).
             let tx_hash = *pending.tx_hash();
-            self.in_flight
-                .lock()
-                .expect("in_flight lock")
-                .insert(next_nonce, fees);
             debug!(
                 tx_nonce = next_nonce,
                 %tx_hash,
@@ -363,7 +449,11 @@ impl BatchPoster for EthereumBatchPoster {
         }
 
         self.wait_for_confirmations(tx_hashes.as_slice()).await?;
-        Ok(tx_hashes)
+        if any_held {
+            Ok(SubmitBatchesOutcome::Held(tx_hashes))
+        } else {
+            Ok(SubmitBatchesOutcome::Submitted(tx_hashes))
+        }
     }
 
     async fn observed_submitted_batch_nonces(
@@ -419,7 +509,7 @@ impl BatchPoster for EthereumBatchPoster {
 
 #[cfg(test)]
 pub(crate) mod mock {
-    use super::{Batch, BatchPoster, BatchPosterError, TxHash};
+    use super::{Batch, BatchPoster, BatchPosterError, SubmitBatchesOutcome, TxHash};
     use crate::l1::watermark::WalletNonceWatermarkSink;
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -430,6 +520,7 @@ pub(crate) mod mock {
         pub observed_submitted_nonces: Mutex<Vec<u64>>,
         pub observed_submitted_error: Mutex<Option<String>>,
         pub last_from_block: Mutex<Option<u64>>,
+        pub held: Mutex<bool>,
     }
 
     impl MockBatchPoster {
@@ -439,6 +530,7 @@ pub(crate) mod mock {
                 observed_submitted_nonces: Mutex::new(Vec::new()),
                 observed_submitted_error: Mutex::new(None),
                 last_from_block: Mutex::new(None),
+                held: Mutex::new(false),
             }
         }
 
@@ -457,6 +549,10 @@ pub(crate) mod mock {
         pub fn last_from_block(&self) -> Option<u64> {
             *self.last_from_block.lock().expect("lock")
         }
+
+        pub fn set_held(&self, held: bool) {
+            *self.held.lock().expect("lock") = held;
+        }
     }
 
     #[async_trait]
@@ -465,7 +561,7 @@ pub(crate) mod mock {
             &self,
             payloads: Vec<Vec<u8>>,
             _watermark: &dyn WalletNonceWatermarkSink,
-        ) -> Result<Vec<TxHash>, BatchPosterError> {
+        ) -> Result<SubmitBatchesOutcome, BatchPosterError> {
             let mut tx_hashes = Vec::with_capacity(payloads.len());
             for payload in payloads {
                 let batch_index = ssz::Decode::from_ssz_bytes(payload.as_ref())
@@ -477,7 +573,11 @@ pub(crate) mod mock {
                     .push((batch_index, payload.len()));
                 tx_hashes.push(TxHash::ZERO);
             }
-            Ok(tx_hashes)
+            if *self.held.lock().expect("lock") {
+                Ok(SubmitBatchesOutcome::Held(tx_hashes))
+            } else {
+                Ok(SubmitBatchesOutcome::Submitted(tx_hashes))
+            }
         }
 
         async fn observed_submitted_batch_nonces(
@@ -511,13 +611,23 @@ mod tests {
 
     use super::{
         BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster,
-        derive_confirmation_timeout, is_replacement_underpriced, mock::MockBatchPoster,
-        pad_gas_estimate,
+        SubmitBatchesOutcome, derive_confirmation_timeout, is_already_known, is_insufficient_funds,
+        is_replacement_underpriced, mock::MockBatchPoster,
     };
+    use crate::l1::eip1559::{fee_ceiling, pad_gas_estimate};
     use crate::l1::watermark::WalletNonceWatermarkSink;
     use alloy::node_bindings::Anvil;
     use alloy::providers::Provider;
     use alloy::rpc::types::BlockNumberOrTag;
+
+    fn submitted_hashes(outcome: SubmitBatchesOutcome) -> Vec<super::TxHash> {
+        match outcome {
+            SubmitBatchesOutcome::Submitted(hashes) => hashes,
+            SubmitBatchesOutcome::Held(hashes) => {
+                panic!("expected Submitted outcome, got Held({hashes:?})")
+            }
+        }
+    }
 
     fn require_anvil() {
         assert!(
@@ -735,16 +845,36 @@ mod tests {
     }
 
     #[test]
+    fn already_known_matches_common_client_wording_case_insensitively() {
+        assert!(is_already_known("already known"));
+        assert!(is_already_known("Already Imported"));
+        assert!(is_already_known("Known transaction"));
+        assert!(!is_already_known("nonce too low"));
+    }
+
+    #[test]
+    fn insufficient_funds_matches_common_client_wording_case_insensitively() {
+        assert!(is_insufficient_funds(
+            "insufficient funds for gas * price + value"
+        ));
+        assert!(is_insufficient_funds("Gas required exceeds allowance"));
+        assert!(!is_insufficient_funds(
+            "replacement transaction underpriced"
+        ));
+    }
+
+    #[test]
     fn underpriced_send_raises_floor_from_attempted_fees() {
-        let attempted = crate::l1::eip1559::Eip1559Fees {
+        let estimate = crate::l1::eip1559::Eip1559Fees {
             base_fee_per_gas: 20_000_000_000,
             max_priority_fee_per_gas: 1_000_000_000,
             max_fee_per_gas: 41_000_000_000,
         };
-        let raised = crate::l1::eip1559::fees_for_nonce(attempted, Some(attempted));
-        assert!(raised.max_fee_per_gas > attempted.max_fee_per_gas);
-        assert!(raised.max_priority_fee_per_gas > attempted.max_priority_fee_per_gas);
-        assert!(raised.max_priority_fee_per_gas <= raised.max_fee_per_gas);
+        let attempted = crate::l1::eip1559::fees_for_nonce(estimate, None).fees;
+        let raised = crate::l1::eip1559::fees_for_nonce(estimate, Some(attempted));
+        assert!(raised.fees.max_fee_per_gas > attempted.max_fee_per_gas);
+        assert!(raised.fees.max_priority_fee_per_gas > attempted.max_priority_fee_per_gas);
+        assert!(raised.fees.max_priority_fee_per_gas <= raised.fees.max_fee_per_gas);
     }
 
     fn poster_config(anvil: &alloy::node_bindings::AnvilInstance) -> BatchPosterConfig {
@@ -783,11 +913,18 @@ mod tests {
             .await
             .expect("base nonce");
         // Prior fees high enough that a fresh Anvil estimate will not clear the
-        // ≥10% floor on its own — the poster must bump against this record.
+        // ≥10% floor on its own, but below this estimate's ceiling so this is a
+        // normal replacement rather than a ceiling hold.
+        let estimate = crate::l1::eip1559::estimate_fees(&provider)
+            .await
+            .expect("fee estimate");
         let prior = crate::l1::eip1559::Eip1559Fees {
-            base_fee_per_gas: 1,
-            max_priority_fee_per_gas: 50_000_000, // 0.05 gwei
-            max_fee_per_gas: 100_000_000_000,     // 100 gwei
+            base_fee_per_gas: estimate.base_fee_per_gas,
+            max_priority_fee_per_gas: estimate
+                .max_priority_fee_per_gas
+                .saturating_mul(2)
+                .min(estimate.max_fee_per_gas.saturating_mul(2)),
+            max_fee_per_gas: estimate.max_fee_per_gas.saturating_mul(2),
         };
         poster.seed_in_flight_fees_for_test(BTreeMap::from([(base_nonce, prior)]));
 
@@ -843,10 +980,12 @@ mod tests {
             .expect("base nonce");
 
         // 1) Original poster tx parks in the mempool (mining disabled).
-        let first_hashes = poster
-            .submit_batches(vec![vec![0u8; 4]], &sink)
-            .await
-            .expect("first submit parks a pending tx");
+        let first_hashes = submitted_hashes(
+            poster
+                .submit_batches(vec![vec![0u8; 4]], &sink)
+                .await
+                .expect("first submit parks a pending tx"),
+        );
         assert_eq!(first_hashes.len(), 1);
         let first_hash = first_hashes[0];
 
@@ -878,10 +1017,12 @@ mod tests {
 
         // 2) Confirmation watch timed out; next tick must bump fees and
         //    broadcast a same-nonce replacement (the gas-estimate fix).
-        let second_hashes = poster
-            .submit_batches(vec![vec![0u8; 4]], &sink)
-            .await
-            .expect("replacement must clear gas estimation and broadcast");
+        let second_hashes = submitted_hashes(
+            poster
+                .submit_batches(vec![vec![0u8; 4]], &sink)
+                .await
+                .expect("replacement must clear gas estimation and broadcast"),
+        );
         assert_eq!(second_hashes.len(), 1);
         let replacement_hash = second_hashes[0];
         assert_ne!(
@@ -1089,7 +1230,7 @@ mod tests {
         let prior = crate::l1::eip1559::Eip1559Fees {
             base_fee_per_gas: 1,
             max_priority_fee_per_gas: 50_000_000,
-            max_fee_per_gas: 100_000_000_000,
+            max_fee_per_gas: 1_000_000_000,
         };
         poster.seed_in_flight_fees_for_test(BTreeMap::from([(base_nonce, prior)]));
         poster.fail_next_send_with_for_test(
@@ -1121,6 +1262,44 @@ mod tests {
         assert!(raised.max_priority_fee_per_gas <= raised.max_fee_per_gas);
     }
 
+    #[tokio::test]
+    async fn submit_batches_underpriced_at_ceiling_holds_without_raising_floor() {
+        require_anvil();
+        let anvil = Anvil::default().arg("--no-mining").timeout(30_000).spawn();
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key, false)
+            .expect("signer provider");
+        let poster = EthereumBatchPoster::new(provider.clone(), poster_config(&anvil));
+        let sink = RecordingWatermarkSink::passing();
+
+        let base_nonce = provider
+            .get_transaction_count(submitter)
+            .await
+            .expect("base nonce");
+        let estimate = crate::l1::eip1559::estimate_fees(&provider)
+            .await
+            .expect("fee estimate");
+        let seed = crate::l1::eip1559::Eip1559Fees {
+            max_fee_per_gas: fee_ceiling(estimate.max_fee_per_gas),
+            ..estimate
+        };
+        let seeded = BTreeMap::from([(base_nonce, seed)]);
+        poster.seed_in_flight_fees_for_test(seeded.clone());
+        poster.fail_next_send_with_for_test("Replacement transaction underpriced");
+
+        let outcome = poster
+            .submit_batches(vec![vec![0u8; 4]], &sink)
+            .await
+            .expect("ceiling hold is a non-error tick outcome");
+        assert_eq!(outcome, SubmitBatchesOutcome::Held(Vec::new()));
+        assert_eq!(
+            poster.in_flight_fees_for_test(),
+            seeded,
+            "ceiling hold must leave the stored floor byte-identical"
+        );
+    }
+
     /// Restart shape: empty in-flight map vs a live pending tx. Unconditional
     /// nonce-free gas estimate must still reach `eth_sendRawTransaction`.
     #[tokio::test]
@@ -1133,40 +1312,29 @@ mod tests {
         let poster = EthereumBatchPoster::new(provider.clone(), poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
 
-        let first_hashes = poster
-            .submit_batches(vec![vec![0u8; 4]], &sink)
-            .await
-            .expect("first submit parks a pending tx");
-        let first_hash = first_hashes[0];
+        let first_hashes = submitted_hashes(
+            poster
+                .submit_batches(vec![vec![0u8; 4]], &sink)
+                .await
+                .expect("first submit parks a pending tx"),
+        );
+        assert_eq!(first_hashes.len(), 1);
 
         // Simulate restart / lost response: forget the floor while the tx is
         // still pending on the node.
         poster.seed_in_flight_fees_for_test(BTreeMap::new());
 
-        let result = poster.submit_batches(vec![vec![0u8; 4]], &sink).await;
-        match result {
-            Ok(second_hashes) => {
-                assert_ne!(
-                    second_hashes[0], first_hash,
-                    "if fees moved, the untracked replacement must be a new hash"
-                );
-            }
-            Err(BatchPosterError::Provider(msg)) => {
-                let lower = msg.to_ascii_lowercase();
-                assert!(
-                    !lower.contains("nonce too low"),
-                    "untracked replacement must not die at estimateGas: {msg}"
-                );
-                // Without a floor the re-estimate can match the pending tx
-                // exactly ("already imported") or land underpriced — either
-                // proves we reached send, which is the restart-shape hole.
-                assert!(
-                    lower.contains("already imported") || is_replacement_underpriced(&msg),
-                    "unexpected send failure for untracked replacement: {msg}"
-                );
-            }
-            Err(other) => panic!("unexpected error: {other:?}"),
-        }
+        let outcome = poster
+            .submit_batches(vec![vec![0u8; 4]], &sink)
+            .await
+            .expect("already-known/imported is successful at-least-once progress");
+        let SubmitBatchesOutcome::Submitted(second_hashes) = outcome else {
+            panic!("untracked first-fee retry cannot enter ceiling hold");
+        };
+        assert!(
+            second_hashes.len() <= 1,
+            "already-known sends may omit the hash; fresh replacements return one"
+        );
     }
 
     /// Multi-nonce suffix: every pending nonce is re-broadcast and floored on
@@ -1188,18 +1356,22 @@ mod tests {
             .expect("base nonce");
         let payloads = vec![vec![0u8; 4], vec![1u8; 4], vec![2u8; 4]];
 
-        let first_hashes = poster
-            .submit_batches(payloads.clone(), &sink)
-            .await
-            .expect("first multi-nonce submit");
+        let first_hashes = submitted_hashes(
+            poster
+                .submit_batches(payloads.clone(), &sink)
+                .await
+                .expect("first multi-nonce submit"),
+        );
         assert_eq!(first_hashes.len(), 3);
         let prior_fees = poster.in_flight_fees_for_test();
         assert_eq!(prior_fees.len(), 3);
 
-        let second_hashes = poster
-            .submit_batches(payloads, &sink)
-            .await
-            .expect("suffix rebroadcast");
+        let second_hashes = submitted_hashes(
+            poster
+                .submit_batches(payloads, &sink)
+                .await
+                .expect("suffix rebroadcast"),
+        );
         assert_eq!(second_hashes.len(), 3);
         for (first, second) in first_hashes.iter().zip(second_hashes.iter()) {
             assert_ne!(

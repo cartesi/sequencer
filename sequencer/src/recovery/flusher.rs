@@ -19,7 +19,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
-use crate::l1::eip1559::bumped_replacement_fees;
+use crate::l1::eip1559::{bumped_replacement_fees, estimate_fees, fee_ceiling, pad_gas_estimate};
 use crate::l1::watermark::{StorageWatermarkSink, WalletNonceWatermarkSink};
 
 #[derive(Debug, Error)]
@@ -239,57 +239,48 @@ impl MempoolFlusher {
             return Ok(Vec::new());
         }
 
-        let fees = self
-            .provider
-            .estimate_eip1559_fees()
+        let estimate = estimate_fees(&self.provider)
             .await
-            .map_err(|e| FlushError::Provider(e.to_string()))?;
+            .map_err(FlushError::Provider)?;
+        let max_fee = fee_ceiling(estimate.max_fee_per_gas);
+        let (_, bumped_priority_fee) =
+            bumped_replacement_fees(estimate.max_fee_per_gas, estimate.max_priority_fee_per_gas);
+        let priority_fee = bumped_priority_fee.min(max_fee);
 
-        // Bump the absolute estimate so no-ops can compete with pending batch
-        // txs at the same wallet nonces (shared ≥10% replacement helper —
-        // symmetric ×1.1+1 on both EIP-1559 components). Safety does not
-        // depend on the no-op winning — `flush_and_wait` only returns once
-        // Pending ≤ Safe.
-        //
-        // Residual gap: this is a one-shot bump of a *fresh* estimate, not of
-        // the pending tx's fees, so a replacement can still be underpriced
-        // when the two EIP-1559 components have moved independently. A
-        // rejected no-op hard-errors `flush_and_wait`; the orchestrator
-        // respawn retries. Tightening that needs the pending tx's fees (or a
-        // raise-on-underpriced-error loop), not a bigger one-shot multiplier.
-        let (bumped_max_fee, bumped_priority_fee) =
-            bumped_replacement_fees(fees.max_fee_per_gas, fees.max_priority_fee_per_gas);
+        // Estimate once without a nonce, explicitly at Latest. This mirrors
+        // the poster's nonce-free estimate and avoids Pending nonce policy;
+        // gas is loop-invariant for identical self-transfer no-ops.
+        let tx_base = alloy::rpc::types::TransactionRequest::default()
+            .with_from(self.address)
+            .with_to(self.address)
+            .with_value(U256::ZERO);
+        let gas = self
+            .provider
+            .estimate_gas(tx_base.clone())
+            .block(BlockNumberOrTag::Latest.into())
+            .await
+            .map(pad_gas_estimate)
+            .map_err(|e| FlushError::Provider(e.to_string()))?;
 
         debug!(
             from_nonce,
             to_nonce,
             count = to_nonce - from_nonce,
-            max_fee_per_gas = bumped_max_fee,
-            max_priority_fee = bumped_priority_fee,
+            max_fee_per_gas = max_fee,
+            max_priority_fee = priority_fee,
+            gas,
             "submitting flush no-ops"
         );
 
         let mut tx_hashes = Vec::new();
         let mut send_failures = Vec::new();
         for nonce in from_nonce..to_nonce {
-            // Estimate without the pending nonce and pin gas (+10% pad) —
-            // same Anvil "nonce too low" hole as the batch poster. With gas
-            // + both fee fields set, the GasFiller skips a second estimate.
-            let tx_base = alloy::rpc::types::TransactionRequest::default()
-                .with_to(self.address)
-                .with_value(U256::ZERO)
-                .with_max_fee_per_gas(bumped_max_fee)
-                .with_max_priority_fee_per_gas(bumped_priority_fee);
-            let gas = match self.provider.estimate_gas(tx_base.clone()).await {
-                Ok(gas) => gas.saturating_add(gas / 10),
-                Err(e) => {
-                    let message = e.to_string();
-                    error!(nonce, error = %message, "flush no-op gas estimate failed");
-                    send_failures.push((nonce, message));
-                    continue;
-                }
-            };
-            let tx = tx_base.with_gas_limit(gas).with_nonce(nonce);
+            let tx = tx_base
+                .clone()
+                .with_gas_limit(gas)
+                .with_nonce(nonce)
+                .with_max_fee_per_gas(max_fee)
+                .with_max_priority_fee_per_gas(priority_fee);
 
             match self.provider.send_transaction(tx).await {
                 Ok(pending) => {
@@ -379,11 +370,9 @@ mod tests {
         }
     }
 
-    // ── H5: replacement-fee bump keeps no-ops competitive ─────────
-    // Rule itself lives in `l1::eip1559` (shared with the poster); the
-    // flusher's use site is the `bumped_replacement_fees(...)` call in
-    // `submit_noops`. Equal ×1.1 growth plus the tip≤cap clamp are what
-    // keep a one-shot bump of a near-zero-base estimate valid.
+    // ── H5: ceiling pricing keeps no-ops competitive ──────────────
+    // The flusher uses the poster's shared ceiling for max fee and a bumped,
+    // cap-clamped priority fee, so it can clear any ordinary poster floor.
 
     #[test]
     fn send_failure_error_summarizes_failed_slots() {
