@@ -8,16 +8,16 @@ See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and fu
 
 The sequencer's recovery loop spans two process lifetimes:
 
-1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`CanonicalDivergence`, `L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `WorkerExit::DangerDetected` under `CommandError::Worker`, closes intake, and drains the workers before returning a non-zero status. Canonical divergence is terminal and arms the independent two-second abort bound; expected-recovery and retryable arms remain cooperatively graceful.
+1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`CanonicalDivergence`, `L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `WorkerExit::DangerDetected` under `CommandError::Worker`, closes intake, and drains the workers before returning a non-zero status. Canonical divergence is terminal and enters containment, which arms the terminal abort bound ([ADR mechanism 1](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership)); expected-recovery and retryable arms remain cooperatively graceful.
 2. **External respawn.** An orchestrator (systemd, k8s, …) restarts the process.
-3. **Startup reducer.** The fresh boot reads divergence, danger, finalized-snapshot presence, Tip presence, and the safe head in one local transaction. The pure reducer selects at most one phase. Every completed phase returns to local inspection before another phase or admission. Initial Sync is itself a phase, so an already-persisted divergence refuses before the first provider call.
+3. **Startup reducer.** The fresh boot reads danger (with canonical divergence ranked first), finalized-snapshot presence, Tip presence, and the safe head in one local transaction (`RecoveryInspection`, so no decision mixes facts from two SQLite snapshots). The pure reducer selects at most one phase. Every completed phase returns to local inspection before another phase or admission. Initial Sync is itself a phase, so an already-persisted divergence refuses before the first provider call.
 4. **Prepare, admit, launch.** A clean decision permits task-free, fallible runtime preparation. Startup then invokes the same reducer once more over one consistent fact set, mints the single-use `RuntimeAdmission` witness, and consumes it in an infallible, non-yielding worker launch.
 
 The detector trip and the startup dispatch share the same `check_danger` function; the detector cares only that *some* arm fired, while the startup dispatch examines *which* arm fired to pick the right action.
 
 Key abstractions, by responsibility:
 
-- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::RecoveryRequired` when any non-`Safe` status fires. The runtime converts that into a `WorkerExit::DangerDetected` worker exit, requests process-wide drain, and returns non-zero after cleanup. A terminal classification gets the hard two-second abort fallback; ordinary recovery does not. The reducer re-derives the authoritative response from fresh facts on the next boot.
+- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::RecoveryRequired` when any non-`Safe` status fires. The runtime converts that into a `WorkerExit::DangerDetected` worker exit, requests process-wide drain, and returns non-zero after cleanup. A terminal classification enters containment and its abort bound; ordinary recovery drains cooperatively. The reducer re-derives the authoritative response from fresh facts on the next boot.
 - **`BatchSubmitter`** ([`l1/submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs)): makes L1 progress only — never checks danger. Productive ticks re-enter immediately; idle/transient ticks sleep `idle_poll_interval`. A pure `decide_submit_start` function folds observed L1 nonces over the scheduler-accepted frontier.
 - **Startup recovery reducer** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): pure policy over one `RecoveryInspection` plus boot-local phase progress. It selects `Admit`, one phase, `Retry`, or `Refuse`. The production driver owns exhaustive error classification; raw provider/storage/flush errors do not escape to a second recovery classifier.
 - **Guarded recovery storage** ([`storage/recovery.rs`](../../sequencer/src/storage/recovery.rs)): reads the reducer facts in one transaction and reasserts the selected mutation's durable preconditions in its write transaction. Divergence is checked before the flush-view coherence check and before every batch-tree mutation.
@@ -315,7 +315,7 @@ Each loop iteration burns gas (no-ops + doomed resubs), takes ~12 minutes (the f
 
 ### Startup behavior summary
 
-The first local inspection always ranks `CanonicalDivergence` and missing finalized state ahead of phase progress. If neither terminal fact exists, `NeedInitialSync` selects the initial Sync phase. A provider failure during that one phase may still admit a warm database whose persisted view remains fresh; every non-provider reader failure is classified terminal or retryable by its typed provenance.
+Every boot runs one unconditional loop — `inspect → classify once → decide → perform at most one phase → inspect again` — over the pure `reduce_recovery`. The first local inspection always ranks `CanonicalDivergence` and missing finalized state ahead of phase progress. If neither terminal fact exists, `NeedInitialSync` selects the initial Sync phase. A provider failure during that one phase may still admit a warm database whose persisted view remains fresh; every non-provider reader failure is classified terminal or retryable by its typed provenance.
 
 After the initial Sync attempt, ordinary inspection maps facts as follows:
 
@@ -329,7 +329,9 @@ After the initial Sync attempt, ordinary inspection maps facts as follows:
 | `EstimatedBatchInDanger(N)` | `Retry` | Observed safe state did not cross danger; recovery never mutates from an estimate alone. |
 | `CanonicalDivergence(N)` | `Refuse` | Standard recovery assumes content identity and is forbidden. |
 
-Closed recovery is structurally `Flush → inspect → post-flush Sync → inspect → Cascade → inspect`. Flush produces a boot-local witness carrying its observed safe block. The post-flush Sync preserves that witness, and Cascade is selected only if the persisted safe head caught up through it. A crash drops the witness, so the next boot repeats the idempotent flush instead of trusting a half-remembered phase. The guarded Cascade transaction checks divergence first, then the required finalized-state fact and the flush-view floor, then mutates.
+Closed recovery is structurally `Flush → inspect → post-flush Sync → inspect → Cascade → inspect`. Flush produces a boot-local witness carrying its observed safe block. The post-flush Sync preserves that witness, and Cascade is selected only if the persisted safe head caught up through it. A crash drops the witness, so the next boot repeats the idempotent flush instead of trusting a half-remembered phase; a `Retry` or `Refuse` erases the witnesses the same way.
+
+There is deliberately no durable recovery-phase state machine. Local inspection comes before any provider call or mutation, so neither a transient RPC error nor a phase's own write can mask a persisted divergence or a missing finalized state. The guarded Cascade transaction checks divergence first, then the required finalized-state fact and the flush-view floor, then mutates. The loop is unbounded by design and terminates by construction — at most five phases per attempt (the initial Sync, then either `RecoverTip` or Flush → post-flush Sync → Cascade, plus at most one guarded `EnsureOpenTip`), because the one cycling edge refuses inside its own transaction; the argument lives on `drive_recovery`.
 
 **Observed repair still outranks clock refusal.** `check_danger` evaluates observed closed/Tip danger before local-clock faults. Once an observed danger selected a repair, the reducer finishes that repair even if the clock arm is also active; the next mandatory inspection returns `Retry` rather than admitting. A successful repair is never itself an admission fact.
 
@@ -380,12 +382,11 @@ Dead batches occupy `w_nonce` slots strictly below `walletNonce`. Recovery batch
 
 Everything above is **standard recovery**: the sequencer's own bookkeeping
 (the batch tree, pending dumps) lets startup cascade a doomed suffix and
-resume. The repair decision is automatic, not an operator-designed reconstruction:
-recovery crosses a process boundary, and the next boot inspects fresh facts
-through the reducer regardless of how the prior process died: an unclean
-exit leaves no gate behind, and there is no operator acknowledgement step.
-A terminal death best-effort records its cause in the `terminal_faults`
-black box, which nothing reads for decisions.
+resume. The repair decision is automatic, not an operator-designed
+reconstruction: recovery crosses a process boundary, and the next boot
+inspects fresh facts through the reducer regardless of how the prior process
+died. Admission and the terminal-fault black box are owned by
+[ADR mechanism 2](../plans/2026-08-authority-boundary-adr.md#2-fact-derived-admission-and-the-terminal-fault-black-box).
 
 **Cockroach recovery** is the catastrophe path — the local DB is lost or has diverged (`CanonicalDivergence`, [I15](../invariants.md)). There is no tree to cascade; the operator supplies a fresh or explicitly wiped data directory and rebuilds canonical logical state from a trusted checkpoint plus L1. It is an operator-driven, one-shot `setup` mode, not a runtime action. There is no automated DB replacement, clone detection, distributed fencing, or partial-fill resume state machine. The summary:
 
@@ -404,44 +405,19 @@ The detect-and-refuse gate is the *trigger*: a fresh `setup` that finds a previo
 Independent of the staleness machinery, the input reader's acceptance
 simulation cross-checks every at/above-anchor **accepted** landing against the
 local valid closed batch at that nonce (the content-identity check:
-`keccak256` of the landed wire bytes vs the hash stamped at seal). The complete
-outcome set for that predicate is `Match`, `Foreign` (no local batch), or
-`Mismatch` (different bytes). `Foreign`/`Mismatch` persist the
-`canonical_divergence` marker in the same transaction as `safe_inputs`, the L1
-safe head, and accepted-frontier projection, and freeze the acceptance
-frontier immediately.
+`keccak256` of the landed wire bytes vs the hash stamped at seal). A `Foreign`
+(no local batch) or `Mismatch` (different bytes) outcome persists the
+`canonical_divergence` marker in the same transaction as the sync that found
+it. The freeze, its runtime reaction, the race bound, and the watchdog
+boundary are owned by
+[I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen);
+the check's completeness scope by [I9](../invariants.md).
 
-This automatic detection starts only when the landing reaches L1 safe and the
-reader successfully ingests it. `check_danger` reports
+This page owns the recovery side. `check_danger` reports
 `CanonicalDivergence` **ahead of every other arm**, so a respawn loop can never
 route a diverged node into a provider call, recovery phase, or admission. Every
 reducer iteration begins with local inspection; mutating phase transactions
 reassert the marker's absence. The controller maps it to terminal `Refuse`.
-At runtime, `DangerDetector` owns prompt process-wide reaction on its two-second
-cadence. The inclusion lane's existing time-gated SQLite read independently
-returns a typed divergence instead of a usable frontier, so a turn that
-observes the marker closes intake and terminates before direct execution,
-promotion, or the five-block frame-clock decision. This is opportunistic
-refusal, not another polling schedule or reaction-time guarantee. A turn that
-already read an open frontier may finish if the reader commits the marker
-concurrently, and a user-op chunk committed before either runtime observation
-may acknowledge; no cross-worker lock or per-chunk marker query is added.
-
-The operator watchdog does not replace this check. The marker freezes finalized
-promotion, so the offending landing normally leaves the watchdog's checkpoint
-endpoint unchanged and its idle optimization skips replay/comparison. It is a
-wire-identity predicate; the watchdog is the broader independent
-application-state comparison once a newer finalized checkpoint exists.
-
-The distinction from standard recovery is important. The danger classifier
-and reducer exhaustively handle the modeled automatic-recovery states on this
-page. The check is complete only for accepted-batch content identity. It is not an
-independent oracle for checkpoint/application correctness, trusted collapsed
-history below the anchor, the mirrored scheduler predicate, or arbitrary
-direct/user execution bugs. In particular, the known wrong-high checkpoint
-nonce case is outside its detection boundary (see
-[`cockroach.md`](cockroach.md#data-dictionary)). Absence of the marker does not
-prove general canonical agreement.
 
 The remedy is **cockroach recovery (wipe + rebuild from L1), never the
 standard recovery on this page**: the cascade reconciles the batch tree's
@@ -495,8 +471,7 @@ RecoverTip, Flush/Sync/Cascade with ephemeral witnesses, Sync-discovered
 divergence, mandatory reinspection after every completed phase,
 crash-and-restart as a fresh attempt over surviving durable facts (nothing
 durable gates the next boot; the terminal-fault black box is non-gating
-telemetry outside the model — written at settlement, read only for a boot
-warning — and there is no acknowledgement action), and atomic minting of the `RuntimeAdmission` witness from the
+telemetry outside the model — see the ADR), and atomic minting of the `RuntimeAdmission` witness from the
 final clean decision. It abstracts away the batch spine and delegates every phase's
 batch mechanics to `preemptive.tla`.
 

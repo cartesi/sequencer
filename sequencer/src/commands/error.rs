@@ -68,11 +68,10 @@ pub enum CommandError {
 // The exit code remains an ops hint, never protocol authority over the next
 // boot. Reserved: 1 (unclassified), 2 (clap usage), and 101 for a panic
 // before the command harness can project trusted-code failures to 30. A
-// terminal containment that cannot drain within the two-second watchdog
-// bound exits via `abort()` (SIGABRT/134), bypassing this projection
-// deliberately — supervisors must treat 134 from the sequencer as
-// terminal-class (the cause is in the logs and, best-effort, the black box;
-// a persistent fault re-detects fail-loud on the next boot that reads it).
+// terminal containment that cannot drain within the terminal abort bound
+// exits via `abort()` (SIGABRT/134), bypassing this projection deliberately;
+// supervisors must treat 134 from the sequencer as terminal-class
+// (`docs/watchdog/operator-deployment.md` says how).
 
 /// Restart with backoff; a recovery boot is expected next (it may take 15+
 /// min: flush + safe-finality wait). Startup probes must accommodate it.

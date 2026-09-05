@@ -106,14 +106,16 @@ order against a fresh instance to rebuild state (catch-up). Therefore:
 has executed** (frame `safe_block` for user ops, L1
 `inclusion_block` for directs), or 0 if nothing has executed.
 
-The live sequencer advances its frame clock on a best-effort safe-block policy:
-once the observed safe head is at least five blocks beyond the open frame, it
-opens exactly one frame at the observed tip. A delayed or epoch-sized head jump
-is not interpolated. All user ops in that frame execute sequentially with the
-same logical block value; newly covered directs execute first but retain their
-own exact L1 inclusion blocks. A clock-only empty frame does not call the
-application or autonomously advance this method—it supplies a newer clock to a
-later executed user op.
+The live sequencer advances its frame clock on the best-effort safe-block
+policy owned by
+[scheduler-semantics](scheduler-semantics.md#sequencer-frame-clock-policy);
+a delayed or epoch-sized head jump therefore arrives as a single step, not
+a sequence of intermediate clocks.
+All user ops in a frame execute sequentially with the same logical block
+value; newly covered directs execute first but retain their own exact L1
+inclusion blocks. A clock-only empty frame does not call the application or
+autonomously advance this method—it supplies a newer clock to a later executed
+user op.
 
 - It is **scheduler-owned, not a setter** — the shared execution boundary
   advances it via `max` only after the application hook returns `Ok`.

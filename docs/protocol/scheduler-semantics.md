@@ -141,6 +141,11 @@ batch's first frame at the unchanged `safe_block`; equal adjacent frame clocks
 are valid. Thus block distance is the only reason logical frame time advances,
 not the only reason a frame row exists.
 
+Five blocks is a sequencer policy chosen comfortably inside the happy-path
+deposit budget. If actual safe-head publication cadence threatens that budget,
+revisit the constant from measurements rather than adding interpolation or a
+second timer.
+
 ---
 
 ## The application-history offset
@@ -213,10 +218,8 @@ I1 names three places this algorithm lives. They are not three rewrites; two are
   (`Match`), no local batch (`Foreign`), or different bytes (`Mismatch`); the
   latter two durably freeze the frontier. Because the check shares #2 and its
   structural omissions, it cannot prove that #1, application state, or trusted
-  collapsed history is correct. A structurally malformed foreign landing may
-  conservatively record divergence even if #1 would reject it; that false
-  positive is accepted under the sequencer self-trust model. See I9/I15 for the
-  runtime and recovery boundary.
+  collapsed history is correct. Its false-positive boundary is recorded once
+  at I9; see I9/I15 for the runtime and recovery boundary.
 - **The expected-nonce fold** is homed once, next to `scheduler_accepts`, as
   [`advance_expected_batch_nonce`](../../sequencer-core/src/protocol.rs). The
   submitter's `decide_submit_start` consumes it directly. The frontier builder

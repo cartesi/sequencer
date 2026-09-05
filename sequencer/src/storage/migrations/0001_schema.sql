@@ -58,6 +58,9 @@ CREATE INDEX IF NOT EXISTS idx_batches_valid_closed_by_nonce
     WHERE invalidated_at_ms IS NULL AND sealed_at_ms IS NOT NULL;
 
 -- ── Views ──────────────────────────────────────────────────────────────────
+-- Readers over batch data go through the `valid_*` views (here and
+-- `valid_sequenced_l2_txs` below), which encapsulate the "exclude invalidated
+-- rows" filter; writers always target the base tables.
 CREATE VIEW IF NOT EXISTS valid_batches AS
     SELECT * FROM batches WHERE invalidated_at_ms IS NULL;
 
@@ -212,6 +215,9 @@ BEGIN
     SELECT RAISE(ABORT, 'frames can only be inserted into the current Tip');
 END;
 
+-- No (sender, nonce) uniqueness is enforced here: included user-op identity
+-- is tracked by application nonce logic, and a DB constraint would block
+-- legitimate resubmission after a recovery cascade.
 CREATE TABLE IF NOT EXISTS user_ops (
     batch_index      INTEGER NOT NULL,
     frame_in_batch   INTEGER NOT NULL,
@@ -390,7 +396,9 @@ CREATE TABLE IF NOT EXISTS canonical_divergence (
 -- itself. Standard recovery is forbidden on a diverged frontier; the typed
 -- Rust refusals (the local-first startup reducer plus guarded Tip/Cascade
 -- mutations and atomic runtime admission) remain the friendly error surface, but these
--- triggers are the enforcement a forgotten call site cannot bypass.
+-- triggers are the enforcement a forgotten call site cannot bypass. The accepted
+-- frontier (`safe_accepted_batches`) has no trigger: its single writer refuses
+-- past the marker in Rust.
 CREATE TRIGGER IF NOT EXISTS trg_batches_frozen_on_divergence_insert
 BEFORE INSERT ON batches FOR EACH ROW
 WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)

@@ -7,7 +7,8 @@ proposal adversarially cross-examined against the invariants register, the
 TLA+ models, and git history, plus an independent premise challenge of the
 ADR. 141 mechanisms inventoried: 98 keep, 25 simplify, 6 cut, 12 question.
 This review adopted the calibration rule now in AGENTS.md (the complexity
-budget belongs to concurrency, durability, and hostile-L1 robustness).
+budget belongs to concurrency, mutual exclusion, durability, and hostile-L1
+robustness).
 
 **Verdict: not over-engineered — unevenly engineered.** The ADR's premise
 survived attack; the rejected alternatives left no residue in code. Three

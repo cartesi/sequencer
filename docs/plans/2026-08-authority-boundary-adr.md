@@ -4,8 +4,8 @@ The architecture decision record for how authority — over speculative state,
 promises, process lifetime, and recovery admission — is owned in the
 sequencer. The mechanisms below are landed; the decision history and the
 review trail that shaped them live in
-[`../review/register.md`](../review/register.md) and the dated ledgers beside
-it.
+[`../review/register.md`](../review/register.md) and the review history it
+records.
 
 ## Context
 
@@ -22,13 +22,11 @@ The policy separates into three guarantees:
    inspection on the next boot. This is carried by the unconditional recovery
    reducer: every boot re-derives its decisions from durable facts, never
    from the previous process's verdict.
-3. **G3 — scoped divergence freeze:** once the canonical-divergence fact is
-   committed, the accepted frontier, batch tree, and snapshot promotion are
-   frozen immediately ([I15](../invariants.md)). `DangerDetector` owns prompt
-   process shutdown; the running inclusion lane also refuses
-   opportunistically when its existing frontier read observes the poison.
-   User-op work authorized before runtime observation may still commit and
-   acknowledge.
+3. **G3 — scoped divergence freeze:** a committed canonical-divergence fact
+   freezes its persisted acceptance domain immediately. The mechanism, its
+   runtime reaction, its race bound, and the watchdog boundary are stated
+   in full at
+   [I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen).
 
 The enforceable unified policy:
 
@@ -63,15 +61,42 @@ detector, the fee oracle) take its pure notification half, the slim
 borrow-scoped `Authorized` token that three effect functions require in
 their signatures — the user-op acknowledgement, the L1 send, and the WS
 emit — so at those sites forgetting the containment consult is a compile
-error, not a convention. The snapshot-stream start, the `POST /tx` success
-body, and the lane's batch-close and reconciliation commits consult the same
-bit by hand, bounded by the exit contract.
+error, not a convention. The token is not an effect gate (the rejected
+`EffectGate`, below): no mutex, no actor, no runtime state — the same
+predicate moved into the signatures of the operations it guards. The
+remaining externalization consults are
+hand-placed and bounded by the exit contract: the three snapshot routes once
+at request start (serving an already-immutable snapshot is not
+authority-bearing, and per-chunk stream cancellation is deliberately not a
+containment guarantee), the `POST /tx` success body, and the lane's fast-turn
+entry
+and its batch-close and reconciliation commits. Inside the token-covered L1
+send, the poster re-consults the same bit before each keyed send and before
+the write-before-broadcast watermark raise; the tick's chain-id gate, fee
+estimate, nonce read, and confirmation watch are not re-gated. Those
+re-checks narrow the bounded lag within an effect already authorized and
+are not separate boundaries. The lane consults once per effect boundary,
+not per line: adjacent re-reads of the bit would narrow the window by
+nanoseconds in a design that already accepts the honest TOCTOU bound.
+
+Containment is classification-at-birth. The first reporter is elected by
+compare-and-swap, the sticky bit and its cause become visible together, the
+abort watchdog is armed before cooperative shutdown is requested (a drain
+may block), and nothing durable is written. A token proves the bit was
+consulted and found clear at some point in its borrow, not at the instant
+of the effect: a consumer that awaits between minting and effect carries
+that bounded lag.
 
 The lock is released only after every runtime-owned child has actually
 stopped; a dropped `JoinHandle` detaches rather than stops, so each worker
 and nested blocking task retains its own lock clone — through the scope or
 directly — until its closure really ends. This is a cheap local foot-gun guard, not distributed fencing:
-it prevents two processes on one data directory and nothing more.
+it prevents two processes on one data directory and nothing more. Cleanup
+polls every worker concurrently, so one hung drain cannot hide a terminal
+exit that must arm the bound. The watchdog holds only a weak
+process-lifetime witness: it fires at the deadline exactly when a
+controller, worker, or nested blocking task still retains the lock, and
+ordinary operator/recovery shutdown has no hard deadline.
 
 Runtime construction is prepare → admit → launch: every fallible or awaited
 operation happens while zero tasks exist; final admission re-runs the
@@ -85,13 +110,15 @@ launched runtime, and no refusal or retry can mint the witness.
 Admission is governed by three facts, each with one owner: the kernel
 process lock (concurrent owners), two-sided `setup_complete` (command
 ordering), and `canonical_divergence` (the one absorbing refusal — only a
-fresh-directory cockroach rebuild proceeds). There is no lifecycle admission
+fresh-directory cockroach rebuild proceeds); baseline schema and history
+creation and setup completion are each one `synchronous=FULL` transaction.
+There is no lifecycle admission
 state machine and no operator acknowledgement: standard recovery is
 automatic, and restart policy after a terminal fault is the exit-code
-contract (30 = do not restart, page), enforced by the supervisor. The only
-durable telemetry is the `terminal_faults` black box — append-only
-terminal-cause rows, written best-effort and verdict-neutrally; nothing
-reads it for decisions.
+contract (30 = do not restart, page), which the supervisor is expected to
+honor. The only durable telemetry is the `terminal_faults` black box —
+append-only terminal-cause rows, written best-effort and verdict-neutrally;
+nothing reads it for decisions.
 
 The accepted trade, eyes open: a known-terminal fault refuses at
 re-detection rather than at a boot gate. Every fault whose evidence the boot
@@ -102,33 +129,25 @@ freeze) never depended on a boot gate.
 
 ### 3. Recovery as a pure run reducer
 
-Normal `run` startup is one unconditional loop:
-
-```text
-inspect -> classify once -> decide -> perform at most one phase -> inspect again
-```
-
-`reduce_recovery` is pure policy over one transactionally consistent
-`RecoveryInspection` plus boot-local phase progress. Local absorbing facts
-are inspected before any provider call, so a transient RPC error can never
-mask a persisted divergence. Closed recovery is phase-granular —
-`Flush → inspect → Sync → inspect → Cascade → inspect` — with the flush's
-safe-block observation carried as an ephemeral, memory-only witness: a crash
-loses it and the next boot repeats the idempotent flush. There is
-deliberately no durable recovery-phase state machine. The
-[`admission.tla`](../recovery/admission.tla) model verifies the controller
-ordering; [`docs/recovery/README.md`](../recovery/README.md) owns the design.
-
-Setup/rebuild, maintenance flush, and normal-run recovery retain distinct
-typed controllers: their facts are unrelated, and a generic command reducer
-would enlarge the state machine without closing an enforcement hole.
+Normal `run` startup is one unconditional loop over a pure decision
+function — inspect, classify once, decide, perform at most one phase,
+inspect again — with no durable recovery-phase state machine.
+Setup/rebuild, maintenance flush, and normal-run recovery
+retain distinct typed controllers. The design, the dispatch table, the
+boot-local witnesses, and the phase bound are owned by
+[`docs/recovery/README.md`](../recovery/README.md);
+[`admission.tla`](../recovery/admission.tla) verifies the controller
+ordering; the arguments against a generic command controller and a durable
+phase ledger are in the [register](../review/register.md).
 
 ### 4. SQLite-centered runtime and the two-regime inclusion lane
 
 SQLite is the durable coordination boundary between components. The input
 reader atomically commits `safe_inputs`, `l1_safe_head`,
 `safe_accepted_batches`, and any `canonical_divergence` fact in one sync
-transaction; the lane reads that durable projection. The one deliberate
+transaction (a `setup --recovery` interim sync defers the frontier half);
+the lane reads that durable projection and receives no in-memory cursor
+from the reader. The one deliberate
 exception is HTTP ingress ↔ inclusion lane (bounded MPSC + oneshot), because
 low-latency request/response over the lane's in-memory application is
 unwieldy through SQLite — an exception for one local interaction, not a
@@ -137,16 +156,23 @@ precedent for an in-memory component bus.
 The lane has two regimes. The **fast user-op regime** dequeues at most one
 bounded chunk per turn — accepted or rejected — and commits the accepted
 subset at most once with `synchronous=FULL`; only that commit authorizes
-acknowledgements. Making the dequeue chunk itself the turn boundary keeps
-entry to reconciliation independent of acceptance outcome, so rejected
-floods cannot starve the frontier check. The **L1 reconciliation regime**
-fires when the observed safe head is at least five blocks past the open
-frame's clock: it consumes the complete accumulated newly-safe range,
-promotes at most once, and opens exactly one frame at the observed tip —
-jumps are never interpolated. There is no elapsed-time budget, preemption,
-or resumable partial cursor inside a turn: the supported deployment assumes
-the application promptly digests the whole range (revisit only if production
-measurements disprove that).
+acknowledgements, which are tied to chunk durability and never to frame or
+batch closure. All-rejected chunks mutate nothing and open no transaction.
+Making the dequeue chunk itself the turn boundary keeps entry to
+reconciliation independent of acceptance outcome — the batch target counts
+only included bytes, so rejected requests never advance it, and a rejected
+flood cannot starve the frontier check; this adds no timer, cursor, or
+fairness knob, and
+returning to the outer loop costs only time-gate bookkeeping — no fsync and
+no frontier read per chunk. The **L1 reconciliation regime** fires when the
+observed safe head is at least five blocks past the open frame's clock: it
+consumes the complete accumulated newly-safe range, catch-up and backlog
+conditions included, promotes at most once, and opens exactly one frame at
+the observed tip — jumps are never interpolated. There is no elapsed-time
+budget, preemption, or resumable partial cursor inside a turn: the supported
+deployment assumes the application promptly digests the whole range
+([application contract §5](../protocol/application-contract.md#5-operational-capacity-for-l1-reconciliation); revisit
+only if production measurements disprove that).
 
 Authority remains role-local and auditable: a FULL-committed user-op chunk
 authorizes its acknowledgement; a valid sealed batch plus the durable
@@ -155,33 +181,17 @@ valid rows plus their canonical `executed_inputs` attribution authorize feed
 output. An already-authorized effect may finish after a later terminal
 transition.
 
-## Rejected alternatives (do not re-propose without new evidence)
+## Rejected alternatives
 
-- **`RunEpoch`** (a globally threaded internal fencing epoch): the OS lock
-  plus structured task lifetime plus fresh per-scope channels already make
-  an old sender unable to reach a new receiver, and there is no in-process
-  hot restart to fence against. Revisit only if in-process restart or
-  multiple admitted runtimes under one lock are introduced.
-- **`EffectGate` / `LiveKernel`** (a universal effect mutex or actor): would
-  duplicate the role-local linearization points the system already needs and
-  force the reader and latency-critical lane through a new in-memory
-  authority protocol, adding a second state machine without making the
-  narrow content-identity check a complete divergence oracle. The
-  `Authorized` token is not this: no mutex, no actor, no runtime state —
-  the same predicate moved into the signatures of the operations it guards.
-- **A generic command controller** over setup/rebuild/run/maintenance:
-  their facts are unrelated; combining them enlarges the cross-product state
-  machine without closing an enforcement hole.
-- **A per-user-op divergence query** (or reader mailbox) on the hot path:
-  the content-identity check is complete only for accepted-batch content
-  identity ([I9](../invariants.md)); paying a per-chunk query would not buy
-  a complete safety boundary.
-- **A durable recovery-phase ledger**: the flush witness is boot-local by
-  design; persisting it would re-create a state machine whose only effect is
-  skipping an idempotent flush.
-- **A durable boot gate on terminal verdicts**: a gate on a non-fact needs
-  an operator acknowledgement to exit, and the acknowledgement carries no
-  information the fact-derived reducer doesn't already re-derive.
+`RunEpoch` (an internal fencing epoch); `EffectGate` / `LiveKernel` (a
+universal effect mutex or actor); a generic command controller (one reducer
+over setup/rebuild/run/maintenance); a
+per-chunk divergence query, provider call, or reader mailbox on the hot
+path; a durable recovery-phase ledger; a durable boot gate on terminal
+verdicts. Each argument, its evidence, and its revisit trigger live in the
+review register's refuted list
+([`../review/register.md`](../review/register.md#refuted--do-not-re-propose-without-new-evidence));
+do not re-propose without new evidence.
 
 ## External history
 
