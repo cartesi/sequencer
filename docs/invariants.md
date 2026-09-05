@@ -357,8 +357,8 @@ by writer and are write-once (`0001_schema.sql`).
   rediscovery. The admission and preemptive TLA+ models verify the
   controller ordering (`LocalDivergenceFirst` in `admission.tla`) and
   slot/batch safety respectively.
-- **Runtime reaction:** `check_danger` owns prompt process-wide reaction on its
-  two-second cadence. Independently, the inclusion lane's existing time-gated
+- **Runtime reaction:** the danger detector owns prompt process-wide reaction,
+  reading `check_danger` on its poll interval (`DANGER_DETECTOR_POLL_INTERVAL`). Independently, the inclusion lane's existing time-gated
   SQLite read returns `SafeFrontierState::CanonicalDivergence` instead of an
   `Open` frontier when the marker is already present. The lane then closes
   intake, rejects queued work, and terminates before direct execution,

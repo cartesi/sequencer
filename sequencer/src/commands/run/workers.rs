@@ -18,13 +18,13 @@
 //!   completion (so a hung drain cannot hide a terminal exit), and surface the
 //!   primary failure.
 //!
-//! Worker plumbing is intentionally explicit per-worker (6 fields, 6 spawn
-//! statements, 6 select arms, 6 cleanup entries). Adding a seventh worker
-//! means editing each of those four sites, and each is compile-forced: the
-//! `Workers` literal in `launch`, and the exhaustive `let Self { .. }`
-//! destructures in `select_first_exit` and `finish` — where a bound-but-
-//! unused field fails CI under `-D warnings`. Keep those destructures
-//! exhaustive (no `..`): they are the enforcement.
+//! Worker plumbing is explicit per worker: one field, one spawn statement,
+//! one select arm, one cleanup entry. Adding a worker means editing each of
+//! those sites, and a missed one fails the build: a field missing from the
+//! `Workers` literal in `launch` or from the exhaustive `let Self { .. }`
+//! destructures in `select_first_exit` and `finish` is a hard error, and a
+//! bound-but-unused field fails under `-D warnings`. Keep those destructures
+//! exhaustive (no `..`).
 
 use std::future::Future;
 use std::marker::PhantomData;
@@ -111,7 +111,7 @@ impl Drop for ShutdownOnDrop {
         if std::thread::panicking() {
             // A panic in the admitted runtime controller is a trusted-code
             // failure just like a worker panic. Contain while the runtime
-            // lifetime is still owned so the terminal watchdog bounds any
+            // lifetime is still owned so the terminal abort bound covers any
             // worker or detached blocking operation left behind by unwind.
             self.0
                 .contain_storage_invariant_failure("runtime controller panicked");

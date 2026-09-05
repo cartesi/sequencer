@@ -22,12 +22,11 @@
 //!   the tables they cover — partial
 //!   backstops, not a barrier.
 //!
-//! Honest bounds: the black box's terminal-cause row is best-effort
-//! telemetry (restart policy is the exit contract, and a persistent fault
-//! re-detects fail-loud on the next boot that reads it).
-//! In a process-lock-backed runtime, terminal containment gives the complete
-//! runtime lifetime two seconds to drain before aborting the process. Ordinary
-//! operator/recovery shutdown remains cooperatively unbounded.
+//! Terminal containment gives the complete runtime lifetime
+//! `TERMINAL_ABORT_TIMEOUT` to drain before aborting the process; ordinary
+//! operator/recovery shutdown remains cooperatively unbounded. Restart
+//! policy after a terminal exit is the exit contract
+//! (`crate::commands::error`), not anything this module records.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -244,7 +243,7 @@ pub(crate) struct Authorized<'scope> {
 
 /// Test scope: a leaked temp-dir lock (bounded by test count) plus a no-op
 /// abort watchdog, so containing a fault in a component test neither needs a
-/// data directory nor risks aborting the test binary at the 2s deadline.
+/// data directory nor risks aborting the test binary at `TERMINAL_ABORT_TIMEOUT`.
 #[cfg(test)]
 impl Default for RuntimeScope {
     fn default() -> Self {

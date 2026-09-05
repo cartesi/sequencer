@@ -19,8 +19,8 @@
 //! against arbitrarily malformed self-submissions: the scheduler-frontier
 //! materialization in [`super::safe_accepted_batches`] trusts that on-chain
 //! batches from the sequencer's own address are structurally valid. The
-//! sequencer controls its own submissions — this is a deliberate system
-//! assumption, not a gap.
+//! sequencer controls its own submissions; the threat model records that
+//! self-trust boundary.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior, params};
 use sequencer_core::protocol::{ProtocolTiming, age_exceeds};

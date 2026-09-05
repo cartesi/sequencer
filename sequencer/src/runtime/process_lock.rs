@@ -17,10 +17,10 @@
 //! dies. This prevents two processes from racing settlement, rebuild, or
 //! boot on one data dir, and is the exclusive-ownership primitive the
 //! authority-boundary ADR's durable lifecycle builds on. A non-owning weak
-//! witness to the same descriptor also drives terminal shutdown: after two
-//! seconds, a live witness means some holder — a worker, a nested blocking
-//! task, or the controller itself through settlement — still owns the
-//! directory, and the process aborts.
+//! witness to the same descriptor also drives terminal shutdown: at the
+//! terminal abort deadline (`super::shutdown`), a live witness means some
+//! holder — a worker, a nested blocking task, or the controller itself
+//! through settlement — still owns the directory, and the process aborts.
 
 use std::fs::{File, TryLockError};
 use std::path::Path;
