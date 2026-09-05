@@ -1053,6 +1053,23 @@ impl ManagedSequencer {
         self.shutdown_child().await
     }
 
+    /// Stop a *healthy* sequencer with SIGTERM and assert the exit-code
+    /// contract's clean class: a graceful operator shutdown is exit 0, the one
+    /// code that tells a supervisor nothing needs doing. Opt-in, because many
+    /// scenarios stop a process that has already exited with a failure class
+    /// on purpose. The literal `0` is deliberate: it pins the wire value, not
+    /// a constant.
+    pub async fn stop_expecting_clean_exit(&mut self) -> HarnessResult<()> {
+        let status = self.drain_child_status().await?;
+        if status.code() != Some(0) {
+            return Err(io_other(format!(
+                "a healthy sequencer must exit 0 on SIGTERM, got {status:?}"
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     /// Respawn the sequencer process using the same data directory and Anvil instance.
     ///
     /// Honors any `l1_endpoint_override` set via [`Self::set_l1_endpoint_override`]
@@ -1133,12 +1150,17 @@ impl ManagedSequencer {
     }
 
     async fn shutdown_child(&mut self) -> HarnessResult<()> {
+        let _ = self.drain_child_status().await?;
+        Ok(())
+    }
+
+    /// Send SIGTERM and wait for the child to drain, returning its exit
+    /// status. A drain that outlives `shutdown_timeout` is force-killed and
+    /// reported as an error.
+    async fn drain_child_status(&mut self) -> HarnessResult<std::process::ExitStatus> {
         send_graceful_terminate(&mut self.child).await;
         match tokio::time::timeout(self.shutdown_timeout, self.child.wait()).await {
-            Ok(wait_result) => {
-                let _ = wait_result?;
-                Ok(())
-            }
+            Ok(wait_result) => Ok(wait_result?),
             Err(_) => {
                 self.child.start_kill()?;
                 let _ = self.child.wait().await;

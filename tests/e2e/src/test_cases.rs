@@ -1269,9 +1269,11 @@ async fn run_recovery_after_stale_batches_test(
         transfer_amount,
     );
 
-    // Step 3: Kill the sequencer (Anvil stays up).
+    // Step 3: Stop the healthy sequencer (Anvil stays up). This is the
+    // suite's process-level pin of the exit-code contract's clean class:
+    // SIGTERM on a healthy process must exit 0.
     drop(ws);
-    runtime.stop().await?;
+    runtime.stop_expecting_clean_exit().await?;
 
     // Step 4: Simulate ~4h of outage: advance both L1 and wall clock by
     // MAX_WAIT_BLOCKS * SECONDS_PER_BLOCK = 1200 * 12 = 14400s. On respawn,

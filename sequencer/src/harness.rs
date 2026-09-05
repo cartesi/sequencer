@@ -180,6 +180,39 @@ mod tests {
         assert_eq!(constructions.load(Ordering::SeqCst), 0);
     }
 
+    /// The dispatch projection of the exit-code contract, pinned with the
+    /// integer the supervisor sees: `run` against a data directory that
+    /// `setup` never completed is deterministic operator error, class 30.
+    /// The per-variant table in `commands::error` pins every shape against
+    /// the constants; this is the in-process assertion of a wire value
+    /// through the real command bracket, beside the e2e suite's 10 (the
+    /// aging-tip scenario) and 0 (`ManagedSequencer::stop_expecting_clean_exit`)
+    /// from a real process. Offline by construction: the admission preflight
+    /// refuses before the key is read or any provider is built.
+    #[tokio::test]
+    async fn run_on_a_never_set_up_data_dir_exits_30() {
+        use crate::commands::test_support::SweepTestApp;
+
+        let data_dir = tempfile::tempdir().expect("create data dir");
+        let cli = Cli::try_parse_from([
+            "sequencer",
+            "run",
+            "--http-addr",
+            "127.0.0.1:0",
+            "--data-dir",
+            data_dir.path().to_str().expect("utf8 path"),
+            "--eth-rpc-url",
+            "http://127.0.0.1:1",
+            "--batch-submitter-private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        ])
+        .expect("parse run");
+
+        let exit = dispatch::<SweepTestApp, _>(cli.command, || SweepTestApp).await;
+
+        assert_eq!(exit, std::process::ExitCode::from(30));
+    }
+
     #[tokio::test]
     async fn top_level_command_panic_maps_to_terminal_exit() {
         let result = tokio::spawn(async {
