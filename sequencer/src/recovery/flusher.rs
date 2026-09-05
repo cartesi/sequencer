@@ -19,6 +19,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
+use crate::l1::eip1559::{bumped_replacement_fees, estimate_fees, fee_ceiling, pad_gas_estimate};
 use crate::l1::watermark::{StorageWatermarkSink, WalletNonceWatermarkSink};
 
 #[derive(Debug, Error)]
@@ -48,20 +49,6 @@ fn derive_timeouts(seconds_per_block: u64) -> (Duration, Duration) {
         Duration::from_secs(10 * seconds_per_block),
         Duration::from_secs(seconds_per_block),
     )
-}
-
-/// Bump current 1559 fee estimates so flush no-ops are competitive with
-/// pending batch transactions at the same wallet nonces.
-///
-/// Safety does not depend on the no-op winning. Either the original batch tx
-/// or the no-op can consume the slot; `flush_and_wait` only returns once
-/// `Pending <= Safe`. These bumped fees are an operational acceleration, not a
-/// correctness precondition. The `+ 1` on `max_fee` avoids integer-rounding
-/// flat spots, and the priority doubling is intentionally generous.
-fn bumped_replacement_fees(base_max_fee: u128, base_priority_fee: u128) -> (u128, u128) {
-    let new_max_fee = base_max_fee.saturating_mul(11) / 10 + 1;
-    let new_priority_fee = base_priority_fee.saturating_mul(2).max(1);
-    (new_max_fee, new_priority_fee)
 }
 
 fn send_failures_error(failures: &[(u64, String)]) -> FlushError {
@@ -252,38 +239,53 @@ impl MempoolFlusher {
             return Ok(Vec::new());
         }
 
-        let fees = self
-            .provider
-            .estimate_eip1559_fees()
+        let estimate = estimate_fees(&self.provider)
             .await
-            .map_err(|e| FlushError::Provider(e.to_string()))?;
+            .map_err(FlushError::Provider)?;
+        let max_fee = fee_ceiling(estimate.max_fee_per_gas);
+        let (_, bumped_priority_fee) =
+            bumped_replacement_fees(estimate.max_fee_per_gas, estimate.max_priority_fee_per_gas);
+        let priority_fee = bumped_priority_fee.min(max_fee);
 
-        let (bumped_max_fee, bumped_priority_fee) =
-            bumped_replacement_fees(fees.max_fee_per_gas, fees.max_priority_fee_per_gas);
+        // Estimate once without a nonce, explicitly at Latest. This mirrors
+        // the poster's nonce-free estimate and avoids Pending nonce policy;
+        // gas is loop-invariant for identical self-transfer no-ops.
+        let tx_base = alloy::rpc::types::TransactionRequest::default()
+            .with_from(self.address)
+            .with_to(self.address)
+            .with_value(U256::ZERO);
+        let gas = self
+            .provider
+            .estimate_gas(tx_base.clone())
+            .block(BlockNumberOrTag::Latest.into())
+            .await
+            .map(pad_gas_estimate)
+            .map_err(|e| FlushError::Provider(e.to_string()))?;
 
         debug!(
             from_nonce,
             to_nonce,
             count = to_nonce - from_nonce,
-            max_fee_per_gas = bumped_max_fee,
-            max_priority_fee = bumped_priority_fee,
+            max_fee_per_gas = max_fee,
+            max_priority_fee = priority_fee,
+            gas,
             "submitting flush no-ops"
         );
 
         let mut tx_hashes = Vec::new();
         let mut send_failures = Vec::new();
         for nonce in from_nonce..to_nonce {
-            let tx = alloy::rpc::types::TransactionRequest::default()
-                .with_to(self.address)
-                .with_value(U256::ZERO)
+            let tx = tx_base
+                .clone()
+                .with_gas_limit(gas)
                 .with_nonce(nonce)
-                .with_max_fee_per_gas(bumped_max_fee)
-                .with_max_priority_fee_per_gas(bumped_priority_fee);
+                .with_max_fee_per_gas(max_fee)
+                .with_max_priority_fee_per_gas(priority_fee);
 
             match self.provider.send_transaction(tx).await {
                 Ok(pending) => {
                     let tx_hash = *pending.tx_hash();
-                    debug!(nonce, %tx_hash, "flush no-op submitted");
+                    debug!(nonce, %tx_hash, gas, "flush no-op submitted");
                     tx_hashes.push(tx_hash);
                 }
                 Err(e) => {
@@ -368,41 +370,9 @@ mod tests {
         }
     }
 
-    // ── H5: replacement-fee bump keeps no-ops competitive ─────────
-
-    #[test]
-    fn replacement_fee_bump_exceeds_ten_percent_for_max_fee() {
-        // `max_fee_per_gas` must strictly exceed base by ≥10% for any positive base.
-        for base in [1_u128, 10, 100, 1_000, 1_000_000, 1_000_000_000_000] {
-            let (new_max, _) = bumped_replacement_fees(base, 0);
-            assert!(
-                new_max.saturating_mul(10) >= base.saturating_mul(11),
-                "max_fee bump violates ≥10% rule: base={base}, new={new_max}",
-            );
-        }
-    }
-
-    #[test]
-    fn replacement_fee_bump_doubles_priority_fee() {
-        // `priority_fee` doubles (200%), easily clearing the 10% replacement threshold.
-        for base in [1_u128, 10, 1_000, 1_000_000_000] {
-            let (_, new_prio) = bumped_replacement_fees(0, base);
-            assert_eq!(new_prio, base.saturating_mul(2));
-            assert!(
-                new_prio.saturating_mul(10) >= base.saturating_mul(11),
-                "priority bump violates ≥10% rule: base={base}, new={new_prio}",
-            );
-        }
-    }
-
-    #[test]
-    fn replacement_fee_floor_is_positive_even_when_base_is_zero() {
-        // If the estimator returns zero, bumped values are still positive so the
-        // tx is actually broadcast rather than rejected by the node.
-        let (new_max, new_prio) = bumped_replacement_fees(0, 0);
-        assert!(new_max >= 1);
-        assert!(new_prio >= 1);
-    }
+    // ── H5: ceiling pricing keeps no-ops competitive ──────────────
+    // The flusher uses the poster's shared ceiling for max fee and a bumped,
+    // cap-clamped priority fee, so it can clear any ordinary poster floor.
 
     #[test]
     fn send_failure_error_summarizes_failed_slots() {
@@ -431,14 +401,6 @@ mod tests {
         let err = map_watch_error(PendingTransactionError::FailedToRegister)
             .expect_err("non-timeout watcher failures must surface");
         assert!(matches!(err, FlushError::Provider(_)));
-    }
-
-    #[test]
-    fn replacement_fee_bump_saturates_at_u128_max() {
-        // Overflow safety: astronomical base fees must not wrap around.
-        let (new_max, new_prio) = bumped_replacement_fees(u128::MAX, u128::MAX);
-        assert_eq!(new_max, u128::MAX / 10 + 1);
-        assert_eq!(new_prio, u128::MAX);
     }
 
     // ── H6: timeouts derive from seconds_per_block ────────────────
