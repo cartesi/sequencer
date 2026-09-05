@@ -77,8 +77,35 @@ read-only reviewers before landing:
   tests use a bare signal instead of a leaked-tempdir scope. The doc claims
   that every worker held a scope clone are restated. Closes finding 22.
 
-Not yet landed from the recommended split: the PR title/body, which come
-last.
+Wave 3 (2026-09-04), the taxonomy, each commit refuted by three read-only
+reviewers before landing:
+
+- **The key file classifies by kind**: a missing, unreadable, non-file, or
+  non-text batch-submitter key exits 30 like bad key content one call
+  later, instead of restart-looping at 1; environmental I/O still exits 1.
+  The typed `BootstrapError::KeyFile { path, source }` names the path and
+  never the contents. Closes finding 19.
+- **Every recovery failure carries one verdict**: `RecoveryFailure::Provider`
+  is split into `ProviderUnreachable` (retry) and `SignerMisconfig`
+  (refuse), classified where it is built and pinned, payload and polarity,
+  against the `BootstrapError` projection. `classify_input_reader`'s doc
+  says what it can receive and why `Bootstrap` and `Join` flip polarity
+  between the startup phases and the live worker; both halves are pinned.
+  Closes finding 27; opens finding 32 (the same L1 misconfiguration exits 1
+  under `setup` and 30 under `run`; recorded, not fixed).
+- **Exit-code tests table-driven**: the five per-class tests, the verdict
+  test, the two startup-reader tests, the fee-oracle fatal-math test, and
+  the two app-bootstrap tests fold into five class functions and one test
+  asserting class and `is_terminal` per row (71 rows), with the five
+  verdicts pinned to the integers 10/20/30/40/1 through an exhaustive
+  match. Two wire-value pins outside the table: `run` on a never-set-up
+  data directory dispatches to 30 through the real command bracket, and
+  `stop_expecting_clean_exit` asserts SIGTERM→0 at the healthy stop of
+  `recovery_after_stale_batches`. Closes the SIGTERM→0 and 30-class halves
+  of the owed exit-code test.
+
+Not yet landed from the recommended split: wave 4 (the documentation
+single-home passes) and the PR title/body, which come last.
 
 ## Verdict
 
