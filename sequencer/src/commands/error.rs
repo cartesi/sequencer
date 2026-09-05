@@ -771,7 +771,9 @@ impl From<FeeOracleError> for CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::l1::fee_oracle::math::MathError;
     use crate::l1::fee_oracle::worker::FeeOracleError;
+    use crate::l1::provider::VerifiedSignerProviderError;
     use crate::l1::submitter::BatchPosterError;
     use crate::l1::watermark::WalletNonceWatermarkError;
     use crate::recovery::{
@@ -796,555 +798,541 @@ mod tests {
         }
     }
 
-    #[test]
-    fn semantic_verdict_drives_lifecycle_and_exit_projection() {
-        let cases = [
+    fn sqlite(code: rusqlite::ffi::ErrorCode, extended_code: std::ffi::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code,
+            },
+            None,
+        )
+    }
+
+    fn busy() -> rusqlite::Error {
+        sqlite(rusqlite::ffi::ErrorCode::DatabaseBusy, 5)
+    }
+
+    fn persistent_watermark() -> WalletNonceWatermarkError {
+        WalletNonceWatermarkError::Storage(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    fn key_file(source: std::io::Error) -> CommandError {
+        CommandError::Bootstrap(BootstrapError::KeyFile {
+            path: "/etc/sequencer/submitter.key".into(),
+            source,
+        })
+    }
+
+    fn recovery_retry(failure: impl Into<RecoveryFailure>) -> CommandError {
+        CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::retry(failure)))
+    }
+
+    fn recovery_refuse(failure: impl Into<RecoveryFailure>) -> CommandError {
+        CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::refuse(failure)))
+    }
+
+    fn input_reader_worker(error: InputReaderError) -> CommandError {
+        CommandError::Worker(WorkerExit::InputReader(WorkerStop::Source(error)))
+    }
+
+    fn submitter_worker(error: BatchSubmitterError) -> CommandError {
+        CommandError::Worker(WorkerExit::BatchSubmitter(WorkerStop::Source(error)))
+    }
+
+    fn detector_worker(error: DangerDetectorError) -> CommandError {
+        CommandError::Worker(WorkerExit::DangerDetector(WorkerStop::Source(error)))
+    }
+
+    fn fee_oracle_worker(error: FeeOracleError) -> CommandError {
+        CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::Source(error)))
+    }
+
+    /// One row of the exit-code table: a failure shape and the label the
+    /// assertion prints when its projection moves.
+    type Row = (CommandError, &'static str);
+
+    /// Class 10: restart; the next boot legitimately runs a slow recovery.
+    fn expect_recovery() -> Vec<Row> {
+        vec![
             (
-                danger(DangerStatus::TipInDanger(3)),
-                CommandFailureVerdict::ExpectedRecovery,
-                EXIT_RESTART_EXPECT_RECOVERY,
+                danger(DangerStatus::ClosedBatchInDanger(0)),
+                "a doomed closed batch",
+            ),
+            (danger(DangerStatus::TipInDanger(3)), "an aging Tip"),
+        ]
+    }
+
+    /// Class 20: restart; a transient refusal that self-heals when the L1
+    /// view or the provider recovers.
+    fn transient() -> Vec<Row> {
+        vec![
+            (
+                danger(DangerStatus::L1ViewStale),
+                "a stale L1 view at runtime",
+            ),
+            (
+                danger(DangerStatus::EstimatedBatchInDanger(2)),
+                "an estimated batch in danger",
+            ),
+            (
+                recovery_retry(RecoveryRetryReason::L1ViewStale),
+                "a stale L1 view at startup recovery",
+            ),
+            (
+                recovery_retry(RecoveryRetryReason::ResyncBehindFlushView {
+                    resynced_safe_block: 1,
+                    flush_observed_safe_block: 2,
+                }),
+                "a resync behind the flush's observed view",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::Identity(
+                    IdentityError::FirstBootRequiresL1,
+                )),
+                "a first boot without L1",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::ChainIdRpc {
                     message: "provider unavailable".into(),
                 }),
-                CommandFailureVerdict::Retryable,
-                EXIT_RESTART_TRANSIENT,
+                "the chain-id read failing",
             ),
             (
-                CommandError::StorageInvariantViolation {
-                    cause: "broken durable invariant".into(),
-                },
-                CommandFailureVerdict::Terminal,
-                EXIT_TERMINAL,
+                CommandError::from(FlushError::Provider("x".into())),
+                "the flush's provider",
             ),
+            // A flush failure surfaced via startup recovery must land in the
+            // same class as the flush-mempool subcommand's FlushError
+            // (review M2).
+            (
+                recovery_retry(RecoveryFailure::Flush(FlushError::Provider("x".into()))),
+                "the same flush provider failure under startup recovery",
+            ),
+            // `bootstrap_failure_verdict` classifies `Recovery` on its
+            // retry/refuse wrapper alone; which wrapper a provider failure
+            // gets is pinned where it is built (`classify_signer_provider`).
+            (
+                recovery_retry(RecoveryFailure::ProviderUnreachable("timeout".into())),
+                "the recovery flush's signer provider unreachable",
+            ),
+            // Documented "may self-heal" — the definition of this class (it
+            // previously projected to unclassified/1, misleading restart
+            // policy).
+            (
+                CommandError::from(FeeOracleError::Transient("RPC unavailable".into())),
+                "a transient fee-oracle failure at bootstrap",
+            ),
+            (
+                CommandError::from(FlushError::Watermark(WalletNonceWatermarkError::Storage(
+                    busy(),
+                ))),
+                "operational watermark contention remains retryable",
+            ),
+            (
+                recovery_retry(RecoveryFailure::OpenStorage(StorageOpenError::Sqlite(
+                    busy(),
+                ))),
+                "a busy open during the startup sync remains restartable",
+            ),
+        ]
+    }
+
+    /// Class 30: do not restart; page. The state cannot self-heal, so the
+    /// black box records the cause (`is_terminal`) for exactly these rows.
+    fn terminal() -> Vec<Row> {
+        let mut rows: Vec<Row> = vec![(
+            CommandError::StorageInvariantViolation {
+                cause: "test cause".into(),
+            },
+            "a broken durable invariant",
+        )];
+        // A key file that is missing, unreadable, not a file, or not text is
+        // the same operator mistake as bad key content one call later, and
+        // must not differ from it by 29 in the exit code.
+        rows.extend(
+            [
+                std::io::ErrorKind::NotFound,
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::InvalidData,
+                std::io::ErrorKind::IsADirectory,
+                std::io::ErrorKind::NotADirectory,
+            ]
+            .map(|kind| {
+                (
+                    key_file(std::io::Error::from(kind)),
+                    "a deterministic misconfiguration of the key file",
+                )
+            }),
+        );
+        rows.extend([
+            // A deterministic signer-construction misconfig (bad RPC URL or
+            // private key) classifies terminal in every command, matching the
+            // ChainIdMismatch precedent; setup/flush previously projected it
+            // unclassified while recovery refused it.
+            (
+                CommandError::from(VerifiedSignerProviderError::Create("bad key".into())),
+                "a signer-construction misconfig",
+            ),
+            // Retry/refuse is the wrapper's, pinned at `classify_signer_provider`.
+            (
+                recovery_refuse(RecoveryFailure::SignerMisconfig("bad key".into())),
+                "the same signer misconfig under startup recovery",
+            ),
+            (
+                CommandError::ReferencedSnapshotArtifact {
+                    path: "/durable/snapshot".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                },
+                "a missing DB-referenced snapshot cannot self-heal on restart",
+            ),
+            (
+                CommandError::Storage(rusqlite::Error::QueryReturnedNoRows),
+                "a mandatory durable row disappearing cannot self-heal on restart",
+            ),
+            (
+                detector_worker(DangerDetectorError::Storage(rusqlite::Error::QueryReturnedNoRows)),
+                "typed persistent storage errors retain terminal classification through workers",
+            ),
+            (
+                fee_oracle_worker(FeeOracleError::Storage(rusqlite::Error::QueryReturnedNoRows)),
+                "the newer fee-oracle worker retains persistent storage classification",
+            ),
+            (
+                fee_oracle_worker(FeeOracleError::Join("blocking storage task panicked".into())),
+                "a fee-oracle blocking-task panic is a trusted-code failure",
+            ),
+            (
+                input_reader_worker(InputReaderError::StorageTaskPanicked {
+                    operation: "reading corrupt state",
+                }),
+                "an input-reader storage-task panic",
+            ),
+            (
+                submitter_worker(BatchSubmitterError::StorageTaskPanicked {
+                    operation: "reading corrupt state",
+                }),
+                "a submitter storage-task panic",
+            ),
+            (
+                detector_worker(DangerDetectorError::StorageTaskPanicked),
+                "a detector storage-task panic",
+            ),
+            (
+                submitter_worker(BatchSubmitterError::Poster(
+                    BatchPosterError::StorageInvariantViolation,
+                )),
+                "a poster storage-invariant violation",
+            ),
+            (
+                submitter_worker(BatchSubmitterError::Poster(BatchPosterError::Watermark(
+                    persistent_watermark(),
+                ))),
+                "persistent write-before-broadcast storage failure must not retry as a provider error",
+            ),
+            (
+                CommandError::from(FlushError::Watermark(persistent_watermark())),
+                "the flush's persistent watermark failure",
+            ),
+            (
+                recovery_refuse(RecoveryFailure::Flush(FlushError::Watermark(
+                    persistent_watermark(),
+                ))),
+                "the same watermark failure under startup recovery",
+            ),
+            (
+                danger(DangerStatus::CanonicalDivergence(0)),
+                "canonical divergence at runtime",
+            ),
+            (
+                recovery_refuse(RecoveryRefusalReason::CanonicalDivergence { nonce: 0 }),
+                "canonical divergence at startup recovery",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::SetupNotComplete),
+                "a data directory whose setup never completed",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::ChainIdMismatch { rpc: 1, config: 2 }),
+                "a chain-id mismatch at boot",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::InvalidProtocolTiming(
+                    ProtocolTimingError::MarginNotLessThanMaxWait {
+                        margin: 1200,
+                        max_wait: 1200,
+                    },
+                )),
+                "invalid protocol timing",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::Identity(IdentityError::OrphanedState)),
+                "orphaned state",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
+                    fields: "chain_id".into(),
+                    stored: Box::new(dummy_identity()),
+                    expected: Box::new(dummy_identity()),
+                })),
+                "a pinned-identity mismatch",
+            ),
+            // `setup --recovery` operator-fixable failures are terminal (a
+            // restart re-runs the same bad inputs).
+            (
+                CommandError::from(SetupRecoveryError::AlreadySetUp),
+                "setup --recovery over an already set-up directory",
+            ),
+            // Partial-recovery residue: operator must wipe — terminal.
+            (
+                CommandError::from(SetupRecoveryError::PartialRecoveryMismatch {
+                    existing_root_nonce: 3,
+                    requested_nonce: 5,
+                }),
+                "partial-recovery residue at a different nonce",
+            ),
+            (
+                CommandError::from(SetupRecoveryError::GenesisOverRecoveryResidue { anchor: 7 }),
+                "genesis over recovery residue",
+            ),
+            (
+                CommandError::from(SetupRecoveryError::PartialRecoveryIncomplete { root_nonce: 3 }),
+                "an incomplete partial recovery",
+            ),
+            (
+                CommandError::from(SetupRecoveryError::RecoveryOverResidualSnapshot {
+                    existing_finalized_block: 0,
+                }),
+                "recovery over a residual snapshot",
+            ),
+            // A checkpoint predating genesis is operator misconfig — terminal
+            // (30), not a recovery trigger (40).
+            (
+                CommandError::Bootstrap(BootstrapError::CheckpointBeforeAppDeployment {
+                    checkpoint_block: 5,
+                    app_deployment_block: 10,
+                }),
+                "a checkpoint predating genesis",
+            ),
+            // Reader-level chain-id mismatch (warm-boot backstop) is terminal,
+            // like the boot-time BootstrapError::ChainIdMismatch.
+            (
+                input_reader_worker(InputReaderError::ChainIdMismatch {
+                    rpc: 1,
+                    expected: 31337,
+                }),
+                "the reader's warm-boot chain-id backstop",
+            ),
+            // The same mismatch surfacing during a startup-recovery safe-head
+            // sync (RecoveryError path) is terminal too — not the unclassified
+            // Recovery catch-all (which would loop on the wrong chain).
+            (
+                recovery_refuse(RecoveryFailure::InputReader(InputReaderError::ChainIdMismatch {
+                    rpc: 1,
+                    expected: 31337,
+                })),
+                "the same mismatch during the startup sync",
+            ),
+            (
+                recovery_refuse(RecoveryFailure::InputReader(
+                    InputReaderError::StorageTaskPanicked {
+                        operation: "startup sync",
+                    },
+                )),
+                "a storage-task panic during the startup sync",
+            ),
+            (
+                recovery_refuse(RecoveryFailure::OpenStorage(StorageOpenError::Sqlite(sqlite(
+                    rusqlite::ffi::ErrorCode::NotADatabase,
+                    26,
+                )))),
+                "a persistent open failure during the startup sync",
+            ),
+            (
+                CommandError::from(FeeOracleError::FatalMath(MathError::Overflow)),
+                "fee-oracle fatal math at bootstrap",
+            ),
+            (
+                fee_oracle_worker(FeeOracleError::FatalMath(MathError::Overflow)),
+                "fee-oracle fatal math in the worker",
+            ),
+            (
+                fee_oracle_worker(FeeOracleError::FatalMath(MathError::ExceedsRepresentableRange)),
+                "fee-oracle out-of-range math in the worker",
+            ),
+            (
+                CommandError::from(FeeOracleError::Misconfig("wrong pair".into())),
+                "a fee-oracle misconfig at bootstrap",
+            ),
+            (
+                fee_oracle_worker(FeeOracleError::Misconfig("wrong pair".into())),
+                "a fee-oracle misconfig in the worker",
+            ),
+            (
+                CommandError::AppBootstrap(AppError::Internal {
+                    reason: "application invariant failed".into(),
+                }),
+                "an application invariant failure at bootstrap",
+            ),
+            // Lifecycle classifies by variant, not wholesale: fact refusals
+            // page; a busy black-box write (class 1 below) must not.
+            (
+                CommandError::Lifecycle(LifecycleError::Storage(
+                    rusqlite::Error::QueryReturnedNoRows,
+                )),
+                "a persistent lifecycle storage failure pages",
+            ),
+            (
+                CommandError::Lifecycle(LifecycleError::NotAdmissible {
+                    requested: crate::storage::LifecycleCommand::Run,
+                    reason: "setup has not completed for this data directory",
+                }),
+                "an admission-fact refusal pages",
+            ),
+            (
+                CommandError::Lifecycle(LifecycleError::CanonicalDivergence { nonce: 7 }),
+                "divergence pages",
+            ),
+        ]);
+        rows
+    }
+
+    /// Class 40: sticky setup refusals. The operator must wipe the
+    /// uncompleted data dir and run `setup --recovery`, not plain-restart
+    /// (which would re-detect and re-refuse) — so they get a dedicated code,
+    /// distinct from the auto-recovery class (10).
+    fn setup_needs_recovery() -> Vec<Row> {
+        vec![
             (
                 CommandError::from(SetupRefuse::WalletNonceUnsettled {
                     pending: 14,
                     safe: 13,
                 }),
-                CommandFailureVerdict::SetupRecoveryRequired,
-                EXIT_SETUP_NEEDS_RECOVERY,
+                "an unsettled wallet nonce past the checkpoint",
             ),
             (
-                CommandError::Io(std::io::Error::other("operational failure")),
-                CommandFailureVerdict::Unclassified,
-                EXIT_UNCLASSIFIED,
+                CommandError::from(SetupRefuse::BatchPastCheckpoint {
+                    checkpoint_block: 100,
+                    found_block: 250,
+                    safe_input_index: 7,
+                }),
+                "a batch past the checkpoint",
             ),
+        ]
+    }
+
+    /// Class 1: unclassified operational failure; restart with backoff.
+    fn unclassified() -> Vec<Row> {
+        vec![
+            (
+                CommandError::Io(std::io::Error::other("boom")),
+                "an operational I/O failure",
+            ),
+            // An environmental read failure on the key file (a device or
+            // memory error, not a wrong path) may clear on restart, so it must
+            // not consume the do-not-restart code. EIO is the kind the OS
+            // actually returns (decoded as `Uncategorized`); `other` is the
+            // synthetic one.
+            (
+                key_file(std::io::Error::from_raw_os_error(5)),
+                "an EIO device error on the key file may clear on restart",
+            ),
+            (
+                key_file(std::io::Error::other("input/output error")),
+                "a synthetic I/O error on the key file may clear on restart",
+            ),
+            (
+                CommandError::ReferencedSnapshotArtifact {
+                    path: "/durable/snapshot".into(),
+                    source: std::io::Error::other("filesystem unavailable"),
+                },
+                "operational filesystem failures remain restartable",
+            ),
+            (
+                CommandError::Storage(busy()),
+                "transient storage contention remains restartable",
+            ),
+            (
+                CommandError::Lifecycle(LifecycleError::Storage(busy())),
+                "a transient lifecycle storage failure remains restartable",
+            ),
+            (
+                CommandError::Worker(WorkerExit::Server(WorkerStop::StoppedUnexpectedly)),
+                "a server that stopped unexpectedly",
+            ),
+            (
+                fee_oracle_worker(FeeOracleError::Transient("RPC unavailable".into())),
+                "a transient fee-oracle failure in the worker",
+            ),
+            (
+                fee_oracle_worker(FeeOracleError::Storage(busy())),
+                "fee-oracle storage contention remains restartable",
+            ),
+            (
+                CommandError::AppBootstrap(AppError::Io(std::io::Error::other("disk unavailable"))),
+                "an application I/O failure at bootstrap",
+            ),
+        ]
+    }
+
+    /// Every failure shape the suite pins, projected once onto the exit-code
+    /// contract. Each row asserts its class and that the black-box verdict
+    /// agrees with it (`is_terminal` exactly for class 30). The five classes
+    /// carry distinct codes (pinned below), so a code pin is a verdict pin.
+    #[test]
+    fn every_pinned_failure_projects_to_its_class() {
+        let table = [
+            (EXIT_RESTART_EXPECT_RECOVERY, expect_recovery()),
+            (EXIT_RESTART_TRANSIENT, transient()),
+            (EXIT_TERMINAL, terminal()),
+            (EXIT_SETUP_NEEDS_RECOVERY, setup_needs_recovery()),
+            (EXIT_UNCLASSIFIED, unclassified()),
         ];
-
-        for (error, expected_verdict, expected_exit_code) in cases {
-            let verdict = error.failure_verdict();
-            assert_eq!(verdict, expected_verdict);
-            assert_eq!(error.exit_code(), expected_exit_code);
-            assert_eq!(
-                verdict.is_terminal(),
-                matches!(verdict, CommandFailureVerdict::Terminal)
-            );
+        for (code, rows) in table {
+            assert!(!rows.is_empty(), "class {code} has no rows");
+            for (error, why) in rows {
+                assert_eq!(error.exit_code(), code, "{why}: {error:?}");
+                assert_eq!(
+                    error.failure_verdict().is_terminal(),
+                    code == EXIT_TERMINAL,
+                    "{why}: {error:?}"
+                );
+            }
         }
     }
 
+    /// The wire values a supervisor matches on, as integers: a renumbered
+    /// constant must fail here, not in a runbook. They are pairwise distinct,
+    /// which is what lets the table above pin verdicts through codes; the
+    /// exhaustive match makes a sixth verdict a compile error until it is
+    /// given its integer here.
     #[test]
-    fn r4_class_10_expect_recovery_boot() {
-        assert_eq!(
-            danger(DangerStatus::ClosedBatchInDanger(0)).exit_code(),
-            EXIT_RESTART_EXPECT_RECOVERY
-        );
-        assert_eq!(
-            danger(DangerStatus::TipInDanger(3)).exit_code(),
-            EXIT_RESTART_EXPECT_RECOVERY
-        );
-    }
-
-    #[test]
-    fn r4_class_20_transient_refusal() {
-        assert_eq!(
-            danger(DangerStatus::L1ViewStale).exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-        assert_eq!(
-            danger(DangerStatus::EstimatedBatchInDanger(2)).exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::retry(
-                RecoveryRetryReason::L1ViewStale,
-            )))
-            .exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Identity(IdentityError::FirstBootRequiresL1))
-                .exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::ChainIdRpc {
-                message: "x".into()
-            })
-            .exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-        assert_eq!(
-            CommandError::from(FlushError::Provider("x".into())).exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-        // Documented "may self-heal" — the definition of this class (it
-        // previously projected to unclassified/1, misleading restart policy).
-        assert_eq!(
-            CommandError::from(FeeOracleError::Transient("RPC unavailable".into())).exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-        assert_eq!(
-            CommandError::from(FlushError::Watermark(WalletNonceWatermarkError::Storage(
-                rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error {
-                        code: rusqlite::ffi::ErrorCode::DatabaseBusy,
-                        extended_code: 5,
-                    },
-                    None,
-                )
-            ),))
-            .exit_code(),
-            EXIT_RESTART_TRANSIENT,
-            "operational watermark contention remains retryable"
-        );
-        // A flush failure surfaced via startup recovery must land in the same
-        // class as the flush-mempool subcommand's FlushError (review M2).
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::retry(
-                RecoveryFailure::Flush(FlushError::Provider("x".into())),
-            )))
-            .exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::retry(
-                RecoveryRetryReason::ResyncBehindFlushView {
-                    resynced_safe_block: 1,
-                    flush_observed_safe_block: 2,
-                },
-            )))
-            .exit_code(),
-            EXIT_RESTART_TRANSIENT
-        );
-    }
-
-    #[test]
-    fn r4_class_30_terminal_operator_required() {
-        assert_eq!(
-            CommandError::StorageInvariantViolation {
-                cause: "test cause".into()
+    fn exit_codes_are_the_documented_integers() {
+        use CommandFailureVerdict::*;
+        let documented = |verdict: CommandFailureVerdict| -> u8 {
+            match verdict {
+                ExpectedRecovery => 10,
+                Retryable => 20,
+                Terminal => 30,
+                SetupRecoveryRequired => 40,
+                Unclassified => 1,
             }
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        // A key file that is missing, unreadable, not a file, or not text is
-        // the same operator mistake as bad key content one call later, and
-        // must not differ from it by 29 in the exit code.
-        for kind in [
-            std::io::ErrorKind::NotFound,
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::InvalidData,
-            std::io::ErrorKind::IsADirectory,
-            std::io::ErrorKind::NotADirectory,
-        ] {
-            assert_eq!(
-                CommandError::Bootstrap(BootstrapError::KeyFile {
-                    path: "/etc/sequencer/submitter.key".into(),
-                    source: std::io::Error::from(kind),
-                })
-                .exit_code(),
-                EXIT_TERMINAL,
-                "{kind:?} on the key file is deterministic misconfiguration"
-            );
+        };
+        let all = [
+            ExpectedRecovery,
+            Retryable,
+            Terminal,
+            SetupRecoveryRequired,
+            Unclassified,
+        ];
+        for verdict in all {
+            assert_eq!(verdict.exit_code(), documented(verdict), "{verdict:?}");
         }
-        // A deterministic signer-construction misconfig (bad RPC URL or
-        // private key) classifies terminal in every command, matching the
-        // ChainIdMismatch precedent; setup/flush previously projected it
-        // unclassified while recovery refused it.
+        let distinct: std::collections::BTreeSet<u8> =
+            all.iter().map(|verdict| verdict.exit_code()).collect();
         assert_eq!(
-            CommandError::from(crate::l1::provider::VerifiedSignerProviderError::Create(
-                "bad key".into()
-            ))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::ReferencedSnapshotArtifact {
-                path: "/durable/snapshot".into(),
-                source: std::io::Error::from(std::io::ErrorKind::NotFound),
-            }
-            .exit_code(),
-            EXIT_TERMINAL,
-            "a missing DB-referenced snapshot cannot self-heal on restart"
-        );
-        assert_eq!(
-            CommandError::Storage(rusqlite::Error::QueryReturnedNoRows).exit_code(),
-            EXIT_TERMINAL,
-            "a mandatory durable row disappearing cannot self-heal on restart"
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::DangerDetector(WorkerStop::Source(
-                DangerDetectorError::Storage(rusqlite::Error::QueryReturnedNoRows,)
-            ),))
-            .exit_code(),
-            EXIT_TERMINAL,
-            "typed persistent storage errors retain terminal classification through workers"
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::Source(
-                FeeOracleError::Storage(rusqlite::Error::QueryReturnedNoRows),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL,
-            "the newer fee-oracle worker retains persistent storage classification"
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::Source(
-                FeeOracleError::Join("blocking storage task panicked".into()),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL,
-            "a fee-oracle blocking-task panic is a trusted-code failure"
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::InputReader(WorkerStop::Source(
-                InputReaderError::StorageTaskPanicked {
-                    operation: "reading corrupt state",
-                },
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::BatchSubmitter(WorkerStop::Source(
-                BatchSubmitterError::StorageTaskPanicked {
-                    operation: "reading corrupt state",
-                },
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::DangerDetector(WorkerStop::Source(
-                DangerDetectorError::StorageTaskPanicked,
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::BatchSubmitter(WorkerStop::Source(
-                BatchSubmitterError::Poster(BatchPosterError::StorageInvariantViolation),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        let persistent_watermark =
-            || WalletNonceWatermarkError::Storage(rusqlite::Error::QueryReturnedNoRows);
-        assert_eq!(
-            CommandError::Worker(WorkerExit::BatchSubmitter(WorkerStop::Source(
-                BatchSubmitterError::Poster(BatchPosterError::Watermark(persistent_watermark())),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL,
-            "persistent write-before-broadcast storage failure must not retry as a provider error"
-        );
-        assert_eq!(
-            CommandError::from(FlushError::Watermark(persistent_watermark())).exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::refuse(
-                RecoveryFailure::Flush(FlushError::Watermark(persistent_watermark())),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            danger(DangerStatus::CanonicalDivergence(0)).exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::refuse(
-                RecoveryRefusalReason::CanonicalDivergence { nonce: 0 },
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::SetupNotComplete).exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::ChainIdMismatch { rpc: 1, config: 2 })
-                .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::InvalidProtocolTiming(
-                ProtocolTimingError::MarginNotLessThanMaxWait {
-                    margin: 1200,
-                    max_wait: 1200
-                }
-            ))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Identity(IdentityError::OrphanedState))
-                .exit_code(),
-            EXIT_TERMINAL
-        );
-        // `setup --recovery` operator-fixable failures are terminal (a restart
-        // re-runs the same bad inputs).
-        assert_eq!(
-            CommandError::from(SetupRecoveryError::AlreadySetUp).exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
-                fields: "chain_id".into(),
-                stored: Box::new(dummy_identity()),
-                expected: Box::new(dummy_identity()),
-            }))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        // Partial-recovery residue: operator must wipe — terminal.
-        assert_eq!(
-            CommandError::from(SetupRecoveryError::PartialRecoveryMismatch {
-                existing_root_nonce: 3,
-                requested_nonce: 5,
-            })
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::from(SetupRecoveryError::GenesisOverRecoveryResidue { anchor: 7 })
-                .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::from(SetupRecoveryError::PartialRecoveryIncomplete { root_nonce: 3 })
-                .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::from(SetupRecoveryError::RecoveryOverResidualSnapshot {
-                existing_finalized_block: 0,
-            })
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        // Reader-level chain-id mismatch (warm-boot backstop) is terminal, like
-        // the boot-time BootstrapError::ChainIdMismatch.
-        assert_eq!(
-            CommandError::Worker(WorkerExit::InputReader(WorkerStop::Source(
-                InputReaderError::ChainIdMismatch {
-                    rpc: 1,
-                    expected: 31337,
-                }
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        // The same mismatch surfacing during a startup-recovery safe-head sync
-        // (RecoveryError path) is terminal too — not the unclassified Recovery
-        // catch-all (which would loop on the wrong chain).
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::refuse(
-                RecoveryFailure::InputReader(InputReaderError::ChainIdMismatch {
-                    rpc: 1,
-                    expected: 31337,
-                }),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::refuse(
-                RecoveryFailure::InputReader(InputReaderError::StorageTaskPanicked {
-                    operation: "startup sync",
-                }),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-    }
-
-    #[test]
-    fn startup_recovery_reader_persistent_open_failure_is_terminal() {
-        let source = StorageOpenError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::NotADatabase,
-                extended_code: 26,
-            },
-            None,
-        ));
-        let error = CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::refuse(
-            RecoveryFailure::OpenStorage(source),
-        )));
-
-        assert_eq!(error.exit_code(), EXIT_TERMINAL);
-    }
-
-    #[test]
-    fn startup_recovery_reader_busy_open_failure_remains_restartable() {
-        let source = StorageOpenError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::DatabaseBusy,
-                extended_code: 5,
-            },
-            None,
-        ));
-        let error = CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::retry(
-            RecoveryFailure::OpenStorage(source),
-        )));
-
-        assert_eq!(error.exit_code(), EXIT_RESTART_TRANSIENT);
-    }
-
-    #[test]
-    fn r4_class_40_setup_needs_operator_recovery() {
-        // Sticky setup refusals: the operator must wipe the uncompleted data
-        // dir and run `setup --recovery`, not plain-restart (which would
-        // re-detect and re-refuse) — so they get a dedicated code, distinct
-        // from the auto-recovery class (10).
-        assert_eq!(
-            CommandError::from(SetupRefuse::WalletNonceUnsettled {
-                pending: 14,
-                safe: 13,
-            })
-            .exit_code(),
-            EXIT_SETUP_NEEDS_RECOVERY
-        );
-        assert_eq!(
-            CommandError::from(SetupRefuse::BatchPastCheckpoint {
-                checkpoint_block: 100,
-                found_block: 250,
-                safe_input_index: 7,
-            })
-            .exit_code(),
-            EXIT_SETUP_NEEDS_RECOVERY
-        );
-        // A checkpoint predating genesis is operator misconfig — terminal (30),
-        // not a recovery trigger.
-        assert_eq!(
-            CommandError::Bootstrap(BootstrapError::CheckpointBeforeAppDeployment {
-                checkpoint_block: 5,
-                app_deployment_block: 10,
-            })
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-    }
-
-    #[test]
-    fn r4_class_1_unclassified() {
-        assert_eq!(
-            CommandError::Io(std::io::Error::other("boom")).exit_code(),
-            EXIT_UNCLASSIFIED
-        );
-        // An environmental read failure on the key file (a device or memory
-        // error, not a wrong path) may clear on restart, so it must not
-        // consume the do-not-restart code. EIO is the kind the OS actually
-        // returns (decoded as `Uncategorized`); `other` is the synthetic one.
-        for source in [
-            std::io::Error::from_raw_os_error(5),
-            std::io::Error::other("input/output error"),
-        ] {
-            assert_eq!(
-                CommandError::Bootstrap(BootstrapError::KeyFile {
-                    path: "/etc/sequencer/submitter.key".into(),
-                    source,
-                })
-                .exit_code(),
-                EXIT_UNCLASSIFIED,
-                "a device error on the key file may clear on restart"
-            );
-        }
-        assert_eq!(
-            CommandError::ReferencedSnapshotArtifact {
-                path: "/durable/snapshot".into(),
-                source: std::io::Error::other("filesystem unavailable"),
-            }
-            .exit_code(),
-            EXIT_UNCLASSIFIED,
-            "operational filesystem failures remain restartable"
-        );
-        assert_eq!(
-            CommandError::Storage(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::DatabaseBusy,
-                    extended_code: 5,
-                },
-                None,
-            ))
-            .exit_code(),
-            EXIT_UNCLASSIFIED,
-            "transient storage contention remains restartable"
-        );
-        // Lifecycle classifies by variant, not wholesale: fact refusals
-        // page; a busy black-box write must not.
-        assert_eq!(
-            CommandError::Lifecycle(LifecycleError::Storage(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::DatabaseBusy,
-                    extended_code: 5,
-                },
-                None,
-            )))
-            .exit_code(),
-            EXIT_UNCLASSIFIED,
-            "a transient lifecycle storage failure remains restartable"
-        );
-        assert_eq!(
-            CommandError::Lifecycle(LifecycleError::Storage(
-                rusqlite::Error::QueryReturnedNoRows
-            ))
-            .exit_code(),
-            EXIT_TERMINAL,
-            "a persistent lifecycle storage failure pages"
-        );
-        assert_eq!(
-            CommandError::Lifecycle(LifecycleError::NotAdmissible {
-                requested: crate::storage::LifecycleCommand::Run,
-                reason: "setup has not completed for this data directory",
-            })
-            .exit_code(),
-            EXIT_TERMINAL,
-            "an admission-fact refusal pages"
-        );
-        assert_eq!(
-            CommandError::Lifecycle(LifecycleError::CanonicalDivergence { nonce: 7 }).exit_code(),
-            EXIT_TERMINAL,
-            "divergence pages"
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::Server(WorkerStop::StoppedUnexpectedly)).exit_code(),
-            EXIT_UNCLASSIFIED
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::Source(
-                FeeOracleError::Transient("RPC unavailable".into()),
-            )))
-            .exit_code(),
-            EXIT_UNCLASSIFIED
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::Source(
-                FeeOracleError::Storage(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error {
-                        code: rusqlite::ffi::ErrorCode::DatabaseBusy,
-                        extended_code: 5,
-                    },
-                    None,
-                )),
-            )))
-            .exit_code(),
-            EXIT_UNCLASSIFIED,
-            "fee-oracle storage contention remains restartable"
+            distinct.len(),
+            all.len(),
+            "a code pin is a verdict pin only while the codes are distinct"
         );
     }
 
@@ -1354,14 +1342,7 @@ mod tests {
             rusqlite::ffi::ErrorCode::DatabaseBusy,
             rusqlite::ffi::ErrorCode::DatabaseLocked,
         ] {
-            let error = FeeOracleError::Storage(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code,
-                    extended_code: 5,
-                },
-                None,
-            ));
-            let mapped = CommandError::from(error);
+            let mapped = CommandError::from(FeeOracleError::Storage(sqlite(code, 5)));
             assert!(matches!(&mapped, CommandError::Storage(_)));
             assert_eq!(
                 mapped.exit_code(),
@@ -1372,67 +1353,13 @@ mod tests {
     }
 
     #[test]
-    fn fee_oracle_fatal_math_is_terminal_on_bootstrap_and_worker() {
-        use crate::l1::fee_oracle::math::MathError;
-        assert_eq!(
-            CommandError::from(FeeOracleError::FatalMath(MathError::Overflow)).exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::Source(
-                FeeOracleError::FatalMath(MathError::Overflow),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::Source(
-                FeeOracleError::FatalMath(MathError::ExceedsRepresentableRange),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::from(FeeOracleError::Misconfig("wrong pair".into())).exit_code(),
-            EXIT_TERMINAL
-        );
-        assert_eq!(
-            CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::Source(
-                FeeOracleError::Misconfig("wrong pair".into()),
-            )))
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-    }
-
-    #[test]
     fn fee_oracle_shutdown_ok_is_graceful() {
         let result: Result<Result<(), FeeOracleError>, tokio::task::JoinError> = Ok(Ok(()));
         assert!(WorkerStop::from_shutdown(result).is_ok());
     }
 
-    #[test]
-    fn r4_app_bootstrap_internal_error_is_terminal() {
-        assert_eq!(
-            CommandError::AppBootstrap(AppError::Internal {
-                reason: "application invariant failed".into(),
-            })
-            .exit_code(),
-            EXIT_TERMINAL
-        );
-    }
-
-    #[test]
-    fn r4_app_bootstrap_io_error_is_unclassified() {
-        assert_eq!(
-            CommandError::AppBootstrap(AppError::Io(std::io::Error::other("disk unavailable")))
-                .exit_code(),
-            EXIT_UNCLASSIFIED
-        );
-    }
-
     #[tokio::test]
-    async fn r4_panicking_outer_worker_join_is_terminal() {
+    async fn panicking_outer_worker_join_is_terminal() {
         let source = tokio::spawn(async {
             panic!("worker invariant failure");
         })

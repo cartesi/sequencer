@@ -193,15 +193,17 @@ Open maintainer decisions:
   +30 min without mining, respawn → refusal with zero invalidations).
 - **Process-level divergence scenario** via `respawn_until_stable` (storage
   and reducer coverage exists; the end-to-end freeze/refuse loop does not).
-- **Per-variant exit-code e2e assertions** (failure-path e2es assert only
-  `!success()`) and a process-level SIGTERM→0 assertion. Assert integer
-  literals: the `EXIT_*` values appear only at their declarations, so
-  renumbering `EXIT_TERMINAL` passes the suite today. Cheapest 30-class case:
-  `run` on a never-set-up data directory.
-- **Polarity pins for `classify_input_reader`'s `Bootstrap`/`Join` refusals**,
-  and a unit test of the production phase→progress mapping in
-  `ProductionRecoveryDriver::perform` (the scripted-driver traces exercise the
-  test double's copy of it).
+- **Per-variant exit-code e2e assertions for classes 20/40/1** (those
+  failure-path e2es still assert only `!success()`). Landed 2026-09-04: 10
+  in the aging-tip scenario, 0 through `stop_expecting_clean_exit` at the
+  healthy stop of `recovery_after_stale_batches`, and 30 in-crate through
+  the real command bracket (`harness.rs`, `run` on a never-set-up data
+  directory); the five verdicts are pinned to their integers in
+  `commands/error.rs`, so renumbering `EXIT_TERMINAL` fails the suite.
+- **A unit test of the production phase→progress mapping in
+  `ProductionRecoveryDriver::perform`** (the scripted-driver traces exercise
+  the test double's copy of it). The `classify_input_reader`
+  `Bootstrap`/`Join` polarity pins landed 2026-09-04.
 - **Full-tear cascade on a recovered (anchor = `N'`) tree** re-rooting at
   `N'` (anchor unit mechanics are covered; this end-to-end shape is not).
 - **Uniswap-mode fee oracle end-to-end**: every fixture and e2e pins fixed
