@@ -294,14 +294,13 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   values; the named `saturating_query_bound` only where clamping preserves
   the predicate → `storage/convert.rs` + the check policy.
 - **The calibration rule** (2026-08-18): the complexity budget belongs to
-  concurrency, durability, and hostile-L1 robustness → AGENTS.md design
-  principles.
+  concurrency, mutual exclusion, durability, and hostile-L1 robustness →
+  AGENTS.md design principles.
 - **The `Authorized` externalization token** (2026-08-18): the containment
   consult is a compile-time obligation of the three effect functions that
-  take the token (ack, L1 send, WS emit); the snapshot-stream start, the
-  `POST /tx` success body, and the lane's mutation commits are hand-placed
-  consults bounded by the exit contract →
-  `runtime/shutdown.rs`, ADR mechanism 1.
+  take the token (ack, L1 send, WS emit); the remaining consults are
+  hand-placed and bounded by the exit contract → `runtime/shutdown.rs` (the
+  token) and ADR mechanism 1 (the consult inventory).
 - **Module homing** (2026-08-19): command brackets in `commands/` (with
   config + the `CommandError` taxonomy), the capability substrate alone in
   `runtime/`, `L1Config` in `l1/`; a full merge was refused because the
@@ -439,7 +438,7 @@ reasoning in the [ledger](2026-09-03-branch-stocktake.md)):
   to a bool** — the 200 body is the acknowledgement leaving the process;
   `LeasedDumpBody` does not exist and `finalized_inclusion_block` has no
   streaming primitive. Evidence: `ingress/api.rs:84-92`,
-  `egress/api/snapshot.rs:101-120,214`. The doc tightening survives (finding
+  `egress/api/snapshot.rs:102-121,209-214`. The doc tightening survives (finding
   25).
 - **Deleting the `#[from]` impls so a refusal reason cannot be typed into a
   retry** — the enums are public with public variants; the longer spelling

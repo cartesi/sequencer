@@ -14,6 +14,9 @@
 //!   newly-safe blocks have accumulated, consumes the complete range, promotes
 //!   snapshots, and advances one frame directly to the observed tip. The time
 //!   gate bounds SQL load; block distance is the semantic clock criterion.
+//!   That frontier read is also the lane's divergence refusal point (I15):
+//!   a marker already present closes intake before direct execution,
+//!   promotion, or the frame-clock decision.
 //!
 //! The lane is a single-thread `spawn_blocking` task. SQLite is the durable data
 //! coordination boundary with the input reader and batch submitter. HTTP
@@ -201,7 +204,7 @@ impl<A: Application + 'static> InclusionLane<A> {
     }
 
     /// Process at most one bounded dequeue chunk. Returning to the outer loop
-    /// does not imply an L1 query: the frontier check remains independently
+    /// does not imply a frontier read: that check remains independently
     /// time-gated, so fast turns normally run back-to-back.
     fn run_fast_turn(
         &mut self,

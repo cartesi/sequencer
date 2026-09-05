@@ -11,11 +11,15 @@
 //!   because a drain may block. Containment writes nothing durable: the
 //!   black box's terminal-cause row is written once, by the command bracket
 //!   at settlement, from the verdict `finish` returns.
-//! - [`RuntimeScope::is_storage_invariant_contained`]: checked by
-//!   externalization sites (acks, L1 sends, WS frames, snapshot stream
-//!   starts) before emitting; set only by containment, so a missed check is
-//!   bounded by the exit contract (terminal exits are not restarted) and
-//!   by the I15 freeze triggers on the tables they cover — partial
+//! - [`RuntimeScope::is_storage_invariant_contained`]: consulted at the
+//!   externalization sites — usually through [`RuntimeScope::authorize`],
+//!   whose token three effect functions require in their signature, and
+//!   directly where the consult mints no token (the lane's batch-close and
+//!   reconciliation commits, the poster's re-checks inside an already
+//!   authorized send); the ADR's mechanism 1 inventories the sites. Set only
+//!   by containment, so a missed check is bounded by the exit contract
+//!   (terminal exits are not restarted) and by the I15 freeze triggers on
+//!   the tables they cover — partial
 //!   backstops, not a barrier.
 //!
 //! Honest bounds: the black box's terminal-cause row is best-effort
@@ -190,9 +194,13 @@ impl RuntimeScope {
     }
 
     /// Whether a terminal fault has been contained. Externalization sites
-    /// (acks, sends, frames, streams) check this before emitting — through
-    /// [`Self::authorize`], whose token their effect functions require. True
-    /// iff [`Self::containment_cause`] is present — one authority, no window.
+    /// consult this before emitting — usually through [`Self::authorize`]
+    /// (forced by signature at the three effect functions; called by hand
+    /// at the snapshot routes, the `POST /tx` success body, and the lane's
+    /// fast-turn entry), and directly only where the consult mints no
+    /// token: the lane's batch-close and reconciliation commits and the
+    /// poster's re-checks. True iff [`Self::containment_cause`] is present —
+    /// one authority, no window.
     pub(crate) fn is_storage_invariant_contained(&self) -> bool {
         self.first_containment_cause.get().is_some()
     }
@@ -206,9 +214,8 @@ impl RuntimeScope {
     /// [`Authorized`] in their signature — the user-op acknowledgement, the
     /// L1 send, and the WS emit — so at those sites forgetting the check is
     /// a compile error, not a convention. The remaining consults are
-    /// hand-placed and bounded by the exit contract: the snapshot-stream
-    /// start, the `POST /tx` success body, and the lane's batch-close and
-    /// reconciliation commits. This is the honest bounded-lag consult, not a
+    /// hand-placed and bounded by the exit contract; the ADR's mechanism 1
+    /// inventories them. This is the honest bounded-lag consult, not a
     /// fence: a token minted before a concurrent containment may finish its
     /// already-authorized effect (ADR).
     pub(crate) fn authorize(&self) -> Option<Authorized<'_>> {

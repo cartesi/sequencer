@@ -131,10 +131,17 @@ The three pockets, in descending confidence:
    readers; the in-scope recorder opens a second SQLite writer from inside
    containment, is the reason the "arm the watchdog before recording" ordering
    hazard exists, and a contained run that drains normally writes two rows.
+   *(Landed 2026-09-04 as wave 2: the recorder is deleted, a contained run
+   writes one row, and `run` reads the table at startup — register finding
+   24.)*
 2. **The exit-code test encoding.** Sixty-seven hand-built projection asserts
    pin a pure function four times over, while no test asserts that a real
    failing process exits with the promised code; renumbering the terminal code
-   passes the whole suite.
+   passes the whole suite. *(Landed 2026-09-04 as wave 3: the table, the
+   integer pins, and the two wire-value assertions; the stalled-safe-head
+   (class 20), 40, and 1 failure paths still assert only a non-zero status,
+   while the backward-clock-jump scenario already pins 20 and the aging-tip
+   scenario pins 10 — see the owed tests.)*
 3. **Documentation fan-out.** Fact-derived admission is described in fourteen
    places and the divergence freeze in eleven files; the branch's own L3
    rename missed three "journal" sites.
@@ -425,7 +432,8 @@ Re-verify the cited lines before acting on any item below.
   — already the documented status for unclean deaths
   (`docs/watchdog/operator-deployment.md:392-395`). Note the confirmed
   dedupe verdict above: the bracket write is a genuine retry, which argues for
-  keeping one writer rather than two, and for the bracket one.
+  keeping one writer rather than two, and for the bracket one. *(Landed
+  2026-09-04, wave 2; register finding 24.)*
 - **delete-terminal-faults-black-box** (threat challenge, Δ−330) and
   **cut_black_box** (minimal design, Δ−185). Delete the table, its two
   triggers, `TerminalFault`, `record_terminal_fault`, `latest_terminal_fault`,
@@ -444,6 +452,8 @@ Re-verify the cited lines before acting on any item below.
   register's settled entry to the true scope. Do not extend the token to the
   lane's mutation commits (they sit inside `&mut self.storage` borrows). The
   jury's refutation of the "uniform" proposal above endorses this framing.
+  *(Resolved 2026-09-03 by restating the ADR and the register to the true
+  scope; register finding 25.)*
 - **sketch_boot_shutdown** (minimal design, Δ−260) — a reference sketch that
   keeps the lock, scope, token, `ShutdownOnDrop`, reducer, hygiene, lifecycle
   facts, and the typed `Workers`/`FirstExit`, and deletes `ShutdownSignal`
@@ -489,7 +499,9 @@ Re-verify the cited lines before acting on any item below.
   The recorded refutation argues against a gate on a verdict; a read that
   changes no decision is untouched by it. This would give the black box its
   first in-product reader; if declined, say in the register that the black
-  box is an out-of-process artifact by design.
+  box is an out-of-process artifact by design. *(Landed 2026-09-04 as
+  `warn_on_previous_terminal_fault`, ahead of the preflight; register
+  finding 24.)*
 - **startup_hygiene_single_finalized_read** (refuted-list audit, Δ−6).
   `require_finalized_snapshot` and `restamp_finalized_promotion` each query
   `finalized_dump()`; fetch once in `run_snapshot_hygiene` and pass the row.
@@ -570,7 +582,9 @@ Re-verify the cited lines before acting on any item below.
   assertions; an empty cause is already impossible at the engine
   (`0001_schema.sql:628-630`). Contradicted in part by
   `startup_log_last_terminal_fault` above, which would give the reader a
-  production caller; decide the black box's reader story once.
+  production caller; decide the black box's reader story once. *(Withdrawn
+  2026-09-04: the startup read landed, so the typed reader has its
+  production caller.)*
 - **single-admission-implementation-for-setup** (Δ−25).
   `preflight_lifecycle_command` has two callers (`run`, `flush`); setup and
   rebuild go through `admit_setup_lifecycle` (`setup/mod.rs:361-388`), which

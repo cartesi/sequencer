@@ -6,21 +6,23 @@
 //! Admission is governed by facts, each with one owner:
 //!
 //! - concurrent owners: the kernel process lock (`crate::runtime`);
-//! - command ordering: `setup_complete`, checked two-sided here at every
-//!   preflight (setup/rebuild never restart over a completed setup; run and
-//!   maintenance never start before one);
+//! - command ordering: two-sided `setup_complete` — run and maintenance
+//!   preflight it here and never start before one; setup and rebuild check
+//!   it in their own admission (`crate::commands::setup`) and never restart
+//!   over a completed one;
 //! - the one absorbing refusal: `canonical_divergence`, checked at every
-//!   entry — its only exit is cockroach rebuild;
+//!   entry — its only exit is a fresh-directory cockroach rebuild;
 //! - restart policy after a terminal fault: the exit-code contract
-//!   (30 = do not restart, page an operator), enforced by the supervisor,
-//!   not by a database gate. Standard recovery needs no intervention at
+//!   (`crate::commands::error`), which the supervisor is expected to honor;
+//!   there is no database gate. Standard recovery needs no intervention at
 //!   all: every run boots through the fact-derived recovery reducer.
 //!
 //! The black box (`terminal_faults`) is for operators and postmortems: the
 //! cause of a terminal death, best-effort recorded before the process
-//! exits, traveling with the data directory. Nothing reads it for
-//! decisions, and its writes are verdict-neutral — a failed record loses
-//! only the black-box copy; the exit code and logs still carry the verdict.
+//! exits, traveling with the data directory. Nothing branches on it — `run`
+//! logs the latest row once at startup, operators read it after the fact —
+//! and its writes are verdict-neutral: a failed record loses only the
+//! black-box copy; the exit code and logs still carry the verdict.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
@@ -204,6 +206,9 @@ impl Storage {
 /// The two-sided completion rule — the one command-ordering fact:
 /// setup/rebuild never restart over a completed setup (completion is
 /// once-per-database), run and maintenance never start before one exists.
+/// Only the run/maintenance side has a production caller; setup and
+/// rebuild admit through `crate::commands::setup`, which checks the same
+/// fact itself.
 fn require_command_fits_completion(
     conn: &rusqlite::Connection,
     command: LifecycleCommand,

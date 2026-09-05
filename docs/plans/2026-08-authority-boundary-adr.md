@@ -63,9 +63,15 @@ detector, the fee oracle) take its pure notification half, the slim
 borrow-scoped `Authorized` token that three effect functions require in
 their signatures — the user-op acknowledgement, the L1 send, and the WS
 emit — so at those sites forgetting the containment consult is a compile
-error, not a convention. The snapshot-stream start, the `POST /tx` success
-body, and the lane's batch-close and reconciliation commits consult the same
-bit by hand, bounded by the exit contract.
+error, not a convention. The remaining externalization consults are
+hand-placed and bounded by the exit contract: the three snapshot routes at
+request start, the `POST /tx` success body, and the lane's fast-turn entry
+and its batch-close and reconciliation commits. Inside the token-covered L1
+send, the poster re-consults the same bit before each keyed send and before
+the write-before-broadcast watermark raise; the tick's chain-id gate, fee
+estimate, nonce read, and confirmation watch are not re-gated. Those
+re-checks narrow the bounded lag within an effect already authorized and
+are not separate boundaries.
 
 The lock is released only after every runtime-owned child has actually
 stopped; a dropped `JoinHandle` detaches rather than stops, so each worker
@@ -88,10 +94,10 @@ ordering), and `canonical_divergence` (the one absorbing refusal — only a
 fresh-directory cockroach rebuild proceeds). There is no lifecycle admission
 state machine and no operator acknowledgement: standard recovery is
 automatic, and restart policy after a terminal fault is the exit-code
-contract (30 = do not restart, page), enforced by the supervisor. The only
-durable telemetry is the `terminal_faults` black box — append-only
-terminal-cause rows, written best-effort and verdict-neutrally; nothing
-reads it for decisions.
+contract (30 = do not restart, page), which the supervisor is expected to
+honor. The only durable telemetry is the `terminal_faults` black box —
+append-only terminal-cause rows, written best-effort and verdict-neutrally;
+nothing reads it for decisions.
 
 The accepted trade, eyes open: a known-terminal fault refuses at
 re-detection rather than at a boot gate. Every fault whose evidence the boot

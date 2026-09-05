@@ -42,10 +42,10 @@ When you change anything listed under *enforced by*, re-check every line under
   admission state machine and no operator acknowledgement: standard
   recovery is automatic — every run boots through the fact-derived
   reducer — and restart policy after a terminal fault is the exit-code
-  contract (30 = do not restart, page), enforced by the supervisor; a
-  persistent fault re-detects fail-loud on any boot that reads it. The
-  only durable telemetry is the `terminal_faults` black box: append-only
-  terminal-cause rows, written best-effort and verdict-neutrally —
+  contract (30 = do not restart, page), which the supervisor is expected
+  to honor; a persistent fault re-detects fail-loud on any boot that reads
+  it. The only durable telemetry is the `terminal_faults` black box:
+  append-only terminal-cause rows, written best-effort and verdict-neutrally —
   telemetry never changes a command's verdict, and nothing reads the
   black box for decisions. Runtime admission re-runs the
   reducer over one transactionally consistent fact set immediately before
@@ -66,15 +66,16 @@ When you change anything listed under *enforced by*, re-check every line under
   cannot hide a terminal exit that must arm the bound. Ordinary
   operator/recovery shutdown has no hard deadline. Externalization sites
   (acks, L1 sends, WS frames) check the containment bit before emitting;
-  snapshot streams check it only at stream start today. A missed check is
-  bounded by the exit-code contract and by the I15 freeze triggers on the
-  tables they cover — partial structural backstops, not a barrier.
+  the snapshot routes check it once at request start — serving an
+  already-immutable operator snapshot is not authority-bearing, and
+  per-chunk stream cancellation is not a containment guarantee. A missed
+  check is bounded by the exit-code contract and by the I15 freeze triggers
+  on the tables they cover — partial structural backstops, not a barrier.
 - **Maintenance is flush-only.** `flush-mempool` is an operator command,
   not a run-reducer alias: it settles the wallet nonce and never acquires
   Sync/Cascade semantics. It requires completed setup and no divergence.
-  (The old origin-restoration machinery is gone with the admission state
-  machine — there is no verdict state for a flush to erase, and a
-  successful wallet flush proves nothing about the rest of the runtime.)
+  There is no verdict state for a flush to erase, and a successful wallet
+  flush proves nothing about the rest of the runtime.
 - **Normal run repair and admission have one reducer boundary.** Local
   absorbing facts are inspected before fallible provider facts. The pure run
   decision performs at most one recovery phase, and every completed phase
@@ -257,8 +258,11 @@ don't.
   documented self-trust omissions), and does not independently detect bugs in
   direct-input/user-op execution. A wrong-high cockroach checkpoint nonce is a
   known example that can escape it. Absence of the marker therefore does not
-  prove global agreement. Detection is automatic once the landing is safe and
-  successfully ingested; repair is manual cockroach recovery, never standard
+  prove global agreement. Conversely, a structurally malformed foreign landing
+  may conservatively record divergence even when the on-chain algorithm would
+  reject it — an accepted false positive under self-trust. Detection is
+  automatic once the landing is safe and successfully ingested; repair is
+  manual cockroach recovery, never standard
   recovery. Detection latency is inherent to the optimistic model: the check
   fires when the divergent landing reaches safe depth and is ingested, so
   soft confirmations issued inside that window are built on already-diverged
@@ -347,15 +351,20 @@ don't.
   (`0001_schema.sql`) — specifically batch-tree writes, promotions, and
   pending-snapshot clears RAISE in the engine while the marker exists. This is
   the immediate persisted freeze for those named tables, not a general
-  user-op hot-path barrier. The typed error surface also includes the marker
-  guard at the top of
-  `populate_safe_accepted_batches` and `check_danger`'s first arm
-  (`CanonicalDivergence`, ranked ahead of every other arm). The run
-  reducer makes that ordering structural at boot: local inspection refuses
-  before any provider query, every completed phase re-enters inspection, and
-  each mutating phase transaction reasserts both its durable preconditions and
-  the absence of divergence before writing. The admission and preemptive TLA+
-  models verify the controller ordering and slot/batch safety respectively.
+  user-op hot-path barrier. The accepted frontier itself has no trigger: its
+  single writer refuses past the marker — the guard at the top of
+  `populate_safe_accepted_batches`. The typed error surface also includes
+  `check_danger`'s first arm (`CanonicalDivergence`, ranked ahead of every
+  other arm). The run reducer makes that ordering structural at boot: local
+  inspection refuses before any provider query, every completed phase
+  re-enters inspection, and each mutating phase transaction reasserts both
+  its durable preconditions and the absence of divergence before writing. A
+  clean worker drain does not clear the fact: `run` re-reads the marker on
+  its Ok path (`refuse_divergence_on_clean_exit`) and exits terminal rather
+  than 0, the one code that would break the supervisor's restart-then-refuse
+  rediscovery. The admission and preemptive TLA+ models verify the
+  controller ordering (`LocalDivergenceFirst` in `admission.tla`) and
+  slot/batch safety respectively.
 - **Runtime reaction:** `check_danger` owns prompt process-wide reaction on its
   two-second cadence. Independently, the inclusion lane's existing time-gated
   SQLite read returns `SafeFrontierState::CanonicalDivergence` instead of an

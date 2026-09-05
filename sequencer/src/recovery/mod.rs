@@ -3,7 +3,7 @@
 
 //! Run-start recovery authority.
 //!
-//! A pure reducer selects exactly one phase from one transactionally
+//! A pure reducer selects at most one phase from one transactionally
 //! consistent local inspection. The driver executes at most that phase and
 //! always returns to local inspection before another phase or runtime
 //! admission. Canonical divergence is therefore an absorbing local fact, not
@@ -152,16 +152,13 @@ pub(crate) fn assert_resync_caught_up(
     Ok(())
 }
 
-/// The phase-ordering state machine of one boot attempt. `Flushed` and
-/// `PostFlushSynced` carry the flush observation as an ephemeral,
-/// memory-only witness: `drive_recovery` is its only writer, phases are its
-/// only source, and it never persists — a restarted attempt has no witness
-/// and must flush again. Cascade is therefore reachable only through
-/// Flush → Sync *in this process* (the ADR's recovery-reducer mechanism).
-/// This one enum is both the
-/// reducer's input and the driver's completion type; the previous
-/// `RecoveryState`/witness-struct/`PhaseCompletion` triple encoded the same
-/// five variants three times.
+/// The phase ordering of one boot attempt. `Flushed` and `PostFlushSynced`
+/// carry the flush observation as an ephemeral, memory-only witness:
+/// `drive_recovery` is its only writer, phases are its only source, and it
+/// never persists — a restarted attempt has no witness and must flush
+/// again. Cascade is therefore reachable only through Flush → Sync *in this
+/// process* (`docs/recovery/README.md`). This one enum is both the
+/// reducer's input and the driver's completion type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryProgress {
     NeedInitialSync,

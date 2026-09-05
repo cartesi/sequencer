@@ -60,14 +60,15 @@ struct SnapshotApiState {
 }
 
 impl SnapshotApiState {
-    /// Refuse to start a stream only after a terminal fault is contained.
-    /// Streaming an already-immutable operator snapshot is not
+    /// Refuse to serve a snapshot route only after a terminal fault is
+    /// contained. Serving an already-immutable operator snapshot is not
     /// authority-bearing (ADR), so ordinary graceful shutdown does NOT gate
     /// these routes — the watchdog's byte-compare poll and indexer fetches
-    /// keep working through an operator drain. Containment is checked
-    /// at stream start; the state a contained fault may have poisoned must
-    /// not be served.
-    fn authorize_stream(&self) -> Option<crate::runtime::shutdown::Authorized<'_>> {
+    /// keep working through an operator drain. Containment is checked once
+    /// at request start on all three routes, the cheap inclusion-block read
+    /// included; the state a contained fault may have poisoned must not be
+    /// served.
+    fn authorize_route(&self) -> Option<crate::runtime::shutdown::Authorized<'_>> {
         self.shutdown.authorize()
     }
 }
@@ -101,7 +102,7 @@ struct InclusionBlockResponse {
 /// `GET /finalized_state/inclusion_block` — cheap read, no lease (no file is
 /// opened). 404 if no finalized snapshot exists.
 async fn finalized_inclusion_block(State(state): State<Arc<SnapshotApiState>>) -> Response {
-    let Some(_auth) = state.authorize_stream() else {
+    let Some(_auth) = state.authorize_route() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let db_path = state.snapshot.db_path.clone();
@@ -126,7 +127,7 @@ async fn finalized_state(
     State(state): State<Arc<SnapshotApiState>>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(_auth) = state.authorize_stream() else {
+    let Some(_auth) = state.authorize_route() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let FinalizedLease {
@@ -173,7 +174,7 @@ async fn finalized_state(
 /// `GET /latest_snapshot` — stream the latest snapshot dump (indexers: fetch
 /// then subscribe at this offset). Latest pending if any, else finalized.
 async fn latest_snapshot(State(state): State<Arc<SnapshotApiState>>) -> Response {
-    let Some(_auth) = state.authorize_stream() else {
+    let Some(_auth) = state.authorize_route() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let leased = match acquire_latest(&state).await {
@@ -423,7 +424,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // A contained terminal fault is the one condition that refuses a
-        // stream start: the state it may have poisoned must not be served.
+        // snapshot route — this one streams nothing: the state it may have
+        // poisoned must not be served.
         shutdown.contain_storage_invariant_failure("test containment");
         let response = finalized_inclusion_block(State(state)).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

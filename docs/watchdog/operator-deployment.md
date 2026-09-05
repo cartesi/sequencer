@@ -398,7 +398,9 @@ unclassified restart-with-backoff. Operational notes:
   through the bracket — SIGKILL, OOM, a node reboot, the two-second abort,
   a controller panic — leaves only the process logs.
 - **Canonical divergence is the one manual path**: the sequencer freezes
-  the acceptance frontier, refuses all commands, and the remedy is a
+  the acceptance frontier
+  ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)),
+  refuses every command on that data directory, and the remedy is a
   fresh-directory `setup --recovery` (cockroach). You will typically learn
   of it from the watchdog before the sequencer tells you.
 
