@@ -31,7 +31,8 @@ use thiserror::Error;
 use tracing::{debug, error};
 
 use crate::l1::submitter::{BatchPoster, BatchPosterError, BatchSubmitterConfig};
-use crate::runtime::shutdown::ShutdownSignal;
+use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
+use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{PendingBatch, Storage, StorageOpenError, SubmitterFrontier};
 
 #[derive(Debug, Error)]
@@ -40,10 +41,27 @@ pub enum BatchSubmitterError {
     OpenStorage(#[from] StorageOpenError),
     #[error(transparent)]
     Storage(#[from] rusqlite::Error),
+    #[error("storage task panicked while {operation}: persistent invariant failure")]
+    StorageTaskPanicked { operation: &'static str },
     #[error("batch submitter join error: {0}")]
     Join(String),
     #[error(transparent)]
     Poster(#[from] BatchPosterError),
+}
+
+impl BatchSubmitterError {
+    /// Whether this error poisons the run rather than restarting. Named
+    /// arms, no wildcard: a new variant must classify itself here.
+    pub(crate) fn is_terminal_invariant(&self) -> bool {
+        match self {
+            Self::Storage(source) => crate::storage::is_persistent_storage_error(source),
+            Self::OpenStorage(source) => crate::storage::is_persistent_storage_open_error(source),
+            Self::StorageTaskPanicked { .. } => true,
+            Self::Poster(source) => source.is_terminal_invariant(),
+            // A non-panic inner-task join is shutdown-path cancellation.
+            Self::Join(_) => false,
+        }
+    }
 }
 
 /// How the submitter loop exited.
@@ -84,71 +102,93 @@ fn decide_submit_start(frontier: SubmitterFrontier, recently_observed_nonces: &[
     )
 }
 
-pub struct BatchSubmitter<P: BatchPoster> {
+pub(crate) struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
     poster: Arc<P>,
     idle_poll_interval: Duration,
-    /// Write-before-broadcast hook (review R1a): the poster raises the
+    /// Write-before-broadcast hook: the poster raises the
     /// persisted wallet-nonce watermark through this before every send.
     watermark_sink: crate::l1::watermark::StorageWatermarkSink,
+    /// Retains data-directory exclusivity in detached blocking reads.
+    /// Required at construction: a submitter without data-dir ownership is
+    /// unrepresentable.
+    process_lock: ProcessLock,
 }
 
 impl<P: BatchPoster + 'static> BatchSubmitter<P> {
-    pub fn new(db_path: impl Into<String>, poster: Arc<P>, config: BatchSubmitterConfig) -> Self {
+    pub(crate) fn new(
+        db_path: impl Into<String>,
+        poster: Arc<P>,
+        config: BatchSubmitterConfig,
+        process_lock: ProcessLock,
+    ) -> Self {
         let db_path = db_path.into();
         Self {
             watermark_sink: crate::l1::watermark::StorageWatermarkSink::new(db_path.clone()),
             db_path,
             poster,
             idle_poll_interval: config.idle_poll_interval(),
+            process_lock,
         }
     }
 
     /// Spawn the worker loop. The `shutdown` signal is what the loop respects;
     /// passing it at start time (instead of construction time) keeps the
     /// construction phase pure.
-    pub fn start(
+    #[cfg(test)]
+    pub(crate) fn start(
         self,
-        shutdown: ShutdownSignal,
+        shutdown: RuntimeScope,
     ) -> Result<tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>, StorageOpenError>
     {
-        let _ = Storage::open_read_only(self.db_path.as_str())?;
-        Ok(tokio::spawn(
-            async move { self.run_forever(shutdown).await },
-        ))
+        self.preflight_storage()?;
+        Ok(self.start_preflighted(shutdown))
     }
 
-    /// Top-level driver. Races the work loop against the shutdown signal.
-    ///
-    /// `biased;` polls the shutdown arm first on every wakeup so a concurrent
-    /// shutdown wins over an in-flight `run_loop` step. Without `biased`,
-    /// `select!` would pick randomly between two ready branches and could
-    /// process one more iteration before shutting down.
+    /// Validate the storage dependency without starting a task.
+    pub(crate) fn preflight_storage(&self) -> Result<(), StorageOpenError> {
+        let _ = Storage::open_read_only(self.db_path.as_str())?;
+        Ok(())
+    }
+
+    /// Spawn after [`Self::preflight_storage`] succeeded. Infallible so the
+    /// runtime can launch all workers in one non-yielding ownership step.
+    pub(crate) fn start_preflighted(
+        self,
+        shutdown: RuntimeScope,
+    ) -> tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>> {
+        tokio::spawn(async move { self.run_forever(shutdown).await })
+    }
+
+    /// Top-level driver. The biased shutdown arm promptly cancels async RPC
+    /// work; nested blocking DB jobs retain their own process-lock clone.
     async fn run_forever(
         self,
-        shutdown: ShutdownSignal,
+        shutdown: RuntimeScope,
     ) -> Result<SubmitterExit, BatchSubmitterError> {
         tokio::select! {
             biased;
             _ = shutdown.wait_for_shutdown() => Ok(SubmitterExit::Shutdown),
-            result = self.run_loop() => result,
+            result = self.run_loop(&shutdown) => result,
         }
     }
 
     /// Tick → sleep-if-idle → tick. Productive ticks re-enter immediately;
     /// idle or transient-error ticks wait `idle_poll_interval`. Fatal errors
     /// propagate.
-    async fn run_loop(&self) -> Result<SubmitterExit, BatchSubmitterError> {
+    async fn run_loop(&self, scope: &RuntimeScope) -> Result<SubmitterExit, BatchSubmitterError> {
         loop {
-            let outcome = match self.tick_once().await {
+            let outcome = match self.tick_once(scope).await {
                 Ok(o) => o,
-                // A wrong-chain RPC is terminal — never retry-loop signing onto
-                // it. Lift it out of the transient `Poster` bucket below.
-                Err(e @ BatchSubmitterError::Poster(BatchPosterError::ChainIdMismatch { .. })) => {
-                    error!(error = %e, "RPC serves the wrong chain — refusing to submit");
-                    return Err(e);
-                }
                 Err(BatchSubmitterError::Poster(source)) => {
+                    if source.is_terminal_invariant() {
+                        let error = BatchSubmitterError::Poster(source);
+                        error!(
+                            error = %error,
+                            "terminal batch-submitter input — refusing to submit"
+                        );
+                        return Err(error);
+                    }
                     error!(error = %source, "L1 provider error — will retry");
                     TickOutcome::Transient
                 }
@@ -163,7 +203,10 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
     }
 
-    pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
+    pub(crate) async fn tick_once(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<TickOutcome, BatchSubmitterError> {
         let frontier = self.load_frontier().await?;
 
         // Must start scanning at `safe_block + 1`: after a danger-zone shutdown
@@ -171,9 +214,13 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         // slots backed by blocks at or below the safe head are already
         // resolved and folded into `accepted_next_nonce`. Re-scanning those
         // blocks here would double-count the finalized prefix.
+        let scan_start = frontier
+            .safe_block
+            .checked_add(1)
+            .expect("persisted safe block must leave room for the next block");
         let recent_observed = self
             .poster
-            .observed_submitted_batch_nonces(frontier.safe_block.saturating_add(1))
+            .observed_submitted_batch_nonces(scan_start)
             .await?;
 
         let from_nonce = decide_submit_start(frontier, &recent_observed);
@@ -191,9 +238,16 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
         let submitted_count = pending.len();
         let payloads: Vec<Vec<u8>> = pending.into_iter().map(|b| b.encoded).collect();
+        // The L1 send requires the externalization token; the poster's own
+        // per-send gate stays as the bounded-lag re-check inside.
+        let Some(auth) = scope.authorize() else {
+            return Err(BatchSubmitterError::Poster(
+                BatchPosterError::StorageInvariantViolation,
+            ));
+        };
         let tx_hashes = self
             .poster
-            .submit_batches(payloads, &self.watermark_sink)
+            .submit_batches(auth, payloads, &self.watermark_sink)
             .await?;
         if tx_hashes.len() != submitted_count {
             return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
@@ -209,14 +263,15 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
 
     async fn load_frontier(&self) -> Result<SubmitterFrontier, BatchSubmitterError> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
+        let process_lock = self.process_lock.clone();
+        spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open_read_only(&db_path)?;
             storage
                 .submitter_frontier()
                 .map_err(BatchSubmitterError::from)
         })
         .await
-        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
+        .map_err(|err| map_storage_task_join(err, "loading the submitter frontier"))?
     }
 
     async fn pending_batches(
@@ -224,25 +279,46 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         min_nonce: u64,
     ) -> Result<Vec<PendingBatch>, BatchSubmitterError> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
+        let process_lock = self.process_lock.clone();
+        spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open_read_only(&db_path)?;
             storage
                 .pending_batches(min_nonce)
                 .map_err(BatchSubmitterError::from)
         })
         .await
-        .map_err(|err| BatchSubmitterError::Join(err.to_string()))?
+        .map_err(|err| map_storage_task_join(err, "loading pending batches"))?
+    }
+}
+
+/// Deliberately per-worker, not shared with the snapshot endpoint's
+/// `storage_task`: this worker carries a typed error to the supervisor
+/// through its exit channel, while an HTTP handler must contain immediately.
+fn map_storage_task_join(
+    err: tokio::task::JoinError,
+    operation: &'static str,
+) -> BatchSubmitterError {
+    if err.is_panic() {
+        BatchSubmitterError::StorageTaskPanicked { operation }
+    } else {
+        BatchSubmitterError::Join(err.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, TxHash};
+    use async_trait::async_trait;
 
     use super::{TickOutcome, decide_submit_start};
-    use crate::l1::submitter::{BatchSubmitterConfig, poster::mock::MockBatchPoster};
+    use crate::l1::submitter::{
+        BatchPoster, BatchPosterError, BatchSubmitterConfig, poster::mock::MockBatchPoster,
+    };
+    use crate::l1::watermark::WalletNonceWatermarkSink;
+    use crate::runtime::process_lock::ProcessLock;
+    use crate::runtime::shutdown::RuntimeScope;
     use crate::storage::test_helpers::{TestDb, temp_db};
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput, SubmitterFrontier};
     use sequencer_core::protocol::ProtocolTiming;
@@ -289,7 +365,7 @@ mod tests {
     fn seed_safe_submitted_batches(db_path: &str, safe_block: u64, nonces: &[u64]) {
         let mut storage = Storage::open(db_path).expect("open storage");
         // Landings carry the local batch's real wire bytes so the
-        // content-identity check (review R2) accepts them.
+        // content-identity check accepts them.
         let inputs: Vec<_> = nonces
             .iter()
             .map(|nonce| StoredSafeInput {
@@ -308,16 +384,72 @@ mod tests {
             .expect("append safe submitted batches");
     }
 
+    struct BlockingObservedPoster {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl BatchPoster for BlockingObservedPoster {
+        async fn submit_batches(
+            &self,
+            _auth: crate::runtime::shutdown::Authorized<'_>,
+            _payloads: Vec<Vec<u8>>,
+            _watermark: &dyn WalletNonceWatermarkSink,
+        ) -> Result<Vec<TxHash>, BatchPosterError> {
+            unreachable!("the observed-nonce call never completes")
+        }
+
+        async fn observed_submitted_batch_nonces(
+            &self,
+            _from_block: u64,
+        ) -> Result<Vec<u64>, BatchPosterError> {
+            if let Some(started) = self.started.lock().expect("lock").take() {
+                let _ = started.send(());
+            }
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_promptly_cancels_a_blocked_submitter_tick() {
+        let TestDb { _dir, path } = temp_db("submitter-cancel-mid-tick");
+        seed_two_closed_batches(&path);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let poster = Arc::new(BlockingObservedPoster {
+            started: Mutex::new(Some(started_tx)),
+        });
+        let submitter =
+            super::BatchSubmitter::new(path, poster, default_test_config(), ProcessLock::test());
+        let shutdown = RuntimeScope::default();
+        let task = submitter.start(shutdown.clone()).expect("start submitter");
+        started_rx.await.expect("tick reached blocked RPC");
+
+        shutdown.request_shutdown();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), task)
+            .await
+            .expect("shutdown must not wait for the blocked RPC")
+            .expect("submitter task must join")
+            .expect("ordinary shutdown is clean");
+        assert!(matches!(result, super::SubmitterExit::Shutdown));
+    }
+
     #[tokio::test]
     async fn tick_once_submits_first_missing_closed_batch() {
         let TestDb { _dir, path } = temp_db("tick-submits");
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
-        let submitter =
-            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
+        let submitter = super::BatchSubmitter::new(
+            path.clone(),
+            mock.clone(),
+            default_test_config(),
+            ProcessLock::test(),
+        );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
+        let outcome = submitter
+            .tick_once(&RuntimeScope::default())
+            .await
+            .expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(3));
 
         let submissions = mock.submissions();
@@ -335,10 +467,17 @@ mod tests {
 
         let mock = Arc::new(MockBatchPoster::new());
         mock.set_observed_submitted_nonces(vec![2]);
-        let submitter =
-            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
+        let submitter = super::BatchSubmitter::new(
+            path.clone(),
+            mock.clone(),
+            default_test_config(),
+            ProcessLock::test(),
+        );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
+        let outcome = submitter
+            .tick_once(&RuntimeScope::default())
+            .await
+            .expect("tick once");
         assert_eq!(outcome, TickOutcome::Idle);
         assert!(mock.submissions().is_empty());
         assert_eq!(mock.last_from_block(), Some(11));
@@ -351,10 +490,17 @@ mod tests {
         seed_safe_submitted_batches(&path, 10, &[0, 1, 2]);
 
         let mock = Arc::new(MockBatchPoster::new());
-        let submitter =
-            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
+        let submitter = super::BatchSubmitter::new(
+            path.clone(),
+            mock.clone(),
+            default_test_config(),
+            ProcessLock::test(),
+        );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
+        let outcome = submitter
+            .tick_once(&RuntimeScope::default())
+            .await
+            .expect("tick once");
         assert_eq!(outcome, TickOutcome::Idle);
         assert!(mock.submissions().is_empty());
     }
@@ -366,10 +512,17 @@ mod tests {
         seed_safe_submitted_batches(&path, 10, &[0, 1]);
 
         let mock = Arc::new(MockBatchPoster::new());
-        let submitter =
-            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
+        let submitter = super::BatchSubmitter::new(
+            path.clone(),
+            mock.clone(),
+            default_test_config(),
+            ProcessLock::test(),
+        );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
+        let outcome = submitter
+            .tick_once(&RuntimeScope::default())
+            .await
+            .expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(1));
         assert_eq!(mock.last_from_block(), Some(11));
 
@@ -386,10 +539,17 @@ mod tests {
 
         let mock = Arc::new(MockBatchPoster::new());
         mock.set_observed_submitted_nonces(vec![1]);
-        let submitter =
-            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
+        let submitter = super::BatchSubmitter::new(
+            path.clone(),
+            mock.clone(),
+            default_test_config(),
+            ProcessLock::test(),
+        );
 
-        let outcome = submitter.tick_once().await.expect("tick once");
+        let outcome = submitter
+            .tick_once(&RuntimeScope::default())
+            .await
+            .expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(1));
         assert_eq!(mock.last_from_block(), Some(11));
 
@@ -405,10 +565,11 @@ mod tests {
 
         let mock = Arc::new(MockBatchPoster::new());
         mock.set_observed_submitted_error(Some("rpc fail"));
-        let submitter = super::BatchSubmitter::new(path, mock, default_test_config());
+        let submitter =
+            super::BatchSubmitter::new(path, mock, default_test_config(), ProcessLock::test());
 
         let err = submitter
-            .tick_once()
+            .tick_once(&RuntimeScope::default())
             .await
             .expect_err("poster error should propagate");
         assert!(matches!(err, super::BatchSubmitterError::Poster(_)));

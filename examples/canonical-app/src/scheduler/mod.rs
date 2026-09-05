@@ -41,7 +41,9 @@ pub fn run_scheduler_forever<R: Rollup, A: Application>(
                     payload,
                 };
 
-                let result = scheduler.process_input(input);
+                let result = scheduler
+                    .process_input(input)
+                    .unwrap_or_else(|err| panic!("canonical application execution failed: {err}"));
                 for output in &result.outputs {
                     emit_app_output(&mut rollup, output)
                         .unwrap_or_else(|err| panic!("scheduler failed to emit app output: {err}"));

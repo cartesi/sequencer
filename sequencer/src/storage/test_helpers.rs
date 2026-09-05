@@ -8,7 +8,7 @@ use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::protocol::ProtocolTiming;
 use tempfile::TempDir;
 
-use super::{SafeInputRange, Storage, StoredSafeInput};
+use super::{DeploymentIdentity, FeeOracleIdentity, SafeInputRange, Storage, StoredSafeInput};
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
 pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
@@ -42,9 +42,37 @@ pub(crate) fn temp_db(name: &str) -> TestDb {
     }
 }
 
+/// Pin the trusted deployment identity a production setup establishes before
+/// any fresh-Tip attribution can classify safe inputs.
+pub(crate) fn pin_test_deployment_identity(
+    storage: &mut Storage,
+    batch_submitter_address: Address,
+) {
+    storage
+        .load_or_insert_deployment_identity(DeploymentIdentity {
+            chain_id: 1,
+            app_address: Address::repeat_byte(0x11),
+            input_box_address: Address::repeat_byte(0x22),
+            app_deployment_block: 0,
+            batch_submitter_address,
+            fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
+        })
+        .expect("pin test deployment identity");
+}
+
+/// Recovery-storage fixture with the same prerequisite ordering as setup:
+/// baseline schema first, then the persisted deployment identity, then any L1
+/// facts or batch-tree mutations driven by the individual test.
+pub(crate) fn temp_db_with_default_deployment_identity(name: &str) -> TestDb {
+    let db = temp_db(name);
+    let mut storage = Storage::open(db.path.as_str()).expect("open test storage");
+    pin_test_deployment_identity(&mut storage, SENDER_A);
+    db
+}
+
 /// Wire bytes of the local valid closed batch at `nonce` — the
 /// production-faithful "our batch landed on L1" payload. Hash-matches the
-/// seal-time stamp, so the content-identity check (review R2) accepts it.
+/// seal-time stamp, so the content-identity check accepts it.
 /// Panics if no valid closed local batch carries `nonce` (test bug: an
 /// accepted landing without a matching local batch is, by design, a
 /// canonical divergence).
@@ -128,7 +156,7 @@ pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
         .ordered_l2_txs_page_from(0, 1_000_000)
         .expect("load all ordered l2 txs")
         .into_iter()
-        .map(|(_offset, tx, _frame_safe_block)| tx)
+        .map(|row| row.tx)
         .collect()
 }
 
@@ -142,4 +170,26 @@ pub(crate) fn make_stale_batch_payload(nonce: u64, safe_block: u64) -> Vec<u8> {
             user_ops: vec![],
         }],
     })
+}
+
+/// Plant the canonical-divergence marker. Test-only lever for
+/// I15 scenarios; production writes it only inside the content-identity
+/// check's sync transaction.
+pub(crate) fn record_canonical_divergence(
+    storage: &mut Storage,
+    nonce: u64,
+    safe_input_index: u64,
+) {
+    storage
+        .conn
+        .execute(
+            "INSERT INTO canonical_divergence \
+             (singleton_id, nonce, safe_input_index, kind, detected_at_ms) \
+             VALUES (0, ?1, ?2, 'mismatch', 0)",
+            [
+                i64::try_from(nonce).unwrap(),
+                i64::try_from(safe_input_index).unwrap(),
+            ],
+        )
+        .expect("record canonical divergence");
 }

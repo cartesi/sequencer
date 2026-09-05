@@ -26,16 +26,17 @@ const DEFAULT_SEQUENCER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Cadence at which the harness mines an L1 block during a recovery boot's
 /// readiness wait when [`ManagedSequencer::set_mine_l1_during_boot`] is on.
-/// Fast enough that Anvil's `safe` tag advances past the flushed nonce within
-/// the readiness window; the exact value is a harness detail, not test-visible.
-const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_millis(200);
-/// Readiness budget for a *recovery* boot (mining-during-boot enabled). The WP2
+/// One block per wall-clock second keeps the ordinary live-chain timestamp
+/// coupled while still advancing Anvil's `safe` tag well within the recovery
+/// readiness window.
+const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_secs(1);
+/// Readiness budget for a *recovery* boot (mining-during-boot enabled). The startup
 /// mempool flush polls `get_transaction_count(Safe)` once per L1 block time
 /// (`safe_poll_interval = seconds_per_block`, 12 s here), so it cannot resolve
 /// the stranded slot in under one poll cycle — well past the 10 s normal-boot
 /// budget. Allow several cycles of slack so a recovery boot has room to flush,
-/// cascade, and come up. Recovery boots are legitimately slow (review R4 class
-/// 10); this is the harness counterpart to that.
+/// cascade, and come up. Recovery boots are legitimately slow (exit-code class
+/// 10: restart and expect recovery); this is the harness counterpart to that.
 const RECOVERY_BOOT_START_TIMEOUT: Duration = Duration::from_secs(45);
 const DEFAULT_SEQUENCER_RUST_LOG: &str = "info";
 pub const DEFAULT_DEVNET_SEQUENCER_BIN: &str = "target/debug/wallet-sequencer-devnet";
@@ -298,10 +299,10 @@ impl ManagedSequencer {
     ///
     /// Why this exists: a *recovery* boot whose persisted state names a wallet
     /// nonce that L1 never accepted — e.g. a batch-submission tx was dropped
-    /// from the mempool ([`Self::drop_all_pending_txs`]) — runs the WP2 mempool
+    /// from the mempool ([`Self::drop_all_pending_txs`]) — runs the mempool
     /// flush during startup. The flush submits a no-op at the stranded nonce
     /// slot and blocks until that slot becomes *safe* (`safe_nonce >=
-    /// watermark + 1`, review R1a). Re-enabling auto-mining is not enough:
+    /// watermark + 1`, I14). Re-enabling auto-mining is not enough:
     /// auto-mining lands the no-op tx but mints no *further* blocks, so Anvil's
     /// `safe` tag never advances past it and the flush waits until the boot
     /// hits the readiness timeout. In production the chain keeps producing
@@ -439,6 +440,41 @@ impl ManagedSequencer {
             .map_err(|_| io_other(format!("first frame fee out of range: {fee}")).into())
     }
 
+    /// Return `(open_frame_safe_block, persisted_l1_safe_head)` from one
+    /// read-only SQLite snapshot. This observes the two sides of the live
+    /// frame-clock condition without relying on incidental Anvil transaction
+    /// counts.
+    pub fn frame_clock_observation(&self) -> HarnessResult<(u64, u64)> {
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path.as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+        let (frame_safe_block, persisted_safe_head): (i64, i64) = conn
+            .query_row(
+                "SELECT f.safe_block, h.block_number \
+                 FROM valid_open_batch b \
+                 JOIN frames f ON f.batch_index = b.batch_index \
+                 JOIN l1_safe_head h ON h.singleton_id = 0 \
+                 ORDER BY f.frame_in_batch DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|err| io_other(format!("read frame-clock observation: {err}")))?;
+        let frame_safe_block = u64::try_from(frame_safe_block).map_err(|_| {
+            io_other(format!(
+                "open-frame safe block is negative: {frame_safe_block}"
+            ))
+        })?;
+        let persisted_safe_head = u64::try_from(persisted_safe_head).map_err(|_| {
+            io_other(format!(
+                "persisted L1 safe head is negative: {persisted_safe_head}"
+            ))
+        })?;
+        Ok((frame_safe_block, persisted_safe_head))
+    }
+
     /// Copy the current finalized snapshot dump to `<data_dir>/checkpoint` (which
     /// survives [`Self::reset_database`], since that only clears `sequencer.db*`
     /// and `dumps/`), returning the captured checkpoint. Call after a batch has
@@ -544,7 +580,7 @@ impl ManagedSequencer {
         Ok(anchor as u64)
     }
 
-    /// The canonical-divergence marker (review R2/I15) from the run DB, or `None`
+    /// The canonical-divergence marker (I9/I15) from the run DB, or `None`
     /// when the frontier is healthy. A recovery/resync e2e asserts this is `None`
     /// to prove the content-identity check did NOT spuriously freeze the frontier
     /// (e.g. a false-positive against below-anchor collapsed history) — otherwise
@@ -782,8 +818,20 @@ impl ManagedSequencer {
         self.rollups.deploy_extra_mock_erc20().await
     }
 
+    /// Mine outage-style L1 progress at 12 seconds per block. Pair large
+    /// advances with faketime, or use [`Self::mine_live_l1_blocks`] for
+    /// ordinary liveness and finality polling.
     pub async fn mine_l1_blocks(&self, block_count: u64) -> HarnessResult<()> {
         self.rollups.mine_l1_blocks(block_count).await
+    }
+
+    /// Mine ordinary live-chain progress at one second per block.
+    pub async fn mine_live_l1_blocks(&self, block_count: u64) -> HarnessResult<()> {
+        self.rollups.mine_live_l1_blocks(block_count).await
+    }
+
+    pub async fn l1_safe_block_number(&self) -> HarnessResult<u64> {
+        self.rollups.l1_safe_block_number().await
     }
 
     /// Toggle Anvil's auto-mining mode. When disabled, txs accumulate in
@@ -1005,6 +1053,23 @@ impl ManagedSequencer {
         self.shutdown_child().await
     }
 
+    /// Stop a *healthy* sequencer with SIGTERM and assert the exit-code
+    /// contract's clean class: a graceful operator shutdown is exit 0, the one
+    /// code that tells a supervisor nothing needs doing. Opt-in, because many
+    /// scenarios stop a process that has already exited with a failure class
+    /// on purpose. The literal `0` is deliberate: it pins the wire value, not
+    /// a constant.
+    pub async fn stop_expecting_clean_exit(&mut self) -> HarnessResult<()> {
+        let status = self.drain_child_status().await?;
+        if status.code() != Some(0) {
+            return Err(io_other(format!(
+                "a healthy sequencer must exit 0 on SIGTERM, got {status:?}"
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     /// Respawn the sequencer process using the same data directory and Anvil instance.
     ///
     /// Honors any `l1_endpoint_override` set via [`Self::set_l1_endpoint_override`]
@@ -1085,16 +1150,25 @@ impl ManagedSequencer {
     }
 
     async fn shutdown_child(&mut self) -> HarnessResult<()> {
+        let _ = self.drain_child_status().await?;
+        Ok(())
+    }
+
+    /// Send SIGTERM and wait for the child to drain, returning its exit
+    /// status. A drain that outlives `shutdown_timeout` is force-killed and
+    /// reported as an error.
+    async fn drain_child_status(&mut self) -> HarnessResult<std::process::ExitStatus> {
         send_graceful_terminate(&mut self.child).await;
         match tokio::time::timeout(self.shutdown_timeout, self.child.wait()).await {
-            Ok(wait_result) => {
-                let _ = wait_result?;
-                Ok(())
-            }
+            Ok(wait_result) => Ok(wait_result?),
             Err(_) => {
                 self.child.start_kill()?;
                 let _ = self.child.wait().await;
-                Ok(())
+                Err(io_other(format!(
+                    "sequencer did not drain within {:?}; forced kill was required",
+                    self.shutdown_timeout
+                ))
+                .into())
             }
         }
     }
@@ -1281,7 +1355,7 @@ async fn spawn_sequencer_process(
                 ))
                 .into());
             }
-            let _ = rollups.mine_l1_blocks(1).await;
+            let _ = rollups.mine_live_l1_blocks(1).await;
             tokio::time::sleep(BOOT_L1_MINE_INTERVAL).await;
         }
     } else {
@@ -1351,7 +1425,7 @@ async fn spawn_sequencer_process(
     })?;
 
     if mine_l1_during_boot {
-        // A recovery boot blocks in the WP2 mempool flush until the stranded
+        // A recovery boot blocks in the mempool flush until the stranded
         // wallet-nonce slot becomes safe, which needs L1 to keep producing
         // blocks. On an on-demand-mining devnet nothing produces them, so mine
         // a trickle concurrently with the readiness wait — mirroring a live
@@ -1363,7 +1437,7 @@ async fn spawn_sequencer_process(
                 // Transient RPC hiccups mid-boot are non-fatal — the next tick
                 // retries. A genuine mining failure manifests as the boot
                 // timing out, reported by the readiness arm.
-                let _ = rollups.mine_l1_blocks(1).await;
+                let _ = rollups.mine_live_l1_blocks(1).await;
             }
         };
         tokio::select! {

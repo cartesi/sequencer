@@ -1,5 +1,9 @@
 tlc := env("TLC", "tlc")
 
+# Check startup reducer and runtime admission safety
+check-admission:
+    {{tlc}} -workers auto -deadlock admission.tla
+
 # Check the preemptive recovery spec (~90s)
 check-preemptive:
     {{tlc}} -workers auto -deadlock preemptive.tla
@@ -9,4 +13,4 @@ check-optimistic:
     {{tlc}} -workers auto -deadlock history/optimistic.tla
 
 # Check all specs
-check-all: check-preemptive check-optimistic
+check-all: check-admission check-preemptive check-optimistic

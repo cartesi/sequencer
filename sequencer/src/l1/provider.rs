@@ -157,7 +157,7 @@ pub async fn create_verified_signer_provider(
 mod tests {
     use super::*;
 
-    // ── H4 regression: URL scheme enforcement ─────────────
+    // ── Regression: URL scheme enforcement ────────────────
 
     #[test]
     fn create_client_rejects_http_for_remote_host() {
@@ -231,7 +231,7 @@ mod tests {
         create_client("http://127.0.0.1:8545", false).expect("loopback needs no opt-in");
     }
 
-    // ── H3 regression: private-key parse error must not echo bytes ─
+    // ── Regression: private-key parse error must not echo bytes ────
 
     #[test]
     fn create_signer_provider_does_not_echo_key_bytes_on_invalid_hex() {

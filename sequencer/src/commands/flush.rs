@@ -9,32 +9,52 @@
 //! the same flush `setup --recovery` will run internally. It is a keyed L1
 //! write, so it needs the signing key; it reads the submitter address and the
 //! wallet-nonce watermark from the DB, so it refuses unless `setup` completed.
-//! Flush-only — it does not cascade (that stays in preemptive recovery).
+//! Flush-only — it does not sync or cascade (those stay in normal-run
+//! recovery), and it requires a completed setup. A successful wallet flush
+//! proves nothing about the rest of the runtime and is never treated as if
+//! it did.
 
-use super::config::FlushConfig;
-use super::{BootstrapError, RunError, load_setup_identity};
-use crate::l1::provider::VerifiedSignerProviderError;
+use super::load_setup_identity;
+use crate::commands::config::FlushConfig;
+use crate::commands::error::CommandError;
 use crate::recovery::MempoolFlusher;
-use crate::storage;
+use crate::storage::{self, LifecycleCommand};
 
-pub async fn flush_mempool(config: FlushConfig) -> Result<(), RunError> {
+pub async fn flush_mempool(config: FlushConfig) -> Result<(), CommandError> {
+    std::fs::create_dir_all(&config.data_dir)?;
+    // Exclusive process ownership: a flush must never broadcast beside a
+    // live sequencer (or another flush) reading the same watermark.
+    let _process_lock = crate::runtime::process_lock::ProcessLock::acquire(&config.data_dir)?;
     let db_path = config.db_path();
 
-    // Gate on a completed setup and read the pinned submitter address.
+    super::preflight_lifecycle_command(&db_path, LifecycleCommand::MaintenanceFlush)?;
     let identity = load_setup_identity(&db_path)?;
 
     // The signing key must match the pinned submitter — flushing under the
     // wrong key would settle the wrong account's nonce.
     let key = super::verify_submitter_key(config.resolve_private_key()?, &identity)?;
 
-    // The durable flush anchor (review R1a): every slot we ever broadcast
+    let result = flush_mempool_admitted(config, identity, key).await;
+    // Verdict-neutral black-box settlement.
+    super::record_terminal_fault_best_effort(&db_path, LifecycleCommand::MaintenanceFlush, &result);
+    result
+}
+
+async fn flush_mempool_admitted(
+    config: FlushConfig,
+    identity: storage::DeploymentIdentity,
+    key: crate::l1::SubmitterKey,
+) -> Result<(), CommandError> {
+    let db_path = config.db_path();
+
+    // The durable flush anchor: every slot we ever broadcast
     // must resolve at safe depth, regardless of the local pool's memory.
     let watermark = {
-        let mut storage = storage::Storage::open(&db_path)?;
+        let mut storage = storage::Storage::open_writer(&db_path)?;
         storage.wallet_nonce_watermark()?
     };
 
-    // Wrong-chain RPC guard (review F6): flush broadcasts keyed L1 txs, so —
+    // Wrong-chain RPC guard: flush broadcasts keyed L1 txs, so —
     // like `setup` and `run` — it must confirm the RPC's chain id matches the
     // pinned one before signing, or it would burn submitter nonce slots on the
     // wrong chain. `create_verified_signer_provider` folds that check into the
@@ -43,23 +63,12 @@ pub async fn flush_mempool(config: FlushConfig) -> Result<(), RunError> {
     // reachable anyway).
     let provider = crate::l1::provider::create_verified_signer_provider(
         &config.eth_rpc_url,
-        &key,
+        key.expose_secret(),
         identity.chain_id,
         config.allow_insecure_rpc,
     )
     .await
-    .map_err(|e| match e {
-        VerifiedSignerProviderError::ChainIdMismatch { rpc, expected } => {
-            RunError::Bootstrap(BootstrapError::ChainIdMismatch {
-                rpc,
-                config: expected,
-            })
-        }
-        VerifiedSignerProviderError::ChainIdRpc(message) => {
-            RunError::Bootstrap(BootstrapError::ChainIdRpc { message })
-        }
-        VerifiedSignerProviderError::Create(msg) => RunError::Io(std::io::Error::other(msg)),
-    })?;
+    .map_err(CommandError::from)?;
     let safe_block = MempoolFlusher::flush_to_safe(
         provider,
         identity.batch_submitter_address,

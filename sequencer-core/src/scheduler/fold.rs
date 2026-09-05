@@ -23,7 +23,7 @@ use alloy_primitives::Address;
 use alloy_sol_types::Eip712Domain;
 
 use super::{Scheduler, SchedulerConfig, SchedulerInput};
-use crate::application::Application;
+use crate::application::{AppError, Application};
 
 /// One reconstructed L1 input for the fold, ordered ascending by inclusion
 /// block (ties broken by safe-input index at the source). Mirrors
@@ -65,7 +65,7 @@ pub fn fold_replay<A, S, R>(
     seeds: S,
     replay: R,
     stop_block: u64,
-) -> (A, u64)
+) -> Result<(A, u64), AppError>
 where
     A: Application,
     S: IntoIterator<Item = FoldInput>,
@@ -122,18 +122,18 @@ where
             "fold replay inputs must arrive in ascending inclusion-block order"
         );
         last_replay_block = Some(input.inclusion_block);
-        let _ = scheduler.process_input(SchedulerInput {
+        scheduler.process_input(SchedulerInput {
             sender: input.sender,
             inclusion_block: input.inclusion_block,
             domain: domain.clone(),
             payload: input.payload,
-        });
+        })?;
     }
 
     // Step 5 — drain the leftover fridge at C. Every still-queued direct has
     // `inclusion_block <= C`, so this executes them all; the booting run, which
     // starts past C with no fridge, would otherwise never see them.
-    let _ = scheduler.drain_covered_at(stop_block);
+    scheduler.drain_covered_at(stop_block)?;
 
     // Fail loud on a dropped direct: after draining at C the fridge MUST be
     // empty. A non-empty fridge means an input arrived with `inclusion_block > C`
@@ -147,13 +147,16 @@ where
         scheduler.queued_direct_len(),
     );
 
-    scheduler.finish()
+    Ok(scheduler.finish())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::{AppError, AppOutputs, InvalidReason};
+    use crate::application::{
+        AppError, AppOutputs, ApplicationProgress, ApplyInputCapability, InvalidReason,
+        ProgressCommitCapability,
+    };
     use crate::batch::{Batch, Frame};
     use crate::l2_tx::{DirectInput, ValidUserOp};
     use crate::user_op::UserOp;
@@ -182,7 +185,8 @@ mod tests {
     #[derive(Default, Clone)]
     struct FoldApp {
         executed_directs: Vec<u8>,
-        safe_block: u64,
+        progress: ApplicationProgress,
+        fail_direct: Option<u8>,
     }
 
     impl Application for FoldApp {
@@ -197,28 +201,39 @@ mod tests {
             Ok(())
         }
 
-        fn execute_valid_user_op(
+        fn apply_valid_user_op(
             &mut self,
+            _capability: ApplyInputCapability<'_>,
             _user_op: &ValidUserOp,
-            safe_block: u64,
+            _safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
-            self.safe_block = self.safe_block.max(safe_block);
             Ok(Vec::new())
         }
 
-        fn execute_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-            self.executed_directs
-                .push(input.payload.first().copied().unwrap_or(0));
-            self.safe_block = self.safe_block.max(input.block_number);
+        fn apply_direct_input(
+            &mut self,
+            _capability: ApplyInputCapability<'_>,
+            input: &DirectInput,
+        ) -> Result<AppOutputs, AppError> {
+            let marker = input.payload.first().copied().unwrap_or(0);
+            if self.fail_direct == Some(marker) {
+                return Err(AppError::Internal {
+                    reason: format!("refusing direct {marker}"),
+                });
+            }
+            self.executed_directs.push(marker);
             Ok(Vec::new())
         }
 
-        fn executed_input_count(&self) -> u64 {
-            self.executed_directs.len() as u64
+        fn execution_progress(&self) -> &ApplicationProgress {
+            &self.progress
         }
 
-        fn last_executed_safe_block(&self) -> u64 {
-            self.safe_block
+        fn execution_progress_mut(
+            &mut self,
+            _capability: ProgressCommitCapability<'_>,
+        ) -> &mut ApplicationProgress {
+            &mut self.progress
         }
 
         fn from_dump(_prefix: &std::path::Path) -> Result<Self, AppError> {
@@ -291,9 +306,35 @@ mod tests {
             Vec::new(),
             Vec::new(),
             1_000,
-        );
+        )
+        .expect("empty fold");
         assert_eq!(n, 7, "no batches ⇒ nonce stays at the checkpoint");
         assert!(app.executed_directs.is_empty());
+    }
+
+    #[test]
+    fn fold_replay_propagates_application_error() {
+        let app = FoldApp {
+            fail_direct: Some(0xEE),
+            ..FoldApp::default()
+        };
+        let error = match fold_replay(
+            app,
+            0,
+            config(),
+            domain(),
+            vec![direct(DIRECT_SENDER, 10, 0xEE)],
+            Vec::new(),
+            10,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("application error must abort recovery fold"),
+        };
+
+        let AppError::Internal { reason } = error else {
+            panic!("unexpected application error: {error}");
+        };
+        assert_eq!(reason, "refusing direct 238");
     }
 
     #[test]
@@ -313,7 +354,8 @@ mod tests {
             Vec::new(),
             replay,
             1_000,
-        );
+        )
+        .expect("replay empty batches");
         assert_eq!(n, 8, "three accepted batches advance N from 5 to 8");
     }
 
@@ -334,7 +376,8 @@ mod tests {
             seeds,
             replay,
             1_000,
-        );
+        )
+        .expect("drain seeded directs");
         assert_eq!(
             app.executed_directs,
             vec![0xAA, 0xBB],
@@ -358,7 +401,8 @@ mod tests {
             seeds,
             Vec::new(),
             30,
-        );
+        )
+        .expect("terminal drain");
         assert_eq!(
             app.executed_directs,
             vec![0xCC],
@@ -384,10 +428,13 @@ mod tests {
                 100,
             )
         };
-        let (app_a, n_a) = run();
-        let (app_b, n_b) = run();
+        let (app_a, n_a) = run().expect("first deterministic fold");
+        let (app_b, n_b) = run().expect("second deterministic fold");
         assert_eq!(app_a.executed_directs, app_b.executed_directs);
-        assert_eq!(app_a.safe_block, app_b.safe_block);
+        assert_eq!(
+            app_a.last_executed_safe_block(),
+            app_b.last_executed_safe_block()
+        );
         assert_eq!(n_a, n_b);
     }
 
@@ -531,15 +578,16 @@ mod tests {
                     inclusion_block: input.inclusion_block,
                     domain: domain(),
                     payload: input.payload,
-                });
+                })?;
             }
+            Ok::<(), AppError>(())
         };
 
         // LIVE: one scheduler over the whole stream, terminal-drained at C.
         let mut live = Scheduler::new(FoldApp::default(), config());
-        feed(&mut live, pre_b());
-        feed(&mut live, post_b());
-        live.drain_covered_at(stop);
+        feed(&mut live, pre_b()).expect("live pre-checkpoint feed");
+        feed(&mut live, post_b()).expect("live post-checkpoint feed");
+        live.drain_covered_at(stop).expect("live terminal drain");
         let (live_app, live_nonce) = live.finish();
 
         // CHECKPOINT @ B: a scheduler over (genesis, B] then `finish` WITHOUT a
@@ -547,7 +595,7 @@ mod tests {
         // as seeds. This is exactly the checkpoint contract: every batch ≤ B
         // applied, no (A,B] direct executed yet.
         let mut at_b = Scheduler::new(FoldApp::default(), config());
-        feed(&mut at_b, pre_b());
+        feed(&mut at_b, pre_b()).expect("checkpoint feed");
         let (checkpoint_app, checkpoint_nonce) = at_b.finish();
         let a = checkpoint_app.last_executed_safe_block();
         assert!(a < 12 && 12 <= 15, "the seed direct(2) must sit in (A, B]");
@@ -562,7 +610,8 @@ mod tests {
             seeds,
             post_b(),
             stop,
-        );
+        )
+        .expect("recovery fold");
 
         assert_eq!(
             recovered_nonce, live_nonce,

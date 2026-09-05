@@ -5,12 +5,14 @@ use std::time::Duration;
 
 /// Batch-submitter-specific options. L1 RPC URL and InputBox address are shared
 /// with the input reader and come from the same discovery at startup (see
-/// `L1Config` in `config`). These fields are parsed as part of `RunConfig` and
-/// passed through at runtime.
+/// [`crate::l1::L1Config`] and its `identity`). These fields are parsed as
+/// part of `RunConfig` and passed through at runtime.
 ///
-/// Danger-zone tuning (`max_wait_blocks`, `preemptive_margin_blocks`,
-/// `seconds_per_block`) lives in `ProtocolTiming`, not here — the submitter
-/// doesn't read it. The [`crate::recovery::DangerDetector`] worker owns that.
+/// Danger-zone tuning (`max_wait_blocks`, `preemptive_margin_blocks`) lives
+/// in `ProtocolTiming`, not here — the submitter doesn't read it; the
+/// [`crate::recovery::DangerDetector`] worker owns that. The one timing value
+/// the poster does read is `seconds_per_block`, carried on
+/// `BatchPosterConfig` for its confirmation timeout.
 #[derive(Debug, Clone)]
 pub struct BatchSubmitterConfig {
     /// How often the submitter polls for new work when idle.

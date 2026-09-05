@@ -36,6 +36,34 @@ Each tick:
 There is no advance-only mode. Advancing the CM is just an implementation step
 inside a compare cycle.
 
+## Detection boundary: watchdog versus the content-identity check
+
+The watchdog is the broad independent detector for application-state
+divergence at a finalized checkpoint. It is not the sequencer's own
+accepted-batch wire-identity detector, and neither mechanism subsumes the
+other.
+
+The content-identity check runs inside the input reader's atomic
+safe-input sync. For every
+at/above-anchor landing the mirrored scheduler accepts, it requires a
+byte-identical valid local sealed batch at that nonce. A foreign or mismatched
+landing persists `canonical_divergence`, which freezes the accepted frontier
+and finalized-snapshot promotion
+([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
+The offending landing therefore normally never produces a newer
+`/finalized_state/inclusion_block` for the watchdog to compare. Under the
+unchanged-head optimization above, a watchdog tick legitimately exits idle. Distinct wire bytes can also be application-state
+equivalent, which a byte comparison of resulting snapshots would not expose.
+
+Conversely, the content-identity check shares the sequencer's off-chain acceptance predicate and does
+not independently replay application execution. The watchdog can catch
+direct-input, user-op, scheduler, or application-state divergence outside its
+narrow predicate once a comparable finalized checkpoint is published.
+Runtime reaction to the durable marker is the detector's, not the
+watchdog's; the detector's prompt process-wide reaction and the lane's
+opportunistic refusal are owned by
+[I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen).
+
 ## Watchdog State
 
 The watchdog state is canonical from the watchdog's point of view. The
@@ -107,7 +135,7 @@ memory, while avoiding whole-range `logs` plus whole-range decoded `inputs`.
 The Cartesi binding may still queue one partition internally while feeding it to
 the machine.
 
-## Open Questions Before Merge
+## Open questions
 
 - Is the current crash model sufficient for a watchdog sidecar, or do operators
   need fsync/SQLite durability?

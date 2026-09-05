@@ -1,493 +1,1145 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Preemptive recovery: detect danger zone, then recover via Tip invalidation
-//! or post-flush cascade.
+//! Run-start recovery authority.
 //!
-//! At runtime a dedicated [`DangerDetector`] worker polls `Storage::check_danger` each
-//! tick. If the L1 view is stale, a closed batch or Tip crosses
-//! `danger_threshold`, or the batch-relative wall-clock estimate fires during
-//! an L1 outage, the detector exits with `DetectorExit::RecoveryRequired`, the
-//! runtime maps that to `DangerDetectorExit::DangerDetected` under
-//! `RunError::Worker`, and the process exits. The detector tripping is *only*
-//! a trigger to enter startup recovery/refusal — it doesn't make the cascade
-//! decision. External orchestration restarts the sequencer, and this startup
-//! path runs.
+//! A pure reducer selects at most one phase from one transactionally
+//! consistent local inspection. The driver executes at most that phase and
+//! always returns to local inspection before another phase or runtime
+//! admission. Canonical divergence is therefore an absorbing local fact, not
+//! a special check each effect must remember.
 //!
-//! Startup recovery branches on [`decide_startup_action`]:
-//!
-//! - `FlushAndCascade`: a closed batch past gold is dangerous. Flush the mempool,
-//!   re-sync the safe head, then call [`crate::storage::Storage::recover_post_flush`] which cascades
-//!   everything past the gold frontier (every non-gold batch is doomed:
-//!   Silver-stale, Silver-poisoned, or Pending no-op'd). If all closed are gold,
-//!   falls through to a Tip danger-zone check — see `docs/recovery/README.md` Step 5.
-//! - `RecoverTip`: only the open Tip is dangerous. It has no L1 footprint, so call
-//!   [`crate::storage::Storage::recover_aging_tip`] directly without flushing.
-//! - `Proceed`: no danger detected. No DB writes here; the genesis Tip (on a
-//!   fresh DB) is opened by the structural [`crate::storage::Storage::ensure_open_tip`]
-//!   step in `Workers::spawn`, after recovery and before the lane starts.
-//! - `Refuse`: L1 view is stale or batch-relative estimated danger fired; bail
-//!   out and surface to the operator.
-//!
-//! ## Fault model
-//!
-//! Recovery is designed to handle **submission and outage failures**: the sequencer
-//! crashes, the L1 provider becomes unreachable, transactions are dropped from the
-//! mempool, or the process is offline for an extended period. It is **not** designed
-//! to handle arbitrarily malformed self-submissions. The scheduler frontier
-//! reconstruction (`populate_safe_accepted_batches`) trusts that on-chain batches
-//! from the sequencer's own address are structurally valid. This is a deliberate
-//! system assumption, not a gap — the sequencer controls its own submissions.
-//!
-//! See `docs/recovery/` for the full design, TLA+ specs, and design history.
+//! The flush and post-flush-sync witnesses live only for this boot attempt. A
+//! crash loses them and the next boot repeats the idempotent flush; no durable
+//! recovery-phase state machine is introduced. See `docs/recovery/README.md`
+//! and `docs/recovery/admission.tla`.
 
 mod detector;
 mod flusher;
 
 use thiserror::Error;
 
+use crate::l1::L1Config;
 use crate::l1::reader::{InputReader, InputReaderError};
-use crate::runtime::config::L1Config;
-use crate::storage::{self, DangerStatus, StorageOpenError};
+use crate::storage::{
+    self, DangerStatus, RecoveryInspection, RecoveryMutationError, StorageOpenError,
+};
 pub use detector::{DangerDetector, DangerDetectorError, DetectorExit};
 pub use flusher::{FlushError, MempoolFlusher};
 use sequencer_core::protocol::ProtocolTiming;
 
+/// A startup recovery failure is already classified when it leaves the
+/// controller. Runtime lifecycle settlement projects only this outer class;
+/// it never reinterprets raw provider/storage/phase errors.
 #[derive(Debug, Error)]
 pub enum RecoveryError {
+    #[error("startup recovery should retry: {0}")]
+    Retry(Box<RecoveryFailure>),
+    #[error("startup recovery refused: {0}")]
+    Refuse(Box<RecoveryFailure>),
+}
+
+/// Diagnostic provenance retained underneath the controller's retry/refuse
+/// verdict.
+#[derive(Debug, Error)]
+pub enum RecoveryFailure {
     #[error(transparent)]
-    OpenStorage(#[from] StorageOpenError),
+    PolicyRetry(#[from] RecoveryRetryReason),
     #[error(transparent)]
-    Storage(#[from] rusqlite::Error),
+    PolicyRefusal(#[from] RecoveryRefusalReason),
+    #[error("open storage: {0}")]
+    OpenStorage(#[source] StorageOpenError),
+    #[error("storage: {0}")]
+    Storage(#[source] rusqlite::Error),
     #[error("flush: {0}")]
-    Flush(#[from] flusher::FlushError),
+    Flush(#[source] FlushError),
     #[error("input reader: {0}")]
-    InputReader(#[from] InputReaderError),
-    #[error("provider: {0}")]
-    Provider(String),
+    InputReader(#[source] InputReaderError),
+    /// The chain-id read on the flush's signer provider failed: transport,
+    /// so retry.
+    #[error("provider unreachable: {0}")]
+    ProviderUnreachable(String),
+    /// The flush's signer provider could not be constructed (bad RPC URL or
+    /// key): deterministic misconfiguration, so refuse. Kept distinct from
+    /// [`Self::ProviderUnreachable`] so the verdict is a function of the
+    /// value, never of the construction site.
+    #[error("signer provider misconfiguration: {0}")]
+    SignerMisconfig(String),
     #[error("recovery flush chain-id mismatch: rpc {rpc} != pinned {expected}")]
     ChainIdMismatch { rpc: u64, expected: u64 },
-    #[error("startup refused: {0:?}")]
-    Refuse(RefuseReason),
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRetryReason {
+    #[error("the persisted L1 view is stale")]
+    L1ViewStale,
+    #[error("batch {batch_index} is in danger only under wall-clock estimation")]
+    EstimatedBatchInDanger { batch_index: u64 },
+    #[error("danger persists after repair: {status:?}")]
+    DangerPersists { status: DangerStatus },
     #[error(
-        "post-flush re-sync reached safe block {resynced_safe_block}, behind the \
-         flusher's observed resolution at {flush_observed_safe_block}; refusing to \
-         cascade on a lagging L1 view (respawn retries with a fresher view)"
+        "post-flush re-sync reached safe block {resynced_safe_block}, behind the flush observation at {flush_observed_safe_block}"
     )]
     ResyncBehindFlushView {
         resynced_safe_block: u64,
         flush_observed_safe_block: u64,
     },
+    #[error("local recovery facts changed before phase execution: {status:?}")]
+    StaleDecision { status: DangerStatus },
+    #[error("the Tip was already open when the EnsureOpenTip phase ran")]
+    TipAlreadyOpen,
+    #[error("runtime preparation outlived its clean admission decision ({decision})")]
+    AdmissionChanged { decision: &'static str },
 }
 
-/// F2 coherence guard: refuse if the post-flush re-sync's safe head lags the
-/// block the flusher observed resolution at. Folding (`setup --recovery`) or
-/// cascading (runtime danger) on a view that stops short of the flush's
-/// resolution would miss inputs the flush already settled. Shared by both
-/// recovery paths; the orchestrator respawn retries with a fresher L1 view (the
-/// flush is idempotent). See [`RecoveryError::ResyncBehindFlushView`].
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRefusalReason {
+    /// A fully accepted L1 landing failed content identity. Standard recovery
+    /// assumes the opposite and is forbidden.
+    #[error("canonical divergence at batch nonce {nonce}")]
+    CanonicalDivergence { nonce: u64 },
+    #[error("the completed setup has no finalized snapshot")]
+    MissingFinalizedSnapshot,
+    #[error("post-sync recovery has no persisted safe head")]
+    MissingSafeHead,
+    /// The `EnsureOpenTip` phase's transaction left no valid open Tip — a
+    /// storage self-invariant failure, refused so the boot cannot spin.
+    #[error("the EnsureOpenTip phase left no valid open Tip")]
+    TipMissingAfterOpen,
+}
+
+/// Single-use proof that the run's final admission decision — the same pure
+/// reducer over one transactionally consistent fact set — selected `Admit`
+/// after all fallible preparation completed. Its private field makes
+/// construction exclusive to [`admit_runtime`]; runtime code may consume the
+/// proof but cannot mint one.
+#[must_use = "runtime admission must be consumed by PreparedRuntime::launch"]
+#[derive(Debug)]
+pub(crate) struct RuntimeAdmission {
+    _private: (),
+}
+
+impl RecoveryError {
+    pub(crate) fn retry(failure: impl Into<RecoveryFailure>) -> Self {
+        Self::Retry(Box::new(failure.into()))
+    }
+
+    pub(crate) fn refuse(failure: impl Into<RecoveryFailure>) -> Self {
+        Self::Refuse(Box::new(failure.into()))
+    }
+
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retry(_))
+    }
+}
+
+/// The post-flush resync coherence check — the resynced safe block must
+/// reach the flush observation before cascade — shared with
+/// `setup --recovery`. Runtime recovery also enforces this inside the
+/// guarded cascade transaction.
 pub(crate) fn assert_resync_caught_up(
     resynced_safe_block: u64,
     flush_observed_safe_block: u64,
 ) -> Result<(), RecoveryError> {
     if resynced_safe_block < flush_observed_safe_block {
-        return Err(RecoveryError::ResyncBehindFlushView {
-            resynced_safe_block,
-            flush_observed_safe_block,
-        });
+        return Err(RecoveryError::retry(
+            RecoveryRetryReason::ResyncBehindFlushView {
+                resynced_safe_block,
+                flush_observed_safe_block,
+            },
+        ));
     }
     Ok(())
 }
 
-/// Why startup cannot proceed safely.
-///
-/// Each variant captures a DB/L1-view state that makes recovery or normal
-/// startup unsafe. The operator sees the variant in logs and must intervene.
+/// The phase ordering of one boot attempt. `Flushed` and `PostFlushSynced`
+/// carry the flush observation as an ephemeral, memory-only witness:
+/// `drive_recovery` is its only writer, phases are its only source, and it
+/// never persists — a restarted attempt has no witness and must flush
+/// again. Cascade is therefore reachable only through Flush → Sync *in this
+/// process* (`docs/recovery/README.md`). This one enum is both the
+/// reducer's input and the driver's completion type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefuseReason {
-    /// A fully-accepted L1 landing failed the content-identity check
-    /// (review R2): canonical state diverged from the local batch tree.
-    /// Terminal — no restart self-heals it; the operator must run cockroach
-    /// recovery (wipe + rebuild from L1). Standard recovery is forbidden:
-    /// it reconciles the tree's *shape* assuming accepted nonce N is our
-    /// batch N, which is exactly what no longer holds.
-    CanonicalDivergence { nonce: u64 },
-    /// The L1 safe block timestamp is too old or unknown, so the local L1 view
-    /// is not usable for recovery or continued soft confirmations.
-    L1ViewStale,
-    /// Batch-relative wall-clock estimation says this batch consumed its
-    /// remaining runway, but the observed safe block has not crossed danger.
-    /// Refuse rather than recover from estimated state.
-    EstimatedBatchInDanger { batch_index: u64 },
+enum RecoveryProgress {
+    NeedInitialSync,
+    Inspecting,
+    Flushed { observed_safe_block: u64 },
+    PostFlushSynced { required_safe_block: u64 },
+    Repaired,
 }
 
-/// What a fresh startup must do, given the current danger state.
-///
-/// Pure function output — no side effects. The `run_preemptive_recovery`
-/// driver executes the chosen action.
-///
-/// The four non-Refuse variants encode the recovery split:
-///
-/// - `Proceed`: no danger detected. No recovery work needed; the genesis Tip
-///   (fresh DB) is opened by the structural `ensure_open_tip` step, not here.
-/// - `RecoverTip`: aging Tip, no closed batch in danger. The Tip has no L1
-///   footprint, so we cascade it directly with no flush.
-/// - `FlushAndCascade`: closed batch in danger. We need a flush to resolve
-///   its L1 transaction's fate before the cascade decision.
-/// - `Refuse`: can't proceed safely; surface to the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartupAction {
-    /// No danger; no DB writes (genesis Tip handled by `ensure_open_tip`).
-    Proceed,
-    /// Open Tip is past `danger_threshold` and no closed batch is in danger.
-    /// No flush needed (Tip has no L1 slot to resolve); cascade the Tip
-    /// directly.
-    RecoverTip { batch_index: u64 },
-    /// Closed batch past the gold frontier is in danger. Flush the mempool,
-    /// re-sync, then run the post-flush cascade.
-    FlushAndCascade { batch_index: u64 },
-    /// Can't proceed safely; return the reason and let the operator decide.
-    Refuse(RefuseReason),
+enum RecoveryPhase {
+    InitialSync,
+    EnsureOpenTip,
+    RecoverTip { expected_batch_index: u64 },
+    Flush,
+    PostFlushSync { required_safe_block: u64 },
+    Cascade { required_safe_block: u64 },
 }
 
-impl StartupAction {
+impl RecoveryPhase {
     fn label(self) -> &'static str {
         match self {
-            StartupAction::Proceed => "proceed",
-            StartupAction::RecoverTip { .. } => "recover_tip",
-            StartupAction::FlushAndCascade { .. } => "flush_and_cascade",
-            StartupAction::Refuse(_) => "refuse",
+            Self::InitialSync => "initial_sync",
+            Self::EnsureOpenTip => "ensure_open_tip",
+            Self::RecoverTip { .. } => "recover_tip",
+            Self::Flush => "flush",
+            Self::PostFlushSync { .. } => "post_flush_sync",
+            Self::Cascade { .. } => "cascade",
         }
     }
 }
 
-impl RefuseReason {
-    /// Stable label for logs/metrics. Inherent method, co-located with the
-    /// variants (`DangerStatus::label`/`batch_index` live next to that enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryDecision {
+    Admit,
+    Act(RecoveryPhase),
+    Retry(RecoveryRetryReason),
+    Refuse(RecoveryRefusalReason),
+}
+
+impl RecoveryDecision {
     fn label(self) -> &'static str {
         match self {
-            RefuseReason::CanonicalDivergence { .. } => "canonical_divergence",
-            RefuseReason::L1ViewStale => "l1_view_stale",
-            RefuseReason::EstimatedBatchInDanger { .. } => "estimated_batch_in_danger",
+            Self::Admit => "admit",
+            Self::Act(phase) => phase.label(),
+            Self::Retry(_) => "retry",
+            Self::Refuse(_) => "refuse",
         }
     }
 }
 
-/// Pure decision: given the danger status, return what startup should do. L1
-/// reachability is an execution concern: if `FlushAndCascade` cannot reach L1,
-/// the flusher returns an error and the orchestrator retries.
-pub fn decide_startup_action(danger: DangerStatus) -> StartupAction {
-    match danger {
-        DangerStatus::Safe => StartupAction::Proceed,
-        DangerStatus::CanonicalDivergence(nonce) => {
-            StartupAction::Refuse(RefuseReason::CanonicalDivergence { nonce })
-        }
-        DangerStatus::ClosedBatchInDanger(batch_index) => {
-            StartupAction::FlushAndCascade { batch_index }
-        }
-        DangerStatus::TipInDanger(batch_index) => StartupAction::RecoverTip { batch_index },
-        DangerStatus::L1ViewStale => StartupAction::Refuse(RefuseReason::L1ViewStale),
-        DangerStatus::EstimatedBatchInDanger(batch_index) => {
-            StartupAction::Refuse(RefuseReason::EstimatedBatchInDanger { batch_index })
-        }
+/// The sole startup policy function. Terminal local facts are ranked before
+/// phase progress, so no provider call or mutation can mask divergence or a
+/// missing finalized state.
+fn reduce_recovery(progress: RecoveryProgress, facts: RecoveryInspection) -> RecoveryDecision {
+    if let DangerStatus::CanonicalDivergence(nonce) = facts.danger {
+        return RecoveryDecision::Refuse(RecoveryRefusalReason::CanonicalDivergence { nonce });
+    }
+    if !facts.has_finalized_snapshot {
+        return RecoveryDecision::Refuse(RecoveryRefusalReason::MissingFinalizedSnapshot);
+    }
+
+    match progress {
+        RecoveryProgress::NeedInitialSync => RecoveryDecision::Act(RecoveryPhase::InitialSync),
+        RecoveryProgress::Flushed {
+            observed_safe_block,
+        } => RecoveryDecision::Act(RecoveryPhase::PostFlushSync {
+            required_safe_block: observed_safe_block,
+        }),
+        RecoveryProgress::PostFlushSynced {
+            required_safe_block,
+        } => match facts.current_safe_block {
+            None => RecoveryDecision::Refuse(RecoveryRefusalReason::MissingSafeHead),
+            Some(resynced_safe_block) if resynced_safe_block < required_safe_block => {
+                RecoveryDecision::Retry(RecoveryRetryReason::ResyncBehindFlushView {
+                    resynced_safe_block,
+                    flush_observed_safe_block: required_safe_block,
+                })
+            }
+            Some(_) => RecoveryDecision::Act(RecoveryPhase::Cascade {
+                required_safe_block,
+            }),
+        },
+        RecoveryProgress::Repaired => match facts.danger {
+            DangerStatus::Safe if facts.has_open_tip => RecoveryDecision::Admit,
+            // Unreachable in production — every repair phase ends with a
+            // valid open tip in its own transaction (the admission model
+            // encodes that postcondition, and `ensure_open_tip_for_recovery`
+            // refuses rather than commits without one, so this edge cannot
+            // cycle). Kept so the `Repaired` and `Inspecting` arms stay
+            // structurally parallel and total.
+            DangerStatus::Safe => RecoveryDecision::Act(RecoveryPhase::EnsureOpenTip),
+            // Named, not a wildcard: a new `DangerStatus` variant must be
+            // classified here explicitly instead of silently defaulting to
+            // retry — the exact mistake this reducer exists to make
+            // compiler-visible.
+            status @ (DangerStatus::ClosedBatchInDanger(_)
+            | DangerStatus::TipInDanger(_)
+            | DangerStatus::L1ViewStale
+            | DangerStatus::EstimatedBatchInDanger(_)) => {
+                RecoveryDecision::Retry(RecoveryRetryReason::DangerPersists { status })
+            }
+            DangerStatus::CanonicalDivergence(_) => {
+                unreachable!("terminal facts were reduced before progress")
+            }
+        },
+        RecoveryProgress::Inspecting => match facts.danger {
+            DangerStatus::Safe if facts.has_open_tip => RecoveryDecision::Admit,
+            DangerStatus::Safe => RecoveryDecision::Act(RecoveryPhase::EnsureOpenTip),
+            DangerStatus::ClosedBatchInDanger(_) => RecoveryDecision::Act(RecoveryPhase::Flush),
+            DangerStatus::TipInDanger(expected_batch_index) => {
+                RecoveryDecision::Act(RecoveryPhase::RecoverTip {
+                    expected_batch_index,
+                })
+            }
+            DangerStatus::L1ViewStale => RecoveryDecision::Retry(RecoveryRetryReason::L1ViewStale),
+            DangerStatus::EstimatedBatchInDanger(batch_index) => {
+                RecoveryDecision::Retry(RecoveryRetryReason::EstimatedBatchInDanger { batch_index })
+            }
+            DangerStatus::CanonicalDivergence(_) => {
+                unreachable!("terminal facts were reduced before progress")
+            }
+        },
     }
 }
 
-/// Run the full preemptive recovery procedure at startup.
+trait RecoveryDriver {
+    fn inspect(&mut self) -> Result<RecoveryInspection, RecoveryError>;
+
+    /// Perform one phase and return the progress it established. The
+    /// production driver derives it from the phase itself, so a
+    /// wrong-progress return is unrepresentable there.
+    async fn perform(&mut self, phase: RecoveryPhase) -> Result<RecoveryProgress, RecoveryError>;
+
+    fn admitted(&mut self) {}
+}
+
+/// Drive one phase per inspection. There is intentionally no edge from a
+/// completed phase directly to another phase or admission.
 ///
-/// 1. Try to sync the safe head from L1. If L1 is unreachable, continue with
-///    the persisted view; whether that view is fresh enough is decided by
-///    `check_danger` in step 2 — a stale persisted view returns
-///    `L1ViewStale` and step 3 refuses.
-/// 2. Consult [`decide_startup_action`] to pick what to do.
-/// 3. If the decision is `FlushAndCascade`: flush the mempool, re-sync, then
-///    continue. If `Refuse`: bail out and let the orchestrator retry.
-/// 4. Run the atomic recovery transaction (cascade stale batches if any,
-///    always re-open the Tip if missing).
-///
-/// Returns the list of invalidated batch indices (empty if no stale batches).
-pub async fn run_preemptive_recovery(
-    db_path: &str,
-    input_reader: &mut InputReader,
-    l1_config: &L1Config,
-    protocol: &ProtocolTiming,
-) -> Result<Vec<u64>, RecoveryError> {
-    // ── Step 1: Sync safe head (tolerate L1 failure) ───────────────
-    //
-    // `sync_to_current_safe_head` goes through `append_safe_inputs`, which
-    // maintains `safe_accepted_batches` atomically with each advance. After
-    // a successful sync, the scheduler-frontier view is consistent with
-    // l1_safe_head for every downstream reader.
-    let l1_reachable = match input_reader.sync_to_current_safe_head().await {
-        Ok(()) => {
-            tracing::info!("L1 safe head synced");
-            true
-        }
-        Err(e) => {
-            let InputReaderError::Provider(error) = e else {
-                return Err(RecoveryError::InputReader(e));
-            };
-            tracing::error!(error = %error, "L1 unreachable during startup safe-head sync");
-            false
-        }
-    };
-
-    // ── Step 2: Read danger and decide action ─────────────────────
-    let danger = {
-        let mut storage = storage::Storage::open(db_path)?;
-        storage.check_danger(protocol, crate::runtime::clock::unix_now_ms())?
-    };
-    let action = decide_startup_action(danger);
-    tracing::info!(
-        danger_status = danger.label(),
-        danger_batch_index = ?danger.batch_index(),
-        startup_action = action.label(),
-        l1_reachable,
-        danger_threshold = protocol.danger_threshold(),
-        max_wait_blocks = protocol.max_wait_blocks,
-        l1_read_stale_after_blocks = protocol.l1_read_stale_after_blocks,
-        "startup recovery decision"
-    );
-
-    // ── Step 3: Execute decision ───────────────────────────────────
-    //
-    // The three non-Refuse paths split the recovery work:
-    //
-    // - `Proceed`: no DB writes. A `Proceed` decision means no batch is in
-    //   danger and the persisted state is fine as-is. Closed batches past
-    //   gold (if any) stay in their natural lifecycle.
-    //
-    // - `RecoverTip`: no flush. Only the open Tip crossed `danger_threshold`;
-    //   it has no L1 slot to resolve, so it can be invalidated directly.
-    //
-    // - `FlushAndCascade`: flush resolves every wallet-nonce slot, then
-    //   re-sync brings the gold frontier to its maximum extent. After that
-    //   point, *everything past gold is doomed* (Silver-stale,
-    //   Silver-poisoned, or Pending-killed — see `Storage::recover_post_flush`
-    //   docs). Cascade unconditionally from the first non-gold.
-    let invalidated = match action {
-        StartupAction::Proceed => {
-            tracing::info!(
-                danger_status = danger.label(),
-                danger_batch_index = ?danger.batch_index(),
-                startup_action = action.label(),
-                "no danger zone detected — proceeding without recovery"
-            );
-            // No DB writes here. A `Proceed` decision means no batch is in
-            // danger and the persisted state is fine as-is; closed batches past
-            // gold (if any) stay in their natural lifecycle. The tip-existence
-            // invariant — including opening the genesis Tip on a fresh DB — is
-            // established structurally by `Storage::ensure_open_tip` in
-            // `Workers::spawn`, after this returns and before the lane starts.
-            Vec::new()
-        }
-        StartupAction::RecoverTip { batch_index } => {
-            tracing::error!(
-                danger_status = danger.label(),
-                danger_batch_index = ?danger.batch_index(),
-                startup_action = action.label(),
-                tip_batch_index = batch_index,
-                danger_threshold = protocol.danger_threshold(),
-                "open Tip in danger zone — invalidating and opening fresh Tip (no flush)"
-            );
-            let mut storage = storage::Storage::open(db_path)?;
-            storage.recover_aging_tip(protocol.danger_threshold())?
-        }
-        StartupAction::FlushAndCascade { batch_index } => {
-            tracing::error!(
-                danger_status = danger.label(),
-                danger_batch_index = ?danger.batch_index(),
-                startup_action = action.label(),
-                batch_index,
-                danger_threshold = protocol.danger_threshold(),
-                max_wait_blocks = protocol.max_wait_blocks,
-                "closed batch in danger zone — entering preemptive recovery (flush + cascade)"
-            );
-            run_flush_and_cascade(db_path, input_reader, l1_config, protocol).await?
-        }
-        StartupAction::Refuse(reason) => {
-            tracing::error!(
-                danger_status = danger.label(),
-                danger_batch_index = ?danger.batch_index(),
-                startup_action = action.label(),
-                ?reason,
-                refuse_reason = reason.label(),
-                l1_reachable,
-                "startup refused: cannot recover safely"
-            );
-            return Err(RecoveryError::Refuse(reason));
-        }
-    };
-
-    if invalidated.is_empty() {
+/// The loop is unbounded by design and terminates by construction: every
+/// phase edge advances `progress` except `Repaired` + `Safe` + no Tip →
+/// `EnsureOpenTip` → `Repaired`, and that phase refuses inside its own
+/// transaction if it would leave no Tip; between phases the Tip cannot
+/// disappear, because the kernel process lock makes this process the only
+/// writer. One attempt therefore performs at
+/// most five phases (`InitialSync`, then `Flush` → `PostFlushSync` →
+/// `Cascade`, then at most one `EnsureOpenTip`) before admitting, retrying,
+/// or refusing.
+async fn drive_recovery(driver: &mut impl RecoveryDriver) -> Result<(), RecoveryError> {
+    let mut progress = RecoveryProgress::NeedInitialSync;
+    loop {
+        let facts = driver.inspect()?;
+        let decision = reduce_recovery(progress, facts);
         tracing::info!(
-            danger_status = danger.label(),
-            danger_batch_index = ?danger.batch_index(),
-            startup_action = action.label(),
-            invalidated_count = 0,
-            "startup recovery complete — no batches invalidated"
+            recovery_progress = ?progress,
+            danger_status = facts.danger.label(),
+            danger_batch_index = ?facts.danger.batch_index(),
+            recovery_decision = decision.label(),
+            "startup recovery reducer decision"
         );
+
+        match decision {
+            RecoveryDecision::Admit => {
+                driver.admitted();
+                return Ok(());
+            }
+            RecoveryDecision::Retry(reason) => return Err(RecoveryError::retry(reason)),
+            RecoveryDecision::Refuse(reason) => return Err(RecoveryError::refuse(reason)),
+            RecoveryDecision::Act(phase) => {
+                progress = driver.perform(phase).await?;
+            }
+        }
+    }
+}
+
+fn log_repair(invalidated: &[u64]) {
+    if invalidated.is_empty() {
+        tracing::info!("startup recovery phase completed without invalidation");
     } else {
-        // Successful self-heal: the system invalidated the doomed suffix and
-        // opened a recovery batch as designed. The upstream "danger detected"
-        // log already alerted the operator at error level; this completes
-        // that incident with a non-error outcome.
         tracing::warn!(
-            danger_status = danger.label(),
-            danger_batch_index = ?danger.batch_index(),
-            startup_action = action.label(),
             invalidated_count = invalidated.len(),
             batches = ?invalidated,
-            "startup recovery complete — batches invalidated and recovery batch opened"
+            "startup recovery invalidated the doomed suffix"
         );
     }
-
-    Ok(invalidated)
 }
 
-/// Execute the flush-and-cascade phase: resolve every pending wallet-nonce
-/// slot on L1, re-sync the safe head so the gold frontier reflects post-flush
-/// state, then cascade-invalidate the doomed non-gold suffix and open a fresh
-/// recovery Tip.
-///
-/// The four steps form one logical phase — they have no meaning on their own
-/// and the orchestrator only ever runs them as a unit.
-async fn run_flush_and_cascade(
+struct ProductionRecoveryDriver<'a> {
+    db_path: &'a str,
+    input_reader: &'a mut InputReader,
+    l1_config: &'a L1Config,
+    protocol: &'a ProtocolTiming,
+}
+
+impl RecoveryDriver for ProductionRecoveryDriver<'_> {
+    fn inspect(&mut self) -> Result<RecoveryInspection, RecoveryError> {
+        let mut storage = storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
+        storage
+            .inspect_recovery(self.protocol, crate::clock::unix_now_ms())
+            .map_err(classify_storage)
+    }
+
+    async fn perform(&mut self, phase: RecoveryPhase) -> Result<RecoveryProgress, RecoveryError> {
+        match phase {
+            RecoveryPhase::InitialSync => {
+                match self.input_reader.sync_to_current_safe_head().await {
+                    Ok(()) => tracing::info!("L1 safe head synced"),
+                    // Preserve warm boot: an unreachable provider counts as a
+                    // completed refresh attempt, then persisted local facts
+                    // decide whether serving is still honest.
+                    Err(InputReaderError::Provider(error)) => tracing::warn!(
+                        error = %error,
+                        "L1 unreachable during initial startup sync; inspecting persisted view"
+                    ),
+                    Err(error) => return Err(classify_input_reader(error)),
+                }
+                Ok(RecoveryProgress::Inspecting)
+            }
+            RecoveryPhase::EnsureOpenTip => {
+                let mut storage =
+                    storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
+                storage
+                    .ensure_open_tip_for_recovery(self.protocol, crate::clock::unix_now_ms())
+                    .map_err(classify_mutation)?;
+                log_repair(&[]);
+                Ok(RecoveryProgress::Repaired)
+            }
+            RecoveryPhase::RecoverTip {
+                expected_batch_index,
+            } => {
+                let mut storage =
+                    storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
+                let invalidated = storage
+                    .recover_aging_tip_for_recovery(
+                        expected_batch_index,
+                        self.protocol,
+                        crate::clock::unix_now_ms(),
+                    )
+                    .map_err(classify_mutation)?;
+                log_repair(&invalidated);
+                Ok(RecoveryProgress::Repaired)
+            }
+            RecoveryPhase::Flush => {
+                let observed_safe_block = self.flush().await?;
+                Ok(RecoveryProgress::Flushed {
+                    observed_safe_block,
+                })
+            }
+            RecoveryPhase::PostFlushSync {
+                required_safe_block,
+            } => {
+                self.input_reader
+                    .sync_to_current_safe_head()
+                    .await
+                    .map_err(classify_input_reader)?;
+                Ok(RecoveryProgress::PostFlushSynced {
+                    required_safe_block,
+                })
+            }
+            RecoveryPhase::Cascade {
+                required_safe_block,
+            } => {
+                let mut storage =
+                    storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
+                let invalidated = storage
+                    .recover_post_flush_for_recovery(
+                        required_safe_block,
+                        self.protocol,
+                        crate::clock::unix_now_ms(),
+                    )
+                    .map_err(classify_mutation)?;
+                log_repair(&invalidated);
+                Ok(RecoveryProgress::Repaired)
+            }
+        }
+    }
+}
+
+impl ProductionRecoveryDriver<'_> {
+    async fn flush(&mut self) -> Result<u64, RecoveryError> {
+        let provider = crate::l1::provider::create_verified_signer_provider(
+            &self.l1_config.eth_rpc_url,
+            self.l1_config.batch_submitter_private_key.expose_secret(),
+            self.l1_config.identity.chain_id,
+            self.l1_config.allow_insecure_rpc,
+        )
+        .await
+        .map_err(classify_signer_provider)?;
+
+        let watermark = {
+            let mut storage = storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
+            storage.wallet_nonce_watermark().map_err(classify_storage)?
+        };
+        MempoolFlusher::flush_to_safe(
+            provider,
+            self.l1_config.identity.batch_submitter_address,
+            self.protocol.seconds_per_block,
+            self.db_path,
+            watermark,
+        )
+        .await
+        .map_err(classify_flush)
+    }
+}
+
+/// Run the startup reducer through its first clean `Admit` decision. This
+/// grants no runtime capability; fallible runtime preparation follows, then
+/// [`admit_runtime`] invokes the same reducer once more over one consistent
+/// fact set.
+pub(crate) async fn run_startup_recovery(
     db_path: &str,
     input_reader: &mut InputReader,
     l1_config: &L1Config,
     protocol: &ProtocolTiming,
-) -> Result<Vec<u64>, RecoveryError> {
-    // Keyed-write chain-id gate (review): the flush signs L1 no-op txs, so it
-    // must confirm the RPC still serves the pinned chain *immediately before
-    // signing*. The boot-time `validate_rpc_chain_id` and the reader's one-shot
-    // `verify_chain_id` are both stale by now (a load-balanced RPC could have
-    // failed over to another chain since), so neither is a sufficient backstop
-    // for a fresh keyed write. `create_verified_signer_provider` folds the check
-    // into the signer build so this path cannot skip it. A mismatch is terminal
-    // (operator misconfig); an RPC error is retryable (handled like `Provider`).
-    let flush_provider = crate::l1::provider::create_verified_signer_provider(
-        &l1_config.eth_rpc_url,
-        &l1_config.batch_submitter_private_key,
-        l1_config.chain_id,
-        l1_config.allow_insecure_rpc,
-    )
-    .await
-    .map_err(|e| match e {
-        crate::l1::provider::VerifiedSignerProviderError::ChainIdMismatch { rpc, expected } => {
-            RecoveryError::ChainIdMismatch { rpc, expected }
-        }
-        other => RecoveryError::Provider(other.to_string()),
-    })?;
-    // The persisted watermark anchors the flush: every slot this deployment
-    // ever broadcast must resolve at safe depth, regardless of what the
-    // local node's pool remembers (review R1a / F1).
-    let watermark = {
-        let mut storage = storage::Storage::open(db_path)?;
-        storage.wallet_nonce_watermark()?
-    };
-    let flush_observed_safe_block = MempoolFlusher::flush_to_safe(
-        flush_provider,
-        l1_config.batch_submitter_address,
-        protocol.seconds_per_block,
+) -> Result<(), RecoveryError> {
+    let mut driver = ProductionRecoveryDriver {
         db_path,
-        watermark,
-    )
-    .await?;
+        input_reader,
+        l1_config,
+        protocol,
+    };
+    drive_recovery(&mut driver).await
+}
 
-    // If this re-sync errors out, L1 has been flushed but the DB has NOT been
-    // cascaded — we exit with the InputReaderError and rely on the orchestrator
-    // to respawn. That's safe by design:
-    //
-    // - `flush_and_wait` is idempotent: on the next attempt it queries L1 for
-    //   pending wallet-nonces, finds zero (the previous flush cleared them),
-    //   and returns immediately.
-    // - `check_danger` re-decides on the post-flush state. Two cases: the
-    //   danger persists (the restart re-enters this same path — flush is a
-    //   no-op the second time), or the original danger resolved during the
-    //   flush (e.g. the frontier batch landed gold), in which case the
-    //   restart proceeds normally with any no-op'd Pending batch left valid —
-    //   safe, since it simply resubmits at a fresh slot with no poisoned
-    //   ancestor.
-    // - `recover_post_flush` is idempotent against the resulting DB state
-    //   (verified by `after_post_recovery_crash_is_no_op` in `recovery_tests`).
-    //
-    // So a failure here just costs an extra orchestrator respawn; correctness
-    // is preserved.
-    //
-    // More importantly, it refuses to boot, during a recovery scenario, when
-    // we can't reach L1.
-    tracing::info!("re-syncing L1 safe head after flush");
-    input_reader.sync_to_current_safe_head().await?;
+/// Reinvoke the same reducer after all fallible preparation, over one
+/// transactionally consistent fact set. Anything except `Admit` drops the
+/// prepared resources and restarts from a fresh boot; workers are never
+/// launched from an aged decision.
+///
+/// This consistent read *is* the linearization of the final admission
+/// decision: the process lock excludes every other process, and no worker
+/// is launched until after this decision — the launch step itself is
+/// non-yielding — so no writer exists that could invalidate the facts
+/// between this read and worker launch.
+pub(crate) fn admit_runtime(
+    db_path: &str,
+    protocol: &ProtocolTiming,
+) -> Result<RuntimeAdmission, RecoveryError> {
+    let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
+    let facts = storage
+        .inspect_recovery(protocol, crate::clock::unix_now_ms())
+        .map_err(classify_storage)?;
+    match reduce_recovery(RecoveryProgress::Inspecting, facts) {
+        RecoveryDecision::Admit => Ok(RuntimeAdmission { _private: () }),
+        RecoveryDecision::Retry(reason) => Err(RecoveryError::retry(reason)),
+        RecoveryDecision::Refuse(reason) => Err(RecoveryError::refuse(reason)),
+        RecoveryDecision::Act(phase) => Err(RecoveryError::retry(
+            RecoveryRetryReason::AdmissionChanged {
+                decision: phase.label(),
+            },
+        )),
+    }
+}
 
-    tracing::info!("running post-flush recovery (cascade non-gold suffix)");
-    let mut storage = storage::Storage::open(db_path)?;
+fn classify_open(error: StorageOpenError) -> RecoveryError {
+    let persistent = storage::is_persistent_storage_open_error(&error);
+    let failure = RecoveryFailure::OpenStorage(error);
+    if persistent {
+        RecoveryError::refuse(failure)
+    } else {
+        RecoveryError::retry(failure)
+    }
+}
 
-    // Coherence check (review F2): the cascade's precondition is that the
-    // gold frontier reflects at least the safe view the flusher observed
-    // resolution at. Behind a load-balanced RPC, the reader's re-sync can be
-    // served by a replica lagging the flusher's view — cascading then could
-    // invalidate a batch the scheduler actually accepted and reuse its
-    // nonce. Refuse instead; the orchestrator respawn retries with a
-    // fresher view (the flush is idempotent).
-    let resynced_safe_block = storage.current_safe_block()?.unwrap_or(0);
-    assert_resync_caught_up(resynced_safe_block, flush_observed_safe_block)?;
+fn classify_storage(error: rusqlite::Error) -> RecoveryError {
+    let persistent = storage::is_persistent_storage_error(&error);
+    let failure = RecoveryFailure::Storage(error);
+    if persistent {
+        RecoveryError::refuse(failure)
+    } else {
+        RecoveryError::retry(failure)
+    }
+}
 
-    Ok(storage.recover_post_flush(protocol.danger_threshold())?)
+/// The flush's signer-provider errors, classified at birth. The
+/// terminal/transient split must agree with `From<VerifiedSignerProviderError>
+/// for BootstrapError` in `commands/error.rs` (mismatch and construction are
+/// terminal; the chain-id read is transient); this is the reducer's own
+/// retry/refuse polarity over the same facts, pinned beside the others.
+fn classify_signer_provider(
+    error: crate::l1::provider::VerifiedSignerProviderError,
+) -> RecoveryError {
+    use crate::l1::provider::VerifiedSignerProviderError;
+    match error {
+        VerifiedSignerProviderError::ChainIdMismatch { rpc, expected } => {
+            RecoveryError::refuse(RecoveryFailure::ChainIdMismatch { rpc, expected })
+        }
+        VerifiedSignerProviderError::ChainIdRpc(message) => {
+            RecoveryError::retry(RecoveryFailure::ProviderUnreachable(message))
+        }
+        VerifiedSignerProviderError::Create(message) => {
+            RecoveryError::refuse(RecoveryFailure::SignerMisconfig(message))
+        }
+    }
+}
+
+/// Input-reader errors met during the startup phases (`InitialSync` and
+/// `PostFlushSync`, both through `sync_to_current_safe_head`), classified
+/// at birth. `ChainIdMismatch` and `StorageTaskPanicked` are refused here
+/// and terminal in the live worker alike. Two variants are phase-dependent
+/// by design and differ from `InputReaderError::is_terminal_invariant`:
+///
+/// - `Bootstrap` here can only be the sync's `create_provider` failing on
+///   the configured RPC URL (parse, the plaintext-remote rule, client
+///   build), refused because re-running the same boot re-fails
+///   identically. The discovery-time facts (wrong contract, pre-v3
+///   InputBox) never reach this function: they arise in `InputReader::new`,
+///   which only `setup` calls and projects as a worker exit (register
+///   finding 32). In the live loop the same URL was already proven by this
+///   boot's initial sync, so a live `Bootstrap` restarts unclassified
+///   rather than poisoning the data directory.
+/// - `Join` (a non-panic loss of a storage task) is shutdown-path
+///   cancellation in the live loop. During startup the runtime that would
+///   cancel it is the one driving this boot, so an unexplained loss is
+///   refused rather than retried blind.
+///
+/// Both halves are pinned.
+fn classify_input_reader(error: InputReaderError) -> RecoveryError {
+    match error {
+        error @ (InputReaderError::Provider(_) | InputReaderError::InconsistentL1Response(_)) => {
+            RecoveryError::retry(RecoveryFailure::InputReader(error))
+        }
+        InputReaderError::OpenStorage(source) => classify_open(source),
+        InputReaderError::Storage(source) => classify_storage(source),
+        error @ (InputReaderError::ChainIdMismatch { .. }
+        | InputReaderError::Bootstrap(_)
+        | InputReaderError::StorageTaskPanicked { .. }
+        | InputReaderError::Join(_)) => RecoveryError::refuse(RecoveryFailure::InputReader(error)),
+    }
+}
+
+fn classify_flush(error: FlushError) -> RecoveryError {
+    let terminal = error.is_terminal_invariant();
+    let failure = RecoveryFailure::Flush(error);
+    if terminal {
+        RecoveryError::refuse(failure)
+    } else {
+        RecoveryError::retry(failure)
+    }
+}
+
+fn classify_mutation(error: RecoveryMutationError) -> RecoveryError {
+    match error {
+        RecoveryMutationError::Storage(source) => classify_storage(source),
+        RecoveryMutationError::CanonicalDivergence { nonce } => {
+            RecoveryError::refuse(RecoveryRefusalReason::CanonicalDivergence { nonce })
+        }
+        RecoveryMutationError::MissingFinalizedSnapshot => {
+            RecoveryError::refuse(RecoveryRefusalReason::MissingFinalizedSnapshot)
+        }
+        RecoveryMutationError::MissingSafeHead => {
+            RecoveryError::refuse(RecoveryRefusalReason::MissingSafeHead)
+        }
+        RecoveryMutationError::ResyncBehindFlushView {
+            resynced_safe_block,
+            flush_observed_safe_block,
+        } => RecoveryError::retry(RecoveryRetryReason::ResyncBehindFlushView {
+            resynced_safe_block,
+            flush_observed_safe_block,
+        }),
+        RecoveryMutationError::StaleDecision { actual, .. } => {
+            RecoveryError::retry(RecoveryRetryReason::StaleDecision { status: actual })
+        }
+        RecoveryMutationError::TipAlreadyOpen => {
+            RecoveryError::retry(RecoveryRetryReason::TipAlreadyOpen)
+        }
+        RecoveryMutationError::TipMissingAfterOpen => {
+            RecoveryError::refuse(RecoveryRefusalReason::TipMissingAfterOpen)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
-    #[test]
-    fn proceed_on_safe() {
-        assert_eq!(
-            decide_startup_action(DangerStatus::Safe),
-            StartupAction::Proceed
+    fn sqlite_failure(code: rusqlite::ffi::ErrorCode, extended_code: i32) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code,
+            },
+            None,
+        )
+    }
+
+    fn assert_retry(error: RecoveryError) {
+        assert!(
+            matches!(error, RecoveryError::Retry(_)),
+            "expected retry, got {error:?}"
+        );
+    }
+
+    fn assert_refuse(error: RecoveryError) {
+        assert!(
+            matches!(error, RecoveryError::Refuse(_)),
+            "expected refusal, got {error:?}"
         );
     }
 
     #[test]
-    fn refuse_on_canonical_divergence() {
-        // Terminal refusal — never `Proceed`, never a flush+cascade on top
-        // of a diverged frontier (review R2). The remedy is cockroach
-        // recovery, outside this dispatch entirely.
+    fn error_classifiers_pin_retry_and_refuse_polarity() {
+        use crate::l1::watermark::WalletNonceWatermarkError;
+
+        let busy = || sqlite_failure(rusqlite::ffi::ErrorCode::DatabaseBusy, 5);
+        let corrupt = || sqlite_failure(rusqlite::ffi::ErrorCode::NotADatabase, 26);
+
+        assert_retry(classify_open(StorageOpenError::Sqlite(busy())));
+        assert_refuse(classify_open(StorageOpenError::Sqlite(corrupt())));
+        assert_retry(classify_storage(busy()));
+        assert_refuse(classify_storage(rusqlite::Error::QueryReturnedNoRows));
+
+        assert_retry(classify_input_reader(InputReaderError::Provider(
+            "offline".into(),
+        )));
+        assert_retry(classify_input_reader(
+            InputReaderError::InconsistentL1Response("gap".into()),
+        ));
+        assert_refuse(classify_input_reader(InputReaderError::ChainIdMismatch {
+            rpc: 1,
+            expected: 2,
+        }));
+        // Phase-dependent: refused at startup, non-terminal in the live
+        // worker (`InputReaderError::is_terminal_invariant`).
+        assert_refuse(classify_input_reader(InputReaderError::Bootstrap(
+            "plaintext rpc url".into(),
+        )));
+        assert_refuse(classify_input_reader(InputReaderError::Join(
+            "sync task lost".into(),
+        )));
+        assert!(!InputReaderError::Bootstrap("x".into()).is_terminal_invariant());
+        assert!(!InputReaderError::Join("x".into()).is_terminal_invariant());
+
+        {
+            use crate::commands::error::BootstrapError;
+            use crate::l1::provider::VerifiedSignerProviderError as Signer;
+            // The split's payloads are load-bearing, not only its polarity:
+            // swapping the two provider variants must go red.
+            assert!(matches!(
+                classify_signer_provider(Signer::ChainIdRpc("timeout".into())),
+                RecoveryError::Retry(f) if matches!(*f, RecoveryFailure::ProviderUnreachable(_))
+            ));
+            assert!(matches!(
+                classify_signer_provider(Signer::Create("bad url".into())),
+                RecoveryError::Refuse(f) if matches!(*f, RecoveryFailure::SignerMisconfig(_))
+            ));
+            assert!(matches!(
+                classify_signer_provider(Signer::ChainIdMismatch {
+                    rpc: 1,
+                    expected: 2,
+                }),
+                RecoveryError::Refuse(f) if matches!(*f, RecoveryFailure::ChainIdMismatch { .. })
+            ));
+            // The doc's "must agree with the `BootstrapError` projection":
+            // the reducer retries exactly the arm that projection calls
+            // transient.
+            let mint = || {
+                [
+                    Signer::ChainIdRpc("timeout".into()),
+                    Signer::Create("bad url".into()),
+                    Signer::ChainIdMismatch {
+                        rpc: 1,
+                        expected: 2,
+                    },
+                ]
+            };
+            for (reducer_side, projection_side) in mint().into_iter().zip(mint()) {
+                let retried = matches!(
+                    classify_signer_provider(reducer_side),
+                    RecoveryError::Retry(_)
+                );
+                let transient = matches!(
+                    BootstrapError::from(projection_side),
+                    BootstrapError::ChainIdRpc { .. }
+                );
+                assert_eq!(retried, transient);
+            }
+        }
+
+        assert_retry(classify_flush(FlushError::Provider("offline".into())));
+        assert_refuse(classify_flush(FlushError::Watermark(
+            WalletNonceWatermarkError::Storage(rusqlite::Error::QueryReturnedNoRows),
+        )));
+
+        assert_retry(classify_mutation(RecoveryMutationError::TipAlreadyOpen));
+        assert_refuse(classify_mutation(
+            RecoveryMutationError::TipMissingAfterOpen,
+        ));
+        assert_retry(classify_mutation(RecoveryMutationError::StaleDecision {
+            expected: DangerStatus::Safe,
+            actual: DangerStatus::L1ViewStale,
+        }));
+        assert_retry(classify_mutation(
+            RecoveryMutationError::ResyncBehindFlushView {
+                resynced_safe_block: 10,
+                flush_observed_safe_block: 11,
+            },
+        ));
+        assert_refuse(classify_mutation(
+            RecoveryMutationError::CanonicalDivergence { nonce: 7 },
+        ));
+        assert_refuse(classify_mutation(
+            RecoveryMutationError::MissingFinalizedSnapshot,
+        ));
+        assert_refuse(classify_mutation(RecoveryMutationError::MissingSafeHead));
+    }
+
+    fn facts(danger: DangerStatus) -> RecoveryInspection {
+        RecoveryInspection {
+            danger,
+            has_finalized_snapshot: true,
+            has_open_tip: true,
+            current_safe_block: Some(1_200),
+        }
+    }
+
+    #[test]
+    fn divergence_dominates_every_progress_state() {
+        let terminal = facts(DangerStatus::CanonicalDivergence(7));
+        for progress in [
+            RecoveryProgress::NeedInitialSync,
+            RecoveryProgress::Inspecting,
+            RecoveryProgress::Flushed {
+                observed_safe_block: 1_201,
+            },
+            RecoveryProgress::PostFlushSynced {
+                required_safe_block: 1_201,
+            },
+            RecoveryProgress::Repaired,
+        ] {
+            assert_eq!(
+                reduce_recovery(progress, terminal),
+                RecoveryDecision::Refuse(RecoveryRefusalReason::CanonicalDivergence { nonce: 7 })
+            );
+        }
+    }
+
+    #[test]
+    fn post_flush_lag_retries_before_cascade() {
+        let decision = reduce_recovery(
+            RecoveryProgress::PostFlushSynced {
+                required_safe_block: 1_201,
+            },
+            facts(DangerStatus::ClosedBatchInDanger(0)),
+        );
         assert_eq!(
-            decide_startup_action(DangerStatus::CanonicalDivergence(7)),
-            StartupAction::Refuse(RefuseReason::CanonicalDivergence { nonce: 7 })
+            decision,
+            RecoveryDecision::Retry(RecoveryRetryReason::ResyncBehindFlushView {
+                resynced_safe_block: 1_200,
+                flush_observed_safe_block: 1_201,
+            })
         );
     }
 
     #[test]
-    fn flush_and_cascade_on_closed_batch_in_danger() {
+    fn repaired_tip_with_surviving_clock_refusal_cannot_admit() {
         assert_eq!(
-            decide_startup_action(DangerStatus::ClosedBatchInDanger(42)),
-            StartupAction::FlushAndCascade { batch_index: 42 }
+            reduce_recovery(RecoveryProgress::Repaired, facts(DangerStatus::L1ViewStale)),
+            RecoveryDecision::Retry(RecoveryRetryReason::DangerPersists {
+                status: DangerStatus::L1ViewStale
+            })
         );
     }
 
-    #[test]
-    fn refuse_on_l1_view_stale() {
+    struct ScriptedDriver {
+        inspections: VecDeque<RecoveryInspection>,
+        trace: Vec<&'static str>,
+        flush_observed_safe_block: u64,
+        inspection_attempts: usize,
+        fail_inspection_at: Option<usize>,
+    }
+
+    impl ScriptedDriver {
+        fn new(inspections: impl IntoIterator<Item = RecoveryInspection>) -> Self {
+            Self {
+                inspections: inspections.into_iter().collect(),
+                trace: Vec::new(),
+                flush_observed_safe_block: 1_200,
+                inspection_attempts: 0,
+                fail_inspection_at: None,
+            }
+        }
+
+        fn fail_inspection_at(mut self, attempt: usize) -> Self {
+            self.fail_inspection_at = Some(attempt);
+            self
+        }
+    }
+
+    impl RecoveryDriver for ScriptedDriver {
+        fn inspect(&mut self) -> Result<RecoveryInspection, RecoveryError> {
+            self.trace.push("inspect");
+            self.inspection_attempts += 1;
+            if self.fail_inspection_at == Some(self.inspection_attempts) {
+                return Err(RecoveryError::retry(RecoveryRetryReason::L1ViewStale));
+            }
+            Ok(self
+                .inspections
+                .pop_front()
+                .expect("script provides one fact set per inspection"))
+        }
+
+        async fn perform(
+            &mut self,
+            phase: RecoveryPhase,
+        ) -> Result<RecoveryProgress, RecoveryError> {
+            Ok(match phase {
+                RecoveryPhase::InitialSync => {
+                    self.trace.push("initial_sync");
+                    RecoveryProgress::Inspecting
+                }
+                RecoveryPhase::EnsureOpenTip => {
+                    self.trace.push("ensure_tip");
+                    RecoveryProgress::Repaired
+                }
+                RecoveryPhase::RecoverTip { .. } => {
+                    self.trace.push("recover_tip");
+                    RecoveryProgress::Repaired
+                }
+                RecoveryPhase::Flush => {
+                    self.trace.push("flush");
+                    RecoveryProgress::Flushed {
+                        observed_safe_block: self.flush_observed_safe_block,
+                    }
+                }
+                RecoveryPhase::PostFlushSync {
+                    required_safe_block,
+                } => {
+                    self.trace.push("post_flush_sync");
+                    RecoveryProgress::PostFlushSynced {
+                        required_safe_block,
+                    }
+                }
+                RecoveryPhase::Cascade { .. } => {
+                    self.trace.push("cascade");
+                    RecoveryProgress::Repaired
+                }
+            })
+        }
+
+        fn admitted(&mut self) {
+            self.trace.push("admit");
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_recovery_runs_exactly_one_phase_per_inspection() {
+        let closed = facts(DangerStatus::ClosedBatchInDanger(0));
+        let mut driver =
+            ScriptedDriver::new([closed, closed, closed, closed, facts(DangerStatus::Safe)]);
+
+        drive_recovery(&mut driver).await.expect("admit");
         assert_eq!(
-            decide_startup_action(DangerStatus::L1ViewStale),
-            StartupAction::Refuse(RefuseReason::L1ViewStale)
+            driver.trace,
+            [
+                "inspect",
+                "initial_sync",
+                "inspect",
+                "flush",
+                "inspect",
+                "post_flush_sync",
+                "inspect",
+                "cascade",
+                "inspect",
+                "admit",
+            ]
         );
     }
 
-    #[test]
-    fn refuse_on_estimated_batch_in_danger() {
+    #[tokio::test]
+    async fn local_divergence_refuses_before_every_phase() {
+        let mut driver = ScriptedDriver::new([facts(DangerStatus::CanonicalDivergence(9))]);
+        let error = drive_recovery(&mut driver)
+            .await
+            .expect_err("divergence refuses");
+        assert!(matches!(error, RecoveryError::Refuse(_)));
+        assert_eq!(driver.trace, ["inspect"]);
+    }
+
+    #[tokio::test]
+    async fn sync_discovered_divergence_stops_before_cascade() {
+        let closed = facts(DangerStatus::ClosedBatchInDanger(0));
+        let mut driver = ScriptedDriver::new([
+            closed,
+            closed,
+            closed,
+            facts(DangerStatus::CanonicalDivergence(0)),
+        ]);
+        let error = drive_recovery(&mut driver)
+            .await
+            .expect_err("divergence discovered by sync refuses");
+        assert!(matches!(error, RecoveryError::Refuse(_)));
         assert_eq!(
-            decide_startup_action(DangerStatus::EstimatedBatchInDanger(7)),
-            StartupAction::Refuse(RefuseReason::EstimatedBatchInDanger { batch_index: 7 })
+            driver.trace,
+            [
+                "inspect",
+                "initial_sync",
+                "inspect",
+                "flush",
+                "inspect",
+                "post_flush_sync",
+                "inspect",
+            ]
         );
     }
 
-    #[test]
-    fn recover_tip_in_danger() {
+    #[tokio::test]
+    async fn tip_repair_reinspects_and_retries_on_surviving_clock_refusal() {
+        let tip = facts(DangerStatus::TipInDanger(0));
+        let mut driver = ScriptedDriver::new([tip, tip, facts(DangerStatus::L1ViewStale)]);
+
+        let error = drive_recovery(&mut driver)
+            .await
+            .expect_err("clock refusal must block admission after repair");
+        assert!(matches!(error, RecoveryError::Retry(_)));
         assert_eq!(
-            decide_startup_action(DangerStatus::TipInDanger(11)),
-            StartupAction::RecoverTip { batch_index: 11 }
+            driver.trace,
+            [
+                "inspect",
+                "initial_sync",
+                "inspect",
+                "recover_tip",
+                "inspect",
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn reconstructed_controller_cannot_reuse_a_post_flush_sync_witness() {
+        let closed = facts(DangerStatus::ClosedBatchInDanger(0));
+        let mut interrupted = ScriptedDriver::new([closed, closed, closed]).fail_inspection_at(4);
+
+        let error = drive_recovery(&mut interrupted)
+            .await
+            .expect_err("the injected inspection boundary ends this controller");
+        assert!(matches!(error, RecoveryError::Retry(_)));
+        assert_eq!(
+            interrupted.trace,
+            [
+                "inspect",
+                "initial_sync",
+                "inspect",
+                "flush",
+                "inspect",
+                "post_flush_sync",
+                "inspect",
+            ],
+            "the first controller reached post-flush Sync before it was lost"
+        );
+
+        // Reconstructing the Rust controller is the restart boundary: its
+        // boot-local witnesses are gone. Even though durable facts still show
+        // the same closed danger, the new attempt must InitialSync and Flush;
+        // it cannot jump straight to Cascade using the previous attempt's
+        // PostFlushSync witness.
+        let mut restarted =
+            ScriptedDriver::new([closed, closed, closed, closed, facts(DangerStatus::Safe)]);
+        drive_recovery(&mut restarted)
+            .await
+            .expect("restart admits");
+        assert_eq!(
+            restarted.trace,
+            [
+                "inspect",
+                "initial_sync",
+                "inspect",
+                "flush",
+                "inspect",
+                "post_flush_sync",
+                "inspect",
+                "cascade",
+                "inspect",
+                "admit",
+            ]
+        );
+    }
+
+    fn admission_fixture(
+        name: &str,
+        has_finalized_snapshot: bool,
+        has_open_tip: bool,
+    ) -> (crate::storage::test_helpers::TestDb, ProtocolTiming) {
+        use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
+
+        let db = temp_db(name);
+        let protocol = default_protocol_timing();
+        let now_ms = crate::clock::unix_now_ms();
+        let mut storage =
+            storage::Storage::initialize_for_command(&db.path, storage::LifecycleCommand::Setup)
+                .expect("initialize setup");
+        storage
+            .append_safe_inputs_with_timestamp(
+                0,
+                now_ms / 1_000,
+                &[],
+                SENDER_A,
+                &protocol,
+                storage::FrontierMode::Populate,
+            )
+            .expect("seed fresh safe head");
+        let prefix = db._dir.path().join("finalized");
+        storage
+            .insert_initial_finalized_dump(&prefix, 0, 0, 0, 0)
+            .expect("seed finalized snapshot");
+        if has_open_tip {
+            storage
+                .initialize_open_state(0, storage::SafeInputRange::empty_at(0))
+                .expect("seed open Tip");
+        }
+        storage.complete_setup().expect("complete setup");
+        if !has_finalized_snapshot {
+            storage
+                .write(|tx| {
+                    tx.execute("DELETE FROM finalized_snapshot", [])?;
+                    Ok(())
+                })
+                .expect("simulate post-setup snapshot loss");
+        }
+        drop(storage);
+        (db, protocol)
+    }
+
+    #[test]
+    fn final_admission_refuses_new_divergence() {
+        let (db, protocol) = admission_fixture("admit-divergence", true, true);
+        let mut storage = storage::Storage::open_writer(&db.path).expect("open writer");
+        crate::storage::test_helpers::record_canonical_divergence(&mut storage, 7, 0);
+        drop(storage);
+
+        let error =
+            admit_runtime(&db.path, &protocol).expect_err("divergence must refuse final admission");
+        assert!(matches!(
+            error,
+            RecoveryError::Refuse(failure)
+                if matches!(
+                    *failure,
+                    RecoveryFailure::PolicyRefusal(
+                        RecoveryRefusalReason::CanonicalDivergence { nonce: 7 }
+                    )
+                )
+        ));
+    }
+
+    #[test]
+    fn final_admission_retries_when_tip_disappeared() {
+        let (db, protocol) = admission_fixture("admit-no-tip", true, false);
+
+        let error = admit_runtime(&db.path, &protocol)
+            .expect_err("a missing Tip requires a fresh recovery attempt");
+        assert!(matches!(
+            error,
+            RecoveryError::Retry(failure)
+                if matches!(
+                    *failure,
+                    RecoveryFailure::PolicyRetry(
+                        RecoveryRetryReason::AdmissionChanged {
+                            decision: "ensure_open_tip"
+                        }
+                    )
+                )
+        ));
+    }
+
+    #[test]
+    fn final_admission_refuses_missing_snapshot() {
+        let (db, protocol) = admission_fixture("admit-no-snapshot", false, true);
+
+        let error = admit_runtime(&db.path, &protocol)
+            .expect_err("a missing finalized snapshot must refuse final admission");
+        assert!(matches!(
+            error,
+            RecoveryError::Refuse(failure)
+                if matches!(
+                    *failure,
+                    RecoveryFailure::PolicyRefusal(
+                        RecoveryRefusalReason::MissingFinalizedSnapshot
+                    )
+                )
+        ));
     }
 }

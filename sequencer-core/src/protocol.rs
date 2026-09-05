@@ -66,6 +66,34 @@ pub enum ProtocolTimingError {
         read_stale_after: u64,
         danger_threshold: u64,
     },
+    /// A zero block-time estimate makes the wall-clock fallback undefined.
+    #[error("seconds_per_block must be greater than zero")]
+    SecondsPerBlockZero,
+    /// The configured read-staleness horizon must fit in the `u64` Unix-time
+    /// arithmetic used by the detector.
+    #[error(
+        "l1_read_stale_after_blocks ({read_stale_after}) * seconds_per_block \
+         ({seconds_per_block}) exceeds u64::MAX seconds"
+    )]
+    ReadStaleWindowOverflow {
+        read_stale_after: u64,
+        seconds_per_block: u64,
+    },
+}
+
+/// The local wall clock predates the persisted safe-head progress baseline.
+///
+/// This is an unusable timing environment, not a storage invariant violation:
+/// callers must stop issuing soft confirmations until the clock catches up or
+/// a new safe-head advance establishes a usable baseline.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error(
+    "current wall clock ({now_ms} ms) predates last safe-head progress \
+     ({last_safe_progress_ms} ms)"
+)]
+pub struct WallClockRegression {
+    pub now_ms: u64,
+    pub last_safe_progress_ms: u64,
 }
 
 /// Time-based protocol parameters: scheduler-mirroring `max_wait_blocks`
@@ -95,6 +123,17 @@ pub struct ProtocolTiming {
 }
 
 impl ProtocolTiming {
+    /// Advance logical frame time after this many newly-safe L1 blocks.
+    ///
+    /// Protocol-visible, deliberately not configurable: user ops validate at
+    /// their frame's safe block, so this value is the application-clock
+    /// granularity (about a minute on mainnet), a product semantics decision
+    /// — not a lane implementation detail (prose owner:
+    /// `docs/protocol/scheduler-semantics.md`, frame-clock policy). The
+    /// observed tip is used directly, so delayed or epoch-sized observations
+    /// create one frame and never synthesize missed intermediate ticks.
+    pub const FRAME_CLOCK_INTERVAL_SAFE_BLOCKS: u64 = 5;
+
     /// Validated constructor. Rejects timing configurations that would
     /// produce an unusable danger threshold or a degenerate margin.
     ///
@@ -119,6 +158,9 @@ impl ProtocolTiming {
         if l1_read_stale_after_blocks == 0 {
             return Err(ProtocolTimingError::ReadStaleAfterZero);
         }
+        if seconds_per_block == 0 {
+            return Err(ProtocolTimingError::SecondsPerBlockZero);
+        }
         let danger_threshold = max_wait_blocks - preemptive_margin_blocks;
         if l1_read_stale_after_blocks >= danger_threshold {
             return Err(ProtocolTimingError::ReadStaleAfterPastDanger {
@@ -126,6 +168,12 @@ impl ProtocolTiming {
                 danger_threshold,
             });
         }
+        l1_read_stale_after_blocks
+            .checked_mul(seconds_per_block)
+            .ok_or(ProtocolTimingError::ReadStaleWindowOverflow {
+                read_stale_after: l1_read_stale_after_blocks,
+                seconds_per_block,
+            })?;
         Ok(Self {
             max_wait_blocks,
             preemptive_margin_blocks,
@@ -136,31 +184,89 @@ impl ProtocolTiming {
 
     /// The block-age threshold at which preemptive recovery triggers.
     ///
-    /// `saturating_sub` keeps this infallible even on a directly-constructed
-    /// `ProtocolTiming` with an invalid margin (returns 0 in that case).
     /// Production code goes through [`ProtocolTiming::try_new`], which rejects
-    /// that configuration up front.
+    /// an invalid margin up front. A directly-constructed invalid value is a
+    /// test/programming bug and fails loud here.
     pub fn danger_threshold(&self) -> u64 {
-        self.max_wait_blocks
-            .saturating_sub(self.preemptive_margin_blocks)
+        assert!(
+            self.preemptive_margin_blocks > 0,
+            "ProtocolTiming must be constructed with a nonzero preemptive margin"
+        );
+        assert!(
+            self.preemptive_margin_blocks < self.max_wait_blocks,
+            "ProtocolTiming must be constructed with margin < max_wait_blocks"
+        );
+        self.max_wait_blocks - self.preemptive_margin_blocks
     }
 
     /// Wall-clock age, in seconds, after which the L1 safe block is too old
     /// for the sequencer to trust its L1 view.
     pub fn l1_read_stale_after_secs(&self) -> u64 {
+        assert!(
+            self.l1_read_stale_after_blocks > 0,
+            "ProtocolTiming must be constructed with a nonzero L1 read-staleness window"
+        );
+        assert!(
+            self.seconds_per_block > 0,
+            "ProtocolTiming must be constructed with nonzero seconds_per_block"
+        );
         self.l1_read_stale_after_blocks
-            .saturating_mul(self.seconds_per_block.max(1))
+            .checked_mul(self.seconds_per_block)
+            .expect("validated L1 read-staleness window must fit in u64 seconds")
     }
 
     /// Whether the safe block timestamp is too old to support recovery or
     /// continued soft confirmations. `None` means the view is unknown and is
     /// treated as unusable.
     pub fn l1_view_is_stale(&self, safe_block_timestamp_secs: Option<u64>, now_ms: u64) -> bool {
+        assert!(
+            self.seconds_per_block > 0,
+            "ProtocolTiming must be constructed with nonzero seconds_per_block"
+        );
         let Some(timestamp_secs) = safe_block_timestamp_secs else {
             return true;
         };
         let now_secs = now_ms / 1000;
-        now_secs.saturating_sub(timestamp_secs) >= self.l1_read_stale_after_secs()
+        let Some(age_secs) = now_secs.checked_sub(timestamp_secs) else {
+            // Ahead-of-clock is not staleness — the observation is the
+            // freshest possible. Whether the local *clock* is usable against
+            // it is a separate fault ([`Self::clock_cannot_age_l1_view`]),
+            // deliberately checked after the observed danger arms.
+            return false;
+        };
+        age_secs >= self.l1_read_stale_after_secs()
+    }
+
+    /// Whether the local clock is a full block-time or more behind the
+    /// persisted L1 safe-block timestamp — i.e. it cannot age the view at
+    /// all. Sub-block ahead-ness is ordinary NTP-scale skew against a
+    /// block-granular timestamp (usable, age 0) and is tolerated.
+    ///
+    /// This is a clock fault, not a view fault: `check_danger` evaluates it
+    /// only after the observed danger arms, which are pure block arithmetic
+    /// and must not be suppressed by a broken local clock.
+    pub fn clock_cannot_age_l1_view(
+        &self,
+        safe_block_timestamp_secs: Option<u64>,
+        now_ms: u64,
+    ) -> bool {
+        assert!(
+            self.seconds_per_block > 0,
+            "ProtocolTiming must be constructed with nonzero seconds_per_block"
+        );
+        let Some(timestamp_secs) = safe_block_timestamp_secs else {
+            return false;
+        };
+        // Compare at millisecond precision: flooring `now_ms` to seconds
+        // would make the full-block refusal fire up to 999 ms early,
+        // contradicting the sub-block tolerance. Saturating multiplies are
+        // safe: a saturated ahead-side only widens toward refusal for
+        // timestamps that are absurd anyway.
+        let timestamp_ms = timestamp_secs.saturating_mul(1000);
+        match timestamp_ms.checked_sub(now_ms) {
+            Some(ahead_ms) => ahead_ms >= self.seconds_per_block.saturating_mul(1000),
+            None => false,
+        }
     }
 
     /// Wall-clock-adjusted danger threshold, used when the L1 safe head may be
@@ -175,21 +281,46 @@ impl ProtocolTiming {
     /// - Less than one block-time has elapsed — adjustment would be 0, so the
     ///   strict check covers this case directly.
     ///
-    /// Returns `Some(adjusted)` where
+    /// Returns `Ok(Some(adjusted))` where
     /// `adjusted = danger_threshold − (elapsed_secs / seconds_per_block)`,
-    /// saturating at 0.
+    /// saturating at 0. A `now_ms` less than one block-time behind the
+    /// baseline is treated as elapsed 0 — the estimate quantizes elapsed time
+    /// into whole blocks, so a sub-block regression cannot change it and is
+    /// ordinary clock-step noise. Returns [`WallClockRegression`] only
+    /// for larger regressions, which genuinely invalidate the extrapolation;
+    /// callers must treat that environment as unusable rather than silently
+    /// reporting no elapsed time.
     pub fn wall_clock_adjusted_danger_threshold(
         &self,
         last_safe_progress_ms: Option<u64>,
         now_ms: u64,
-    ) -> Option<u64> {
-        let last = last_safe_progress_ms?;
-        let elapsed_secs = now_ms.saturating_sub(last) / 1000;
-        let missed = elapsed_secs / self.seconds_per_block.max(1);
+    ) -> Result<Option<u64>, WallClockRegression> {
+        assert!(
+            self.seconds_per_block > 0,
+            "ProtocolTiming must be constructed with nonzero seconds_per_block"
+        );
+        let Some(last) = last_safe_progress_ms else {
+            return Ok(None);
+        };
+        let elapsed_ms = match now_ms.checked_sub(last) {
+            Some(elapsed) => elapsed,
+            None => {
+                let regression_secs = (last - now_ms) / 1000;
+                if regression_secs < self.seconds_per_block {
+                    return Ok(None);
+                }
+                return Err(WallClockRegression {
+                    now_ms,
+                    last_safe_progress_ms: last,
+                });
+            }
+        };
+        let elapsed_secs = elapsed_ms / 1000;
+        let missed = elapsed_secs / self.seconds_per_block;
         if missed == 0 {
-            return None;
+            return Ok(None);
         }
-        Some(self.danger_threshold().saturating_sub(missed))
+        Ok(Some(self.danger_threshold().saturating_sub(missed)))
     }
 
     /// Scheduler's staleness predicate: a batch is stale when
@@ -295,7 +426,9 @@ pub fn advance_expected_batch_nonce(
 ) -> u64 {
     for nonce in observed_nonces {
         if nonce == expected {
-            expected = expected.saturating_add(1);
+            expected = expected
+                .checked_add(1)
+                .expect("expected batch nonce overflow: contract-impossible");
         }
     }
     expected
@@ -379,10 +512,60 @@ mod tests {
     }
 
     #[test]
+    fn l1_view_is_stale_never_fires_on_a_future_timestamp() {
+        // Ahead-of-clock is not staleness — the observation is the freshest
+        // possible. Clock usability is `clock_cannot_age_l1_view`'s job.
+        assert!(!timing().l1_view_is_stale(Some(1_001), 1_000_000));
+        assert!(!timing().l1_view_is_stale(Some(1_012), 1_000_000));
+        assert!(
+            !timing().l1_view_is_stale(Some(1_001), 1_001_000),
+            "equality is a usable zero-age observation"
+        );
+    }
+
+    #[test]
+    fn clock_cannot_age_l1_view_tolerates_sub_block_skew() {
+        let cfg = timing();
+        // No view at all: nothing for the clock to age — not a clock fault.
+        assert!(!cfg.clock_cannot_age_l1_view(None, 1_000_000));
+        // Behind or equal: ordinary aging, never a clock fault.
+        assert!(!cfg.clock_cannot_age_l1_view(Some(900), 1_000_000));
+        assert!(!cfg.clock_cannot_age_l1_view(Some(1_000), 1_000_000));
+        // Sub-block ahead-ness is NTP-scale skew against a block-granular
+        // timestamp: usable, age 0.
+        assert!(!cfg.clock_cannot_age_l1_view(Some(1_011), 1_000_000));
+        // Millisecond precision at the boundary: 11.999 s and 11.001 s ahead
+        // are both sub-block; exactly 12.000 s refuses.
+        assert!(!cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_001));
+        assert!(!cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_999));
+        assert!(cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_000));
+    }
+
+    #[test]
+    #[should_panic(expected = "nonzero seconds_per_block")]
+    fn l1_view_is_stale_fails_loud_on_zero_block_time_direct_construction() {
+        let cfg = ProtocolTiming {
+            seconds_per_block: 0,
+            ..timing()
+        };
+        let _ = cfg.l1_view_is_stale(Some(1_001), 1_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "nonzero seconds_per_block")]
+    fn clock_cannot_age_l1_view_fails_loud_on_zero_block_time_direct_construction() {
+        let cfg = ProtocolTiming {
+            seconds_per_block: 0,
+            ..timing()
+        };
+        let _ = cfg.clock_cannot_age_l1_view(Some(1_001), 1_000_000);
+    }
+
+    #[test]
     fn wall_clock_adjusted_threshold_returns_none_without_baseline() {
         assert_eq!(
             timing().wall_clock_adjusted_danger_threshold(None, 1_000_000),
-            None,
+            Ok(None),
         );
     }
 
@@ -393,7 +576,39 @@ mod tests {
         let now = last + 11_000;
         assert_eq!(
             timing().wall_clock_adjusted_danger_threshold(Some(last), now),
-            None,
+            Ok(None),
+        );
+    }
+
+    #[test]
+    fn wall_clock_adjusted_threshold_rejects_regression() {
+        let last = 1_000_000;
+        // Sub-block regressions are quantization noise: identical outcome to
+        // elapsed = 0 for a block-granular estimate (clock steps are
+        // legitimate).
+        assert_eq!(
+            timing().wall_clock_adjusted_danger_threshold(Some(last), last - 1),
+            Ok(None),
+            "a sub-block clock step must not be a fault"
+        );
+        assert_eq!(
+            timing().wall_clock_adjusted_danger_threshold(Some(last), last - 11_999),
+            Ok(None),
+            "just under one block-time of regression is still noise"
+        );
+        // A regression of one block-time or more genuinely invalidates the
+        // extrapolation.
+        assert_eq!(
+            timing().wall_clock_adjusted_danger_threshold(Some(last), last - 12_000),
+            Err(WallClockRegression {
+                now_ms: last - 12_000,
+                last_safe_progress_ms: last,
+            }),
+        );
+        assert_eq!(
+            timing().wall_clock_adjusted_danger_threshold(Some(last), last),
+            Ok(None),
+            "equality is a usable zero-elapsed baseline"
         );
     }
 
@@ -405,7 +620,7 @@ mod tests {
         let cfg = timing();
         assert_eq!(
             cfg.wall_clock_adjusted_danger_threshold(Some(last), now),
-            Some(cfg.danger_threshold() - 25),
+            Ok(Some(cfg.danger_threshold() - 25)),
         );
     }
 
@@ -416,27 +631,40 @@ mod tests {
         let now = u64::MAX / 2;
         assert_eq!(
             timing().wall_clock_adjusted_danger_threshold(Some(last), now),
-            Some(0),
+            Ok(Some(0)),
         );
     }
 
     #[test]
-    fn danger_threshold_saturates_to_zero_on_invalid_margin() {
-        // try_new rejects this configuration; if a test ever constructs it
-        // directly via struct-literal syntax, danger_threshold returns 0
-        // rather than panicking. (Cleaner than a hard panic during a logging
-        // macro on production startup.)
+    #[should_panic(expected = "ProtocolTiming must be constructed with margin < max_wait_blocks")]
+    fn danger_threshold_fails_loud_on_invalid_direct_construction() {
+        // Production uses try_new. A direct invalid struct literal is a
+        // programming error and must not be normalized into threshold zero.
         let cfg = ProtocolTiming {
             preemptive_margin_blocks: MAX_WAIT,
             ..timing()
         };
-        assert_eq!(cfg.danger_threshold(), 0);
+        let _ = cfg.danger_threshold();
+    }
 
+    #[test]
+    #[should_panic(expected = "nonzero preemptive margin")]
+    fn danger_threshold_fails_loud_on_zero_margin_direct_construction() {
         let cfg = ProtocolTiming {
-            preemptive_margin_blocks: MAX_WAIT + 1,
+            preemptive_margin_blocks: 0,
             ..timing()
         };
-        assert_eq!(cfg.danger_threshold(), 0);
+        let _ = cfg.danger_threshold();
+    }
+
+    #[test]
+    #[should_panic(expected = "nonzero seconds_per_block")]
+    fn wall_clock_helpers_fail_loud_on_zero_block_time_direct_construction() {
+        let cfg = ProtocolTiming {
+            seconds_per_block: 0,
+            ..timing()
+        };
+        let _ = cfg.wall_clock_adjusted_danger_threshold(None, 0);
     }
 
     #[test]
@@ -485,6 +713,25 @@ mod tests {
         assert_eq!(
             ProtocolTiming::try_new(MAX_WAIT, 75, 0, 12),
             Err(ProtocolTimingError::ReadStaleAfterZero),
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_zero_seconds_per_block() {
+        assert_eq!(
+            ProtocolTiming::try_new(MAX_WAIT, 75, 1, 0),
+            Err(ProtocolTimingError::SecondsPerBlockZero),
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_overflowing_read_staleness_window() {
+        assert_eq!(
+            ProtocolTiming::try_new(u64::MAX, 1, u64::MAX - 2, 2),
+            Err(ProtocolTimingError::ReadStaleWindowOverflow {
+                read_stale_after: u64::MAX - 2,
+                seconds_per_block: 2,
+            }),
         );
     }
 
@@ -659,5 +906,11 @@ mod tests {
         );
         assert_eq!(advance_expected_batch_nonce(0, vec![0, 2, 1]), 2);
         assert_eq!(advance_expected_batch_nonce(2, vec![2, 3]), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected batch nonce overflow: contract-impossible")]
+    fn advance_expected_batch_nonce_fails_loud_on_overflow() {
+        let _ = advance_expected_batch_nonce(u64::MAX, [u64::MAX]);
     }
 }

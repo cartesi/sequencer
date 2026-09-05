@@ -19,14 +19,15 @@
 //! against arbitrarily malformed self-submissions: the scheduler-frontier
 //! materialization in [`super::safe_accepted_batches`] trusts that on-chain
 //! batches from the sequencer's own address are structurally valid. The
-//! sequencer controls its own submissions — this is a deliberate system
-//! assumption, not a gap.
+//! sequencer controls its own submissions; the threat model records that
+//! self-trust boundary.
 
-use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior, params};
 use sequencer_core::protocol::{ProtocolTiming, age_exceeds};
 
 use super::Storage;
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
+use super::history::advance_recovery_generation_in;
 use super::ingress::open_fresh_tip_in_tx;
 use super::queries::{
     current_safe_block_required, current_safe_block_timestamp, last_safe_progress_ms,
@@ -36,21 +37,19 @@ use super::snapshot_dumps::{batch_nonce_in, clear_pending_dumps_from_nonce_in};
 
 /// Outcome of a danger-zone check.
 ///
-/// Each variant maps to a distinct recovery response, encoded in
-/// [`super::super::recovery::StartupAction`]:
+/// Each variant maps to a distinct response in the startup recovery reducer:
 ///
-/// - `L1ViewStale` → refuse boot. The L1 safe block is too old or unknown.
-/// - `ClosedBatchInDanger(closed_idx)` → flush + cascade. A closed batch past the
-///   accepted frontier has L1 transactions that may already be on chain;
-///   we need the flush to resolve their fate before cascading.
+/// - `L1ViewStale` → retry boot. The L1 safe block is too old or unknown.
+/// - `ClosedBatchInDanger(closed_idx)` → enter the phase-granular
+///   Flush/Sync/Cascade sequence.
 /// - `TipInDanger(tip_idx)` → direct Tip recovery, no flush. The Tip has no L1
 ///   footprint, so we can invalidate it and open a fresh one without
 ///   any L1 round-trip.
-/// - `EstimatedBatchInDanger(idx)` → refuse boot. The observed safe block is
+/// - `EstimatedBatchInDanger(idx)` → retry boot. The observed safe block is
 ///   still below the danger threshold, but wall-clock time since the last
 ///   safe-head advance has consumed the batch's remaining runway.
-/// - `Safe` → no recovery work; just ensure the Tip exists (torn-state
-///   crash recovery branch).
+/// - `Safe` → admit when a Tip exists, otherwise run `EnsureOpenTip` and
+///   re-inspect.
 ///
 /// The runtime danger detector treats every non-`Safe` variant as
 /// "exit for recovery" — the difference between them only matters at the
@@ -59,16 +58,16 @@ use super::snapshot_dumps::{batch_nonce_in, clear_pending_dumps_from_nonce_in};
 pub enum DangerStatus {
     /// No danger detected — none of the checks tripped.
     Safe,
-    /// A fully-accepted L1 landing failed the content-identity check
-    /// (review R2): canonical state contains executed effects with no
+    /// A fully-accepted L1 landing failed the content-identity check:
+    /// canonical state contains executed effects with no
     /// reliable local source. Carries the diverged batch nonce. Ranked
     /// ahead of every other arm so the respawn loop can never route a
-    /// diverged node into `Proceed`/`FlushAndCascade`. The remedy is
-    /// cockroach recovery (wipe + rebuild from L1), never standard
-    /// recovery.
+    /// diverged node into a provider call, mutation, or admission. The remedy
+    /// is cockroach recovery (wipe + rebuild from L1), never standard recovery.
     CanonicalDivergence(u64),
-    /// L1 safe-head timestamp is too old or unknown. Recovery cannot reason
-    /// from the local L1 view, so startup must refuse.
+    /// L1 safe-head timestamp is too old/unknown, or the current clock
+    /// predates one of the persisted safety baselines. Recovery cannot reason
+    /// from the local L1 view, so startup must retry.
     L1ViewStale,
     /// Observed-safe check tripped on a *closed* batch past the
     /// accepted frontier: aged beyond `protocol.danger_threshold()` against
@@ -84,6 +83,57 @@ pub enum DangerStatus {
     /// freshness check passed. We refuse rather than recover because the batch
     /// only crossed danger in estimated time, not observed safe-state.
     EstimatedBatchInDanger(u64),
+}
+
+/// One transactionally consistent local view consumed by the startup
+/// recovery reducer.
+///
+/// Keeping these facts together is load-bearing: admission and recovery-phase
+/// selection must not combine a danger verdict from one SQLite snapshot with
+/// Tip/snapshot/head facts from another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryInspection {
+    pub(crate) danger: DangerStatus,
+    pub(crate) has_finalized_snapshot: bool,
+    pub(crate) has_open_tip: bool,
+    pub(crate) current_safe_block: Option<u64>,
+}
+
+/// A recovery mutation was refused because the transaction no longer
+/// satisfies the phase selected by the reducer.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecoveryMutationError {
+    #[error(transparent)]
+    Storage(#[from] rusqlite::Error),
+    #[error("canonical divergence at batch nonce {nonce} forbids standard recovery")]
+    CanonicalDivergence { nonce: u64 },
+    #[error("recovery decision is stale: expected {expected:?}, found {actual:?}")]
+    StaleDecision {
+        expected: DangerStatus,
+        actual: DangerStatus,
+    },
+    #[error("cannot open the Tip without a finalized snapshot")]
+    MissingFinalizedSnapshot,
+    /// The `EnsureOpenTip` phase found a valid open Tip already present. A
+    /// stale no-Tip decision, not a danger change; unreachable under the
+    /// process lock, and retryable if it ever fires.
+    #[error("the Tip was already open when the EnsureOpenTip phase ran")]
+    TipAlreadyOpen,
+    /// The `EnsureOpenTip` phase's own transaction left no valid open Tip
+    /// after opening one. Impossible by construction; refused rather than
+    /// committed, so the reducer's one cycle (Repaired → EnsureOpenTip →
+    /// Repaired) cannot spin on it.
+    #[error("the EnsureOpenTip phase left no valid open Tip in its own transaction")]
+    TipMissingAfterOpen,
+    #[error(
+        "post-flush re-sync reached safe block {resynced_safe_block}, behind the flush observation at {flush_observed_safe_block}"
+    )]
+    ResyncBehindFlushView {
+        resynced_safe_block: u64,
+        flush_observed_safe_block: u64,
+    },
+    #[error("post-flush re-sync did not persist a safe head")]
+    MissingSafeHead,
 }
 
 impl DangerStatus {
@@ -116,20 +166,40 @@ impl DangerStatus {
 }
 
 impl Storage {
+    /// Whether the canonical-divergence marker (I15) is present, and the
+    /// recorded `(nonce, safe_input_index)` if so. Standard
+    /// recovery is forbidden while the marker exists; callers on the recovery
+    /// path must check this before any batch-tree mutation.
+    pub fn canonical_divergence(&mut self) -> Result<Option<(u64, u64)>> {
+        self.read(|tx| canonical_divergence_in(tx))
+    }
+
     /// Unified danger-zone detection.
     ///
-    /// Runs four checks inside a single read transaction, in priority order:
+    /// Runs checks inside a single read transaction, in priority order:
     ///
-    /// 1. **L1 read freshness**: if the safe block timestamp is missing or
+    /// 1. **Canonical divergence**: an already-confirmed mismatch is an
+    ///    absorbing terminal fact and outranks every view/clock condition.
+    /// 2. **L1 view freshness**: if the safe block timestamp is missing or
     ///    older than `protocol.l1_read_stale_after_blocks`, return
-    ///    `L1ViewStale`. A stale L1 view is unusable even if the RPC answers.
-    /// 2. **Observed closed-frontier**: `find_closed_frontier_batch_in_danger`
+    ///    `L1ViewStale`. A stale L1 *view* is unusable even if the RPC
+    ///    answers — recovery itself needs a trustworthy view, so this gate
+    ///    stays ahead of everything.
+    /// 3. **Observed closed-frontier**: `find_closed_frontier_batch_in_danger`
     ///    against `protocol.danger_threshold()`. Uses the observed safe block.
-    /// 3. **Observed open Tip**: `find_tip_batch_in_danger` against
+    /// 4. **Observed open Tip**: `find_tip_batch_in_danger` against
     ///    `protocol.danger_threshold()`. Catches the case where all closed
     ///    batches are gold but the Tip is aging — the lane is stuck or the
     ///    Tip rotated without a safe-block advance.
-    /// 4. **Batch-relative wall-clock estimate**: if a correction applies
+    /// 5. **Clock faults**, deliberately after the observed arms: a local
+    ///    clock a full block-time or more out of step with either persisted
+    ///    baseline (behind the safe-block timestamp, or behind the local
+    ///    last-progress baseline) is a *clock* fault, not a view fault. The
+    ///    observed arms (3, 4) are pure block arithmetic, and a wall-clock
+    ///    fault must never suppress a danger verdict that stands on L1
+    ///    observation alone. Sub-block skew in either direction is
+    ///    quantization noise, not a fault.
+    /// 6. **Batch-relative wall-clock estimate**: if a correction applies
     ///    ([`ProtocolTiming::wall_clock_adjusted_danger_threshold`] returns
     ///    `Some`), widens to `find_first_batch_in_danger` against
     ///    `danger_threshold − missed_blocks`. This is a fallback for when the
@@ -138,13 +208,18 @@ impl Storage {
     ///    to trust for continued soft confirmations.
     ///
     /// Returns the first variant that fires, in the order
-    /// `L1ViewStale` → `ClosedBatchInDanger` → `TipInDanger` →
+    /// `CanonicalDivergence` → `L1ViewStale` (stale view) →
+    /// `ClosedBatchInDanger` → `TipInDanger` → `L1ViewStale` (clock fault) →
     /// `EstimatedBatchInDanger` → `Safe`. The order encodes the
     /// "trust" hierarchy:
     ///
-    /// - **L1 view freshness gates everything.** If the safe block timestamp
-    ///   is too old or unknown, neither recovery nor continued soft
-    ///   confirmations are honest.
+    /// - **View staleness gates everything after divergence.** If the safe
+    ///   block timestamp is too old or unknown, neither recovery nor
+    ///   continued soft confirmations are honest.
+    /// - **Clock faults yield to observed danger.** A local clock a full
+    ///   block-time or more out of step with either persisted baseline
+    ///   refuses only when no observed danger stands; sub-block skew is
+    ///   tolerated.
     /// - **Closed observed danger beats Tip.** When a closed batch is in danger,
     ///   we need a flush (to resolve its L1 transaction's fate) regardless
     ///   of the Tip's state. The cascade naturally catches the Tip via
@@ -160,37 +235,113 @@ impl Storage {
     /// so the storage layer stays testable without time mocking. Production
     /// callers pass the current Unix-ms clock.
     pub fn check_danger(&mut self, protocol: &ProtocolTiming, now_ms: u64) -> Result<DangerStatus> {
-        self.read(|tx| {
-            // The divergence marker outranks everything — including the
-            // L1-staleness gate: it records an already-confirmed fact about
-            // canonical state, not a view-dependent estimate, and no amount
-            // of L1 freshening or flushing repairs it (review R2).
-            if let Some((nonce, _)) = canonical_divergence_in(tx)? {
-                return Ok(DangerStatus::CanonicalDivergence(nonce));
-            }
+        self.read(|tx| check_danger_in(tx, protocol, now_ms))
+    }
 
-            if protocol.l1_view_is_stale(current_safe_block_timestamp(tx)?, now_ms) {
-                return Ok(DangerStatus::L1ViewStale);
-            }
+    /// Read every local fact used by the startup reducer in one transaction.
+    pub(crate) fn inspect_recovery(
+        &mut self,
+        protocol: &ProtocolTiming,
+        now_ms: u64,
+    ) -> Result<RecoveryInspection> {
+        self.read(|tx| inspect_recovery_in(tx, protocol, now_ms))
+    }
 
-            let danger_threshold = protocol.danger_threshold();
-            if let Some(idx) = find_closed_frontier_batch_in_danger(tx, danger_threshold)? {
-                return Ok(DangerStatus::ClosedBatchInDanger(idx));
-            }
+    /// Execute the reducer's `EnsureOpenTip` phase only if its local decision
+    /// still holds in the write transaction.
+    pub(crate) fn ensure_open_tip_for_recovery(
+        &mut self,
+        protocol: &ProtocolTiming,
+        now_ms: u64,
+    ) -> std::result::Result<(), RecoveryMutationError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let facts = inspect_recovery_in(&tx, protocol, now_ms)?;
+        refuse_divergence(facts.danger)?;
+        if !facts.has_finalized_snapshot {
+            return Err(RecoveryMutationError::MissingFinalizedSnapshot);
+        }
+        if facts.danger != DangerStatus::Safe {
+            return Err(RecoveryMutationError::StaleDecision {
+                expected: DangerStatus::Safe,
+                actual: facts.danger,
+            });
+        }
+        if facts.has_open_tip {
+            return Err(RecoveryMutationError::TipAlreadyOpen);
+        }
+        open_fresh_tip_in_tx(&tx)?;
+        // Postcondition, enforced where it can be violated: this phase is the
+        // only edge back into `Repaired` without a Tip, so it must never
+        // commit without one. A violation is a typed refuse (exit 30), never
+        // a retry that would spin the reducer, and never a `debug_assert`
+        // that compiles out.
+        if !has_valid_open_batch(&tx)? {
+            return Err(RecoveryMutationError::TipMissingAfterOpen);
+        }
+        tx.commit()?;
+        Ok(())
+    }
 
-            if let Some(idx) = find_tip_batch_in_danger(tx, danger_threshold)? {
-                return Ok(DangerStatus::TipInDanger(idx));
-            }
+    /// Execute the reducer's `RecoverTip` phase only while the same Tip is
+    /// still the observed-danger arm in the write transaction.
+    pub(crate) fn recover_aging_tip_for_recovery(
+        &mut self,
+        expected_batch_index: u64,
+        protocol: &ProtocolTiming,
+        now_ms: u64,
+    ) -> std::result::Result<Vec<u64>, RecoveryMutationError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let facts = inspect_recovery_in(&tx, protocol, now_ms)?;
+        refuse_divergence(facts.danger)?;
+        if !facts.has_finalized_snapshot {
+            return Err(RecoveryMutationError::MissingFinalizedSnapshot);
+        }
+        let expected = DangerStatus::TipInDanger(expected_batch_index);
+        if facts.danger != expected {
+            return Err(RecoveryMutationError::StaleDecision {
+                expected,
+                actual: facts.danger,
+            });
+        }
+        let invalidated = recover_aging_tip_inner(&tx, protocol.danger_threshold())?;
+        tx.commit()?;
+        Ok(invalidated)
+    }
 
-            let last = last_safe_progress_ms(tx)?;
-            if let Some(adjusted) = protocol.wall_clock_adjusted_danger_threshold(last, now_ms)
-                && let Some(idx) = find_first_batch_in_danger(tx, adjusted)?
-            {
-                return Ok(DangerStatus::EstimatedBatchInDanger(idx));
-            }
-
-            Ok(DangerStatus::Safe)
-        })
+    /// Execute the reducer's `Cascade` phase. The ephemeral flush witness is
+    /// represented by its observed safe-block floor; this transaction
+    /// reasserts both I15 and the post-flush resync coherence check
+    /// immediately before changing the batch tree.
+    pub(crate) fn recover_post_flush_for_recovery(
+        &mut self,
+        flush_observed_safe_block: u64,
+        protocol: &ProtocolTiming,
+        now_ms: u64,
+    ) -> std::result::Result<Vec<u64>, RecoveryMutationError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let facts = inspect_recovery_in(&tx, protocol, now_ms)?;
+        refuse_divergence(facts.danger)?;
+        if !facts.has_finalized_snapshot {
+            return Err(RecoveryMutationError::MissingFinalizedSnapshot);
+        }
+        let resynced_safe_block = facts
+            .current_safe_block
+            .ok_or(RecoveryMutationError::MissingSafeHead)?;
+        if resynced_safe_block < flush_observed_safe_block {
+            return Err(RecoveryMutationError::ResyncBehindFlushView {
+                resynced_safe_block,
+                flush_observed_safe_block,
+            });
+        }
+        let invalidated = recover_post_flush_inner(&tx, protocol.danger_threshold())?;
+        tx.commit()?;
+        Ok(invalidated)
     }
 
     /// Mark a single batch as invalid. Test-only seeder — production code goes
@@ -207,127 +358,172 @@ impl Storage {
         Ok(())
     }
 
-    /// Cascade everything past the gold frontier. Called from the
-    /// `FlushAndCascade` startup path, after the mempool flush has resolved
-    /// every wallet-nonce slot and `safe_accepted_batches` has been re-synced.
-    ///
-    /// # The "everything past gold is doomed" rule
-    ///
-    /// At this point the gold frontier is at its maximum extent: every
-    /// submitted batch has either been accepted (gold) or rejected by the
-    /// scheduler simulation (Silver-stale, since nonce-mismatch is impossible
-    /// at the frontier under self-trust), or its tx was killed by a flush
-    /// no-op (Pending, no `safe_input`). All three non-gold states are doomed:
-    ///
-    /// - **Silver-stale:** scheduler skipped it; downstream batches are
-    ///   nonce-poisoned.
-    /// - **Pending:** the original L1 tx is dead. Re-submission could in
-    ///   principle land fresh, but the *next* recovery cycle's flush would
-    ///   compete with the resub at its new wallet-nonce slot and the bumped
-    ///   no-op typically wins. The system would loop until current staleness
-    ///   crossed `MAX_WAIT_BLOCKS`. Cascading now converges in one cycle.
-    ///
-    /// So once we've committed to recovery (the danger detector tripped, the
-    /// flush ran), the right move is to cascade the entire non-gold suffix
-    /// and open a fresh recovery batch.
-    ///
-    /// Three aftermath shapes:
-    ///
-    /// 1. **Everything worked:** all in-flight batches landed fresh and were
-    ///    accepted. Gold extends to the last submitted batch; no first
-    ///    non-gold closed. (See "Tip handling" below for the subtle subcase.)
-    /// 2. **Mixed:** some landed (stale or poisoned), some replaced. First
-    ///    non-gold closed is either Silver-stale or Pending. Cascade from
-    ///    there; the `batch_index >= N` rule catches the rest of the suffix
-    ///    including the open Tip.
-    /// 3. **All replaced:** flush no-ops won every race. Gold doesn't
-    ///    advance; first non-gold closed is the very first non-accepted batch.
-    ///
-    /// # Tip handling
-    ///
-    /// In cases (2)/(3) the cascade catches the Tip via `batch_index >= N`.
-    /// In case (1), there's no closed pivot — but the Tip can still be in
-    /// the danger zone:
-    ///
-    /// When the lane rotates a batch without a safe-block advance between
-    /// frames (e.g. immediately after init, when both share the bootstrap
-    /// `safe_block`), the Tip's `first_frame.safe_block` equals the closed
-    /// batch's. The closed batch can become gold by inclusion-staleness
-    /// (`inclusion_block - first_frame < MAX_WAIT`) while the Tip's age,
-    /// computed against `current_safe_block` after the flush wait, has
-    /// crossed `danger_threshold`. Pure monotonicity (`S_tip ≥ S_closed`) doesn't
-    /// rule this out — equality is allowed.
-    ///
-    /// So in the no-pivot branch we additionally check the Tip against
-    /// `danger_threshold` (the same threshold that would have triggered
-    /// recovery had the Tip been a closed batch). We're already committed
-    /// to recovery; the Tip is past gold; if it's also in the danger zone,
-    /// cascade it and open a fresh one.
-    ///
-    /// # Atomicity
-    ///
-    /// Runs as a single SQLite write transaction. On crash mid-way, the
-    /// txn rolls back; on commit, the cascade and the recovery batch open
-    /// land together. Idempotent on re-run because `valid_*` views filter
-    /// out already-invalidated rows.
-    ///
-    /// # Precondition
-    ///
-    /// The caller MUST have just synced L1 state via
-    /// [`Storage::append_safe_inputs`]; the gold frontier in
-    /// `safe_accepted_batches` must reflect the latest safe head. Otherwise
-    /// the cascade may invalidate batches that haven't yet had a chance to
-    /// be processed by the scheduler simulation.
-    ///
-    /// Returns the newly-invalidated batch indices (empty if none).
+    /// Test-only unguarded Cascade primitive. Production calls
+    /// [`Storage::recover_post_flush_for_recovery`]; the design rationale
+    /// lives on [`recover_post_flush_inner`], the shared body.
+    #[cfg(test)]
     pub fn recover_post_flush(&mut self, danger_threshold: u64) -> Result<Vec<u64>> {
         self.write(|tx| recover_post_flush_inner(tx, danger_threshold))
     }
 
-    /// Cascade the open Tip if its first frame has aged past
-    /// `danger_threshold`. Called from the `RecoverTip` startup path (no flush
-    /// happened). The `Proceed` path performs no DB writes and does not call
-    /// this.
-    ///
-    /// # Why a threshold here, but no closed-frontier check
-    ///
-    /// In the Proceed path no flush ran, so closed batches past the gold
-    /// frontier (if any) might still be in their natural lifecycle —
-    /// pending in the mempool, recently included, awaiting safe finality.
-    /// Cascading them would prematurely abort their progression.
-    ///
-    /// The Tip is different: it has no L1 footprint at all (no `w_nonce`,
-    /// no `safe_input`), so there's no L1 outcome to wait on. Once its
-    /// first frame has aged into the danger zone, the rule "everything
-    /// past gold is bad once we're committed to recovery" applies, and in
-    /// the `RecoverTip` path startup is already committed.
-    ///
-    /// # Threshold = danger_threshold, not MAX_WAIT
-    ///
-    /// We use `danger_threshold` (= `MAX_WAIT_BLOCKS - margin`) rather than
-    /// `MAX_WAIT_BLOCKS`. The Tip threshold is the same one that would
-    /// trigger the recovery cycle had the Tip been a closed batch. If the
-    /// Tip is past that threshold, the next danger detector tick after
-    /// resume would re-trip on the Tip's eventual first close + submission
-    /// anyway (the closed batch would inherit its first frame's safe_block).
-    /// Cascading now saves the cycle.
-    ///
-    /// # Precondition
-    ///
-    /// As with [`Storage::recover_post_flush`], the caller must have synced
-    /// L1 state. (Threshold comparison reads `current_safe_block` from
-    /// `l1_safe_head`.)
-    ///
-    /// Returns the newly-invalidated batch indices (empty if Tip is fresh,
-    /// `[tip_index]` when the Tip was cascaded).
+    /// Test-only unguarded primitive; production calls
+    /// [`Storage::recover_aging_tip_for_recovery`], which transactionally
+    /// reasserts the exact reducer decision. Design rationale on
+    /// [`recover_aging_tip_inner`], the shared body.
+    #[cfg(test)]
     pub fn recover_aging_tip(&mut self, danger_threshold: u64) -> Result<Vec<u64>> {
         self.write(|tx| recover_aging_tip_inner(tx, danger_threshold))
     }
 }
 
+pub(super) fn inspect_recovery_in(
+    conn: &Connection,
+    protocol: &ProtocolTiming,
+    now_ms: u64,
+) -> Result<RecoveryInspection> {
+    let danger = check_danger_in(conn, protocol, now_ms)?;
+    let has_finalized_snapshot = has_finalized_snapshot_in(conn)?;
+    Ok(RecoveryInspection {
+        danger,
+        has_finalized_snapshot,
+        has_open_tip: has_valid_open_batch(conn)?,
+        current_safe_block: super::queries::current_safe_block(conn)?,
+    })
+}
+
+fn has_finalized_snapshot_in(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM finalized_snapshot)",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn check_danger_in(
+    conn: &Connection,
+    protocol: &ProtocolTiming,
+    now_ms: u64,
+) -> Result<DangerStatus> {
+    // The divergence marker outranks everything — including the L1-staleness
+    // gate. It records an already-confirmed canonical fact.
+    if let Some((nonce, _)) = canonical_divergence_in(conn)? {
+        return Ok(DangerStatus::CanonicalDivergence(nonce));
+    }
+
+    let safe_block_timestamp = current_safe_block_timestamp(conn)?;
+    let last_progress = last_safe_progress_ms(conn)?;
+    if protocol.l1_view_is_stale(safe_block_timestamp, now_ms) {
+        return Ok(DangerStatus::L1ViewStale);
+    }
+
+    let danger_threshold = protocol.danger_threshold();
+    if let Some(idx) = find_closed_frontier_batch_in_danger(conn, danger_threshold)? {
+        return Ok(DangerStatus::ClosedBatchInDanger(idx));
+    }
+    if let Some(idx) = find_tip_batch_in_danger(conn, danger_threshold)? {
+        return Ok(DangerStatus::TipInDanger(idx));
+    }
+
+    if protocol.clock_cannot_age_l1_view(safe_block_timestamp, now_ms) {
+        return Ok(DangerStatus::L1ViewStale);
+    }
+    let adjusted_danger_threshold =
+        match protocol.wall_clock_adjusted_danger_threshold(last_progress, now_ms) {
+            Ok(adjusted) => adjusted,
+            Err(_) => return Ok(DangerStatus::L1ViewStale),
+        };
+    if let Some(adjusted) = adjusted_danger_threshold
+        && let Some(idx) = find_first_batch_in_danger(conn, adjusted)?
+    {
+        return Ok(DangerStatus::EstimatedBatchInDanger(idx));
+    }
+    Ok(DangerStatus::Safe)
+}
+
+fn refuse_divergence(danger: DangerStatus) -> std::result::Result<(), RecoveryMutationError> {
+    if let DangerStatus::CanonicalDivergence(nonce) = danger {
+        return Err(RecoveryMutationError::CanonicalDivergence { nonce });
+    }
+    Ok(())
+}
+
 // ── Free functions used by both recovery and the batch submitter ──────────
 
-/// See [`Storage::recover_post_flush`] for the design rationale.
+/// Cascade the non-gold suffix and open a fresh recovery batch (the shared
+/// body behind [`Storage::recover_post_flush_for_recovery`], which the
+/// reducer reaches after carrying a Flush witness through a caught-up
+/// Sync). Homed here, not on the test wrapper, so rustdoc builds it and a
+/// wrapper cleanup cannot delete the design record.
+///
+/// # The "everything past gold is doomed" rule
+///
+/// At this point the gold frontier is at its maximum extent: every
+/// submitted batch has either been accepted (gold) or rejected by the
+/// scheduler simulation (Silver-stale, since nonce-mismatch is impossible
+/// at the frontier under self-trust), or its tx was killed by a flush
+/// no-op (Pending, no `safe_input`). All three non-gold states are doomed:
+///
+/// - **Silver-stale:** scheduler skipped it; downstream batches are
+///   nonce-poisoned.
+/// - **Pending:** the original L1 tx is dead. Re-submission could in
+///   principle land fresh, but the *next* recovery cycle's flush would
+///   compete with the resub at its new wallet-nonce slot and the bumped
+///   no-op typically wins. The system would loop until current staleness
+///   crossed `MAX_WAIT_BLOCKS`. Cascading now converges in one cycle.
+///
+/// So once we've committed to recovery (the danger detector tripped, the
+/// flush ran), the right move is to cascade the entire non-gold suffix
+/// and open a fresh recovery batch.
+///
+/// Three aftermath shapes:
+///
+/// 1. **Everything worked:** all in-flight batches landed fresh and were
+///    accepted. Gold extends to the last submitted batch; no first
+///    non-gold closed. (See "Tip handling" below for the subtle subcase.)
+/// 2. **Mixed:** some landed (stale or poisoned), some replaced. First
+///    non-gold closed is either Silver-stale or Pending. Cascade from
+///    there; the `batch_index >= N` rule catches the rest of the suffix
+///    including the open Tip.
+/// 3. **All replaced:** flush no-ops won every race. Gold doesn't
+///    advance; first non-gold closed is the very first non-accepted batch.
+///
+/// # Tip handling
+///
+/// In cases (2)/(3) the cascade catches the Tip via `batch_index >= N`.
+/// In case (1), there's no closed pivot — but the Tip can still be in
+/// the danger zone:
+///
+/// When the lane rotates a batch without a safe-block advance between
+/// frames (e.g. immediately after init, when both share the bootstrap
+/// `safe_block`), the Tip's `first_frame.safe_block` equals the closed
+/// batch's. The closed batch can become gold by inclusion-staleness
+/// (`inclusion_block - first_frame < MAX_WAIT`) while the Tip's age,
+/// computed against `current_safe_block` after the flush wait, has
+/// crossed `danger_threshold`. Pure monotonicity (`S_tip ≥ S_closed`) doesn't
+/// rule this out — equality is allowed.
+///
+/// So in the no-pivot branch we additionally check the Tip against
+/// `danger_threshold` (the same threshold that would have triggered
+/// recovery had the Tip been a closed batch). We're already committed
+/// to recovery; the Tip is past gold; if it's also in the danger zone,
+/// cascade it and open a fresh one.
+///
+/// # Atomicity
+///
+/// Runs as a single SQLite write transaction. On crash mid-way, the
+/// txn rolls back; on commit, the cascade and the recovery batch open
+/// land together. Idempotent on re-run because `valid_*` views filter
+/// out already-invalidated rows.
+///
+/// # Precondition
+///
+/// The caller MUST have just synced L1 state via
+/// [`Storage::append_safe_inputs`]; the gold frontier in
+/// `safe_accepted_batches` must reflect the latest safe head. Otherwise
+/// the cascade may invalidate batches that haven't yet had a chance to
+/// be processed by the scheduler simulation.
+///
+/// Returns the newly-invalidated batch indices (empty if none).
 fn recover_post_flush_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Result<Vec<u64>> {
     // Path 1: any closed batch past gold cascades unconditionally.
     let pivot = match first_non_gold_closed_batch(tx)? {
@@ -339,7 +535,43 @@ fn recover_post_flush_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resu
     cascade_and_reopen(tx, pivot)
 }
 
-/// See [`Storage::recover_aging_tip`] for the design rationale.
+/// Cascade the open Tip if its first frame has aged past
+/// `danger_threshold` (the shared body behind
+/// [`Storage::recover_aging_tip_for_recovery`]). Homed here, not on the
+/// test wrapper, so rustdoc builds it and a wrapper cleanup cannot delete
+/// the design record.
+///
+/// # Why a threshold here, but no closed-frontier check
+///
+/// Outside a flush path, closed batches past the gold
+/// frontier (if any) might still be in their natural lifecycle —
+/// pending in the mempool, recently included, awaiting safe finality.
+/// Cascading them would prematurely abort their progression.
+///
+/// The Tip is different: it has no L1 footprint at all (no `w_nonce`,
+/// no `safe_input`), so there's no L1 outcome to wait on. Once its
+/// first frame has aged into the danger zone, the rule "everything
+/// past gold is bad once we're committed to recovery" applies, and in
+/// the `RecoverTip` path startup is already committed.
+///
+/// # Threshold = danger_threshold, not MAX_WAIT
+///
+/// We use `danger_threshold` (= `MAX_WAIT_BLOCKS - margin`) rather than
+/// `MAX_WAIT_BLOCKS`. The Tip threshold is the same one that would
+/// trigger the recovery cycle had the Tip been a closed batch. If the
+/// Tip is past that threshold, the next danger detector tick after
+/// resume would re-trip on the Tip's eventual first close + submission
+/// anyway (the closed batch would inherit its first frame's safe_block).
+/// Cascading now saves the cycle.
+///
+/// # Precondition
+///
+/// As with [`Storage::recover_post_flush`], the caller must have synced
+/// L1 state. (Threshold comparison reads `current_safe_block` from
+/// `l1_safe_head`.)
+///
+/// Returns the newly-invalidated batch indices (empty if Tip is fresh,
+/// `[tip_index]` when the Tip was cascaded).
 fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Result<Vec<u64>> {
     let pivot = find_tip_batch_in_danger(tx, danger_threshold)?;
     cascade_and_reopen(tx, pivot)
@@ -356,8 +588,8 @@ fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resul
 ///    Gold-but-unpromoted pendings (batches that landed while the process
 ///    was down) carry lower nonces and *survive*: catch-up resumes from a
 ///    fresher checkpoint, and the rows are cleaned up by the next
-///    promotion's `DELETE <= max_nonce`. Scoping is load-bearing (review
-///    F9): a blanket clear would arm a promote-wedge crash-loop whenever a
+///    promotion's `DELETE <= max_nonce`. Scoping is load-bearing: a
+///    blanket clear would arm a promote-wedge crash-loop whenever a
 ///    *valid in-flight* closed batch existed at clear time — its pending
 ///    row would be deleted while the batch stayed valid, and the lane's
 ///    later promotion of its landing would hit the deleted row with no
@@ -366,7 +598,11 @@ fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resul
 ///    or belongs to a post-recovery batch with a fresh row. In the
 ///    `RecoverTip` path the scope deletes nothing — the Tip never has a
 ///    pending row. Finalized is untouched (L1-confirmed bytes).
-/// 3. **Reopen the Tip** the cascade just invalidated (or one a torn crash
+/// 3. **Advance `RecoveryGeneration`** exactly once when the cascade
+///    invalidated any valid batch. This is the externally visible statement
+///    that the current era's soft-history reality changed; composing it here
+///    makes generation and invalidation inseparable across crashes.
+/// 4. **Reopen the Tip** the cascade just invalidated (or one a torn crash
 ///    left missing), atomically with the cascade. Same mechanism the
 ///    runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
 fn cascade_and_reopen(tx: &Transaction<'_>, pivot: Option<u64>) -> Result<Vec<u64>> {
@@ -379,6 +615,9 @@ fn cascade_and_reopen(tx: &Transaction<'_>, pivot: Option<u64>) -> Result<Vec<u6
         }
         None => Vec::new(),
     };
+    if !invalidated.is_empty() {
+        advance_recovery_generation_in(tx)?;
+    }
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
         open_fresh_tip_in_tx(tx)?;
     }
@@ -484,17 +723,16 @@ fn batch_in_danger(conn: &Connection, batch_index: u64, threshold: u64) -> Resul
 }
 
 /// `frames.safe_block` of the lowest `frame_in_batch` in `batch_index`.
-/// Returns 0 if the batch has no frames yet.
+///
+/// Every committed valid batch has a first frame. Missing one is an
+/// invariant violation and propagates as `QueryReturnedNoRows`.
 fn first_frame_safe_block_of(conn: &Connection, batch_index: i64) -> Result<u64> {
-    let value: Option<i64> = conn
-        .query_row(
-            "SELECT safe_block FROM frames \
-             WHERE batch_index = ?1 ORDER BY frame_in_batch ASC LIMIT 1",
-            params![batch_index],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(i64_to_u64(value.unwrap_or(0)))
+    conn.query_row(
+        "SELECT safe_block FROM frames \
+         WHERE batch_index = ?1 ORDER BY frame_in_batch ASC LIMIT 1",
+        params![batch_index],
+        |row| row.get::<_, i64>(0).map(i64_to_u64),
+    )
 }
 
 /// Cascade-invalidate all valid batches with `batch_index >= from_batch_index`.

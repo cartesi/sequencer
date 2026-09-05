@@ -1,11 +1,317 @@
 use super::super::test_helpers::{
     SENDER_A, all_ordered_l2_txs, default_protocol_timing, local_batch_payload,
-    make_stale_batch_payload, seed_closed_batches, seed_safe_inputs_with_batch_nonces, temp_db,
+    make_stale_batch_payload, seed_closed_batches, seed_safe_inputs_with_batch_nonces,
+    temp_db_with_default_deployment_identity as temp_db,
 };
 use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
-use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+use crate::storage::{
+    DirectInputExecution, ExecutedInputCount, SafeInputRange, Storage, StoredSafeInput,
+};
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
+use sequencer_core::protocol::ProtocolTiming;
+
+mod guarded_phases {
+    use super::*;
+    use crate::storage::RecoveryMutationError;
+
+    fn invalidated_count(storage: &Storage) -> u64 {
+        storage
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM batches WHERE invalidated_at_ms IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count invalidated batches") as u64
+    }
+
+    fn open_tip_count(storage: &Storage) -> u64 {
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM valid_open_batch", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count open Tips") as u64
+    }
+
+    fn ensure_tip_fixture(
+        name: &str,
+        with_finalized_snapshot: bool,
+    ) -> (
+        crate::storage::test_helpers::TestDb,
+        Storage,
+        ProtocolTiming,
+    ) {
+        let db = temp_db(name);
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_protocol_timing();
+        let now_ms = crate::clock::unix_now_ms();
+        storage
+            .append_safe_inputs_with_timestamp(
+                0,
+                now_ms / 1_000,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
+            .expect("seed fresh safe head");
+        if with_finalized_snapshot {
+            let prefix = db._dir.path().join("finalized");
+            storage
+                .insert_finalized_dump(&prefix, 0, 0)
+                .expect("seed finalized snapshot");
+        }
+        (db, storage, protocol)
+    }
+
+    #[test]
+    fn ensure_tip_guard_opens_one_tip_only_from_clean_facts() {
+        let (_db, mut storage, protocol) = ensure_tip_fixture("guarded-ensure-tip", true);
+        assert_eq!(open_tip_count(&storage), 0);
+
+        storage
+            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .expect("clean no-Tip facts authorize one Tip");
+        assert_eq!(open_tip_count(&storage), 1);
+    }
+
+    #[test]
+    fn ensure_tip_guard_refuses_missing_snapshot_without_mutation() {
+        let (_db, mut storage, protocol) =
+            ensure_tip_fixture("guarded-ensure-tip-no-snapshot", false);
+        storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("a stale phase opened the Tip");
+
+        let error = storage
+            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .expect_err("missing finalized state must outrank the stale Tip decision");
+        assert!(matches!(
+            error,
+            RecoveryMutationError::MissingFinalizedSnapshot
+        ));
+        assert_eq!(open_tip_count(&storage), 1, "the existing Tip is untouched");
+    }
+
+    #[test]
+    fn ensure_tip_guard_refuses_divergence_without_mutation() {
+        let (_db, mut storage, protocol) =
+            ensure_tip_fixture("guarded-ensure-tip-divergence", true);
+        crate::storage::test_helpers::record_canonical_divergence(&mut storage, 7, 0);
+
+        let error = storage
+            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .expect_err("divergence must outrank Tip creation");
+        assert!(matches!(
+            error,
+            RecoveryMutationError::CanonicalDivergence { nonce: 7 }
+        ));
+        assert_eq!(open_tip_count(&storage), 0);
+    }
+
+    #[test]
+    fn ensure_tip_guard_rejects_an_already_open_tip_without_duplication() {
+        let (_db, mut storage, protocol) = ensure_tip_fixture("guarded-ensure-tip-existing", true);
+        storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("a competing phase opened the Tip");
+
+        let error = storage
+            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .expect_err("stale no-Tip decision must be rejected");
+        assert!(matches!(error, RecoveryMutationError::TipAlreadyOpen));
+        assert_eq!(open_tip_count(&storage), 1);
+    }
+
+    #[test]
+    fn ensure_tip_refuses_and_rolls_back_if_its_transaction_leaves_no_tip() {
+        // The fixture seeds no safe inputs on purpose: with a non-empty drain
+        // range the invalidated Tip would trip the sequenced-rows trigger
+        // first and the opener would fail with a storage error instead of
+        // returning `Ok` — which is the exact shape this test needs.
+        let (db, storage, protocol) = ensure_tip_fixture("guarded-ensure-tip-postcondition", true);
+        // Fault injection: invalidate the new Tip the moment its first frame
+        // lands, so `open_fresh_tip_in_tx` returns `Ok` having left no valid
+        // open Tip. (Invalidating on the batch insert itself is caught one
+        // step earlier by the schema — "frames can only be inserted into the
+        // current Tip" — so the injection must fire after the frame.
+        // `open.rs` documents failure triggers as the sanctioned way past the
+        // typed API in tests.)
+        drop(storage);
+        Storage::open_connection(db.path.as_str())
+            .expect("raw connection")
+            .execute_batch(
+                "CREATE TRIGGER test_invalidate_new_tip AFTER INSERT ON frames \
+                 BEGIN \
+                   UPDATE batches SET invalidated_at_ms = 1 \
+                   WHERE batch_index = NEW.batch_index; \
+                 END",
+            )
+            .expect("install failure trigger");
+        let mut storage = Storage::open(db.path.as_str()).expect("reopen");
+
+        let error = storage
+            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .expect_err("a phase that leaves no Tip must refuse, not commit");
+        assert!(
+            matches!(error, RecoveryMutationError::TipMissingAfterOpen),
+            "expected the postcondition refuse, got {error:?}"
+        );
+        assert_eq!(open_tip_count(&storage), 0);
+        // Refused inside the transaction: nothing of the attempt persisted.
+        let batches: i64 = storage
+            .read(|tx| tx.query_row("SELECT COUNT(*) FROM batches", [], |row| row.get(0)))
+            .expect("count batches");
+        assert_eq!(batches, 0, "the refused phase must roll back its insert");
+    }
+
+    fn cascade_fixture(name: &str) -> (crate::storage::test_helpers::TestDb, Storage) {
+        let db = temp_db(name);
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_protocol_timing();
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize Tip");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close cascade candidate");
+        storage
+            .append_safe_inputs_with_timestamp(
+                1_200,
+                1_000,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
+            .expect("advance safe head");
+        let prefix = db._dir.path().join("finalized");
+        storage
+            .insert_finalized_dump(&prefix, 0, 0)
+            .expect("seed finalized snapshot");
+        (db, storage)
+    }
+
+    #[test]
+    fn cascade_guard_ranks_divergence_before_f2_and_mutates_nothing() {
+        let (_db, mut storage) = cascade_fixture("guarded-cascade-divergence");
+        let protocol = default_protocol_timing();
+        crate::storage::test_helpers::record_canonical_divergence(&mut storage, 0, 0);
+
+        let error = storage
+            .recover_post_flush_for_recovery(1_201, &protocol, crate::clock::unix_now_ms())
+            .expect_err("divergence must refuse before lag");
+        assert!(matches!(
+            error,
+            RecoveryMutationError::CanonicalDivergence { nonce: 0 }
+        ));
+        assert_eq!(invalidated_count(&storage), 0);
+    }
+
+    #[test]
+    fn cascade_guard_rejects_lagging_sync_without_tree_mutation() {
+        let (_db, mut storage) = cascade_fixture("guarded-cascade-f2");
+        let protocol = default_protocol_timing();
+
+        let error = storage
+            .recover_post_flush_for_recovery(1_201, &protocol, crate::clock::unix_now_ms())
+            .expect_err("lagging post-flush view must retry");
+        assert!(matches!(
+            error,
+            RecoveryMutationError::ResyncBehindFlushView {
+                resynced_safe_block: 1_200,
+                flush_observed_safe_block: 1_201,
+            }
+        ));
+        assert_eq!(invalidated_count(&storage), 0);
+    }
+
+    #[test]
+    fn cascade_guard_ranks_missing_snapshot_before_f2_without_mutation() {
+        let (_db, mut storage) = cascade_fixture("guarded-cascade-no-snapshot");
+        let protocol = default_protocol_timing();
+        storage
+            .conn
+            .execute("DELETE FROM finalized_snapshot", [])
+            .expect("remove finalized snapshot fact");
+
+        let error = storage
+            .recover_post_flush_for_recovery(1_201, &protocol, crate::clock::unix_now_ms())
+            .expect_err("missing finalized state must outrank a lagging view");
+        assert!(matches!(
+            error,
+            RecoveryMutationError::MissingFinalizedSnapshot
+        ));
+        assert_eq!(invalidated_count(&storage), 0);
+    }
+
+    #[test]
+    fn tip_guard_reasserts_the_exact_reducer_decision() {
+        let db = temp_db("guarded-tip-decision");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_protocol_timing();
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize Tip");
+        storage
+            .append_safe_inputs_with_timestamp(
+                1_200,
+                1_000,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
+            .expect("advance safe head");
+        let prefix = db._dir.path().join("finalized");
+        storage
+            .insert_finalized_dump(&prefix, 0, 0)
+            .expect("seed finalized snapshot");
+
+        let error = storage
+            .recover_aging_tip_for_recovery(1, &protocol, 1_000_000)
+            .expect_err("a stale expected Tip must not mutate");
+        assert!(matches!(
+            error,
+            RecoveryMutationError::StaleDecision {
+                expected: crate::storage::DangerStatus::TipInDanger(1),
+                actual: crate::storage::DangerStatus::TipInDanger(0),
+            }
+        ));
+        assert_eq!(invalidated_count(&storage), 0);
+    }
+
+    #[test]
+    fn tip_guard_refuses_missing_snapshot_without_tree_mutation() {
+        let db = temp_db("guarded-tip-no-snapshot");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_protocol_timing();
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize Tip");
+        storage
+            .append_safe_inputs_with_timestamp(
+                1_200,
+                1_000,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
+            .expect("advance safe head");
+
+        let error = storage
+            .recover_aging_tip_for_recovery(0, &protocol, 1_000_000)
+            .expect_err("missing finalized state must refuse Tip recovery");
+        assert!(matches!(
+            error,
+            RecoveryMutationError::MissingFinalizedSnapshot
+        ));
+        assert_eq!(invalidated_count(&storage), 0);
+    }
+}
 
 mod invalid_batches {
     use super::*;
@@ -214,6 +520,8 @@ mod recover_post_flush {
     fn is_idempotent() {
         let db = temp_db("detect-idempotent");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let initial_history = storage.history_state().expect("initial history");
+        assert_eq!(initial_history.version.recovery_generation.get(), 0);
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -237,9 +545,38 @@ mod recover_post_flush {
             .expect("append safe input");
         let first = storage.recover_post_flush(1200).expect("first detect");
         assert_eq!(first, vec![0, 1]);
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history after recovery")
+                .version
+                .recovery_generation
+                .get(),
+            1,
+            "one invalidating recovery advances exactly once"
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history after recovery")
+                .version
+                .era_id,
+            initial_history.version.era_id,
+            "standard recovery stays within the same era"
+        );
 
         let second = storage.recover_post_flush(1200).expect("second detect");
         assert!(second.is_empty());
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history after no-op")
+                .version
+                .recovery_generation
+                .get(),
+            1,
+            "a recovery no-op must not invent a new history reality"
+        );
     }
 
     #[test]
@@ -278,6 +615,15 @@ mod recover_post_flush {
         // batch 2 opened with nonce reused (= 0).
         let first = storage.recover_post_flush(1200).expect("gen1 recovery");
         assert_eq!(first, vec![0, 1]);
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("generation one")
+                .version
+                .recovery_generation
+                .get(),
+            1
+        );
 
         // Submitter posts the recovery batch; it lands fresh on L1.
         let mut head = storage.open_state().expect("load").unwrap();
@@ -361,6 +707,15 @@ mod recover_post_flush {
             second,
             vec![2, 3],
             "stale reused nonce in gen2 must still be detected"
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("generation two")
+                .version
+                .recovery_generation
+                .get(),
+            2
         );
     }
 
@@ -496,7 +851,7 @@ mod tip_staleness {
     //   - boundary at threshold: invalidated
     //   - boundary just below threshold: not invalidated
     //
-    // The remaining tests cover the FlushAndCascade path's combined
+    // The remaining tests cover the guarded post-flush Cascade phase's combined
     // closed+open behavior (`recover_post_flush`'s `batch_index >= N`
     // cascade rule catches the Tip too).
 
@@ -525,6 +880,16 @@ mod tip_staleness {
             invalidated,
             vec![0],
             "open batch 0 should be invalidated by current staleness"
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history after Tip recovery")
+                .version
+                .recovery_generation
+                .get(),
+            1,
+            "the direct RecoverTip path advances the shared generation boundary"
         );
 
         // A fresh recovery batch must be opened at batch_index=1.
@@ -655,6 +1020,16 @@ mod tip_staleness {
             .recover_post_flush(1200)
             .expect("recover from torn state");
         assert!(invalidated.is_empty(), "no new invalidations");
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history after structural repair")
+                .version
+                .recovery_generation
+                .get(),
+            0,
+            "opening a missing Tip without invalidating history is not a recovery generation"
+        );
 
         let head = storage.open_state().expect("load open state");
         assert!(head.is_some(), "recovery should have opened a fresh batch");
@@ -730,6 +1105,121 @@ mod tip_staleness {
             open_batch_index, 1,
             "failed recovery must leave the original Tip in place"
         );
+    }
+
+    #[test]
+    fn rolls_back_generation_and_invalidation_when_tip_reopen_aborts() {
+        let db = temp_db("detect-tip-reopen-abort");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .append_safe_inputs(
+                10,
+                &[StoredSafeInput {
+                    sender: Address::ZERO,
+                    payload: vec![0xd1],
+                    block_number: 10,
+                }],
+                SENDER_A,
+                &default_protocol_timing(),
+            )
+            .expect("append mapped direct");
+        storage
+            .close_frame_only_with_executions(
+                &mut head,
+                10,
+                SafeInputRange::new(0, 1),
+                &[DirectInputExecution {
+                    safe_input_index: 0,
+                    executed_input_offset: ExecutedInputCount::ZERO,
+                }],
+            )
+            .expect("attribute mapped direct");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+        assert_eq!(
+            storage
+                .next_executed_input_count()
+                .expect("pre-recovery history head"),
+            ExecutedInputCount::new(1)
+        );
+        storage
+            .append_safe_inputs(1500, &[], SENDER_A, &default_protocol_timing())
+            .expect("advance safe head past staleness");
+
+        storage
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_recovery_tip_insert
+                     BEFORE INSERT ON batches
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected Tip reopen failure');
+                     END;",
+            )
+            .expect("install failure trigger");
+
+        let err = storage
+            .recover_post_flush(1200)
+            .expect_err("Tip reopen failure must abort the whole recovery transaction");
+        assert!(
+            err.to_string().contains("injected Tip reopen failure"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history after rollback")
+                .version
+                .recovery_generation
+                .get(),
+            0,
+            "the generation bump must roll back with the failed Tip reopen"
+        );
+        let invalidated_count: i64 = storage
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM batches WHERE invalidated_at_ms IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count invalidated");
+        assert_eq!(
+            invalidated_count, 0,
+            "the cascade must roll back with the generation bump"
+        );
+        let mappings: Vec<i64> = storage
+            .conn
+            .prepare(
+                "SELECT executed_input_offset FROM executed_inputs ORDER BY executed_input_offset",
+            )
+            .expect("prepare mapping query")
+            .query_map([], |row| row.get(0))
+            .expect("query mappings")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect mappings");
+        assert_eq!(
+            mappings,
+            vec![0],
+            "trigger-deleted mappings must roll back with the failed recovery"
+        );
+        assert_eq!(
+            storage
+                .next_executed_input_count()
+                .expect("history head after rollback"),
+            ExecutedInputCount::new(1),
+            "the canonical history head must roll back with its mapping"
+        );
+        let open_batch_index: i64 = storage
+            .conn
+            .query_row("SELECT batch_index FROM valid_open_batch", [], |row| {
+                row.get(0)
+            })
+            .expect("query original Tip");
+        assert_eq!(open_batch_index, 1);
     }
 
     #[test]
@@ -1293,7 +1783,7 @@ mod check_any_unresolved {
         // When BOTH the closed frontier batch and the open Tip are aged past the
         // threshold, find_first_batch_in_danger must return the CLOSED frontier:
         // cascading from it covers the Tip (batch_index >= pivot), and the scoped
-        // pending-snapshot clear keys on the pivot's nonce (F9). Both existing
+        // pending-snapshot clear keys on the pivot's nonce. Both existing
         // find_*_in_danger tests use open-batch-only scenarios; the closed-over-Tip
         // preference (the helper's whole point) was unasserted.
         let db = temp_db("danger-prefers-closed-frontier");
@@ -1933,7 +2423,7 @@ mod schema_invariants {
 
     #[test]
     fn schema_rejects_payload_hash_rewrite() {
-        // payload_hash is the content-identity anchor for the R2 canonical-
+        // payload_hash is the content-identity anchor for the canonical-
         // divergence check; a rewrite would let a foreign/zombie L1 landing
         // false-match a local batch. Write-once once stamped at seal.
         let db = temp_db("schema-payload-hash-write-once");
@@ -2128,7 +2618,7 @@ mod schema_invariants {
         // collide with the EIP-712 domain's unspecified-chain sentinel
         // and break signature recovery; the CHECK refuses to persist it
         // in the first place.
-        let db = temp_db("schema-deployment-chain-id-zero");
+        let db = crate::storage::test_helpers::temp_db("schema-deployment-chain-id-zero");
         let storage = Storage::open(db.path.as_str()).expect("open storage");
         let address = vec![0u8; 20];
         let err = storage.conn.execute(
@@ -2165,6 +2655,84 @@ mod schema_invariants {
             format!("{err:?}").contains("CHECK constraint failed"),
             "expected CHECK constraint error on block_number >= 0, got: {err:?}",
         );
+    }
+
+    #[test]
+    fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
+        // I15 structural enforcement: with the canonical-divergence marker
+        // present, the trg_*_frozen_on_divergence family must RAISE on batch
+        // inserts/updates, promotion inserts, and pending-snapshot deletes —
+        // even for a caller that bypassed every typed Rust refusal.
+        let db = temp_db("schema-divergence-freeze");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize open state");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0 before freezing");
+        storage
+            .insert_pending_dump(std::path::Path::new("/tmp/pending-fixture"), 1, 0)
+            .expect("insert a pending dump row to attempt deleting");
+        crate::storage::test_helpers::record_canonical_divergence(&mut storage, 0, 0);
+
+        let frozen = |err: rusqlite::Error| {
+            let text = format!("{err}");
+            assert!(
+                text.contains("frozen") && text.contains("divergence"),
+                "expected a divergence-freeze RAISE, got: {text}"
+            );
+        };
+
+        frozen(
+            storage
+                .conn
+                .execute(
+                    "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
+                     VALUES (99, NULL, 0, 0)",
+                    [],
+                )
+                .expect_err("batch INSERT must be frozen"),
+        );
+        frozen(
+            storage
+                .conn
+                .execute(
+                    "UPDATE batches SET invalidated_at_ms = 1 WHERE invalidated_at_ms IS NULL",
+                    [],
+                )
+                .expect_err("batch UPDATE (cascade shape) must be frozen"),
+        );
+        frozen(
+            storage
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO finalized_snapshot \
+                     (singleton_id, dump_id, inclusion_block, l2_tx_index) \
+                     VALUES (0, 999, 1, 0)",
+                    [],
+                )
+                .expect_err("promotion INSERT must be frozen"),
+        );
+        frozen(
+            storage
+                .conn
+                .execute("DELETE FROM pending_snapshots", [])
+                .expect_err("pending-snapshot DELETE must be frozen"),
+        );
+
+        // Reads stay usable on a frozen DB: the danger check must still
+        // classify the divergence (the boot-refusal path depends on it).
+        let protocol = ProtocolTiming {
+            max_wait_blocks: 1200,
+            preemptive_margin_blocks: 75,
+            l1_read_stale_after_blocks: 900,
+            seconds_per_block: 12,
+        };
+        let status = storage
+            .check_danger(&protocol, 1_000_000)
+            .expect("check danger on a frozen DB");
+        assert_eq!(status, crate::storage::DangerStatus::CanonicalDivergence(0));
     }
 
     #[test]
@@ -2636,7 +3204,7 @@ mod recovery_clears_pending_snapshots {
         );
     }
 
-    /// Review F9 regression: the cascade's pending clear is scoped to
+    /// Regression test: the cascade's pending clear is scoped to
     /// `nonce >= pivot.nonce`. A gold-but-unpromoted pending (its batch
     /// landed accepted while the process was down, the lane never
     /// promoted it) sits *below* the pivot and must survive — deleting

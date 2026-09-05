@@ -14,11 +14,14 @@
 //! drain), GC after each promotion.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, Result, Transaction, params};
 
-use super::Storage;
 use super::convert::{i64_to_u64, u64_to_i64};
+use super::history::{bind_history_base_in, next_executed_input_count_in};
+use super::{Storage, is_persistent_storage_error, is_persistent_storage_open_error};
+use sequencer_core::history::ExecutedInputCount;
 
 /// A row in `dumps`: SQLite primary key plus the on-disk directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +36,7 @@ pub struct PendingDump {
     pub nonce: u64,
     pub dump: DumpRow,
     pub l2_tx_index: u64,
+    pub executed_input_count: ExecutedInputCount,
 }
 
 /// The singleton `finalized_snapshot` row joined with the underlying
@@ -42,15 +46,18 @@ pub struct FinalizedDump {
     pub dump: DumpRow,
     pub inclusion_block: u64,
     pub l2_tx_index: u64,
+    pub executed_input_count: ExecutedInputCount,
 }
 
-/// How a [`LeaseGuard`] runs its (blocking) release on drop. Injected by the
+/// How a [`LeaseGuard`] schedules its blocking release on drop. Injected by the
 /// caller so storage stays runtime-agnostic: the egress HTTP layer passes a
-/// scheduler that offloads to `tokio::spawn_blocking` (so a release triggered
-/// by client disconnect doesn't stall an async worker); sync callers and tests
-/// pass one that runs it inline. Same fn-pointer decoupling as
-/// `egress::api::snapshot`'s `state_file_in_dump`.
-pub type ReleaseScheduler = fn(release: Box<dyn FnOnce() + Send + 'static>);
+/// supervised queue, while sync callers and tests pass one that runs inline.
+/// The owned callback lets each guard retain the queue's producer token until
+/// its `Drop` has submitted the release. A separate required reporter carries
+/// only the persistent-failure signal back to the runtime, keeping storage
+/// independent of runtime shutdown types.
+pub type ReleaseScheduler = Arc<dyn Fn(Box<dyn FnOnce() + Send + 'static>) + Send + Sync + 'static>;
+pub type PersistentReleaseFailureReporter = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
 /// An armed lease release, inseparable from the lease it holds. Handed out
 /// bundled inside a [`LeasedDump`]: while it lives, `lease_count > 0` keeps GC
@@ -63,40 +70,74 @@ pub struct LeaseGuard {
     path: String,
     dump_id: i64,
     schedule: ReleaseScheduler,
+    report_persistent_failure: PersistentReleaseFailureReporter,
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
         let path = std::mem::take(&mut self.path);
         let dump_id = self.dump_id;
+        let report_persistent_failure = self.report_persistent_failure.clone();
         (self.schedule)(Box::new(move || match Storage::open_writer(&path) {
             Ok(mut storage) => {
                 if let Err(err) = storage.release_dump_lease(dump_id) {
+                    // Log before reporting: the reporter blocks on the
+                    // externalization gate, and the operator must see the
+                    // actual error even if publication stalls.
+                    if is_persistent_storage_error(&err) {
+                        tracing::error!(
+                            error = %err, dump_id,
+                            "snapshot lease release failed persistently",
+                        );
+                        report_persistent_failure(&format!(
+                            "snapshot lease release for dump {dump_id} failed persistently: {err}"
+                        ));
+                    } else {
+                        tracing::warn!(
+                            error = %err, dump_id,
+                            "snapshot lease release failed; will be reset at next startup",
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                if is_persistent_storage_open_error(&err) {
+                    tracing::error!(
+                        error = %err, dump_id,
+                        "snapshot lease release: writer open failed persistently",
+                    );
+                    report_persistent_failure(&format!(
+                        "snapshot lease release for dump {dump_id}: writer open failed persistently: {err}"
+                    ));
+                } else {
                     tracing::warn!(
                         error = %err, dump_id,
-                        "snapshot lease release failed; will be reset at next startup",
+                        "snapshot lease release: open failed; will be reset at next startup",
                     );
                 }
             }
-            Err(err) => tracing::warn!(
-                error = %err, dump_id,
-                "snapshot lease release: open failed; will be reset at next startup",
-            ),
         }));
     }
 }
 
 /// A leased dump: the data the egress handler needs, plus an armed release.
-/// Returned by [`Storage::acquire_finalized_lease`] /
-/// [`Storage::acquire_latest_snapshot_lease`] — you cannot obtain the data
-/// without the guard, so there is no code path with a held lease and no armed
-/// release. `inclusion_block` is `Some` for the finalized snapshot, `None` for
-/// the latest pending.
+/// Returned by [`Storage::acquire_finalized_lease`] (inside a
+/// [`FinalizedLease`]) and [`Storage::acquire_latest_snapshot_lease`] — you
+/// cannot obtain the data without the guard, so there is no code path with a
+/// held lease and no armed release.
 pub struct LeasedDump {
     pub prefix: PathBuf,
     pub l2_tx_index: u64,
-    pub inclusion_block: Option<u64>,
+    pub executed_input_count: ExecutedInputCount,
     pub guard: LeaseGuard,
+}
+
+/// The finalized snapshot's lease: the leased dump plus the inclusion block
+/// its row carries. The column is `NOT NULL` at the engine, so the value is
+/// never optional here; the latest-snapshot lease carries no block.
+pub struct FinalizedLease {
+    pub inclusion_block: u64,
+    pub dump: LeasedDump,
 }
 
 impl Storage {
@@ -108,13 +149,19 @@ impl Storage {
     /// exists in `dumps`; this is intentional — the caller is expected
     /// to pass fresh, unique prefixes per call, and reuse is a bug
     /// worth surfacing loudly.
-    pub fn insert_pending_dump(
+    /// Test seed only: production stages pending rows exclusively through
+    /// the lane's atomic `close_batch_with_snapshot` path.
+    #[cfg(test)]
+    pub(crate) fn insert_pending_dump(
         &mut self,
         prefix: &Path,
         nonce: u64,
         l2_tx_index: u64,
     ) -> Result<i64> {
-        self.write(|tx| insert_pending_dump_in(tx, prefix, nonce, l2_tx_index))
+        self.write(|tx| {
+            let executed_input_count = next_executed_input_count_in(tx)?;
+            insert_pending_dump_in(tx, prefix, nonce, l2_tx_index, executed_input_count)
+        })
     }
 
     /// Atomically promote the pending dump for `max_nonce` into the
@@ -133,11 +180,13 @@ impl Storage {
     /// *supersede* an existing finalized row, which `insert_finalized_dump`
     /// can't). **Production does not call this**: the lane promotes via
     /// `promote_finalized_in` folded into the safe-frontier-advance
-    /// transaction ([`Storage::close_frame_only_promoting`]), so the promotion
-    /// commits atomically with the drain it derives from — a separate promotion
-    /// could commit ahead of the drain and wedge a restart on a deleted pending
-    /// row.
-    pub fn promote_finalized(&mut self, max_nonce: u64, inclusion_block: u64) -> Result<()> {
+    /// transaction
+    /// ([`Storage::close_frame_only_promoting_with_executions`]), so promotion,
+    /// drain, and canonical attribution commit atomically. A separate
+    /// promotion could commit ahead of the drain and wedge a restart on a
+    /// deleted pending row.
+    #[cfg(test)]
+    pub(crate) fn promote_finalized(&mut self, max_nonce: u64, inclusion_block: u64) -> Result<()> {
         self.write(|tx| promote_finalized_in(tx, max_nonce, inclusion_block))
     }
 
@@ -235,11 +284,11 @@ impl Storage {
     }
 
     /// The snapshot to resume or serve from: the latest pending dump, else the
-    /// finalized snapshot. Returns its `(dump row, l2_tx_index)`, or `None` if
-    /// neither exists. This is catch-up's resume checkpoint; the leasing variant
+    /// finalized snapshot. Returns its `(dump row, l2_tx_index,
+    /// executed_input_count)`, or `None` if neither exists. This is catch-up's resume checkpoint; the leasing variant
     /// [`Storage::acquire_latest_snapshot_lease`] shares the same "pending else
     /// finalized" selection via `latest_snapshot_in`.
-    pub fn latest_snapshot(&mut self) -> Result<Option<(DumpRow, u64)>> {
+    pub fn latest_snapshot(&mut self) -> Result<Option<(DumpRow, u64, ExecutedInputCount)>> {
         self.read(latest_snapshot_in)
     }
 
@@ -248,57 +297,85 @@ impl Storage {
     /// handler reads the row, a promotion + GC delete the dump, and the open
     /// then fails: the lease is held from the moment of the read. `None` if no
     /// finalized snapshot exists. `schedule` controls where the (blocking)
-    /// release runs on drop — see [`ReleaseScheduler`].
+    /// release runs on drop — see [`ReleaseScheduler`]. The reporter is
+    /// required — an unreported persistent release failure must be impossible;
+    /// it is called only for persistent row/schema failures, never
+    /// BUSY/I/O. Tests pass a no-op closure.
     pub fn acquire_finalized_lease(
         &mut self,
         schedule: ReleaseScheduler,
-    ) -> Result<Option<LeasedDump>> {
+        report_persistent_failure: PersistentReleaseFailureReporter,
+    ) -> Result<Option<FinalizedLease>> {
         let path = self.path.clone();
-        self.write(|tx| {
-            let Some(f) = finalized_dump_in(tx)? else {
+        let acquired = self.write(|tx| {
+            let Some(finalized) = finalized_dump_in(tx)? else {
                 return Ok(None);
             };
-            let dump_id = f.dump.id;
-            acquire_dump_lease_in(tx, dump_id)?;
-            Ok(Some(LeasedDump {
-                prefix: f.dump.prefix,
-                l2_tx_index: f.l2_tx_index,
-                inclusion_block: Some(f.inclusion_block),
-                guard: LeaseGuard {
-                    path,
-                    dump_id,
-                    schedule,
+            acquire_dump_lease_in(tx, finalized.dump.id)?;
+            Ok(Some(finalized))
+        })?;
+
+        Ok(acquired.map(
+            |FinalizedDump {
+                 dump,
+                 inclusion_block,
+                 l2_tx_index,
+                 executed_input_count,
+             }| FinalizedLease {
+                inclusion_block,
+                dump: LeasedDump {
+                    prefix: dump.prefix,
+                    l2_tx_index,
+                    executed_input_count,
+                    // Arm the release only after `Storage::write` has committed
+                    // the increment. A failed COMMIT rolls back the lease and
+                    // must not schedule a decrement for a lease that never
+                    // existed.
+                    guard: LeaseGuard {
+                        path,
+                        dump_id: dump.id,
+                        schedule,
+                        report_persistent_failure,
+                    },
                 },
-            }))
-        })
+            },
+        ))
     }
 
     /// Atomically read the snapshot to serve (latest pending, else finalized)
     /// AND lease its dump, returning it bundled with an armed release. Same
-    /// contract as [`Storage::acquire_finalized_lease`]; `inclusion_block` is
-    /// `None` (the `/latest_snapshot` consumer doesn't use it).
+    /// contract as [`Storage::acquire_finalized_lease`], without the
+    /// inclusion block (the `/latest_snapshot` consumer has no use for it).
     pub fn acquire_latest_snapshot_lease(
         &mut self,
         schedule: ReleaseScheduler,
+        report_persistent_failure: PersistentReleaseFailureReporter,
     ) -> Result<Option<LeasedDump>> {
         let path = self.path.clone();
-        self.write(|tx| {
-            let Some((dump, l2_tx_index)) = latest_snapshot_in(tx)? else {
+        let acquired = self.write(|tx| {
+            let Some((dump, l2_tx_index, executed_input_count)) = latest_snapshot_in(tx)? else {
                 return Ok(None);
             };
             let dump_id = dump.id;
             acquire_dump_lease_in(tx, dump_id)?;
-            Ok(Some(LeasedDump {
+            Ok(Some((dump, l2_tx_index, executed_input_count)))
+        })?;
+
+        Ok(
+            acquired.map(|(dump, l2_tx_index, executed_input_count)| LeasedDump {
                 prefix: dump.prefix,
                 l2_tx_index,
-                inclusion_block: None,
+                executed_input_count,
+                // See `acquire_finalized_lease`: the guard owns a release only
+                // after the matching increment is durable.
                 guard: LeaseGuard {
                     path,
-                    dump_id,
+                    dump_id: dump.id,
                     schedule,
+                    report_persistent_failure,
                 },
-            }))
-        })
+            }),
+        )
     }
 
     /// Return every row in `dumps`. Used at startup to reconcile
@@ -311,7 +388,7 @@ impl Storage {
 
     /// Delete every row from `pending_snapshots`. Test-only convenience wrapper
     /// for the *unscoped* clear: production danger-zone recovery instead composes
-    /// the pivot-scoped `clear_pending_dumps_from_nonce_in` (F9) into the same
+    /// the pivot-scoped `clear_pending_dumps_from_nonce_in` into the same
     /// transaction as the cascade invalidation (see `storage/recovery.rs`), so
     /// only the cascade-doomed batches' pending rows are cleared, atomically with
     /// them.
@@ -324,29 +401,51 @@ impl Storage {
     /// transaction. Used at first startup to register the genesis dump
     /// directly as finalized (bypassing pending). Fails if a finalized
     /// row already exists (the singleton constraint).
-    pub fn insert_finalized_dump(
+    /// Test seed only: production registers the genesis/recovery snapshot
+    /// through `insert_initial_finalized_dump`, which binds the canonical
+    /// coordinates atomically (this branch replaced both former
+    /// production callers).
+    #[cfg(test)]
+    pub(crate) fn insert_finalized_dump(
         &mut self,
         prefix: &Path,
         inclusion_block: u64,
         l2_tx_index: u64,
     ) -> Result<i64> {
         self.write(|tx| {
-            tx.execute(
-                "INSERT INTO dumps (prefix) VALUES (?1)",
-                params![path_to_text(prefix)],
-            )?;
-            let dump_id = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO finalized_snapshot \
-                 (singleton_id, dump_id, inclusion_block, l2_tx_index) \
-                 VALUES (0, ?1, ?2, ?3)",
-                params![
-                    dump_id,
-                    u64_to_i64(inclusion_block),
-                    u64_to_i64(l2_tx_index)
-                ],
-            )?;
-            Ok(dump_id)
+            let executed_input_count = next_executed_input_count_in(tx)?;
+            insert_finalized_dump_in(
+                tx,
+                prefix,
+                inclusion_block,
+                l2_tx_index,
+                executed_input_count,
+            )
+        })
+    }
+
+    /// Establish the era's application-history base, durable safe-input drain
+    /// floor, and initial finalized snapshot in one transaction. Plain setup
+    /// reasserts the migration's zero bases; cockroach setup binds the folded
+    /// application's absolute executed-input count and the recovery root's
+    /// exclusive safe-input cursor for the first and only time.
+    pub(crate) fn insert_initial_finalized_dump(
+        &mut self,
+        prefix: &Path,
+        inclusion_block: u64,
+        l2_tx_index: u64,
+        base_executed_input_count: u64,
+        base_safe_input_index: u64,
+    ) -> Result<i64> {
+        self.write(|tx| {
+            bind_history_base_in(tx, base_executed_input_count, base_safe_input_index)?;
+            insert_finalized_dump_in(
+                tx,
+                prefix,
+                inclusion_block,
+                l2_tx_index,
+                ExecutedInputCount::new(base_executed_input_count),
+            )
         })
     }
 
@@ -387,6 +486,45 @@ impl Storage {
     }
 }
 
+fn assert_snapshot_count_in(
+    tx: &Transaction<'_>,
+    executed_input_count: ExecutedInputCount,
+) -> Result<()> {
+    assert_eq!(
+        executed_input_count,
+        next_executed_input_count_in(tx)?,
+        "snapshot executed-input count differs from canonical storage history"
+    );
+    Ok(())
+}
+
+fn insert_finalized_dump_in(
+    tx: &Transaction<'_>,
+    prefix: &Path,
+    inclusion_block: u64,
+    l2_tx_index: u64,
+    executed_input_count: ExecutedInputCount,
+) -> Result<i64> {
+    assert_snapshot_count_in(tx, executed_input_count)?;
+    tx.execute(
+        "INSERT INTO dumps (prefix) VALUES (?1)",
+        params![path_to_text(prefix)],
+    )?;
+    let dump_id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO finalized_snapshot \
+         (singleton_id, dump_id, inclusion_block, l2_tx_index, executed_input_count) \
+         VALUES (0, ?1, ?2, ?3, ?4)",
+        params![
+            dump_id,
+            u64_to_i64(inclusion_block),
+            u64_to_i64(l2_tx_index),
+            u64_to_i64(executed_input_count.get()),
+        ],
+    )?;
+    Ok(dump_id)
+}
+
 // ── transaction-scoped helpers ────────────────────────────────────────────
 
 pub(super) fn insert_pending_dump_in(
@@ -394,16 +532,24 @@ pub(super) fn insert_pending_dump_in(
     prefix: &Path,
     nonce: u64,
     l2_tx_index: u64,
+    executed_input_count: ExecutedInputCount,
 ) -> Result<i64> {
+    assert_snapshot_count_in(tx, executed_input_count)?;
     tx.execute(
         "INSERT INTO dumps (prefix) VALUES (?1)",
         params![path_to_text(prefix)],
     )?;
     let dump_id = tx.last_insert_rowid();
     tx.execute(
-        "INSERT INTO pending_snapshots (nonce, dump_id, l2_tx_index) \
-         VALUES (?1, ?2, ?3)",
-        params![u64_to_i64(nonce), dump_id, u64_to_i64(l2_tx_index)],
+        "INSERT INTO pending_snapshots \
+         (nonce, dump_id, l2_tx_index, executed_input_count) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            u64_to_i64(nonce),
+            dump_id,
+            u64_to_i64(l2_tx_index),
+            u64_to_i64(executed_input_count.get()),
+        ],
     )?;
     Ok(dump_id)
 }
@@ -415,17 +561,23 @@ pub(super) fn promote_finalized_in(
 ) -> Result<()> {
     // The promoted dump's bytes correspond to state at batch close, so
     // we carry over its `l2_tx_index` directly.
-    let (new_dump_id, l2_tx_index): (i64, i64) = tx.query_row(
-        "SELECT dump_id, l2_tx_index FROM pending_snapshots WHERE nonce = ?1",
+    let (new_dump_id, l2_tx_index, executed_input_count): (i64, i64, i64) = tx.query_row(
+        "SELECT dump_id, l2_tx_index, executed_input_count \
+         FROM pending_snapshots WHERE nonce = ?1",
         params![u64_to_i64(max_nonce)],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
 
     tx.execute(
         "INSERT OR REPLACE INTO finalized_snapshot \
-         (singleton_id, dump_id, inclusion_block, l2_tx_index) \
-         VALUES (0, ?1, ?2, ?3)",
-        params![new_dump_id, u64_to_i64(inclusion_block), l2_tx_index],
+         (singleton_id, dump_id, inclusion_block, l2_tx_index, executed_input_count) \
+         VALUES (0, ?1, ?2, ?3, ?4)",
+        params![
+            new_dump_id,
+            u64_to_i64(inclusion_block),
+            l2_tx_index,
+            executed_input_count,
+        ],
     )?;
 
     // Clean up the promoted row plus any stale ones behind it. The
@@ -488,17 +640,21 @@ fn delete_dump_row_in(tx: &Transaction<'_>, dump_id: i64) -> Result<()> {
 
 fn latest_pending_dump_in(tx: &Transaction<'_>) -> Result<Option<PendingDump>> {
     tx.query_row(
-        "SELECT p.nonce, p.dump_id, d.prefix, p.l2_tx_index \
+        "SELECT p.nonce, p.dump_id, d.prefix, p.l2_tx_index, p.executed_input_count \
          FROM pending_snapshots p \
-         JOIN dumps d ON d.id = p.dump_id \
+         LEFT JOIN dumps d ON d.id = p.dump_id \
          ORDER BY p.nonce DESC \
          LIMIT 1",
         [],
         |row| {
             let nonce: i64 = row.get(0)?;
             let dump_id: i64 = row.get(1)?;
+            // LEFT JOIN keeps a dangling reference visible; reading NULL as
+            // String then returns InvalidColumnType instead of laundering the
+            // corruption into OptionalExtension's `None`.
             let prefix: String = row.get(2)?;
             let l2_tx_index: i64 = row.get(3)?;
+            let executed_input_count: i64 = row.get(4)?;
             Ok(PendingDump {
                 nonce: i64_to_u64(nonce),
                 dump: DumpRow {
@@ -506,6 +662,7 @@ fn latest_pending_dump_in(tx: &Transaction<'_>) -> Result<Option<PendingDump>> {
                     prefix: PathBuf::from(prefix),
                 },
                 l2_tx_index: i64_to_u64(l2_tx_index),
+                executed_input_count: ExecutedInputCount::new(i64_to_u64(executed_input_count)),
             })
         },
     )
@@ -514,16 +671,20 @@ fn latest_pending_dump_in(tx: &Transaction<'_>) -> Result<Option<PendingDump>> {
 
 fn finalized_dump_in(tx: &Transaction<'_>) -> Result<Option<FinalizedDump>> {
     tx.query_row(
-        "SELECT f.dump_id, d.prefix, f.inclusion_block, f.l2_tx_index \
+        "SELECT f.dump_id, d.prefix, f.inclusion_block, f.l2_tx_index, \
+                f.executed_input_count \
          FROM finalized_snapshot f \
-         JOIN dumps d ON d.id = f.dump_id \
+         LEFT JOIN dumps d ON d.id = f.dump_id \
          WHERE f.singleton_id = 0",
         [],
         |row| {
             let dump_id: i64 = row.get(0)?;
+            // See latest_pending_dump_in: a missing referenced dump row must
+            // be an error, not an apparent absence of the singleton.
             let prefix: String = row.get(1)?;
             let inclusion_block: i64 = row.get(2)?;
             let l2_tx_index: i64 = row.get(3)?;
+            let executed_input_count: i64 = row.get(4)?;
             Ok(FinalizedDump {
                 dump: DumpRow {
                     id: dump_id,
@@ -531,6 +692,7 @@ fn finalized_dump_in(tx: &Transaction<'_>) -> Result<Option<FinalizedDump>> {
                 },
                 inclusion_block: i64_to_u64(inclusion_block),
                 l2_tx_index: i64_to_u64(l2_tx_index),
+                executed_input_count: ExecutedInputCount::new(i64_to_u64(executed_input_count)),
             })
         },
     )
@@ -542,10 +704,14 @@ fn finalized_dump_in(tx: &Transaction<'_>) -> Result<Option<FinalizedDump>> {
 /// resume checkpoint) and [`Storage::acquire_latest_snapshot_lease`] (the
 /// `/latest_snapshot` lease), so the "pending else finalized" rule lives in one
 /// place.
-fn latest_snapshot_in(tx: &Transaction<'_>) -> Result<Option<(DumpRow, u64)>> {
+fn latest_snapshot_in(tx: &Transaction<'_>) -> Result<Option<(DumpRow, u64, ExecutedInputCount)>> {
     Ok(match latest_pending_dump_in(tx)? {
-        Some(pending) => Some((pending.dump, pending.l2_tx_index)),
-        None => finalized_dump_in(tx)?.map(|f| (f.dump, f.l2_tx_index)),
+        Some(pending) => Some((
+            pending.dump,
+            pending.l2_tx_index,
+            pending.executed_input_count,
+        )),
+        None => finalized_dump_in(tx)?.map(|f| (f.dump, f.l2_tx_index, f.executed_input_count)),
     })
 }
 
@@ -568,7 +734,7 @@ pub(super) fn clear_pending_dumps_in(tx: &Transaction<'_>) -> Result<usize> {
 /// Scoped pending-snapshot clear for the recovery cascade: delete only the
 /// rows whose `nonce >= from_nonce` (the cascade pivot's nonce) — exactly
 /// the cascaded batches' pendings. Lower-nonce rows are gold-but-unpromoted
-/// pendings that must survive (review F9: deleting them arms a
+/// pendings that must survive (deleting them arms a
 /// promote-wedge crash-loop when their landing is later observed). Same
 /// same-transaction composition rationale as [`clear_pending_dumps_in`].
 pub(super) fn clear_pending_dumps_from_nonce_in(
@@ -614,10 +780,12 @@ fn path_to_text(path: &Path) -> String {
 mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use crate::storage::{Storage, test_helpers::temp_db};
+    use crate::storage::{ExecutedInputCount, LifecycleCommand, Storage, test_helpers::temp_db};
 
-    use super::{DumpRow, FinalizedDump, PendingDump};
+    use super::{DumpRow, FinalizedDump, FinalizedLease, LeaseGuard, PendingDump};
 
     fn prefix(n: u64) -> PathBuf {
         PathBuf::from(format!("/data/dumps/{n}"))
@@ -642,6 +810,7 @@ mod tests {
                     prefix: prefix(0),
                 },
                 l2_tx_index: 10,
+                executed_input_count: ExecutedInputCount::ZERO,
             }
         );
 
@@ -664,6 +833,96 @@ mod tests {
         assert!(
             err.to_string().contains("UNIQUE"),
             "expected UNIQUE failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn initial_finalized_snapshot_binds_rebuild_base_atomically() {
+        let db = temp_db("initial-finalized-history-base");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("pending history")
+                .base_executed_input_count,
+            None
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("pending history")
+                .base_safe_input_index,
+            None
+        );
+
+        storage
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_initial_finalized_snapshot
+                     BEFORE INSERT ON finalized_snapshot
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected finalized snapshot failure');
+                     END;",
+            )
+            .expect("install failure trigger");
+        let err = storage
+            .insert_initial_finalized_dump(&prefix(0), 100, 7, 41, 7)
+            .expect_err("snapshot failure must roll back the history base");
+        assert!(
+            err.to_string()
+                .contains("injected finalized snapshot failure"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history after rollback")
+                .base_executed_input_count,
+            None,
+            "the base cannot survive without its establishing snapshot"
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("history after rollback")
+                .base_safe_input_index,
+            None,
+            "the safe-input floor cannot survive without its establishing snapshot"
+        );
+        assert!(storage.finalized_dump().expect("read finalized").is_none());
+        assert!(storage.list_dump_rows().expect("read dumps").is_empty());
+
+        storage
+            .conn
+            .execute_batch("DROP TRIGGER fail_initial_finalized_snapshot;")
+            .expect("remove failure trigger");
+        storage
+            .insert_initial_finalized_dump(&prefix(1), 100, 7, 41, 7)
+            .expect("bind base with finalized snapshot");
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("bound history")
+                .base_executed_input_count,
+            Some(41)
+        );
+        assert_eq!(
+            storage
+                .history_state()
+                .expect("bound history")
+                .base_safe_input_index,
+            Some(7)
+        );
+        assert_eq!(
+            storage
+                .finalized_dump()
+                .expect("read finalized")
+                .expect("finalized snapshot")
+                .l2_tx_index,
+            7,
+            "the physical replay cursor remains distinct from application base K"
         );
     }
 
@@ -705,6 +964,7 @@ mod tests {
                 },
                 inclusion_block: 500,
                 l2_tx_index: 102,
+                executed_input_count: ExecutedInputCount::ZERO,
             }
         );
 
@@ -1032,11 +1292,74 @@ mod tests {
         release();
     }
 
+    fn install_deferred_lease_commit_failure(path: &str) {
+        let conn = Storage::open_connection(path).expect("open failure-injection connection");
+        conn.execute_batch(
+            "CREATE TABLE lease_commit_parent (
+                 id INTEGER PRIMARY KEY
+             );
+             CREATE TABLE lease_commit_child (
+                 id INTEGER PRIMARY KEY,
+                 parent_id INTEGER NOT NULL
+                     REFERENCES lease_commit_parent(id)
+                     DEFERRABLE INITIALLY DEFERRED
+             );
+             CREATE TRIGGER fail_lease_commit
+             AFTER UPDATE OF lease_count ON dumps
+             WHEN NEW.lease_count > OLD.lease_count
+             BEGIN
+                 INSERT INTO lease_commit_child(parent_id) VALUES (1);
+             END;",
+        )
+        .expect("install deferred commit failure");
+    }
+
+    fn noop_reporter() -> super::PersistentReleaseFailureReporter {
+        Arc::new(|_cause: &str| {})
+    }
+
+    fn counting_scheduler(scheduled: Arc<AtomicUsize>) -> super::ReleaseScheduler {
+        Arc::new(move |_release| {
+            scheduled.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    #[test]
+    fn lease_release_reports_persistent_missing_row_failure() {
+        let db = temp_db("lease-release-persistent-failure");
+        let _storage = Storage::open(db.path.as_str()).expect("open");
+        let reported = Arc::new(AtomicBool::new(false));
+        let reporter = {
+            let reported = reported.clone();
+            Arc::new(move |_cause: &str| {
+                reported.store(true, Ordering::SeqCst);
+            })
+        };
+        let guard = LeaseGuard {
+            path: db.path,
+            dump_id: i64::MAX,
+            schedule: Arc::new(inline),
+            report_persistent_failure: reporter,
+        };
+
+        drop(guard);
+
+        assert!(
+            reported.load(Ordering::SeqCst),
+            "a durable lease-row invariant failure must reach the runtime reporter"
+        );
+    }
+
     #[test]
     fn acquire_finalized_lease_returns_none_when_no_finalized() {
         let db = temp_db("acquire-finalized-none");
         let mut storage = Storage::open(db.path.as_str()).expect("open");
-        assert!(storage.acquire_finalized_lease(inline).unwrap().is_none());
+        assert!(
+            storage
+                .acquire_finalized_lease(Arc::new(inline), noop_reporter())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1046,11 +1369,15 @@ mod tests {
 
         let id_a = storage.insert_finalized_dump(&prefix(0), 100, 5).unwrap();
         let leased = storage
-            .acquire_finalized_lease(inline)
+            .acquire_finalized_lease(Arc::new(inline), noop_reporter())
             .unwrap()
             .expect("a finalized snapshot exists");
+        let FinalizedLease {
+            inclusion_block,
+            dump: leased,
+        } = leased;
         assert_eq!(leased.prefix, prefix(0));
-        assert_eq!(leased.inclusion_block, Some(100));
+        assert_eq!(inclusion_block, 100);
         assert_eq!(leased.l2_tx_index, 5);
         assert_eq!(
             storage.dump_lease_count(id_a).unwrap(),
@@ -1091,6 +1418,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_finalized_lease_commit_never_arms_a_release() {
+        let db = temp_db("acquire-finalized-commit-failure");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let dump_id = storage.insert_finalized_dump(&prefix(0), 100, 5).unwrap();
+        install_deferred_lease_commit_failure(db.path.as_str());
+        let scheduled = Arc::new(AtomicUsize::new(0));
+
+        let err = match storage
+            .acquire_finalized_lease(counting_scheduler(scheduled.clone()), noop_reporter())
+        {
+            Ok(_) => panic!("deferred foreign-key violation must fail COMMIT"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("FOREIGN KEY"),
+            "expected deferred constraint failure, got: {err}"
+        );
+        assert_eq!(
+            scheduled.load(Ordering::SeqCst),
+            0,
+            "a rolled-back increment has no matching release to schedule"
+        );
+        assert_eq!(
+            storage.dump_lease_count(dump_id).unwrap(),
+            Some(0),
+            "the failed transaction rolled back the lease increment"
+        );
+    }
+
+    #[test]
     fn acquire_latest_snapshot_lease_prefers_pending_and_leases() {
         let db = temp_db("acquire-latest-pending");
         let mut storage = Storage::open(db.path.as_str()).expect("open");
@@ -1099,12 +1457,11 @@ mod tests {
         let id_pending = storage.insert_pending_dump(&prefix(1), 3, 9).unwrap();
 
         let leased = storage
-            .acquire_latest_snapshot_lease(inline)
+            .acquire_latest_snapshot_lease(Arc::new(inline), noop_reporter())
             .unwrap()
             .expect("a snapshot exists");
         assert_eq!(leased.prefix, prefix(1), "prefers the latest pending");
         assert_eq!(leased.l2_tx_index, 9);
-        assert_eq!(leased.inclusion_block, None, "latest carries no block");
 
         // Clear pending so the leased dump is unreferenced; the held lease
         // still blocks GC.
@@ -1137,10 +1494,41 @@ mod tests {
 
         storage.insert_finalized_dump(&prefix(0), 100, 5).unwrap();
         let leased = storage
-            .acquire_latest_snapshot_lease(inline)
+            .acquire_latest_snapshot_lease(Arc::new(inline), noop_reporter())
             .unwrap()
             .expect("falls back to finalized");
         assert_eq!(leased.prefix, prefix(0));
         assert_eq!(leased.l2_tx_index, 5);
+    }
+
+    #[test]
+    fn failed_latest_snapshot_lease_commit_never_arms_a_release() {
+        let db = temp_db("acquire-latest-commit-failure");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let dump_id = storage.insert_pending_dump(&prefix(0), 3, 9).unwrap();
+        install_deferred_lease_commit_failure(db.path.as_str());
+        let scheduled = Arc::new(AtomicUsize::new(0));
+
+        let err = match storage
+            .acquire_latest_snapshot_lease(counting_scheduler(scheduled.clone()), noop_reporter())
+        {
+            Ok(_) => panic!("deferred foreign-key violation must fail COMMIT"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("FOREIGN KEY"),
+            "expected deferred constraint failure, got: {err}"
+        );
+        assert_eq!(
+            scheduled.load(Ordering::SeqCst),
+            0,
+            "a rolled-back increment has no matching release to schedule"
+        );
+        assert_eq!(
+            storage.dump_lease_count(dump_id).unwrap(),
+            Some(0),
+            "the failed transaction rolled back the lease increment"
+        );
     }
 }

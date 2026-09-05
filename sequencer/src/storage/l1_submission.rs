@@ -4,7 +4,7 @@
 //! The submitter's storage half: frontier lookup, per-batch frames + user
 //! ops, the catch-up / per-batch replay reader, the SSZ-encoded pending-batch
 //! list the submitter pulls each tick — and the one submission-side write,
-//! the wallet-nonce watermark (raised before every broadcast, review R1a).
+//! the wallet-nonce watermark (raised before every broadcast).
 //!
 //! Structural nonces are assigned by the `batches.nonce` trigger at close
 //! time (see `ingress`), and `safe_accepted_batches` is maintained by
@@ -15,12 +15,15 @@
 use rusqlite::{Result, params};
 
 use super::Storage;
-use super::convert::{i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
+use super::convert::{external_u64_to_i64, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
 use super::mutations::{batch_tree_anchor_in, set_batch_tree_anchor_in};
-use super::queries::{current_safe_block_required, decode_l2_tx_row};
+use super::queries::current_safe_block_required;
+#[cfg(test)]
+use super::queries::decode_l2_tx_row;
 use super::safe_accepted_batches::frontier_nonce;
 use super::{FrameHeader, PendingBatch, SubmitterFrontier};
 use sequencer_core::batch::{Batch, Frame as BatchFrame, WireUserOp};
+#[cfg(test)]
 use sequencer_core::l2_tx::SequencedL2Tx;
 
 impl Storage {
@@ -33,9 +36,9 @@ impl Storage {
     ///
     /// **Precondition:** at least one safe-head observation must have been
     /// recorded (via [`Storage::append_safe_inputs`]). In production this is
-    /// always true because `run_preemptive_recovery` either syncs L1 first
-    /// or refuses to boot via `L1ViewStale`. Tests must seed an observation
-    /// explicitly; calling against a fresh DB returns `QueryReturnedNoRows`.
+    /// always true because the startup reducer completes InitialSync and
+    /// refuses admission unless its persisted view is usable. Tests must seed
+    /// an observation explicitly; a fresh DB returns `QueryReturnedNoRows`.
     pub fn submitter_frontier(&mut self) -> Result<SubmitterFrontier> {
         self.read(|tx| {
             Ok(SubmitterFrontier {
@@ -59,7 +62,7 @@ impl Storage {
 
     /// The highest wallet nonce ever broadcast by this deployment's
     /// batch-submitter key, or `None` if nothing was ever broadcast
-    /// (review R1a — the durable realization of the TLA+ `walletNonce`).
+    /// (the durable realization of the TLA+ `walletNonce`).
     /// The flush reads this as its coverage floor; it never resets.
     pub fn wallet_nonce_watermark(&mut self) -> Result<Option<u64>> {
         use rusqlite::OptionalExtension;
@@ -74,7 +77,7 @@ impl Storage {
         })
     }
 
-    /// Write-before-broadcast (review R1a): durably raise the watermark to
+    /// Write-before-broadcast: durably raise the watermark to
     /// cover `nonce` *before* any tx at a nonce `<= nonce` is sent. The
     /// commit is power-loss durable (`synchronous=FULL`); a crash between
     /// commit and send only over-covers — the flush later no-ops a
@@ -86,15 +89,16 @@ impl Storage {
                  VALUES (0, ?1) \
                  ON CONFLICT(singleton_id) \
                  DO UPDATE SET watermark = MAX(watermark, excluded.watermark)",
-                params![u64_to_i64(nonce)],
+                params![external_u64_to_i64(nonce, "batch-submitter wallet nonce")?],
             )?;
             Ok(())
         })
     }
 
     /// Highest valid (non-invalidated) `batch_index`, or `None` if no valid
-    /// batches exist. The open batch is included.
-    pub fn latest_batch_index(&mut self) -> Result<Option<u64>> {
+    /// batches exist. The open batch is included. Test-only.
+    #[cfg(test)]
+    pub(crate) fn latest_batch_index(&mut self) -> Result<Option<u64>> {
         let value: Option<i64> =
             self.conn
                 .query_row("SELECT MAX(batch_index) FROM valid_batches", [], |row| {
@@ -124,9 +128,14 @@ impl Storage {
         frames_for_batch_in(&self.conn, batch_index)
     }
 
-    /// Materialize all sequenced L2 txs in one batch (used by the catch-up /
-    /// per-batch replay paths). Returns `[]` for invalidated batches.
-    pub fn ordered_l2_txs_for_batch(&mut self, batch_index: u64) -> Result<Vec<SequencedL2Tx>> {
+    /// Materialize all sequenced L2 txs in one batch. Returns `[]` for
+    /// invalidated batches. Test-only: production replay pages the valid
+    /// stream by offset, never per batch.
+    #[cfg(test)]
+    pub(crate) fn ordered_l2_txs_for_batch(
+        &mut self,
+        batch_index: u64,
+    ) -> Result<Vec<SequencedL2Tx>> {
         const SQL: &str = "
             SELECT
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END AS kind,
@@ -225,7 +234,7 @@ fn frames_for_batch_in(conn: &rusqlite::Connection, batch_index: u64) -> Result<
 
 /// Free-function form so the seal path can encode the closing batch inside
 /// its own transaction — the content-identity check's hash-at-seal must come
-/// from **the same encode path the submitter uses** (review R2); this
+/// from **the same encode path the submitter uses**; this
 /// function being that single path is load-bearing.
 pub(super) fn load_batch_frames_in(
     conn: &rusqlite::Connection,
@@ -429,6 +438,16 @@ mod tests {
 
         storage.raise_wallet_nonce_watermark(9).expect("raise to 9");
         assert_eq!(storage.wallet_nonce_watermark().expect("read"), Some(9));
+
+        let err = storage
+            .raise_wallet_nonce_watermark(i64::MAX as u64 + 1)
+            .expect_err("external wallet nonce outside SQLite range must be refused");
+        assert!(matches!(err, rusqlite::Error::ToSqlConversionFailure(_)));
+        assert_eq!(
+            storage.wallet_nonce_watermark().expect("read"),
+            Some(9),
+            "failed external raise must not alter the durable watermark"
+        );
     }
 
     #[test]
@@ -722,6 +741,170 @@ mod tests {
     }
 
     #[test]
+    fn check_danger_refuses_when_safe_block_timestamp_is_in_the_future() {
+        let db = temp_db("check-danger-future-safe-timestamp");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_test_protocol();
+        let now_ms = 1_000_000_u64;
+
+        // A full block-time (12 s) ahead of the local clock: unusable. Sub-block
+        // ahead-ness is NTP-scale skew and tolerated (see the companion assert).
+        storage
+            .append_safe_inputs_with_timestamp(
+                10,
+                1_012,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
+            .expect("record future L1 timestamp");
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+                [i64::try_from(now_ms).expect("test time fits")],
+            )
+            .expect("make local progress baseline usable");
+
+        assert_eq!(
+            storage
+                .check_danger(&protocol, now_ms)
+                .expect("check danger"),
+            crate::storage::DangerStatus::L1ViewStale
+        );
+
+        // Sub-block skew (1 s ahead) is the freshest possible view, not a fault.
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET block_timestamp = 1001 WHERE singleton_id = 0",
+                [],
+            )
+            .expect("set sub-block-ahead timestamp");
+        assert_eq!(
+            storage
+                .check_danger(&protocol, now_ms)
+                .expect("check danger"),
+            crate::storage::DangerStatus::Safe
+        );
+    }
+
+    #[test]
+    fn check_danger_refuses_when_local_progress_timestamp_is_in_the_future() {
+        let db = temp_db("check-danger-future-progress");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let protocol = default_test_protocol();
+        let now_ms = 1_000_000_u64;
+
+        storage
+            .append_safe_inputs_with_timestamp(
+                10,
+                1_000,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
+            .expect("record safe head");
+        // One full block-time (12 s) of regression: the wall-clock
+        // extrapolation is genuinely invalid — refuse. A sub-block step is
+        // tolerated (companion assert below).
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+                [i64::try_from(now_ms + 12_000).expect("test time fits")],
+            )
+            .expect("move local progress baseline into future");
+
+        assert_eq!(
+            storage
+                .check_danger(&protocol, now_ms)
+                .expect("check danger"),
+            crate::storage::DangerStatus::L1ViewStale
+        );
+
+        // A 1 ms step is quantization noise for a block-granular estimate.
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+                [i64::try_from(now_ms + 1).expect("test time fits")],
+            )
+            .expect("move baseline a sub-block step into the future");
+        assert_eq!(
+            storage
+                .check_danger(&protocol, now_ms)
+                .expect("check danger"),
+            crate::storage::DangerStatus::Safe
+        );
+    }
+
+    #[test]
+    fn observed_batch_danger_outranks_regressed_progress_clock() {
+        let db = temp_db("check-danger-future-progress-priority");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("close batch 0");
+        let protocol = default_test_protocol();
+        let now_ms = 1_000_000_u64;
+
+        storage
+            .append_safe_inputs_with_timestamp(
+                1200,
+                1_000,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
+            .expect("advance observed safe block past danger");
+        // Even a full-block clock regression (a real fault, not noise) must
+        // not suppress the observed arm: batch age here is pure block
+        // arithmetic on persisted L1 observations, valid regardless of the
+        // local clock. The refusal only wins when no observed danger stands
+        // (2026-07-31 review of the containment commit).
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
+                [i64::try_from(now_ms + 12_000).expect("test time fits")],
+            )
+            .expect("move local progress baseline into future");
+
+        assert_eq!(
+            storage
+                .check_danger(&protocol, now_ms)
+                .expect("check danger"),
+            crate::storage::DangerStatus::ClosedBatchInDanger(0),
+            "observed danger stands on L1 observation alone; a wall-clock \
+             fault must not delay recovery of a batch aging toward staleness"
+        );
+
+        // Same verdict with BOTH baselines faulted: the safe-block timestamp
+        // a full block ahead of the clock AND the progress baseline regressed.
+        storage
+            .conn
+            .execute(
+                "UPDATE l1_safe_head SET block_timestamp = ?1 WHERE singleton_id = 0",
+                [i64::try_from(now_ms / 1000 + 12).expect("test time fits")],
+            )
+            .expect("move safe-block timestamp a block into the future");
+        assert_eq!(
+            storage
+                .check_danger(&protocol, now_ms)
+                .expect("check danger"),
+            crate::storage::DangerStatus::ClosedBatchInDanger(0),
+            "both clock-fault baselines together still yield to observed danger"
+        );
+    }
+
+    #[test]
     fn check_danger_safe_when_never_synced() {
         // Fresh DB, no prior safe block timestamp. The L1 view is unusable
         // until the input reader records a real safe-head observation.
@@ -731,6 +914,28 @@ mod tests {
             .check_danger(&default_test_protocol(), unix_now_ms())
             .expect("check_danger");
         assert_eq!(status, crate::storage::DangerStatus::L1ViewStale);
+    }
+
+    #[test]
+    fn check_danger_errors_when_valid_tip_has_no_first_frame() {
+        let db = temp_db("check-danger-missing-first-frame");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        let protocol = default_test_protocol();
+        storage
+            .append_safe_inputs(10, &[], SENDER_A, &protocol)
+            .expect("record fresh safe head");
+        storage
+            .conn
+            .execute("DELETE FROM frames WHERE batch_index = 0", [])
+            .expect("inject missing-frame corruption");
+
+        let err = storage
+            .check_danger(&protocol, unix_now_ms())
+            .expect_err("a valid batch without a first frame must fail loud");
+        assert!(matches!(err, rusqlite::Error::QueryReturnedNoRows));
     }
 
     #[test]
@@ -843,7 +1048,7 @@ mod tests {
 
     #[test]
     fn seal_stamps_payload_hash_of_the_submitter_encode_path() {
-        // Hash-at-seal (review R2): the hash stamped on the sealed row must
+        // Hash-at-seal: the hash stamped on the sealed row must
         // be the keccak256 of exactly the bytes the submitter will broadcast
         // (`pending_batches`'s encoding) — same code path, by construction.
         let db = temp_db("seal-stamps-payload-hash");
@@ -873,7 +1078,7 @@ mod tests {
 
     #[test]
     fn accepted_landing_with_mismatched_content_freezes_frontier() {
-        // The F1-zombie / F3-re-seal shape: a landing at the expected nonce
+        // The zombie / re-seal shape: a landing at the expected nonce
         // whose bytes differ from the batch we sealed. The check records a
         // 'mismatch' marker atomically with the sync and freezes the
         // frontier; later syncs stay frozen.
@@ -939,7 +1144,7 @@ mod tests {
         // `scheduler_accepts` deliberately omits the two structural
         // rejections (future safe_block, non-monotonic frames) under
         // self-trust — the sequencer never produces them. Before the
-        // content-identity check (review R2), such a foreign batch at the
+        // content-identity check, such a foreign batch at the
         // expected nonce would be sim-accepted and silently desync the
         // frontier forever. With the check, it fails the local-batch lookup
         // (kind = foreign), the poison marker persists atomically with the

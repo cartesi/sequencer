@@ -361,9 +361,11 @@ See [`staging-drills.md`](staging-drills.md) for divergence signal and watchdog 
 ## Related sequencer tests
 
 ```bash
-cargo test -p sequencer snapshot_endpoints -- --test-threads=1
+cargo test -p sequencer --lib integration_tests::snapshot_endpoints -- --test-threads=1
 cargo test -p app-core wallet_snapshot -- --test-threads=1
 ```
 
-HTTP integration for snapshot routes lives in `sequencer/tests/snapshot_endpoints.rs`.
+HTTP integration-style coverage for snapshot routes lives in
+`sequencer/src/integration_tests/snapshot_endpoints.rs`; it stays inside the
+crate so raw server launch remains crate-private.
 SSZ golden bytes for the toy wallet live in `tests/fixtures/wallet_snapshot_empty.{hex,bin}`.

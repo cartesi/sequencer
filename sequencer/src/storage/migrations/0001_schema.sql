@@ -23,19 +23,18 @@
 -- wall clock — write-once (triggers below), but deliberately NOT
 -- cross-checked against `created_at_ms`: wall-clock monotonicity is an
 -- environmental assumption, not an invariant (NTP steps, VM resume), and a
--- CHECK on it wedged batch close and the recovery cascade in a clock
--- regression (review F8). No production code reads these as values; every
+-- CHECK on it once wedged batch close and the recovery cascade in a clock
+-- regression. No production code reads these as values; every
 -- reader is an IS NULL / IS NOT NULL predicate.
 -- `payload_hash` is the keccak256 of the batch's SSZ wire bytes, stamped at
--- seal time by the same encode path the submitter uses (review R2,
--- hash-at-seal). It is what the content-identity check compares an accepted
+-- seal time by the same encode path the submitter uses (hash-at-seal). It is what the content-identity check compares an accepted
 -- L1 landing against — and because it is computed by the code that sealed
 -- the batch, it survives wire-format upgrades. NULL only while the batch is
 -- the open Tip (and on recovery sentinels, which carry no payload).
 CREATE TABLE IF NOT EXISTS batches (
     batch_index        INTEGER PRIMARY KEY,
     parent_batch_index INTEGER REFERENCES batches(batch_index),  -- NULL only for genesis
-    nonce              INTEGER NOT NULL CHECK (nonce >= 0),
+    nonce              INTEGER NOT NULL CHECK (typeof(nonce) = 'integer' AND nonce >= 0),
     created_at_ms      INTEGER NOT NULL,
     sealed_at_ms       INTEGER CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= 0),
     invalidated_at_ms  INTEGER CHECK (invalidated_at_ms IS NULL OR invalidated_at_ms >= 0),
@@ -59,6 +58,9 @@ CREATE INDEX IF NOT EXISTS idx_batches_valid_closed_by_nonce
     WHERE invalidated_at_ms IS NULL AND sealed_at_ms IS NOT NULL;
 
 -- ── Views ──────────────────────────────────────────────────────────────────
+-- Readers over batch data go through the `valid_*` views (here and
+-- `valid_sequenced_l2_txs` below), which encapsulate the "exclude invalidated
+-- rows" filter; writers always target the base tables.
 CREATE VIEW IF NOT EXISTS valid_batches AS
     SELECT * FROM batches WHERE invalidated_at_ms IS NULL;
 
@@ -96,6 +98,13 @@ INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
 -- would break it. The Rust writer is still the source of truth for the
 -- transition sequence — triggers just ensure the DB never reaches an
 -- inconsistent state if the writer misbehaves.
+--
+-- typeof() guards: INTEGER affinity does not reject an unconvertible value,
+-- and TEXT/BLOB sort above INTEGER, so a bare `x >= 0` CHECK passes 'abc'.
+-- Columns that feed SQL-level arithmetic or comparisons (trigger math,
+-- frontier folds, lease counts) therefore carry an explicit
+-- typeof(x) = 'integer' guard: a mis-bound positional parameter must refuse,
+-- not coerce to 0 inside a trigger.
 
 -- Nonce contiguity: `nonce = parent.nonce + 1`, or the batch-tree anchor nonce
 -- (0 for a genesis deployment, N' for a recovered one) for the parentless root.
@@ -206,6 +215,9 @@ BEGIN
     SELECT RAISE(ABORT, 'frames can only be inserted into the current Tip');
 END;
 
+-- No (sender, nonce) uniqueness is enforced here: included user-op identity
+-- is tracked by application nonce logic, and a DB constraint would block
+-- legitimate resubmission after a recovery cascade.
 CREATE TABLE IF NOT EXISTS user_ops (
     batch_index      INTEGER NOT NULL,
     frame_in_batch   INTEGER NOT NULL,
@@ -251,7 +263,8 @@ CREATE TABLE IF NOT EXISTS safe_inputs (
     sender             BLOB NOT NULL CHECK (length(sender) = 20),
     payload            BLOB NOT NULL,
     -- Block number of the chain block where this direct input was included (e.g. InputAdded event block).
-    block_number       INTEGER NOT NULL CHECK (block_number >= 0),
+    block_number       INTEGER NOT NULL
+        CHECK (typeof(block_number) = 'integer' AND block_number >= 0),
     -- Timestamp of the carrying L1 block.
     block_timestamp    INTEGER NOT NULL CHECK (block_timestamp >= 0),
     -- Hash of the L1 transaction that carried this input.
@@ -328,7 +341,9 @@ WHERE batch_index NOT IN (SELECT batch_index FROM batches WHERE invalidated_at_m
 -- acceptance logic over new safe_inputs rows.
 CREATE TABLE IF NOT EXISTS safe_accepted_batches (
     safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),
-    nonce                INTEGER NOT NULL,
+    -- CHECK aligns this column with its siblings (batches.nonce, anchor nonce);
+    -- the writer is u64-sourced, so a negative value is corruption.
+    nonce                INTEGER NOT NULL CHECK (typeof(nonce) = 'integer' AND nonce >= 0),
     first_frame_safe_block INTEGER NOT NULL,
     inclusion_block      INTEGER NOT NULL
 );
@@ -345,19 +360,19 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
 );
 
 -- Highest wallet nonce ever broadcast by this deployment's batch-submitter
--- key (review R1a — the durable realization of the TLA+ spec's
--- `walletNonce`). Write-before-broadcast: any component about to send a tx
+-- key (the durable realization of the TLA+ spec's `walletNonce`). Write-before-broadcast: any component about to send a tx
 -- at wallet nonce n first commits watermark = max(watermark, n) — power-loss
 -- durable under synchronous=FULL — then sends. Uniform for batch txs and
 -- flush no-ops alike, so the flush's slot coverage never depends on the
--- local node's volatile mempool memory (the F1 zombie). Absent row =
+-- local node's volatile mempool memory (which a dropped-locally but
+-- network-alive zombie tx evades). Absent row =
 -- nothing ever broadcast. Never reset, never lowered.
 CREATE TABLE IF NOT EXISTS wallet_nonce_watermark (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     watermark    INTEGER NOT NULL CHECK (watermark >= 0)
 );
 
--- Canonical-divergence poison marker (review R2). Written by the input
+-- Canonical-divergence poison marker. Written by the input
 -- reader's acceptance simulation — atomically with the sync that detected
 -- it — when a fully-accepted L1 landing fails the content-identity check:
 -- either no valid closed local batch exists at the accepted nonce
@@ -375,6 +390,269 @@ CREATE TABLE IF NOT EXISTS canonical_divergence (
     kind             TEXT    NOT NULL CHECK (kind IN ('foreign', 'mismatch')),
     detected_at_ms   INTEGER NOT NULL CHECK (detected_at_ms >= 0)
 );
+
+-- I15 structural enforcement: while the divergence marker exists, the batch
+-- tree, promotions, and the pending-snapshot pool are frozen in the engine
+-- itself. Standard recovery is forbidden on a diverged frontier; the typed
+-- Rust refusals (the local-first startup reducer plus guarded Tip/Cascade
+-- mutations and atomic runtime admission) remain the friendly error surface, but these
+-- triggers are the enforcement a forgotten call site cannot bypass. The accepted
+-- frontier (`safe_accepted_batches`) has no trigger: its single writer refuses
+-- past the marker in Rust.
+CREATE TRIGGER IF NOT EXISTS trg_batches_frozen_on_divergence_insert
+BEFORE INSERT ON batches FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
+BEGIN SELECT RAISE(ABORT, 'batch tree frozen: canonical divergence marker present'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_batches_frozen_on_divergence_update
+BEFORE UPDATE ON batches FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
+BEGIN SELECT RAISE(ABORT, 'batch tree frozen: canonical divergence marker present'); END;
+
+-- External history identity. One database serves exactly one era. The era is
+-- minted with the baseline schema; standard recovery advances only the
+-- generation. A rebuild's application-history base and durable safe-input
+-- drain floor are unknown until the recovered finalized snapshot exists, so
+-- they alone start NULL and fill together exactly once before setup completes.
+CREATE TABLE IF NOT EXISTS history_state (
+    singleton_id                 INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    era_id                       BLOB    NOT NULL CHECK (
+        typeof(era_id) = 'blob'
+        AND length(era_id) = 16
+        AND substr(hex(era_id), 13, 1) = '4'
+        AND substr(hex(era_id), 17, 1) IN ('8', '9', 'A', 'B')
+    ),
+    era_created_at_ms            INTEGER NOT NULL CHECK (
+        typeof(era_created_at_ms) = 'integer'
+        AND era_created_at_ms >= 0
+    ),
+    recovery_generation          INTEGER NOT NULL CHECK (
+        typeof(recovery_generation) = 'integer'
+        AND recovery_generation >= 0
+    ),
+    base_executed_input_count    INTEGER CHECK (
+        base_executed_input_count IS NULL
+        OR (
+            typeof(base_executed_input_count) = 'integer'
+            AND base_executed_input_count >= 0
+        )
+    ),
+    base_safe_input_index        INTEGER CHECK (
+        base_safe_input_index IS NULL
+        OR (
+            typeof(base_safe_input_index) = 'integer'
+            AND base_safe_input_index >= 0
+        )
+    ),
+    CHECK (
+        (base_executed_input_count IS NULL AND base_safe_input_index IS NULL)
+        OR
+        (base_executed_input_count IS NOT NULL AND base_safe_input_index IS NOT NULL)
+    )
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_history_state_single_insert
+BEFORE INSERT ON history_state
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM history_state WHERE singleton_id = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'history state is inserted once per database');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_history_identity_write_once
+BEFORE UPDATE OF singleton_id, era_id, era_created_at_ms ON history_state
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'history era identity is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_history_base_write_once
+BEFORE UPDATE OF base_executed_input_count, base_safe_input_index ON history_state
+FOR EACH ROW
+WHEN OLD.base_executed_input_count IS NOT NULL
+  OR OLD.base_safe_input_index IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'history base is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_history_generation_monotonic
+BEFORE UPDATE OF recovery_generation ON history_state
+FOR EACH ROW
+WHEN OLD.recovery_generation = 9223372036854775807
+  OR NEW.recovery_generation != OLD.recovery_generation + 1
+BEGIN
+    SELECT RAISE(ABORT, 'recovery generation must advance by exactly one');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_history_state_not_deletable
+BEFORE DELETE ON history_state
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'history state is write-once per database');
+END;
+
+-- Canonical application-history coordinates attached to physical replay rows.
+--
+-- `sequenced_l2_txs.offset` remains the append-only SQLite pagination cursor:
+-- it may contain invalidated rows and rows that the application never executes
+-- (our own batch submissions and cockroach-root cursor padding). This table is
+-- the separate, sparse attribution saying which physical rows did execute and
+-- at which `Application::executed_input_count` boundary.
+--
+-- The primary key makes attribution one-to-one per physical row. This is a
+-- derived *current canonical projection*, not the audit log: invalidating a
+-- batch atomically deletes its mappings while retaining the physical replay
+-- rows. The replacement suffix can then reuse its canonical offsets, enforced
+-- by the global logical UNIQUE constraint.
+CREATE TABLE IF NOT EXISTS executed_inputs (
+    sequenced_l2_tx_offset INTEGER PRIMARY KEY
+        REFERENCES sequenced_l2_txs(offset),
+    executed_input_offset  INTEGER NOT NULL CHECK (
+        typeof(executed_input_offset) = 'integer'
+        AND executed_input_offset >= 0
+    ),
+    UNIQUE(executed_input_offset)
+);
+
+-- Invalidation structurally deletes mappings below, so this projection can
+-- join the physical table directly without re-running the valid-batch filter.
+CREATE VIEW IF NOT EXISTS valid_executed_inputs AS
+SELECT
+    e.sequenced_l2_tx_offset,
+    e.executed_input_offset,
+    s.batch_index,
+    s.frame_in_batch,
+    s.user_op_pos_in_frame,
+    s.safe_input_index
+FROM executed_inputs e
+JOIN sequenced_l2_txs s ON s.offset = e.sequenced_l2_tx_offset;
+
+-- Attribution is creation-time state, not a catch-up repair operation. The
+-- Rust writer maps rows in their creation transaction; this backstop limits a
+-- target to the current valid Tip and refuses physical-order rewrites.
+CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_target_must_be_tip
+BEFORE INSERT ON executed_inputs
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM sequenced_l2_txs s
+    JOIN batches b ON b.batch_index = s.batch_index
+    WHERE s.offset = NEW.sequenced_l2_tx_offset
+      AND b.sealed_at_ms IS NULL
+      AND b.invalidated_at_ms IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'executed input must target the current valid Tip');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_requires_bound_base
+BEFORE INSERT ON executed_inputs
+FOR EACH ROW
+WHEN (SELECT base_executed_input_count FROM history_state WHERE singleton_id = 0) IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'executed input history base is not bound');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_physical_order
+BEFORE INSERT ON executed_inputs
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM executed_inputs
+    WHERE sequenced_l2_tx_offset >= NEW.sequenced_l2_tx_offset
+)
+BEGIN
+    SELECT RAISE(ABORT, 'executed input attributions must follow physical replay order');
+END;
+
+-- Every new mapping consumes exactly the current canonical next offset:
+-- max(the era base, MAX(current mapping) + 1). Invalidation deletes its suffix
+-- mappings, naturally rewinding the next offset for the replacement suffix.
+CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_contiguous
+BEFORE INSERT ON executed_inputs
+FOR EACH ROW
+WHEN NEW.executed_input_offset != (
+    SELECT MAX(
+        base_executed_input_count,
+        COALESCE((SELECT MAX(executed_input_offset) + 1 FROM executed_inputs), 0)
+    )
+    FROM history_state
+    WHERE singleton_id = 0
+)
+BEGIN
+    SELECT RAISE(ABORT, 'executed input offset must equal canonical next count');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_append_only_update
+BEFORE UPDATE ON executed_inputs
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'executed input attribution is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_protect_valid_executed_input_delete
+BEFORE DELETE ON executed_inputs
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM sequenced_l2_txs s
+    JOIN batches b ON b.batch_index = s.batch_index
+    WHERE s.offset = OLD.sequenced_l2_tx_offset
+      AND b.invalidated_at_ms IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'valid executed input attribution cannot be deleted');
+END;
+
+-- Recovery owns the only deletion path. The batch row is already invalid when
+-- this AFTER trigger runs, so the guarded delete above permits exactly these
+-- derived mappings to disappear in the same transaction as suffix invalidation.
+CREATE TRIGGER IF NOT EXISTS trg_drop_invalidated_executed_inputs
+AFTER UPDATE OF invalidated_at_ms ON batches
+FOR EACH ROW
+WHEN OLD.invalidated_at_ms IS NULL AND NEW.invalidated_at_ms IS NOT NULL
+BEGIN
+    DELETE FROM executed_inputs
+    WHERE sequenced_l2_tx_offset IN (
+        SELECT offset FROM sequenced_l2_txs WHERE batch_index = NEW.batch_index
+    );
+END;
+
+-- Terminal-fault black box: an append-only trail of terminal causes,
+-- best-effort recorded before death. DELIBERATELY NOT AN ADMISSION GATE:
+-- admission
+-- is governed by facts — the kernel process lock excludes concurrent
+-- owners, `setup_complete` orders commands (two-sided), and
+-- `canonical_divergence` is the one absorbing refusal (cockroach rebuild is
+-- the only exit). Restart policy after a terminal fault is the exit-code
+-- contract (30 = do not restart, page), not a database gate. Nothing reads
+-- this table for decisions; it exists so the cause of death travels with
+-- the data directory for operator postmortems, surviving log rotation.
+CREATE TABLE IF NOT EXISTS terminal_faults (
+    fault_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    command        TEXT    NOT NULL CHECK (command IN (
+        'setup', 'rebuild', 'run', 'maintenance_flush'
+    )),
+    cause          TEXT    NOT NULL CHECK (
+        typeof(cause) = 'text' AND length(cause) > 0
+    ),
+    recorded_at_ms INTEGER NOT NULL CHECK (
+        typeof(recorded_at_ms) = 'integer' AND recorded_at_ms >= 0
+    )
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_terminal_faults_append_only_update
+BEFORE UPDATE ON terminal_faults
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'terminal-fault black box is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_terminal_faults_append_only_delete
+BEFORE DELETE ON terminal_faults
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'terminal-fault black box is append-only');
+END;
 
 -- Deployment identity: the persisted DB is only valid for this deployment.
 -- Allows L1-unreachable startup after first boot, and prevents interpreting
@@ -472,7 +750,7 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     -- Log-space fee exponent fed by the oracle.
     log_gas_price            INTEGER NOT NULL CHECK (log_gas_price >= 0),
     -- Unix-ms of the last successful oracle (or Fixed setup) write.
-    -- 0 means never written; Uniswap treats that as stale.
+    -- 0 means never written; completed setup guarantees a nonzero observation.
     log_gas_price_updated_at_ms INTEGER NOT NULL CHECK (log_gas_price_updated_at_ms >= 0),
     -- log_{129/128}(10), rounded by log_fee_ratio(10, 1) = 296.
     -- This tenfold price slack is applied in log space, not in the oracle.
@@ -564,18 +842,43 @@ FROM batch_policy;
 CREATE TABLE IF NOT EXISTS dumps (
     id           INTEGER PRIMARY KEY,
     prefix       TEXT NOT NULL UNIQUE,
-    lease_count  INTEGER NOT NULL DEFAULT 0 CHECK (lease_count >= 0)
+    lease_count  INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(lease_count) = 'integer' AND lease_count >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS pending_snapshots (
-    nonce        INTEGER PRIMARY KEY CHECK (nonce >= 0),
-    dump_id      INTEGER NOT NULL REFERENCES dumps(id) ON DELETE RESTRICT,
-    l2_tx_index  INTEGER NOT NULL CHECK (l2_tx_index >= 0)
+    nonce                 INTEGER PRIMARY KEY CHECK (typeof(nonce) = 'integer' AND nonce >= 0),
+    dump_id               INTEGER NOT NULL REFERENCES dumps(id) ON DELETE RESTRICT,
+    l2_tx_index           INTEGER NOT NULL
+        CHECK (typeof(l2_tx_index) = 'integer' AND l2_tx_index >= 0),
+    executed_input_count  INTEGER NOT NULL CHECK (
+        typeof(executed_input_count) = 'integer'
+        AND executed_input_count >= 0
+    )
 );
 
 CREATE TABLE IF NOT EXISTS finalized_snapshot (
-    singleton_id     INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    dump_id          INTEGER NOT NULL REFERENCES dumps(id) ON DELETE RESTRICT,
-    inclusion_block  INTEGER NOT NULL CHECK (inclusion_block >= 0),
-    l2_tx_index      INTEGER NOT NULL CHECK (l2_tx_index >= 0)
+    singleton_id          INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    dump_id               INTEGER NOT NULL REFERENCES dumps(id) ON DELETE RESTRICT,
+    inclusion_block       INTEGER NOT NULL
+        CHECK (typeof(inclusion_block) = 'integer' AND inclusion_block >= 0),
+    l2_tx_index           INTEGER NOT NULL
+        CHECK (typeof(l2_tx_index) = 'integer' AND l2_tx_index >= 0),
+    executed_input_count  INTEGER NOT NULL CHECK (
+        typeof(executed_input_count) = 'integer'
+        AND executed_input_count >= 0
+    )
 );
+
+-- I15 structural enforcement, snapshot half (batch-tree half lives next to
+-- the canonical_divergence table): promotions and pending-pool clears are
+-- frozen while the divergence marker exists.
+CREATE TRIGGER IF NOT EXISTS trg_promotion_frozen_on_divergence
+BEFORE INSERT ON finalized_snapshot FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
+BEGIN SELECT RAISE(ABORT, 'promotion frozen: canonical divergence marker present'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_pending_clear_frozen_on_divergence
+BEFORE DELETE ON pending_snapshots FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
+BEGIN SELECT RAISE(ABORT, 'pending-snapshot clear frozen: canonical divergence marker present'); END;

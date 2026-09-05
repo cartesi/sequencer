@@ -363,6 +363,47 @@ with its store or prune, and omitting `--delete` **accumulates a per-block
 history in S3** while local disk stays at one snapshot. Restore feeds a chosen
 snapshot back through the watchdog/sequencer recovery workflow.
 
+## Sequencer restart policy
+
+The sequencer's exit codes are the restart contract: 10
+restart-expect-recovery, 20 restart-transient, 30 terminal — **page an
+operator, do not auto-restart**, 40 wipe + `setup --recovery`, 1
+unclassified restart-with-backoff. Operational notes:
+
+- **The exit code is the whole restart contract.** There is no database
+  gate and no acknowledgement command:
+  standard recovery is automatic on every boot, and a persistent terminal
+  fault re-detects fail-loud when the faulty state is next read. Configure
+  the supervisor to honor 30 (stop and page) — that configuration is what
+  bounds a crash loop.
+- **Supervisor recipes.** systemd can act on the code directly:
+  `RestartPreventExitStatus=30 ABRT` (SIGABRT/134 is terminal-class too).
+  Kubernetes Deployments restart regardless of exit code, and there is no
+  boot gate — so on k8s a terminal exit will restart-loop through
+  re-detection windows, serving traffic in between. There, the crash-loop
+  bound is your alerting, not the restart policy: page immediately on
+  `lastState.terminated.exitCode == 30` (and on signal exits / 134).
+- **A terminal containment that cannot drain within two seconds exits via
+  `abort()` (SIGABRT, status 134), not code 30.** Treat 134 from the
+  sequencer as terminal-class. The cause is in the process logs only:
+  containment writes nothing durable, and the black box's row is written at
+  settlement, after the drain — which the abort pre-empts by definition.
+- **After an unclean death (OOM, node reboot, SIGKILL) no action is
+  needed**: the next start re-derives everything from facts. For
+  postmortems, the `terminal_faults` table records the cause of every
+  command that returned through its bracket with a terminal verdict
+  (best-effort, append-only, traveling with the data directory —
+  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`; the next `run`
+  also logs the latest row once at startup). Any death that did not return
+  through the bracket — SIGKILL, OOM, a node reboot, the two-second abort,
+  a controller panic — leaves only the process logs.
+- **Canonical divergence is the one manual path**: the sequencer freezes
+  the acceptance frontier
+  ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)),
+  refuses every command on that data directory, and the remedy is a
+  fresh-directory `setup --recovery` (cockroach). You will typically learn
+  of it from the watchdog before the sequencer tells you.
+
 ## Troubleshooting (live deployments)
 
 | Symptom | Likely cause |

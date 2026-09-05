@@ -2,14 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Shared `#[cfg(test)]` fixtures for the runtime modules: a minimal
-//! [`Application`] stub plus a dump-layout helper, used by both the worker
-//! lifecycle tests ([`super::workers`]) and the setup-fill tests
-//! ([`super::setup_fill`]).
+//! [`Application`] stub plus a dump-layout helper, used by the worker
+//! lifecycle tests (`run::workers`), the startup-hygiene tests
+//! (`run::startup_hygiene`), and the setup-fill tests (`setup::fill`).
 
 use std::path::Path;
 
 use crate::ingress::inclusion_lane::dump_info::{self, create_dump_dir_with_info};
-use sequencer_core::application::{AppError, AppOutputs, Application, InvalidReason};
+use sequencer_core::application::{
+    AppError, AppOutputs, Application, ApplicationProgress, ApplyInputCapability, InvalidReason,
+    ProgressCommitCapability,
+};
+use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::ValidUserOp;
 use sequencer_core::user_op::UserOp;
 
@@ -17,7 +21,17 @@ use sequencer_core::user_op::UserOp;
 /// a directory with a marker file inside, `delete_dump` is
 /// `remove_dir_all`. The actual marker content is irrelevant —
 /// we only care about which directories exist post-sweep.
-pub(crate) struct SweepTestApp;
+#[derive(Clone, Default)]
+pub(crate) struct SweepTestApp {
+    progress: ApplicationProgress,
+}
+
+// Preserve the unit-struct-like fixture spelling used across runtime tests
+// while carrying the scheduler-owned progress required by `Application`.
+#[allow(non_upper_case_globals)]
+pub(crate) const SweepTestApp: SweepTestApp = SweepTestApp {
+    progress: ApplicationProgress::try_new(ExecutedInputCount::ZERO, 0).expect("coherent progress"),
+};
 
 impl Application for SweepTestApp {
     const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
@@ -29,28 +43,33 @@ impl Application for SweepTestApp {
     ) -> Result<(), InvalidReason> {
         Ok(())
     }
-    fn execute_valid_user_op(
+    fn apply_valid_user_op(
         &mut self,
+        _capability: ApplyInputCapability<'_>,
         _user_op: &ValidUserOp,
         _safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
         Ok(Vec::new())
     }
-    fn execute_direct_input(
+    fn apply_direct_input(
         &mut self,
+        _capability: ApplyInputCapability<'_>,
         _input: &sequencer_core::l2_tx::DirectInput,
     ) -> Result<AppOutputs, AppError> {
         unimplemented!("not used in these tests")
     }
-    fn executed_input_count(&self) -> u64 {
-        0
+    fn execution_progress(&self) -> &ApplicationProgress {
+        &self.progress
     }
-    fn last_executed_safe_block(&self) -> u64 {
-        0
+    fn execution_progress_mut(
+        &mut self,
+        _capability: ProgressCommitCapability<'_>,
+    ) -> &mut ApplicationProgress {
+        &mut self.progress
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        Ok(SweepTestApp)
+        Ok(Self::default())
     }
     fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
@@ -70,7 +89,7 @@ impl Application for SweepTestApp {
 /// dir with `info.toml` + the stub app's dump under `state`.
 pub(crate) fn create_structured_dump(dump_dir: &std::path::Path) {
     create_dump_dir_with_info(
-        &SweepTestApp,
+        &SweepTestApp::default(),
         dump_dir,
         &dump_info::DumpInfo {
             format_version: dump_info::FORMAT_VERSION,

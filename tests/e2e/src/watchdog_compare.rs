@@ -164,7 +164,7 @@ pub async fn run_watchdog_non_genesis_compare_test(
     }
     let decoded = wallet_snapshot::decode(body.as_slice())
         .map_err(|err| format!("decode non-genesis finalized_state: {err}"))?;
-    if decoded.executed_input_count() == 0 {
+    if decoded.executed_input_count() == sequencer_core::history::ExecutedInputCount::ZERO {
         return Err("expected non-genesis finalized_state executed_input_count > 0".into());
     }
 

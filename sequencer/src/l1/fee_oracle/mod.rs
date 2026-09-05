@@ -3,9 +3,11 @@
 
 //! L1-native fee-token gas-price oracle.
 
+mod bootstrap;
 pub mod math;
 pub mod uniswap;
 pub mod worker;
 
+pub(crate) use bootstrap::{UniswapConnectError, connect_uniswap, persist_first_price};
 pub use uniswap::{TokenPriceSource, UniswapConfig, UniswapV3PriceSource};
 pub use worker::FeeOracle;

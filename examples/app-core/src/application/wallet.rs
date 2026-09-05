@@ -14,7 +14,11 @@ use types::{Erc20Deposit, Erc20Transfer};
 use super::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
 use super::Method;
 use super::{DepositNotice, TransferNotice};
-use sequencer_core::application::{AppError, AppOutput, AppOutputs, Application, InvalidReason};
+use sequencer_core::application::{
+    AppError, AppOutput, AppOutputs, Application, ApplicationProgress, ApplyInputCapability,
+    InvalidReason, ProgressCommitCapability,
+};
+use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::ValidUserOp;
 use sequencer_core::user_op::UserOp;
 
@@ -55,8 +59,7 @@ pub struct WalletApp {
     config: WalletConfig,
     balances: HashMap<Address, U256>,
     nonces: HashMap<Address, u32>,
-    executed_input_count: u64,
-    last_executed_safe_block: u64,
+    execution_progress: ApplicationProgress,
 }
 
 /// Rollups-contracts v3.0.0-alpha.6 ERC20Portal. The contracts deploy at
@@ -87,26 +90,38 @@ impl WalletApp {
             config,
             balances: HashMap::new(),
             nonces: HashMap::new(),
-            executed_input_count: 0,
-            last_executed_safe_block: 0,
+            execution_progress: ApplicationProgress::default(),
         }
     }
 
     /// Reconstruct from decoded snapshot parts. Used by `crate::wallet_snapshot::decode`.
+    ///
+    /// The progress pair comes from untrusted dump bytes, so an incoherent
+    /// pair is a typed decode error like every other corrupt-snapshot case —
+    /// not a panic escaping `from_dump`'s `Result`.
     pub(crate) fn from_snapshot_parts(
         config: WalletConfig,
         balances: HashMap<Address, U256>,
         nonces: HashMap<Address, u32>,
         executed_input_count: u64,
         last_executed_safe_block: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AppError> {
+        let execution_progress = ApplicationProgress::try_new(
+            ExecutedInputCount::new(executed_input_count),
+            last_executed_safe_block,
+        )
+        .ok_or_else(|| AppError::Internal {
+            reason: format!(
+                "snapshot progress is incoherent: zero executed inputs with \
+                 nonzero safe-block clock {last_executed_safe_block}"
+            ),
+        })?;
+        Ok(Self {
             config,
             balances,
             nonces,
-            executed_input_count,
-            last_executed_safe_block,
-        }
+            execution_progress,
+        })
     }
 
     // Accessors for the canonical snapshot encoder (`crate::wallet_snapshot`).
@@ -134,15 +149,15 @@ impl WalletApp {
 
     #[cfg(test)]
     pub(crate) fn set_executed_input_count(&mut self, count: u64) {
-        self.executed_input_count = count;
-    }
-
-    pub(crate) fn executed_input_count(&self) -> u64 {
-        self.executed_input_count
+        self.execution_progress = ApplicationProgress::try_new(
+            ExecutedInputCount::new(count),
+            self.execution_progress.last_executed_safe_block(),
+        )
+        .expect("coherent progress");
     }
 
     pub fn last_executed_safe_block(&self) -> u64 {
-        self.last_executed_safe_block
+        self.execution_progress.last_executed_safe_block()
     }
 
     /// Deterministic JSON of the non-default logical state (debug only).
@@ -208,7 +223,10 @@ impl WalletApp {
     }
 
     fn bump_nonce(&mut self, addr: Address) {
-        let next = self.expected_nonce(&addr).wrapping_add(1);
+        let next = self
+            .expected_nonce(&addr)
+            .checked_add(1)
+            .expect("wallet nonce overflow: no canonical successor");
         self.nonces.insert(addr, next);
     }
 
@@ -266,10 +284,11 @@ impl Application for WalletApp {
         Ok(())
     }
 
-    fn execute_valid_user_op(
+    fn apply_valid_user_op(
         &mut self,
+        _capability: ApplyInputCapability<'_>,
         user_op: &ValidUserOp,
-        safe_block: u64,
+        _safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
         let sender = user_op.sender;
         let fee_cost = sequencer_core::fee::fee_to_linear(user_op.fee);
@@ -314,13 +333,12 @@ impl Application for WalletApp {
             _ => {}
         }
 
-        self.executed_input_count = self.executed_input_count.saturating_add(1);
-        self.last_executed_safe_block = self.last_executed_safe_block.max(safe_block);
         Ok(outputs)
     }
 
-    fn execute_direct_input(
+    fn apply_direct_input(
         &mut self,
+        _capability: ApplyInputCapability<'_>,
         input: &sequencer_core::l2_tx::DirectInput,
     ) -> Result<AppOutputs, AppError> {
         let mut outputs = Vec::new();
@@ -357,17 +375,18 @@ impl Application for WalletApp {
             }
         }
 
-        self.executed_input_count = self.executed_input_count.saturating_add(1);
-        self.last_executed_safe_block = self.last_executed_safe_block.max(input.block_number);
         Ok(outputs)
     }
 
-    fn executed_input_count(&self) -> u64 {
-        self.executed_input_count
+    fn execution_progress(&self) -> &ApplicationProgress {
+        &self.execution_progress
     }
 
-    fn last_executed_safe_block(&self) -> u64 {
-        self.last_executed_safe_block
+    fn execution_progress_mut(
+        &mut self,
+        _capability: ProgressCommitCapability<'_>,
+    ) -> &mut ApplicationProgress {
+        &mut self.execution_progress
     }
 
     fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError> {
@@ -432,9 +451,10 @@ mod tests {
     use types::Erc20Transfer;
     use types::alloy_sol_types::SolCall;
 
-    use super::{WalletApp, WalletConfig};
+    use super::{ApplicationProgress, ExecutedInputCount, WalletApp, WalletConfig};
     use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};
     use sequencer_core::application::{AppError, AppOutput, Application, InvalidReason};
+    use sequencer_core::application::{execute_direct_input, execute_valid_user_op};
     use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
     use sequencer_core::user_op::UserOp;
 
@@ -480,9 +500,9 @@ mod tests {
             data: Vec::new(),
         };
         let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
-        let outputs = app
-            .execute_valid_user_op(&valid, 0)
-            .expect("execute valid op");
+        let outputs = execute_valid_user_op(&mut app, &valid, 0)
+            .expect("execute valid op")
+            .outputs;
 
         assert_eq!(app.current_user_nonce(sender), 1);
         assert_eq!(app.current_user_balance(sender), initial_balance - gas_cost);
@@ -545,9 +565,9 @@ mod tests {
             data: ssz::Encode::as_ssz_bytes(&legacy),
         };
 
-        let outputs = app
-            .execute_valid_user_op(&valid, 0)
-            .expect("execute valid user op");
+        let outputs = execute_valid_user_op(&mut app, &valid, 0)
+            .expect("execute valid user op")
+            .outputs;
 
         assert_eq!(app.current_user_nonce(sender), before_sender_nonce + 1);
         // Gas cost of 1 unit (fee_to_linear(0) = 1) is deducted
@@ -573,8 +593,9 @@ mod tests {
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
 
         let before = app.current_user_balance(nested_sender);
-        let outputs = app
-            .execute_direct_input(&DirectInput {
+        let outputs = execute_direct_input(
+            &mut app,
+            &DirectInput {
                 sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
                 block_number: 123,
                 payload: encode_erc20_deposit_payload(
@@ -582,14 +603,16 @@ mod tests {
                     nested_sender,
                     U256::from(250_u64),
                 ),
-            })
-            .expect("execute deposit direct input");
+            },
+        )
+        .expect("execute deposit direct input")
+        .outputs;
 
         assert_eq!(
             app.current_user_balance(nested_sender),
             before + U256::from(250_u64)
         );
-        assert_eq!(app.executed_input_count(), 1);
+        assert_eq!(app.executed_input_count().get(), 1);
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
             AppOutput::Notice(payload) => {
@@ -608,8 +631,9 @@ mod tests {
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
 
         let before = app.current_user_balance(nested_sender);
-        let outputs = app
-            .execute_direct_input(&DirectInput {
+        let outputs = execute_direct_input(
+            &mut app,
+            &DirectInput {
                 sender: address!("0x3333333333333333333333333333333333333333"),
                 block_number: 123,
                 payload: encode_erc20_deposit_payload(
@@ -617,11 +641,13 @@ mod tests {
                     nested_sender,
                     U256::from(250_u64),
                 ),
-            })
-            .expect("execute non-portal direct input");
+            },
+        )
+        .expect("execute non-portal direct input")
+        .outputs;
 
         assert_eq!(app.current_user_balance(nested_sender), before);
-        assert_eq!(app.executed_input_count(), 1);
+        assert_eq!(app.executed_input_count().get(), 1);
         assert!(outputs.is_empty());
     }
 
@@ -632,8 +658,9 @@ mod tests {
         let unsupported_token = address!("0x9999999999999999999999999999999999999999");
 
         let before = app.current_user_balance(nested_sender);
-        let outputs = app
-            .execute_direct_input(&DirectInput {
+        let outputs = execute_direct_input(
+            &mut app,
+            &DirectInput {
                 sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
                 block_number: 123,
                 payload: encode_erc20_deposit_payload(
@@ -641,11 +668,13 @@ mod tests {
                     nested_sender,
                     U256::from(250_u64),
                 ),
-            })
-            .expect("unsupported token should be ignored");
+            },
+        )
+        .expect("unsupported token should be ignored")
+        .outputs;
 
         assert_eq!(app.current_user_balance(nested_sender), before);
-        assert_eq!(app.executed_input_count(), 1);
+        assert_eq!(app.executed_input_count().get(), 1);
         assert!(outputs.is_empty());
     }
 
@@ -653,15 +682,18 @@ mod tests {
     fn malformed_trusted_portal_deposit_is_a_no_op() {
         let mut app = WalletApp::new(WalletConfig::default());
 
-        let outputs = app
-            .execute_direct_input(&DirectInput {
+        let outputs = execute_direct_input(
+            &mut app,
+            &DirectInput {
                 sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
                 block_number: 123,
                 payload: vec![0xaa; 10],
-            })
-            .expect("malformed trusted portal payload should be ignored");
+            },
+        )
+        .expect("malformed trusted portal payload should be ignored")
+        .outputs;
 
-        assert_eq!(app.executed_input_count(), 1);
+        assert_eq!(app.executed_input_count().get(), 1);
         assert!(outputs.is_empty());
     }
 
@@ -684,9 +716,9 @@ mod tests {
             })),
         };
 
-        let outputs = app
-            .execute_valid_user_op(&valid, 0)
-            .expect("execute transfer");
+        let outputs = execute_valid_user_op(&mut app, &valid, 0)
+            .expect("execute transfer")
+            .outputs;
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -721,9 +753,9 @@ mod tests {
             })),
         };
 
-        let outputs = app
-            .execute_valid_user_op(&valid, 0)
-            .expect("execute withdrawal");
+        let outputs = execute_valid_user_op(&mut app, &valid, 0)
+            .expect("execute withdrawal")
+            .outputs;
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -778,7 +810,7 @@ mod tests {
             fee: fee_exponent,
             data: Vec::new(),
         };
-        app.execute_valid_user_op(&valid, 0).expect("execute op");
+        execute_valid_user_op(&mut app, &valid, 0).expect("execute op");
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -808,7 +840,7 @@ mod tests {
             fee: fee_exponent,
             data: Vec::new(),
         };
-        app.execute_valid_user_op(&valid, 0).expect("execute op");
+        execute_valid_user_op(&mut app, &valid, 0).expect("execute op");
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -831,8 +863,8 @@ mod tests {
         app.balances.insert(bob, U256::from(5678_u64));
         app.nonces.insert(alice, 4);
         app.nonces.insert(bob, 9);
-        app.executed_input_count = 42;
-        app.last_executed_safe_block = 777;
+        app.execution_progress = ApplicationProgress::try_new(ExecutedInputCount::new(42), 777)
+            .expect("coherent progress");
 
         let prefix = temp_dump_prefix();
         app.create_dump(&prefix).expect("create dump");
@@ -855,11 +887,7 @@ mod tests {
         );
         assert_eq!(restored.balances, app.balances);
         assert_eq!(restored.nonces, app.nonces);
-        assert_eq!(restored.executed_input_count, app.executed_input_count);
-        assert_eq!(
-            restored.last_executed_safe_block,
-            app.last_executed_safe_block
-        );
+        assert_eq!(restored.execution_progress, app.execution_progress);
     }
 
     #[test]
@@ -875,7 +903,7 @@ mod tests {
             fee: 0,
             data: Vec::new(),
         };
-        app.execute_valid_user_op(&valid, 100).expect("execute op");
+        execute_valid_user_op(&mut app, &valid, 100).expect("execute op");
         assert_eq!(app.last_executed_safe_block(), 100);
 
         // A direct input advances the clock via its own inclusion block.
@@ -884,7 +912,7 @@ mod tests {
             block_number: 150,
             payload: Vec::new(),
         };
-        app.execute_direct_input(&direct).expect("execute direct");
+        execute_direct_input(&mut app, &direct).expect("execute direct");
         assert_eq!(app.last_executed_safe_block(), 150);
 
         // max(): an older block must never regress the clock. A direct's
@@ -895,8 +923,7 @@ mod tests {
             block_number: 120,
             payload: Vec::new(),
         };
-        app.execute_direct_input(&older_direct)
-            .expect("execute older direct");
+        execute_direct_input(&mut app, &older_direct).expect("execute older direct");
         assert_eq!(app.last_executed_safe_block(), 150);
     }
 
@@ -923,7 +950,7 @@ mod tests {
             .insert(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), 7);
         app.nonces
             .insert(address!("0x1111111111111111111111111111111111111111"), 8);
-        app.executed_input_count = 99;
+        app.set_executed_input_count(99);
 
         let prefix_a = temp_dump_prefix();
         let prefix_b = temp_dump_prefix();

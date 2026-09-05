@@ -14,6 +14,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::get;
 
+use crate::runtime::shutdown::RuntimeScope;
+use crate::storage::ReleaseScheduler;
+
 pub(crate) use health::HealthState;
 pub use snapshot::SnapshotState;
 pub(crate) use state::SubscribeState;
@@ -24,7 +27,9 @@ pub(crate) use state::SubscribeState;
 pub(crate) fn router(
     subscribe_state: Arc<SubscribeState>,
     health_state: Arc<HealthState>,
-    snapshot_state: Arc<SnapshotState>,
+    snapshot_state: SnapshotState,
+    shutdown: RuntimeScope,
+    snapshot_release_scheduler: ReleaseScheduler,
 ) -> Router {
     let subscribe_router = Router::new()
         .route("/ws/subscribe", get(subscribe::subscribe_l2_txs))
@@ -38,5 +43,9 @@ pub(crate) fn router(
 
     subscribe_router
         .merge(health_router)
-        .merge(snapshot::router(snapshot_state))
+        .merge(snapshot::router(
+            snapshot_state,
+            shutdown,
+            snapshot_release_scheduler,
+        ))
 }

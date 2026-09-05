@@ -9,6 +9,7 @@ pub mod application;
 pub mod batch;
 pub mod broadcast;
 pub mod fee;
+pub mod history;
 pub mod l2_tx;
 pub mod protocol;
 pub mod scheduler;

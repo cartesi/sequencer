@@ -25,19 +25,27 @@ aren't. Section references point to the full reasoning below.
   at cold start). Absence is a bug, surfaced fail-loud as
   `CatchUpError::NoSnapshot` — never a branch the happy path handles. (§2)
 - **Tip exists before the lane.** A valid open Tip exists when the lane starts:
-  `ensure_open_tip` opens the genesis Tip on a fresh DB (after recovery's safe-head
-  sync, before the lane); recovery reopens it atomically across cascades. The lane
+  the reducer's guarded `EnsureOpenTip` phase opens the genesis Tip on a fresh
+  DB (after the initial safe-head sync, before the lane); recovery reopens it
+  atomically across cascades. The lane
   loads the resulting head from storage (fail-loud if absent), so it only ever
   *loads* — it never branches on tip existence or initializes one. (§7)
 - **A committed promotion implies an advanced drain.** Promotion is folded into
-  the drain's transaction (`close_frame_only_promoting`), so the two commit
-  together — this is what makes a crash safe. (§5, §6)
+  the drain's attributed transaction
+  (`close_frame_only_promoting_with_executions`), so promotion, physical
+  drain, and logical mappings commit together—this is what makes a crash safe.
+  (§5, §6)
 - **No dangling row.** No `dumps` row references a missing directory: create the
   file before the row; delete the row before the file. (§7)
-- **One resume checkpoint.** The same row supplies both the `from_dump` prefix
-  and the replay offset, so loaded state and replay cursor can't drift. (§4)
+- **One resume checkpoint.** The same row supplies the `from_dump` prefix,
+  physical replay cursor, and canonical executed-input count. Startup checks
+  the loaded app count before replay, so state and either coordinate cannot
+  drift. (§4)
 - **Snapshot `l2_tx_index` is the global valid replay head**, not the batch's
   own last offset — so an empty batch doesn't reset catch-up to genesis. (§3)
+- **Snapshot `executed_input_count` is storage-derived `H`.** Registration
+  fails loud if the application's count differs from the canonical mapping;
+  promotion carries the count with the physical cursor. (§3–5)
 - **Storage is SQLite-only; the lane owns FS cleanup.** That boundary *is* the
   GC crash-ordering guarantee — don't push filesystem work into
   `storage/snapshot_dumps.rs`. (§7)
@@ -49,7 +57,8 @@ aren't. Section references point to the full reasoning below.
   skipped checkpoints were never observable. Not a bug. (§5)
 - **`Storage::promote_finalized` (standalone) is `pub`, but production must not
   call it.** Promoting outside the drain transaction re-opens the wedge (§6); it
-  exists only for test setup. Production promotes via `close_frame_only_promoting`.
+  exists only for test setup. Production promotes via
+  `close_frame_only_promoting_with_executions`.
 - **Several snapshot `Storage` methods are `#[cfg(test)]`** — non-atomic
   siblings of the atomic production methods (`gc_dump_rows` vs
   `gc_unreferenced_dumps`; `acquire_dump_lease` vs `acquire_*_lease`;
@@ -68,7 +77,8 @@ aren't. Section references point to the full reasoning below.
 ## 1. Purpose & model
 
 A snapshot is a durable copy of the application's canonical state at a known
-point in the L2-tx stream. It exists for three consumers:
+physical replay cursor and canonical executed-input boundary. It exists for
+three consumers:
 
 - **Catch-up** (lane startup): instead of replaying the entire L2-tx history,
   the lane loads the freshest snapshot and replays only the tail after it — a
@@ -77,15 +87,17 @@ point in the L2-tx stream. It exists for three consumers:
   sequencer's state against an independent canonical machine advanced through
   L1.
 - **Indexers** (operator): fetch the **latest** snapshot, then subscribe to the
-  L2-tx feed from that snapshot's offset.
+  L2-tx feed from that snapshot's offset. The current API exposes the physical
+  `l2_tx_index`; Track 3 will expose/admit the canonical
+  `executed_input_count` with `HistoryVersion`.
 
 Three SQLite tables back it (`storage/migrations/0001_schema.sql`):
 
 | Table                | Holds                                              |
 |----------------------|----------------------------------------------------|
 | `dumps`              | `(id, prefix, lease_count)` — one row per on-disk dump directory |
-| `pending_snapshots`  | `(nonce, dump_id, l2_tx_index)` — snapshots of closed-but-not-yet-L1-confirmed batches |
-| `finalized_snapshot` | single row `(dump_id, inclusion_block, l2_tx_index)` — the latest L1-confirmed state |
+| `pending_snapshots`  | `(nonce, dump_id, l2_tx_index, executed_input_count)` — snapshots of closed-but-not-yet-L1-confirmed batches |
+| `finalized_snapshot` | single row `(dump_id, inclusion_block, l2_tx_index, executed_input_count)` — the latest L1-confirmed state |
 
 `prefix` is the **dump directory** — a structured dir the sequencer owns
 (`ingress/inclusion_lane/dump_info.rs`):
@@ -109,6 +121,11 @@ closing the commit-then-stamp crash window). An in-place update of a file
 and GC — all keyed on the immutable directory path — are untouched. The dir
 name itself stays opaque; metadata lives only in `info.toml`.
 
+`executed_input_count` is intentionally not another `info.toml` field. It is
+already canonical application state inside `state`, while SQLite stores the
+independent expected value used to reject a mismatched dump at startup. The
+physical replay cursor remains sequencer-owned checkpoint metadata.
+
 The split between **pending** and **finalized** mirrors the sequencer's
 optimism: a batch closes off-chain (soft) → its snapshot is *pending*; the
 batch lands safe on L1 → its snapshot is *promoted* to finalized.
@@ -121,12 +138,19 @@ the GC crash-ordering (§7).
 ## 2. The always-load invariant
 
 **A finalized snapshot always exists by the time the lane starts.** The runtime
-guarantees it in `Workers::spawn` (`runtime/workers.rs`): on cold start
-`ensure_finalized_snapshot` consumes the genesis `Application`, writes it as a
-dump, and registers it directly as finalized (bypassing pending); on warm start
-it is a no-op. This gives catch-up a single unconditional path — there is always
-*something* to load — and turns "no snapshot" into a violated invariant surfaced
-fail-loud as `CatchUpError::NoSnapshot`, never a branch the happy path handles.
+establishes it across the setup/run boundary: `setup` writes and registers the
+genesis dump directly as finalized (bypassing pending) before atomically
+committing setup completion. On every `run`, the startup reducer refuses a
+missing finalized-snapshot fact before any provider call, and task-free
+`PreparedRuntime::prepare` requires and re-stamps the referenced artifact before
+durable runtime admission. This gives catch-up a single unconditional path —
+there is always *something* to load — and turns "no snapshot" into a violated
+invariant surfaced fail-loud as `CatchUpError::NoSnapshot`, never a branch the
+happy path handles.
+The same applies when the durable row exists but its referenced metadata or app
+artifact is missing or structurally corrupt: startup classifies that provenance
+as terminal instead of restart-looping. Other filesystem availability errors
+remain operational.
 
 ## 3. Taking a snapshot at batch close
 
@@ -155,36 +179,51 @@ the batch's own last offset. An empty batch (no sequenced txs of its own) thus
 inherits the prior head rather than recording genesis — otherwise catch-up from
 its promoted snapshot would replay the whole stream and double-apply it.
 
+The same row records `executed_input_count` = storage-derived live head `H`.
+The lane passes the count embedded in the just-dumped application;
+`insert_pending_dump_in` asserts it equals the maximum current canonical
+execution attribution (or era base `K`). This check is inside the
+seal/open/snapshot transaction, so a disagreement cannot produce either a
+sealed batch or a registered checkpoint.
+
 ## 4. The resume checkpoint
 
 On startup the lane selects **one** checkpoint (`catch_up_snapshot`, in
 `catch_up.rs`): the latest pending snapshot if any, else finalized. The *same*
-row supplies both `A::from_dump(&prefix)` and the catch-up replay offset
-(`l2_tx_index`), so the loaded state and the replay cursor can never drift apart
-(they come from one row). Loading from a *pending* (not-yet-L1-confirmed)
+row supplies `A::from_dump(&prefix)`, physical catch-up cursor
+`l2_tx_index`, and canonical `executed_input_count`. Before replay, startup
+requires the loaded application's count to equal the stored count. During
+replay, each executable physical row must carry exactly the app's current
+count, while our batch-envelope rows must carry no mapping. These checks happen
+before executing the row and make missing, extra, or wrong attribution a
+terminal invariant failure rather than a repair/backfill path. Loading from a
+*pending* (not-yet-L1-confirmed)
 snapshot is safe because danger-zone recovery clears any cascade-doomed pending
 **before** the lane starts (§8) — a surviving pending is either gold or
 legitimately in-flight under the optimistic model.
 
 ## 5. Promotion
 
-As the lane advances the safe frontier (`maybe_advance_safe_frontier`), it walks
-the newly-safe inputs. For each input that is one of *our* batches landing on
-L1, `accepted_batch_nonce_at` (reading `safe_accepted_batches`, the
+When the lane's five-safe-block clock criterion admits an L1-reconciliation
+turn (`maybe_advance_safe_frontier`), it walks the complete accumulated
+newly-safe range. For each input that is one of *our* batches landing on L1,
+`accepted_batch_nonce_at` (reading `safe_accepted_batches`, the
 scheduler-acceptance view) yields its nonce. A `BlockObservation` accumulates
 the **highest accepted nonce seen in the range and the L1 block it landed in**.
 At range close the lane promotes that one `(nonce, block)` target.
 
 `promote_finalized` points the singleton `finalized_snapshot` at the pending
-dump for `max_nonce`, carries over its `l2_tx_index`, and **deletes every
+dump for `max_nonce`, carries over its `l2_tx_index` and
+`executed_input_count`, and **deletes every
 pending row with `nonce <= max_nonce`** — the promoted one plus any stale rows
 behind it.
 
 ### Per-range, not per-block
 
-Promotion happens **once per safe-frontier advance**, even when the range spans
-several L1 blocks with several of our batches. This is sound, and loses nothing,
-because of two facts:
+Promotion happens **once per eligible clock/reconciliation turn**, even when
+the range spans several L1 blocks with several of our batches. Safe-head
+observations below the five-block threshold accumulate without draining or
+promotion. This is sound, and loses nothing, because of two facts:
 
 - **Monotonic landing order.** L1 wallet nonces guarantee a higher nonce lands
   in a later-or-equal block, so the range's max nonce sits in its *latest*
@@ -195,24 +234,29 @@ because of two facts:
 - **The intermediate checkpoints were never observable.** `finalized` is a
   single row the watchdog polls *asynchronously* — even with per-block
   promotion it can miss intermediates between polls. So "visits every block" was
-  never a guarantee; per-range removes a cadence nicety, not a contract. In
-  steady state a range is ~1 block anyway; the difference only appears during
-  multi-block catch-up, where a finalized that jumps to the latest block is
-  exactly what you want.
+  never a guarantee; per-range removes a cadence nicety, not a contract. The
+  five-block clock intentionally makes multi-block ranges normal, and a delayed
+  or epoch-sized safe-head jump may make them larger. Finalized state advances
+  directly to the latest accepted landing in the range; no intermediate
+  checkpoint is synthesized.
 
-`BlockObservation` (`snapshot.rs`) is therefore a **constant-memory
-accumulator**: one `Option<(nonce, block)>`, `observe()` infallible and
-storage-free, `promotion()` returning the target. It does no I/O on the hot
-loop.
+`BlockObservation` (`snapshot.rs`) keeps one `Option<(nonce, block)>` for
+promotion and the direct-execution receipts for the complete reconciliation
+range. That vector is required to attach each canonical offset in the eventual
+atomic frame transaction. It is confined to the deliberately slow L1 regime;
+the user-op hot path does not use it, and scratch paging may bound input reads
+without turning the logical reconciliation turn into resumable state.
 
 ### Atomic with the drain
 
 The promotion is **folded into the same transaction that advances the drain**:
-`maybe_advance_safe_frontier` calls `close_frame_only_promoting`, which sequences
-the drained safe inputs, rotates the frame, *and* runs `promote_finalized_in` —
-all in one `write`. A crash therefore leaves promote + delete-pending +
-drain-sequence either all committed or all rolled back. This is the fix for the
-wedge in §6; see there for why a *separate* promotion is dangerous.
+`maybe_advance_safe_frontier` calls
+`close_frame_only_promoting_with_executions`, which sequences the drained safe
+inputs, attaches their canonical execution offsets, rotates the frame, and
+runs `promote_finalized_in`—all in one `write`. A crash therefore leaves
+promote + delete-pending + drain-sequence + attribution either all committed
+or all rolled back. This is the fix for the wedge in §6; see there for why a
+*separate* promotion is dangerous.
 
 The standalone `Storage::promote_finalized` is retained only for test setup
 (it's the only way to *supersede* an existing finalized row, which
@@ -286,10 +330,11 @@ such garbage (the superseded finalized, lower-nonce pendings).
 
 ### When GC runs
 
-**After a promoting safe-frontier advance, on the lane's own thread**
-(`maybe_advance_safe_frontier`, right after `close_frame_only_promoting`
+**After a promoting clock/reconciliation turn, on the lane's own thread**
+(`maybe_advance_safe_frontier`, right after
+`close_frame_only_promoting_with_executions`
 commits — `run_gc::<A>` when a promotion occurred). One full
-`gc_unreferenced_dumps` pass per advance that promoted; it reclaims the
+`gc_unreferenced_dumps` pass per turn that promoted; it reclaims the
 just-superseded finalized plus any earlier lease-released garbage.
 
 Why this, and not the alternatives:
@@ -338,21 +383,34 @@ serializes against any concurrent writer.
 The streaming endpoints (`/finalized_state`, `/latest_snapshot`) must not have
 their dump GC'd mid-response. The lease read and the row read are **one atomic
 tx** (`acquire_finalized_lease` / `acquire_latest_snapshot_lease`), and the
-handler holds the lease for the response lifetime via a **drop-guard** inside the
-streaming body — so it releases on completion, error, *and* client disconnect.
-Release is offloaded to `spawn_blocking` so the write-lock-contended release
-never stalls an async worker. `reset_dump_leases` at startup is the crash
-backstop. (Endpoint shapes: [`AGENTS.md`](../../AGENTS.md) and the root
-[`README.md`](../../README.md).)
+release guard is armed only after that transaction commits — a failed commit
+cannot schedule a decrement for an increment that rolled back. The handler then
+holds the lease for the response lifetime via the **drop-guard** inside the
+streaming body, so it releases on completion, error, *and* client disconnect.
+Releases are enqueued to a **supervised** blocking task set
+(`http.rs::supervise_snapshot_releases`) that the HTTP worker drains before
+exit classification, so no release can outlive the runtime's verdict. A
+release failure is classified like any storage failure: a *persistent* error
+(e.g. the lease row is gone — `StatementChangedRows` — or a persistent
+open/migration failure) is a storage-invariant violation and takes the
+runtime down terminally (exit 30); transient failures (BUSY, I/O) are logged
+and left to the startup backstop. `reset_dump_leases` at startup remains the
+crash backstop for releases that never ran. (Endpoint shapes:
+[`AGENTS.md`](../../AGENTS.md) and the root [`README.md`](../../README.md).)
 
 ### Startup sequence
 
-`Workers::spawn` runs five steps, order-critical: (1) `reset_dump_leases`
-(clear stale leases from a crashed run), (2) `ensure_finalized_snapshot`
-(genesis snapshot if cold), (3) `ensure_open_tip` (genesis Tip if cold — the
-tip-existence invariant below; the lane loads the head itself after catch-up),
-(4) `snapshot_gc_at_startup`, (5) `sweep_orphan_dumps` (remove on-disk dirs not
-in `dumps`; runs *after* (2) so the genesis prefix is registered and not swept).
+Before this sequence, the startup reducer has already required a finalized
+snapshot fact and established a Tip through either guarded `EnsureOpenTip` or
+an atomic recovery reopen. `PreparedRuntime::prepare` then calls
+`startup_hygiene::run_snapshot_hygiene`, which runs five order-critical
+steps before runtime admission, while no task
+exists: (1) `reset_dump_leases` (clear stale leases from a crashed run),
+(2) `require_finalized_snapshot`, (3) `restamp_finalized_promotion`,
+(4) `snapshot_gc_at_startup`, and (5) `sweep_orphan_dumps` (remove on-disk dirs
+not in `dumps`; the finalized prefix is already registered and cannot be
+swept). Durable admission and the non-yielding worker launch follow only after
+preparation completes and the reducer re-inspects current facts.
 
 ## 8. Recovery interaction
 
@@ -361,8 +419,15 @@ Danger-zone recovery (`storage/recovery.rs`, see
 that the canonical stream will never reach. In the same transaction as the
 cascade it clears `pending_snapshots` **scoped to the cascade**: only rows
 with `nonce >= pivot.nonce` — exactly the cascaded batches' pendings, which
-catch-up must never load. (Review F9; implemented in `cascade_and_reopen`,
-the shared tail of both recovery paths.)
+catch-up must never load (`cascade_and_reopen`, the shared tail of both
+recovery paths).
+
+The same cascade retains the physical `sequenced_l2_txs` audit rows but deletes
+their derived `executed_inputs` mappings, advances `RecoveryGeneration` once,
+and opens the replacement Tip atomically. The surviving snapshot count is the
+retained logical head; replacement history reuses the rewound suffix offsets
+under the new generation. A crash cannot expose a new generation with old
+mappings, or a rewound projection with doomed pending state.
 
 Pendings of *gold but not-yet-promoted* batches (landed and accepted while
 the process was down) carry lower nonces and **survive**: catch-up resumes
@@ -372,8 +437,8 @@ promote-wedge **unrepresentable** rather than unreachable: any nonce the lane
 can later observe as accepted either has its pending row intact or belongs
 to a post-recovery batch with a fresh row. (The earlier blanket clear was
 safe only through a chain of cross-file couplings — same-tx full-backlog
-reopen drain, `check_danger` arm ordering, frame-safe-block monotonicity —
-documented in the 2026-06-10 review, F9.) In the `RecoverTip` path the
+reopen drain, `check_danger` arm ordering, frame-safe-block
+monotonicity.) In the `RecoverTip` path the
 scope deletes nothing: the Tip never has a pending row.
 
 `finalized` is untouched (its bytes are for an L1-confirmed batch, which
@@ -388,7 +453,7 @@ This is why catch-up can safely resume from a surviving pending (§4).
 | Dump trait + wire format        | [`format.md`](format.md); `sequencer-core/src/application/`, `examples/app-core/` |
 | Storage (SQLite only)           | `sequencer/src/storage/snapshot_dumps.rs`; atomic close + promote in `storage/ingress.rs` |
 | Lane integration (take/observe/GC) | `sequencer/src/ingress/inclusion_lane/snapshot.rs`, `mod.rs`, `catch_up.rs` |
-| Runtime startup sequence        | `sequencer/src/runtime/workers.rs` |
+| Runtime startup sequence        | `sequencer/src/commands/run/startup_hygiene.rs` (called from `commands/run/workers.rs`) |
 | HTTP serving + leases           | `sequencer/src/egress/api/snapshot.rs` |
 | Recovery clear                  | `sequencer/src/storage/recovery.rs` |
 

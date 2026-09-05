@@ -4,19 +4,22 @@
 //! The `setup` subcommand: establish everything timeless
 //! and pin it in the DB, then mark setup complete so `run` will boot.
 //!
-//! Steps, in order — each individually idempotent so a crashed `setup`
-//! re-runs cleanly, and the marker written *last* is the single
-//! linearization point for "A finished":
+//! Steps, in order. The storage phases are re-entry-safe (a crashed
+//! attempt's retry begins fresh over its idempotent residue), and the final
+//! transaction is the single linearization point for "A finished":
 //!
 //! 1. Validate protocol timing; create the data dir + `dumps/`.
 //! 2. Require L1: discover the InputBox address + app deployment block from the app
 //!    contract, validate the RPC chain id. (No cached-identity fallback —
 //!    this is first-boot; an unreachable L1 is a retryable refusal.)
-//! 3. Pin the deployment identity (chain id, app address, InputBox address,
-//!    app deployment block, batch-submitter **address** — `setup` never signs).
+//! 3. Resolve the fee source, pin the complete deployment identity (chain id,
+//!    app address, InputBox address, app deployment block, batch-submitter
+//!    **address**, and fee-oracle identity), and persist the first price.
+//!    `setup` never signs.
 //! 4. Initial L1 sync: read all direct inputs up to the current safe head.
-//! 5. Register the genesis application state as the finalized snapshot.
-//! 6. Write the `setup_complete` marker.
+//! 5. For plain setup, construct and register the genesis application state as
+//!    the finalized snapshot. Recovery supplies its state from the checkpoint.
+//! 6. Commit the `setup_complete` fact.
 //!
 //! `setup` is L1-read-only: it takes the batch-submitter address (not the
 //! key) and does no L1 writes.
@@ -25,20 +28,22 @@ use alloy_primitives::Address;
 use sequencer_core::application::Application;
 use sequencer_core::scheduler::{FoldInput, SchedulerConfig, fold_replay};
 
-use super::config::{FeeOracleMode, SetupConfig};
-use super::{
-    BootstrapError, IdentityError, InputReaderExit, RunError, SetupRecoveryError, SetupRefuse,
-    WorkerExit, ensure_deployment_identity, setup_fill, validate_rpc_chain_id,
+pub(crate) mod fill;
+
+use super::{ensure_deployment_identity, validate_rpc_chain_id};
+use crate::commands::config::{FeeOracleMode, SetupConfig};
+use crate::commands::error::{
+    BootstrapError, CommandError, IdentityError, SetupRecoveryError, SetupRefuse, WorkerExit,
 };
 use crate::ingress::inclusion_lane::dump_info;
-use crate::l1::provider::VerifiedSignerProviderError;
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
 use crate::recovery::{MempoolFlusher, assert_resync_caught_up};
 use crate::storage::{self, DeploymentIdentity, FeeOracleIdentity};
 
-pub async fn setup<A>(config: SetupConfig, genesis_app: A) -> Result<(), RunError>
+pub async fn setup<A, F>(config: SetupConfig, genesis_app: F) -> Result<(), CommandError>
 where
     A: Application + 'static,
+    F: FnOnce() -> A,
 {
     // Cross-field config validation (recovery vs the recovery-only args). A
     // misconfig is operator error — terminal, before any filesystem touch.
@@ -47,30 +52,46 @@ where
         .map_err(|message| SetupRecoveryError::InvalidConfig { message })?;
 
     std::fs::create_dir_all(&config.data_dir)?;
-    let dumps_dir = std::path::Path::new(&config.data_dir).join("dumps");
-    std::fs::create_dir_all(&dumps_dir)?;
+    // Exclusive process ownership before any read or mutation: setup rewrites
+    // deployment state and must never run beside a live sequencer (or a
+    // second setup) on the same data dir.
+    let process_lock = crate::runtime::process_lock::ProcessLock::acquire(&config.data_dir)?;
+
+    let db_path = config.db_path();
+    config.timing.protocol_timing()?;
+    let command = if config.recovery {
+        storage::LifecycleCommand::Rebuild
+    } else {
+        storage::LifecycleCommand::Setup
+    };
+    if let SetupAdmission::AlreadyComplete =
+        admit_setup_lifecycle(&db_path, command, config.recovery)?
+    {
+        tracing::info!(data_dir = %config.data_dir, "setup already complete — nothing to do");
+        return Ok(());
+    }
+
+    let result = setup_admitted(config, genesis_app, process_lock.clone()).await;
+    settle_setup_lifecycle(&db_path, command, &result)?;
+    result
+}
+
+async fn setup_admitted<A, F>(
+    config: SetupConfig,
+    genesis_app: F,
+    process_lock: crate::runtime::process_lock::ProcessLock,
+) -> Result<(), CommandError>
+where
+    A: Application + 'static,
+    F: FnOnce() -> A,
+{
     let db_path = config.db_path();
     let timing = config.timing.protocol_timing()?;
 
-    // The `setup_complete` marker gates re-invocation differently per mode:
-    //   * plain `setup` is idempotent — a re-run on a complete DB is a no-op
-    //     success (a half-finished setup has no marker and re-runs below);
-    //   * `setup --recovery` is a strict one-shot on a freshly-wiped DB — a
-    //     complete DB means recovery already ran (or this is a live deployment),
-    //     and re-pointing it at a different checkpoint would strand its state,
-    //     so refuse (terminal). A crash-*before*-marker recovery has no marker;
-    //     its fill is not blindly idempotent either — the partial/residue cases
-    //     are handled fail-loud by `setup_fill::fill_recovery_state` (see there).
-    {
-        let storage = storage::Storage::open(&db_path)?;
-        if storage.is_setup_complete()? {
-            if config.recovery {
-                return Err(SetupRecoveryError::AlreadySetUp.into());
-            }
-            tracing::info!(data_dir = %config.data_dir, "setup already complete — nothing to do");
-            return Ok(());
-        }
-    }
+    // Do not create auxiliary data-dir entries before durable lifecycle
+    // admission. The lock file itself is the unavoidable ownership anchor.
+    let dumps_dir = std::path::Path::new(&config.data_dir).join("dumps");
+    std::fs::create_dir_all(&dumps_dir)?;
 
     // ── L1 discovery (required) ──────────────────────────────
     let input_reader_config = InputReaderConfig {
@@ -88,6 +109,7 @@ where
         input_reader_config,
         config.batch_submitter_address,
         timing,
+        process_lock.clone(),
     )
     .await
     {
@@ -99,8 +121,8 @@ where
             return Err(IdentityError::FirstBootRequiresL1.into());
         }
         Err(source) => {
-            return Err(RunError::Worker(WorkerExit::InputReader(
-                InputReaderExit::Source(source),
+            return Err(CommandError::Worker(WorkerExit::InputReader(
+                crate::commands::error::WorkerStop::Source(source),
             )));
         }
     };
@@ -133,23 +155,22 @@ where
     let prepared_fee_oracle = match fee_oracle {
         FeeOracleMode::Fixed { log_gas_price } => PreparedFeeOracle::Fixed { log_gas_price },
         FeeOracleMode::Uniswap(uniswap) => {
-            let provider = crate::l1::provider::create_provider(
+            // Setup requires L1: transient and misconfig both abort, before
+            // anything pins (one connect/classify home).
+            let (provider, token) = crate::l1::fee_oracle::connect_uniswap(
                 &config.eth_rpc_url,
                 config.allow_insecure_rpc,
+                uniswap,
             )
-            .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
-            let token =
-                crate::l1::fee_oracle::UniswapV3PriceSource::connect(provider.clone(), uniswap)
-                    .await
-                    .map_err(|error| {
-                        let (transient, message) =
-                            crate::l1::fee_oracle::uniswap::bootstrap_price_source_error(error);
-                        if transient {
-                            BootstrapError::FeeOracleTransient { message }
-                        } else {
-                            BootstrapError::FeeOracleMisconfig { message }
-                        }
-                    })?;
+            .await
+            .map_err(|error| match error {
+                crate::l1::fee_oracle::UniswapConnectError::Transient { message, .. } => {
+                    BootstrapError::FeeOracleTransient { message }
+                }
+                crate::l1::fee_oracle::UniswapConnectError::Misconfig(message) => {
+                    BootstrapError::FeeOracleMisconfig { message }
+                }
+            })?;
             PreparedFeeOracle::Uniswap {
                 identity: FeeOracleIdentity::Uniswap {
                     weth: uniswap.weth,
@@ -195,15 +216,13 @@ where
         PreparedFeeOracle::Uniswap {
             provider, token, ..
         } => {
-            let max_price_age_ms = timing.l1_read_stale_after_secs().saturating_mul(1000);
-            let oracle = crate::l1::fee_oracle::FeeOracle::new(
+            crate::l1::fee_oracle::persist_first_price(
                 db_path.clone(),
-                crate::l1::fee_oracle::FeeOracle::DEFAULT_POLL_INTERVAL,
-                max_price_age_ms,
                 provider,
-                Box::new(token),
-            );
-            oracle.refresh_once().await?;
+                token,
+                process_lock.clone(),
+            )
+            .await?;
         }
     }
 
@@ -211,8 +230,8 @@ where
     // A checkpoint promotion cannot predate the application's deployment
     // block (the scan genesis — no input exists before it).
     // `B = 0` is the genesis bootstrap (no checkpoint) and is always valid.
-    // (PR3 detects only; loading a non-genesis checkpoint machine and the
-    // `A < B` check are `setup --recovery` / PR5.)
+    // (plain setup detects only; loading a non-genesis checkpoint machine and
+    // the `A < B` check are `setup --recovery`'s job.)
     if config.checkpoint_block != 0 && config.checkpoint_block < input_reader.app_deployment_block()
     {
         return Err(BootstrapError::CheckpointBeforeAppDeployment {
@@ -225,9 +244,9 @@ where
     // ── Initial L1 sync ──────────────────────────────────────
     // One pass reads every direct input up to the current safe head into
     // `safe_inputs` + `safe_accepted_batches` and persists `l1_safe_head`.
-    // Idempotent: a retried setup resumes from the persisted safe head. A
-    // transient sync failure leaves the marker unwritten, so a re-run resyncs
-    // cleanly.
+    // Re-entry-safe: a retry resumes from the persisted safe head. A
+    // transient sync failure leaves setup incomplete; the operator simply
+    // re-runs `setup`.
     //
     // Recovery rebuilds the batch tree from the checkpoint *after* this sync, so
     // the local tree is empty here. Disable frontier population for recovery's
@@ -241,7 +260,11 @@ where
     input_reader
         .sync_to_current_safe_head()
         .await
-        .map_err(|e| RunError::Worker(WorkerExit::InputReader(InputReaderExit::Source(e))))?;
+        .map_err(|e| {
+            CommandError::Worker(WorkerExit::InputReader(
+                crate::commands::error::WorkerStop::Source(e),
+            ))
+        })?;
 
     // ── Branch: recovery rebuild vs the genesis-style detect-and-refuse ──
     let mut storage = storage::Storage::open(&db_path)?;
@@ -263,12 +286,11 @@ where
         // ── Detection gate, steps 1–2: refuse if a previous instance left work ──
         // Read-only: no key, no L1 write. Runs *after*
         // the sync so step 2 reads a `safe_inputs` table populated to the safe
-        // head, and *before* the genesis snapshot / marker so a refusing setup
-        // leaves no marker — a re-run (while still incomplete) re-detects
-        // identically. (Once the marker *is* written, the idempotent early-return
-        // above skips the gate; that is correct — the deployment is this
-        // instance's own, and detecting a dirty chain is the job of a *fresh*
-        // `setup` whose marker is absent.)
+        // head, and *before* the genesis snapshot / completion transaction so
+        // a refusing setup cannot complete. A retry while still incomplete
+        // re-detects identically. Once setup is complete,
+        // plain `setup` is a no-op; detecting a dirty chain is the job of a
+        // fresh setup/rebuild.
         //
         // Coherence: read the submitter's `safe` nonce at the **persisted** safe
         // block from the sync, not the live `Safe` tag. The head can advance
@@ -278,7 +300,7 @@ where
         // be missing from the not-yet-resynced scan. `pending` stays live, so any
         // submitter activity past the synced head still trips `pending > safe`.
         //
-        // F1: step 1 reads the LOCAL provider's pool view — a zombie tx dropped
+        // Step 1 reads the LOCAL provider's pool view — a zombie tx dropped
         // from this pool but alive elsewhere evades it, bounded at runtime by the
         // content-identity check (CanonicalDivergence → cockroach recovery).
         let synced_safe_block = storage.current_safe_block()?;
@@ -297,28 +319,28 @@ where
         )?;
 
         // Refuse to register genesis over leftover recovery state. A
-        // `setup --recovery` that crashed before its marker leaves a non-zero
+        // `setup --recovery` that crashed before completion leaves a non-zero
         // batch-tree anchor (and maybe a root tip); booting genesis-style over
         // it would root the tree at the recovery nonce instead of 0. Fail loud
-        // (the marker is the only "this DB is mine" signal, and it's absent in
-        // both the fresh-genesis and crashed-recovery cases — so we check the
-        // anchor explicitly). Operator wipes the data dir and re-runs.
+        // Setup completion is absent in both the fresh-genesis and interrupted
+        // recovery cases, so we check the anchor explicitly. Operator wipes
+        // the data dir and re-runs.
         let anchor = storage.batch_tree_anchor()?;
         if anchor != 0 {
             return Err(SetupRecoveryError::GenesisOverRecoveryResidue { anchor }.into());
         }
 
         // ── Genesis snapshot ─────────────────────────────────────
-        setup_fill::register_genesis_finalized_snapshot::<A>(
-            genesis_app,
-            &mut storage,
-            &dumps_dir,
-        )?;
+        // Construct only after the admission facts and every
+        // detect-and-refuse gate. A panic leaves setup incomplete (the
+        // completion fact is never written, so the retry starts fresh),
+        // while completed no-ops and recovery never construct genesis
+        // state at all.
+        let genesis_app = genesis_app();
+        fill::register_genesis_finalized_snapshot::<A>(genesis_app, &mut storage, &dumps_dir)?;
     }
 
-    // ── Marker (the single linearization point for "setup finished") ──
-    storage.mark_setup_complete()?;
-
+    // The caller commits setup_complete + Ready as one final transaction.
     tracing::info!(
         data_dir = %config.data_dir,
         chain_id = identity.chain_id,
@@ -329,6 +351,62 @@ where
         "setup complete"
     );
     Ok(())
+}
+
+enum SetupAdmission {
+    Proceed,
+    AlreadyComplete,
+}
+
+fn admit_setup_lifecycle(
+    db_path: &str,
+    command: storage::LifecycleCommand,
+    recovery: bool,
+) -> Result<SetupAdmission, CommandError> {
+    let populated =
+        std::path::Path::new(db_path).try_exists()? && !existing_sqlite_schema_is_empty(db_path)?;
+    if !populated {
+        storage::Storage::initialize_for_command(db_path, command)?;
+        return Ok(SetupAdmission::Proceed);
+    }
+
+    // Admission facts only: divergence is absorbing; a completed setup
+    // is once-per-database (already-complete plain setup is a no-op, an
+    // already-complete rebuild is an error); a crashed prior attempt left
+    // only idempotent residue behind — the retry proceeds fresh over it.
+    let mut storage = storage::Storage::open_read_only(db_path)?;
+    if let Some((nonce, _)) = storage.canonical_divergence()? {
+        return Err(storage::LifecycleError::CanonicalDivergence { nonce }.into());
+    }
+    if storage.is_setup_complete()? {
+        if recovery {
+            return Err(SetupRecoveryError::AlreadySetUp.into());
+        }
+        return Ok(SetupAdmission::AlreadyComplete);
+    }
+    Ok(SetupAdmission::Proceed)
+}
+
+fn settle_setup_lifecycle(
+    db_path: &str,
+    command: storage::LifecycleCommand,
+    result: &Result<(), CommandError>,
+) -> Result<(), CommandError> {
+    match result {
+        Ok(()) => {
+            // The completion fact is part of the command, not telemetry: if
+            // it cannot be written, setup did not complete.
+            let mut storage = storage::Storage::open_writer(db_path)?;
+            storage.complete_setup()?;
+            Ok(())
+        }
+        Err(_) => {
+            // Verdict-neutral black-box settlement: the write never
+            // replaces the command's own error.
+            crate::commands::record_terminal_fault_best_effort(db_path, command, result);
+            Ok(())
+        }
+    }
 }
 
 /// The trusted checkpoint a `setup --recovery` folds from — the machine state
@@ -394,7 +472,7 @@ fn source_fold_inputs<A>(
     checkpoint: &Checkpoint<A>,
     stop_block: u64,
     submitter: Address,
-) -> Result<(Vec<FoldInput>, Vec<FoldInput>), RunError> {
+) -> Result<(Vec<FoldInput>, Vec<FoldInput>), CommandError> {
     let seeds = storage
         .safe_inputs_in_block_range(checkpoint.executed_safe_block, checkpoint.checkpoint_block)?
         .into_iter()
@@ -431,7 +509,7 @@ async fn recover<A>(
     input_reader: &mut InputReader,
     storage: &mut storage::Storage,
     dumps_dir: &std::path::Path,
-) -> Result<(), RunError>
+) -> Result<(), CommandError>
 where
     A: Application + 'static,
 {
@@ -448,7 +526,8 @@ where
     let stop_block =
         flush_wallet_nonce(config, identity, timing.seconds_per_block, storage).await?;
 
-    // 3. Re-sync through C; F2 coherence. Frontier population stays OFF (the
+    // 3. Re-sync through C, then verify the resynced safe block reaches the
+    //    flush observation before cascade. Frontier population stays OFF (the
     //    caller disabled it before the initial sync): the tree is rebuilt in
     //    step 6, so a frontier built here against an empty tree would falsely
     //    diverge. `run`'s first sync populates it correctly once anchor = N'.
@@ -456,8 +535,12 @@ where
     input_reader
         .sync_to_current_safe_head()
         .await
-        .map_err(|e| RunError::Worker(WorkerExit::InputReader(InputReaderExit::Source(e))))?;
-    let resynced_safe_block = storage.current_safe_block()?.unwrap_or(0);
+        .map_err(|e| {
+            CommandError::Worker(WorkerExit::InputReader(
+                crate::commands::error::WorkerStop::Source(e),
+            ))
+        })?;
+    let resynced_safe_block = require_resynced_safe_block(storage.current_safe_block()?)?;
     assert_resync_caught_up(resynced_safe_block, stop_block)?;
 
     // 4. Source the (A, B] direct seeds + the (B, C] replay stream.
@@ -481,13 +564,13 @@ where
         seeds,
         replay,
         stop_block,
-    );
+    )?;
 
     // 6. Fill the DB: finalized S', tree anchored at N', cursor past the ≤C
     //    directs (already in S'). run boots from this state, and its first sync
     //    populates the gold frontier from L1 with the anchor = N' (so the folded
     //    `< N'` batches are skipped as trusted collapsed history, not foreign).
-    setup_fill::fill_recovery_state(recovered_app, resume_nonce, stop_block, storage, dumps_dir)?;
+    fill::fill_recovery_state(recovered_app, resume_nonce, stop_block, storage, dumps_dir)?;
 
     tracing::info!(
         executed_safe_block,
@@ -497,6 +580,10 @@ where
         "recovery complete — DB rebuilt from checkpoint"
     );
     Ok(())
+}
+
+fn require_resynced_safe_block(observed: Option<u64>) -> Result<u64, SetupRecoveryError> {
+    observed.ok_or(SetupRecoveryError::MissingResyncedSafeHead)
 }
 
 /// Recovery step 2: flush the previous instance's stranded batch txs and wait
@@ -513,7 +600,7 @@ async fn flush_wallet_nonce(
     identity: &DeploymentIdentity,
     seconds_per_block: u64,
     storage: &mut storage::Storage,
-) -> Result<u64, RunError> {
+) -> Result<u64, CommandError> {
     // The recovery key must match the pinned batch-submitter address — flushing
     // under a different account's key would settle the wrong wallet's nonce (and
     // burn its gas) while recovery never settles `identity.batch_submitter_address`.
@@ -525,23 +612,12 @@ async fn flush_wallet_nonce(
     // guarded constructor the runtime flush and `flush-mempool` use.
     let provider = crate::l1::provider::create_verified_signer_provider(
         &config.eth_rpc_url,
-        &key,
+        key.expose_secret(),
         config.chain_id,
         config.allow_insecure_rpc,
     )
     .await
-    .map_err(|e| match e {
-        VerifiedSignerProviderError::ChainIdMismatch { rpc, expected } => {
-            RunError::Bootstrap(BootstrapError::ChainIdMismatch {
-                rpc,
-                config: expected,
-            })
-        }
-        VerifiedSignerProviderError::ChainIdRpc(message) => {
-            RunError::Bootstrap(BootstrapError::ChainIdRpc { message })
-        }
-        VerifiedSignerProviderError::Create(msg) => RunError::Io(std::io::Error::other(msg)),
-    })?;
+    .map_err(CommandError::from)?;
     let watermark = storage.wallet_nonce_watermark()?;
     let stop_block = MempoolFlusher::flush_to_safe(
         provider,
@@ -578,7 +654,7 @@ fn run_detection_gate(
     batch_submitter: Address,
     checkpoint_block: u64,
     (pending_nonce, safe_nonce): (u64, u64),
-) -> Result<(), RunError> {
+) -> Result<(), CommandError> {
     // Step 1 — `pending > safe` means a previous instance left in-flight
     // (pending or mined-but-unsafe) batch txs.
     if pending_nonce > safe_nonce {
@@ -592,8 +668,8 @@ fn run_detection_gate(
     // `safe_inputs` already reflect every previous batch (scanning them is
     // equivalent to scanning `(B, safe]`). Refuse if any batch-submitter tx
     // landed strictly past the checkpoint block. The query reads the
-    // reader-synced table, inheriting the reader's range-completeness hardening
-    // (F5) — see `first_batch_submitter_input_after_block`.
+    // reader-synced table, inheriting the reader's range-completeness
+    // hardening — see `first_batch_submitter_input_after_block`.
     if let Some((safe_input_index, found_block)) =
         storage.first_batch_submitter_input_after_block(batch_submitter, checkpoint_block)?
     {
@@ -656,12 +732,73 @@ async fn read_submitter_nonce_views(
     Ok((pending, safe))
 }
 
+/// A first `Connection::open` can create the DB file before the transactional
+/// baseline migration begins. That exact empty-schema crash state contains no
+/// possible DB verdict and may resume setup. Any object at all makes the DB
+/// non-empty; malformed/populated databases then take the strict read-only
+/// lifecycle gate and are never migrated speculatively.
+fn existing_sqlite_schema_is_empty(
+    db_path: &str,
+) -> Result<bool, crate::commands::error::CommandError> {
+    if std::fs::metadata(db_path)?.len() == 0 {
+        return Ok(true);
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let object_count: i64 =
+        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+    Ok(object_count == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::Storage;
     use crate::storage::StoredSafeInput;
     use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
+
+    #[test]
+    fn completed_plain_setup_is_a_noop_and_writes_nothing() {
+        let db = temp_db("setup-noop-preserves-recovery");
+        let mut storage =
+            Storage::initialize_for_command(db.path.as_str(), storage::LifecycleCommand::Setup)
+                .expect("initialize");
+        storage
+            .insert_initial_finalized_dump(&db._dir.path().join("finalized"), 0, 0, 0, 0)
+            .expect("register finalized snapshot");
+        storage.complete_setup().expect("complete setup");
+        storage
+            .record_terminal_fault(storage::LifecycleCommand::Run, "prior terminal death")
+            .expect("record prior fault");
+        let before = storage
+            .latest_terminal_fault()
+            .expect("read")
+            .expect("recorded fault");
+        drop(storage);
+
+        assert!(matches!(
+            admit_setup_lifecycle(db.path.as_str(), storage::LifecycleCommand::Setup, false)
+                .expect("plain setup no-op"),
+            SetupAdmission::AlreadyComplete
+        ));
+        let after = Storage::open_read_only(db.path.as_str())
+            .expect("reopen")
+            .latest_terminal_fault()
+            .expect("read")
+            .expect("still recorded");
+        assert_eq!(after, before, "plain setup must write nothing");
+    }
+
+    #[test]
+    fn recovery_resync_requires_a_persisted_safe_head() {
+        assert_eq!(require_resynced_safe_block(Some(7)).unwrap(), 7);
+        assert!(matches!(
+            require_resynced_safe_block(None),
+            Err(SetupRecoveryError::MissingResyncedSafeHead)
+        ));
+    }
 
     /// Seed `safe_inputs` with one batch-submitter (`SENDER_A`) input per block
     /// in `blocks`, synced up to the max block. Payloads are junk (scheduler
@@ -697,7 +834,7 @@ mod tests {
         // Step 1 gates step 2: `pending > safe` refuses regardless of inputs
         // (and the DB is empty here, proving step 2 never ran).
         match run_detection_gate(&mut storage, SENDER_A, 0, (14, 13)) {
-            Err(RunError::Bootstrap(BootstrapError::SetupRefuse(
+            Err(CommandError::Bootstrap(BootstrapError::SetupRefuse(
                 SetupRefuse::WalletNonceUnsettled { pending, safe },
             ))) => assert_eq!((pending, safe), (14, 13)),
             other => panic!("expected WalletNonceUnsettled, got {other:?}"),
@@ -710,7 +847,7 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
         seed_submitter_inputs(&mut storage, &[18]);
         match run_detection_gate(&mut storage, SENDER_A, 0, (1, 1)) {
-            Err(RunError::Bootstrap(BootstrapError::SetupRefuse(
+            Err(CommandError::Bootstrap(BootstrapError::SetupRefuse(
                 SetupRefuse::BatchPastCheckpoint {
                     checkpoint_block,
                     found_block,
@@ -794,7 +931,7 @@ mod tests {
 
         let result = flush_wallet_nonce(&config, &identity, 12, &mut storage).await;
         match result {
-            Err(RunError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
+            Err(CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
                 fields,
                 ..
             }))) => assert_eq!(fields, "batch_submitter_address"),

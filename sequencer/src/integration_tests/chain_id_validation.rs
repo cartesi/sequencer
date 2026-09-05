@@ -13,7 +13,7 @@
 //!     must run `setup`). Fires before any L1 contact.
 //!   - **Wrong signing key** → `IdentityError::Mismatch { batch_submitter_address }`
 //!     (the key's address must match the pinned submitter). Fires before L1.
-//!   - **Wrong-chain RPC** (review F6) → `ChainIdMismatch`: a reachable RPC
+//!   - **Wrong-chain RPC** → `ChainIdMismatch`: a reachable RPC
 //!     whose `eth_chainId` differs from the pinned chain id is refused. Needs
 //!     a live RPC, so it uses Anvil.
 //!   - **Matching-chain RPC** positive control: a matching chain must NOT
@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, address};
 use clap::Parser;
-use sequencer::runtime::{BootstrapError, IdentityError, RunError};
+use sequencer::commands::{BootstrapError, CommandError, IdentityError};
+use sequencer::l1::reader::InputReaderError;
+use sequencer::recovery::{RecoveryError, RecoveryFailure};
 use sequencer::storage::{DeploymentIdentity, Storage};
 use sequencer::{Cli, Command};
 use tempfile::TempDir;
@@ -70,10 +72,17 @@ fn run_config(data_dir: &str, eth_rpc_url: &str, key: &str) -> sequencer::RunCon
 }
 
 /// Seed a pinned deployment identity (chain id `chain_id`, submitter
-/// `submitter`) and mark setup complete — the minimal DB state `run` expects
-/// from a completed `setup`, without `setup`'s L1 discovery.
+/// `submitter`), finalized-snapshot fact, and completed setup lifecycle — the
+/// minimal local state needed to reach `run`'s initial L1 sync without doing
+/// `setup`'s on-chain discovery. Uses the same typed controller path `setup`
+/// itself records through (admission → facts → completion), so this seed
+/// cannot drift from the lifecycle schema or encode a state the controller
+/// would never write (previously raw SQL from outside the crate).
 fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
-    let mut storage = Storage::open(db_path).expect("open db for seed");
+    use sequencer::storage::LifecycleCommand;
+
+    let mut storage = Storage::initialize_for_command(db_path, LifecycleCommand::Setup)
+        .expect("initialize setup lifecycle");
     storage
         .load_or_insert_deployment_identity(DeploymentIdentity {
             chain_id,
@@ -84,12 +93,16 @@ fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
             fee_oracle: sequencer::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .expect("seed deployment identity");
-    storage.mark_setup_complete().expect("mark setup complete");
+    let snapshot_prefix = std::path::Path::new(db_path).with_file_name("seed-finalized");
+    storage
+        .insert_initial_finalized_dump(&snapshot_prefix, 0, 0, 0, 0)
+        .expect("seed finalized snapshot fact");
+    storage.complete_setup().expect("complete setup");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_refuses_when_setup_incomplete() {
-    // Fresh DB, no marker: `run` must refuse before touching L1.
+    // Fresh DB, no lifecycle: `run` must refuse before touching L1.
     let dir = TempDir::new().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();
     let config = run_config(data_dir, "http://127.0.0.1:1", ANVIL_KEY);
@@ -99,12 +112,12 @@ async fn run_refuses_when_setup_incomplete() {
         sequencer::run::<app_core::application::WalletApp>(config),
     )
     .await
-    .expect("run() must return quickly without a setup-complete marker");
+    .expect("run() must return quickly without a completed setup lifecycle");
 
     assert!(
         matches!(
             result,
-            Err(RunError::Bootstrap(BootstrapError::SetupNotComplete))
+            Err(CommandError::Bootstrap(BootstrapError::SetupNotComplete))
         ),
         "expected SetupNotComplete, got: {result:?}"
     );
@@ -128,7 +141,7 @@ async fn run_refuses_on_submitter_key_mismatch() {
     .expect("run() must return quickly on key/identity mismatch");
 
     match result {
-        Err(RunError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
+        Err(CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
             fields,
             ..
         }))) => assert_eq!(fields, "batch_submitter_address"),
@@ -139,7 +152,7 @@ async fn run_refuses_on_submitter_key_mismatch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_refuses_on_wrong_chain_rpc() {
     // Pinned chain id 31337, but the (reachable) RPC reports a different
-    // chain id — review F6: a wrong-chain RPC after setup must be refused.
+    // chain id: a wrong-chain RPC after setup must be refused.
     require_anvil();
     let anvil = alloy::node_bindings::Anvil::default().chain_id(99).spawn();
     let dir = TempDir::new().expect("tempdir");
@@ -158,9 +171,17 @@ async fn run_refuses_on_wrong_chain_rpc() {
     .expect("run() must return quickly on chain-id mismatch");
 
     match result {
-        Err(RunError::Bootstrap(BootstrapError::ChainIdMismatch { rpc, config })) => {
-            assert_eq!(rpc, 99);
-            assert_eq!(config, 31_337);
+        Err(CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::Refuse(failure)))) => {
+            match *failure {
+                RecoveryFailure::InputReader(InputReaderError::ChainIdMismatch {
+                    rpc,
+                    expected,
+                }) => {
+                    assert_eq!(rpc, 99);
+                    assert_eq!(expected, 31_337);
+                }
+                other => panic!("expected input-reader chain-id mismatch, got: {other:?}"),
+            }
         }
         other => panic!("expected ChainIdMismatch, got: {other:?}"),
     }
@@ -169,11 +190,9 @@ async fn run_refuses_on_wrong_chain_rpc() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_accepts_matching_chain_rpc() {
     // Positive control: a matching chain id must NOT produce ChainIdMismatch.
-    // The DB has identity + marker but no genesis snapshot, so `run` passes
-    // the chain-id check and then refuses at the always-load gate with
-    // SetupNotComplete — a deterministic proof the chain-id guard let it
-    // through (the gate sits immediately after the chain-id check, before any
-    // recovery write).
+    // The DB has a finalized-snapshot fact whose artifact is deliberately
+    // absent. `run` must pass the initial reader chain-id check and reach
+    // task-free runtime preparation, where loading that artifact fails.
     require_anvil();
     let anvil = alloy::node_bindings::Anvil::default().spawn(); // chain id 31337
     let dir = TempDir::new().expect("tempdir");
@@ -187,27 +206,12 @@ async fn run_accepts_matching_chain_rpc() {
         sequencer::run::<app_core::application::WalletApp>(config),
     )
     .await
-    .expect("run() returns promptly: chain-id passes, then the no-snapshot gate fires");
+    .expect("run() returns promptly: chain-id passes, then snapshot preparation fails");
 
-    // Assert the chain-id check positively did NOT fail, independent of which
-    // gate fires next: if `seed_setup_complete` ever starts registering a
-    // genesis snapshot, the `SetupNotComplete` arm below would stop firing and
-    // silently stop witnessing "chain id passed" — this negative pins it.
+    // The later artifact failure proves startup crossed the initial sync
+    // boundary, which includes the reader's chain-id verification.
     assert!(
-        !matches!(
-            result,
-            Err(RunError::Bootstrap(
-                BootstrapError::ChainIdMismatch { .. } | BootstrapError::ChainIdRpc { .. }
-            ))
-        ),
-        "matching chain id must not produce a chain-id error, got: {result:?}"
-    );
-    assert!(
-        matches!(
-            result,
-            Err(RunError::Bootstrap(BootstrapError::SetupNotComplete))
-        ),
-        "matching chain id must pass the chain-id check and reach the \
-         always-load gate (SetupNotComplete), got: {result:?}"
+        matches!(result, Err(CommandError::ReferencedSnapshotArtifact { .. })),
+        "matching chain id must reach snapshot preparation, got: {result:?}"
     );
 }

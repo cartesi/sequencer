@@ -45,6 +45,14 @@ const ACCEPTANCE_POLL_ATTEMPTS: usize = 40;
 /// Per-attempt pause while waiting for batch submission and safe-head ingestion.
 const ACCEPTANCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Product-visible live frame-clock interval. E2E advancement must derive from
+/// the protocol constant rather than incidental Anvil transaction counts.
+const FRAME_CLOCK_INTERVAL_SAFE_BLOCKS: u64 =
+    sequencer_core::protocol::ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS;
+
+const FRAME_CLOCK_POLL_ATTEMPTS: usize = 80;
+const FRAME_CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 // ── Zone-math constants for the outage-matrix and recovery tests ─────────
 //
 // These derive from the sequencer's default config so a change to
@@ -174,8 +182,8 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ("concurrent_user_ops_test", |runtime| {
             Box::pin(run_concurrent_user_ops_test(runtime))
         }),
-        ("multi_deposit_same_block_test", |runtime| {
-            Box::pin(run_multi_deposit_same_block_test(runtime))
+        ("multi_deposit_reconciliation_test", |runtime| {
+            Box::pin(run_multi_deposit_reconciliation_test(runtime))
         }),
         (
             "restart_after_committed_tx_replays_cleanly_test",
@@ -199,9 +207,20 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ("provider_outage_wall_clock_refuses_boot_test", |runtime| {
             Box::pin(run_provider_outage_wall_clock_refuses_boot_test(runtime))
         }),
-        ("wall_clock_backward_jump_no_panic_test", |runtime| {
-            Box::pin(run_wall_clock_backward_jump_no_panic_test(runtime))
-        }),
+        (
+            "warm_restart_from_fresh_persisted_facts_with_l1_down_test",
+            |runtime| {
+                Box::pin(run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(runtime))
+            },
+        ),
+        (
+            "wall_clock_backward_jump_retries_then_recovers_test",
+            |runtime| {
+                Box::pin(run_wall_clock_backward_jump_retries_then_recovers_test(
+                    runtime,
+                ))
+            },
+        ),
         ("stalled_safe_head_startup_refuses_boot_test", |runtime| {
             Box::pin(run_stalled_safe_head_startup_refuses_boot_test(runtime))
         }),
@@ -380,7 +399,8 @@ async fn prepare_non_genesis_watchdog_state(runtime: &mut ManagedSequencer) -> S
     let withdrawal_amount = U256::from(150_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
+    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
+        .await?;
 
     alice_l2.transfer(bob_address, transfer_amount).await?;
     replay.apply(ws.expect_user_op_from(alice_address).await?)?;
@@ -417,16 +437,16 @@ async fn prepare_non_genesis_watchdog_state(runtime: &mut ManagedSequencer) -> S
 /// Mine L1 forward until a finalized snapshot is promoted at an inclusion block
 /// strictly above `floor` (the value observed before the batch that should
 /// promote), polling the DB instead of sleeping a fixed submitter-tick
-/// interval. Each attempt mines a couple of blocks and pauses briefly, so the
-/// submitter and promoter get to run; returns the new inclusion block, or times
-/// out loudly. Robust against CI jitter — it waits exactly as long as promotion
-/// takes, no more.
+/// interval. Each attempt mines one live block and pauses for the same wall
+/// time, so the submitter and promoter get to run without synthesizing a future
+/// L1 clock; returns the new inclusion block, or times out loudly. Robust
+/// against CI jitter — it waits exactly as long as promotion takes, no more.
 async fn mine_until_finalized_advances(
     runtime: &ManagedSequencer,
     floor: u64,
 ) -> ScenarioResult<u64> {
     for _ in 0..PROMOTION_POLL_ATTEMPTS {
-        runtime.mine_l1_blocks(2).await?;
+        runtime.mine_live_l1_blocks(1).await?;
         tokio::time::sleep(PROMOTION_POLL_INTERVAL).await;
         let (inclusion_block, _) = runtime.finalized_snapshot_info()?;
         if inclusion_block > floor {
@@ -443,7 +463,7 @@ async fn mine_until_batch_is_safe_accepted(
     runtime: &ManagedSequencer,
 ) -> ScenarioResult<(u64, Option<u64>)> {
     for _ in 0..ACCEPTANCE_POLL_ATTEMPTS {
-        runtime.mine_l1_blocks(2).await?;
+        runtime.mine_live_l1_blocks(1).await?;
         tokio::time::sleep(ACCEPTANCE_POLL_INTERVAL).await;
         let accepted = runtime.count_safe_accepted_batches()?;
         if accepted.0 > 0 {
@@ -451,6 +471,87 @@ async fn mine_until_batch_is_safe_accepted(
         }
     }
     Err("timed out waiting for a batch to reach safe_accepted_batches".into())
+}
+
+/// Advance Anvil only as far as the next semantic live-frame tick needs, then
+/// wait for the input reader and inclusion lane to commit a frame covering
+/// `required_safe_block`. The live safe-head query prevents stale SQLite
+/// observations from turning an asynchronous reader poll into over-mining.
+async fn advance_live_frame_until_covers(
+    runtime: &ManagedSequencer,
+    required_safe_block: u64,
+) -> ScenarioResult<u64> {
+    for _ in 0..FRAME_CLOCK_POLL_ATTEMPTS {
+        let (frame_safe_block, _) = runtime.frame_clock_observation()?;
+        if frame_safe_block >= required_safe_block {
+            return Ok(frame_safe_block);
+        }
+
+        let next_tick = frame_safe_block
+            .checked_add(FRAME_CLOCK_INTERVAL_SAFE_BLOCKS)
+            .ok_or("frame-clock target overflow")?;
+        let target_safe_head = next_tick.max(required_safe_block);
+        let live_safe_head = runtime.l1_safe_block_number().await?;
+        if live_safe_head < target_safe_head {
+            runtime
+                .mine_live_l1_blocks(target_safe_head - live_safe_head)
+                .await?;
+        }
+
+        tokio::time::sleep(FRAME_CLOCK_POLL_INTERVAL).await;
+    }
+
+    let (frame_safe_block, persisted_safe_head) = runtime.frame_clock_observation()?;
+    let live_safe_head = runtime.l1_safe_block_number().await?;
+    Err(format!(
+        "timed out advancing live frame to cover block {required_safe_block}: \
+         frame={frame_safe_block} persisted_safe_head={persisted_safe_head} \
+         live_safe_head={live_safe_head}"
+    )
+    .into())
+}
+
+/// Reach one exact Anvil safe head and wait for the input reader to persist it.
+/// Used only by the frame-clock boundary test, where overshooting would erase
+/// the below-threshold assertion.
+async fn advance_persisted_safe_head_exactly(
+    runtime: &ManagedSequencer,
+    target_safe_head: u64,
+) -> ScenarioResult<()> {
+    for _ in 0..FRAME_CLOCK_POLL_ATTEMPTS {
+        let live_safe_head = runtime.l1_safe_block_number().await?;
+        if live_safe_head > target_safe_head {
+            return Err(format!(
+                "cannot pin safe head {target_safe_head}: live Anvil safe head is already {live_safe_head}"
+            )
+            .into());
+        }
+        if live_safe_head < target_safe_head {
+            // Mine one at a time: Anvil's safe tag may lag the chain head, so
+            // requested block count and safe-head delta are not interchangeable.
+            runtime.mine_live_l1_blocks(1).await?;
+            tokio::time::sleep(FRAME_CLOCK_POLL_INTERVAL).await;
+            continue;
+        }
+
+        let (_, persisted_safe_head) = runtime.frame_clock_observation()?;
+        if persisted_safe_head == target_safe_head {
+            return Ok(());
+        }
+        if persisted_safe_head > target_safe_head {
+            return Err(format!(
+                "persisted safe head overshot {target_safe_head}: got {persisted_safe_head}"
+            )
+            .into());
+        }
+        tokio::time::sleep(FRAME_CLOCK_POLL_INTERVAL).await;
+    }
+
+    let (_, persisted_safe_head) = runtime.frame_clock_observation()?;
+    Err(format!(
+        "timed out waiting for persisted safe head {target_safe_head}: got {persisted_safe_head}"
+    )
+    .into())
 }
 
 /// Close the open batch, land it on L1, and wait for snapshot promotion so
@@ -496,7 +597,7 @@ async fn run_direct_input_not_safe_yet_test(runtime: &mut ManagedSequencer) -> S
     let transfer_amount = U256::from(400_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay,
@@ -505,21 +606,68 @@ async fn run_direct_input_not_safe_yet_test(runtime: &mut ManagedSequencer) -> S
     )
     .await?;
 
+    let (frame_anchor, persisted_safe_head) = runtime.frame_clock_observation()?;
+    let live_safe_head = runtime.l1_safe_block_number().await?;
+    assert_eq!(
+        persisted_safe_head, frame_anchor,
+        "funding reconciliation must leave a clean frame-clock anchor",
+    );
+    assert_eq!(
+        live_safe_head, frame_anchor,
+        "Anvil safe head must match the clean frame-clock anchor",
+    );
+
     alice_l1
         .mint_supported_token(pending_deposit_amount)
         .await?;
-    alice_l1
+    let deposit_block = alice_l1
         .deposit_supported_token(pending_deposit_amount)
         .await?;
 
     alice_l2.transfer(bob_address, transfer_amount).await?;
-    replay.apply(ws.expect_user_op_from(alice_address).await?)?;
+    let user_op = ws.expect_user_op_from(alice_address).await?;
+    match &user_op {
+        WsTxMessage::UserOp { safe_block, .. } => assert_eq!(
+            *safe_block, frame_anchor,
+            "below-threshold direct must not advance the user-op frame clock",
+        ),
+        other => unreachable!("expected user op after typed WS assertion, got {other:?}"),
+    }
+    replay.apply(user_op)?;
 
-    runtime.mine_l1_blocks(1).await?;
-    replay.apply(
-        ws.expect_direct_input_from(runtime.erc20_portal_address())
-            .await?,
-    )?;
+    let below_threshold = frame_anchor + FRAME_CLOCK_INTERVAL_SAFE_BLOCKS - 1;
+    assert!(
+        deposit_block <= below_threshold,
+        "boundary setup consumed too many L1 blocks: deposit={deposit_block} \
+         below_threshold={below_threshold}",
+    );
+    advance_persisted_safe_head_exactly(runtime, below_threshold).await?;
+    assert_eq!(
+        runtime.frame_clock_observation()?,
+        (frame_anchor, below_threshold),
+        "S+4 must leave the open frame at S",
+    );
+    ws.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
+
+    let at_threshold = frame_anchor + FRAME_CLOCK_INTERVAL_SAFE_BLOCKS;
+    advance_persisted_safe_head_exactly(runtime, at_threshold).await?;
+    let rotated_frame = advance_live_frame_until_covers(runtime, deposit_block).await?;
+    assert_eq!(
+        rotated_frame, at_threshold,
+        "S+5 must create exactly one frame at the observed safe head",
+    );
+    let direct = ws
+        .expect_direct_input_from(runtime.erc20_portal_address())
+        .await?;
+    match &direct {
+        WsTxMessage::DirectInput { block_number, .. } => assert_eq!(
+            *block_number, deposit_block,
+            "direct must retain its exact L1 inclusion block",
+        ),
+        other => unreachable!("expected direct after typed WS assertion, got {other:?}"),
+    }
+    replay.apply(direct)?;
+    ws.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
 
     // Alice: 700_000 - 400_000 - gas + 600_000. Bob: 400_000 (no ops from Bob).
     assert_wallet_state(
@@ -557,7 +705,8 @@ async fn run_rejected_user_op_not_broadcast_test(
     let transfer_amount = U256::from(100_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
+    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
+        .await?;
 
     alice_l2.transfer(bob_address, transfer_amount).await?;
     replay.apply(ws.expect_user_op_from(alice_address).await?)?;
@@ -608,9 +757,14 @@ async fn run_reconnect_from_offset_test(runtime: &mut ManagedSequencer) -> Scena
     let withdrawal_amount = U256::from(100_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    let deposit_message =
-        apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
-            .await?;
+    let deposit_message = apply_reconciled_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay,
+        &alice_l1,
+        deposit_amount,
+    )
+    .await?;
     // WS replay is cursor-based and exclusive: `from_offset` means
     // "start after this already-consumed DB offset".
     let reconnect_offset = deposit_message.offset();
@@ -658,7 +812,7 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
     let withdrawal_amount = U256::from(150_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before_restart,
@@ -740,15 +894,22 @@ async fn run_unsupported_token_deposit_noop_test(
     alice_l1
         .mint_token(unsupported_token, U256::from(123_000_u64))
         .await?;
-    alice_l1
+    let deposit_block = alice_l1
         .deposit_token(unsupported_token, U256::from(123_000_u64))
         .await?;
-    runtime.mine_l1_blocks(1).await?;
+    advance_live_frame_until_covers(runtime, deposit_block).await?;
 
-    replay.apply(
-        ws.expect_direct_input_from(runtime.erc20_portal_address())
-            .await?,
-    )?;
+    let direct = ws
+        .expect_direct_input_from(runtime.erc20_portal_address())
+        .await?;
+    match &direct {
+        WsTxMessage::DirectInput { block_number, .. } => assert_eq!(
+            *block_number, deposit_block,
+            "unsupported-token direct must retain its L1 inclusion block",
+        ),
+        other => unreachable!("expected direct after typed WS assertion, got {other:?}"),
+    }
+    replay.apply(direct)?;
 
     assert_eq!(replay.current_user_balance(alice_address), U256::ZERO);
     assert_eq!(replay.current_user_nonce(alice_address), 0);
@@ -756,7 +917,7 @@ async fn run_unsupported_token_deposit_noop_test(
     Ok(())
 }
 
-async fn apply_safe_supported_deposit(
+async fn apply_reconciled_supported_deposit(
     runtime: &ManagedSequencer,
     ws: &mut WsClient,
     replay: &mut ReplayWalletApp,
@@ -764,12 +925,19 @@ async fn apply_safe_supported_deposit(
     amount: U256,
 ) -> ScenarioResult<WsTxMessage> {
     wallet_l1.mint_supported_token(amount).await?;
-    wallet_l1.deposit_supported_token(amount).await?;
-    runtime.mine_l1_blocks(1).await?;
+    let deposit_block = wallet_l1.deposit_supported_token(amount).await?;
+    advance_live_frame_until_covers(runtime, deposit_block).await?;
 
     let message = ws
         .expect_direct_input_from(runtime.erc20_portal_address())
         .await?;
+    match &message {
+        WsTxMessage::DirectInput { block_number, .. } => assert_eq!(
+            *block_number, deposit_block,
+            "reconciled direct must retain its exact L1 inclusion block",
+        ),
+        other => unreachable!("expected direct after typed WS assertion, got {other:?}"),
+    }
     replay.apply(message.clone())?;
     Ok(message)
 }
@@ -783,7 +951,8 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
     let mut replay = ReplayWalletApp::devnet();
 
     let deposit_amount = U256::from(600_000_u64);
-    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
+    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
+        .await?;
 
     // Submit user-op with max_fee=0, which is below the default frame fee (1356).
     let client = SequencerClient::new(runtime.endpoint())?;
@@ -834,7 +1003,8 @@ async fn run_fixed_fee_oracle_sets_frame_fee_test(
     let mut replay = ReplayWalletApp::devnet();
 
     let deposit_amount = U256::from(600_000_u64);
-    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
+    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
+        .await?;
 
     let transfer_amount = U256::from(100_u64);
     alice_l2.transfer(alice_address, transfer_amount).await?;
@@ -897,7 +1067,8 @@ async fn run_concurrent_user_ops_test(runtime: &mut ManagedSequencer) -> Scenari
     // Fund all signers via L1 deposits.
     for signer in &signers {
         let l1 = runtime.wallet_l1(signer.clone()).await?;
-        apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &l1, deposit_amount).await?;
+        apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &l1, deposit_amount)
+            .await?;
     }
 
     // Submit transfers concurrently from all signers (each sends to signer 0).
@@ -962,7 +1133,9 @@ async fn run_concurrent_user_ops_test(runtime: &mut ManagedSequencer) -> Scenari
     Ok(())
 }
 
-async fn run_multi_deposit_same_block_test(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
+async fn run_multi_deposit_reconciliation_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
     let alice_address = alice.address();
@@ -976,14 +1149,16 @@ async fn run_multi_deposit_same_block_test(runtime: &mut ManagedSequencer) -> Sc
     let alice_deposit = U256::from(500_000_u64);
     let bob_deposit = U256::from(300_000_u64);
 
-    // Mint and deposit for both in quick succession (before mining).
-    alice_l1
+    // Default automining puts these deposits in separate blocks. This scenario
+    // pins one reconciliation turn draining multiple accumulated directs; a
+    // true same-block ordering scenario is tracked separately.
+    let alice_deposit_block = alice_l1
         .mint_and_deposit_supported_token(alice_deposit)
         .await?;
-    bob_l1.mint_and_deposit_supported_token(bob_deposit).await?;
+    let bob_deposit_block = bob_l1.mint_and_deposit_supported_token(bob_deposit).await?;
 
-    // Mine to make both deposits safe.
-    runtime.mine_l1_blocks(1).await?;
+    // Drive one or more semantic frame ticks until both deposits are covered.
+    advance_live_frame_until_covers(runtime, alice_deposit_block.max(bob_deposit_block)).await?;
 
     // Expect two direct inputs (one per deposit).
     let portal = runtime.erc20_portal_address();
@@ -1017,7 +1192,8 @@ async fn run_restart_after_committed_tx_replays_cleanly_test(
     let transfer_amount = U256::from(100_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount).await?;
+    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
+        .await?;
 
     // Submit a transfer, then immediately restart.
     alice_l2.transfer(alice_address, transfer_amount).await?;
@@ -1070,7 +1246,7 @@ async fn run_recovery_after_stale_batches_test(
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
     // Step 1: Fund Alice via L1 deposit.
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before,
@@ -1093,9 +1269,11 @@ async fn run_recovery_after_stale_batches_test(
         transfer_amount,
     );
 
-    // Step 3: Kill the sequencer (Anvil stays up).
+    // Step 3: Stop the healthy sequencer (Anvil stays up). This is the
+    // suite's process-level pin of the exit-code contract's clean class:
+    // SIGTERM on a healthy process must exit 0.
     drop(ws);
-    runtime.stop().await?;
+    runtime.stop_expecting_clean_exit().await?;
 
     // Step 4: Simulate ~4h of outage: advance both L1 and wall clock by
     // MAX_WAIT_BLOCKS * SECONDS_PER_BLOCK = 1200 * 12 = 14400s. On respawn,
@@ -1209,7 +1387,7 @@ async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> S
     // the post-recovery gold-batch pump (~150 self-transfers × ~38k fee).
     let deposit = U256::from(10_000_000_u64);
     let transfer1 = U256::from(100_000_u64);
-    apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit).await?;
+    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit).await?;
     alice_l2.transfer(bob_address, transfer1).await?;
     replay.apply(ws.expect_user_op_from(alice_address).await?)?;
     let expected_alice = deposit - transfer1 - gas;
@@ -1334,7 +1512,7 @@ async fn run_sequencer_outage_pre_danger_no_recovery_test(
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
     // Step 1: Fund Alice and record a transfer.
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before,
@@ -1404,7 +1582,7 @@ async fn run_sequencer_outage_pre_danger_no_recovery_test(
 //   - `check_danger` returns `TipInDanger(idx)` — the closed-frontier check finds
 //     nothing past gold, but the open Tip's first frame has aged past
 //     `danger_threshold`.
-//   - `decide_startup_action` returns `RecoverTip` (no flush — the Tip has
+//   - the startup reducer selects `RecoverTip` (no flush — the Tip has
 //     no L1 footprint).
 //   - `recover_aging_tip` cascades the Tip; pre-outage soft-confirmed user
 //     ops are rolled back (this is the documented "soft confirmations may
@@ -1420,10 +1598,10 @@ async fn run_sequencer_outage_pre_danger_no_recovery_test(
 async fn run_sequencer_outage_danger_zone_tip_cascade_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    // Pick advance in the danger zone: > danger_threshold (900) but < MAX_WAIT (1200).
-    // Decoupled from wall clock on purpose: this test exercises the
-    // block-based danger check in isolation. Uses module-level
-    // `DANGER_ZONE_BLOCKS` (see top-of-file zone constants).
+    // Pick an advance in the danger zone: > danger_threshold (900) but <
+    // MAX_WAIT (1200). L1 block time and process time advance together so the
+    // observed Tip age selects `RecoverTip` without leaving the repaired L1
+    // view future-dated during the mandatory post-recovery inspection.
 
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
@@ -1439,7 +1617,7 @@ async fn run_sequencer_outage_danger_zone_tip_cascade_test(
     let transfer_amount = U256::from(100_000_u64);
     let gas = fee_to_linear(DEFAULT_FRAME_FEE);
 
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before,
@@ -1461,11 +1639,19 @@ async fn run_sequencer_outage_danger_zone_tip_cascade_test(
     // so the startup `RecoverTip` path cascades it (no flush — the Tip
     // has no L1 footprint). Alice's pre-outage transfer was a soft
     // confirmation against the Tip; it's rolled back.
-    runtime.mine_l1_blocks(DANGER_ZONE_BLOCKS).await?;
+    runtime
+        .advance_wall_and_mine(blocks_as_duration(DANGER_ZONE_BLOCKS))
+        .await?;
     let _ = expected_alice_balance;
     let _ = expected_bob_balance;
 
     runtime.respawn().await?;
+
+    let counts = runtime.count_batches()?;
+    assert!(
+        counts.invalidated >= 1,
+        "RecoverTip must invalidate the aged Tip before admission: {counts:?}",
+    );
 
     // After Tip cascade: balances roll back to the post-deposit / pre-transfer
     // state, nonces reset, and the WS feed should not replay the invalidated
@@ -1545,7 +1731,7 @@ async fn run_provider_outage_past_stale_cascades_test(
     let deposit_amount = U256::from(600_000_u64);
     let transfer_amount = U256::from(100_000_u64);
 
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before,
@@ -1575,9 +1761,9 @@ async fn run_provider_outage_past_stale_cascades_test(
 
     // Step 4: Respawn. The sequencer dials the proxy, the proxy forwards
     // to Anvil, `sync_to_current_safe_head` returns 1250+ blocks past the
-    // open Tip's first frame. `check_danger` fires `TipInDanger(idx)`,
-    // `decide_startup_action` returns `RecoverTip`, `recover_aging_tip`
-    // cascades the Tip and opens a fresh one.
+    // open Tip's first frame. `check_danger` fires `TipInDanger(idx)`, and
+    // the reducer's guarded `RecoverTip` phase cascades the Tip and opens a
+    // fresh one.
     runtime.respawn().await?;
 
     // Step 5: Verify via WS replay.
@@ -1645,7 +1831,7 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
     let mut replay_before = ReplayWalletApp::devnet();
 
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before,
@@ -1673,7 +1859,8 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     //   - dials the proxy → sync_to_current_safe_head fails (L1 unreachable).
     //   - sees the persisted safe block timestamp is older than the L1
     //     read-staleness threshold.
-    //   - decide_startup_action returns Refuse(L1ViewStale) → process exits with failure.
+    //   - the startup reducer returns Retry(L1ViewStale), so the process exits
+    //     without runtime admission.
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -1707,19 +1894,109 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     Ok(())
 }
 
-// `SystemTime::now()` backward jump → `saturating_sub` handles
-// cleanly, no panic.
+// Warm restart from a fresh persisted L1 view while the RPC is unreachable.
 //
-// Scenario: normal setup creates DB state at real time T. Stop, disconnect
-// proxy, backward-jump the clock via faketime, respawn with L1 unreachable.
-// The wall-clock fallback runs:
-//
-//     elapsed = now(T-1h).saturating_sub(last_sync_at_ms(≈T)) = 0
-//
-// No danger → boot proceeds. After reconnect, normal operation resumes.
-// If `saturating_sub` ever regresses to a plain subtraction (underflow
-// panic on u64), this test panics at respawn.
-async fn run_wall_clock_backward_jump_no_panic_test(
+// This is the production-shaped discriminator for startup admission: an
+// initial refresh attempt may fail, but a recent persisted view that still
+// reduces to `Admit` is sufficient authority to prepare and launch the
+// runtime. The test keeps the proxy disconnected through readiness, one full
+// background-worker retry cadence, POST /tx, and WS broadcast. A boot path
+// that makes provider reachability an unconditional admission gate fails at
+// `respawn`; a runtime that launches without a usable inclusion lane fails the
+// transaction or WS assertion.
+async fn run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    const STABILITY_WINDOW: Duration = Duration::from_secs(3);
+
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_address = alice.address();
+    let bob_address = bob.address();
+    let deposit_amount = U256::from(600_000_u64);
+    let transfer_amount = U256::from(100_000_u64);
+    let fee = fee_to_linear(DEFAULT_FRAME_FEE);
+
+    // Persist a recent safe-head observation plus replayable wallet state,
+    // then stop cleanly so the next run boots over fresh facts without a
+    // recovery phase.
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut ws = runtime.ws(0).await?;
+    let mut replay = ReplayWalletApp::devnet();
+    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
+        .await?;
+    drop(ws);
+    runtime.stop().await?;
+
+    // Route the next process through an already-disconnected gateway. The
+    // proxy stays down until after the admitted runtime serves the write and
+    // its corresponding ordered-tx feed event.
+    let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
+    runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
+    proxy.disconnect();
+    runtime.respawn().await?;
+    assert!(
+        !proxy.is_connected(),
+        "warm restart must reach readiness without reconnecting the L1 proxy",
+    );
+
+    // Cross the 2s input-reader/danger-detector cadence before submitting, so
+    // this proves more than racing a request ahead of the first failed RPC
+    // retry. Fresh local facts must keep the process admitted and live.
+    let exit = runtime.observe_for(STABILITY_WINDOW).await?;
+    assert!(
+        exit.is_none(),
+        "warm runtime must remain live while the fresh persisted L1 view is valid; got {exit:?}",
+    );
+
+    let mut ws_after = runtime.ws(0).await?;
+    let mut replay_after = ReplayWalletApp::devnet();
+    replay_after.apply(
+        ws_after
+            .expect_direct_input_from(runtime.erc20_portal_address())
+            .await?,
+    )?;
+    let mut alice_l2 = runtime.wallet_l2(alice)?;
+    alice_l2.transfer(bob_address, transfer_amount).await?;
+    replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
+
+    assert_wallet_state(
+        &replay_after,
+        ExpectedWalletState {
+            address: alice_address,
+            balance: deposit_amount - transfer_amount - fee,
+            nonce: 1,
+        },
+        ExpectedWalletState {
+            address: bob_address,
+            balance: transfer_amount,
+            nonce: 0,
+        },
+        2,
+    );
+    assert!(
+        !proxy.is_connected(),
+        "POST /tx and WS must succeed before L1 connectivity is restored",
+    );
+    assert_eq!(
+        runtime.count_batches()?.invalidated,
+        0,
+        "a fresh-view warm restart must not invalidate the batch tree",
+    );
+
+    proxy.reconnect();
+    runtime.set_l1_endpoint_override(None);
+    proxy.shutdown().await?;
+    Ok(())
+}
+
+// A wall-clock regression of at least one configured block interval makes a
+// persisted L1-progress timestamp unusable. With L1 unreachable, startup must
+// return the retryable `L1ViewStale` verdict (exit 20) without mutating the
+// batch tree. Restoring both time and connectivity must make the next boot
+// healthy. Sub-block regressions remain tolerated and are pinned by protocol
+// unit tests.
+async fn run_wall_clock_backward_jump_retries_then_recovers_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     let alice = TestSigner::from_default(1)?;
@@ -1727,7 +2004,7 @@ async fn run_wall_clock_backward_jump_no_panic_test(
     let mut ws = runtime.ws(0).await?;
     let mut replay_before = ReplayWalletApp::devnet();
 
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before,
@@ -1737,22 +2014,46 @@ async fn run_wall_clock_backward_jump_no_panic_test(
     .await?;
     drop(ws);
 
+    let counts_before = runtime.count_batches()?;
     runtime.stop().await?;
     let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
     runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
     proxy.disconnect();
     runtime.set_faketime_offset(Some("-1h".to_string()))?;
 
-    // Respawn must NOT panic. With L1 unreachable, the wall-clock fallback
-    // is the only path that sees `now - last_sync_ms` — if the subtraction
-    // ever became non-saturating, this call would panic via u64 underflow.
+    let respawn_error = runtime
+        .respawn()
+        .await
+        .expect_err("a one-hour clock regression with L1 unreachable must refuse admission");
+    let respawn_error = respawn_error.to_string();
+    assert!(
+        respawn_error.contains("status=exit status: 20"),
+        "backward-clock refusal must use the retryable exit class, not panic: {respawn_error}",
+    );
+
+    let counts_after_retry = runtime.count_batches()?;
+    assert_eq!(
+        counts_after_retry, counts_before,
+        "retryable clock refusal must not mutate the batch tree",
+    );
+
+    // Restore the usable clock and L1 connection. The same persisted facts
+    // are now ageable again, so startup admits and the runtime remains healthy
+    // past the danger detector's two-second cadence.
+    runtime.set_faketime_offset(None)?;
+    proxy.reconnect();
     runtime.respawn().await?;
 
-    // Clean up: reconnect and let the sequencer catch up normally.
-    proxy.reconnect();
-    // Clear the offset for subsequent respawns (not used here, but keeps the
-    // teardown deterministic if future cleanup code respawns).
-    runtime.set_faketime_offset(None)?;
+    let exit = runtime.observe_for(Duration::from_secs(3)).await?;
+    assert!(
+        exit.is_none(),
+        "restoring time and L1 connectivity must produce a stable runtime; got {exit:?}",
+    );
+    assert_eq!(
+        runtime.count_batches()?,
+        counts_before,
+        "recovering from a retryable clock refusal must not invalidate batches",
+    );
 
     proxy.shutdown().await?;
     Ok(())
@@ -1798,7 +2099,7 @@ async fn run_stalled_safe_head_startup_refuses_boot_test(
     let mut replay = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay,
@@ -1884,8 +2185,14 @@ async fn run_provider_outage_pre_danger_sequencer_continues_test(
     let mut replay = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
-            .await?;
+        apply_reconciled_supported_deposit(
+            runtime,
+            &mut ws,
+            &mut replay,
+            &alice_l1,
+            deposit_amount,
+        )
+        .await?;
     }
 
     // Step 2: Insert the proxy and route the sequencer through it via
@@ -1999,7 +2306,7 @@ async fn run_provider_outage_danger_zone_sequencer_self_exits_test(
     let mut replay = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay,
@@ -2039,9 +2346,9 @@ async fn run_provider_outage_danger_zone_sequencer_self_exits_test(
         "sequencer must self-exit with non-zero status on danger detection, got {exit_status:?}",
     );
 
-    // Step 5: Try to respawn while proxy is still disconnected. Startup
-    // runs the same wall-clock fallback via `run_preemptive_recovery` and
-    // should refuse to boot (`decide_startup_action → Refuse(...)`).
+    // Step 5: Try to respawn while proxy is still disconnected. The startup
+    // reducer runs the same wall-clock fallback and must return
+    // `Retry(L1ViewStale)` without runtime admission.
     let respawn_result = runtime.respawn().await;
     assert!(
         respawn_result.is_err(),
@@ -2096,8 +2403,14 @@ async fn run_provider_outage_short_hiccup_no_recovery_test(
     let mut replay = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
-            .await?;
+        apply_reconciled_supported_deposit(
+            runtime,
+            &mut ws,
+            &mut replay,
+            &alice_l1,
+            deposit_amount,
+        )
+        .await?;
     }
 
     // Route through the proxy (stop → override → respawn).
@@ -2185,7 +2498,7 @@ async fn run_both_down_danger_zone_sequencer_first_refuses_boot_test(
     let mut replay_before = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay_before,
@@ -2235,8 +2548,8 @@ async fn run_both_down_danger_zone_sequencer_first_refuses_boot_test(
 // Complement to  (sequencer first): here L1 comes back before the
 // sequencer does. Once the sequencer restarts, startup recovery sees L1
 // reachable and the Tip aged past `danger_threshold`, so `check_danger`
-// returns `TipInDanger(idx)` → `decide_startup_action` returns `RecoverTip` →
-// `recover_aging_tip` cascades the Tip and opens a fresh one. Convergence
+// returns `TipInDanger(idx)` and the guarded `RecoverTip` phase cascades the
+// Tip and opens a fresh one. Convergence
 // typically happens on the first respawn.
 //
 // Other paths can fire under different timings — e.g., the lane might
@@ -2272,7 +2585,7 @@ async fn run_both_down_danger_zone_proxy_first_restart_cycle_recovers_test(
     let mut replay_before = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay_before,
@@ -2363,8 +2676,8 @@ async fn run_both_down_danger_zone_proxy_first_restart_cycle_recovers_test(
 // Other paths can fire depending on timing — e.g., the lane might close the
 // Tip into a nonced batch before the detector trips, the submitter might
 // get the batch onto L1 fresh, and convergence happens by the next respawn
-// seeing it in `safe_inputs`. Or the closed batch lands stale, routes
-// through `FlushAndCascade`, and converges after a flush cycle.
+// seeing it in `safe_inputs`. Or the closed batch lands stale, routes through
+// the guarded Flush → Sync → Cascade phases, and converges after a flush cycle.
 //
 // The test's load-bearing assertion is restart-loop convergence under a
 // realistic coupled outage, not which specific recovery path fires nor how
@@ -2385,7 +2698,7 @@ async fn run_sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test(
     let mut replay_before = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay_before,
@@ -2418,7 +2731,7 @@ async fn run_sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test(
 
     // Convergence is the load-bearing claim. The number of attempts depends
     // on which recovery path fires (`RecoverTip` typically converges on the
-    // first respawn; `FlushAndCascade` may take more), so we don't pin a
+    // first respawn; Flush → Sync → Cascade may take more), so we don't pin a
     // minimum here.
     assert!(
         !outcomes.is_empty(),
@@ -2493,7 +2806,7 @@ async fn run_provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recover
     let mut replay_before = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay_before,
@@ -2586,9 +2899,9 @@ async fn run_provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recover
 // first boot (needs L1 reachable to deploy contracts and pin the deployment
 // identity). We stop, rewrite the recorded L1 safe-head observation to
 // unknown, then respawn with the proxy disconnected. The deployment identity
-// is still populated — so the sequencer gets past the contract-discovery
-// phase — but `check_danger` sees the missing safe-head row and
-// `decide_startup_action` returns `Refuse(L1ViewStale)`.
+// is still populated — so the sequencer gets past the identity gate — but
+// `check_danger` sees the missing safe-head row and the reducer returns
+// `Retry(L1ViewStale)`.
 //
 // Scope note: a "truly" first-ever boot would fail even earlier (no
 // deployment identity, can't discover contracts). That's a separate test; this
@@ -2673,7 +2986,7 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
     let mut replay_before = ReplayWalletApp::devnet();
 
     let mut ws = runtime.ws(0).await?;
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before,
@@ -2725,7 +3038,7 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
     runtime.advance_wall_and_mine(PAST_STALE).await?;
 
     // Re-enable auto-mining AND mine L1 throughout the recovery boot. Startup
-    // recovery's WP2 flush submits a no-op at the stranded wallet-nonce slot
+    // recovery's mempool flush submits a no-op at the stranded wallet-nonce slot
     // and blocks until that slot is *safe* (`safe_nonce >= watermark + 1`).
     // Auto-mining alone lands the no-op but mints no further blocks, so Anvil's
     // `safe` tag never advances past it and the boot would hang; the boot miner
@@ -2787,15 +3100,17 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
 //
 // Staging:
 //   1. Baseline: deposit + transfer → Tip at first_frame_safe_block X.
-//   2. `mine_l1_blocks(DANGER_ZONE_BLOCKS)` — current_safe_block jumps
-//      ~1150 past X, so the Tip's age clears `danger_threshold`. Wall
-//      clock untouched (decoupled advance).
+//   2. Advance only L1 by `DANGER_ZONE_BLOCKS` — current_safe_block jumps
+//      ~1150 past X before the wall-clock batch deadline can close the Tip.
+//      Once the reader persists that head, observed Tip age outranks the
+//      deliberately future-dated L1 clock and clears `danger_threshold`.
 //   3. `wait_for_exit` — input reader catches up; detector ticks; sees
 //      `DangerStatus::TipInDanger(_)`; process exits non-zero.
-//   4. Respawn — startup `check_danger` again sees Tip in danger →
+//   4. Align wall time with the already-mined L1 time, then respawn. Startup
+//      can now age the persisted head normally and sees Tip in danger →
 //      `RecoverTip` → `recover_aging_tip` cascades the Tip + opens a fresh
-//      one. Alice's pre-outage transfer was a soft confirmation against
-//      the cascaded Tip; it's rolled back.
+//      one. Alice's pre-outage transfer was a soft confirmation against the
+//      cascaded Tip; it's rolled back.
 async fn run_aging_open_tip_runtime_danger_zone_exit_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
@@ -2809,7 +3124,7 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
     let mut replay = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay,
@@ -2821,17 +3136,26 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
         replay.apply(ws.expect_user_op_from(alice_address).await?)?;
     }
 
-    // L1 jumps into the danger window; wall clock stays put.
+    // Advance L1 atomically while leaving wall time still: this injects the
+    // "lane failed to close its Tip" condition without letting the normal
+    // wall-clock batch deadline repair it first.
     runtime.mine_l1_blocks(DANGER_ZONE_BLOCKS).await?;
 
     // The detector must trip on `DangerStatus::TipInDanger` once the input reader
     // catches up. Allow a window for input-reader poll (~2 s) plus
     // detector poll (2 s) plus margin.
     let exit = runtime.wait_for_exit(Duration::from_secs(15)).await?;
-    assert!(
-        !exit.success(),
-        "sequencer must exit non-zero on `DangerStatus::TipInDanger` once the Tip's \
-         first frame ages past `danger_threshold`, got {exit:?}",
+    // Exit 10 (`EXIT_RESTART_EXPECT_RECOVERY`) is the observed-danger class
+    // (`TipInDanger` / `ClosedBatchInDanger`); a clock fallback (`L1ViewStale`,
+    // `EstimatedBatchInDanger`) would exit 20. The scenario has no closed
+    // batch, so 10 here means the detector saw the aging Tip, not the
+    // future-dated L1 clock. The exit code is the contract; the rendered log
+    // line is not.
+    assert_eq!(
+        exit.code(),
+        Some(10),
+        "runtime detector must exit with the observed-danger class on \
+         `DangerStatus::TipInDanger`, not a clock fallback; got {exit:?}",
     );
 
     // No cascade fires on detector exit alone. The recovery happens at
@@ -2844,6 +3168,14 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
         "detector exit alone must not invalidate batches; that happens at startup: {counts_before:?}",
     );
 
+    // The reader's persisted L1 head is future-dated because Anvil advanced
+    // atomically. Add ordinary live progress, then align process time before
+    // restart: initial sync observes a strictly newer safe head and refreshes
+    // the wall-progress witness, so the mandatory post-repair inspection can
+    // admit the fresh Tip rather than correctly retaining a stale-view retry.
+    runtime.mine_live_l1_blocks(1).await?;
+    let aligned_offset_secs = blocks_as_duration(DANGER_ZONE_BLOCKS).as_secs() + 1;
+    runtime.set_faketime_offset(Some(format!("+{aligned_offset_secs}s")))?;
     runtime.respawn().await?;
 
     let mut ws_after = runtime.ws(0).await?;
@@ -2908,7 +3240,7 @@ async fn run_stalled_safe_head_live_exit_test(
     let mut replay = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay,
@@ -2973,7 +3305,7 @@ async fn run_ws_reconnect_at_invalidated_offset_skips_cleanly_test(
     // Build up offsets 0 (deposit) and 1 (transfer) and capture the
     // transfer's offset so we can later reconnect at it.
     let mut ws = runtime.ws(0).await?;
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_before,
@@ -3069,7 +3401,7 @@ async fn run_ws_subscribe_from_future_offset_waits_silently_test(
     let mut replay = ReplayWalletApp::devnet();
     {
         let mut ws = runtime.ws(0).await?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay,
@@ -3242,7 +3574,7 @@ async fn run_replay_matches_live_for_mixed_workload_test(
 
     // Diverse workload — exercises deposit-interleaving and every op
     // combination supported by the wallet app.
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_live,
@@ -3255,7 +3587,7 @@ async fn run_replay_matches_live_for_mixed_workload_test(
         .await?;
     replay_live.apply(ws.expect_user_op_from(alice_address).await?)?;
 
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay_live,
@@ -3365,7 +3697,7 @@ async fn run_provider_outage_input_reader_retries_after_reconnect_test(
 
     // Baseline deposit with the proxy connected — proves the WS + reader
     // path works end-to-end before we break it.
-    apply_safe_supported_deposit(
+    apply_reconciled_supported_deposit(
         runtime,
         &mut ws,
         &mut replay,
@@ -3419,9 +3751,9 @@ async fn run_provider_outage_input_reader_retries_after_reconnect_test(
 // recovery logic runs.
 //
 // Distinct from `run_first_boot_l1_unreachable_never_synced_refuses_boot_test`
-// (already covered): that test exercises the wall-clock fallback inside
-// `run_preemptive_recovery`, which only fires AFTER bootstrap discovery has
-// succeeded once (so the deployment identity is pinned). This test targets
+// (already covered): that test exercises the run reducer's wall-clock fallback,
+// which only runs after setup has succeeded once (so deployment identity is
+// pinned). This test targets
 // the earlier failure: the
 // `InputReader::new` discovery step where the sequencer asks L1 for the
 // InputBox address. With no deployment identity, that call has no
@@ -3567,7 +3899,7 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
     {
         let mut ws = runtime.ws(0).await?;
         let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
-        apply_safe_supported_deposit(
+        apply_reconciled_supported_deposit(
             runtime,
             &mut ws,
             &mut replay_before,
@@ -3592,7 +3924,7 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
     runtime.drop_all_pending_txs().await?;
 
     runtime.advance_wall_and_mine(PAST_STALE).await?;
-    // Re-enable auto-mining AND mine L1 throughout the recovery boot: the WP2
+    // Re-enable auto-mining AND mine L1 throughout the recovery boot: the mempool
     // flush submits a no-op at the stranded nonce-0 slot and waits for it to
     // become safe. Auto-mining lands the no-op but mints no further blocks, so
     // the boot miner supplies the steady block production needed to advance
