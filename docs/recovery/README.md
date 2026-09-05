@@ -365,12 +365,11 @@ Dead batches occupy `w_nonce` slots strictly below `walletNonce`. Recovery batch
 
 Everything above is **standard recovery**: the sequencer's own bookkeeping
 (the batch tree, pending dumps) lets startup cascade a doomed suffix and
-resume. The repair decision is automatic, not an operator-designed reconstruction:
-recovery crosses a process boundary, and the next boot inspects fresh facts
-through the reducer regardless of how the prior process died: an unclean
-exit leaves no gate behind, and there is no operator acknowledgement step.
-A terminal death best-effort records its cause in the `terminal_faults`
-black box, which nothing reads for decisions.
+resume. The repair decision is automatic, not an operator-designed
+reconstruction: recovery crosses a process boundary, and the next boot
+inspects fresh facts through the reducer regardless of how the prior process
+died. Admission and the terminal-fault black box are owned by
+[ADR mechanism 2](../plans/2026-08-authority-boundary-adr.md#2-fact-derived-admission-and-the-terminal-fault-black-box).
 
 **Cockroach recovery** is the catastrophe path — the local DB is lost or has diverged (`CanonicalDivergence`, [I15](../invariants.md)). There is no tree to cascade; the operator supplies a fresh or explicitly wiped data directory and rebuilds canonical logical state from a trusted checkpoint plus L1. It is an operator-driven, one-shot `setup` mode, not a runtime action. There is no automated DB replacement, clone detection, distributed fencing, or partial-fill resume state machine. The summary:
 
@@ -389,44 +388,19 @@ The detect-and-refuse gate is the *trigger*: a fresh `setup` that finds a previo
 Independent of the staleness machinery, the input reader's acceptance
 simulation cross-checks every at/above-anchor **accepted** landing against the
 local valid closed batch at that nonce (the content-identity check:
-`keccak256` of the landed wire bytes vs the hash stamped at seal). The complete
-outcome set for that predicate is `Match`, `Foreign` (no local batch), or
-`Mismatch` (different bytes). `Foreign`/`Mismatch` persist the
-`canonical_divergence` marker in the same transaction as `safe_inputs`, the L1
-safe head, and accepted-frontier projection, and freeze the acceptance
-frontier immediately.
+`keccak256` of the landed wire bytes vs the hash stamped at seal). A `Foreign`
+(no local batch) or `Mismatch` (different bytes) outcome persists the
+`canonical_divergence` marker in the same transaction as the sync that found
+it. The freeze, its runtime reaction, the race bound, and the watchdog
+boundary are owned by
+[I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen);
+the check's completeness scope by [I9](../invariants.md).
 
-This automatic detection starts only when the landing reaches L1 safe and the
-reader successfully ingests it. `check_danger` reports
+This page owns the recovery side. `check_danger` reports
 `CanonicalDivergence` **ahead of every other arm**, so a respawn loop can never
 route a diverged node into a provider call, recovery phase, or admission. Every
 reducer iteration begins with local inspection; mutating phase transactions
 reassert the marker's absence. The controller maps it to terminal `Refuse`.
-At runtime, `DangerDetector` owns prompt process-wide reaction on its two-second
-cadence. The inclusion lane's existing time-gated SQLite read independently
-returns a typed divergence instead of a usable frontier, so a turn that
-observes the marker closes intake and terminates before direct execution,
-promotion, or the five-block frame-clock decision. This is opportunistic
-refusal, not another polling schedule or reaction-time guarantee. A turn that
-already read an open frontier may finish if the reader commits the marker
-concurrently, and a user-op chunk committed before either runtime observation
-may acknowledge; no cross-worker lock or per-chunk marker query is added.
-
-The operator watchdog does not replace this check. The marker freezes finalized
-promotion, so the offending landing normally leaves the watchdog's checkpoint
-endpoint unchanged and its idle optimization skips replay/comparison. It is a
-wire-identity predicate; the watchdog is the broader independent
-application-state comparison once a newer finalized checkpoint exists.
-
-The distinction from standard recovery is important. The danger classifier
-and reducer exhaustively handle the modeled automatic-recovery states on this
-page. The check is complete only for accepted-batch content identity. It is not an
-independent oracle for checkpoint/application correctness, trusted collapsed
-history below the anchor, the mirrored scheduler predicate, or arbitrary
-direct/user execution bugs. In particular, the known wrong-high checkpoint
-nonce case is outside its detection boundary (see
-[`cockroach.md`](cockroach.md#data-dictionary)). Absence of the marker does not
-prove general canonical agreement.
 
 The remedy is **cockroach recovery (wipe + rebuild from L1), never the
 standard recovery on this page**: the cascade reconciles the batch tree's
@@ -480,8 +454,7 @@ RecoverTip, Flush/Sync/Cascade with ephemeral witnesses, Sync-discovered
 divergence, mandatory reinspection after every completed phase,
 crash-and-restart as a fresh attempt over surviving durable facts (nothing
 durable gates the next boot; the terminal-fault black box is non-gating
-telemetry outside the model — written at settlement, read only for a boot
-warning — and there is no acknowledgement action), and atomic minting of the `RuntimeAdmission` witness from the
+telemetry outside the model — see the ADR), and atomic minting of the `RuntimeAdmission` witness from the
 final clean decision. It abstracts away the batch spine and delegates every phase's
 batch mechanics to `preemptive.tla`.
 

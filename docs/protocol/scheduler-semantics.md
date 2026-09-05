@@ -141,6 +141,11 @@ batch's first frame at the unchanged `safe_block`; equal adjacent frame clocks
 are valid. Thus block distance is the only reason logical frame time advances,
 not the only reason a frame row exists.
 
+Five blocks is a sequencer policy chosen comfortably inside the happy-path
+deposit budget. If actual safe-head publication cadence threatens that budget,
+revisit the constant from measurements rather than adding interpolation or a
+second timer.
+
 ---
 
 ## The application-history offset

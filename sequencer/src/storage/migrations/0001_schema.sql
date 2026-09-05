@@ -58,6 +58,9 @@ CREATE INDEX IF NOT EXISTS idx_batches_valid_closed_by_nonce
     WHERE invalidated_at_ms IS NULL AND sealed_at_ms IS NOT NULL;
 
 -- ── Views ──────────────────────────────────────────────────────────────────
+-- Readers over batch data go through the `valid_*` views (here and
+-- `valid_sequenced_l2_txs` below), which encapsulate the "exclude invalidated
+-- rows" filter; writers always target the base tables.
 CREATE VIEW IF NOT EXISTS valid_batches AS
     SELECT * FROM batches WHERE invalidated_at_ms IS NULL;
 
@@ -212,6 +215,9 @@ BEGIN
     SELECT RAISE(ABORT, 'frames can only be inserted into the current Tip');
 END;
 
+-- No (sender, nonce) uniqueness is enforced here: included user-op identity
+-- is tracked by application nonce logic, and a DB constraint would block
+-- legitimate resubmission after a recovery cascade.
 CREATE TABLE IF NOT EXISTS user_ops (
     batch_index      INTEGER NOT NULL,
     frame_in_batch   INTEGER NOT NULL,

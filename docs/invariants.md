@@ -30,65 +30,33 @@ When you change anything listed under *enforced by*, re-check every line under
   `unwrap_or_default` on data the contracts make impossible; use the loud
   variant of the same operation.
 - **Command admission is fact-derived; a contained terminal fault closes
-  in-process first.** Admission is governed by three facts, each with one
-  owner: the kernel process lock (concurrent owners; the exclusive OS-held
-  lock in `sequencer/src/runtime/process_lock.rs` makes
-  one-process-per-data-dir kernel-enforced, the controller retains it
-  through settlement, and nested work retains clones until it actually
-  stops), `setup_complete` (two-sided command ordering: setup/rebuild never
-  restart over a completed setup, run/flush never start before one), and
-  `canonical_divergence` (the one absorbing refusal — only a
-  fresh-directory cockroach rebuild proceeds). There is no lifecycle
-  admission state machine and no operator acknowledgement: standard
-  recovery is automatic — every run boots through the fact-derived
-  reducer — and restart policy after a terminal fault is the exit-code
-  contract (30 = do not restart, page), which the supervisor is expected
-  to honor; a persistent fault re-detects fail-loud on any boot that reads
-  it. The only durable telemetry is the `terminal_faults` black box:
-  append-only terminal-cause rows, written best-effort and verdict-neutrally —
-  telemetry never changes a command's verdict, and nothing reads the
-  black box for decisions. Runtime admission re-runs the
-  reducer over one transactionally consistent fact set immediately before
-  the non-yielding launch block; the process lock plus the task-free
-  prepare phase make that read the decision's linearization. Baseline
-  schema+history creation and setup completion are each one
-  `synchronous=FULL` transaction. Runtime
-  containment remains classification-at-birth: detection CAS-elects one
-  reporter, sets the sticky containment bit, arms the independent
-  two-second abort watchdog, and requests cooperative shutdown; it writes
-  nothing durable. The black box's terminal-cause row is written once, by
-  the command bracket at settlement, from the verdict the drain returns
-  (best-effort telemetry — the exit code and logs carry the verdict if it
-  fails). The watchdog holds only a
-  weak process-lifetime witness; it aborts at the deadline exactly when a
-  controller, worker, or nested blocking operation still retains the
-  process lock. Cleanup polls all workers concurrently so one hung drain
-  cannot hide a terminal exit that must arm the bound. Ordinary
-  operator/recovery shutdown has no hard deadline. Externalization sites
-  (acks, L1 sends, WS frames) check the containment bit before emitting;
-  the snapshot routes check it once at request start — serving an
-  already-immutable operator snapshot is not authority-bearing, and
-  per-chunk stream cancellation is not a containment guarantee. A missed
-  check is bounded by the exit-code contract and by the I15 freeze triggers
-  on the tables they cover — partial structural backstops, not a barrier.
+  in-process first.** Three facts (the kernel process lock, two-sided
+  `setup_complete`, `canonical_divergence`), no admission state machine, no
+  operator acknowledgement, and a verdict-neutral black box; the statement,
+  the accepted trade, and the containment mechanism are owned by the
+  [authority-boundary ADR](plans/2026-08-authority-boundary-adr.md)
+  (mechanisms 1 and 2). What this policy adds: telemetry writes are
+  verdict-neutral — a failed black-box record loses only the black-box copy,
+  and the exit code and logs still carry the verdict — and a missed
+  externalization check is bounded only by the exit-code contract and by the
+  [I15](#i15-divergence-marker-present--acceptance-frontier-frozen) freeze
+  triggers on the tables they cover: partial structural backstops, not a
+  barrier.
 - **Maintenance is flush-only.** `flush-mempool` is an operator command,
   not a run-reducer alias: it settles the wallet nonce and never acquires
   Sync/Cascade semantics. It requires completed setup and no divergence.
   There is no verdict state for a flush to erase, and a successful wallet
   flush proves nothing about the rest of the runtime.
 - **Normal run repair and admission have one reducer boundary.** Local
-  absorbing facts are inspected before fallible provider facts. The pure run
-  decision performs at most one recovery phase, and every completed phase
-  returns to inspection. A successful flush contributes only an ephemeral
-  safe-block witness for the current boot attempt; Sync must catch the
-  persisted view up through that witness before Cascade, and a crash may safely
-  establish a fresh witness by flushing again. After the reducer decides to
-  admit, runtime preparation remains fallible and task-free; final
-  admission then re-runs the same reducer over one consistent fact set and
-  yields the single-use `RuntimeAdmission` witness consumed by the
-  infallible, non-yielding launch. Raw worker and HTTP launch surfaces are
-  crate-private; production app crates enter through `run`/`run_main`. No
-  refusal or retry can construct the capability. Mutation and output
+  absorbing facts are inspected before fallible provider facts; the pure run
+  decision performs at most one recovery phase; every completed phase
+  returns to inspection; the flush's safe-block witness is boot-local, and
+  Sync must catch the persisted view up through it before Cascade. Final
+  admission re-runs the same reducer over one consistent fact set and yields
+  the single-use `RuntimeAdmission` witness consumed by the infallible,
+  non-yielding launch; no refusal or retry can construct it, and raw worker
+  and HTTP launch surfaces are crate-private. Design:
+  [`docs/recovery/README.md`](recovery/README.md). Mutation and output
   authorization remains role-local at the durable boundaries documented
   below; public low-level storage helpers are not an authority API.
 - An assertion must check a **real invariant** — true in every legitimate
@@ -102,6 +70,28 @@ Decision test for any proposed check: (a) real invariant? (b) near-zero cost?
 don't.
 
 ## Register
+
+### Writer roles
+
+One writer role per fact. Reads over batch data go through the `valid_*`
+views (`valid_batches`, `valid_closed_batches`, `valid_open_batch`,
+`valid_sequenced_l2_txs`), which encapsulate the "exclude invalidated rows"
+filter; writers target the base tables. The batch lifecycle columns partition
+by writer and are write-once (`0001_schema.sql`).
+
+| Writer | Writes |
+|---|---|
+| inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `sequenced_l2_txs`, `executed_inputs`, `dumps`/`pending_snapshots` (batch close), `finalized_snapshot` (promotion only — setup registers the initial row) |
+| input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
+| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, scoped `pending_snapshots` clear, derived `executed_inputs` suffix deletion |
+| history metadata (setup/recovery) | `history_state` — era/generation at baseline, generation bump in a non-empty standard-recovery cascade, rebuild application base + safe-input drain floor at initial finalized-snapshot registration |
+| batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
+| egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
+| setup | `deployment_identity` (pinned once), `batch_tree_anchor` (the root nonce, frozen once setup completes), the initial `dumps` + `finalized_snapshot` rows (genesis or rebuild registration, atomic with the history bases), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
+| snapshot GC (the lane after a promotion, `run`'s startup hygiene) | unreferenced `dumps` row deletion (`gc_unreferenced_dumps`) |
+| command brackets (run, setup, flush) | `terminal_faults` (append-only, best-effort at settlement) |
+| admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
+| fee oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
 
 ### I1. Scheduler-acceptance semantics agree across all implementations
 
@@ -134,7 +124,8 @@ don't.
   (`close_frame_in`, `storage/ingress.rs`). Directs may have accumulated across
   several below-threshold observations. Frame K's wire content is therefore
   "directs ≤ S_K, then ops validated on top"; a clock tick with no directs is
-  an empty-prefix instance of the same rule.
+  an empty-prefix instance of the same rule. That leading direct prefix is
+  recoverable from `sequenced_l2_txs` plus `frames.safe_block` alone.
 - **Enforced by:** `close_frame_in` ordering; lane convention.
 - **Depended on by:** the duality (scheduler's drain-before-ops equals the
   flattened replay order); catch-up; the feed.
@@ -155,7 +146,8 @@ don't.
   (`storage/l1_inputs.rs`) +
   `ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS` (homed with its timing
   siblings in `sequencer-core/src/protocol.rs`; prose owner is the
-  scheduler-semantics frame-clock section).
+  scheduler-semantics frame-clock section). The lane's frontier time gate
+  bounds SQLite observation load and is not part of the clock semantics.
 - **Depended on by:** `check_danger`'s arm ordering (see I4); the scheduler's
   within-batch monotonicity check; "if the frontier batch is fresh, all are".
 - **Breaks:** I4's guarantee evaporates; danger detection mis-orders.
@@ -372,7 +364,7 @@ don't.
   intake, rejects queued work, and terminates before direct execution,
   promotion, or the five-block rotation decision. This is opportunistic
   refusal at an existing read, not another detector or a timing guarantee.
-  One bounded dequeue chunk is the fast-turn limit, so rejected traffic cannot
+  One bounded dequeue chunk (`max_user_ops_per_chunk`) is the fast-turn limit, so rejected traffic cannot
   starve the read once its time gate is due. There is deliberately no
   per-chunk marker query or extra poll.
 - **Race bound:** a lane turn that already read `Open` may finish if the reader
@@ -590,8 +582,12 @@ like a simplification and would break a registered invariant:
   both physical `l2_tx_index` and canonical `executed_input_count`. Snapshot
   registration asserts its count equals storage-derived `H`; startup compares
   the loaded application's count with the row; catch-up then checks each
-  physical row's expected mapping before executing it. Missing, extra, or
-  wrong mappings are terminal invariant failures, never repaired/backfilled.
+  physical row's expected mapping before executing it, and replays each
+  user op with the persisted `frames.fee`, so the fee charged at replay is
+  the one inclusion-time execution used (catch-up re-executes through
+  `execute_valid_user_op` and does not re-validate).
+  Missing, extra, or wrong mappings are terminal invariant failures, never
+  repaired/backfilled.
 - **Enforced by:** `ExecutedInputCount` receipts
   (`sequencer-core/src/application/mod.rs`); attributed lane/storage APIs
   (`ingress/inclusion_lane/`, `storage/ingress.rs`,

@@ -52,16 +52,13 @@ cross-checks every at/above-anchor batch its off-chain scheduler simulation
 accepts on L1 against the batch it sealed locally (a content-identity check).
 When a foreign or byte-different landing reaches L1 *safe* finality and the
 input reader ingests it, the same transaction records canonical divergence and
-freezes the accepted frontier. The runtime stops when it next observes that
-fact: the danger detector owns prompt process-wide reaction, while the
-inclusion lane also refuses a poisoned projection if its existing time-gated
-frontier read wins first. Every later boot refuses until an operator performs
-cockroach recovery. User-op chunks committed before runtime observation may
-still acknowledge and be rolled back. This check is a narrow
-zombie/foreign-batch backstop, not proof that arbitrary application or
-scheduler divergence cannot exist. It is not subsumed by the watchdog: the
-marker freezes finalized-snapshot promotion, so the watchdog can legitimately
-observe an unchanged finalized head and skip its state comparison.
+freezes the accepted frontier; the runtime stops when it next observes that
+fact, and every later boot refuses until an operator performs cockroach
+recovery. User-op chunks committed before runtime observation may still
+acknowledge and be rolled back. This check is a narrow zombie/foreign-batch
+backstop, not proof that arbitrary application or scheduler divergence cannot
+exist, and it does not replace the watchdog. The mechanism and its bounds are
+recorded in [`docs/invariants.md`](docs/invariants.md) (I9 and I15).
 
 The third case is handled by the recovery subsystem. Batches that are too old when they reach L1 (`inclusion_block − safe_block ≥ MAX_WAIT_BLOCKS`) are skipped by the scheduler. This "staleness" poisons the nonce counter: all subsequent batches become unreachable regardless of their individual freshness. The sequencer detects this via a danger-zone threshold, preemptively goes offline, flushes the L1 mempool, and cascade-invalidates the doomed chain. See [`docs/recovery/`](docs/recovery/) for the full design, TLA+ formal verification, and design history.
 
@@ -232,7 +229,7 @@ released even on client disconnect.
 - `user_ops`: included user operations
 - `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`); inserting into `user_ops` also appends the corresponding replay row via trigger `trg_sequence_user_op`
 - `safe_inputs`: direct-input payload stream
-- `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target`. Setup writes the first `log_gas_price` (and observation stamp) for both Fixed and Uniswap modes, failing if the initial Uniswap quote cannot be read. Fixed local pricing has no oracle worker; Uniswap starts from the persisted price and refreshes lazily via the setup-pinned WETH/fee-token TWAP source, retaining that price across transient source failures. `log_slack = log(10)` applies the 10× safety margin in log space. Fees are app-token smallest units — initially USDC (6 decimals) for the wallet prototype — not a protocol-level USDC invariant.
+- `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target`. A batch closes on whichever fires first: the derived `batch_size_target` byte budget or the `max_batch_open` wall-clock deadline (an inclusion-lane setting, `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS`, not a `batch_policy` column). Setup writes the first `log_gas_price` (and observation stamp) for both Fixed and Uniswap modes, failing if the initial Uniswap quote cannot be read. Fixed local pricing has no oracle worker; Uniswap starts from the persisted price and refreshes lazily via the setup-pinned WETH/fee-token TWAP source, retaining that price across transient source failures. `log_slack = log(10)` applies the 10× safety margin in log space. Fees are app-token smallest units — initially USDC (6 decimals) for the wallet prototype — not a protocol-level USDC invariant.
 
 ## Project Layout
 

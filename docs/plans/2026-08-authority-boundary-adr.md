@@ -65,8 +65,11 @@ error, not a convention. The token is not an effect gate (the rejected
 `EffectGate`, below): no mutex, no actor, no runtime state — the same
 predicate moved into the signatures of the operations it guards. The
 remaining externalization consults are
-hand-placed and bounded by the exit contract: the three snapshot routes at
-request start, the `POST /tx` success body, and the lane's fast-turn entry
+hand-placed and bounded by the exit contract: the three snapshot routes once
+at request start (serving an already-immutable snapshot is not
+authority-bearing, and per-chunk stream cancellation is deliberately not a
+containment guarantee), the `POST /tx` success body, and the lane's fast-turn
+entry
 and its batch-close and reconciliation commits. Inside the token-covered L1
 send, the poster re-consults the same bit before each keyed send and before
 the write-before-broadcast watermark raise; the tick's chain-id gate, fee
@@ -88,7 +91,12 @@ The lock is released only after every runtime-owned child has actually
 stopped; a dropped `JoinHandle` detaches rather than stops, so each worker
 and nested blocking task retains its own lock clone — through the scope or
 directly — until its closure really ends. This is a cheap local foot-gun guard, not distributed fencing:
-it prevents two processes on one data directory and nothing more.
+it prevents two processes on one data directory and nothing more. Cleanup
+polls every worker concurrently, so one hung drain cannot hide a terminal
+exit that must arm the bound. The watchdog holds only a weak
+process-lifetime witness: it fires at the deadline exactly when a
+controller, worker, or nested blocking task still retains the lock, and
+ordinary operator/recovery shutdown has no hard deadline.
 
 Runtime construction is prepare → admit → launch: every fallible or awaited
 operation happens while zero tasks exist; final admission re-runs the
@@ -102,7 +110,9 @@ launched runtime, and no refusal or retry can mint the witness.
 Admission is governed by three facts, each with one owner: the kernel
 process lock (concurrent owners), two-sided `setup_complete` (command
 ordering), and `canonical_divergence` (the one absorbing refusal — only a
-fresh-directory cockroach rebuild proceeds). There is no lifecycle admission
+fresh-directory cockroach rebuild proceeds); baseline schema and history
+creation and setup completion are each one `synchronous=FULL` transaction.
+There is no lifecycle admission
 state machine and no operator acknowledgement: standard recovery is
 automatic, and restart policy after a terminal fault is the exit-code
 contract (30 = do not restart, page), which the supervisor is expected to
@@ -135,7 +145,9 @@ phase ledger are in the [register](../review/register.md).
 SQLite is the durable coordination boundary between components. The input
 reader atomically commits `safe_inputs`, `l1_safe_head`,
 `safe_accepted_batches`, and any `canonical_divergence` fact in one sync
-transaction; the lane reads that durable projection. The one deliberate
+transaction (a `setup --recovery` interim sync defers the frontier half);
+the lane reads that durable projection and receives no in-memory cursor
+from the reader. The one deliberate
 exception is HTTP ingress ↔ inclusion lane (bounded MPSC + oneshot), because
 low-latency request/response over the lane's in-memory application is
 unwieldy through SQLite — an exception for one local interaction, not a
@@ -144,16 +156,23 @@ precedent for an in-memory component bus.
 The lane has two regimes. The **fast user-op regime** dequeues at most one
 bounded chunk per turn — accepted or rejected — and commits the accepted
 subset at most once with `synchronous=FULL`; only that commit authorizes
-acknowledgements. Making the dequeue chunk itself the turn boundary keeps
-entry to reconciliation independent of acceptance outcome, so rejected
-floods cannot starve the frontier check. The **L1 reconciliation regime**
-fires when the observed safe head is at least five blocks past the open
-frame's clock: it consumes the complete accumulated newly-safe range,
-promotes at most once, and opens exactly one frame at the observed tip —
-jumps are never interpolated. There is no elapsed-time budget, preemption,
-or resumable partial cursor inside a turn: the supported deployment assumes
-the application promptly digests the whole range (revisit only if production
-measurements disprove that).
+acknowledgements, which are tied to chunk durability and never to frame or
+batch closure. All-rejected chunks mutate nothing and open no transaction.
+Making the dequeue chunk itself the turn boundary keeps entry to
+reconciliation independent of acceptance outcome — the batch target counts
+only included bytes, so rejected requests never advance it, and a rejected
+flood cannot starve the frontier check; this adds no timer, cursor, or
+fairness knob, and
+returning to the outer loop costs only time-gate bookkeeping — no fsync and
+no frontier read per chunk. The **L1 reconciliation regime** fires when the
+observed safe head is at least five blocks past the open frame's clock: it
+consumes the complete accumulated newly-safe range, catch-up and backlog
+conditions included, promotes at most once, and opens exactly one frame at
+the observed tip — jumps are never interpolated. There is no elapsed-time
+budget, preemption, or resumable partial cursor inside a turn: the supported
+deployment assumes the application promptly digests the whole range
+([application contract §5](../protocol/application-contract.md#5-operational-capacity-for-l1-reconciliation); revisit
+only if production measurements disprove that).
 
 Authority remains role-local and auditable: a FULL-committed user-op chunk
 authorizes its acknowledgement; a valid sealed batch plus the durable

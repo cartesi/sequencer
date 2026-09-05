@@ -29,7 +29,8 @@ In order of importance:
 - **App-specific sequencer.** The sequencer may link against the application, enabling validation and execution at ingress time. This is a deliberate design choice.
 - **Soft confirmations may be invalidated.** Under adversarial conditions (network, infrastructure, provider, or L1 outages), soft confirmations can be rolled back via recovery. This is by design, not a bug — it is what makes the sequencer sound in the face of liveness failures.
 - **App UX may depend on the sequencer.** Without the sequencer, user experience may degrade substantially. This is an acceptable tradeoff: the on-chain scheduler remains the canonical source of truth; the sequencer only accelerates the UX.
-- **SQLite-centered local coordination.** Components publish and consume durable local facts through their owned SQLite tables. The on-chain scheduler remains canonical authority; SQLite is the sequencer's local coordination plane. HTTP ingress ↔ inclusion lane MPSC/oneshot is the deliberate exception because low-latency request/response over the lane's in-memory application is unwieldy through SQLite. Do not turn that exception into a general in-memory component bus.
+- **SQLite-centered local coordination.** Components publish and consume durable local facts through their owned SQLite tables. The on-chain scheduler remains canonical authority; SQLite is the sequencer's local coordination plane. HTTP ingress ↔ inclusion lane MPSC/oneshot is the deliberate exception because low-latency request/response over the lane's in-memory application is unwieldy through SQLite. Do not turn that exception into a general in-memory component bus. Full statement: [ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md).
+- **Append-oriented storage.** Avoid mutable status flags for open/closed entities; prefer write-once NULL→value transitions with one owner each, and derive cursors and heads from persisted facts rather than duplicating them as mutable fields.
 - **Assumption-driven robustness.** Every hardening mechanism must name the invariant it protects, the assumptions under which it is needed, and a trigger for revisiting them. Machinery for failures outside the supported model enlarges the state surface developers must audit and can make the system less robust rather than more.
 - **The complexity budget belongs to concurrency, mutual exclusion, durability, and hostile-L1 robustness.** This sequencer is not algorithmically complex. A large file is a smell: an invariant we're not seeing, a reasonable assumption we're not taking, or plain over-engineering. Judge every mechanism — current or proposed — against its weight.
 
@@ -75,7 +76,7 @@ The expected-nonce fold is homed next to `scheduler_accepts` as `advance_expecte
 
 Two mechanical facts the agreement rests on:
 
-- **Drain attribution.** At an eligible five-safe-block clock advance, every accumulated newly-safe direct is sequenced into the **new** frame — the frame stamped with the latest observed `safe_block`. So frame K's wire content reads "directs ≤ S_K, then user ops validated on top of them", exactly the scheduler's drain-before-ops rule. A clock tick may have an empty direct prefix.
+- **Drain attribution.** Accumulated newly-safe directs land in the clock-advanced frame — frame K reads "directs ≤ S_K, then user ops validated on top", exactly the scheduler's drain-before-ops rule ([I2](docs/invariants.md)).
 - **Empty batches are never stale and consume the nonce** (no first frame to measure staleness against). Consistent across all implementations, test-pinned.
 
 ## Batch Staleness and Recovery
@@ -101,19 +102,14 @@ The cycle crosses a process boundary by design: the in-process
 [`DangerDetector`](sequencer/src/recovery/detector.rs) polls
 `Storage::check_danger` on a cadence and returns a non-`Safe` worker exit; the
 runtime closes intake and drains before the command returns non-zero (stopping
-the process is how the sequencer goes offline). Terminal containment has the
-two-second hard abort fallback; expected-recovery/retryable exits are graceful;
-the orchestrator respawns; on every boot the startup
-reducer inspects local facts before the first provider call, executes at most
-one phase, and re-inspects after every completed phase. Closed recovery is
-structurally `Flush → inspect → Sync → inspect → Cascade → inspect`, with an
-ephemeral safe-block witness carried only by that boot attempt. A clean
-decision permits task-free runtime preparation; the same reducer is invoked
-again over one consistent fact set before the single-use `RuntimeAdmission`
-witness is minted, then worker launch is infallible and non-yielding.
+the process is how the sequencer goes offline). Terminal containment has a
+hard abort fallback; expected-recovery and retryable exits are graceful; the
+orchestrator respawns; on every boot the startup reducer re-derives the
+response from local facts.
 
-The authoritative dispatch table, the "everything past gold is doomed" model,
-and the per-path rationale live in
+The authoritative dispatch table, phase ordering, boot-local witnesses, the
+admission sequence, the "everything past gold is doomed" model, and the
+per-path rationale live in
 [`docs/recovery/README.md`](docs/recovery/README.md) — that document **owns**
 the recovery design; this section is only the map. Do not restate dispatch
 details here.
@@ -126,11 +122,10 @@ When the sequencer's view of L1 stops advancing — most often because the RPC g
 
 ### Formal verification
 
-The recovery design is verified by complementary bounded TLA+ models:
-`preemptive.tla` for slot/batch safety and `admission.tla` for startup phase
-ordering and runtime admission. See [`docs/recovery/`](docs/recovery/) for the
-full design, specs, and history. When touching recovery code, read both current
-models first.
+The recovery design is verified by two bounded TLA+ models;
+[`docs/recovery/README.md`](docs/recovery/README.md) "Formal Verification"
+says what each proves. When touching recovery code, read both current models
+first.
 
 ## Threat Model (brief)
 
@@ -184,11 +179,11 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Chunk** — bounded list of user ops processed and persisted together to amortize SQLite cost.
 - **Frame** — ordering boundary; commits `safe_block` + user ops.
 - **Batch** — list of frames posted on-chain as one L1 transaction (SSZ-encoded).
-- **Inclusion lane** — single ordering lane with two regimes: a latency-critical user-op regime that commits at most one bounded chunk per fast turn, and an L1-reconciliation regime that advances logical frame time to the latest observed safe head once at least five safe blocks have accumulated. That slow turn executes every accumulated direct input and promotes snapshots, even when the new frame has no directs. The lane is the only writer of open batch/frame state and the system's execution bottleneck.
+- **Inclusion lane** — the single ordering lane, with a latency-critical user-op regime and a slower L1-reconciliation regime ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)); the only writer of open batch/frame state ([I17](docs/invariants.md)) and the system's execution bottleneck.
 - **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Nonces are assigned by storage (structural `parent.nonce + 1`) when batches are closed; the submitter just reads them.
 - **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `RecoveryRequired` when any non-`Safe` danger status fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery or refusal can run.
 - **Fee oracle** — setup pins either a fixed exponent or a reviewed Uniswap V3 WETH/X TWAP tuple into deployment identity, and writes the first `log_gas_price` (+ observation stamp) in both modes. Setup requires a successful live quote; `run` performs no fee-source read before recovery/admission. Fixed mode has no worker; Uniswap launches a lazy refresher that immediately attempts a quote, persists successes, and retains the last price while logging and retrying transient source failures. The stamp is telemetry, not a runtime-admission or expiry gate. A shared-endpoint outage/stale view is already detected from L1 safe-head progress; a fee-source-only outage is an accepted economic residual (stale-low may subsidize DA, stale-high may reject users), not a canonical-correctness fault. Deterministic source misconfiguration, fatal arithmetic, and persistent storage faults remain terminal. The 10× margin lives in `batch_policy.log_slack`; it is a buffer rather than a bound on market movement, and frame fees stay immutable until the next frame opens.
-- **Input reader** — ingests safe inputs from L1 InputBox and atomically maintains the durable safe head, accepted-batch projection, and content-identity divergence marker in SQLite. It does not hand an in-memory cursor to the inclusion lane.
+- **Input reader** — ingests safe inputs from L1 InputBox and maintains the durable safe head, accepted-batch projection, and divergence marker in one atomic transaction (`sequencer/src/storage/l1_inputs.rs`); it hands the lane no in-memory cursor.
 - **L2 tx feed** — DB-backed ordered-tx stream used by WS subscribers. The
   existing endpoint still paginates by the physical SQLite rowid cursor.
   SQLite now also stores the canonical `ExecutedInputCount` attribution for
@@ -254,53 +249,40 @@ User ops are executed only through `sequencer_core::application::validate_and_ex
 
 ## Hot-Path Invariants
 
-- API ack is tied to chunk durability, not frame/batch closure. "Durable" means power-loss-durable: WAL with `synchronous=FULL`, so every commit fsyncs before anything externalizes on it.
-- Command admission is fact-derived: the kernel process lock excludes concurrent owners, `setup_complete` orders commands two-sided, and `canonical_divergence` is the one absorbing refusal (cockroach rebuild only). There is no lifecycle admission state machine and no operator acknowledgement — standard recovery is automatic, and restart policy after a terminal fault is the exit-code contract (30 = do not restart, page). The only durable telemetry is the `terminal_faults` black box: append-only terminal-cause rows, written best-effort and verdict-neutrally — telemetry never changes a command's verdict, and nothing reads the black box for decisions. `run` admits only after fallible preparation, by re-running the reducer over one consistent fact set immediately before non-yielding worker launch; SIGKILL/OOM/cancellation writes nothing (the next boot proceeds and re-derives from facts). In-process terminal containment sets the bit, arms an independent two-second process-abort watchdog, and requests cooperative shutdown; it writes nothing durable — the black box's terminal-cause row is written once, by the command bracket at settlement, from the verdict the drain returns (best-effort telemetry). The watchdog holds a weak process-lock witness and aborts only if a controller, worker, or nested blocking task has not drained by the deadline; ordinary operator/recovery shutdown stays graceful. If the terminal-cause write fails, the exit code and logs still carry the verdict, and a persistent fault re-detects fail-loud on the next boot that reads it. One process per data dir is kernel-enforced by an exclusive lock (`sequencer/src/runtime/process_lock.rs`); the controller retains it through black-box settlement and nested work retains clones until it actually stops. Cleanup polls all workers concurrently so a hung drain cannot hide a terminal exit. An already-authorized effect may complete, and snapshot streams check containment only at start (they are non-authority-bearing immutable reads; per-chunk stream cancellation is not a containment guarantee).
-- Setup/rebuild, normal-run recovery, and maintenance flush deliberately retain distinct typed controllers; do not combine their unrelated facts into a generic command state machine. `flush-mempool` is flush-only and requires a completed setup and no divergence — there is no admission state for it to restore or erase, and a successful wallet flush is never treated as proof the runtime is clean.
-- Initial setup/rebuild creates the baseline schema, UUIDv4 `EraId`, and generation zero in one transaction. A rebuild leaves `base_executed_input_count` and `base_safe_input_index` NULL until cockroach fill derives `K = recovered_app.executed_input_count()` and the recovery root's exclusive safe-input cursor, then binds both atomically with the initial finalized snapshot; setup completion requires both non-NULL bases and the snapshot. `K` is application history, not physical `l2_tx_index` cursor padding. The safe-input base is a durable drain floor: standard recovery derives the next cursor as `max(base_safe_input_index, max valid attribution + 1)`, so invalidating the cockroach root cannot re-execute inputs already represented by `S'`. Cockroach recovery deliberately remains an explicit fresh/wiped-directory operator flow—no automated DB replacement, clone detection, distributed fencing, or partial-fill resume state machine. A retained early incomplete DB reuses its unexposed era; a fail-loud partial fill requires wipe/retry and therefore a new unexposed era.
-- Chunk commit and ack remain low-latency; frame closure is orthogonal and can happen less frequently. The product contract is under 500 ms; same-host release sweeps across the authority cutover found ACK p99 at or below ~50 ms through concurrency 256 with zero rejections, and concurrency-1 HTTP ACK p50 around 13 ms while submit-to-matching-WS-event p50 was roughly double — always name which metric "round-trip" means. Same-host numbers are method-specific regression evidence, never portable capacity claims (the load clients contend with the sequencer at high concurrency).
-- Never add a divergence-marker query, provider call, or reader mailbox to every user-op chunk. The content-identity check is complete for at/above-anchor, simulated-accepted batch content identity, not arbitrary canonical/application divergence (its scope boundary is [I9](docs/invariants.md)). The danger detector owns prompt process-wide reaction; the lane's existing time-gated frontier read opportunistically returns a typed divergence instead of a usable frontier. No extra poll or reaction deadline exists.
-- Entry to reconciliation is bounded by dequeued attempts, not only included bytes: rejected requests do not advance the batch target. One existing `max_user_ops_per_chunk` dequeue chunk is the fast-turn boundary before the outer frontier check. This adds no timer, cursor, or fairness knob and prevents sustained rejected traffic from starving the slow turn. Returning to the outer loop normally performs only cheap time-gate bookkeeping; it does not fsync or query SQLite after every chunk.
-- Once reconciliation starts, process the complete accumulated newly-safe range, including supported catch-up/backlog conditions, before returning to user ops. Supported applications are assumed to digest that range promptly; paging bounds scratch memory/read-query size, not the atomic drain transaction or logical work. Add preemption or a durable partial cursor only if production measurements disprove that assumption.
-- During an admitted live run, L1 reconciliation has no tight acknowledgement SLA. Its semantic clock trigger is block-only: if the latest persisted safe head `H` is at least five blocks beyond the open frame's `safe_block` `S`, reconcile once and open exactly one frame at `H`. Never synthesize intermediary frames after a jump; `H` becomes the new anchor. Bootstrap and recovery instead anchor a fresh Tip at their proven checkpoint/current safe head; they are not live clock ticks. The time gate controls SQLite observation load, not clock semantics. Direct-input presence is work discovered at the turn, never another trigger.
-- A newly-safe direct may therefore wait below the five-block threshold. When the tick arrives it still executes with its exact inclusion-block clock, before user ops at the new frame clock. Five blocks is a sequencer policy chosen comfortably inside the happy-path deposit budget; if actual safe-head publication cadence threatens that budget, revisit the constant from measurements rather than adding interpolation or a second timer.
-- `POST /tx` queue admission: `try_send` on a full queue returns `429 OVERLOADED` with message `queue full`.
-- A logical-clock frame transition may drain zero or more directs. Batch closure separately creates the successor batch's structural first frame at the unchanged `safe_block`; block distance is the only reason logical frame time advances, not the only reason a frame row exists.
-- Batch closure is controlled by batch policy (size and/or deadline).
-- Preserve single-lane deterministic ordering. Do not introduce extra concurrency in hot-path ordering logic without explicit approval.
+The hot-path rules are owned elsewhere; this section is only the map.
+
+- Drain attribution, frame-clock monotonicity, the
+  content-identity check and the divergence freeze, history metadata, the
+  `WriteHead` cache, and the executed-inputs projection are registered in
+  [`docs/invariants.md`](docs/invariants.md) (the fail-loud check policy plus
+  I2, I3, I9, I10, I12–I18, I20) — that register owns them; do not restate
+  them here.
+- Command admission, containment, the two-regime lane and its
+  acknowledgement rule, and role-local authority are owned by the
+  [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md)
+  (mechanisms 1, 2, and 4); the recovery reducer by
+  [`docs/recovery/README.md`](docs/recovery/README.md).
+- The frame-clock policy (five newly-safe blocks, one frame at the observed
+  tip, never interpolated, and its revisit trigger) is owned by
+  [`docs/protocol/scheduler-semantics.md`](docs/protocol/scheduler-semantics.md);
+  the no-preemption digestibility assumption by
+  [`docs/protocol/application-contract.md` §5](docs/protocol/application-contract.md#5-operational-capacity-for-l1-reconciliation).
+- Queue admission (`429 OVERLOADED`), batch closure, and every other API or
+  storage-model shape are owned by [`README.md`](README.md).
+
+One rule lives here because nothing else owns it: preserve single-lane
+deterministic ordering. Do not introduce extra concurrency in hot-path
+ordering logic without explicit approval.
 
 ## Storage Invariants
 
-Writer roles — one writer per table; reads over batch data go through the `valid_*` views:
-
-| Writer | Writes |
-|---|---|
-| inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `sequenced_l2_txs`, `executed_inputs`, `dumps`/`pending_snapshots` (batch close), `finalized_snapshot` (promotion) |
-| input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `deployment_identity`, `canonical_divergence` (the divergence poison marker) |
-| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, scoped `pending_snapshots` clear, derived `executed_inputs` suffix deletion, `wallet_nonce_watermark` (flush no-ops, write-before-broadcast) |
-| history metadata (setup/recovery) | `history_state` — era/generation at baseline, generation bump in a non-empty standard-recovery cascade, rebuild application base + safe-input drain floor at initial finalized-snapshot registration |
-| batch submitter | `wallet_nonce_watermark` (write-before-broadcast — its only write) |
-| egress (HTTP) | `dumps.lease_count` (leases) |
-| admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
-| setup | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
-| fee_oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
-
-- Storage model is append-oriented; avoid mutable status flags for open/closed entities.
-- Open batch/frame are derived by "latest row" convention.
-- A frame's leading direct-input prefix is derivable from `sequenced_l2_txs` plus `frames.safe_block`.
-- Safe cursor/head values should be derived from persisted facts when possible, not duplicated as mutable fields.
-- Replay/catch-up uses persisted ordering plus persisted frame fee (`frames.fee`) to mirror inclusion semantics exactly.
-- Current cursor pagination for ordered L2 txs uses **SQLite rowid**. This is a
-  physical replay cursor and audit log, so invalidated rows remain and create
-  holes in the valid view. `executed_inputs` is the separate sparse,
-  current-canonical projection from physical rows to
-  `Application::executed_input_count()` offsets; invalidation deletes only the
-  doomed mappings so replacement history can reuse the same logical suffix.
-  The existing WS API has not switched coordinates yet.
-- Included user-op identity is tracked by application nonce logic; no DB uniqueness constraint (removed to allow resubmission after recovery).
-- **Reads over batch data go through `valid_batches`, `valid_closed_batches`, `valid_open_batch`, and `valid_sequenced_l2_txs` views.** These encapsulate the "exclude invalidated rows" filter so individual queries don't repeat it. Writers go to the base tables.
-- **`batches` row columns partition cleanly by writer.** `sealed_at_ms` is owned by the inclusion lane (set when closing a batch); `invalidated_at_ms` is owned by recovery (set during cascade). Each is write-once (NULL → non-NULL, never back) and enforced by triggers. The partial unique index `ux_single_valid_tip` guarantees at most one row has both NULL — the Tip.
-- The inclusion lane is the **only writer** of open batch/frame state. SQLite is durable authority for those rows; `WriteHead` is a trusted coherent lane-local cache loaded from SQLite, advanced only after successful commits, and discarded on error/restart. It is reconstructible convenience, not an inter-component authority. `Storage::append_executed_user_ops_chunk` and the attributed `close_*` methods trust it without re-reading because the lane is the sole writer; the Tip-targeting triggers and the `pos_in_frame` PK catch stale-cache bugs for **user ops**. **Direct-input sequencing has no structural uniqueness guard** (re-drain support requires duplicate `safe_input_index` across invalidated batches) — double-sequencing prevention rests on the lane's drain-cursor discipline and its startup re-derivation. The sparse `executed_inputs` projection adds logical uniqueness and contiguity, but intentionally does not forbid duplicate physical safe-input rows across invalidated histories (see [`docs/invariants.md`](docs/invariants.md)). A more DB-derived, turn-stateless lane is a valid independent simplification to benchmark later, not part of the lane-reconciliation cutover.
+Owned by [`docs/invariants.md`](docs/invariants.md): the writer-role table
+(one writer role per fact), the `valid_*` view rule, `WriteHead` coherence
+(I17), history metadata (I18), the replay cursor and the executed-inputs
+projection (I10, I20). The schema
+(`sequencer/src/storage/migrations/0001_schema.sql`) owns the write-once
+batch lifecycle, the Tip's uniqueness, and the user-op identity rule. Do not
+restate them here.
 
 ## Type Boundaries
 
