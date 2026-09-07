@@ -102,9 +102,8 @@ pub(super) fn next_executed_input_count_in(conn: &Connection) -> Result<Executed
 }
 
 /// Attach a sequence of explicit application offsets inside the physical-row
-/// creation transaction. Each offset must equal the currently-derived next
-/// boundary; the baseline schema independently enforces the same rule over the
-/// valid projection, including offset reuse after suffix invalidation.
+/// creation transaction. The schema enforces contiguous canonical offsets,
+/// including offset reuse after suffix invalidation.
 pub(super) fn attach_executed_inputs_in(
     tx: &rusqlite::Transaction<'_>,
     mappings: &[ExecutedInputMapping],
@@ -113,23 +112,15 @@ pub(super) fn attach_executed_inputs_in(
         return Ok(());
     }
 
-    let mut expected = next_executed_input_count_in(tx)?;
     let mut stmt = tx.prepare_cached(
         "INSERT INTO executed_inputs \
          (sequenced_l2_tx_offset, executed_input_offset) VALUES (?1, ?2)",
     )?;
     for mapping in mappings {
-        assert_eq!(
-            mapping.executed_input_offset, expected,
-            "executed input attribution does not match canonical next count"
-        );
         stmt.execute(rusqlite::params![
             u64_to_i64(mapping.sequenced_l2_tx_offset),
             u64_to_i64(mapping.executed_input_offset.get()),
         ])?;
-        expected = expected
-            .checked_next()
-            .expect("executed input count overflow: contract-impossible");
     }
     Ok(())
 }
