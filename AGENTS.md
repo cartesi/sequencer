@@ -160,7 +160,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
   - `l2_tx_feed/` — DB-backed ordered-tx feed.
 - `sequencer/src/l1/` — L1 client surface.
   - `reader.rs` — safe-input ingestion from InputBox into SQLite.
-  - `submitter/` — batch submitter (`worker.rs` + `poster.rs`); stateless about fees — it re-estimates every tick and never escalates a price it already offered. The reasoning, and the gap that policy knowingly leaves, is the fee-policy note at the top of `submitter/poster.rs`: read it before proposing fee bumps.
+  - `submitter/` — batch submitter (`worker.rs` + `poster.rs`); re-estimates fees every tick without carrying a fee floor from earlier attempts. The rationale, accepted liveness limits, and revisit criteria live in [`docs/l1-fee-policy.md`](docs/l1-fee-policy.md).
   - `fee_oracle/` — setup-pinned L1 Uniswap V3 TWAP → `batch_policy.log_gas_price` (+ `log_gas_price_updated_at_ms`); fixed mode writes once at setup and has no worker.
   - `eip1559.rs` — shared EIP-1559 fee estimation (poster, oracle, flusher).
   - `provider.rs` — alloy provider construction.

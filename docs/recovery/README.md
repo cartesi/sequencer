@@ -211,7 +211,24 @@ Every `w_nonce` slot from N to M-1 is now resolved:
 
 There are no more mempool entries. All uncertainty is resolved.
 
-**Flush safety does not depend on eviction.** A no-op may fail to evict a still-pending batch tx (e.g. our local node rejects the replacement under EIP-1559's ≥10% bump rule). That's fine: a rejected send surfaces as a hard `FlushError` and the process exits, the orchestrator respawn re-runs the flush, and *eventual* inclusion of either the original batch tx or the no-op resolves the slot — the unbounded retry lives in the respawn loop, not inside `flush_and_wait`. Safety holds regardless of which lands; eviction is only an operational efficiency concern. (No-ops are priced with a fixed 3× headroom over the current estimate, so eviction fails only when the market has fallen more than 3× since the poster's send — a pending tx that is by then over-priced and mineable — or when the flusher's own no-op from a previous pass still occupies the slot. The poster never escalates its own prices; see the fee-policy note in `sequencer/src/l1/submitter/poster.rs`.)
+**Flush safety does not depend on eviction; completion depends on L1 progress.**
+A rejected no-op surfaces as a hard `FlushError` and the process exits. The
+orchestrator respawn re-runs the flush. Inclusion of either the original batch
+or a no-op can resolve the slot, but the sequencer remains offline until every
+covered slot reaches safe depth. Neither retries nor the danger threshold
+establish a recovery deadline.
+
+No-ops use 3× the fresh fee estimate, followed by a symmetric replacement bump.
+This headroom improves their chance of replacing an earlier transaction; it
+does not guarantee replacement. Base fees and priority estimates can move in
+opposite directions. For example, a poster tx sent at base 10 gwei with cap
+22 gwei and tip 2 gwei cannot mine at base 30 gwei. If the current tip estimate
+is 0.5 gwei, the no-op offers cap 199.65 gwei and tip 1.65 gwei (plus 1 wei on
+each). Geth rejects that replacement because its tip misses the 2.2 gwei
+threshold. Both the original and the no-op can therefore fail to make progress.
+A previous flush no-op can also block another pass on a flat market. These are
+accepted liveness limits of the current [fee policy](../l1-fee-policy.md), not
+permission to cascade before the slots resolve.
 
 ### Step 5: Run recovery
 
