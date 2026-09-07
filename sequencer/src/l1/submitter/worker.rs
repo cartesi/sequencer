@@ -17,8 +17,9 @@
 //!
 //! The outer loop is uniform: tick, maybe sleep, repeat. A tick that produced
 //! submissions re-enters immediately (no sleep) so the suffix drains quickly;
-//! an idle or transient-error tick sleeps `idle_poll_interval`, while a
-//! fee-ceiling hold sleeps the confirmation cadence before the next probe.
+//! an idle, transient-error, or waiting tick (the mempool already holds our
+//! txs — see the poster's fee-policy note) sleeps `idle_poll_interval` before
+//! the next attempt.
 //!
 //! Mid-tick cancellation is crash-safe: storage transactions either commit or
 //! auto-roll-back on drop, and any already-sent L1 transaction is picked up by
@@ -64,12 +65,14 @@ pub enum SubmitterExit {
 pub(crate) enum TickOutcome {
     /// Nothing pending; sleep before the next tick.
     Idle,
-    /// Submitted one or more batches; re-enter immediately so the suffix
-    /// drains without idle-sleep.
+    /// Broadcast and confirmed one or more batches; re-enter immediately to
+    /// pick up newly closed batches without idle-sleep.
     Submitted(usize),
-    /// Fee ceiling prevented a valid replacement floor. This is not an
-    /// internal retry loop; the outer loop waits on confirmation cadence.
-    Held,
+    /// At least one pending nonce is still unresolved — the node refused a
+    /// re-broadcast because it already holds our tx there, or a broadcast
+    /// timed out waiting for confirmation. Nothing to do until it lands or
+    /// the market moves. Sleeps like `Idle` and re-estimates.
+    Waiting,
     /// Transient provider error; log and sleep before retrying.
     Transient,
 }
@@ -93,7 +96,6 @@ pub struct BatchSubmitter<P: BatchPoster> {
     db_path: String,
     poster: Arc<P>,
     idle_poll_interval: Duration,
-    confirmation_cadence: Duration,
     /// Write-before-broadcast hook (review R1a): the poster raises the
     /// persisted wallet-nonce watermark through this before every send.
     watermark_sink: crate::l1::watermark::StorageWatermarkSink,
@@ -107,7 +109,6 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             db_path,
             poster,
             idle_poll_interval: config.idle_poll_interval(),
-            confirmation_cadence: config.confirmation_cadence(),
         }
     }
 
@@ -143,8 +144,8 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     }
 
     /// Tick → sleep-if-idle → tick. Productive ticks re-enter immediately;
-    /// idle or transient-error ticks wait `idle_poll_interval`; held ticks
-    /// wait the confirmation cadence. Fatal errors propagate.
+    /// idle, waiting, or transient-error ticks wait `idle_poll_interval`.
+    /// Fatal errors propagate.
     async fn run_loop(&self) -> Result<SubmitterExit, BatchSubmitterError> {
         loop {
             let outcome = match self.tick_once().await {
@@ -163,10 +164,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             };
             match outcome {
                 TickOutcome::Submitted(_) => continue,
-                TickOutcome::Held => {
-                    tokio::time::sleep(self.confirmation_cadence).await;
-                }
-                TickOutcome::Idle | TickOutcome::Transient => {
+                TickOutcome::Idle | TickOutcome::Waiting | TickOutcome::Transient => {
                     tokio::time::sleep(self.idle_poll_interval).await;
                 }
             }
@@ -217,16 +215,18 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
                 }
                 Ok(TickOutcome::Submitted(submitted_count))
             }
-            SubmitBatchesOutcome::Held(tx_hashes) => {
-                if tx_hashes.len() > submitted_count {
+            SubmitBatchesOutcome::Waiting { broadcast } => {
+                // A waiting tick broadcast at most one tx per payload (fewer
+                // when a re-broadcast was refused); more is a poster bug.
+                if broadcast.len() > submitted_count {
                     return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
                         format!(
-                            "held poster returned {} tx hashes for {submitted_count} submitted batches",
-                            tx_hashes.len(),
+                            "waiting poster returned {} tx hashes for {submitted_count} submitted batches",
+                            broadcast.len(),
                         ),
                     )));
                 }
-                Ok(TickOutcome::Held)
+                Ok(TickOutcome::Waiting)
             }
         }
     }
@@ -287,8 +287,6 @@ mod tests {
     fn default_test_config() -> BatchSubmitterConfig {
         BatchSubmitterConfig {
             idle_poll_interval_ms: 1000,
-            confirmation_depth: 0,
-            seconds_per_block: 1,
         }
     }
 
@@ -354,17 +352,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_once_surfaces_fee_ceiling_hold() {
-        let TestDb { _dir, path } = temp_db("tick-held");
+    async fn tick_once_surfaces_mempool_wait_without_error() {
+        let TestDb { _dir, path } = temp_db("tick-waiting");
         seed_two_closed_batches(&path);
 
         let mock = Arc::new(MockBatchPoster::new());
-        mock.set_held(true);
+        mock.set_waiting(true);
         let submitter =
             super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
 
         let outcome = submitter.tick_once().await.expect("tick once");
-        assert_eq!(outcome, TickOutcome::Held);
+        assert_eq!(outcome, TickOutcome::Waiting);
+        assert_eq!(mock.submissions().len(), 3);
+    }
+
+    /// The shape the real poster produces when a pending prefix is refused and
+    /// a newly closed batch behind it is broadcast: `Waiting` with fewer
+    /// hashes than payloads is a normal tick, not a contract violation.
+    #[tokio::test]
+    async fn tick_once_accepts_partial_broadcast_while_waiting() {
+        let TestDb { _dir, path } = temp_db("tick-waiting-partial");
+        seed_two_closed_batches(&path);
+
+        let mock = Arc::new(MockBatchPoster::new());
+        mock.set_waiting_after(1);
+        let submitter =
+            super::BatchSubmitter::new(path.clone(), mock.clone(), default_test_config());
+
+        let outcome = submitter.tick_once().await.expect("tick once");
+        assert_eq!(outcome, TickOutcome::Waiting);
         assert_eq!(mock.submissions().len(), 3);
     }
 
