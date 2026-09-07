@@ -8,23 +8,23 @@ See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and fu
 
 The sequencer's recovery loop spans two process lifetimes:
 
-1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger` on a cadence. When any non-`Safe` status fires (`CanonicalDivergence`, `L1ViewStale`, `ClosedBatchInDanger`, `TipInDanger`, or `EstimatedBatchInDanger`), the runtime converts that into `WorkerExit::DangerDetected` under `CommandError::Worker`, closes intake, and drains the workers before returning a non-zero status. Canonical divergence is terminal and enters containment, which arms the terminal abort bound ([ADR mechanism 1](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership)); expected-recovery and retryable arms remain cooperatively graceful.
-2. **External respawn.** An orchestrator (systemd, k8s, …) restarts the process.
-3. **Startup reducer.** The fresh boot reads danger (with canonical divergence ranked first), finalized-snapshot presence, Tip presence, and the safe head in one local transaction (`RecoveryInspection`, so no decision mixes facts from two SQLite snapshots). The pure reducer selects at most one phase. Every completed phase returns to local inspection before another phase or admission. Initial Sync is itself a phase, so an already-persisted divergence refuses before the first provider call.
-4. **Prepare, admit, launch.** A clean decision permits task-free, fallible runtime preparation. Startup then invokes the same reducer once more over one consistent fact set, mints the single-use `RuntimeAdmission` witness, and consumes it in an infallible, non-yielding worker launch.
+1. **In-process detection.** The `DangerDetector` polls `Storage::check_danger`. Expected-recovery and retryable exits close intake and drain workers before returning non-zero. A terminal fault aborts the process immediately ([ADR mechanism 1](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership)).
+2. **External respawn.** An orchestrator (systemd, k8s, …) restarts expected-recovery and retryable exits. A terminal exit (30 or SIGABRT) requires operator investigation before a deliberate restart.
+3. **Startup recovery.** Under the process lock, before workers exist, startup checks local terminal facts, attempts an initial L1 Sync, then selects at most one repair from a consistent `RecoveryInspection`: open a missing Tip, replace an aging Tip, or Flush → Sync → Cascade. Repair is followed by a fresh check.
+4. **Prepare, admit, launch.** A clean result permits task-free, fallible preparation. A final current inspection must still be clean to mint the single-use `RuntimeAdmission` witness; worker launch consumes it synchronously.
 
 The detector trip and the startup dispatch share the same `check_danger` function; the detector cares only that *some* arm fired, while the startup dispatch examines *which* arm fired to pick the right action.
 
 Key abstractions, by responsibility:
 
-- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): tiny background task that calls `Storage::check_danger` on a cadence. Never writes to the DB, never talks to L1. Exits with `DetectorExit::RecoveryRequired` when any non-`Safe` status fires. The runtime converts that into a `WorkerExit::DangerDetected` worker exit, requests process-wide drain, and returns non-zero after cleanup. A terminal classification enters containment and its abort bound; ordinary recovery drains cooperatively. The reducer re-derives the authoritative response from fresh facts on the next boot.
-- **`BatchSubmitter`** ([`l1/submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs)): makes L1 progress only — never checks danger. Productive ticks re-enter immediately; idle/transient ticks sleep `idle_poll_interval`. A pure `decide_submit_start` function folds observed L1 nonces over the scheduler-accepted frontier.
-- **Startup recovery reducer** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): pure policy over one `RecoveryInspection` plus boot-local phase progress. It selects `Admit`, one phase, `Retry`, or `Refuse`. The production driver owns exhaustive error classification; raw provider/storage/flush errors do not escape to a second recovery classifier.
-- **Guarded recovery storage** ([`storage/recovery.rs`](../../sequencer/src/storage/recovery.rs)): reads the reducer facts in one transaction and reasserts the selected mutation's durable preconditions in its write transaction. Divergence is checked before the flush-view coherence check and before every batch-tree mutation.
-- **`MempoolFlusher`** ([`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs)): submits no-op transactions to consume all pending wallet-nonce slots and waits for safe finality. Does **not** retry internally on provider errors — the orchestrator's respawn loop is the retry mechanism.
-- **`ProtocolTiming`** ([`sequencer-core/src/protocol.rs`](../../sequencer-core/src/protocol.rs)): single source of truth for scheduler timing (`max_wait_blocks`) plus the sequencer-local tuning knobs (`preemptive_margin_blocks`, `l1_read_stale_after_blocks`, `seconds_per_block`). The batch-submitter address is deployment identity and is passed separately to `scheduler_accepts`.
+- **`DangerDetector`** ([`recovery/detector.rs`](../../sequencer/src/recovery/detector.rs)): reads danger on a cadence and exits on any non-`Safe` status. It writes nothing and performs no L1 calls.
+- **`BatchSubmitter`** ([`l1/submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs)): makes L1 progress; the detector owns danger checks.
+- **Startup recovery** ([`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs)): a sequential procedure with one exhaustive dispatch shared by repair selection and final admission. Error classification belongs here; command settlement consumes the resulting retry/refuse verdict.
+- **Guarded recovery storage** ([`storage/recovery.rs`](../../sequencer/src/storage/recovery.rs)): checks each repair's preconditions and commits its mutation atomically. The cascade checks divergence and the flush-view floor before changing the batch tree.
+- **`MempoolFlusher`** ([`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs)): consumes unresolved wallet-nonce slots and waits for safe finality. Provider errors leave the attempt; the orchestrator retries.
+- **`ProtocolTiming`** ([`sequencer-core/src/protocol.rs`](../../sequencer-core/src/protocol.rs)): shared scheduler timing plus sequencer-local danger and clock policy.
 
-These pieces remain independently testable: the decision is pure, the phase driver has a discriminating trace, storage returns a fact struct rather than ad-hoc tuples, and the detector/submitter remain separate workers.
+Procedure tests use the real SQLite inspections and repair transactions, substituting only Sync and Flush at the L1 boundary.
 
 ## The Batch Tree
 
@@ -276,7 +276,7 @@ Closed batches past gold (if any) are still in their natural lifecycle — pendi
 2. Open a fresh recovery batch in the same transaction.
 3. If no Tip in danger and no Tip exists at all (torn-state crash recovery), open a Tip anyway.
 
-The `Safe` decision with no open Tip selects `EnsureOpenTip` as its own reducer phase. That phase rechecks `Safe`, finalized-snapshot presence, and Tip absence in the write transaction, then uses the shared `open_fresh_tip_in_tx` mechanism, and re-reads the Tip inside that transaction after opening: it refuses (terminal) rather than commit without one, so the reducer's single `Repaired` → `EnsureOpenTip` → `Repaired` edge cannot cycle. Tip creation is therefore inside the same inspect → one phase → inspect discipline, never a worker-construction side effect.
+The `Safe` decision with no open Tip runs `EnsureOpenTip`. Its transaction rechecks `Safe`, finalized-snapshot presence, and Tip absence, then opens the Tip through `open_fresh_tip_in_tx`. It refuses rather than commit without an open Tip. Startup rechecks danger after this repair; Tip creation never occurs as a worker-construction side effect.
 
 #### Why `danger_threshold`, not `MAX_WAIT_BLOCKS`, for the Tip threshold
 
@@ -315,41 +315,33 @@ Each loop iteration burns gas (no-ops + doomed resubs), takes ~12 minutes (the f
 
 ### Startup behavior summary
 
-Every boot runs one unconditional loop — `inspect → classify once → decide → perform at most one phase → inspect again` — over the pure `reduce_recovery`. The first local inspection always ranks `CanonicalDivergence` and missing finalized state ahead of phase progress. If neither terminal fact exists, `NeedInitialSync` selects the initial Sync phase. A provider failure during that one phase may still admit a warm database whose persisted view remains fresh; every non-provider reader failure is classified terminal or retryable by its typed provenance.
+Startup holds the exclusive process lock and launches no workers until recovery and preparation finish. Its first local inspection refuses canonical divergence or missing finalized state before any provider call. It then attempts one initial Sync: a provider failure may use a still-fresh persisted view, while other failures retain their typed retry/refuse classification.
 
-After the initial Sync attempt, ordinary inspection maps facts as follows:
+After that attempt, `select_recovery` maps one consistent local inspection as follows:
 
-| Local fact | Reducer decision | Why |
+| Local fact | Action | Why |
 |---|---|---|
-| `Safe` + open Tip | `Admit` | The local prediction is clean and structurally resumable. |
-| `Safe` + no Tip | `EnsureOpenTip` | Open the genesis/torn-state Tip under the phase guard, then re-inspect. |
-| `L1ViewStale` | `Retry` | The persisted view cannot honestly authorize new soft confirmations. |
-| `TipInDanger(N)` | `RecoverTip { N }` | The Tip has no L1 footprint; invalidate and reopen directly, then re-inspect. |
-| `ClosedBatchInDanger(N)` | `Flush` | Closed batches have uncertain L1 slots that must be resolved before tree mutation. |
-| `EstimatedBatchInDanger(N)` | `Retry` | Observed safe state did not cross danger; recovery never mutates from an estimate alone. |
-| `CanonicalDivergence(N)` | `Refuse` | Standard recovery assumes content identity and is forbidden. |
+| `Safe` + open Tip | Ready for preparation | The local prediction is clean and structurally resumable. |
+| `Safe` + no Tip | `EnsureOpenTip` | Open the Tip under its transaction guard, then recheck. |
+| `L1ViewStale` | Retry | The persisted view cannot authorize new soft confirmations. |
+| `TipInDanger(N)` | `RecoverTip { N }` | The Tip has no L1 footprint; invalidate and reopen directly. |
+| `ClosedBatchInDanger(N)` | Flush → Sync → Cascade | Resolve the closed batches' L1 slots before changing their local suffix. |
+| `EstimatedBatchInDanger(N)` | Retry | Recovery never mutates from an estimate alone. |
+| `CanonicalDivergence(N)` | Refuse | Standard recovery assumes content identity and is forbidden. |
 
-Closed recovery is structurally `Flush → inspect → post-flush Sync → inspect → Cascade → inspect`. Flush produces a boot-local witness carrying its observed safe block. The post-flush Sync preserves that witness, and Cascade is selected only if the persisted safe head caught up through it. A crash drops the witness, so the next boot repeats the idempotent flush instead of trusting a half-remembered phase; a `Retry` or `Refuse` erases the witnesses the same way.
+Closed recovery retains the flush's observed safe block in a local variable. Post-flush Sync must succeed; its provider failure cannot use the initial-sync fallback. The guarded cascade transaction refuses divergence or missing finalized state, requires the persisted safe head to reach the flush observation, and then applies the post-flush policy. It runs even if the refreshed danger verdict is `Safe`: a young unresolved suffix is still doomed after flushing. A crash or retry loses the observation, so another invocation must flush again.
 
-There is deliberately no durable recovery-phase state machine. Local inspection comes before any provider call or mutation, so neither a transient RPC error nor a phase's own write can mask a persisted divergence or a missing finalized state. The guarded Cascade transaction checks divergence first, then the required finalized-state fact and the flush-view floor, then mutates. The loop is unbounded by design and terminates by construction — at most five phases per attempt (the initial Sync, then either `RecoverTip` or Flush → post-flush Sync → Cascade, plus at most one guarded `EnsureOpenTip`), because the one cycling edge refuses inside its own transaction; the argument lives on `drive_recovery`.
+Flush changes only the wallet watermark locally. New divergence can be discovered only by Sync, and the next dispatch or guarded cascade checks it before repair. There is no additional inspection between Flush and Sync. The process lock and task-free startup exclude a competing local writer; revisit this sequencing if startup gains concurrent writers.
 
-**Observed repair still outranks clock refusal.** `check_danger` evaluates observed closed/Tip danger before local-clock faults. Once an observed danger selected a repair, the reducer finishes that repair even if the clock arm is also active; the next mandatory inspection returns `Retry` rather than admitting. A successful repair is never itself an admission fact.
+Every repair is followed by a current inspection. A surviving view/clock refusal retries the boot; successful mutation alone does not authorize serving. The guarded Tip operations also recheck their policy at mutation time, because wall-clock aging can change a verdict without a database writer. A repair must commit an open Tip, and startup never starts a second repair in the same invocation.
 
-After the first clean decision, runtime preparation launches zero tasks. The same reducer is invoked again after preparation, over one transactionally consistent fact set — the process lock plus the task-free prepare phase make that read the decision's linearization. Only another `Admit` decision mints the single-use `RuntimeAdmission` witness; launch consumes it synchronously. Raw component launch functions are crate-private, so external app crates can enter the runtime only through `run`/`run_main`. Runtime mutation and output authorization remains role-local at the durable boundaries in the authority ADR; the reducer establishes admission, not a new global authority service.
+After a clean result, runtime preparation launches zero tasks. `admit_runtime` then applies the same dispatch to current facts. Only `Ready` mints `RuntimeAdmission`; any repair requirement or refusal drops the prepared resources and exits. Launch consumes the witness synchronously. This final check is necessary because preparation can outlive the freshness of the persisted L1 view.
 
-The two formal models split responsibility deliberately: `preemptive.tla` proves slot/batch safety, while `admission.tla` proves local-first terminal dominance, one-phase-per-inspection ordering, witness requirements, crash/restart soundness (a crashed attempt leaves nothing behind that gates the next boot), and capability soundness. The “everything past gold is doomed” policy argument remains external to both bounded models.
+`preemptive.tla` covers slot/batch safety. `admission.tla` covers local terminal dominance, flush/sync prerequisites, loss of observations across retries/crashes, repair postconditions, and final admission soundness. The “everything past gold is doomed” argument remains external to both bounded models.
 
 ### Startup observability
 
-Startup recovery logs each reducer decision and repair outcome with stable structured fields:
-
-- `danger_status` — `safe`, `l1_view_stale`, `closed_batch_in_danger`, `tip_in_danger`, or `estimated_batch_in_danger`.
-- `danger_batch_index` — set for batch-specific danger statuses.
-- `recovery_progress` — initial sync, ordinary inspection, flushed, post-flush synced, or repaired.
-- `recovery_decision` — `admit`, a single phase label, `retry`, or `refuse`.
-- `invalidated_count` on the completion log, plus `batches` when any batch was invalidated.
-
-The orchestrator remains the source of restart-loop policy and alert routing. Exit projection consumes the controller's already-classified `Retry`/`Refuse` result instead of reclassifying raw recovery errors.
+Startup logs its selected action with `danger_status`, `danger_batch_index`, and `recovery_decision`, and records the invalidated batch indexes after repair. Errors retain the classified retry/refuse verdict and their diagnostic cause. The orchestrator owns restart policy and alert routing.
 
 ### L1 view freshness
 
@@ -384,7 +376,7 @@ Everything above is **standard recovery**: the sequencer's own bookkeeping
 (the batch tree, pending dumps) lets startup cascade a doomed suffix and
 resume. The repair decision is automatic, not an operator-designed
 reconstruction: recovery crosses a process boundary, and the next boot
-inspects fresh facts through the reducer regardless of how the prior process
+inspects fresh facts regardless of how the prior process
 died. Admission and the terminal-fault black box are owned by
 [ADR mechanism 2](../plans/2026-08-authority-boundary-adr.md#2-fact-derived-admission-and-the-terminal-fault-black-box).
 
@@ -415,9 +407,10 @@ the check's completeness scope by [I9](../invariants.md).
 
 This page owns the recovery side. `check_danger` reports
 `CanonicalDivergence` **ahead of every other arm**, so a respawn loop can never
-route a diverged node into a provider call, recovery phase, or admission. Every
-reducer iteration begins with local inspection; mutating phase transactions
-reassert the marker's absence. The controller maps it to terminal `Refuse`.
+route a known-diverged node into a provider call, batch-tree mutation, or admission.
+Startup checks before its initial Sync, after that Sync, inside the post-flush
+cascade transaction, and before admission. The guarded repair transactions
+reassert the marker's absence and map it to terminal `Refuse`.
 
 The remedy is **cockroach recovery (wipe + rebuild from L1), never the
 standard recovery on this page**: the cascade reconciles the batch tree's
@@ -464,24 +457,13 @@ The model is a **safety over-approximation for the actions it shares with the im
 | SchedulerBehindL1 | Scheduler cursor doesn't pass L1 cursor |
 | DeadNotYetIncluded | Dead batches have `w_nonce >= nextL1Slot` |
 
-### `admission.tla` -- Startup reduction and authority
+### `admission.tla` -- Sequential startup and admission
 
-Models local-first inspection, typed Retry/Refuse, InitialSync, EnsureTip,
-RecoverTip, Flush/Sync/Cascade with ephemeral witnesses, Sync-discovered
-divergence, mandatory reinspection after every completed phase,
-crash-and-restart as a fresh attempt over surviving durable facts (nothing
-durable gates the next boot; the terminal-fault black box is non-gating
-telemetry outside the model — see the ADR), and atomic minting of the `RuntimeAdmission` witness from the
-final clean decision. It abstracts away the batch spine and delegates every phase's
-batch mechanics to `preemptive.tla`.
+Models the local terminal gate, initial Sync with warm-provider fallback, repair selection, guarded Tip repair, Flush → Sync → Cascade with an ephemeral observation, Sync-discovered divergence, post-repair checking, task-free preparation, and final current admission. Retry, refusal, and crash return to a fresh attempt over surviving durable facts; terminal-fault telemetry does not gate the next boot.
 
-**Verified**: 860 generated states, 266 distinct states, depth 13, 0 violations.
+**Verified**: 554 generated states, 155 distinct states, depth 11, 0 violations.
 
-Key invariants include capability soundness, reducer/phase control while an
-attempt is begun, completed-phase reinspection, terminal dominance, Cascade
-witness preconditions, and Retry never being interpreted as clean. Concrete SQLite
-mutation guards and transaction atomicity are tested in Rust rather than
-modeled as database actions here.
+The invariants cover runtime admission soundness, terminal dominance, repair preconditions, the caught-up post-flush view, and observation scope across attempts. They express these safety obligations independently of the number of inspections. Concrete SQLite transaction atomicity and guards are tested in Rust; the batch spine remains in `preemptive.tla`.
 
 ### Running the spec
 

@@ -36,7 +36,7 @@ impl Storage {
     ///
     /// **Precondition:** at least one safe-head observation must have been
     /// recorded (via [`Storage::append_safe_inputs`]). In production this is
-    /// always true because the startup reducer completes InitialSync and
+    /// always true because the startup recovery procedure completes InitialSync and
     /// refuses admission unless its persisted view is usable. Tests must seed
     /// an observation explicitly; a fresh DB returns `QueryReturnedNoRows`.
     pub fn submitter_frontier(&mut self) -> Result<SubmitterFrontier> {

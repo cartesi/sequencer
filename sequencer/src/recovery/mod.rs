@@ -1,18 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Run-start recovery authority.
-//!
-//! A pure reducer selects at most one phase from one transactionally
-//! consistent local inspection. The driver executes at most that phase and
-//! always returns to local inspection before another phase or runtime
-//! admission. Canonical divergence is therefore an absorbing local fact, not
-//! a special check each effect must remember.
-//!
-//! The flush and post-flush-sync witnesses live only for this boot attempt. A
-//! crash loses them and the next boot repeats the idempotent flush; no durable
-//! recovery-phase state machine is introduced. See `docs/recovery/README.md`
-//! and `docs/recovery/admission.tla`.
+//! Startup recovery while the process lock excludes other writers and no
+//! workers are running. Local inspection selects one repair: Tip replacement
+//! or Flush → Sync → Cascade. A fresh check follows repair and runtime
+//! preparation; only the final check authorizes worker launch.
 
 mod detector;
 mod flusher;
@@ -102,17 +94,13 @@ pub enum RecoveryRefusalReason {
     MissingFinalizedSnapshot,
     #[error("post-sync recovery has no persisted safe head")]
     MissingSafeHead,
-    /// The `EnsureOpenTip` phase's transaction left no valid open Tip — a
-    /// storage self-invariant failure, refused so the boot cannot spin.
+    /// The `EnsureOpenTip` transaction violated its open-Tip postcondition.
     #[error("the EnsureOpenTip phase left no valid open Tip")]
     TipMissingAfterOpen,
 }
 
-/// Single-use proof that the run's final admission decision — the same pure
-/// reducer over one transactionally consistent fact set — selected `Admit`
-/// after all fallible preparation completed. Its private field makes
-/// construction exclusive to [`admit_runtime`]; runtime code may consume the
-/// proof but cannot mint one.
+/// Single-use proof that the final check found clean, consistent facts after
+/// all fallible preparation. Only [`admit_runtime`] can construct it.
 #[must_use = "runtime admission must be consumed by PreparedRuntime::launch"]
 #[derive(Debug)]
 pub(crate) struct RuntimeAdmission {
@@ -152,293 +140,86 @@ pub(crate) fn assert_resync_caught_up(
     Ok(())
 }
 
-/// The phase ordering of one boot attempt. `Flushed` and `PostFlushSynced`
-/// carry the flush observation as an ephemeral, memory-only witness:
-/// `drive_recovery` is its only writer, phases are its only source, and it
-/// never persists — a restarted attempt has no witness and must flush
-/// again. Cascade is therefore reachable only through Flush → Sync *in this
-/// process* (`docs/recovery/README.md`). This one enum is both the
-/// reducer's input and the driver's completion type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryProgress {
-    NeedInitialSync,
-    Inspecting,
-    Flushed { observed_safe_block: u64 },
-    PostFlushSynced { required_safe_block: u64 },
-    Repaired,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryPhase {
-    InitialSync,
+enum RecoveryAction {
+    Ready,
     EnsureOpenTip,
-    RecoverTip { expected_batch_index: u64 },
+    RecoverTip { batch_index: u64 },
     Flush,
-    PostFlushSync { required_safe_block: u64 },
-    Cascade { required_safe_block: u64 },
 }
 
-impl RecoveryPhase {
+impl RecoveryAction {
     fn label(self) -> &'static str {
         match self {
-            Self::InitialSync => "initial_sync",
+            Self::Ready => "admit",
             Self::EnsureOpenTip => "ensure_open_tip",
             Self::RecoverTip { .. } => "recover_tip",
             Self::Flush => "flush",
-            Self::PostFlushSync { .. } => "post_flush_sync",
-            Self::Cascade { .. } => "cascade",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryDecision {
-    Admit,
-    Act(RecoveryPhase),
-    Retry(RecoveryRetryReason),
-    Refuse(RecoveryRefusalReason),
-}
-
-impl RecoveryDecision {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Admit => "admit",
-            Self::Act(phase) => phase.label(),
-            Self::Retry(_) => "retry",
-            Self::Refuse(_) => "refuse",
-        }
-    }
-}
-
-/// The sole startup policy function. Terminal local facts are ranked before
-/// phase progress, so no provider call or mutation can mask divergence or a
-/// missing finalized state.
-fn reduce_recovery(progress: RecoveryProgress, facts: RecoveryInspection) -> RecoveryDecision {
+fn refuse_local_terminal(facts: RecoveryInspection) -> Result<(), RecoveryError> {
     if let DangerStatus::CanonicalDivergence(nonce) = facts.danger {
-        return RecoveryDecision::Refuse(RecoveryRefusalReason::CanonicalDivergence { nonce });
+        return Err(RecoveryError::refuse(
+            RecoveryRefusalReason::CanonicalDivergence { nonce },
+        ));
     }
     if !facts.has_finalized_snapshot {
-        return RecoveryDecision::Refuse(RecoveryRefusalReason::MissingFinalizedSnapshot);
+        return Err(RecoveryError::refuse(
+            RecoveryRefusalReason::MissingFinalizedSnapshot,
+        ));
     }
-
-    match progress {
-        RecoveryProgress::NeedInitialSync => RecoveryDecision::Act(RecoveryPhase::InitialSync),
-        RecoveryProgress::Flushed {
-            observed_safe_block,
-        } => RecoveryDecision::Act(RecoveryPhase::PostFlushSync {
-            required_safe_block: observed_safe_block,
-        }),
-        RecoveryProgress::PostFlushSynced {
-            required_safe_block,
-        } => match facts.current_safe_block {
-            None => RecoveryDecision::Refuse(RecoveryRefusalReason::MissingSafeHead),
-            Some(resynced_safe_block) if resynced_safe_block < required_safe_block => {
-                RecoveryDecision::Retry(RecoveryRetryReason::ResyncBehindFlushView {
-                    resynced_safe_block,
-                    flush_observed_safe_block: required_safe_block,
-                })
-            }
-            Some(_) => RecoveryDecision::Act(RecoveryPhase::Cascade {
-                required_safe_block,
-            }),
-        },
-        RecoveryProgress::Repaired => match facts.danger {
-            DangerStatus::Safe if facts.has_open_tip => RecoveryDecision::Admit,
-            // Unreachable in production — every repair phase ends with a
-            // valid open tip in its own transaction (the admission model
-            // encodes that postcondition, and `ensure_open_tip_for_recovery`
-            // refuses rather than commits without one, so this edge cannot
-            // cycle). Kept so the `Repaired` and `Inspecting` arms stay
-            // structurally parallel and total.
-            DangerStatus::Safe => RecoveryDecision::Act(RecoveryPhase::EnsureOpenTip),
-            // Named, not a wildcard: a new `DangerStatus` variant must be
-            // classified here explicitly instead of silently defaulting to
-            // retry — the exact mistake this reducer exists to make
-            // compiler-visible.
-            status @ (DangerStatus::ClosedBatchInDanger(_)
-            | DangerStatus::TipInDanger(_)
-            | DangerStatus::L1ViewStale
-            | DangerStatus::EstimatedBatchInDanger(_)) => {
-                RecoveryDecision::Retry(RecoveryRetryReason::DangerPersists { status })
-            }
-            DangerStatus::CanonicalDivergence(_) => {
-                unreachable!("terminal facts were reduced before progress")
-            }
-        },
-        RecoveryProgress::Inspecting => match facts.danger {
-            DangerStatus::Safe if facts.has_open_tip => RecoveryDecision::Admit,
-            DangerStatus::Safe => RecoveryDecision::Act(RecoveryPhase::EnsureOpenTip),
-            DangerStatus::ClosedBatchInDanger(_) => RecoveryDecision::Act(RecoveryPhase::Flush),
-            DangerStatus::TipInDanger(expected_batch_index) => {
-                RecoveryDecision::Act(RecoveryPhase::RecoverTip {
-                    expected_batch_index,
-                })
-            }
-            DangerStatus::L1ViewStale => RecoveryDecision::Retry(RecoveryRetryReason::L1ViewStale),
-            DangerStatus::EstimatedBatchInDanger(batch_index) => {
-                RecoveryDecision::Retry(RecoveryRetryReason::EstimatedBatchInDanger { batch_index })
-            }
-            DangerStatus::CanonicalDivergence(_) => {
-                unreachable!("terminal facts were reduced before progress")
-            }
-        },
-    }
+    Ok(())
 }
 
-trait RecoveryDriver {
-    fn inspect(&mut self) -> Result<RecoveryInspection, RecoveryError>;
-
-    /// Perform one phase and return the progress it established. The
-    /// production driver derives it from the phase itself, so a
-    /// wrong-progress return is unrepresentable there.
-    async fn perform(&mut self, phase: RecoveryPhase) -> Result<RecoveryProgress, RecoveryError>;
-
-    fn admitted(&mut self) {}
-}
-
-/// Drive one phase per inspection. There is intentionally no edge from a
-/// completed phase directly to another phase or admission.
-///
-/// The loop is unbounded by design and terminates by construction: every
-/// phase edge advances `progress` except `Repaired` + `Safe` + no Tip →
-/// `EnsureOpenTip` → `Repaired`, and that phase refuses inside its own
-/// transaction if it would leave no Tip; between phases the Tip cannot
-/// disappear, because the kernel process lock makes this process the only
-/// writer. One attempt therefore performs at
-/// most five phases (`InitialSync`, then `Flush` → `PostFlushSync` →
-/// `Cascade`, then at most one `EnsureOpenTip`) before admitting, retrying,
-/// or refusing.
-async fn drive_recovery(driver: &mut impl RecoveryDriver) -> Result<(), RecoveryError> {
-    let mut progress = RecoveryProgress::NeedInitialSync;
-    loop {
-        let facts = driver.inspect()?;
-        let decision = reduce_recovery(progress, facts);
-        tracing::info!(
-            recovery_progress = ?progress,
-            danger_status = facts.danger.label(),
-            danger_batch_index = ?facts.danger.batch_index(),
-            recovery_decision = decision.label(),
-            "startup recovery reducer decision"
-        );
-
-        match decision {
-            RecoveryDecision::Admit => {
-                driver.admitted();
-                return Ok(());
-            }
-            RecoveryDecision::Retry(reason) => return Err(RecoveryError::retry(reason)),
-            RecoveryDecision::Refuse(reason) => return Err(RecoveryError::refuse(reason)),
-            RecoveryDecision::Act(phase) => {
-                progress = driver.perform(phase).await?;
-            }
+/// The startup dispatch and final admission use the same exhaustive policy.
+fn select_recovery(facts: RecoveryInspection) -> Result<RecoveryAction, RecoveryError> {
+    refuse_local_terminal(facts)?;
+    match facts.danger {
+        DangerStatus::Safe if facts.has_open_tip => Ok(RecoveryAction::Ready),
+        DangerStatus::Safe => Ok(RecoveryAction::EnsureOpenTip),
+        DangerStatus::ClosedBatchInDanger(_) => Ok(RecoveryAction::Flush),
+        DangerStatus::TipInDanger(batch_index) => Ok(RecoveryAction::RecoverTip { batch_index }),
+        DangerStatus::L1ViewStale => Err(RecoveryError::retry(RecoveryRetryReason::L1ViewStale)),
+        DangerStatus::EstimatedBatchInDanger(batch_index) => Err(RecoveryError::retry(
+            RecoveryRetryReason::EstimatedBatchInDanger { batch_index },
+        )),
+        DangerStatus::CanonicalDivergence(_) => {
+            unreachable!("terminal facts were checked before dispatch")
         }
     }
 }
 
-fn log_repair(invalidated: &[u64]) {
-    if invalidated.is_empty() {
-        tracing::info!("startup recovery phase completed without invalidation");
-    } else {
-        tracing::warn!(
-            invalidated_count = invalidated.len(),
-            batches = ?invalidated,
-            "startup recovery invalidated the doomed suffix"
-        );
-    }
+fn inspect_recovery(
+    db_path: &str,
+    protocol: &ProtocolTiming,
+) -> Result<RecoveryInspection, RecoveryError> {
+    let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
+    storage
+        .inspect_recovery(protocol, crate::clock::unix_now_ms())
+        .map_err(classify_storage)
 }
 
-struct ProductionRecoveryDriver<'a> {
+/// Only L1 operations are abstracted: tests keep the real local inspections
+/// and repair transactions and substitute the external system.
+trait RecoveryL1 {
+    async fn sync(&mut self) -> Result<(), InputReaderError>;
+    async fn flush(&mut self) -> Result<u64, RecoveryError>;
+}
+
+struct StartupL1<'a> {
     db_path: &'a str,
     input_reader: &'a mut InputReader,
     l1_config: &'a L1Config,
     protocol: &'a ProtocolTiming,
 }
 
-impl RecoveryDriver for ProductionRecoveryDriver<'_> {
-    fn inspect(&mut self) -> Result<RecoveryInspection, RecoveryError> {
-        let mut storage = storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
-        storage
-            .inspect_recovery(self.protocol, crate::clock::unix_now_ms())
-            .map_err(classify_storage)
+impl RecoveryL1 for StartupL1<'_> {
+    async fn sync(&mut self) -> Result<(), InputReaderError> {
+        self.input_reader.sync_to_current_safe_head().await
     }
 
-    async fn perform(&mut self, phase: RecoveryPhase) -> Result<RecoveryProgress, RecoveryError> {
-        match phase {
-            RecoveryPhase::InitialSync => {
-                match self.input_reader.sync_to_current_safe_head().await {
-                    Ok(()) => tracing::info!("L1 safe head synced"),
-                    // Preserve warm boot: an unreachable provider counts as a
-                    // completed refresh attempt, then persisted local facts
-                    // decide whether serving is still honest.
-                    Err(InputReaderError::Provider(error)) => tracing::warn!(
-                        error = %error,
-                        "L1 unreachable during initial startup sync; inspecting persisted view"
-                    ),
-                    Err(error) => return Err(classify_input_reader(error)),
-                }
-                Ok(RecoveryProgress::Inspecting)
-            }
-            RecoveryPhase::EnsureOpenTip => {
-                let mut storage =
-                    storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
-                storage
-                    .ensure_open_tip_for_recovery(self.protocol, crate::clock::unix_now_ms())
-                    .map_err(classify_mutation)?;
-                log_repair(&[]);
-                Ok(RecoveryProgress::Repaired)
-            }
-            RecoveryPhase::RecoverTip {
-                expected_batch_index,
-            } => {
-                let mut storage =
-                    storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
-                let invalidated = storage
-                    .recover_aging_tip_for_recovery(
-                        expected_batch_index,
-                        self.protocol,
-                        crate::clock::unix_now_ms(),
-                    )
-                    .map_err(classify_mutation)?;
-                log_repair(&invalidated);
-                Ok(RecoveryProgress::Repaired)
-            }
-            RecoveryPhase::Flush => {
-                let observed_safe_block = self.flush().await?;
-                Ok(RecoveryProgress::Flushed {
-                    observed_safe_block,
-                })
-            }
-            RecoveryPhase::PostFlushSync {
-                required_safe_block,
-            } => {
-                self.input_reader
-                    .sync_to_current_safe_head()
-                    .await
-                    .map_err(classify_input_reader)?;
-                Ok(RecoveryProgress::PostFlushSynced {
-                    required_safe_block,
-                })
-            }
-            RecoveryPhase::Cascade {
-                required_safe_block,
-            } => {
-                let mut storage =
-                    storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
-                let invalidated = storage
-                    .recover_post_flush_for_recovery(
-                        required_safe_block,
-                        self.protocol,
-                        crate::clock::unix_now_ms(),
-                    )
-                    .map_err(classify_mutation)?;
-                log_repair(&invalidated);
-                Ok(RecoveryProgress::Repaired)
-            }
-        }
-    }
-}
-
-impl ProductionRecoveryDriver<'_> {
     async fn flush(&mut self) -> Result<u64, RecoveryError> {
         let provider = crate::l1::provider::create_verified_signer_provider(
             &self.l1_config.eth_rpc_url,
@@ -465,50 +246,132 @@ impl ProductionRecoveryDriver<'_> {
     }
 }
 
-/// Run the startup reducer through its first clean `Admit` decision. This
-/// grants no runtime capability; fallible runtime preparation follows, then
-/// [`admit_runtime`] invokes the same reducer once more over one consistent
-/// fact set.
+/// Repair once, then require a clean view. Flush cannot change local recovery
+/// facts except the wallet watermark; Sync is the only external operation that
+/// can discover divergence. The guarded repair transaction checks those new
+/// facts before mutation, including the post-flush safe-head floor.
+async fn recover_startup(
+    db_path: &str,
+    protocol: &ProtocolTiming,
+    l1: &mut impl RecoveryL1,
+) -> Result<(), RecoveryError> {
+    refuse_local_terminal(inspect_recovery(db_path, protocol)?)?;
+    match l1.sync().await {
+        Ok(()) => tracing::info!("L1 safe head synced"),
+        // An unreachable provider does not invalidate a still-fresh persisted
+        // view. Post-flush Sync has no such fallback: cascade needs its result.
+        Err(InputReaderError::Provider(error)) => tracing::warn!(
+            error = %error,
+            "L1 unreachable during initial startup sync; inspecting persisted view"
+        ),
+        Err(error) => return Err(classify_input_reader(error)),
+    }
+
+    let facts = inspect_recovery(db_path, protocol)?;
+    let action = select_recovery(facts)?;
+    tracing::info!(
+        danger_status = facts.danger.label(),
+        danger_batch_index = ?facts.danger.batch_index(),
+        recovery_decision = action.label(),
+        "startup recovery decision"
+    );
+    let invalidated = match action {
+        RecoveryAction::Ready => return Ok(()),
+        RecoveryAction::EnsureOpenTip => {
+            let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
+            storage
+                .ensure_open_tip_for_recovery(protocol, crate::clock::unix_now_ms())
+                .map_err(classify_mutation)?;
+            Vec::new()
+        }
+        RecoveryAction::RecoverTip { batch_index } => {
+            let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
+            storage
+                .recover_aging_tip_for_recovery(batch_index, protocol, crate::clock::unix_now_ms())
+                .map_err(classify_mutation)?
+        }
+        RecoveryAction::Flush => {
+            // The observation exists only on this invocation's stack. A crash
+            // or retry loses it; a new attempt must flush again before cascade.
+            let observed_safe_block = l1.flush().await?;
+            l1.sync().await.map_err(classify_input_reader)?;
+            let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
+            storage
+                .recover_post_flush_for_recovery(
+                    observed_safe_block,
+                    protocol,
+                    crate::clock::unix_now_ms(),
+                )
+                .map_err(classify_mutation)?
+        }
+    };
+    if invalidated.is_empty() {
+        tracing::info!("startup recovery completed without invalidation");
+    } else {
+        tracing::warn!(
+            invalidated_count = invalidated.len(),
+            batches = ?invalidated,
+            "startup recovery invalidated the doomed suffix"
+        );
+    }
+
+    let facts = inspect_recovery(db_path, protocol)?;
+    refuse_local_terminal(facts)?;
+    // Observed repair can expose a surviving clock/view refusal. Never treat
+    // successful mutation as admission or begin another repair in this boot.
+    match facts.danger {
+        DangerStatus::Safe => {
+            assert!(facts.has_open_tip, "recovery committed without an open Tip");
+            Ok(())
+        }
+        status @ (DangerStatus::ClosedBatchInDanger(_)
+        | DangerStatus::TipInDanger(_)
+        | DangerStatus::L1ViewStale
+        | DangerStatus::EstimatedBatchInDanger(_)) => {
+            Err(RecoveryError::retry(RecoveryRetryReason::DangerPersists {
+                status,
+            }))
+        }
+        DangerStatus::CanonicalDivergence(_) => {
+            unreachable!("terminal facts were checked after repair")
+        }
+    }
+}
+
+/// Finish startup recovery before fallible, task-free runtime preparation.
+/// This grants no runtime authority; [`admit_runtime`] checks again afterwards.
 pub(crate) async fn run_startup_recovery(
     db_path: &str,
     input_reader: &mut InputReader,
     l1_config: &L1Config,
     protocol: &ProtocolTiming,
 ) -> Result<(), RecoveryError> {
-    let mut driver = ProductionRecoveryDriver {
+    recover_startup(
         db_path,
-        input_reader,
-        l1_config,
         protocol,
-    };
-    drive_recovery(&mut driver).await
+        &mut StartupL1 {
+            db_path,
+            input_reader,
+            l1_config,
+            protocol,
+        },
+    )
+    .await
 }
 
-/// Reinvoke the same reducer after all fallible preparation, over one
-/// transactionally consistent fact set. Anything except `Admit` drops the
-/// prepared resources and restarts from a fresh boot; workers are never
-/// launched from an aged decision.
-///
-/// This consistent read *is* the linearization of the final admission
-/// decision: the process lock excludes every other process, and no worker
-/// is launched until after this decision — the launch step itself is
-/// non-yielding — so no writer exists that could invalidate the facts
-/// between this read and worker launch.
+/// Check current facts after preparation. The process lock and task-free
+/// preparation exclude another writer, but elapsed time can stale the view.
+/// Launch consumes the resulting witness without yielding or further fallible
+/// preparation.
 pub(crate) fn admit_runtime(
     db_path: &str,
     protocol: &ProtocolTiming,
 ) -> Result<RuntimeAdmission, RecoveryError> {
-    let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
-    let facts = storage
-        .inspect_recovery(protocol, crate::clock::unix_now_ms())
-        .map_err(classify_storage)?;
-    match reduce_recovery(RecoveryProgress::Inspecting, facts) {
-        RecoveryDecision::Admit => Ok(RuntimeAdmission { _private: () }),
-        RecoveryDecision::Retry(reason) => Err(RecoveryError::retry(reason)),
-        RecoveryDecision::Refuse(reason) => Err(RecoveryError::refuse(reason)),
-        RecoveryDecision::Act(phase) => Err(RecoveryError::retry(
+    match select_recovery(inspect_recovery(db_path, protocol)?)? {
+        RecoveryAction::Ready => Ok(RuntimeAdmission { _private: () }),
+        action => Err(RecoveryError::retry(
             RecoveryRetryReason::AdmissionChanged {
-                decision: phase.label(),
+                decision: action.label(),
             },
         )),
     }
@@ -537,7 +400,7 @@ fn classify_storage(error: rusqlite::Error) -> RecoveryError {
 /// The flush's signer-provider errors, classified at birth. The
 /// terminal/transient split must agree with `From<VerifiedSignerProviderError>
 /// for BootstrapError` in `commands/error.rs` (mismatch and construction are
-/// terminal; the chain-id read is transient); this is the reducer's own
+/// terminal; the chain-id read is transient); this is recovery's own
 /// retry/refuse polarity over the same facts, pinned beside the others.
 fn classify_signer_provider(
     error: crate::l1::provider::VerifiedSignerProviderError,
@@ -716,7 +579,7 @@ mod tests {
                 RecoveryError::Refuse(f) if matches!(*f, RecoveryFailure::ChainIdMismatch { .. })
             ));
             // The doc's "must agree with the `BootstrapError` projection":
-            // the reducer retries exactly the arm that projection calls
+            // recovery retries exactly the arm that projection calls
             // transient.
             let mint = || {
                 [
@@ -728,9 +591,9 @@ mod tests {
                     },
                 ]
             };
-            for (reducer_side, projection_side) in mint().into_iter().zip(mint()) {
+            for (recovery_side, projection_side) in mint().into_iter().zip(mint()) {
                 let retried = matches!(
-                    classify_signer_provider(reducer_side),
+                    classify_signer_provider(recovery_side),
                     RecoveryError::Retry(_)
                 );
                 let transient = matches!(
@@ -769,276 +632,6 @@ mod tests {
         assert_refuse(classify_mutation(RecoveryMutationError::MissingSafeHead));
     }
 
-    fn facts(danger: DangerStatus) -> RecoveryInspection {
-        RecoveryInspection {
-            danger,
-            has_finalized_snapshot: true,
-            has_open_tip: true,
-            current_safe_block: Some(1_200),
-        }
-    }
-
-    #[test]
-    fn divergence_dominates_every_progress_state() {
-        let terminal = facts(DangerStatus::CanonicalDivergence(7));
-        for progress in [
-            RecoveryProgress::NeedInitialSync,
-            RecoveryProgress::Inspecting,
-            RecoveryProgress::Flushed {
-                observed_safe_block: 1_201,
-            },
-            RecoveryProgress::PostFlushSynced {
-                required_safe_block: 1_201,
-            },
-            RecoveryProgress::Repaired,
-        ] {
-            assert_eq!(
-                reduce_recovery(progress, terminal),
-                RecoveryDecision::Refuse(RecoveryRefusalReason::CanonicalDivergence { nonce: 7 })
-            );
-        }
-    }
-
-    #[test]
-    fn post_flush_lag_retries_before_cascade() {
-        let decision = reduce_recovery(
-            RecoveryProgress::PostFlushSynced {
-                required_safe_block: 1_201,
-            },
-            facts(DangerStatus::ClosedBatchInDanger(0)),
-        );
-        assert_eq!(
-            decision,
-            RecoveryDecision::Retry(RecoveryRetryReason::ResyncBehindFlushView {
-                resynced_safe_block: 1_200,
-                flush_observed_safe_block: 1_201,
-            })
-        );
-    }
-
-    #[test]
-    fn repaired_tip_with_surviving_clock_refusal_cannot_admit() {
-        assert_eq!(
-            reduce_recovery(RecoveryProgress::Repaired, facts(DangerStatus::L1ViewStale)),
-            RecoveryDecision::Retry(RecoveryRetryReason::DangerPersists {
-                status: DangerStatus::L1ViewStale
-            })
-        );
-    }
-
-    struct ScriptedDriver {
-        inspections: VecDeque<RecoveryInspection>,
-        trace: Vec<&'static str>,
-        flush_observed_safe_block: u64,
-        inspection_attempts: usize,
-        fail_inspection_at: Option<usize>,
-    }
-
-    impl ScriptedDriver {
-        fn new(inspections: impl IntoIterator<Item = RecoveryInspection>) -> Self {
-            Self {
-                inspections: inspections.into_iter().collect(),
-                trace: Vec::new(),
-                flush_observed_safe_block: 1_200,
-                inspection_attempts: 0,
-                fail_inspection_at: None,
-            }
-        }
-
-        fn fail_inspection_at(mut self, attempt: usize) -> Self {
-            self.fail_inspection_at = Some(attempt);
-            self
-        }
-    }
-
-    impl RecoveryDriver for ScriptedDriver {
-        fn inspect(&mut self) -> Result<RecoveryInspection, RecoveryError> {
-            self.trace.push("inspect");
-            self.inspection_attempts += 1;
-            if self.fail_inspection_at == Some(self.inspection_attempts) {
-                return Err(RecoveryError::retry(RecoveryRetryReason::L1ViewStale));
-            }
-            Ok(self
-                .inspections
-                .pop_front()
-                .expect("script provides one fact set per inspection"))
-        }
-
-        async fn perform(
-            &mut self,
-            phase: RecoveryPhase,
-        ) -> Result<RecoveryProgress, RecoveryError> {
-            Ok(match phase {
-                RecoveryPhase::InitialSync => {
-                    self.trace.push("initial_sync");
-                    RecoveryProgress::Inspecting
-                }
-                RecoveryPhase::EnsureOpenTip => {
-                    self.trace.push("ensure_tip");
-                    RecoveryProgress::Repaired
-                }
-                RecoveryPhase::RecoverTip { .. } => {
-                    self.trace.push("recover_tip");
-                    RecoveryProgress::Repaired
-                }
-                RecoveryPhase::Flush => {
-                    self.trace.push("flush");
-                    RecoveryProgress::Flushed {
-                        observed_safe_block: self.flush_observed_safe_block,
-                    }
-                }
-                RecoveryPhase::PostFlushSync {
-                    required_safe_block,
-                } => {
-                    self.trace.push("post_flush_sync");
-                    RecoveryProgress::PostFlushSynced {
-                        required_safe_block,
-                    }
-                }
-                RecoveryPhase::Cascade { .. } => {
-                    self.trace.push("cascade");
-                    RecoveryProgress::Repaired
-                }
-            })
-        }
-
-        fn admitted(&mut self) {
-            self.trace.push("admit");
-        }
-    }
-
-    #[tokio::test]
-    async fn closed_recovery_runs_exactly_one_phase_per_inspection() {
-        let closed = facts(DangerStatus::ClosedBatchInDanger(0));
-        let mut driver =
-            ScriptedDriver::new([closed, closed, closed, closed, facts(DangerStatus::Safe)]);
-
-        drive_recovery(&mut driver).await.expect("admit");
-        assert_eq!(
-            driver.trace,
-            [
-                "inspect",
-                "initial_sync",
-                "inspect",
-                "flush",
-                "inspect",
-                "post_flush_sync",
-                "inspect",
-                "cascade",
-                "inspect",
-                "admit",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn local_divergence_refuses_before_every_phase() {
-        let mut driver = ScriptedDriver::new([facts(DangerStatus::CanonicalDivergence(9))]);
-        let error = drive_recovery(&mut driver)
-            .await
-            .expect_err("divergence refuses");
-        assert!(matches!(error, RecoveryError::Refuse(_)));
-        assert_eq!(driver.trace, ["inspect"]);
-    }
-
-    #[tokio::test]
-    async fn sync_discovered_divergence_stops_before_cascade() {
-        let closed = facts(DangerStatus::ClosedBatchInDanger(0));
-        let mut driver = ScriptedDriver::new([
-            closed,
-            closed,
-            closed,
-            facts(DangerStatus::CanonicalDivergence(0)),
-        ]);
-        let error = drive_recovery(&mut driver)
-            .await
-            .expect_err("divergence discovered by sync refuses");
-        assert!(matches!(error, RecoveryError::Refuse(_)));
-        assert_eq!(
-            driver.trace,
-            [
-                "inspect",
-                "initial_sync",
-                "inspect",
-                "flush",
-                "inspect",
-                "post_flush_sync",
-                "inspect",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn tip_repair_reinspects_and_retries_on_surviving_clock_refusal() {
-        let tip = facts(DangerStatus::TipInDanger(0));
-        let mut driver = ScriptedDriver::new([tip, tip, facts(DangerStatus::L1ViewStale)]);
-
-        let error = drive_recovery(&mut driver)
-            .await
-            .expect_err("clock refusal must block admission after repair");
-        assert!(matches!(error, RecoveryError::Retry(_)));
-        assert_eq!(
-            driver.trace,
-            [
-                "inspect",
-                "initial_sync",
-                "inspect",
-                "recover_tip",
-                "inspect",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn reconstructed_controller_cannot_reuse_a_post_flush_sync_witness() {
-        let closed = facts(DangerStatus::ClosedBatchInDanger(0));
-        let mut interrupted = ScriptedDriver::new([closed, closed, closed]).fail_inspection_at(4);
-
-        let error = drive_recovery(&mut interrupted)
-            .await
-            .expect_err("the injected inspection boundary ends this controller");
-        assert!(matches!(error, RecoveryError::Retry(_)));
-        assert_eq!(
-            interrupted.trace,
-            [
-                "inspect",
-                "initial_sync",
-                "inspect",
-                "flush",
-                "inspect",
-                "post_flush_sync",
-                "inspect",
-            ],
-            "the first controller reached post-flush Sync before it was lost"
-        );
-
-        // Reconstructing the Rust controller is the restart boundary: its
-        // boot-local witnesses are gone. Even though durable facts still show
-        // the same closed danger, the new attempt must InitialSync and Flush;
-        // it cannot jump straight to Cascade using the previous attempt's
-        // PostFlushSync witness.
-        let mut restarted =
-            ScriptedDriver::new([closed, closed, closed, closed, facts(DangerStatus::Safe)]);
-        drive_recovery(&mut restarted)
-            .await
-            .expect("restart admits");
-        assert_eq!(
-            restarted.trace,
-            [
-                "inspect",
-                "initial_sync",
-                "inspect",
-                "flush",
-                "inspect",
-                "post_flush_sync",
-                "inspect",
-                "cascade",
-                "inspect",
-                "admit",
-            ]
-        );
-    }
-
     fn admission_fixture(
         name: &str,
         has_finalized_snapshot: bool,
@@ -1052,6 +645,7 @@ mod tests {
         let mut storage =
             storage::Storage::initialize_for_command(&db.path, storage::LifecycleCommand::Setup)
                 .expect("initialize setup");
+        crate::storage::test_helpers::pin_test_deployment_identity(&mut storage, SENDER_A);
         storage
             .append_safe_inputs_with_timestamp(
                 0,
@@ -1082,6 +676,309 @@ mod tests {
         }
         drop(storage);
         (db, protocol)
+    }
+
+    enum SyncStep {
+        Keep,
+        Fail(InputReaderError),
+        Observe {
+            block: u64,
+            inputs: Vec<storage::StoredSafeInput>,
+        },
+    }
+
+    struct TestL1<'a> {
+        db_path: &'a str,
+        protocol: &'a ProtocolTiming,
+        syncs: VecDeque<SyncStep>,
+        flush_block: u64,
+        calls: Vec<&'static str>,
+    }
+
+    impl<'a> TestL1<'a> {
+        fn new(db_path: &'a str, protocol: &'a ProtocolTiming, syncs: Vec<SyncStep>) -> Self {
+            Self {
+                db_path,
+                protocol,
+                syncs: syncs.into(),
+                flush_block: protocol.danger_threshold(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl RecoveryL1 for TestL1<'_> {
+        async fn sync(&mut self) -> Result<(), InputReaderError> {
+            self.calls.push("sync");
+            match self.syncs.pop_front().expect("unexpected L1 sync") {
+                SyncStep::Keep => Ok(()),
+                SyncStep::Fail(error) => Err(error),
+                SyncStep::Observe { block, inputs } => storage::Storage::open_writer(self.db_path)
+                    .expect("open fixture storage")
+                    .append_safe_inputs_with_timestamp(
+                        block,
+                        crate::clock::unix_now_ms() / 1_000,
+                        &inputs,
+                        crate::storage::test_helpers::SENDER_A,
+                        self.protocol,
+                        storage::FrontierMode::Populate,
+                    )
+                    .map_err(InputReaderError::Storage),
+            }
+        }
+
+        async fn flush(&mut self) -> Result<u64, RecoveryError> {
+            self.calls.push("flush");
+            Ok(self.flush_block)
+        }
+    }
+
+    fn danger_fixture(
+        name: &str,
+        closed: bool,
+    ) -> (crate::storage::test_helpers::TestDb, ProtocolTiming) {
+        let (db, protocol) = admission_fixture(name, true, true);
+        let mut storage = storage::Storage::open_writer(&db.path).expect("open writer");
+        if closed {
+            let mut head = storage.open_state().unwrap().unwrap();
+            storage.close_frame_and_batch(&mut head, 0).unwrap();
+        }
+        storage
+            .append_safe_inputs_with_timestamp(
+                protocol.danger_threshold(),
+                crate::clock::unix_now_ms() / 1_000,
+                &[],
+                crate::storage::test_helpers::SENDER_A,
+                &protocol,
+                storage::FrontierMode::Populate,
+            )
+            .expect("advance into observed danger");
+        (db, protocol)
+    }
+
+    fn invalidated_batches(db_path: &str) -> Vec<u64> {
+        let mut storage = storage::Storage::open_writer(db_path).unwrap();
+        storage
+            .read(|tx| {
+                tx.prepare("SELECT batch_index FROM batches WHERE invalidated_at_ms IS NOT NULL ORDER BY batch_index")?
+                    .query_map([], |row| {
+                        Ok(u64::try_from(row.get::<_, i64>(0)?).expect("nonnegative batch index"))
+                    })?
+                    .collect()
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn initial_provider_failure_uses_only_a_fresh_persisted_view() {
+        let (db, protocol) = admission_fixture("recovery-warm-provider-failure", true, true);
+        let offline = || SyncStep::Fail(InputReaderError::Provider("offline".into()));
+        let mut l1 = TestL1::new(&db.path, &protocol, vec![offline()]);
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
+        assert_eq!(l1.calls, ["sync"]);
+
+        storage::Storage::open_writer(&db.path)
+            .unwrap()
+            .write(|tx| tx.execute("UPDATE l1_safe_head SET block_timestamp = 0", []))
+            .unwrap();
+        let mut l1 = TestL1::new(&db.path, &protocol, vec![offline()]);
+        assert_retry(
+            recover_startup(&db.path, &protocol, &mut l1)
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(l1.calls, ["sync"]);
+    }
+
+    #[tokio::test]
+    async fn local_terminal_facts_refuse_before_l1() {
+        for diverged in [false, true] {
+            let (db, protocol) = admission_fixture("recovery-local-terminal", diverged, true);
+            if diverged {
+                let mut storage = storage::Storage::open_writer(&db.path).unwrap();
+                crate::storage::test_helpers::record_canonical_divergence(&mut storage, 7, 0);
+            }
+            let mut l1 = TestL1::new(&db.path, &protocol, vec![]);
+            assert_refuse(
+                recover_startup(&db.path, &protocol, &mut l1)
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(l1.calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_start_opens_tip_and_tip_repair_never_flushes() {
+        let (db, protocol) = admission_fixture("recovery-ensure-tip", true, false);
+        let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
+        assert!(inspect_recovery(&db.path, &protocol).unwrap().has_open_tip);
+        assert_eq!(l1.calls, ["sync"]);
+
+        let (db, protocol) = danger_fixture("recovery-tip", false);
+        let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
+        assert_eq!(invalidated_batches(&db.path), [0]);
+        assert_eq!(l1.calls, ["sync"]);
+        assert_eq!(
+            inspect_recovery(&db.path, &protocol).unwrap().danger,
+            DangerStatus::Safe
+        );
+    }
+
+    #[tokio::test]
+    async fn post_flush_cascade_runs_even_when_the_refreshed_view_is_safe() {
+        use crate::storage::test_helpers::{SENDER_A, local_batch_payload};
+
+        let (db, protocol) = admission_fixture("recovery-unconditional-cascade", true, true);
+        let block = protocol.danger_threshold();
+        let mut storage = storage::Storage::open_writer(&db.path).unwrap();
+        let mut head = storage.open_state().unwrap().unwrap();
+        storage.close_frame_and_batch(&mut head, block).unwrap();
+        storage.close_frame_and_batch(&mut head, block).unwrap();
+        storage
+            .append_safe_inputs_with_timestamp(
+                block,
+                crate::clock::unix_now_ms() / 1_000,
+                &[],
+                SENDER_A,
+                &protocol,
+                storage::FrontierMode::Populate,
+            )
+            .unwrap();
+        let landed = storage::StoredSafeInput {
+            sender: SENDER_A,
+            payload: local_batch_payload(&mut storage, 0),
+            block_number: block,
+        };
+        drop(storage);
+        let mut l1 = TestL1::new(
+            &db.path,
+            &protocol,
+            vec![
+                SyncStep::Keep,
+                SyncStep::Observe {
+                    block: block + 1,
+                    inputs: vec![landed],
+                },
+            ],
+        );
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
+        assert_eq!(l1.calls, ["sync", "flush", "sync"]);
+        // Batch 0 became gold; the young unresolved batch 1 still belongs to
+        // the flushed suffix even though it no longer trips observed danger.
+        assert_eq!(invalidated_batches(&db.path), [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn sync_discovered_divergence_refuses_before_cascade() {
+        use crate::storage::test_helpers::SENDER_A;
+        let (db, protocol) = danger_fixture("recovery-sync-divergence", true);
+        let block = protocol.danger_threshold();
+        let foreign = storage::StoredSafeInput {
+            sender: SENDER_A,
+            payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+                nonce: 0,
+                frames: vec![],
+            }),
+            block_number: block + 1,
+        };
+        let mut l1 = TestL1::new(
+            &db.path,
+            &protocol,
+            vec![
+                SyncStep::Keep,
+                SyncStep::Observe {
+                    block: block + 1,
+                    inputs: vec![foreign],
+                },
+            ],
+        );
+        assert_refuse(
+            recover_startup(&db.path, &protocol, &mut l1)
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(l1.calls, ["sync", "flush", "sync"]);
+        assert!(invalidated_batches(&db.path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_post_flush_sync_cannot_use_the_initial_sync_fallback() {
+        let (db, protocol) = danger_fixture("recovery-post-flush-offline", true);
+        let mut l1 = TestL1::new(
+            &db.path,
+            &protocol,
+            vec![
+                SyncStep::Keep,
+                SyncStep::Fail(InputReaderError::Provider("offline".into())),
+            ],
+        );
+        assert_retry(
+            recover_startup(&db.path, &protocol, &mut l1)
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(l1.calls, ["sync", "flush", "sync"]);
+        assert!(invalidated_batches(&db.path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_discards_the_flush_observation_and_flushes_again() {
+        let (db, protocol) = danger_fixture("recovery-flush-floor", true);
+        let mut interrupted =
+            TestL1::new(&db.path, &protocol, vec![SyncStep::Keep, SyncStep::Keep]);
+        interrupted.flush_block += 1;
+        let error = recover_startup(&db.path, &protocol, &mut interrupted)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RecoveryError::Retry(failure)
+            if matches!(*failure, RecoveryFailure::PolicyRetry(RecoveryRetryReason::ResyncBehindFlushView { .. }))));
+        assert_eq!(interrupted.calls, ["sync", "flush", "sync"]);
+        assert!(invalidated_batches(&db.path).is_empty());
+        drop(interrupted);
+
+        let mut restarted = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep, SyncStep::Keep]);
+        recover_startup(&db.path, &protocol, &mut restarted)
+            .await
+            .unwrap();
+        assert_eq!(restarted.calls, ["sync", "flush", "sync"]);
+        assert_eq!(invalidated_batches(&db.path), [0, 1]);
+    }
+
+    #[tokio::test]
+    async fn observed_tip_repair_still_refuses_a_surviving_clock_fault() {
+        let (db, protocol) = danger_fixture("recovery-tip-clock", false);
+        let ahead = crate::clock::unix_now_ms() + protocol.seconds_per_block * 2_000;
+        storage::Storage::open_writer(&db.path)
+            .unwrap()
+            .write(|tx| {
+                tx.execute(
+                    "UPDATE l1_safe_head SET synced_at_ms = ?1",
+                    [i64::try_from(ahead).unwrap()],
+                )
+            })
+            .unwrap();
+        let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
+        let error = recover_startup(&db.path, &protocol, &mut l1)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RecoveryError::Retry(failure)
+            if matches!(*failure, RecoveryFailure::PolicyRetry(RecoveryRetryReason::DangerPersists { status: DangerStatus::L1ViewStale }))));
+        assert_eq!(invalidated_batches(&db.path), [0]);
+        assert_eq!(l1.calls, ["sync"]);
+    }
+
+    #[test]
+    fn final_admission_rechecks_view_freshness_after_preparation() {
+        let (db, protocol) = admission_fixture("admit-stale-view", true, true);
+        let _admission = admit_runtime(&db.path, &protocol).unwrap();
+        storage::Storage::open_writer(&db.path)
+            .unwrap()
+            .write(|tx| tx.execute("UPDATE l1_safe_head SET block_timestamp = 0", []))
+            .unwrap();
+        assert_retry(admit_runtime(&db.path, &protocol).unwrap_err());
     }
 
     #[test]

@@ -137,7 +137,7 @@ impl Storage {
     /// marker outranks and withholds the otherwise-usable frontier.
     ///
     /// **Precondition:** at least one safe-head observation must have been
-    /// recorded. The lane only starts after the recovery reducer admits,
+    /// recorded. The lane only starts after the recovery procedure admits,
     /// which guarantees this in production.
     pub fn safe_frontier_state(&mut self) -> Result<SafeFrontierState> {
         self.read(|tx| {

@@ -37,7 +37,7 @@ use super::snapshot_dumps::{batch_nonce_in, clear_pending_dumps_from_nonce_in};
 
 /// Outcome of a danger-zone check.
 ///
-/// Each variant maps to a distinct response in the startup recovery reducer:
+/// Each variant maps to a distinct response in the startup recovery procedure:
 ///
 /// - `L1ViewStale` → retry boot. The L1 safe block is too old or unknown.
 /// - `ClosedBatchInDanger(closed_idx)` → enter the phase-granular
@@ -86,7 +86,7 @@ pub enum DangerStatus {
 }
 
 /// One transactionally consistent local view consumed by the startup
-/// recovery reducer.
+/// recovery procedure.
 ///
 /// Keeping these facts together is load-bearing: admission and recovery-phase
 /// selection must not combine a danger verdict from one SQLite snapshot with
@@ -238,7 +238,7 @@ impl Storage {
         self.read(|tx| check_danger_in(tx, protocol, now_ms))
     }
 
-    /// Read every local fact used by the startup reducer in one transaction.
+    /// Read every local fact used by the startup recovery procedure in one transaction.
     pub(crate) fn inspect_recovery(
         &mut self,
         protocol: &ProtocolTiming,
