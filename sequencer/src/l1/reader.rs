@@ -284,27 +284,34 @@ impl InputReader {
         self.advance_once(&provider).await
     }
 
-    /// Top-level driver. Races the work loop against the shutdown signal.
-    /// Nested blocking DB jobs retain their own process-lock clone, so prompt
-    /// cancellation cannot release data-directory exclusivity under them.
     async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), InputReaderError> {
-        tokio::select! {
-            biased;
-            _ = shutdown.wait_for_shutdown() => Ok(()),
-            result = self.run_loop() => result,
-        }
-    }
-
-    /// Tick → sleep → tick. Provider errors are logged and retried; other
-    /// errors propagate. Shutdown is handled by the outer biased select.
-    async fn run_loop(mut self) -> Result<(), InputReaderError> {
         let provider = crate::l1::provider::create_provider(
             &self.config.rpc_url,
             self.config.allow_insecure_rpc,
         )
         .map_err(InputReaderError::Bootstrap)?;
+        self.run_loop(&provider, shutdown).await
+    }
+
+    /// Shutdown cancels reads and provider waits. An accepted SQLite append
+    /// finishes before the worker exits, so settlement sees its facts and errors.
+    async fn run_loop(
+        mut self,
+        provider: &impl Provider,
+        shutdown: ShutdownSignal,
+    ) -> Result<(), InputReaderError> {
         loop {
-            match self.advance_once(&provider).await {
+            let update = tokio::select! {
+                biased;
+                _ = shutdown.wait_for_shutdown() => return Ok(()),
+                update = self.read_safe_inputs(provider) => update,
+            };
+            let result = match update {
+                Ok(Some(update)) => self.append_safe_inputs(update.head, update.inputs).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(()) => {}
                 Err(err @ InputReaderError::InconsistentL1Response(_)) => {
                     tracing::error!(
@@ -318,7 +325,11 @@ impl InputReader {
                 }
                 Err(err) => return Err(err),
             }
-            tokio::time::sleep(self.config.poll_interval).await;
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for_shutdown() => return Ok(()),
+                _ = tokio::time::sleep(self.config.poll_interval) => {}
+            }
         }
     }
 
@@ -326,6 +337,16 @@ impl InputReader {
         &mut self,
         provider: &impl Provider,
     ) -> Result<(), InputReaderError> {
+        if let Some(update) = self.read_safe_inputs(provider).await? {
+            self.append_safe_inputs(update.head, update.inputs).await?;
+        }
+        Ok(())
+    }
+
+    async fn read_safe_inputs(
+        &mut self,
+        provider: &impl Provider,
+    ) -> Result<Option<SafeInputUpdate>, InputReaderError> {
         // Verify the provider serves the pinned chain before reading anything
         // from it — a wrong-chain RPC's address-filtered logs would otherwise
         // flow into `safe_inputs`.
@@ -344,10 +365,10 @@ impl InputReader {
         // real safe head so storage distinguishes "observed L1" from "no L1
         // view yet".
         if current_safe_block < start_block {
-            return match previous_safe_block {
-                None => self.append_safe_inputs(current_safe_head, Vec::new()).await,
-                Some(_) => Ok(()),
-            };
+            return Ok(previous_safe_block.is_none().then_some(SafeInputUpdate {
+                head: current_safe_head,
+                inputs: Vec::new(),
+            }));
         }
 
         // The input-completeness witness, fetched *before* the scan. Pinning the count
@@ -376,7 +397,10 @@ impl InputReader {
                 block_range = %format!("{}..={}", start_block, current_safe_block),
                 "no new inputs — advancing safe head without scanning"
             );
-            return self.append_safe_inputs(current_safe_head, Vec::new()).await;
+            return Ok(Some(SafeInputUpdate {
+                head: current_safe_head,
+                inputs: Vec::new(),
+            }));
         }
 
         // The dense-index contiguity witness below requires L1 event order.
@@ -446,7 +470,10 @@ impl InputReader {
             "appending safe inputs"
         );
 
-        self.append_safe_inputs(current_safe_head, batch).await
+        Ok(Some(SafeInputUpdate {
+            head: current_safe_head,
+            inputs: batch,
+        }))
     }
 
     /// Verify the provider serves the pinned chain id, once per reader instance,
@@ -637,6 +664,11 @@ fn check_input_box_version(
         )));
     }
     Ok(())
+}
+
+struct SafeInputUpdate {
+    head: SafeHead,
+    inputs: Vec<IngestedSafeInput>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1383,6 +1415,148 @@ mod tests {
 
     fn abi_u256(value: u64) -> alloy_primitives::Bytes {
         U256::from(value).to_be_bytes::<32>().to_vec().into()
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_append_and_preserves_its_outcome() {
+        use alloy::sol_types::SolEvent;
+
+        for fail_append in [false, true] {
+            let db_file = NamedTempFile::new().expect("temp file");
+            let db_path = db_file.path().to_string_lossy().into_owned();
+            let reader = test_reader(
+                db_path.clone(),
+                "http://127.0.0.1:0".to_string(),
+                0,
+                Duration::from_secs(60),
+            );
+            reader.preflight_storage().expect("initialize storage");
+            let write_lock = rusqlite::Connection::open(&db_path).expect("open write blocker");
+            if fail_append {
+                write_lock
+                    .execute_batch(
+                        "CREATE TRIGGER reject_safe_inputs BEFORE INSERT ON safe_inputs \
+                         BEGIN SELECT RAISE(ABORT, 'append failure'); END;",
+                    )
+                    .expect("install failing append");
+            }
+            write_lock
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("hold writer lock");
+
+            let payload = cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall {
+                chainId: U256::from(31337_u64),
+                appContract: Address::ZERO,
+                msgSender: Address::ZERO,
+                blockNumber: U256::from(7),
+                blockTimestamp: U256::from(1_700_000_000_u64),
+                prevRandao: U256::ZERO,
+                index: U256::ZERO,
+                payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+                    nonce: 0,
+                    frames: Vec::new(),
+                })
+                .into(),
+            }
+            .abi_encode();
+            let (event, mut log) = input_added_pair(
+                0,
+                payload,
+                Some(7),
+                Some(alloy_primitives::B256::repeat_byte(0xaa)),
+            );
+            log.inner.data = event.encode_log_data();
+            let asserter = alloy::transports::mock::Asserter::new();
+            asserter.push_success(&alloy_primitives::U64::from(31337_u64));
+            asserter.push_success(&mock_safe_block(7));
+            asserter.push_success(&abi_u256(1));
+            asserter.push_success(&vec![log]);
+            let provider =
+                alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
+            let shutdown = ShutdownSignal::default();
+            let worker_shutdown = shutdown.clone();
+            let mut worker =
+                tokio::spawn(async move { reader.run_loop(&provider, worker_shutdown).await });
+
+            // The current-thread runtime cannot resume this task between the
+            // last mock response and the worker awaiting its SQLite append.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !asserter.read_q().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reader reached its append");
+            shutdown.request_shutdown();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut worker)
+                    .await
+                    .is_err(),
+                "shutdown must join the append that is waiting for SQLite"
+            );
+            write_lock
+                .execute_batch("COMMIT")
+                .expect("release writer lock");
+            let result = tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .expect("reader drained its append")
+                .expect("reader task joined");
+            let mut storage = Storage::open_read_only(&db_path).expect("read settled facts");
+            if fail_append {
+                let error = result.expect_err("an append failure must survive shutdown");
+                assert!(error.is_terminal_invariant(), "got {error:?}");
+                assert_eq!(storage.current_safe_block().expect("safe head"), None);
+            } else {
+                result.expect("reader stopped cleanly after committing");
+                assert_eq!(storage.current_safe_block().expect("safe head"), Some(7));
+                assert!(
+                    storage
+                        .canonical_divergence()
+                        .expect("divergence")
+                        .is_some(),
+                    "the foreign batch's divergence must be visible before reader completion"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_stalled_provider_request() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind RPC listener");
+        let db_file = NamedTempFile::new().expect("temp file");
+        let db_path = db_file.path().to_string_lossy().into_owned();
+        let reader = test_reader(
+            db_path.clone(),
+            format!("http://{}", listener.local_addr().expect("RPC address")),
+            0,
+            Duration::from_secs(60),
+        );
+        let shutdown = ShutdownSignal::default();
+        let worker = reader.start(shutdown.clone()).expect("start reader");
+        let (mut connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("reader connected")
+            .expect("accept RPC connection");
+        let mut request = [0_u8; 1024];
+        let bytes = tokio::time::timeout(Duration::from_secs(2), connection.read(&mut request))
+            .await
+            .expect("reader sent a request")
+            .expect("read RPC request");
+        assert!(bytes > 0);
+
+        // Keep the connection open without ever supplying an RPC response.
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("shutdown must cancel the provider wait")
+            .expect("reader task joined")
+            .expect("ordinary shutdown is clean");
+        let mut storage = Storage::open_read_only(&db_path).expect("read storage");
+        assert_eq!(storage.current_safe_block().expect("safe head"), None);
     }
 
     #[tokio::test]
