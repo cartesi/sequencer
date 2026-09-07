@@ -8,11 +8,10 @@
 //! 1. **Gate + identity**: refuse unless `setup` completed; read the pinned
 //!    deployment identity from the DB (chain id / app address are no longer
 //!    CLI args — they come from the identity).
-//! 2. **Recovery reducer**: inspect one local fact set, execute at most one
-//!    phase, and re-inspect until the reducer selects admission
+//! 2. **Recovery**: inspect local facts, sync L1, and perform the selected repair
 //!    (`crate::recovery` owns the mechanism; this bracket only invokes it).
 //! 3. **Prepare + admit + launch**: prepare every fallible runtime resource,
-//!    re-run the reducer over one consistent fact set, then consume the
+//!    recheck admission over one consistent fact set, then consume the
 //!    single-use admission in one non-yielding worker launch (`workers`).
 //!
 //! Two senses of "admitted": phase 1 is the *lifecycle* gate (the
@@ -149,14 +148,12 @@ where
         "sequencer startup"
     );
 
-    // ── Recovery reducer ─────────────────────────────────────
-    // Local terminal facts are inspected before the first provider call. A
-    // completed phase always returns through the same reducer before another
-    // phase or admission.
+    // ── Recovery ─────────────────────────────────────────────
+    // Local terminal facts are inspected before the first provider call.
     crate::recovery::run_startup_recovery(&db_path, &mut input_reader, &l1_config, &timing).await?;
 
     // Setup persisted a real first price, so run performs no synchronous
-    // fee-source I/O and fee availability never precedes the reducer's local
+    // fee-source I/O and fee availability never precedes recovery's local
     // terminal-fact inspection. The exhaustive identity match is the worker
     // launch decision: fixed mode has no task; Uniswap's supervised worker
     // performs the first runtime quote after admission.
@@ -206,7 +203,7 @@ where
     .await?;
 
     // Preparation may take long enough for a clock/view refusal to arise.
-    // Reinvoke the same reducer over one consistent fact set; workers are
+    // Recheck one consistent fact set; workers are
     // never launched from an aged decision.
     let admission = crate::recovery::admit_runtime(&db_path, &timing)?;
     let mut workers = prepared.launch(admission);

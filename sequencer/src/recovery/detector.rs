@@ -7,7 +7,7 @@
 //! whether recovery or refusal is needed. If so, the task exits with
 //! [`DetectorExit::RecoveryRequired`] — the runtime turns that into a
 //! deliberate non-error process shutdown, the orchestrator respawns, and the
-//! local-first startup reducer takes over.
+//! local-first startup recovery procedure takes over.
 //!
 //! This is its own worker (not part of the batch submitter) because the two
 //! concerns are orthogonal: the submitter makes progress on L1, which involves

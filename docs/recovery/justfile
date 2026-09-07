@@ -1,6 +1,6 @@
 tlc := env("TLC", "tlc")
 
-# Check startup reducer and runtime admission safety
+# Check startup recovery procedure and runtime admission safety
 check-admission:
     {{tlc}} -workers auto -deadlock admission.tla
 

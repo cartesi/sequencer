@@ -15,7 +15,7 @@
 //! - restart policy after a terminal fault: the exit-code contract
 //!   (`crate::commands::error`), which the supervisor is expected to honor;
 //!   there is no database gate. Standard recovery needs no intervention at
-//!   all: every run boots through the fact-derived recovery reducer.
+//!   all: every run boots through the fact-derived recovery procedure.
 //!
 //! The black box (`terminal_faults`) is for operators and postmortems: the
 //! cause of a terminal death, best-effort recorded before the process

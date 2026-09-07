@@ -1295,7 +1295,7 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
         .expect("pin test deployment identity");
 
     // Always record a safe-head observation: production callers are gated by
-    // the startup recovery reducer, so storage paths like `safe_input_frontier`
+    // the startup recovery procedure, so storage paths like `safe_input_frontier`
     // assume a row exists. With no deposits we still write an empty advance
     // so the lane can start without `current_safe_block_required` failing.
     let safe_inputs: Vec<StoredSafeInput> = deposits

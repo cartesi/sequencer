@@ -1,376 +1,183 @@
 ----------------------------- MODULE admission -----------------------------
 (*
- * Run-specific admission model for the startup recovery controller.
+ * Sequential startup while a kernel lock excludes other writers and no
+ * runtime worker exists. Batch/slot mechanics are modeled in preemptive.tla.
  *
- * Batch/L1 slot mechanics stay in preemptive.tla. This model checks the
- * controller protocol implemented by recovery/mod.rs and commands/run/:
+ * Local gate -> initial Sync -> select at most one repair -> clean check
+ * -> task-free Prepare -> final fresh check -> atomic runtime admission.
+ * Closed recovery is Flush -> Sync -> guarded Cascade, regardless of whether
+ * the refreshed danger verdict still calls for recovery. Only Sync can
+ * discover canonical divergence. Flush changes no local recovery fact.
  *
- *   inspect one local SQLite fact set -> classify once -> decide
- *       -> perform at most one phase -> inspect again
- *
- * The first clean decision grants no authority. It starts fallible, task-free
- * Prepare, whose successful completion also returns to local inspection. Only
- * a second clean decision mints the single-use RuntimeAdmission witness.
- *
- * Admission gating is fact-derived: there is no
- * lifecycle admission state machine and no acknowledgement step, and no
- * durable per-attempt record gates anything (the
- * terminal-fault black box is non-gating telemetry outside this model,
- * written at settlement and read only for a boot warning).
- * Settlement and crash both end the attempt, and the next boot begins fresh
- * over whatever facts persist. Divergence and danger facts are durable and
- * survive attempts; everything else is boot-local.
- *
- * Flushed and PostFlushSynced abstract the boot-local session witnesses carried
- * by the Rust controller. They are ephemeral: crash, Retry, and Refuse erase
- * them, so another attempt must flush again before it can cascade.
+ * The flush observation and post-flush view are boot-local. Retry, refusal,
+ * and crash erase them; another attempt must flush again before cascading.
+ * Persisted history and danger facts survive. Terminal-fault telemetry does
+ * not gate admission and is outside the model.
  *)
 
 EXTENDS TLC
 
 Idle          == "Idle"
-InspectLocal  == "InspectLocal"
-Decide        == "Decide"
-Prepare       == "Prepare"
+LocalGate     == "LocalGate"
 InitialSync   == "InitialSync"
+SelectRepair  == "SelectRepair"
 EnsureOpenTip == "EnsureOpenTip"
 RecoverTip    == "RecoverTip"
 Flush         == "Flush"
 PostFlushSync == "PostFlushSync"
 Cascade       == "Cascade"
+CheckRepair   == "CheckRepair"
+Prepare       == "Prepare"
+FinalCheck    == "FinalCheck"
 Admitted      == "Admitted"
 
-PhasePC == {InitialSync, EnsureOpenTip, RecoverTip, Flush, PostFlushSync,
-             Cascade}
-StartupPC == {InspectLocal, Decide, Prepare} \union PhasePC
+StartupPC == {LocalGate, InitialSync, SelectRepair, EnsureOpenTip, RecoverTip,
+              Flush, PostFlushSync, Cascade, CheckRepair, Prepare, FinalCheck}
 ControllerStates == {Idle, Admitted} \union StartupPC
-
-NoProgress       == "NoProgress"
-NeedInitialSync  == "NeedInitialSync"
-Inspecting       == "Inspecting"
-Flushed          == "Flushed"
-PostFlushSynced  == "PostFlushSynced"
-Repaired         == "Repaired"
-
-ProgressStates == {NoProgress, NeedInitialSync, Inspecting, Flushed,
-                    PostFlushSynced, Repaired}
 
 Safe         == "Safe"
 ClosedDanger == "ClosedDanger"
 TipDanger    == "TipDanger"
 RetryDanger  == "RetryDanger"
-
 DangerStates == {Safe, ClosedDanger, TipDanger, RetryDanger}
 
 NoPostFlushView == "NoPostFlushView"
 CaughtUp        == "CaughtUp"
 Behind          == "Behind"
 MissingSafeHead == "MissingSafeHead"
-
 PostFlushViews == {CaughtUp, Behind, MissingSafeHead}
 
-NoDecision == "NoDecision"
-Admit       == "Admit"
-Retry       == "Retry"
-Refuse      == "Refuse"
+VARIABLES controller, admittedRuntime, prepared, flushed, postFlushView,
+          danger, hasFinalizedSnapshot, hasOpenTip, canonicalDivergence
 
-Decisions == {NoDecision, Admit, Retry, Refuse} \union PhasePC
+vars == <<controller, admittedRuntime, prepared, flushed, postFlushView,
+          danger, hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
 
-VARIABLES
-    controller,
-    admittedRuntime,
-    prepared,
-    progress,
-    danger,
-    hasFinalizedSnapshot,
-    hasOpenTip,
-    postFlushView,
-    canonicalDivergence,
-    decision,
-    mustInspect
-
-vars == <<controller, admittedRuntime, prepared, progress,
-          danger, hasFinalizedSnapshot, hasOpenTip, postFlushView,
-          canonicalDivergence, decision, mustInspect>>
-
-HasFlushWitness == progress \in {Flushed, PostFlushSynced}
-HasPostFlushSyncWitness == progress = PostFlushSynced
-
-Reduce(currentProgress, currentDanger, snapshotPresent, tipPresent,
-       currentPostFlushView, diverged) ==
-    IF diverged \/ ~snapshotPresent
-    THEN Refuse
-    ELSE CASE currentProgress = NeedInitialSync -> InitialSync
-         []   currentProgress = Flushed -> PostFlushSync
-         []   currentProgress = PostFlushSynced ->
-                  CASE currentPostFlushView = MissingSafeHead -> Refuse
-                  []   currentPostFlushView = Behind -> Retry
-                  []   OTHER -> Cascade
-         []   currentProgress = Repaired ->
-                  CASE currentDanger = Safe /\ tipPresent -> Admit
-                  []   currentDanger = Safe -> EnsureOpenTip
-                  []   OTHER -> Retry
-         []   currentProgress = Inspecting ->
-                  CASE currentDanger = Safe /\ tipPresent -> Admit
-                  []   currentDanger = Safe -> EnsureOpenTip
-                  []   currentDanger = ClosedDanger -> Flush
-                  []   currentDanger = TipDanger -> RecoverTip
-                  []   OTHER -> Retry
-         []   OTHER -> Refuse
-
----------------------------------------------------------------------------
-(* Initial state: a boot begins over any persisted fact shape, including
- * pre-existing divergence. TLC explores all locally inspectable fact
- * shapes. *)
+LocalTerminal == canonicalDivergence \/ ~hasFinalizedSnapshot
+Clean == ~LocalTerminal /\ danger = Safe /\ hasOpenTip
 
 Init ==
     /\ controller = Idle
     /\ admittedRuntime = FALSE
     /\ prepared = FALSE
-    /\ progress = NoProgress
+    /\ flushed = FALSE
+    /\ postFlushView = NoPostFlushView
     /\ danger \in DangerStates
     /\ hasFinalizedSnapshot \in BOOLEAN
     /\ hasOpenTip \in BOOLEAN
-    /\ postFlushView = NoPostFlushView
     /\ canonicalDivergence \in BOOLEAN
-    /\ decision = NoDecision
-    /\ mustInspect = FALSE
 
-(* Retry/Refuse ends the attempt. Prepared resources and session witnesses do
- * not cross that boundary; the next attempt begins fresh. *)
 Settle ==
     /\ controller' = Idle
     /\ admittedRuntime' = FALSE
     /\ prepared' = FALSE
-    /\ progress' = NoProgress
+    /\ flushed' = FALSE
     /\ postFlushView' = NoPostFlushView
-    /\ decision' = NoDecision
-    /\ mustInspect' = FALSE
-    /\ UNCHANGED <<danger, hasFinalizedSnapshot, hasOpenTip,
-                    canonicalDivergence>>
+    /\ UNCHANGED <<danger, hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
 
----------------------------------------------------------------------------
-(* Attempt begin and the single local inspection step. Begin has no
- * lifecycle-state precondition: the fact gates the code checks here —
- * two-sided setup completion — are outside this model's scope, and the
- * kernel process lock excludes a concurrent owner. *)
+MoveTo(next) ==
+    /\ controller' = next
+    /\ UNCHANGED <<admittedRuntime, prepared, flushed, postFlushView,
+                    danger, hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
 
 BeginRun ==
     /\ controller = Idle
-    /\ controller' = InspectLocal
-    /\ admittedRuntime' = FALSE
-    /\ prepared' = FALSE
-    /\ progress' = NeedInitialSync
-    /\ postFlushView' = NoPostFlushView
-    /\ decision' = NoDecision
-    /\ mustInspect' = TRUE
-    /\ UNCHANGED <<danger, hasFinalizedSnapshot, hasOpenTip,
-                    canonicalDivergence>>
+    /\ MoveTo(LocalGate)
 
-(* One SQLite RecoveryInspection is the only input to Reduce. Persisted
- * divergence and missing finalized state are classified by the same call. *)
-InspectFacts ==
-    /\ controller = InspectLocal
-    /\ controller' = Decide
-    /\ decision' = Reduce(progress, danger, hasFinalizedSnapshot,
-                           hasOpenTip, postFlushView,
-                           canonicalDivergence)
-    /\ mustInspect' = FALSE
-    /\ UNCHANGED <<admittedRuntime, prepared, progress, danger,
-                    hasFinalizedSnapshot, hasOpenTip, postFlushView,
-                    canonicalDivergence>>
+CheckLocalGate ==
+    /\ controller = LocalGate
+    /\ IF LocalTerminal THEN Settle ELSE MoveTo(InitialSync)
 
-(* Storage-open/query failures are centrally classified. A known local
- * divergence cannot be masked by the retry edge. *)
-InspectRetry ==
-    /\ controller = InspectLocal
-    /\ ~canonicalDivergence
-    /\ Settle
+(* Successful sync writes one atomic input/safe-head observation. Only these
+ * two calls can discover new divergence; all other startup actions preserve
+ * it. Initial provider failure may instead use the persisted local view. *)
+SyncCompleted ==
+    /\ controller \in {InitialSync, PostFlushSync}
+    /\ ~LocalTerminal
+    /\ \E nextDanger \in DangerStates, diverged \in BOOLEAN:
+        /\ danger' = nextDanger
+        /\ canonicalDivergence' = diverged
+        /\ IF controller = InitialSync
+           THEN /\ controller' = SelectRepair
+                /\ postFlushView' = NoPostFlushView
+           ELSE /\ controller' = Cascade
+                /\ postFlushView' \in PostFlushViews
+        /\ UNCHANGED <<admittedRuntime, prepared, flushed,
+                        hasFinalizedSnapshot, hasOpenTip>>
 
-InspectRefuse ==
-    /\ controller = InspectLocal
-    /\ Settle
-
----------------------------------------------------------------------------
-(* Decision handling before preparation. *)
-
-DecidePhase ==
-    /\ controller = Decide
-    /\ ~prepared
-    /\ decision \in PhasePC
-    /\ controller' = decision
-    /\ UNCHANGED <<admittedRuntime, prepared, progress, danger,
-                    hasFinalizedSnapshot, hasOpenTip, postFlushView,
-                    canonicalDivergence, decision, mustInspect>>
-
-DecideRetry ==
-    /\ controller = Decide
-    /\ decision = Retry
-    /\ Settle
-
-DecideRefuse ==
-    /\ controller = Decide
-    /\ decision = Refuse
-    /\ Settle
-
-(* The first clean decision begins authority-neutral, task-free preparation. *)
-BeginPrepare ==
-    /\ controller = Decide
-    /\ ~prepared
-    /\ decision = Admit
-    /\ controller' = Prepare
-    /\ UNCHANGED <<admittedRuntime, prepared, progress, danger,
-                    hasFinalizedSnapshot, hasOpenTip, postFlushView,
-                    canonicalDivergence, decision, mustInspect>>
-
-(* If the final inspection no longer says Admit, prepared resources are
- * dropped and the attempt exits; no new recovery phase runs on the aged
- * prepared state. *)
-PreparedDecisionChanged ==
-    /\ controller = Decide
-    /\ prepared
-    /\ decision \in PhasePC
-    /\ Settle
-
-(* The capability boundary: the final clean decision and the RuntimeAdmission
- * witness are one atomic action; launch consumes the witness without
- * yielding. *)
-AdmitRuntime ==
-    /\ controller = Decide
-    /\ prepared
-    /\ decision = Admit
-    /\ controller' = Admitted
-    /\ admittedRuntime' = TRUE
-    /\ UNCHANGED <<prepared, progress, danger, hasFinalizedSnapshot,
-                    hasOpenTip, postFlushView, canonicalDivergence,
-                    decision, mustInspect>>
-
----------------------------------------------------------------------------
-(* Recovery phase completion. Every successful phase returns to InspectLocal.
- * InitialSync and PostFlushSync may update observed danger facts; either Sync
- * may also discover canonical divergence. *)
-
-CompletePhase(nextProgress, nextDanger, nextTipPresent, nextPostFlushView,
-              discoversDivergence) ==
-    /\ controller \in PhasePC
-    /\ ~prepared
-    /\ ~canonicalDivergence
-    /\ controller' = InspectLocal
-    /\ progress' = nextProgress
-    /\ danger' = nextDanger
-    /\ hasOpenTip' = nextTipPresent
-    /\ postFlushView' = nextPostFlushView
-    /\ canonicalDivergence' = discoversDivergence
-    /\ decision' = NoDecision
-    /\ mustInspect' = TRUE
-    /\ UNCHANGED <<admittedRuntime, prepared, hasFinalizedSnapshot>>
-
-InitialSyncCompleted ==
+InitialProviderFailure ==
     /\ controller = InitialSync
-    /\ \E nextDanger \in DangerStates:
-        CompletePhase(Inspecting, nextDanger, hasOpenTip,
-                      NoPostFlushView, FALSE)
+    /\ MoveTo(SelectRepair)
 
-(* `hasOpenTip' = TRUE` is an enforced postcondition, not an assumption:
- * `ensure_open_tip_for_recovery` re-reads the Tip inside its own transaction
- * and refuses rather than commit without one (storage/recovery.rs). *)
-EnsureOpenTipCompleted ==
-    /\ controller = EnsureOpenTip
-    /\ CompletePhase(Repaired, Safe, TRUE, NoPostFlushView, FALSE)
-
-(* The two repair completions restrict post-repair facts deliberately: these
- * are faithful storage postconditions, not narrowing. `hasOpenTip' = TRUE`
- * because `recover_aging_tip_for_recovery` / `cascade_and_reopen` end with a
- * valid open batch in the same transaction (storage/recovery.rs). Danger is
- * `{Safe, RetryDanger}`: RecoverTip fires only after the closed frontier was
- * checked clean and its cascade touches only `>= tip`, Cascade invalidates
- * the whole non-gold closed suffix, the fresh tip's first frame carries the
- * current safe block, and no repair phase contacts L1 — so ClosedDanger /
- * TipDanger cannot reappear and only the retryable observations remain.
- * Widening either action would model states the implementation cannot
- * produce. *)
-RecoverTipCompleted ==
-    /\ controller = RecoverTip
-    /\ \E nextDanger \in {Safe, RetryDanger}:
-        CompletePhase(Repaired, nextDanger, TRUE,
-                      NoPostFlushView, FALSE)
+SelectAction ==
+    /\ controller = SelectRepair
+    /\ IF LocalTerminal \/ danger = RetryDanger
+       THEN Settle
+       ELSE CASE danger = Safe /\ hasOpenTip -> MoveTo(Prepare)
+            []   danger = Safe -> MoveTo(EnsureOpenTip)
+            []   danger = TipDanger -> MoveTo(RecoverTip)
+            []   danger = ClosedDanger -> MoveTo(Flush)
 
 FlushCompleted ==
     /\ controller = Flush
-    /\ CompletePhase(Flushed, danger, hasOpenTip,
-                     NoPostFlushView, FALSE)
+    /\ controller' = PostFlushSync
+    /\ flushed' = TRUE
+    /\ UNCHANGED <<admittedRuntime, prepared, postFlushView, danger,
+                    hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
 
-PostFlushSyncCompleted ==
-    /\ controller = PostFlushSync
-    /\ \E nextDanger \in DangerStates:
-        \E nextView \in PostFlushViews:
-            CompletePhase(PostFlushSynced, nextDanger, hasOpenTip,
-                          nextView, FALSE)
+(* Repair methods commit an open Tip in the same transaction as their
+ * mutation. No L1 observation changes, so observed danger cannot reappear;
+ * elapsed time or a clock fault can still leave RetryDanger. *)
+CommitRepair ==
+    /\ controller' = CheckRepair
+    /\ hasOpenTip' = TRUE
+    /\ danger' \in {Safe, RetryDanger}
+    /\ UNCHANGED <<admittedRuntime, prepared, flushed, postFlushView,
+                    hasFinalizedSnapshot, canonicalDivergence>>
 
-CascadeCompleted ==
+LocalRepairCompleted ==
+    /\ controller \in {EnsureOpenTip, RecoverTip}
+    /\ ~LocalTerminal
+    /\ CommitRepair
+
+(* The cascade transaction itself checks new terminal facts and the observed
+ * flush floor. Even a now-Safe view must take this branch: the flushed suffix
+ * may contain young unresolved batches that no longer trigger danger. *)
+GuardedCascade ==
     /\ controller = Cascade
-    /\ \E nextDanger \in {Safe, RetryDanger}:
-        CompletePhase(Repaired, nextDanger, TRUE,
-                      NoPostFlushView, FALSE)
+    /\ IF LocalTerminal \/ postFlushView # CaughtUp
+       THEN Settle
+       ELSE CommitRepair
 
-SyncDiscoversDivergence ==
-    \/ /\ controller = InitialSync
-       /\ \E nextDanger \in DangerStates:
-           CompletePhase(Inspecting, nextDanger, hasOpenTip,
-                         NoPostFlushView, TRUE)
-    \/ /\ controller = PostFlushSync
-       /\ \E nextDanger \in DangerStates:
-           \E nextView \in PostFlushViews:
-               CompletePhase(PostFlushSynced, nextDanger, hasOpenTip,
-                             nextView, TRUE)
+CheckRepairCompleted ==
+    /\ controller = CheckRepair
+    /\ IF Clean THEN MoveTo(Prepare) ELSE Settle
 
-PhaseRetry ==
-    /\ controller \in PhasePC
-    /\ ~canonicalDivergence
-    /\ Settle
-
-PhaseRefuse ==
-    /\ controller \in PhasePC
-    /\ ~canonicalDivergence
-    /\ Settle
-
----------------------------------------------------------------------------
-(* Fallible task-free preparation. Time may pass, so the next inspection may
- * derive a different danger status even though preparation changes no local
- * recovery fact itself. *)
-
+(* Preparation changes no durable recovery fact. Its duration can invalidate
+ * a previously clean view, so final admission must check current danger. *)
 PrepareCompleted ==
     /\ controller = Prepare
-    /\ ~prepared
-    /\ decision = Admit
-    /\ \E nextDanger \in DangerStates:
-        /\ controller' = InspectLocal
-        /\ prepared' = TRUE
-        /\ progress' = Inspecting
-        /\ danger' = nextDanger
-        /\ decision' = NoDecision
-        /\ mustInspect' = TRUE
-        /\ UNCHANGED <<admittedRuntime, hasFinalizedSnapshot,
-                        hasOpenTip, postFlushView,
-                        canonicalDivergence>>
+    /\ controller' = FinalCheck
+    /\ prepared' = TRUE
+    /\ danger' \in {Safe, RetryDanger}
+    /\ UNCHANGED <<admittedRuntime, flushed, postFlushView,
+                    hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
 
-PrepareRetry ==
-    /\ controller = Prepare
-    /\ ~canonicalDivergence
+FinalAdmission ==
+    /\ controller = FinalCheck
+    /\ IF Clean
+       THEN /\ controller' = Admitted
+            /\ admittedRuntime' = TRUE
+            /\ UNCHANGED <<prepared, flushed, postFlushView, danger,
+                            hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
+       ELSE Settle
+
+(* Typed I/O/guard failures terminate the attempt. In particular, post-flush
+ * Sync has no provider-failure fallback. Guard time can age the selected
+ * Safe/TipDanger state before the corresponding local write. *)
+OperationFailed ==
+    /\ controller \in StartupPC
     /\ Settle
-
-PrepareRefuse ==
-    /\ controller = Prepare
-    /\ ~canonicalDivergence
-    /\ Settle
-
----------------------------------------------------------------------------
-(* Crash destroys PreparedRuntime, the RuntimeAdmission witness, and session
- * witnesses.
- * Nothing durable gates the next boot (the terminal-fault black box
- * is non-gating telemetry), so a restart is simply a fresh attempt over the
- * surviving durable facts. Modeled as returning directly to the pre-begin
- * shape with facts unchanged. *)
 
 Crash ==
     /\ controller \in StartupPC \union {Admitted}
@@ -378,148 +185,61 @@ Crash ==
 
 CleanShutdown ==
     /\ controller = Admitted
-    /\ admittedRuntime
     /\ Settle
 
 ---------------------------------------------------------------------------
-(* Safety invariants. *)
+(* Semantic safety properties, independent of how inspections are factored. *)
 
 TypeOK ==
     /\ controller \in ControllerStates
     /\ admittedRuntime \in BOOLEAN
     /\ prepared \in BOOLEAN
-    /\ progress \in ProgressStates
+    /\ flushed \in BOOLEAN
+    /\ postFlushView \in PostFlushViews \union {NoPostFlushView}
     /\ danger \in DangerStates
     /\ hasFinalizedSnapshot \in BOOLEAN
     /\ hasOpenTip \in BOOLEAN
-    /\ postFlushView \in PostFlushViews \union {NoPostFlushView}
     /\ canonicalDivergence \in BOOLEAN
-    /\ decision \in Decisions
-    /\ mustInspect \in BOOLEAN
-
-ControllerShape ==
-    /\ controller = Idle =>
-        /\ ~admittedRuntime
-        /\ ~prepared
-        /\ progress = NoProgress
-    /\ controller \in StartupPC => ~admittedRuntime
-
-ProgressShape ==
-    /\ controller \in StartupPC => progress \in ProgressStates \ {NoProgress}
-    /\ controller = Admitted => progress = Inspecting
-    /\ postFlushView # NoPostFlushView <=> HasPostFlushSyncWitness
-    /\ prepared =>
-        /\ progress = Inspecting
-        /\ controller \in {InspectLocal, Decide, Admitted}
 
 AdmittedRuntimeSound ==
-    admittedRuntime =>
-        /\ controller = Admitted
-        /\ prepared
-        /\ progress = Inspecting
-        /\ decision = Admit
-        /\ decision = Reduce(progress, danger, hasFinalizedSnapshot,
-                             hasOpenTip, postFlushView,
-                             canonicalDivergence)
-        /\ danger = Safe
-        /\ hasFinalizedSnapshot
-        /\ hasOpenTip
-        /\ ~canonicalDivergence
+    admittedRuntime => controller = Admitted /\ prepared /\ Clean
 
-AdmissionIsAtomic ==
-    controller = Admitted => admittedRuntime
-
-MandatoryReinspection ==
-    mustInspect =>
-        /\ controller = InspectLocal
-        /\ ~admittedRuntime
-
-ClassifiedOnce ==
-    controller = Decide =>
-        decision = Reduce(progress, danger, hasFinalizedSnapshot,
-                          hasOpenTip, postFlushView,
-                          canonicalDivergence)
+AdmissionIsAtomic == (controller = Admitted) = admittedRuntime
 
 EphemeralWitnessScope ==
-    /\ HasPostFlushSyncWitness => HasFlushWitness
-    /\ HasFlushWitness =>
-        /\ ~prepared
-        /\ controller \in StartupPC
-    /\ controller = PostFlushSync => progress = Flushed
-    /\ controller = Cascade =>
-        /\ progress = PostFlushSynced
-        /\ postFlushView = CaughtUp
+    /\ controller \in {Idle, LocalGate, InitialSync, SelectRepair, Flush}
+        => ~flushed /\ postFlushView = NoPostFlushView
+    /\ controller = PostFlushSync => flushed /\ postFlushView = NoPostFlushView
+    /\ controller = Cascade => flushed /\ postFlushView \in PostFlushViews
+    /\ postFlushView # NoPostFlushView => flushed
+    /\ controller = Idle => ~prepared /\ ~admittedRuntime
 
-LocalDivergenceFirst ==
-    /\ canonicalDivergence => ~admittedRuntime
-    /\ canonicalDivergence /\ controller = Decide => decision = Refuse
-    /\ controller \in ({Prepare, Admitted} \union PhasePC) =>
-        ~canonicalDivergence
+LocalTerminalDominance ==
+    /\ LocalTerminal => ~admittedRuntime
+    /\ controller \in {InitialSync, EnsureOpenTip, RecoverTip, Flush,
+                         PostFlushSync, Prepare, FinalCheck, Admitted}
+        => ~LocalTerminal
 
-PhasePreconditions ==
-    /\ controller \in PhasePC => decision = controller
-    /\ controller = InitialSync => progress = NeedInitialSync
-    /\ controller = EnsureOpenTip =>
-        /\ progress \in {Inspecting, Repaired}
-        /\ danger = Safe
-        /\ ~hasOpenTip
-    /\ controller = RecoverTip =>
-        /\ progress = Inspecting
-        /\ danger = TipDanger
-    /\ controller = Flush =>
-        /\ progress = Inspecting
-        /\ danger = ClosedDanger
+PostFlushRepairSound ==
+    flushed /\ controller \in {CheckRepair, Prepare, FinalCheck, Admitted}
+        => postFlushView = CaughtUp
 
-PrepareRequiresFirstCleanInspection ==
-    controller = Prepare =>
-        /\ ~prepared
-        /\ progress \in {Inspecting, Repaired}
-        /\ decision = Admit
-        /\ danger = Safe
-        /\ hasFinalizedSnapshot
-        /\ hasOpenTip
-        /\ ~canonicalDivergence
+RepairPreconditions ==
+    /\ controller = EnsureOpenTip => danger = Safe /\ ~hasOpenTip
+    /\ controller = RecoverTip => danger = TipDanger
+    /\ controller = Flush => danger = ClosedDanger
+    /\ controller = CheckRepair => hasOpenTip /\ ~LocalTerminal
+    /\ controller = Prepare => Clean /\ ~prepared
+    /\ prepared => controller \in {FinalCheck, Admitted}
 
-Inv ==
-    /\ TypeOK
-    /\ ControllerShape
-    /\ ProgressShape
-    /\ AdmittedRuntimeSound
-    /\ AdmissionIsAtomic
-    /\ MandatoryReinspection
-    /\ ClassifiedOnce
-    /\ EphemeralWitnessScope
-    /\ LocalDivergenceFirst
-    /\ PhasePreconditions
-    /\ PrepareRequiresFirstCleanInspection
+Inv == TypeOK /\ AdmittedRuntimeSound /\ AdmissionIsAtomic
+       /\ EphemeralWitnessScope /\ LocalTerminalDominance /\ PostFlushRepairSound
+       /\ RepairPreconditions
 
----------------------------------------------------------------------------
-
-Next ==
-    \/ BeginRun
-    \/ InspectFacts
-    \/ InspectRetry
-    \/ InspectRefuse
-    \/ DecidePhase
-    \/ DecideRetry
-    \/ DecideRefuse
-    \/ BeginPrepare
-    \/ PreparedDecisionChanged
-    \/ AdmitRuntime
-    \/ InitialSyncCompleted
-    \/ EnsureOpenTipCompleted
-    \/ RecoverTipCompleted
-    \/ FlushCompleted
-    \/ PostFlushSyncCompleted
-    \/ CascadeCompleted
-    \/ SyncDiscoversDivergence
-    \/ PhaseRetry
-    \/ PhaseRefuse
-    \/ PrepareCompleted
-    \/ PrepareRetry
-    \/ PrepareRefuse
-    \/ Crash
-    \/ CleanShutdown
+Next == BeginRun \/ CheckLocalGate \/ SyncCompleted \/ InitialProviderFailure
+        \/ SelectAction \/ FlushCompleted \/ LocalRepairCompleted \/ GuardedCascade
+        \/ CheckRepairCompleted \/ PrepareCompleted \/ FinalAdmission
+        \/ OperationFailed \/ Crash \/ CleanShutdown
 
 Spec == Init /\ [][Next]_vars
 

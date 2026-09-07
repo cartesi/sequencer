@@ -394,7 +394,7 @@ CREATE TABLE IF NOT EXISTS canonical_divergence (
 -- I15 structural enforcement: while the divergence marker exists, the batch
 -- tree, promotions, and the pending-snapshot pool are frozen in the engine
 -- itself. Standard recovery is forbidden on a diverged frontier; the typed
--- Rust refusals (the local-first startup reducer plus guarded Tip/Cascade
+-- Rust refusals (the local-first startup recovery procedure plus guarded Tip/Cascade
 -- mutations and atomic runtime admission) remain the friendly error surface, but these
 -- triggers are the enforcement a forgotten call site cannot bypass. The accepted
 -- frontier (`safe_accepted_batches`) has no trigger: its single writer refuses
