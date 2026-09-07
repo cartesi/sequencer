@@ -100,15 +100,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readyz_is_unavailable_after_storage_invariant_failure() {
-        let (state, _rx) = fresh_state();
-        state
-            .shutdown
-            .contain_storage_invariant_failure("test fault");
-        assert_eq!(readyz(State(state)).await, StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[tokio::test]
     async fn readyz_is_unavailable_when_lane_dropped() {
         let (state, rx) = fresh_state();
         drop(rx);

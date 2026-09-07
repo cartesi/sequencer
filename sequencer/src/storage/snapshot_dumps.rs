@@ -81,14 +81,7 @@ impl Drop for LeaseGuard {
         (self.schedule)(Box::new(move || match Storage::open_writer(&path) {
             Ok(mut storage) => {
                 if let Err(err) = storage.release_dump_lease(dump_id) {
-                    // Log before reporting: the reporter blocks on the
-                    // externalization gate, and the operator must see the
-                    // actual error even if publication stalls.
                     if is_persistent_storage_error(&err) {
-                        tracing::error!(
-                            error = %err, dump_id,
-                            "snapshot lease release failed persistently",
-                        );
                         report_persistent_failure(&format!(
                             "snapshot lease release for dump {dump_id} failed persistently: {err}"
                         ));
@@ -102,10 +95,6 @@ impl Drop for LeaseGuard {
             }
             Err(err) => {
                 if is_persistent_storage_open_error(&err) {
-                    tracing::error!(
-                        error = %err, dump_id,
-                        "snapshot lease release: writer open failed persistently",
-                    );
                     report_persistent_failure(&format!(
                         "snapshot lease release for dump {dump_id}: writer open failed persistently: {err}"
                     ));

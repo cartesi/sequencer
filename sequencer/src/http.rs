@@ -29,7 +29,7 @@ use crate::egress::api::SubscribeState;
 use crate::egress::l2_tx_feed::L2TxFeed;
 use crate::ingress::api::SubmitState;
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
-use crate::runtime::shutdown::RuntimeScope;
+use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
 use crate::storage::ReleaseScheduler;
 use sequencer_core::api::{TxRequest, TxRequestError};
 
@@ -163,17 +163,12 @@ type SnapshotReleaseTask = Box<dyn FnOnce() + Send + 'static>;
 /// including a guard dropping concurrently with graceful HTTP shutdown.
 struct SnapshotReleaseDrain {
     supervisor: JoinHandle<()>,
-    shutdown: RuntimeScope,
 }
 
 impl SnapshotReleaseDrain {
     async fn finish(self) {
         if let Err(join) = self.supervisor.await {
-            tracing::error!(
-                error = %join,
-                "snapshot lease release supervisor task failed"
-            );
-            self.shutdown.contain_storage_invariant_failure(format!(
+            abort_terminal(format_args!(
                 "snapshot lease release supervisor task failed: {join}"
             ));
         }
@@ -184,35 +179,21 @@ fn supervise_snapshot_releases(shutdown: RuntimeScope) -> (ReleaseScheduler, Sna
     let (sender, receiver) = mpsc::unbounded_channel::<SnapshotReleaseTask>();
     let schedule_shutdown = shutdown.clone();
     let scheduler: ReleaseScheduler = Arc::new(move |release| {
+        let _runtime_lifetime = &schedule_shutdown;
         if sender.send(release).is_err() {
-            tracing::error!("snapshot lease release supervisor is unavailable");
-            // A closed receiver while this producer still exists means the
-            // supervisor failed. Containment is sync and callable from any
-            // thread — the old `tokio::spawn` wrapper was residue of the
-            // deleted async containment API and would have panicked on a
-            // non-runtime thread. `SnapshotReleaseDrain` also
-            // classifies its join before the HTTP worker can finish.
-            schedule_shutdown.contain_storage_invariant_failure(
-                "snapshot lease release supervisor is unavailable",
-            );
+            abort_terminal("snapshot lease release supervisor is unavailable");
         }
     });
     let supervisor_shutdown = shutdown.clone();
     let supervisor = tokio::spawn(async move {
         run_snapshot_release_supervisor(receiver, supervisor_shutdown).await;
     });
-    (
-        scheduler,
-        SnapshotReleaseDrain {
-            supervisor,
-            shutdown,
-        },
-    )
+    (scheduler, SnapshotReleaseDrain { supervisor })
 }
 
 async fn run_snapshot_release_supervisor(
     mut receiver: mpsc::UnboundedReceiver<SnapshotReleaseTask>,
-    shutdown: RuntimeScope,
+    _shutdown: RuntimeScope,
 ) {
     let mut releases = JoinSet::new();
     let mut accepting = true;
@@ -229,14 +210,7 @@ async fn run_snapshot_release_supervisor(
             }
             result = releases.join_next(), if !releases.is_empty() => {
                 if let Some(Err(join)) = result {
-                    tracing::error!(
-                        error = %join,
-                        "snapshot lease release task failed"
-                    );
-                    shutdown
-                        .contain_storage_invariant_failure(format!(
-                            "snapshot lease release task panicked: {join}"
-                        ));
+                    abort_terminal(format_args!("snapshot lease release task panicked: {join}"));
                 }
             }
         }
@@ -320,8 +294,7 @@ pub(crate) fn start_on_listener(
                 shutdown.wait_for_shutdown().await;
             })
             .await;
-        // `Workers::finish` awaits this server handle before its final sticky
-        // fault check, so no supervised release may outlive classification.
+        // Finish every scheduled release before ordinary HTTP shutdown ends.
         snapshot_release_drain.finish().await;
         result
     })
@@ -336,12 +309,11 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn snapshot_release_drain_waits_for_late_terminal_report() {
+    async fn snapshot_release_drain_waits_for_late_release() {
         let shutdown = RuntimeScope::default();
         let (schedule, drain) = supervise_snapshot_releases(shutdown.clone());
         let (started_tx, started_rx) = oneshot::channel();
         let (unblock_tx, unblock_rx) = std::sync::mpsc::channel();
-        let release_shutdown = shutdown.clone();
         let mut drain_task = tokio::spawn(drain.finish());
 
         // Start draining first. The scheduler's producer token must keep the
@@ -353,7 +325,6 @@ mod tests {
         schedule(Box::new(move || {
             let _ = started_tx.send(());
             unblock_rx.recv().expect("release test gate");
-            release_shutdown.contain_storage_invariant_failure("test release fault");
         }));
         started_rx.await.expect("release task started");
         drop(schedule);
@@ -367,21 +338,20 @@ mod tests {
 
         unblock_tx.send(()).expect("unblock release");
         drain_task.await.expect("join release drain");
-        assert!(
-            shutdown.is_storage_invariant_contained(),
-            "the terminal report must be sticky before the drain returns"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
     async fn snapshot_release_task_panic_is_terminal_before_drain_returns() {
-        let shutdown = RuntimeScope::default();
-        let (schedule, drain) = supervise_snapshot_releases(shutdown.clone());
-
+        if !crate::runtime::shutdown::abort_test_child(
+            "http::tests::snapshot_release_task_panic_is_terminal_before_drain_returns",
+        ) {
+            return;
+        }
+        let (schedule, drain) = supervise_snapshot_releases(RuntimeScope::default());
         schedule(Box::new(|| panic!("simulated lease release panic")));
         drop(schedule);
         drain.finish().await;
-
-        assert!(shutdown.is_storage_invariant_contained());
+        panic!("terminal runtime returned instead of aborting");
     }
 }

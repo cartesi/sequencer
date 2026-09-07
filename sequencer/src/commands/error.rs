@@ -42,8 +42,6 @@ pub enum CommandError {
     Bootstrap(#[from] BootstrapError),
     #[error("worker exited: {0}")]
     Worker(#[from] WorkerExit),
-    #[error("persistent storage invariant violation: {cause}")]
-    StorageInvariantViolation { cause: String },
     #[error("DB-referenced snapshot artifact {path:?} failed: {source}")]
     ReferencedSnapshotArtifact {
         path: std::path::PathBuf,
@@ -68,8 +66,8 @@ pub enum CommandError {
 // The exit code remains an ops hint, never protocol authority over the next
 // boot. Reserved: 1 (unclassified), 2 (clap usage), and 101 for a panic
 // before the command harness can project trusted-code failures to 30. A
-// terminal containment that cannot drain within the terminal abort bound
-// exits via `abort()` (SIGABRT/134), bypassing this projection deliberately;
+// diagnosed terminal runtime fault immediately exits via `abort()` (SIGABRT/134),
+// bypassing this projection deliberately;
 // supervisors must treat 134 from the sequencer as terminal-class
 // (`docs/watchdog/operator-deployment.md` says how).
 
@@ -134,11 +132,6 @@ impl CommandError {
             CommandError::Worker(WorkerExit::DangerDetected { status }) => {
                 danger_failure_verdict(status)
             }
-            // A storage decoder panic means the durable state violated an
-            // internal contract. Restarting cannot repair that row. Egress
-            // reports the same condition through the supervisor's terminal
-            // fault signal; background tasks retain it in their exit shape.
-            CommandError::StorageInvariantViolation { .. } => CommandFailureVerdict::Terminal,
             // Admission-fact refusals are terminal: the wrong command for
             // this database, the absorbing divergence, a malformed black
             // box. A plain storage failure underneath a lifecycle operation
@@ -681,8 +674,8 @@ impl From<crate::runtime::process_lock::ProcessLockError> for CommandError {
 /// One shared classification for the keyed signer-provider constructor, so
 /// `setup`, `flush-mempool`, and any future keyed command cannot drift (the
 /// three sites previously classified `Create` three different ways). The
-/// run-recovery reducer keeps its own explicit Retry/Refuse polarity map —
-/// that polarity is the reducer's to own — but its terminal/transient split
+/// run-recovery procedure keeps its own explicit Retry/Refuse polarity map —
+/// that polarity is recovery's to own — but its terminal/transient split
 /// must agree with this one.
 impl From<crate::l1::provider::VerifiedSignerProviderError> for BootstrapError {
     fn from(e: crate::l1::provider::VerifiedSignerProviderError) -> Self {
@@ -939,12 +932,7 @@ mod tests {
     /// Class 30: do not restart; page. The state cannot self-heal, so the
     /// black box records the cause (`is_terminal`) for exactly these rows.
     fn terminal() -> Vec<Row> {
-        let mut rows: Vec<Row> = vec![(
-            CommandError::StorageInvariantViolation {
-                cause: "test cause".into(),
-            },
-            "a broken durable invariant",
-        )];
+        let mut rows: Vec<Row> = vec![];
         // A key file that is missing, unreadable, not a file, or not text is
         // the same operator mistake as bad key content one call later, and
         // must not differ from it by 29 in the exit code.
@@ -1015,12 +1003,6 @@ mod tests {
             (
                 detector_worker(DangerDetectorError::StorageTaskPanicked),
                 "a detector storage-task panic",
-            ),
-            (
-                submitter_worker(BatchSubmitterError::Poster(
-                    BatchPosterError::StorageInvariantViolation,
-                )),
-                "a poster storage-invariant violation",
             ),
             (
                 submitter_worker(BatchSubmitterError::Poster(BatchPosterError::Watermark(

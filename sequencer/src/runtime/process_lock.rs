@@ -16,15 +16,11 @@
 //! a kernel-held lock can — it vanishes with the process, however the process
 //! dies. This prevents two processes from racing settlement, rebuild, or
 //! boot on one data dir, and is the exclusive-ownership primitive the
-//! authority-boundary ADR's durable lifecycle builds on. A non-owning weak
-//! witness to the same descriptor also drives terminal shutdown: at the
-//! terminal abort deadline (`super::shutdown`), a live witness means some
-//! holder — a worker, a nested blocking task, or the controller itself
-//! through settlement — still owns the directory, and the process aborts.
+//! authority-boundary ADR's durable lifecycle builds on.
 
 use std::fs::{File, TryLockError};
 use std::path::Path;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -61,20 +57,6 @@ pub(crate) struct ProcessLock {
     _file: Arc<File>,
 }
 
-/// Non-owning observation of a command/runtime lifetime. The terminal abort
-/// watchdog uses this to distinguish a completed drain from work that still
-/// owns the data directory without retaining the lock itself.
-#[derive(Clone, Debug)]
-pub(crate) struct ProcessLockWitness {
-    file: Weak<File>,
-}
-
-impl ProcessLockWitness {
-    pub(crate) fn is_held(&self) -> bool {
-        self.file.upgrade().is_some()
-    }
-}
-
 impl ProcessLock {
     /// Acquire the exclusive data-directory lock without blocking.
     /// [`ProcessLockError::Locked`] means another live process owns the
@@ -109,14 +91,6 @@ impl ProcessLock {
             Self::acquire(dir.path().to_str().expect("utf8 path")).expect("test lock acquire");
         std::mem::forget(dir);
         lock
-    }
-
-    /// Return a non-owning witness for the lifetime of this lock and all of
-    /// its clones. Observing the witness never extends that lifetime.
-    pub(crate) fn witness(&self) -> ProcessLockWitness {
-        ProcessLockWitness {
-            file: Arc::downgrade(&self._file),
-        }
     }
 }
 
@@ -187,27 +161,6 @@ mod tests {
 
         drop(retained);
         ProcessLock::acquire(data_dir).expect("last clone releases the lock");
-    }
-
-    #[test]
-    fn weak_witness_tracks_the_last_lock_owner_without_retaining_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let data_dir = dir.path().to_str().expect("utf8 path");
-        let original = ProcessLock::acquire(data_dir).expect("acquire");
-        let retained = original.clone();
-        let witness = original.witness();
-
-        assert!(witness.is_held());
-        drop(original);
-        assert!(
-            witness.is_held(),
-            "a retained clone still owns the lifetime"
-        );
-        drop(retained);
-        assert!(
-            !witness.is_held(),
-            "the weak witness must not retain the lock"
-        );
     }
 
     #[tokio::test]

@@ -19,8 +19,11 @@ pub enum SubscribeError {
         #[source]
         source: rusqlite::Error,
     },
-    #[error("persistent storage invariant violation while preparing subscription")]
-    StorageInvariantViolation,
+    #[error("subscription preparation task join error: {source}")]
+    Join {
+        #[source]
+        source: tokio::task::JoinError,
+    },
     #[error(
         "catch-up window exceeded: requested offset {requested_offset}, live start {live_start_offset}, max {max_catchup_events}"
     )]
@@ -36,7 +39,7 @@ impl SubscribeError {
         match self {
             Self::OpenStorage { source } => open_error_is_persistent(source),
             Self::LoadHeadOffset { source } => is_persistent_storage_error(source),
-            Self::StorageInvariantViolation => true,
+            Self::Join { source } => source.is_panic(),
             Self::CatchUpWindowExceeded { .. } => false,
         }
     }
@@ -55,8 +58,6 @@ pub enum SubscriptionError {
         #[source]
         source: rusqlite::Error,
     },
-    #[error("persistent storage invariant violation while reading subscription")]
-    StorageInvariantViolation,
     #[error("subscription task join error: {source}")]
     Join {
         #[source]
@@ -69,7 +70,6 @@ impl SubscriptionError {
         match self {
             Self::OpenStorage { source } => open_error_is_persistent(source),
             Self::LoadReplay { source, .. } => is_persistent_storage_error(source),
-            Self::StorageInvariantViolation => true,
             Self::Join { source } => source.is_panic(),
         }
     }

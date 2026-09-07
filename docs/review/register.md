@@ -15,6 +15,12 @@ Findings 19–31 and the 2026-09-03 refuted block come from the
 [branch stock-take](2026-09-03-branch-stocktake.md), which records every
 proposal that review raised, including the ones no jury examined.
 
+The 2026-09-07 maintainer-approved simplification changes two earlier
+premises: terminal runtime faults abort immediately, and startup recovery
+uses an ordered procedure. Earlier dated containment/token and phase-driver
+entries below record their historical rationale; those mechanisms and their
+test-only obligations are superseded by the current ADR and recovery design.
+
 ## Findings
 
 Code findings, oldest first (file references are starting points, not exact
@@ -172,6 +178,11 @@ remaining dated ledgers stay valid.
     Candidate fixes: classify `setup`'s bootstrap failure through the same
     phase table as `run`, or give `setup` its own terminal variant for L1
     misconfiguration. Surfaced by the 2026-09-04 refuters; not yet decided.
+33. **Closed** (2026-09-07): ordinary shutdown no longer cancels the reader's
+    in-flight blocking append. The reader joins it before returning, so the
+    final clean-exit check sees committed divergence and append failures
+    reach the supervisor. The actual worker-loop regression fails when
+    cancellation around the append is restored.
 
 Open maintainer decisions:
 
@@ -204,10 +215,10 @@ Statuses swept 2026-08-22 and updated through 2026-09-04.
   the real command bracket (`harness.rs`, `run` on a never-set-up data
   directory); the five verdicts are pinned to their integers in
   `commands/error.rs`, so renumbering `EXIT_TERMINAL` fails the suite.
-- **A unit test of the production phase→progress mapping in
-  `ProductionRecoveryDriver::perform`** (the scripted-driver traces exercise
-  the test double's copy of it). The `classify_input_reader`
-  `Bootstrap`/`Join` polarity pins landed 2026-09-04.
+- **Closed** (2026-09-07): the phase→progress mapping and scripted driver
+  were removed. Procedure tests now exercise real SQLite inspections and
+  mutations, replacing only external Sync/Flush operations. The
+  `classify_input_reader` polarity pins remain.
 - **Full-tear cascade on a recovered (anchor = `N'`) tree** re-rooting at
   `N'` (anchor unit mechanics are covered; this end-to-end shape is not).
 - **Uniswap-mode fee oracle end-to-end**: every fixture and e2e pins fixed
@@ -296,9 +307,9 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   undrained so `run` leads them exactly once → `cockroach.md` steps 3/6.
 - **Don't resurrect TEST_PLAN.md** (2026-06): the scenario matrix rotted
   once; owed tests live here as a dated, finite list.
-- **The authority boundary** (2026-08, re-evaluated 2026-08-02): four
-  mechanisms — `RuntimeScope`, fact-derived admission, the pure recovery
-  reducer, SQLite-centered runtime with the two-regime lane → the
+- **The authority boundary** (2026-08, re-evaluated 2026-09-07): four
+  mechanisms — process ownership and terminal abort, fact-derived admission,
+  ordered startup recovery, SQLite-centered runtime with the two-regime lane → the
   [ADR](../plans/2026-08-authority-boundary-adr.md).
 - **Storage decode policy** (2026-07): fail-loud for contract-impossible
   values; the named `saturating_query_bound` only where clamping preserves
@@ -306,11 +317,21 @@ Each entry: the decision, its reason, and where the reasoning now lives.
 - **The calibration rule** (2026-08-18): the complexity budget belongs to
   concurrency, mutual exclusion, durability, and hostile-L1 robustness →
   AGENTS.md design principles.
-- **The `Authorized` externalization token** (2026-08-18): the containment
-  consult is a compile-time obligation of the three effect functions that
-  take the token (ack, L1 send, WS emit); the remaining consults are
-  hand-placed and bounded by the exit contract → `runtime/shutdown.rs` (the
-  token) and ADR mechanism 1 (the consult inventory).
+- **Terminal runtime abort** (2026-09-07, supersedes the 2026-08-18
+  `Authorized` token): a diagnosed terminal fault logs and aborts, so there
+  is no terminal runtime to drain or gate. Ordinary shutdown signals,
+  concurrent joins, and process-lock ownership remain. Dedicated-process
+  hosting and prompt diagnostic logging are the supported assumptions;
+  orderly terminal requests and settlement are explicitly given up → ADR
+  mechanism 1.
+- **Snapshot leases remain** (2026-09-07): application dumps may contain a
+  directory of state files. GC racing a download is an ordinary supported
+  operation; relying on open-file unlink behavior is not the general dump
+  lifetime contract → snapshot lifecycle, leases.
+- **Execution-offset continuity has one enforcement point** (2026-09-07):
+  the SQLite trigger rejects a noncanonical offset inside the physical-row
+  transaction. The duplicate Rust loop was removed; rollback, invalidation,
+  and offset-reuse tests remain → I20.
 - **Module homing** (2026-08-19): command brackets in `commands/` (with
   config + the `CommandError` taxonomy), the capability substrate alone in
   `runtime/`, `L1Config` in `l1/`; a full merge was refused because the
@@ -333,12 +354,12 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   Debug-derive open finding → `l1/mod.rs`. Deferred separately: the startup
   log prints the full RPC URL, which the help-leak test treats as
   token-bearing.
-- **One home per mechanism** (2026-09-05): every mechanism has one canonical
+- **One home per mechanism** (2026-09-05, updated 2026-09-07): every mechanism has one canonical
   statement, and every other site is a pointer or an explicitly scoped
-  partial. The homes: the authority-boundary ADR for `RuntimeScope`, the
-  token, and containment (mechanism 1), fact-derived admission and the black
+  partial. The homes: the authority-boundary ADR for `RuntimeScope` and
+  terminal abort (mechanism 1), fact-derived admission and the black
   box (2), and the SQLite-centered runtime and the two-regime lane (4);
-  `docs/recovery/README.md` for the reducer; `docs/invariants.md` for the
+  `docs/recovery/README.md` for the procedure; `docs/invariants.md` for the
   cross-module invariants, the check policy, the writer roles, and the
   divergence freeze (I15) with the check's completeness scope (I9);
   `docs/protocol/scheduler-semantics.md` for the frame clock;
@@ -347,11 +368,11 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   schema for the write-once batch lifecycle; `commands/error.rs` for the
   exit-code contract, with the operator runbook and README carrying the
   operator- and user-facing lists; `runtime/shutdown.rs` and the runbook for
-  the abort bound; this register for refuted proposals and the review
+  terminal stop policy; this register for refuted proposals and the review
   history. Code-side exceptions, where the argument is falsifiable
-  only at the code: the memory-only witness (`RecoveryProgress`), the
-  admission linearization (`admit_runtime`), the one-transaction inspection
-  (`RecoveryInspection`), and the ≤5-phase bound (`drive_recovery`) →
+  only at the code: the stack-local flush observation, the admission
+  linearization (`admit_runtime`), and the one-transaction inspection
+  (`RecoveryInspection`) →
   AGENTS.md "Documentation Practice".
 
 ## Refuted — do not re-propose without new evidence
@@ -628,3 +649,4 @@ for `2026-06-10-correctness-review.md`, `2026-06-10-simplification.md`,
 | 2026-08-18 | Over-engineering review: the full branch, seven parallel subsystem reviews plus an independent premise challenge of the ADR | Not over-engineered, unevenly engineered; 141 mechanisms inventoried (98 keep, 25 simplify, 6 cut, 12 question) | [`2026-08-18-over-engineering-review.md`](2026-08-18-over-engineering-review.md), kept for the inventory, the ~700-line harvest, and the eleven defects |
 | 2026-08-22 | Lifecycle simplification, decision L3 | The attempt journal bought only what tracing already provided; it narrowed to the `terminal_faults` black box, and telemetry writes became verdict-neutral | [`2026-08-22-lifecycle-simplification.md`](2026-08-22-lifecycle-simplification.md), kept for the journal weight audit, the `admission.tla` ghost-variable result, and the verdict-integrity defects |
 | 2026-09-03 | Branch stock-take of the authority-boundary PR: first-hand reads, then a read-only fleet of seven subsystem lenses and five premise challengers, then three refuters over the eighteen highest-ranked proposals | Proportionate overall, with three residue pockets; every proposal recorded, the jury-refuted ones listed above | [`2026-09-03-branch-stocktake.md`](2026-09-03-branch-stocktake.md), the ledger of the current branch, with its "Landed" section |
+| 2026-09-07 | PR #28 premise review and maintainer-approved simplification | Ordered recovery replaces the phase driver; diagnosed terminal runtime faults abort immediately; ordinary shutdown and snapshot leases remain; reader drain race and duplicate offset check fixed | Current ADR and recovery design; finding 33 and settled decisions above. Validation: 692 host tests, seven targeted restart/outage E2Es, workspace check, strict Clippy, formatting, and admission TLC passed. The broader stale-batch recovery E2E reached its watchdog comparison but was blocked by the host Lua emulator 0.21 loading the pinned 0.20 image (archive version mismatch); no protocol pin was changed. |

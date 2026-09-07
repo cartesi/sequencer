@@ -1022,7 +1022,9 @@ mod tests {
             .append_executed_user_ops_chunk(&mut head, &[included])
             .expect_err("non-canonical execution offset must fail loud");
         assert!(
-            error.to_string().contains("must equal canonical next count"),
+            error
+                .to_string()
+                .contains("must equal canonical next count"),
             "unexpected trigger error: {error}"
         );
 

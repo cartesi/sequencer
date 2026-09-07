@@ -9,101 +9,66 @@ records.
 
 ## Context
 
-Repeated review rounds found instances of one bug class: an effect, mutation,
-or admission point forgot to consult a distributed terminal predicate. The
-root cause was not one missing check — authority was implicit across workers,
-markers, triggers, classifiers, and shutdown guards.
+Authority is split between durable facts, their writer roles, and exclusive
+process ownership. A diagnosed terminal runtime fault stops the process;
+there is no supported partially failed runtime that continues serving work.
 
 The policy separates into three guarantees:
 
-1. **G1 — in-process closure:** after terminal closure, no new
-   authority-bearing work is accepted.
-2. **G2 — no silent fast-path:** an interrupted or terminal run cannot skip
-   inspection on the next boot. This is carried by the unconditional recovery
-   reducer: every boot re-derives its decisions from durable facts, never
-   from the previous process's verdict.
+1. **G1 — terminal stop:** a diagnosed terminal runtime fault aborts the
+   process without worker drain or database settlement.
+2. **G2 — no silent fast-path:** every boot inspects durable facts and runs
+   recovery, regardless of the previous process's verdict.
 3. **G3 — scoped divergence freeze:** a committed canonical-divergence fact
    freezes its persisted acceptance domain immediately. The mechanism, its
    runtime reaction, its race bound, and the watchdog boundary are stated
    in full at
    [I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen).
 
-The enforceable unified policy:
-
-> After in-process terminal closure linearizes, no new **authority-bearing
-> mutation or promise** may be authorized. Work already accepted may
-> complete. A durable divergence fact freezes its persisted acceptance
-> domain immediately. It is deliberately not a per-user-op transaction
-> fence. Containment/telemetry writes and immutable operator reads are not
-> authority-bearing. A later command may start only after exclusive process
-> ownership and the admission facts pass.
-
-An acknowledgement, live feed event, nonce reservation, or L1 submission is
-authority-bearing. Streaming an already-immutable operator snapshot is not.
-Absolute cancellation of an effect already handed to the network is neither
-claimed nor implementable; the zombie-transaction model already accounts for
-that case.
+A later command may start only after exclusive process ownership and the
+admission facts pass. Effects handed to the network before process termination
+may still complete remotely; the zombie-transaction model accounts for them.
 
 ## The mechanisms
-
-Four mechanisms, each solving a different problem:
 
 ### 1. `RuntimeScope`: structured process ownership
 
 Every command acquires the OS-held exclusive data-directory lock before
 inspection (`runtime/process_lock.rs`). For `run`, ownership transfers into a
-`RuntimeScope` — the lock, terminal abort watchdog, and containment
-authority in one capability, constructible only from a held lock — shared
-by the workers that externalize or contain faults (the lane, the HTTP
-server, the submitter); the workers that only need to stop (the reader, the
-detector, the fee oracle) take its pure notification half, the slim
-`ShutdownSignal`, and hold the lock directly. `RuntimeScope::authorize()` mints the
-borrow-scoped `Authorized` token that three effect functions require in
-their signatures — the user-op acknowledgement, the L1 send, and the WS
-emit — so at those sites forgetting the containment consult is a compile
-error, not a convention. The token is not an effect gate (the rejected
-`EffectGate`, below): no mutex, no actor, no runtime state — the same
-predicate moved into the signatures of the operations it guards. The
-remaining externalization consults are
-hand-placed and bounded by the exit contract: the three snapshot routes once
-at request start (serving an already-immutable snapshot is not
-authority-bearing, and per-chunk stream cancellation is deliberately not a
-containment guarantee), the `POST /tx` success body, and the lane's fast-turn
-entry
-and its batch-close and reconciliation commits. Inside the token-covered L1
-send, the poster re-consults the same bit before each keyed send and before
-the write-before-broadcast watermark raise; the tick's chain-id gate, fee
-estimate, nonce read, and confirmation watch are not re-gated. Those
-re-checks narrow the bounded lag within an effect already authorized and
-are not separate boundaries. The lane consults once per effect boundary,
-not per line: adjacent re-reads of the bit would narrow the window by
-nanoseconds in a design that already accepts the honest TOCTOU bound.
+`RuntimeScope` containing the lock and a `ShutdownSignal`. Workers may hold
+the scope or the lock and signal separately. Operator shutdown, expected
+recovery, and transient exits signal all workers and drain them normally.
 
-Containment is classification-at-birth. The first reporter is elected by
-compare-and-swap, the sticky bit and its cause become visible together, the
-abort watchdog is armed before cooperative shutdown is requested (a drain
-may block), and nothing durable is written. A token proves the bit was
-consulted and found clear at some point in its borrow, not at the instant
-of the effect: a consumer that awaits between minting and effect carries
-that bounded lag.
+Terminal runtime errors call `abort_terminal`: emit a diagnostic and call
+`std::process::abort`. They do not signal a graceful drain, write a terminal
+row, or return an error to an embedding caller. A terminal error discovered
+during an ordinary drain follows the same path. Acknowledged user operations
+already have a `synchronous=FULL` commit; interrupted transactions and
+unacknowledged requests are covered by ordinary crash recovery. Downloads
+and other active requests may be interrupted.
+
+The supported deployment dedicates the process to the sequencer and assumes
+the configured tracing subscriber returns promptly. Logging is best-effort;
+there is no wall-clock termination bound if that subscriber blocks. Revisit
+this policy if the sequencer must share a host process with independently
+surviving services, or if production diagnostics can block.
 
 The lock is released only after every runtime-owned child has actually
 stopped; a dropped `JoinHandle` detaches rather than stops, so each worker
-and nested blocking task retains its own lock clone — through the scope or
-directly — until its closure really ends. This is a cheap local foot-gun guard, not distributed fencing:
-it prevents two processes on one data directory and nothing more. Cleanup
-polls every worker concurrently, so one hung drain cannot hide a terminal
-exit that must arm the bound. The watchdog holds only a weak
-process-lifetime witness: it fires at the deadline exactly when a
-controller, worker, or nested blocking task still retains the lock, and
-ordinary operator/recovery shutdown has no hard deadline.
+and nested blocking task retains its own lock clone until its closure ends.
+This prevents two processes on one data directory; it is not distributed
+fencing. Cleanup polls every worker concurrently, so one hung drain cannot
+hide another worker's terminal exit. Ordinary shutdown has no hard deadline.
+The reader can cancel a pending RPC read, but awaits any started SQLite
+append before joining, so the final clean-exit divergence check sees every
+committed sync.
 
 Runtime construction is prepare → admit → launch: every fallible or awaited
-operation happens while zero tasks exist; final admission re-runs the
-recovery reducer over one consistent fact set; launch spawns every worker in
-one infallible, non-yielding block, consuming the single-use
-`RuntimeAdmission` witness. A preparation failure cannot leave a partially
-launched runtime, and no refusal or retry can mint the witness.
+operation happens while zero tasks exist; final admission checks one
+consistent fact set; launch spawns every worker in one infallible,
+non-yielding block, consuming the single-use `RuntimeAdmission` witness. A
+preparation failure cannot leave a partially launched runtime, and no
+refusal or retry can mint the witness.
 
 ### 2. Fact-derived admission and the terminal-fault black box
 
@@ -112,33 +77,33 @@ process lock (concurrent owners), two-sided `setup_complete` (command
 ordering), and `canonical_divergence` (the one absorbing refusal — only a
 fresh-directory cockroach rebuild proceeds); baseline schema and history
 creation and setup completion are each one `synchronous=FULL` transaction.
-There is no lifecycle admission
-state machine and no operator acknowledgement: standard recovery is
-automatic, and restart policy after a terminal fault is the exit-code
-contract (30 = do not restart, page), which the supervisor is expected to
-honor. The only durable telemetry is the `terminal_faults` black box —
-append-only terminal-cause rows, written best-effort and verdict-neutrally;
-nothing reads it for decisions.
+There is no lifecycle admission state machine or operator acknowledgement.
+Standard recovery is automatic, and restart policy after a terminal fault
+is the exit contract (30 or SIGABRT = do not restart, page), which the
+supervisor is expected to honor.
 
-The accepted trade, eyes open: a known-terminal fault refuses at
-re-detection rather than at a boot gate. Every fault whose evidence the boot
-path reads re-refuses before the first soft confirmation; the narrow
-residual window is recorded in the threat model, and the honesty backstops
-(rollbackable soft confirmations, the watchdog byte-compare, the divergence
-freeze) never depended on a boot gate.
+`terminal_faults` stores append-only causes for terminal errors returned
+through a command bracket, best-effort and verdict-neutrally. Runtime aborts
+do not pass through that bracket and leave only process diagnostics. Nothing
+reads the black box for decisions.
 
-### 3. Recovery as a pure run reducer
+A known-terminal fault refuses at re-detection rather than at a boot gate.
+Every fault whose evidence the boot path reads re-refuses before the first
+soft confirmation; the residual window is recorded in the threat model.
+The honesty backstops (rollbackable soft confirmations, the watchdog
+byte-compare, and the divergence freeze) do not depend on a boot gate.
 
-Normal `run` startup is one unconditional loop over a pure decision
-function — inspect, classify once, decide, perform at most one phase,
-inspect again — with no durable recovery-phase state machine.
-Setup/rebuild, maintenance flush, and normal-run recovery
-retain distinct typed controllers. The design, the dispatch table, the
-boot-local witnesses, and the phase bound are owned by
+### 3. Ordered startup recovery
+
+Normal `run` startup inspects local terminal facts, syncs L1, selects a repair
+from current facts, and checks the result. The flush branch orders flush →
+sync through the returned safe block → cascade explicitly. There is no
+phase driver or progress ledger; the flush witness is a local value.
+Setup/rebuild, maintenance flush, and normal-run recovery retain distinct
+typed controllers. The dispatch table, boot-local witnesses, and final
+admission check are owned by
 [`docs/recovery/README.md`](../recovery/README.md);
-[`admission.tla`](../recovery/admission.tla) verifies the controller
-ordering; the arguments against a generic command controller and a durable
-phase ledger are in the [register](../review/register.md).
+[`admission.tla`](../recovery/admission.tla) verifies the controller ordering.
 
 ### 4. SQLite-centered runtime and the two-regime inclusion lane
 
@@ -177,9 +142,8 @@ only if production measurements disprove that).
 Authority remains role-local and auditable: a FULL-committed user-op chunk
 authorizes its acknowledgement; a valid sealed batch plus the durable
 write-before-broadcast watermark authorizes an L1 submission; committed
-valid rows plus their canonical `executed_inputs` attribution authorize feed
-output. An already-authorized effect may finish after a later terminal
-transition.
+valid physical replay rows authorize the current feed output. Effects handed to the network before process termination may still
+complete remotely.
 
 ## Rejected alternatives
 
@@ -204,10 +168,10 @@ HistoryPosition = (HistoryVersion, ExecutedInputCount)
 setup/rebuild era; `RecoveryGeneration` increments exactly once in the
 standard-recovery transaction iff it invalidates at least one valid batch; a
 clean restart changes neither. The pair is an equality/discontinuity token,
-not an ordered counter. The feed coordinate is the canonical
-`Application::executed_input_count()`, never a SQLite cursor. The durable
-foundation is landed ([I18](../invariants.md), [I20](../invariants.md));
-the public wire projection is owned by the
+not an ordered counter. The durable canonical-coordinate foundation is
+landed ([I18](../invariants.md), [I20](../invariants.md)). The current public
+feed still uses physical SQLite rowid offsets; replacing them with
+`ExecutedInputCount` and exposing history versions is owned by the
 [Track 3 handoff](2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff).
 
 ## Performance posture

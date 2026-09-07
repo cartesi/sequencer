@@ -79,40 +79,22 @@ async fn run_ws_session(
             let reason = format!(
                 "{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset={live_start_offset}"
             );
-            close_with_frame(&mut socket, close_code::POLICY, reason.as_str(), &shutdown).await;
+            close_with_frame(&mut socket, close_code::POLICY, reason.as_str()).await;
             return;
         }
         Err(SubscribeError::OpenStorage { source }) => {
             warn!(error = %source, "ws subscription failed to open replay storage");
-            close_with_frame(
-                &mut socket,
-                close_code::ERROR,
-                "subscription unavailable",
-                &shutdown,
-            )
-            .await;
+            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
             return;
         }
         Err(SubscribeError::LoadHeadOffset { source }) => {
             warn!(error = %source, "ws subscription failed to read replay head");
-            close_with_frame(
-                &mut socket,
-                close_code::ERROR,
-                "subscription unavailable",
-                &shutdown,
-            )
-            .await;
+            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
             return;
         }
-        Err(SubscribeError::StorageInvariantViolation) => {
-            warn!("ws subscription encountered a persistent storage invariant failure");
-            close_with_frame(
-                &mut socket,
-                close_code::ERROR,
-                "subscription unavailable",
-                &shutdown,
-            )
-            .await;
+        Err(SubscribeError::Join { source }) => {
+            warn!(error = %source, "ws subscription preparation was cancelled");
+            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
             return;
         }
     };
@@ -125,7 +107,7 @@ async fn run_ws_session(
                 let Some(event) = maybe_event else {
                     break;
                 };
-                if send_ws_event(&mut socket, &event, &shutdown).await.is_err() {
+                if send_ws_event(&mut socket, &event).await.is_err() {
                     break;
                 }
             }
@@ -133,7 +115,7 @@ async fn run_ws_session(
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(Message::Ping(payload))) => {
-                        if send_ws_message(&mut socket, Message::Pong(payload), &shutdown)
+                        if send_ws_message(&mut socket, Message::Pong(payload))
                             .await
                             .is_err()
                         {
@@ -152,28 +134,18 @@ async fn run_ws_session(
     }
 }
 
-async fn close_with_frame(
-    socket: &mut WebSocket,
-    code: u16,
-    reason: &str,
-    shutdown: &crate::runtime::shutdown::RuntimeScope,
-) {
+async fn close_with_frame(socket: &mut WebSocket, code: u16, reason: &str) {
     let _ = send_ws_message(
         socket,
         Message::Close(Some(CloseFrame {
             code,
             reason: reason.into(),
         })),
-        shutdown,
     )
     .await;
 }
 
-async fn send_ws_event(
-    socket: &mut WebSocket,
-    event: &BroadcastTxMessage,
-    shutdown: &crate::runtime::shutdown::RuntimeScope,
-) -> Result<(), ()> {
+async fn send_ws_event(socket: &mut WebSocket, event: &BroadcastTxMessage) -> Result<(), ()> {
     let payload = match serde_json::to_string(event) {
         Ok(value) => value,
         Err(err) => {
@@ -182,29 +154,9 @@ async fn send_ws_event(
         }
     };
 
-    send_ws_message(socket, Message::Text(payload.into()), shutdown).await
+    send_ws_message(socket, Message::Text(payload.into())).await
 }
 
-/// The WS externalization primitive: emitting requires the token, so a new
-/// frame-sending site cannot skip the containment consult.
-async fn send_ws_message(
-    socket: &mut WebSocket,
-    message: Message,
-    shutdown: &crate::runtime::shutdown::RuntimeScope,
-) -> Result<(), ()> {
-    let Some(auth) = shutdown.authorize() else {
-        return Err(());
-    };
-    send_authorized(auth, socket, message).await
-}
-
-async fn send_authorized(
-    _auth: crate::runtime::shutdown::Authorized<'_>,
-    socket: &mut WebSocket,
-    message: Message,
-) -> Result<(), ()> {
-    match socket.send(message).await {
-        Ok(()) => Ok(()),
-        Err(_) => Err(()),
-    }
+async fn send_ws_message(socket: &mut WebSocket, message: Message) -> Result<(), ()> {
+    socket.send(message).await.map_err(|_| ())
 }

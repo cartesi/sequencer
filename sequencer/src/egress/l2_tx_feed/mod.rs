@@ -18,7 +18,7 @@ use alloy_primitives::Address;
 use tokio::sync::mpsc;
 
 use crate::runtime::process_lock::spawn_blocking_with_lock;
-use crate::runtime::shutdown::RuntimeScope;
+use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
 use crate::storage::{OrderedL2TxRow, Storage};
 
 /// Best-effort extraction of a panic payload's message for fault causes.
@@ -91,60 +91,40 @@ impl L2TxFeed {
         from_offset: u64,
         max_catchup_events: u64,
     ) -> Result<Subscription, SubscribeError> {
-        // Blocking SQLite (an open plus a COUNT over up to
-        // `max_catchup_events` rows) runs on the blocking pool, making this
-        // signature's `async` honest; the join classifies a decoder panic, so
-        // the prepare phase needs no inline `catch_unwind`. The
-        // streaming task below keeps its `catch_unwind` deliberately: its
-        // only join point is `Subscription::finish`, and containment must
-        // fire at the fault, not when the socket unwinds. Cancelling the
-        // awaiting WS task detaches started blocking work, so the prepare
-        // closure independently retains the process lock until its SQLite
-        // work ends.
+        // Classify faults inside blocking work: a cancelled request cannot
+        // discard a persistent error or panic after its SQLite task starts.
+        // The task independently retains the process lock until it finishes.
         let prepare = {
             let db_path = self.db_path.clone();
             let batch_submitter_address = self.batch_submitter_address;
             spawn_blocking_with_lock(self.shutdown.process_lock(), move || {
-                load_catchup_info(
-                    db_path.as_str(),
-                    from_offset,
-                    max_catchup_events,
-                    batch_submitter_address,
-                )
+                match catch_unwind(AssertUnwindSafe(|| {
+                    load_catchup_info(
+                        db_path.as_str(),
+                        from_offset,
+                        max_catchup_events,
+                        batch_submitter_address,
+                    )
+                })) {
+                    Ok(Err(error)) if error.is_persistent_storage_invariant() => {
+                        abort_terminal(format_args!("preparing tx-feed subscription: {error}"));
+                    }
+                    Ok(result) => result,
+                    Err(payload) => abort_terminal(format_args!(
+                        "panic preparing tx-feed subscription: {}",
+                        panic_message(&*payload)
+                    )),
+                }
             })
             .await
         };
         let (head_offset, catchup_events) = match prepare {
             Ok(Ok(info)) => info,
-            Ok(Err(error)) if error.is_persistent_storage_invariant() => {
-                tracing::error!(
-                    error = %error,
-                    "persistent storage invariant violation while preparing tx-feed subscription"
-                );
-                self.shutdown.contain_storage_invariant_failure(format!(
-                    "preparing tx-feed subscription: {error}"
-                ));
-                return Err(SubscribeError::StorageInvariantViolation);
-            }
             Ok(Err(error)) => return Err(error),
             Err(join) if join.is_panic() => {
-                let payload = join.into_panic();
-                let message = panic_message(&*payload);
-                tracing::error!(
-                    panic = message,
-                    "storage invariant violation while preparing tx-feed subscription"
-                );
-                self.shutdown.contain_storage_invariant_failure(format!(
-                    "panic preparing tx-feed subscription: {message}"
-                ));
-                return Err(SubscribeError::StorageInvariantViolation);
+                abort_terminal(format_args!("preparing tx-feed subscription: {join}"))
             }
-            // Not a panic: the runtime is tearing down and cancelled the
-            // blocking task before it started. Nothing to contain.
-            Err(join) => {
-                tracing::warn!(error = %join, "tx-feed prepare task did not run");
-                return Err(SubscribeError::StorageInvariantViolation);
-            }
+            Err(source) => return Err(SubscribeError::Join { source }),
         };
         if catchup_events > max_catchup_events {
             return Err(SubscribeError::CatchUpWindowExceeded {
@@ -173,27 +153,13 @@ impl L2TxFeed {
                 )
             })) {
                 Ok(Err(error)) if error.is_persistent_storage_invariant() => {
-                    tracing::error!(
-                        error = %error,
-                        "persistent storage invariant violation while reading tx-feed subscription"
-                    );
-                    shutdown.contain_storage_invariant_failure(format!(
-                        "reading tx-feed subscription: {error}"
-                    ));
-                    Err(SubscriptionError::StorageInvariantViolation)
+                    abort_terminal(format_args!("reading tx-feed subscription: {error}"));
                 }
                 Ok(result) => result,
-                Err(payload) => {
-                    let message = panic_message(&*payload);
-                    tracing::error!(
-                        panic = message,
-                        "storage invariant violation while reading tx-feed subscription"
-                    );
-                    shutdown.contain_storage_invariant_failure(format!(
-                        "panic reading tx-feed subscription: {message}"
-                    ));
-                    Err(SubscriptionError::StorageInvariantViolation)
-                }
+                Err(payload) => abort_terminal(format_args!(
+                    "panic reading tx-feed subscription: {}",
+                    panic_message(&*payload)
+                )),
             }
         });
 

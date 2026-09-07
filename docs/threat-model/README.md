@@ -37,13 +37,23 @@ This is **not** a prohibition on checking. Internal invariants are enforced loud
 
 Inputs from untrusted actors are validated rigorously, as ever.
 
+The supported host process is dedicated to the sequencer. A diagnosed
+terminal runtime fault logs its cause and aborts the process, including
+when another worker is already draining. Orderly completion of terminal
+requests, snapshots, or in-memory application work is not required;
+acknowledged user operations are already durably committed. The configured
+logging subscriber is assumed to return promptly. There is no hard
+termination deadline if logging itself blocks. Shared-process hosting or
+blocking production diagnostics would require revisiting that assumption
+([authority-boundary ADR](../plans/2026-08-authority-boundary-adr.md)).
+
 ## In-scope failure modes
 
-- L1 provider outages (primary and fallback), minutes to hours
+- L1 provider outages at the single configured endpoint, minutes to hours
 - Process crashes at arbitrary points, including mid-transaction
 - **Restart after a terminal exit (accepted residual window).** There
   is no boot gate on a prior terminal verdict: a deliberate restart after
-  exit 30 boots through the fact-derived reducer. Every fault whose evidence
+  exit 30 or SIGABRT boots through fact-derived recovery. Every fault whose evidence
   the boot path reads re-refuses before the first soft confirmation —
   canonical divergence (persisted fact), misconfiguration (re-checked every
   boot), boot-path storage corruption, incomplete setup — and the
@@ -53,7 +63,8 @@ Inputs from untrusted actors are validated rigorously, as ever.
   feed pages them (bounded by its catch-up window) or the submitter
   re-encodes a pending batch, and a fault with no durable evidence (a panic
   whose trigger does not recur) does not re-trip at all. The window is
-  entered only by a deliberate operator restart after an exit-30 page, and
+  entered by restarting after a terminal exit (including supervisors that
+  restart regardless of exit status), and
   it is bounded by backstops that never depended on a boot gate:
   rollbackable soft confirmations, the watchdog byte-compare, and the I15
   divergence freeze.
@@ -80,10 +91,10 @@ These are preconditions the sequencer takes as given. They are neither "trust" n
 
 ### L1 block-time coupling
 
-The wall-clock fallback in [`sequencer/src/recovery/mod.rs`](../../sequencer/src/recovery/mod.rs) estimates missed blocks as:
+The wall-clock fallback in [`sequencer/src/storage/recovery.rs`](../../sequencer/src/storage/recovery.rs) estimates missed blocks as:
 
 ```
-estimated_missed_blocks = (now - last_sync_ms) / CARTESI_SEQUENCER_SECONDS_PER_BLOCK
+estimated_missed_blocks = (now - last_safe_progress_ms) / CARTESI_SEQUENCER_SECONDS_PER_BLOCK
 ```
 
 This assumes a **known, bounded-variance relationship** between elapsed wall-clock time and mined L1 block count. The assumption has three parts:

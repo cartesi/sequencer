@@ -41,6 +41,8 @@ use workers::{PreparedRuntime, WorkersConfig};
 /// (for the lane's `from_dump`, the egress state-file path, and the
 /// max-payload bound) but takes no app *value* — `setup` already registered
 /// the genesis snapshot, so the lane reloads via `A::from_dump`.
+/// Requires a dedicated host process: diagnosed terminal runtime faults abort
+/// it. Ordinary shutdown drains workers; typed startup failures return an error.
 pub async fn run<A>(config: RunConfig) -> Result<(), CommandError>
 where
     A: Application + Clone + Sync + 'static,

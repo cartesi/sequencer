@@ -6,9 +6,8 @@
 //!
 //! - [`process_lock`] — the exclusive kernel-enforced data-directory lock
 //!   every command and nested blocking task retains until it truly stops.
-//! - [`shutdown`] — `RuntimeScope` (lock + terminal-abort watchdog +
-//!   containment authority) and the slim cooperative
-//!   `ShutdownSignal`.
+//! - [`shutdown`] — `RuntimeScope` (lock + cooperative `ShutdownSignal`) and
+//!   terminal runtime abort.
 //!
 //! Everything here is consumed crate-wide (workers, egress, l1, recovery);
 //! the command brackets live in [`crate::commands`], which also owns the

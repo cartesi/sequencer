@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Runtime worker lifecycle: prepare → admit → launch → orderly cleanup.
+//! Runtime worker lifecycle: prepare → admit → launch → stop.
 //!
 //! [`Workers`] owns the core runtime worker handles plus an optional live
 //! Uniswap fee-oracle worker; fixed pricing has no worker.
@@ -14,9 +14,8 @@
 //!   non-yielding step, returning the owning struct.
 //! - [`Workers::select_first_exit`]: race the workers + OS shutdown signal,
 //!   return whichever fired first.
-//! - [`Workers::finish`]: request shutdown, race all remaining components to
-//!   completion (so a hung drain cannot hide a terminal exit), and surface the
-//!   primary failure.
+//! - [`Workers::finish`]: abort terminal failures; otherwise request shutdown,
+//!   drain the remaining workers concurrently, and surface the primary failure.
 //!
 //! Worker plumbing is explicit per worker: one field, one spawn statement,
 //! one select arm, one cleanup entry. Adding a worker means editing each of
@@ -53,7 +52,7 @@ use crate::l1::submitter::{
 };
 use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit};
 use crate::runtime::process_lock::ProcessLock;
-use crate::runtime::shutdown::RuntimeScope;
+use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
 use sequencer_core::application::Application;
 use sequencer_core::protocol::ProtocolTiming;
 
@@ -66,16 +65,12 @@ const DANGER_DETECTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub(super) enum FirstExit {
     Signal(Option<CommandError>),
     Worker(WorkerExit),
-    /// A terminal fault was contained by a runtime component; `finish`
-    /// surfaces its cause as the terminal verdict, and the command bracket
-    /// records that verdict in the black box at settlement.
-    Contained,
 }
 
 /// Inputs to [`PreparedRuntime::prepare`]. Consumed entirely; the caller has
 /// nothing further to do with these after the call.
 ///
-/// Everything here is built by `run` because the recovery reducer consumes
+/// Everything here is built by `run` because the recovery procedure consumes
 /// it or must run after it; anything the workers alone need is derived
 /// inside `prepare`.
 ///
@@ -98,7 +93,7 @@ pub(super) struct WorkersConfig {
 }
 
 /// Requests shutdown if construction or runtime ownership is dropped; a panic
-/// instead enters terminal containment before unwind can strand runtime work.
+/// instead aborts before unwind can strand runtime work.
 /// Data-directory exclusivity does not depend on this guard: every worker
 /// holds a construction-required [`ProcessLock`] clone — the lane and
 /// server through their [`RuntimeScope`], the submitter both ways, the
@@ -109,15 +104,9 @@ struct ShutdownOnDrop(RuntimeScope);
 impl Drop for ShutdownOnDrop {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            // A panic in the admitted runtime controller is a trusted-code
-            // failure just like a worker panic. Contain while the runtime
-            // lifetime is still owned so the terminal abort bound covers any
-            // worker or detached blocking operation left behind by unwind.
-            self.0
-                .contain_storage_invariant_failure("runtime controller panicked");
-        } else {
-            self.0.request_shutdown();
+            abort_terminal("runtime controller panicked");
         }
+        self.0.request_shutdown();
     }
 }
 
@@ -184,7 +173,7 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
         );
 
         // The scope is the runtime-lifetime capability: the workers that
-        // externalize or contain receive a clone, and every clone keeps the
+        // need the complete lifetime receive a clone, and every clone keeps the
         // process lock alive; the others take its signal and hold the lock
         // directly.
         // The drop guard requests shutdown on any partial-construction `?`,
@@ -304,7 +293,7 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
             InclusionLane::<A>::start(QUEUE_CAPACITY, shutdown.clone(), storage, lane_config);
         // The reader, detector, and fee oracle only need to stop: they take
         // the notification half and hold the process lock directly. The
-        // lane, server, and submitter externalize or contain, so they take
+        // lane, server, and submitter retain the complete scope, so they take
         // the scope.
         let reader = input_reader.start_preflighted(shutdown.signal());
         let submitter = submitter.start_preflighted(shutdown.clone());
@@ -355,15 +344,7 @@ impl Workers {
         tokio::pin!(shutdown_signal);
         tokio::select! {
             biased;
-            _ = shutdown.wait_for_shutdown() => {
-                if shutdown.is_storage_invariant_contained() {
-                    FirstExit::Contained
-                } else {
-                    // Externally requested shutdown without a contained
-                    // fault: treated like a signal-driven drain.
-                    FirstExit::Signal(None)
-                }
-            }
+            _ = shutdown.wait_for_shutdown() => FirstExit::Signal(None),
             signal_result = &mut shutdown_signal => FirstExit::signal(signal_result),
             server_result = &mut *server =>
                 FirstExit::Worker(WorkerExit::Server(WorkerStop::from_select(server_result))),
@@ -390,33 +371,16 @@ impl Workers {
         }
     }
 
-    /// Drive orderly cleanup: request shutdown, poll all workers concurrently
-    /// to completion, and surface the primary failure. A sticky storage
-    /// invariant fault or terminal cleanup error always takes precedence over
-    /// an earlier nonterminal worker/signal result. Concurrent polling matters:
-    /// a hung drain must not hide a terminal exit that arms the hard watchdog.
+    /// Abort a terminal primary failure; otherwise stop intake and drain all
+    /// remaining workers. A terminal failure discovered during ordinary drain
+    /// also aborts immediately, even if another worker is still blocked.
     pub(super) async fn finish(self, first_exit: FirstExit) -> Result<(), CommandError> {
-        match &first_exit {
-            // Already contained by the raising component.
-            FirstExit::Contained => {}
-            FirstExit::Worker(exit) if exit.is_terminal() => {
-                // Log the typed exit here: the terminal return path below
-                // reports the invariant-violation class, and the cause must
-                // not be flattened out of the operator's view.
-                tracing::error!(
-                    component = exit.worker_id().label(),
-                    error = %exit,
-                    "terminal worker exit; containing runtime"
-                );
-                self.shutdown.contain_storage_invariant_failure(format!(
-                    "terminal {} worker exit: {exit}",
-                    exit.worker_id().label()
-                ));
-            }
-            FirstExit::Signal(_) | FirstExit::Worker(_) => {
-                self.shutdown.request_shutdown();
-            }
+        if let FirstExit::Worker(exit) = &first_exit
+            && exit.is_terminal()
+        {
+            abort_terminal(exit);
         }
+        self.shutdown.request_shutdown();
 
         let Self {
             server,
@@ -425,7 +389,7 @@ impl Workers {
             submitter,
             detector,
             fee_oracle,
-            shutdown,
+            shutdown: _shutdown,
             _shutdown_on_drop,
         } = self;
         let mut components: Vec<(WorkerId, ComponentShutdown)> = vec![
@@ -454,7 +418,7 @@ impl Workers {
         // One drain, two phases:
         // - "cleanup-time" (worker failure): the primary is already in hand;
         //   every OTHER component is awaited for orderly cleanup.
-        // - "shutdown-time" (signal or already-contained): everything drains;
+        // - "shutdown-time" (signal): everything drains;
         //   the signal handler's own error outranks any later component error.
         let (worker_failure, signal_error): (Option<(WorkerId, WorkerExit)>, Option<CommandError>) =
             match first_exit {
@@ -463,7 +427,6 @@ impl Workers {
                     let id = exit.worker_id();
                     (Some((id, exit)), None)
                 }
-                FirstExit::Contained => (None, None),
             };
 
         if let Some((failed, _)) = &worker_failure {
@@ -493,40 +456,25 @@ impl Workers {
         // exists to clean up after. The primary removed above is the one
         // deliberate exception: its task already completed, so awaiting it
         // would panic rather than drain anything. Keep the first ordinary
-        // error to surface; terminal errors contain instead.
+        // error to surface; terminal errors abort instead.
         let mut drain_error: Option<WorkerExit> = None;
         while let Some((id, result)) = next_component_shutdown(&mut components).await {
-            if let Err(e) = result {
-                warn!(
-                    component = id.label(),
-                    phase,
-                    error = %e,
-                    "component errored during runtime drain"
-                );
-                if e.is_terminal() {
-                    shutdown.contain_storage_invariant_failure(format!(
-                        "{phase} {} worker exit: {e}",
-                        id.label()
-                    ));
-                } else if drain_error.is_none() {
-                    drain_error = Some(e);
+            if let Err(error) = result {
+                if error.is_terminal() {
+                    abort_terminal(error);
+                }
+                warn!(component = id.label(), phase, error = %error, "component errored during runtime drain");
+                if drain_error.is_none() {
+                    drain_error = Some(error);
                 }
             }
         }
 
-        // The single precedence site: contained > primary > signal > first
-        // drain error.
-        match (
-            contained_verdict(&shutdown),
-            worker_failure,
-            signal_error,
-            drain_error,
-        ) {
-            (Some(contained), ..) => Err(contained),
-            (None, Some((_, primary_exit)), _, _) => Err(CommandError::Worker(primary_exit)),
-            (None, None, Some(signal_err), _) => Err(signal_err),
-            (None, None, None, Some(exit)) => Err(CommandError::Worker(exit)),
-            (None, None, None, None) => Ok(()),
+        match (worker_failure, signal_error, drain_error) {
+            (Some((_, primary_exit)), _, _) => Err(CommandError::Worker(primary_exit)),
+            (None, Some(signal_err), _) => Err(signal_err),
+            (None, None, Some(exit)) => Err(CommandError::Worker(exit)),
+            (None, None, None) => Ok(()),
         }
     }
 }
@@ -629,14 +577,12 @@ type ComponentShutdown = Pin<Box<dyn Future<Output = Result<(), WorkerExit>> + S
 
 /// Observe whichever remaining component finishes next. Cleanup must poll all
 /// workers concurrently: otherwise one hung component can hide a terminal
-/// panic/invariant exit from a later slot forever, preventing containment and
-/// its hard abort bound from ever arming.
+/// panic/invariant exit from a later slot forever, preventing the terminal abort.
 ///
 /// No `.await` may separate the inner `Poll::Ready` from the `swap_remove` —
 /// a cancellation in that window would leave a completed future in the set,
 /// and the next poll of it panics. `swap_remove` also reorders the set, so
-/// completion order among concurrently-ready components is unspecified; only
-/// terminal exits carry precedence.
+/// completion order among concurrently-ready components is unspecified.
 async fn next_component_shutdown(
     components: &mut Vec<(WorkerId, ComponentShutdown)>,
 ) -> Option<(WorkerId, Result<(), WorkerExit>)> {
@@ -655,18 +601,6 @@ async fn next_component_shutdown(
     .await;
     let (id, _) = components.swap_remove(ready_index);
     Some((id, result))
-}
-
-/// The single post-cleanup containment check: if a terminal fault was
-/// contained anywhere (primary, cleanup, or a non-worker component), surface
-/// the terminal class. The cause is present whenever containment reads true
-/// (they are one `OnceLock`).
-fn contained_verdict(shutdown: &RuntimeScope) -> Option<CommandError> {
-    shutdown
-        .containment_cause()
-        .map(|cause| CommandError::StorageInvariantViolation {
-            cause: cause.to_string(),
-        })
 }
 
 async fn wait_for_server_shutdown(
@@ -845,8 +779,7 @@ mod tests {
         ));
     }
 
-    /// Workers whose tasks idle until shutdown. The shared scope retains the
-    /// first containment cause for `finish` to surface.
+    /// Workers whose tasks idle until shutdown, for supervisor tests.
     fn waiting_workers(shutdown: &RuntimeScope) -> (Workers, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("workers tempdir");
         let server = tokio::spawn({
@@ -937,22 +870,15 @@ mod tests {
     }
 
     #[test]
-    fn controller_panic_is_contained_before_scope_unwind_finishes() {
-        let shutdown = RuntimeScope::default();
-        let guard = ShutdownOnDrop(shutdown.clone());
-
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _guard = guard;
-            panic!("controller panic probe");
-        }));
-
-        assert!(panic.is_err());
-        assert!(shutdown.is_storage_invariant_contained());
-        assert!(shutdown.is_shutdown_requested());
-        assert_eq!(
-            shutdown.containment_cause(),
-            Some("runtime controller panicked")
-        );
+    #[cfg(unix)]
+    fn controller_panic_aborts_before_scope_unwind_finishes() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "commands::run::workers::tests::controller_panic_aborts_before_scope_unwind_finishes",
+        ) {
+            return;
+        }
+        let _guard = ShutdownOnDrop(RuntimeScope::default());
+        panic!("controller panic probe");
     }
 
     fn startup_workers_config(
@@ -1143,89 +1069,42 @@ mod tests {
         drop(prepared);
     }
 
-    #[tokio::test]
-    async fn contained_component_fault_surfaces_first_cause() {
-        // A non-worker component contains a fault: the select yields
-        // Contained, and finish's verdict carries the cause read back from
-        // the in-memory first-winner record.
-        let shutdown = RuntimeScope::default();
-        let (mut workers, _dir) = waiting_workers(&shutdown);
-
-        shutdown.contain_storage_invariant_failure("egress component fault: dangling dump row");
-        let first_exit = workers.select_first_exit().await;
-        assert!(matches!(first_exit, FirstExit::Contained));
-
-        let err = workers
-            .finish(first_exit)
-            .await
-            .expect_err("contained fault must fail run");
-        let CommandError::StorageInvariantViolation { cause } = &err else {
-            panic!("expected terminal invariant violation, got {err:?}");
-        };
-        assert_eq!(cause, "egress component fault: dangling dump row");
-        assert_eq!(err.exit_code(), crate::commands::error::EXIT_TERMINAL);
-    }
-
-    #[tokio::test]
-    async fn containment_overrides_an_already_selected_nonterminal_worker_exit() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn terminal_primary_worker_exit_aborts() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "commands::run::workers::tests::terminal_primary_worker_exit_aborts",
+        ) {
+            return;
+        }
         let shutdown = RuntimeScope::default();
         let (workers, _dir) = waiting_workers(&shutdown);
-
-        shutdown.contain_storage_invariant_failure("fault raced the worker exit");
-        let err = workers
-            .finish(FirstExit::Worker(WorkerExit::Server(
-                WorkerStop::StoppedUnexpectedly,
-            )))
-            .await
-            .expect_err("containment must outrank the nonterminal exit");
-        assert!(matches!(
-            err,
-            CommandError::StorageInvariantViolation { .. }
-        ));
-        assert_eq!(err.exit_code(), crate::commands::error::EXIT_TERMINAL);
-    }
-
-    #[tokio::test]
-    async fn terminal_primary_worker_exit_contains_with_typed_cause() {
-        let shutdown = RuntimeScope::default();
-        let (workers, _dir) = waiting_workers(&shutdown);
-
-        let err = workers
+        let _ = workers
             .finish(FirstExit::Worker(WorkerExit::DangerDetected {
                 status: DangerStatus::CanonicalDivergence(7),
             }))
-            .await
-            .expect_err("canonical divergence must fail run");
-        let CommandError::StorageInvariantViolation { cause } = &err else {
-            panic!("expected terminal invariant violation, got {err:?}");
-        };
-        assert!(
-            cause.contains("terminal") && cause.contains("worker exit"),
-            "a terminal primary exit must surface its typed cause, got: {cause}"
-        );
-        assert!(shutdown.is_storage_invariant_contained());
+            .await;
+        panic!("terminal runtime returned instead of aborting");
     }
 
-    #[tokio::test]
-    async fn panicked_primary_contains_terminal_fault() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn panicked_primary_aborts() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "commands::run::workers::tests::panicked_primary_aborts",
+        ) {
+            return;
+        }
         let shutdown = RuntimeScope::default();
         let (mut workers, _dir) = waiting_workers(&shutdown);
-        workers.lane = tokio::spawn(async { panic!("lane task panicked in test") });
-
+        workers.lane = tokio::spawn(async { panic!("lane task panic probe") });
         let first_exit = workers.select_first_exit().await;
-        let err = workers
-            .finish(first_exit)
-            .await
-            .expect_err("panicked worker must fail run");
-        assert!(matches!(
-            err,
-            CommandError::StorageInvariantViolation { .. }
-        ));
-        assert!(shutdown.is_storage_invariant_contained());
+        let _ = workers.finish(first_exit).await;
+        panic!("terminal runtime returned instead of aborting");
     }
 
     #[tokio::test]
-    async fn recovery_primary_uses_ordinary_shutdown_without_containment() {
+    async fn recovery_primary_uses_ordinary_shutdown() {
         let shutdown = RuntimeScope::default();
         let (workers, _dir) = waiting_workers(&shutdown);
 
@@ -1236,11 +1115,10 @@ mod tests {
             .await
             .expect_err("danger exit must fail run");
         assert!(matches!(err, CommandError::Worker(_)));
-        assert!(!shutdown.is_storage_invariant_contained());
     }
 
     #[tokio::test]
-    async fn transient_primary_uses_ordinary_shutdown_without_containment() {
+    async fn transient_primary_uses_ordinary_shutdown() {
         let shutdown = RuntimeScope::default();
         let (workers, _dir) = waiting_workers(&shutdown);
 
@@ -1251,7 +1129,6 @@ mod tests {
             .await
             .expect_err("unexpected server stop must fail run");
         assert!(matches!(err, CommandError::Worker(_)));
-        assert!(!shutdown.is_storage_invariant_contained());
     }
 
     /// The oracle's cleanup entry exists only when the worker does, and the
@@ -1279,11 +1156,16 @@ mod tests {
             err,
             CommandError::Worker(WorkerExit::FeeOracle(WorkerStop::StoppedUnexpectedly))
         ));
-        assert!(!shutdown.is_storage_invariant_contained());
     }
 
-    #[tokio::test]
-    async fn terminal_cleanup_error_overrides_nonterminal_primary_exit() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn terminal_cleanup_error_aborts_after_nonterminal_primary_exit() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "commands::run::workers::tests::terminal_cleanup_error_aborts_after_nonterminal_primary_exit",
+        ) {
+            return;
+        }
         let shutdown = RuntimeScope::default();
         let (mut workers, _dir) = waiting_workers(&shutdown);
         workers.reader = tokio::spawn(async {
@@ -1291,63 +1173,46 @@ mod tests {
                 operation: "reading corrupt state during cleanup",
             })
         });
-
-        let err = workers
+        let _ = workers
             .finish(FirstExit::Worker(WorkerExit::Server(
                 WorkerStop::StoppedUnexpectedly,
             )))
-            .await
-            .expect_err("terminal cleanup error must outrank nonterminal primary");
-        let CommandError::StorageInvariantViolation { cause } = &err else {
-            panic!("expected terminal invariant violation, got {err:?}");
-        };
-        assert!(
-            cause.contains("cleanup-time")
-                && cause.contains("reading corrupt state during cleanup"),
-            "a cleanup-time terminal exit must surface its typed cause, got: {cause}"
-        );
-        assert!(shutdown.is_storage_invariant_contained());
+            .await;
+        panic!("terminal runtime returned instead of aborting");
     }
 
-    #[tokio::test]
-    async fn terminal_cleanup_is_observed_while_another_component_is_still_draining() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn terminal_cleanup_aborts_while_another_component_is_still_draining() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "commands::run::workers::tests::terminal_cleanup_aborts_while_another_component_is_still_draining",
+        ) {
+            return;
+        }
         let shutdown = RuntimeScope::default();
         let (mut workers, _dir) = waiting_workers(&shutdown);
-        let (release_server, server_released) = tokio::sync::oneshot::channel();
-        workers.server = tokio::spawn(async move {
-            let _ = server_released.await;
-            Ok(())
-        });
+        workers.server = tokio::spawn(std::future::pending());
         workers.reader = tokio::spawn(async {
             Err(InputReaderError::StorageTaskPanicked {
                 operation: "terminal cleanup behind a draining server",
             })
         });
-
-        let finish = tokio::spawn(workers.finish(FirstExit::Worker(WorkerExit::Lane(
-            WorkerStop::StoppedUnexpectedly,
-        ))));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !shutdown.is_storage_invariant_contained() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a draining earlier component must not hide a terminal cleanup exit");
-
-        release_server.send(()).expect("release server drain");
-        let err = finish
-            .await
-            .expect("finish task")
-            .expect_err("terminal cleanup must fail the run");
-        let CommandError::StorageInvariantViolation { cause } = err else {
-            panic!("expected terminal invariant violation");
-        };
-        assert!(cause.contains("terminal cleanup behind a draining server"));
+        let _ = workers
+            .finish(FirstExit::Worker(WorkerExit::Lane(
+                WorkerStop::StoppedUnexpectedly,
+            )))
+            .await;
+        panic!("terminal runtime returned instead of aborting");
     }
 
-    #[tokio::test]
-    async fn signal_cleanup_contains_terminal_fault() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn signal_cleanup_aborts_on_terminal_fault() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "commands::run::workers::tests::signal_cleanup_aborts_on_terminal_fault",
+        ) {
+            return;
+        }
         let shutdown = RuntimeScope::default();
         let (mut workers, _dir) = waiting_workers(&shutdown);
         workers.reader = tokio::spawn(async {
@@ -1355,16 +1220,8 @@ mod tests {
                 operation: "reading corrupt state during signal drain",
             })
         });
-
-        let err = workers
-            .finish(FirstExit::Signal(None))
-            .await
-            .expect_err("terminal fault during signal drain must fail run");
-        let CommandError::StorageInvariantViolation { cause } = &err else {
-            panic!("expected terminal invariant violation, got {err:?}");
-        };
-        assert!(cause.contains("shutdown-time"), "got: {cause}");
-        assert!(shutdown.is_storage_invariant_contained());
+        let _ = workers.finish(FirstExit::Signal(None)).await;
+        panic!("terminal runtime returned instead of aborting");
     }
 
     use crate::commands::test_support::create_structured_dump;

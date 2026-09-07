@@ -65,8 +65,6 @@ pub enum BatchPosterError {
         first_nonce: u64,
         batch_count: usize,
     },
-    #[error("runtime stopped L1 submission after a persistent storage invariant failure")]
-    StorageInvariantViolation,
     #[error("runtime shutdown cancelled L1 submission")]
     Shutdown,
     #[error(transparent)]
@@ -78,9 +76,7 @@ impl BatchPosterError {
         // Exhaustive on purpose: a new variant must decide its terminality
         // here, not silently default to restartable.
         match self {
-            Self::ChainIdMismatch { .. }
-            | Self::WalletNonceRangeUnrepresentable { .. }
-            | Self::StorageInvariantViolation => true,
+            Self::ChainIdMismatch { .. } | Self::WalletNonceRangeUnrepresentable { .. } => true,
             Self::Watermark(source) => source.is_persistent_invariant(),
             Self::Provider(_) | Self::Shutdown => false,
         }
@@ -106,13 +102,8 @@ pub(crate) trait BatchPoster: Send + Sync {
     /// Broadcast the payloads as L1 txs at consecutive wallet nonces.
     /// Implementations must raise `watermark` to the highest nonce they
     /// are about to use *before* the first send (write-before-broadcast).
-    /// Requires the externalization token: the caller consulted containment
-    /// this tick. Implementations may re-check at finer grain (the Ethereum
-    /// poster gates each send); a mock ignoring `_auth` is correct — the
-    /// token is the caller's proof, not the implementation's.
     async fn submit_batches(
         &self,
-        auth: crate::runtime::shutdown::Authorized<'_>,
         payloads: Vec<Vec<u8>>,
         watermark: &dyn WalletNonceWatermarkSink,
     ) -> Result<SubmitBatchesOutcome, BatchPosterError>;
@@ -166,9 +157,7 @@ pub struct EthereumBatchPoster {
     /// broadcasting, so tests can drive the error-classification paths.
     #[cfg(test)]
     fail_next_send: Arc<Mutex<Option<String>>>,
-    /// Externalization gate for keyed L1 sends. A construction-time field,
-    /// not a trait parameter: the gate is this implementation's posture, and
-    /// mocks were ignoring the parameter anyway.
+    /// Cancels pending keyed sends during ordinary shutdown.
     shutdown: RuntimeScope,
 }
 
@@ -384,18 +373,9 @@ async fn externalize_provider_call<T>(
     shutdown: &RuntimeScope,
     call: impl Future<Output = Result<T, BatchPosterError>>,
 ) -> Result<T, BatchPosterError> {
-    if shutdown.is_storage_invariant_contained() {
-        return Err(BatchPosterError::StorageInvariantViolation);
-    }
     tokio::select! {
         biased;
-        _ = shutdown.wait_for_shutdown() => {
-            if shutdown.is_storage_invariant_contained() {
-                Err(BatchPosterError::StorageInvariantViolation)
-            } else {
-                Err(BatchPosterError::Shutdown)
-            }
-        }
+        _ = shutdown.wait_for_shutdown() => Err(BatchPosterError::Shutdown),
         result = call => result,
     }
 }
@@ -404,7 +384,6 @@ async fn externalize_provider_call<T>(
 impl BatchPoster for EthereumBatchPoster {
     async fn submit_batches(
         &self,
-        _auth: crate::runtime::shutdown::Authorized<'_>,
         payloads: Vec<Vec<u8>>,
         watermark: &dyn WalletNonceWatermarkSink,
     ) -> Result<SubmitBatchesOutcome, BatchPosterError> {
@@ -444,9 +423,6 @@ impl BatchPoster for EthereumBatchPoster {
         // tick will use before the first send. One raise to the highest
         // covers the whole consecutive range.
         let highest_nonce = checked_highest_wallet_nonce(first_nonce, payloads.len())?;
-        if self.shutdown.is_storage_invariant_contained() {
-            return Err(BatchPosterError::StorageInvariantViolation);
-        }
         watermark.raise_to(highest_nonce)?;
 
         let mut broadcast = Vec::with_capacity(payloads.len());
@@ -626,7 +602,6 @@ pub(crate) mod mock {
     impl BatchPoster for MockBatchPoster {
         async fn submit_batches(
             &self,
-            _auth: crate::runtime::shutdown::Authorized<'_>,
             payloads: Vec<Vec<u8>>,
             _watermark: &dyn WalletNonceWatermarkSink,
         ) -> Result<SubmitBatchesOutcome, BatchPosterError> {
@@ -739,37 +714,6 @@ mod tests {
             send.await.expect("provider send task"),
             Err(BatchPosterError::Shutdown)
         ));
-        assert!(
-            !shutdown.is_storage_invariant_contained(),
-            "ordinary shutdown cancellation must remain nonterminal"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn terminal_close_cancels_provider_send_and_finishes_publication() {
-        let shutdown = RuntimeScope::default();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let send = tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move {
-                externalize_provider_call(&shutdown, async move {
-                    started_tx.send(()).expect("mark provider send started");
-                    std::future::pending::<Result<(), BatchPosterError>>().await
-                })
-                .await
-            }
-        });
-        started_rx.await.expect("provider send acquired the gate");
-
-        // Containment is sync and never waits — a stalled provider cannot
-        // delay the durable verdict.
-        shutdown.contain_storage_invariant_failure("test fault");
-
-        assert!(matches!(
-            send.await.expect("provider send task"),
-            Err(BatchPosterError::StorageInvariantViolation)
-        ));
-        assert!(shutdown.is_storage_invariant_contained());
     }
 
     fn require_anvil() {
@@ -874,10 +818,7 @@ mod tests {
         let sink = RecordingWatermarkSink::failing();
         let payloads = vec![vec![0u8; 4], vec![1u8; 4], vec![2u8; 4]]; // 3 consecutive nonces
 
-        let scope = RuntimeScope::default();
-        let result = poster
-            .submit_batches(scope.authorize().expect("clear scope"), payloads, &sink)
-            .await;
+        let result = poster.submit_batches(payloads, &sink).await;
 
         assert!(
             matches!(
@@ -936,10 +877,7 @@ mod tests {
         let sink = RecordingWatermarkSink::passing();
         let payloads = vec![vec![0u8; 4], vec![1u8; 4]];
 
-        let scope = RuntimeScope::default();
-        let result = poster
-            .submit_batches(scope.authorize().expect("clear scope"), payloads, &sink)
-            .await;
+        let result = poster.submit_batches(payloads, &sink).await;
 
         assert!(
             matches!(
@@ -961,63 +899,6 @@ mod tests {
         assert_eq!(
             pending, base_nonce,
             "no tx may be broadcast on the wrong chain"
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_storage_fault_blocks_watermark_and_broadcast() {
-        require_anvil();
-        let anvil = Anvil::default().spawn();
-        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        let submitter = alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-        let provider = crate::l1::provider::create_signer_provider(&anvil.endpoint(), key, false)
-            .expect("signer provider");
-        let shutdown = RuntimeScope::default();
-        let poster = EthereumBatchPoster::new(
-            provider.clone(),
-            BatchPosterConfig {
-                l1_submit_address: alloy_primitives::Address::repeat_byte(0x11),
-                app_address: alloy_primitives::Address::repeat_byte(0x22),
-                batch_submitter_address: submitter,
-                start_block: 0,
-                confirmation_depth: 0,
-                seconds_per_block: 1,
-                long_block_range_error_codes: vec![],
-                expected_chain_id: anvil.chain_id(),
-            },
-            shutdown.clone(),
-        );
-        let base_nonce = provider
-            .get_transaction_count(submitter)
-            .await
-            .expect("base nonce");
-        let sink = RecordingWatermarkSink::passing();
-        // Mint the token BEFORE the fault is contained: the honest race the
-        // ADR accepts. The poster's inner per-send gate must still refuse a
-        // stale token's send.
-        let auth = shutdown
-            .authorize()
-            .expect("token minted before the fault is contained");
-        shutdown.contain_storage_invariant_failure("test fault");
-
-        let result = poster.submit_batches(auth, vec![vec![0u8; 4]], &sink).await;
-
-        assert!(matches!(
-            result,
-            Err(BatchPosterError::StorageInvariantViolation)
-        ));
-        assert!(
-            sink.calls().is_empty(),
-            "terminal gate must close before the watermark write"
-        );
-        let pending = provider
-            .get_transaction_count(submitter)
-            .block_id(BlockNumberOrTag::Pending.into())
-            .await
-            .expect("pending nonce");
-        assert_eq!(
-            pending, base_nonce,
-            "terminal gate must prevent an L1 broadcast"
         );
     }
 
@@ -1104,7 +985,6 @@ mod tests {
             RuntimeScope::default(),
         );
         let sink = RecordingWatermarkSink::passing();
-        let scope = RuntimeScope::default();
 
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -1113,11 +993,7 @@ mod tests {
 
         // 1) Broadcast parks in the mempool; the confirmation watch times out.
         let first = poster
-            .submit_batches(
-                scope.authorize().expect("clear scope"),
-                vec![vec![0u8; 4]],
-                &sink,
-            )
+            .submit_batches(vec![vec![0u8; 4]], &sink)
             .await
             .expect("first submit parks a pending tx");
         let SubmitBatchesOutcome::Waiting { broadcast: first } = first else {
@@ -1128,11 +1004,7 @@ mod tests {
         // 2) Next tick re-estimates (unchanged under --no-mining) and
         //    re-broadcasts the identical tx.
         let outcome = poster
-            .submit_batches(
-                scope.authorize().expect("clear scope"),
-                vec![vec![0u8; 4]],
-                &sink,
-            )
+            .submit_batches(vec![vec![0u8; 4]], &sink)
             .await
             .expect("a mempool conflict is not an error");
         assert_eq!(
@@ -1180,7 +1052,6 @@ mod tests {
             RuntimeScope::default(),
         );
         let sink = RecordingWatermarkSink::passing();
-        let scope = RuntimeScope::default();
 
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -1188,11 +1059,7 @@ mod tests {
             .expect("base nonce");
 
         let outcome = poster
-            .submit_batches(
-                scope.authorize().expect("clear scope"),
-                vec![vec![0u8; 4], vec![1u8; 4]],
-                &sink,
-            )
+            .submit_batches(vec![vec![0u8; 4], vec![1u8; 4]], &sink)
             .await
             .expect("automined submit");
         assert!(
@@ -1206,11 +1073,7 @@ mod tests {
         );
 
         let outcome = poster
-            .submit_batches(
-                scope.authorize().expect("clear scope"),
-                vec![vec![2u8; 4]],
-                &sink,
-            )
+            .submit_batches(vec![vec![2u8; 4]], &sink)
             .await
             .expect("next automined submit");
         assert!(matches!(outcome, SubmitBatchesOutcome::Submitted(ref h) if h.len() == 1));
@@ -1232,7 +1095,6 @@ mod tests {
             RuntimeScope::default(),
         );
         let sink = RecordingWatermarkSink::passing();
-        let scope = RuntimeScope::default();
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
             .await
@@ -1242,11 +1104,7 @@ mod tests {
             "server returned an error response: error code -32000: Replacement transaction underpriced",
         );
         let outcome = poster
-            .submit_batches(
-                scope.authorize().expect("clear scope"),
-                vec![vec![0u8; 4]],
-                &sink,
-            )
+            .submit_batches(vec![vec![0u8; 4]], &sink)
             .await
             .expect("an underpriced rejection is not an error");
         assert_eq!(
@@ -1273,16 +1131,9 @@ mod tests {
             RuntimeScope::default(),
         );
         let sink = RecordingWatermarkSink::passing();
-        let scope = RuntimeScope::default();
 
         poster.fail_next_send_with_for_test("test-injected send failure");
-        let result = poster
-            .submit_batches(
-                scope.authorize().expect("clear scope"),
-                vec![vec![0u8; 4]],
-                &sink,
-            )
-            .await;
+        let result = poster.submit_batches(vec![vec![0u8; 4]], &sink).await;
         assert!(
             matches!(result, Err(BatchPosterError::Provider(ref msg)) if msg.contains("test-injected")),
             "unclassified send failures must surface, got {result:?}"
@@ -1306,7 +1157,6 @@ mod tests {
             RuntimeScope::default(),
         );
         let sink = RecordingWatermarkSink::passing();
-        let scope = RuntimeScope::default();
 
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -1316,11 +1166,7 @@ mod tests {
 
         let first = broadcast_hashes(
             poster
-                .submit_batches(
-                    scope.authorize().expect("clear scope"),
-                    suffix.clone(),
-                    &sink,
-                )
+                .submit_batches(suffix.clone(), &sink)
                 .await
                 .expect("first multi-nonce submit"),
         );
@@ -1332,7 +1178,7 @@ mod tests {
         longer.push(vec![3u8; 4]);
         let started = Instant::now();
         let outcome = poster
-            .submit_batches(scope.authorize().expect("clear scope"), longer, &sink)
+            .submit_batches(longer, &sink)
             .await
             .expect("conflicts on the pending prefix must not abort the tick");
         let SubmitBatchesOutcome::Waiting { broadcast } = outcome else {
@@ -1365,11 +1211,7 @@ mod tests {
 
         // A tick after inclusion prunes the resolved nonces.
         let outcome = poster
-            .submit_batches(
-                scope.authorize().expect("clear scope"),
-                vec![vec![4u8; 4]],
-                &sink,
-            )
+            .submit_batches(vec![vec![4u8; 4]], &sink)
             .await
             .expect("fresh send after inclusion");
         assert!(

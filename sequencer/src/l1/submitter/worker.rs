@@ -174,24 +174,20 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         tokio::select! {
             biased;
             _ = shutdown.wait_for_shutdown() => Ok(SubmitterExit::Shutdown),
-            result = self.run_loop(&shutdown) => result,
+            result = self.run_loop() => result,
         }
     }
 
     /// Tick → sleep-if-idle → tick. Productive ticks re-enter immediately;
     /// idle, waiting, or transient-error ticks wait `idle_poll_interval`.
     /// Fatal errors propagate.
-    async fn run_loop(&self, scope: &RuntimeScope) -> Result<SubmitterExit, BatchSubmitterError> {
+    async fn run_loop(&self) -> Result<SubmitterExit, BatchSubmitterError> {
         loop {
-            let outcome = match self.tick_once(scope).await {
+            let outcome = match self.tick_once().await {
                 Ok(o) => o,
                 Err(BatchSubmitterError::Poster(source)) => {
                     if source.is_terminal_invariant() {
                         let error = BatchSubmitterError::Poster(source);
-                        error!(
-                            error = %error,
-                            "terminal batch-submitter input — refusing to submit"
-                        );
                         return Err(error);
                     }
                     error!(error = %source, "L1 provider error — will retry");
@@ -208,10 +204,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
     }
 
-    pub(crate) async fn tick_once(
-        &self,
-        scope: &RuntimeScope,
-    ) -> Result<TickOutcome, BatchSubmitterError> {
+    pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
         let frontier = self.load_frontier().await?;
 
         // Must start scanning at `safe_block + 1`: after a danger-zone shutdown
@@ -243,16 +236,9 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
         }
         let submitted_count = pending.len();
         let payloads: Vec<Vec<u8>> = pending.into_iter().map(|b| b.encoded).collect();
-        // The L1 send requires the externalization token; the poster's own
-        // per-send gate stays as the bounded-lag re-check inside.
-        let Some(auth) = scope.authorize() else {
-            return Err(BatchSubmitterError::Poster(
-                BatchPosterError::StorageInvariantViolation,
-            ));
-        };
         let outcome = self
             .poster
-            .submit_batches(auth, payloads, &self.watermark_sink)
+            .submit_batches(payloads, &self.watermark_sink)
             .await?;
         match outcome {
             SubmitBatchesOutcome::Submitted(tx_hashes) => {
@@ -314,7 +300,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
 
 /// Deliberately per-worker, not shared with the snapshot endpoint's
 /// `storage_task`: this worker carries a typed error to the supervisor
-/// through its exit channel, while an HTTP handler must contain immediately.
+/// through its exit channel, while an HTTP handler must abort immediately.
 fn map_storage_task_join(
     err: tokio::task::JoinError,
     operation: &'static str,
@@ -414,7 +400,6 @@ mod tests {
     impl BatchPoster for BlockingObservedPoster {
         async fn submit_batches(
             &self,
-            _auth: crate::runtime::shutdown::Authorized<'_>,
             _payloads: Vec<Vec<u8>>,
             _watermark: &dyn WalletNonceWatermarkSink,
         ) -> Result<SubmitBatchesOutcome, BatchPosterError> {
@@ -468,10 +453,7 @@ mod tests {
             ProcessLock::test(),
         );
 
-        let outcome = submitter
-            .tick_once(&RuntimeScope::default())
-            .await
-            .expect("tick once");
+        let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(3));
 
         let submissions = mock.submissions();
@@ -495,10 +477,7 @@ mod tests {
             ProcessLock::test(),
         );
 
-        let outcome = submitter
-            .tick_once(&RuntimeScope::default())
-            .await
-            .expect("tick once");
+        let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Waiting);
         assert_eq!(mock.submissions().len(), 3);
     }
@@ -520,10 +499,7 @@ mod tests {
             ProcessLock::test(),
         );
 
-        let outcome = submitter
-            .tick_once(&RuntimeScope::default())
-            .await
-            .expect("tick once");
+        let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Waiting);
         assert_eq!(mock.submissions().len(), 3);
     }
@@ -543,10 +519,7 @@ mod tests {
             ProcessLock::test(),
         );
 
-        let outcome = submitter
-            .tick_once(&RuntimeScope::default())
-            .await
-            .expect("tick once");
+        let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Idle);
         assert!(mock.submissions().is_empty());
         assert_eq!(mock.last_from_block(), Some(11));
@@ -566,10 +539,7 @@ mod tests {
             ProcessLock::test(),
         );
 
-        let outcome = submitter
-            .tick_once(&RuntimeScope::default())
-            .await
-            .expect("tick once");
+        let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Idle);
         assert!(mock.submissions().is_empty());
     }
@@ -588,10 +558,7 @@ mod tests {
             ProcessLock::test(),
         );
 
-        let outcome = submitter
-            .tick_once(&RuntimeScope::default())
-            .await
-            .expect("tick once");
+        let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(1));
         assert_eq!(mock.last_from_block(), Some(11));
 
@@ -615,10 +582,7 @@ mod tests {
             ProcessLock::test(),
         );
 
-        let outcome = submitter
-            .tick_once(&RuntimeScope::default())
-            .await
-            .expect("tick once");
+        let outcome = submitter.tick_once().await.expect("tick once");
         assert_eq!(outcome, TickOutcome::Submitted(1));
         assert_eq!(mock.last_from_block(), Some(11));
 
@@ -638,7 +602,7 @@ mod tests {
             super::BatchSubmitter::new(path, mock, default_test_config(), ProcessLock::test());
 
         let err = submitter
-            .tick_once(&RuntimeScope::default())
+            .tick_once()
             .await
             .expect_err("poster error should propagate");
         assert!(matches!(err, super::BatchSubmitterError::Poster(_)));
