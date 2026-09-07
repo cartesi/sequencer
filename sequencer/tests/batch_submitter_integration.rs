@@ -175,8 +175,6 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
     let shutdown = ShutdownSignal::default();
     let config = BatchSubmitterConfig {
         idle_poll_interval_ms: 5000,
-        confirmation_depth: 0,
-        seconds_per_block: 1,
     };
     let submitter = BatchSubmitter::new(path, mock.clone(), config);
     let handle = submitter
@@ -233,8 +231,6 @@ async fn submitter_re_enters_immediately_after_productive_tick() {
         // Ten seconds — anything above ~2s would be enough to fail if the
         // immediate-retry cadence regressed to always-sleep.
         idle_poll_interval_ms: 10_000,
-        confirmation_depth: 0,
-        seconds_per_block: 1,
     };
     let submitter = BatchSubmitter::new(path.clone(), mock.clone(), config);
     let handle = submitter
@@ -290,8 +286,6 @@ async fn submitter_recovers_from_transient_poster_error_without_exiting() {
         // test window. Still long enough that accidentally always-sleeping
         // would delay the single submission past the assertion.
         idle_poll_interval_ms: 50,
-        confirmation_depth: 0,
-        seconds_per_block: 1,
     };
     let submitter = BatchSubmitter::new(path.clone(), mock.clone(), config);
     let handle = submitter
