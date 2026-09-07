@@ -17,9 +17,8 @@
 //!
 //! The outer loop is uniform: tick, maybe sleep, repeat. A tick that produced
 //! submissions re-enters immediately (no sleep) so the suffix drains quickly;
-//! an idle, transient-error, or waiting tick (the mempool already holds our
-//! txs — see the poster's fee-policy note) sleeps `idle_poll_interval` before
-//! the next attempt.
+//! an idle, transient-error, or waiting tick sleeps `idle_poll_interval`
+//! before the next attempt. Fee-policy limits live in `docs/l1-fee-policy.md`.
 //!
 //! Mid-tick cancellation is crash-safe: storage transactions either commit or
 //! auto-roll-back on drop, and any already-sent L1 transaction is picked up by
@@ -68,10 +67,8 @@ pub(crate) enum TickOutcome {
     /// Broadcast and confirmed one or more batches; re-enter immediately to
     /// pick up newly closed batches without idle-sleep.
     Submitted(usize),
-    /// At least one pending nonce is still unresolved — the node refused a
-    /// re-broadcast because it already holds our tx there, or a broadcast
-    /// timed out waiting for confirmation. Nothing to do until it lands or
-    /// the market moves. Sleeps like `Idle` and re-estimates.
+    /// A mempool conflict or confirmation timeout occurred. Sleeps like
+    /// `Idle` before re-estimating.
     Waiting,
     /// Transient provider error; log and sleep before retrying.
     Transient,

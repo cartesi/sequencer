@@ -51,17 +51,10 @@ fn derive_timeouts(seconds_per_block: u64) -> (Duration, Duration) {
     )
 }
 
-/// Headroom on the fresh estimate when pricing flush no-ops.
-///
-/// A no-op replaces a pending batch tx only if it beats it by ≥10% on *both*
-/// EIP-1559 components, and the poster's pending tx carries the market price
-/// of the moment it was sent (the poster never escalates — see the fee-policy
-/// note in `l1::submitter::poster`). A no-op priced off today's market alone
-/// therefore loses whenever the market has fallen at all since that send.
-/// Three times the current estimate clears any poster tx sent when the market
-/// was up to 3× higher on either component. This is one-shot and stateless
-/// (every flush pass re-estimates from scratch), on a 21 000-gas transfer, so
-/// it cannot compound and costs about `21000 × 3.3 × cap` per no-op.
+/// Fixed headroom on each component of the fresh estimate, before the
+/// replacement bump. This allows for some decline since a poster's send;
+/// it does not guarantee replacement. Each pass re-estimates from scratch,
+/// so retries do not compound the headroom. See `docs/l1-fee-policy.md`.
 const NOOP_FEE_HEADROOM: u128 = 3;
 
 /// Bump one EIP-1559 component for a same-nonce replacement: ×1.1, plus 1 wei
@@ -75,14 +68,8 @@ fn bump_replacement_component(value: u128) -> u128 {
 
 /// Price a one-shot same-nonce replacement under geth's ≥10% rule.
 ///
-/// Both components grow by the same ×1.1 (+1) factor and the tip is clamped
-/// to the cap. Asymmetric growth (the historical tip ×2 / cap ×1.1) yields
-/// `tip > max_fee` — an invalid EIP-1559 pair every node rejects — as soon as
-/// the estimate's cap sits close to its tip, which is the normal shape on a
-/// zero-base-fee chain (`max_fee = 2·base + tip`); on such a chain every
-/// no-op failed and recovery could not complete. Equal growth preserves
-/// `tip ≤ max_fee` whenever the input satisfied it; the clamp covers
-/// already-invalid inputs.
+/// Symmetric growth preserves `tip ≤ max_fee`, including zero-base-fee
+/// chains where the two caps coincide. The clamp covers invalid inputs.
 fn bumped_replacement_fees(base_max_fee: u128, base_priority_fee: u128) -> (u128, u128) {
     let tip = base_priority_fee.min(base_max_fee);
     let new_max_fee = bump_replacement_component(base_max_fee);
@@ -281,21 +268,12 @@ impl MempoolFlusher {
         let estimate = estimate_fees(&self.provider)
             .await
             .map_err(FlushError::Provider)?;
-        // One-shot: `NOOP_FEE_HEADROOM ×` the fresh estimate, then the ≥10%
-        // replacement bump on both components, so a no-op can replace a
-        // pending batch tx at the same wallet nonce. Safety does not depend
-        // on the no-op winning — `flush_and_wait` only returns once
-        // Pending ≤ Safe.
-        //
-        // Residual gap: this prices off a *fresh* estimate, not the pending
-        // tx's own fees, so the no-op is rejected as underpriced when the
-        // market has fallen more than the headroom since the poster's send
-        // (that tx is then over-priced, hence mineable) — and when this
-        // flusher's own no-op from a previous pass still occupies the slot
-        // after a watch timeout on a flat market. Either way `submit_noops`
-        // hard-errors and the orchestrator respawn retries until the slot
-        // resolves. Tightening that needs the pending tx's own fees, not a
-        // bigger multiplier.
+        // Fresh estimates cannot guarantee replacement: a falling tip can
+        // miss the old tip's bump even while a rising base makes the original
+        // unmineable. A previous no-op can also block a retry. Send errors
+        // propagate to the respawn loop; flush_and_wait requires both
+        // Pending ≤ Safe and Safe ≥ watermark + 1 before returning.
+        // The accepted liveness limit is documented in docs/recovery/README.md.
         let (max_fee, priority_fee) = bumped_replacement_fees(
             estimate.max_fee_per_gas.saturating_mul(NOOP_FEE_HEADROOM),
             estimate
@@ -427,10 +405,8 @@ mod tests {
     }
 
     // ── H5: replacement-fee bump keeps no-ops competitive ─────────
-    // One-shot: `NOOP_FEE_HEADROOM ×` the fresh estimate, then a symmetric
-    // ×1.1 bump; the use site is `submit_noops`. It clears a poster tx sent
-    // when the market was up to 3× higher on either component; a larger fall
-    // since that send is the documented residual (and that tx is mineable).
+    // Fixed headroom helps with some market moves, but cannot establish
+    // replacement or inclusion for every independently moving fee pair.
 
     #[test]
     fn replacement_fee_bump_exceeds_ten_percent_for_max_fee() {
@@ -512,6 +488,27 @@ mod tests {
         );
         assert!(noop_cap.saturating_mul(10) >= sent_cap.saturating_mul(11));
         assert!(noop_tip.saturating_mul(10) >= sent_tip.saturating_mul(11));
+    }
+
+    #[test]
+    fn noop_headroom_can_miss_tip_bump_while_original_cannot_cover_base() {
+        use alloy::providers::utils::eip1559_default_estimator;
+
+        // Base rises from 10 to 30 gwei while the estimated tip falls from
+        // 2 to 0.5 gwei: the documented residual in docs/recovery/README.md.
+        let original = eip1559_default_estimator(10_000_000_000, &[vec![2_000_000_000]]);
+        let current_base = 30_000_000_000;
+        let current = eip1559_default_estimator(current_base, &[vec![500_000_000]]);
+        let (noop_cap, noop_tip) = bumped_replacement_fees(
+            current.max_fee_per_gas * NOOP_FEE_HEADROOM,
+            current.max_priority_fee_per_gas * NOOP_FEE_HEADROOM,
+        );
+
+        assert!(original.max_fee_per_gas < current_base);
+        assert!(noop_cap >= original.max_fee_per_gas * 11 / 10);
+        // Geth rejects a replacement whose tip does not even exceed the old
+        // tip, regardless of its cap. Anvil does not enforce this same rule.
+        assert!(noop_tip < original.max_priority_fee_per_gas);
     }
 
     #[test]

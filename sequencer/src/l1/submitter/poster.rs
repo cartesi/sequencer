@@ -1,138 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Batch poster: broadcasts closed batches to the InputBox at consecutive
-//! wallet nonces and watches them to confirmation depth.
-//!
-//! # Fee policy: re-estimate, never escalate
-//!
-//! Every tick re-derives the unresolved suffix from L1 and re-broadcasts each
-//! pending batch at **this tick's fresh market estimate** ([`estimate_fees`]).
-//! The poster keeps no per-nonce fee state and never bumps a price it already
-//! offered. This note records why, because the gap that policy leaves is easy
-//! to re-find, and the obvious fix is worse than the gap.
-//!
-//! ## The gap
-//!
-//! A pending tx at wallet nonce `n` can only be replaced by one that beats it
-//! on **both** EIP-1559 components, `max_fee_per_gas` and
-//! `max_priority_fee_per_gas`, each strictly and by ≥10% (geth's rule; reth,
-//! erigon, Besu and Nethermind ship the same default). A fresh market estimate
-//! moves the two components independently: Alloy's default estimator gives
-//! `max_fee = 2·base + tip`, where `tip` is a lagging 10-block median of the
-//! 20th-percentile reward. So if the base fee more than doubles after a
-//! broadcast (our tx is now unmineable) while the tip median has not moved
-//! 10%, every re-broadcast is refused — "replacement transaction underpriced",
-//! or "already known" when it is byte-identical — and the batch waits until
-//! the market moves.
-//!
-//! The same two replies also appear on an ordinary flat or falling market: a
-//! fresh estimate that is not 10% above the pending one is refused either way.
-//! There they are benign — the pending tx is at or above the current market
-//! and mines. Only the base-doubling case leaves an unmineable tx in the slot.
-//!
-//! ## Why we accept it
-//!
-//! The requirement is that a batch land within `MAX_WAIT_BLOCKS` (1200
-//! blocks, about four hours at 12 s) or the scheduler skips it as stale — not
-//! that any particular tx wins. Well before that, at
-//! `MAX_WAIT_BLOCKS − preemptive_margin_blocks` (900 blocks, about three
-//! hours at the shipped defaults, counted from the batch's own first frame),
-//! the danger detector stops the process and hands the slot to recovery.
-//! Measured against those numbers:
-//!
-//! - The gap needs two conditions that pull against each other. Our cap
-//!   carries 2× headroom, so the tx must sit unmined through at least six
-//!   consecutive full blocks (base ×1.125 per block; the `+ tip` term makes
-//!   six a floor) — *and* the 20th-percentile tip median must stay flat
-//!   through exactly those full blocks. Sustained full blocks are when tips
-//!   rise; the median follows within one or two minutes, after which the
-//!   fresh estimate clears both components and the replacement goes through.
-//!   (Inclusion degrades a little before the sixth block, as the effective
-//!   tip `max_fee − base` is squeezed, but the estimator bids a
-//!   20th-percentile reward, which sits above the marginal included tip.)
-//! - It also clears itself when the base falls back below our cap (the
-//!   original mines) or when the node drops the tx — eviction, a node
-//!   restart, an RPC failover to a peer that never saw it. A *sequencer*
-//!   restart does not clear it: with no fee state to lose, the poster
-//!   re-derives the same suffix, re-offers the same price, and gets the same
-//!   reply. What a restart loses is the in-memory wait clock below, so a
-//!   stall that survives one is under-reported, not resolved.
-//! - The expected cost is therefore minutes of quiet waiting in a rare
-//!   regime, bounded by the danger detector, which is a safe, designed
-//!   fallback. And the recovery flusher's one-shot no-op is priced with a
-//!   fixed headroom above the current market, so it evicts a pending poster
-//!   tx unless the market has fallen more than that headroom since the send
-//!   — in which case that tx is over-priced, hence mineable (the residual is
-//!   spelled out at the flusher's `submit_noops`).
-//!
-//! ## Why we do not escalate
-//!
-//! Any escalation needs memory of what was last offered and a rule for
-//! growing it. Four rounds of that were built and adversarially reviewed on
-//! cartesi/sequencer#34; each mechanism closed the gap and opened a worse
-//! hole:
-//!
-//! - **A per-nonce floor with asymmetric bumps** (tip ×2, cap ×1.1): the
-//!   components compound until `tip > max_fee`, an invalid tx every node
-//!   rejects; because a failed send must not raise the floor, the poster
-//!   re-sends the same invalid pair forever — a permanent wedge.
-//! - **Head-only escalation with suffix skip-and-watch**: a stored hash stops
-//!   being ours when the payload↔nonce assignment shifts (RPC read skew, a
-//!   nonce consumed by an out-of-gas revert), silently dropping a batch; and
-//!   it assumes the node still holds the tx across failover, restart, and
-//!   eviction.
-//! - **Symmetric floors on every nonce** (the correct memory): the floor
-//!   compounds ×1.1 per retry round across the whole suffix, and any tick
-//!   that errs after a successful send re-bumps five seconds later. geth
-//!   reserves `gas_limit × max_fee` for *every* pending tx from the sender,
-//!   so a suffix of compounded caps exhausts an under-funded wallet's balance
-//!   check within a single stall — after which every send is refused with
-//!   "insufficient funds" and the floor, which a failed send must not raise,
-//!   can never come back down.
-//! - **A market-relative ceiling on the floor** (K × fresh cap, an escape
-//!   valve, a hold state): the flusher priced its cap at the ceiling but its
-//!   tip at only ×1.1, so it could not clear a poster tip that had ratcheted
-//!   — geth needs ≥10% on *both* — and recovery crash-looped on exactly the
-//!   txs it exists to clear; the hold and the node's "already known" reply
-//!   formed a fixed point that spun every five seconds; and the escape valve
-//!   lifted the recorded cap above the ceiling, voiding the funding bound the
-//!   ceiling existed to give.
-//!
-//! The machinery and the tests pinning it grew by about 1,450 lines across
-//! nine files, and every round's review found the next hole in the previous
-//! round's fix. Against a fallback that is already safe and a gap whose
-//! expected cost is minutes, none of it earns its failure modes.
-//!
-//! ## What we do instead
-//!
-//! 1. Re-estimate and attempt every pending nonce, every tick. Nothing is
-//!    skipped on the strength of remembered state: a fresh send is accepted,
-//!    an identical or underpriced one is refused by the node, and the next
-//!    tick tries again. (A refusal does assume the tx occupying that nonce is
-//!    this payload's. If the payload↔nonce assignment has shifted, the
-//!    refused payload goes out one round later, once the slot resolves —
-//!    nothing is dropped, because nothing remembered is trusted.)
-//! 2. Treat the node's "this slot is taken and you have not outbid it"
-//!    replies — "replacement transaction underpriced", "already known", and
-//!    the other clients' wordings listed at [`is_pending_tx_conflict`] — as
-//!    what they mean, and report [`SubmitBatchesOutcome::Waiting`] instead of
-//!    an error. A confirmation timeout reports the same. The worker sleeps
-//!    its idle interval and re-estimates. (The slot is ours because the
-//!    runtime's exclusive process lock owns the key.)
-//! 3. Warn once a nonce has been unresolved longer than
-//!    [`PENDING_WAIT_WARN_AFTER`], and again each interval, whatever the
-//!    cause — refused re-broadcasts, or accepted ones that never mine. That
-//!    log line is what makes this decision falsifiable. Revisit if it fires
-//!    on the same nonce across more than one interval, or on several nonces
-//!    in one stall; record the excerpt and the L1 block range in the review
-//!    register next to this decision before proposing any memory of past
-//!    prices. Two limits: the clock is process-local, so a restart resets it,
-//!    and it starts at this process's first attempt, so it is a lower bound
-//!    on pending age.
-//! 4. Estimate gas without a nonce, at Latest, and pin it padded. Anvil
-//!    applies mempool nonce policy to pending-block estimates and would
-//!    otherwise reject the re-broadcast before it ever reaches the node.
+//! Broadcasts closed batches at consecutive wallet nonces and watches confirmation.
+//! Re-estimates fees each tick without carrying a fee floor from earlier attempts.
+//! Fee policy, accepted liveness limits, and revisit criteria: `docs/l1-fee-policy.md`.
 
 use alloy::providers::{
     DynProvider, PendingTransactionBuilder, PendingTransactionConfig, PendingTransactionError,
@@ -154,9 +25,8 @@ use std::time::{Duration, Instant};
 
 pub type TxHash = alloy_primitives::B256;
 
-/// A pending nonce is expected to resolve within minutes (see the fee-policy
-/// note above). Warn once it has been unresolved this long, and again every
-/// interval, so a longer wait is visible.
+/// Warn after this unresolved age and at most once per further interval.
+/// This is an observability threshold, not an inclusion deadline.
 pub(crate) const PENDING_WAIT_WARN_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
@@ -194,15 +64,10 @@ pub enum SubmitBatchesOutcome {
     /// per payload, in nonce order. The worker re-enters at once to pick up
     /// newly closed batches.
     Submitted(Vec<TxHash>),
-    /// At least one nonce is still unresolved at the end of the tick: either
-    /// the node refused a re-broadcast because it already holds our tx there
-    /// at a price this tick's estimate does not beat by ≥10% ("already known"
-    /// / "replacement transaction underpriced"), or a broadcast timed out
-    /// waiting for confirmation. Nothing is wrong and nothing can be done but
-    /// wait for inclusion or for the market to move, so the worker sleeps and
-    /// re-estimates. `broadcast` holds the hashes of the payloads that were
-    /// sent this tick (fewer than the payload count when a re-broadcast was
-    /// refused).
+    /// A re-broadcast met a mempool conflict or a confirmation watch timed
+    /// out. The worker sleeps before re-estimating; this outcome makes no
+    /// claim about when the pending transactions will land. `broadcast`
+    /// holds the hashes sent this tick, excluding refused re-broadcasts.
     Waiting { broadcast: Vec<TxHash> },
 }
 
@@ -318,8 +183,8 @@ impl EthereumBatchPoster {
             warn!(
                 tx_nonce = nonce,
                 pending_secs = now.duration_since(entry.since).as_secs(),
-                "batch tx at this wallet nonce has been unresolved longer than expected (see \
-                 the fee-policy note in l1::submitter::poster before changing fee policy)"
+                "batch tx at this wallet nonce has been unresolved longer than expected \
+                 (see docs/l1-fee-policy.md)"
             );
         }
     }
@@ -370,8 +235,7 @@ impl EthereumBatchPoster {
             .addInput(self.config.app_address, payload.into())
             .max_fee_per_gas(fees.max_fee_per_gas)
             .max_priority_fee_per_gas(fees.max_priority_fee_per_gas)
-            // Estimate at Latest (pinned explicitly: item 4 of the fee-policy
-            // note depends on it) and without the nonce. Anvil applies
+            // Estimate at Latest and without the nonce. Anvil applies
             // mempool nonce policy to pending-block `eth_estimateGas` and
             // rejects a re-broadcast at an already-pending nonce with "nonce
             // too low" before it reaches the node (geth skips nonce checks in
@@ -494,8 +358,7 @@ impl BatchPoster for EthereumBatchPoster {
             });
         }
 
-        // This tick's market price, used as-is for every send (see the
-        // fee-policy note at the top of this file).
+        // This tick's market price, used as-is for every send.
         let fees = estimate_fees(&self.provider)
             .await
             .map_err(BatchPosterError::Provider)?;

@@ -1,14 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared EIP-1559 fee estimate and gas-limit padding.
-//!
-//! Used by the batch poster (submission), the fee oracle (charge), and the
-//! mempool flusher (no-op pricing). The batch poster sends the fresh estimate
-//! as-is and never bumps a price it already offered — that is a deliberate
-//! decision, explained in the fee-policy note at the top of
-//! `l1::submitter::poster`. The one place a price is bumped for a same-nonce
-//! replacement is the flusher's one-shot no-op (`recovery::flusher`).
+//! Shared fee estimate and gas padding for the poster, oracle, and flusher.
+//! The poster uses fresh estimates; the flusher applies fixed headroom.
+//! Rationale and limitations: `docs/l1-fee-policy.md`.
 
 use alloy::consensus::BlockHeader;
 use alloy::providers::{DynProvider, Provider, utils};
