@@ -1018,12 +1018,12 @@ mod tests {
             .expect("initialize open state");
 
         let included = included_user_op(0, 1);
-        let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = storage.append_executed_user_ops_chunk(&mut head, &[included]);
-        }));
+        let error = storage
+            .append_executed_user_ops_chunk(&mut head, &[included])
+            .expect_err("non-canonical execution offset must fail loud");
         assert!(
-            panic.is_err(),
-            "non-canonical execution offset must fail loud"
+            error.to_string().contains("must equal canonical next count"),
+            "unexpected trigger error: {error}"
         );
 
         for table in ["user_ops", "sequenced_l2_txs", "executed_inputs"] {
