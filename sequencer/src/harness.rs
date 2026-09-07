@@ -97,6 +97,7 @@ fn project_dispatch_join(
 /// Dispatch a parsed [`Command`], projecting the result onto the exit-code
 /// contract (see [`crate::commands::error`]). Clean completion is exit 0; every
 /// `CommandError` maps through `CommandError::exit_code`.
+/// Terminal runtime faults abort the process directly; see [`crate::run`].
 ///
 /// `genesis_app` is called at most once — only when plain `setup` needs to
 /// register the genesis snapshot.

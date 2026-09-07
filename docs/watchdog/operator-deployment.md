@@ -374,7 +374,7 @@ unclassified restart-with-backoff. Operational notes:
   gate and no acknowledgement command:
   standard recovery is automatic on every boot, and a persistent terminal
   fault re-detects fail-loud when the faulty state is next read. Configure
-  the supervisor to honor 30 (stop and page) — that configuration is what
+  the supervisor to honor 30 and SIGABRT (stop and page) — that configuration is what
   bounds a crash loop.
 - **Supervisor recipes.** systemd can act on the code directly:
   `RestartPreventExitStatus=30 ABRT` (SIGABRT/134 is terminal-class too).
@@ -383,11 +383,11 @@ unclassified restart-with-backoff. Operational notes:
   re-detection windows, serving traffic in between. There, the crash-loop
   bound is your alerting, not the restart policy: page immediately on
   `lastState.terminated.exitCode == 30` (and on signal exits / 134).
-- **A terminal containment that cannot drain within two seconds exits via
-  `abort()` (SIGABRT, status 134), not code 30.** Treat 134 from the
-  sequencer as terminal-class. The cause is in the process logs only:
-  containment writes nothing durable, and the black box's row is written at
-  settlement, after the drain — which the abort pre-empts by definition.
+- **Diagnosed terminal runtime faults immediately call `abort()` (SIGABRT,
+  status 134).** They skip worker drain and database settlement. Treat 134
+  from the sequencer as terminal-class and retain its process logs for the
+  diagnostic. Operator shutdown, expected recovery, and transient errors
+  still drain workers gracefully.
 - **After an unclean death (OOM, node reboot, SIGKILL) no action is
   needed**: the next start re-derives everything from facts. For
   postmortems, the `terminal_faults` table records the cause of every
@@ -395,7 +395,7 @@ unclassified restart-with-backoff. Operational notes:
   (best-effort, append-only, traveling with the data directory —
   `SELECT * FROM terminal_faults ORDER BY fault_id DESC`; the next `run`
   also logs the latest row once at startup). Any death that did not return
-  through the bracket — SIGKILL, OOM, a node reboot, the two-second abort,
+  through the bracket — SIGKILL, OOM, a node reboot, a terminal runtime abort,
   a controller panic — leaves only the process logs.
 - **Canonical divergence is the one manual path**: the sequencer freezes
   the acceptance frontier

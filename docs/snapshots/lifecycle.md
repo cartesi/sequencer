@@ -25,7 +25,7 @@ aren't. Section references point to the full reasoning below.
   at cold start). Absence is a bug, surfaced fail-loud as
   `CatchUpError::NoSnapshot` — never a branch the happy path handles. (§2)
 - **Tip exists before the lane.** A valid open Tip exists when the lane starts:
-  the reducer's guarded `EnsureOpenTip` phase opens the genesis Tip on a fresh
+  the guarded `ensure_open_tip_for_recovery` operation opens the genesis Tip on a fresh
   DB (after the initial safe-head sync, before the lane); recovery reopens it
   atomically across cascades. The lane
   loads the resulting head from storage (fail-loud if absent), so it only ever
@@ -140,10 +140,10 @@ the GC crash-ordering (§7).
 **A finalized snapshot always exists by the time the lane starts.** The runtime
 establishes it across the setup/run boundary: `setup` writes and registers the
 genesis dump directly as finalized (bypassing pending) before atomically
-committing setup completion. On every `run`, the startup reducer refuses a
+committing setup completion. On every `run`, startup recovery refuses a
 missing finalized-snapshot fact before any provider call, and task-free
 `PreparedRuntime::prepare` requires and re-stamps the referenced artifact before
-durable runtime admission. This gives catch-up a single unconditional path —
+runtime admission over durable facts. This gives catch-up a single unconditional path —
 there is always *something* to load — and turns "no snapshot" into a violated
 invariant surfaced fail-loud as `CatchUpError::NoSnapshot`, never a branch the
 happy path handles.
@@ -389,19 +389,19 @@ holds the lease for the response lifetime via the **drop-guard** inside the
 streaming body, so it releases on completion, error, *and* client disconnect.
 Releases are enqueued to a **supervised** blocking task set
 (`http.rs::supervise_snapshot_releases`) that the HTTP worker drains before
-exit classification, so no release can outlive the runtime's verdict. A
+ordinary shutdown completes. Terminal failures abort without draining. A
 release failure is classified like any storage failure: a *persistent* error
 (e.g. the lease row is gone — `StatementChangedRows` — or a persistent
 open/migration failure) is a storage-invariant violation and takes the
-runtime down terminally (exit 30); transient failures (BUSY, I/O) are logged
+runtime down terminally (SIGABRT); transient failures (BUSY, I/O) are logged
 and left to the startup backstop. `reset_dump_leases` at startup remains the
 crash backstop for releases that never ran. (Endpoint shapes:
 [`AGENTS.md`](../../AGENTS.md) and the root [`README.md`](../../README.md).)
 
 ### Startup sequence
 
-Before this sequence, the startup reducer has already required a finalized
-snapshot fact and established a Tip through either guarded `EnsureOpenTip` or
+Before this sequence, startup recovery has already required a finalized
+snapshot fact and established a Tip through either guarded `ensure_open_tip_for_recovery` or
 an atomic recovery reopen. `PreparedRuntime::prepare` then calls
 `startup_hygiene::run_snapshot_hygiene`, which runs five order-critical
 steps before runtime admission, while no task
@@ -409,8 +409,8 @@ exists: (1) `reset_dump_leases` (clear stale leases from a crashed run),
 (2) `require_finalized_snapshot`, (3) `restamp_finalized_promotion`,
 (4) `snapshot_gc_at_startup`, and (5) `sweep_orphan_dumps` (remove on-disk dirs
 not in `dumps`; the finalized prefix is already registered and cannot be
-swept). Durable admission and the non-yielding worker launch follow only after
-preparation completes and the reducer re-inspects current facts.
+swept). Final admission and the non-yielding worker launch follow only after
+preparation completes and admission re-inspects current facts.
 
 ## 8. Recovery interaction
 

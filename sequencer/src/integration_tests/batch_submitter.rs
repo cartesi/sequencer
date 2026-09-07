@@ -59,7 +59,6 @@ impl TestMock {
 impl BatchPoster for TestMock {
     async fn submit_batches(
         &self,
-        _auth: crate::runtime::shutdown::Authorized<'_>,
         payloads: Vec<Vec<u8>>,
         _watermark: &dyn WalletNonceWatermarkSink,
     ) -> Result<SubmitBatchesOutcome, BatchPosterError> {
@@ -109,7 +108,7 @@ impl BatchPoster for TestMock {
     }
 }
 
-/// Mirrors what the startup recovery reducer establishes in production: persist a real
+/// Mirrors what the startup recovery procedure establishes in production: persist a real
 /// safe-head observation so `submitter_frontier` has a row to read. Without
 /// this, the submitter's first tick errors out on `current_safe_block_required`
 /// and the loop exits before submitting anything.

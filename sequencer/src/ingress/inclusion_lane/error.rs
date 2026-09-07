@@ -21,8 +21,6 @@ pub enum InclusionLaneError {
     },
     #[error(transparent)]
     Storage(#[from] rusqlite::Error),
-    #[error("terminal storage invariant failure requested runtime shutdown")]
-    TerminalStorageInvariant,
     #[error(
         "canonical divergence at batch nonce {nonce}, safe-input index {safe_input_index}; \
          cockroach recovery required"
@@ -48,7 +46,7 @@ pub enum InclusionLaneError {
     PromotionStamp(#[from] StampError),
     #[error(
         "no open Tip at lane startup; the runtime must establish it via \
-         the recovery reducer's EnsureOpenTip phase before starting the lane"
+         guarded startup recovery before starting the lane"
     )]
     NoOpenTip,
 }
@@ -67,9 +65,7 @@ impl InclusionLaneError {
             | Self::PromotionStamp(StampError::Storage(source)) => {
                 crate::storage::is_persistent_storage_error(source)
             }
-            Self::TerminalStorageInvariant | Self::CanonicalDivergence { .. } | Self::NoOpenTip => {
-                true
-            }
+            Self::CanonicalDivergence { .. } | Self::NoOpenTip => true,
             Self::ChannelClosed | Self::PromotionStamp(StampError::Io(_)) => false,
         }
     }

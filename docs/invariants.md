@@ -29,30 +29,28 @@ When you change anything listed under *enforced by*, re-check every line under
 - **Never absorb silently.** No `INSERT OR IGNORE`, saturating decode, or
   `unwrap_or_default` on data the contracts make impossible; use the loud
   variant of the same operation.
-- **Command admission is fact-derived; a contained terminal fault closes
-  in-process first.** Three facts (the kernel process lock, two-sided
+- **Command admission is fact-derived; terminal runtime faults abort the
+  process.** Three facts (the kernel process lock, two-sided
   `setup_complete`, `canonical_divergence`), no admission state machine, no
   operator acknowledgement, and a verdict-neutral black box; the statement,
-  the accepted trade, and the containment mechanism are owned by the
+  the accepted trade, and the termination policy are owned by the
   [authority-boundary ADR](plans/2026-08-authority-boundary-adr.md)
   (mechanisms 1 and 2). What this policy adds: telemetry writes are
   verdict-neutral — a failed black-box record loses only the black-box copy,
-  and the exit code and logs still carry the verdict — and a missed
-  externalization check is bounded only by the exit-code contract and by the
-  [I15](#i15-divergence-marker-present--acceptance-frontier-frozen) freeze
-  triggers on the tables they cover: partial structural backstops, not a
-  barrier.
+  and the exit code and logs still carry the verdict. Runtime aborts skip
+  settlement entirely. The [I15](#i15-divergence-marker-present--acceptance-frontier-frozen)
+  freeze applies immediately to its named tables; runtime reaction still
+  requires a worker to observe the committed marker.
 - **Maintenance is flush-only.** `flush-mempool` is an operator command,
-  not a run-reducer alias: it settles the wallet nonce and never acquires
+  not a startup-recovery alias: it settles the wallet nonce and never acquires
   Sync/Cascade semantics. It requires completed setup and no divergence.
   There is no verdict state for a flush to erase, and a successful wallet
   flush proves nothing about the rest of the runtime.
-- **Normal run repair and admission have one reducer boundary.** Local
-  absorbing facts are inspected before fallible provider facts; the pure run
-  decision performs at most one recovery phase; every completed phase
-  returns to inspection; the flush's safe-block witness is boot-local, and
-  Sync must catch the persisted view up through it before Cascade. Final
-  admission re-runs the same reducer over one consistent fact set and yields
+- **Normal run repair and admission share one selection policy.** Local
+  absorbing facts are inspected before fallible provider facts; startup
+  selects one repair and checks its result. The flush's safe-block witness
+  is boot-local, and Sync must catch the persisted view up through it before
+  Cascade. Final admission checks one consistent fact set and yields
   the single-use `RuntimeAdmission` witness consumed by the infallible,
   non-yielding launch; no refusal or retry can construct it, and raw worker
   and HTTP launch surfaces are crate-private. Design:
@@ -208,8 +206,8 @@ by writer and are write-once (`0001_schema.sql`).
 - **Holds:** cold start registers the genesis dump as finalized and opens the
   genesis Tip; recovery reopens the Tip atomically across cascades.
 - **Enforced by:** `setup` atomically registers the genesis finalized snapshot
-  before its completion fact; the run reducer refuses a missing finalized
-  fact, opens a missing Tip only through its guarded `EnsureOpenTip` phase,
+  before its completion fact; startup recovery refuses a missing finalized
+  fact, opens a missing Tip only through `ensure_open_tip_for_recovery`,
   and recovery's cascade reopens in-transaction. `PreparedRuntime::prepare`
   reasserts the snapshot artifact before admission.
 - **Depended on by:** catch-up's unconditional load path
@@ -347,21 +345,20 @@ by writer and are write-once (`0001_schema.sql`).
   single writer refuses past the marker — the guard at the top of
   `populate_safe_accepted_batches`. The typed error surface also includes
   `check_danger`'s first arm (`CanonicalDivergence`, ranked ahead of every
-  other arm). The run reducer makes that ordering structural at boot: local
-  inspection refuses before any provider query, every completed phase
-  re-enters inspection, and each mutating phase transaction reasserts both
-  its durable preconditions and the absence of divergence before writing. A
-  clean worker drain does not clear the fact: `run` re-reads the marker on
+  other arm). Startup inspection refuses before any provider query, and
+  each repair transaction reasserts its durable preconditions and the
+  absence of divergence before writing. A clean worker drain waits for
+  in-flight reader appends: `run` then re-reads the marker on
   its Ok path (`refuse_divergence_on_clean_exit`) and exits terminal rather
   than 0, the one code that would break the supervisor's restart-then-refuse
   rediscovery. The admission and preemptive TLA+ models verify the
-  controller ordering (`LocalDivergenceFirst` in `admission.tla`) and
+  controller ordering (`LocalTerminalDominance` in `admission.tla`) and
   slot/batch safety respectively.
 - **Runtime reaction:** the danger detector owns prompt process-wide reaction,
   reading `check_danger` on its poll interval (`DANGER_DETECTOR_POLL_INTERVAL`). Independently, the inclusion lane's existing time-gated
   SQLite read returns `SafeFrontierState::CanonicalDivergence` instead of an
-  `Open` frontier when the marker is already present. The lane then closes
-  intake, rejects queued work, and terminates before direct execution,
+  `Open` frontier when the marker is already present. The lane then exits
+  with a terminal error, causing the supervisor to abort, before direct execution,
   promotion, or the five-block rotation decision. This is opportunistic
   refusal at an existing read, not another detector or a timing guarantee.
   One bounded dequeue chunk (`max_user_ops_per_chunk`) is the fast-turn limit, so rejected traffic cannot

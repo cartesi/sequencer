@@ -69,7 +69,7 @@ The sequencer trusts its own code is bug-free. Recovery means recovery from live
 The sequencer is designed to handle:
 
 - **L1 provider outages** — workers retry with exponential backoff. The inclusion lane and API continue operating locally. A wall-clock fallback detects when an outage pushes batches into the danger zone.
-- **Process crashes** — no operator action is needed: every boot derives any required recovery from SQLite and L1 safe state through the startup reducer, never assuming the previous exit was clean. A terminal death best-effort records its cause in the `terminal_faults` black box, which travels with the data directory for postmortems.
+- **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart can recover automatically: every boot derives any required recovery from SQLite and L1 safe state through startup recovery, never assuming the previous exit was clean. Terminal errors returned through a command bracket best-effort record their cause in `terminal_faults`; terminal runtime aborts leave only process diagnostics.
 - **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission; restart policy is the exit-code contract (a terminal exit means: do not restart, page an operator — the one manual remedy is a fresh-directory `setup --recovery` after canonical divergence).
 - **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. The recovery flusher consumes every pending nonce slot with a no-op so delayed "zombie" submissions cannot land later.
 
@@ -130,7 +130,7 @@ environment:
   CARTESI_SEQUENCER_ALLOW_INSECURE_RPC: "true"
 ```
 
-Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), `40` a previous instance left work past the checkpoint (wipe the data directory and run `setup --recovery`), and `1` for an unclassified operational failure. Panics inside the command harness or supervised workers are projected to `30` under the fail-loud self-trust policy; `101` remains possible only before the harness can contain the command (for example, process/runtime initialization), and a contained terminal fault that cannot drain within the abort bound exits by `abort()` (SIGABRT, status 134), which supervisors must treat as terminal class. The constants live in `sequencer/src/commands/error.rs`; supervisor recipes are in [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md).
+Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal command refusal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), `40` a previous instance left work past the checkpoint (wipe the data directory and run `setup --recovery`), and `1` for an unclassified operational failure. Diagnosed terminal runtime faults, including worker panics, immediately call `abort()` (SIGABRT, status 134), without worker drain or database settlement. Supervisors must treat SIGABRT as terminal class. Ordinary shutdown, expected recovery, and transient errors still drain gracefully. Startup panics caught by the command harness are projected to `30`; panics after runtime scope creation abort; `101` remains possible before the command harness starts. The constants live in `sequencer/src/commands/error.rs`; supervisor recipes are in [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md).
 
 Fixed protocol identity (EIP-712):
 
@@ -236,7 +236,7 @@ released even on client disconnect.
 - `sequencer/src/lib.rs`: public crate surface (`run`, `RunConfig`) — the sequencer is a library; app crates build the binary (see `examples/wallet-sequencer/`)
 - `examples/wallet-sequencer/`: binary crate composing the sequencer library with the placeholder wallet app
 - `sequencer/src/http.rs`: shared HTTP error type, JSON error shape, and `axum::serve` orchestration
-- `sequencer/src/runtime/`: process bootstrap, config parsing, EIP-712 domain, shutdown signal, shared clock
+- `sequencer/src/runtime/`: process lock and shutdown scope; command bootstrap and config live in `commands/`, the shared clock in `clock.rs`, and EIP-712 domain construction in `sequencer-core/`
 - `sequencer/src/ingress/`: public write path — `POST /tx` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)
 - `sequencer/src/egress/`: internal read path — WS subscribe + health probes (`api/`) and the DB-backed ordered-L2Tx feed (`l2_tx_feed/`)
 - `sequencer/src/l1/`: L1 client surface — input reader, batch submitter, fee oracle, shared EIP-1559 estimation, provider, partition helper

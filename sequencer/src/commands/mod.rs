@@ -5,7 +5,7 @@
 //! acquire the exclusive process lock, preflight the admission facts,
 //! execute the body, and best-effort record a terminal cause in the black
 //! box. The *mechanisms* the brackets invoke live in their domain modules
-//! (`crate::recovery` for the reducer/flusher, `crate::runtime` for the
+//! (`crate::recovery` for startup repair and flushing, `crate::runtime` for the
 //! shared authority machinery: process lock, `RuntimeScope`).
 //!
 //! - [`run`] — boot workers from a set-up DB (plus `workers`, its supervisor)
@@ -83,9 +83,8 @@ pub(crate) fn record_terminal_fault_best_effort(
 /// this data directory died terminal, say so once at boot, so the cause is in
 /// this process's log even when the last process's final lines were lost.
 /// Nothing branches on the value. Bounded by the settlement writer: a death
-/// that never returned through its command bracket (an abort at the
-/// terminal abort deadline in `crate::runtime::shutdown`, a controller
-/// panic, SIGKILL) left no row, so there is nothing to report. It runs
+/// that never returned through its command bracket (a terminal runtime abort,
+/// a controller panic, SIGKILL) left no row, so there is nothing to report. It runs
 /// ahead of the admission preflight so that a
 /// boot the preflight refuses still logs why the last one died; a data
 /// directory with no database yet is the ordinary case, not a warning.
@@ -314,11 +313,11 @@ mod tests {
             None
         );
 
-        // A terminal verdict — the shape `finish` returns for a contained
-        // fault — lands as one row carrying the error's Display form.
-        let terminal: Result<(), CommandError> = Err(CommandError::StorageInvariantViolation {
-            cause: "lane invariant broke".into(),
-        });
+        // A terminal startup verdict lands as one row carrying the error's
+        // Display form. Runtime faults abort before settlement.
+        let error = CommandError::Storage(rusqlite::Error::InvalidQuery);
+        let expected_cause = error.to_string();
+        let terminal = Err(error);
         record_terminal_fault_best_effort(&db.path, LifecycleCommand::Run, &terminal);
         let fault = Storage::open_read_only(&db.path)
             .expect("reopen")
@@ -326,10 +325,7 @@ mod tests {
             .expect("read")
             .expect("terminal verdict recorded");
         assert_eq!(fault.command, LifecycleCommand::Run);
-        assert_eq!(
-            fault.cause,
-            "persistent storage invariant violation: lane invariant broke"
-        );
+        assert_eq!(fault.cause, expected_cause);
     }
 
     #[test]

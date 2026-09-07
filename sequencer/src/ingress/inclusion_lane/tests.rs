@@ -502,54 +502,6 @@ fn make_included_user_op(seed: u8, offset: u64) -> IncludedUserOp {
     }
 }
 
-#[tokio::test]
-async fn terminal_storage_fault_rejects_current_and_queued_ops_before_persistence() {
-    let db = temp_db("lane-terminal-storage-fault");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
-    let shutdown = RuntimeScope::default();
-    let (tx, rx) = mpsc::channel(2);
-    let (current, current_response) = make_pending_user_op(0x61);
-    let (queued, queued_response) = make_pending_user_op(0x62);
-    tx.try_send(queued).expect("queue pending op");
-
-    let mut lane = InclusionLane {
-        rx,
-        shutdown: shutdown.clone(),
-        app: TestApp::default(),
-        storage,
-        config: default_test_config(),
-    };
-    let mut included = vec![IncludedUserOp {
-        pending: current,
-        executed_input_offset: ExecutedInputCount::ZERO,
-    }];
-    shutdown.contain_storage_invariant_failure("test fault");
-
-    assert!(
-        lane.shutdown.authorize().is_none(),
-        "containment must refuse the externalization token"
-    );
-    assert!(matches!(
-        lane.refuse_externalization(&mut included),
-        InclusionLaneError::TerminalStorageInvariant
-    ));
-    assert!(included.is_empty());
-    assert!(matches!(
-        current_response.await.expect("current response"),
-        Err(SequencerError::Unavailable(_))
-    ));
-    assert!(matches!(
-        queued_response.await.expect("queued response"),
-        Err(SequencerError::Unavailable(_))
-    ));
-    assert!(
-        lane.storage
-            .ordered_l2_txs_page_from(0, 1)
-            .expect("read ordered txs")
-            .is_empty()
-    );
-}
-
 #[test]
 fn fast_turn_processes_at_most_one_rejected_chunk() {
     let db = temp_db("one-rejected-chunk-per-fast-turn");

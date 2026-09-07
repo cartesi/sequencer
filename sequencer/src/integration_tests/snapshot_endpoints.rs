@@ -531,29 +531,28 @@ async fn live_stream_blocks_gc_until_it_drops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalized_state_file_open_failure_releases_lease() {
-    let db = temp_db("snap-open-fail");
+#[cfg(unix)]
+async fn finalized_state_missing_registered_artifact_aborts_process() {
+    if !crate::runtime::shutdown::abort_test_child(
+        "integration_tests::snapshot_endpoints::finalized_state_missing_registered_artifact_aborts_process",
+    ) {
+        return;
+    }
+    let db = temp_db("snap-missing-artifact");
     let dir = tempfile::tempdir().expect("dumps dir");
-    let dump_id = register_finalized(db.path.as_str(), dir.path(), "fin", b"bytes", 1, 1);
-    // Delete the state file out from under the registered row to force the
-    // post-acquire `File::open` error path.
+    register_finalized(db.path.as_str(), dir.path(), "fin", b"bytes", 1, 1);
+    // The durable row promises the artifact exists. This is a terminal
+    // invariant failure, so the process stops before HTTP or lease cleanup.
     std::fs::remove_file(WalletApp::state_file_in_dump(&dump_info::app_prefix(
         &dir.path().join("fin"),
     )))
     .expect("remove state file");
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
-
-    let resp = reqwest::get(server.url("/finalized_state"))
+    let server = start_server(db.path.as_str())
         .await
-        .expect("request");
-    assert_eq!(resp.status().as_u16(), 500);
+        .expect("missing-artifact abort probe needs a real listener");
 
-    assert!(
-        wait_for_lease(db.path.as_str(), dump_id, 0).await,
-        "lease acquired before the open must still be released when the open fails"
-    );
+    let _ = reqwest::get(server.url("/finalized_state")).await;
+    panic!("missing registered snapshot returned instead of aborting");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

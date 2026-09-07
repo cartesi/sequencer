@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 use alloy_primitives::{Address, B256, Signature};
 use tokio::sync::oneshot;
 
-use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError, SubscriptionError};
+use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError};
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use crate::runtime::process_lock::{ProcessLock, ProcessLockError};
 use crate::runtime::shutdown::RuntimeScope;
@@ -267,28 +267,13 @@ async fn shutdown_signal_closes_subscription() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn terminal_fault_discards_already_queued_subscription_events() {
-    let db = temp_db("terminal-discards-queued-feed");
-    seed_ordered_txs(db.path.as_str());
-    let shutdown = RuntimeScope::default();
-    let feed = test_feed(db.path.as_str(), shutdown.clone());
-    let mut subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    shutdown.contain_storage_invariant_failure("test fault");
-
-    assert!(
-        subscription.recv().await.is_none(),
-        "biased shutdown must outrank a replay event queued before terminal publication"
-    );
-    subscription
-        .finish()
-        .await
-        .expect("clean terminal shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
 async fn corrupt_feed_head_trips_terminal_storage_fault() {
+    if !crate::runtime::shutdown::abort_test_child(
+        "egress::l2_tx_feed::tests::corrupt_feed_head_trips_terminal_storage_fault",
+    ) {
+        return;
+    }
     let db = temp_db("corrupt-feed-head");
     seed_ordered_txs(db.path.as_str());
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
@@ -299,16 +284,18 @@ async fn corrupt_feed_head_trips_terminal_storage_fault() {
     let shutdown = RuntimeScope::default();
     let feed = test_feed(db.path.as_str(), shutdown.clone());
 
-    assert!(matches!(
-        feed.subscribe_from(0, u64::MAX).await,
-        Err(SubscribeError::StorageInvariantViolation)
-    ));
-    assert!(shutdown.is_storage_invariant_contained());
-    assert!(shutdown.is_shutdown_requested());
+    let _ = feed.subscribe_from(0, u64::MAX).await;
+    panic!("corrupt feed head returned instead of aborting");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
 async fn corrupt_feed_page_trips_terminal_storage_fault() {
+    if !crate::runtime::shutdown::abort_test_child(
+        "egress::l2_tx_feed::tests::corrupt_feed_page_trips_terminal_storage_fault",
+    ) {
+        return;
+    }
     let db = temp_db("corrupt-feed-page");
     seed_ordered_txs(db.path.as_str());
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
@@ -318,17 +305,10 @@ async fn corrupt_feed_page_trips_terminal_storage_fault() {
 
     let shutdown = RuntimeScope::default();
     let feed = test_feed(db.path.as_str(), shutdown.clone());
-    let subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
+    let mut subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
 
-    tokio::time::timeout(Duration::from_secs(1), shutdown.wait_for_shutdown())
-        .await
-        .expect("terminal fault containment requests shutdown");
-    assert!(shutdown.is_storage_invariant_contained());
-    assert!(shutdown.is_shutdown_requested());
-    assert!(matches!(
-        subscription.finish().await,
-        Err(SubscriptionError::StorageInvariantViolation)
-    ));
+    let _ = subscription.recv().await;
+    panic!("corrupt feed page returned instead of aborting");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -134,7 +134,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         self.run_catch_up(catch_up_from)?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
-        // The Tip exists by construction: the startup reducer established it
+        // The Tip exists by construction: the startup recovery procedure established it
         // before runtime admission. The lane only
         // loads — read the open frame (fail-loud if absent) and the drain
         // cursor together from storage, so both come from the same place. Any
@@ -154,21 +154,11 @@ impl<A: Application + 'static> InclusionLane<A> {
                 return Ok(());
             }
 
-            // Containment is consulted once per effect boundary, not per
-            // line: `run_fast_turn` checks on entry and before persist+ack,
-            // the batch-close branch below checks before its commit, and the
-            // reconciliation turn checks before its commit. Adjacent re-reads
-            // of the same bit buy a nanoseconds-narrower window in a design
-            // that already accepts the honest TOCTOU bound.
             self.maybe_advance_safe_frontier(&mut lane_state, &mut safe_inputs)?;
             let turn = self.run_fast_turn(&mut lane_state.head, &mut included)?;
 
             if turn.hit_batch_target() || should_close_batch_by_time(&lane_state.head, &self.config)
             {
-                if self.shutdown.is_storage_invariant_contained() {
-                    self.reject_pending_user_ops_due_to_shutdown();
-                    return Err(InclusionLaneError::TerminalStorageInvariant);
-                }
                 let next_safe_block = lane_state.head.safe_block;
                 // Atomic close: dump the app state, then seal the batch
                 // and register its pending snapshot in one transaction.
@@ -211,9 +201,6 @@ impl<A: Application + 'static> InclusionLane<A> {
         head: &mut WriteHead,
         included: &mut Vec<IncludedUserOp>,
     ) -> Result<FastTurnSummary, InclusionLaneError> {
-        if self.shutdown.authorize().is_none() {
-            return Err(self.refuse_externalization(included));
-        }
         let (included_count, outcome) = self.process_user_op_chunk(head, included)?;
         match outcome {
             ChunkOutcome::HitBatchTarget => Ok(FastTurnSummary::HitBatchTarget),
@@ -244,15 +231,8 @@ impl<A: Application + 'static> InclusionLane<A> {
         };
         let included_count = included.len();
 
-        // Field-disjoint borrows: the token borrows `self.shutdown` while the
-        // commit mutably borrows `self.storage`; the acknowledgement function
-        // requires the token, so the FULL-committed-chunk-authorizes-ack
-        // boundary is a signature, not a convention.
-        let Some(auth) = self.shutdown.authorize() else {
-            return Err(refuse_externalization_parts(&mut self.rx, included));
-        };
         persist_included_user_ops(&mut self.storage, head, included)?;
-        acknowledge_included(auth, included);
+        acknowledge_included(included);
 
         Ok((included_count, outcome))
     }
@@ -309,10 +289,6 @@ impl<A: Application + 'static> InclusionLane<A> {
         // promoted-but-undrained batch — the state a restart would re-process
         // and re-promote on a deleted pending row.
         let observation = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
-        if self.shutdown.is_storage_invariant_contained() {
-            self.reject_pending_user_ops_due_to_shutdown();
-            return Err(InclusionLaneError::TerminalStorageInvariant);
-        }
         let promoted = observation.commit(
             &mut self.storage,
             &mut lane_state.head,
@@ -337,12 +313,6 @@ impl<A: Application + 'static> InclusionLane<A> {
             }
         }
         Ok(())
-    }
-
-    /// Containment observed: refuse queued work and surface the terminal
-    /// class. The counterpart of a failed [`RuntimeScope::authorize`].
-    fn refuse_externalization(&mut self, included: &mut Vec<IncludedUserOp>) -> InclusionLaneError {
-        refuse_externalization_parts(&mut self.rx, included)
     }
 
     /// Process the safe inputs in `direct_range`, accumulating which of our
@@ -449,36 +419,11 @@ fn persist_included_user_ops(
         })
 }
 
-/// Acknowledge the FULL-committed chunk. Requires the externalization token:
-/// a new acknowledgement site cannot skip the containment consult.
-fn acknowledge_included(
-    _auth: crate::runtime::shutdown::Authorized<'_>,
-    included: &mut Vec<IncludedUserOp>,
-) {
+/// Acknowledge the FULL-committed chunk.
+fn acknowledge_included(included: &mut Vec<IncludedUserOp>) {
     for item in included.drain(..) {
         let _ = item.pending.respond_to.send(Ok(()));
     }
-}
-
-/// Shared refusal tail for a failed authorize: answer in-flight requests
-/// unavailable, close intake, reject queued work, surface the terminal class.
-fn refuse_externalization_parts(
-    rx: &mut mpsc::Receiver<PendingUserOp>,
-    included: &mut Vec<IncludedUserOp>,
-) -> InclusionLaneError {
-    for item in included.drain(..) {
-        let _ = item
-            .pending
-            .respond_to
-            .send(Err(SequencerError::unavailable("sequencer shutting down")));
-    }
-    rx.close();
-    while let Ok(item) = rx.try_recv() {
-        let _ = item
-            .respond_to
-            .send(Err(SequencerError::unavailable("sequencer shutting down")));
-    }
-    InclusionLaneError::TerminalStorageInvariant
 }
 
 #[derive(Debug, PartialEq, Eq)]

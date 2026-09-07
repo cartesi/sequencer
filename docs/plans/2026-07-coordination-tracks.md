@@ -19,7 +19,7 @@ freely at this stage — no backward-compatibility constraints.
 | 5 | Fee exponentiation LUT | us | **deferred** — decided exact-floor if built (the table *is* the spec, algorithm-free; replay continuity across the upgrade explicitly not preserved); a separate pending design decision may make log-space fees defunct — revisit after syncing with Bart |
 | 6 | Dump / `Application` API redesign | us + Bart | **design drafted, under review with Bart** — [`2026-07-track6-dump-api-design.md`](2026-07-track6-dump-api-design.md); see the constraints below |
 | 7 | LLM context-engineering review | us | **done** — skills/agents/settings homed in-tree; the docs-practice rules live in AGENTS.md |
-| 8 | Terminal-containment structural consolidation | us | **done** — superseded by and landed through the [authority-boundary ADR](2026-08-authority-boundary-adr.md) |
+| 8 | Runtime ownership and terminal stop | us | **done** — owned by the [authority-boundary ADR](2026-08-authority-boundary-adr.md) |
 
 **Current campaign order:**
 

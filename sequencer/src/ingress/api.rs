@@ -81,12 +81,6 @@ async fn submit_tx(
         .await
         .map_err(|_| ApiError::internal_error("inclusion lane dropped response"))?;
     commit_result.map_err(ApiError::from)?;
-    // Publication gate: the lane's acknowledgement already required the
-    // token; the success body after a post-commit containment is suppressed
-    // by the same consult.
-    if state.shutdown.authorize().is_none() {
-        return Err(ApiError::unavailable("sequencer shutting down"));
-    }
     debug!(sender = %sender, nonce, "tx committed");
 
     Ok(Json(TxResponse {
@@ -221,54 +215,6 @@ mod tests {
         let result = submit_tx(State(state), Ok(Json(request))).await;
 
         let err = result.expect_err("submit should be rejected during shutdown");
-        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(err.code(), "UNAVAILABLE");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn terminal_fault_after_enqueue_prevents_success_response() {
-        let db = TempDir::new().expect("create temp dir");
-        let db_path = db.path().join("sequencer.db");
-        let _storage = Storage::open(&db_path.to_string_lossy()).expect("create db");
-        let shutdown = RuntimeScope::default();
-        let (tx_sender, mut rx) = mpsc::channel::<PendingUserOp>(1);
-        let state = Arc::new(SubmitState::new(
-            tx_sender,
-            Eip712Domain {
-                name: None,
-                version: None,
-                chain_id: None,
-                verifying_contract: None,
-                salt: None,
-            },
-            128,
-            shutdown.clone(),
-        ));
-        let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
-        let sender = address_from_signing_key(&signing_key);
-        let user_op = UserOp {
-            nonce: 0,
-            max_fee: 0,
-            data: Vec::new().into(),
-        };
-        let request = TxRequest {
-            message: user_op.clone(),
-            signature: sign_user_op_hex(&state.domain, &user_op, &signing_key),
-            sender: sender.to_string(),
-        };
-        let response = tokio::spawn(submit_tx(State(state), Ok(Json(request))));
-        let pending = rx.recv().await.expect("request reached the lane");
-
-        shutdown.contain_storage_invariant_failure("test fault");
-        pending
-            .respond_to
-            .send(Ok(()))
-            .expect("simulate a stale post-fault lane acknowledgement");
-
-        let err = response
-            .await
-            .expect("handler task")
-            .expect_err("terminal publication must prevent HTTP 200");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.code(), "UNAVAILABLE");
     }

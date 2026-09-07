@@ -102,9 +102,9 @@ The cycle crosses a process boundary by design: the in-process
 [`DangerDetector`](sequencer/src/recovery/detector.rs) polls
 `Storage::check_danger` on a cadence and returns a non-`Safe` worker exit; the
 runtime closes intake and drains before the command returns non-zero (stopping
-the process is how the sequencer goes offline). Terminal containment has a
-hard abort fallback; expected-recovery and retryable exits are graceful; the
-orchestrator respawns; on every boot the startup reducer re-derives the
+the process is how the sequencer goes offline). Diagnosed terminal runtime
+faults abort immediately; expected-recovery and retryable exits are graceful;
+the orchestrator respawns; on every boot startup recovery re-derives the
 response from local facts.
 
 The authoritative dispatch table, phase ordering, boot-local witnesses, the
@@ -157,7 +157,7 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - `sequencer/src/lib.rs` — public sequencer API. The thin binary entrypoints live in `examples/wallet-sequencer/`.
 - `sequencer/src/harness.rs` — CLI harness: the `setup`/`run`/`flush-mempool` subcommand parser, `dispatch`, and the exit-code projection. An app's `main` is ~5 lines (`run_main` + a genesis-app closure).
 - `sequencer/src/http.rs` — shared HTTP error type, JSON `ErrorResponse`, `ApiConfig`, and `axum::serve` orchestration.
-- `sequencer/src/commands/` — the operator command brackets: `setup` (phase A — pin identity, initial sync, genesis snapshot, atomic `setup_complete` fact), `run` (phase B — recover, prepare, admit, and boot workers; its `workers` supervisor lives beside it), and `flush` (`flush-mempool`). `sequencer/src/commands/` also owns the command-scoped `config` and `error` taxonomy (incl. the exit-code projection); `sequencer/src/runtime/` is exactly the runtime authority capabilities — the process lock and `shutdown` (runtime scope/containment) — consumed crate-wide. `L1Config` lives in `sequencer/src/l1/`; the crate-wide wall clock is `sequencer/src/clock.rs`.
+- `sequencer/src/commands/` — the operator command brackets: `setup` (phase A — pin identity, initial sync, genesis snapshot, atomic `setup_complete` fact), `run` (phase B — recover, prepare, admit, and boot workers; its `workers` supervisor lives beside it), and `flush` (`flush-mempool`). `sequencer/src/commands/` also owns the command-scoped `config` and `error` taxonomy (incl. the exit-code projection); `sequencer/src/runtime/` is exactly the runtime authority capabilities — the process lock and `shutdown` (runtime scope and graceful notification) — consumed crate-wide. `L1Config` lives in `sequencer/src/l1/`; the crate-wide wall clock is `sequencer/src/clock.rs`.
 - `sequencer/src/ingress/` — public write path.
   - `api.rs` — `POST /tx` handler, JSON-rejection mapping.
   - `inclusion_lane/` — single-lane hot-path loop (`mod.rs`), catch-up replay, config, error types.
@@ -257,10 +257,10 @@ The hot-path rules are owned elsewhere; this section is only the map.
   [`docs/invariants.md`](docs/invariants.md) (the fail-loud check policy plus
   I2, I3, I9, I10, I12–I18, I20) — that register owns them; do not restate
   them here.
-- Command admission, containment, the two-regime lane and its
+- Command admission, terminal stop, the two-regime lane and its
   acknowledgement rule, and role-local authority are owned by the
   [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md)
-  (mechanisms 1, 2, and 4); the recovery reducer by
+  (mechanisms 1, 2, and 4); startup recovery by
   [`docs/recovery/README.md`](docs/recovery/README.md).
 - The frame-clock policy (five newly-safe blocks, one frame at the observed
   tip, never interpolated, and its revisit trigger) is owned by
