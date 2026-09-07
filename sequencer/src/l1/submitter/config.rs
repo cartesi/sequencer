@@ -13,21 +13,13 @@ use std::time::Duration;
 /// doesn't read it. The [`crate::recovery::DangerDetector`] worker owns that.
 #[derive(Debug, Clone)]
 pub struct BatchSubmitterConfig {
-    /// How often the submitter polls for new work when idle.
+    /// How often the submitter polls for new work when idle, and how long it
+    /// waits before re-estimating when the mempool already holds its txs.
     pub idle_poll_interval_ms: u64,
-    /// Safe-confirmation depth used by the poster.
-    pub confirmation_depth: u64,
-    /// Assumed L1 block time used to pace fee-ceiling hold probes.
-    pub seconds_per_block: u64,
 }
 
 impl BatchSubmitterConfig {
     pub fn idle_poll_interval(&self) -> Duration {
         Duration::from_millis(self.idle_poll_interval_ms)
-    }
-
-    pub fn confirmation_cadence(&self) -> Duration {
-        let blocks = self.confirmation_depth.saturating_add(1).saturating_mul(2);
-        Duration::from_secs(blocks.saturating_mul(self.seconds_per_block))
     }
 }

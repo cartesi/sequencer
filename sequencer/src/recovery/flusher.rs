@@ -19,7 +19,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
-use crate::l1::eip1559::{bumped_replacement_fees, estimate_fees, fee_ceiling, pad_gas_estimate};
+use crate::l1::eip1559::{estimate_fees, pad_gas_estimate};
 use crate::l1::watermark::{StorageWatermarkSink, WalletNonceWatermarkSink};
 
 #[derive(Debug, Error)]
@@ -49,6 +49,45 @@ fn derive_timeouts(seconds_per_block: u64) -> (Duration, Duration) {
         Duration::from_secs(10 * seconds_per_block),
         Duration::from_secs(seconds_per_block),
     )
+}
+
+/// Headroom on the fresh estimate when pricing flush no-ops.
+///
+/// A no-op replaces a pending batch tx only if it beats it by ≥10% on *both*
+/// EIP-1559 components, and the poster's pending tx carries the market price
+/// of the moment it was sent (the poster never escalates — see the fee-policy
+/// note in `l1::submitter::poster`). A no-op priced off today's market alone
+/// therefore loses whenever the market has fallen at all since that send.
+/// Three times the current estimate clears any poster tx sent when the market
+/// was up to 3× higher on either component. This is one-shot and stateless
+/// (every flush pass re-estimates from scratch), on a 21 000-gas transfer, so
+/// it cannot compound and costs about `21000 × 3.3 × cap` per no-op.
+const NOOP_FEE_HEADROOM: u128 = 3;
+
+/// Bump one EIP-1559 component for a same-nonce replacement: ×1.1, plus 1 wei
+/// so integer division cannot stall on a flat spot and geth's strict-greater
+/// precheck still passes when `x` is tiny. Saturating `x+1` keeps a
+/// `u128::MAX` fee from shrinking after `saturating_mul`.
+fn bump_replacement_component(value: u128) -> u128 {
+    let bumped = value.saturating_mul(11) / 10 + 1;
+    bumped.max(value.saturating_add(1))
+}
+
+/// Price a one-shot same-nonce replacement under geth's ≥10% rule.
+///
+/// Both components grow by the same ×1.1 (+1) factor and the tip is clamped
+/// to the cap. Asymmetric growth (the historical tip ×2 / cap ×1.1) yields
+/// `tip > max_fee` — an invalid EIP-1559 pair every node rejects — as soon as
+/// the estimate's cap sits close to its tip, which is the normal shape on a
+/// zero-base-fee chain (`max_fee = 2·base + tip`); on such a chain every
+/// no-op failed and recovery could not complete. Equal growth preserves
+/// `tip ≤ max_fee` whenever the input satisfied it; the clamp covers
+/// already-invalid inputs.
+fn bumped_replacement_fees(base_max_fee: u128, base_priority_fee: u128) -> (u128, u128) {
+    let tip = base_priority_fee.min(base_max_fee);
+    let new_max_fee = bump_replacement_component(base_max_fee);
+    let new_priority_fee = bump_replacement_component(tip).min(new_max_fee);
+    (new_max_fee, new_priority_fee)
 }
 
 fn send_failures_error(failures: &[(u64, String)]) -> FlushError {
@@ -242,10 +281,27 @@ impl MempoolFlusher {
         let estimate = estimate_fees(&self.provider)
             .await
             .map_err(FlushError::Provider)?;
-        let max_fee = fee_ceiling(estimate.max_fee_per_gas);
-        let (_, bumped_priority_fee) =
-            bumped_replacement_fees(estimate.max_fee_per_gas, estimate.max_priority_fee_per_gas);
-        let priority_fee = bumped_priority_fee.min(max_fee);
+        // One-shot: `NOOP_FEE_HEADROOM ×` the fresh estimate, then the ≥10%
+        // replacement bump on both components, so a no-op can replace a
+        // pending batch tx at the same wallet nonce. Safety does not depend
+        // on the no-op winning — `flush_and_wait` only returns once
+        // Pending ≤ Safe.
+        //
+        // Residual gap: this prices off a *fresh* estimate, not the pending
+        // tx's own fees, so the no-op is rejected as underpriced when the
+        // market has fallen more than the headroom since the poster's send
+        // (that tx is then over-priced, hence mineable) — and when this
+        // flusher's own no-op from a previous pass still occupies the slot
+        // after a watch timeout on a flat market. Either way `submit_noops`
+        // hard-errors and the orchestrator respawn retries until the slot
+        // resolves. Tightening that needs the pending tx's own fees, not a
+        // bigger multiplier.
+        let (max_fee, priority_fee) = bumped_replacement_fees(
+            estimate.max_fee_per_gas.saturating_mul(NOOP_FEE_HEADROOM),
+            estimate
+                .max_priority_fee_per_gas
+                .saturating_mul(NOOP_FEE_HEADROOM),
+        );
 
         // Estimate once without a nonce, explicitly at Latest. This mirrors
         // the poster's nonce-free estimate and avoids Pending nonce policy;
@@ -370,9 +426,93 @@ mod tests {
         }
     }
 
-    // ── H5: ceiling pricing keeps no-ops competitive ──────────────
-    // The flusher uses the poster's shared ceiling for max fee and a bumped,
-    // cap-clamped priority fee, so it can clear any ordinary poster floor.
+    // ── H5: replacement-fee bump keeps no-ops competitive ─────────
+    // One-shot: `NOOP_FEE_HEADROOM ×` the fresh estimate, then a symmetric
+    // ×1.1 bump; the use site is `submit_noops`. It clears a poster tx sent
+    // when the market was up to 3× higher on either component; a larger fall
+    // since that send is the documented residual (and that tx is mineable).
+
+    #[test]
+    fn replacement_fee_bump_exceeds_ten_percent_for_max_fee() {
+        for base in [1_u128, 10, 100, 1_000, 1_000_000, 1_000_000_000_000] {
+            let (new_max, _) = bumped_replacement_fees(base, 0);
+            assert!(
+                new_max.saturating_mul(10) >= base.saturating_mul(11),
+                "max_fee bump violates ≥10% rule: base={base}, new={new_max}",
+            );
+            assert!(new_max > base);
+        }
+    }
+
+    #[test]
+    fn replacement_fee_bump_exceeds_ten_percent_for_priority_fee() {
+        for base in [1_u128, 10, 100, 1_000, 1_000_000, 1_000_000_000_000] {
+            let (_, new_prio) = bumped_replacement_fees(base.saturating_mul(4), base);
+            assert!(
+                new_prio.saturating_mul(10) >= base.saturating_mul(11),
+                "priority bump violates ≥10% rule: base={base}, new={new_prio}",
+            );
+            assert!(new_prio > base);
+        }
+    }
+
+    #[test]
+    fn replacement_fee_bump_keeps_tip_at_or_below_fee_cap() {
+        for (max_fee, tip) in [
+            (0_u128, 0),
+            (0, 100),
+            (1, 1),
+            (1, 10),
+            (20_000_000_000, 1_000_000_000),
+            (u128::MAX, u128::MAX),
+        ] {
+            let (new_max, new_prio) = bumped_replacement_fees(max_fee, tip);
+            assert!(
+                new_prio <= new_max,
+                "bumped tip {new_prio} exceeds fee cap {new_max} (from max={max_fee} tip={tip})",
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_fee_bump_of_zero_base_estimate_stays_valid() {
+        // Zero-base chain: the default estimator gives max_fee == tip. The
+        // historical tip ×2 bump produced tip > max_fee here — an invalid tx
+        // every node rejects, so recovery could never complete on devnet.
+        let (new_max, new_prio) = bumped_replacement_fees(1_000, 1_000);
+        assert_eq!(new_max, 1_101);
+        assert_eq!(new_prio, 1_101);
+    }
+
+    #[test]
+    fn replacement_fee_floor_is_positive_even_when_base_is_zero() {
+        let (new_max, new_prio) = bumped_replacement_fees(0, 0);
+        assert!(new_max >= 1);
+        assert!(new_prio >= 1);
+    }
+
+    #[test]
+    fn replacement_fee_bump_saturates_at_u128_max() {
+        let (new_max, new_prio) = bumped_replacement_fees(u128::MAX, u128::MAX);
+        assert_eq!(new_max, u128::MAX);
+        assert_eq!(new_prio, u128::MAX);
+    }
+
+    #[test]
+    fn noop_headroom_clears_a_poster_tx_sent_when_the_market_was_three_times_higher() {
+        // Poster sent at cap 63 gwei / tip 3 gwei; the market has since
+        // fallen 3× on both components (exact thirds, so integer rounding
+        // does not eat the boundary). The no-op must still beat the pending
+        // tx by ≥10% on both.
+        let (sent_cap, sent_tip) = (63_000_000_000_u128, 3_000_000_000_u128);
+        let (now_cap, now_tip) = (sent_cap / 3, sent_tip / 3);
+        let (noop_cap, noop_tip) = bumped_replacement_fees(
+            now_cap.saturating_mul(NOOP_FEE_HEADROOM),
+            now_tip.saturating_mul(NOOP_FEE_HEADROOM),
+        );
+        assert!(noop_cap.saturating_mul(10) >= sent_cap.saturating_mul(11));
+        assert!(noop_tip.saturating_mul(10) >= sent_tip.saturating_mul(11));
+    }
 
     #[test]
     fn send_failure_error_summarizes_failed_slots() {
