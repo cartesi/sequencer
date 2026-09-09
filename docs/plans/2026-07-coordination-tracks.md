@@ -17,7 +17,7 @@ freely at this stage — no backward-compatibility constraints.
 | 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **storage foundation landed; public API open** — the [Track 3 ordered handoff](2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff) exclusively owns its sequence and decision gates |
 | 4 | Storage decode policy | us | **done** — fail-loud for contract-impossible values; the named `saturating_query_bound` only where clamping preserves the predicate (policy lives in `storage/convert.rs` + the invariants check policy) |
 | 5 | Fee exponentiation LUT | us | **deferred** — decided exact-floor if built (the table *is* the spec, algorithm-free; replay continuity across the upgrade explicitly not preserved); a separate pending design decision may make log-space fees defunct — revisit after syncing with Bart |
-| 6 | Dump / `Application` API redesign | us + Bart | **design drafted, under review with Bart** — [`2026-07-track6-dump-api-design.md`](2026-07-track6-dump-api-design.md); see the constraints below |
+| 6 | Dump / `Application` API redesign | us + Bart | **revised interface implemented** — [Application contract](../protocol/application-contract.md); native bridge conformance is a separate integration branch |
 | 7 | LLM context-engineering review | us | **done** — skills/agents/settings homed in-tree; the docs-practice rules live in AGENTS.md |
 | 8 | Runtime ownership and terminal stop | us | **done** — owned by the [authority-boundary ADR](2026-08-authority-boundary-adr.md) |
 
@@ -26,7 +26,7 @@ freely at this stage — no backward-compatibility constraints.
 1. Land the authority-boundary + durable-history-foundation branch (squashed,
    review complete — ready for its PR against main).
 2. Implement Track 3's public protocol on a focused successor branch.
-3. Track 6 implementation after the design settles with Bart.
+3. Validate Track 6 against the reference C bridge, then the private DEX engine when shared.
 4. Track 5 (fee LUT) only after the log-space-fees decision.
 
 Deferred (revisit with libdex rollout): multi-file/tar snapshot serving
@@ -84,29 +84,23 @@ until the pending log-space-fees decision lands (with Bart).
 
 ## Track 6 — Dump / `Application` API redesign
 
-The `create_dump` / `from_dump` / `delete_dump` / `state_file_in_dump`
-surface is a leaky projection of what the inclusion lane needs; the design
-doc inventories the real requirements (atomic crash-durable checkpoint,
-startup reconstruct, disposal, serve-canonical-bytes-without-instantiating).
-Constraints established for the design review with Bart:
+The accepted boundary keeps checkpoint creation, restore, disposal, and a pure
+path to canonical comparison bytes. Creation takes `&mut self`, allowing an
+adapter to flush or replace backing mappings while preserving logical state.
+Checkpoints are durable before SQLite references them, immutable afterward,
+and independently restorable even after source deletion. The application
+prefix may be a file or directory.
 
-- The CM emulator has **no commit/revert** — its API is
-  `load / store / clone_stored / remove_stored`; commit/revert stay
-  sequencer-side (DB row as commit point; older-dump+replay as revert). The
-  genuinely missing primitive is **cheap clone** (reflink with graceful
-  full-copy fallback; hardlink suitability for a mutable working image is
-  disputed — settle in the design review).
-- **Durability postures are opposite and must not be silently inherited:**
-  the sequencer mandates fsync inside the checkpoint (I13); CM/Dave fsync
-  nothing and compensate with hash-on-load. Keep the app-fsync posture; a
-  CoW implementation must fsync what reflink leaves unsynced. (CM PR #398's
-  durable `rename_stored`/`remove_stored` narrows this gap — re-check before
-  finalizing the crash-safety section.)
-- **libdex layout constraint to communicate early:** the served canonical
-  file must byte-match the canonical machine's `inspect_state` output (the
-  watchdog byte-compares). A raw mmap buffer with allocator padding or
-  pointer-valued fields breaks that: either the buffer layout is itself
-  canonical, or libdex needs a separate canonical projection.
+The engine owns count/clock progress and reports it by value. Successful apply
+hooks advance it; the shared boundary verifies the exact successor. Keep
+`Send`, remove unused `Clone + Sync`, and place canonical inspection on its
+actual consumer. See the [Application contract](../protocol/application-contract.md)
+for migration and the [review ledger](../review/2026-09-09-application-lane-dex-review.md)
+for the accepted simplifications.
 
-Deliverable: design settled jointly with the Track 3 doc, in front of Bart
-together — his on-disk layout decision depends on both.
+The [July proposal](2026-07-track6-dump-api-design.md) is superseded. CoW,
+flush/reopen sequencing, and working-image management belong inside an engine
+adapter. Additional public primitives or asynchronous checkpoint scheduling
+need a measured requirement. The DEX's private scheduler and bridge have not
+been shared; conformance of the reference C bridge cannot establish theirs.
+A watchdog comparison against the canonical DEX state drive is separate work.

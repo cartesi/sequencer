@@ -30,7 +30,7 @@ use sequencer_core::application::Application;
 /// `setup`. The genesis checkpoint is born finalized: resume nonce 0, replay
 /// cursor 0, `B` = 0 (implicit-genesis inclusion block, matching the row).
 pub(crate) fn register_genesis_finalized_snapshot<A: Application + 'static>(
-    initial_app: A,
+    mut initial_app: A,
     storage: &mut crate::storage::Storage,
     dumps_dir: &std::path::Path,
 ) -> Result<(), CommandError> {
@@ -57,7 +57,7 @@ pub(crate) fn register_genesis_finalized_snapshot<A: Application + 'static>(
         .unwrap_or(0);
     let genesis_dir = dumps_dir.join(format!("genesis-{nanos}"));
     create_dump_dir_with_info(
-        &initial_app,
+        &mut initial_app,
         &genesis_dir,
         &dump_info::DumpInfo {
             format_version: dump_info::FORMAT_VERSION,
@@ -105,7 +105,7 @@ pub(crate) fn register_genesis_finalized_snapshot<A: Application + 'static>(
 /// (offsets below the head) are skipped — they are already in `S'`, while
 /// on-chain `run`'s first batch (frame `safe_block ≥ C`) drains them once.
 pub(crate) fn fill_recovery_state<A: Application + 'static>(
-    recovered_app: A,
+    mut recovered_app: A,
     resume_nonce: u64,
     // `C`, the post-flush stop block; recorded as the snapshot's
     // `promoted_inclusion_block` and the recovery tip frame's safe block.
@@ -184,7 +184,7 @@ pub(crate) fn fill_recovery_state<A: Application + 'static>(
         .unwrap_or(0);
     let recovery_dir = dumps_dir.join(format!("recovery-{nanos}"));
     create_dump_dir_with_info(
-        &recovered_app,
+        &mut recovered_app,
         &recovery_dir,
         &dump_info::DumpInfo::at_recovery(resume_nonce, head, stop_block),
     )
@@ -213,8 +213,7 @@ mod tests {
     use alloy_primitives::{Address, U256};
     use app_core::application::{WalletApp, WalletConfig};
     use sequencer_core::application::{
-        AppError, AppOutputs, ApplicationProgress, ApplyInputCapability, InvalidReason,
-        ProgressCommitCapability,
+        AppError, AppOutputs, ApplicationProgress, ValidationOutcome,
     };
     use sequencer_core::history::ExecutedInputCount;
     use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
@@ -242,36 +241,25 @@ mod tests {
             _sender: Address,
             _user_op: &UserOp,
             _current_fee: u16,
-        ) -> Result<(), InvalidReason> {
-            Ok(())
+        ) -> Result<ValidationOutcome, AppError> {
+            Ok(ValidationOutcome::Accept)
         }
 
         fn apply_valid_user_op(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             _user_op: &ValidUserOp,
             _safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
             unreachable!("not used by setup-fill tests")
         }
 
-        fn apply_direct_input(
-            &mut self,
-            _capability: ApplyInputCapability<'_>,
-            _input: &DirectInput,
-        ) -> Result<AppOutputs, AppError> {
+        fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
+            self.0.advance(input.block_number);
             Ok(Vec::new())
         }
 
-        fn execution_progress(&self) -> &ApplicationProgress {
-            &self.0
-        }
-
-        fn execution_progress_mut(
-            &mut self,
-            _capability: ProgressCommitCapability<'_>,
-        ) -> &mut ApplicationProgress {
-            &mut self.0
+        fn progress(&self) -> ApplicationProgress {
+            self.0
         }
 
         fn from_dump(prefix: &Path) -> Result<Self, AppError> {
@@ -288,7 +276,7 @@ mod tests {
             ))
         }
 
-        fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+        fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
             std::fs::create_dir(prefix)?;
             let mut bytes = Vec::with_capacity(16);
             bytes.extend_from_slice(&self.0.executed_input_count().get().to_le_bytes());

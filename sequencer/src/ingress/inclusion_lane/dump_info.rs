@@ -7,14 +7,14 @@
 //!
 //! ```text
 //! dumps/<id>/
-//!   state       app-owned subtree — the prefix handed to
+//!   state       app-owned file or directory — the prefix handed to
 //!               `Application::{create_dump, from_dump, delete_dump}`
 //!   info.toml   sequencer-owned checkpoint metadata (this module)
 //! ```
 //!
 //! `info.toml` makes a finalized dump a self-contained checkpoint for the
 //! recovery handoff — and, together with the app's `state`
-//! subtree, the unit an operator backs up: `setup --recovery` rebuilds a wiped
+//! file or directory, the unit an operator backs up: `setup --recovery` rebuilds a wiped
 //! DB from exactly this pair, reading `N` straight from the file. `next_batch_nonce`
 //! (`N`) is known at batch close and written then; `promoted_inclusion_block`
 //! (`B`) is known at promotion and stamped in place afterwards. An in-place update of a file
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use sequencer_core::application::{AppError, Application};
 
-/// Name of the app-owned subtree inside a dump directory.
+/// Name of the app-owned file or directory inside a dump directory.
 const APP_STATE_SUBDIR: &str = "state";
 /// Name of the sequencer-owned metadata file inside a dump directory.
 const INFO_FILE: &str = "info.toml";
@@ -125,10 +125,10 @@ pub enum CreateDumpDirError {
 /// sequencer-owned `info.toml`, then the app's dump under `state` —
 /// every file durable before the caller writes the DB row that
 /// references the dir. The app's `create_dump` contract fsyncs its
-/// subtree and its parent (the dump dir); the final parent-dir fsync
+/// files and directory entries (the dump dir); the final parent-dir fsync
 /// persists the dump dir's own entry in the dumps directory.
 pub fn create_dump_dir_with_info<A: Application>(
-    app: &A,
+    app: &mut A,
     dump_dir: &Path,
     info: &DumpInfo,
 ) -> Result<(), CreateDumpDirError> {
@@ -142,7 +142,7 @@ pub fn create_dump_dir_with_info<A: Application>(
     Ok(())
 }
 
-/// Delete one structured dump directory: the app's subtree via its
+/// Delete one structured dump directory: the app's prefix via its
 /// `delete_dump` hook (when present — an orphan from a crash between
 /// dir creation and `create_dump` legitimately lacks it), then the
 /// rest of the dir (`info.toml` + the dir itself).
@@ -214,8 +214,8 @@ pub fn read_info(dump_dir: &Path) -> io::Result<DumpInfo> {
 /// (`manifest.json` + `snapshot/`) from a merely empty/wrong path.
 pub fn diagnose_missing_dump(dump_dir: &Path) -> String {
     let expected = format!(
-        "expected a finalized sequencer dump at {} with `info.toml` and a `state/` \
-         app subtree (usually `$CARTESI_SEQUENCER_DATA_DIR/dumps/<id>/`). \
+        "expected a finalized sequencer dump at {} with `info.toml` and a `state` \
+         app dump (usually `$CARTESI_SEQUENCER_DATA_DIR/dumps/<id>/`). \
          See docs/snapshots/lifecycle.md and docs/recovery/cockroach.md.",
         dump_dir.display()
     );
@@ -247,7 +247,7 @@ pub fn diagnose_missing_dump(dump_dir: &Path) -> String {
     let has_state = dump_dir.join(APP_STATE_SUBDIR).exists();
     if has_state {
         return format!(
-            "missing `info.toml` (found `state/` but no checkpoint metadata) — {expected}"
+            "missing `info.toml` (found `state` but no checkpoint metadata) — {expected}"
         );
     }
 
@@ -268,6 +268,154 @@ pub fn stamp_promoted_inclusion_block(dump_dir: &Path, block: u64) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::Address;
+    use sequencer_core::application::{
+        AppOutputs, ApplicationProgress, ValidationOutcome, execute_direct_input,
+    };
+    use sequencer_core::history::ExecutedInputCount;
+    use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+    use sequencer_core::user_op::UserOp;
+
+    #[derive(Default)]
+    struct PrefixDumpApp<const DIRECTORY: bool> {
+        progress: ApplicationProgress,
+        flushes: usize,
+    }
+
+    impl<const DIRECTORY: bool> Application for PrefixDumpApp<DIRECTORY> {
+        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+
+        fn validate_user_op(
+            &self,
+            _sender: Address,
+            _user_op: &UserOp,
+            _fee: u16,
+        ) -> Result<ValidationOutcome, AppError> {
+            Ok(ValidationOutcome::Accept)
+        }
+
+        fn apply_valid_user_op(
+            &mut self,
+            _user_op: &ValidUserOp,
+            safe_block: u64,
+        ) -> Result<AppOutputs, AppError> {
+            self.progress.advance(safe_block);
+            Ok(Vec::new())
+        }
+
+        fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
+            self.progress.advance(input.block_number);
+            Ok(Vec::new())
+        }
+
+        fn progress(&self) -> ApplicationProgress {
+            self.progress
+        }
+
+        fn from_dump(prefix: &Path) -> Result<Self, AppError> {
+            let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
+            let count = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let block = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+            if DIRECTORY {
+                assert_eq!(std::fs::read(prefix.join("manifest"))?, b"complete");
+            }
+            Ok(Self {
+                progress: ApplicationProgress::try_new(ExecutedInputCount::new(count), block)
+                    .expect("coherent dumped progress"),
+                flushes: 0,
+            })
+        }
+
+        fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
+            self.flushes += 1;
+            if DIRECTORY {
+                std::fs::create_dir(prefix)?;
+                std::fs::write(prefix.join("manifest"), b"complete")?;
+                std::fs::File::open(prefix.join("manifest"))?.sync_all()?;
+            }
+            let bytes = [
+                self.progress.executed_input_count().get().to_le_bytes(),
+                self.progress.last_executed_safe_block().to_le_bytes(),
+            ]
+            .concat();
+            let state = Self::state_file_in_dump(prefix);
+            std::fs::write(&state, bytes)?;
+            std::fs::File::open(state)?.sync_all()?;
+            if DIRECTORY {
+                std::fs::File::open(prefix)?.sync_all()?;
+            }
+            std::fs::File::open(prefix.parent().unwrap())?.sync_all()?;
+            Ok(())
+        }
+
+        fn delete_dump(prefix: &Path) -> Result<(), AppError> {
+            if DIRECTORY {
+                std::fs::remove_dir_all(prefix)?;
+            } else {
+                std::fs::remove_file(prefix)?;
+            }
+            Ok(())
+        }
+
+        fn state_file_in_dump(prefix: &Path) -> PathBuf {
+            if DIRECTORY {
+                prefix.join("progress")
+            } else {
+                prefix.to_path_buf()
+            }
+        }
+    }
+
+    fn assert_dump_prefix_round_trip<const DIRECTORY: bool>() {
+        let root = tempfile::tempdir().unwrap();
+        let dump = root.path().join("original");
+        let input = DirectInput {
+            sender: Address::ZERO,
+            block_number: 7,
+            payload: vec![],
+        };
+        let mut app = PrefixDumpApp::<DIRECTORY>::default();
+        execute_direct_input(&mut app, &input).unwrap();
+        let checkpoint = app.progress();
+        create_dump_dir_with_info(&mut app, &dump, &sample()).unwrap();
+        assert_eq!(
+            app.flushes, 1,
+            "dump creation can flush mutable runtime state"
+        );
+        assert_eq!(
+            app.progress(),
+            checkpoint,
+            "dumping preserves logical state"
+        );
+        assert_eq!(app_prefix(&dump).is_dir(), DIRECTORY);
+        assert_eq!(read_info(&dump).unwrap(), sample());
+
+        let mut first = PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&dump)).unwrap();
+        let second = PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&dump)).unwrap();
+        delete_dump_dir::<PrefixDumpApp<DIRECTORY>>(&dump).unwrap();
+        execute_direct_input(&mut first, &input).unwrap();
+        assert_eq!(app.progress(), checkpoint);
+        assert_eq!(
+            second.progress(),
+            checkpoint,
+            "restored instances own independent state"
+        );
+        let successor = root.path().join("successor");
+        create_dump_dir_with_info(&mut first, &successor, &sample()).unwrap();
+        let reloaded = PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&successor)).unwrap();
+        assert_eq!(
+            reloaded.progress(),
+            first.progress(),
+            "restored state survives source deletion"
+        );
+        delete_dump_dir::<PrefixDumpApp<DIRECTORY>>(&successor).unwrap();
+    }
+
+    #[test]
+    fn single_file_and_directory_dumps_restore_independent_instances() {
+        assert_dump_prefix_round_trip::<false>();
+        assert_dump_prefix_round_trip::<true>();
+    }
 
     fn sample() -> DumpInfo {
         DumpInfo {
@@ -414,7 +562,7 @@ mod tests {
         std::fs::create_dir(dir.path().join(APP_STATE_SUBDIR)).unwrap();
         let msg = diagnose_missing_dump(dir.path());
         assert!(msg.contains("missing `info.toml`"), "got: {msg}");
-        assert!(msg.contains("found `state/`"), "got: {msg}");
+        assert!(msg.contains("found `state`"), "got: {msg}");
     }
 
     #[test]

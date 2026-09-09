@@ -28,6 +28,12 @@ pub enum ExecutionOutcome {
     Invalid(InvalidReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationOutcome {
+    Accept,
+    Reject(InvalidReason),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppOutput {
     Notice(Vec<u8>),
@@ -40,12 +46,7 @@ pub enum AppOutput {
 
 pub type AppOutputs = Vec<AppOutput>;
 
-/// Scheduler-owned progress embedded in the application's durable state.
-///
-/// Application hooks own only application-specific mutation. The shared
-/// execution functions below advance this value after a hook succeeds, so the
-/// history coordinate and safe-block clock are not hand-maintained by every
-/// application implementation.
+/// Canonical progress owned and persisted by the application alongside its state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ApplicationProgress {
     executed_input_count: ExecutedInputCount,
@@ -55,9 +56,9 @@ pub struct ApplicationProgress {
 impl ApplicationProgress {
     /// Construct a coherent application-history boundary: `None` when the
     /// pair is incoherent (zero executed inputs with a nonzero clock), since
-    /// a nonzero clock proves that at least one input executed. The only
-    /// production constructor is a decode path, which owes a typed error, not
-    /// a panic; a genesis instance starts from `Default`.
+    /// a nonzero clock proves that at least one input executed. Used when
+    /// restoring a dump or importing progress from a native application;
+    /// a genesis instance starts from `Default`.
     pub const fn try_new(
         executed_input_count: ExecutedInputCount,
         last_executed_safe_block: u64,
@@ -79,6 +80,14 @@ impl ApplicationProgress {
         self.last_executed_safe_block
     }
 
+    /// Advance after one successful input, including an application-level no-op.
+    /// Panics if the history count has no representable successor.
+    pub fn advance(&mut self, safe_block: u64) {
+        *self = self
+            .checked_after_input(safe_block)
+            .expect("executed input count overflow: no canonical successor");
+    }
+
     fn checked_after_input(self, safe_block: u64) -> Option<Self> {
         Some(Self {
             executed_input_count: self.executed_input_count.checked_next()?,
@@ -89,26 +98,6 @@ impl ApplicationProgress {
             },
         })
     }
-}
-
-struct CapabilitySeal;
-
-/// Opaque, call-scoped authority to invoke an application's raw mutation hook.
-///
-/// Only the shared execution functions in this module can construct this
-/// capability. Its borrowed private seal prevents application implementations
-/// from safely forging or retaining it beyond the hook call.
-pub struct ApplyInputCapability<'a> {
-    _seal: &'a CapabilitySeal,
-}
-
-/// Opaque, call-scoped authority to commit scheduler-owned application progress.
-///
-/// This is deliberately distinct from [`ApplyInputCapability`]: application
-/// hooks receive authority to mutate application state, never authority to
-/// overwrite the canonical history count or safe-block clock.
-pub struct ProgressCommitCapability<'a> {
-    _seal: &'a CapabilitySeal,
 }
 
 /// One successfully executed canonical application input.
@@ -161,153 +150,112 @@ impl fmt::Display for InvalidReason {
     }
 }
 
+/// Deterministic application state with exclusive ownership and thread transfer.
 pub trait Application: Send + Sized {
     const MAX_METHOD_PAYLOAD_BYTES: usize;
 
     /// Pure validation predicate over current app state: nonce match
     /// (user replay protection) and fee-balance coverage. Must not
-    /// mutate state. The protocol-level `max_fee >= current_fee` guard
-    /// is NOT this method's job — [`validate_and_execute_user_op`]
-    /// enforces it before calling here.
+    /// mutate state. [`validate_and_execute_user_op`] enforces the protocol
+    /// `max_fee >= current_fee` guard before calling here. Rejection leaves
+    /// the app unchanged; `AppError` is fatal and defines no successor.
     fn validate_user_op(
         &self,
         sender: Address,
         user_op: &UserOp,
         current_fee: u16,
-    ) -> Result<(), InvalidReason>;
+    ) -> Result<ValidationOutcome, AppError>;
 
-    /// Apply a validated user op's application-specific mutation.
-    ///
-    /// Callers use [`execute_valid_user_op`], never this hook directly. The
-    /// shared function advances [`ApplicationProgress`] only after this hook
-    /// returns `Ok`. The opaque capability makes that boundary structural for
-    /// safe Rust callers.
+    /// Apply a validated user op and advance progress exactly once on success,
+    /// using `safe_block` for the clock. Included business failures and no-ops
+    /// also advance progress. `AppError` is fatal: callers discard the instance.
+    /// Execution callers use [`execute_valid_user_op`] to check the transition.
     fn apply_valid_user_op(
         &mut self,
-        capability: ApplyInputCapability<'_>,
         user_op: &ValidUserOp,
         safe_block: u64,
     ) -> Result<AppOutputs, AppError>;
 
-    /// Required (no default): deposits are direct-input-only, so a silent
-    /// no-op impl would strand every deposit on L1 with no L2 credit.
-    /// Callers use [`execute_direct_input`], never this hook directly. The
-    /// shared function advances [`ApplicationProgress`] only after this hook
-    /// returns `Ok`. The opaque capability makes that boundary structural for
-    /// safe Rust callers.
-    fn apply_direct_input(
-        &mut self,
-        capability: ApplyInputCapability<'_>,
-        input: &DirectInput,
-    ) -> Result<AppOutputs, AppError>;
+    /// Apply a direct input and advance progress exactly once on success,
+    /// using its L1 block number for the clock. Ignored or malformed inputs
+    /// still count. Execution callers use [`execute_direct_input`] to check
+    /// the transition; `AppError` requires discarding the instance.
+    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError>;
 
-    /// Scheduler-owned progress embedded in, and persisted with, application
-    /// state. Application hooks must not mutate it.
-    fn execution_progress(&self) -> &ApplicationProgress;
-
-    /// Mutable access exists only for the shared execution boundary. Its
-    /// distinct opaque capability is never passed to application hooks, and
-    /// the progress type itself exposes no mutating operation.
-    fn execution_progress_mut(
-        &mut self,
-        capability: ProgressCommitCapability<'_>,
-    ) -> &mut ApplicationProgress;
+    /// Return the progress embedded in the application's logical state.
+    fn progress(&self) -> ApplicationProgress;
 
     /// The app's safe-block clock: the maximum block carried by any input
     /// this instance has executed (frame safe blocks for user ops, L1
     /// inclusion blocks for direct inputs), or 0 if nothing executed.
-    /// Carried in [`ApplicationProgress`] so it advances at the same shared
-    /// boundary as the history count. Recovery reads this as `A`, the safe
-    /// block a checkpoint state reflects; it must survive dump round-trips.
+    /// Recovery reads this as `A`, the safe block a checkpoint state reflects;
+    /// it must survive dump round-trips.
     fn last_executed_safe_block(&self) -> u64 {
-        self.execution_progress().last_executed_safe_block()
+        self.progress().last_executed_safe_block()
     }
 
     /// Canonical application-history boundary. Starts at zero and advances by
     /// exactly one after each successful user-op or direct-input execution; an
     /// application at `X` is ready to consume history input `X`. It must
-    /// survive dump round-trips. The planned Track 3 feed uses this value as
-    /// its subscription offset; the current rowid feed has not cut over yet.
+    /// survive dump round-trips.
     fn executed_input_count(&self) -> ExecutedInputCount {
-        self.execution_progress().executed_input_count()
+        self.progress().executed_input_count()
     }
 
-    // -------- snapshot / dump lifecycle --------
-    //
-    // These methods are used by the inclusion lane to drive snapshot
-    // lifecycle (write dumps at batch close, load from the latest dump
-    // during catch-up, garbage-collect superseded dumps). Genesis
-    // construction is intentionally NOT on the trait — it varies per
-    // impl (CLI config for the toy wallet, machine image path for a
-    // CM-wrapping app, etc.) and lives on the concrete type, called
-    // by the runtime at bootstrap.
+    // Genesis construction stays on the concrete type: its inputs depend on
+    // the application. The host manages the resulting instance through dumps.
 
     /// Construct an instance from a dump at `prefix`. The dump must have
     /// been produced by a previous call to [`Application::create_dump`]
-    /// on the same implementation; loading a dump written by a different
-    /// impl is undefined.
+    /// on the same implementation. The loaded instance must own independent
+    /// mutable state: executing it must not change the dump or another instance
+    /// loaded from that dump. It must remain usable after the dump is deleted.
     fn from_dump(prefix: &Path) -> Result<Self, AppError>;
 
-    /// Write a complete recovery dump rooted at the directory `prefix`,
-    /// which must not already exist. The implementation is responsible
-    /// for creating `prefix` and populating it with whatever files it
-    /// needs; a subsequent [`Application::from_dump`] call on the same
-    /// impl must rehydrate equivalent logical state from those bytes.
+    /// Write a complete recovery dump at the absent path `prefix`, which may
+    /// be a file or directory. A subsequent [`Application::from_dump`] must
+    /// rehydrate equivalent logical state, including progress. Creating the
+    /// dump must preserve the live instance's logical state; later execution
+    /// of that instance must not change the dump.
     ///
     /// **Durability**: when this method returns `Ok`, the dump on disk
     /// must survive an immediate kernel crash. Concretely, the impl
     /// must `fsync` the dump's files and the directory entries that
-    /// reference them (on POSIX, that means `fsync`ing the prefix
-    /// directory and its parent) before returning. The sequencer
-    /// inserts the SQLite row that references this path after
+    /// reference them, including the parent of `prefix`, before returning.
+    /// The sequencer inserts the SQLite row that references this path after
     /// `create_dump` returns; without the in-method fsync, the OS may
     /// flush the SQLite WAL ahead of our file contents and leave a
     /// crash-recovered DB with a row pointing at a missing path.
     ///
     /// Implementations must also ensure that
-    /// [`Application::state_file_in_dump`] points at a file inside
-    /// `prefix` whose bytes match what an independent canonical machine's
-    /// `inspect_state` procedure would produce for the same logical
-    /// state. For impls whose persistence representation already IS the
-    /// canonical state, the file written by `create_dump` and the file
-    /// named by `state_file_in_dump` can be the same file.
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError>;
+    /// [`Application::state_file_in_dump`] points at a file in the dump
+    /// whose bytes match the independent canonical application's
+    /// state representation, obtained through inspection or its designated
+    /// state drive, for the same logical state. The recovery dump and canonical
+    /// state file may be the same file when their representations coincide.
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError>;
 
     /// Delete a previously-created dump at `prefix`.
     fn delete_dump(prefix: &Path) -> Result<(), AppError>;
 
-    /// Path of the canonical state file within a dump at `prefix`. The
-    /// returned path must point at a single file (not a directory). It
+    /// Path of the canonical state file in a dump at `prefix` (possibly
+    /// `prefix` itself). The returned path must point at a single file. It
     /// is a pure function of `prefix`: callers may invoke it without
     /// loading the dump or instantiating the Application.
     fn state_file_in_dump(prefix: &Path) -> PathBuf;
-
-    /// Deterministic canonical state bytes (SSZ for the toy wallet). Used by
-    /// CM `inspect_state` and the watchdog's `/finalized_state` compare.
-    /// Default: not implemented.
-    fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError> {
-        Err(AppError::Internal {
-            reason: "canonical snapshot bytes are not implemented".to_string(),
-        })
-    }
-
-    /// Optional human-readable JSON for debugging only (not loaded on recovery).
-    fn export_state(&self) -> Result<String, AppError> {
-        Err(AppError::Internal {
-            reason: "application state export is not implemented".to_string(),
-        })
-    }
 }
 
-/// The single entry point for executing a user op against an app: protocol
-/// guard, then app validation, then execution.
+/// Canonical inspection for applications hosted by the shared Rust scheduler.
+/// Applications using another canonical runtime need not implement this trait.
+pub trait CanonicalState {
+    /// Deterministic bytes matching the state file in a dump of this state.
+    fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError>;
+}
+
+/// Validate and execute a live user op: protocol guard, app validation, execution.
 ///
-/// Deliberately a free function, not a trait method: an overridable default
-/// would let an `Application` impl skip the protocol-level
-/// `max_fee >= current_fee` invariant. As a free function the guard is
-/// non-bypassable by construction. Both consumers — the inclusion lane and
-/// the canonical scheduler — must execute user ops through here; agreement
-/// between them is the system's most load-bearing invariant.
+/// Live inclusion and the canonical scheduler use this boundary. Trusted
+/// replay uses [`execute_valid_user_op`] with the persisted validation result.
 pub fn validate_and_execute_user_op<A: Application>(
     app: &mut A,
     sender: Address,
@@ -315,8 +263,6 @@ pub fn validate_and_execute_user_op<A: Application>(
     current_fee: u16,
     safe_block: u64,
 ) -> Result<ExecutionOutcome, AppError> {
-    let progress_before_validation = *app.execution_progress();
-
     // Protocol invariant: max_fee must cover the current frame fee.
     if user_op.max_fee < current_fee {
         return Ok(ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
@@ -325,13 +271,7 @@ pub fn validate_and_execute_user_op<A: Application>(
         }));
     }
 
-    let validation = app.validate_user_op(sender, user_op, current_fee);
-    assert_eq!(
-        *app.execution_progress(),
-        progress_before_validation,
-        "validate_user_op mutated scheduler-owned application progress"
-    );
-    if let Err(reason) = validation {
+    if let ValidationOutcome::Reject(reason) = app.validate_user_op(sender, user_op, current_fee)? {
         return Ok(ExecutionOutcome::Invalid(reason));
     }
 
@@ -343,30 +283,27 @@ pub fn validate_and_execute_user_op<A: Application>(
     execute_valid_user_op(app, &valid, safe_block).map(ExecutionOutcome::Included)
 }
 
-/// Execute one already-validated user op and advance scheduler-owned progress.
+/// Execute an already-validated user op and verify the application-owned progress.
+/// The caller is responsible for supplying a valid op, including its fee.
 pub fn execute_valid_user_op<A: Application>(
     app: &mut A,
     user_op: &ValidUserOp,
     safe_block: u64,
 ) -> Result<ExecutedInput, AppError> {
-    let seal = CapabilitySeal;
-    execute_and_advance(app, safe_block, |app| {
-        app.apply_valid_user_op(ApplyInputCapability { _seal: &seal }, user_op, safe_block)
+    execute_and_verify_progress(app, safe_block, |app| {
+        app.apply_valid_user_op(user_op, safe_block)
     })
 }
 
-/// Execute one direct input and advance scheduler-owned progress.
+/// Execute one direct input and verify the application-owned progress.
 pub fn execute_direct_input<A: Application>(
     app: &mut A,
     input: &DirectInput,
 ) -> Result<ExecutedInput, AppError> {
-    let seal = CapabilitySeal;
-    execute_and_advance(app, input.block_number, |app| {
-        app.apply_direct_input(ApplyInputCapability { _seal: &seal }, input)
-    })
+    execute_and_verify_progress(app, input.block_number, |app| app.apply_direct_input(input))
 }
 
-fn execute_and_advance<A, F>(
+fn execute_and_verify_progress<A, F>(
     app: &mut A,
     safe_block: u64,
     apply: F,
@@ -375,25 +312,16 @@ where
     A: Application,
     F: FnOnce(&mut A) -> Result<AppOutputs, AppError>,
 {
-    let progress_before = *app.execution_progress();
+    let progress_before = app.progress();
     let progress_after = progress_before
         .checked_after_input(safe_block)
         .expect("executed input count overflow: no canonical successor");
 
-    let apply_result = apply(app);
+    let outputs = apply(app)?;
     assert_eq!(
-        *app.execution_progress(),
-        progress_before,
-        "application hook mutated scheduler-owned application progress"
-    );
-    let outputs = apply_result?;
-
-    let seal = CapabilitySeal;
-    *app.execution_progress_mut(ProgressCommitCapability { _seal: &seal }) = progress_after;
-    assert_eq!(
-        *app.execution_progress(),
+        app.progress(),
         progress_after,
-        "application progress commit is incoherent with its immutable accessor"
+        "successful application execution must advance progress exactly once"
     );
 
     Ok(ExecutedInput {
@@ -408,12 +336,12 @@ mod tests {
 
     struct ProgressApp {
         progress: ApplicationProgress,
-        commit_target: ApplicationProgress,
         applied: u64,
         reject: bool,
-        fail: bool,
-        mutate_progress_in_hook: bool,
-        misdirect_progress_commit: bool,
+        fail_validation: bool,
+        fail_apply: bool,
+        advance_count: usize,
+        clock_override: Option<u64>,
     }
 
     impl ProgressApp {
@@ -421,13 +349,27 @@ mod tests {
             Self {
                 progress: ApplicationProgress::try_new(ExecutedInputCount::new(count), 0)
                     .expect("coherent progress"),
-                commit_target: ApplicationProgress::default(),
                 applied: 0,
                 reject: false,
-                fail: false,
-                mutate_progress_in_hook: false,
-                misdirect_progress_commit: false,
+                fail_validation: false,
+                fail_apply: false,
+                advance_count: 1,
+                clock_override: None,
             }
+        }
+
+        fn apply(&mut self, safe_block: u64) -> Result<AppOutputs, AppError> {
+            self.applied += 1;
+            if self.fail_apply {
+                return Err(AppError::Internal {
+                    reason: "execution failed".into(),
+                });
+            }
+            for _ in 0..self.advance_count {
+                self.progress
+                    .advance(self.clock_override.unwrap_or(safe_block));
+            }
+            Ok(Vec::new())
         }
     }
 
@@ -439,95 +381,51 @@ mod tests {
             _sender: Address,
             _user_op: &UserOp,
             _current_fee: u16,
-        ) -> Result<(), InvalidReason> {
+        ) -> Result<ValidationOutcome, AppError> {
+            if self.fail_validation {
+                return Err(AppError::Internal {
+                    reason: "validation failed".into(),
+                });
+            }
             if self.reject {
-                Err(InvalidReason::InvalidNonce {
+                Ok(ValidationOutcome::Reject(InvalidReason::InvalidNonce {
                     expected: 1,
                     got: 0,
-                })
+                }))
             } else {
-                Ok(())
+                Ok(ValidationOutcome::Accept)
             }
         }
 
         fn apply_valid_user_op(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             _user_op: &ValidUserOp,
-            _safe_block: u64,
+            safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
-            self.applied += 1;
-            if self.mutate_progress_in_hook {
-                self.progress = ApplicationProgress::try_new(
-                    self.progress
-                        .executed_input_count()
-                        .checked_next()
-                        .expect("test count"),
-                    99,
-                )
-                .expect("coherent progress");
-            }
-            if self.fail {
-                Err(AppError::Internal {
-                    reason: "injected failure".to_string(),
-                })
-            } else {
-                Ok(Vec::new())
-            }
+            self.apply(safe_block)
         }
 
-        fn apply_direct_input(
-            &mut self,
-            _capability: ApplyInputCapability<'_>,
-            _input: &DirectInput,
-        ) -> Result<AppOutputs, AppError> {
-            self.applied += 1;
-            if self.mutate_progress_in_hook {
-                self.progress = ApplicationProgress::try_new(
-                    self.progress
-                        .executed_input_count()
-                        .checked_next()
-                        .expect("test count"),
-                    99,
-                )
-                .expect("coherent progress");
-            }
-            if self.fail {
-                Err(AppError::Internal {
-                    reason: "injected failure".to_string(),
-                })
-            } else {
-                Ok(Vec::new())
-            }
+        fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
+            self.apply(input.block_number)
         }
 
-        fn execution_progress(&self) -> &ApplicationProgress {
-            &self.progress
-        }
-
-        fn execution_progress_mut(
-            &mut self,
-            _capability: ProgressCommitCapability<'_>,
-        ) -> &mut ApplicationProgress {
-            if self.misdirect_progress_commit {
-                &mut self.commit_target
-            } else {
-                &mut self.progress
-            }
+        fn progress(&self) -> ApplicationProgress {
+            assert!(
+                !(self.fail_apply && self.applied > 0),
+                "failed instance is unusable"
+            );
+            self.progress
         }
 
         fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
             unreachable!("not used")
         }
-
-        fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
+        fn create_dump(&mut self, _prefix: &Path) -> Result<(), AppError> {
             unreachable!("not used")
         }
-
         fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
             unreachable!("not used")
         }
-
         fn state_file_in_dump(prefix: &Path) -> PathBuf {
             prefix.join("state")
         }
@@ -541,73 +439,88 @@ mod tests {
         }
     }
 
+    fn direct(block_number: u64) -> DirectInput {
+        DirectInput {
+            sender: Address::ZERO,
+            block_number,
+            payload: Vec::new(),
+        }
+    }
+
     #[test]
-    fn shared_boundaries_own_count_and_clock_progress() {
+    fn native_progress_defines_receipt_offsets_and_monotonic_clock() {
         let mut app = ProgressApp::new(0);
-        let user = validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 0, 9)
-            .expect("execute user op");
-        let ExecutionOutcome::Included(user) = user else {
+        let ExecutionOutcome::Included(user) =
+            validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 0, 9).unwrap()
+        else {
             panic!("user op should be included")
         };
         assert_eq!(user.offset, ExecutedInputCount::ZERO);
         assert_eq!(app.executed_input_count(), ExecutedInputCount::new(1));
         assert_eq!(app.last_executed_safe_block(), 9);
 
-        let direct = execute_direct_input(
-            &mut app,
-            &DirectInput {
-                sender: Address::ZERO,
-                block_number: 12,
-                payload: Vec::new(),
-            },
-        )
-        .expect("execute direct");
-        assert_eq!(direct.offset, ExecutedInputCount::new(1));
-        assert_eq!(app.executed_input_count(), ExecutedInputCount::new(2));
-        assert_eq!(app.last_executed_safe_block(), 12);
+        for (offset, block, clock) in [(1, 12, 12), (2, 10, 12)] {
+            let receipt = execute_direct_input(&mut app, &direct(block)).unwrap();
+            assert_eq!(receipt.offset, ExecutedInputCount::new(offset));
+            assert!(
+                receipt.outputs.is_empty(),
+                "included no-ops still advance progress"
+            );
+            assert_eq!(
+                app.executed_input_count(),
+                ExecutedInputCount::new(offset + 1)
+            );
+            assert_eq!(app.last_executed_safe_block(), clock);
+        }
     }
 
     #[test]
-    fn rejection_and_error_do_not_commit_progress() {
-        let mut rejected = ProgressApp::new(7);
-        rejected.reject = true;
+    fn rejection_and_fatal_validation_do_not_execute() {
+        let mut app = ProgressApp::new(7);
+        app.reject = true;
         assert!(matches!(
-            validate_and_execute_user_op(&mut rejected, Address::ZERO, &user_op(), 0, 9)
-                .expect("validation rejection"),
-            ExecutionOutcome::Invalid(_)
+            validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 0, 9).unwrap(),
+            ExecutionOutcome::Invalid(InvalidReason::InvalidNonce { .. })
         ));
-        assert_eq!(rejected.executed_input_count(), ExecutedInputCount::new(7));
-        assert_eq!(rejected.applied, 0);
+        app.fail_validation = true;
+        assert!(matches!(
+            validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 0, 9),
+            Err(AppError::Internal { reason }) if reason == "validation failed"
+        ));
+        assert_eq!(app.applied, 0);
+        assert_eq!(app.executed_input_count(), ExecutedInputCount::new(7));
+    }
 
-        let mut failed = ProgressApp::new(7);
-        failed.fail = true;
-        assert!(
-            execute_direct_input(
-                &mut failed,
-                &DirectInput {
-                    sender: Address::ZERO,
-                    block_number: 12,
-                    payload: Vec::new(),
-                },
-            )
-            .is_err()
-        );
-        assert_eq!(failed.executed_input_count(), ExecutedInputCount::new(7));
-        assert_eq!(failed.last_executed_safe_block(), 0);
+    #[test]
+    fn protocol_max_fee_guard_precedes_application_validation() {
+        let mut app = ProgressApp::new(0);
+        app.fail_validation = true;
+        assert!(matches!(
+            validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 1, 9).unwrap(),
+            ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
+                max_fee: 0,
+                base_fee: 1
+            })
+        ));
+        assert_eq!(app.applied, 0);
+    }
+
+    #[test]
+    fn execution_error_is_propagated_without_reading_the_failed_instance() {
+        let mut app = ProgressApp::new(7);
+        app.fail_apply = true;
+        assert!(matches!(
+            execute_direct_input(&mut app, &direct(12)),
+            Err(AppError::Internal { reason }) if reason == "execution failed"
+        ));
+        assert_eq!(app.applied, 1);
     }
 
     #[test]
     fn count_exhaustion_fails_before_application_mutation() {
         let mut app = ProgressApp::new(u64::MAX);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = execute_direct_input(
-                &mut app,
-                &DirectInput {
-                    sender: Address::ZERO,
-                    block_number: 1,
-                    payload: Vec::new(),
-                },
-            );
+            let _ = execute_direct_input(&mut app, &direct(1));
         }));
         assert!(panic.is_err());
         assert_eq!(app.applied, 0, "overflow must preflight the app hook");
@@ -618,52 +531,22 @@ mod tests {
     }
 
     #[test]
-    fn zero_count_rejects_nonzero_safe_block_clock() {
-        assert!(ApplicationProgress::try_new(ExecutedInputCount::ZERO, 1).is_none());
-        assert!(ApplicationProgress::try_new(ExecutedInputCount::ZERO, 0).is_some());
-        assert!(ApplicationProgress::try_new(ExecutedInputCount::new(1), 7).is_some());
-    }
-
-    #[test]
-    fn hook_progress_mutation_panics_on_success_and_error() {
-        for fail in [false, true] {
+    fn successful_hooks_must_report_the_exact_successor() {
+        for (advances, clock_override) in [(0, None), (2, None), (1, Some(99))] {
             let mut app = ProgressApp::new(1);
-            app.fail = fail;
-            app.mutate_progress_in_hook = true;
+            app.advance_count = advances;
+            app.clock_override = clock_override;
             let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = execute_direct_input(
-                    &mut app,
-                    &DirectInput {
-                        sender: Address::ZERO,
-                        block_number: 12,
-                        payload: Vec::new(),
-                    },
-                );
+                let _ = execute_direct_input(&mut app, &direct(12));
             }));
-            assert!(
-                panic.is_err(),
-                "progress mutation must fail loud when hook fail={fail}"
-            );
+            assert!(panic.is_err(), "wrong application progress must fail loud");
         }
     }
 
     #[test]
-    fn incoherent_mutable_progress_accessor_fails_after_commit() {
-        let mut app = ProgressApp::new(1);
-        app.misdirect_progress_commit = true;
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = execute_direct_input(
-                &mut app,
-                &DirectInput {
-                    sender: Address::ZERO,
-                    block_number: 12,
-                    payload: Vec::new(),
-                },
-            );
-        }));
-        assert!(
-            panic.is_err(),
-            "incoherent progress accessors must fail loud"
-        );
+    fn zero_count_rejects_nonzero_safe_block_clock() {
+        assert!(ApplicationProgress::try_new(ExecutedInputCount::ZERO, 1).is_none());
+        assert!(ApplicationProgress::try_new(ExecutedInputCount::ZERO, 0).is_some());
+        assert!(ApplicationProgress::try_new(ExecutedInputCount::new(1), 7).is_some());
     }
 }

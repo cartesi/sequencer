@@ -153,10 +153,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::{
-        AppError, AppOutputs, ApplicationProgress, ApplyInputCapability, InvalidReason,
-        ProgressCommitCapability,
-    };
+    use crate::application::{AppError, AppOutputs, ApplicationProgress, ValidationOutcome};
     use crate::batch::{Batch, Frame};
     use crate::l2_tx::{DirectInput, ValidUserOp};
     use crate::user_op::UserOp;
@@ -197,24 +194,20 @@ mod tests {
             _sender: Address,
             _user_op: &UserOp,
             _current_fee: u16,
-        ) -> Result<(), InvalidReason> {
-            Ok(())
+        ) -> Result<ValidationOutcome, AppError> {
+            Ok(ValidationOutcome::Accept)
         }
 
         fn apply_valid_user_op(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             _user_op: &ValidUserOp,
-            _safe_block: u64,
+            safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
+            self.progress.advance(safe_block);
             Ok(Vec::new())
         }
 
-        fn apply_direct_input(
-            &mut self,
-            _capability: ApplyInputCapability<'_>,
-            input: &DirectInput,
-        ) -> Result<AppOutputs, AppError> {
+        fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
             let marker = input.payload.first().copied().unwrap_or(0);
             if self.fail_direct == Some(marker) {
                 return Err(AppError::Internal {
@@ -222,24 +215,18 @@ mod tests {
                 });
             }
             self.executed_directs.push(marker);
+            self.progress.advance(input.block_number);
             Ok(Vec::new())
         }
 
-        fn execution_progress(&self) -> &ApplicationProgress {
-            &self.progress
-        }
-
-        fn execution_progress_mut(
-            &mut self,
-            _capability: ProgressCommitCapability<'_>,
-        ) -> &mut ApplicationProgress {
-            &mut self.progress
+        fn progress(&self) -> ApplicationProgress {
+            self.progress
         }
 
         fn from_dump(_prefix: &std::path::Path) -> Result<Self, AppError> {
             unimplemented!("FoldApp does not participate in snapshot lifecycle")
         }
-        fn create_dump(&self, _prefix: &std::path::Path) -> Result<(), AppError> {
+        fn create_dump(&mut self, _prefix: &std::path::Path) -> Result<(), AppError> {
             unimplemented!("FoldApp does not participate in snapshot lifecycle")
         }
         fn delete_dump(_prefix: &std::path::Path) -> Result<(), AppError> {

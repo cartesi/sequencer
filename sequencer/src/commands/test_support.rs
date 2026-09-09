@@ -10,8 +10,7 @@ use std::path::Path;
 
 use crate::ingress::inclusion_lane::dump_info::{self, create_dump_dir_with_info};
 use sequencer_core::application::{
-    AppError, AppOutputs, Application, ApplicationProgress, ApplyInputCapability, InvalidReason,
-    ProgressCommitCapability,
+    AppError, AppOutputs, Application, ApplicationProgress, ValidationOutcome,
 };
 use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::ValidUserOp;
@@ -27,7 +26,7 @@ pub(crate) struct SweepTestApp {
 }
 
 // Preserve the unit-struct-like fixture spelling used across runtime tests
-// while carrying the scheduler-owned progress required by `Application`.
+// while carrying the execution progress required by `Application`.
 #[allow(non_upper_case_globals)]
 pub(crate) const SweepTestApp: SweepTestApp = SweepTestApp {
     progress: ApplicationProgress::try_new(ExecutedInputCount::ZERO, 0).expect("coherent progress"),
@@ -40,38 +39,31 @@ impl Application for SweepTestApp {
         _sender: alloy_primitives::Address,
         _user_op: &UserOp,
         _current_fee: u16,
-    ) -> Result<(), InvalidReason> {
-        Ok(())
+    ) -> Result<ValidationOutcome, AppError> {
+        Ok(ValidationOutcome::Accept)
     }
     fn apply_valid_user_op(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         _user_op: &ValidUserOp,
-        _safe_block: u64,
+        safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
+        self.progress.advance(safe_block);
         Ok(Vec::new())
     }
     fn apply_direct_input(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         _input: &sequencer_core::l2_tx::DirectInput,
     ) -> Result<AppOutputs, AppError> {
         unimplemented!("not used in these tests")
     }
-    fn execution_progress(&self) -> &ApplicationProgress {
-        &self.progress
-    }
-    fn execution_progress_mut(
-        &mut self,
-        _capability: ProgressCommitCapability<'_>,
-    ) -> &mut ApplicationProgress {
-        &mut self.progress
+    fn progress(&self) -> ApplicationProgress {
+        self.progress
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
         Ok(Self::default())
     }
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(prefix.join("state"), b"")?;
         Ok(())
@@ -89,7 +81,7 @@ impl Application for SweepTestApp {
 /// dir with `info.toml` + the stub app's dump under `state`.
 pub(crate) fn create_structured_dump(dump_dir: &std::path::Path) {
     create_dump_dir_with_info(
-        &SweepTestApp::default(),
+        &mut SweepTestApp::default(),
         dump_dir,
         &dump_info::DumpInfo {
             format_version: dump_info::FORMAT_VERSION,

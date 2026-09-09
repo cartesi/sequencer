@@ -39,7 +39,7 @@ pub(super) struct CatchUpSnapshot {
 ///
 /// Returns the checkpoint directly rather than an `Option`: the
 /// always-load invariant — `setup` registers the genesis finalized snapshot,
-/// and `run` checks it in reducer inspection plus task-free runtime
+/// and `run` checks it during startup recovery and task-free runtime
 /// preparation before `InclusionLane::start` — guarantees at least the
 /// genesis finalized snapshot exists by the time
 /// the lane resumes. Absence is a violated invariant (runtime/setup bug),

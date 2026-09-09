@@ -189,9 +189,9 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
   SQLite now also stores the canonical `ExecutedInputCount` attribution for
   every application input; switching the public feed and history-version
   handshake to that coordinate remains Track 3 API work.
-- **Application progress** — scheduler-owned
+- **Application progress** — engine-owned, with protocol-defined semantics:
   `(ExecutedInputCount, last_executed_safe_block)` embedded in every
-  application dump. Shared execution functions advance it and return the
+  application dump. Shared execution functions verify its transition and return the
   input's pre-execution offset. SQLite records that offset atomically with the
   corresponding valid replay row; only the WebSocket/HTTP projection remains
   Track 3 work.
@@ -229,23 +229,25 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 
 ## Application Trait Contract
 
-Implementors of the `Application` trait must respect these contracts. The shared execution boundary enforces scheduler-owned count/clock progress; application-specific determinism and mutation remain self-trusted. The full, code-grounded contract — method table, dump round-trip durability, the safe-block clock — is **owned by [`docs/protocol/application-contract.md`](docs/protocol/application-contract.md)**; the essentials follow.
+Implementors of the `Application` trait must respect these contracts. The shared execution boundary verifies application-owned count/clock progress; application-specific determinism and mutation remain self-trusted. The full, code-grounded contract — method table, dump round-trip durability, the safe-block clock — is **owned by [`docs/protocol/application-contract.md`](docs/protocol/application-contract.md)**; the essentials follow.
 
 ### Replay determinism
 
 The sequencer persists every included user op and every ingested direct input. On restart, catch-up replays them in order against a fresh `Application` instance to rebuild state. **Any input that succeeded live must succeed on replay.**
 
 - `apply_direct_input` and `apply_valid_user_op` must not return `AppError::Internal` for any byte sequence that previously executed successfully. The canonical scheduler, catch-up, and recovery fold treat `Internal` as fatal: no canonical successor is defined.
-- Prefer `ExecutionOutcome::Invalid` for malformed or ill-typed input caught at the app level. Reserve `AppError::Internal` for genuine invariant violations ("validated user op cannot pay fee") — real bugs, not adversarial inputs. `Invalid` is replay-safe; `Internal` is not.
+- Validation returns `Accept`, `Reject(InvalidReason)`, or fatal `AppError`. A rejected op changes no state. Included business failures and malformed direct-input no-ops still advance progress; do not turn them into validation rejections. See the application contract for the wallet's nonce/fee semantics.
 - `validate_user_op` must be pure over the current app state. No side effects, no time dependence, no randomness.
 
 ### No implicit state
 
-Application-specific state changes flow exclusively through the `apply_valid_user_op` and `apply_direct_input` hooks. Scheduler-owned `ApplicationProgress` (executed-input count plus safe-block clock) changes only through the shared free execution functions. Mutating state from `validate_user_op` breaks replay determinism.
+Logical state changes, including `ApplicationProgress`, flow through the `apply_valid_user_op` and `apply_direct_input` hooks. The engine reports progress by value. Mutating state from `validate_user_op` breaks replay determinism; mutable checkpoint creation may replace backing resources while preserving logical state.
 
 ### One execution entry point
 
-User ops are executed only through `sequencer_core::application::validate_and_execute_user_op`; already-validated user ops and directs use the shared `execute_valid_user_op` / `execute_direct_input` free functions. Raw hooks and mutable progress access require distinct borrowed opaque capabilities whose constructors are private to this boundary. It preflights the checked successor, verifies progress stayed unchanged after validation and after the hook on both `Ok` and `Err`, commits only after `Ok`, then re-reads the getter to assert accessor coherence. Count zero implies clock zero. `AppError` is fatal and defines no canonical successor; callers discard the application instance rather than resume it. The inclusion lane, canonical scheduler, catch-up, and recovery fold all use this boundary — part of the duality agreement.
+User ops are executed only through `sequencer_core::application::validate_and_execute_user_op`; already-validated user ops and directs use `execute_valid_user_op` / `execute_direct_input`. The shared boundary preflights the checked successor, then verifies the engine's progress after a successful hook and returns its pre-execution offset. Count zero implies clock zero. Validation purity and native mutation remain self-trusted. `AppError` is fatal and defines no canonical successor; callers discard the instance rather than resume it. The inclusion lane, canonical scheduler, catch-up, and recovery fold all use this boundary — part of the duality agreement.
+
+`Application` requires `Send`, with neither `Clone` nor `Sync`. Dumps must be durable and immutable, and restored engines must remain independent after source deletion. The opaque app prefix may be a file or directory. Canonical inspection belongs to the separate `CanonicalState` trait; the native sequencer serves the comparison file in the checkpoint.
 
 ## Hot-Path Invariants
 

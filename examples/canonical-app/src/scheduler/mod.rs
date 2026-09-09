@@ -11,7 +11,7 @@
 
 use alloy_primitives::U256;
 use sequencer_core::application::AppOutput;
-use sequencer_core::application::Application;
+use sequencer_core::application::{Application, CanonicalState};
 use sequencer_core::scheduler::{
     InspectError, ProcessOutcome, Scheduler, SchedulerInput, input_domain,
 };
@@ -20,7 +20,7 @@ use types::{Notice, Voucher};
 
 pub use sequencer_core::scheduler::{STATE_INSPECT_QUERY, SchedulerConfig};
 
-pub fn run_scheduler_forever<R: Rollup, A: Application>(
+pub fn run_scheduler_forever<R: Rollup, A: Application + CanonicalState>(
     mut rollup: R,
     app: A,
     scheduler_config: SchedulerConfig,

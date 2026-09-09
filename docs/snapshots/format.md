@@ -11,7 +11,8 @@ This document covers two things:
    participate in snapshot lifecycle (`from_dump`, `create_dump`,
    `delete_dump`, `state_file_in_dump`).
 2. The wire format the toy wallet uses to encode its canonical state into
-   the dump's state file.
+   the dump's state file. Checkpoint ownership and durability are defined by
+the [Application contract](../protocol/application-contract.md#6-checkpoint-lifecycle).
 
 It does NOT define when snapshots are triggered, how the inclusion lane
 records and promotes them, how the HTTP layer serves them, or recovery
@@ -25,7 +26,7 @@ trait Application: Send + Sized {
     // ... other methods ...
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError>;
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError>;
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError>;
     fn delete_dump(prefix: &Path) -> Result<(), AppError>;
     fn state_file_in_dump(prefix: &Path) -> PathBuf;
 }
@@ -33,32 +34,47 @@ trait Application: Send + Sized {
 
 Contract:
 
-- `prefix` is always a directory. The impl owns whatever layout lives
-  inside; callers treat the path as opaque after creation.
-- `create_dump` is responsible for creating `prefix` (which must not
-  already exist) and writing the dump artifacts inside.
+- `prefix` is an opaque app-owned path, which may be a file or directory.
+  The sequencer owns the enclosing dump directory and its `info.toml`.
+- `create_dump` creates the absent `prefix` and makes the complete checkpoint
+  durable before returning. It may replace backing resources but preserves
+  logical state. Later execution cannot alter a checkpoint. Restored engines
+  are independent of one another and remain usable after source deletion.
 - `state_file_in_dump` is a pure function of `prefix`: callers may
   compute it without loading the dump or instantiating the Application.
   Each impl pins its own layout convention.
 - The bytes at `state_file_in_dump(prefix)` are the canonical state —
   the bytes a watchdog running an independent canonical machine would
-  produce for the same logical state via its `inspect_state` procedure.
+  produce for the same logical state through inspect or a designated state
+  drive.
   They must be deterministic: identical logical state must produce
   byte-identical files across runs, hosts, and toolchains.
 - For implementations whose persistence representation IS the canonical
-  state (the toy wallet, the bare-metal DEX), `create_dump` writes the
+  state (the toy wallet), `create_dump` writes the
   same bytes that `state_file_in_dump` names — a single file with no
   duplication. For implementations whose persistence is richer than the
   canonical state (e.g. a Cartesi Machine wrapping app), `create_dump`
   writes the full machine state alongside a separate canonical-state file
   under the same prefix.
 
-Genesis construction is intentionally not on the trait. The way an
-Application comes into existence at cold start varies per impl (CLI
-config for the toy wallet, machine image path for a CM-wrapping app,
-etc.) and lives on the concrete type, called by the runtime at bootstrap.
-The inclusion lane only needs `from_dump` to rehydrate from a previously
-persisted state during catch-up.
+The recovery checkpoint and canonical comparison representation differ by app:
+
+| Engine | Recovery checkpoint | Canonical comparison file |
+|---|---|---|
+| Toy wallet | SSZ wallet state | The same SSZ file, also returned by canonical inspect |
+| Cartesi Machine wrapper | Full multi-file machine state | Deterministic app-state projection stored alongside it |
+| Native DEX design | Fixed-memory state `M` plus any required resumable metadata | Canonical `M`, matching the designated drive in the canonical machine |
+
+The DEX row describes the integration requirement, not a verified private
+implementation. The current watchdog reads canonical inspect output; direct
+comparison against a canonical drive remains separate watchdog work. A native
+adapter does not need to implement the Rust canonical inspection trait to serve
+its checkpoint's comparison file.
+
+CoW is an implementation choice within checkpoint creation and restore. Shared
+physical extents are compatible with the contract; shared mutable bytes are
+not. The sequencer does not prescribe a filesystem clone primitive or expose
+engine flush/reopen steps.
 
 ## Toy Wallet Layout
 

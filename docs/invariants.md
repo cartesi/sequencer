@@ -183,7 +183,7 @@ by writer and are write-once (`0001_schema.sql`).
 ### I6. A committed promotion implies an advanced drain
 
 - **Holds:** promotion is folded into the drain's transaction
-  (`close_frame_only_promoting_with_executions`), together with canonical
+  (`close_frame_only_with_executions`), together with canonical
   direct-input attribution.
 - **Enforced by:** the single `write` tx in `storage/ingress.rs`; the
   standalone `Storage::promote_finalized` is test-only by policy.
@@ -530,7 +530,7 @@ like a simplification and would break a registered invariant:
   current-relative) — deliberately different formulas for different
   questions.
 
-### I19. Application progress advances only at the shared execution boundary
+### I19. Application progress follows the shared execution contract
 
 - **Holds:** `ApplicationProgress` is the pair
   `(ExecutedInputCount, last_executed_safe_block)`. Count zero implies clock
@@ -538,11 +538,11 @@ like a simplification and would break a registered invariant:
   count as the offset and commits exactly `(count + 1, max(clock,
   input_clock))`; rejection changes neither field. `AppError` is fatal and
   defines no canonical successor.
-- **Enforced by:** raw `apply_*` hooks and mutable progress access require
-  distinct borrowed opaque capabilities constructible only by the shared
-  execution functions. The boundary preflights count overflow, checks progress
-  unchanged after validation and after a hook on both `Ok` and `Err`, and
-  re-reads the immutable getter after commit to assert accessor coherence.
+- **Enforced by:** the application owns and persists the progress pair and
+  returns it by value. All execution consumers use the shared boundary, which
+  preflights count overflow and asserts the exact expected successor after a
+  successful hook. Validation purity and native-engine mutation remain
+  self-trusted; progress ownership does not require a Rust-side mirror.
 - **Depended on by:** the canonical scheduler, inclusion lane, catch-up,
   recovery fold, cockroach base `K`, durable execution attribution, and the
   future Track 3 API projection.
