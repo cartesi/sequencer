@@ -3,7 +3,7 @@
 --
 -- Real watchdog end-to-end checks against cartesi-machine (and optionally a
 -- live sequencer). Run from repo root:
---   lua watchdog/tests/e2e.lua
+--   lua5.4 watchdog/tests/e2e.lua
 -- or:
 --   just test-watchdog-e2e
 

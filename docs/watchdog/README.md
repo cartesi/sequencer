@@ -32,7 +32,7 @@ just test-watchdog-compare-harness
 just devnet-for-watchdog          # terminal 1 — leave running
 # terminal 2: paste exports, then:
 export CARTESI_WATCHDOG_LUA_ROOT="$(pwd)"
-export CARTESI_WATCHDOG_LUA_BIN=lua
+export CARTESI_WATCHDOG_LUA_BIN=lua5.4
 export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ./watchdog/sequencer-watchdog init
 ./watchdog/sequencer-watchdog tick
@@ -150,7 +150,7 @@ The watchdog compares the finalized SSZ bytes with the bytes returned by CM
 inspect. It must not canonicalize either side before deciding pass/fail.
 
 For the toy wallet app, SSZ encoding lives in `examples/app-core/src/wallet_snapshot.rs`
-and is shared by `WalletApp::create_dump`, `Application::canonical_snapshot_bytes`,
+and is shared by `WalletApp::create_dump`, `CanonicalState::canonical_snapshot_bytes`,
 and the canonical scheduler's `Inspect` handler (`examples/canonical-app`).
 
 ## Checkpoints

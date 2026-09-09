@@ -611,4 +611,47 @@ async fn cors_permits_browser_preflight_on_tx() {
         .to_str()
         .expect("header utf8");
     assert_eq!(allow_origin, "*");
+    assert_eq!(resp.headers()["access-control-allow-methods"], "POST");
+    assert_eq!(resp.headers()["access-control-allow-headers"], "*");
+    assert_eq!(resp.headers()["access-control-max-age"], "3600");
+}
+
+#[tokio::test]
+async fn cors_is_limited_to_ingress_and_covers_rejections() {
+    let db = temp_db("cors-route-scope");
+    let dumps = tempfile::tempdir().expect("snapshot directory");
+    let dump_id = register_finalized(&db.path, dumps.path(), "finalized", b"canonical", 0, 0);
+    let Some(server) = start_server(db.path.as_str()).await else {
+        return;
+    };
+    let client = reqwest::Client::new();
+    let rejected = client
+        .post(server.url("/tx"))
+        .header("Origin", "https://wallet.example")
+        .header("Content-Type", "application/json")
+        .body("{")
+        .send()
+        .await
+        .expect("invalid POST /tx");
+    assert_eq!(rejected.status().as_u16(), 400);
+    assert_eq!(rejected.headers()["access-control-allow-origin"], "*");
+
+    for route in ["/livez", "/finalized_state"] {
+        let response = client
+            .get(server.url(route))
+            .header("Origin", "https://wallet.example")
+            .send()
+            .await
+            .expect("egress request");
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "egress must not opt into browser cross-origin reads: {route}"
+        );
+        assert!(response.status().is_success());
+        let _ = response.bytes().await.expect("response body");
+    }
+    assert!(wait_for_lease(&db.path, dump_id, 0).await);
 }

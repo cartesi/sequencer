@@ -5,7 +5,7 @@
 -- fake deps (same pattern as watchdog/tests/run.lua).
 --
 -- Usage:
---   lua watchdog/tests/drill_divergence.lua
+--   lua5.4 watchdog/tests/drill_divergence.lua
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
