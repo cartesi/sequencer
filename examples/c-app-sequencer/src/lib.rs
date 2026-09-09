@@ -24,8 +24,8 @@ use tracing_subscriber::EnvFilter;
              All options can also be set via environment variables (shown in brackets)."
 )]
 struct Cli {
-    /// Engine genesis state, read-only and load-bearing for `setup` alone, `run` opens dumps.
-    /// Must already hold a deployment written by the application's genesis tool
+    /// Genesis dump used only when plain setup needs its initial snapshot.
+    /// Created by the application's genesis tool
     #[arg(long, env = "CARTESI_SEQUENCER_STATE_FILE", value_name = "PATH")]
     state_file: Option<PathBuf>,
     #[command(subcommand)]
@@ -47,26 +47,14 @@ pub async fn run() -> ExitCode {
         )
         .init();
 
-    // Only `setup` starts from this file, `run` and `flush-mempool` work from the dumps the
-    // sequencer took, so demanding it of them would keep a warm deployment from restarting once
-    // the genesis state is gone. Opened here rather than inside the closure so a state the engine
-    // cannot read names what to do about it instead of raising the closure's panic.
-    let mut app = None;
-    if matches!(&command, sequencer::Command::Setup(config) if !config.recovery) {
-        let Some(state_file) = state_file else {
-            tracing::error!("plain setup requires --state-file or CARTESI_SEQUENCER_STATE_FILE");
-            return ExitCode::FAILURE;
-        };
-        match EngineApp::from_dump(&state_file) {
-            Ok(engine) => app = Some(engine),
-            Err(err) => {
-                tracing::error!(state = %state_file.display(),
-                    "cannot open the engine state, write one with the application's genesis tool first: {err:?}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
-    // Only plain setup invokes the genesis constructor.
-    sequencer::dispatch(command, move || app.expect("engine opened for setup")).await
+    sequencer::run_command(command, move || {
+        let state_file = state_file.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "plain setup requires --state-file or CARTESI_SEQUENCER_STATE_FILE",
+            )
+        })?;
+        EngineApp::from_dump(&state_file)
+    })
+    .await
 }

@@ -20,5 +20,5 @@ async fn main() -> std::process::ExitCode {
 
     // `setup` is the only subcommand that constructs a genesis app; the
     // closure runs only on that path.
-    sequencer::run_main(|| WalletApp::new(WalletConfig::devnet())).await
+    sequencer::run_main(|| Ok(WalletApp::new(WalletConfig::devnet()))).await
 }

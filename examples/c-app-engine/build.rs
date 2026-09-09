@@ -17,9 +17,6 @@ use std::path::{Path, PathBuf};
 /// rather than reaching a host. An application outside this workspace always declares its own.
 const REFERENCE_ENGINE_METHOD_PAYLOAD_LIMIT: u32 = 1 + 32 + 20;
 
-/// A ceiling on what an application may declare, since the bound gates ingress.
-const MAX_METHOD_PAYLOAD_LIMIT: u32 = 1 << 20;
-
 /// Generate `sys`'s contents from the engine header, the one authoritative declaration of what
 /// the archive exports, so a change on the engine side is either picked up here or fails this
 /// build.
@@ -123,12 +120,6 @@ fn external_engine(engine_lib: &str) -> (PathBuf, u32) {
     let limit = declared.trim().parse::<u32>().unwrap_or_else(|err| {
         panic!("APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT is not a number: {err}")
     });
-    // The bound gates ingress and sizes batches, so a fat-fingered value is worth refusing here
-    // rather than discovering as a memory bill
-    assert!(
-        limit > 0 && limit <= MAX_METHOD_PAYLOAD_LIMIT,
-        "APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT is {limit}, expected 1..={MAX_METHOD_PAYLOAD_LIMIT}"
-    );
     (header, limit)
 }
 

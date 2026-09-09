@@ -39,8 +39,17 @@ cargo test -p c-wallet-engine --test conformance
 ```
 
 The ordinary setup/run environment configuration is still required. The genesis
-path is required only for plain `setup`; warm startup, `flush-mempool`, and
-`setup --recovery` use the sequencer's durable checkpoints.
+path is required only when plain `setup` needs its first snapshot; completed
+setup, warm startup, `flush-mempool`, and `setup --recovery` use the sequencer's
+durable checkpoints.
+
+The host adds `--state-file` through its own parser and passes the parsed command
+to `sequencer::run_command`. This shares `run_main`'s command lifecycle and exit
+policy. Both take a lazy `FnOnce() -> Result<A, AppError>` genesis factory;
+infallible Rust constructors therefore use
+`run_main(|| Ok(WalletApp::new(WalletConfig::default())))`. A missing genesis file
+returns an ordinary application-bootstrap I/O error, while a caught factory
+panic follows the shared terminal-error policy.
 
 ## External engine
 
