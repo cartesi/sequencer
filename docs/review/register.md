@@ -592,7 +592,10 @@ reasoning in the [ledger](2026-09-03-branch-stocktake.md)):
   transition; cockroach recovery reads the clock from a dump into a wiped
   database. Evidence: `examples/app-core/src/wallet_snapshot.rs:41-42`,
   `commands/setup/mod.rs:433-451`. Record the composition in the application
-  contract (jury-confirmed as a do-not-adopt).
+  contract. **2026-09-09 refinement:** keep native progress in the engine and
+  expose it by value; remove the mutable accessor and capabilities. This
+  preserves canonical checkpoint bytes without requiring a Rust-side mirror.
+  See the [Application/lane review](2026-09-09-application-lane-dex-review.md).
 
 Also standing, from the same reviews: the **do-not-simplify list** now
 lives beside the invariants it protects

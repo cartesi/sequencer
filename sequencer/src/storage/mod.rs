@@ -130,12 +130,6 @@ impl SafeInputRange {
         Self::new(index, index)
     }
 
-    /// Extend the range forward, producing `[self.end, new_end)`. Panics if
-    /// `new_end < self.end` — this is the "advance" direction only.
-    pub fn advance_to(self, end_exclusive: u64) -> Self {
-        Self::new(self.end_exclusive, end_exclusive)
-    }
-
     pub fn start(self) -> u64 {
         self.start_inclusive
     }

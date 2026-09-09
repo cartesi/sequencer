@@ -1109,10 +1109,10 @@ async fn start_full_server_with_max_body(
     // on cold start we register a genesis dump from a fresh wallet.
     // The lane reloads via `from_dump` either way.
     if storage.finalized_dump().expect("read finalized").is_none() {
-        let app = WalletApp::new(WalletConfig::default());
+        let mut app = WalletApp::new(WalletConfig::default());
         let genesis_dir = dumps_dir.join("genesis");
         dump_info::create_dump_dir_with_info(
-            &app,
+            &mut app,
             &genesis_dir,
             &dump_info::DumpInfo {
                 format_version: dump_info::FORMAT_VERSION,

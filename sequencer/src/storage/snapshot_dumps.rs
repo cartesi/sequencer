@@ -170,7 +170,7 @@ impl Storage {
     /// can't). **Production does not call this**: the lane promotes via
     /// `promote_finalized_in` folded into the safe-frontier-advance
     /// transaction
-    /// ([`Storage::close_frame_only_promoting_with_executions`]), so promotion,
+    /// ([`Storage::close_frame_only_with_executions`]), so promotion,
     /// drain, and canonical attribution commit atomically. A separate
     /// promotion could commit ahead of the drain and wedge a restart on a
     /// deleted pending row.

@@ -1136,6 +1136,7 @@ mod tip_staleness {
                     safe_input_index: 0,
                     executed_input_offset: ExecutedInputCount::ZERO,
                 }],
+                None,
             )
             .expect("attribute mapped direct");
         storage

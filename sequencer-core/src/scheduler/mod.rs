@@ -5,7 +5,7 @@ pub mod fold;
 
 pub use fold::{FoldInput, fold_replay};
 
-use crate::application::{AppError, AppOutputs, Application, ExecutionOutcome};
+use crate::application::{AppError, AppOutputs, Application, CanonicalState, ExecutionOutcome};
 use crate::batch::{Batch, Frame, WireUserOp};
 use crate::history::ExecutedInputCount;
 use crate::l2_tx::DirectInput;
@@ -193,7 +193,10 @@ impl<A: Application> Scheduler<A> {
     /// Watchdog / CM `inspect_state` hook: the app's canonical snapshot bytes
     /// for the `/finalized_state` byte-compare. `pub` (not `pub(super)`) because
     /// the canonical-app harness is now a separate crate over this library.
-    pub fn inspect_state(&self, query: &[u8]) -> Result<Vec<u8>, InspectError> {
+    pub fn inspect_state(&self, query: &[u8]) -> Result<Vec<u8>, InspectError>
+    where
+        A: CanonicalState,
+    {
         if !query.is_empty() && query != STATE_INSPECT_QUERY {
             return Err(InspectError::UnsupportedQuery);
         }
@@ -418,7 +421,7 @@ pub fn input_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::{ApplicationProgress, ApplyInputCapability, ProgressCommitCapability};
+    use crate::application::{ApplicationProgress, ValidationOutcome};
     use crate::user_op::UserOp;
     use alloy_primitives::{U256, address};
     use k256::ecdsa::SigningKey;
@@ -485,36 +488,41 @@ mod tests {
             sender: Address,
             user_op: &crate::user_op::UserOp,
             current_fee: u16,
-        ) -> Result<(), crate::application::InvalidReason> {
+        ) -> Result<ValidationOutcome, AppError> {
             let expected_nonce = self.nonce_of(sender);
             if user_op.nonce != expected_nonce {
-                return Err(crate::application::InvalidReason::InvalidNonce {
-                    expected: expected_nonce,
-                    got: user_op.nonce,
-                });
+                return Ok(ValidationOutcome::Reject(
+                    crate::application::InvalidReason::InvalidNonce {
+                        expected: expected_nonce,
+                        got: user_op.nonce,
+                    },
+                ));
             }
             if user_op.max_fee < current_fee {
-                return Err(crate::application::InvalidReason::InvalidMaxFee {
-                    max_fee: user_op.max_fee,
-                    base_fee: current_fee,
-                });
+                return Ok(ValidationOutcome::Reject(
+                    crate::application::InvalidReason::InvalidMaxFee {
+                        max_fee: user_op.max_fee,
+                        base_fee: current_fee,
+                    },
+                ));
             }
             let required = crate::fee::fee_to_linear(current_fee);
             let balance = self.balance_of(sender);
             if balance < required {
-                return Err(crate::application::InvalidReason::InsufficientFeeBalance {
-                    required,
-                    available: balance,
-                });
+                return Ok(ValidationOutcome::Reject(
+                    crate::application::InvalidReason::InsufficientFeeBalance {
+                        required,
+                        available: balance,
+                    },
+                ));
             }
-            Ok(())
+            Ok(ValidationOutcome::Accept)
         }
 
         fn apply_valid_user_op(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             user_op: &crate::l2_tx::ValidUserOp,
-            _safe_block: u64,
+            safe_block: u64,
         ) -> Result<crate::application::AppOutputs, crate::application::AppError> {
             let marker = user_op.data.first().copied().unwrap_or_default();
             let event = RecordedTx::UserOp(marker);
@@ -537,12 +545,12 @@ mod tests {
             self.nonces.insert(sender, next_nonce);
 
             self.executed.push(event);
+            self.progress.advance(safe_block);
             Ok(Vec::new())
         }
 
         fn apply_direct_input(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             input: &DirectInput,
         ) -> Result<crate::application::AppOutputs, crate::application::AppError> {
             let marker = input.payload.first().copied().unwrap_or(0);
@@ -553,18 +561,12 @@ mod tests {
                 });
             }
             self.executed.push(event);
+            self.progress.advance(input.block_number);
             Ok(Vec::new())
         }
 
-        fn execution_progress(&self) -> &ApplicationProgress {
-            &self.progress
-        }
-
-        fn execution_progress_mut(
-            &mut self,
-            _capability: ProgressCommitCapability<'_>,
-        ) -> &mut ApplicationProgress {
-            &mut self.progress
+        fn progress(&self) -> ApplicationProgress {
+            self.progress
         }
 
         fn from_dump(_prefix: &std::path::Path) -> Result<Self, crate::application::AppError> {
@@ -572,7 +574,7 @@ mod tests {
         }
 
         fn create_dump(
-            &self,
+            &mut self,
             _prefix: &std::path::Path,
         ) -> Result<(), crate::application::AppError> {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
@@ -585,7 +587,9 @@ mod tests {
         fn state_file_in_dump(_prefix: &std::path::Path) -> std::path::PathBuf {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
         }
+    }
 
+    impl CanonicalState for RecordingApp {
         fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, crate::application::AppError> {
             Ok(format!("events:{}", self.executed.len()).into_bytes())
         }

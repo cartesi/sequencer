@@ -16,7 +16,7 @@
 //!    batch of ours that landed in the range. At range close the lane
 //!    promotes that one `(nonce, block)` target, folded into the same
 //!    transaction that advances the drain
-//!    ([`crate::storage::Storage::close_frame_only_promoting_with_executions`])
+//!    ([`crate::storage::Storage::close_frame_only_with_executions`])
 //!    — so promotion, drain, and canonical execution attributions commit
 //!    atomically. Promotion is **per-range, not per-block**: the range's max
 //!    nonce supersedes every lower one, and the skipped intermediate
@@ -124,7 +124,7 @@ pub(super) fn stamp_finalized_promotion(storage: &mut Storage) -> Result<(), Sta
 /// a chronic snapshot failure (e.g. a full disk) is an operational
 /// problem to surface, not paper over.
 pub(super) fn close_batch_with_snapshot<A: Application>(
-    app: &A,
+    app: &mut A,
     storage: &mut Storage,
     head: &mut WriteHead,
     next_safe_block: u64,
@@ -159,7 +159,7 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
 /// against batches sealed by `seed_closed_batches`.
 #[cfg(test)]
 pub(super) fn take_dump_at_batch_close<A: Application>(
-    app: &A,
+    app: &mut A,
     storage: &mut Storage,
     dumps_dir: &Path,
     closed_batch_index: u64,
@@ -185,7 +185,7 @@ pub(super) fn take_dump_at_batch_close<A: Application>(
 /// block it landed in, then **commits itself once** at range close (via
 /// [`BlockObservation::commit`]): the promotion, if any, folds into the same
 /// transaction that advances the drain
-/// ([`Storage::close_frame_only_promoting_with_executions`]) — so promotion,
+/// ([`Storage::close_frame_only_with_executions`]) — so promotion,
 /// drain, and canonical execution mappings commit atomically.
 ///
 /// Per-range (not per-block) promotion is sound because nonces land in
@@ -232,7 +232,7 @@ impl BlockObservation {
 
     /// Close the frame for this safe-frontier advance, folding the observed
     /// promotion — if any — into the **same transaction** as the drain
-    /// ([`Storage::close_frame_only_promoting_with_executions`]); otherwise an
+    /// ([`Storage::close_frame_only_with_executions`]); otherwise an
     /// attributed plain frame close.
     /// Returns whether a batch was promoted, so the caller can collect the dumps
     /// it superseded. Consumes the observation — it is spent once committed.
@@ -243,28 +243,14 @@ impl BlockObservation {
         next_safe_block: u64,
         drained: SafeInputRange,
     ) -> Result<bool, rusqlite::Error> {
-        match self.max {
-            Some((max_nonce, inclusion_block)) => {
-                storage.close_frame_only_promoting_with_executions(
-                    head,
-                    next_safe_block,
-                    drained,
-                    &self.direct_executions,
-                    max_nonce,
-                    inclusion_block,
-                )?;
-                Ok(true)
-            }
-            None => {
-                storage.close_frame_only_with_executions(
-                    head,
-                    next_safe_block,
-                    drained,
-                    &self.direct_executions,
-                )?;
-                Ok(false)
-            }
-        }
+        storage.close_frame_only_with_executions(
+            head,
+            next_safe_block,
+            drained,
+            &self.direct_executions,
+            self.max,
+        )?;
+        Ok(self.max.is_some())
     }
 
     /// Test-only inspection of the accumulated `(max_nonce, inclusion_block)`.
@@ -293,12 +279,10 @@ fn make_dump_dir(dumps_dir: &Path, nonce: u64) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
 
     use alloy_primitives::Address;
     use sequencer_core::application::{
-        AppError, AppOutputs, Application, ApplicationProgress, ApplyInputCapability,
-        InvalidReason, ProgressCommitCapability,
+        AppError, AppOutputs, Application, ApplicationProgress, ValidationOutcome,
     };
     use sequencer_core::l2_tx::ValidUserOp;
     use sequencer_core::user_op::UserOp;
@@ -312,20 +296,20 @@ mod tests {
     /// Minimal Application that records every `create_dump` call. The
     /// other trait methods aren't exercised in these tests.
     struct RecordingDumpApp {
-        dumps: Mutex<Vec<PathBuf>>,
+        dumps: Vec<PathBuf>,
         progress: ApplicationProgress,
     }
 
     impl RecordingDumpApp {
         fn new() -> Self {
             Self {
-                dumps: Mutex::new(Vec::new()),
+                dumps: Vec::new(),
                 progress: ApplicationProgress::default(),
             }
         }
 
         fn recorded(&self) -> Vec<PathBuf> {
-            self.dumps.lock().unwrap().clone()
+            self.dumps.clone()
         }
     }
 
@@ -337,46 +321,38 @@ mod tests {
             _sender: Address,
             _user_op: &UserOp,
             _current_fee: u16,
-        ) -> Result<(), InvalidReason> {
-            Ok(())
+        ) -> Result<ValidationOutcome, AppError> {
+            Ok(ValidationOutcome::Accept)
         }
 
         fn apply_valid_user_op(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             _user_op: &ValidUserOp,
-            _safe_block: u64,
+            safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
+            self.progress.advance(safe_block);
             Ok(Vec::new())
         }
 
         fn apply_direct_input(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             _input: &sequencer_core::l2_tx::DirectInput,
         ) -> Result<AppOutputs, AppError> {
             unimplemented!("not used in these tests")
         }
 
-        fn execution_progress(&self) -> &ApplicationProgress {
-            &self.progress
-        }
-
-        fn execution_progress_mut(
-            &mut self,
-            _capability: ProgressCommitCapability<'_>,
-        ) -> &mut ApplicationProgress {
-            &mut self.progress
+        fn progress(&self) -> ApplicationProgress {
+            self.progress
         }
 
         fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
             unimplemented!("not used in these tests")
         }
 
-        fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+        fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
             std::fs::create_dir(prefix)?;
             std::fs::write(prefix.join("state"), b"recorded")?;
-            self.dumps.lock().unwrap().push(prefix.to_path_buf());
+            self.dumps.push(prefix.to_path_buf());
             Ok(())
         }
 
@@ -410,10 +386,10 @@ mod tests {
     fn take_dump_at_batch_close_creates_dump_and_pending_row() {
         let (mut storage, _db) = temp_storage_with_closed_batches("take-dump", 3);
         let dumps_dir = tempfile::tempdir().unwrap();
-        let app = RecordingDumpApp::new();
+        let mut app = RecordingDumpApp::new();
 
         // Batch index 1 is closed with nonce 1 (per seed_closed_batches).
-        take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 1).unwrap();
+        take_dump_at_batch_close(&mut app, &mut storage, dumps_dir.path(), 1).unwrap();
 
         let recorded = app.recorded();
         assert_eq!(recorded.len(), 1);
@@ -474,12 +450,12 @@ mod tests {
     fn run_gc_drops_unreferenced_rows_and_their_filesystem_prefixes() {
         let (mut storage, _db) = temp_storage_with_closed_batches("run-gc-removes-fs", 3);
         let dumps_dir = tempfile::tempdir().unwrap();
-        let app = RecordingDumpApp::new();
+        let mut app = RecordingDumpApp::new();
 
         // Create two snapshots and promote both — the first becomes
         // unreferenced when the second supersedes it as finalized.
-        take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 0).unwrap();
-        take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 1).unwrap();
+        take_dump_at_batch_close(&mut app, &mut storage, dumps_dir.path(), 0).unwrap();
+        take_dump_at_batch_close(&mut app, &mut storage, dumps_dir.path(), 1).unwrap();
         storage.promote_finalized(0, 500).unwrap();
         storage.promote_finalized(1, 501).unwrap();
 
@@ -502,8 +478,8 @@ mod tests {
     fn run_gc_with_no_eligible_rows_is_a_noop() {
         let (mut storage, _db) = temp_storage_with_closed_batches("run-gc-noop", 1);
         let dumps_dir = tempfile::tempdir().unwrap();
-        let app = RecordingDumpApp::new();
-        take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 0).unwrap();
+        let mut app = RecordingDumpApp::new();
+        take_dump_at_batch_close(&mut app, &mut storage, dumps_dir.path(), 0).unwrap();
 
         // Pending row references the dump; nothing eligible.
         let removed = super::run_gc::<RecordingDumpApp>(&mut storage).unwrap();
@@ -526,43 +502,35 @@ mod tests {
             _sender: Address,
             _user_op: &UserOp,
             _current_fee: u16,
-        ) -> Result<(), InvalidReason> {
-            Ok(())
+        ) -> Result<ValidationOutcome, AppError> {
+            Ok(ValidationOutcome::Accept)
         }
 
         fn apply_valid_user_op(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             _user_op: &ValidUserOp,
-            _safe_block: u64,
+            safe_block: u64,
         ) -> Result<AppOutputs, AppError> {
+            self.progress.advance(safe_block);
             Ok(Vec::new())
         }
 
         fn apply_direct_input(
             &mut self,
-            _capability: ApplyInputCapability<'_>,
             _input: &sequencer_core::l2_tx::DirectInput,
         ) -> Result<AppOutputs, AppError> {
             unimplemented!("not used in these tests")
         }
 
-        fn execution_progress(&self) -> &ApplicationProgress {
-            &self.progress
-        }
-
-        fn execution_progress_mut(
-            &mut self,
-            _capability: ProgressCommitCapability<'_>,
-        ) -> &mut ApplicationProgress {
-            &mut self.progress
+        fn progress(&self) -> ApplicationProgress {
+            self.progress
         }
 
         fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
             Ok(Self::default())
         }
 
-        fn create_dump(&self, _prefix: &Path) -> Result<(), AppError> {
+        fn create_dump(&mut self, _prefix: &Path) -> Result<(), AppError> {
             Err(AppError::Internal {
                 reason: "simulated create_dump failure".to_string(),
             })
@@ -587,10 +555,15 @@ mod tests {
         let open_before = head.batch_index;
 
         let dumps_dir = tempfile::tempdir().unwrap();
-        let app = FailingDumpApp::default();
-        let err =
-            super::close_batch_with_snapshot(&app, &mut storage, &mut head, 0, dumps_dir.path())
-                .expect_err("create_dump failure must abort the close");
+        let mut app = FailingDumpApp::default();
+        let err = super::close_batch_with_snapshot(
+            &mut app,
+            &mut storage,
+            &mut head,
+            0,
+            dumps_dir.path(),
+        )
+        .expect_err("create_dump failure must abort the close");
         assert!(matches!(
             err,
             super::TakeDumpError::CreateDump(dump_info::CreateDumpDirError::App(_))
@@ -622,8 +595,8 @@ mod tests {
         let sealed_index = head.batch_index;
 
         let dumps_dir = tempfile::tempdir().unwrap();
-        let app = RecordingDumpApp::new();
-        super::close_batch_with_snapshot(&app, &mut storage, &mut head, 0, dumps_dir.path())
+        let mut app = RecordingDumpApp::new();
+        super::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 0, dumps_dir.path())
             .expect("atomic close");
 
         // Head advanced to the freshly opened batch; the sealed batch

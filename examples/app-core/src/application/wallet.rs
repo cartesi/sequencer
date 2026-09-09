@@ -15,8 +15,8 @@ use super::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
 use super::Method;
 use super::{DepositNotice, TransferNotice};
 use sequencer_core::application::{
-    AppError, AppOutput, AppOutputs, Application, ApplicationProgress, ApplyInputCapability,
-    InvalidReason, ProgressCommitCapability,
+    AppError, AppOutput, AppOutputs, Application, ApplicationProgress, CanonicalState,
+    InvalidReason, ValidationOutcome,
 };
 use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::ValidUserOp;
@@ -160,36 +160,6 @@ impl WalletApp {
         self.execution_progress.last_executed_safe_block()
     }
 
-    /// Deterministic JSON of the non-default logical state (debug only).
-    fn state_json(&self) -> String {
-        let mut balances: Vec<_> = self
-            .balances
-            .iter()
-            .filter(|(_, balance)| **balance != U256::ZERO)
-            .collect();
-        balances.sort_by_key(|(address, _)| address.as_slice());
-
-        let mut nonces: Vec<_> = self
-            .nonces
-            .iter()
-            .filter(|(_, nonce)| **nonce != 0)
-            .collect();
-        nonces.sort_by_key(|(address, _)| address.as_slice());
-
-        let balance_entries = balances
-            .into_iter()
-            .map(|(address, balance)| format!("\"{}\":\"{balance}\"", json_address(address)))
-            .collect::<Vec<_>>()
-            .join(",");
-        let nonce_entries = nonces
-            .into_iter()
-            .map(|(address, nonce)| format!("\"{}\":{nonce}", json_address(address)))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        format!("{{\"balances\":{{{balance_entries}}},\"nonces\":{{{nonce_entries}}}}}")
-    }
-
     fn balance_of(&self, addr: &Address) -> U256 {
         *self.balances.get(addr).unwrap_or(&U256::ZERO)
     }
@@ -242,10 +212,6 @@ impl WalletApp {
     }
 }
 
-fn json_address(address: &Address) -> String {
-    format!("0x{}", alloy_primitives::hex::encode(address.as_slice()))
-}
-
 impl Default for WalletApp {
     fn default() -> Self {
         Self::new(WalletConfig::default())
@@ -260,13 +226,13 @@ impl Application for WalletApp {
         sender: Address,
         user_op: &UserOp,
         current_fee: u16,
-    ) -> Result<(), InvalidReason> {
+    ) -> Result<ValidationOutcome, AppError> {
         let expected_nonce = self.expected_nonce(&sender);
         if user_op.nonce != expected_nonce {
-            return Err(InvalidReason::InvalidNonce {
+            return Ok(ValidationOutcome::Reject(InvalidReason::InvalidNonce {
                 expected: expected_nonce,
                 got: user_op.nonce,
-            });
+            }));
         }
 
         // max_fee < current_fee is already checked by the free function
@@ -275,20 +241,21 @@ impl Application for WalletApp {
         let fee_cost = sequencer_core::fee::fee_to_linear(current_fee);
         let balance = self.balance_of(&sender);
         if balance < fee_cost {
-            return Err(InvalidReason::InsufficientFeeBalance {
-                required: fee_cost,
-                available: balance,
-            });
+            return Ok(ValidationOutcome::Reject(
+                InvalidReason::InsufficientFeeBalance {
+                    required: fee_cost,
+                    available: balance,
+                },
+            ));
         }
 
-        Ok(())
+        Ok(ValidationOutcome::Accept)
     }
 
     fn apply_valid_user_op(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         user_op: &ValidUserOp,
-        _safe_block: u64,
+        safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
         let sender = user_op.sender;
         let fee_cost = sequencer_core::fee::fee_to_linear(user_op.fee);
@@ -333,12 +300,12 @@ impl Application for WalletApp {
             _ => {}
         }
 
+        self.execution_progress.advance(safe_block);
         Ok(outputs)
     }
 
     fn apply_direct_input(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         input: &sequencer_core::l2_tx::DirectInput,
     ) -> Result<AppOutputs, AppError> {
         let mut outputs = Vec::new();
@@ -375,26 +342,12 @@ impl Application for WalletApp {
             }
         }
 
+        self.execution_progress.advance(input.block_number);
         Ok(outputs)
     }
 
-    fn execution_progress(&self) -> &ApplicationProgress {
-        &self.execution_progress
-    }
-
-    fn execution_progress_mut(
-        &mut self,
-        _capability: ProgressCommitCapability<'_>,
-    ) -> &mut ApplicationProgress {
-        &mut self.execution_progress
-    }
-
-    fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError> {
-        Ok(crate::wallet_snapshot::encode(self))
-    }
-
-    fn export_state(&self) -> Result<String, AppError> {
-        Ok(self.state_json())
+    fn progress(&self) -> ApplicationProgress {
+        self.execution_progress
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
@@ -403,7 +356,7 @@ impl Application for WalletApp {
         crate::wallet_snapshot::decode(&bytes)
     }
 
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         // `create_dir` (not `create_dir_all`) deliberately errors if the
         // prefix already exists. Snapshot prefixes are expected to be
         // unique per call; a collision means a lane bug worth surfacing
@@ -440,6 +393,12 @@ impl Application for WalletApp {
     }
 }
 
+impl CanonicalState for WalletApp {
+    fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError> {
+        Ok(crate::wallet_snapshot::encode(self))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -453,7 +412,9 @@ mod tests {
 
     use super::{ApplicationProgress, ExecutedInputCount, WalletApp, WalletConfig};
     use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};
-    use sequencer_core::application::{AppError, AppOutput, Application, InvalidReason};
+    use sequencer_core::application::{
+        AppError, AppOutput, Application, CanonicalState, InvalidReason, ValidationOutcome,
+    };
     use sequencer_core::application::{execute_direct_input, execute_valid_user_op};
     use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
     use sequencer_core::user_op::UserOp;
@@ -486,6 +447,40 @@ mod tests {
     }
 
     #[test]
+    fn validation_is_repeatable_and_preserves_the_entire_state() {
+        let mut app = WalletApp::default();
+        let sender = Address::from_slice(&[0x11; 20]);
+        app.balances.insert(sender, U256::from(10_u64));
+        let before = app.canonical_snapshot_bytes().unwrap();
+        let mut user_op = UserOp {
+            nonce: 0,
+            max_fee: 0,
+            data: Vec::new().into(),
+        };
+
+        for _ in 0..2 {
+            assert_eq!(
+                app.validate_user_op(sender, &user_op, 0).unwrap(),
+                ValidationOutcome::Accept
+            );
+            user_op.nonce = 1;
+            assert_eq!(
+                app.validate_user_op(sender, &user_op, 0).unwrap(),
+                ValidationOutcome::Reject(InvalidReason::InvalidNonce {
+                    expected: 0,
+                    got: 1
+                })
+            );
+            user_op.nonce = 0;
+            assert!(matches!(
+                app.validate_user_op(Address::ZERO, &user_op, 0).unwrap(),
+                ValidationOutcome::Reject(InvalidReason::InsufficientFeeBalance { .. })
+            ));
+            assert_eq!(app.canonical_snapshot_bytes().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn execute_valid_user_op_charges_current_fee() {
         let mut app = WalletApp::new(WalletConfig::default());
         let sender = Address::from_slice(&[0x22; 20]);
@@ -500,12 +495,14 @@ mod tests {
             data: Vec::new(),
         };
         let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
-        let outputs = execute_valid_user_op(&mut app, &valid, 0)
+        let outputs = execute_valid_user_op(&mut app, &valid, 123)
             .expect("execute valid op")
             .outputs;
 
         assert_eq!(app.current_user_nonce(sender), 1);
         assert_eq!(app.current_user_balance(sender), initial_balance - gas_cost);
+        assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.last_executed_safe_block(), 123);
         assert!(outputs.is_empty());
     }
 
@@ -694,6 +691,7 @@ mod tests {
         .outputs;
 
         assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.last_executed_safe_block(), 123);
         assert!(outputs.is_empty());
     }
 
@@ -888,6 +886,42 @@ mod tests {
         assert_eq!(restored.balances, app.balances);
         assert_eq!(restored.nonces, app.nonces);
         assert_eq!(restored.execution_progress, app.execution_progress);
+    }
+
+    #[test]
+    fn dump_and_loaded_instances_have_independent_mutable_state() {
+        let mut live = WalletApp::default();
+        let sender = Address::from_slice(&[0x11; 20]);
+        live.balances.insert(sender, U256::from(10_u64));
+        let before = live.canonical_snapshot_bytes().unwrap();
+        let prefix = temp_dump_prefix();
+        live.create_dump(&prefix).unwrap();
+        assert_eq!(live.canonical_snapshot_bytes().unwrap(), before);
+        assert_eq!(
+            std::fs::read(WalletApp::state_file_in_dump(&prefix)).unwrap(),
+            before
+        );
+
+        let mut first = WalletApp::from_dump(&prefix).unwrap();
+        let second = WalletApp::from_dump(&prefix).unwrap();
+        let user_op = ValidUserOp {
+            sender,
+            fee: 0,
+            data: Vec::new(),
+        };
+        execute_valid_user_op(&mut first, &user_op, 11).unwrap();
+        assert_ne!(first.canonical_snapshot_bytes().unwrap(), before);
+        assert_eq!(live.canonical_snapshot_bytes().unwrap(), before);
+        execute_valid_user_op(&mut live, &user_op, 12).unwrap();
+        assert_ne!(live.canonical_snapshot_bytes().unwrap(), before);
+        assert_eq!(second.canonical_snapshot_bytes().unwrap(), before);
+        assert_eq!(
+            std::fs::read(WalletApp::state_file_in_dump(&prefix)).unwrap(),
+            before
+        );
+        WalletApp::delete_dump(&prefix).unwrap();
+        execute_valid_user_op(&mut first, &user_op, 13).unwrap();
+        assert_eq!(first.executed_input_count().get(), 2);
     }
 
     #[test]

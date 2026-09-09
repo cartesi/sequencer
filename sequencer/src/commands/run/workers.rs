@@ -148,7 +148,7 @@ pub(super) struct Workers {
     _shutdown_on_drop: ShutdownOnDrop,
 }
 
-impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
+impl<A: Application + 'static> PreparedRuntime<A> {
     /// Prepare every fallible or awaited runtime dependency while launching
     /// zero tasks. Durable admission remains the controller's responsibility.
     pub(super) async fn prepare(cfg: WorkersConfig) -> Result<Self, CommandError> {
@@ -245,7 +245,7 @@ impl<A: Application + Clone + Sync + 'static> PreparedRuntime<A> {
         let snapshot_state = http::SnapshotState {
             db_path,
             // The DB row stores the dump *directory*; the app's state
-            // file lives under its `state` subtree.
+            // file is located relative to the opaque application prefix.
             state_file_in_dump: |dump_dir| A::state_file_in_dump(&dump_info::app_prefix(dump_dir)),
         };
 
@@ -674,8 +674,9 @@ mod tests {
     use crate::storage::DangerStatus;
     use clap::Parser;
 
-    #[derive(Clone, Default)]
+    #[derive(Default)]
     struct StartupProbeApp {
+        _single_owner: std::cell::Cell<()>,
         progress: sequencer_core::application::ApplicationProgress,
     }
 
@@ -687,38 +688,34 @@ mod tests {
             _sender: alloy_primitives::Address,
             _user_op: &sequencer_core::user_op::UserOp,
             _current_fee: u16,
-        ) -> Result<(), sequencer_core::application::InvalidReason> {
-            Ok(())
+        ) -> Result<
+            sequencer_core::application::ValidationOutcome,
+            sequencer_core::application::AppError,
+        > {
+            Ok(sequencer_core::application::ValidationOutcome::Accept)
         }
 
         fn apply_valid_user_op(
             &mut self,
-            _capability: sequencer_core::application::ApplyInputCapability<'_>,
             _user_op: &sequencer_core::l2_tx::ValidUserOp,
-            _safe_block: u64,
+            safe_block: u64,
         ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
         {
+            self.progress.advance(safe_block);
             Ok(Vec::new())
         }
 
         fn apply_direct_input(
             &mut self,
-            _capability: sequencer_core::application::ApplyInputCapability<'_>,
-            _input: &sequencer_core::l2_tx::DirectInput,
+            input: &sequencer_core::l2_tx::DirectInput,
         ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
         {
+            self.progress.advance(input.block_number);
             Ok(Vec::new())
         }
 
-        fn execution_progress(&self) -> &sequencer_core::application::ApplicationProgress {
-            &self.progress
-        }
-
-        fn execution_progress_mut(
-            &mut self,
-            _capability: sequencer_core::application::ProgressCommitCapability<'_>,
-        ) -> &mut sequencer_core::application::ApplicationProgress {
-            &mut self.progress
+        fn progress(&self) -> sequencer_core::application::ApplicationProgress {
+            self.progress
         }
 
         fn from_dump(
@@ -728,7 +725,7 @@ mod tests {
         }
 
         fn create_dump(
-            &self,
+            &mut self,
             prefix: &std::path::Path,
         ) -> Result<(), sequencer_core::application::AppError> {
             std::fs::create_dir(prefix)?;

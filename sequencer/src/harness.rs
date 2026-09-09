@@ -63,7 +63,7 @@ pub enum Command {
 /// Parse argv and dispatch. Returns the process exit code.
 pub async fn run_main<A, F>(genesis_app: F) -> std::process::ExitCode
 where
-    A: Application + Clone + Sync + 'static,
+    A: Application + 'static,
     F: FnOnce() -> A + Send + 'static,
 {
     let cli = Cli::parse();
@@ -103,7 +103,7 @@ fn project_dispatch_join(
 /// register the genesis snapshot.
 pub async fn dispatch<A, F>(command: Command, genesis_app: F) -> std::process::ExitCode
 where
-    A: Application + Clone + Sync + 'static,
+    A: Application + 'static,
     F: FnOnce() -> A,
 {
     let result = match command {

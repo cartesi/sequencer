@@ -32,7 +32,7 @@ aren't. Section references point to the full reasoning below.
   *loads* — it never branches on tip existence or initializes one. (§7)
 - **A committed promotion implies an advanced drain.** Promotion is folded into
   the drain's attributed transaction
-  (`close_frame_only_promoting_with_executions`), so promotion, physical
+  (`close_frame_only_with_executions`), so promotion, physical
   drain, and logical mappings commit together—this is what makes a crash safe.
   (§5, §6)
 - **No dangling row.** No `dumps` row references a missing directory: create the
@@ -58,7 +58,7 @@ aren't. Section references point to the full reasoning below.
 - **`Storage::promote_finalized` (standalone) is `pub`, but production must not
   call it.** Promoting outside the drain transaction re-opens the wedge (§6); it
   exists only for test setup. Production promotes via
-  `close_frame_only_promoting_with_executions`.
+  `close_frame_only_with_executions`.
 - **Several snapshot `Storage` methods are `#[cfg(test)]`** — non-atomic
   siblings of the atomic production methods (`gc_dump_rows` vs
   `gc_unreferenced_dumps`; `acquire_dump_lease` vs `acquire_*_lease`;
@@ -104,7 +104,7 @@ Three SQLite tables back it (`storage/migrations/0001_schema.sql`):
 
 ```text
 dumps/<id>/
-  state       app-owned subtree — the prefix handed to
+  state       app-owned file or directory — the prefix handed to
               Application::{create_dump, from_dump, delete_dump}
               (opaque to the sequencer; see format.md)
   info.toml   sequencer-owned checkpoint metadata:
@@ -251,7 +251,7 @@ without turning the logical reconciliation turn into resumable state.
 
 The promotion is **folded into the same transaction that advances the drain**:
 `maybe_advance_safe_frontier` calls
-`close_frame_only_promoting_with_executions`, which sequences the drained safe
+`close_frame_only_with_executions`, which sequences the drained safe
 inputs, attaches their canonical execution offsets, rotates the frame, and
 runs `promote_finalized_in`—all in one `write`. A crash therefore leaves
 promote + delete-pending + drain-sequence + attribution either all committed
@@ -332,7 +332,7 @@ such garbage (the superseded finalized, lower-nonce pendings).
 
 **After a promoting clock/reconciliation turn, on the lane's own thread**
 (`maybe_advance_safe_frontier`, right after
-`close_frame_only_promoting_with_executions`
+`close_frame_only_with_executions`
 commits — `run_gc::<A>` when a promotion occurred). One full
 `gc_unreferenced_dumps` pass per turn that promoted; it reclaims the
 just-superseded finalized plus any earlier lease-released garbage.

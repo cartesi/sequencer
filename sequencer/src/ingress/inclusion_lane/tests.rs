@@ -17,8 +17,7 @@ use crate::storage::test_helpers::{
 };
 use crate::storage::{DirectInputExecution, SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use sequencer_core::application::{
-    AppError, AppOutputs, Application, ApplicationProgress, ApplyInputCapability, InvalidReason,
-    ProgressCommitCapability,
+    AppError, AppOutputs, Application, ApplicationProgress, InvalidReason, ValidationOutcome,
 };
 use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
@@ -28,8 +27,8 @@ use super::catch_up::{catch_up_application_paged, catch_up_snapshot};
 use super::dequeue_and_execute_user_op_chunk;
 use super::error::CatchUpError;
 use super::{
-    FastTurnSummary, IncludedUserOp, InclusionLane, InclusionLaneConfig, InclusionLaneError,
-    LaneState, PendingUserOp, SequencerError,
+    IncludedUserOp, InclusionLane, InclusionLaneConfig, InclusionLaneError, LaneState,
+    PendingUserOp, SequencerError, TurnOutcome,
 };
 
 fn encode_progress(progress: ApplicationProgress) -> [u8; 16] {
@@ -70,46 +69,36 @@ impl Application for TestApp {
         _sender: Address,
         user_op: &UserOp,
         _current_fee: u16,
-    ) -> Result<(), InvalidReason> {
+    ) -> Result<ValidationOutcome, AppError> {
         if let Some(delay) = self.reject_user_ops_after {
             std::thread::sleep(delay);
-            return Err(InvalidReason::InvalidNonce {
+            return Ok(ValidationOutcome::Reject(InvalidReason::InvalidNonce {
                 expected: user_op.nonce.wrapping_add(1),
                 got: user_op.nonce,
-            });
+            }));
         }
-        Ok(())
+        Ok(ValidationOutcome::Accept)
     }
 
     fn apply_valid_user_op(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         user_op: &ValidUserOp,
-        _safe_block: u64,
+        safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
         let current = self.nonces.get(&user_op.sender).copied().unwrap_or(0);
         let next_nonce = current.wrapping_add(1);
         self.nonces.insert(user_op.sender, next_nonce);
+        self.progress.advance(safe_block);
         Ok(Vec::new())
     }
 
-    fn apply_direct_input(
-        &mut self,
-        _capability: ApplyInputCapability<'_>,
-        _input: &DirectInput,
-    ) -> Result<AppOutputs, AppError> {
+    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
+        self.progress.advance(input.block_number);
         Ok(Vec::new())
     }
 
-    fn execution_progress(&self) -> &ApplicationProgress {
-        &self.progress
-    }
-
-    fn execution_progress_mut(
-        &mut self,
-        _capability: ProgressCommitCapability<'_>,
-    ) -> &mut ApplicationProgress {
-        &mut self.progress
+    fn progress(&self) -> ApplicationProgress {
+        self.progress
     }
 
     // The lane loads its app via `from_dump` after the runtime
@@ -121,7 +110,7 @@ impl Application for TestApp {
         Ok(Self::default())
     }
 
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(Self::state_file_in_dump(prefix), b"")?;
         Ok(())
@@ -139,6 +128,7 @@ impl Application for TestApp {
 
 #[derive(Default)]
 struct InternalUserOpApp {
+    fail_validation: bool,
     progress: ApplicationProgress,
 }
 
@@ -150,13 +140,17 @@ impl Application for InternalUserOpApp {
         _sender: Address,
         _user_op: &UserOp,
         _current_fee: u16,
-    ) -> Result<(), InvalidReason> {
-        Ok(())
+    ) -> Result<ValidationOutcome, AppError> {
+        if self.fail_validation {
+            return Err(AppError::Internal {
+                reason: "app invariant failed".into(),
+            });
+        }
+        Ok(ValidationOutcome::Accept)
     }
 
     fn apply_valid_user_op(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         _user_op: &ValidUserOp,
         _safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
@@ -165,30 +159,19 @@ impl Application for InternalUserOpApp {
         })
     }
 
-    fn apply_direct_input(
-        &mut self,
-        _capability: ApplyInputCapability<'_>,
-        _input: &DirectInput,
-    ) -> Result<AppOutputs, AppError> {
+    fn apply_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
         unimplemented!("not used in these tests")
     }
 
-    fn execution_progress(&self) -> &ApplicationProgress {
-        &self.progress
-    }
-
-    fn execution_progress_mut(
-        &mut self,
-        _capability: ProgressCommitCapability<'_>,
-    ) -> &mut ApplicationProgress {
-        &mut self.progress
+    fn progress(&self) -> ApplicationProgress {
+        self.progress
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
         Ok(Self::default())
     }
 
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(Self::state_file_in_dump(prefix), b"")?;
         Ok(())
@@ -248,36 +231,26 @@ impl Application for SharedCountingApp {
         _sender: Address,
         _user_op: &UserOp,
         _current_fee: u16,
-    ) -> Result<(), InvalidReason> {
-        Ok(())
+    ) -> Result<ValidationOutcome, AppError> {
+        Ok(ValidationOutcome::Accept)
     }
 
     fn apply_valid_user_op(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         _user_op: &ValidUserOp,
-        _safe_block: u64,
+        safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
+        self.progress.advance(safe_block);
         Ok(Vec::new())
     }
 
-    fn apply_direct_input(
-        &mut self,
-        _capability: ApplyInputCapability<'_>,
-        _input: &DirectInput,
-    ) -> Result<AppOutputs, AppError> {
+    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
+        self.progress.advance(input.block_number);
         Ok(Vec::new())
     }
 
-    fn execution_progress(&self) -> &ApplicationProgress {
-        &self.progress
-    }
-
-    fn execution_progress_mut(
-        &mut self,
-        _capability: ProgressCommitCapability<'_>,
-    ) -> &mut ApplicationProgress {
-        &mut self.progress
+    fn progress(&self) -> ApplicationProgress {
+        self.progress
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
@@ -286,7 +259,7 @@ impl Application for SharedCountingApp {
         Ok(Self { progress })
     }
 
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(
             Self::state_file_in_dump(prefix),
@@ -332,52 +305,42 @@ impl Application for ReplayRecordingApp {
         _sender: Address,
         _user_op: &UserOp,
         _current_fee: u16,
-    ) -> Result<(), InvalidReason> {
-        Ok(())
+    ) -> Result<ValidationOutcome, AppError> {
+        Ok(ValidationOutcome::Accept)
     }
 
     fn apply_valid_user_op(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         user_op: &ValidUserOp,
-        _safe_block: u64,
+        safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
         self.replayed.push(ReplayEvent::UserOp {
             sender: user_op.sender,
             data: user_op.data.clone(),
         });
+        self.progress.advance(safe_block);
         Ok(Vec::new())
     }
 
-    fn apply_direct_input(
-        &mut self,
-        _capability: ApplyInputCapability<'_>,
-        input: &DirectInput,
-    ) -> Result<AppOutputs, AppError> {
+    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
         self.replayed.push(ReplayEvent::DirectInput {
             sender: input.sender,
             block_number: input.block_number,
             payload: input.payload.clone(),
         });
+        self.progress.advance(input.block_number);
         Ok(Vec::new())
     }
 
-    fn execution_progress(&self) -> &ApplicationProgress {
-        &self.progress
-    }
-
-    fn execution_progress_mut(
-        &mut self,
-        _capability: ProgressCommitCapability<'_>,
-    ) -> &mut ApplicationProgress {
-        &mut self.progress
+    fn progress(&self) -> ApplicationProgress {
+        self.progress
     }
 
     fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
         Ok(Self::default())
     }
 
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(Self::state_file_in_dump(prefix), b"")?;
         Ok(())
@@ -416,7 +379,7 @@ fn default_test_config() -> InclusionLaneConfig {
 /// invariant holds. Tests use this to satisfy the catch-up
 /// precondition; production startup goes through the runtime's
 /// `bootstrap_application` which does the same thing.
-fn register_genesis_snapshot<A: Application>(app: &A, storage: &mut Storage, dumps_dir: &Path) {
+fn register_genesis_snapshot<A: Application>(app: &mut A, storage: &mut Storage, dumps_dir: &Path) {
     // Unique per call: the dumps_dir is a tempdir but tests may
     // register multiple snapshots within one test (e.g., catch-up
     // tests that re-seed storage), so reuse-free naming matters.
@@ -452,8 +415,8 @@ async fn start_lane(
     storage
         .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
         .expect("seed observed safe head");
-    let app = TestApp::default();
-    register_genesis_snapshot(&app, &mut storage, &config.dumps_dir);
+    let mut app = TestApp::default();
+    register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
     // `app` instance is dropped here; the lane reloads it from the
     // genesis dump on its background thread.
     drop(app);
@@ -537,7 +500,7 @@ fn fast_turn_processes_at_most_one_rejected_chunk() {
         .run_fast_turn(&mut head, &mut included)
         .expect("run one fast turn");
 
-    assert_eq!(summary, FastTurnSummary::Processed);
+    assert_eq!(summary, TurnOutcome::Processed);
     assert_eq!(lane.rx.len(), 4, "exactly one four-attempt chunk runs");
     assert_eq!(read_count(db.path.as_str(), "user_ops"), 0);
     for response in responses.iter_mut().take(4) {
@@ -671,7 +634,7 @@ fn reconciliation_digests_an_epoch_sized_outage_backlog_in_one_turn() {
         storage,
         config,
     };
-    let mut state = LaneState::new(SafeInputRange::empty_at(0), head);
+    let mut state = LaneState::new(0, head);
     let mut safe_inputs = Vec::new();
 
     let started = std::time::Instant::now();
@@ -715,7 +678,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
         storage,
         config,
     };
-    let mut state = LaneState::new(SafeInputRange::empty_at(0), head);
+    let mut state = LaneState::new(0, head);
     let mut safe_inputs = Vec::new();
 
     lane.storage
@@ -749,7 +712,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     assert_eq!(
         lane.run_fast_turn(&mut state.head, &mut included)
             .expect("execute op at frame clock"),
-        FastTurnSummary::Processed
+        TurnOutcome::Processed
     );
     assert!(matches!(response.try_recv(), Ok(Ok(()))));
     let sequenced = lane
@@ -809,7 +772,7 @@ fn structural_batch_frame_does_not_reset_frame_clock_anchor() {
         storage,
         config: default_test_config(),
     };
-    let mut state = LaneState::new(SafeInputRange::empty_at(0), head);
+    let mut state = LaneState::new(0, head);
     let mut safe_inputs = Vec::new();
 
     lane.storage
@@ -854,7 +817,7 @@ fn poisoned_frontier_outranks_frame_clock_and_closes_intake() {
         storage,
         config: default_test_config(),
     };
-    let mut state = LaneState::new(SafeInputRange::empty_at(0), head);
+    let mut state = LaneState::new(0, head);
     let mut safe_inputs = Vec::new();
 
     let err = lane
@@ -915,6 +878,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 safe_input_index: 0,
                 executed_input_offset: ExecutedInputCount::new(2),
             }],
+            None,
         )
         .expect("close first frame with direct attribution");
 
@@ -943,6 +907,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 safe_input_index: 1,
                 executed_input_offset: ExecutedInputCount::new(4),
             }],
+            None,
         )
         .expect("close second frame with direct attribution");
 
@@ -967,6 +932,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 safe_input_index: 2,
                 executed_input_offset: ExecutedInputCount::new(5),
             }],
+            None,
         )
         .expect("close third frame with direct attribution");
 
@@ -1126,8 +1092,8 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     };
     pin_test_deployment_identity(&mut storage, batch_submitter_address);
     {
-        let app = SharedCountingApp::new();
-        register_genesis_snapshot(&app, &mut storage, &config.dumps_dir);
+        let mut app = SharedCountingApp::new();
+        register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
     }
     storage.ensure_open_tip().expect("establish genesis tip");
     let shutdown = RuntimeScope::default();
@@ -1411,35 +1377,40 @@ fn dequeue_flushes_executed_ops_before_observing_disconnect() {
 
 #[test]
 fn dequeue_returns_lane_error_when_app_reports_internal() {
-    let (tx, mut rx) = mpsc::channel::<PendingUserOp>(1);
-    let (pending, recv) = make_pending_user_op(0x45);
-    tx.blocking_send(pending).expect("enqueue pending user op");
+    for fail_validation in [false, true] {
+        let (tx, mut rx) = mpsc::channel::<PendingUserOp>(1);
+        let (pending, recv) = make_pending_user_op(0x45);
+        tx.blocking_send(pending).expect("enqueue pending user op");
 
-    let mut app = InternalUserOpApp::default();
-    let mut included = Vec::new();
-    let head = unbounded_head();
-    let err = dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 16, &head, &mut included)
-        .expect_err("internal application error should stop the lane");
+        let mut app = InternalUserOpApp {
+            fail_validation,
+            ..InternalUserOpApp::default()
+        };
+        let mut included = Vec::new();
+        let head = unbounded_head();
+        let err = dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 16, &head, &mut included)
+            .expect_err("internal application error should stop the lane");
 
-    // The application's reason travels on the lane error (and the log) ...
-    assert!(matches!(
-        &err,
-        InclusionLaneError::ExecuteUserOp { source }
-            if source.to_string().contains("app invariant failed")
-    ));
-    assert!(
-        included.is_empty(),
-        "internal errors must not leave an op ready to persist"
-    );
-    // ... never into the client's 500 body, which is fixed text.
-    let response = recv
-        .blocking_recv()
-        .expect("lane should respond to triggering op")
-        .expect_err("triggering op should receive internal error");
-    assert!(matches!(
-        response,
-        super::SequencerError::Internal(message) if message == "application internal error"
-    ));
+        // The application's reason travels on the lane error (and the log) ...
+        assert!(matches!(
+            &err,
+            InclusionLaneError::ExecuteUserOp { source }
+                if source.to_string().contains("app invariant failed")
+        ));
+        assert!(
+            included.is_empty(),
+            "internal errors must not leave an op ready to persist"
+        );
+        // ... never into the client's 500 body, which is fixed text.
+        let response = recv
+            .blocking_recv()
+            .expect("lane should respond to triggering op")
+            .expect_err("triggering op should receive internal error");
+        assert!(matches!(
+            response,
+            super::SequencerError::Internal(message) if message == "application internal error"
+        ));
+    }
 }
 
 #[test]
@@ -1467,7 +1438,7 @@ fn catch_up_replays_multiple_pages() {
     assert_eq!(
         app.last_executed_safe_block(),
         30,
-        "catch-up must advance scheduler-owned progress through the shared boundary"
+        "catch-up must advance application-owned progress through execution"
     );
 }
 
@@ -1579,7 +1550,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         .append_executed_user_ops_chunk(&mut head, &included)
         .expect("persist prefix user op");
     super::snapshot::close_batch_with_snapshot(
-        &live_app,
+        &mut live_app,
         &mut storage,
         &mut head,
         0,
@@ -1616,7 +1587,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         .expect("execute direct input in doomed suffix");
     assert_eq!(direct_receipt.offset, ExecutedInputCount::new(1));
     storage
-        .close_frame_only_promoting_with_executions(
+        .close_frame_only_with_executions(
             &mut head,
             10,
             SafeInputRange::new(0, 2),
@@ -1624,8 +1595,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
                 safe_input_index: 1,
                 executed_input_offset: direct_receipt.offset,
             }],
-            0,
-            10,
+            Some((0, 10)),
         )
         .expect("drain direct and promote prefix snapshot");
     let finalized_before = storage
@@ -1658,7 +1628,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         .append_executed_user_ops_chunk(&mut head, &included)
         .expect("persist doomed user op");
     super::snapshot::close_batch_with_snapshot(
-        &live_app,
+        &mut live_app,
         &mut storage,
         &mut head,
         10,
@@ -1837,11 +1807,11 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
         )
         .expect("seed observed safe head");
 
-    let app = SharedCountingApp {
+    let mut app = SharedCountingApp {
         progress: ApplicationProgress::try_new(ExecutedInputCount::new(1), 0)
             .expect("coherent progress"),
     };
-    register_genesis_snapshot(&app, &mut storage, &config.dumps_dir);
+    register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
     storage.ensure_open_tip().expect("establish genesis tip");
 
     let shutdown = RuntimeScope::default();
@@ -1888,36 +1858,25 @@ impl Application for UserOpCounterApp {
         _sender: Address,
         _user_op: &UserOp,
         _current_fee: u16,
-    ) -> Result<(), InvalidReason> {
-        Ok(())
+    ) -> Result<ValidationOutcome, AppError> {
+        Ok(ValidationOutcome::Accept)
     }
 
     fn apply_valid_user_op(
         &mut self,
-        _capability: ApplyInputCapability<'_>,
         _user_op: &ValidUserOp,
-        _safe_block: u64,
+        safe_block: u64,
     ) -> Result<AppOutputs, AppError> {
+        self.progress.advance(safe_block);
         Ok(Vec::new())
     }
 
-    fn apply_direct_input(
-        &mut self,
-        _capability: ApplyInputCapability<'_>,
-        _input: &DirectInput,
-    ) -> Result<AppOutputs, AppError> {
+    fn apply_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
         unimplemented!("not used in these tests")
     }
 
-    fn execution_progress(&self) -> &ApplicationProgress {
-        &self.progress
-    }
-
-    fn execution_progress_mut(
-        &mut self,
-        _capability: ProgressCommitCapability<'_>,
-    ) -> &mut ApplicationProgress {
-        &mut self.progress
+    fn progress(&self) -> ApplicationProgress {
+        self.progress
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
@@ -1926,7 +1885,7 @@ impl Application for UserOpCounterApp {
         Ok(Self { progress })
     }
 
-    fn create_dump(&self, prefix: &Path) -> Result<(), AppError> {
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(
             Self::state_file_in_dump(prefix),
@@ -1988,8 +1947,8 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     // `app` only writes the genesis dump here; the lane reloads its own
     // instance via `from_dump` on its background thread.
-    let app = UserOpCounterApp::new();
-    register_genesis_snapshot(&app, &mut storage, &config1.dumps_dir);
+    let mut app = UserOpCounterApp::new();
+    register_genesis_snapshot(&mut app, &mut storage, &config1.dumps_dir);
     storage.ensure_open_tip().expect("establish genesis tip");
     let shutdown1 = RuntimeScope::default();
     let (tx1, handle1) =
@@ -2108,8 +2067,8 @@ fn empty_batch_snapshot_records_global_replay_head_not_genesis() {
         .expect("close empty batch 1");
 
     let dumps_dir = tempfile::tempdir().expect("dumps dir");
-    let app = TestApp::default();
-    super::snapshot::take_dump_at_batch_close(&app, &mut storage, dumps_dir.path(), 1)
+    let mut app = TestApp::default();
+    super::snapshot::take_dump_at_batch_close(&mut app, &mut storage, dumps_dir.path(), 1)
         .expect("take dump for empty batch 1");
 
     let pending = storage
@@ -2145,13 +2104,14 @@ fn empty_batch_snapshot_records_global_replay_head_not_genesis() {
 /// against the SQL: `accepted_batch_nonce_at` has no pending-row gate, and
 /// `next_undrained` advances only when inputs are sequenced by the drain).
 ///
-/// `close_frame_only_promoting` folds the promotion into the drain's
+/// `close_frame_only_with_executions` folds the promotion into the drain's
 /// transaction, so a committed promotion always comes with an advanced drain —
 /// the wedge state is unrepresentable.
 #[test]
 fn promotion_advances_drain_atomically_so_restart_cannot_re_promote() {
     let db = temp_db("promote-drain-atomic");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    pin_test_deployment_identity(&mut storage, SENDER_A);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("open batch 0");
@@ -2187,13 +2147,24 @@ fn promotion_advances_drain_atomically_so_restart_cannot_re_promote() {
         .close_frame_and_batch(&mut head, 100)
         .expect("close batch 0");
     let dumps = tempfile::tempdir().expect("dumps dir");
-    super::snapshot::take_dump_at_batch_close(&TestApp::default(), &mut storage, dumps.path(), 0)
-        .expect("pending snapshot for batch 0");
+    super::snapshot::take_dump_at_batch_close(
+        &mut TestApp::default(),
+        &mut storage,
+        dumps.path(),
+        0,
+    )
+    .expect("pending snapshot for batch 0");
 
     // The lane advances the safe frontier over batch 0's landing: it promotes
     // batch 0 AND sequences the drain in one transaction.
     storage
-        .close_frame_only_promoting(&mut head, 100, SafeInputRange::new(0, 1), 0, 100)
+        .close_frame_only_with_executions(
+            &mut head,
+            100,
+            SafeInputRange::new(0, 1),
+            &[],
+            Some((0, 100)),
+        )
         .expect("atomic close-frame + promote");
 
     // The promotion committed...
@@ -2221,34 +2192,40 @@ fn promotion_advances_drain_atomically_so_restart_cannot_re_promote() {
 /// it. There is never a half-applied "drained but not promoted" state — the
 /// mirror of the wedge.
 #[test]
-fn close_frame_only_promoting_rolls_back_the_drain_when_promotion_fails() {
+fn frame_promotion_failure_rolls_back_drain_execution_offsets_and_head() {
     let db = temp_db("close-promote-rollback");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    pin_test_deployment_identity(&mut storage, SENDER_A);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("open batch 0");
 
     // A safe input exists to drain, but there is no pending snapshot for the
     // nonce we ask to promote, so `promote_finalized_in` errors mid-transaction.
-    let batch0 = StoredSafeInput {
-        sender: SENDER_A,
-        payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-            nonce: 0,
-            frames: Vec::new(),
-        }),
+    let direct = StoredSafeInput {
+        sender: Address::ZERO,
+        payload: vec![1],
         block_number: 100,
     };
     storage
         .append_safe_inputs(
             100,
-            std::slice::from_ref(&batch0),
+            std::slice::from_ref(&direct),
             SENDER_A,
             &default_protocol_timing(),
         )
         .expect("append safe input");
 
-    let result =
-        storage.close_frame_only_promoting(&mut head, 100, SafeInputRange::new(0, 1), 7, 100);
+    let result = storage.close_frame_only_with_executions(
+        &mut head,
+        100,
+        SafeInputRange::new(0, 1),
+        &[DirectInputExecution {
+            safe_input_index: 0,
+            executed_input_offset: ExecutedInputCount::ZERO,
+        }],
+        Some((7, 100)),
+    );
     assert!(
         result.is_err(),
         "promoting a missing pending row must fail the whole call",
@@ -2264,4 +2241,11 @@ fn close_frame_only_promoting_rolls_back_the_drain_when_promotion_fails() {
         0,
         "the drain rolled back together with the failed promotion",
     );
+    assert_eq!(
+        storage.next_executed_input_count().unwrap(),
+        ExecutedInputCount::ZERO
+    );
+    assert_eq!(head.frame_in_batch, 0);
+    assert_eq!(head.safe_block, 0);
+    assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0]);
 }

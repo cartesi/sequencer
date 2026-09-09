@@ -29,7 +29,7 @@ address, never by a tag byte** ([`process_input`](../../sequencer-core/src/sched
 | anything else | a **direct input** (deposit) | appended to the *fridge* (the direct-input FIFO), drained later |
 
 The payload is opaque to classification; app-specific decoding happens inside
-the capability-gated `Application::apply_direct_input` hook, reached through
+the `Application::apply_direct_input` hook, reached through
 the shared `execute_direct_input` boundary (see the
 [application contract](application-contract.md)).
 
@@ -290,10 +290,10 @@ boundary in the scheduler, live lane, catch-up, and recovery fold:
    skips leave it unchanged.
 2. `AppError` is fatal everywhere; there is no parallel scheduler-only
    transition after a possibly partial hook failure.
-3. Distinct opaque capabilities let application hooks mutate application state
-   without granting them authority to overwrite scheduler-owned progress. The
-   shared boundary checks progress before/after both successful and failing
-   hooks and asserts getter coherence after commit.
+3. The engine advances its embedded progress in each successful apply hook.
+   The shared boundary preflights overflow and asserts the exact expected
+   successor after success. Validation purity and native-engine mutation
+   remain self-trusted.
 4. Tests pin direct/user advancement, every skip/reject family, pre-batch
    overdue-drain ordering, overflow, dump round-trips, nonzero recovery bases,
    and live/replay mapping agreement.

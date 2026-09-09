@@ -45,7 +45,7 @@ use workers::{PreparedRuntime, WorkersConfig};
 /// it. Ordinary shutdown drains workers; typed startup failures return an error.
 pub async fn run<A>(config: RunConfig) -> Result<(), CommandError>
 where
-    A: Application + Clone + Sync + 'static,
+    A: Application + 'static,
 {
     // ── Gate + identity ──────────────────────────────────────
     std::fs::create_dir_all(&config.data_dir)?;
@@ -108,7 +108,7 @@ async fn run_admitted<A>(
     process_lock: process_lock::ProcessLock,
 ) -> Result<(), CommandError>
 where
-    A: Application + Clone + Sync + 'static,
+    A: Application + 'static,
 {
     let db_path = config.db_path();
 

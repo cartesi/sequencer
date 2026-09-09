@@ -287,18 +287,25 @@ impl Storage {
         Ok(())
     }
 
-    /// Rotate to the next frame inside the same batch. Used when the safe
-    /// block advances but batch policy hasn't triggered a batch close — the
-    /// new frame inherits the batch and gets a fresh fee/safe-block.
+    /// Rotate to the next frame, atomically attaching the drain and its
+    /// execution offsets and optionally promoting `(batch_nonce, inclusion_block)`.
+    /// Promotion must share the drain transaction: otherwise a restart could
+    /// replay the observation and try to promote its already-deleted pending row.
     pub fn close_frame_only_with_executions(
         &mut self,
         head: &mut WriteHead,
         next_safe_block: u64,
         leading_direct_range: SafeInputRange,
         executions: &[DirectInputExecution],
+        promotion: Option<(u64, u64)>,
     ) -> Result<()> {
         let policy = self.write(|tx| {
-            close_frame_in(tx, head, next_safe_block, leading_direct_range, executions)
+            let policy =
+                close_frame_in(tx, head, next_safe_block, leading_direct_range, executions)?;
+            if let Some((max_nonce, inclusion_block)) = promotion {
+                promote_finalized_in(tx, max_nonce, inclusion_block)?;
+            }
+            Ok(policy)
         })?;
         head.advance_frame(policy, next_safe_block);
         Ok(())
@@ -316,35 +323,6 @@ impl Storage {
     ) -> Result<()> {
         let policy = self.write(|tx| {
             close_frame_physical_only_in(tx, head, next_safe_block, leading_direct_range)
-        })?;
-        head.advance_frame(policy, next_safe_block);
-        Ok(())
-    }
-
-    /// Like [`Storage::close_frame_only`], but in the **same transaction** also
-    /// promotes the snapshot for `max_nonce` (which landed at `inclusion_block`)
-    /// to finalized.
-    ///
-    /// Used when a safe-frontier advance observed one of our batches landing on
-    /// L1. The promotion and the drain advance it derives from commit
-    /// atomically, so a crash can never leave a promoted-but-undrained batch —
-    /// the state where a restart re-processes the safe input, re-derives the
-    /// accepted nonce, and re-promotes on a now-deleted pending row
-    /// (`QueryReturnedNoRows`, a fail-loud wedge).
-    pub fn close_frame_only_promoting_with_executions(
-        &mut self,
-        head: &mut WriteHead,
-        next_safe_block: u64,
-        leading_direct_range: SafeInputRange,
-        executions: &[DirectInputExecution],
-        max_nonce: u64,
-        inclusion_block: u64,
-    ) -> Result<()> {
-        let policy = self.write(|tx| {
-            let policy =
-                close_frame_in(tx, head, next_safe_block, leading_direct_range, executions)?;
-            promote_finalized_in(tx, max_nonce, inclusion_block)?;
-            Ok(policy)
         })?;
         head.advance_frame(policy, next_safe_block);
         Ok(())
@@ -1224,6 +1202,7 @@ mod tests {
                 10,
                 SafeInputRange::new(0, 2),
                 &incomplete,
+                None,
             );
         }));
         assert!(panic.is_err(), "omitted executable direct must fail loud");
@@ -1245,7 +1224,13 @@ mod tests {
             },
         ];
         storage
-            .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 2), &complete)
+            .close_frame_only_with_executions(
+                &mut head,
+                10,
+                SafeInputRange::new(0, 2),
+                &complete,
+                None,
+            )
             .expect("commit complete direct attribution");
         assert_eq!(
             storage.next_executed_input_count().unwrap(),

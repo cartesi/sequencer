@@ -67,10 +67,9 @@ pub struct InclusionLane<A: Application + 'static> {
 }
 
 impl<A: Application + 'static> InclusionLane<A> {
-    /// Spawn the lane on a blocking thread. The runtime establishes the open
-    /// Tip structurally before this — via the reducer's guarded
-    /// `EnsureOpenTip` phase or recovery's atomic reopen — so the lane only
-    /// ever *loads* its resume state and never initializes a Tip. It fail-louds with
+    /// Spawn the lane on a blocking thread. Startup recovery establishes the
+    /// open Tip, so the lane loads its resume state and never initializes a Tip.
+    /// It fails loudly with
     /// [`InclusionLaneError::NoOpenTip`] if the invariant was somehow violated.
     ///
     /// The lane selects one resume checkpoint — the latest pending
@@ -134,9 +133,8 @@ impl<A: Application + 'static> InclusionLane<A> {
         self.run_catch_up(catch_up_from)?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
-        // The Tip exists by construction: the startup recovery procedure established it
-        // before runtime admission. The lane only
-        // loads — read the open frame (fail-loud if absent) and the drain
+        // Startup recovery established the Tip before runtime admission.
+        // Read the open frame (fail-loud if absent) and the drain
         // cursor together from storage, so both come from the same place. Any
         // leading range already sequenced into the Tip's frames (genesis or a
         // recovery batch) was replayed into the app by `run_catch_up` above,
@@ -146,7 +144,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             .open_state()?
             .ok_or(InclusionLaneError::NoOpenTip)?;
         let next_undrained = self.storage.next_undrained_safe_input_index()?;
-        let mut lane_state = LaneState::new(SafeInputRange::empty_at(next_undrained), head);
+        let mut lane_state = LaneState::new(next_undrained, head);
 
         loop {
             if self.shutdown.is_shutdown_requested() {
@@ -166,7 +164,7 @@ impl<A: Application + 'static> InclusionLane<A> {
                 // a committed close always has a promotable snapshot row.
                 // Errors propagate per the lane's fail-loud policy.
                 snapshot::close_batch_with_snapshot(
-                    &self.app,
+                    &mut self.app,
                     &mut self.storage,
                     &mut lane_state.head,
                     next_safe_block,
@@ -200,21 +198,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         &mut self,
         head: &mut WriteHead,
         included: &mut Vec<IncludedUserOp>,
-    ) -> Result<FastTurnSummary, InclusionLaneError> {
-        let (included_count, outcome) = self.process_user_op_chunk(head, included)?;
-        match outcome {
-            ChunkOutcome::HitBatchTarget => Ok(FastTurnSummary::HitBatchTarget),
-            ChunkOutcome::MoreToProcess => Ok(FastTurnSummary::Processed),
-            ChunkOutcome::QueueEmpty if included_count == 0 => Ok(FastTurnSummary::Idle),
-            ChunkOutcome::QueueEmpty => Ok(FastTurnSummary::Processed),
-        }
-    }
-
-    fn process_user_op_chunk(
-        &mut self,
-        head: &mut WriteHead,
-        included: &mut Vec<IncludedUserOp>,
-    ) -> Result<(usize, ChunkOutcome), InclusionLaneError> {
+    ) -> Result<TurnOutcome, InclusionLaneError> {
         included.clear();
         let outcome = match dequeue_and_execute_user_op_chunk::<A>(
             &mut self.rx,
@@ -229,12 +213,10 @@ impl<A: Application + 'static> InclusionLane<A> {
                 return Err(err);
             }
         };
-        let included_count = included.len();
-
         persist_included_user_ops(&mut self.storage, head, included)?;
         acknowledge_included(included);
 
-        Ok((included_count, outcome))
+        Ok(outcome)
     }
 
     /// Time-gated to bound idle SQL load. The preceding fast turn is one
@@ -264,10 +246,10 @@ impl<A: Application + 'static> InclusionLane<A> {
             }
         };
         assert!(
-            frontier.end_exclusive >= lane_state.last_drained_direct_range.end(),
+            frontier.end_exclusive >= lane_state.next_safe_input_index,
             "safe-input head regressed: safe_end={}, next={}",
             frontier.end_exclusive,
-            lane_state.last_drained_direct_range.end()
+            lane_state.next_safe_input_index
         );
         assert!(
             frontier.safe_block >= lane_state.head.safe_block,
@@ -281,9 +263,8 @@ impl<A: Application + 'static> InclusionLane<A> {
             return Ok(());
         }
 
-        let leading_direct_range = lane_state
-            .last_drained_direct_range
-            .advance_to(frontier.end_exclusive);
+        let leading_direct_range =
+            SafeInputRange::new(lane_state.next_safe_input_index, frontier.end_exclusive);
         // The observation commits its promotion (if any) in the same
         // transaction as the drain, so a crash can never leave a
         // promoted-but-undrained batch — the state a restart would re-process
@@ -295,7 +276,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             frontier.safe_block,
             leading_direct_range,
         )?;
-        lane_state.last_drained_direct_range = leading_direct_range;
+        lane_state.next_safe_input_index = frontier.end_exclusive;
 
         // A promotion supersedes the previous finalized (and any lower-nonce
         // pendings); reclaim them now. The full pass also collects earlier
@@ -427,7 +408,7 @@ fn acknowledge_included(included: &mut Vec<IncludedUserOp>) {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum FastTurnSummary {
+enum TurnOutcome {
     /// The queue was observed empty and no accepted operation was persisted.
     Idle,
     /// Processed one chunk without crossing the batch target. This includes a
@@ -437,7 +418,7 @@ enum FastTurnSummary {
     HitBatchTarget,
 }
 
-impl FastTurnSummary {
+impl TurnOutcome {
     fn hit_batch_target(&self) -> bool {
         matches!(self, Self::HitBatchTarget)
     }
@@ -445,16 +426,6 @@ impl FastTurnSummary {
     fn processed_any(&self) -> bool {
         !matches!(self, Self::Idle)
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum ChunkOutcome {
-    /// Queue drained or sender disconnected with at least one op processed.
-    QueueEmpty,
-    /// Including the latest op pushed the batch over `max_batch_user_op_bytes`.
-    HitBatchTarget,
-    /// Hit `max_user_ops_per_chunk` cap; queue may still have more.
-    MoreToProcess,
 }
 
 fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) -> bool {
@@ -491,10 +462,8 @@ fn execute_user_op(
                 .respond_to
                 .send(Err(SequencerError::invalid(reason.to_string())));
         }
-        // Fail loud: an error from a validated op is an internal-invariant
-        // breach, not a user-facing rejection. The shared execution boundary
-        // does not advance scheduler-owned progress, and this op is never
-        // persisted or acknowledged.
+        // An application error has no canonical successor. Discard the
+        // application-owned state; this op is never persisted or acknowledged.
         Err(err) => {
             // The client gets a fixed message: the application's reason and
             // any I/O detail travel on the lane error and the log, never
@@ -515,20 +484,20 @@ fn execute_user_op(
 /// is the count we'd add by persisting now. When their sum's bytes equal or
 /// exceed `head.max_batch_user_op_bytes`, we stop and the caller closes the
 /// batch.
-pub(super) fn dequeue_and_execute_user_op_chunk<A: Application>(
+fn dequeue_and_execute_user_op_chunk<A: Application>(
     rx: &mut mpsc::Receiver<PendingUserOp>,
     app: &mut A,
     max_chunk: usize,
     head: &WriteHead,
     included: &mut Vec<IncludedUserOp>,
-) -> Result<ChunkOutcome, InclusionLaneError> {
-    let mut executed = 0_usize;
+) -> Result<TurnOutcome, InclusionLaneError> {
+    let mut attempted = 0_usize;
 
-    while executed < max_chunk {
+    while attempted < max_chunk {
         match rx.try_recv() {
             Ok(item) => {
                 execute_user_op(app, item, head.frame_fee, head.safe_block, included)?;
-                executed += 1;
+                attempted += 1;
 
                 let included_count =
                     u64::try_from(included.len()).expect("in-memory chunk length must fit in u64");
@@ -537,20 +506,24 @@ pub(super) fn dequeue_and_execute_user_op_chunk<A: Application>(
                     .checked_add(included_count)
                     .expect("batch user-op count overflow: contract-impossible");
                 if user_op_count_to_bytes::<A>(projected) >= head.max_batch_user_op_bytes {
-                    return Ok(ChunkOutcome::HitBatchTarget);
+                    return Ok(TurnOutcome::HitBatchTarget);
                 }
             }
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(ChunkOutcome::QueueEmpty),
+            Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
-                if executed == 0 {
+                if attempted == 0 {
                     return Err(InclusionLaneError::ChannelClosed);
                 }
-                return Ok(ChunkOutcome::QueueEmpty);
+                break;
             }
         }
     }
 
-    Ok(ChunkOutcome::MoreToProcess)
+    Ok(if attempted == max_chunk || !included.is_empty() {
+        TurnOutcome::Processed
+    } else {
+        TurnOutcome::Idle
+    })
 }
 
 fn user_op_count_to_bytes<A: Application>(user_op_count: u64) -> u64 {
@@ -567,22 +540,22 @@ fn user_op_count_to_bytes<A: Application>(user_op_count: u64) -> u64 {
 
 /// Lane-local state threaded through every loop iteration.
 ///
-/// `head` and `last_drained_direct_range` stay in lockstep — every safe-frontier
+/// `head` and `next_safe_input_index` stay in lockstep — every safe-frontier
 /// advance updates both `head.safe_block` (persisted in the open frame) and
-/// `last_drained_direct_range.end()` (in-memory drain cursor).
+/// `next_safe_input_index` (in-memory drain cursor).
 ///
 /// `last_frontier_check` is the time gate's bookkeeping; `None` initially so
 /// the first iteration always polls.
 struct LaneState {
-    last_drained_direct_range: SafeInputRange,
+    next_safe_input_index: u64,
     head: WriteHead,
     last_frontier_check: Option<Instant>,
 }
 
 impl LaneState {
-    fn new(last_drained_direct_range: SafeInputRange, head: WriteHead) -> Self {
+    fn new(next_safe_input_index: u64, head: WriteHead) -> Self {
         Self {
-            last_drained_direct_range,
+            next_safe_input_index,
             head,
             last_frontier_check: None,
         }

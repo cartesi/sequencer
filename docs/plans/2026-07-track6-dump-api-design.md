@@ -1,10 +1,12 @@
 # Dump / `Application` API — Design Draft (Track 6)
 
-**Status: draft for review** (us, Bart). Companion to the Track 3 feed
-design — review together; libdex's on-disk layout depends on both. On
-acceptance, the trait contract graduates into
-`docs/protocol/application-contract.md` and the lifecycle changes into
-`docs/snapshots/lifecycle.md`.
+**Status: superseded by the 2026-09-09 design decision.** Preserved as the
+original proposal; its public clone/flush machinery was not adopted. The
+[current Application contract](../protocol/application-contract.md) specifies
+mutable checkpoint creation, independent restore, and the distinction between
+recovery checkpoints and canonical comparison bytes. The
+[review ledger](../review/2026-09-09-application-lane-dex-review.md) records the
+reasoning. The text below is historical.
 
 ## 1. Motivation
 
