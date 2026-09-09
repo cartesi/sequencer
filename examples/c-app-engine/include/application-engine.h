@@ -376,8 +376,8 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_create_dump(Ap
 /// @returns OK, NOT_FOUND when the dump is absent, IO_ERROR for other filesystem failures,
 /// or INTERNAL_ERROR.
 /// @details An engine still holding this dump open keeps running, its mapping outlives the name.
-/// Synchronizing the directory entry before returning is what would let a caller drop its record
-/// of the path on OK, so an engine that skips it can leave an orphan behind a crash.
+/// The sequencer removes the database reference before deleting the artifact. Deletion must not
+/// affect other dumps or independently loaded engines.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_delete_dump(
     const char *prefix) APPLICATION_ENGINE_NOEXCEPT;
 

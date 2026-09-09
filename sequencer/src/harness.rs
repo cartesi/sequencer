@@ -13,18 +13,17 @@
 //! #[tokio::main]
 //! async fn main() -> std::process::ExitCode {
 //!     init_tracing();
-//!     sequencer::harness::run_main(|| WalletApp::new(WalletConfig::default())).await
+//!     sequencer::harness::run_main(|| Ok(WalletApp::new(WalletConfig::default()))).await
 //! }
 //! ```
 //!
-//! Genesis construction stays off the `Application` trait (it varies per impl)
-//! and is supplied by this closure. When a future app needs setup-time CLI
-//! args of its own (e.g. a machine-image path), the extension point is a
-//! `Cli<AppArgs>` generic on the parser — deferred until an app needs it, so
-//! the harness imposes no `clap` bound on the (possibly FFI) app type.
+//! Genesis construction stays off the `Application` trait (it varies per impl).
+//! Apps with their own CLI options can parse [`Command`] and call [`run_command`]
+//! with a lazy, fallible genesis factory. Both entry points share the command
+//! lifecycle and exit policy without imposing a `clap` bound on the app type.
 
 use clap::{Parser, Subcommand};
-use sequencer_core::application::Application;
+use sequencer_core::application::{AppError, Application};
 
 use crate::commands::config::{FlushConfig, RunConfig, SetupConfig};
 
@@ -64,10 +63,20 @@ pub enum Command {
 pub async fn run_main<A, F>(genesis_app: F) -> std::process::ExitCode
 where
     A: Application + 'static,
-    F: FnOnce() -> A + Send + 'static,
+    F: FnOnce() -> Result<A, AppError> + Send + 'static,
 {
     let cli = Cli::parse();
-    project_dispatch_join(tokio::spawn(dispatch(cli.command, genesis_app)).await)
+    run_command(cli.command, genesis_app).await
+}
+
+/// Run a parsed command with the same panic and exit-code handling as [`run_main`].
+/// The fallible genesis factory runs only when plain setup needs its initial snapshot.
+pub async fn run_command<A, F>(command: Command, genesis_app: F) -> std::process::ExitCode
+where
+    A: Application + 'static,
+    F: FnOnce() -> Result<A, AppError> + Send + 'static,
+{
+    project_dispatch_join(tokio::spawn(dispatch(command, genesis_app)).await)
 }
 
 fn project_dispatch_join(
@@ -100,11 +109,12 @@ fn project_dispatch_join(
 /// Terminal runtime faults abort the process directly; see [`crate::run`].
 ///
 /// `genesis_app` is called at most once — only when plain `setup` needs to
-/// register the genesis snapshot.
+/// register the genesis snapshot. File-backed applications return load errors through
+/// `AppError`; ordinary I/O failures are not invariant panics.
 pub async fn dispatch<A, F>(command: Command, genesis_app: F) -> std::process::ExitCode
 where
     A: Application + 'static,
-    F: FnOnce() -> A,
+    F: FnOnce() -> Result<A, AppError>,
 {
     let result = match command {
         Command::Setup(config) => crate::commands::setup::setup(*config, genesis_app).await,
@@ -171,9 +181,12 @@ mod tests {
 
         let constructions = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&constructions);
-        let exit = dispatch::<SweepTestApp, _>(cli.command, move || {
+        let exit = run_command::<SweepTestApp, _>(cli.command, move || {
             observed.fetch_add(1, Ordering::SeqCst);
-            SweepTestApp
+            Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "genesis file no longer exists",
+            )))
         })
         .await;
 
@@ -209,7 +222,7 @@ mod tests {
         ])
         .expect("parse run");
 
-        let exit = dispatch::<SweepTestApp, _>(cli.command, || SweepTestApp).await;
+        let exit = dispatch::<SweepTestApp, _>(cli.command, || Ok(SweepTestApp)).await;
 
         assert_eq!(exit, std::process::ExitCode::from(30));
     }
