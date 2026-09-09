@@ -249,7 +249,7 @@ the agreement — only review and the duality tests. **Change one, check all.**
 - [I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)
   — frame `safe_block`s are non-decreasing, the lane-side mirror of gate d's
   monotonicity rule.
-- [I19](../invariants.md#i19-application-progress-advances-only-at-the-shared-execution-boundary)
+- [I19](../invariants.md#i19-application-progress-follows-the-shared-execution-contract)
   — every successful application input advances one typed count/clock pair;
   rejected inputs do not, and `AppError` is terminal.
 

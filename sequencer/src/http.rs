@@ -21,7 +21,6 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 pub use crate::egress::api::SnapshotState;
@@ -283,10 +282,7 @@ pub(crate) fn start_on_listener(
         ))
         // Enforces a raw request-body cap before JSON deserialization, including whitespace.
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
-        .layer(TraceLayer::new_for_http())
-        // Permissive CORS so browser wallets can POST /tx (and preflight OPTIONS).
-        // Tighten when the ingress/egress port split lands and public exposure is narrower.
-        .layer(CorsLayer::permissive());
+        .layer(TraceLayer::new_for_http());
 
     tokio::spawn(async move {
         let result = axum::serve(listener, app)

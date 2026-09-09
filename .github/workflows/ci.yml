@@ -53,7 +53,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Watchdog Lua tests
-        run: lua watchdog/tests/run.lua
+        run: lua5.4 watchdog/tests/run.lua
 
       - name: Watchdog divergence drill
         run: bash scripts/test-watchdog-divergence-drill.sh

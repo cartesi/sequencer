@@ -6,16 +6,17 @@
 //! client's perspective: 200 means included.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use alloy_sol_types::Eip712Domain;
 use axum::Router;
 use axum::extract::{Json, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 
 use crate::http::ApiError;
@@ -62,6 +63,13 @@ pub(crate) fn router(state: Arc<SubmitState>) -> Router {
     Router::new()
         .route("/tx", post(submit_tx))
         .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::POST])
+                .allow_headers(Any)
+                .max_age(Duration::from_secs(3600)),
+        )
 }
 
 async fn submit_tx(

@@ -85,7 +85,7 @@ async fn main() -> HarnessResult<()> {
     eprintln!();
     eprintln!("Run watchdog (from repo root, after `just watchdog-lua-deps`):");
     eprintln!("  export CARTESI_WATCHDOG_LUA_ROOT=$(pwd)");
-    eprintln!("  export CARTESI_WATCHDOG_LUA_BIN=lua");
+    eprintln!("  export CARTESI_WATCHDOG_LUA_BIN=lua5.4");
     eprintln!("  ./watchdog/sequencer-watchdog init");
     eprintln!("  ./watchdog/sequencer-watchdog tick");
     eprintln!();

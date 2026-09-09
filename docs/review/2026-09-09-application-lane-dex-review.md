@@ -345,3 +345,42 @@ The existing cheap-app 5,000-direct backlog test took about 47 ms in this run.
 That is neither a DEX benchmark nor a concurrent ACK latency measurement.
 No private DEX engine/scheduler, native bridge runtime, or canonical-machine
 end-to-end execution was validated in this pass.
+
+## Implementation validation (2026-09-09)
+
+The local implementation passes `cargo check --workspace --all-targets`,
+strict workspace/all-targets/all-features Clippy, and formatting checks.
+`cargo test --workspace --exclude canonical-test -- --test-threads=1` passed
+697 tests; one pre-existing doc example remains ignored. Wallet SSZ golden
+bytes are unchanged. The watchdog Lua 5.4 suite passed 62/62.
+
+New coverage includes pure validation, native progress mismatch and overflow,
+fatal validation propagation, no reads after a failed apply hook, independent
+wallet and file/directory checkpoint restores, atomic frame/promotion rollback,
+a Send-but-not-Clone-or-Sync runtime, ingress-only CORS on success and rejection,
+and POST preflight policy. The CORS fixture initially queried an uninitialized
+snapshot service and correctly triggered a terminal fault; it now seeds the
+required finalized checkpoint. An unrelated lock-lifetime test failed once in
+a parallel run and passed alone and in the final serial workspace suite.
+
+CORS and Lua invocation changes close the reviewed public branch's remaining
+narrow parity gaps. This does not deliver the separately planned history API,
+remote full-dump export, output stream, or private scheduler integration.
+
+Real-process follow-up rebuilt the devnet binaries at `5773b833` and passed
+`restart_and_replay_test` with deposit, transfer, withdrawal, and restart replay.
+`setup_recovery_round_trip_test` restored checkpoint `B=26, N=1`, accepted the
+continuing nonce, passed its anchor/divergence checks, and finalized the resumed
+snapshot at block 35. The test then failed during watchdog initialization:
+`expected "archive_version" 7 (got 6)`. The installed in-process Lua Cartesi
+binding expects the newer archive, while the repository image is pinned to
+CM 0.20. The verified CM 0.20 CLI shim does not affect that Lua binding. This
+E2E remains incomplete; no emulator pin or image was changed to make it pass.
+
+The separate reference bridge integration also exposed a concrete host need:
+lazy genesis construction must be fallible, and a custom CLI must reuse the
+library's command-task exit projection. Its integration branch makes the
+factory return `Result<A, AppError>` and exposes `run_command` for parsed
+commands. Completed setup still avoids opening the original genesis. This
+keeps file-load errors in the existing bootstrap error policy without adding
+a second setup-admission check in the C host.

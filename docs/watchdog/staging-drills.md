@@ -25,7 +25,7 @@ injected fake deps — no sequencer required.
 
 ```bash
 just watchdog-lua-deps
-CARTESI_WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua   # exits 2
+CARTESI_WATCHDOG_LUA_DEPS=.deps/lua lua5.4 watchdog/tests/drill_divergence.lua   # exits 2
 # or: just test-watchdog-divergence-drill   # wraps the drill; recipe exits 0
 ```
 
@@ -58,7 +58,7 @@ export CARTESI_WATCHDOG_STATE_DIR=/tmp/watchdog-state
 export CARTESI_WATCHDOG_CM_SNAPSHOT_DIR=examples/canonical-app/out/canonical-machine-image
 export CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0
 export CARTESI_WATCHDOG_LUA_ROOT="$(pwd)"
-export CARTESI_WATCHDOG_LUA_BIN=lua
+export CARTESI_WATCHDOG_LUA_BIN=lua5.4
 export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ./watchdog/sequencer-watchdog init
 ./watchdog/sequencer-watchdog tick
@@ -104,7 +104,7 @@ dir=$(mktemp -d)
 export CARTESI_WATCHDOG_STATE_DIR="$dir"
 export CARTESI_WATCHDOG_BLOCKCHAIN_ID=31337
 # init once (needs CM snapshot env — reuse Drill 2 exports), then:
-CARTESI_WATCHDOG_LUA_DEPS=.deps/lua lua watchdog/tests/drill_divergence.lua || true
+CARTESI_WATCHDOG_LUA_DEPS=.deps/lua lua5.4 watchdog/tests/drill_divergence.lua || true
 cat "$dir/status.prom"
 ```
 

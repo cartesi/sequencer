@@ -135,7 +135,7 @@ From repo root, after `just watchdog-lua-deps`:
 ```bash
 # Paste exports from Terminal 1, then initialize once and run one tick:
 export CARTESI_WATCHDOG_LUA_ROOT="$(pwd)"
-export CARTESI_WATCHDOG_LUA_BIN=lua
+export CARTESI_WATCHDOG_LUA_BIN=lua5.4
 export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ./watchdog/sequencer-watchdog init
 ./watchdog/sequencer-watchdog tick
