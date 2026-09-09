@@ -25,7 +25,7 @@
 //! key) and does no L1 writes.
 
 use alloy_primitives::Address;
-use sequencer_core::application::Application;
+use sequencer_core::application::{AppError, Application};
 use sequencer_core::scheduler::{FoldInput, SchedulerConfig, fold_replay};
 
 pub(crate) mod fill;
@@ -43,7 +43,7 @@ use crate::storage::{self, DeploymentIdentity, FeeOracleIdentity};
 pub async fn setup<A, F>(config: SetupConfig, genesis_app: F) -> Result<(), CommandError>
 where
     A: Application + 'static,
-    F: FnOnce() -> A,
+    F: FnOnce() -> Result<A, AppError>,
 {
     // Cross-field config validation (recovery vs the recovery-only args). A
     // misconfig is operator error — terminal, before any filesystem touch.
@@ -83,7 +83,7 @@ async fn setup_admitted<A, F>(
 ) -> Result<(), CommandError>
 where
     A: Application + 'static,
-    F: FnOnce() -> A,
+    F: FnOnce() -> Result<A, AppError>,
 {
     let db_path = config.db_path();
     let timing = config.timing.protocol_timing()?;
@@ -332,11 +332,9 @@ where
 
         // ── Genesis snapshot ─────────────────────────────────────
         // Construct only after the admission facts and every
-        // detect-and-refuse gate. A panic leaves setup incomplete (the
-        // completion fact is never written, so the retry starts fresh),
-        // while completed no-ops and recovery never construct genesis
-        // state at all.
-        let genesis_app = genesis_app();
+        // detect-and-refuse gate. Factory errors follow normal setup settlement;
+        // completed no-ops and recovery never construct genesis state.
+        let genesis_app = genesis_app()?;
         fill::register_genesis_finalized_snapshot::<A>(genesis_app, &mut storage, &dumps_dir)?;
     }
 

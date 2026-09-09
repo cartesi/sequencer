@@ -37,5 +37,5 @@ mod integration_tests;
 pub use commands::config::{FlushConfig, RunConfig, SetupConfig};
 pub use commands::error::CommandError;
 pub use commands::run::run;
-pub use harness::{Cli, Command, dispatch, run_main};
+pub use harness::{Cli, Command, dispatch, run_command, run_main};
 pub use http::{ApiConfig, ApiError, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
