@@ -186,7 +186,7 @@ by writer and are write-once (`0001_schema.sql`).
   (`close_frame_only_with_executions`), together with canonical
   direct-input attribution.
 - **Enforced by:** the single `write` tx in `storage/ingress.rs`; the
-  standalone `Storage::promote_finalized` is test-only by policy.
+  standalone `Storage::promote_finalized` is `#[cfg(test)] pub(crate)`.
 - **Depended on by:** crash-safety of the safe-frontier walk
   (`lifecycle.md` §5–§6).
 - **Breaks:** restart re-processes the range and re-promotes a deleted pending

@@ -105,7 +105,9 @@ remaining dated ledgers stay valid.
     so the operator sees it; the guard test and the polarity pin assert it.
 21. **Closed** (2026-09-03): `Storage::ensure_open_tip` is
     `#[cfg(test)] pub(crate)`; the two intra-doc links and the snapshot
-    lifecycle doc now name the reducer's guarded `EnsureOpenTip` phase.
+    lifecycle doc then named the reducer's guarded `EnsureOpenTip` phase.
+    That phase-driver description was superseded by ordered recovery on
+    2026-09-07; the guarded storage operation remains.
 22. **Closed** (2026-09-04): `DangerDetector`, `InputReader`, and the
     fee-oracle worker (narrowed with them: same single use, same
     construction-required lock) take `ShutdownSignal`; `launch` passes
@@ -113,11 +115,15 @@ remaining dated ledgers stay valid.
     submitter. Data-directory ownership is each worker's own `ProcessLock`,
     so the watchdog's weak witness is unaffected; the doc comments now say
     workers that externalize or contain take a scope.
+    Historical containment/watchdog rationale: superseded by the
+    [2026-09-07 immediate-abort model](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership).
 23. **Closed** (2026-09-04): the guarded `EnsureOpenTip` phase re-reads
     `has_valid_open_batch` inside its own transaction and returns
     `TipMissingAfterOpen` (classified `refuse`, exit 30) rather than commit
     without a Tip; `drive_recovery`'s doc records the ≤5-phase bound and
     `admission.tla`'s comment names the enforced postcondition.
+    The phase driver and its bound were superseded by ordered recovery on
+    2026-09-07; the storage postcondition remains.
 24. **Closed** (2026-09-04): the in-scope recorder is deleted, so a
     contained run writes exactly one `terminal_faults` row — the command
     bracket's, at settlement. Containment writes nothing durable. The
@@ -125,17 +131,25 @@ remaining dated ledgers stay valid.
     abort at the terminal abort deadline, a controller panic, SIGKILL) leaves
     only the process logs, and the single write has no second attempt. The
     row is telemetry; restart policy is the exit code.
+    Historical settlement behavior: superseded on 2026-09-07. Terminal
+    runtime faults now abort immediately without a drain or terminal row;
+    terminal command errors returned through the bracket still get a
+    best-effort row.
 25. **Closed** (2026-09-03): the token's doc, the ADR, and the settled
     entry state its true scope (three compile-forced primitives; the rest
     hand-placed); "non-clone" became "boot-local"; the witness comment names
     every holder; the "journal", "acknowledge", and `DangerDetectorExit`
     remnants are gone.
+    Historical token documentation: the token was removed by the
+    2026-09-07 immediate-abort model.
 26. **Closed** (2026-09-04): `acquire_finalized_lease` returns its own
     `FinalizedLease { inclusion_block: u64, dump: LeasedDump }`, so the
     `NOT NULL` column is no longer an `Option` and the impossible-`None`
     containment branch in `finalized_state` is gone. Corrupt-row containment
     is unchanged (the persistent-storage classifier and the decode panic, as
     `corrupt_finalized_snapshot_trips_terminal_storage_fault` pins).
+    The lease type remains; the historical containment response was
+    superseded by immediate terminal abort on 2026-09-07.
 27. **Closed** (2026-09-04): the two-verdict `RecoveryFailure::Provider`
     is split into `ProviderUnreachable` (retry) and `SignerMisconfig`
     (refuse), constructed by a pure `classify_signer_provider` pinned on all

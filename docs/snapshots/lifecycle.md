@@ -55,9 +55,9 @@ aren't. Section references point to the full reasoning below.
 - **Per-range promotion intentionally skips intermediate blocks** — only the
   range's max nonce is promoted. Sound because nonces land monotonically and the
   skipped checkpoints were never observable. Not a bug. (§5)
-- **`Storage::promote_finalized` (standalone) is `pub`, but production must not
-  call it.** Promoting outside the drain transaction re-opens the wedge (§6); it
-  exists only for test setup. Production promotes via
+- **`Storage::promote_finalized` (standalone) is `#[cfg(test)] pub(crate)`.**
+  Promoting outside the drain transaction re-opens the wedge (§6); the helper
+  exists only in test builds. Production promotes via
   `close_frame_only_with_executions`.
 - **Several snapshot `Storage` methods are `#[cfg(test)]`** — non-atomic
   siblings of the atomic production methods (`gc_dump_rows` vs
