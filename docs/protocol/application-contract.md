@@ -184,5 +184,9 @@ also stays on the concrete application.
    Remove any `Clone` or `Sync` added solely to satisfy the old host bounds;
    justify `Send` against the native engine's ownership contract.
 
-Changing these Rust interfaces does not change transaction encoding, rejection
-semantics, snapshot bytes, scheduler ordering, or the database schema.
+Changing these Rust interfaces preserves transaction encoding, expected
+rejection semantics, snapshot bytes, scheduler ordering, and the database
+schema. Fatal `AppError` propagation is an intentional exception: validation
+and execution failures discard the engine rather than becoming a rejection
+or an included no-op. The host's terminal-versus-retryable classification
+still applies.

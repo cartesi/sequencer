@@ -26,7 +26,10 @@ cherry-picked into the main implementation.
   atomicity. CORS and Lua executable parity remain a separate focused commit.
 
 The private DEX scheduler and native engine are still unavailable. Reference
-bridge tests verify the proposed seam, not private engine conformance.
+bridge tests verify the proposed seam, not private engine conformance. DEX
+conformance and the [Track 3 history API](../plans/2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff)
+remain follow-ups. This review establishes reference integration coverage;
+it does not establish that the Application surface is production-proven.
 
 Reviewed on 2026-09-09:
 
