@@ -71,3 +71,5 @@ archive configured, the generic binary reports that no engine was linked, and
 The conformance suite compares native and ABI execution over mixed inputs,
 notices and vouchers, rejection/no-op progress, dump round trips, independent
 instances, and fatal/error classification.
+`cargo test -p c-app-engine --lib` also checks mixed-output ordering, copying
+reused engine buffers, and full-width voucher values with a small ABI fixture.

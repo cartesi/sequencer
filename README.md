@@ -244,6 +244,7 @@ released even on client disconnect.
 - `sequencer/src/storage/`: schema, migrations, SQLite persistence (split per writer role), and replay reads
 - `sequencer-core/src/`: shared domain types and interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, feed message types)
 - `examples/app-core/src/`: wallet prototype implementing `Application`
+- [`examples/c-app-engine/`](examples/c-app-engine/README.md): C ABI bridge, reference wallet engine, and external static-archive integration guide
 - `tests/benchmarks/`: benchmark harnesses and benchmark spec
 
 Related docs:
