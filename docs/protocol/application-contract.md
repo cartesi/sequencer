@@ -11,6 +11,8 @@ of a native engine, its FFI, or its canonical counterpart
 This document **owns** the contract. [`AGENTS.md`](../../AGENTS.md) is the map.
 The [wallet](../../examples/app-core/) is the reference implementation. A
 production application may execute natively or wrap a Cartesi Machine.
+The [C application bridge](../../examples/c-app-engine/README.md) adapts a native
+engine through a C ABI and includes a reference wallet integration.
 
 ## The execution methods
 

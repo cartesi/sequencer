@@ -5,6 +5,9 @@
 
 pub mod sys;
 
+#[cfg(test)]
+mod tests;
+
 use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
