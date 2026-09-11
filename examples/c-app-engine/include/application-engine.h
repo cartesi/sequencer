@@ -12,10 +12,10 @@
 /// agnostic and an engine is swappable behind this header. Plain C so any host can consume it.
 ///
 /// An application implements these declarations into a static archive, which the `c-app-engine`
-/// shim links at build time to become the sequencer's Application, and which the application's
-/// own canonical binary links natively from the same objects. One compiled engine on both sides
-/// is what makes off-chain and on-chain execution deterministic. An application written in C++,
-/// or in any language with a C ABI, implements it the same way.
+/// shim links at build time to become the sequencer's Application. The same engine implementation
+/// can be compiled for the native sequencer and the application's canonical target; deterministic,
+/// equivalent behavior across those builds remains the application's responsibility. An engine
+/// written in C++, or in any language with a C ABI, implements it the same way.
 ///
 /// Nothing application specific crosses. An engine is handed a dump already holding a configured
 /// deployment, so a host never learns what configures the application it runs, and the path is
