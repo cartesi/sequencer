@@ -12,7 +12,7 @@ This document **owns** the contract. [`AGENTS.md`](../../AGENTS.md) is the map.
 The [wallet](../../examples/app-core/) is the reference implementation. A
 production application may execute natively or wrap a Cartesi Machine.
 The [C application binding](c-application-binding.md) adapts this contract to
-native engines; its [build guide](../../examples/c-app-engine/README.md) includes
+native engines; its [build guide](../../bindings/c-app-engine/README.md) includes
 a reference wallet integration.
 
 ## The execution methods
