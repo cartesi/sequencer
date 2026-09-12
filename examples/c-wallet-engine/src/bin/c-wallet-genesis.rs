@@ -9,17 +9,21 @@ use std::process::ExitCode;
 
 use app_core::application::WalletConfig;
 
+const USAGE: &str = "usage: c-wallet-genesis <state-dir> [devnet|sepolia]\n\n\
+    Writes a genesis wallet state at <state-dir>, which must not already exist.";
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(arguments.as_slice(), [flag] if flag == "--help" || flag == "-h") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let config = match arguments.as_slice() {
         [_, preset] if preset == "devnet" => WalletConfig::devnet(),
         [_, preset] if preset == "sepolia" => WalletConfig::sepolia(),
         [_] => WalletConfig::default(),
         _ => {
-            eprintln!(
-                "usage: c-wallet-genesis <state-dir> [devnet|sepolia]\n\n\
-                 Writes a genesis wallet state at <state-dir>, which must not already exist."
-            );
+            eprintln!("{USAGE}");
             return ExitCode::from(2);
         }
     };
