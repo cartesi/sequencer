@@ -156,6 +156,21 @@ impl CommandError {
             CommandError::AppBootstrap(AppError::Internal { .. }) => {
                 CommandFailureVerdict::Terminal
             }
+            CommandError::AppBootstrap(AppError::Io(source))
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::IsADirectory
+                        | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // An absent option or unusable genesis dump needs operator repair.
+                CommandFailureVerdict::Terminal
+            }
             CommandError::ReferencedSnapshotArtifact { source, .. }
                 if referenced_artifact_io_is_terminal(source) =>
             {
@@ -951,6 +966,23 @@ mod tests {
                 )
             }),
         );
+        rows.extend(
+            [
+                std::io::ErrorKind::InvalidInput,
+                std::io::ErrorKind::NotFound,
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::InvalidData,
+                std::io::ErrorKind::UnexpectedEof,
+                std::io::ErrorKind::IsADirectory,
+                std::io::ErrorKind::NotADirectory,
+            ]
+            .map(|kind| {
+                (
+                    CommandError::AppBootstrap(AppError::Io(std::io::Error::from(kind))),
+                    "a missing option or unusable application genesis dump",
+                )
+            }),
+        );
         rows.extend([
             // A deterministic signer-construction misconfig (bad RPC URL or
             // private key) classifies terminal in every command, matching the
@@ -1251,6 +1283,14 @@ mod tests {
             (
                 CommandError::AppBootstrap(AppError::Io(std::io::Error::other("disk unavailable"))),
                 "an application I/O failure at bootstrap",
+            ),
+            (
+                CommandError::AppBootstrap(AppError::Io(std::io::ErrorKind::Interrupted.into())),
+                "an interrupted genesis read remains restartable",
+            ),
+            (
+                CommandError::AppBootstrap(AppError::Io(std::io::ErrorKind::TimedOut.into())),
+                "a timed out genesis read remains restartable",
             ),
         ]
     }
