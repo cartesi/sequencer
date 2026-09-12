@@ -481,7 +481,9 @@ mod tests {
         // Mirrors the wallet app's method-payload cap (selector + amount +
         // address). A local literal keeps sequencer-core free of an app-core
         // dependency (which would invert the crate graph).
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 1 + 32 + 20;
+        fn max_method_payload_bytes() -> usize {
+            1 + 32 + 20
+        }
 
         fn validate_user_op(
             &self,
@@ -577,10 +579,6 @@ mod tests {
             &mut self,
             _prefix: &std::path::Path,
         ) -> Result<(), crate::application::AppError> {
-            unimplemented!("RecordingApp does not participate in snapshot lifecycle")
-        }
-
-        fn delete_dump(_prefix: &std::path::Path) -> Result<(), crate::application::AppError> {
             unimplemented!("RecordingApp does not participate in snapshot lifecycle")
         }
 

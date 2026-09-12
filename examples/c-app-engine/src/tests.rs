@@ -3,12 +3,22 @@
 
 use super::*;
 
-// Only the drain seam is needed here; wallet integration tests cover execution and dumps.
+// This fixture covers output borrowing and a zero payload bound; wallet tests cover execution/dumps.
 // Every non-empty output borrows the same allocation, overwritten by the next drain.
 #[derive(Default)]
 struct OutputEngine {
     drained: usize,
     payload: [u8; 4],
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn application_engine_max_method_payload_bytes() -> u64 {
+    0
+}
+
+#[test]
+fn empty_method_payload_bound_comes_from_the_engine() {
+    assert_eq!(EngineApp::max_method_payload_bytes(), 0);
 }
 
 #[unsafe(no_mangle)]

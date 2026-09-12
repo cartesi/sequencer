@@ -31,19 +31,18 @@
 
 use crate::commands::error::CommandError;
 use crate::ingress::inclusion_lane::dump_info::{self, delete_dump_dir};
-use sequencer_core::application::Application;
 
 /// Run the five-step repair pass (see the module doc for the steps and
 /// their ordering).
-pub(super) fn run_snapshot_hygiene<A: Application + 'static>(
+pub(super) fn run_snapshot_hygiene(
     storage: &mut crate::storage::Storage,
     dumps_dir: &std::path::Path,
 ) -> Result<(), CommandError> {
     storage.reset_dump_leases()?;
     require_finalized_snapshot(storage)?;
     restamp_finalized_promotion(storage)?;
-    let gc_removed = snapshot_gc_at_startup::<A>(storage)?;
-    let sweep_removed = sweep_orphan_dumps::<A>(storage, dumps_dir)?;
+    let gc_removed = snapshot_gc_at_startup(storage)?;
+    let sweep_removed = sweep_orphan_dumps(storage, dumps_dir)?;
     tracing::debug!(
         gc_removed,
         sweep_removed,
@@ -82,12 +81,10 @@ fn restamp_finalized_promotion(storage: &mut crate::storage::Storage) -> Result<
 /// finalized, no leases). The companion `sweep_orphan_dumps` then
 /// catches anything on disk that this leaves behind, plus
 /// crash-during-create_dump orphans the SQLite layer never saw.
-fn snapshot_gc_at_startup<A: Application + 'static>(
-    storage: &mut crate::storage::Storage,
-) -> Result<usize, CommandError> {
+fn snapshot_gc_at_startup(storage: &mut crate::storage::Storage) -> Result<usize, CommandError> {
     let removed = storage.gc_unreferenced_dumps()?;
     for row in &removed {
-        if let Err(err) = delete_dump_dir::<A>(&row.prefix) {
+        if let Err(err) = delete_dump_dir(&row.prefix) {
             tracing::warn!(
                 error = %err,
                 prefix = ?row.prefix,
@@ -111,7 +108,7 @@ fn snapshot_gc_at_startup<A: Application + 'static>(
 /// continue (the next startup retries). The post-`require_finalized_snapshot`
 /// ordering matters: the genesis dump's dir is in
 /// `list_dump_rows` by the time this runs, so we never delete it.
-fn sweep_orphan_dumps<A: Application + 'static>(
+fn sweep_orphan_dumps(
     storage: &mut crate::storage::Storage,
     dumps_dir: &std::path::Path,
 ) -> Result<usize, CommandError> {
@@ -127,7 +124,7 @@ fn sweep_orphan_dumps<A: Application + 'static>(
         if known.contains(&path) {
             continue;
         }
-        match delete_dump_dir::<A>(&path) {
+        match delete_dump_dir(&path) {
             Ok(()) => removed += 1,
             Err(err) => {
                 tracing::warn!(
@@ -144,7 +141,7 @@ fn sweep_orphan_dumps<A: Application + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::{SweepTestApp, create_structured_dump};
+    use crate::commands::test_support::create_structured_dump;
     use crate::storage::Storage;
     use crate::storage::test_helpers::temp_db;
 
@@ -212,7 +209,7 @@ mod tests {
         create_structured_dump(&orphan_a);
         std::fs::create_dir(&orphan_b).expect("orphan b dir");
 
-        let removed = sweep_orphan_dumps::<SweepTestApp>(&mut storage, dumps_dir.path()).unwrap();
+        let removed = sweep_orphan_dumps(&mut storage, dumps_dir.path()).unwrap();
         assert_eq!(removed, 2);
         assert!(tracked.exists(), "tracked dump must survive");
         assert!(!orphan_a.exists());
@@ -225,7 +222,7 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
 
-        let removed = sweep_orphan_dumps::<SweepTestApp>(&mut storage, dumps_dir.path()).unwrap();
+        let removed = sweep_orphan_dumps(&mut storage, dumps_dir.path()).unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -251,7 +248,7 @@ mod tests {
         // `superseded`'s row is now unreferenced (replaced by
         // finalized's promotion), but the directory is still on disk.
 
-        let removed = snapshot_gc_at_startup::<SweepTestApp>(&mut storage).unwrap();
+        let removed = snapshot_gc_at_startup(&mut storage).unwrap();
         assert_eq!(removed, 1);
         assert!(!superseded.exists(), "GC removed the superseded directory");
         assert!(finalized.exists(), "current finalized survived");

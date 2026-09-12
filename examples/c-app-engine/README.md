@@ -4,6 +4,8 @@
 [application-engine C ABI](include/application-engine.h). The sequencer owns one
 engine at a time. A handle can move between threads; calls on it never overlap.
 The bridge is `Send`, without `Clone` or `Sync`.
+The [binding guide](../../docs/protocol/c-application-binding.md) maps the ABI
+to the Application and scheduler contracts.
 
 The native engine owns application state and its execution count/safe-block
 clock. Successful execution advances that progress, including counted no-ops;
@@ -21,6 +23,9 @@ A dump prefix may be a file or a directory. Opening it produces independently
 mutable state without changing the source; checkpoint creation may mutate the
 engine's backing arrangement, while preserving logical state and progress.
 Successful checkpoints are durable and immutable under subsequent execution.
+All checkpoint artifacts reside at or below the prefix; the sequencer disposes
+of them with ordinary recursive filesystem deletion. Restored engines remain
+usable after source deletion.
 `state_file_in_dump` names the one canonical comparison file, which can be the
 whole dump or a projection alongside richer restoration artifacts. `EngineApp`
 does not implement the optional Rust `CanonicalState` inspection trait.
@@ -47,8 +52,9 @@ The host adds `--state-file` through its own parser and passes the parsed comman
 to `sequencer::run_command`. This shares `run_main`'s command lifecycle and exit
 policy. Both take a lazy `FnOnce() -> Result<A, AppError>` genesis factory;
 infallible Rust constructors therefore use
-`run_main(|| Ok(WalletApp::new(WalletConfig::default())))`. A missing genesis file
-returns an ordinary application-bootstrap I/O error, while a caught factory
+`run_main(|| Ok(WalletApp::new(WalletConfig::default())))`. An absent required
+genesis path or a missing/corrupt genesis dump is a terminal bootstrap error;
+operational I/O failures retain their retryable classification. A caught factory
 panic follows the shared terminal-error policy.
 
 ## External engine
@@ -58,14 +64,15 @@ Build the application's static archive and use the corresponding header:
 ```sh
 APPLICATION_ENGINE_LIB=/absolute/path/libengine.a \
 APPLICATION_ENGINE_HEADER=/absolute/path/application-engine.h \
-APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT=53 \
   cargo build -p c-app-sequencer
 ```
 
-The payload limit must match the engine's own build. Bindgen generates the Rust
-records from that header, so a build needs libclang. The engine also supplies its
-own genesis tool; configuration does not cross this ABI. With no external
-archive configured, the generic binary reports that no engine was linked, and
+The linked engine reports its stable payload bound through
+`application_engine_max_method_payload_bytes()`; zero permits only empty method
+payloads. Bindgen generates the Rust records from the header, so a build needs
+libclang. The engine also supplies its own genesis tool; configuration does not
+cross this ABI. With no external archive configured, the generic binary reports
+that no engine was linked, and
 `c-wallet-sequencer` supplies the reference implementation through Cargo.
 
 The conformance suite compares native and ABI execution over mixed inputs,
