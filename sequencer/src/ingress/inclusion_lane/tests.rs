@@ -62,7 +62,9 @@ struct TestApp {
 }
 
 impl Application for TestApp {
-    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+    fn max_method_payload_bytes() -> usize {
+        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    }
 
     fn validate_user_op(
         &self,
@@ -116,11 +118,6 @@ impl Application for TestApp {
         Ok(())
     }
 
-    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-        std::fs::remove_dir_all(prefix)?;
-        Ok(())
-    }
-
     fn state_file_in_dump(prefix: &Path) -> PathBuf {
         prefix.join("state")
     }
@@ -133,7 +130,9 @@ struct InternalUserOpApp {
 }
 
 impl Application for InternalUserOpApp {
-    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+    fn max_method_payload_bytes() -> usize {
+        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    }
 
     fn validate_user_op(
         &self,
@@ -174,11 +173,6 @@ impl Application for InternalUserOpApp {
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(Self::state_file_in_dump(prefix), b"")?;
-        Ok(())
-    }
-
-    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-        std::fs::remove_dir_all(prefix)?;
         Ok(())
     }
 
@@ -224,7 +218,9 @@ impl SharedCountingApp {
 }
 
 impl Application for SharedCountingApp {
-    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+    fn max_method_payload_bytes() -> usize {
+        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    }
 
     fn validate_user_op(
         &self,
@@ -268,11 +264,6 @@ impl Application for SharedCountingApp {
         Ok(())
     }
 
-    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-        std::fs::remove_dir_all(prefix)?;
-        Ok(())
-    }
-
     fn state_file_in_dump(prefix: &Path) -> PathBuf {
         prefix.join("state")
     }
@@ -298,7 +289,9 @@ impl Default for ReplayRecordingApp {
 }
 
 impl Application for ReplayRecordingApp {
-    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+    fn max_method_payload_bytes() -> usize {
+        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    }
 
     fn validate_user_op(
         &self,
@@ -343,11 +336,6 @@ impl Application for ReplayRecordingApp {
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(Self::state_file_in_dump(prefix), b"")?;
-        Ok(())
-    }
-
-    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-        std::fs::remove_dir_all(prefix)?;
         Ok(())
     }
 
@@ -1851,7 +1839,9 @@ impl UserOpCounterApp {
 }
 
 impl Application for UserOpCounterApp {
-    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+    fn max_method_payload_bytes() -> usize {
+        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    }
 
     fn validate_user_op(
         &self,
@@ -1891,11 +1881,6 @@ impl Application for UserOpCounterApp {
             Self::state_file_in_dump(prefix),
             encode_progress(self.progress),
         )?;
-        Ok(())
-    }
-
-    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-        std::fs::remove_dir_all(prefix)?;
         Ok(())
     }
 

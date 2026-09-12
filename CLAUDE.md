@@ -34,6 +34,10 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 - `sequencer-core/` — shared domain types consumed by both sequencer and scheduler.
 - `examples/app-core/` — placeholder wallet app implementing `Application`.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library.
+- `bindings/c-app-engine/` — reusable native engine adapter implementing `Application` through a C ABI.
+- `bindings/c-app-sequencer/` — optional C-engine CLI host and external-archive binary.
+- `examples/c-wallet-engine/` — reference C ABI exports, genesis tool, and conformance tests.
+- `examples/c-wallet-sequencer/` — binary composing the C-engine host with the reference wallet engine.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.
 - `examples/canonical-test/` — e2e test harness for the canonical app.
 - `sdk/rust-client/` — Rust client library for the sequencer API.
@@ -58,7 +62,7 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
 ## Before You Start Real Work
 
 - **[`AGENTS.md`](AGENTS.md)** — mission, requirements, invariants, duality, recovery, conventions, rules.
-- **[`docs/protocol/`](docs/protocol/)** — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (canonical acceptance algorithm) and [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` FFI trait). Read before touching the scheduler, the gold frontier, the fold, or an `Application` impl.
+- **[`docs/protocol/`](docs/protocol/)** — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (canonical acceptance algorithm), [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` trait), and [`c-application-binding.md`](docs/protocol/c-application-binding.md) (the native C binding). Read before touching the scheduler, the gold frontier, the fold, or an `Application` impl.
 - **[`docs/invariants.md`](docs/invariants.md)** — cross-module invariants register + the fail-loud check policy. Check it before changing anything it lists as load-bearing.
 - **[`docs/review/register.md`](docs/review/register.md)** — the review register: open findings, settled decisions, refuted proposals (do-not-re-propose). Check it for open findings in code you're about to touch, and before proposing a mechanism or simplification.
 - **[`docs/plans/`](docs/plans/)** — the [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md), active coordination tracks, and in-flight design handoffs. Check before starting work that might belong to a track.

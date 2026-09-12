@@ -208,6 +208,13 @@ Open maintainer decisions:
   seed test digests 5,000 directs over a 7,200-block jump in one turn).
 - **Track 6 with Bart**: the hardlink-suitability dispute and the
   changed-era bootstrap contract (see the tracks doc).
+- **C engine follow-up boundary** (2026-09-11): agree output storage and
+  checkpoint layout with Bart before replacing the drain protocol with output
+  arrays or the path callback with a static suffix. ABI version negotiation,
+  checked-in bindings, and linker policy also need concrete integration
+  requirements. Keep these separate from the port and the agreed contract
+  reductions; the private DEX engine and scheduler remain unavailable for
+  conformance testing.
 
 ## Owed tests
 
@@ -271,6 +278,12 @@ Statuses swept 2026-08-22 and updated through 2026-09-04.
   (unit-level provider mocks instead; e2e validates only the passing
   path) and fsync/power-loss WAL-rewind injection (out of scope —
   state-construction variants cover the detectable halves).
+- **External-engine conformance** (2026-09-11): a reusable runner needs
+  application-supplied genesis and meaningful accepted/rejected inputs; compare
+  canonical comparison files rather than byte-identical recovery dumps.
+  Native repeatability alone does not establish native/canonical-machine
+  equivalence. Publish fee-conversion data and vectors for the C++ integration
+  (finding 8), and add targeted devnet E2E coverage through the C host in CI.
 
 ## Settled decisions
 
@@ -342,6 +355,24 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   directory of state files. GC racing a download is an ordinary supported
   operation; relying on open-file unlink behavior is not the general dump
   lifetime contract → snapshot lifecycle, leases.
+- **C bridge contract reductions** (2026-09-11): the linked engine reports its
+  stable payload bound at runtime, including a valid zero bound; C progress is
+  one count/clock record. This removes duplicated build configuration and
+  presents the protocol pair together without introducing another state owner.
+  Checkpoint artifacts are self-contained beneath their supplied prefix and
+  require only ordinary filesystem deletion, so the sequencer recursively
+  removes its enclosing dump directory without an application deletion hook.
+  Reader leases, SQLite-first deletion, and restored-engine independence remain
+  required → [C binding guide](../protocol/c-application-binding.md) and
+  [Application checkpoint contract](../protocol/application-contract.md#6-checkpoint-lifecycle).
+- **C host failure boundaries** (2026-09-11): snapshot-path callback panics
+  enter the host's terminal-abort boundary; a failed HTTP task alone must not
+  leave sequencing active after an application invariant violation. Missing or
+  malformed genesis dumps and absent required options are terminal bootstrap
+  failures; operational I/O remains retryable. Genesis stays lazy: completed setup may
+  succeed after its original source has been deleted. A pre-command mandatory
+  state-file check would violate that lifecycle contract → snapshot handlers,
+  command error classification, and genesis harness tests.
 - **Execution-offset continuity has one enforcement point** (2026-09-07):
   the SQLite trigger rejects a noncanonical offset inside the physical-row
   transaction. The duplicate Rust loop was removed; rollback, invalidation,
@@ -668,3 +699,4 @@ for `2026-06-10-correctness-review.md`, `2026-06-10-simplification.md`,
 | 2026-09-03 | Branch stock-take of the authority-boundary PR: first-hand reads, then a read-only fleet of seven subsystem lenses and five premise challengers, then three refuters over the eighteen highest-ranked proposals | Proportionate overall, with three residue pockets; every proposal recorded, the jury-refuted ones listed above | [`2026-09-03-branch-stocktake.md`](2026-09-03-branch-stocktake.md), the ledger of the current branch, with its "Landed" section |
 | 2026-09-07 | PR #28 premise review and maintainer-approved simplification | Ordered recovery replaces the phase driver; diagnosed terminal runtime faults abort immediately; ordinary shutdown and snapshot leases remain; reader drain race and duplicate offset check fixed | Current ADR and recovery design; finding 33 and settled decisions above. Validation: 692 host tests, seven targeted restart/outage E2Es, workspace check, strict Clippy, formatting, and admission TLC passed. The broader stale-batch recovery E2E reached its watchdog comparison but was blocked by the host Lua emulator 0.21 loading the pinned 0.20 image (archive version mismatch); no protocol pin was changed. |
 | 2026-09-09 | Application, inclusion lane, and public DEX integration branch | Native progress ownership, typed validation failures, mutable independent checkpoints, optional canonical inspection, and lane bookkeeping simplified; ingress CORS and Lua 5.4 parity restored. Reference C bridge port kept separate. | [Application/lane review](2026-09-09-application-lane-dex-review.md); current Application and snapshot contracts. Workspace check, strict Clippy, 697 host tests, and 62 watchdog tests passed; private DEX conformance remains unverified. |
+| 2026-09-11 | Reference C bridge port and review boundary | Keep the current Application contract, runtime payload bound, paired progress, filesystem-owned checkpoint disposal, and host failure fixes together. Engine-dependent API refinements and external-engine conformance remain follow-ups. | Settled decisions and owed tests above; [C binding guide](../protocol/c-application-binding.md), Application contract, and snapshot lifecycle. |

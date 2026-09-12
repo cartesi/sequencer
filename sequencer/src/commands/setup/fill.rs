@@ -234,7 +234,9 @@ mod tests {
     }
 
     impl Application for CountedSweepTestApp {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+        fn max_method_payload_bytes() -> usize {
+            0
+        }
 
         fn validate_user_op(
             &self,
@@ -283,10 +285,6 @@ mod tests {
             bytes.extend_from_slice(&self.0.last_executed_safe_block().to_le_bytes());
             std::fs::write(prefix.join("state"), bytes)?;
             Ok(())
-        }
-
-        fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-            <SweepTestApp as Application>::delete_dump(prefix)
         }
 
         fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {

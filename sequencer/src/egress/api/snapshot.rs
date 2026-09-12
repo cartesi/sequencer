@@ -125,7 +125,7 @@ async fn finalized_state(
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let path = (state.snapshot.state_file_in_dump)(&leased.prefix);
+    let path = state_file_path(&state.snapshot, &leased.prefix);
     let l2_tx_index = leased.l2_tx_index;
     let LeasedDump { guard, .. } = leased;
 
@@ -159,7 +159,7 @@ async fn latest_snapshot(State(state): State<Arc<SnapshotApiState>>) -> Response
         Err(err) => return internal_error("acquire latest snapshot lease", err),
     };
 
-    let path = (state.snapshot.state_file_in_dump)(&leased.prefix);
+    let path = state_file_path(&state.snapshot, &leased.prefix);
     let l2_tx_index = leased.l2_tx_index;
     let LeasedDump { guard, .. } = leased;
 
@@ -179,6 +179,12 @@ async fn latest_snapshot(State(state): State<Arc<SnapshotApiState>>) -> Response
             internal_error("open latest snapshot file", err)
         }
     }
+}
+
+fn state_file_path(state: &SnapshotState, prefix: &Path) -> PathBuf {
+    // HTTP request panics are otherwise isolated from the worker supervisor.
+    std::panic::catch_unwind(|| (state.state_file_in_dump)(prefix))
+        .unwrap_or_else(|_| abort_terminal("application snapshot path callback panicked"))
 }
 
 fn stream_body(file: File, guard: LeaseGuard) -> Body {
@@ -311,6 +317,58 @@ fn persistent_storage_error(mut error: &(dyn std::error::Error + 'static)) -> bo
 mod tests {
     use super::*;
     use crate::storage::test_helpers::temp_db;
+
+    #[cfg(unix)]
+    async fn panicking_state_path_aborts(test_name: &str, finalized: bool) {
+        if !crate::runtime::shutdown::abort_test_child(test_name) {
+            return;
+        }
+        let db = temp_db("panicking-snapshot-path");
+        let mut storage = Storage::open(&db.path).expect("open storage");
+        storage
+            .insert_finalized_dump(Path::new("/tmp/panicking-snapshot-path"), 12, 34)
+            .expect("insert finalized snapshot");
+        drop(storage);
+        let state = Arc::new(SnapshotApiState {
+            snapshot: SnapshotState {
+                db_path: db.path,
+                state_file_in_dump: |_| panic!("application returned no state path"),
+            },
+            shutdown: RuntimeScope::default(),
+            release_scheduler: Arc::new(|release| release()),
+        });
+
+        // Exercise the request-task boundary that would swallow this panic.
+        let result = tokio::spawn(async move {
+            if finalized {
+                finalized_state(State(state), HeaderMap::new()).await
+            } else {
+                latest_snapshot(State(state)).await
+            }
+        })
+        .await;
+        panic!("snapshot path callback panic did not abort the process: {result:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn finalized_state_path_panic_aborts_process() {
+        panicking_state_path_aborts(
+            "egress::api::snapshot::tests::finalized_state_path_panic_aborts_process",
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn latest_snapshot_path_panic_aborts_process() {
+        panicking_state_path_aborts(
+            "egress::api::snapshot::tests::latest_snapshot_path_panic_aborts_process",
+            false,
+        )
+        .await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]

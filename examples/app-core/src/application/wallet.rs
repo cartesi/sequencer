@@ -219,7 +219,9 @@ impl Default for WalletApp {
 }
 
 impl Application for WalletApp {
-    const MAX_METHOD_PAYLOAD_BYTES: usize = WALLET_MAX_METHOD_PAYLOAD_BYTES;
+    fn max_method_payload_bytes() -> usize {
+        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    }
 
     fn validate_user_op(
         &self,
@@ -380,11 +382,6 @@ impl Application for WalletApp {
         if let Some(parent) = prefix.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
-        Ok(())
-    }
-
-    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-        std::fs::remove_dir_all(prefix)?;
         Ok(())
     }
 
@@ -869,7 +866,7 @@ mod tests {
 
         let restored = WalletApp::from_dump(&prefix).expect("load dump");
 
-        WalletApp::delete_dump(&prefix).expect("cleanup dump");
+        std::fs::remove_dir_all(&prefix).expect("cleanup dump");
 
         assert_eq!(
             restored.config.erc20_portal_address,
@@ -919,7 +916,7 @@ mod tests {
             std::fs::read(WalletApp::state_file_in_dump(&prefix)).unwrap(),
             before
         );
-        WalletApp::delete_dump(&prefix).unwrap();
+        std::fs::remove_dir_all(&prefix).unwrap();
         execute_valid_user_op(&mut first, &user_op, 13).unwrap();
         assert_eq!(first.executed_input_count().get(), 2);
     }
@@ -994,8 +991,8 @@ mod tests {
         let bytes_a = std::fs::read(WalletApp::state_file_in_dump(&prefix_a)).expect("read a");
         let bytes_b = std::fs::read(WalletApp::state_file_in_dump(&prefix_b)).expect("read b");
 
-        WalletApp::delete_dump(&prefix_a).expect("cleanup a");
-        WalletApp::delete_dump(&prefix_b).expect("cleanup b");
+        std::fs::remove_dir_all(&prefix_a).expect("cleanup a");
+        std::fs::remove_dir_all(&prefix_b).expect("cleanup b");
 
         assert_eq!(
             bytes_a, bytes_b,
@@ -1011,7 +1008,7 @@ mod tests {
             .expect("write malformed");
 
         let err = WalletApp::from_dump(&prefix).expect_err("invalid bytes should fail");
-        WalletApp::delete_dump(&prefix).expect("cleanup");
+        std::fs::remove_dir_all(&prefix).expect("cleanup");
 
         match err {
             AppError::Internal { reason } => assert!(

@@ -187,7 +187,9 @@ mod tests {
     }
 
     impl Application for FoldApp {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 1 + 32 + 20;
+        fn max_method_payload_bytes() -> usize {
+            1 + 32 + 20
+        }
 
         fn validate_user_op(
             &self,
@@ -227,9 +229,6 @@ mod tests {
             unimplemented!("FoldApp does not participate in snapshot lifecycle")
         }
         fn create_dump(&mut self, _prefix: &std::path::Path) -> Result<(), AppError> {
-            unimplemented!("FoldApp does not participate in snapshot lifecycle")
-        }
-        fn delete_dump(_prefix: &std::path::Path) -> Result<(), AppError> {
             unimplemented!("FoldApp does not participate in snapshot lifecycle")
         }
         fn state_file_in_dump(_prefix: &std::path::Path) -> std::path::PathBuf {

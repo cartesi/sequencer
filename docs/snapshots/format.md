@@ -9,7 +9,7 @@ This document covers two things:
 
 1. The trait shape that any `Application` implementation must satisfy to
    participate in snapshot lifecycle (`from_dump`, `create_dump`,
-   `delete_dump`, `state_file_in_dump`).
+   `state_file_in_dump`).
 2. The wire format the toy wallet uses to encode its canonical state into
    the dump's state file. Checkpoint ownership and durability are defined by
 the [Application contract](../protocol/application-contract.md#6-checkpoint-lifecycle).
@@ -27,7 +27,6 @@ trait Application: Send + Sized {
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError>;
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError>;
-    fn delete_dump(prefix: &Path) -> Result<(), AppError>;
     fn state_file_in_dump(prefix: &Path) -> PathBuf;
 }
 ```
@@ -35,7 +34,9 @@ trait Application: Send + Sized {
 Contract:
 
 - `prefix` is an opaque app-owned path, which may be a file or directory.
-  The sequencer owns the enclosing dump directory and its `info.toml`.
+  All checkpoint-owned artifacts reside at or below it. The sequencer owns the
+  enclosing dump directory and its `info.toml`, and disposes of the checkpoint
+  by removing that directory recursively. No other resource cleanup is needed.
 - `create_dump` creates the absent `prefix` and makes the complete checkpoint
   durable before returning. It may replace backing resources but preserves
   logical state. Later execution cannot alter a checkpoint. Restored engines
@@ -108,7 +109,7 @@ and its canonical state coincide; one write per `create_dump`.
   - `nonce` (`u32`)
 - `executed_input_count` (`u64`)
 - `last_executed_safe_block` (`u64`) — the app's safe-block clock
-  (`Application::last_executed_safe_block`): max block carried by any
+  (reported by `Application::progress`): max block carried by any
   executed input. Recovery reads it as `A`, the safe block this state
   reflects, so it must live in the canonical state bytes (both the
   bare-metal and canonical-machine sides advance it identically).
