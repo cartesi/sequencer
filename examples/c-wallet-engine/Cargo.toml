@@ -21,7 +21,7 @@ path = "src/bin/c-wallet-genesis.rs"
 
 [dependencies]
 app-core = { path = "../app-core" }
-c-app-engine = { path = "../c-app-engine" }
+c-app-engine = { path = "../../bindings/c-app-engine" }
 sequencer-core = { path = "../../sequencer-core" }
 alloy-primitives = { workspace = true }
 
