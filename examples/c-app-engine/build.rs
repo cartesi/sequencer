@@ -3,27 +3,17 @@
 
 //! Links the application's engine archive and generates the FFI declarations from its header.
 //!
-//! The three environment variables are the whole application-specific binding, documented in
+//! The two environment variables are the whole application-specific binding, documented in
 //! `README.md`. With none of them set this crate links no archive,
 //! and the binary that uses it supplies the engine instead.
 
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// The in-workspace wallet engine's own bound, used when a build declares none.
-///
-/// Only reachable when `c-wallet-engine` is the engine, which asserts this same value against
-/// `WalletApp::MAX_METHOD_PAYLOAD_BYTES`, so a number that drifts fails that crate's compile
-/// rather than reaching a host. An application outside this workspace always declares its own.
-const REFERENCE_ENGINE_METHOD_PAYLOAD_LIMIT: u32 = 1 + 32 + 20;
-
 /// Generate `sys`'s contents from the engine header, the one authoritative declaration of what
 /// the archive exports, so a change on the engine side is either picked up here or fails this
 /// build.
-///
-/// The payload bound is defined for the parse rather than read out of the header, because the
-/// header deliberately refuses to carry a default for it.
-fn generate_bindings(header: &Path, method_payload_limit: u32) {
+fn generate_bindings(header: &Path) {
     let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("bindings.rs");
     let bindings = bindgen::Builder::default()
         .header(
@@ -34,9 +24,6 @@ fn generate_bindings(header: &Path, method_payload_limit: u32) {
         // Parse the C arm of the header. Its C++ arm only spells noexcept, which has no bearing
         // on the ABI and no Rust spelling.
         .clang_args(["-x", "c", "-std=c11"])
-        .clang_arg(format!(
-            "-DAPPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT={method_payload_limit}"
-        ))
         // Only the seam's own surface, never what stdint.h drags in behind it
         .allowlist_item("^(application_engine_|ApplicationEngine|APPLICATION_ENGINE_).*")
         // Plain integer constants, never Rust enums. The contract requires refusing a value the
@@ -98,10 +85,8 @@ fn link_application_archive(engine_lib: &Path) {
 
 /// What an application supplying its own archive has to declare alongside it.
 ///
-/// Both are demanded rather than defaulted. The archive and the header are separate artifacts and
-/// only that pairing is meaningful, and a bound guessed here would be exactly the silently wrong
-/// number the header's own `#error` exists to prevent.
-fn external_engine(engine_lib: &str) -> (PathBuf, u32) {
+/// The archive and header must come from the same engine build.
+fn external_engine(engine_lib: &str) -> PathBuf {
     link_application_archive(Path::new(engine_lib));
 
     let header = PathBuf::from(env::var("APPLICATION_ENGINE_HEADER").expect(
@@ -113,38 +98,26 @@ fn external_engine(engine_lib: &str) -> (PathBuf, u32) {
         header.display()
     );
 
-    let declared = env::var("APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT").expect(
-        "APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT is unset, set it to the application's largest \
-         method payload, the same value the archive was built with",
-    );
-    let limit = declared.trim().parse::<u32>().unwrap_or_else(|err| {
-        panic!("APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT is not a number: {err}")
-    });
-    (header, limit)
+    header
 }
 
 fn main() {
     println!("cargo::rerun-if-env-changed=APPLICATION_ENGINE_LIB");
     println!("cargo::rerun-if-env-changed=APPLICATION_ENGINE_HEADER");
-    println!("cargo::rerun-if-env-changed=APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let (header, method_payload_limit) = match env::var("APPLICATION_ENGINE_LIB") {
+    let header = match env::var("APPLICATION_ENGINE_LIB") {
         Ok(engine_lib) => external_engine(&engine_lib),
         // Linked from inside this workspace, where `c-wallet-engine` is the engine
         Err(_) => {
             assert!(
-                env::var_os("APPLICATION_ENGINE_HEADER").is_none()
-                    && env::var_os("APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT").is_none(),
+                env::var_os("APPLICATION_ENGINE_HEADER").is_none(),
                 "external engine settings require APPLICATION_ENGINE_LIB"
             );
-            (
-                manifest_dir.join("include").join("application-engine.h"),
-                REFERENCE_ENGINE_METHOD_PAYLOAD_LIMIT,
-            )
+            manifest_dir.join("include").join("application-engine.h")
         }
     };
 
     println!("cargo::rerun-if-changed={}", header.display());
-    generate_bindings(&header, method_payload_limit);
+    generate_bindings(&header);
 }

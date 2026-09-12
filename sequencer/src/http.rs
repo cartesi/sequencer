@@ -225,7 +225,7 @@ async fn run_snapshot_release_supervisor(
 pub struct ApiConfig {
     /// EIP-712 domain user-op signatures are verified against.
     pub domain: Eip712Domain,
-    /// The app's `MAX_METHOD_PAYLOAD_BYTES` bound on user-op payloads.
+    /// The app's `max_method_payload_bytes()` bound on user-op payloads.
     pub max_user_op_data_bytes: usize,
     pub max_body_bytes: usize,
     pub ws_max_subscribers: usize,

@@ -44,6 +44,11 @@ fn deposit(config: WalletConfig, recipient: Address, amount: u64, block: u64) ->
 #[test]
 fn abi_mixed_history_matches_native_outputs_progress_and_dump() {
     let (dir, mut bridge, mut native, config) = fixture();
+    assert_eq!(
+        EngineApp::max_method_payload_bytes(),
+        WalletApp::max_method_payload_bytes()
+    );
+    assert_eq!(bridge.progress(), native.progress());
     let sender = Address::repeat_byte(0x11);
     let recipient = Address::repeat_byte(0x22);
     for direct in [
@@ -175,7 +180,7 @@ fn abi_restored_instances_and_checkpoints_are_independent() {
         std::fs::read(EngineApp::state_file_in_dump(&frozen)).unwrap(),
         frozen_bytes
     );
-    EngineApp::delete_dump(&source).unwrap();
+    std::fs::remove_dir_all(&source).unwrap();
     execute_direct_input(&mut second, &input).unwrap();
     assert_eq!(
         state_bytes(&mut second, &dir.path().join("second")),

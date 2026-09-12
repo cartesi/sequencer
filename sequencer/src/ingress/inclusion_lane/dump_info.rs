@@ -8,7 +8,7 @@
 //! ```text
 //! dumps/<id>/
 //!   state       app-owned file or directory — the prefix handed to
-//!               `Application::{create_dump, from_dump, delete_dump}`
+//!               `Application::{create_dump, from_dump}`
 //!   info.toml   sequencer-owned checkpoint metadata (this module)
 //! ```
 //!
@@ -142,17 +142,9 @@ pub fn create_dump_dir_with_info<A: Application>(
     Ok(())
 }
 
-/// Delete one structured dump directory: the app's prefix via its
-/// `delete_dump` hook (when present — an orphan from a crash between
-/// dir creation and `create_dump` legitimately lacks it), then the
-/// rest of the dir (`info.toml` + the dir itself).
-pub fn delete_dump_dir<A: Application>(dump_dir: &Path) -> Result<(), AppError> {
-    let app_prefix = app_prefix(dump_dir);
-    if app_prefix.exists() {
-        A::delete_dump(&app_prefix)?;
-    }
-    std::fs::remove_dir_all(dump_dir)?;
-    Ok(())
+/// Delete a checkpoint and its metadata, including incomplete creation remnants.
+pub fn delete_dump_dir(dump_dir: &Path) -> io::Result<()> {
+    std::fs::remove_dir_all(dump_dir)
 }
 
 /// Write `info.toml` into `dump_dir`, durably: temp file, fsync, rename
@@ -283,7 +275,9 @@ mod tests {
     }
 
     impl<const DIRECTORY: bool> Application for PrefixDumpApp<DIRECTORY> {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+        fn max_method_payload_bytes() -> usize {
+            0
+        }
 
         fn validate_user_op(
             &self,
@@ -348,15 +342,6 @@ mod tests {
             Ok(())
         }
 
-        fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-            if DIRECTORY {
-                std::fs::remove_dir_all(prefix)?;
-            } else {
-                std::fs::remove_file(prefix)?;
-            }
-            Ok(())
-        }
-
         fn state_file_in_dump(prefix: &Path) -> PathBuf {
             if DIRECTORY {
                 prefix.join("progress")
@@ -391,8 +376,18 @@ mod tests {
         assert_eq!(read_info(&dump).unwrap(), sample());
 
         let mut first = PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&dump)).unwrap();
-        let second = PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&dump)).unwrap();
-        delete_dump_dir::<PrefixDumpApp<DIRECTORY>>(&dump).unwrap();
+        let mut second = PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&dump)).unwrap();
+        let sibling = root.path().join("sibling");
+        create_dump_dir_with_info(&mut second, &sibling, &sample()).unwrap();
+        delete_dump_dir(&dump).unwrap();
+        assert!(!dump.exists(), "the entire checkpoint directory is removed");
+        assert_eq!(
+            PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&sibling))
+                .unwrap()
+                .progress(),
+            checkpoint,
+            "other checkpoints survive deletion"
+        );
         execute_direct_input(&mut first, &input).unwrap();
         assert_eq!(app.progress(), checkpoint);
         assert_eq!(
@@ -408,7 +403,8 @@ mod tests {
             first.progress(),
             "restored state survives source deletion"
         );
-        delete_dump_dir::<PrefixDumpApp<DIRECTORY>>(&successor).unwrap();
+        delete_dump_dir(&successor).unwrap();
+        delete_dump_dir(&sibling).unwrap();
     }
 
     #[test]

@@ -22,14 +22,10 @@ use sequencer_core::application::{
 use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
 use sequencer_core::user_op::UserOp;
 
-// The header carries no default for the ingress bound, so a build supplies it. This is what
-// makes the two agree: a build that told the host a different number than the wallet implements
-// fails here rather than at the boundary.
-const _: () = assert!(
-    sys::APPLICATION_ENGINE_MAX_METHOD_PAYLOAD_BYTES as usize
-        == WalletApp::MAX_METHOD_PAYLOAD_BYTES,
-    "the payload bound this build declares to the host is not the wallet's own"
-);
+#[unsafe(no_mangle)]
+pub extern "C" fn application_engine_max_method_payload_bytes() -> u64 {
+    u64::try_from(WalletApp::max_method_payload_bytes()).expect("wallet payload bound exceeds u64")
+}
 
 thread_local! {
     /// The last failure's message, and the buffer `state_file_in_dump` answers out of.
@@ -367,28 +363,19 @@ fn span_of(payload: &[u8]) -> sys::ApplicationEngineByteSpan {
 }
 
 /// # Safety
-/// `engine` is a live handle.
+/// `engine` is a live handle and `out_progress` is writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn application_engine_last_executed_safe_block(
+pub unsafe extern "C" fn application_engine_progress(
     engine: *const ApplicationEngine,
-) -> u64 {
-    unsafe { engine_ref(engine) }
-        .app
-        .progress()
-        .last_executed_safe_block()
-}
-
-/// # Safety
-/// `engine` is a live handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn application_engine_executed_input_count(
-    engine: *const ApplicationEngine,
-) -> u64 {
-    unsafe { engine_ref(engine) }
-        .app
-        .progress()
-        .executed_input_count()
-        .get()
+    out_progress: *mut sys::ApplicationEngineProgress,
+) {
+    let progress = unsafe { engine_ref(engine) }.app.progress();
+    unsafe {
+        *out_progress = sys::ApplicationEngineProgress {
+            executed_input_count: progress.executed_input_count().get(),
+            last_executed_safe_block: progress.last_executed_safe_block(),
+        }
+    };
 }
 
 /// # Safety
@@ -404,20 +391,6 @@ pub unsafe extern "C" fn application_engine_create_dump(
     match engine.app.create_dump(&prefix) {
         Ok(()) => sys::APPLICATION_ENGINE_STATUS_OK,
         Err(err) => report(&err, "create_dump"),
-    }
-}
-
-/// # Safety
-/// `prefix` is a NUL terminated path.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn application_engine_delete_dump(
-    prefix: *const c_char,
-) -> sys::ApplicationEngineStatus {
-    clear_error();
-    let prefix = unsafe { path_from(prefix) };
-    match WalletApp::delete_dump(&prefix) {
-        Ok(()) => sys::APPLICATION_ENGINE_STATUS_OK,
-        Err(err) => report(&err, "delete_dump"),
     }
 }
 

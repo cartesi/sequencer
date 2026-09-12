@@ -105,7 +105,7 @@ Three SQLite tables back it (`storage/migrations/0001_schema.sql`):
 ```text
 dumps/<id>/
   state       app-owned file or directory — the prefix handed to
-              Application::{create_dump, from_dump, delete_dump}
+              Application::{create_dump, from_dump}
               (opaque to the sequencer; see format.md)
   info.toml   sequencer-owned checkpoint metadata:
               format_version, next_batch_nonce (N), l2_tx_index,
@@ -364,8 +364,9 @@ gives the create/delete orderings:
   the reference row is written.
 - **SQLite delete → file delete** (SQLite-first): `gc_unreferenced_dumps`
   deletes the rows inside one `write` tx and *returns* the prefixes; the lane's
-  `run_gc` then `A::delete_dump`s them after commit. If a directory delete
-  fails, an orphan file is acceptable — the next startup's `sweep_orphan_dumps`
+  `run_gc` then removes the enclosing dump directories recursively after
+  commit. If a directory delete fails, an orphan file is acceptable — the next
+  startup's `sweep_orphan_dumps`
   catches it. The reverse ordering would leave a dangling row.
 
 This is why `storage/snapshot_dumps.rs` is SQLite-only and the FS half lives in

@@ -70,10 +70,10 @@ pub enum StampError {
 /// orphan file is acceptable per the no-dangling-row invariant; only
 /// the reverse (SQLite row pointing at a missing path) would matter,
 /// and the SQL-first ordering prevents it.
-pub(super) fn run_gc<A: Application + 'static>(storage: &mut Storage) -> Result<usize, GcError> {
+pub(super) fn run_gc(storage: &mut Storage) -> Result<usize, GcError> {
     let removed = storage.gc_unreferenced_dumps()?;
     for row in &removed {
-        if let Err(err) = dump_info::delete_dump_dir::<A>(&row.prefix) {
+        if let Err(err) = dump_info::delete_dump_dir(&row.prefix) {
             tracing::warn!(
                 error = %err,
                 prefix = ?row.prefix,
@@ -314,7 +314,9 @@ mod tests {
     }
 
     impl Application for RecordingDumpApp {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+        fn max_method_payload_bytes() -> usize {
+            0
+        }
 
         fn validate_user_op(
             &self,
@@ -353,11 +355,6 @@ mod tests {
             std::fs::create_dir(prefix)?;
             std::fs::write(prefix.join("state"), b"recorded")?;
             self.dumps.push(prefix.to_path_buf());
-            Ok(())
-        }
-
-        fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-            std::fs::remove_dir_all(prefix)?;
             Ok(())
         }
 
@@ -465,7 +462,7 @@ mod tests {
         let superseded_prefix = recorded.first().expect("a dump was recorded").clone();
         assert!(superseded_prefix.exists(), "pre-GC sanity");
 
-        let removed = super::run_gc::<RecordingDumpApp>(&mut storage).unwrap();
+        let removed = super::run_gc(&mut storage).unwrap();
         assert_eq!(removed, 1, "exactly one unreferenced dump cleaned");
         assert!(!superseded_prefix.exists(), "filesystem prefix removed too",);
 
@@ -482,7 +479,7 @@ mod tests {
         take_dump_at_batch_close(&mut app, &mut storage, dumps_dir.path(), 0).unwrap();
 
         // Pending row references the dump; nothing eligible.
-        let removed = super::run_gc::<RecordingDumpApp>(&mut storage).unwrap();
+        let removed = super::run_gc(&mut storage).unwrap();
         assert_eq!(removed, 0);
         assert!(app.recorded()[0].exists());
     }
@@ -495,7 +492,9 @@ mod tests {
     }
 
     impl Application for FailingDumpApp {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+        fn max_method_payload_bytes() -> usize {
+            0
+        }
 
         fn validate_user_op(
             &self,
@@ -534,10 +533,6 @@ mod tests {
             Err(AppError::Internal {
                 reason: "simulated create_dump failure".to_string(),
             })
-        }
-
-        fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
-            Ok(())
         }
 
         fn state_file_in_dump(prefix: &Path) -> PathBuf {

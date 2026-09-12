@@ -8,7 +8,7 @@ operator's watchdog (`/finalized_state`) and indexers (`/latest_snapshot`).
 Two documents, split by concern:
 
 - **[`format.md`](format.md)** — the on-disk *format*: the `Application` dump
-  trait (`from_dump` / `create_dump` / `delete_dump` / `state_file_in_dump`) and
+  trait (`from_dump` / `create_dump` / `state_file_in_dump`) and
   the toy wallet's SSZ wire encoding. What a dump *is*.
 
 - **[`lifecycle.md`](lifecycle.md)** — the *lifecycle* and its rationale: take at

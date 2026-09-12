@@ -186,7 +186,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
 
         // Authority-neutral snapshot repair before the boundary; the five
         // order-critical steps are documented in `startup_hygiene`.
-        super::startup_hygiene::run_snapshot_hygiene::<A>(&mut storage, &dumps_dir)?;
+        super::startup_hygiene::run_snapshot_hygiene(&mut storage, &dumps_dir)?;
 
         // Prepare every remaining fallible or awaited dependency before the
         // authority boundary. Cancellation observes zero workers.
@@ -239,7 +239,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         let lane_config =
             InclusionLaneConfig::new(l1_config.identity.batch_submitter_address, dumps_dir)
                 .with_max_batch_open(run_config.max_batch_open());
-        let api_config = ApiConfig::new(domain, A::MAX_METHOD_PAYLOAD_BYTES);
+        let api_config = ApiConfig::new(domain, A::max_method_payload_bytes());
         let listener = tokio::net::TcpListener::bind(&run_config.http_addr).await?;
         let bound_addr = listener.local_addr()?;
         let snapshot_state = http::SnapshotState {
@@ -681,7 +681,9 @@ mod tests {
     }
 
     impl Application for StartupProbeApp {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+        fn max_method_payload_bytes() -> usize {
+            0
+        }
 
         fn validate_user_op(
             &self,
@@ -730,13 +732,6 @@ mod tests {
         ) -> Result<(), sequencer_core::application::AppError> {
             std::fs::create_dir(prefix)?;
             std::fs::write(prefix.join("state"), [])?;
-            Ok(())
-        }
-
-        fn delete_dump(
-            prefix: &std::path::Path,
-        ) -> Result<(), sequencer_core::application::AppError> {
-            std::fs::remove_dir_all(prefix)?;
             Ok(())
         }
 

@@ -137,8 +137,10 @@ impl EngineApp {
 }
 
 impl Application for EngineApp {
-    const MAX_METHOD_PAYLOAD_BYTES: usize =
-        sys::APPLICATION_ENGINE_MAX_METHOD_PAYLOAD_BYTES as usize;
+    fn max_method_payload_bytes() -> usize {
+        usize::try_from(unsafe { sys::application_engine_max_method_payload_bytes() })
+            .expect("engine payload bound exceeds usize")
+    }
 
     fn validate_user_op(
         &self,
@@ -240,10 +242,16 @@ impl Application for EngineApp {
     }
 
     fn progress(&self) -> ApplicationProgress {
-        let count = unsafe { sys::application_engine_executed_input_count(self.engine) };
-        let clock = unsafe { sys::application_engine_last_executed_safe_block(self.engine) };
-        ApplicationProgress::try_new(ExecutedInputCount::new(count), clock)
-            .expect("engine returned incoherent application progress")
+        let mut progress = sys::ApplicationEngineProgress {
+            executed_input_count: 0,
+            last_executed_safe_block: 0,
+        };
+        unsafe { sys::application_engine_progress(self.engine, &mut progress) };
+        ApplicationProgress::try_new(
+            ExecutedInputCount::new(progress.executed_input_count),
+            progress.last_executed_safe_block,
+        )
+        .expect("engine returned incoherent application progress")
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
@@ -265,14 +273,6 @@ impl Application for EngineApp {
         check(
             unsafe { sys::application_engine_create_dump(self.engine, prefix.as_ptr()) },
             "create_dump",
-        )
-    }
-
-    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-        let prefix = path_to_cstring(prefix);
-        check(
-            unsafe { sys::application_engine_delete_dump(prefix.as_ptr()) },
-            "delete_dump",
         )
     }
 

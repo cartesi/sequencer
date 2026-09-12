@@ -21,9 +21,9 @@
 /// deployment, so a host never learns what configures the application it runs, and the path is
 /// opaque, a file or a directory as the engine chooses.
 ///
-/// This header is the surface a host binds to, and the Rust host generates its declarations from
-/// it with bindgen rather than restating them, so a signature changed here cannot disagree with
-/// the host that links the engine. The records that cross are plain C layout and the
+/// The Rust host generates its declarations from this header with bindgen. The supplied header
+/// must match the linked archive; binding generation does not verify that pairing.
+/// The records that cross are plain C layout and the
 /// engine must static_assert their sizes and field offsets, so a compiler laying one out
 /// differently fails its build rather than the seam. A generated binding carries the same checks
 /// on the host side.
@@ -44,8 +44,17 @@
 ///
 /// No exception may cross. Fallible entry points report errors through status codes; a fatal
 /// validation or execution error defines no successor and the caller must discard the instance.
-/// Lifecycle statuses distinguish operational I/O from missing or malformed dump artifacts.
-/// Only accept or reject is consensus visible; rejection diagnostics are descriptive.
+/// IO_ERROR is legal from every status-returning entry point. In validation, execution, and
+/// output draining it is fatal for the instance; the host may retry with a fresh instance after
+/// an operational failure. NOT_FOUND and INVALID_DUMP describe lifecycle failures only.
+/// Validation acceptance, state transitions, progress, and outputs must agree with the canonical
+/// application. Rejection diagnostics and error messages need not be identical across builds.
+///
+/// Fees are uint16_t exponents with base 129/128, denominated in the fee token's smallest unit.
+/// The conversion is defined by sequencer-core/src/fee.rs and its build.rs-generated table:
+/// integer fixed-point arithmetic with 64 fractional bits, including its rounding and exponent
+/// bound. Native and canonical implementations must agree on this conversion; the max-fee guard
+/// compares exponents, while balance validation and execution use the converted amount.
 ///
 /// Errors are errno style. A fallible entry point returns a status (or a null pointer for
 /// application_engine_state_file_in_dump) and leaves the reason for
@@ -79,34 +88,15 @@
 /// raw big-endian bytes rather than as a number a host may not be able to spell.
 #define APPLICATION_ENGINE_VALUE_SIZE 32
 
-/// @brief The one value this header does not fix, supplied by the application's build.
-/// @details The ingress bound on a single user op's method payload is an application sizing
-/// decision, the largest payload any of its methods can carry, so it is defined on the compile
-/// line rather than here. Every consumer of this header, the engine's own translation units and
-/// the binding generation alike, must be given the same value, which is what keeps the bound the
-/// host enforces and the bound the engine parses under from being two numbers.
-///
-/// There is deliberately no default. A silently wrong bound is the exact failure this
-/// declaration exists to prevent, so an undefined one stops the build here.
-#ifndef APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT
-#error "define APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT to the application's largest method payload"
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/// @brief The bounds an engine declares, spelled as constants a generated binding can read.
-/// @details A binding generator sees a macro only where it is defined, and
-/// APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT is defined on the compile line, so the value is
-/// restated here as an enumeration constant. That is what carries it across to a host: the
-/// application defines one number, and both sides read it from this declaration.
-typedef enum ApplicationEngineLimits {
-    /// The largest method payload a user op may carry, in bytes. The host publishes it as the
-    /// sequencer's MAX_METHOD_PAYLOAD_BYTES and refuses anything larger, so an engine that raised
-    /// its own bound without raising this one would never see the payloads it grew to accept.
-    APPLICATION_ENGINE_MAX_METHOD_PAYLOAD_BYTES = APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT,
-} ApplicationEngineLimits;
+/// @brief The largest user-op method payload, in bytes.
+/// @details Pure, infallible, and constant for the linked engine implementation, independent of
+/// any loaded deployment. Zero permits only empty method payloads. The host uses this value for
+/// ingress admission and batch sizing; it does not bound direct inputs from L1.
+APPLICATION_ENGINE_API uint64_t application_engine_max_method_payload_bytes(void) APPLICATION_ENGINE_NOEXCEPT;
 
 /// @brief An account address, raw bytes and no encoding.
 /// @details A named type rather than a loose buffer, so an address and an amount cannot be
@@ -147,7 +137,7 @@ typedef enum ApplicationEngineStatus {
 /// that guard belongs to the caller, so an op arrives whole.
 typedef struct ApplicationEngineUserOp {
     uint32_t nonce;                 ///< Sender replay protection nonce.
-    uint16_t max_fee;               ///< Highest frame fee price the sender accepts, in log space.
+    uint16_t max_fee;               ///< Highest frame fee exponent the sender accepts, base 129/128.
     ApplicationEngineByteSpan data; ///< Method payload, opaque here and parsed by the engine.
 } ApplicationEngineUserOp;
 
@@ -156,13 +146,13 @@ typedef struct ApplicationEngineUserOp {
 /// went with the guard the caller already settled, leaving the fee the frame charges.
 typedef struct ApplicationEngineValidUserOp {
     ApplicationEngineEthereumAddress sender; ///< The recovered signer.
-    uint16_t fee;                            ///< The frame fee price charged, in log space.
+    uint16_t fee;                            ///< The charged frame fee exponent, base 129/128.
     ApplicationEngineByteSpan data;          ///< Method payload, opaque here and parsed by the engine.
 } ApplicationEngineValidUserOp;
 
 /// @brief An input taken straight from the L1 input box.
-/// @details Its sender is authenticated by the chain rather than recovered from a signature,
-/// which is what lets the engine trust it without validating anything first.
+/// @details Its sender is authenticated by the chain rather than recovered from a signature.
+/// Its payload is still untrusted application input and has no method-payload bound at this ABI.
 typedef struct ApplicationEngineDirectInput {
     ApplicationEngineEthereumAddress sender; ///< The L1 authenticated sender.
     uint64_t block_number;                   ///< The L1 inclusion block number.
@@ -248,6 +238,12 @@ typedef struct ApplicationEngineOutput {
 /// @brief The engine instance behind the handle, opaque to every caller.
 typedef struct ApplicationEngine ApplicationEngine;
 
+/// @brief Progress embedded in the engine's logical state and every checkpoint.
+typedef struct ApplicationEngineProgress {
+    uint64_t executed_input_count;     ///< Next input offset; included no-ops count, rejections do not.
+    uint64_t last_executed_safe_block; ///< Maximum block carried by any executed input.
+} ApplicationEngineProgress;
+
 /// @brief Get the message describing the most recent failure.
 /// @returns A NUL terminated string, never null, empty when the last fallible call succeeded.
 /// @details Read it after a negative status or a null handle. Every fallible entry point clears
@@ -289,12 +285,12 @@ APPLICATION_ENGINE_API void application_engine_destroy(ApplicationEngine *engine
 /// @param engine The engine handle.
 /// @param sender The recovered signer.
 /// @param user_op The op to validate, as its sender signed it.
-/// @param current_fee The frame fee price in log space.
+/// @param current_fee The frame fee exponent, base 129/128.
 /// @param out_invalid Why the op was refused, written whole and only on INVALID.
-/// @returns OK, INVALID with diagnostics, or INTERNAL_ERROR.
+/// @returns OK, INVALID with diagnostics, IO_ERROR, or INTERNAL_ERROR.
 /// @details A rejection reports itself through out_invalid and leaves the last error message
-/// empty, only INTERNAL_ERROR carries one. The max-fee guard belongs to the caller and is never
-/// checked here, so APPLICATION_ENGINE_INVALID_MAX_FEE never comes back from this call. Queued
+/// empty; IO_ERROR and INTERNAL_ERROR carry an error message. The max-fee guard belongs to the
+/// caller and is never checked here, so APPLICATION_ENGINE_INVALID_MAX_FEE never comes back. Queued
 /// outputs are left alone, only an execution touches them.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_validate_user_op(const ApplicationEngine *engine,
     const ApplicationEngineEthereumAddress *sender, const ApplicationEngineUserOp *user_op, uint16_t current_fee,
@@ -305,10 +301,10 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_validate_user_
 /// @param user_op The validated op to execute.
 /// @param safe_block The covering frame safe block, folded into the clock as max(clock, it).
 /// @param out_output_count How many outputs this op left waiting, written only on OK.
-/// @returns OK or INTERNAL_ERROR (an engine throw is fatal-no-resume).
+/// @returns OK, IO_ERROR, or INTERNAL_ERROR. An error requires discarding the instance.
 /// @details An op the method rejects still executed and still counts, so it reports OK. Only
-/// accept or reject is consensus visible and the state carries it, the seam does not surface
-/// the application's own reason.
+/// the resulting state, progress, and outputs cross the seam; the application's business-failure
+/// diagnostics are not returned separately.
 ///
 /// An execution refuses to run while an earlier execution's outputs are still queued, reporting
 /// INTERNAL_ERROR without executing anything rather than discarding outputs meant to reach the
@@ -321,7 +317,7 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_valid_
 /// @param engine The engine handle.
 /// @param input The input to execute, its L1 block folded into the clock as max(clock, it).
 /// @param out_output_count How many outputs this input left waiting, written only on OK.
-/// @returns OK or INTERNAL_ERROR (an engine throw is fatal-no-resume).
+/// @returns OK, IO_ERROR, or INTERNAL_ERROR. An error requires discarding the instance.
 /// @details An input the engine rejects is a counted no-op and still reports OK, the same way a
 /// rejected user op does. Outputs behave as they do for a user op.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_direct_input(ApplicationEngine *engine,
@@ -330,7 +326,7 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_direct
 /// @brief Take the next queued output, in emission order.
 /// @param engine The engine handle.
 /// @param out_output The output taken, written whole and only on OK.
-/// @returns OK with an output written, or INTERNAL_ERROR.
+/// @returns OK with an output written, IO_ERROR, or INTERNAL_ERROR.
 /// @details Call it exactly as many times as the execution reported, which is what attributes
 /// the outputs to the input that produced them. Taking one more than were queued is a caller bug
 /// and reports INTERNAL_ERROR rather than an empty output a host might act on. The payload
@@ -340,45 +336,37 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_direct
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_drain_output(ApplicationEngine *engine,
     ApplicationEngineOutput *out_output) APPLICATION_ENGINE_NOEXCEPT;
 
-/// @brief Get the maximum block carried by any executed input (the engine's safe-block clock).
+/// @brief Read the engine's current progress without changing state.
 /// @param engine The engine handle.
-/// @returns The last executed safe block, zero when nothing has executed.
-/// @details Carried by execution rather than set, so an engine cannot execute and forget to
-/// advance it. It lives in the state, so a resumed one reports the block it reflects.
-APPLICATION_ENGINE_API uint64_t application_engine_last_executed_safe_block(
-    const ApplicationEngine *engine) APPLICATION_ENGINE_NOEXCEPT;
-
-/// @brief Get the count of executed inputs, user ops and direct inputs alike.
-/// @param engine The engine handle.
-/// @returns The executed input count.
-APPLICATION_ENGINE_API uint64_t application_engine_executed_input_count(
-    const ApplicationEngine *engine) APPLICATION_ENGINE_NOEXCEPT;
+/// @param out_progress Writable record, written whole before returning.
+/// @details Count zero implies clock zero. Every successful execution advances the count once
+/// with checked arithmetic and takes max(previous clock, input block). Both fields survive dumps.
+APPLICATION_ENGINE_API void application_engine_progress(const ApplicationEngine *engine,
+    ApplicationEngineProgress *out_progress) APPLICATION_ENGINE_NOEXCEPT;
 
 /// @brief Create a crash durable dump of the engine state (write, fsync).
 /// @param engine The engine handle.
 /// @param prefix The dump to create, must not pre-exist. It carries whatever shape the engine's
 /// state does, a directory or a plain file as the engine chooses.
-/// @returns OK, IO_ERROR when the filesystem refused, which is what a full filesystem or an
-/// exhausted quota reports, or INTERNAL_ERROR.
+/// @returns OK, NOT_FOUND for a missing required path, IO_ERROR for other filesystem failures,
+/// or INTERNAL_ERROR.
 /// @details Must be called at a quiescent point only, no in-flight execution. On OK the dump
 /// survives an immediate kernel crash, its payload and the directory entry naming it are both
-/// synchronized before returning. An engine that cleans up after a failed write leaves the prefix
-/// free for a clean retry, which a host cannot do on its behalf.
+/// synchronized before returning. Failed creation may leave artifacts beneath prefix for the
+/// host to remove with the unreferenced checkpoint directory.
 ///
 /// The dump contains the current state. The engine may change backing files or reopen internal
 /// handles while checkpointing, but application state and progress stay unchanged. Subsequent
 /// execution must leave the completed dump immutable.
+/// All checkpoint-owned artifacts reside at or beneath prefix as ordinary files/directories.
+/// The host discards a checkpoint by recursive filesystem deletion, with no engine callback.
+/// Deletion must leave other checkpoints and independently restored engines usable. Filesystem
+/// CoW sharing is allowed when writes remain isolated.
+///
+/// The file named by application_engine_state_file_in_dump must byte-equal the canonical build's
+/// deterministic inspection or designated state-drive representation for the same logical state.
+/// The bridge does not verify this cross-build equivalence.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_create_dump(ApplicationEngine *engine,
-    const char *prefix) APPLICATION_ENGINE_NOEXCEPT;
-
-/// @brief Delete a previously created dump.
-/// @param prefix The dump to remove.
-/// @returns OK, NOT_FOUND when the dump is absent, IO_ERROR for other filesystem failures,
-/// or INTERNAL_ERROR.
-/// @details An engine still holding this dump open keeps running, its mapping outlives the name.
-/// The sequencer removes the database reference before deleting the artifact. Deletion must not
-/// affect other dumps or independently loaded engines.
-APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_delete_dump(
     const char *prefix) APPLICATION_ENGINE_NOEXCEPT;
 
 /// @brief Get the path of the canonical state file inside a dump.
@@ -388,6 +376,8 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_delete_dump(
 /// file sits follows from the shape the engine gives a dump, which is why the engine answers
 /// rather than a host assuming. An engine whose dump is a directory answers with a file inside
 /// it, and one whose dump is the state image itself answers with the prefix unchanged.
+/// Its bytes must match the independent canonical build's deterministic comparison representation
+/// for the same logical state, as required by application_engine_create_dump.
 ///
 /// The storage is engine owned and thread local, overwritten by the next call on the same
 /// thread, so copy rather than retain the pointer. Being fallible, it also clears the last error

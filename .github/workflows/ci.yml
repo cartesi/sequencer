@@ -68,7 +68,6 @@ jobs:
           cargo build --locked -p c-wallet-engine
           APPLICATION_ENGINE_LIB="$PWD/target/debug/libc_wallet_engine.a" \
           APPLICATION_ENGINE_HEADER="$PWD/examples/c-app-engine/include/application-engine.h" \
-          APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT=53 \
             cargo build --locked -p c-app-sequencer
           ./target/debug/c-app-sequencer --help > /dev/null
 

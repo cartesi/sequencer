@@ -11,8 +11,9 @@ of a native engine, its FFI, or its canonical counterpart
 This document **owns** the contract. [`AGENTS.md`](../../AGENTS.md) is the map.
 The [wallet](../../examples/app-core/) is the reference implementation. A
 production application may execute natively or wrap a Cartesi Machine.
-The [C application bridge](../../examples/c-app-engine/README.md) adapts a native
-engine through a C ABI and includes a reference wallet integration.
+The [C application binding](c-application-binding.md) adapts this contract to
+native engines; its [build guide](../../examples/c-app-engine/README.md) includes
+a reference wallet integration.
 
 ## The execution methods
 
@@ -37,9 +38,10 @@ Overflow fails before the hook runs. An error defines no successor: callers
 terminate the execution path and discard the instance, without attempting to
 roll back or inspect partially updated state.
 
-`MAX_METHOD_PAYLOAD_BYTES` is both an ingress payload limit and a batch-sizing
-input. HTTP rejects oversized method payloads; the lane uses the declared bound
-plus signed-op metadata to compute batch capacity. It is not a canonical
+`Application::max_method_payload_bytes()` returns the engine's stable method
+payload bound without constructing an instance. Zero permits only empty method
+payloads. HTTP rejects oversized method payloads; the lane uses the declared
+bound plus signed-op metadata to compute batch capacity. It is not a canonical
 scheduler rejection rule.
 
 ## Cross-cutting contracts
@@ -153,8 +155,11 @@ machine checkpoint may instead contain a separate app-state projection. The
   possibly `prefix` itself. Its bytes match the canonical application's
   deterministic comparison representation, whether obtained through inspect
   or from a designated state drive.
-- `delete_dump(prefix)` removes the app-owned checkpoint. The sequencer owns
-  the outer directory and `info.toml`; the app owns its opaque `state` prefix.
+- All checkpoint-owned artifacts reside at or below `prefix`, including the
+  canonical comparison file. Disposal requires only ordinary filesystem
+  deletion: the sequencer removes the enclosing directory, including its own
+  `info.toml`. Removing a checkpoint must leave other checkpoints and restored
+  engines usable; external resource cleanup is outside this contract.
 
 Mutable checkpoint creation permits flushing, replacing mappings, or changing
 working backing files inside an adapter. It does not permit a logical state
@@ -185,6 +190,9 @@ also stays on the concrete application.
 4. Implement `CanonicalState` only where canonical inspection needs it.
    Remove any `Clone` or `Sync` added solely to satisfy the old host bounds;
    justify `Send` against the native engine's ownership contract.
+5. Return the stable payload bound from `max_method_payload_bytes()` rather
+   than an associated constant. Keep checkpoint artifacts self-contained so
+   recursive filesystem deletion disposes of them without an application hook.
 
 Changing these Rust interfaces preserves transaction encoding, expected
 rejection semantics, snapshot bytes, scheduler ordering, and the database

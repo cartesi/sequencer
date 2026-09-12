@@ -17,8 +17,7 @@ async fn main() -> ExitCode {
 fn main() -> ExitCode {
     eprintln!(
         "built without an engine, so there is no application to run. Set \
-         APPLICATION_ENGINE_LIB, APPLICATION_ENGINE_HEADER and \
-         APPLICATION_ENGINE_METHOD_PAYLOAD_LIMIT, then build again."
+         APPLICATION_ENGINE_LIB and APPLICATION_ENGINE_HEADER, then build again."
     );
     ExitCode::FAILURE
 }
