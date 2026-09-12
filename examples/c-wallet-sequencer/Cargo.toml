@@ -10,6 +10,6 @@ readme = "../../README.md"
 authors.workspace = true
 
 [dependencies]
-c-app-sequencer = { path = "../c-app-sequencer" }
+c-app-sequencer = { path = "../../bindings/c-app-sequencer" }
 c-wallet-engine = { path = "../c-wallet-engine" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

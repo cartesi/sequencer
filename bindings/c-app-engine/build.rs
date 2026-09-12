@@ -108,7 +108,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let header = match env::var("APPLICATION_ENGINE_LIB") {
         Ok(engine_lib) => external_engine(&engine_lib),
-        // Linked from inside this workspace, where `c-wallet-engine` is the engine
+        // The final binary supplies the engine when no external archive is configured.
         Err(_) => {
             assert!(
                 env::var_os("APPLICATION_ENGINE_HEADER").is_none(),

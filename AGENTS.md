@@ -147,8 +147,8 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - `sequencer-core/` — shared domain types (`Application`, `SignedUserOp`, `SequencedL2Tx`, `Batch`, `Frame`).
 - `examples/app-core/` — placeholder wallet app implementing the `Application` trait.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library. The model for what an app author builds (their `Application` impl ≙ `app-core`; their binary crate ≙ this).
-- `examples/c-app-engine/` — C ABI adapter implementing `Application` for a native engine.
-- `examples/c-app-sequencer/` — shared C-engine CLI host and external-archive binary.
+- `bindings/c-app-engine/` — reusable C ABI adapter implementing `Application` for a native engine.
+- `bindings/c-app-sequencer/` — optional C-engine CLI host and external-archive binary.
 - `examples/c-wallet-engine/` — reference wallet engine exporting the C ABI, plus its genesis tool and conformance tests.
 - `examples/c-wallet-sequencer/` — binary composing the C-engine host with the reference wallet engine.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.

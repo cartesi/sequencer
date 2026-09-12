@@ -1,10 +1,12 @@
 # C application binding
 
 An application exposes the
-[`application-engine.h`](../../examples/c-app-engine/include/application-engine.h)
+[`application-engine.h`](../../bindings/c-app-engine/include/application-engine.h)
 C ABI in a static archive. `c-app-engine::EngineApp` adapts that engine to the
-Rust `Application` trait. The [build guide](../../examples/c-app-engine/README.md)
-covers linking, genesis, host commands, and reference tests.
+Rust `Application` trait. These reusable bindings live under `bindings/`;
+`c-app-sequencer` supplies an optional CLI host. The
+[build guide](../../bindings/c-app-engine/README.md) covers downstream dependencies,
+linking, genesis, host commands, and the reference wallet under `examples/`.
 
 ## Contract ownership
 
@@ -13,7 +15,7 @@ covers linking, genesis, host commands, and reference tests.
 - [Scheduler semantics](scheduler-semantics.md) defines canonical ordering and
   the acceptance boundary. The native engine does not acquire an ordering role
   through this ABI.
-- The [C header](../../examples/c-app-engine/include/application-engine.h)
+- The [C header](../../bindings/c-app-engine/include/application-engine.h)
   defines record layout, statuses, pointer ownership, and call lifetimes. An
   engine archive and its generated Rust bindings must agree on that header.
 - [Snapshot lifecycle](../snapshots/lifecycle.md) owns checkpoint registration,

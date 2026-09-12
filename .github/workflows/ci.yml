@@ -63,13 +63,8 @@ jobs:
         timeout-minutes: 15
         run: cargo test --workspace --all-targets --all-features --locked
 
-      - name: C application archive path
-        run: |
-          cargo build --locked -p c-wallet-engine
-          APPLICATION_ENGINE_LIB="$PWD/target/debug/libc_wallet_engine.a" \
-          APPLICATION_ENGINE_HEADER="$PWD/examples/c-app-engine/include/application-engine.h" \
-            cargo build --locked -p c-app-sequencer
-          ./target/debug/c-app-sequencer --help > /dev/null
+      - name: C application archive and downstream consumer
+        run: bash scripts/ci-c-application-smoke.sh
 
   canonical-guest:
     runs-on: ubuntu-latest

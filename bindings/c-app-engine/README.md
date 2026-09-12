@@ -1,5 +1,8 @@
 # C application bridge
 
+The crates under `bindings/` are reusable integration libraries. The wallet
+engine and binary under `examples/` demonstrate their use.
+
 `EngineApp` implements `sequencer_core::application::Application` using the
 [application-engine C ABI](include/application-engine.h). The sequencer owns one
 engine at a time. A handle can move between threads; calls on it never overlap.
@@ -59,7 +62,9 @@ panic follows the shared terminal-error policy.
 
 ## External engine
 
-Build the application's static archive and use the corresponding header:
+Build the application's static archive against the header from the chosen
+sequencer revision. From a checkout of that revision, build the generic host
+with that same header:
 
 ```sh
 APPLICATION_ENGINE_LIB=/absolute/path/libengine.a \
@@ -74,6 +79,28 @@ libclang. The engine also supplies its own genesis tool; configuration does not
 cross this ABI. With no external archive configured, the generic binary reports
 that no engine was linked, and
 `c-wallet-sequencer` supplies the reference implementation through Cargo.
+
+For a binary in another repository, depend on the host directly. Replace
+`<full-commit-hash>` with the sequencer revision whose header the engine uses:
+
+```toml
+[dependencies]
+c-app-sequencer = { git = "https://github.com/cartesi/sequencer", rev = "<full-commit-hash>" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+```rust
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    c_app_sequencer::run().await
+}
+```
+
+Set the same `APPLICATION_ENGINE_LIB` and `APPLICATION_ENGINE_HEADER` variables
+when running `cargo build` in that binary's repository. The host's `run()` owns
+CLI parsing and tracing setup. For custom host wiring, depend on `c-app-engine`
+and `sequencer` at the same Git revision and compose `EngineApp` with
+`sequencer::run_command` directly. No wallet crate is required in either case.
 
 The conformance suite compares native and ABI execution over mixed inputs,
 notices and vouchers, rejection/no-op progress, dump round trips, independent
