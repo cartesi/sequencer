@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Shared HTTP surface: error type + JSON response shape used by both
-//! ingress (`/tx`) and egress (`/ws/subscribe`, future routes), plus the
+//! ingress (`/tx`, `/fee`) and egress (`/ws/subscribe`, future routes), plus the
 //! `axum::serve` orchestration that wires the two side routers together.
 //!
 //! Today both sides serve from one listener; the planned api split puts each
@@ -26,7 +26,7 @@ use tower_http::trace::TraceLayer;
 pub use crate::egress::api::SnapshotState;
 use crate::egress::api::SubscribeState;
 use crate::egress::l2_tx_feed::L2TxFeed;
-use crate::ingress::api::SubmitState;
+use crate::ingress::api::{FeeState, SubmitState};
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
 use crate::storage::ReleaseScheduler;
@@ -266,13 +266,17 @@ pub(crate) fn start_on_listener(
         config.max_user_op_data_bytes,
         shutdown.clone(),
     ));
+    let fee_state = Arc::new(FeeState::new(
+        snapshot_state.db_path.clone(),
+        shutdown.clone(),
+    ));
     let subscribe_state = Arc::new(SubscribeState::new(
         shutdown.clone(),
         tx_feed,
         config.ws_max_subscribers,
         config.ws_max_catchup_events,
     ));
-    let app: Router = crate::ingress::api::router(submit_state)
+    let app: Router = crate::ingress::api::router(submit_state, fee_state)
         .merge(crate::egress::api::router(
             subscribe_state,
             health_state,

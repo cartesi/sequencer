@@ -3,9 +3,9 @@
 
 mod errors;
 
-pub use errors::{ClientBuildError, SubmitRejected, SubmitTxError, SubscribeError};
+pub use errors::{ClientBuildError, GetFeeError, SubmitRejected, SubmitTxError, SubscribeError};
 
-use sequencer_core::api::{TxRequest, TxResponse};
+use sequencer_core::api::{FeeResponse, TxRequest, TxResponse};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -100,6 +100,25 @@ impl SequencerClient {
             return Err(SubmitRejected::Http { status, body });
         }
         serde_json::from_str::<TxResponse>(&body).map_err(|e| SubmitRejected::Decode(e.to_string()))
+    }
+
+    pub async fn get_fee(&self) -> Result<FeeResponse, GetFeeError> {
+        let url = format!("{}/fee", self.endpoint.trim_end_matches('/'));
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| SubmitTxError::IoRead(e.to_string()))?;
+        if status != 200 {
+            return Err(GetFeeError::Http { status, body });
+        }
+        serde_json::from_str::<FeeResponse>(&body).map_err(|e| GetFeeError::Decode(e.to_string()))
     }
 
     pub async fn subscribe(&self, from_offset: u64) -> Result<SubscribeStream, SubscribeError> {

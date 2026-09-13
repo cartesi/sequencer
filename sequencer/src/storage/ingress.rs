@@ -56,6 +56,17 @@ impl Storage {
         self.read(load_current_write_head)
     }
 
+    /// Open-frame fee and current `recommended_fee`. `None` if there is no Tip.
+    pub fn current_fee_quote(&mut self) -> Result<Option<(u16, u16)>> {
+        self.read(|tx| {
+            let Some(head) = load_current_write_head(tx)? else {
+                return Ok(None);
+            };
+            let policy = query_batch_policy(tx)?;
+            Ok(Some((head.frame_fee, policy.recommended_fee)))
+        })
+    }
+
     /// Bootstrap the very first batch + frame with explicit values, returning
     /// its loaded [`WriteHead`]. Asserts no open state exists.
     ///

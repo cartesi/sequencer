@@ -48,7 +48,7 @@ Rust edition 2024 / Axum API / SQLite (rusqlite, WAL) / EIP-712 signing / SSZ en
   `error` taxonomy (incl. exit-code projection).
 - `runtime/` — the runtime authority capabilities, consumed crate-wide:
   the exclusive process lock and the runtime scope/shutdown machinery.
-- `ingress/` — public write path: `api.rs` (`POST /tx`) + `inclusion_lane/` (hot path).
+- `ingress/` — public-facing: `api.rs` (`POST /tx`, `GET /fee`) + `inclusion_lane/` (hot path).
 - `egress/` — internal read path: `api/` (WS subscribe + health) + `l2_tx_feed/`.
 - `l1/` — reader, submitter, fee oracle, provider, partition helper.
 - `recovery/` — startup preemptive-recovery procedure, runtime danger detector, mempool flusher.

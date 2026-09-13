@@ -77,7 +77,7 @@ The sequencer is designed to handle:
 
 ### User Operations
 
-Users submit signed operations via `POST /tx` (JSON). Operations are signed with EIP-712 using the rollup's chain ID and app address. The sequencer validates the signature, executes the operation against the current app state, and returns a soft confirmation.
+Users submit signed operations via `POST /tx` (JSON). Operations are signed with EIP-712 using the rollup's chain ID and app address. The sequencer validates the signature, executes the operation against the current app state, and returns a soft confirmation. `GET /fee` quotes the live frame fee, the next-frame recommendation, and a suggested `max_fee` a wallet can sign.
 
 ### Sequenced Transaction Feed
 
@@ -166,7 +166,23 @@ Notes:
 - payload size is bounded at ingress; oversized requests are rejected before entering the hot path.
 - overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
-- Browser wallets can call `POST /tx` from any origin with any request headers; preflight permits POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
+- Browser wallets can call `POST /tx` and `GET /fee` from any origin with any request headers; preflight permits GET and POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
+
+### `GET /fee`
+
+Fee quote for setting signed user-op `max_fee` before `POST /tx`. All three fields are log-space exponents (base 129/128), the same encoding as `max_fee`. Inclusion rejects any op with `max_fee` below the open-frame `fee`.
+
+```json
+{ "fee": 1356, "recommended_fee": 1356, "suggested_max_fee": 1409 }
+```
+
+Notes:
+
+- `fee` is frozen for the lifetime of the open frame (the live inclusion check).
+- `recommended_fee` is what the next frame will sample at rotation (currently after five newly-safe L1 blocks, best-effort).
+- `suggested_max_fee` is `max(fee, recommended_fee)` plus 1.5× log-space slack. Wallets can copy this into signed `max_fee`; the user pays the frame fee, not this cap. Clients that want their own policy can ignore it and combine the two facts themselves.
+- `200` while an open frame exists (the admitted runtime always has one).
+- `503` with code `UNAVAILABLE` during shutdown, or if no open frame exists.
 
 ### `GET /ws/subscribe?from_offset=<u64>`
 
@@ -237,7 +253,7 @@ released even on client disconnect.
 - `examples/wallet-sequencer/`: binary crate composing the sequencer library with the placeholder wallet app
 - `sequencer/src/http.rs`: shared HTTP error type, JSON error shape, and `axum::serve` orchestration
 - `sequencer/src/runtime/`: process lock and shutdown scope; command bootstrap and config live in `commands/`, the shared clock in `clock.rs`, and EIP-712 domain construction in `sequencer-core/`
-- `sequencer/src/ingress/`: public write path — `POST /tx` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)
+- `sequencer/src/ingress/`: public-facing — `POST /tx` and `GET /fee` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)
 - `sequencer/src/egress/`: internal read path — WS subscribe + health probes (`api/`) and the DB-backed ordered-L2Tx feed (`l2_tx_feed/`)
 - `sequencer/src/l1/`: L1 client surface — input reader, batch submitter, fee oracle, shared EIP-1559 estimation, provider, partition helper
 - `sequencer/src/recovery/`: preemptive recovery startup, runtime danger detector, mempool flusher

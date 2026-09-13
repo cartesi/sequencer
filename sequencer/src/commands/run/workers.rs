@@ -299,7 +299,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         let submitter = submitter.start_preflighted(shutdown.clone());
         let detector = detector.start_preflighted(shutdown.signal());
         let fee_oracle = fee_oracle.map(|oracle| oracle.start(shutdown.signal()));
-        // HTTP server (ingress /tx + egress /ws/subscribe + /health, currently merged).
+        // HTTP server (ingress /tx + /fee + egress /ws/subscribe + /health, currently merged).
         let server = http::start_on_listener(
             listener,
             tx,

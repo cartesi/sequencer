@@ -1,9 +1,13 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! `POST /tx` — validate a signed user op, enqueue it for the inclusion lane,
-//! and wait for the lane's commit ack before responding. Synchronous from the
-//! client's perspective: 200 means included.
+//! Public ingress HTTP:
+//!
+//! - `POST /tx` — validate a signed user op, enqueue it for the inclusion
+//!   lane, and wait for the lane's commit ack. Synchronous from the client's
+//!   perspective: 200 means included.
+//! - `GET /fee` — quote the open-frame fee, recommended fee, and a suggested
+//!   `max_fee` so a wallet can sign before submitting.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -13,7 +17,7 @@ use axum::Router;
 use axum::extract::{Json, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
@@ -22,7 +26,8 @@ use tracing::debug;
 use crate::http::ApiError;
 use crate::ingress::inclusion_lane::PendingUserOp;
 use crate::runtime::shutdown::RuntimeScope;
-use sequencer_core::api::{TxRequest, TxResponse};
+use crate::storage::Storage;
+use sequencer_core::api::{FeeResponse, TxRequest, TxResponse};
 use sequencer_core::user_op::SignedUserOp;
 
 /// State for the submit endpoint. Kept narrow — only what `/tx` actually needs.
@@ -58,15 +63,38 @@ impl SubmitState {
     }
 }
 
+/// State for `GET /fee`. Reads the open-frame fee from SQLite; the inclusion
+/// lane remains the sole writer of that fact.
+#[derive(Clone)]
+pub(crate) struct FeeState {
+    db_path: String,
+    shutdown: RuntimeScope,
+}
+
+impl FeeState {
+    pub(crate) fn new(db_path: String, shutdown: RuntimeScope) -> Self {
+        Self { db_path, shutdown }
+    }
+
+    fn reject_if_shutting_down(&self) -> Result<(), ApiError> {
+        if self.shutdown.is_shutdown_requested() {
+            Err(ApiError::unavailable("sequencer shutting down"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Build the ingress router. Caller wires it into an `axum::serve` listener.
-pub(crate) fn router(state: Arc<SubmitState>) -> Router {
+pub(crate) fn router(submit: Arc<SubmitState>, fee: Arc<FeeState>) -> Router {
     Router::new()
         .route("/tx", post(submit_tx))
-        .with_state(state)
+        .with_state(submit)
+        .merge(Router::new().route("/fee", get(get_fee)).with_state(fee))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([Method::POST])
+                .allow_methods([Method::GET, Method::POST])
                 .allow_headers(Any)
                 .max_age(Duration::from_secs(3600)),
         )
@@ -97,6 +125,34 @@ async fn submit_tx(
         nonce,
     })
     .into_response())
+}
+
+async fn get_fee(State(state): State<Arc<FeeState>>) -> Result<Response, ApiError> {
+    state.reject_if_shutting_down()?;
+    let db_path = state.db_path.clone();
+    let shutdown = state.shutdown.clone();
+    let quote = tokio::task::spawn_blocking(move || {
+        let _runtime_lifetime = shutdown;
+        read_fee_quote(&db_path)
+    })
+    .await
+    .map_err(|_| ApiError::internal_error("fee read task failed"))??;
+    Ok(Json(quote).into_response())
+}
+
+fn read_fee_quote(db_path: &str) -> Result<FeeResponse, ApiError> {
+    let mut storage = Storage::open_read_only(db_path).map_err(|err| {
+        tracing::debug!(error = %err, "GET /fee storage open failed");
+        ApiError::internal_error("fee unavailable")
+    })?;
+    match storage.current_fee_quote() {
+        Ok(Some((fee, recommended_fee))) => Ok(FeeResponse::quote(fee, recommended_fee)),
+        Ok(None) => Err(ApiError::unavailable("no open frame")),
+        Err(err) => {
+            tracing::debug!(error = %err, "GET /fee quote read failed");
+            Err(ApiError::internal_error("fee unavailable"))
+        }
+    }
 }
 
 /// Normalize JSON-extractor failures into fixed client-facing messages.
@@ -223,6 +279,36 @@ mod tests {
         let result = submit_tx(State(state), Ok(Json(request))).await;
 
         let err = result.expect_err("submit should be rejected during shutdown");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), "UNAVAILABLE");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_fee_rejects_when_shutdown_has_started() {
+        let shutdown = RuntimeScope::default();
+        shutdown.request_shutdown();
+        let state = Arc::new(FeeState::new("unused.db".into(), shutdown));
+
+        let err = get_fee(State(state))
+            .await
+            .expect_err("fee should be rejected during shutdown");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), "UNAVAILABLE");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_fee_is_unavailable_when_no_open_frame() {
+        let db = TempDir::new().expect("create temp dir");
+        let db_path = db.path().join("sequencer.db");
+        let _storage = Storage::open(&db_path.to_string_lossy()).expect("create db");
+        let state = Arc::new(FeeState::new(
+            db_path.to_string_lossy().into_owned(),
+            RuntimeScope::default(),
+        ));
+
+        let err = get_fee(State(state))
+            .await
+            .expect_err("fee requires an open frame");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.code(), "UNAVAILABLE");
     }

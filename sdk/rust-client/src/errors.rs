@@ -58,6 +58,16 @@ pub enum SubmitRejected {
 }
 
 #[derive(Debug, Error)]
+pub enum GetFeeError {
+    #[error("fee request failed: {0}")]
+    Transport(#[from] SubmitTxError),
+    #[error("/fee rejected with status {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("invalid /fee success body: {0}")]
+    Decode(String),
+}
+
+#[derive(Debug, Error)]
 pub enum SubscribeError {
     #[error("invalid endpoint: {0}")]
     InvalidEndpoint(String),

@@ -218,6 +218,26 @@ pub fn log_fee_ratio(num: u64, denom: u64) -> i32 {
     }
 }
 
+/// Smallest log-space exponent `n` such that `(129/128)^n >= 3/2`.
+///
+/// Signing slack for [`suggested_signing_max_fee`]: wallets may over-estimate
+/// `max_fee` because the user pays the frame fee, not the signed cap. 1.5×
+/// sits on top of `max(open-frame fee, recommended_fee)` so a quote can
+/// survive a frame rotation. Distinct from `batch_policy.log_slack` (the 10×
+/// DA margin already baked into both inputs).
+pub const SUGGESTED_MAX_FEE_SLACK: u16 = 53;
+
+/// Suggested user-op `max_fee`: `max(frame_fee, recommended_fee)` plus
+/// [`SUGGESTED_MAX_FEE_SLACK`] (1.5× in log space), clamped to
+/// [`MAX_EXPONENT`].
+pub fn suggested_signing_max_fee(frame_fee: u16, recommended_fee: u16) -> u16 {
+    let base = frame_fee.max(recommended_fee);
+    match base.checked_add(SUGGESTED_MAX_FEE_SLACK) {
+        Some(sum) if sum <= MAX_EXPONENT => sum,
+        _ => MAX_EXPONENT,
+    }
+}
+
 /// Fixed-point multiplication: `(a * b) >> FRAC_BITS`.
 ///
 /// Uses a 512-bit intermediate to avoid overflow.
@@ -311,6 +331,32 @@ mod tests {
     #[test]
     fn tenfold_slack_exponent_is_pinned() {
         assert_eq!(log_fee_ratio(10, 1), 296);
+    }
+
+    #[test]
+    fn suggested_max_fee_slack_is_ceil_three_halves() {
+        assert_eq!(SUGGESTED_MAX_FEE_SLACK, 53);
+        // Nearest-rounding log(1.5) undercharges; the signing slack is ceil.
+        assert!(log_fee_ratio(3, 2) < i32::from(SUGGESTED_MAX_FEE_SLACK));
+        let base = 1000_u16;
+        let suggested = suggested_signing_max_fee(base, 0);
+        assert_eq!(suggested, base + SUGGESTED_MAX_FEE_SLACK);
+        assert!(
+            fee_to_linear(suggested) * U256::from(2u64) >= fee_to_linear(base) * U256::from(3u64)
+        );
+    }
+
+    #[test]
+    fn suggested_signing_max_fee_uses_the_higher_input_and_clamps() {
+        assert_eq!(
+            suggested_signing_max_fee(100, 200),
+            200 + SUGGESTED_MAX_FEE_SLACK
+        );
+        assert_eq!(suggested_signing_max_fee(MAX_EXPONENT, 0), MAX_EXPONENT);
+        assert_eq!(
+            suggested_signing_max_fee(MAX_EXPONENT - 1, MAX_EXPONENT - 10),
+            MAX_EXPONENT
+        );
     }
 
     #[test]
