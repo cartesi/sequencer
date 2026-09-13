@@ -118,6 +118,30 @@ pub struct TxResponse {
     pub nonce: u32,
 }
 
+/// Fee quote for wallets that need to set signed `max_fee` before `POST /tx`.
+///
+/// `fee` is frozen on the open frame (the live inclusion check).
+/// `recommended_fee` is what the next frame will sample.
+/// `suggested_max_fee` is `max(fee, recommended_fee)` plus 1.5× log-space
+/// slack — the value a wallet can copy into `max_fee` so the signature
+/// survives a frame rotation. The user pays the frame fee, not this cap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeeResponse {
+    pub fee: u16,
+    pub recommended_fee: u16,
+    pub suggested_max_fee: u16,
+}
+
+impl FeeResponse {
+    pub fn quote(fee: u16, recommended_fee: u16) -> Self {
+        Self {
+            fee,
+            recommended_fee,
+            suggested_max_fee: crate::fee::suggested_signing_max_fee(fee, recommended_fee),
+        }
+    }
+}
+
 pub type WsTxMessage = BroadcastTxMessage;
 
 fn decode_hex_0x(value: &str) -> Result<Vec<u8>, String> {

@@ -611,9 +611,61 @@ async fn cors_permits_browser_preflight_on_tx() {
         .to_str()
         .expect("header utf8");
     assert_eq!(allow_origin, "*");
-    assert_eq!(resp.headers()["access-control-allow-methods"], "POST");
+    let allow_methods = resp
+        .headers()
+        .get("access-control-allow-methods")
+        .expect("Access-Control-Allow-Methods")
+        .to_str()
+        .expect("header utf8");
+    assert!(
+        allow_methods
+            .split(',')
+            .any(|method| method.trim() == "POST"),
+        "preflight must allow POST, got {allow_methods}"
+    );
     assert_eq!(resp.headers()["access-control-allow-headers"], "*");
     assert_eq!(resp.headers()["access-control-max-age"], "3600");
+}
+
+#[tokio::test]
+async fn cors_permits_browser_preflight_on_fee() {
+    let db = temp_db("cors-fee-preflight");
+    let Some(server) = start_server(db.path.as_str()).await else {
+        return;
+    };
+
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, server.url("/fee"))
+        .header("Origin", "https://wallet.example")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .expect("OPTIONS /fee");
+
+    assert!(
+        resp.status().is_success(),
+        "preflight status: {}",
+        resp.status()
+    );
+    let allow_origin = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .expect("Access-Control-Allow-Origin")
+        .to_str()
+        .expect("header utf8");
+    assert_eq!(allow_origin, "*");
+    let allow_methods = resp
+        .headers()
+        .get("access-control-allow-methods")
+        .expect("Access-Control-Allow-Methods")
+        .to_str()
+        .expect("header utf8");
+    assert!(
+        allow_methods
+            .split(',')
+            .any(|method| method.trim() == "GET"),
+        "preflight must allow GET, got {allow_methods}"
+    );
 }
 
 #[tokio::test]
@@ -635,6 +687,14 @@ async fn cors_is_limited_to_ingress_and_covers_rejections() {
         .expect("invalid POST /tx");
     assert_eq!(rejected.status().as_u16(), 400);
     assert_eq!(rejected.headers()["access-control-allow-origin"], "*");
+
+    let fee = client
+        .get(server.url("/fee"))
+        .header("Origin", "https://wallet.example")
+        .send()
+        .await
+        .expect("GET /fee");
+    assert_eq!(fee.headers()["access-control-allow-origin"], "*");
 
     for route in ["/livez", "/finalized_state"] {
         let response = client

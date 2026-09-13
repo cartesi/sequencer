@@ -158,8 +158,8 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - `sequencer/src/harness.rs` — CLI harness: the `setup`/`run`/`flush-mempool` subcommand parser, `dispatch`, and the exit-code projection. An app's `main` is ~5 lines (`run_main` + a genesis-app closure).
 - `sequencer/src/http.rs` — shared HTTP error type, JSON `ErrorResponse`, `ApiConfig`, and `axum::serve` orchestration.
 - `sequencer/src/commands/` — the operator command brackets: `setup` (phase A — pin identity, initial sync, genesis snapshot, atomic `setup_complete` fact), `run` (phase B — recover, prepare, admit, and boot workers; its `workers` supervisor lives beside it), and `flush` (`flush-mempool`). `sequencer/src/commands/` also owns the command-scoped `config` and `error` taxonomy (incl. the exit-code projection); `sequencer/src/runtime/` is exactly the runtime authority capabilities — the process lock and `shutdown` (runtime scope and graceful notification) — consumed crate-wide. `L1Config` lives in `sequencer/src/l1/`; the crate-wide wall clock is `sequencer/src/clock.rs`.
-- `sequencer/src/ingress/` — public write path.
-  - `api.rs` — `POST /tx` handler, JSON-rejection mapping.
+- `sequencer/src/ingress/` — public-facing HTTP + inclusion lane.
+  - `api.rs` — `POST /tx` and `GET /fee` handlers, JSON-rejection mapping.
   - `inclusion_lane/` — single-lane hot-path loop (`mod.rs`), catch-up replay, config, error types.
 - `sequencer/src/egress/` — internal read path.
   - `api/` — `/ws/subscribe`, `/livez`, `/readyz`, `/healthz`.
@@ -300,7 +300,7 @@ restate them here.
 
 ## HTTP Endpoints
 
-- **Ingress** (public-facing): `POST /tx`.
+- **Ingress** (public-facing): `POST /tx`, `GET /fee`.
 - **Egress** (internal indexers/watchdog): `GET /ws/subscribe`, `GET /finalized_state`, `GET /finalized_state/inclusion_block`, `GET /latest_snapshot`, `GET /livez`, `GET /readyz`, `GET /healthz`. The snapshot/state endpoints are **operator-only** (no auth) and must not be exposed publicly; the streaming routes hold a GC lease for the response lifetime ([`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md)).
 
 Today both sides serve from one listener; the planned API split puts each side on its own port (same binary) so internal probes and subscribers can be firewalled from public submit traffic.

@@ -862,6 +862,37 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_quotes_open_frame_fee() {
+    let db = temp_db("fee-endpoint");
+    let domain = test_domain();
+    bootstrap_open_frame(db.path.as_str());
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain).await else {
+        return;
+    };
+
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
+        .expect("build sequencer client");
+    let quoted = client.get_fee().await.expect("GET /fee");
+    assert_eq!(
+        quoted.fee, 1356,
+        "quoted fee must match the bootstrapped open-frame fee"
+    );
+    assert_eq!(
+        quoted.recommended_fee, 1356,
+        "bootstrapped recommended_fee matches the open-frame fee"
+    );
+    assert_eq!(
+        quoted.suggested_max_fee,
+        sequencer_core::fee::suggested_signing_max_fee(quoted.fee, quoted.recommended_fee),
+        "suggested_max_fee is max(fee, recommended_fee) plus signing slack"
+    );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_user_op_when_balance_below_fee_cost() {
     // if sender's balance < `fee_to_linear(current_frame_fee)` the
     // user op must be rejected with 422 `InsufficientFeeBalance` and leave
