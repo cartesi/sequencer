@@ -216,6 +216,62 @@ async fn run_snapshot_release_supervisor(
     }
 }
 
+// ── Blocking storage tasks ─────────────────────────────────────────────────
+//
+// Shared by ingress (`GET /fee`) and egress snapshot handlers. Classify
+// inside the blocking task: cancellation of the HTTP request must not
+// discard a persistent fault discovered by work that already started.
+
+pub(crate) type StorageTaskError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Run `work` on a blocking thread with a runtime-scope clone that outlives
+/// the SQLite connection. Panics and persistent storage errors abort the
+/// process; other errors return to the handler.
+pub(crate) async fn storage_task<T, F>(
+    shutdown: RuntimeScope,
+    operation: &'static str,
+    work: F,
+) -> Result<T, StorageTaskError>
+where
+    T: Send + 'static,
+    F: FnOnce(RuntimeScope) -> Result<T, StorageTaskError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        let _runtime_lifetime = shutdown.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(shutdown))) {
+            Ok(Err(error)) if persistent_storage_error(error.as_ref()) => {
+                abort_terminal(format_args!("{operation}: {error}"));
+            }
+            Ok(result) => result,
+            Err(_) => abort_terminal(format_args!("{operation}: storage task panicked")),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join) if join.is_panic() => abort_terminal(format_args!("{operation}: {join}")),
+        Err(join) => Err(Box::new(join)),
+    }
+}
+
+pub(crate) fn persistent_storage_error(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        let persistent = error
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(crate::storage::is_persistent_storage_error)
+            || error
+                .downcast_ref::<crate::storage::StorageOpenError>()
+                .is_some_and(crate::storage::is_persistent_storage_open_error);
+        if persistent {
+            return true;
+        }
+        let Some(source) = error.source() else {
+            return false;
+        };
+        error = source;
+    }
+}
+
 /// The API's per-deployment configuration: the two ingress values that vary
 /// (the EIP-712 verification domain and the app's payload bound) plus three
 /// service limits. The limits are module constants by design — not

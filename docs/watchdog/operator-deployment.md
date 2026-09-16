@@ -9,9 +9,9 @@ For **local development only** (Anvil + `sequencer-devnet`, CI smoke tests), use
 ## Two deployment tiers
 
 ```text
-                    ┌─────────────────────────────────────┐
-  Internet / users  │  Public ingress (POST /tx, WS)     │  ← benchmarks, wallets
-                    └─────────────────┬───────────────────┘
+                    ┌──────────────────────────────────────────────┐
+  Internet / users  │  Public ingress (POST /tx, GET /fee, WS)    │  ← benchmarks, wallets
+                    └──────────────────────┬───────────────────────┘
                                       │
                     ┌─────────────────▼───────────────────┐
   Operator network  │  Sequencer process                 │
