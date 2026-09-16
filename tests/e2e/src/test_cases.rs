@@ -152,6 +152,10 @@ struct ExpectedWalletState {
 
 pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
     vec![
+        (
+            "cold_replica_snapshot_backlog_live_recovery_test",
+            |runtime| Box::pin(crate::cold_replica::run(runtime)),
+        ),
         ("deposit_transfer_withdrawal_test", |runtime| {
             Box::pin(run_deposit_transfer_withdrawal_test(runtime))
         }),
@@ -473,7 +477,7 @@ async fn mine_until_batch_is_safe_accepted(
 /// wait for the input reader and inclusion lane to commit a frame covering
 /// `required_safe_block`. The live safe-head query prevents stale SQLite
 /// observations from turning an asynchronous reader poll into over-mining.
-async fn advance_live_frame_until_covers(
+pub(crate) async fn advance_live_frame_until_covers(
     runtime: &ManagedSequencer,
     required_safe_block: u64,
 ) -> ScenarioResult<u64> {

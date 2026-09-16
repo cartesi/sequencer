@@ -114,14 +114,20 @@ Snapshot integration tests own artifact/header association and restore proof.
 The Anvil recovery/WS gate also exercises process restart, generation refusal,
 and re-drained direct replay at a reused offset.
 
+The cold-replica E2E restores a nonempty HTTP archive, checks it against a
+genesis-fed replica, and holds catch-up behind a barrier while new writes commit.
+It checks whole-state, count, and clock agreement through live direct inputs
+and user operations, then exercises real stale recovery, claim refusal, and
+fresh bootstrap. Canonical-machine gates cover genesis, ordinary execution,
+stale recovery, and database reconstruction from an exported checkpoint.
+The [validation record](../review/2026-09-16-track3-validation.md) records the
+pinned environment and local latency measurements.
+
 Remaining integration gates are concrete consumers and environments:
 
 - Validate the native reference adapter and, when available, the private DEX
   bridge against the application contract and this bootstrap workflow.
 - Remeasure submit-to-matching-WS-event latency on the representative deployment.
-- Complete the broader recovery/watchdog scenarios in the pinned emulator
-  environment. The native Anvil recovery gate does not prove canonical-machine
-  comparison; the local host currently has emulator 0.21 while the repo pins 0.20.
 
 Revisit resumable snapshot transfer only when artifact size requires it;
 retained client checkpoints only when full rebootstrap cost matters; archival

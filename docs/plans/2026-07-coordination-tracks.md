@@ -23,10 +23,9 @@ freely at this stage — no backward-compatibility constraints.
 
 **Current campaign order:**
 
-1. Review and validate the integrated application-history, snapshot, and Track 3 cutover.
-2. Validate Track 6 against the reference C bridge, then the private DEX engine when shared.
-3. Run recovery/watchdog end-to-end gates and remeasure feed latency in the representative environment.
-4. Track 5 (fee LUT) only after the log-space-fees decision.
+1. Validate Track 6 against the reference C bridge, then the private DEX engine when shared.
+2. Exercise native-engine snapshot bootstrap and remeasure feed latency in the representative environment.
+3. Track 5 (fee LUT) only after the log-space-fees decision.
 
 Full restore archives now support file and directory application prefixes.
 Additional snapshot retention or transport mechanisms require a measured consumer need.
@@ -47,10 +46,11 @@ available backlog is replayable without a total catch-up cap, with bounded pages
 queues, and subscribers. Recovery refuses old claims before delivering inputs.
 
 The former physical replay cursor and sparse attribution design are superseded
-by the [application-history design](application-history.md). Native-engine
-bootstrap, representative latency measurements, and environment-dependent
-recovery/watchdog runs remain integration gates; no additional protocol layer
-is assumed for them.
+by the [application-history design](application-history.md). The wallet's cold
+replica and canonical recovery/watchdog gates have a
+[validation record](../review/2026-09-16-track3-validation.md). Native-engine
+bootstrap and representative latency measurements remain integration gates;
+no additional protocol layer is assumed for them.
 
 ## Track 5 — Fee exponentiation LUT (deferred)
 
