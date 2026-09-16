@@ -591,7 +591,8 @@ like a simplification and would break a registered invariant:
   `storage/mutations.rs`); `executed_inputs` constraints and invalidation
   trigger (`storage/migrations/0001_schema.sql`); storage-derived `H`
   (`storage/history.rs`); snapshot count checks
-  (`storage/snapshot_dumps.rs`); and pre-execution catch-up checks
+  (`storage/snapshot_dumps.rs`); coherent egress bounds/pages with contiguous
+  count checks (`storage/egress/canonical.rs`); and pre-execution catch-up checks
   (`ingress/inclusion_lane/catch_up.rs`).
 - **Depended on by:** restart determinism, standard-recovery rollback/reuse,
   post-cockroach continuation at `K`, snapshot coherence, and the future

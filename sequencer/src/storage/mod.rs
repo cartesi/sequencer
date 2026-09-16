@@ -52,7 +52,7 @@ pub(crate) use convert::is_persistent_storage_error;
 use std::time::SystemTime;
 use thiserror::Error;
 
-pub(crate) use egress::OrderedL2TxRow;
+pub(crate) use egress::L2TxContext;
 pub use history::{DirectInputExecution, HistoryState};
 pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
 pub use open::Storage;

@@ -49,7 +49,9 @@ remaining dated ledgers stay valid.
    log.
 6. **WS session hygiene** — a mid-session transient read error tears down
    with no close frame; a beyond-head `from_offset` idles forever (currently
-   e2e-pinned as intended — decide the contract, then re-pin).
+   e2e-pinned as intended). The accepted
+   [Track 3 contract](../plans/2026-07-track3-feed-replay-design.md#51-admission-and-continuity)
+   chooses a typed ahead-of-head error; API implementation and re-pinning remain open.
 7. **WS invalidation/rollback contract** — `/ws/subscribe` still pages by
    physical rowid with no `HistoryVersion` claim, so a cursor-resumed
    subscriber silently keeps invalidated rows across recovery. Interim

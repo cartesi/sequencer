@@ -3,12 +3,11 @@
 
 //! Egress reader: ordered-L2-tx queries used by the WS feed and catch-up replay.
 //!
-//! Read-only — every method here either pages the `valid_sequenced_l2_txs` view
-//! or counts over it. The view encapsulates the exclusion of invalidated batches
-//! so callers don't repeat the filter.
+//! Physical replay and canonical history use their respective `valid_*` views;
+//! payload and provenance decoding is shared between both coordinates.
 
 use alloy_primitives::{Address, B256};
-use rusqlite::{Result, params};
+use rusqlite::{Result, Row, params};
 
 use super::Storage;
 use super::convert::{i64_to_u32, i64_to_u64, saturating_query_bound};
@@ -16,62 +15,55 @@ use super::queries::decode_l2_tx_row;
 use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 
-/// One persisted L2 transaction and the ordering context of its covering frame.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Internal canonical reads await the coordinated WS cutover."
+    )
+)]
+mod canonical;
+
+/// Application input and persisted context shared by both replay coordinates.
 #[derive(Debug, Clone)]
-pub(crate) enum OrderedL2TxRow {
+pub(crate) enum L2TxContext {
     UserOp {
-        offset: u64,
         tx: ValidUserOp,
         nonce: u32,
         safe_block: u64,
         batch_nonce: u64,
-        executed_input_offset: Option<ExecutedInputCount>,
     },
     DirectInput {
-        offset: u64,
         tx: DirectInput,
         input_index: u64,
         safe_block: u64,
         batch_nonce: u64,
         block_timestamp: u64,
         transaction_hash: B256,
-        executed_input_offset: Option<ExecutedInputCount>,
     },
 }
 
-impl OrderedL2TxRow {
-    pub(crate) fn offset(&self) -> u64 {
-        match self {
-            Self::UserOp { offset, .. } | Self::DirectInput { offset, .. } => *offset,
-        }
-    }
+/// Physical replay row, including rows that do not execute in the application.
+#[derive(Debug, Clone)]
+pub(crate) struct OrderedL2TxRow {
+    pub(crate) offset: u64,
+    pub(crate) executed_input_offset: Option<ExecutedInputCount>,
+    pub(crate) context: L2TxContext,
+}
 
+impl OrderedL2TxRow {
     fn into_replay_row(self) -> ReplayL2TxRow {
-        match self {
-            Self::UserOp {
-                offset,
-                tx,
-                safe_block,
-                executed_input_offset,
-                ..
-            } => ReplayL2TxRow {
-                db_offset: offset,
-                tx: SequencedL2Tx::UserOp(tx),
-                frame_safe_block: safe_block,
-                executed_input_offset,
-            },
-            Self::DirectInput {
-                offset,
-                tx,
-                safe_block,
-                executed_input_offset,
-                ..
-            } => ReplayL2TxRow {
-                db_offset: offset,
-                tx: SequencedL2Tx::Direct(tx),
-                frame_safe_block: safe_block,
-                executed_input_offset,
-            },
+        let (tx, frame_safe_block) = match self.context {
+            L2TxContext::UserOp { tx, safe_block, .. } => (SequencedL2Tx::UserOp(tx), safe_block),
+            L2TxContext::DirectInput { tx, safe_block, .. } => {
+                (SequencedL2Tx::Direct(tx), safe_block)
+            }
+        };
+        ReplayL2TxRow {
+            db_offset: self.offset,
+            tx,
+            frame_safe_block,
+            executed_input_offset: self.executed_input_offset,
         }
     }
 }
@@ -167,44 +159,7 @@ impl Storage {
                 saturating_query_bound(offset),
                 saturating_query_bound(limit)
             ],
-            |row| {
-                let db_offset: i64 = row.get(0)?;
-                let tx = decode_l2_tx_row(
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                );
-                // Non-NULL for every sequenced row: batches and frames exist before
-                // anything can be sequenced into them.
-                let safe_block = i64_to_u64(row.get(7)?);
-                let batch_nonce = i64_to_u64(row.get(8)?);
-                let executed_input_offset = row
-                    .get::<_, Option<i64>>(13)?
-                    .map(|value| ExecutedInputCount::new(i64_to_u64(value)));
-                match tx {
-                    SequencedL2Tx::UserOp(tx) => Ok(OrderedL2TxRow::UserOp {
-                        offset: i64_to_u64(db_offset),
-                        tx,
-                        nonce: i64_to_u32(row.get(10)?),
-                        safe_block,
-                        batch_nonce,
-                        executed_input_offset,
-                    }),
-                    SequencedL2Tx::Direct(tx) => Ok(OrderedL2TxRow::DirectInput {
-                        offset: i64_to_u64(db_offset),
-                        tx,
-                        input_index: i64_to_u64(row.get(9)?),
-                        safe_block,
-                        batch_nonce,
-                        block_timestamp: i64_to_u64(row.get(11)?),
-                        transaction_hash: B256::from_slice(row.get::<_, Vec<u8>>(12)?.as_slice()),
-                        executed_input_offset,
-                    }),
-                }
-            },
+            decode_ordered_l2_tx_row,
         )?;
         rows.collect::<Result<Vec<_>>>()
     }
@@ -253,4 +208,40 @@ impl Storage {
         )?;
         Ok(i64_to_u64(value))
     }
+}
+
+fn decode_ordered_l2_tx_row(row: &Row<'_>) -> Result<OrderedL2TxRow> {
+    let tx = decode_l2_tx_row(
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    );
+    let safe_block = i64_to_u64(row.get(7)?);
+    let batch_nonce = i64_to_u64(row.get(8)?);
+    let context = match tx {
+        SequencedL2Tx::UserOp(tx) => L2TxContext::UserOp {
+            tx,
+            nonce: i64_to_u32(row.get(10)?),
+            safe_block,
+            batch_nonce,
+        },
+        SequencedL2Tx::Direct(tx) => L2TxContext::DirectInput {
+            tx,
+            input_index: i64_to_u64(row.get(9)?),
+            safe_block,
+            batch_nonce,
+            block_timestamp: i64_to_u64(row.get(11)?),
+            transaction_hash: B256::from_slice(row.get::<_, Vec<u8>>(12)?.as_slice()),
+        },
+    };
+    Ok(OrderedL2TxRow {
+        offset: i64_to_u64(row.get(0)?),
+        executed_input_offset: row
+            .get::<_, Option<i64>>(13)?
+            .map(|value| ExecutedInputCount::new(i64_to_u64(value))),
+        context,
+    })
 }

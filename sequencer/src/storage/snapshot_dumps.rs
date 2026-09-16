@@ -19,9 +19,9 @@ use std::sync::Arc;
 use rusqlite::{OptionalExtension, Result, Transaction, params};
 
 use super::convert::{i64_to_u64, u64_to_i64};
-use super::history::{bind_history_base_in, next_executed_input_count_in};
+use super::history::{bind_history_base_in, next_executed_input_count_in, query_history_state};
 use super::{Storage, is_persistent_storage_error, is_persistent_storage_open_error};
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::{ExecutedInputCount, HistoryVersion};
 
 /// A row in `dumps`: SQLite primary key plus the on-disk directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +118,8 @@ pub struct LeasedDump {
     pub prefix: PathBuf,
     pub l2_tx_index: u64,
     pub executed_input_count: ExecutedInputCount,
+    /// History in which this artifact was selected, captured with its lease.
+    pub history_version: HistoryVersion,
     pub guard: LeaseGuard,
 }
 
@@ -281,8 +283,8 @@ impl Storage {
         self.read(latest_snapshot_in)
     }
 
-    /// Atomically read the finalized snapshot AND lease its dump, returning it
-    /// bundled with an armed release ([`LeaseGuard`]). Closes the race where a
+    /// Atomically read the finalized snapshot and history version, and lease
+    /// its dump, bundled with an armed release ([`LeaseGuard`]). Closes the race where a
     /// handler reads the row, a promotion + GC delete the dump, and the open
     /// then fails: the lease is held from the moment of the read. `None` if no
     /// finalized snapshot exists. `schedule` controls where the (blocking)
@@ -300,22 +302,27 @@ impl Storage {
             let Some(finalized) = finalized_dump_in(tx)? else {
                 return Ok(None);
             };
+            let history_version = query_history_state(tx)?.version;
             acquire_dump_lease_in(tx, finalized.dump.id)?;
-            Ok(Some(finalized))
+            Ok(Some((finalized, history_version)))
         })?;
 
         Ok(acquired.map(
-            |FinalizedDump {
-                 dump,
-                 inclusion_block,
-                 l2_tx_index,
-                 executed_input_count,
-             }| FinalizedLease {
+            |(
+                FinalizedDump {
+                    dump,
+                    inclusion_block,
+                    l2_tx_index,
+                    executed_input_count,
+                },
+                history_version,
+            )| FinalizedLease {
                 inclusion_block,
                 dump: LeasedDump {
                     prefix: dump.prefix,
                     l2_tx_index,
                     executed_input_count,
+                    history_version,
                     // Arm the release only after `Storage::write` has committed
                     // the increment. A failed COMMIT rolls back the lease and
                     // must not schedule a decrement for a lease that never
@@ -345,16 +352,23 @@ impl Storage {
             let Some((dump, l2_tx_index, executed_input_count)) = latest_snapshot_in(tx)? else {
                 return Ok(None);
             };
+            let history_version = query_history_state(tx)?.version;
             let dump_id = dump.id;
             acquire_dump_lease_in(tx, dump_id)?;
-            Ok(Some((dump, l2_tx_index, executed_input_count)))
+            Ok(Some((
+                dump,
+                l2_tx_index,
+                executed_input_count,
+                history_version,
+            )))
         })?;
 
-        Ok(
-            acquired.map(|(dump, l2_tx_index, executed_input_count)| LeasedDump {
+        Ok(acquired.map(
+            |(dump, l2_tx_index, executed_input_count, history_version)| LeasedDump {
                 prefix: dump.prefix,
                 l2_tx_index,
                 executed_input_count,
+                history_version,
                 // See `acquire_finalized_lease`: the guard owns a release only
                 // after the matching increment is durable.
                 guard: LeaseGuard {
@@ -363,8 +377,8 @@ impl Storage {
                     schedule,
                     report_persistent_failure,
                 },
-            }),
-        )
+            },
+        ))
     }
 
     /// Return every row in `dumps`. Used at startup to reconcile
@@ -767,12 +781,21 @@ fn path_to_text(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::{Address, Signature};
+    use sequencer_core::history::RecoveryGeneration;
+    use sequencer_core::user_op::{SignedUserOp, UserOp};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::SystemTime;
+    use tokio::sync::oneshot;
 
-    use crate::storage::{ExecutedInputCount, LifecycleCommand, Storage, test_helpers::temp_db};
+    use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
+    use crate::storage::{
+        ExecutedInputCount, LifecycleCommand, SafeInputRange, Storage,
+        history::advance_recovery_generation_in, test_helpers::temp_db,
+    };
 
     use super::{DumpRow, FinalizedDump, FinalizedLease, LeaseGuard, PendingDump};
 
@@ -1349,6 +1372,135 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn snapshot_leases_keep_artifact_count_and_history_after_promotion_and_generation_advance() {
+        let db = temp_db("snapshot-lease-history");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .unwrap();
+        let first_id = storage.insert_finalized_dump(&prefix(0), 100, 0).unwrap();
+        let first_version = storage.history_state().unwrap().version;
+        let first_finalized = storage
+            .acquire_finalized_lease(Arc::new(inline), noop_reporter())
+            .unwrap()
+            .unwrap();
+        let first_latest = storage
+            .acquire_latest_snapshot_lease(Arc::new(inline), noop_reporter())
+            .unwrap()
+            .unwrap();
+
+        let (respond_to, _response) = oneshot::channel();
+        storage
+            .append_executed_user_ops_chunk(
+                &mut head,
+                &[IncludedUserOp {
+                    pending: PendingUserOp {
+                        signed: SignedUserOp {
+                            sender: Address::ZERO,
+                            signature: Signature::test_signature(),
+                            user_op: UserOp {
+                                nonce: 0,
+                                max_fee: u16::MAX,
+                                data: vec![].into(),
+                            },
+                        },
+                        respond_to,
+                        received_at: SystemTime::now(),
+                    },
+                    executed_input_offset: ExecutedInputCount::ZERO,
+                }],
+            )
+            .unwrap();
+        let next_id = storage.insert_pending_dump(&prefix(1), 0, 1).unwrap();
+        let pending = storage
+            .acquire_latest_snapshot_lease(Arc::new(inline), noop_reporter())
+            .unwrap()
+            .unwrap();
+        storage.promote_finalized(0, 101).unwrap();
+        storage.write(advance_recovery_generation_in).unwrap();
+
+        let next_version = storage.history_state().unwrap().version;
+        assert_eq!(next_version.era_id, first_version.era_id);
+        assert_eq!(next_version.recovery_generation, RecoveryGeneration::new(1));
+        for leased in [&first_finalized.dump, &first_latest] {
+            assert_eq!(leased.prefix, prefix(0));
+            assert_eq!(leased.executed_input_count, ExecutedInputCount::ZERO);
+            assert_eq!(leased.l2_tx_index, 0);
+            assert_eq!(leased.history_version, first_version);
+        }
+        assert_eq!(first_finalized.inclusion_block, 100);
+        assert_eq!(pending.prefix, prefix(1));
+        assert_eq!(pending.executed_input_count, ExecutedInputCount::new(1));
+        assert_eq!(pending.history_version, first_version);
+
+        let next_finalized = storage
+            .acquire_finalized_lease(Arc::new(inline), noop_reporter())
+            .unwrap()
+            .unwrap();
+        let next_latest = storage
+            .acquire_latest_snapshot_lease(Arc::new(inline), noop_reporter())
+            .unwrap()
+            .unwrap();
+        for leased in [&next_finalized.dump, &next_latest] {
+            assert_eq!(leased.prefix, prefix(1));
+            assert_eq!(leased.executed_input_count, ExecutedInputCount::new(1));
+            assert_eq!(leased.l2_tx_index, 1);
+            assert_eq!(leased.history_version, next_version);
+        }
+        assert_eq!(next_finalized.inclusion_block, 101);
+        assert!(storage.gc_unreferenced_dumps().unwrap().is_empty());
+        assert_eq!(storage.dump_lease_count(first_id).unwrap(), Some(2));
+        assert_eq!(storage.dump_lease_count(next_id).unwrap(), Some(3));
+
+        drop((
+            first_finalized,
+            first_latest,
+            pending,
+            next_finalized,
+            next_latest,
+        ));
+        assert_eq!(storage.dump_lease_count(first_id).unwrap(), Some(0));
+        assert_eq!(storage.dump_lease_count(next_id).unwrap(), Some(0));
+        assert_eq!(
+            storage.gc_unreferenced_dumps().unwrap(),
+            vec![DumpRow {
+                id: first_id,
+                prefix: prefix(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn failed_snapshot_history_query_does_not_lease_or_arm_a_release() {
+        let db = temp_db("snapshot-lease-history-query-failure");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let finalized_id = storage.insert_finalized_dump(&prefix(0), 100, 0).unwrap();
+        let pending_id = storage.insert_pending_dump(&prefix(1), 0, 1).unwrap();
+        storage
+            .conn
+            .execute_batch("DROP TABLE history_state")
+            .unwrap();
+        let scheduled = Arc::new(AtomicUsize::new(0));
+
+        assert!(
+            storage
+                .acquire_finalized_lease(counting_scheduler(scheduled.clone()), noop_reporter())
+                .is_err()
+        );
+        assert!(
+            storage
+                .acquire_latest_snapshot_lease(
+                    counting_scheduler(scheduled.clone()),
+                    noop_reporter()
+                )
+                .is_err()
+        );
+        assert_eq!(scheduled.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.dump_lease_count(finalized_id).unwrap(), Some(0));
+        assert_eq!(storage.dump_lease_count(pending_id).unwrap(), Some(0));
     }
 
     #[test]

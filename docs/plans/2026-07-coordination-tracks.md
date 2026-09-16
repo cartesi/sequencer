@@ -14,7 +14,7 @@ freely at this stage — no backward-compatibility constraints.
 |---|-------|-------|--------|
 | 1 | WS context fields + L1 provenance (PR #26) | Stephen | **done** — merged to main |
 | 2 | Restore `docs/review/` ledger + this plan | us | **done** |
-| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **storage foundation landed; public API open** — the [Track 3 ordered handoff](2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff) exclusively owns its sequence and decision gates |
+| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **internal read foundation implemented; consumer API open** — the [Track 3 ordered handoff](2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff) owns the accepted workflow and remaining cutover |
 | 4 | Storage decode policy | us | **done** — fail-loud for contract-impossible values; the named `saturating_query_bound` only where clamping preserves the predicate (policy lives in `storage/convert.rs` + the invariants check policy) |
 | 5 | Fee exponentiation LUT | us | **deferred** — decided exact-floor if built (the table *is* the spec, algorithm-free; replay continuity across the upgrade explicitly not preserved); a separate pending design decision may make log-space fees defunct — revisit after syncing with Bart |
 | 6 | Dump / `Application` API redesign | us + Bart | **revised interface implemented** — [Application contract](../protocol/application-contract.md); native bridge conformance is a separate integration branch |
@@ -23,9 +23,8 @@ freely at this stage — no backward-compatibility constraints.
 
 **Current campaign order:**
 
-1. Land the authority-boundary + durable-history-foundation branch (squashed,
-   review complete — ready for its PR against main).
-2. Implement Track 3's public protocol on a focused successor branch.
+1. Review the Track 3 internal history-read and snapshot-metadata foundation.
+2. Implement the coordinated Track 3 HTTP/WS/SDK cutover on its successor branch.
 3. Validate Track 6 against the reference C bridge, then the private DEX engine when shared.
 4. Track 5 (fee LUT) only after the log-space-fees decision.
 
@@ -34,37 +33,23 @@ Deferred (revisit with libdex rollout): multi-file/tar snapshot serving
 
 ## Track 3 — Feed & replay protocol redesign
 
-The current protocol grew ad hoc; the redesign is type-first and covers the
-whole consumer data-access story: paginated finalized-history endpoints plus
-the live subscription, composable without races. The
-[design doc](2026-07-track3-feed-replay-design.md) owns the requirements and
-the ordered implementation handoff; the storage/recovery foundation
-(era/generation metadata, canonical `ExecutedInputCount` attribution,
-snapshot/catch-up verification) is landed, while `GET /history-version`,
-replay routes, gold-boundary projection, and WS v2 remain open.
+Infrastructure subscribers download an application-defined snapshot over HTTP,
+restore their application, and use one WS stream for both canonical backlog and
+live inputs. The [design](2026-07-track3-feed-replay-design.md) owns the history
+claims, typed refusals, resource bounds, and fresh-snapshot recovery workflow.
+Raw `/inputs` and separate HTTP transaction replay are outside this feature.
+The watchdog retains its independent trusted-state/L1 comparison workflow.
 
-Settled decisions the implementation must respect:
+The internal foundation provides typed history claims and policy errors,
+coherent history-bound reads, inclusive canonical pagination, and history
+identity captured with a snapshot's lease and count. Existing HTTP/WS responses
+still expose physical cursors. The consumer cutover updates snapshot metadata,
+WS admission/replay, SDK, and harness together; it must also remove the total
+catch-up cap while retaining bounded pages, queues, and subscriber counts.
 
-- **Feed coordinate:** `Application::executed_input_count()`, not SQLite
-  rowid. An application at count `X` subscribes at `X`, consumes entry `X`,
-  advances to `X + 1`. Standard recovery may reuse suffix offsets under a new
-  generation; cockroach recovery records the folded count `K` as the era's
-  available-history base, and requests below `K` fail with `available_from`
-  plus the bootstrap recipe.
-- **Discontinuity detection is pull-based.** A crash or danger-detector exit
-  cannot send a farewell frame, so the load-bearing contract is the required
-  subscription claim `{era_id, recovery_generation, offset}` plus a
-  current-pair endpoint; in-band disconnect errors are best-effort only.
-  Bart confirmed the scalar generation contract (2026-07-28); the `EraId`
-  generalization and changed-era bootstrap behavior still need his consumer
-  review and are not attributed to that confirmation.
-- **Event framing:** per-row denormalized context (as shipped in PR #26);
-  no `FrameSealed`/`BatchSealed` boundary events unless a consumer
-  demonstrates the row context cannot express its need.
-- **Clock:** application time is safe-block based. Direct inputs execute at
-  their exact inclusion block; user ops at their frame's safe block.
-  `block_timestamp` may ride as provenance but is never an application
-  transition input (see the application contract).
+Close the consumer invalidation finding only after that cutover and its
+recovery/bootstrap acceptance tests. The next PR must demonstrate cold start,
+ordinary resume, fresh-snapshot recovery, and gap-free backlog-to-tip delivery.
 
 ## Track 5 — Fee exponentiation LUT (deferred)
 

@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::runtime::process_lock::spawn_blocking_with_lock;
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
-use crate::storage::{OrderedL2TxRow, Storage};
+use crate::storage::{L2TxContext, Storage};
 
 /// Best-effort extraction of a panic payload's message for fault causes.
 fn panic_message(payload: &dyn std::any::Any) -> &str {
@@ -260,18 +260,17 @@ fn run_subscription(
                 return Ok(());
             }
 
-            next_offset = row.offset();
-            let event = match row {
-                OrderedL2TxRow::UserOp {
-                    offset,
+            next_offset = row.offset;
+            let offset = row.offset;
+            let event = match row.context {
+                L2TxContext::UserOp {
                     tx,
                     nonce,
                     safe_block,
                     batch_nonce,
                     ..
                 } => BroadcastTxMessage::from_user_op(offset, tx, nonce, safe_block, batch_nonce),
-                OrderedL2TxRow::DirectInput {
-                    offset,
+                L2TxContext::DirectInput {
                     tx,
                     input_index,
                     batch_nonce,
