@@ -1527,6 +1527,11 @@ mod tests {
             head.frame_fee, 1356,
             "WriteHead.frame_fee must stay stable until advance_frame runs",
         );
+        assert_eq!(
+            storage.current_fee_quote().expect("quote"),
+            Some((1356, 1456)),
+            "quote splits the frozen open-frame fee from the advanced recommended_fee",
+        );
 
         // Closing the frame picks up the new policy — the *next* frame opens
         // at 1456. This is the expected policy-flow boundary.
@@ -1537,6 +1542,11 @@ mod tests {
         assert_eq!(
             head.frame_fee, 1456,
             "the next frame must use the updated policy's fee (policy flows in at close)",
+        );
+        assert_eq!(
+            storage.current_fee_quote().expect("quote"),
+            Some((1456, 1456)),
+            "after rotation the quote's two fees agree again",
         );
     }
 

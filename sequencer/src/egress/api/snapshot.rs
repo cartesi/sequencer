@@ -38,10 +38,11 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 
+use crate::http::{StorageTaskError, storage_task};
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
 use crate::storage::{FinalizedLease, LeaseGuard, LeasedDump, ReleaseScheduler, Storage};
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type BoxError = StorageTaskError;
 
 /// Wiring for the snapshot endpoints: where the DB is, and how to find the
 /// canonical state file inside a dump. `state_file_in_dump` is threaded as a
@@ -89,9 +90,11 @@ struct InclusionBlockResponse {
 /// opened). 404 if no finalized snapshot exists.
 async fn finalized_inclusion_block(State(state): State<Arc<SnapshotApiState>>) -> Response {
     let db_path = state.snapshot.db_path.clone();
-    let result = storage_task(&state, "read finalized inclusion block", move |_scope| {
-        Ok(Storage::open_read_only(&db_path)?.finalized_dump()?)
-    })
+    let result = storage_task(
+        state.shutdown.clone(),
+        "read finalized inclusion block",
+        move |_scope| Ok(Storage::open_read_only(&db_path)?.finalized_dump()?),
+    )
     .await;
     match result {
         Ok(Some(finalized)) => Json(InclusionBlockResponse {
@@ -188,69 +191,44 @@ fn stream_body(file: File, guard: LeaseGuard) -> Body {
     }))
 }
 
-// ── Blocking storage tasks ─────────────────────────────────────────────────
-
-/// Classify inside the blocking task: cancellation of the HTTP request must
-/// not discard a persistent fault discovered by work that already started.
-async fn storage_task<T, F>(
-    state: &SnapshotApiState,
-    operation: &'static str,
-    work: F,
-) -> Result<T, BoxError>
-where
-    T: Send + 'static,
-    F: FnOnce(RuntimeScope) -> Result<T, BoxError> + Send + 'static,
-{
-    let scope = state.shutdown.clone();
-    match tokio::task::spawn_blocking(move || {
-        // The independent clone outlives both work and its SQLite connection,
-        // even when work consumes its scope argument before returning.
-        let _runtime_lifetime = scope.clone();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(scope))) {
-            Ok(Err(error)) if persistent_storage_error(error.as_ref()) => {
-                abort_terminal(format_args!("{operation}: {error}"));
-            }
-            Ok(result) => result,
-            Err(_) => abort_terminal(format_args!("{operation}: storage task panicked")),
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(join) if join.is_panic() => abort_terminal(format_args!("{operation}: {join}")),
-        Err(join) => Err(Box::new(join)),
-    }
-}
-
 // ── Lease acquisition (storage returns the dump bundled with its release) ──
 
 async fn acquire_finalized(state: &SnapshotApiState) -> Result<Option<FinalizedLease>, BoxError> {
     let db_path = state.snapshot.db_path.clone();
     let release_scheduler = state.release_scheduler.clone();
-    storage_task(state, "acquire finalized snapshot lease", move |scope| {
-        let report_persistent_failure: crate::storage::PersistentReleaseFailureReporter =
-            Arc::new(move |cause: &str| {
-                let _runtime_lifetime = &scope;
-                abort_terminal(cause)
-            });
-        let mut storage = Storage::open_writer(&db_path)?;
-        Ok(storage.acquire_finalized_lease(release_scheduler, report_persistent_failure)?)
-    })
+    storage_task(
+        state.shutdown.clone(),
+        "acquire finalized snapshot lease",
+        move |scope| {
+            let report_persistent_failure: crate::storage::PersistentReleaseFailureReporter =
+                Arc::new(move |cause: &str| {
+                    let _runtime_lifetime = &scope;
+                    abort_terminal(cause)
+                });
+            let mut storage = Storage::open_writer(&db_path)?;
+            Ok(storage.acquire_finalized_lease(release_scheduler, report_persistent_failure)?)
+        },
+    )
     .await
 }
 
 async fn acquire_latest(state: &SnapshotApiState) -> Result<Option<LeasedDump>, BoxError> {
     let db_path = state.snapshot.db_path.clone();
     let release_scheduler = state.release_scheduler.clone();
-    storage_task(state, "acquire latest snapshot lease", move |scope| {
-        let report_persistent_failure: crate::storage::PersistentReleaseFailureReporter =
-            Arc::new(move |cause: &str| {
-                let _runtime_lifetime = &scope;
-                abort_terminal(cause)
-            });
-        let mut storage = Storage::open_writer(&db_path)?;
-        Ok(storage.acquire_latest_snapshot_lease(release_scheduler, report_persistent_failure)?)
-    })
+    storage_task(
+        state.shutdown.clone(),
+        "acquire latest snapshot lease",
+        move |scope| {
+            let report_persistent_failure: crate::storage::PersistentReleaseFailureReporter =
+                Arc::new(move |cause: &str| {
+                    let _runtime_lifetime = &scope;
+                    abort_terminal(cause)
+                });
+            let mut storage = Storage::open_writer(&db_path)?;
+            Ok(storage
+                .acquire_latest_snapshot_lease(release_scheduler, report_persistent_failure)?)
+        },
+    )
     .await
 }
 
@@ -288,23 +266,6 @@ fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
 fn internal_error(context: &str, err: impl std::fmt::Display) -> Response {
     tracing::warn!(error = %err, context, "snapshot endpoint failed");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
-}
-fn persistent_storage_error(mut error: &(dyn std::error::Error + 'static)) -> bool {
-    loop {
-        let persistent = error
-            .downcast_ref::<rusqlite::Error>()
-            .is_some_and(crate::storage::is_persistent_storage_error)
-            || error
-                .downcast_ref::<crate::storage::StorageOpenError>()
-                .is_some_and(crate::storage::is_persistent_storage_open_error);
-        if persistent {
-            return true;
-        }
-        let Some(source) = error.source() else {
-            return false;
-        };
-        error = source;
-    }
 }
 
 #[cfg(test)]
@@ -430,7 +391,7 @@ mod tests {
             None,
         ));
 
-        assert!(!persistent_storage_error(&error));
+        assert!(!crate::http::persistent_storage_error(&error));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -477,19 +438,12 @@ mod tests {
         ) {
             return;
         }
-        let state = SnapshotApiState {
-            snapshot: SnapshotState {
-                db_path: String::new(),
-                state_file_in_dump: |prefix| prefix.join("state"),
-            },
-            shutdown: RuntimeScope::default(),
-            release_scheduler: Arc::new(|release| release()),
-        };
+        let shutdown = RuntimeScope::default();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let request = tokio::spawn(async move {
             storage_task::<(), _>(
-                &state,
+                shutdown,
                 "cancelled request corruption probe",
                 move |_scope| {
                     started_tx.send(()).expect("started storage task");

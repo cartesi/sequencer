@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 
-use crate::http::ApiError;
+use crate::http::{ApiError, storage_task};
 use crate::ingress::inclusion_lane::PendingUserOp;
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::Storage;
@@ -130,26 +130,18 @@ async fn submit_tx(
 async fn get_fee(State(state): State<Arc<FeeState>>) -> Result<Response, ApiError> {
     state.reject_if_shutting_down()?;
     let db_path = state.db_path.clone();
-    let shutdown = state.shutdown.clone();
-    let quote = tokio::task::spawn_blocking(move || {
-        let _runtime_lifetime = shutdown;
-        read_fee_quote(&db_path)
+    let result = storage_task(state.shutdown.clone(), "read fee quote", move |_scope| {
+        let mut storage = Storage::open_read_only(&db_path)?;
+        Ok(storage.current_fee_quote()?)
     })
-    .await
-    .map_err(|_| ApiError::internal_error("fee read task failed"))??;
-    Ok(Json(quote).into_response())
-}
-
-fn read_fee_quote(db_path: &str) -> Result<FeeResponse, ApiError> {
-    let mut storage = Storage::open_read_only(db_path).map_err(|err| {
-        tracing::debug!(error = %err, "GET /fee storage open failed");
-        ApiError::internal_error("fee unavailable")
-    })?;
-    match storage.current_fee_quote() {
-        Ok(Some((fee, recommended_fee))) => Ok(FeeResponse::quote(fee, recommended_fee)),
+    .await;
+    match result {
+        Ok(Some((fee, recommended_fee))) => {
+            Ok(Json(FeeResponse::quote(fee, recommended_fee)).into_response())
+        }
         Ok(None) => Err(ApiError::unavailable("no open frame")),
         Err(err) => {
-            tracing::debug!(error = %err, "GET /fee quote read failed");
+            tracing::warn!(error = %err, "GET /fee failed");
             Err(ApiError::internal_error("fee unavailable"))
         }
     }
@@ -311,6 +303,41 @@ mod tests {
             .expect_err("fee requires an open frame");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.code(), "UNAVAILABLE");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn corrupt_fee_policy_trips_terminal_storage_fault() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "ingress::api::tests::corrupt_fee_policy_trips_terminal_storage_fault",
+        ) {
+            return;
+        }
+        let db = TempDir::new().expect("create temp dir");
+        let db_path = db.path().join("sequencer.db");
+        let mut storage = Storage::open(&db_path.to_string_lossy()).expect("create db");
+        storage
+            .initialize_open_state(0, crate::storage::SafeInputRange::empty_at(0))
+            .expect("open tip");
+        drop(storage);
+
+        let conn = Storage::open_connection(&db_path.to_string_lossy()).expect("raw connection");
+        conn.execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE batch_policy SET log_delta = -10000 WHERE singleton_id = 0;",
+        )
+        .expect("inject impossible policy row");
+        drop(conn);
+
+        let state = Arc::new(FeeState::new(
+            db_path.to_string_lossy().into_owned(),
+            RuntimeScope::default(),
+        ));
+        let result = get_fee(State(state)).await;
+        panic!(
+            "terminal fee fault returned instead of aborting: {:?}",
+            result.as_ref().err().map(ApiError::status)
+        );
     }
 
     fn sign_user_op_hex(
