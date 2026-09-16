@@ -17,9 +17,9 @@
 //!    **address**, and fee-oracle identity), and persist the first price.
 //!    `setup` never signs.
 //! 4. Initial L1 sync: read all direct inputs up to the current safe head.
-//! 5. For plain setup, construct and register the genesis application state as
-//!    the finalized snapshot. Recovery supplies its state from the checkpoint.
-//! 6. Commit the `setup_complete` fact.
+//! 5. Create the durable genesis or recovered application baseline dump.
+//! 6. Atomically register complete baseline metadata, its artifact, any recovery
+//!    root, and the `setup_complete` fact.
 //!
 //! `setup` is L1-read-only: it takes the batch-submitter address (not the
 //! key) and does no L1 writes.
@@ -231,7 +231,7 @@ where
     // block (the scan genesis — no input exists before it).
     // `B = 0` is the genesis bootstrap (no checkpoint) and is always valid.
     // (plain setup detects only; loading a non-genesis checkpoint machine and
-    // the `A < B` check are `setup --recovery`'s job.)
+    // the checkpoint clock check are `setup --recovery`'s job.)
     if config.checkpoint_block != 0 && config.checkpoint_block < input_reader.app_deployment_block()
     {
         return Err(BootstrapError::CheckpointBeforeAppDeployment {
@@ -318,27 +318,15 @@ where
             nonce_views,
         )?;
 
-        // Refuse to register genesis over leftover recovery state. A
-        // `setup --recovery` that crashed before completion leaves a non-zero
-        // batch-tree anchor (and maybe a root tip); booting genesis-style over
-        // it would root the tree at the recovery nonce instead of 0. Fail loud
-        // Setup completion is absent in both the fresh-genesis and interrupted
-        // recovery cases, so we check the anchor explicitly. Operator wipes
-        // the data dir and re-runs.
-        let anchor = storage.batch_tree_anchor()?;
-        if anchor != 0 {
-            return Err(SetupRecoveryError::GenesisOverRecoveryResidue { anchor }.into());
-        }
-
         // ── Genesis snapshot ─────────────────────────────────────
         // Construct only after the admission facts and every
         // detect-and-refuse gate. Factory errors follow normal setup settlement;
         // completed no-ops and recovery never construct genesis state.
         let genesis_app = genesis_app()?;
-        fill::register_genesis_finalized_snapshot::<A>(genesis_app, &mut storage, &dumps_dir)?;
+        fill::register_genesis_baseline::<A>(genesis_app, &mut storage, &dumps_dir)?;
     }
 
-    // The caller commits setup_complete + Ready as one final transaction.
+    // Baseline registration committed setup_complete with the restore point.
     tracing::info!(
         data_dir = %config.data_dir,
         chain_id = identity.chain_id,
@@ -392,10 +380,13 @@ fn settle_setup_lifecycle(
 ) -> Result<(), CommandError> {
     match result {
         Ok(()) => {
-            // The completion fact is part of the command, not telemetry: if
-            // it cannot be written, setup did not complete.
-            let mut storage = storage::Storage::open_writer(db_path)?;
-            storage.complete_setup()?;
+            let storage = storage::Storage::open_read_only(db_path)?;
+            if !storage.is_setup_complete()? {
+                return Err(storage::LifecycleError::Malformed(
+                    "setup returned without its complete baseline".to_string(),
+                )
+                .into());
+            }
             Ok(())
         }
         Err(_) => {
@@ -426,17 +417,33 @@ struct Checkpoint<A> {
 
 impl<A: Application> Checkpoint<A> {
     /// Load `S` from the dump dir, derive `A` and `N`, and enforce the load-time
-    /// precondition `A < B` (else the `(A, B]` fridge range is ill-defined). All
-    /// failures are terminal — the operator must supply a valid checkpoint.
+    /// precondition `A < B`, except for the known empty genesis checkpoint.
+    /// Equality otherwise hides pending directs later in the same block.
     fn load(dir: &std::path::Path, checkpoint_block: u64) -> Result<Self, SetupRecoveryError> {
         let load_err = |message: String| SetupRecoveryError::CheckpointLoad {
             path: dir.display().to_string(),
             message,
         };
         let info = dump_info::read_info(dir).map_err(|e| load_err(e.to_string()))?;
+        let checkpoint =
+            dump_info::read_checkpoint_info(dir).map_err(|e| load_err(e.to_string()))?;
+        if checkpoint.inclusion_block != checkpoint_block {
+            return Err(load_err(format!(
+                "checkpoint receipt block {} differs from configured block {checkpoint_block}",
+                checkpoint.inclusion_block,
+            )));
+        }
+        if checkpoint.next_batch_nonce != info.next_batch_nonce {
+            return Err(load_err(
+                "checkpoint receipt nonce differs from immutable dump metadata".into(),
+            ));
+        }
         let app = A::from_dump(&dump_info::app_prefix(dir)).map_err(|e| load_err(e.to_string()))?;
         let executed_safe_block = app.last_executed_safe_block();
-        if executed_safe_block >= checkpoint_block {
+        let is_genesis = checkpoint_block == 0
+            && info.next_batch_nonce == 0
+            && app.executed_input_count() == sequencer_core::history::ExecutedInputCount::ZERO;
+        if executed_safe_block >= checkpoint_block && !is_genesis {
             return Err(SetupRecoveryError::CheckpointNotBeforeBlock {
                 executed_safe_block,
                 checkpoint_block,
@@ -511,7 +518,7 @@ async fn recover<A>(
 where
     A: Application + 'static,
 {
-    // 1. Load the trusted checkpoint (S, A, N, B); require A < B.
+    // 1. Load the trusted checkpoint (S, A, N, B); require A < B or empty genesis.
     let checkpoint_dir = std::path::Path::new(
         config
             .checkpoint_dump_dir
@@ -564,10 +571,8 @@ where
         stop_block,
     )?;
 
-    // 6. Fill the DB: finalized S', tree anchored at N', cursor past the ≤C
-    //    directs (already in S'). run boots from this state, and its first sync
-    //    populates the gold frontier from L1 with the anchor = N' (so the folded
-    //    `< N'` batches are skipped as trusted collapsed history, not foreign).
+    // 6. Publish the local resume baseline and root atomically. The first run
+    //    scans acceptance only after C, beginning with expected nonce N'.
     fill::fill_recovery_state(recovered_app, resume_nonce, stop_block, storage, dumps_dir)?;
 
     tracing::info!(
@@ -758,15 +763,158 @@ mod tests {
     use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
 
     #[test]
+    fn checkpoint_load_requires_an_export_receipt_matching_the_artifact_and_block() {
+        use crate::commands::test_support::SweepTestApp;
+        let dir = tempfile::tempdir().expect("checkpoint parent");
+        let prefix = dir.path().join("checkpoint");
+        let mut app = SweepTestApp;
+        dump_info::create_dump_dir_with_info(
+            &mut app,
+            &prefix,
+            &dump_info::DumpInfo::at_baseline(3),
+        )
+        .expect("create artifact");
+        assert!(matches!(
+            Checkpoint::<SweepTestApp>::load(&prefix, 10),
+            Err(SetupRecoveryError::CheckpointLoad { .. })
+        ));
+        let write_receipt = |nonce| {
+            let receipt = dump_info::CheckpointInfo {
+                format_version: dump_info::FORMAT_VERSION,
+                next_batch_nonce: nonce,
+                inclusion_block: 10,
+            };
+            std::fs::write(
+                prefix.join("checkpoint.toml"),
+                toml::to_string(&receipt).unwrap(),
+            )
+            .expect("write receipt");
+        };
+        write_receipt(4);
+        assert!(matches!(
+            Checkpoint::<SweepTestApp>::load(&prefix, 10),
+            Err(SetupRecoveryError::CheckpointLoad { .. })
+        ));
+        write_receipt(3);
+        assert!(matches!(
+            Checkpoint::<SweepTestApp>::load(&prefix, 11),
+            Err(SetupRecoveryError::CheckpointLoad { .. })
+        ));
+        let checkpoint = Checkpoint::<SweepTestApp>::load(&prefix, 10).unwrap();
+        assert_eq!(
+            (checkpoint.checkpoint_nonce, checkpoint.checkpoint_block),
+            (3, 10)
+        );
+    }
+
+    #[test]
+    fn genesis_checkpoint_loads_and_has_an_empty_seed_interval() {
+        use crate::commands::test_support::SweepTestApp;
+        let dir = tempfile::tempdir().expect("checkpoint parent");
+        let prefix = dir.path().join("genesis");
+        let mut app = SweepTestApp;
+        dump_info::create_dump_dir_with_info(
+            &mut app,
+            &prefix,
+            &dump_info::DumpInfo::at_baseline(0),
+        )
+        .expect("genesis artifact");
+        std::fs::write(
+            prefix.join("checkpoint.toml"),
+            toml::to_string(&dump_info::CheckpointInfo {
+                format_version: dump_info::FORMAT_VERSION,
+                next_batch_nonce: 0,
+                inclusion_block: 0,
+            })
+            .unwrap(),
+        )
+        .expect("genesis receipt");
+        let checkpoint = Checkpoint::<SweepTestApp>::load(&prefix, 0).expect("load genesis export");
+        assert_eq!(checkpoint.executed_safe_block, checkpoint.checkpoint_block);
+        let db = temp_db("genesis-checkpoint-seed");
+        let mut storage = Storage::open(&db.path).expect("storage");
+        storage
+            .append_safe_inputs(
+                10,
+                &[StoredSafeInput {
+                    sender: Address::repeat_byte(0x22),
+                    payload: vec![1],
+                    block_number: 5,
+                }],
+                SENDER_A,
+                &default_protocol_timing(),
+            )
+            .expect("post-genesis direct");
+        let (seeds, replay) = source_fold_inputs(&mut storage, &checkpoint, 10, SENDER_A)
+            .expect("source empty seed and replay");
+        assert!(seeds.is_empty());
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].inclusion_block, 5);
+    }
+
+    #[test]
+    fn non_genesis_checkpoint_rejects_equal_execution_and_inclusion_blocks() {
+        use app_core::application::{WalletApp, WalletConfig};
+        use sequencer_core::application::execute_direct_input;
+        use sequencer_core::l2_tx::DirectInput;
+
+        let dir = tempfile::tempdir().expect("checkpoint parent");
+        let prefix = dir.path().join("checkpoint");
+        let mut app = WalletApp::new(WalletConfig::devnet());
+        execute_direct_input(
+            &mut app,
+            &DirectInput {
+                sender: Address::repeat_byte(0x22),
+                payload: vec![],
+                block_number: 10,
+            },
+        )
+        .expect("execute direct at checkpoint block");
+        dump_info::create_dump_dir_with_info(
+            &mut app,
+            &prefix,
+            &dump_info::DumpInfo::at_batch_close(0),
+        )
+        .expect("checkpoint artifact");
+        std::fs::write(
+            prefix.join("checkpoint.toml"),
+            toml::to_string(&dump_info::CheckpointInfo {
+                format_version: dump_info::FORMAT_VERSION,
+                next_batch_nonce: 1,
+                inclusion_block: 10,
+            })
+            .unwrap(),
+        )
+        .expect("checkpoint receipt");
+
+        // A direct arriving after this batch in the same L1 block is still
+        // pending, but the (A, B] seed interval would omit the whole block.
+        let error = Checkpoint::<WalletApp>::load(&prefix, 10).err().unwrap();
+        assert!(matches!(
+            error,
+            SetupRecoveryError::CheckpointNotBeforeBlock {
+                executed_safe_block: 10,
+                checkpoint_block: 10,
+            }
+        ));
+        assert!(error.to_string().contains("pending same-block directs"));
+    }
+
+    #[test]
     fn completed_plain_setup_is_a_noop_and_writes_nothing() {
         let db = temp_db("setup-noop-preserves-recovery");
         let mut storage =
             Storage::initialize_for_command(db.path.as_str(), storage::LifecycleCommand::Setup)
                 .expect("initialize");
         storage
-            .insert_initial_finalized_dump(&db._dir.path().join("finalized"), 0, 0, 0, 0)
-            .expect("register finalized snapshot");
-        storage.complete_setup().expect("complete setup");
+            .complete_baseline_setup(
+                &db._dir.path().join("baseline"),
+                sequencer_core::history::ExecutedInputCount::ZERO,
+                0,
+                0,
+                false,
+            )
+            .expect("complete setup");
         storage
             .record_terminal_fault(storage::LifecycleCommand::Run, "prior terminal death")
             .expect("record prior fault");

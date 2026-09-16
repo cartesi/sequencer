@@ -115,9 +115,9 @@ cockroach recovery supplies an absolute starting count from the recovered
 engine. SQLite stores an independent expected snapshot count and per-input
 execution offsets, checked during catch-up.
 
-The current HTTP/WS feed still uses physical SQLite rowids. History-version
-and canonical-offset projection remain Track 3 work; clients must follow the
-current README until that cutover.
+HTTP snapshot metadata and mandatory WS claims carry the history version and
+this count. Both restart and subscriber replay read the same current application
+sequence; see the [API contract](../../README.md).
 
 ### 5. Operational capacity for L1 reconciliation
 
@@ -126,7 +126,7 @@ accumulated input range the persisted frontier can expose in one L1
 reconciliation turn, including backlog within the supported operating
 envelope. The lane processes that range before returning to user-op work.
 There is no elapsed-time cutoff, preemption, or durable timeout-and-resume
-cursor. Paging may bound memory; the drain/promotion commit remains atomic.
+cursor. Paging may bound memory; the complete-range reconciliation commit remains atomic.
 
 This is a deployment assumption. A request overlapping reconciliation or
 synchronous checkpoint creation may see extra acknowledgement latency.

@@ -90,8 +90,8 @@ pub enum RecoveryRefusalReason {
     /// assumes the opposite and is forbidden.
     #[error("canonical divergence at batch nonce {nonce}")]
     CanonicalDivergence { nonce: u64 },
-    #[error("the completed setup has no finalized snapshot")]
-    MissingFinalizedSnapshot,
+    #[error("the completed setup has no recovery checkpoint")]
+    MissingRecoveryCheckpoint,
     #[error("post-sync recovery has no persisted safe head")]
     MissingSafeHead,
     /// The `EnsureOpenTip` transaction violated its open-Tip postcondition.
@@ -165,9 +165,9 @@ fn refuse_local_terminal(facts: RecoveryInspection) -> Result<(), RecoveryError>
             RecoveryRefusalReason::CanonicalDivergence { nonce },
         ));
     }
-    if !facts.has_finalized_snapshot {
+    if !facts.has_recovery_checkpoint {
         return Err(RecoveryError::refuse(
-            RecoveryRefusalReason::MissingFinalizedSnapshot,
+            RecoveryRefusalReason::MissingRecoveryCheckpoint,
         ));
     }
     Ok(())
@@ -470,8 +470,8 @@ fn classify_mutation(error: RecoveryMutationError) -> RecoveryError {
         RecoveryMutationError::CanonicalDivergence { nonce } => {
             RecoveryError::refuse(RecoveryRefusalReason::CanonicalDivergence { nonce })
         }
-        RecoveryMutationError::MissingFinalizedSnapshot => {
-            RecoveryError::refuse(RecoveryRefusalReason::MissingFinalizedSnapshot)
+        RecoveryMutationError::MissingRecoveryCheckpoint => {
+            RecoveryError::refuse(RecoveryRefusalReason::MissingRecoveryCheckpoint)
         }
         RecoveryMutationError::MissingSafeHead => {
             RecoveryError::refuse(RecoveryRefusalReason::MissingSafeHead)
@@ -627,14 +627,14 @@ mod tests {
             RecoveryMutationError::CanonicalDivergence { nonce: 7 },
         ));
         assert_refuse(classify_mutation(
-            RecoveryMutationError::MissingFinalizedSnapshot,
+            RecoveryMutationError::MissingRecoveryCheckpoint,
         ));
         assert_refuse(classify_mutation(RecoveryMutationError::MissingSafeHead));
     }
 
     fn admission_fixture(
         name: &str,
-        has_finalized_snapshot: bool,
+        has_recovery_checkpoint: bool,
         has_open_tip: bool,
     ) -> (crate::storage::test_helpers::TestDb, ProtocolTiming) {
         use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
@@ -658,18 +658,23 @@ mod tests {
             .expect("seed fresh safe head");
         let prefix = db._dir.path().join("finalized");
         storage
-            .insert_initial_finalized_dump(&prefix, 0, 0, 0, 0)
-            .expect("seed finalized snapshot");
+            .complete_baseline_setup(
+                &prefix,
+                sequencer_core::history::ExecutedInputCount::ZERO,
+                0,
+                0,
+                false,
+            )
+            .expect("seed recovery checkpoint");
         if has_open_tip {
             storage
                 .initialize_open_state(0, storage::SafeInputRange::empty_at(0))
                 .expect("seed open Tip");
         }
-        storage.complete_setup().expect("complete setup");
-        if !has_finalized_snapshot {
+        if !has_recovery_checkpoint {
             storage
                 .write(|tx| {
-                    tx.execute("DELETE FROM finalized_snapshot", [])?;
+                    tx.execute("DELETE FROM snapshots WHERE batch_index IS NULL", [])?;
                     Ok(())
                 })
                 .expect("simulate post-setup snapshot loss");
@@ -835,8 +840,17 @@ mod tests {
         let block = protocol.danger_threshold();
         let mut storage = storage::Storage::open_writer(&db.path).unwrap();
         let mut head = storage.open_state().unwrap().unwrap();
+        storage
+            .close_frame_only(&mut head, block, storage::SafeInputRange::empty_at(0))
+            .unwrap();
         storage.close_frame_and_batch(&mut head, block).unwrap();
+        storage
+            .insert_batch_snapshot(&db._dir.path().join("batch0"), 0)
+            .unwrap();
         storage.close_frame_and_batch(&mut head, block).unwrap();
+        storage
+            .insert_batch_snapshot(&db._dir.path().join("batch1"), 1)
+            .unwrap();
         storage
             .append_safe_inputs_with_timestamp(
                 block,
@@ -1027,14 +1041,14 @@ mod tests {
         let (db, protocol) = admission_fixture("admit-no-snapshot", false, true);
 
         let error = admit_runtime(&db.path, &protocol)
-            .expect_err("a missing finalized snapshot must refuse final admission");
+            .expect_err("a missing recovery checkpoint must refuse final admission");
         assert!(matches!(
             error,
             RecoveryError::Refuse(failure)
                 if matches!(
                     *failure,
                     RecoveryFailure::PolicyRefusal(
-                        RecoveryRefusalReason::MissingFinalizedSnapshot
+                        RecoveryRefusalReason::MissingRecoveryCheckpoint
                     )
                 )
         ));

@@ -13,6 +13,10 @@
  * and crash erase them; another attempt must flush again before cascading.
  * Persisted history and danger facts survive. Terminal-fault telemetry does
  * not gate admission and is outside the model.
+ *
+ * A recovery checkpoint is the baseline or an accepted batch snapshot. It
+ * survives every standard cascade; an unaccepted snapshot alone is insufficient.
+ * Artifact creation, leases, and garbage collection are outside this model.
  *)
 
 EXTENDS TLC
@@ -48,12 +52,12 @@ MissingSafeHead == "MissingSafeHead"
 PostFlushViews == {CaughtUp, Behind, MissingSafeHead}
 
 VARIABLES controller, admittedRuntime, prepared, flushed, postFlushView,
-          danger, hasFinalizedSnapshot, hasOpenTip, canonicalDivergence
+          danger, hasRecoveryCheckpoint, hasOpenTip, canonicalDivergence
 
 vars == <<controller, admittedRuntime, prepared, flushed, postFlushView,
-          danger, hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
+          danger, hasRecoveryCheckpoint, hasOpenTip, canonicalDivergence>>
 
-LocalTerminal == canonicalDivergence \/ ~hasFinalizedSnapshot
+LocalTerminal == canonicalDivergence \/ ~hasRecoveryCheckpoint
 Clean == ~LocalTerminal /\ danger = Safe /\ hasOpenTip
 
 Init ==
@@ -63,7 +67,7 @@ Init ==
     /\ flushed = FALSE
     /\ postFlushView = NoPostFlushView
     /\ danger \in DangerStates
-    /\ hasFinalizedSnapshot \in BOOLEAN
+    /\ hasRecoveryCheckpoint \in BOOLEAN
     /\ hasOpenTip \in BOOLEAN
     /\ canonicalDivergence \in BOOLEAN
 
@@ -73,12 +77,12 @@ Settle ==
     /\ prepared' = FALSE
     /\ flushed' = FALSE
     /\ postFlushView' = NoPostFlushView
-    /\ UNCHANGED <<danger, hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
+    /\ UNCHANGED <<danger, hasRecoveryCheckpoint, hasOpenTip, canonicalDivergence>>
 
 MoveTo(next) ==
     /\ controller' = next
     /\ UNCHANGED <<admittedRuntime, prepared, flushed, postFlushView,
-                    danger, hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
+                    danger, hasRecoveryCheckpoint, hasOpenTip, canonicalDivergence>>
 
 BeginRun ==
     /\ controller = Idle
@@ -103,7 +107,7 @@ SyncCompleted ==
            ELSE /\ controller' = Cascade
                 /\ postFlushView' \in PostFlushViews
         /\ UNCHANGED <<admittedRuntime, prepared, flushed,
-                        hasFinalizedSnapshot, hasOpenTip>>
+                        hasRecoveryCheckpoint, hasOpenTip>>
 
 InitialProviderFailure ==
     /\ controller = InitialSync
@@ -123,7 +127,7 @@ FlushCompleted ==
     /\ controller' = PostFlushSync
     /\ flushed' = TRUE
     /\ UNCHANGED <<admittedRuntime, prepared, postFlushView, danger,
-                    hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
+                    hasRecoveryCheckpoint, hasOpenTip, canonicalDivergence>>
 
 (* Repair methods commit an open Tip in the same transaction as their
  * mutation. No L1 observation changes, so observed danger cannot reappear;
@@ -133,7 +137,7 @@ CommitRepair ==
     /\ hasOpenTip' = TRUE
     /\ danger' \in {Safe, RetryDanger}
     /\ UNCHANGED <<admittedRuntime, prepared, flushed, postFlushView,
-                    hasFinalizedSnapshot, canonicalDivergence>>
+                    hasRecoveryCheckpoint, canonicalDivergence>>
 
 LocalRepairCompleted ==
     /\ controller \in {EnsureOpenTip, RecoverTip}
@@ -161,7 +165,7 @@ PrepareCompleted ==
     /\ prepared' = TRUE
     /\ danger' \in {Safe, RetryDanger}
     /\ UNCHANGED <<admittedRuntime, flushed, postFlushView,
-                    hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
+                    hasRecoveryCheckpoint, hasOpenTip, canonicalDivergence>>
 
 FinalAdmission ==
     /\ controller = FinalCheck
@@ -169,7 +173,7 @@ FinalAdmission ==
        THEN /\ controller' = Admitted
             /\ admittedRuntime' = TRUE
             /\ UNCHANGED <<prepared, flushed, postFlushView, danger,
-                            hasFinalizedSnapshot, hasOpenTip, canonicalDivergence>>
+                            hasRecoveryCheckpoint, hasOpenTip, canonicalDivergence>>
        ELSE Settle
 
 (* Typed I/O/guard failures terminate the attempt. In particular, post-flush
@@ -197,7 +201,7 @@ TypeOK ==
     /\ flushed \in BOOLEAN
     /\ postFlushView \in PostFlushViews \union {NoPostFlushView}
     /\ danger \in DangerStates
-    /\ hasFinalizedSnapshot \in BOOLEAN
+    /\ hasRecoveryCheckpoint \in BOOLEAN
     /\ hasOpenTip \in BOOLEAN
     /\ canonicalDivergence \in BOOLEAN
 

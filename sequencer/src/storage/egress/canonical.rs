@@ -8,22 +8,25 @@ use sequencer_core::history::{
     ExecutedInputCount, HistoryBounds, HistoryClaim, HistoryPolicyError,
 };
 
-use super::{L2TxContext, decode_ordered_l2_tx_row};
+use super::{ApplicationInputRow, decode_application_input};
 use crate::storage::Storage;
 use crate::storage::convert::{saturating_query_bound, u64_to_i64};
 use crate::storage::history::{next_executed_input_count_in, query_history_state};
 
 #[derive(Debug)]
-pub(crate) struct CanonicalHistoryRow {
-    pub(crate) offset: ExecutedInputCount,
-    pub(crate) context: L2TxContext,
-}
-
-#[derive(Debug)]
 pub(crate) struct CanonicalHistoryPage {
     pub(crate) bounds: HistoryBounds,
-    pub(crate) rows: Vec<CanonicalHistoryRow>,
-    pub(crate) next: HistoryClaim,
+    pub(crate) rows: Vec<ApplicationInputRow>,
+    pub(crate) next_input: ExecutedInputCount,
+}
+
+impl CanonicalHistoryPage {
+    pub(crate) fn next_claim(&self) -> HistoryClaim {
+        HistoryClaim {
+            version: self.bounds.version,
+            next_input: self.next_input,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -59,11 +62,7 @@ impl Storage {
 
 fn history_bounds_in(conn: &Connection) -> rusqlite::Result<HistoryBounds> {
     let state = query_history_state(conn)?;
-    let available_from = ExecutedInputCount::new(
-        state
-            .base_executed_input_count
-            .expect("application history base is unbound outside rebuild fill"),
-    );
+    let available_from = ExecutedInputCount::new(state.base_executed_input_count);
     Ok(HistoryBounds {
         version: state.version,
         available_from,
@@ -85,7 +84,7 @@ fn canonical_page_in(
     if expected_len > 0 {
         const SQL: &str = "
             SELECT
-                s.sequenced_l2_tx_offset,
+                s.offset,
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END,
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.sender ELSE d.sender END,
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.data ELSE NULL END,
@@ -97,9 +96,8 @@ fn canonical_page_in(
                 s.safe_input_index,
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.nonce ELSE NULL END,
                 CASE WHEN s.safe_input_index IS NOT NULL THEN d.block_timestamp ELSE NULL END,
-                CASE WHEN s.safe_input_index IS NOT NULL THEN d.transaction_hash ELSE NULL END,
-                s.executed_input_offset
-            FROM valid_executed_inputs s
+                CASE WHEN s.safe_input_index IS NOT NULL THEN d.transaction_hash ELSE NULL END
+            FROM application_inputs s
             LEFT JOIN user_ops u
               ON u.batch_index = s.batch_index
              AND u.frame_in_batch = s.frame_in_batch
@@ -108,29 +106,23 @@ fn canonical_page_in(
               ON f.batch_index = s.batch_index AND f.frame_in_batch = s.frame_in_batch
             LEFT JOIN safe_inputs d ON d.safe_input_index = s.safe_input_index
             LEFT JOIN batches b ON b.batch_index = s.batch_index
-            WHERE s.executed_input_offset >= ?1
-            ORDER BY s.executed_input_offset
+            WHERE s.offset >= ?1
+            ORDER BY s.offset
             LIMIT ?2
         ";
         let mut stmt = tx.prepare_cached(SQL)?;
         let mapped = stmt.query_map(
             params![u64_to_i64(from.get()), saturating_query_bound(expected_len)],
-            decode_ordered_l2_tx_row,
+            decode_application_input,
         )?;
         let mut expected = from;
         for row in mapped {
             let row = row?;
-            let offset = row
-                .executed_input_offset
-                .expect("canonical history row has no execution attribution");
             assert_eq!(
-                offset, expected,
+                row.offset, expected,
                 "canonical history page has an attribution gap"
             );
-            rows.push(CanonicalHistoryRow {
-                offset,
-                context: row.context,
-            });
+            rows.push(row);
             expected = expected
                 .checked_next()
                 .expect("canonical input count overflow");
@@ -143,12 +135,9 @@ fn canonical_page_in(
     }
     Ok(CanonicalHistoryPage {
         bounds,
-        next: HistoryClaim {
-            version: bounds.version,
-            next_input: from
-                .checked_add(expected_len)
-                .expect("page ends at or before head"),
-        },
+        next_input: from
+            .checked_add(expected_len)
+            .expect("page ends at or before head"),
         rows,
     })
 }

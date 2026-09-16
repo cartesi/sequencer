@@ -7,11 +7,14 @@ use alloy_primitives::{Address, B256, Signature};
 use tokio::sync::oneshot;
 
 use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError};
-use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
+use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, SequencerError};
 use crate::runtime::process_lock::{ProcessLock, ProcessLockError};
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::test_helpers::temp_db;
-use crate::storage::{FrontierMode, IngestedSafeInput, SafeInputRange, Storage, StoredSafeInput};
+use crate::storage::test_helpers::{pin_test_deployment_identity, temp_db};
+use crate::storage::{FrontierMode, IngestedSafeInput, SafeInputRange, Storage};
+use sequencer_core::history::{
+    ExecutedInputCount, HistoryClaim, HistoryPolicyError, RecoveryGeneration,
+};
 use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
 use sequencer_core::user_op::UserOp;
 
@@ -65,36 +68,71 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscribe_from_rejects_catchup_window() {
-    let db = temp_db("catchup-window");
-    seed_ordered_txs(db.path.as_str());
-    append_direct_input(db.path.as_str());
-    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
-
-    let result = feed.subscribe_from(1, 1).await;
-
+async fn subscription_refuses_ahead_and_stale_claims() {
+    let db = temp_db("subscription-claims");
+    seed_ordered_txs(&db.path);
+    let feed = test_feed(&db.path, RuntimeScope::default());
+    assert!(matches!(feed.subscribe_from(claim(&db.path, 3)).await,
+        Err(SubscribeError::History(HistoryPolicyError::AheadOfHead { head })) if head.get() == 2));
+    let mut stale = claim(&db.path, 0);
+    stale.version.recovery_generation = RecoveryGeneration::new(1);
     assert!(matches!(
-        result,
-        Err(SubscribeError::CatchUpWindowExceeded {
-            requested_offset: 1,
-            live_start_offset: 3,
-            max_catchup_events: 1,
-        })
+        feed.subscribe_from(stale).await,
+        Err(SubscribeError::History(
+            HistoryPolicyError::StaleGeneration { .. }
+        ))
     ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscribe_from_accepts_exact_catchup_window() {
-    let db = temp_db("catchup-window-exact");
-    seed_ordered_txs(db.path.as_str());
-    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
-
-    let subscription = feed.subscribe_from(0, 2).await;
-
-    assert!(
-        subscription.is_ok(),
-        "exactly 2 replayable events should be allowed"
+async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_cap() {
+    let db = temp_db("subscription-deep-history");
+    let mut storage = Storage::open(&db.path).unwrap();
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .unwrap();
+    let inputs: Vec<_> = (0..50_001)
+        .map(|offset| {
+            let (respond_to, _) = oneshot::channel();
+            IncludedUserOp {
+                pending: PendingUserOp {
+                    signed: sequencer_core::user_op::SignedUserOp {
+                        sender: Address::repeat_byte(0x11),
+                        signature: Signature::test_signature(),
+                        user_op: UserOp {
+                            nonce: offset,
+                            max_fee: u16::MAX,
+                            data: vec![0x42].into(),
+                        },
+                    },
+                    respond_to,
+                    received_at: SystemTime::now(),
+                },
+                executed_input_offset: ExecutedInputCount::new(u64::from(offset)),
+            }
+        })
+        .collect();
+    storage
+        .append_executed_user_ops_chunk(&mut head, &inputs)
+        .unwrap();
+    drop(storage);
+    let feed = L2TxFeed::new(
+        db.path.clone(),
+        RuntimeScope::default(),
+        L2TxFeedConfig {
+            page_size: 2,
+            ..Default::default()
+        },
     );
+    let mut subscription = feed.subscribe_from(claim(&db.path, 0)).await.unwrap();
+    for expected in 0..3 {
+        let event = tokio::time::timeout(Duration::from_secs(2), subscription.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.offset(), expected);
+    }
+    subscription.finish().await.unwrap();
 }
 
 #[test]
@@ -103,6 +141,7 @@ fn cancelled_catchup_prepare_retains_process_lock_until_blocking_read_finishes()
     seed_ordered_txs(db.path.as_str());
     let data_dir = db._dir.path().to_str().expect("utf8 data dir").to_string();
     let db_path = db.path.clone();
+    let start = claim(&db_path, 0);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)
         .enable_all()
@@ -126,7 +165,7 @@ fn cancelled_catchup_prepare_retains_process_lock_until_blocking_read_finishes()
         let (subscribe_entered_tx, subscribe_entered_rx) = oneshot::channel();
         let subscribe = tokio::spawn(async move {
             let _ = subscribe_entered_tx.send(());
-            feed.subscribe_from(0, u64::MAX).await
+            feed.subscribe_from(start).await
         });
         subscribe_entered_rx
             .await
@@ -170,7 +209,10 @@ async fn subscription_replays_existing_rows_in_order() {
     seed_ordered_txs(db.path.as_str());
     let feed = test_feed(db.path.as_str(), RuntimeScope::default());
 
-    let mut subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
+    let mut subscription = feed
+        .subscribe_from(claim(&db.path, 0))
+        .await
+        .expect("subscribe");
 
     let first = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
         .await
@@ -184,7 +226,7 @@ async fn subscription_replays_existing_rows_in_order() {
     assert!(matches!(
         first,
         BroadcastTxMessage::UserOp {
-            offset: 1,
+            offset: 0,
             nonce: 7,
             safe_block: 123,
             batch_nonce: 1,
@@ -194,7 +236,7 @@ async fn subscription_replays_existing_rows_in_order() {
     assert!(matches!(
         second,
         BroadcastTxMessage::DirectInput {
-            offset: 2,
+            offset: 1,
             input_index: 0,
             batch_nonce: 1,
             block_timestamp: 1_700_000_000,
@@ -207,43 +249,6 @@ async fn subscription_replays_existing_rows_in_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscription_filters_batch_submitter_safe_inputs() {
-    let db = temp_db("filters-batch-submitter-inputs");
-    let batch_submitter_address = Address::from([0xfe; 20]);
-    seed_ordered_txs_with_sender(db.path.as_str(), batch_submitter_address);
-    let feed = L2TxFeed::new(
-        db.path.clone(),
-        RuntimeScope::default(),
-        L2TxFeedConfig {
-            idle_poll_interval: Duration::from_millis(2),
-            page_size: 64,
-            ..L2TxFeedConfig::new(batch_submitter_address)
-        },
-    );
-
-    let mut subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
-    let first = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
-        .await
-        .expect("wait first event")
-        .expect("first event");
-
-    // DB offsets start at 1. The user op is the first sequenced tx (offset=1),
-    // and the batch submitter's safe input (offset=2) is filtered out.
-    assert!(matches!(
-        first,
-        BroadcastTxMessage::UserOp { offset: 1, .. }
-    ));
-
-    let no_second = tokio::time::timeout(Duration::from_millis(50), subscription.recv()).await;
-    assert!(
-        no_second.is_err(),
-        "filtered batch-submitter input should not be broadcast"
-    );
-
-    subscription.finish().await.expect("finish subscription");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_signal_closes_subscription() {
     let db = temp_db("shutdown-closes");
     seed_ordered_txs(db.path.as_str());
@@ -251,7 +256,7 @@ async fn shutdown_signal_closes_subscription() {
     let feed = test_feed(db.path.as_str(), shutdown.clone());
 
     let mut subscription = feed
-        .subscribe_from(u64::MAX, u64::MAX)
+        .subscribe_from(claim(&db.path, 2))
         .await
         .expect("subscribe");
 
@@ -277,14 +282,14 @@ async fn corrupt_feed_head_trips_terminal_storage_fault() {
     let db = temp_db("corrupt-feed-head");
     seed_ordered_txs(db.path.as_str());
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
-    conn.execute("UPDATE sequenced_l2_txs SET offset = -offset", [])
-        .expect("corrupt offsets");
+    let start = claim(&db.path, 0);
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON; DROP TRIGGER trg_history_generation_monotonic; UPDATE history_state SET recovery_generation = 'broken';").expect("corrupt generation");
     drop(conn);
 
     let shutdown = RuntimeScope::default();
     let feed = test_feed(db.path.as_str(), shutdown.clone());
 
-    let _ = feed.subscribe_from(0, u64::MAX).await;
+    let _ = feed.subscribe_from(start).await;
     panic!("corrupt feed head returned instead of aborting");
 }
 
@@ -305,159 +310,13 @@ async fn corrupt_feed_page_trips_terminal_storage_fault() {
 
     let shutdown = RuntimeScope::default();
     let feed = test_feed(db.path.as_str(), shutdown.clone());
-    let mut subscription = feed.subscribe_from(0, u64::MAX).await.expect("subscribe");
+    let mut subscription = feed
+        .subscribe_from(claim(&db.path, 0))
+        .await
+        .expect("subscribe");
 
     let _ = subscription.recv().await;
     panic!("corrupt feed page returned instead of aborting");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catchup_window_not_inflated_by_invalidated_batch_holes() {
-    // Regression test: after batch invalidation, offset holes in sequenced_l2_txs
-    // must not inflate the catch-up event count. The check should count actual
-    // valid events, not subtract rowids.
-    let db = temp_db("catchup-holes");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-
-    // Create two closed batches, each with one direct input.
-    let mut head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .expect("initialize");
-    storage
-        .append_safe_inputs(
-            10,
-            &[StoredSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xaa],
-                block_number: 10,
-            }],
-            Address::ZERO,
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
-        )
-        .expect("append direct 0");
-    storage
-        .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
-        .expect("close frame");
-    storage
-        .close_frame_and_batch(&mut head, 10)
-        .expect("close batch 0");
-
-    storage
-        .append_safe_inputs(
-            20,
-            &[StoredSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xbb],
-                block_number: 20,
-            }],
-            Address::ZERO,
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
-        )
-        .expect("append direct 1");
-    storage
-        .close_frame_only(&mut head, 20, SafeInputRange::new(1, 2))
-        .expect("close frame");
-    drop(storage);
-
-    // Before invalidation: 2 valid events.
-    // With max_catchup_events=1, subscribing from 0 should fail.
-    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
-    assert!(
-        feed.subscribe_from(0, 1).await.is_err(),
-        "should reject: 2 valid events > max 1"
-    );
-
-    // Invalidate batch 0 — this creates a hole in the offset space.
-    // Now only 1 valid event remains (from batch 1).
-    let mut storage = Storage::open(db.path.as_str()).expect("reopen storage");
-    storage.insert_invalid_batch(0).expect("invalidate batch 0");
-    drop(storage);
-
-    // After invalidation: only 1 valid event, so max_catchup_events=1 should succeed.
-    let feed = test_feed(db.path.as_str(), RuntimeScope::default());
-    assert!(
-        feed.subscribe_from(0, 1).await.is_ok(),
-        "should accept: only 1 valid event after invalidation, despite rowid hole"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catchup_window_excludes_batch_submitter_direct_inputs() {
-    // Regression test: batch-submitter direct inputs are filtered before WS
-    // delivery, so the catch-up window must not count them. Otherwise a
-    // reconnecting client could be rejected even when the number of
-    // replayable messages is within the limit.
-    let db = temp_db("catchup-submitter-filter");
-    let batch_submitter = Address::from([0xfe; 20]);
-    let user_address = Address::from([0x01; 20]);
-
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let mut head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .expect("initialize");
-
-    // Two direct inputs: one from the batch submitter, one from a user.
-    storage
-        .append_safe_inputs(
-            10,
-            &[
-                StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: vec![0xaa],
-                    block_number: 10,
-                },
-                StoredSafeInput {
-                    sender: user_address,
-                    payload: vec![0xbb],
-                    block_number: 10,
-                },
-            ],
-            Address::ZERO,
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
-        )
-        .expect("append directs");
-    storage
-        .close_frame_only(&mut head, 10, SafeInputRange::new(0, 2))
-        .expect("close frame");
-    drop(storage);
-
-    // With a submitter address that matches no seeded sender: 2 events,
-    // max=1 should reject.
-    let feed_no_filter = L2TxFeed::new(
-        db.path.clone(),
-        RuntimeScope::default(),
-        L2TxFeedConfig::new(NO_OWN_BATCHES),
-    );
-    assert!(
-        feed_no_filter.subscribe_from(0, 1).await.is_err(),
-        "without filter: 2 events > max 1"
-    );
-
-    // With batch_submitter_address filtering: only the user's event counts.
-    let feed_filtered = L2TxFeed::new(
-        db.path.clone(),
-        RuntimeScope::default(),
-        L2TxFeedConfig::new(batch_submitter),
-    );
-    assert!(
-        feed_filtered.subscribe_from(0, 1).await.is_ok(),
-        "with filter: only 1 broadcastable event, should accept"
-    );
 }
 
 /// Sentinel submitter for fixtures that seed no own-batch rows. Must not
@@ -471,17 +330,13 @@ fn test_feed(db_path: &str, shutdown: RuntimeScope) -> L2TxFeed {
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            ..L2TxFeedConfig::new(NO_OWN_BATCHES)
         },
     )
 }
 
 fn seed_ordered_txs(db_path: &str) {
-    seed_ordered_txs_with_sender(db_path, Address::ZERO);
-}
-
-fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
     let mut storage = Storage::open(db_path).expect("open storage");
+    pin_test_deployment_identity(&mut storage, NO_OWN_BATCHES);
     let mut head = storage
         .initialize_open_state(123, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -505,20 +360,26 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
     };
 
     storage
-        .append_user_ops_chunk(&mut head, &[pending])
+        .append_executed_user_ops_chunk(
+            &mut head,
+            &[IncludedUserOp {
+                pending,
+                executed_input_offset: ExecutedInputCount::ZERO,
+            }],
+        )
         .expect("append user-op chunk");
     storage
         .append_ingested_safe_inputs_with_timestamp(
             456,
             456,
             &[IngestedSafeInput {
-                sender: direct_sender,
+                sender: Address::ZERO,
                 payload: vec![0xaa],
                 block_number: 456,
                 block_timestamp: 1_700_000_000,
                 transaction_hash: B256::repeat_byte(0xcd),
             }],
-            Address::ZERO,
+            NO_OWN_BATCHES,
             &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
@@ -533,34 +394,10 @@ fn seed_ordered_txs_with_sender(db_path: &str, direct_sender: Address) {
         .expect("close frame with one drained direct input");
 }
 
-fn append_direct_input(db_path: &str) {
-    let mut storage = Storage::open(db_path).expect("open storage");
-    let mut head = storage
-        .open_state()
-        .expect("load open state")
-        .expect("open state exists");
-    storage
-        .append_ingested_safe_inputs_with_timestamp(
-            789,
-            789,
-            &[IngestedSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xbb],
-                block_number: 789,
-                block_timestamp: 1_700_000_001,
-                transaction_hash: B256::repeat_byte(0xef),
-            }],
-            Address::ZERO,
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
-            FrontierMode::Populate,
-        )
-        .expect("append second direct input");
-    storage
-        .close_frame_only(&mut head, 789, SafeInputRange::new(1, 2))
-        .expect("close frame with second direct input");
+fn claim(db_path: &str, next: u64) -> HistoryClaim {
+    let storage = Storage::open_read_only(db_path).unwrap();
+    HistoryClaim {
+        version: storage.history_state().unwrap().version,
+        next_input: ExecutedInputCount::new(next),
+    }
 }

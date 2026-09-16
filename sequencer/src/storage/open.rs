@@ -6,10 +6,10 @@
 //! Method clusters live in sibling files (`ingress`, `egress`, `l1_inputs`,
 //! `l1_submission`, `recovery`, `admin`) — each adds its own `impl Storage`.
 
-use rusqlite::{Connection, OpenFlags, Result, Transaction, TransactionBehavior, types::Type};
+use rusqlite::{Connection, OpenFlags, Result, Transaction, TransactionBehavior};
 use rusqlite_migration::{HookResult, M, Migrations};
 
-use super::{EraId, LifecycleCommand, StorageOpenError};
+use super::{LifecycleCommand, StorageOpenError};
 
 const MIGRATION_0001_SCHEMA: &str = include_str!("migrations/0001_schema.sql");
 
@@ -23,14 +23,8 @@ const MIGRATION_0001_SCHEMA: &str = include_str!("migrations/0001_schema.sql");
 /// scheduler executed. The dump side already pays the same cost
 /// (`create_dump` fsyncs); this closes the DB half. Also a precondition
 /// for the wallet-nonce watermark's write-before-broadcast guarantee.
-/// And it is what makes the setup completion transaction a valid
-/// linearization point: it commits after the genesis-snapshot row's
-/// transaction, so "completion durable ⇒
-/// snapshot row durable ⇒ dump dir durable" only holds because FULL fsyncs
-/// every commit — under NORMAL the completion WAL frame could survive while
-/// the snapshot row's frames are lost, and `run` would boot a half-set-up
-/// DB. Benchmarked at the flip: round-trip/ack deltas were noise-level on
-/// NVMe.
+/// Setup publishes its complete baseline and completion together after the
+/// artifact is durable; FULL makes that boundary survive power loss too.
 ///
 /// Do not relax to NORMAL without revisiting all three (externalized
 /// commits, the write-before-broadcast watermark, and the setup-completion
@@ -58,7 +52,7 @@ impl Storage {
     /// database is created by an owning command through
     /// [`Storage::initialize_for_command`], so a missing file here is a
     /// deployment mistake (mistyped `--data-dir`, wrong mount). Creating one
-    /// on the fly would mint an ownerless era with no creating command —
+    /// on the fly would create an ownerless schema with no creating command —
     /// database absence means uninitialized, never create-and-proceed.
     /// Crate tests keep create-on-open as their fixture idiom; the
     /// command-less baseline in [`baseline_migration`] exists for them.
@@ -77,8 +71,8 @@ impl Storage {
         })
     }
 
-    /// Create the baseline schema and history era in one migration
-    /// transaction, with the creating command deciding the history bases. On
+    /// Create the schema and record its owning command in one migration
+    /// transaction. The complete history baseline is published later. On
     /// an already-migrated database the hook does not run; callers must
     /// inspect the existing facts.
     pub(crate) fn initialize_for_command(
@@ -211,54 +205,18 @@ fn baseline_migration(
     post_initial_metadata: Option<PostInitialMetadataHook>,
 ) -> M<'static> {
     M::up_with_hook(MIGRATION_0001_SCHEMA, move |tx: &Transaction<'_>| {
-        let recorded_at_ms = i64::try_from(crate::clock::unix_now_ms()).unwrap_or(i64::MAX);
-        let era_id = mint_era_id(tx)?;
-        let (base_executed_input_count, base_safe_input_index) = match initial_command {
-            Some(LifecycleCommand::Rebuild) => (None, None),
-            Some(LifecycleCommand::Setup) | None => (Some(0_i64), Some(0_i64)),
-            Some(LifecycleCommand::Run | LifecycleCommand::MaintenanceFlush) => {
-                unreachable!("baseline command was checked before migration")
-            }
-        };
-        tx.execute(
-            "INSERT INTO history_state \
-             (singleton_id, era_id, era_created_at_ms, recovery_generation, \
-              base_executed_input_count, base_safe_input_index) \
-             VALUES (0, ?1, ?2, 0, ?3, ?4)",
-            rusqlite::params![
-                era_id.as_bytes().as_slice(),
-                recorded_at_ms,
-                base_executed_input_count,
-                base_safe_input_index
-            ],
-        )?;
+        if initial_command.is_none() {
+            super::history::initialize_history_in(
+                tx,
+                sequencer_core::history::ExecutedInputCount::ZERO,
+                0,
+            )?;
+        }
         if let Some(hook) = post_initial_metadata {
             hook(tx)?;
         }
         Ok(())
     })
-}
-
-fn mint_era_id(tx: &Transaction<'_>) -> Result<EraId> {
-    let random = tx.query_row("SELECT randomblob(16)", [], |row| row.get::<_, Vec<u8>>(0))?;
-    let mut bytes: [u8; EraId::BYTE_LEN] = random.try_into().map_err(|value: Vec<u8>| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            Type::Blob,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "SQLite randomblob returned {} bytes, expected {}",
-                    value.len(),
-                    EraId::BYTE_LEN
-                ),
-            )),
-        )
-    })?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    EraId::from_bytes(bytes)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 #[cfg(test)]
@@ -270,7 +228,7 @@ mod tests {
             "SELECT COUNT(*) FROM history_state \
              WHERE singleton_id = 0 AND recovery_generation = 0 \
                AND base_executed_input_count = 0 \
-               AND base_safe_input_index = 0",
+               AND base_safe_block = 0",
             [],
             |row| row.get(0),
         )?;
@@ -290,7 +248,7 @@ mod tests {
         let path = dir.path().join("atomic-init.sqlite");
         let mut conn = open_writer_connection(path.to_str().expect("utf8")).expect("open");
         let definitions = [baseline_migration(
-            Some(LifecycleCommand::Setup),
+            None,
             Some(fail_after_observing_initial_metadata),
         )];
         let migrations = Migrations::from_slice(&definitions);
@@ -314,38 +272,48 @@ mod tests {
     }
 
     #[test]
-    fn baseline_mints_distinct_uuid_v4_eras_and_initializes_known_bases() {
-        let setup_dir = tempfile::tempdir().expect("setup tempdir");
-        let setup_path = setup_dir.path().join("sequencer.sqlite");
-        let setup = Storage::initialize_for_command(
-            setup_path.to_str().expect("utf8"),
-            LifecycleCommand::Setup,
-        )
-        .expect("initialize setup");
-        let setup_history = setup.history_state().expect("setup history");
-        assert_eq!(setup_history.version.recovery_generation.get(), 0);
-        assert_eq!(setup_history.base_executed_input_count, Some(0));
-        assert_eq!(setup_history.base_safe_input_index, Some(0));
-
-        let rebuild_dir = tempfile::tempdir().expect("rebuild tempdir");
-        let rebuild_path = rebuild_dir.path().join("sequencer.sqlite");
-        let rebuild = Storage::initialize_for_command(
-            rebuild_path.to_str().expect("utf8"),
+    fn setup_registers_history_only_with_complete_baseline() {
+        let setup_dir = tempfile::tempdir().unwrap();
+        let setup_path = setup_dir.path().join("setup.sqlite");
+        let mut setup =
+            Storage::initialize_for_command(setup_path.to_str().unwrap(), LifecycleCommand::Setup)
+                .unwrap();
+        assert!(matches!(
+            setup.history_state(),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        setup
+            .write(|tx| {
+                super::super::history::initialize_history_in(
+                    tx,
+                    sequencer_core::history::ExecutedInputCount::ZERO,
+                    0,
+                )
+            })
+            .unwrap();
+        let a = setup.history_state().unwrap();
+        let rebuild_path = setup_dir.path().join("rebuild.sqlite");
+        let mut rebuild = Storage::initialize_for_command(
+            rebuild_path.to_str().unwrap(),
             LifecycleCommand::Rebuild,
         )
-        .expect("initialize rebuild");
-        let rebuild_history = rebuild.history_state().expect("rebuild history");
-        assert_eq!(rebuild_history.version.recovery_generation.get(), 0);
-        assert_eq!(rebuild_history.base_executed_input_count, None);
-        assert_eq!(rebuild_history.base_safe_input_index, None);
-        assert_ne!(setup_history.version.era_id, rebuild_history.version.era_id);
-
-        let generic_dir = tempfile::tempdir().expect("generic tempdir");
-        let generic_path = generic_dir.path().join("sequencer.sqlite");
-        let generic =
-            Storage::open(generic_path.to_str().expect("utf8")).expect("initialize generic schema");
-        let generic_history = generic.history_state().expect("generic history");
-        assert_eq!(generic_history.base_executed_input_count, Some(0));
-        assert_eq!(generic_history.base_safe_input_index, Some(0));
+        .unwrap();
+        assert!(matches!(
+            rebuild.history_state(),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        rebuild
+            .write(|tx| {
+                super::super::history::initialize_history_in(
+                    tx,
+                    sequencer_core::history::ExecutedInputCount::new(8),
+                    100,
+                )
+            })
+            .unwrap();
+        let b = rebuild.history_state().unwrap();
+        assert_ne!(a.version.era_id, b.version.era_id);
+        assert_eq!(b.base_executed_input_count, 8);
+        assert_eq!(b.base_safe_block, 100);
     }
 }

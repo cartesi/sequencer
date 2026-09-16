@@ -59,7 +59,8 @@ pub(super) fn query_latest_safe_accepted_batch(
 /// Next nonce the scheduler is expected to accept — the gold frontier's
 /// "expected next" cursor.
 ///
-/// Returns `latest_accepted.nonce + 1` if any batch has been accepted, else `0`.
+/// Returns `latest_accepted.nonce + 1` if any batch has been accepted, else the
+/// deployment anchor (`0` for genesis, `N'` after rebuild).
 /// Equivalently, the nonce that the very next valid closed batch (the cascade
 /// pivot, when one exists) will carry, by the contiguity invariant on the
 /// valid path (`trg_enforce_nonce_contiguity`).
@@ -91,7 +92,7 @@ fn next_expected_nonce(nonce: u64) -> u64 {
 /// matches to `safe_accepted_batches`.
 ///
 /// The content-identity check (I9/I15) is complete for this mirrored
-/// predicate: every at/above-anchor accepted landing is a byte-identical
+/// predicate: every post-baseline accepted landing is a byte-identical
 /// local match, foreign, or mismatched. It is not
 /// an independent oracle for the canonical scheduler, application state, or
 /// collapsed checkpoint history; foreign/mismatch requires manual cockroach
@@ -136,14 +137,15 @@ pub(super) fn populate_safe_accepted_batches(
     const SELECT_SQL: &str = "SELECT safe_input_index, payload, block_number \
                               FROM safe_inputs \
                               WHERE sender = ?1 AND safe_input_index > ?2 \
-                              ORDER BY safe_input_index ASC LIMIT ?3";
+                                AND block_number > ?3 \
+                              ORDER BY safe_input_index ASC LIMIT ?4";
     const INSERT_SQL: &str = "INSERT INTO safe_accepted_batches \
                               (safe_input_index, nonce, first_frame_safe_block, inclusion_block) \
                               VALUES (?1, ?2, ?3, ?4)";
 
     // A persisted divergence marker freezes the acceptance frontier: the
     // local batch tree is no longer a reliable mirror of canonical state,
-    // and advancing it (or promoting on it) would compound the divergence.
+    // and advancing it would compound the divergence.
     // `check_danger` reports `CanonicalDivergence` ahead of every other arm,
     // so the detector exits / startup refuses; the remedy is cockroach
     // recovery, never standard recovery.
@@ -151,16 +153,29 @@ pub(super) fn populate_safe_accepted_batches(
         return Ok(());
     }
 
-    // The frontier begins at the batch-tree anchor: 0 for a genesis
-    // deployment (unchanged), or N' for a cockroach-recovered one. Below the
-    // anchor the local tree has no batches — that history is folded into the
-    // recovered checkpoint `S'`, not kept as tree batches — so those L1
-    // landings are *trusted collapsed history*, not foreign. Seeding `expected`
-    // at the anchor makes the scan skip them by nonce-mismatch (they never
-    // reach the content-identity check), while landings at/above the anchor —
-    // the resumed instance's own batches — are accepted and checked normally.
-    // (See I16 / docs/recovery: the anchor is where the local tree's authority
-    // begins.)
+    // The recovered prefix is opaque. Replaying it with the final nonce N'
+    // could accept an old future-nonce submission that the scheduler rejected
+    // at its original position. Only inputs after the baseline belong here.
+    let base_safe_block: Option<i64> = conn
+        .query_row(
+            "SELECT base_safe_block FROM history_state WHERE singleton_id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let base_safe_block = match base_safe_block {
+        Some(block) => block,
+        None => {
+            let setup_complete: bool =
+                conn.query_row("SELECT EXISTS(SELECT 1 FROM setup_complete)", [], |row| {
+                    row.get(0)
+                })?;
+            assert!(!setup_complete, "completed setup has no history baseline");
+            // Plain setup detects prior activity before installing genesis.
+            // Rebuild ingestion defers this projection until its baseline exists.
+            0
+        }
+    };
     let anchor = batch_tree_anchor_in(conn)?;
     let latest_accepted = query_latest_safe_accepted_batch(conn)?;
     let mut cursor = latest_accepted
@@ -178,7 +193,12 @@ pub(super) fn populate_safe_accepted_batches(
         let page: Vec<(i64, Vec<u8>, i64)> = {
             let mut stmt = conn.prepare_cached(SELECT_SQL)?;
             stmt.query_map(
-                params![batch_submitter.as_slice(), cursor, PAGE_SIZE,],
+                params![
+                    batch_submitter.as_slice(),
+                    cursor,
+                    base_safe_block,
+                    PAGE_SIZE
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?
             .collect::<Result<_>>()?
@@ -357,6 +377,126 @@ fn record_canonical_divergence_in(
 mod tests {
     use super::*;
     use crate::storage::{Storage, test_helpers::temp_db};
+
+    #[test]
+    fn recovered_prefix_does_not_reinterpret_a_rejected_future_nonce() {
+        use crate::storage::test_helpers::{
+            default_protocol_timing, local_batch_payload, pin_test_deployment_identity,
+        };
+        use crate::storage::{FrontierMode, LifecycleCommand, StoredSafeInput};
+        use sequencer_core::{batch::Batch, history::ExecutedInputCount};
+        use ssz::Encode;
+
+        let db = temp_db("accepted-recovered-prefix");
+        let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild)
+            .expect("initialize rebuild");
+        let submitter = Address::repeat_byte(0x99);
+        let timing = default_protocol_timing();
+        pin_test_deployment_identity(&mut storage, submitter);
+        let old_future = Batch {
+            nonce: 1,
+            frames: vec![],
+        }
+        .as_ssz_bytes();
+        let old_accepted = Batch {
+            nonce: 0,
+            frames: vec![],
+        }
+        .as_ssz_bytes();
+        assert!(
+            timing
+                .scheduler_accepts(
+                    submitter,
+                    SafeInputView {
+                        safe_input_index: 0,
+                        sender: submitter,
+                        payload: &old_future,
+                        inclusion_block: 20,
+                    },
+                    0
+                )
+                .is_none()
+        );
+        assert!(
+            timing
+                .scheduler_accepts(
+                    submitter,
+                    SafeInputView {
+                        safe_input_index: 1,
+                        sender: submitter,
+                        payload: &old_accepted,
+                        inclusion_block: 30,
+                    },
+                    0
+                )
+                .is_some()
+        );
+        storage
+            .append_safe_inputs_with_timestamp(
+                30,
+                30,
+                &[
+                    StoredSafeInput {
+                        sender: submitter,
+                        payload: old_future,
+                        block_number: 20,
+                    },
+                    StoredSafeInput {
+                        sender: submitter,
+                        payload: old_accepted,
+                        block_number: 30,
+                    },
+                ],
+                submitter,
+                &timing,
+                FrontierMode::DeferUntilAnchorSet,
+            )
+            .expect("ingest opaque prefix");
+        storage
+            .write(|tx| {
+                super::super::history::initialize_history_in(tx, ExecutedInputCount::new(41), 30)?;
+                super::super::mutations::set_batch_tree_anchor_in(tx, 1)?;
+                super::super::ingress::open_recovery_tip_in_tx(tx, 30)
+            })
+            .expect("install recovered baseline");
+        let mut head = storage.open_state().expect("read root").expect("root");
+        storage
+            .close_frame_and_batch(&mut head, 30)
+            .expect("close resumed batch");
+        let payload = local_batch_payload(&mut storage, 1);
+        storage
+            .append_safe_inputs(
+                31,
+                &[StoredSafeInput {
+                    sender: submitter,
+                    payload,
+                    block_number: 31,
+                }],
+                submitter,
+                &timing,
+            )
+            .expect("accept post-baseline batch");
+        assert!(
+            storage
+                .canonical_divergence()
+                .expect("divergence")
+                .is_none()
+        );
+        let accepted = query_latest_safe_accepted_batch(&storage.conn)
+            .expect("accepted frontier")
+            .expect("resumed acceptance");
+        assert_eq!((accepted.safe_input_index, accepted.nonce), (2, 1));
+        assert_eq!(
+            storage
+                .conn
+                .query_row("SELECT COUNT(*) FROM safe_accepted_batches", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .expect("accepted count"),
+            1
+        );
+    }
 
     fn insert_safe_input_zero(storage: &Storage) {
         storage

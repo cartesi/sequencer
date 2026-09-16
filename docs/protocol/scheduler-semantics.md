@@ -179,11 +179,9 @@ suffix at the same application offsets; cockroach recovery resumes from the
 absolute count persisted in the recovered application state even when older
 history is no longer locally available.
 
-> **Cutover status:** the typed execution boundary, scheduler count
-> transitions, and durable per-input mapping are landed. Physical
-> `sequenced_l2_txs.offset` remains SQLite rowid and the existing WebSocket
-> still exposes that cursor; changing the public protocol to canonical offsets
-> and `HistoryVersion` remains Track 3 work.
+The durable `application_inputs` sequence uses these same offsets. HTTP
+snapshots carry the history version and application count; WS subscriptions
+must claim both before inclusive replay. See the [history contract](../plans/application-history.md).
 
 ---
 
@@ -231,7 +229,7 @@ I1 names three places this algorithm lives. They are not three rewrites; two are
   site.
 
 **Why the agreement is load-bearing:** the gold frontier (#2) is what
-recovery's cascade pivots on and what promotion trusts; the lane (#3) is what
+recovery's cascade pivots on and what accepted-checkpoint selection trusts; the lane (#3) is what
 users see as soft confirmations. If any of the three computes a different
 accept/reject/order than the canonical fold (#1), the sequencer will have
 promised users a future the scheduler will not produce. No mechanism enforces

@@ -1,6 +1,6 @@
 # Batch Recovery
 
-This document describes the recovery design for the sequencer: how the system detects that batches are failing to land on L1, how startup recovers to a consistent state, and where runtime authority begins. Two complementary bounded TLA+ models cover the design: [`preemptive.tla`](preemptive.tla) for batch/slot safety and [`admission.tla`](admission.tla) for startup phase ordering and admission. They do not currently model the external era/generation/base metadata or the derived canonical `executed_inputs` projection; their crash atomicity is enforced by the SQLite transaction boundaries and schema triggers described below.
+This document describes the recovery design for the sequencer: how the system detects that batches are failing to land on L1, how startup recovers to a consistent state, and where runtime authority begins. Two complementary bounded TLA+ models cover the design: [`preemptive.tla`](preemptive.tla) for batch/slot safety and [`admission.tla`](admission.tla) for startup phase ordering and admission. They do not currently model the external era/generation/base metadata or the canonical `application_inputs` projection or snapshot artifact/GC lifecycle; their crash atomicity is enforced by the SQLite transaction boundaries and schema triggers described below.
 
 See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and function names.
 
@@ -260,9 +260,9 @@ After step 3 (flush) and step 4 (re-sync), the gold frontier is fresh. Run the a
 
 1. **Find the cascade pivot.** First try the closed pivot: first valid closed batch with `nonce >= frontier_nonce`. By the contiguity invariant, this batch's nonce is exactly `frontier_nonce`. If one exists, cascade from it.
 2. **No closed pivot? Check the Tip.** When all closed batches landed fresh and were accepted (the "everything worked" aftermath), there's no closed pivot — but the Tip can still be in the danger zone. When the lane rotates without a safe-block advance between frames (e.g. immediately after init, both frames share the bootstrap `safe_block`), `S_tip = S_closed`. The closed batch can become gold by inclusion-staleness while the Tip's age — measured against `current_safe_block` after the flush wait — has crossed the danger zone. Pure monotonicity (`S_tip ≥ S_closed`) doesn't rule this out: equality is allowed. So fall through to `find_tip_batch_in_danger(danger_threshold)`. If the Tip's age clears `danger_threshold`, cascade it.
-3. **Cascade-invalidate the suffix**: set `invalidated_at_ms` on every valid batch with `batch_index >= pivot.batch_index`. This catches all non-gold batches in cases (2)/(3) above, and the Tip alone in the no-pivot-but-Tip-aging case. The invalidation trigger retains physical replay rows but deletes their derived `executed_inputs` mappings, rewinding canonical head `H` to the surviving prefix.
-4. **Advance external history reality**: iff step 3 invalidated at least one valid batch, increment `RecoveryGeneration` exactly once in this same SQLite transaction. A no-invalidation repair does not bump it. Mapping rewind and generation change are therefore one visible transition.
-5. **Open recovery batch**: parent is the last valid ancestor (`MAX(batch_index) FROM valid_batches` after the cascade). Nonce is structurally `parent.nonce + 1`, which equals `frontier_nonce` — the scheduler's `expected_nonce`. Re-drain direct inputs from the invalidated batches starting at `max(base_safe_input_index, MAX(valid safe_input_index) + 1)`. Their new physical rows reuse the rewound logical offsets under the incremented generation.
+3. **Cascade-invalidate the suffix**: set `invalidated_at_ms` on every valid batch with `batch_index >= pivot.batch_index`. This catches all non-gold batches in cases (2)/(3) above, and the Tip alone in the no-pivot-but-Tip-aging case. The invalidation trigger deletes those batches' canonical `application_inputs` rows, rewinding head `H` to the surviving prefix. Raw L1, batch, frame, and user-op source facts remain available for audit.
+4. **Advance external history reality**: iff step 3 invalidated at least one valid batch, increment `RecoveryGeneration` exactly once in this same SQLite transaction. A no-invalidation repair does not bump it. Application-history rewind and generation change are therefore one visible transition.
+5. **Open recovery batch**: parent is the last valid ancestor (`MAX(batch_index) FROM valid_batches` after the cascade). Nonce is structurally `parent.nonce + 1`, which equals `frontier_nonce` — the scheduler's `expected_nonce`. Reconcile external directs after the latest surviving frame's `safe_block`, or immutable baseline block `C` if no frame survives. The new application rows reuse offsets beginning at the rewound head under the incremented generation.
 
 **Threshold = `danger_threshold`, not `MAX_WAIT_BLOCKS`**. We're already committed to recovery; the Tip is past gold; if it's also past the threshold that would have triggered recovery had it been a closed batch, cascade it. Otherwise the next danger detector tick after resume would re-trip on the Tip's eventual close + submission anyway (the closed batch would inherit its first frame's safe_block).
 
@@ -276,7 +276,7 @@ Closed batches past gold (if any) are still in their natural lifecycle — pendi
 2. Open a fresh recovery batch in the same transaction.
 3. If no Tip in danger and no Tip exists at all (torn-state crash recovery), open a Tip anyway.
 
-The `Safe` decision with no open Tip runs `EnsureOpenTip`. Its transaction rechecks `Safe`, finalized-snapshot presence, and Tip absence, then opens the Tip through `open_fresh_tip_in_tx`. It refuses rather than commit without an open Tip. Startup rechecks danger after this repair; Tip creation never occurs as a worker-construction side effect.
+The `Safe` decision with no open Tip runs `EnsureOpenTip`. Its transaction rechecks `Safe`, rollback-safe checkpoint presence, and Tip absence, then opens the Tip through `open_fresh_tip_in_tx`. It refuses rather than commit without an open Tip. Startup rechecks danger after this repair; Tip creation never occurs as a worker-construction side effect.
 
 #### Why `danger_threshold`, not `MAX_WAIT_BLOCKS`, for the Tip threshold
 
@@ -315,7 +315,7 @@ Each loop iteration burns gas (no-ops + doomed resubs), takes ~12 minutes (the f
 
 ### Startup behavior summary
 
-Startup holds the exclusive process lock and launches no workers until recovery and preparation finish. Its first local inspection refuses canonical divergence or missing finalized state before any provider call. It then attempts one initial Sync: a provider failure may use a still-fresh persisted view, while other failures retain their typed retry/refuse classification.
+Startup holds the exclusive process lock and launches no workers until recovery and preparation finish. Its first local inspection refuses canonical divergence or a missing rollback-safe checkpoint before any provider call. It then attempts one initial Sync: a provider failure may use a still-fresh persisted view, while other failures retain their typed retry/refuse classification.
 
 After that attempt, `select_recovery` maps one consistent local inspection as follows:
 
@@ -329,7 +329,7 @@ After that attempt, `select_recovery` maps one consistent local inspection as fo
 | `EstimatedBatchInDanger(N)` | Retry | Recovery never mutates from an estimate alone. |
 | `CanonicalDivergence(N)` | Refuse | Standard recovery assumes content identity and is forbidden. |
 
-Closed recovery retains the flush's observed safe block in a local variable. Post-flush Sync must succeed; its provider failure cannot use the initial-sync fallback. The guarded cascade transaction refuses divergence or missing finalized state, requires the persisted safe head to reach the flush observation, and then applies the post-flush policy. It runs even if the refreshed danger verdict is `Safe`: a young unresolved suffix is still doomed after flushing. A crash or retry loses the observation, so another invocation must flush again.
+Closed recovery retains the flush's observed safe block in a local variable. Post-flush Sync must succeed; its provider failure cannot use the initial-sync fallback. The guarded cascade transaction refuses divergence or a missing rollback-safe checkpoint, requires the persisted safe head to reach the flush observation, and then applies the post-flush policy. It runs even if the refreshed danger verdict is `Safe`: a young unresolved suffix is still doomed after flushing. A crash or retry loses the observation, so another invocation must flush again.
 
 Flush changes only the wallet watermark locally. New divergence can be discovered only by Sync, and the next dispatch or guarded cascade checks it before repair. There is no additional inspection between Flush and Sync. The process lock and task-free startup exclude a competing local writer; revisit this sequencing if startup gains concurrent writers.
 
@@ -386,9 +386,9 @@ Given a trusted checkpoint machine `S` at block `B` (a finalized `dumps/<id>/` d
 
 1. **Flush** the wallet nonce (keyed — recovery, unlike plain `setup`, signs) so every previous-instance batch resolves at safe depth `≤ C`, the post-flush safe head. Re-sync `safe_inputs` through `C`.
 2. **Fold** (the pure `sequencer-core` engine, shared with the on-chain scheduler so it is consistent by construction): seed the fridge from the `(A, B]` directs (drop batches — already in `S`), replay the `(B, C]` stream, drain the leftover fridge at `C`. Yields `(S', N')` = the advanced app state and the resume nonce.
-3. **Fill** a consistent DB: the baseline transaction has already minted a UUIDv4 `EraId` and initialized `RecoveryGeneration = 0`, while leaving the rebuild's `base_executed_input_count` and `base_safe_input_index` NULL. Derive `K = S'.executed_input_count()`. **Anchor the batch tree at `N'`** ([I16](../invariants.md) — the root tip *is* `N'`, no sentinel batch); sequence the `≤ C` inputs so the replay cursor starts past them (they're already in `S'`, while `run`'s first on-chain batch re-drains them by `safe_block`). Capture that root's exclusive safe-input cursor as the durable drain floor, then bind it with `K` in the same transaction that registers `S'` as the initial finalized snapshot at `C`; setup completion requires both non-NULL bases and the snapshot. Later standard recovery uses `max(base_safe_input_index, max valid attribution + 1)`, so invalidating the root cannot re-sequence those inputs. Physical `l2_tx_index` includes unmapped cursor padding and is deliberately distinct from application-history base `K`; the first executable input above the floor is mapped at `K`. `run` boots from this state.
+3. **Fill** a consistent DB: write the recovered application dump first, then atomically register its complete `(era, generation = 0, K, C)` history baseline, anchor `N'`, parentless root frame at `C`, snapshot, and `setup_complete`. The collapsed prefix creates no application rows. The first later application input has offset `K`; ordinary recovery falls back to immutable `C` if the root is invalidated. The terminal-drained baseline is a local restore point and is not automatically a canonical comparison checkpoint at `C`.
 
-During recovery the gold frontier (`safe_accepted_batches`) population is **deferred** (`FrontierMode::DeferUntilAnchorSet`): the tree is empty until fill, so simulating acceptance against it would flag every L1 batch as foreign and freeze the frontier ([I15](../invariants.md)). It is populated on `run`'s first sync — once the anchor `N'` is set — so the folded `< N'` history is skipped as trusted collapsed history. `N` is **trusted checkpoint metadata**, not re-verified at recovery time: a wrong-low `N` surfaces at `run` via the content-identity check, but a wrong-high `N` does not — sound because a sequencer-produced finalized dump cannot carry a wrong `N` by construction (see [`cockroach.md`](cockroach.md#data-dictionary) for the full trust boundary). Recovery is a **strict one-shot**: it refuses (terminal) on a DB that is already set up. A retained incomplete DB reuses the still-unexposed era minted by its baseline transaction. Once matching root Tip plus the atomically bound finalized snapshot/`K` exist, that durable fill is authoritative and retry is a no-op; it does not compare stored `K` against a later fold at a newer `C`. A fail-loud partial fill instead requires the operator to wipe and retry, minting another unexposed era. This is not general resume machinery.
+During rebuild the accepted frontier is deferred until the baseline exists. The first `run` sync seeds expected nonce `N'` and scans only inputs after `C`, explicitly excluding the trusted prefix. Replaying the old prefix with a later expected nonce could reinterpret a rejected future-nonce batch as accepted. Checkpoint state and nonce remain operator-trusted; the export receipt checks metadata agreement rather than independently verifying the checkpoint. Rebuild is one-shot after completion. File-first creation plus atomic registration removes partial-baseline resume states; a failed transaction leaves only an orphan artifact. See [cockroach recovery](cockroach.md) for the full contract.
 
 The detect-and-refuse gate is the *trigger*: a fresh `setup` that finds a previous instance's batches past the checkpoint refuses with exit `40` (`EXIT_SETUP_NEEDS_RECOVERY`), pointing the operator here.
 
@@ -417,6 +417,16 @@ standard recovery on this page**: the cascade reconciles the batch tree's
 *shape* under the assumption that accepted nonce N is our batch N — a content
 mismatch means canonical state contains executed effects with no reliable
 local source, so rebuild-from-L1 is the only honest repair.
+
+### Restore points and admission
+
+Every admitted database retains a rollback-safe application artifact: the
+baseline before any local batch is accepted, or an accepted batch snapshot.
+Startup may load a newer surviving optimistic snapshot to reduce replay, but
+that snapshot alone cannot justify admission because recovery may remove it.
+Once an accepted artifact exists, GC may retire baseline bytes while preserving
+immutable baseline metadata and active leases. `admission.tla` calls this
+`hasRecoveryCheckpoint`; artifact creation and GC remain outside that model.
 
 ## Implementation Constraints
 

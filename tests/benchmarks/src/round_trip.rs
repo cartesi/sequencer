@@ -30,7 +30,6 @@ const DEFAULT_BACKLOG_DRAIN_MAX_MS: u64 = 2_000;
 pub struct RoundTripRunConfig {
     pub endpoint: String,
     pub domain: BenchmarkDomain,
-    pub from_offset: u64,
     pub duration: Duration,
     pub concurrency: usize,
     /// Per-worker nonce offsets (worker i starts at nonce_offsets[i]).
@@ -84,7 +83,9 @@ pub async fn run_round_trip_benchmark(
         SequencerClient::new_with_timeout(config.endpoint.clone(), timeout).map_err(|e| {
             crate::support::io_err(format!("invalid endpoint '{}': {e}", config.endpoint))
         })?;
-    let ws_subscribe_url = client.ws_subscribe_url(config.from_offset);
+    // This observer tracks latency only; it holds no application state to restore.
+    let claim = client.latest_snapshot().await?.claim;
+    let ws_subscribe_url = client.ws_subscribe_url(claim);
     let domain = config.domain.eip712_domain();
 
     let workers = config.concurrency;
@@ -99,7 +100,7 @@ pub async fn run_round_trip_benchmark(
     )?;
 
     // Connect WS and drain backlog.
-    let mut ws = client.subscribe(config.from_offset).await.map_err(|err| {
+    let mut ws = client.subscribe(claim).await.map_err(|err| {
         io_err(format!(
             "ws connect failed: url={ws_subscribe_url}, error={err}"
         ))

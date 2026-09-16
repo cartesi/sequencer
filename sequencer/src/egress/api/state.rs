@@ -15,7 +15,6 @@ use crate::runtime::shutdown::RuntimeScope;
 pub(crate) struct SubscribeState {
     pub shutdown: RuntimeScope,
     pub ws_subscriber_limit: Arc<Semaphore>,
-    pub ws_max_catchup_events: u64,
     pub tx_feed: L2TxFeed,
 }
 
@@ -24,12 +23,10 @@ impl SubscribeState {
         shutdown: RuntimeScope,
         tx_feed: L2TxFeed,
         ws_max_subscribers: usize,
-        ws_max_catchup_events: u64,
     ) -> Self {
         Self {
             shutdown,
             ws_subscriber_limit: Arc::new(Semaphore::new(ws_max_subscribers)),
-            ws_max_catchup_events,
             tx_feed,
         }
     }

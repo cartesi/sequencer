@@ -377,7 +377,7 @@ pub struct SetupConfig {
     pub checkpoint_block: u64,
     /// Recovery mode (cockroach recovery): rebuild this freshly-wiped DB from a
     /// trusted checkpoint at `--checkpoint-block` instead of genesis bootstrap.
-    /// Requires `--checkpoint-dump-dir`, `--checkpoint-block > 0`, and the
+    /// Requires `--checkpoint-dump-dir` and the
     /// batch-submitter signing key (recovery flushes the wallet nonce, which
     /// signs L1 no-ops). Plain `setup` stays L1-read-only and key-less.
     #[arg(long, env = "CARTESI_SEQUENCER_RECOVERY", default_value_t = false)]
@@ -410,7 +410,7 @@ impl SetupConfig {
     /// conditionally-required arg group). Returns the first violation as a
     /// human-readable message; the caller maps it to a terminal bootstrap error.
     ///
-    /// Recovery requires a real checkpoint (`--checkpoint-block > 0` + a dump
+    /// Recovery requires an exported checkpoint (a matching block + dump
     /// dir) and the signing key; a plain `setup` must carry none of the
     /// recovery-only inputs (key, dump dir).
     pub fn validate(&self) -> Result<(), String> {
@@ -425,11 +425,6 @@ impl SetupConfig {
         if self.recovery {
             if self.checkpoint_dump_dir.is_none() {
                 return Err("--recovery requires --checkpoint-dump-dir".to_string());
-            }
-            if self.checkpoint_block == 0 {
-                return Err("--recovery requires --checkpoint-block > 0 \
-                            (recovery boots a non-genesis checkpoint)"
-                    .to_string());
             }
             if !key_present {
                 return Err("--recovery requires the batch-submitter signing key \
@@ -722,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_requires_dump_dir_block_and_key() {
+    fn recovery_requires_dump_dir_and_key() {
         // --recovery alone (no dump dir / block / key) is invalid; each missing
         // input is reported.
         let bare = setup_config_from(&["--recovery"]);
@@ -732,13 +727,17 @@ mod tests {
                 .contains("--checkpoint-dump-dir")
         );
 
-        let no_block = setup_config_from(&["--recovery", "--checkpoint-dump-dir", "/tmp/ckpt"]);
-        assert!(
-            no_block
-                .validate()
-                .unwrap_err()
-                .contains("--checkpoint-block > 0")
-        );
+        let genesis = setup_config_from(&[
+            "--recovery",
+            "--checkpoint-dump-dir",
+            "/tmp/ckpt",
+            "--batch-submitter-private-key",
+            TEST_KEY,
+        ]);
+        genesis
+            .validate()
+            .expect("genesis checkpoint is a valid recovery source");
+        assert_eq!(genesis.checkpoint_block, 0);
 
         let no_key = setup_config_from(&[
             "--recovery",

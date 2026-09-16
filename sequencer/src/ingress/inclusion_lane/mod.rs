@@ -11,12 +11,11 @@
 //!   subset commits at most once, bounding ack latency for its first op.
 //!   All-rejected chunks mutate nothing and do not open a transaction.
 //! - **L1 reconciliation** (observed at `frontier_min_interval`): once five
-//!   newly-safe blocks have accumulated, consumes the complete range, promotes
-//!   snapshots, and advances one frame directly to the observed tip. The time
+//!   newly-safe blocks have accumulated, executes the complete direct-input range and advances one frame directly to the observed tip. The time
 //!   gate bounds SQL load; block distance is the semantic clock criterion.
 //!   That frontier read is also the lane's divergence refusal point (I15):
 //!   a marker already present closes intake before direct execution,
-//!   promotion, or the frame-clock decision.
+//!   or the frame-clock decision.
 //!
 //! The lane is a single-thread `spawn_blocking` task. SQLite is the durable data
 //! coordination boundary with the input reader and batch submitter. HTTP
@@ -47,11 +46,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::{SafeFrontierState, SafeInputRange, Storage, StoredSafeInput, WriteHead};
+use crate::storage::{SafeFrontierState, SafeInputRange, Storage, StoredDirectInput, WriteHead};
 use sequencer_core::application::{
     Application, ExecutionOutcome, execute_direct_input, validate_and_execute_user_op,
 };
-use sequencer_core::l2_tx::DirectInput;
+use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::user_op::SignedUserOp;
 
 use catch_up::{catch_up_application, catch_up_snapshot};
@@ -72,14 +71,9 @@ impl<A: Application + 'static> InclusionLane<A> {
     /// It fails loudly with
     /// [`InclusionLaneError::NoOpenTip`] if the invariant was somehow violated.
     ///
-    /// The lane selects one resume checkpoint — the latest pending
-    /// snapshot if any, else the finalized snapshot (see
-    /// `catch_up_snapshot`) — and uses it for both `A::from_dump` and the
-    /// catch-up replay offset, so the loaded state and the replay cursor
-    /// can never drift apart. The runtime guarantees at least a genesis
-    /// finalized snapshot exists before this is called (cold start
-    /// registers one; warm start reuses the previous run's). A missing
-    /// snapshot surfaces as `CatchUpError::NoSnapshot`.
+    /// Restore the newest surviving snapshot and replay from its exact
+    /// application count. Startup preserves a rollback-safe checkpoint before
+    /// admitting any runtime work.
     ///
     /// Returns the input MPSC sender (for the API to enqueue user
     /// ops) and the join handle (for the runtime to observe lane
@@ -114,7 +108,7 @@ impl<A: Application + 'static> InclusionLane<A> {
                 });
             }
             tracing::debug!(
-                l2_tx_index = checkpoint.l2_tx_index,
+                executed_input_count = checkpoint.executed_input_count.get(),
                 "inclusion lane resuming from snapshot"
             );
             let mut lane = Self {
@@ -124,12 +118,12 @@ impl<A: Application + 'static> InclusionLane<A> {
                 storage,
                 config,
             };
-            lane.run_forever(checkpoint.l2_tx_index)
+            lane.run_forever(checkpoint.executed_input_count)
         });
         (tx, handle)
     }
 
-    fn run_forever(&mut self, catch_up_from: u64) -> Result<(), InclusionLaneError> {
+    fn run_forever(&mut self, catch_up_from: ExecutedInputCount) -> Result<(), InclusionLaneError> {
         self.run_catch_up(catch_up_from)?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
@@ -159,9 +153,9 @@ impl<A: Application + 'static> InclusionLane<A> {
             {
                 let next_safe_block = lane_state.head.safe_block;
                 // Atomic close: dump the app state, then seal the batch
-                // and register its pending snapshot in one transaction.
+                // and register its snapshot in one transaction.
                 // A create_dump failure leaves the batch open for retry;
-                // a committed close always has a promotable snapshot row.
+                // a committed close always has its immutable snapshot row.
                 // Errors propagate per the lane's fail-loud policy.
                 snapshot::close_batch_with_snapshot(
                     &mut self.app,
@@ -172,23 +166,15 @@ impl<A: Application + 'static> InclusionLane<A> {
                 )
                 .map_err(InclusionLaneError::Snapshot)?;
             } else if !turn.processed_any() {
-                // Nothing to drain and no batch to close: back off. GC no longer
-                // lives here — it runs after a promotion in
-                // `maybe_advance_safe_frontier`, so it tracks garbage creation
-                // rather than idleness and is never starved under load.
+                // Nothing to drain and no batch to close: back off. GC runs on the reconciliation cadence so load cannot starve it.
                 thread::sleep(self.config.idle_poll_interval);
             }
         }
     }
 
-    fn run_catch_up(&mut self, start_offset: u64) -> Result<(), InclusionLaneError> {
-        catch_up_application(
-            &mut self.app,
-            &mut self.storage,
-            self.config.batch_submitter_address,
-            start_offset,
-        )
-        .map_err(|source| InclusionLaneError::CatchUp { source })
+    fn run_catch_up(&mut self, start_offset: ExecutedInputCount) -> Result<(), InclusionLaneError> {
+        catch_up_application(&mut self.app, &mut self.storage, start_offset)
+            .map_err(|source| InclusionLaneError::CatchUp { source })
     }
 
     /// Process at most one bounded dequeue chunk. Returning to the outer loop
@@ -225,7 +211,7 @@ impl<A: Application + 'static> InclusionLane<A> {
     fn maybe_advance_safe_frontier(
         &mut self,
         lane_state: &mut LaneState,
-        safe_inputs: &mut Vec<StoredSafeInput>,
+        safe_inputs: &mut Vec<StoredDirectInput>,
     ) -> Result<(), InclusionLaneError> {
         if !lane_state.frontier_check_due(self.config.frontier_min_interval) {
             return Ok(());
@@ -265,100 +251,42 @@ impl<A: Application + 'static> InclusionLane<A> {
 
         let leading_direct_range =
             SafeInputRange::new(lane_state.next_safe_input_index, frontier.end_exclusive);
-        // The observation commits its promotion (if any) in the same
-        // transaction as the drain, so a crash can never leave a
-        // promoted-but-undrained batch — the state a restart would re-process
-        // and re-promote on a deleted pending row.
-        let observation = self.execute_safe_inputs_range(leading_direct_range, safe_inputs)?;
-        let promoted = observation.commit(
-            &mut self.storage,
+        let executions = self.execute_direct_range(leading_direct_range, safe_inputs)?;
+        self.storage.close_frame_only_with_executions(
             &mut lane_state.head,
             frontier.safe_block,
             leading_direct_range,
+            &executions,
         )?;
         lane_state.next_safe_input_index = frontier.end_exclusive;
 
-        // A promotion supersedes the previous finalized (and any lower-nonce
-        // pendings); reclaim them now. The full pass also collects earlier
-        // lease-released garbage. On the lane's own thread, only when a
-        // promotion created garbage — so GC tracks garbage creation, never
-        // starved by load.
-        if promoted {
-            // Stamp `B` into the freshly finalized dump's info.toml before
-            // GC (the stamp targets the survivor; GC removes the superseded).
-            snapshot::stamp_finalized_promotion(&mut self.storage)?;
-            let removed = snapshot::run_gc(&mut self.storage).map_err(InclusionLaneError::Gc)?;
-            if removed > 0 {
-                tracing::debug!(removed, "post-promotion GC removed unreferenced dumps");
-            }
+        // Acceptance can advance independently of application inputs. A bounded
+        // reconciliation cadence reclaims retired artifacts even under load.
+        let removed = snapshot::run_gc(&mut self.storage)?;
+        if removed > 0 {
+            tracing::debug!(removed, "snapshot garbage collection removed artifacts");
         }
         Ok(())
     }
 
-    /// Process the safe inputs in `direct_range`, accumulating which of our
-    /// batches landed into a [`snapshot::BlockObservation`] for the caller to
-    /// [`commit`](snapshot::BlockObservation::commit).
-    fn execute_safe_inputs_range(
+    fn execute_direct_range(
         &mut self,
-        direct_range: SafeInputRange,
-        chunk: &mut Vec<StoredSafeInput>,
-    ) -> Result<snapshot::BlockObservation, InclusionLaneError> {
-        let mut observation = snapshot::BlockObservation::new();
-        let max_chunk_len = self.config.safe_input_buffer_capacity.max(1) as u64;
-        for chunk_range in direct_range.chunks(max_chunk_len) {
-            self.storage.fill_safe_inputs(chunk_range, chunk)?;
-            self.execute_safe_inputs_chunk(
-                chunk.as_slice(),
-                chunk_range.start(),
-                &mut observation,
-            )?;
-        }
-        Ok(observation)
-    }
-
-    fn execute_safe_inputs_chunk(
-        &mut self,
-        chunk: &[StoredSafeInput],
-        base_safe_input_index: u64,
-        observation: &mut snapshot::BlockObservation,
-    ) -> Result<(), InclusionLaneError> {
-        for (offset, input) in chunk.iter().enumerate() {
-            let safe_input_index = base_safe_input_index + offset as u64;
-            let own_batch_nonce = if input.sender == self.config.batch_submitter_address {
-                // Look up whether the scheduler accepted this batch.
-                // Stale-nonce batches end up in safe_inputs but NOT in
-                // safe_accepted_batches; only accepted ones get promoted.
-                self.storage
-                    .accepted_batch_nonce_at(safe_input_index)
-                    .map_err(InclusionLaneError::Storage)?
-            } else {
-                None
-            };
-
-            // Accumulate the observation — infallible, no storage. The lane
-            // promotes once at range close, atomically with the drain.
-            observation.observe(input.block_number, own_batch_nonce);
-
-            if input.sender == self.config.batch_submitter_address {
-                // Our own batch (accepted or rejected) — never replayed
-                // as a direct input.
-                continue;
+        range: SafeInputRange,
+        chunk: &mut Vec<StoredDirectInput>,
+    ) -> Result<Vec<crate::storage::DirectInputExecution>, InclusionLaneError> {
+        let mut executions = Vec::new();
+        for chunk_range in range.chunks(self.config.safe_input_buffer_capacity.max(1) as u64) {
+            self.storage.fill_direct_inputs(chunk_range, chunk)?;
+            for input in chunk.iter() {
+                let receipt = execute_direct_input(&mut self.app, &input.input)
+                    .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?;
+                executions.push(crate::storage::DirectInputExecution {
+                    safe_input_index: input.safe_input_index,
+                    executed_input_offset: receipt.offset,
+                });
             }
-
-            let direct_input = DirectInput {
-                sender: input.sender,
-                block_number: input.block_number,
-                payload: input.payload.clone(),
-            };
-
-            let receipt = execute_direct_input(&mut self.app, &direct_input)
-                .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?;
-            observation.observe_direct_execution(crate::storage::DirectInputExecution {
-                safe_input_index,
-                executed_input_offset: receipt.offset,
-            });
         }
-        Ok(())
+        Ok(executions)
     }
 
     fn respond_internal_to_all(pending: &mut Vec<IncludedUserOp>, message: String) {

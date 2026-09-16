@@ -119,7 +119,7 @@ In another shell (use the printed `CARTESI_WATCHDOG_SEQUENCER_URL`):
 curl -s "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
 ```
 
-When you see JSON like `{"inclusion_block":0,"l2_tx_index":0}` (numbers may differ), the watchdog can compare. If it stays 404 for a long time, check sequencer logs in `tests/e2e/results/` and that L1 is mining (devnet Anvil auto-mines by default).
+When you see JSON like `{"inclusion_block":0,"executed_input_count":0}` (numbers may differ), the watchdog can compare. If it stays 404 for a long time, check sequencer logs in `tests/e2e/results/` and that L1 is mining (devnet Anvil auto-mines by default).
 
 Optional — inspect SSZ size:
 

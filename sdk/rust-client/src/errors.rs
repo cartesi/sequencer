@@ -69,8 +69,18 @@ pub enum GetFeeError {
 
 #[derive(Debug, Error)]
 pub enum SubscribeError {
+    #[error(transparent)]
+    History(#[from] sequencer_core::history::HistoryPolicyError),
     #[error("invalid endpoint: {0}")]
     InvalidEndpoint(String),
     #[error("ws connect failed: {0}")]
     Connect(String),
+}
+
+#[derive(Debug, Error)]
+pub enum SnapshotError {
+    #[error("snapshot request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("invalid snapshot metadata: {0}")]
+    Metadata(String),
 }

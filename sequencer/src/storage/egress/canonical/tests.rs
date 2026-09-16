@@ -9,6 +9,8 @@ use tokio::sync::oneshot;
 
 use super::*;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
+use crate::storage::L2TxContext;
+use crate::storage::history::initialize_history_in;
 use crate::storage::test_helpers::{
     SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload, pin_test_deployment_identity,
     temp_db,
@@ -111,7 +113,6 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
                 safe_input_index: 0,
                 executed_input_offset: ExecutedInputCount::new(1),
             }],
-            None,
         )
         .unwrap();
     storage
@@ -121,10 +122,9 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
     let bounds = storage.history_bounds().unwrap();
     assert_eq!(bounds.available_from, ExecutedInputCount::ZERO);
     assert_eq!(bounds.head, ExecutedInputCount::new(3));
-    assert_eq!(storage.ordered_l2_txs_page_from(0, 10).unwrap().len(), 4);
     let first = storage.canonical_history_page(claim(bounds, 0), 2).unwrap();
     assert_eq!(first.bounds, bounds);
-    assert_eq!(first.next, claim(bounds, 2));
+    assert_eq!(first.next_claim(), claim(bounds, 2));
     assert_eq!(first.rows.len(), 2);
     assert_eq!(first.rows[0].offset, ExecutedInputCount::ZERO);
     match &first.rows[0].context {
@@ -146,7 +146,6 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
         L2TxContext::DirectInput {
             tx,
             input_index,
-            safe_block,
             batch_nonce,
             block_timestamp,
             transaction_hash: actual_hash,
@@ -154,15 +153,14 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
             assert_eq!(tx.sender, SENDER_B);
             assert_eq!(tx.payload, vec![0x22]);
             assert_eq!(tx.block_number, 10);
-            assert_eq!(
-                (*input_index, *safe_block, *batch_nonce, *block_timestamp),
-                (0, 10, 1, 100)
-            );
+            assert_eq!((*input_index, *batch_nonce, *block_timestamp), (0, 1, 100));
             assert_eq!(*actual_hash, transaction_hash);
         }
         other => panic!("expected direct input, got {other:?}"),
     }
-    let last = storage.canonical_history_page(first.next, 2).unwrap();
+    let last = storage
+        .canonical_history_page(first.next_claim(), 2)
+        .unwrap();
     assert_eq!(last.rows.len(), 1);
     assert_eq!(last.rows[0].offset, ExecutedInputCount::new(2));
     match &last.rows[0].context {
@@ -178,17 +176,19 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
         }
         other => panic!("expected user op, got {other:?}"),
     }
-    assert_eq!(last.next, claim(bounds, 3));
-    let tail = storage.canonical_history_page(last.next, 2).unwrap();
+    assert_eq!(last.next_claim(), claim(bounds, 3));
+    let tail = storage
+        .canonical_history_page(last.next_claim(), 2)
+        .unwrap();
     assert!(tail.rows.is_empty());
-    assert_eq!(tail.next, last.next);
+    assert_eq!(tail.next_claim(), last.next_claim());
     let zero = storage.canonical_history_page(claim(bounds, 1), 0).unwrap();
     assert!(zero.rows.is_empty());
-    assert_eq!(zero.next, claim(bounds, 1));
+    assert_eq!(zero.next_claim(), claim(bounds, 1));
 }
 
 #[test]
-fn recovery_refuses_old_claims_and_reuses_canonical_offsets_across_physical_holes() {
+fn recovery_refuses_old_claims_and_reuses_canonical_offsets_after_suffix_replacement() {
     let db = temp_db("canonical-page-recovery");
     let mut storage = Storage::open(&db.path).unwrap();
     seed_aging_tip(&mut storage);
@@ -223,27 +223,28 @@ fn recovery_refuses_old_claims_and_reuses_canonical_offsets_across_physical_hole
         .unwrap();
     assert_eq!(page.rows.len(), 1);
     assert_eq!(page.rows[0].offset, ExecutedInputCount::new(1));
-    assert_eq!(page.next.next_input, before.head);
+    assert_eq!(page.next_input, before.head);
     match &page.rows[0].context {
         L2TxContext::UserOp { tx, .. } => assert_eq!(tx.data, vec![0xcc]),
         other => panic!("expected replacement user op, got {other:?}"),
     }
-    let physical = storage.ordered_l2_txs_page_from(0, 10).unwrap();
-    assert_eq!(
-        physical.iter().map(|row| row.db_offset).collect::<Vec<_>>(),
-        vec![1, 3]
-    );
     let audit_rows: i64 = storage
         .conn
-        .query_row("SELECT COUNT(*) FROM sequenced_l2_txs", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT COUNT(*) FROM user_ops", [], |row| row.get(0))
         .unwrap();
     assert_eq!(audit_rows, 3);
+    assert_eq!(
+        storage
+            .canonical_history_page(claim(recovered, 0), 10)
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
 }
 
 #[test]
-fn rebuilt_history_starts_at_its_absolute_base_and_excludes_padding() {
+fn rebuilt_history_starts_at_its_absolute_base_without_padding() {
     let db = temp_db("canonical-page-rebuild");
     let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
     storage
@@ -265,10 +266,11 @@ fn rebuilt_history_starts_at_its_absolute_base_and_excludes_padding() {
             &default_protocol_timing(),
         )
         .unwrap();
-    storage.open_recovery_tip(10).unwrap();
-    let physical_head = storage.valid_ordered_l2_tx_head().unwrap();
     storage
-        .insert_initial_finalized_dump(&db._dir.path().join("recovered"), 10, physical_head, 41, 2)
+        .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(41), 10))
+        .unwrap();
+    storage
+        .initialize_open_state(10, SafeInputRange::empty_at(2))
         .unwrap();
     let bounds = storage.history_bounds().unwrap();
     assert_eq!(bounds.available_from, ExecutedInputCount::new(41));
@@ -300,14 +302,7 @@ fn rebuilt_history_starts_at_its_absolute_base_and_excludes_padding() {
         .unwrap();
     assert_eq!(page.rows.len(), 1);
     assert_eq!(page.rows[0].offset, ExecutedInputCount::new(41));
-    assert_eq!(page.next.next_input, ExecutedInputCount::new(42));
-    let physical = storage.ordered_l2_txs_page_from(0, 10).unwrap();
-    assert_eq!(physical.len(), 3);
-    assert!(
-        physical[..2]
-            .iter()
-            .all(|row| row.executed_input_offset.is_none())
-    );
+    assert_eq!(page.next_input, ExecutedInputCount::new(42));
 }
 
 #[test]
@@ -336,7 +331,7 @@ fn a_deep_backlog_can_be_read_in_small_bounded_pages() {
                 .collect::<Vec<_>>(),
             vec![from, from + 1]
         );
-        assert_eq!(page.next, claim(bounds, from + 2));
+        assert_eq!(page.next_claim(), claim(bounds, from + 2));
     }
 }
 
@@ -379,10 +374,12 @@ fn one_read_transaction_keeps_history_identity_and_rows_coherent_during_recovery
 fn tail_after_the_largest_sqlite_offset_is_empty_without_clamping() {
     let db = temp_db("canonical-page-sqlite-tail");
     let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
-    storage.open_recovery_tip(0).unwrap();
     let last = i64::MAX as u64;
     storage
-        .insert_initial_finalized_dump(&db._dir.path().join("recovered"), 0, 0, last, 0)
+        .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(last), 0))
+        .unwrap();
+    storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
     let mut head = storage.open_state().unwrap().unwrap();
     storage
@@ -396,15 +393,15 @@ fn tail_after_the_largest_sqlite_offset_is_empty_without_clamping() {
     assert_eq!(page.rows.len(), 1);
     assert_eq!(page.rows[0].offset, ExecutedInputCount::new(last));
     let tail = storage
-        .canonical_history_page(page.next, usize::MAX)
+        .canonical_history_page(page.next_claim(), usize::MAX)
         .unwrap();
     assert!(tail.rows.is_empty());
-    assert_eq!(tail.next, page.next);
+    assert_eq!(tail.next_claim(), page.next_claim());
 }
 
 #[test]
 #[should_panic(expected = "canonical history page has an attribution gap")]
-fn an_interior_mapping_hole_fails_loud() {
+fn an_interior_history_hole_fails_loud() {
     let db = temp_db("canonical-page-corrupt-attribution");
     let mut storage = Storage::open(&db.path).unwrap();
     let mut head = storage
@@ -423,8 +420,8 @@ fn an_interior_mapping_hole_fails_loud() {
     storage
         .conn
         .execute_batch(
-            "DROP TRIGGER trg_protect_valid_executed_input_delete;\n\
-         DELETE FROM executed_inputs WHERE executed_input_offset = 1;",
+            "DROP TRIGGER trg_protect_valid_application_input_delete;\n\
+         DELETE FROM application_inputs WHERE offset = 1;",
         )
         .unwrap();
     let bounds = storage.history_bounds().unwrap();

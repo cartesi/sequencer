@@ -4,7 +4,7 @@
 //! External history identity and version coordinates.
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, str::FromStr};
 use thiserror::Error;
 
 /// Boundary before the next canonical application input executes.
@@ -44,10 +44,8 @@ impl ExecutedInputCount {
 
 /// One durable setup/rebuild era.
 ///
-/// The bytes must carry the RFC 4122 UUIDv4 version and variant bits. Display
-/// uses the canonical lowercase hyphenated representation. The wire (text /
-/// JSON) codec deliberately does not exist yet: Track 3 owns the wire
-/// projection and adds it beside its consumer when that lands.
+/// The bytes must carry the RFC 4122 UUIDv4 version and variant bits. Text and
+/// JSON use the canonical lowercase hyphenated representation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EraId([u8; 16]);
 
@@ -95,6 +93,33 @@ impl fmt::Display for EraId {
     }
 }
 
+impl FromStr for EraId {
+    type Err = EraIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 36 || [8, 13, 18, 23].iter().any(|&i| value.as_bytes()[i] != b'-') {
+            return Err(EraIdParseError::InvalidText);
+        }
+        let hex = value.replace('-', "");
+        let bytes = alloy_primitives::hex::decode(hex).map_err(|_| EraIdParseError::InvalidText)?;
+        Self::try_from(bytes.as_slice())
+    }
+}
+
+impl Serialize for EraId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for EraId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Debug for EraId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("EraId").field(&self.to_string()).finish()
@@ -103,6 +128,8 @@ impl fmt::Debug for EraId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum EraIdParseError {
+    #[error("era id must be a hyphenated UUIDv4")]
+    InvalidText,
     #[error("era id blob has length {actual}, expected 16")]
     InvalidByteLength { actual: usize },
     #[error("era id is not UUID version 4")]
@@ -129,22 +156,22 @@ impl RecoveryGeneration {
 }
 
 /// Equality/discontinuity token for locally available application history.
-/// Like [`EraId`], its wire form is Track 3's to define beside its consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Consumers must claim both fields when resuming application history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HistoryVersion {
     pub era_id: EraId,
     pub recovery_generation: RecoveryGeneration,
 }
 
 /// The history a consumer holds and the next application input it can execute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryClaim {
     pub version: HistoryVersion,
     pub next_input: ExecutedInputCount,
 }
 
 /// One coherent view of the locally available canonical history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryBounds {
     pub version: HistoryVersion,
     pub available_from: ExecutedInputCount,
@@ -182,7 +209,8 @@ impl HistoryBounds {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HistoryPolicyError {
     #[error("history era changed")]
     EraChanged { current: HistoryVersion },
@@ -203,6 +231,32 @@ mod tests {
         0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
         0x00,
     ];
+
+    #[test]
+    fn era_and_claim_json_preserve_their_exact_identity() {
+        let era: EraId = "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap();
+        assert_eq!(
+            serde_json::to_string(&era).unwrap(),
+            "\"00112233-4455-4677-8899-aabbccddeeff\""
+        );
+        let claim = HistoryClaim {
+            version: HistoryVersion {
+                era_id: era,
+                recovery_generation: RecoveryGeneration::new(7),
+            },
+            next_input: ExecutedInputCount::new(u64::MAX),
+        };
+        assert_eq!(
+            serde_json::from_str::<HistoryClaim>(&serde_json::to_string(&claim).unwrap()).unwrap(),
+            claim
+        );
+        assert!(
+            "00112233-4455-1677-8899-aabbccddeeff"
+                .parse::<EraId>()
+                .is_err()
+        );
+        assert!("00112233445546778899aabbccddeeff".parse::<EraId>().is_err());
+    }
 
     #[test]
     fn era_id_displays_canonical_lowercase_hyphenated_form() {

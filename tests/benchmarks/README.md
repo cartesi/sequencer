@@ -79,7 +79,7 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
 - Self-contained variants therefore require Foundry's `anvil` binary to be installed locally.
 - `--max-fee` must be at or above the placeholder app's base fee, or every tx is rejected (`422 EXECUTION_REJECTED`) and the run reports no accepted txs. The error message includes the rejection breakdown and the first rejection body, which names the base fee.
 - `round_trip_latency` drains existing WS backlog before timing so stale history does not pollute the measurement window.
-- `sweep --round-trip` carries `from_offset` forward across rounds to avoid re-reading old WS history.
+- `sweep --round-trip` bootstraps each latency observation run from the latest snapshot history claim and drains the remaining backlog before measurement.
 - If sweep hits `Too many open files`, increase the shell limit (`ulimit -n 4096`) or use a smaller concurrency list.
 - Self-contained variants automatically build a temp DB, spawn `anvil`, start the sequencer, and persist logs/results under `tests/benchmarks/results`.
 - For non-self-contained runs, start a sequencer instance first and make sure the benchmark domain matches the sequencer domain.

@@ -14,7 +14,7 @@ freely at this stage — no backward-compatibility constraints.
 |---|-------|-------|--------|
 | 1 | WS context fields + L1 provenance (PR #26) | Stephen | **done** — merged to main |
 | 2 | Restore `docs/review/` ledger + this plan | us | **done** |
-| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **internal read foundation implemented; consumer API open** — the [Track 3 ordered handoff](2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff) owns the accepted workflow and remaining cutover |
+| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **implemented** — canonical application history, snapshot restore archives, mandatory WS claims, typed refusals, and SDK cutover; [remaining integration gates](2026-07-track3-feed-replay-design.md#5-acceptance-evidence-and-remaining-work) |
 | 4 | Storage decode policy | us | **done** — fail-loud for contract-impossible values; the named `saturating_query_bound` only where clamping preserves the predicate (policy lives in `storage/convert.rs` + the invariants check policy) |
 | 5 | Fee exponentiation LUT | us | **deferred** — decided exact-floor if built (the table *is* the spec, algorithm-free; replay continuity across the upgrade explicitly not preserved); a separate pending design decision may make log-space fees defunct — revisit after syncing with Bart |
 | 6 | Dump / `Application` API redesign | us + Bart | **revised interface implemented** — [Application contract](../protocol/application-contract.md); native bridge conformance is a separate integration branch |
@@ -23,13 +23,13 @@ freely at this stage — no backward-compatibility constraints.
 
 **Current campaign order:**
 
-1. Review the Track 3 internal history-read and snapshot-metadata foundation.
-2. Implement the coordinated Track 3 HTTP/WS/SDK cutover on its successor branch.
-3. Validate Track 6 against the reference C bridge, then the private DEX engine when shared.
+1. Review and validate the integrated application-history, snapshot, and Track 3 cutover.
+2. Validate Track 6 against the reference C bridge, then the private DEX engine when shared.
+3. Run recovery/watchdog end-to-end gates and remeasure feed latency in the representative environment.
 4. Track 5 (fee LUT) only after the log-space-fees decision.
 
-Deferred (revisit with libdex rollout): multi-file/tar snapshot serving
-(`docs/snapshots/lifecycle.md` known limitation), pending-snapshot-pool cap.
+Full restore archives now support file and directory application prefixes.
+Additional snapshot retention or transport mechanisms require a measured consumer need.
 
 ## Track 3 — Feed & replay protocol redesign
 
@@ -40,16 +40,17 @@ claims, typed refusals, resource bounds, and fresh-snapshot recovery workflow.
 Raw `/inputs` and separate HTTP transaction replay are outside this feature.
 The watchdog retains its independent trusted-state/L1 comparison workflow.
 
-The internal foundation provides typed history claims and policy errors,
-coherent history-bound reads, inclusive canonical pagination, and history
-identity captured with a snapshot's lease and count. Existing HTTP/WS responses
-still expose physical cursors. The consumer cutover updates snapshot metadata,
-WS admission/replay, SDK, and harness together; it must also remove the total
-catch-up cap while retaining bounded pages, queues, and subscriber counts.
+The implemented path uses one current `application_inputs` projection for catch-up
+and egress. Snapshot headers identify the same leased artifact being downloaded;
+WS claims name an era, generation, and inclusive next-input count. A valid
+available backlog is replayable without a total catch-up cap, with bounded pages,
+queues, and subscribers. Recovery refuses old claims before delivering inputs.
 
-Close the consumer invalidation finding only after that cutover and its
-recovery/bootstrap acceptance tests. The next PR must demonstrate cold start,
-ordinary resume, fresh-snapshot recovery, and gap-free backlog-to-tip delivery.
+The former physical replay cursor and sparse attribution design are superseded
+by the [application-history design](application-history.md). Native-engine
+bootstrap, representative latency measurements, and environment-dependent
+recovery/watchdog runs remain integration gates; no additional protocol layer
+is assumed for them.
 
 ## Track 5 — Fee exponentiation LUT (deferred)
 

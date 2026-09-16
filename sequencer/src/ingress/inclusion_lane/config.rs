@@ -7,8 +7,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use alloy_primitives::Address;
-
 const DEFAULT_MAX_USER_OPS_PER_CHUNK: usize = 64;
 const DEFAULT_SAFE_INPUT_BUFFER_CAPACITY: usize = 2048;
 const DEFAULT_MAX_BATCH_OPEN: Duration = Duration::from_secs(2 * 60 * 60);
@@ -20,10 +18,6 @@ const DEFAULT_FRONTIER_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct InclusionLaneConfig {
-    /// Address of the batch submitter wallet. Direct inputs from this sender
-    /// are skipped during application execution (they're our own batch
-    /// submissions; the application doesn't apply them as user-level inputs).
-    pub batch_submitter_address: Address,
     /// Directory under which the lane creates snapshot dumps. Each dump
     /// lives in its own unique subdirectory of this path. The runtime
     /// sets this to `{data_dir}/dumps/`.
@@ -45,9 +39,8 @@ pub struct InclusionLaneConfig {
 }
 
 impl InclusionLaneConfig {
-    pub fn new(batch_submitter_address: Address, dumps_dir: PathBuf) -> Self {
+    pub fn new(dumps_dir: PathBuf) -> Self {
         Self {
-            batch_submitter_address,
             dumps_dir,
             max_user_ops_per_chunk: DEFAULT_MAX_USER_OPS_PER_CHUNK,
             safe_input_buffer_capacity: DEFAULT_SAFE_INPUT_BUFFER_CAPACITY,

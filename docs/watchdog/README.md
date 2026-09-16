@@ -139,8 +139,8 @@ the Lua side without also porting the version witness that makes it sound.
 
 The sequencer exposes operator-internal snapshot routes (see `sequencer/src/egress/api/snapshot.rs`):
 
-- `GET /finalized_state/inclusion_block` — cheap JSON `{ inclusion_block, l2_tx_index }` polled every compare tick.
-- `GET /finalized_state` — streams the finalized SSZ state file (`application/octet-stream`) with `X-Inclusion-Block` and `X-L2-Tx-Index` headers.
+- `GET /finalized_state/inclusion_block` — cheap JSON `{ inclusion_block, executed_input_count }` polled every compare tick.
+- `GET /finalized_state` — streams the finalized SSZ state file (`application/octet-stream`) with `X-Inclusion-Block` and `X-Executed-Input-Count` headers.
 
 **Idle optimization:** when `inclusion_block` has not advanced past the watchdog
 checkpoint's `safe_block`, the tick returns
