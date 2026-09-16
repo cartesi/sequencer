@@ -4,6 +4,7 @@
 use std::io::ErrorKind;
 use std::time::Duration;
 
+use crate::storage::{ApplicationInputRow, L2TxContext};
 use alloy_primitives::{Address, Signature, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
 use app_core::application::{
@@ -21,7 +22,7 @@ use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{DeploymentIdentity, FeeOracleIdentity, Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::application::Application;
-use sequencer_core::l2_tx::SequencedL2Tx;
+use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -210,7 +211,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint.clone(), Duration::from_secs(2))
         .expect("build sequencer client");
-    let ws_url = client.ws_subscribe_url(0);
+    let ws_url = client.ws_subscribe_url(history_claim(&db.path, 0));
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(ws_url))
         .await
         .expect("timeout connecting websocket")
@@ -219,7 +220,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
     // The deposit is broadcast first.
     let deposit_message = recv_ws_message(&mut ws).await;
     match deposit_message {
-        WsTxMessage::DirectInput { offset, .. } => assert_eq!(offset, 1),
+        WsTxMessage::DirectInput { offset, .. } => assert_eq!(offset, 0),
         other => panic!("expected deposit direct input as first WS message, got {other:?}"),
     }
     let method = Method::Withdrawal(Withdrawal {
@@ -276,7 +277,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
             data,
             ..
         } => {
-            assert_eq!(offset, 2);
+            assert_eq!(offset, 1);
             assert_eq!(ws_sender, sender.to_string());
             // Frame fee includes the default tenfold log-space slack.
             assert_eq!(fee, 1356);
@@ -1026,7 +1027,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint.clone(), Duration::from_secs(2))
         .expect("build sequencer client");
-    let ws_url = client.ws_subscribe_url(0);
+    let ws_url = client.ws_subscribe_url(history_claim(&db.path, 0));
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(ws_url))
         .await
         .expect("timeout connecting websocket")
@@ -1056,10 +1057,10 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
         3,
         "expected deposit, direct input, and user op"
     );
-    // DB offsets (SQLite rowid) start at 1.
-    assert_ws_message_matches_tx(deposit_live, &expected[0], 1);
-    assert_ws_message_matches_tx(first_live, &expected[1], 2);
-    assert_ws_message_matches_tx(second_live, &expected[2], 3);
+    // Application offsets start at zero.
+    assert_ws_message_matches_tx(deposit_live, &expected[0], 0);
+    assert_ws_message_matches_tx(first_live, &expected[1], 1);
+    assert_ws_message_matches_tx(second_live, &expected[2], 2);
 
     shutdown_runtime(runtime).await;
 
@@ -1071,7 +1072,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     let restarted_client =
         SequencerClient::new_with_timeout(restarted_endpoint, Duration::from_secs(2))
             .expect("build sequencer client after restart");
-    let restarted_ws_url = restarted_client.ws_subscribe_url(0);
+    let restarted_ws_url = restarted_client.ws_subscribe_url(history_claim(&db.path, 0));
     let (mut restarted_ws, _) =
         tokio::time::timeout(Duration::from_secs(5), connect_async(restarted_ws_url))
             .await
@@ -1080,8 +1081,8 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
 
     for (i, expected_tx) in expected.iter().enumerate() {
         let replayed = recv_ws_message(&mut restarted_ws).await;
-        // DB offsets start at 1.
-        assert_ws_message_matches_tx(replayed, expected_tx, (i + 1) as u64);
+        // Replaying preserves canonical offsets.
+        assert_ws_message_matches_tx(replayed, expected_tx, i as u64);
     }
     drop(restarted_ws);
 
@@ -1148,13 +1149,11 @@ async fn start_full_server_with_max_body(
             &dump_info::DumpInfo {
                 format_version: dump_info::FORMAT_VERSION,
                 next_batch_nonce: 0,
-                l2_tx_index: 0,
-                promoted_inclusion_block: Some(0),
             },
         )
         .expect("genesis dump");
         storage
-            .insert_finalized_dump(&genesis_dir, 0, 0)
+            .insert_baseline_snapshot(&genesis_dir, ExecutedInputCount::ZERO)
             .expect("register genesis");
     }
 
@@ -1175,7 +1174,6 @@ async fn start_full_server_with_max_body(
         shutdown.clone(),
         storage,
         InclusionLaneConfig {
-            batch_submitter_address: TEST_BATCH_SUBMITTER,
             dumps_dir,
             max_user_ops_per_chunk: 32,
             safe_input_buffer_capacity: 32,
@@ -1193,7 +1191,6 @@ async fn start_full_server_with_max_body(
             page_size: 64,
             // Sentinel submitter: the WS assertions here observe the
             // unfiltered stream, so pass an address no fixture seeds.
-            ..L2TxFeedConfig::new(alloy_primitives::Address::repeat_byte(0x7f))
         },
     );
 
@@ -1250,7 +1247,6 @@ async fn start_api_only_server(
             page_size: 64,
             // Sentinel submitter: the WS assertions here observe the
             // unfiltered stream, so pass an address no fixture seeds.
-            ..L2TxFeedConfig::new(alloy_primitives::Address::repeat_byte(0x7f))
         },
     );
     let server_task = http::start_on_listener(
@@ -1390,7 +1386,7 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 payload,
                 block_number: safe_block,
             }],
-            Address::ZERO,
+            TEST_BATCH_SUBMITTER,
             &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
@@ -1401,22 +1397,20 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
         .expect("append safe direct input");
 }
 
-fn all_ordered_l2_txs(db_path: &str) -> Vec<SequencedL2Tx> {
+fn all_ordered_l2_txs(db_path: &str) -> Vec<ApplicationInputRow> {
     let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
     storage
-        .ordered_l2_txs_page_from(0, 1_000_000)
+        .canonical_history_page(history_claim(db_path, 0), 1_000_000)
         .expect("load ordered l2 txs")
-        .into_iter()
-        .map(|row| row.tx)
-        .collect()
+        .rows
 }
 
 fn assert_ws_message_matches_tx(
     actual: WsTxMessage,
-    expected: &SequencedL2Tx,
+    expected: &ApplicationInputRow,
     expected_offset: u64,
 ) {
-    match (actual, expected) {
+    match (actual, &expected.context) {
         (
             WsTxMessage::UserOp {
                 offset,
@@ -1425,7 +1419,7 @@ fn assert_ws_message_matches_tx(
                 data,
                 ..
             },
-            SequencedL2Tx::UserOp(expected),
+            L2TxContext::UserOp { tx: expected, .. },
         ) => {
             assert_eq!(offset, expected_offset);
             assert_eq!(
@@ -1443,7 +1437,7 @@ fn assert_ws_message_matches_tx(
                 payload,
                 ..
             },
-            SequencedL2Tx::Direct(expected),
+            L2TxContext::DirectInput { tx: expected, .. },
         ) => {
             assert_eq!(offset, expected_offset);
             assert_eq!(
@@ -1578,4 +1572,15 @@ fn decode_hex_prefixed(value: &str) -> Vec<u8> {
 
 fn test_domain() -> Eip712Domain {
     sequencer_core::build_input_domain(1, Address::from_slice(&[0_u8; 20]))
+}
+
+fn history_claim(db_path: &str, next: u64) -> HistoryClaim {
+    HistoryClaim {
+        version: Storage::open_read_only(db_path)
+            .unwrap()
+            .history_state()
+            .unwrap()
+            .version,
+        next_input: ExecutedInputCount::new(next),
+    }
 }

@@ -33,7 +33,7 @@ use super::queries::{
     current_safe_block_required, current_safe_block_timestamp, last_safe_progress_ms,
 };
 use super::safe_accepted_batches::{canonical_divergence_in, frontier_nonce};
-use super::snapshot_dumps::{batch_nonce_in, clear_pending_dumps_from_nonce_in};
+use super::snapshot_dumps::has_rollback_safe_snapshot_in;
 
 /// Outcome of a danger-zone check.
 ///
@@ -94,7 +94,7 @@ pub enum DangerStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecoveryInspection {
     pub(crate) danger: DangerStatus,
-    pub(crate) has_finalized_snapshot: bool,
+    pub(crate) has_recovery_checkpoint: bool,
     pub(crate) has_open_tip: bool,
     pub(crate) current_safe_block: Option<u64>,
 }
@@ -112,8 +112,8 @@ pub(crate) enum RecoveryMutationError {
         expected: DangerStatus,
         actual: DangerStatus,
     },
-    #[error("cannot open the Tip without a finalized snapshot")]
-    MissingFinalizedSnapshot,
+    #[error("cannot open the Tip without a recovery checkpoint")]
+    MissingRecoveryCheckpoint,
     /// The `EnsureOpenTip` phase found a valid open Tip already present. A
     /// stale no-Tip decision, not a danger change; unreachable under the
     /// process lock, and retryable if it ever fires.
@@ -259,8 +259,8 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let facts = inspect_recovery_in(&tx, protocol, now_ms)?;
         refuse_divergence(facts.danger)?;
-        if !facts.has_finalized_snapshot {
-            return Err(RecoveryMutationError::MissingFinalizedSnapshot);
+        if !facts.has_recovery_checkpoint {
+            return Err(RecoveryMutationError::MissingRecoveryCheckpoint);
         }
         if facts.danger != DangerStatus::Safe {
             return Err(RecoveryMutationError::StaleDecision {
@@ -297,8 +297,8 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let facts = inspect_recovery_in(&tx, protocol, now_ms)?;
         refuse_divergence(facts.danger)?;
-        if !facts.has_finalized_snapshot {
-            return Err(RecoveryMutationError::MissingFinalizedSnapshot);
+        if !facts.has_recovery_checkpoint {
+            return Err(RecoveryMutationError::MissingRecoveryCheckpoint);
         }
         let expected = DangerStatus::TipInDanger(expected_batch_index);
         if facts.danger != expected {
@@ -327,8 +327,8 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let facts = inspect_recovery_in(&tx, protocol, now_ms)?;
         refuse_divergence(facts.danger)?;
-        if !facts.has_finalized_snapshot {
-            return Err(RecoveryMutationError::MissingFinalizedSnapshot);
+        if !facts.has_recovery_checkpoint {
+            return Err(RecoveryMutationError::MissingRecoveryCheckpoint);
         }
         let resynced_safe_block = facts
             .current_safe_block
@@ -382,21 +382,13 @@ pub(super) fn inspect_recovery_in(
     now_ms: u64,
 ) -> Result<RecoveryInspection> {
     let danger = check_danger_in(conn, protocol, now_ms)?;
-    let has_finalized_snapshot = has_finalized_snapshot_in(conn)?;
+    let has_recovery_checkpoint = has_rollback_safe_snapshot_in(conn)?;
     Ok(RecoveryInspection {
         danger,
-        has_finalized_snapshot,
+        has_recovery_checkpoint,
         has_open_tip: has_valid_open_batch(conn)?,
         current_safe_block: super::queries::current_safe_block(conn)?,
     })
-}
-
-fn has_finalized_snapshot_in(conn: &Connection) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM finalized_snapshot)",
-        [],
-        |row| row.get(0),
-    )
 }
 
 fn check_danger_in(
@@ -582,22 +574,9 @@ fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resul
 ///
 /// 1. **Cascade** from `pivot` (no-op when `None`): invalidate it and every
 ///    successor, including the open Tip.
-/// 2. **Clear doomed pending snapshots, scoped to the cascade**: delete
-///    pending rows with `nonce >= pivot.nonce` — exactly the cascaded
-///    batches' pendings, states the canonical replay will never reach.
-///    Gold-but-unpromoted pendings (batches that landed while the process
-///    was down) carry lower nonces and *survive*: catch-up resumes from a
-///    fresher checkpoint, and the rows are cleaned up by the next
-///    promotion's `DELETE <= max_nonce`. Scoping is load-bearing: a
-///    blanket clear would arm a promote-wedge crash-loop whenever a
-///    *valid in-flight* closed batch existed at clear time — its pending
-///    row would be deleted while the batch stayed valid, and the lane's
-///    later promotion of its landing would hit the deleted row with no
-///    danger arm ever firing to heal it. With the scope, any nonce the
-///    lane can later observe as accepted either has its pending row intact
-///    or belongs to a post-recovery batch with a fresh row. In the
-///    `RecoverTip` path the scope deletes nothing — the Tip never has a
-///    pending row. Finalized is untouched (L1-confirmed bytes).
+/// 2. Snapshot selection excludes invalidated batches in the same committed
+///    state. Accepted batch snapshots survive; before any acceptance the
+///    baseline supplies the rollback-safe restore point.
 /// 3. **Advance `RecoveryGeneration`** exactly once when the cascade
 ///    invalidated any valid batch. This is the externally visible statement
 ///    that the current era's soft-history reality changed; composing it here
@@ -607,12 +586,7 @@ fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resul
 ///    runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
 fn cascade_and_reopen(tx: &Transaction<'_>, pivot: Option<u64>) -> Result<Vec<u64>> {
     let invalidated = match pivot {
-        Some(batch_index) => {
-            let pivot_nonce = batch_nonce_in(tx, batch_index)?;
-            let invalidated = cascade_invalidate_from(tx, batch_index)?;
-            clear_pending_dumps_from_nonce_in(tx, pivot_nonce)?;
-            invalidated
-        }
+        Some(batch_index) => cascade_invalidate_from(tx, batch_index)?,
         None => Vec::new(),
     };
     if !invalidated.is_empty() {
@@ -661,7 +635,7 @@ fn first_non_gold_closed_batch(conn: &Connection) -> Result<Option<u64>> {
 /// spine, so the closed frontier is at least as *old* as the Tip — whenever
 /// the Tip is in danger, the closed frontier is too, and cascading from the
 /// closed batch covers the Tip via `batch_index >= N`. (This ordering is
-/// load-bearing for the pending-snapshot clear — see `docs/invariants.md`.)
+/// also determines which batch snapshots remain valid.)
 ///
 /// Reads `safe_accepted_batches`, which is maintained atomically with each
 /// [`Storage::append_safe_inputs`] call.

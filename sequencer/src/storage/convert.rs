@@ -106,7 +106,7 @@ pub(super) fn i64_to_u32(value: i64) -> u32 {
 // ── Query-bound conversion (saturating, by design) ────────────────────────
 
 /// Saturating clamp for **untrusted or config-sourced** SQL query bounds:
-/// WS `from_offset` cursors, page/count `LIMIT`s, and setup/recovery block
+/// page/count `LIMIT`s and setup/recovery block
 /// predicates. The full `u64` range is legal input here, and clamping to
 /// `i64::MAX` preserves the comparison exactly — no SQLite `INTEGER` or rowid
 /// exceeds `i64::MAX`, so a past-the-end lower bound matches zero rows while a

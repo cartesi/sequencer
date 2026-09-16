@@ -4,54 +4,48 @@
 //! Inclusion-lane writer: opens the initial batch/frame, appends user-op chunks,
 //! and rotates frame/batch boundaries on the hot path.
 //!
-//! The lane also reads `safe_inputs` (executed by the application) and the open
+//! The lane also reads classified external directs and the open
 //! state (resumed on startup) — those reads live here too because they're driven
 //! by the lane's flow, not by an L1 ingress event.
 
 use std::path::Path;
 
 use alloy_primitives::Address;
-use rusqlite::{Result, Transaction, params};
+use rusqlite::{OptionalExtension, Result, Transaction, params};
 
+#[cfg(test)]
+use super::StoredSafeInput;
+#[cfg(test)]
+use super::convert::external_u64_to_i64;
 use super::convert::{
-    external_u64_to_i64, from_unix_ms, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms,
-    u64_to_i64,
+    from_unix_ms, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms, u64_to_i64,
 };
-use super::history::{ExecutedInputMapping, attach_executed_inputs_in, safe_input_floor_in};
+use super::history::{next_executed_input_count_in, query_history_state};
 use super::mutations::{
     insert_new_batch, insert_open_frame, persist_frame_direct_sequence,
-    persist_frame_direct_sequence_derived, persist_frame_direct_sequence_physical_only, seal_batch,
+    persist_frame_direct_sequence_derived, seal_batch,
 };
 use super::queries::{
     current_safe_block_required, load_current_write_head, query_batch_policy,
-    query_latest_safe_input_index_exclusive, valid_ordered_l2_tx_head,
+    query_latest_safe_input_index_exclusive,
 };
 use super::safe_accepted_batches::canonical_divergence_in;
-use super::snapshot_dumps::{insert_pending_dump_in, promote_finalized_in};
+use super::snapshot_dumps::insert_batch_snapshot_in;
 use super::{
     BatchPolicy, DirectInputExecution, ExecutedInputCount, SafeFrontierState, SafeInputFrontier,
-    SafeInputRange, Storage, StoredSafeInput, WriteHead,
+    SafeInputRange, Storage, WriteHead,
 };
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 
 impl Storage {
-    /// Cursor for the next safe input to drain into a frame. Takes the maximum
-    /// of the era's durable drain floor and the highest already-drained
-    /// `safe_input_index` from valid (non-invalidated) `sequenced_l2_txs` rows
-    /// plus one.
-    ///
-    /// Using `MAX + 1` instead of `COUNT(*)` makes this robust against gaps:
-    /// when a batch is invalidated, those rows drop out of the view and the
-    /// cursor naturally rewinds, allowing the recovery batch to re-drain only
-    /// the invalidated suffix. The durable floor prevents a standard recovery
-    /// from crossing back into cockroach-root padding already represented by
-    /// the recovered application snapshot.
+    /// First L1 input beyond the latest surviving frame's accounted block,
+    /// bounded below by the immutable era prefix.
     pub fn next_undrained_safe_input_index(&mut self) -> Result<u64> {
         self.read(next_undrained_safe_input_index_in)
     }
 
     /// Resume the lane on startup. Returns `None` if storage is empty (caller
-    /// should follow up with [`Storage::initialize_open_state`]).
+    /// must establish the Tip through startup recovery).
     pub fn open_state(&mut self) -> Result<Option<WriteHead>> {
         self.read(load_current_write_head)
     }
@@ -70,8 +64,7 @@ impl Storage {
     /// Bootstrap the very first batch + frame with explicit values, returning
     /// its loaded [`WriteHead`]. Asserts no open state exists.
     ///
-    /// Production opens the genesis Tip through the reducer's guarded
-    /// `EnsureOpenTip` phase, which derives `safe_block`/leading range from the
+    /// Production opens the genesis Tip through guarded startup recovery, which derives `safe_block`/leading range from the
     /// synced L1 view; this explicit form is kept for tests that seed a
     /// specific open state without a safe-head observation.
     #[cfg(test)]
@@ -86,7 +79,7 @@ impl Storage {
                 "open state already exists"
             );
             let batch_index = insert_tip_rows(tx, Some(0), None, safe_block)?;
-            persist_frame_direct_sequence_physical_only(tx, batch_index, 0, leading_direct_range)?;
+            persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
             Ok(load_current_write_head(tx)?.expect("genesis tip just inserted"))
         })
     }
@@ -122,23 +115,9 @@ impl Storage {
         })
     }
 
-    /// Open the cockroach-recovery root tip: a fresh anchored tip (`batch_index`
-    /// 0, parentless, nonce = the batch-tree anchor `N'`) whose first frame sits
-    /// at the checkpoint stop block `C` and leads exactly the directs the fold
-    /// folded into `S'` — those with `block_number <= C`.
-    ///
-    /// Distinct from [`open_fresh_tip_in_tx`] (reached in production through
-    /// the reducer's guarded `EnsureOpenTip` phase), which drains the **whole**
-    /// synced table at the live safe head. That is
-    /// correct for genesis, but wrong here: `setup --recovery` resyncs to the
-    /// live safe head `H1`, which is normally **past** `C`, and the fold only
-    /// folded `<= C` into `S'`. Draining `(C, H1]` into this tip would sequence
-    /// those directs as "already executed" (advancing the cursor / snapshot
-    /// `l2_tx_index` past them) even though `S'` never executed them — they would
-    /// then be skipped by catch-up and never re-led, vanishing from local state
-    /// while the scheduler drains them on-chain (divergence). Capping the drain
-    /// at `C` leaves `(C, H1]` undrained, so `run`'s lane leads and executes them
-    /// exactly once as the safe frontier advances `C -> H1`.
+    /// Open the rebuilt root at the baseline's L1 stop block. Its prefix is
+    /// represented by the baseline artifact and contributes no replay rows.
+    #[cfg(test)]
     pub(crate) fn open_recovery_tip(&mut self, stop_block: u64) -> Result<()> {
         external_u64_to_i64(stop_block, "recovery checkpoint block")?;
         self.write(|tx| open_recovery_tip_in_tx(tx, stop_block))
@@ -165,10 +144,51 @@ impl Storage {
         })
     }
 
+    pub(crate) fn fill_direct_inputs(
+        &mut self,
+        range: SafeInputRange,
+        out: &mut Vec<super::StoredDirectInput>,
+    ) -> Result<()> {
+        out.clear();
+        if range.is_empty() {
+            return Ok(());
+        }
+        let identity = super::l1_inputs::query_deployment_identity(&self.conn)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let mut statement = self.conn.prepare_cached(
+            "SELECT safe_input_index, sender, payload, block_number FROM safe_inputs
+             WHERE safe_input_index >= ?1 AND safe_input_index < ?2 AND sender != ?3
+             ORDER BY safe_input_index",
+        )?;
+        let rows = statement.query_map(
+            params![
+                u64_to_i64(range.start()),
+                u64_to_i64(range.end()),
+                identity.batch_submitter_address.as_slice()
+            ],
+            |row| {
+                let sender: Vec<u8> = row.get(1)?;
+                Ok(super::StoredDirectInput {
+                    safe_input_index: i64_to_u64(row.get(0)?),
+                    input: sequencer_core::l2_tx::DirectInput {
+                        sender: Address::from_slice(&sender),
+                        payload: row.get(2)?,
+                        block_number: i64_to_u64(row.get(3)?),
+                    },
+                })
+            },
+        )?;
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(())
+    }
+
     /// Replace `out`'s contents with the safe-input rows in `range`. Asserts
     /// contiguity — gaps in `safe_input_index` are a bug, not a runtime
     /// condition.
-    pub fn fill_safe_inputs(
+    #[cfg(test)]
+    pub(crate) fn fill_safe_inputs(
         &mut self,
         range: SafeInputRange,
         out: &mut Vec<StoredSafeInput>,
@@ -298,31 +318,22 @@ impl Storage {
         Ok(())
     }
 
-    /// Rotate to the next frame, atomically attaching the drain and its
-    /// execution offsets and optionally promoting `(batch_nonce, inclusion_block)`.
-    /// Promotion must share the drain transaction: otherwise a restart could
-    /// replay the observation and try to promote its already-deleted pending row.
+    /// Commit frame advancement together with its application inputs.
     pub fn close_frame_only_with_executions(
         &mut self,
         head: &mut WriteHead,
         next_safe_block: u64,
         leading_direct_range: SafeInputRange,
         executions: &[DirectInputExecution],
-        promotion: Option<(u64, u64)>,
     ) -> Result<()> {
         let policy = self.write(|tx| {
-            let policy =
-                close_frame_in(tx, head, next_safe_block, leading_direct_range, executions)?;
-            if let Some((max_nonce, inclusion_block)) = promotion {
-                promote_finalized_in(tx, max_nonce, inclusion_block)?;
-            }
-            Ok(policy)
+            close_frame_in(tx, head, next_safe_block, leading_direct_range, executions)
         })?;
         head.advance_frame(policy, next_safe_block);
         Ok(())
     }
 
-    /// Physical-only fixture frame rotation. Production must supply explicit
+    /// Fixture frame rotation with derived application offsets. Production must supply explicit
     /// execution attributions through
     /// [`Storage::close_frame_only_with_executions`].
     #[cfg(test)]
@@ -332,36 +343,15 @@ impl Storage {
         next_safe_block: u64,
         leading_direct_range: SafeInputRange,
     ) -> Result<()> {
-        let policy = self.write(|tx| {
-            close_frame_physical_only_in(tx, head, next_safe_block, leading_direct_range)
-        })?;
-        head.advance_frame(policy, next_safe_block);
-        Ok(())
-    }
-
-    /// Physical-only fixture form of the atomic drain + promotion operation.
-    #[cfg(test)]
-    pub fn close_frame_only_promoting(
-        &mut self,
-        head: &mut WriteHead,
-        next_safe_block: u64,
-        leading_direct_range: SafeInputRange,
-        max_nonce: u64,
-        inclusion_block: u64,
-    ) -> Result<()> {
-        let policy = self.write(|tx| {
-            let policy =
-                close_frame_physical_only_in(tx, head, next_safe_block, leading_direct_range)?;
-            promote_finalized_in(tx, max_nonce, inclusion_block)?;
-            Ok(policy)
-        })?;
+        let policy = self
+            .write(|tx| close_frame_derived_in(tx, head, next_safe_block, leading_direct_range))?;
         head.advance_frame(policy, next_safe_block);
         Ok(())
     }
 
     /// Close the current batch and open a fresh one with its first frame,
-    /// without registering a pending snapshot. Test-only: production closes
-    /// through [`Storage::close_frame_and_batch_with_pending_dump`], which
+    /// without registering a snapshot. Test-only: production closes
+    /// through [`Storage::close_frame_and_batch_with_snapshot`], which
     /// registers the snapshot row in the same transaction (I7).
     ///
     /// Atomically: seal the current Tip (sets `sealed_at_ms`), insert the new
@@ -385,48 +375,29 @@ impl Storage {
         Ok(())
     }
 
-    /// Close the current batch, open a fresh one with its first frame, and
-    /// in the same transaction register the pending snapshot for the batch
-    /// being sealed. The production batch close.
-    ///
-    /// The caller must have already created the dump on disk at
-    /// `dump_prefix` (filesystem-first, outside this tx). That ordering
-    /// gives clean failure semantics:
-    /// - `create_dump` fails → caller never reaches here → batch stays
-    ///   the open Tip → retried next pass.
-    /// - this tx fails → seal rolls back → no sealed-without-dump batch,
-    ///   only an orphan directory the startup sweep reaps.
-    /// - this tx commits → the sealed batch always has a promotable
-    ///   `pending_snapshots` row, closing the "seal succeeds, snapshot
-    ///   fails, promotion wedges on `QueryReturnedNoRows` forever" gap.
-    ///
-    /// `nonce` is the closing batch's nonce (assigned at open, so known
-    /// before the seal). `l2_tx_index` is the global valid replay head
-    /// the caller read when writing the dump's `info.toml` — correct
-    /// even when the closing batch is empty.
-    pub fn close_frame_and_batch_with_pending_dump(
+    /// The artifact is durable before sealing and registering its snapshot in
+    /// one transaction. A failed commit leaves only an unreferenced artifact.
+    pub fn close_frame_and_batch_with_snapshot(
         &mut self,
         head: &mut WriteHead,
         next_safe_block: u64,
         dump_dir: &Path,
-        nonce: u64,
-        l2_tx_index: u64,
+        batch_index: u64,
         executed_input_count: ExecutedInputCount,
     ) -> Result<()> {
+        assert_eq!(
+            batch_index, head.batch_index,
+            "snapshot belongs to another batch"
+        );
         let (next_batch_index, now_ms, policy) = self.write(|tx| {
-            // The lane is the single writer and nothing sequences between
-            // the caller's head read and this close, so the head cannot
-            // have moved. Assert it: the snapshot row and the dump's
-            // info.toml must record the same cursor.
-            let head_now = valid_ordered_l2_tx_head(tx)?;
             assert_eq!(
-                head_now, l2_tx_index,
-                "replay head moved between dump creation and batch close"
+                next_executed_input_count_in(tx)?,
+                executed_input_count,
+                "application count changed between dump creation and batch close"
             );
-            let (next_batch_index, now_ms, policy) =
-                seal_and_open_next_batch(tx, head.batch_index, next_safe_block)?;
-            insert_pending_dump_in(tx, dump_dir, nonce, l2_tx_index, executed_input_count)?;
-            Ok((next_batch_index, now_ms, policy))
+            let result = seal_and_open_next_batch(tx, head.batch_index, next_safe_block)?;
+            insert_batch_snapshot_in(tx, dump_dir, batch_index, executed_input_count)?;
+            Ok(result)
         })?;
         head.move_to_next_batch(
             next_batch_index,
@@ -442,17 +413,9 @@ impl Storage {
     }
 }
 
-/// Insert a fresh open batch (the Tip) and its first empty frame inside `tx`.
-/// The caller immediately persists the leading direct range through either the
-/// production attributed path or the explicit cockroach/test padding path.
-/// Lineage is the caller's: `batch_index_opt = Some(0)` forces the genesis index, `None`
-/// auto-assigns the PK; `parent = None` roots a nonce-0 batch (genesis or a
-/// fully-torn refork), else it inherits `parent.nonce + 1`. The single-Tip
-/// invariant is enforced by the `ux_single_valid_tip` partial index.
-///
-/// Does **not** build a [`WriteHead`] — callers load it via
-/// `load_current_write_head`, so the head has one constructor. Returns the new
-/// `batch_index`.
+/// Insert the Tip and its first frame. Callers separately attach the complete
+/// leading application range, except for a recovery baseline's empty root.
+/// Returns its local identity; callers load `WriteHead` through the shared reader.
 fn insert_tip_rows(
     tx: &Transaction<'_>,
     batch_index_opt: Option<u64>,
@@ -477,11 +440,11 @@ fn insert_tip_rows(
 /// draining all currently-undrained safe inputs into its first frame.
 ///
 /// One mechanism, two callers with distinct intents (each keeps its own guard):
-/// the reducer's guarded `EnsureOpenTip` phase (genesis / first startup) and
+/// startup recovery's guarded Tip creation (genesis / first startup) and
 /// recovery's cascade (reopening the Tip it just invalidated, atomically — see
 /// `storage/recovery.rs`). Lineage is derived from the tree: `parent` is the
 /// highest-indexed valid batch — `None` when the valid path is empty (genesis,
-/// or a fully-torn cascade), rooting a nonce-0 batch; `batch_index` is the
+/// or a fully-torn cascade), rooting a batch at the deployment anchor; `batch_index` is the
 /// explicit genesis `0` only when the `batches` table is empty, otherwise the
 /// monotonic PK (so recovery batches keep climbing and indices are never
 /// reused).
@@ -507,13 +470,8 @@ pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
     )
 }
 
-/// The shared tail of [`open_fresh_tip_in_tx`] and [`open_recovery_tip_in_tx`]:
-/// open the single valid Tip draining `[next_undrained, drain_upper)`, framed at
-/// `safe_block`, with the given lineage. The two callers differ only in
-/// `drain_upper` — the live safe-input head on the fresh path vs the `<= C` cap
-/// on the recovery path (the load-bearing `(C, H1]` difference) — plus
-/// `safe_block` and lineage, which they pass explicitly so the cap rule stays
-/// visible at each call site rather than hidden in one branch.
+/// Capture the unaccounted range before creating its new frame, then attribute
+/// its external directs. Catch-up executes these rows before runtime admission.
 fn insert_draining_tip_with_executions(
     tx: &Transaction<'_>,
     batch_index: Option<u64>,
@@ -528,69 +486,51 @@ fn insert_draining_tip_with_executions(
     Ok(())
 }
 
-/// See [`Storage::open_recovery_tip`]. Like [`open_fresh_tip_in_tx`] but the
-/// frame's safe block is the checkpoint stop block `C` and the leading drain
-/// range is capped at the `<= C` directs (not the whole synced table), so the
-/// `(C, H1]` directs the resync pulled past `C` stay undrained for `run`.
-fn open_recovery_tip_in_tx(tx: &Transaction<'_>, stop_block: u64) -> Result<()> {
-    debug_assert!(
+/// The folded prefix is represented by the baseline, so the root contains no
+/// replay entries for it. Inputs beyond the stop block remain unaccounted.
+pub(super) fn open_recovery_tip_in_tx(tx: &Transaction<'_>, stop_block: u64) -> Result<()> {
+    assert!(
         load_current_write_head(tx)?.is_none(),
-        "recovery tip opened over existing open state"
+        "recovery tip already exists"
     );
-    // Fresh DB after wipe: batch_index 0, parentless (rooted at the anchor via
-    // `compute_next_nonce(None)` -> `N'`); drain capped at the `<= C` safe
-    // inputs.
-    //
-    // That range is sender-unfiltered: it includes the `<= C` batch-submitter
-    // rows alongside the user directs, exactly as the fresh / genesis tip drains
-    // its whole `[next_undrained, latest)` span. Correct because the leading
-    // range is *sequenced, not executed* — it only advances the replay cursor so
-    // `run`'s catch-up (`offset > l2_tx_index`) skips the rows already in `S'`.
-    // The `sender != batch_submitter` drop belongs to the *fold's* seed filter
-    // (those batches were folded into `S'` as batches, not directs); it is not a
-    // cursor concern, so it deliberately does not reappear here.
-    let leading_direct_range = SafeInputRange::new(
-        next_undrained_safe_input_index_in(tx)?,
-        safe_input_index_exclusive_through_block_in(tx, stop_block)?,
-    );
-    // These rows are cursor padding for state already represented by the
-    // recovered snapshot. They permanently remain outside `executed_inputs`.
-    let batch_index = insert_tip_rows(tx, Some(0), None, stop_block)?;
-    persist_frame_direct_sequence_physical_only(tx, batch_index, 0, leading_direct_range)?;
+    insert_tip_rows(tx, Some(0), None, stop_block)?;
     Ok(())
 }
 
-/// Exclusive `safe_input_index` boundary separating directs at `block_number <=
-/// block` from those past it. `safe_input_index` is dense and assigned in
-/// block-ascending ingest order, so the `<= block` rows occupy `[0, count)` and
-/// this count is the boundary.
 fn safe_input_index_exclusive_through_block_in(tx: &Transaction<'_>, block: u64) -> Result<u64> {
-    let boundary: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM safe_inputs WHERE block_number <= ?1",
-        params![saturating_query_bound(block)],
-        |row| row.get(0),
-    )?;
-    Ok(i64_to_u64(boundary))
+    let last: Option<i64> = tx
+        .query_row(
+            "SELECT safe_input_index FROM safe_inputs WHERE block_number <= ?1
+         ORDER BY block_number DESC, safe_input_index DESC LIMIT 1",
+            [saturating_query_bound(block)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(last.map_or(0, |index| {
+        i64_to_u64(index)
+            .checked_add(1)
+            .expect("safe input index overflow")
+    }))
 }
 
-/// Maximum of the durable era floor and `MAX(safe_input_index) + 1` over valid
-/// drained rows (or 0 if none), inside `tx`. The valid attribution may rewind
-/// when a batch is invalidated, but never below inputs already represented by
-/// the cockroach-recovered base snapshot.
 fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
-    const SQL: &str = "
-        SELECT COALESCE(MAX(safe_input_index) + 1, 0)
-        FROM valid_sequenced_l2_txs
-        WHERE safe_input_index IS NOT NULL
-    ";
-    let value: i64 = tx.query_row(SQL, [], |row| row.get(0))?;
-    Ok(safe_input_floor_in(tx)?.max(i64_to_u64(value)))
+    let floor = query_history_state(tx)?.base_safe_block;
+    let latest_frame: Option<i64> = tx
+        .query_row(
+            "SELECT safe_block FROM frames
+         WHERE batch_index = (SELECT MAX(batch_index) FROM valid_batches)
+         ORDER BY frame_in_batch DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    safe_input_index_exclusive_through_block_in(tx, floor.max(latest_frame.map_or(0, i64_to_u64)))
 }
 
 /// Seal the current Tip and open the successor batch's first frame, in `tx`.
 ///
 /// Shared by [`Storage::close_frame_and_batch`] and
-/// [`Storage::close_frame_and_batch_with_pending_dump`] so the seal ordering
+/// [`Storage::close_frame_and_batch_with_snapshot`] so the seal ordering
 /// invariant lives in one place: seal first (which frees the old row from the
 /// `ux_single_valid_tip` partial index), then insert the successor as the new
 /// Tip. Returns the new batch index, the close timestamp, and the sampled
@@ -600,6 +540,11 @@ fn seal_and_open_next_batch(
     closing_batch_index: u64,
     next_safe_block: u64,
 ) -> Result<(u64, i64, BatchPolicy)> {
+    let current = load_current_write_head(tx)?.expect("a batch close requires the Tip");
+    assert_eq!(
+        current.safe_block, next_safe_block,
+        "batch closure cannot advance the frame clock"
+    );
     let now_ms = now_unix_ms();
     // Batch policy is sampled here: the derived fee is committed to the newly
     // opened frame, and the batch size target is stored on the write head.
@@ -627,8 +572,8 @@ fn seal_and_open_next_batch(
 
 /// Rotate to the next frame inside the current batch, in `tx`: open the
 /// successor frame (fresh fee/safe-block) and sequence the drained safe-input
-/// range into it. Shared by the attributed production close/promote paths and
-/// their physical-only test siblings so the frame-rotation invariant lives in
+/// range into it. Shared by the attributed production frame-close path and
+/// their application-history test siblings so the frame-rotation invariant lives in
 /// one place. Returns the sampled policy for the caller to apply to the
 /// in-memory write head.
 fn close_frame_in(
@@ -638,6 +583,14 @@ fn close_frame_in(
     leading_direct_range: SafeInputRange,
     executions: &[DirectInputExecution],
 ) -> Result<BatchPolicy> {
+    assert_eq!(
+        leading_direct_range,
+        SafeInputRange::new(
+            next_undrained_safe_input_index_in(tx)?,
+            safe_input_index_exclusive_through_block_in(tx, next_safe_block)?,
+        ),
+        "frame advancement must account for its complete L1 interval"
+    );
     let (policy, next_frame_in_batch) = open_successor_frame_in(tx, head, next_safe_block)?;
     persist_frame_direct_sequence(
         tx,
@@ -650,14 +603,14 @@ fn close_frame_in(
 }
 
 #[cfg(test)]
-fn close_frame_physical_only_in(
+fn close_frame_derived_in(
     tx: &Transaction<'_>,
     head: &WriteHead,
     next_safe_block: u64,
     leading_direct_range: SafeInputRange,
 ) -> Result<BatchPolicy> {
     let (policy, next_frame_in_batch) = open_successor_frame_in(tx, head, next_safe_block)?;
-    persist_frame_direct_sequence_physical_only(
+    persist_frame_direct_sequence_derived(
         tx,
         head.batch_index,
         next_frame_in_batch,
@@ -671,6 +624,10 @@ fn open_successor_frame_in(
     head: &WriteHead,
     next_safe_block: u64,
 ) -> Result<(BatchPolicy, u32)> {
+    assert!(
+        next_safe_block >= head.safe_block,
+        "frame clock cannot regress"
+    );
     let now_ms = now_unix_ms();
     let policy = query_batch_policy(tx)?;
     let next_frame_in_batch = head
@@ -688,8 +645,7 @@ fn open_successor_frame_in(
     Ok((policy, next_frame_in_batch))
 }
 
-/// Insert user ops into `user_ops`. The `trg_sequence_user_op` trigger then
-/// appends the matching `sequenced_l2_txs` row for each insert.
+/// Fixture insertion of source operations and their application positions.
 #[cfg(test)]
 fn insert_user_ops_batch(
     tx: &Transaction<'_>,
@@ -698,13 +654,21 @@ fn insert_user_ops_batch(
     frame_pos_start: u32,
     user_ops: &[PendingUserOp],
 ) -> Result<()> {
+    let mut next = next_executed_input_count_in(tx)?;
     insert_user_op_iter(
         tx,
         batch_index,
         frame_in_batch,
         frame_pos_start,
         user_ops.iter(),
-    )
+    )?;
+    for position in 0..user_ops.len() {
+        tx.execute("INSERT INTO application_inputs (offset,batch_index,frame_in_batch,user_op_pos_in_frame) VALUES (?1,?2,?3,?4)",
+            params![u64_to_i64(next.get()),u64_to_i64(batch_index),i64::from(frame_in_batch),
+                i64::from(frame_pos_start.checked_add(u32::try_from(position).unwrap()).unwrap())])?;
+        next = next.checked_next().expect("input count overflow");
+    }
+    Ok(())
 }
 
 fn insert_user_op_iter<'a>(
@@ -742,10 +706,7 @@ fn insert_user_op_iter<'a>(
     Ok(())
 }
 
-/// Persist one included user-op chunk and attach every explicit application
-/// offset before the transaction can commit. The trigger-created physical rows
-/// are selected in frame-position order once per chunk, keeping the hot path to
-/// one attribution read rather than one lookup per operation.
+/// User-op source and application position become durable before acknowledgement.
 fn insert_executed_user_ops_batch(
     tx: &Transaction<'_>,
     batch_index: u64,
@@ -760,64 +721,22 @@ fn insert_executed_user_ops_batch(
         frame_pos_start,
         user_ops.iter().map(|item| &item.pending),
     )?;
-    if user_ops.is_empty() {
-        return Ok(());
-    }
-
-    let chunk_len = u32::try_from(user_ops.len())
-        .expect("user-op chunk length exceeds u32: contract-impossible");
-    let frame_pos_end = frame_pos_start
-        .checked_add(chunk_len)
-        .expect("user-op position overflow: contract-impossible");
     let mut stmt = tx.prepare_cached(
-        "SELECT offset, user_op_pos_in_frame \
-         FROM sequenced_l2_txs \
-         WHERE batch_index = ?1 \
-           AND frame_in_batch = ?2 \
-           AND user_op_pos_in_frame >= ?3 \
-           AND user_op_pos_in_frame < ?4 \
-         ORDER BY user_op_pos_in_frame ASC",
+        "INSERT INTO application_inputs (offset, batch_index, frame_in_batch, user_op_pos_in_frame)
+         VALUES (?1, ?2, ?3, ?4)",
     )?;
-    let rows = stmt.query_map(
-        params![
+    for (position, item) in user_ops.iter().enumerate() {
+        let position = frame_pos_start
+            .checked_add(u32::try_from(position).expect("chunk fits u32"))
+            .expect("user-op position overflow");
+        stmt.execute(params![
+            u64_to_i64(item.executed_input_offset.get()),
             u64_to_i64(batch_index),
             i64::from(frame_in_batch),
-            i64::from(frame_pos_start),
-            i64::from(frame_pos_end),
-        ],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    )?;
-    let persisted = rows.collect::<Result<Vec<_>>>()?;
-    drop(stmt);
-    assert_eq!(
-        persisted.len(),
-        user_ops.len(),
-        "user-op physical row count differs from included execution count"
-    );
-
-    let mut mappings = Vec::with_capacity(persisted.len());
-    for (offset, ((physical_offset, position), executed_input_offset)) in persisted
-        .into_iter()
-        .zip(user_ops.iter().map(|item| item.executed_input_offset))
-        .enumerate()
-    {
-        let offset =
-            u32::try_from(offset).expect("user-op chunk offset exceeds u32: contract-impossible");
-        assert_eq!(
-            i64_to_u64(position),
-            u64::from(
-                frame_pos_start
-                    .checked_add(offset)
-                    .expect("user-op position overflow: contract-impossible")
-            ),
-            "user-op physical rows are not contiguous in frame order"
-        );
-        mappings.push(ExecutedInputMapping {
-            sequenced_l2_tx_offset: i64_to_u64(physical_offset),
-            executed_input_offset,
-        });
+            i64::from(position)
+        ])?;
     }
-    attach_executed_inputs_in(tx, &mappings)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -860,20 +779,6 @@ mod tests {
         }
     }
 
-    fn physical_user_op_offsets(storage: &Storage) -> Vec<i64> {
-        storage
-            .conn
-            .prepare(
-                "SELECT offset FROM sequenced_l2_txs \
-                 WHERE user_op_pos_in_frame IS NOT NULL ORDER BY offset",
-            )
-            .expect("prepare physical user-op query")
-            .query_map([], |row| row.get(0))
-            .expect("query physical user-op offsets")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("collect physical user-op offsets")
-    }
-
     fn pin_deployment_identity(storage: &mut Storage, batch_submitter_address: Address) {
         storage
             .load_or_insert_deployment_identity(DeploymentIdentity {
@@ -885,6 +790,73 @@ mod tests {
                 fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
             })
             .expect("pin deployment identity");
+    }
+
+    #[test]
+    fn snapshot_registration_failure_rolls_back_batch_close_and_cached_head() {
+        let db = temp_db("snapshot-close-rollback");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .unwrap();
+        let prefix = std::path::Path::new("existing-baseline");
+        storage
+            .insert_baseline_snapshot(prefix, ExecutedInputCount::ZERO)
+            .unwrap();
+        let batch = head.batch_index;
+        let error = storage
+            .close_frame_and_batch_with_snapshot(
+                &mut head,
+                10,
+                prefix,
+                batch,
+                ExecutedInputCount::ZERO,
+            )
+            .expect_err("colliding artifact name must roll back the whole close");
+        assert!(error.to_string().contains("UNIQUE"));
+        assert_eq!(head.batch_index, batch);
+        let persisted = storage.open_state().unwrap().unwrap();
+        assert_eq!(persisted.batch_index, batch);
+        assert_eq!(persisted.frame_in_batch, head.frame_in_batch);
+        assert_eq!(
+            storage
+                .conn
+                .query_row("SELECT COUNT(*) FROM batches", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .conn
+                .query_row("SELECT COUNT(*) FROM valid_closed_batches", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .conn
+                .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "frame clock cannot regress")]
+    fn frame_clock_cannot_regress_even_when_the_l1_interval_has_no_inputs() {
+        let db = temp_db("empty-frame-clock-regression");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .unwrap();
+        storage
+            .close_frame_only_with_executions(&mut head, 9, SafeInputRange::empty_at(0), &[])
+            .unwrap();
     }
 
     #[test]
@@ -999,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_user_execution_offset_rolls_back_physical_and_logical_rows() {
+    fn mismatched_execution_offset_rolls_back_source_and_history() {
         let db = temp_db("user-execution-offset-atomicity");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let mut head = storage
@@ -1011,13 +983,11 @@ mod tests {
             .append_executed_user_ops_chunk(&mut head, &[included])
             .expect_err("non-canonical execution offset must fail loud");
         assert!(
-            error
-                .to_string()
-                .contains("must equal canonical next count"),
+            error.to_string().contains("must equal next count"),
             "unexpected trigger error: {error}"
         );
 
-        for table in ["user_ops", "sequenced_l2_txs", "executed_inputs"] {
+        for table in ["user_ops", "application_inputs"] {
             let persisted: i64 = storage
                 .conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -1029,153 +999,6 @@ mod tests {
         assert_eq!(
             storage.next_executed_input_count().expect("next count"),
             ExecutedInputCount::ZERO
-        );
-    }
-
-    #[test]
-    fn schema_rejects_execution_attribution_to_a_non_tip_row() {
-        let db = temp_db("executed-input-non-tip");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let mut head = storage
-            .initialize_open_state(0, SafeInputRange::empty_at(0))
-            .expect("initialize open state");
-        storage
-            .append_user_ops_chunk(&mut head, &[pending_user_op(0)])
-            .expect("append physical-only user op");
-        let physical_offset = physical_user_op_offsets(&storage)[0];
-        storage
-            .close_frame_and_batch(&mut head, 0)
-            .expect("seal the physical row's batch");
-
-        let err = storage
-            .conn
-            .execute(
-                "INSERT INTO executed_inputs \
-                 (sequenced_l2_tx_offset, executed_input_offset) VALUES (?1, 0)",
-                [physical_offset],
-            )
-            .expect_err("a sealed batch cannot acquire execution attribution");
-        assert!(
-            err.to_string().contains("current valid Tip"),
-            "unexpected trigger error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn schema_rejects_execution_attribution_before_rebuild_base_is_bound() {
-        let db = temp_db("executed-input-unbound-base");
-        let mut storage =
-            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
-                .expect("initialize rebuild storage");
-        let mut head = storage
-            .initialize_open_state(0, SafeInputRange::empty_at(0))
-            .expect("initialize recovery root fixture");
-        storage
-            .append_user_ops_chunk(&mut head, &[pending_user_op(0)])
-            .expect("append physical-only user op");
-        let physical_offset = physical_user_op_offsets(&storage)[0];
-
-        let err = storage
-            .conn
-            .execute(
-                "INSERT INTO executed_inputs \
-                 (sequenced_l2_tx_offset, executed_input_offset) VALUES (?1, 0)",
-                [physical_offset],
-            )
-            .expect_err("an unbound rebuild cannot acquire execution attribution");
-        assert!(
-            err.to_string().contains("history base is not bound"),
-            "unexpected trigger error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn schema_rejects_execution_attribution_physical_backfill() {
-        let db = temp_db("executed-input-physical-backfill");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let mut head = storage
-            .initialize_open_state(0, SafeInputRange::empty_at(0))
-            .expect("initialize open state");
-        storage
-            .append_user_ops_chunk(&mut head, &[pending_user_op(0), pending_user_op(1)])
-            .expect("append physical-only user ops");
-        let physical_offsets = physical_user_op_offsets(&storage);
-        storage
-            .conn
-            .execute(
-                "INSERT INTO executed_inputs \
-                 (sequenced_l2_tx_offset, executed_input_offset) VALUES (?1, 0)",
-                [physical_offsets[1]],
-            )
-            .expect("seed the later physical attribution");
-
-        let err = storage
-            .conn
-            .execute(
-                "INSERT INTO executed_inputs \
-                 (sequenced_l2_tx_offset, executed_input_offset) VALUES (?1, 1)",
-                [physical_offsets[0]],
-            )
-            .expect_err("execution attribution cannot move backward physically");
-        assert!(
-            err.to_string()
-                .contains("must follow physical replay order"),
-            "unexpected trigger error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn schema_rejects_noncanonical_execution_offset() {
-        let db = temp_db("executed-input-logical-gap");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let mut head = storage
-            .initialize_open_state(0, SafeInputRange::empty_at(0))
-            .expect("initialize open state");
-        storage
-            .append_user_ops_chunk(&mut head, &[pending_user_op(0)])
-            .expect("append physical-only user op");
-        let physical_offset = physical_user_op_offsets(&storage)[0];
-
-        let err = storage
-            .conn
-            .execute(
-                "INSERT INTO executed_inputs \
-                 (sequenced_l2_tx_offset, executed_input_offset) VALUES (?1, 1)",
-                [physical_offset],
-            )
-            .expect_err("the first canonical offset must equal the zero base");
-        assert!(
-            err.to_string().contains("must equal canonical next count"),
-            "unexpected trigger error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn schema_rejects_deleting_valid_execution_attribution() {
-        let db = temp_db("executed-input-valid-delete");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let mut head = storage
-            .initialize_open_state(0, SafeInputRange::empty_at(0))
-            .expect("initialize open state");
-        storage
-            .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])
-            .expect("append mapped user op");
-
-        let err = storage
-            .conn
-            .execute(
-                "DELETE FROM executed_inputs WHERE executed_input_offset = 0",
-                [],
-            )
-            .expect_err("valid canonical attribution is not deletable");
-        assert!(
-            err.to_string()
-                .contains("valid executed input attribution cannot be deleted"),
-            "unexpected trigger error: {err:?}"
-        );
-        assert_eq!(
-            storage.next_executed_input_count().expect("preserved head"),
-            ExecutedInputCount::new(1)
         );
     }
 
@@ -1213,7 +1036,6 @@ mod tests {
                 10,
                 SafeInputRange::new(0, 2),
                 &incomplete,
-                None,
             );
         }));
         assert!(panic.is_err(), "omitted executable direct must fail loud");
@@ -1235,13 +1057,7 @@ mod tests {
             },
         ];
         storage
-            .close_frame_only_with_executions(
-                &mut head,
-                10,
-                SafeInputRange::new(0, 2),
-                &complete,
-                None,
-            )
+            .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 2), &complete)
             .expect("commit complete direct attribution");
         assert_eq!(
             storage.next_executed_input_count().unwrap(),
@@ -1294,128 +1110,21 @@ mod tests {
 
         let current: Vec<i64> = storage
             .conn
-            .prepare(
-                "SELECT executed_input_offset FROM executed_inputs \
-                 ORDER BY sequenced_l2_tx_offset",
-            )
+            .prepare("SELECT offset FROM application_inputs ORDER BY offset")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(current, vec![0, 1]);
-        let valid: Vec<i64> = storage
+        let source_rows: i64 = storage
             .conn
-            .prepare(
-                "SELECT executed_input_offset FROM valid_executed_inputs \
-                 ORDER BY sequenced_l2_tx_offset",
-            )
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(valid, vec![0, 1]);
-        let physical_rows: i64 = storage
-            .conn
-            .query_row("SELECT COUNT(*) FROM sequenced_l2_txs", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM user_ops", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            physical_rows, 3,
-            "invalidation removes only derived mappings, not physical audit rows"
+            source_rows, 3,
+            "invalidation preserves original signed operations"
         );
-    }
-
-    #[test]
-    fn snapshot_promotion_preserves_executed_input_count() {
-        let db = temp_db("snapshot-executed-input-count-promotion");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let mut head = storage
-            .initialize_open_state(0, SafeInputRange::empty_at(0))
-            .expect("initialize open state");
-        storage
-            .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])
-            .expect("append mapped user op");
-        let physical_head = storage.valid_ordered_l2_tx_head().unwrap();
-        storage
-            .insert_pending_dump(&db._dir.path().join("pending"), 0, physical_head)
-            .expect("insert pending checkpoint");
-        assert_eq!(
-            storage
-                .latest_pending_dump()
-                .unwrap()
-                .unwrap()
-                .executed_input_count,
-            ExecutedInputCount::new(1)
-        );
-
-        storage
-            .promote_finalized(0, 10)
-            .expect("promote checkpoint");
-        assert_eq!(
-            storage
-                .finalized_dump()
-                .unwrap()
-                .unwrap()
-                .executed_input_count,
-            ExecutedInputCount::new(1),
-            "promotion must copy the application boundary with the physical cursor"
-        );
-    }
-
-    #[test]
-    fn cockroach_padding_stays_unmapped_above_absolute_history_base() {
-        let db = temp_db("cockroach-padding-execution-offsets");
-        let mut storage =
-            Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
-                .expect("initialize rebuild storage");
-        let recovered = [
-            StoredSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xaa],
-                block_number: 10,
-            },
-            StoredSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xbb],
-                block_number: 10,
-            },
-        ];
-        storage
-            .append_safe_inputs(10, &recovered, SENDER_A, &default_protocol_timing())
-            .expect("persist recovered L1 prefix");
-        storage
-            .open_recovery_tip(10)
-            .expect("open padded recovery root");
-        let physical_head = storage
-            .valid_ordered_l2_tx_head()
-            .expect("physical replay head");
-        storage
-            .insert_initial_finalized_dump(
-                &db._dir.path().join("recovered"),
-                10,
-                physical_head,
-                41,
-                2,
-            )
-            .expect("bind recovered application base");
-
-        let mapped: i64 = storage
-            .conn
-            .query_row("SELECT COUNT(*) FROM executed_inputs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(mapped, 0, "recovery-root padding is never re-attributed");
-        assert_eq!(
-            storage
-                .next_executed_input_count()
-                .expect("absolute next count"),
-            ExecutedInputCount::new(41)
-        );
-        let replay = storage.ordered_l2_txs_page_from(0, 10).unwrap();
-        assert_eq!(replay.len(), 2);
-        assert!(replay.iter().all(|row| row.executed_input_offset.is_none()));
     }
 
     #[test]
@@ -1551,9 +1260,10 @@ mod tests {
     }
 
     #[test]
-    fn next_undrained_safe_input_index_is_derived_from_sequenced_directs() {
+    fn next_undrained_input_is_derived_from_accounted_frame_block() {
         let db = temp_db("safe-cursor");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        pin_deployment_identity(&mut storage, SENDER_A);
         assert_eq!(
             storage
                 .next_undrained_safe_input_index()
@@ -1618,6 +1328,7 @@ mod tests {
     fn replay_returns_direct_inputs_in_drain_order() {
         let db = temp_db("replay-order");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        pin_deployment_identity(&mut storage, SENDER_A);
         let head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -1642,15 +1353,13 @@ mod tests {
             .close_frame_only(&mut head, 10, SafeInputRange::new(0, drained.len() as u64))
             .expect("close frame with directs");
 
-        let replay = storage
-            .ordered_l2_txs_page_from(0, 100)
-            .expect("load replay");
+        let replay = crate::storage::test_helpers::all_ordered_l2_txs(&mut storage);
         assert_eq!(replay.len(), 2);
-        match &replay[0].tx {
+        match &replay[0] {
             SequencedL2Tx::Direct(value) => assert_eq!(value.payload.as_slice(), &[0xaa]),
             _ => panic!("expected direct input at position 0"),
         }
-        match &replay[1].tx {
+        match &replay[1] {
             SequencedL2Tx::Direct(value) => assert_eq!(value.payload.as_slice(), &[0xbb]),
             _ => panic!("expected direct input at position 1"),
         }
@@ -1713,22 +1422,24 @@ mod tests {
         // The rows are in the ordered L2-tx stream for catch-up to replay and
         // carry their creation-time application offsets. ensure_open_tip does
         // not itself run application code; replay validates those offsets.
+        let bounds = storage.history_bounds().expect("bounds");
         let replay = storage
-            .ordered_l2_txs_page_from(0, 100)
-            .expect("load replay");
+            .canonical_history_page(
+                sequencer_core::history::HistoryClaim {
+                    version: bounds.version,
+                    next_input: bounds.available_from,
+                },
+                100,
+            )
+            .expect("load replay")
+            .rows;
         assert_eq!(
             replay.len(),
             2,
             "leading directs are in the replay stream for catch-up"
         );
-        assert_eq!(
-            replay[0].executed_input_offset,
-            Some(ExecutedInputCount::ZERO)
-        );
-        assert_eq!(
-            replay[1].executed_input_offset,
-            Some(ExecutedInputCount::new(1))
-        );
+        assert_eq!(replay[0].offset, ExecutedInputCount::ZERO);
+        assert_eq!(replay[1].offset, ExecutedInputCount::new(1));
     }
 
     #[test]
@@ -1756,5 +1467,75 @@ mod tests {
             head.safe_block, 5,
             "existing frame's safe_block is preserved, not refreshed"
         );
+    }
+    #[test]
+    fn application_rows_require_initialized_baseline_and_a_live_tip() {
+        let db = temp_db("application-history-baseline-required");
+        let mut storage =
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .unwrap();
+        assert!(
+            storage
+                .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])
+                .is_err()
+        );
+        storage
+            .write(|tx| {
+                super::super::history::initialize_history_in(tx, ExecutedInputCount::ZERO, 0)
+            })
+            .unwrap();
+        storage
+            .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])
+            .unwrap();
+        storage.close_frame_and_batch(&mut head, 0).unwrap();
+        let err = storage.conn.execute("INSERT INTO application_inputs (offset,batch_index,frame_in_batch,user_op_pos_in_frame) VALUES (1,0,0,0)", []).unwrap_err();
+        assert!(err.to_string().contains("current valid Tip"));
+        assert!(
+            storage
+                .conn
+                .execute("UPDATE application_inputs SET offset = 1", [])
+                .is_err()
+        );
+        assert!(
+            storage
+                .conn
+                .execute("DELETE FROM application_inputs", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn envelopes_advance_accounting_without_becoming_application_inputs() {
+        let db = temp_db("envelope-only-accounting");
+        let mut storage = Storage::open(&db.path).unwrap();
+        pin_deployment_identity(&mut storage, SENDER_A);
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .unwrap();
+        storage
+            .append_safe_inputs(
+                10,
+                &[StoredSafeInput {
+                    sender: SENDER_A,
+                    payload: vec![0xff],
+                    block_number: 10,
+                }],
+                SENDER_A,
+                &default_protocol_timing(),
+            )
+            .unwrap();
+        storage
+            .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 1), &[])
+            .unwrap();
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
+        assert_eq!(
+            storage.next_executed_input_count().unwrap(),
+            ExecutedInputCount::ZERO
+        );
+        assert!(crate::storage::test_helpers::all_ordered_l2_txs(&mut storage).is_empty());
+        storage.close_frame_and_batch(&mut head, 10).unwrap();
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
     }
 }

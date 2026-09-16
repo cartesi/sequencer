@@ -397,27 +397,26 @@ impl ManagedSequencer {
         self.max_batch_open_seconds = secs;
     }
 
-    /// Read the finalized snapshot's `(inclusion_block B, resume_nonce N)`. `B`
-    /// is `0` for the genesis snapshot and `> 0` once a real batch has been
-    /// promoted — poll this (mining L1 in between) to wait for a recoverable
-    /// checkpoint. Read-only.
-    pub fn finalized_snapshot_info(&self) -> HarnessResult<(u64, u64)> {
-        let db_path = self.data_dir_path.join("sequencer.db");
-        let conn = rusqlite::Connection::open_with_flags(
-            db_path.as_path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
-        let (prefix, inclusion_block): (String, i64) = conn
-            .query_row(
-                "SELECT d.prefix, f.inclusion_block FROM finalized_snapshot f \
-                 JOIN dumps d ON d.id = f.dump_id WHERE f.singleton_id = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|err| io_other(format!("read finalized_snapshot: {err}")))?;
-        let resume_nonce = read_info_next_batch_nonce(Path::new(&prefix))?;
-        Ok((inclusion_block as u64, resume_nonce))
+    /// The currently exportable canonical checkpoint's L1 block. A rebuilt
+    /// optimistic baseline returns `None` until a matching batch is accepted.
+    pub async fn finalized_inclusion_block(&self) -> HarnessResult<Option<u64>> {
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/finalized_state/inclusion_block",
+                self.endpoint()
+            ))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        #[derive(serde::Deserialize)]
+        struct Metadata {
+            inclusion_block: u64,
+        }
+        let metadata: Metadata = response.error_for_status()?.json().await?;
+        Ok(Some(metadata.inclusion_block))
     }
 
     /// Read the first frame's persisted fee. This observes startup directly,
@@ -475,37 +474,46 @@ impl ManagedSequencer {
         Ok((frame_safe_block, persisted_safe_head))
     }
 
-    /// Copy the current finalized snapshot dump to `<data_dir>/checkpoint` (which
-    /// survives [`Self::reset_database`], since that only clears `sequencer.db*`
-    /// and `dumps/`), returning the captured checkpoint. Call after a batch has
-    /// been promoted (`finalized_snapshot_info().0 > 0`).
-    pub fn capture_finalized_checkpoint(&self) -> HarnessResult<RecoveryCheckpoint> {
-        let db_path = self.data_dir_path.join("sequencer.db");
-        let conn = rusqlite::Connection::open_with_flags(
-            db_path.as_path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
-        let (prefix, inclusion_block): (String, i64) = conn
-            .query_row(
-                "SELECT d.prefix, f.inclusion_block FROM finalized_snapshot f \
-                 JOIN dumps d ON d.id = f.dump_id WHERE f.singleton_id = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|err| io_other(format!("read finalized_snapshot: {err}")))?;
-        let src = PathBuf::from(prefix);
+    /// Download the leased accepted-checkpoint export, including its coherent
+    /// `checkpoint.toml` receipt, outside the paths cleared by reset_database.
+    pub async fn capture_finalized_checkpoint(&self) -> HarnessResult<RecoveryCheckpoint> {
+        let response = reqwest::Client::new()
+            .get(format!("{}/finalized_snapshot", self.endpoint()))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?
+            .error_for_status()?;
+        let inclusion_block: u64 = response
+            .headers()
+            .get("X-Inclusion-Block")
+            .ok_or_else(|| io_other("checkpoint export missing X-Inclusion-Block"))?
+            .to_str()?
+            .parse()?;
+        let bytes = response.bytes().await?;
         let dst = self.data_dir_path.join("checkpoint");
         if dst.exists() {
-            fs::remove_dir_all(dst.as_path())
-                .map_err(|err| io_other(format!("clear prior checkpoint ({dst:?}): {err}")))?;
+            fs::remove_dir_all(&dst)?;
         }
-        copy_dir_recursive(src.as_path(), dst.as_path())
-            .map_err(|err| io_other(format!("copy checkpoint {src:?} -> {dst:?}: {err}")))?;
-        let resume_nonce = read_info_next_batch_nonce(dst.as_path())?;
+        fs::create_dir_all(&dst)?;
+        tar::Archive::new(bytes.as_ref()).unpack(&dst)?;
+        #[derive(serde::Deserialize)]
+        struct Receipt {
+            inclusion_block: u64,
+            next_batch_nonce: u64,
+        }
+        let receipt: Receipt = toml::from_str(&fs::read_to_string(dst.join("checkpoint.toml"))?)?;
+        let resume_nonce = read_info_next_batch_nonce(&dst)?;
+        assert_eq!(
+            receipt.inclusion_block, inclusion_block,
+            "checkpoint receipt/header boundary mismatch"
+        );
+        assert_eq!(
+            receipt.next_batch_nonce, resume_nonce,
+            "checkpoint receipt/artifact nonce mismatch"
+        );
         Ok(RecoveryCheckpoint {
             dir: dst,
-            checkpoint_block: inclusion_block as u64,
+            checkpoint_block: inclusion_block,
             resume_nonce,
         })
     }
@@ -1112,9 +1120,34 @@ impl ManagedSequencer {
         std::fs::read_to_string(&self.log_path).map_err(Into::into)
     }
 
-    pub async fn ws(&self, from_offset: u64) -> HarnessResult<WsClient> {
+    /// Test-only fresh replay claim. Reconnection tests retain their original claim explicitly.
+    pub fn history_claim(
+        &self,
+        next_input: u64,
+    ) -> HarnessResult<sequencer_rust_client::HistoryClaim> {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.data_dir_path.join("sequencer.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let (era, generation): (Vec<u8>, i64) = conn.query_row(
+            "SELECT era_id, recovery_generation FROM history_state",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(sequencer_rust_client::HistoryClaim {
+            version: sequencer_rust_client::HistoryVersion {
+                era_id: sequencer_core::history::EraId::try_from(era.as_slice())?,
+                recovery_generation: sequencer_core::history::RecoveryGeneration::new(
+                    u64::try_from(generation)?,
+                ),
+            },
+            next_input: sequencer_rust_client::ExecutedInputCount::new(next_input),
+        })
+    }
+
+    pub async fn ws(&self, next_input: u64) -> HarnessResult<WsClient> {
         let client = self.sequencer_client()?;
-        WsClient::connect(&client, from_offset).await
+        WsClient::connect(&client, self.history_claim(next_input)?).await
     }
 
     pub async fn wallet_l1(&self, signer: TestSigner) -> HarnessResult<WalletL1Client> {
@@ -1199,23 +1232,6 @@ fn read_info_next_batch_nonce(dump_dir: &Path) -> HarnessResult<u64> {
         }
     }
     Err(io_other(format!("info.toml missing next_batch_nonce: {info_path:?}")).into())
-}
-
-/// Recursively copy a directory tree (used to stash a checkpoint dump where
-/// [`ManagedSequencer::reset_database`] won't wipe it).
-fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else {
-            fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

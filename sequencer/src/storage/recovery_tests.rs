@@ -11,6 +11,39 @@ use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::protocol::ProtocolTiming;
 
+/// Exercise the same frame-advance-before-close sequence as the live lane.
+trait RecoveryFixture {
+    fn close_batch_at(
+        &mut self,
+        head: &mut crate::storage::WriteHead,
+        safe_block: u64,
+    ) -> rusqlite::Result<()>;
+}
+impl RecoveryFixture for Storage {
+    fn close_batch_at(
+        &mut self,
+        head: &mut crate::storage::WriteHead,
+        safe_block: u64,
+    ) -> rusqlite::Result<()> {
+        if head.safe_block != safe_block {
+            let start = self.next_undrained_safe_input_index()?;
+            let end: i64 = self.read(|tx| {
+                tx.query_row(
+                    "SELECT COUNT(*) FROM safe_inputs WHERE block_number <= ?1",
+                    [i64::try_from(safe_block).unwrap()],
+                    |r| r.get(0),
+                )
+            })?;
+            self.close_frame_only(
+                head,
+                safe_block,
+                SafeInputRange::new(start, u64::try_from(end).unwrap()),
+            )?;
+        }
+        self.close_frame_and_batch(head, safe_block)
+    }
+}
+
 mod guarded_phases {
     use super::*;
     use crate::storage::RecoveryMutationError;
@@ -37,7 +70,7 @@ mod guarded_phases {
 
     fn ensure_tip_fixture(
         name: &str,
-        with_finalized_snapshot: bool,
+        with_recovery_checkpoint: bool,
     ) -> (
         crate::storage::test_helpers::TestDb,
         Storage,
@@ -57,10 +90,10 @@ mod guarded_phases {
                 crate::storage::FrontierMode::Populate,
             )
             .expect("seed fresh safe head");
-        if with_finalized_snapshot {
+        if with_recovery_checkpoint {
             let prefix = db._dir.path().join("finalized");
             storage
-                .insert_finalized_dump(&prefix, 0, 0)
+                .insert_baseline_snapshot(&prefix, ExecutedInputCount::ZERO)
                 .expect("seed finalized snapshot");
         }
         (db, storage, protocol)
@@ -90,7 +123,7 @@ mod guarded_phases {
             .expect_err("missing finalized state must outrank the stale Tip decision");
         assert!(matches!(
             error,
-            RecoveryMutationError::MissingFinalizedSnapshot
+            RecoveryMutationError::MissingRecoveryCheckpoint
         ));
         assert_eq!(open_tip_count(&storage), 1, "the existing Tip is untouched");
     }
@@ -175,7 +208,7 @@ mod guarded_phases {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize Tip");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close cascade candidate");
         storage
             .append_safe_inputs_with_timestamp(
@@ -189,7 +222,7 @@ mod guarded_phases {
             .expect("advance safe head");
         let prefix = db._dir.path().join("finalized");
         storage
-            .insert_finalized_dump(&prefix, 0, 0)
+            .insert_baseline_snapshot(&prefix, ExecutedInputCount::ZERO)
             .expect("seed finalized snapshot");
         (db, storage)
     }
@@ -234,7 +267,7 @@ mod guarded_phases {
         let protocol = default_protocol_timing();
         storage
             .conn
-            .execute("DELETE FROM finalized_snapshot", [])
+            .execute("DELETE FROM snapshots WHERE batch_index IS NULL", [])
             .expect("remove finalized snapshot fact");
 
         let error = storage
@@ -242,7 +275,7 @@ mod guarded_phases {
             .expect_err("missing finalized state must outrank a lagging view");
         assert!(matches!(
             error,
-            RecoveryMutationError::MissingFinalizedSnapshot
+            RecoveryMutationError::MissingRecoveryCheckpoint
         ));
         assert_eq!(invalidated_count(&storage), 0);
     }
@@ -267,7 +300,7 @@ mod guarded_phases {
             .expect("advance safe head");
         let prefix = db._dir.path().join("finalized");
         storage
-            .insert_finalized_dump(&prefix, 0, 0)
+            .insert_baseline_snapshot(&prefix, ExecutedInputCount::ZERO)
             .expect("seed finalized snapshot");
 
         let error = storage
@@ -307,7 +340,7 @@ mod guarded_phases {
             .expect_err("missing finalized state must refuse Tip recovery");
         assert!(matches!(
             error,
-            RecoveryMutationError::MissingFinalizedSnapshot
+            RecoveryMutationError::MissingRecoveryCheckpoint
         ));
         assert_eq!(invalidated_count(&storage), 0);
     }
@@ -361,7 +394,7 @@ mod invalid_batches {
             .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
             .expect("close frame");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         let directs_1 = vec![StoredSafeInput {
@@ -384,12 +417,14 @@ mod invalid_batches {
         let all = all_ordered_l2_txs(&mut storage);
         assert_eq!(all.len(), 2);
 
-        storage.insert_invalid_batch(0).expect("mark invalid");
+        storage
+            .insert_invalid_batch(1)
+            .expect("invalidate the suffix");
 
         let filtered = all_ordered_l2_txs(&mut storage);
         assert_eq!(filtered.len(), 1);
         match &filtered[0] {
-            SequencedL2Tx::Direct(d) => assert_eq!(d.payload.as_slice(), &[0xbb]),
+            SequencedL2Tx::Direct(d) => assert_eq!(d.payload.as_slice(), &[0xaa]),
             _ => panic!("expected direct input"),
         }
     }
@@ -414,7 +449,7 @@ mod invalid_batches {
             .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
             .expect("close frame");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         let txs = storage.ordered_l2_txs_for_batch(0).expect("load batch 0");
@@ -488,9 +523,7 @@ mod recover_post_flush {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         for _ in 0..3 {
-            storage
-                .close_frame_and_batch(&mut head, 10)
-                .expect("close batch");
+            storage.close_batch_at(&mut head, 10).expect("close batch");
         }
 
         let batch_submitter = Address::repeat_byte(0xAA);
@@ -526,9 +559,7 @@ mod recover_post_flush {
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 10)
-            .expect("close batch");
+        storage.close_batch_at(&mut head, 10).expect("close batch");
 
         let batch_submitter = Address::repeat_byte(0xAA);
         storage
@@ -595,7 +626,7 @@ mod recover_post_flush {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         let batch_submitter = Address::repeat_byte(0xAA);
@@ -628,7 +659,7 @@ mod recover_post_flush {
         // Submitter posts the recovery batch; it lands fresh on L1.
         let mut head = storage.open_state().expect("load").unwrap();
         storage
-            .close_frame_and_batch(&mut head, 1300)
+            .close_batch_at(&mut head, 1300)
             .expect("close recovery batch");
         let landed = local_batch_payload(&mut storage, 0);
         storage
@@ -666,7 +697,7 @@ mod recover_post_flush {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         let batch_submitter = Address::repeat_byte(0xAA);
@@ -687,7 +718,7 @@ mod recover_post_flush {
 
         let mut head = storage.open_state().expect("load").unwrap();
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_batch_at(&mut head, 1210)
             .expect("close gen2 batch");
 
         storage
@@ -695,7 +726,7 @@ mod recover_post_flush {
                 2410,
                 &[StoredSafeInput {
                     sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 100),
+                    payload: make_stale_batch_payload(0, 1210),
                     block_number: 2410,
                 }],
                 SENDER_A,
@@ -740,7 +771,7 @@ mod recover_post_flush {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0; open Tip with same safe_block=10");
 
         let batch_submitter = Address::repeat_byte(0xAA);
@@ -799,7 +830,7 @@ mod recover_post_flush {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         let batch_submitter = Address::repeat_byte(0xAA);
@@ -982,7 +1013,7 @@ mod tip_staleness {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize at safe_block=10");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         // Advance safe head so batch 0's first frame (safe_block=10) is stale.
@@ -1007,7 +1038,7 @@ mod tip_staleness {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         storage.insert_invalid_batch(0).expect("invalidate 0");
@@ -1045,7 +1076,7 @@ mod tip_staleness {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         // Advance safe head so batch 0's first frame (safe_block=10) is stale.
@@ -1113,7 +1144,7 @@ mod tip_staleness {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
 
         let mut head = storage
-            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
             .append_safe_inputs(
@@ -1136,11 +1167,10 @@ mod tip_staleness {
                     safe_input_index: 0,
                     executed_input_offset: ExecutedInputCount::ZERO,
                 }],
-                None,
             )
             .expect("attribute mapped direct");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
         assert_eq!(
             storage
@@ -1194,9 +1224,7 @@ mod tip_staleness {
         );
         let mappings: Vec<i64> = storage
             .conn
-            .prepare(
-                "SELECT executed_input_offset FROM executed_inputs ORDER BY executed_input_offset",
-            )
+            .prepare("SELECT offset FROM application_inputs ORDER BY offset")
             .expect("prepare mapping query")
             .query_map([], |row| row.get(0))
             .expect("query mappings")
@@ -1255,7 +1283,7 @@ mod tip_staleness {
             .close_frame_only(&mut head, 10, SafeInputRange::new(0, 2))
             .expect("close frame with deposits");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         let before = all_ordered_l2_txs(&mut storage);
@@ -1322,7 +1350,7 @@ mod tip_staleness {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0 with no deposits");
 
         let non_submitter = Address::repeat_byte(0xCC);
@@ -1394,7 +1422,7 @@ mod tip_staleness {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         let batch_submitter = SENDER_A;
@@ -1442,7 +1470,7 @@ mod tip_staleness {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0 (nonce 0)");
 
         let batch_submitter = SENDER_A;
@@ -1514,7 +1542,7 @@ mod tip_staleness {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
         let batch_submitter = SENDER_A;
@@ -1584,7 +1612,7 @@ mod check_danger_zone {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_batch_at(&mut head, 100)
             .expect("close batch 0");
 
         let landed = local_batch_payload(&mut storage, 0);
@@ -1710,10 +1738,10 @@ mod check_any_unresolved {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_batch_at(&mut head, 100)
             .expect("close batch 1");
 
         let landed = local_batch_payload(&mut storage, 0);
@@ -1748,10 +1776,10 @@ mod check_any_unresolved {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_batch_at(&mut head, 100)
             .expect("close batch 1");
 
         let landed = local_batch_payload(&mut storage, 0);
@@ -1797,10 +1825,10 @@ mod check_any_unresolved {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 50)
+            .close_batch_at(&mut head, 50)
             .expect("seal batch 0, open batch 1 @ sb 50");
         storage
-            .close_frame_and_batch(&mut head, 50)
+            .close_batch_at(&mut head, 50)
             .expect("seal batch 1, open the Tip @ sb 50");
 
         // Make batch 0 gold: land its genuine bytes (accepted) → frontier → nonce 1.
@@ -1854,9 +1882,7 @@ mod boundary {
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 100)
-            .expect("close batch");
+        storage.close_batch_at(&mut head, 100).expect("close batch");
 
         storage
             .append_safe_inputs(
@@ -1883,9 +1909,7 @@ mod boundary {
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 100)
-            .expect("close batch");
+        storage.close_batch_at(&mut head, 100).expect("close batch");
 
         let landed = local_batch_payload(&mut storage, 0);
         storage
@@ -1916,7 +1940,7 @@ mod boundary {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         for _ in 0..3 {
-            storage.close_frame_and_batch(&mut head, 10).expect("close");
+            storage.close_batch_at(&mut head, 10).expect("close");
         }
 
         storage
@@ -1944,7 +1968,7 @@ mod boundary {
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage.close_frame_and_batch(&mut head, 10).expect("close");
+        storage.close_batch_at(&mut head, 10).expect("close");
 
         storage
             .append_safe_inputs(
@@ -1963,7 +1987,7 @@ mod boundary {
 
         let mut head2 = storage.open_state().expect("load").unwrap();
         storage
-            .close_frame_and_batch(&mut head2, 1210)
+            .close_batch_at(&mut head2, 1210)
             .expect("close gen2");
 
         storage
@@ -1991,7 +2015,7 @@ mod boundary {
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("init");
-        storage.close_frame_and_batch(&mut head, 10).expect("close");
+        storage.close_batch_at(&mut head, 10).expect("close");
         storage
             .append_safe_inputs(
                 1210,
@@ -2008,7 +2032,7 @@ mod boundary {
 
         let mut head2 = storage.open_state().expect("load").unwrap();
         storage
-            .close_frame_and_batch(&mut head2, 1210)
+            .close_batch_at(&mut head2, 1210)
             .expect("close gen2");
         storage
             .append_safe_inputs(
@@ -2026,7 +2050,7 @@ mod boundary {
 
         let mut head3 = storage.open_state().expect("load").unwrap();
         storage
-            .close_frame_and_batch(&mut head3, 2410)
+            .close_batch_at(&mut head3, 2410)
             .expect("close gen3");
         let landed = local_batch_payload(&mut storage, 0);
         storage
@@ -2054,7 +2078,7 @@ mod boundary {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         for _ in 0..50 {
-            storage.close_frame_and_batch(&mut head, 10).expect("close");
+            storage.close_batch_at(&mut head, 10).expect("close");
         }
 
         storage
@@ -2123,7 +2147,7 @@ mod schema_invariants {
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 0)
+            .close_batch_at(&mut head, 0)
             .expect("close batch 0; batch 1 is now Tip");
         // Batch 1 has nonce 1 (0 + 1). Insert child with nonce 99 (should be 2).
         let err = storage.conn.execute(
@@ -2275,7 +2299,7 @@ mod schema_invariants {
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 0)
+            .close_batch_at(&mut head, 0)
             .expect("close batch 0 (seals it)");
         // Batch 0 is sealed. Attempt to re-seal with a different timestamp.
         let err = storage.conn.execute(
@@ -2318,7 +2342,7 @@ mod schema_invariants {
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 0)
+            .close_batch_at(&mut head, 0)
             .expect("close batch 0; batch 0 is now sealed");
         // Batch 0 is sealed. Any direct insert into its frames must fail.
         let err = storage.conn.execute(
@@ -2359,9 +2383,7 @@ mod schema_invariants {
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 0)
-            .expect("close batch 0");
+        storage.close_batch_at(&mut head, 0).expect("close batch 0");
         // Try to change parent of batch 1 — should be rejected.
         let err = storage.conn.execute(
             "UPDATE batches SET parent_batch_index = NULL WHERE batch_index = 1",
@@ -2374,9 +2396,9 @@ mod schema_invariants {
     }
 
     #[test]
-    fn schema_rejects_sequenced_l2_tx_into_non_tip() {
+    fn schema_rejects_application_input_into_non_tip() {
         // The third sibling of the tip-only triggers (frames + user_ops already
-        // have negative tests; sequenced_l2_txs did not). The global replay order
+        // have negative tests; application_inputs did not). The global replay order
         // is the source for recovery re-drain and catch-up; a stale-WriteHead row
         // into a sealed batch would corrupt it.
         let db = temp_db("schema-sequenced-into-sealed");
@@ -2385,18 +2407,18 @@ mod schema_invariants {
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 0)
+            .close_batch_at(&mut head, 0)
             .expect("close batch 0; it is now sealed (no longer the Tip)");
         // Target the sealed batch's existing frame (0, 0). The BEFORE-INSERT
         // trigger fires before the safe_input_index FK is evaluated.
         let err = storage.conn.execute(
-            "INSERT INTO sequenced_l2_txs \
+            "INSERT INTO application_inputs \
              (offset, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
-             VALUES (999, 0, 0, NULL, 0)",
+             VALUES (0, 0, 0, NULL, 0)",
             [],
         );
         assert!(
-            format!("{err:?}").contains("sequenced_l2_txs can only target the current Tip"),
+            format!("{err:?}").contains("application input must target the current valid Tip"),
             "expected tip-only-sequenced trigger, got: {err:?}"
         );
     }
@@ -2409,9 +2431,7 @@ mod schema_invariants {
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 0)
-            .expect("close batch 0");
+        storage.close_batch_at(&mut head, 0).expect("close batch 0");
         let err = storage.conn.execute(
             "UPDATE batches SET nonce = nonce + 1 WHERE batch_index = 0",
             [],
@@ -2433,7 +2453,7 @@ mod schema_invariants {
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 0)
+            .close_batch_at(&mut head, 0)
             .expect("close batch 0; payload_hash is stamped at seal");
         let err = storage.conn.execute(
             "UPDATE batches SET payload_hash = \
@@ -2466,13 +2486,13 @@ mod schema_invariants {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize at safe_block=10");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_batch_at(&mut head, 100)
             .expect("close batch 0 (nonce 0)");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_batch_at(&mut head, 100)
             .expect("close batch 1 (nonce 1)");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_batch_at(&mut head, 100)
             .expect("close batch 2 (nonce 2)");
         // Head is now batch 3 (nonce 3, first_frame_safe_block=100).
 
@@ -2589,8 +2609,8 @@ mod schema_invariants {
     }
 
     #[test]
-    fn schema_rejects_sequenced_l2_tx_with_neither_xor_branch() {
-        // `sequenced_l2_txs` must be either a user-op row
+    fn schema_rejects_application_input_with_neither_xor_branch() {
+        // `application_inputs` must be either a user-op row
         // (user_op_pos_in_frame IS NOT NULL) or a direct-input row
         // (safe_input_index IS NOT NULL), never both and never neither.
         // Setting both to NULL is the clean XOR violation to test —
@@ -2602,14 +2622,14 @@ mod schema_invariants {
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
         let err = storage.conn.execute(
-            "INSERT INTO sequenced_l2_txs \
+            "INSERT INTO application_inputs \
                  (offset, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
                  VALUES (0, 0, 0, NULL, NULL)",
             [],
         );
         assert!(
             format!("{err:?}").contains("CHECK constraint failed"),
-            "expected CHECK constraint error on sequenced_l2_txs XOR, got: {err:?}",
+            "expected CHECK constraint error on application_inputs XOR, got: {err:?}",
         );
     }
 
@@ -2670,10 +2690,10 @@ mod schema_invariants {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize open state");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_batch_at(&mut head, 10)
             .expect("close batch 0 before freezing");
         storage
-            .insert_pending_dump(std::path::Path::new("/tmp/pending-fixture"), 1, 0)
+            .insert_batch_snapshot(std::path::Path::new("/tmp/pending-fixture"), 0)
             .expect("insert a pending dump row to attempt deleting");
         crate::storage::test_helpers::record_canonical_divergence(&mut storage, 0, 0);
 
@@ -2707,18 +2727,7 @@ mod schema_invariants {
         frozen(
             storage
                 .conn
-                .execute(
-                    "INSERT OR REPLACE INTO finalized_snapshot \
-                     (singleton_id, dump_id, inclusion_block, l2_tx_index) \
-                     VALUES (0, 999, 1, 0)",
-                    [],
-                )
-                .expect_err("promotion INSERT must be frozen"),
-        );
-        frozen(
-            storage
-                .conn
-                .execute("DELETE FROM pending_snapshots", [])
+                .execute("DELETE FROM snapshots", [])
                 .expect_err("pending-snapshot DELETE must be frozen"),
         );
 
@@ -2894,9 +2903,7 @@ mod tree_invariants {
             .expect("initialize");
         assert_tree_invariants(&mut storage);
         for _ in 0..4 {
-            storage
-                .close_frame_and_batch(&mut head, 100)
-                .expect("close");
+            storage.close_batch_at(&mut head, 100).expect("close");
             assert_tree_invariants(&mut storage);
         }
         // Tree: 0(Gold sentinel in concept)→1→2→3→4 (Tip)
@@ -2925,9 +2932,7 @@ mod tree_invariants {
         // Phase 3: more rotations after partial cascade.
         let mut head = storage.open_state().expect("load").unwrap();
         for _ in 0..3 {
-            storage
-                .close_frame_and_batch(&mut head, 1500)
-                .expect("close gen2");
+            storage.close_batch_at(&mut head, 1500).expect("close gen2");
             assert_tree_invariants(&mut storage);
         }
 
@@ -2942,9 +2947,7 @@ mod tree_invariants {
         // Phase 5: rotations after torn cascade — new Tip has parent=NULL, nonce=0.
         let mut head = storage.open_state().expect("load").unwrap();
         for _ in 0..5 {
-            storage
-                .close_frame_and_batch(&mut head, 2000)
-                .expect("close gen3");
+            storage.close_batch_at(&mut head, 2000).expect("close gen3");
             assert_tree_invariants(&mut storage);
         }
     }
@@ -2963,9 +2966,7 @@ mod tree_invariants {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         for _ in 0..4 {
-            storage
-                .close_frame_and_batch(&mut head, 100)
-                .expect("close");
+            storage.close_batch_at(&mut head, 100).expect("close");
         }
         let landed = local_batch_payload(&mut storage, 0);
         storage
@@ -2987,9 +2988,7 @@ mod tree_invariants {
 
         let mut head = storage.open_state().expect("load").unwrap();
         for _ in 0..2 {
-            storage
-                .close_frame_and_batch(&mut head, 1500)
-                .expect("close");
+            storage.close_batch_at(&mut head, 1500).expect("close");
         }
 
         // Assert equivalence among VALID batches for every valid N.
@@ -3050,209 +3049,172 @@ mod tree_invariants {
     }
 }
 
-mod recovery_clears_pending_snapshots {
-    //! Recovery's interaction with `pending_snapshots`.
-    //!
-    //! When a cascade invalidates a span of batches, their pending
-    //! snapshots correspond to states the canonical replay will never
-    //! reach. Catch-up after recovery would load one of those rows
-    //! and end up with state ahead of the canonical stream — a real
-    //! correctness issue, not hygiene. So the recovery transaction
-    //! clears `pending_snapshots` atomically with the cascade.
-    //!
-    //! `finalized_snapshot` is untouched: it's bytes for an
-    //! L1-confirmed batch, which survives any cascade.
-
+mod recovery_snapshot_selection {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::Path;
 
-    fn register_finalized(storage: &mut Storage, prefix: &str) {
+    fn baseline(storage: &mut Storage) -> i64 {
         storage
-            .insert_finalized_dump(&PathBuf::from(format!("/tmp/test-{prefix}")), 0, 0)
-            .expect("insert finalized");
+            .insert_baseline_snapshot(
+                Path::new("/tmp/recovery-baseline"),
+                ExecutedInputCount::ZERO,
+            )
+            .expect("baseline")
     }
 
-    fn register_pending(storage: &mut Storage, nonce: u64) {
+    fn batch_snapshot(storage: &mut Storage, batch_index: u64) -> i64 {
         storage
-            .insert_pending_dump(
-                &PathBuf::from(format!("/tmp/test-pending-{nonce}")),
-                nonce,
-                0,
+            .insert_batch_snapshot(
+                Path::new(&format!("/tmp/recovery-batch-{batch_index}")),
+                batch_index,
             )
-            .expect("insert pending");
+            .expect("batch snapshot")
     }
 
     #[test]
-    fn post_flush_cascade_clears_pending_dumps() {
-        let db = temp_db("recovery-clears-pending-post-flush");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-
-        let mut head = storage
-            .initialize_open_state(10, SafeInputRange::empty_at(0))
-            .expect("initialize");
-        for _ in 0..3 {
-            storage
-                .close_frame_and_batch(&mut head, 10)
-                .expect("close batch");
+    fn cascade_hides_every_doomed_snapshot_and_retains_baseline() {
+        let db = temp_db("recovery-baseline-fallback");
+        let mut storage = Storage::open(&db.path).expect("open");
+        let baseline_id = baseline(&mut storage);
+        seed_closed_batches(&mut storage, 3);
+        for index in 0..3 {
+            batch_snapshot(&mut storage, index);
         }
-        register_finalized(&mut storage, "fin");
-        register_pending(&mut storage, 0);
-        register_pending(&mut storage, 1);
-        register_pending(&mut storage, 2);
-        assert!(storage.latest_pending_dump().unwrap().is_some());
-
-        let batch_submitter = Address::repeat_byte(0xAA);
+        assert_ne!(
+            storage.latest_snapshot().unwrap().unwrap().dump.id,
+            baseline_id
+        );
         storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append safe input");
-
-        let invalidated = storage
-            .recover_post_flush(1200)
-            .expect("post-flush recover");
-        assert_eq!(invalidated, vec![0, 1, 2, 3]);
-
-        assert!(
-            storage.latest_pending_dump().unwrap().is_none(),
-            "cascade should clear pending snapshots"
-        );
-        assert!(
-            storage.finalized_dump().unwrap().is_some(),
-            "cascade must not touch finalized"
-        );
-    }
-
-    #[test]
-    fn aging_tip_cascade_clears_pending_dumps() {
-        let db = temp_db("recovery-clears-pending-aging-tip");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-
-        // Initialize Tip and age it past the threshold by advancing the
-        // safe head well beyond the Tip's safe_block.
-        let _head = storage
-            .initialize_open_state(10, SafeInputRange::empty_at(0))
-            .expect("initialize");
-        register_finalized(&mut storage, "fin-aging");
-        register_pending(&mut storage, 0);
-        assert!(storage.latest_pending_dump().unwrap().is_some());
-
-        let batch_submitter = Address::repeat_byte(0xAA);
-        storage
-            .append_safe_inputs(1210, &[], batch_submitter, &default_protocol_timing())
-            .expect("advance safe head past threshold");
-
-        let invalidated = storage.recover_aging_tip(1200).expect("aging-tip recover");
-        assert_eq!(invalidated, vec![0], "Tip should cascade");
-
-        assert!(
-            storage.latest_pending_dump().unwrap().is_none(),
-            "Tip cascade should clear pending snapshots"
-        );
-        assert!(
-            storage.finalized_dump().unwrap().is_some(),
-            "Tip cascade must not touch finalized"
-        );
-    }
-
-    #[test]
-    fn no_op_recovery_does_not_touch_pending_dumps() {
-        // When recovery has nothing to invalidate (closed batches are
-        // all "gold" — their nonces are below the scheduler's
-        // frontier — and the Tip isn't aged), pending snapshots must
-        // stay: their batches are in-flight, the snapshots still
-        // useful for catch-up.
-        let db = temp_db("recovery-noop-keeps-pending");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-
-        let mut head = storage
-            .initialize_open_state(10, SafeInputRange::empty_at(0))
-            .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 10)
-            .expect("close batch");
-
-        // Acknowledge our batch (nonce 0) at L1, advancing the gold
-        // frontier to nonce 1 so the closed batch we just made falls
-        // "below" frontier and isn't a cascade pivot.
-        let batch_submitter = Address::repeat_byte(0xAA);
-        seed_safe_inputs_with_batch_nonces(&mut storage, batch_submitter, 10, &[0]);
-
-        register_finalized(&mut storage, "fin-noop");
-        register_pending(&mut storage, 1);
-
-        let post_flush_invalidated = storage.recover_post_flush(1200).expect("post-flush no-op");
-        let aging_tip_invalidated = storage.recover_aging_tip(1200).expect("aging-tip no-op");
-
-        assert!(
-            post_flush_invalidated.is_empty(),
-            "post-flush should be a no-op"
-        );
-        assert!(
-            aging_tip_invalidated.is_empty(),
-            "aging-tip should be a no-op"
-        );
-        assert!(
-            storage.latest_pending_dump().unwrap().is_some(),
-            "no-op recovery must preserve in-flight pending snapshots"
-        );
-    }
-
-    /// Regression test: the cascade's pending clear is scoped to
-    /// `nonce >= pivot.nonce`. A gold-but-unpromoted pending (its batch
-    /// landed accepted while the process was down, the lane never
-    /// promoted it) sits *below* the pivot and must survive — deleting
-    /// it would arm a promote-wedge crash-loop when the lane later
-    /// observes the landing and promotion hits the deleted row.
-    #[test]
-    fn cascade_preserves_gold_unpromoted_pending_below_pivot() {
-        let db = temp_db("recovery-scoped-clear-preserves-gold");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-
-        let mut head = storage
-            .initialize_open_state(10, SafeInputRange::empty_at(0))
-            .expect("initialize");
-        // Close two batches: nonce 0 (will land gold) and nonce 1 (doomed).
-        storage
-            .close_frame_and_batch(&mut head, 10)
-            .expect("close batch nonce 0");
-        storage
-            .close_frame_and_batch(&mut head, 10)
-            .expect("close batch nonce 1");
-
-        register_finalized(&mut storage, "fin-scoped");
-        register_pending(&mut storage, 0); // gold-but-unpromoted
-        register_pending(&mut storage, 1); // doomed (past the frontier)
-
-        // Batch nonce 0 lands accepted: gold frontier advances to 1, so
-        // the post-flush cascade pivots at the nonce-1 batch.
-        let batch_submitter = Address::repeat_byte(0xAA);
-        seed_safe_inputs_with_batch_nonces(&mut storage, batch_submitter, 10, &[0]);
-
-        let invalidated = storage
-            .recover_post_flush(1200)
-            .expect("post-flush recover");
+            .append_safe_inputs(1500, &[], SENDER_A, &default_protocol_timing())
+            .expect("safe head");
         assert_eq!(
-            invalidated,
-            vec![1, 2],
-            "cascade covers the nonce-1 batch and the Tip"
+            storage.recover_post_flush(1200).expect("cascade"),
+            vec![0, 1, 2, 3]
         );
-
-        let survivor = storage
-            .latest_pending_dump()
-            .unwrap()
-            .expect("gold-unpromoted pending must survive the scoped clear");
-        assert_eq!(survivor.nonce, 0, "the survivor is the gold pending");
+        assert_eq!(
+            storage.latest_snapshot().unwrap().unwrap().dump.id,
+            baseline_id
+        );
         assert!(
-            storage.finalized_dump().unwrap().is_some(),
-            "cascade must not touch finalized"
+            storage
+                .has_rollback_safe_snapshot()
+                .expect("rollback checkpoint")
+        );
+        let garbage = storage
+            .gc_unreferenced_dumps()
+            .expect("gc doomed snapshots");
+        assert_eq!(garbage.len(), 3);
+        assert!(garbage.iter().all(|dump| dump.id != baseline_id));
+    }
+
+    #[test]
+    fn accepted_snapshot_survives_cascade_after_baseline_gc_and_restart() {
+        let db = temp_db("recovery-accepted-fallback");
+        let mut storage = Storage::open(&db.path).expect("open");
+        let baseline_id = baseline(&mut storage);
+        seed_closed_batches(&mut storage, 2);
+        let accepted_id = batch_snapshot(&mut storage, 0);
+        let doomed_id = batch_snapshot(&mut storage, 1);
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0]);
+        let garbage = storage.gc_unreferenced_dumps().expect("retire baseline");
+        assert_eq!(
+            garbage.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![baseline_id]
+        );
+        assert_eq!(
+            storage.latest_snapshot().unwrap().unwrap().dump.id,
+            doomed_id
+        );
+        drop(storage);
+        let mut storage = Storage::open(&db.path).expect("restart");
+        assert!(
+            storage
+                .has_rollback_safe_snapshot()
+                .expect("accepted checkpoint")
+        );
+        assert_eq!(
+            storage.recover_post_flush(1200).expect("cascade suffix"),
+            vec![1, 2]
+        );
+        assert_eq!(
+            storage.latest_snapshot().unwrap().unwrap().dump.id,
+            accepted_id
+        );
+        assert_eq!(
+            storage.finalized_dump().unwrap().unwrap().dump.id,
+            accepted_id
+        );
+        assert_eq!(
+            storage
+                .gc_unreferenced_dumps()
+                .unwrap()
+                .iter()
+                .map(|d| d.id)
+                .collect::<Vec<_>>(),
+            vec![doomed_id]
+        );
+        assert!(
+            storage
+                .recover_post_flush(1200)
+                .expect("idempotent recovery")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_optimistic_snapshot_alone_does_not_admit_recovery() {
+        let db = temp_db("recovery-optimistic-is-not-fallback");
+        let mut storage = Storage::open(&db.path).expect("open");
+        seed_closed_batches(&mut storage, 1);
+        batch_snapshot(&mut storage, 0);
+        let protocol = default_protocol_timing();
+        let now = crate::clock::unix_now_ms();
+        storage
+            .append_safe_inputs_with_timestamp(
+                1500,
+                now / 1000,
+                &[],
+                SENDER_A,
+                &protocol,
+                crate::storage::FrontierMode::Populate,
+            )
+            .expect("fresh observation");
+        assert!(
+            storage
+                .latest_snapshot()
+                .expect("optimistic snapshot")
+                .is_some()
+        );
+        assert!(
+            !storage
+                .has_rollback_safe_snapshot()
+                .expect("no stable fallback")
+        );
+        let err = storage
+            .recover_post_flush_for_recovery(1500, &protocol, now)
+            .expect_err("refuse before losing only snapshot");
+        assert!(matches!(
+            err,
+            crate::storage::RecoveryMutationError::MissingRecoveryCheckpoint
+        ));
+        assert_eq!(
+            storage
+                .latest_snapshot()
+                .unwrap()
+                .unwrap()
+                .executed_input_count,
+            ExecutedInputCount::ZERO
+        );
+        assert_eq!(
+            storage
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM batches WHERE invalidated_at_ms IS NOT NULL",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
         );
     }
 }

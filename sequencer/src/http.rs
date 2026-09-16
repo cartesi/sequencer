@@ -142,14 +142,7 @@ impl IntoResponse for ApiError {
 // replace this with per-side starts on different ports.
 
 const DEFAULT_WS_MAX_SUBSCRIBERS: usize = 64;
-const DEFAULT_WS_MAX_CATCHUP_EVENTS: u64 = 50_000;
 const DEFAULT_MAX_BODY_BYTES: usize = TxRequest::MAX_JSON_BYTES_RECOMMENDED;
-
-/// Stable prefix of the WS Close-frame reason when the subscriber's requested
-/// `from_offset` is too old for the catch-up window to bridge.
-///
-/// The full reason is `{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset=<u64>`.
-pub const WS_CATCHUP_WINDOW_EXCEEDED_REASON: &str = "catch-up window exceeded";
 
 pub type ApiServerTask = JoinHandle<std::io::Result<()>>;
 
@@ -285,7 +278,6 @@ pub struct ApiConfig {
     pub max_user_op_data_bytes: usize,
     pub max_body_bytes: usize,
     pub ws_max_subscribers: usize,
-    pub ws_max_catchup_events: u64,
 }
 
 impl ApiConfig {
@@ -297,7 +289,6 @@ impl ApiConfig {
             max_user_op_data_bytes,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             ws_max_subscribers: DEFAULT_WS_MAX_SUBSCRIBERS,
-            ws_max_catchup_events: DEFAULT_WS_MAX_CATCHUP_EVENTS,
         }
     }
 }
@@ -330,7 +321,6 @@ pub(crate) fn start_on_listener(
         shutdown.clone(),
         tx_feed,
         config.ws_max_subscribers,
-        config.ws_max_catchup_events,
     ));
     let app: Router = crate::ingress::api::router(submit_state, fee_state)
         .merge(crate::egress::api::router(

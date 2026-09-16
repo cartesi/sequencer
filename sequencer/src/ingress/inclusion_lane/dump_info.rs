@@ -1,30 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Sequencer-owned dump-directory structure and metadata (`info.toml`).
-//!
-//! Every dump is a directory `dumps/<id>/` with exactly two entries:
-//!
-//! ```text
-//! dumps/<id>/
-//!   state       app-owned file or directory — the prefix handed to
-//!               `Application::{create_dump, from_dump}`
-//!   info.toml   sequencer-owned checkpoint metadata (this module)
-//! ```
-//!
-//! `info.toml` makes a finalized dump a self-contained checkpoint for the
-//! recovery handoff — and, together with the app's `state`
-//! file or directory, the unit an operator backs up: `setup --recovery` rebuilds a wiped
-//! DB from exactly this pair, reading `N` straight from the file. `next_batch_nonce`
-//! (`N`) is known at batch close and written then; `promoted_inclusion_block`
-//! (`B`) is known at promotion and stamped in place afterwards. An in-place update of a file
-//! *inside* the dir changes no path, so the no-dangling-row invariant, leases,
-//! and GC — all keyed on the immutable directory path — are untouched.
-//!
-//! The DB row (`dumps.prefix`) stores the dump *directory*; the app prefix is
-//! always derived via [`app_prefix`]. Crash-safety ordering is unchanged from
-//! the lifecycle doc: dir + `info.toml` + app dump are durable on disk before
-//! the row that references the dir; row deletion precedes file deletion.
+//! Immutable restore-artifact metadata. Accepted recovery exports add a
+//! separate `checkpoint.toml` receipt selected from SQLite under a dump lease.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -36,7 +14,7 @@ const APP_STATE_SUBDIR: &str = "state";
 /// Name of the sequencer-owned metadata file inside a dump directory.
 const INFO_FILE: &str = "info.toml";
 
-pub const FORMAT_VERSION: u64 = 1;
+pub const FORMAT_VERSION: u64 = 2;
 
 /// The app's dump prefix inside `dump_dir`. Pure path derivation.
 pub fn app_prefix(dump_dir: &Path) -> PathBuf {
@@ -57,59 +35,87 @@ pub(crate) fn referenced_artifact_io_is_terminal(source: &io::Error) -> bool {
     )
 }
 
-/// Sequencer-owned checkpoint metadata for one dump.
-///
-/// Serialized as real TOML (`#[serde(deny_unknown_fields)]` keeps the parse
-/// strict — unknown keys, type mismatches, and TOML's own duplicate-key ban all
-/// fail loud, the same guarantees the old hand parser gave). The on-disk layout
-/// is plain `key = value` integer lines, so it is operator-readable and any
-/// previously-written file round-trips unchanged.
+/// Metadata known when the application artifact is created.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DumpInfo {
     pub format_version: u64,
-    /// `N` — the batch nonce the sequencer resumes submitting at when
-    /// booting from this checkpoint (snapshot batch's nonce + 1; 0 for
-    /// the genesis dump). Known at batch close.
     pub next_batch_nonce: u64,
-    /// Replay cursor: global valid replay head at dump time. Mirrors the
-    /// snapshot row exactly.
-    pub l2_tx_index: u64,
-    /// `B` — the L1 inclusion block of the promotion that finalized this
-    /// dump. `None` until promotion; stamped in place when the batch is
-    /// observed accepted (and re-stamped from the DB at startup, closing
-    /// the commit-then-stamp crash window). Omitted from the file while
-    /// `None` (TOML has no null); a missing key reads back as `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub promoted_inclusion_block: Option<u64>,
 }
 
 impl DumpInfo {
-    /// Checkpoint metadata for the snapshot taken at the close of batch
-    /// `batch_nonce`: the sequencer resumes submitting at `batch_nonce + 1`, and
-    /// `B` is unknown until promotion (stamped in place then). The single home
-    /// for the resume-nonce `+ 1` skew, so the batch-close and recovery-fill
-    /// sites cannot drift on how `next_batch_nonce` is derived.
-    pub fn at_batch_close(batch_nonce: u64, l2_tx_index: u64) -> Self {
+    pub fn at_batch_close(batch_nonce: u64) -> Self {
         Self {
             format_version: FORMAT_VERSION,
-            next_batch_nonce: batch_nonce + 1,
-            l2_tx_index,
-            promoted_inclusion_block: None,
+            next_batch_nonce: batch_nonce.checked_add(1).expect("batch nonce overflow"),
         }
     }
 
-    /// Checkpoint metadata for a finalized snapshot rebuilt by `setup --recovery`
-    /// at inclusion block `inclusion_block`, resuming at `resume_nonce` — the
-    /// fold's next-expected nonce `N'`, already the resume value (no `+ 1`).
-    pub fn at_recovery(resume_nonce: u64, l2_tx_index: u64, inclusion_block: u64) -> Self {
+    pub fn at_baseline(next_batch_nonce: u64) -> Self {
         Self {
             format_version: FORMAT_VERSION,
-            next_batch_nonce: resume_nonce,
-            l2_tx_index,
-            promoted_inclusion_block: Some(inclusion_block),
+            next_batch_nonce,
         }
     }
+}
+
+/// Acceptance receipt packaged with an operator's recovery export. Its block
+/// is an exact end-of-block comparison boundary under per-batch snapshotting.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointInfo {
+    pub format_version: u64,
+    pub next_batch_nonce: u64,
+    pub inclusion_block: u64,
+}
+
+pub fn read_checkpoint_info(dump_dir: &Path) -> io::Result<CheckpointInfo> {
+    let content = std::fs::read_to_string(dump_dir.join("checkpoint.toml"))?;
+    let info: CheckpointInfo =
+        toml::from_str(&content).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if info.format_version != FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported checkpoint format",
+        ));
+    }
+    Ok(info)
+}
+
+/// Stream a complete, restorable artifact. A receipt makes it an accepted
+/// recovery export; the on-disk dump remains unchanged.
+pub(crate) fn write_archive<W: io::Write>(
+    writer: W,
+    dump_dir: &Path,
+    next_batch_nonce: u64,
+    checkpoint: Option<&CheckpointInfo>,
+) -> io::Result<()> {
+    let info = read_info(dump_dir)?;
+    if info.next_batch_nonce != next_batch_nonce {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dump nonce differs from snapshot boundary",
+        ));
+    }
+    let mut archive = tar::Builder::new(writer);
+    archive.append_path_with_name(dump_dir.join(INFO_FILE), INFO_FILE)?;
+    let state = app_prefix(dump_dir);
+    if state.is_dir() {
+        archive.append_dir_all(APP_STATE_SUBDIR, state)?;
+    } else {
+        archive.append_path_with_name(state, APP_STATE_SUBDIR)?;
+    }
+    if let Some(checkpoint) = checkpoint {
+        let bytes = toml::to_string(checkpoint)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            .into_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        archive.append_data(&mut header, "checkpoint.toml", bytes.as_slice())?;
+    }
+    archive.finish()
 }
 
 /// Errors from creating a structured dump directory.
@@ -148,8 +154,7 @@ pub fn delete_dump_dir(dump_dir: &Path) -> io::Result<()> {
 }
 
 /// Write `info.toml` into `dump_dir`, durably: temp file, fsync, rename
-/// over, fsync the directory. Safe both for initial creation and for the
-/// in-place promotion stamp.
+/// over, fsync the directory. Called only during artifact creation.
 pub fn write_info(dump_dir: &Path, info: &DumpInfo) -> io::Result<()> {
     let content = toml::to_string(info)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("info.toml: {e}")))?;
@@ -206,8 +211,8 @@ pub fn read_info(dump_dir: &Path) -> io::Result<DumpInfo> {
 /// (`manifest.json` + `snapshot/`) from a merely empty/wrong path.
 pub fn diagnose_missing_dump(dump_dir: &Path) -> String {
     let expected = format!(
-        "expected a finalized sequencer dump at {} with `info.toml` and a `state` \
-         app dump (usually `$CARTESI_SEQUENCER_DATA_DIR/dumps/<id>/`). \
+        "expected a sequencer dump at {} with `info.toml` and a `state` app artifact. \
+         Recovery additionally requires `checkpoint.toml` from `/finalized_snapshot`. \
          See docs/snapshots/lifecycle.md and docs/recovery/cockroach.md.",
         dump_dir.display()
     );
@@ -244,17 +249,6 @@ pub fn diagnose_missing_dump(dump_dir: &Path) -> String {
     }
 
     format!("missing `info.toml` — {expected}")
-}
-
-/// Stamp `B` (the promotion's inclusion block) into an existing
-/// `info.toml`. Idempotent: re-stamping the same block is a no-op write.
-pub fn stamp_promoted_inclusion_block(dump_dir: &Path, block: u64) -> io::Result<()> {
-    let mut info = read_info(dump_dir)?;
-    if info.promoted_inclusion_block == Some(block) {
-        return Ok(());
-    }
-    info.promoted_inclusion_block = Some(block);
-    write_info(dump_dir, &info)
 }
 
 #[cfg(test)]
@@ -413,17 +407,49 @@ mod tests {
         assert_dump_prefix_round_trip::<true>();
     }
 
+    #[test]
+    fn archives_restore_file_and_directory_artifacts_without_mutating_metadata() {
+        fn check<const DIRECTORY: bool>() {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            let mut app = PrefixDumpApp::<DIRECTORY>::default();
+            create_dump_dir_with_info(&mut app, &source, &sample()).unwrap();
+            let original_info = std::fs::read(source.join(INFO_FILE)).unwrap();
+            let receipt = CheckpointInfo {
+                format_version: FORMAT_VERSION,
+                next_batch_nonce: 7,
+                inclusion_block: 42,
+            };
+            let mut bytes = Vec::new();
+            write_archive(&mut bytes, &source, 7, Some(&receipt)).unwrap();
+            assert_eq!(
+                std::fs::read(source.join(INFO_FILE)).unwrap(),
+                original_info
+            );
+            assert!(!source.join("checkpoint.toml").exists());
+            delete_dump_dir(&source).unwrap();
+            let destination = root.path().join("restored");
+            tar::Archive::new(bytes.as_slice())
+                .unpack(&destination)
+                .unwrap();
+            assert_eq!(read_checkpoint_info(&destination).unwrap(), receipt);
+            let restored =
+                PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&destination)).unwrap();
+            assert_eq!(restored.progress(), app.progress());
+        }
+        check::<false>();
+        check::<true>();
+    }
+
     fn sample() -> DumpInfo {
         DumpInfo {
             format_version: FORMAT_VERSION,
             next_batch_nonce: 7,
-            l2_tx_index: 123,
-            promoted_inclusion_block: None,
         }
     }
 
     #[test]
-    fn write_then_read_round_trips_without_promotion() {
+    fn immutable_info_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         write_info(dir.path(), &sample()).unwrap();
         assert_eq!(read_info(dir.path()).unwrap(), sample());
@@ -450,23 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn stamp_fills_b_and_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        write_info(dir.path(), &sample()).unwrap();
-
-        stamp_promoted_inclusion_block(dir.path(), 456).unwrap();
-        let stamped = read_info(dir.path()).unwrap();
-        assert_eq!(stamped.promoted_inclusion_block, Some(456));
-        assert_eq!(stamped.next_batch_nonce, 7, "other fields untouched");
-
-        stamp_promoted_inclusion_block(dir.path(), 456).unwrap();
-        assert_eq!(
-            read_info(dir.path()).unwrap().promoted_inclusion_block,
-            Some(456)
-        );
-    }
-
-    #[test]
     fn read_rejects_unknown_duplicate_and_missing_keys() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -485,23 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn on_disk_bytes_stay_simple_key_value_lines() {
-        // The serialized form must remain plain `key = value` integer lines:
-        // no `[table]` headers, no quoting. This is the operator-readable
-        // contract and what any previously-written file already looks like.
-        let dir = tempfile::tempdir().unwrap();
-        let mut info = sample();
-        info.promoted_inclusion_block = Some(456);
-        write_info(dir.path(), &info).unwrap();
-        let bytes = std::fs::read_to_string(dir.path().join(INFO_FILE)).unwrap();
-        assert_eq!(
-            bytes,
-            "format_version = 1\nnext_batch_nonce = 7\nl2_tx_index = 123\n\
-             promoted_inclusion_block = 456\n"
-        );
-    }
-
-    #[test]
     fn read_tolerates_comments_blanks_and_reordering() {
         // The robustness win from real TOML over the old line parser: an
         // operator inspecting/annotating the file under recovery pressure can
@@ -509,8 +501,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(INFO_FILE),
-            "# checkpoint metadata\n\nl2_tx_index = 123\nnext_batch_nonce = 7\n\
-             format_version = 1\n",
+            "# checkpoint metadata\n\nnext_batch_nonce = 7\nformat_version = 2\n",
         )
         .unwrap();
         assert_eq!(read_info(dir.path()).unwrap(), sample());
@@ -528,7 +519,8 @@ mod tests {
             "got: {msg}"
         );
         assert!(msg.contains("manifest.json and snapshot/"), "got: {msg}");
-        assert!(msg.contains("dumps/<id>/"), "got: {msg}");
+        assert!(msg.contains("/finalized_snapshot"), "got: {msg}");
+        assert!(msg.contains("checkpoint.toml"), "got: {msg}");
 
         let err = read_info(dir.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -566,7 +558,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(INFO_FILE),
-            "format_version = 999\nnext_batch_nonce = 0\nl2_tx_index = 0\n",
+            "format_version = 999\nnext_batch_nonce = 0\n",
         )
         .unwrap();
         assert!(read_info(dir.path()).is_err());

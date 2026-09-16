@@ -6,7 +6,7 @@ use std::time::Duration;
 use alloy_primitives::Address;
 use futures_util::StreamExt;
 use sequencer_core::api::WsTxMessage;
-use sequencer_rust_client::SequencerClient;
+use sequencer_rust_client::{HistoryClaim, SequencerClient};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::HarnessResult;
@@ -20,11 +20,10 @@ pub struct WsClient {
 }
 
 impl WsClient {
-    pub async fn connect(client: &SequencerClient, from_offset: u64) -> HarnessResult<Self> {
-        let stream =
-            tokio::time::timeout(DEFAULT_WS_CONNECT_TIMEOUT, client.subscribe(from_offset))
-                .await
-                .map_err(|_| io_other("timeout connecting websocket"))??;
+    pub async fn connect(client: &SequencerClient, claim: HistoryClaim) -> HarnessResult<Self> {
+        let stream = tokio::time::timeout(DEFAULT_WS_CONNECT_TIMEOUT, client.subscribe(claim))
+            .await
+            .map_err(|_| io_other("timeout connecting websocket"))??;
         Ok(Self { stream })
     }
 

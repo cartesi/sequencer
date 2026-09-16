@@ -50,8 +50,8 @@ function sequencer_reader.new(http, json, base_url)
         if type(decoded.inclusion_block) ~= "number" then
             return nil, "inclusion_block must be a number"
         end
-        if type(decoded.l2_tx_index) ~= "number" then
-            return nil, "l2_tx_index must be a number"
+        if type(decoded.executed_input_count) ~= "number" then
+            return nil, "executed_input_count must be a number"
         end
         return decoded
     end
@@ -76,8 +76,8 @@ function sequencer_reader.new(http, json, base_url)
         if not inclusion_block then
             return nil, inclusion_err
         end
-        local l2_tx_index, index_err = parse_header_number(response.headers, "X-L2-Tx-Index")
-        if not l2_tx_index then
+        local executed_input_count, index_err = parse_header_number(response.headers, "X-Executed-Input-Count")
+        if not executed_input_count then
             return nil, index_err
         end
 
@@ -88,7 +88,7 @@ function sequencer_reader.new(http, json, base_url)
 
         return {
             inclusion_block = inclusion_block,
-            l2_tx_index = l2_tx_index,
+            executed_input_count = executed_input_count,
             state = response.body,
             etag = response.headers and response.headers["etag"],
         }

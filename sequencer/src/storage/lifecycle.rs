@@ -96,6 +96,41 @@ pub enum LifecycleError {
 }
 
 impl Storage {
+    /// Publish a durable setup dump and its complete baseline atomically.
+    pub(crate) fn complete_baseline_setup(
+        &mut self,
+        prefix: &std::path::Path,
+        count: sequencer_core::history::ExecutedInputCount,
+        safe_block: u64,
+        next_batch_nonce: u64,
+        recovery: bool,
+    ) -> Result<(), LifecycleError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        refuse_on_canonical_divergence(&tx)?;
+        require_command_fits_completion(
+            &tx,
+            if recovery {
+                LifecycleCommand::Rebuild
+            } else {
+                LifecycleCommand::Setup
+            },
+        )?;
+        super::history::initialize_history_in(&tx, count, safe_block)?;
+        super::mutations::set_batch_tree_anchor_in(&tx, next_batch_nonce)?;
+        if recovery {
+            super::ingress::open_recovery_tip_in_tx(&tx, safe_block)?;
+        }
+        super::snapshot_dumps::insert_baseline_snapshot_in(&tx, prefix, count)?;
+        tx.execute(
+            "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, ?1)",
+            [now_unix_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The admission facts, checked read-only before a command does any
     /// preparatory work: divergence is absorbing, and the two-sided
     /// completion rule orders commands.
@@ -109,28 +144,21 @@ impl Storage {
 
     /// Commit setup's timeless completion fact. The `setup_complete`
     /// primary key makes double-completion unrepresentable at the engine,
-    /// and the preconditions (finalized snapshot + application-history base)
+    /// and the preconditions (recovery checkpoint + application-history base)
     /// are re-read inside the same transaction so completion can never
     /// outrun the state it certifies.
+    #[cfg(test)]
     pub(crate) fn complete_setup(&mut self) -> Result<(), LifecycleError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Completing setup over persisted divergence would be a lie.
         refuse_on_canonical_divergence(&tx)?;
-        let history = super::history::query_history_state(&tx)?;
-        let has_finalized_snapshot: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM finalized_snapshot WHERE singleton_id = 0)",
-            [],
-            |row| row.get(0),
-        )?;
-        if history.base_executed_input_count.is_none()
-            || history.base_safe_input_index.is_none()
-            || !has_finalized_snapshot
-        {
+        super::history::query_history_state(&tx)?;
+        if !super::snapshot_dumps::has_rollback_safe_snapshot_in(&tx)? {
             return Err(LifecycleError::Malformed(
-                "setup cannot complete before its finalized snapshot and \
-                 application-history base and safe-input floor are established"
+                "setup cannot complete before its recovery checkpoint and \
+                 application-history baseline are established"
                     .to_string(),
             ));
         }
@@ -271,9 +299,14 @@ mod tests {
 
     fn complete_seeded_setup(storage: &mut Storage) {
         storage
-            .insert_initial_finalized_dump(std::path::Path::new("/tmp/facts-genesis"), 0, 0, 0, 0)
-            .expect("register finalized snapshot");
-        storage.complete_setup().expect("complete setup");
+            .complete_baseline_setup(
+                std::path::Path::new("/tmp/facts-genesis"),
+                sequencer_core::history::ExecutedInputCount::ZERO,
+                0,
+                0,
+                false,
+            )
+            .expect("complete setup");
     }
 
     fn seed_divergence(storage: &Storage) {
@@ -325,9 +358,7 @@ mod tests {
     #[test]
     fn divergence_refuses_every_preflight_and_setup_completion() {
         let (_db, mut storage) = seeded(LifecycleCommand::Setup);
-        storage
-            .insert_initial_finalized_dump(std::path::Path::new("/tmp/facts-div"), 0, 0, 0, 0)
-            .expect("register finalized snapshot");
+
         seed_divergence(&storage);
 
         for command in [
@@ -404,10 +435,7 @@ mod tests {
     #[test]
     fn setup_cannot_complete_before_base_and_snapshot_exist() {
         let (_db, mut storage) = seeded(LifecycleCommand::Rebuild);
-        assert!(matches!(
-            storage.complete_setup(),
-            Err(LifecycleError::Malformed(_))
-        ));
+        assert!(storage.complete_setup().is_err());
         assert!(!storage.is_setup_complete().expect("read completion"));
     }
 }

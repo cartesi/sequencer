@@ -15,7 +15,7 @@ This document covers two things:
 the [Application contract](../protocol/application-contract.md#6-checkpoint-lifecycle).
 
 It does NOT define when snapshots are triggered, how the inclusion lane
-records and promotes them, how the HTTP layer serves them, or recovery
+records and selects them, how the HTTP layer serves them, or recovery
 interactions. Those are layered above the trait and live in their own
 modules.
 
@@ -178,7 +178,7 @@ format itself does not provide one.
 This document deliberately does not define:
 
 - When the inclusion lane decides to take a snapshot.
-- How dumps are registered, promoted from pending to finalized, or
+- How dumps are registered, selected by acceptance, or
   garbage-collected.
 - The on-the-wire archive format for streaming a dump over HTTP.
 - Inspect-state procedures on other implementations (Cartesi Machine,

@@ -132,7 +132,7 @@ returning to the outer loop costs only time-gate bookkeeping — no fsync and
 no frontier read per chunk. The **L1 reconciliation regime** fires when the
 observed safe head is at least five blocks past the open frame's clock: it
 consumes the complete accumulated newly-safe range, catch-up and backlog
-conditions included, promotes at most once, and opens exactly one frame at
+conditions included, and opens exactly one frame at
 the observed tip — jumps are never interpolated. There is no elapsed-time
 budget, preemption, or resumable partial cursor inside a turn: the supported
 deployment assumes the application promptly digests the whole range
@@ -142,7 +142,7 @@ only if production measurements disprove that).
 Authority remains role-local and auditable: a FULL-committed user-op chunk
 authorizes its acknowledgement; a valid sealed batch plus the durable
 write-before-broadcast watermark authorizes an L1 submission; committed
-valid physical replay rows authorize the current feed output. Effects handed to the network before process termination may still
+version-checked application-input rows authorize the feed output. Effects handed to the network before process termination may still
 complete remotely.
 
 ## Rejected alternatives
@@ -168,11 +168,10 @@ HistoryPosition = (HistoryVersion, ExecutedInputCount)
 setup/rebuild era; `RecoveryGeneration` increments exactly once in the
 standard-recovery transaction iff it invalidates at least one valid batch; a
 clean restart changes neither. The pair is an equality/discontinuity token,
-not an ordered counter. The durable canonical-coordinate foundation is
-landed ([I18](../invariants.md), [I20](../invariants.md)). The current public
-feed still uses physical SQLite rowid offsets; replacing them with
-`ExecutedInputCount` and exposing history versions is owned by the
-[Track 3 handoff](2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff).
+not an ordered counter. Snapshot headers and mandatory WS claims expose these coordinates. Every
+application row has its pre-execution count; recovery replaces only the current
+suffix. See the [history contract](application-history.md) and
+[Track 3 handoff](2026-07-track3-feed-replay-design.md).
 
 ## Performance posture
 

@@ -18,6 +18,9 @@ cartesi-rollups-contracts = { workspace = true }
 futures-util = { workspace = true }
 k256 = { workspace = true }
 rusqlite = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tar = "0.4"
+toml = "0.8"
 sequencer-core = { path = "../../sequencer-core" }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
 serde = { workspace = true }

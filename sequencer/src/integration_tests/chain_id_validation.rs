@@ -95,9 +95,14 @@ fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
         .expect("seed deployment identity");
     let snapshot_prefix = std::path::Path::new(db_path).with_file_name("seed-finalized");
     storage
-        .insert_initial_finalized_dump(&snapshot_prefix, 0, 0, 0, 0)
+        .complete_baseline_setup(
+            &snapshot_prefix,
+            sequencer_core::history::ExecutedInputCount::ZERO,
+            0,
+            0,
+            false,
+        )
         .expect("seed finalized snapshot fact");
-    storage.complete_setup().expect("complete setup");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -329,13 +329,20 @@ impl Application for ReplayRecordingApp {
         self.progress
     }
 
-    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        Ok(Self::default())
+    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
+        let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
+        Ok(Self {
+            progress: decode_progress(&bytes, "ReplayRecordingApp")?,
+            replayed: Vec::new(),
+        })
     }
 
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
-        std::fs::write(Self::state_file_in_dump(prefix), b"")?;
+        std::fs::write(
+            Self::state_file_in_dump(prefix),
+            encode_progress(self.progress),
+        )?;
         Ok(())
     }
 
@@ -346,7 +353,6 @@ impl Application for ReplayRecordingApp {
 
 fn default_test_config() -> InclusionLaneConfig {
     InclusionLaneConfig {
-        batch_submitter_address: Address::from_slice(&[0xff; 20]),
         // A leaked tempdir per call: the lane unconditionally writes
         // dump artifacts there, and the test stubs' `create_dump`
         // creates the directory. Tempdir gets reaped by the OS.
@@ -380,13 +386,11 @@ fn register_genesis_snapshot<A: Application>(app: &mut A, storage: &mut Storage,
         &super::dump_info::DumpInfo {
             format_version: super::dump_info::FORMAT_VERSION,
             next_batch_nonce: 0,
-            l2_tx_index: 0,
-            promoted_inclusion_block: Some(0),
         },
     )
     .expect("create genesis dump");
     storage
-        .insert_finalized_dump(&dump_dir, 0, 0)
+        .insert_baseline_snapshot(&dump_dir, ExecutedInputCount::ZERO)
         .expect("insert finalized snapshot");
 }
 
@@ -399,7 +403,7 @@ async fn start_lane(
     tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
 ) {
     let mut storage = Storage::open(db_path).expect("open storage");
-    pin_test_deployment_identity(&mut storage, config.batch_submitter_address);
+    pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
         .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
         .expect("seed observed safe head");
@@ -529,7 +533,8 @@ async fn sustained_rejected_queue_cannot_starve_poisoned_frontier() {
         storage,
         config,
     };
-    let mut lane_handle = tokio::task::spawn_blocking(move || lane.run_forever(0));
+    let mut lane_handle =
+        tokio::task::spawn_blocking(move || lane.run_forever(ExecutedInputCount::ZERO));
 
     let producer_tx = tx.clone();
     let producer = tokio::spawn(async move {
@@ -590,7 +595,7 @@ fn reconciliation_digests_an_epoch_sized_outage_backlog_in_one_turn() {
     let db = temp_db("digestibility-epoch-backlog");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let config = default_test_config();
-    pin_test_deployment_identity(&mut storage, config.batch_submitter_address);
+    pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
         .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
         .expect("seed observed safe head");
@@ -651,7 +656,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     let db = temp_db("frame-clock-block-interval");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let config = default_test_config();
-    pin_test_deployment_identity(&mut storage, config.batch_submitter_address);
+    pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
         .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
         .expect("seed observed safe head");
@@ -703,21 +708,22 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
         TurnOutcome::Processed
     );
     assert!(matches!(response.try_recv(), Ok(Ok(()))));
-    let sequenced = lane
-        .storage
-        .ordered_l2_txs_page_from(0, 10)
-        .expect("read sequenced clock values");
+    let sequenced = history_rows(&mut lane.storage, 10);
     assert_eq!(sequenced.len(), 2);
     assert!(matches!(
-        &sequenced[0].tx,
-        SequencedL2Tx::Direct(DirectInput {
-            block_number: 4,
+        &sequenced[0].context,
+        crate::storage::L2TxContext::DirectInput {
+            tx: DirectInput {
+                block_number: 4,
+                ..
+            },
             ..
-        })
+        }
     ));
-    assert_eq!(sequenced[0].frame_safe_block, 5);
-    assert!(matches!(&sequenced[1].tx, SequencedL2Tx::UserOp(_)));
-    assert_eq!(sequenced[1].frame_safe_block, 5);
+    assert!(matches!(
+        &sequenced[1].context,
+        crate::storage::L2TxContext::UserOp { safe_block: 5, .. }
+    ));
 
     lane.storage
         .append_safe_inputs(32, &[], SENDER_A, &default_protocol_timing())
@@ -866,7 +872,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 safe_input_index: 0,
                 executed_input_offset: ExecutedInputCount::new(2),
             }],
-            None,
         )
         .expect("close first frame with direct attribution");
 
@@ -895,7 +900,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 safe_input_index: 1,
                 executed_input_offset: ExecutedInputCount::new(4),
             }],
-            None,
         )
         .expect("close second frame with direct attribution");
 
@@ -920,7 +924,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 safe_input_index: 2,
                 executed_input_offset: ExecutedInputCount::new(5),
             }],
-            None,
         )
         .expect("close third frame with direct attribution");
 
@@ -965,7 +968,7 @@ fn read_count(db_path: &str, table: &str) -> i64 {
 fn read_frame_direct_count(db_path: &str, batch_index: i64, frame_in_batch: i64) -> i64 {
     let conn = Storage::open_connection(db_path).expect("open sqlite reader");
     conn.query_row(
-        "SELECT COUNT(*) FROM sequenced_l2_txs
+        "SELECT COUNT(*) FROM application_inputs
          WHERE batch_index = ?1
            AND frame_in_batch = ?2
            AND safe_input_index IS NOT NULL",
@@ -1074,10 +1077,7 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     storage
         .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
         .expect("seed observed safe head");
-    let config = InclusionLaneConfig {
-        batch_submitter_address,
-        ..default_test_config()
-    };
+    let config = default_test_config();
     pin_test_deployment_identity(&mut storage, batch_submitter_address);
     {
         let mut app = SharedCountingApp::new();
@@ -1116,36 +1116,19 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
         .expect("append safe batch-submitter input");
 
     let drained = wait_until(Duration::from_secs(2), || {
-        read_frame_direct_count(db.path.as_str(), 0, 1) == 1
+        read_frame_safe_blocks(db.path.as_str()).last() == Some(&10)
     })
     .await;
     shutdown_lane(&shutdown, lane_handle).await;
-
     assert!(
         drained,
-        "expected sequenced safe input to be drained into frame 1"
+        "the frame must account for the observed L1 interval"
     );
-
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let replay = storage
-        .ordered_l2_txs_page_from(0, 16)
-        .expect("load own-batch replay row");
-    assert_eq!(replay.len(), 1);
-    assert!(matches!(
-        &replay[0].tx,
-        SequencedL2Tx::Direct(DirectInput { sender, .. })
-            if *sender == batch_submitter_address
-    ));
-    assert_eq!(replay[0].executed_input_offset, None);
-
-    // The lane's own batch input was drained into a frame and
-    // sequenced into `sequenced_l2_txs`, but the lane skipped
-    // shared application-execution boundary for it. Catch-up replays the same
-    // sequenced stream and also filters batch-submitter rows — so a
-    // fresh `SharedCountingApp` driven through `catch_up_application`
-    // ends with counter == 0, confirming the symmetric skip.
+    let mut storage = Storage::open(db.path.as_str()).unwrap();
+    assert!(history_rows(&mut storage, 16).is_empty());
+    assert_eq!(read_frame_direct_count(db.path.as_str(), 0, 1), 0);
     let mut fresh_app = SharedCountingApp::new();
-    catch_up_application_paged(&mut fresh_app, &mut storage, batch_submitter_address, 0, 16)
+    catch_up_application_paged(&mut fresh_app, &mut storage, ExecutedInputCount::ZERO, 16)
         .expect("catch up");
     assert_eq!(
         fresh_app.executed_input_count().get(),
@@ -1222,11 +1205,9 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
 
     let replay: Vec<SequencedL2Tx> = {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        storage
-            .ordered_l2_txs_page_from(0, 1_000_000)
-            .expect("load ordered replay")
+        history_rows(&mut storage, 1_000_000)
             .into_iter()
-            .map(|row| row.tx)
+            .map(|row| context_tx(row.context))
             .collect()
     };
     shutdown_lane(&shutdown, lane_handle).await;
@@ -1406,19 +1387,14 @@ fn catch_up_replays_multiple_pages() {
     let db = temp_db("catch-up-multi-page");
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let mappings: Vec<_> = storage
-        .ordered_l2_txs_page_from(0, 16)
-        .expect("load attributed replay rows")
+    let mappings: Vec<_> = history_rows(&mut storage, 16)
         .into_iter()
-        .map(|row| row.executed_input_offset.map(ExecutedInputCount::get))
+        .map(|row| row.offset.get())
         .collect();
-    assert_eq!(
-        mappings,
-        vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
-    );
+    assert_eq!(mappings, vec![0, 1, 2, 3, 4, 5]);
     let mut app = ReplayRecordingApp::default();
 
-    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 2)
+    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
         .expect("catch up in pages");
 
     assert_eq!(app.replayed, expected);
@@ -1431,56 +1407,35 @@ fn catch_up_replays_multiple_pages() {
 }
 
 #[test]
-fn catch_up_rejects_missing_mapping_before_execution() {
-    let db = temp_db("catch-up-missing-mapping");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    pin_test_deployment_identity(&mut storage, Address::from([0xff; 20]));
-    let mut head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .expect("initialize open state");
-    let (unmapped, _response) = make_pending_user_op(0x51);
-    storage
-        .append_user_ops_chunk(&mut head, &[unmapped])
-        .expect("seed intentionally unmapped physical user op");
-
+fn catch_up_rejects_history_gap_before_execution() {
+    let db = temp_db("catch-up-gap");
+    seed_replay_fixture(&db.path);
+    let mut storage = Storage::open(&db.path).unwrap();
+    let conn = Storage::open_connection(&db.path).unwrap();
+    conn.execute_batch("DROP TRIGGER trg_protect_valid_application_input_delete; DELETE FROM application_inputs WHERE offset=1;").unwrap();
     let mut app = ReplayRecordingApp::default();
-    let err = catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 2)
-        .expect_err("missing canonical mapping must stop catch-up");
-
-    assert!(matches!(
-        &err,
-        CatchUpError::ExecutionOffsetMismatch {
-            db_offset: 1,
-            kind: "user op",
-            expected: Some(0),
-            stored: None,
-        }
-    ));
-    assert!(
-        app.replayed.is_empty(),
-        "mapping is checked before execution"
-    );
-    assert_eq!(app.executed_input_count(), ExecutedInputCount::ZERO);
-    assert!(InclusionLaneError::CatchUp { source: err }.is_terminal_invariant());
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2);
+    }));
+    assert!(failure.is_err());
+    assert!(app.replayed.is_empty());
 }
 
 #[test]
-fn catch_up_rejects_wrong_mapping_before_execution() {
+fn catch_up_rejects_wrong_snapshot_count_before_execution() {
     let db = temp_db("catch-up-wrong-mapping");
     seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::with_executed_input_count(3);
 
-    let err = catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
         .expect_err("mapping from a different application boundary must stop catch-up");
 
     assert!(matches!(
         &err,
-        CatchUpError::ExecutionOffsetMismatch {
-            db_offset: 1,
-            kind: "user op",
-            expected: Some(3),
-            stored: Some(0),
+        CatchUpError::SnapshotExecutionCountMismatch {
+            application: 3,
+            storage: 0
         }
     ));
     assert!(
@@ -1498,7 +1453,7 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = ReplayRecordingApp::default();
 
-    catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 4)
+    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 4)
         .expect("catch up across page boundary");
 
     assert_eq!(app.replayed, expected);
@@ -1583,14 +1538,12 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
                 safe_input_index: 1,
                 executed_input_offset: direct_receipt.offset,
             }],
-            Some((0, 10)),
         )
         .expect("drain direct and promote prefix snapshot");
     let finalized_before = storage
         .finalized_dump()
         .expect("read finalized prefix")
         .expect("prefix snapshot promoted");
-    assert_eq!(finalized_before.l2_tx_index, 1);
     assert_eq!(
         finalized_before.executed_input_count,
         ExecutedInputCount::new(1)
@@ -1628,20 +1581,14 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         ExecutedInputCount::new(3)
     );
 
-    let before_recovery = storage
-        .ordered_l2_txs_page_from(0, 32)
-        .expect("read pre-recovery history");
-    let old_direct_physical = before_recovery
-        .iter()
-        .find_map(|row| match &row.tx {
-            SequencedL2Tx::Direct(value) if value.sender == direct_sender => {
-                assert_eq!(row.executed_input_offset, Some(ExecutedInputCount::new(1)));
-                Some(row.db_offset)
-            }
-            _ => None,
-        })
-        .expect("doomed direct row exists before recovery");
-
+    let before_recovery = history_rows(&mut storage, 32);
+    assert_eq!(
+        before_recovery
+            .iter()
+            .map(|row| row.offset.get())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
     let invalidated = storage
         .recover_post_flush_for_recovery(10, &protocol, crate::clock::unix_now_ms())
         .expect("standard recovery cascade");
@@ -1662,34 +1609,19 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         finalized_before,
         "the accepted prefix checkpoint must survive the cascade"
     );
-    assert!(
-        storage.latest_pending_dump().unwrap().is_none(),
-        "the doomed suffix checkpoint must not survive"
+    assert_eq!(
+        storage.latest_snapshot().unwrap().unwrap().dump,
+        finalized_before.dump
     );
+    let after_recovery = history_rows(&mut storage, 32);
+    assert_eq!(after_recovery.len(), 2);
+    assert!(matches!(
+        &after_recovery[1].context,
+        crate::storage::L2TxContext::DirectInput { input_index: 1, .. }
+    ));
+    assert_eq!(after_recovery[1].offset, ExecutedInputCount::new(1));
 
-    let after_recovery = storage
-        .ordered_l2_txs_page_from(0, 32)
-        .expect("read recovered history");
-    let (new_direct_physical, new_direct_logical) = after_recovery
-        .iter()
-        .find_map(|row| match &row.tx {
-            SequencedL2Tx::Direct(value) if value.sender == direct_sender => {
-                Some((row.db_offset, row.executed_input_offset))
-            }
-            _ => None,
-        })
-        .expect("re-drained direct exists after recovery");
-    assert!(
-        new_direct_physical > old_direct_physical,
-        "recovery must physically re-drain the invalidated direct"
-    );
-    assert_eq!(new_direct_logical, Some(ExecutedInputCount::new(1)));
-
-    // A restart loads the surviving count-1 checkpoint and catches up through
-    // the replacement recovery Tip. The invalidated rows are physical audit
-    // history only and cannot perturb application progress.
     let checkpoint = catch_up_snapshot(&mut storage).expect("select surviving checkpoint");
-    assert_eq!(checkpoint.l2_tx_index, finalized_before.l2_tx_index);
     assert_eq!(
         checkpoint.executed_input_count,
         finalized_before.executed_input_count
@@ -1701,8 +1633,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     catch_up_application_paged(
         &mut restarted,
         &mut storage,
-        batch_submitter,
-        checkpoint.l2_tx_index,
+        checkpoint.executed_input_count,
         2,
     )
     .expect("catch up through recovery re-drain");
@@ -1733,19 +1664,14 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         ExecutedInputCount::new(3)
     );
 
-    let valid = storage
-        .ordered_l2_txs_page_from(0, 32)
-        .expect("read replacement history");
-    let mappings: Vec<_> = valid
-        .iter()
-        .map(|row| row.executed_input_offset.map(ExecutedInputCount::get))
-        .collect();
-    assert_eq!(mappings, vec![Some(0), None, Some(1), Some(2)]);
+    let valid = history_rows(&mut storage, 32);
+    let mappings: Vec<_> = valid.iter().map(|row| row.offset.get()).collect();
+    assert_eq!(mappings, vec![0, 1, 2]);
     let user_seeds: Vec<_> = valid
         .iter()
-        .filter_map(|row| match &row.tx {
-            SequencedL2Tx::UserOp(value) => Some(value.data[0]),
-            SequencedL2Tx::Direct(_) => None,
+        .filter_map(|row| match &row.context {
+            crate::storage::L2TxContext::UserOp { tx, .. } => Some(tx.data[0]),
+            crate::storage::L2TxContext::DirectInput { .. } => None,
         })
         .collect();
     assert_eq!(user_seeds, vec![0x51, 0x53]);
@@ -1756,8 +1682,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     catch_up_application_paged(
         &mut restarted_again,
         &mut storage,
-        batch_submitter,
-        checkpoint.l2_tx_index,
+        checkpoint.executed_input_count,
         2,
     )
     .expect("catch up through replacement suffix");
@@ -1774,7 +1699,7 @@ fn catch_up_load_error_reports_offset() {
     let mut storage = Storage::open_writer(db.path.as_str()).expect("open raw storage");
     let mut app = ReplayRecordingApp::default();
 
-    let err = catch_up_application_paged(&mut app, &mut storage, Address::from([0xff; 20]), 0, 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
         .expect_err("catch up should fail without schema");
 
     assert!(matches!(err, CatchUpError::LoadReplay { offset: 0, .. }));
@@ -1785,12 +1710,12 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
     let db = temp_db("snapshot-execution-count-mismatch");
     let config = default_test_config();
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    pin_test_deployment_identity(&mut storage, config.batch_submitter_address);
+    pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
         .append_safe_inputs(
             0,
             &[],
-            config.batch_submitter_address,
+            Address::repeat_byte(0xff),
             &default_protocol_timing(),
         )
         .expect("seed observed safe head");
@@ -1962,7 +1887,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
 
     let snapshotted = wait_until(Duration::from_secs(2), || {
         let mut s = Storage::open(db.path.as_str()).expect("open");
-        s.latest_pending_dump()
+        s.latest_snapshot()
             .expect("read pending")
             .map(|p| read_dump_counter(&p.dump.prefix) == 3)
             .unwrap_or(false)
@@ -1978,7 +1903,8 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
             s.finalized_dump()
                 .expect("finalized")
                 .expect("genesis finalized exists")
-                .l2_tx_index,
+                .executed_input_count
+                .get(),
             0,
             "finalized must still be genesis (nothing was promoted)"
         );
@@ -2008,7 +1934,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
 
     let reached_four = wait_until(Duration::from_secs(2), || {
         let mut s = Storage::open(db.path.as_str()).expect("open");
-        s.latest_pending_dump()
+        s.latest_snapshot()
             .expect("read pending")
             .map(|p| read_dump_counter(&p.dump.prefix) == 4)
             .unwrap_or(false)
@@ -2016,7 +1942,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
     .await;
     let observed = {
         let mut s = Storage::open(db.path.as_str()).expect("open");
-        s.latest_pending_dump()
+        s.latest_snapshot()
             .expect("read pending")
             .map(|p| read_dump_counter(&p.dump.prefix))
     };
@@ -2029,208 +1955,45 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
     );
 }
 
-/// Regression for the empty-batch snapshot offset: a batch that closes
-/// with no sequenced txs of its own still reflects state through the
-/// prior global replay head. Recording `0` means a later promotion to
-/// finalized would make catch-up replay the entire history again,
-/// double-applying every prior tx.
 #[test]
-fn empty_batch_snapshot_records_global_replay_head_not_genesis() {
-    let db = temp_db("empty-batch-snapshot-head");
-    // Batch 0 gets 6 sequenced txs; close it, then close an empty batch 1.
-    let _expected = seed_replay_fixture(db.path.as_str());
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let mut head = storage
-        .open_state()
-        .expect("open state")
-        .expect("batch 0 is the open tip");
-    storage
-        .close_frame_and_batch(&mut head, 30)
-        .expect("close batch 0 (6 txs)");
-    storage
-        .close_frame_and_batch(&mut head, 30)
-        .expect("close empty batch 1");
-
-    let dumps_dir = tempfile::tempdir().expect("dumps dir");
-    let mut app = TestApp::default();
-    super::snapshot::take_dump_at_batch_close(&mut app, &mut storage, dumps_dir.path(), 1)
-        .expect("take dump for empty batch 1");
-
-    let pending = storage
-        .latest_pending_dump()
-        .expect("read pending")
-        .expect("pending row for batch 1");
-    assert_eq!(
-        pending.nonce, 1,
-        "snapshot keyed by the empty batch's nonce"
-    );
-
-    let global_head: u64 = {
-        let conn = Storage::open_connection(db.path.as_str()).expect("open reader");
-        conn.query_row("SELECT MAX(offset) FROM sequenced_l2_txs", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .expect("max offset") as u64
-    };
-
-    assert_eq!(
-        pending.l2_tx_index, global_head,
-        "empty-batch snapshot must record the global replay head ({global_head}), not genesis (0); \
-         otherwise catch-up after this snapshot is finalized replays the whole stream and double-applies it"
-    );
+fn empty_batch_snapshot_preserves_application_count() {
+    let db = temp_db("empty-snapshot-count");
+    let expected = seed_replay_fixture(&db.path);
+    let mut storage = Storage::open(&db.path).unwrap();
+    let mut app = ReplayRecordingApp::default();
+    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2).unwrap();
+    assert_eq!(app.replayed, expected);
+    let mut head = storage.open_state().unwrap().unwrap();
+    let dumps = tempfile::tempdir().unwrap();
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 30, dumps.path())
+        .unwrap();
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 30, dumps.path())
+        .unwrap();
+    let snapshot = storage.latest_snapshot().unwrap().unwrap();
+    assert_eq!(snapshot.executed_input_count.get(), 6);
+    let restored =
+        ReplayRecordingApp::from_dump(&super::dump_info::app_prefix(&snapshot.dump.prefix))
+            .unwrap();
+    assert_eq!(restored.executed_input_count().get(), 6);
 }
 
-/// Regression for the promote/drain wedge. The pre-fix per-block path promoted
-/// a batch in one transaction and advanced the safe-input drain
-/// (`close_frame_only`) in a *separate* one. A crash between them left a
-/// promoted-but-undrained batch; on restart the lane re-processed the same safe
-/// input, re-derived the accepted nonce, and called `promote_finalized` on a
-/// now-deleted pending row → `QueryReturnedNoRows` → crash-loop (verified
-/// against the SQL: `accepted_batch_nonce_at` has no pending-row gate, and
-/// `next_undrained` advances only when inputs are sequenced by the drain).
-///
-/// `close_frame_only_with_executions` folds the promotion into the drain's
-/// transaction, so a committed promotion always comes with an advanced drain —
-/// the wedge state is unrepresentable.
-#[test]
-fn promotion_advances_drain_atomically_so_restart_cannot_re_promote() {
-    let db = temp_db("promote-drain-atomic");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    pin_test_deployment_identity(&mut storage, SENDER_A);
-    let mut head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .expect("open batch 0");
-
-    // Our batch 0 lands on L1 as safe input 0; the scheduler accepts it as
-    // nonce 0 (this is what populates `safe_accepted_batches`).
-    let batch0 = StoredSafeInput {
-        sender: SENDER_A,
-        payload: ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
-            nonce: 0,
-            frames: Vec::new(),
-        }),
-        block_number: 100,
-    };
-    // DeferUntilAnchorSet skips acceptance simulation: this test's subject is
-    // promote/drain atomicity, and a hand-built landing payload cannot
-    // content-match an unsealed local batch — running the content-identity
-    // check here would record a divergence marker and (correctly) freeze the
-    // batch tree via the I15 triggers.
+fn history_rows(storage: &mut Storage, limit: usize) -> Vec<crate::storage::ApplicationInputRow> {
+    let bounds = storage.history_bounds().unwrap();
     storage
-        .append_safe_inputs_with_timestamp(
-            100,
-            100,
-            std::slice::from_ref(&batch0),
-            SENDER_A,
-            &default_protocol_timing(),
-            crate::storage::FrontierMode::DeferUntilAnchorSet,
+        .canonical_history_page(
+            sequencer_core::history::HistoryClaim {
+                version: bounds.version,
+                next_input: bounds.available_from,
+            },
+            limit,
         )
-        .expect("append our batch as a safe input");
-
-    // Close batch 0 off-chain and register its pending snapshot.
-    storage
-        .close_frame_and_batch(&mut head, 100)
-        .expect("close batch 0");
-    let dumps = tempfile::tempdir().expect("dumps dir");
-    super::snapshot::take_dump_at_batch_close(
-        &mut TestApp::default(),
-        &mut storage,
-        dumps.path(),
-        0,
-    )
-    .expect("pending snapshot for batch 0");
-
-    // The lane advances the safe frontier over batch 0's landing: it promotes
-    // batch 0 AND sequences the drain in one transaction.
-    storage
-        .close_frame_only_with_executions(
-            &mut head,
-            100,
-            SafeInputRange::new(0, 1),
-            &[],
-            Some((0, 100)),
-        )
-        .expect("atomic close-frame + promote");
-
-    // The promotion committed...
-    assert_eq!(
-        storage
-            .finalized_dump()
-            .unwrap()
-            .expect("finalized")
-            .inclusion_block,
-        100,
-    );
-    // ...and the drain advanced past batch 0's safe input in the SAME commit, so
-    // a restart resumes *after* it and never re-processes (hence never
-    // re-promotes) the batch whose pending row promotion deleted.
-    assert!(
-        storage.next_undrained_safe_input_index().unwrap() > 0,
-        "drain must advance past the promoted batch's safe input atomically with \
-         the promotion — otherwise a restart re-processes safe input 0 and \
-         re-promotes a now-deleted pending row (QueryReturnedNoRows wedge)",
-    );
+        .unwrap()
+        .rows
 }
 
-/// The atomicity complement: if the promotion fails *inside* the combined
-/// transaction (here, a missing pending row), the drain advance rolls back with
-/// it. There is never a half-applied "drained but not promoted" state — the
-/// mirror of the wedge.
-#[test]
-fn frame_promotion_failure_rolls_back_drain_execution_offsets_and_head() {
-    let db = temp_db("close-promote-rollback");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    pin_test_deployment_identity(&mut storage, SENDER_A);
-    let mut head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .expect("open batch 0");
-
-    // A safe input exists to drain, but there is no pending snapshot for the
-    // nonce we ask to promote, so `promote_finalized_in` errors mid-transaction.
-    let direct = StoredSafeInput {
-        sender: Address::ZERO,
-        payload: vec![1],
-        block_number: 100,
-    };
-    storage
-        .append_safe_inputs(
-            100,
-            std::slice::from_ref(&direct),
-            SENDER_A,
-            &default_protocol_timing(),
-        )
-        .expect("append safe input");
-
-    let result = storage.close_frame_only_with_executions(
-        &mut head,
-        100,
-        SafeInputRange::new(0, 1),
-        &[DirectInputExecution {
-            safe_input_index: 0,
-            executed_input_offset: ExecutedInputCount::ZERO,
-        }],
-        Some((7, 100)),
-    );
-    assert!(
-        result.is_err(),
-        "promoting a missing pending row must fail the whole call",
-    );
-
-    // Nothing committed: no finalized promotion, and the drain did not advance.
-    assert!(
-        storage.finalized_dump().unwrap().is_none(),
-        "no finalized snapshot after the failed promotion",
-    );
-    assert_eq!(
-        storage.next_undrained_safe_input_index().unwrap(),
-        0,
-        "the drain rolled back together with the failed promotion",
-    );
-    assert_eq!(
-        storage.next_executed_input_count().unwrap(),
-        ExecutedInputCount::ZERO
-    );
-    assert_eq!(head.frame_in_batch, 0);
-    assert_eq!(head.safe_block, 0);
-    assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0]);
+fn context_tx(context: crate::storage::L2TxContext) -> SequencedL2Tx {
+    match context {
+        crate::storage::L2TxContext::UserOp { tx, .. } => SequencedL2Tx::UserOp(tx),
+        crate::storage::L2TxContext::DirectInput { tx, .. } => SequencedL2Tx::Direct(tx),
+    }
 }

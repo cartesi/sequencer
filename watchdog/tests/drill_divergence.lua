@@ -64,12 +64,12 @@ local deps = {
     },
     sequencer = {
         get_finalized_inclusion_block = function()
-            return { inclusion_block = 1, l2_tx_index = 0 }
+            return { inclusion_block = 1, executed_input_count = 0 }
         end,
         get_finalized_state = function()
             return {
                 inclusion_block = 1,
-                l2_tx_index = 0,
+                executed_input_count = 0,
                 state = string.char(0x01, 0x02, 0x03, 0x04),
             }
         end,

@@ -83,8 +83,6 @@ pub(crate) fn create_structured_dump(dump_dir: &std::path::Path) {
         &dump_info::DumpInfo {
             format_version: dump_info::FORMAT_VERSION,
             next_batch_nonce: 0,
-            l2_tx_index: 0,
-            promoted_inclusion_block: None,
         },
     )
     .expect("create structured dump");

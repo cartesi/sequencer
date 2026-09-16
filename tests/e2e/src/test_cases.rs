@@ -291,21 +291,16 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
             Box::pin(run_stalled_safe_head_live_exit_test(runtime))
         }),
         (
-            "ws_reconnect_at_invalidated_offset_skips_cleanly_test",
+            "ws_reconnect_with_invalidated_claim_is_refused_test",
             |runtime| {
-                Box::pin(run_ws_reconnect_at_invalidated_offset_skips_cleanly_test(
+                Box::pin(run_ws_reconnect_with_invalidated_claim_is_refused_test(
                     runtime,
                 ))
             },
         ),
-        (
-            "ws_subscribe_from_future_offset_waits_silently_test",
-            |runtime| {
-                Box::pin(run_ws_subscribe_from_future_offset_waits_silently_test(
-                    runtime,
-                ))
-            },
-        ),
+        ("ws_subscribe_ahead_of_head_is_refused_test", |runtime| {
+            Box::pin(run_ws_subscribe_ahead_of_head_is_refused_test(runtime))
+        }),
         (
             "recovery_drains_safe_but_undrained_direct_input_test",
             |runtime| {
@@ -448,8 +443,9 @@ async fn mine_until_finalized_advances(
     for _ in 0..PROMOTION_POLL_ATTEMPTS {
         runtime.mine_live_l1_blocks(1).await?;
         tokio::time::sleep(PROMOTION_POLL_INTERVAL).await;
-        let (inclusion_block, _) = runtime.finalized_snapshot_info()?;
-        if inclusion_block > floor {
+        if let Some(inclusion_block) = runtime.finalized_inclusion_block().await?
+            && inclusion_block > floor
+        {
             return Ok(inclusion_block);
         }
     }
@@ -563,7 +559,7 @@ async fn drive_finalized_gold_batch_for_watchdog(
     alice_l2: &mut WalletL2Client,
     alice_address: Address,
 ) -> ScenarioResult<()> {
-    let (floor_inclusion_block, _) = runtime.finalized_snapshot_info()?;
+    let floor_inclusion_block = runtime.finalized_inclusion_block().await?.unwrap_or(0);
     let batches_before = runtime.count_batches()?;
     for _ in 0..TRANSFERS_TO_FORCE_BATCH_CLOSE {
         alice_l2.transfer(alice_address, U256::from(1_u64)).await?;
@@ -765,15 +761,16 @@ async fn run_reconnect_from_offset_test(runtime: &mut ManagedSequencer) -> Scena
         deposit_amount,
     )
     .await?;
-    // WS replay is cursor-based and exclusive: `from_offset` means
-    // "start after this already-consumed DB offset".
-    let reconnect_offset = deposit_message.offset();
+    // The resume claim names the next input, after the consumed deposit.
+    let reconnect_claim =
+        runtime.history_claim(deposit_message.offset().checked_add(1).unwrap())?;
     drop(ws);
 
     alice_l2.transfer(bob_address, transfer_amount).await?;
     bob_l2.withdraw(withdrawal_amount).await?;
 
-    let mut resumed_ws = runtime.ws(reconnect_offset).await?;
+    let mut resumed_ws =
+        WsClient::connect(&SequencerClient::new(runtime.endpoint())?, reconnect_claim).await?;
     replay.apply(resumed_ws.expect_user_op_from(alice_address).await?)?;
     replay.apply(resumed_ws.expect_user_op_from(bob_address).await?)?;
 
@@ -1364,7 +1361,7 @@ async fn drive_promotion_and_capture(
     runtime: &ManagedSequencer,
 ) -> ScenarioResult<RecoveryCheckpoint> {
     mine_until_finalized_advances(runtime, 0).await?;
-    runtime.capture_finalized_checkpoint()
+    runtime.capture_finalized_checkpoint().await
 }
 
 async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
@@ -1459,7 +1456,7 @@ async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> S
     // S' and the resumed submission both land exactly on the canonical chain
     // state. The local `replay` can't check this (the wiped history is never
     // re-fed), so the watchdog's independent CM is the authority.
-    let (floor_inclusion_block, _) = runtime.finalized_snapshot_info()?;
+    let floor_inclusion_block = runtime.finalized_inclusion_block().await?.unwrap_or(0);
     let batches_before = runtime.count_batches()?;
     for _ in 0..TRANSFERS_TO_FORCE_BATCH_CLOSE {
         alice_l2_after
@@ -3276,18 +3273,9 @@ async fn run_stalled_safe_head_live_exit_test(
 // after the WS connection dropped.
 //
 // A WS connection cannot span invalidation: the sequencer necessarily exits
-// (danger detection or stop) before any cascade runs (`recover_post_flush` or
-// `recover_aging_tip`), and the socket dies with the process. The
-// meaningful invariant is the **reconnect** behavior —
-// a client that reconnects at `from_offset=N`, where `N` was an offset it
-// previously received and whose row is *now invalidated*, must see the
-// cursor skip cleanly past `N` and deliver only post-recovery events.
-//
-//  covers the adjacent case (`from_offset=0`), which trivially walks
-// `valid_sequenced_l2_txs` from the start. This case is distinct because
-// the query `WHERE offset > N` is pointed at an offset that no longer
-// exists in the valid view.
-async fn run_ws_reconnect_at_invalidated_offset_skips_cleanly_test(
+// (danger detection or stop) before any cascade runs. Recovery invalidates
+// the identity attached to a previously consumed prefix.
+async fn run_ws_reconnect_with_invalidated_claim_is_refused_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     // Past-stale: matches `recovery_after_stale_batches_test` sizing.
@@ -3317,7 +3305,7 @@ async fn run_ws_reconnect_at_invalidated_offset_skips_cleanly_test(
         .transfer(bob_address, U256::from(100_000_u64))
         .await?;
     let transfer_msg = ws.expect_user_op_from(alice_address).await?;
-    let last_seen_offset = transfer_msg.offset();
+    let resume_claim = runtime.history_claim(transfer_msg.offset().checked_add(1).unwrap())?;
     replay_before.apply(transfer_msg)?;
 
     // Kill the WS socket and the sequencer (same way a real reconnect arc
@@ -3328,104 +3316,36 @@ async fn run_ws_reconnect_at_invalidated_offset_skips_cleanly_test(
     runtime.advance_wall_and_mine(PAST_STALE).await?;
     runtime.respawn().await?;
 
-    // Reconnect at the last offset the client observed — now invalidated.
-    // The query `WHERE offset > last_seen_offset` against
-    // `valid_sequenced_l2_txs` must skip cleanly past the invalidated
-    // rows and deliver only the post-recovery events (the re-drained
-    // deposit).
-    let mut ws_after = runtime.ws(last_seen_offset).await?;
-    let redrained = ws_after
+    assert!(matches!(
+        SequencerClient::new(runtime.endpoint())?
+            .subscribe(resume_claim)
+            .await,
+        Err(sequencer_rust_client::SubscribeError::History(
+            sequencer_rust_client::HistoryPolicyError::StaleGeneration { .. }
+        ))
+    ));
+    let mut replay = runtime.ws(0).await?;
+    let redrained = replay
         .expect_direct_input_from(runtime.erc20_portal_address())
         .await?;
-    // The re-drained deposit's offset is strictly greater than the
-    // last-seen offset — if the cursor ever delivered an invalidated row
-    // or the same offset again, that'd be the regression.
-    assert!(
-        redrained.offset() > last_seen_offset,
-        "re-drained event must have a strictly-greater offset: \
-         last_seen={last_seen_offset}, redrained={}",
-        redrained.offset(),
-    );
-    ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
-
-    // Sanity check: also reconnecting at 0 produces the same single event
-    // ('s property), to rule out any one-off weirdness in the
-    // non-zero reconnect path.
-    drop(ws_after);
-    let mut ws_from_zero = runtime.ws(0).await?;
-    let redrained_from_zero = ws_from_zero
-        .expect_direct_input_from(runtime.erc20_portal_address())
-        .await?;
-    assert_eq!(
-        redrained.offset(),
-        redrained_from_zero.offset(),
-        "reconnect-at-invalidated and reconnect-at-zero must deliver the \
-         same next valid event",
-    );
-    ws_from_zero
-        .expect_no_message_for(NO_WS_MESSAGE_WAIT)
-        .await?;
+    assert_eq!(redrained.offset(), 0);
+    replay.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
 
     Ok(())
 }
 
-// `from_offset=future` waits silently without erroring.
-//
-// A subscribe at a far-future offset is a valid subscription that should
-// behave the same way `from_offset=0` does on an empty feed: sit idle on
-// the live broadcast channel until an event with a greater offset arrives,
-// no error, no close.
-//
-// The behavior is deliberately consistent with `from_offset=0` on an empty
-// head — otherwise we'd be making the wait-for-something-new path differ
-// based on whether history exists. Test pins this as part of the WS
-// subscription contract.
-async fn run_ws_subscribe_from_future_offset_waits_silently_test(
+async fn run_ws_subscribe_ahead_of_head_is_refused_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    // Comfortably beyond any offset this test will produce. `sequenced_l2_txs`
-    // is rowid-based; rowid_u64 ≤ a few by the end of the short workload.
-    const FUTURE_OFFSET: u64 = 1_000_000;
-    // Enough real time to observe "waits silently" without being slow.
-    const WAIT_WINDOW: Duration = Duration::from_secs(2);
-
-    let alice = TestSigner::from_default(1)?;
-    let bob = TestSigner::from_default(2)?;
-    let alice_address = alice.address();
-    let bob_address = bob.address();
-
-    // Seed some actual events so we're not testing "empty head, future
-    // offset" (trivial case). We want "non-trivial head, offset beyond it".
-    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
-    let mut alice_l2 = runtime.wallet_l2(alice)?;
-    let mut replay = ReplayWalletApp::devnet();
-    {
-        let mut ws = runtime.ws(0).await?;
-        apply_reconciled_supported_deposit(
-            runtime,
-            &mut ws,
-            &mut replay,
-            &alice_l1,
-            U256::from(500_000_u64),
-        )
-        .await?;
-        alice_l2.transfer(bob_address, U256::from(1_u64)).await?;
-        replay.apply(ws.expect_user_op_from(alice_address).await?)?;
-    }
-
-    // Subscribe far beyond the current head. The subscribe itself must
-    // succeed (no 4xx / WS close code), and the resulting stream must be
-    // quiet until something with a greater offset arrives.
-    let mut ws_future = runtime.ws(FUTURE_OFFSET).await?;
-    ws_future.expect_no_message_for(WAIT_WINDOW).await?;
-
-    // Generate more activity. These events are still at offsets far below
-    // `FUTURE_OFFSET`, so they must not be delivered — the subscription
-    // keeps waiting.
-    alice_l2.transfer(bob_address, U256::from(1_u64)).await?;
-    alice_l2.transfer(bob_address, U256::from(1_u64)).await?;
-    ws_future.expect_no_message_for(WAIT_WINDOW).await?;
-
+    let claim = runtime.history_claim(u64::MAX)?;
+    assert!(matches!(
+        SequencerClient::new(runtime.endpoint())?
+            .subscribe(claim)
+            .await,
+        Err(sequencer_rust_client::SubscribeError::History(
+            sequencer_rust_client::HistoryPolicyError::AheadOfHead { .. }
+        ))
+    ));
     Ok(())
 }
 
