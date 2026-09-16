@@ -130,6 +130,11 @@ The split between **pending** and **finalized** mirrors the sequencer's
 optimism: a batch closes off-chain (soft) → its snapshot is *pending*; the
 batch lands safe on L1 → its snapshot is *promoted* to finalized.
 
+Egress lease acquisition captures `HistoryVersion` in the same transaction as
+the selected artifact and its canonical count. The returned metadata remains
+associated with those bytes even if another snapshot is promoted afterward.
+HTTP projection of this identity belongs to the Track 3 consumer cutover.
+
 The storage half lives in `storage/snapshot_dumps.rs` (SQLite only — no
 filesystem); the lane half in `ingress/inclusion_lane/snapshot.rs` +
 `dump_info.rs` (drives the trait and FS work). That split is load-bearing for

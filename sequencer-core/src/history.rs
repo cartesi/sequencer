@@ -136,6 +136,64 @@ pub struct HistoryVersion {
     pub recovery_generation: RecoveryGeneration,
 }
 
+/// The history a consumer holds and the next application input it can execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryClaim {
+    pub version: HistoryVersion,
+    pub next_input: ExecutedInputCount,
+}
+
+/// One coherent view of the locally available canonical history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryBounds {
+    pub version: HistoryVersion,
+    pub available_from: ExecutedInputCount,
+    pub head: ExecutedInputCount,
+}
+
+impl HistoryBounds {
+    /// Validate identity before position: equal counts cannot resume a different
+    /// history. Every count in the inclusive range is admissible; `head` waits
+    /// for the next input.
+    pub fn validate(&self, claim: HistoryClaim) -> Result<(), HistoryPolicyError> {
+        assert!(
+            self.available_from <= self.head,
+            "available history base exceeds its head"
+        );
+        if claim.version.era_id != self.version.era_id {
+            return Err(HistoryPolicyError::EraChanged {
+                current: self.version,
+            });
+        }
+        if claim.version.recovery_generation != self.version.recovery_generation {
+            return Err(HistoryPolicyError::StaleGeneration {
+                current: self.version,
+            });
+        }
+        if claim.next_input < self.available_from {
+            return Err(HistoryPolicyError::HistoryUnavailable {
+                available_from: self.available_from,
+            });
+        }
+        if claim.next_input > self.head {
+            return Err(HistoryPolicyError::AheadOfHead { head: self.head });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum HistoryPolicyError {
+    #[error("history era changed")]
+    EraChanged { current: HistoryVersion },
+    #[error("history generation changed")]
+    StaleGeneration { current: HistoryVersion },
+    #[error("requested input precedes locally available history")]
+    HistoryUnavailable { available_from: ExecutedInputCount },
+    #[error("requested input is ahead of the history head")]
+    AheadOfHead { head: ExecutedInputCount },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +238,112 @@ mod tests {
             ExecutedInputCount::new(7).checked_add(5),
             Some(ExecutedInputCount::new(12))
         );
+    }
+
+    fn history_bounds(base: u64, head: u64) -> HistoryBounds {
+        HistoryBounds {
+            version: HistoryVersion {
+                era_id: EraId::from_bytes(CANONICAL_BYTES).unwrap(),
+                recovery_generation: RecoveryGeneration::new(4),
+            },
+            available_from: ExecutedInputCount::new(base),
+            head: ExecutedInputCount::new(head),
+        }
+    }
+
+    #[test]
+    fn history_claim_checks_era_before_generation_and_position() {
+        let bounds = history_bounds(41, 45);
+        let mut other_era = CANONICAL_BYTES;
+        other_era[0] ^= 1;
+        let other_era = EraId::from_bytes(other_era).unwrap();
+        for (generation, next_input) in [(4, 43), (3, 0), (u64::MAX, u64::MAX)] {
+            assert_eq!(
+                bounds.validate(HistoryClaim {
+                    version: HistoryVersion {
+                        era_id: other_era,
+                        recovery_generation: RecoveryGeneration::new(generation),
+                    },
+                    next_input: ExecutedInputCount::new(next_input),
+                }),
+                Err(HistoryPolicyError::EraChanged {
+                    current: bounds.version,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn history_claim_requires_equal_generation_before_checking_position() {
+        let bounds = history_bounds(41, 45);
+        for generation in [0, 3, 5, u64::MAX] {
+            for next_input in [0, 43, u64::MAX] {
+                assert_eq!(
+                    bounds.validate(HistoryClaim {
+                        version: HistoryVersion {
+                            recovery_generation: RecoveryGeneration::new(generation),
+                            ..bounds.version
+                        },
+                        next_input: ExecutedInputCount::new(next_input),
+                    }),
+                    Err(HistoryPolicyError::StaleGeneration {
+                        current: bounds.version,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_claim_rejects_unavailable_and_future_counts() {
+        let bounds = history_bounds(41, 45);
+        for next_input in [0, 40, 46, u64::MAX] {
+            let expected = if next_input < 41 {
+                HistoryPolicyError::HistoryUnavailable {
+                    available_from: bounds.available_from,
+                }
+            } else {
+                HistoryPolicyError::AheadOfHead { head: bounds.head }
+            };
+            assert_eq!(
+                bounds.validate(HistoryClaim {
+                    version: bounds.version,
+                    next_input: ExecutedInputCount::new(next_input),
+                }),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn history_claim_accepts_the_full_inclusive_range_without_a_depth_cap() {
+        for (base, head, next_input) in [
+            (0, 0, 0),
+            (41, 45, 41),
+            (41, 45, 43),
+            (41, 45, 45),
+            (0, 100_001, 0),
+            (i64::MAX as u64, i64::MAX as u64 + 1, i64::MAX as u64 + 1),
+            (u64::MAX, u64::MAX, u64::MAX),
+        ] {
+            let bounds = history_bounds(base, head);
+            assert_eq!(
+                bounds.validate(HistoryClaim {
+                    version: bounds.version,
+                    next_input: ExecutedInputCount::new(next_input),
+                }),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "available history base exceeds its head")]
+    fn incoherent_history_bounds_fail_loud() {
+        let bounds = history_bounds(42, 41);
+        let _ = bounds.validate(HistoryClaim {
+            version: bounds.version,
+            next_input: ExecutedInputCount::new(41),
+        });
     }
 }
