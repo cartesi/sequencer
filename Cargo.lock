@@ -3882,6 +3882,7 @@ dependencies = [
  "sequencer-core",
  "sequencer-rust-client",
  "serde_json",
+ "tar",
  "tempfile",
  "tokio",
  "tracing-subscriber",

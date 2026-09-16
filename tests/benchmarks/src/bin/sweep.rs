@@ -54,7 +54,7 @@ struct Args {
     accounts_file: Option<String>,
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TRANSFER_AMOUNT)]
     transfer_amount: u64,
-    #[arg(long, default_value_t = 1200_u16)]
+    #[arg(long, default_value_t = 2000_u16)]
     max_fee: u16,
     #[arg(
         long,

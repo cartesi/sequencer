@@ -27,7 +27,7 @@ const FUNDING_ESTIMATE_TXS_PER_WORKER: u64 = 100_000;
     name = "round_trip_latency",
     about = "round-trip latency benchmark",
     version,
-    after_help = "Examples:\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 30 --concurrency 16 --max-fee 0 --from-offset 0\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 60 --concurrency 16 --evaluate"
+    after_help = "Examples:\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 30 --concurrency 16 --max-fee 2000\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 60 --concurrency 16 --evaluate"
 )]
 struct Args {
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
@@ -51,7 +51,7 @@ struct Args {
     /// Number of concurrent workers (one wallet per worker).
     #[arg(long, default_value_t = 1_usize)]
     concurrency: usize,
-    #[arg(long, default_value_t = 1200_u16)]
+    #[arg(long, default_value_t = 2000_u16)]
     max_fee: u16,
     #[arg(long, default_value_t = 3_000_u64)]
     request_timeout_ms: u64,

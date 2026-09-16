@@ -34,25 +34,26 @@ just --justfile tests/benchmarks/justfile all
 just --justfile tests/benchmarks/justfile all-and-compare
 ```
 
-The `just` recipes default `max_fee=1200`, which is above the placeholder app's
-base fee. A run whose `--max-fee` is below the base fee has **every** tx
-rejected (`422 EXECUTION_REJECTED: "max fee N below base fee ..."`) and reports
-no accepted txs — set a fee at or above the base fee.
+The CLI and `just` recipes default `max_fee=2000`, above the self-contained
+harness's initial frame fee of 1356. External deployments can charge a different
+fee. A run whose `--max-fee` is below the frame fee rejects its transactions
+with `422 EXECUTION_REJECTED`; choose a sufficient limit and require accepted
+transactions and matching WS events before interpreting latency results.
 
 Direct `cargo` examples:
 
 ```bash
 # Round-trip latency, self-contained (spawns anvil + sequencer). Runs are
 # time-bounded (`--duration-secs`), not count-bounded.
-cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs 30 --concurrency 4 --max-fee 1200
-cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs 60 --concurrency 16 --max-fee 1200 --evaluate
+cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs 30 --concurrency 4 --max-fee 2000
+cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs 60 --concurrency 16 --max-fee 2000 --evaluate
 
 # Against an external sequencer (pass that deployment's EIP-712 domain):
-cargo run -p benchmarks --bin round_trip_latency --release -- --endpoint http://127.0.0.1:3000 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --duration-secs 30 --concurrency 4 --max-fee 1200
+cargo run -p benchmarks --bin round_trip_latency --release -- --endpoint http://127.0.0.1:3000 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --duration-secs 30 --concurrency 4 --max-fee 2000
 
 # Concurrency sweep — ack latency by default, round-trip with `--round-trip`:
-cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs 30 --max-fee 1200 --concurrency-list "1 2 4 8 16 32 64 128"
-cargo run -p benchmarks --bin sweep --release -- --round-trip --self-contained --duration-secs 30 --max-fee 1200 --concurrency-list "1 2 4 8"
+cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs 30 --max-fee 2000 --concurrency-list "1 2 4 8 16 32 64 128"
+cargo run -p benchmarks --bin sweep --release -- --round-trip --self-contained --duration-secs 30 --max-fee 2000 --concurrency-list "1 2 4 8"
 
 # Aggregate the JSON artifacts / compare the two latest of a kind:
 cargo run -p benchmarks --bin report --release -- --results-dir tests/benchmarks/results
