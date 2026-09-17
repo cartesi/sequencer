@@ -2,7 +2,7 @@
 
 **Status:** active plan of record. Tick / annotate as work lands; when a
 track completes, move its durable outcomes into the normative docs and
-collapse its entry here.
+remove its entry here. Track numbers retain their existing identities.
 
 Context: Bart is building **libdex**, a native (non-CM) app whose backing
 storage is an mmap'd flat buffer, and will reimplement the scheduler in C++.
@@ -12,14 +12,9 @@ freely at this stage — no backward-compatibility constraints.
 
 | # | Track | Owner | Status |
 |---|-------|-------|--------|
-| 1 | WS context fields + L1 provenance (PR #26) | Stephen | **done** — merged to main |
-| 2 | Restore `docs/review/` ledger + this plan | us | **done** |
 | 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **implemented** — canonical application history, snapshot restore archives, mandatory WS claims, typed refusals, and SDK cutover; [remaining integration gates](2026-07-track3-feed-replay-design.md#remaining-integration-gates) |
-| 4 | Storage decode policy | us | **done** — fail-loud for contract-impossible values; the named `saturating_query_bound` only where clamping preserves the predicate (policy lives in `storage/convert.rs` + the invariants check policy) |
 | 5 | Fee exponentiation LUT | us | **deferred** — decided exact-floor if built (the table *is* the spec, algorithm-free; replay continuity across the upgrade explicitly not preserved); a separate pending design decision may make log-space fees defunct — revisit after syncing with Bart |
 | 6 | Dump / `Application` API redesign | us + Bart | **interface and reference C binding implemented** — [Application contract](../protocol/application-contract.md); native-engine integration gates remain |
-| 7 | LLM context-engineering review | us | **done** — skills/agents/settings homed in-tree; the docs-practice rules live in AGENTS.md |
-| 8 | Runtime ownership and terminal stop | us | **done** — owned by the [authority-boundary ADR](2026-08-authority-boundary-adr.md) |
 
 **Current campaign order:**
 
@@ -67,8 +62,22 @@ implemented. End-to-end native snapshot-to-live bootstrap remains an integration
 gate, alongside the private DEX engine when available. Reference bridge
 conformance cannot establish private-engine correctness.
 
-The [July proposal](2026-07-track6-dump-api-design.md) is historical; the
-[September review](../review/2026-09-09-application-lane-dex-review.md) records the
-accepted simplifications. Additional public checkpoint primitives or asynchronous
-scheduling need a measured requirement. Watchdog extraction from the DEX's
-canonical state drive remains separate work.
+Remaining checks need the actual consumer:
+
+- Exercise snapshot-to-live bootstrap and canonical comparison through the C
+  host in CI; its current smoke test builds and invokes `--help`. A reusable
+  conformance runner needs engine-supplied genesis and meaningful accepted and
+  rejected inputs. Compare canonical state files, not recovery-dump layouts.
+- Verify the external scheduler's ordering, fee conversion, and recovery
+  agreement. Publish independent-port fee vectors for the
+  [current arithmetic](../../sequencer-core/src/fee.rs); a deferred LUT is a
+  separate semantic change. Watchdog extraction from the DEX's canonical state
+  drive remains integration work.
+- Decide output storage, checkpoint layout, ABI version negotiation, generated
+  bindings, and linker policy from concrete engine requirements. The current
+  drain protocol and path callback remain the contract until then.
+
+Additional checkpoint primitives or asynchronous scheduling need a measured
+requirement. Any future microbatch priority scheme must preserve per-account
+nonce order, serial execution, and the frame-time contract; the current lane
+does not promise priority scheduling.
