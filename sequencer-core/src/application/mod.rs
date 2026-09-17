@@ -152,7 +152,9 @@ impl fmt::Display for InvalidReason {
 
 /// Deterministic application state with exclusive ownership and thread transfer.
 pub trait Application: Send + Sized {
-    const MAX_METHOD_PAYLOAD_BYTES: usize;
+    /// Maximum user-op method payload size, stable for this implementation.
+    /// Zero permits only empty method payloads.
+    fn max_method_payload_bytes() -> usize;
 
     /// Pure validation predicate over current app state: nonce match
     /// (user replay protection) and fee-balance coverage. Must not
@@ -216,7 +218,10 @@ pub trait Application: Send + Sized {
     /// be a file or directory. A subsequent [`Application::from_dump`] must
     /// rehydrate equivalent logical state, including progress. Creating the
     /// dump must preserve the live instance's logical state; later execution
-    /// of that instance must not change the dump.
+    /// of that instance must not change the dump. All checkpoint-owned artifacts
+    /// must reside at or beneath `prefix`; discarding them uses ordinary
+    /// filesystem deletion and requires no application-specific cleanup.
+    /// Deletion must leave other checkpoints and restored instances usable.
     ///
     /// **Durability**: when this method returns `Ok`, the dump on disk
     /// must survive an immediate kernel crash. Concretely, the impl
@@ -234,9 +239,6 @@ pub trait Application: Send + Sized {
     /// state drive, for the same logical state. The recovery dump and canonical
     /// state file may be the same file when their representations coincide.
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError>;
-
-    /// Delete a previously-created dump at `prefix`.
-    fn delete_dump(prefix: &Path) -> Result<(), AppError>;
 
     /// Path of the canonical state file in a dump at `prefix` (possibly
     /// `prefix` itself). The returned path must point at a single file. It
@@ -374,7 +376,9 @@ mod tests {
     }
 
     impl Application for ProgressApp {
-        const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+        fn max_method_payload_bytes() -> usize {
+            0
+        }
 
         fn validate_user_op(
             &self,
@@ -421,9 +425,6 @@ mod tests {
             unreachable!("not used")
         }
         fn create_dump(&mut self, _prefix: &Path) -> Result<(), AppError> {
-            unreachable!("not used")
-        }
-        fn delete_dump(_prefix: &Path) -> Result<(), AppError> {
             unreachable!("not used")
         }
         fn state_file_in_dump(prefix: &Path) -> PathBuf {

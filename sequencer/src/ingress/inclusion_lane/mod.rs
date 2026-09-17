@@ -287,8 +287,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             // Stamp `B` into the freshly finalized dump's info.toml before
             // GC (the stamp targets the survivor; GC removes the superseded).
             snapshot::stamp_finalized_promotion(&mut self.storage)?;
-            let removed =
-                snapshot::run_gc::<A>(&mut self.storage).map_err(InclusionLaneError::Gc)?;
+            let removed = snapshot::run_gc(&mut self.storage).map_err(InclusionLaneError::Gc)?;
             if removed > 0 {
                 tracing::debug!(removed, "post-promotion GC removed unreferenced dumps");
             }
@@ -528,7 +527,7 @@ fn dequeue_and_execute_user_op_chunk<A: Application>(
 
 fn user_op_count_to_bytes<A: Application>(user_op_count: u64) -> u64 {
     let one_user_op_bytes = SignedUserOp::max_batch_metadata()
-        .checked_add(A::MAX_METHOD_PAYLOAD_BYTES)
+        .checked_add(A::max_method_payload_bytes())
         .expect("one user-op wire bound overflow: contract-impossible");
     let one_user_op_bytes =
         u64::try_from(one_user_op_bytes).expect("one user-op wire bound must fit in u64");

@@ -17,8 +17,7 @@ use sequencer_core::l2_tx::ValidUserOp;
 use sequencer_core::user_op::UserOp;
 
 /// Application stub used in the sweep tests: `create_dump` makes
-/// a directory with a marker file inside, `delete_dump` is
-/// `remove_dir_all`. The actual marker content is irrelevant —
+/// a directory with a marker file inside. The marker content is irrelevant —
 /// we only care about which directories exist post-sweep.
 #[derive(Clone, Default)]
 pub(crate) struct SweepTestApp {
@@ -33,7 +32,9 @@ pub(crate) const SweepTestApp: SweepTestApp = SweepTestApp {
 };
 
 impl Application for SweepTestApp {
-    const MAX_METHOD_PAYLOAD_BYTES: usize = 0;
+    fn max_method_payload_bytes() -> usize {
+        0
+    }
     fn validate_user_op(
         &self,
         _sender: alloy_primitives::Address,
@@ -66,10 +67,6 @@ impl Application for SweepTestApp {
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         std::fs::create_dir(prefix)?;
         std::fs::write(prefix.join("state"), b"")?;
-        Ok(())
-    }
-    fn delete_dump(prefix: &Path) -> Result<(), AppError> {
-        std::fs::remove_dir_all(prefix)?;
         Ok(())
     }
     fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {

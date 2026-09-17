@@ -147,6 +147,10 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - `sequencer-core/` — shared domain types (`Application`, `SignedUserOp`, `SequencedL2Tx`, `Batch`, `Frame`).
 - `examples/app-core/` — placeholder wallet app implementing the `Application` trait.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library. The model for what an app author builds (their `Application` impl ≙ `app-core`; their binary crate ≙ this).
+- `bindings/c-app-engine/` — reusable C ABI adapter implementing `Application` for a native engine.
+- `bindings/c-app-sequencer/` — optional C-engine CLI host and external-archive binary.
+- `examples/c-wallet-engine/` — reference wallet engine exporting the C ABI, plus its genesis tool and conformance tests.
+- `examples/c-wallet-sequencer/` — binary composing the C-engine host with the reference wallet engine.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.
 - `examples/canonical-test/` — e2e test harness for the canonical app.
 - `sdk/rust-client/` — Rust client library for the sequencer API.
@@ -247,7 +251,7 @@ Logical state changes, including `ApplicationProgress`, flow through the `apply_
 
 User ops are executed only through `sequencer_core::application::validate_and_execute_user_op`; already-validated user ops and directs use `execute_valid_user_op` / `execute_direct_input`. The shared boundary preflights the checked successor, then verifies the engine's progress after a successful hook and returns its pre-execution offset. Count zero implies clock zero. Validation purity and native mutation remain self-trusted. `AppError` is fatal and defines no canonical successor; callers discard the instance rather than resume it. The inclusion lane, canonical scheduler, catch-up, and recovery fold all use this boundary — part of the duality agreement.
 
-`Application` requires `Send`, with neither `Clone` nor `Sync`. Dumps must be durable and immutable, and restored engines must remain independent after source deletion. The opaque app prefix may be a file or directory. Canonical inspection belongs to the separate `CanonicalState` trait; the native sequencer serves the comparison file in the checkpoint.
+`Application` requires `Send`, with neither `Clone` nor `Sync`. Dumps must be durable and immutable, and restored engines must remain independent after source deletion. The opaque app prefix may be a file or directory; checkpoint disposal uses ordinary recursive filesystem deletion. Canonical inspection belongs to the separate `CanonicalState` trait; the native sequencer serves the comparison file in the checkpoint. The [C binding guide](docs/protocol/c-application-binding.md) maps the contract to native engines.
 
 ## Hot-Path Invariants
 
@@ -455,7 +459,7 @@ Before finishing a change, ensure:
 
 - [`README.md`](README.md) — product framing, user-facing trust model, **API contract** (endpoint shapes, caps, close codes, health semantics).
 - [`CLAUDE.md`](CLAUDE.md) — shell setup, quick reference, pointer back here.
-- [`docs/protocol/`](docs/protocol/) — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (the canonical acceptance algorithm, I1) and [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` FFI trait contract).
+- [`docs/protocol/`](docs/protocol/) — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (the canonical acceptance algorithm, I1), [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` trait contract), and [`c-application-binding.md`](docs/protocol/c-application-binding.md) (the native C binding).
 - [`docs/invariants.md`](docs/invariants.md) — register of cross-module invariants (what's load-bearing across files) + the fail-loud check policy.
 - [`docs/review/register.md`](docs/review/register.md) — the review register: open findings, settled decisions, refuted proposals (do-not-re-propose), and the review history table; the dated ledgers beside it carry the evidence the table points at.
 - [`docs/plans/`](docs/plans/) — the architecture decision record ([`2026-08-authority-boundary-adr.md`](docs/plans/2026-08-authority-boundary-adr.md)), active coordination tracks, and in-flight design handoffs.
