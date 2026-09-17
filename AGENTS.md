@@ -1,6 +1,9 @@
 # AGENTS.md
 
-This file tells AI coding agents and human contributors how to work effectively in this repository. Start here.
+Start here for the repository's mental model and working rules. Read this baseline
+once, then use [Reading Routes](#reading-routes) to follow the contracts relevant
+to the work. Those documents own detailed behavior; this guide explains why it
+matters and where to look.
 
 ## Mission
 
@@ -72,7 +75,10 @@ Scheduler-acceptance semantics exist in exactly three implementations that must 
 2. the off-chain acceptance predicate — `ProtocolTiming::scheduler_accepts` ([`sequencer-core/src/protocol.rs`](sequencer-core/src/protocol.rs)), which feeds `safe_accepted_batches`;
 3. the inclusion lane's live prediction (drain + execution order).
 
-The expected-nonce fold is homed next to `scheduler_accepts` as `advance_expected_batch_nonce` (same file); the submitter's `decide_submit_start` consumes it, and `populate_safe_accepted_batches` keeps a deliberate inline copy (its advance is interleaved with storage-only side effects — the content-identity check and the divergence freeze — that can't move below the protocol layer). Touching any of these means re-checking the others — their agreement is the system's most load-bearing invariant (see [`docs/invariants.md`](docs/invariants.md)).
+The submitter's expected-nonce scan also depends on this agreement. The
+[scheduler contract](docs/protocol/scheduler-semantics.md#the-three-implementations-and-why-they-agree)
+maps the implementations and the deliberate storage-local copy. Changing one
+requires checking the others.
 
 Two mechanical facts the agreement rests on:
 
@@ -88,44 +94,40 @@ A batch is **stale** when `inclusion_block - first_frame.safe_block >= MAX_WAIT_
 1. **Liveness failure** — the sequencer went offline and failed to submit batches in time.
 2. **Censorship** — the sequencer kept submitting batches but froze `safe_block` to hold back direct inputs.
 
-When the scheduler encounters a stale batch, it **skips it entirely** — no nonce consumed, no state change. This is the **censorship-resistance backstop**: the sequencer cannot hold write priority indefinitely without advancing the drain cursor. Direct inputs are force-drained at `MAX_WAIT_BLOCKS`, guaranteeing deposit availability within ~4h even under adversarial conditions.
+When the scheduler encounters a stale batch, it skips its frames without
+consuming the batch nonce. The overdue-direct backstop still runs. Together,
+these rules prevent the sequencer from holding write priority indefinitely
+without advancing the drain cursor; direct inputs are force-drained at
+`MAX_WAIT_BLOCKS`, giving the ~4h censorship-resistance bound.
 
 ### Cascading invalidation
 
 If a batch is stale, all existing subsequent batches are also invalid. The scheduler's expected-nonce counter does not advance on a stale skip, so every subsequent batch arrives at an unexpected nonce and is rejected. Invalidation is a suffix operation: marking batch `N` invalid cascades to `N+1`, `N+2`, …, including the open batch. New batches created after recovery are unaffected.
 
-### Preemptive recovery
+### Two recovery paths
 
-Rather than waiting for a batch to go stale on L1, the sequencer uses a **danger threshold** (`MAX_WAIT_BLOCKS − MARGIN`). The threshold is *only a trigger*: it tells the system "stop running, hand off to recovery." It does not encode "this batch is doomed" — that decision belongs to the post-flush cascade.
+**Automatic recovery** repairs optimistic history after liveness failures. The
+danger detector signals service to stop when a danger check fires; startup recovery
+settles outstanding submissions and replaces the invalid suffix using local
+SQLite facts and safe L1 history. The danger threshold is a trigger, not proof
+that a batch is doomed. Detection uses safe state, with wall-clock checks when
+the L1 view stops advancing. Expected recovery exits gracefully; diagnosed
+terminal runtime faults abort immediately. The [automatic recovery design](docs/recovery/README.md)
+owns detection, startup ordering, dispatch, and admission.
 
-The cycle crosses a process boundary by design: the in-process
-[`DangerDetector`](sequencer/src/recovery/detector.rs) polls
-`Storage::check_danger` on a cadence and returns a non-`Safe` worker exit; the
-runtime closes intake and drains before the command returns non-zero (stopping
-the process is how the sequencer goes offline). Diagnosed terminal runtime
-faults abort immediately; expected-recovery and retryable exits are graceful;
-the orchestrator respawns; on every boot startup recovery re-derives the
-response from local facts.
+**Manual cockroach recovery** (`setup --recovery`) rebuilds from a trusted
+canonical application checkpoint and L1 history into a fresh data directory.
+It also applies after sequencer bugs: fix the bug, choose a trusted canonical
+checkpoint, and then run recovery. Historical batches,
+including malformed ones, receive the canonical scheduler's treatment. The
+result accounts for a fixed input prefix from which sequencing can resume; it
+does not need to catch the moving L1 tip or preserve prior soft confirmations.
+The [cockroach recovery guide](docs/recovery/cockroach.md) owns the checkpoint
+requirements, stopping boundary, and rebuild procedure.
 
-The authoritative dispatch table, phase ordering, boot-local witnesses, the
-admission sequence, the "everything past gold is doomed" model, and the
-per-path rationale live in
-[`docs/recovery/README.md`](docs/recovery/README.md) — that document **owns**
-the recovery design; this section is only the map. Do not restate dispatch
-details here.
-
-### Detection: safe-only, with wall-clock fallback
-
-Staleness is only checked against L1 **safe** state, never latest. Stale batches in latest that haven't reached safe yet will eventually become safe, and the check will fire at that point. This avoids reacting to L1 reorgs.
-
-When the sequencer's view of L1 stops advancing — most often because the RPC gateway is stalled or returning stale reads, occasionally because L1 itself is unhealthy — the DB-based staleness check sees a frozen `current_safe_block` and may fail to trigger. The danger detector uses two wall-clock signals: the recorded L1 safe block timestamp must remain younger than `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS`, and unresolved batches are also checked with `estimated_missed_blocks = (now − last_safe_progress_ms) / seconds_per_block` by adjusting the danger threshold downward. This prevents silently issuing doomed soft confirmations during stale-provider periods or L1 outages.
-
-### Formal verification
-
-The recovery design is verified by two bounded TLA+ models;
-[`docs/recovery/README.md`](docs/recovery/README.md) "Formal Verification"
-says what each proves. When touching recovery code, read both current models
-first.
+Before changing recovery code, read its guide and both current bounded TLA+
+models. The automatic recovery guide's [Formal Verification](docs/recovery/README.md#formal-verification)
+section explains their scopes; the models are not a proof of every recovery path.
 
 ## Threat Model (brief)
 
@@ -134,12 +136,18 @@ See [`docs/threat-model/README.md`](docs/threat-model/README.md) for the full mo
 - **Trusted:** InputBox contract, our own Ethereum node (fail-stop, not byzantine), operator config, batch-submitter key.
 - **Adversarial:** `POST /tx` callers, direct-input senders, the L1 mempool and block builders (zombie transactions are a first-class threat).
 - **RPC endpoint:** single (`CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`), trusted fail-stop, **must be one consistent node** — no fallback tier exists yet (see the threat model's actor table).
-- **Self-trust:** the sequencer trusts its own code is correct. Bugs that emit malformed batches are fault states requiring manual intervention, not threats to defend against at runtime.
+- **Self-trust:** normal operation assumes the sequencer's own code is correct.
+  Invariant violations fail loud. Bug-induced malformed batches require fixing
+  the bug and, when rebuilding is necessary, manual cockroach recovery; automatic
+  recovery does not repair software defects.
 - **In scope:** correctness bugs *and* exploitation. Under rollup semantics, a correctness bug that causes scheduler/sequencer state divergence is as severe as direct theft.
 
 ## Architecture Map
 
 Top-level layout follows the system's data flow. Each sequencer module corresponds to a writer role; the matching `storage/<role>.rs` holds its storage half.
+
+The implementation uses Rust edition 2024, Axum, SQLite (rusqlite/WAL), EIP-712
+signing, and SSZ batch encoding.
 
 ### Workspace
 
@@ -158,25 +166,17 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 
 ### Sequencer module layout
 
-- `sequencer/src/lib.rs` — public sequencer API. The thin binary entrypoints live in `examples/wallet-sequencer/`.
-- `sequencer/src/harness.rs` — CLI harness: the `setup`/`run`/`flush-mempool` subcommand parser, `dispatch`, and the exit-code projection. An app's `main` is ~5 lines (`run_main` + a genesis-app closure).
-- `sequencer/src/http.rs` — shared HTTP error type, JSON `ErrorResponse`, `ApiConfig`, and `axum::serve` orchestration.
-- `sequencer/src/commands/` — the operator command brackets: `setup` (phase A — pin identity, initial sync, genesis snapshot, atomic `setup_complete` fact), `run` (phase B — recover, prepare, admit, and boot workers; its `workers` supervisor lives beside it), and `flush` (`flush-mempool`). `sequencer/src/commands/` also owns the command-scoped `config` and `error` taxonomy (incl. the exit-code projection); `sequencer/src/runtime/` is exactly the runtime authority capabilities — the process lock and `shutdown` (runtime scope and graceful notification) — consumed crate-wide. `L1Config` lives in `sequencer/src/l1/`; the crate-wide wall clock is `sequencer/src/clock.rs`.
-- `sequencer/src/ingress/` — public-facing HTTP + inclusion lane.
-  - `api.rs` — `POST /tx` and `GET /fee` handlers, JSON-rejection mapping.
-  - `inclusion_lane/` — single-lane hot-path loop (`mod.rs`), catch-up replay, config, error types.
-- `sequencer/src/egress/` — internal read path.
-  - `api/` — `/ws/subscribe`, `/livez`, `/readyz`, `/healthz`.
-  - `l2_tx_feed/` — DB-backed ordered-tx feed.
-- `sequencer/src/l1/` — L1 client surface.
-  - `reader.rs` — safe-input ingestion from InputBox into SQLite.
-  - `submitter/` — batch submitter (`worker.rs` + `poster.rs`); re-estimates fees every tick without carrying a fee floor from earlier attempts. The rationale, accepted liveness limits, and revisit criteria live in [`docs/l1-fee-policy.md`](docs/l1-fee-policy.md).
-  - `fee_oracle/` — setup-pinned L1 Uniswap V3 TWAP → `batch_policy.log_gas_price` (+ `log_gas_price_updated_at_ms`); fixed mode writes once at setup and has no worker.
-  - `eip1559.rs` — shared EIP-1559 fee estimation (poster, oracle, flusher).
-  - `provider.rs` — alloy provider construction.
-  - `partition.rs` — long-block-range retry helper.
-- `sequencer/src/recovery/` — preemptive recovery startup procedure (`mod.rs`), runtime danger detector (`detector.rs`), and mempool flusher (`flusher.rs`).
-- `sequencer/src/storage/` — SQLite persistence, split by writer role (`ingress`, `egress`, `l1_inputs`, `l1_submission`, `recovery`, `admin`, `safe_accepted_batches`, `snapshot_dumps`, plus shared `history`, `mod`, `open`, `convert`, `queries`, `mutations`, and `migrations/`).
+Paths below are relative to `sequencer/src/`:
+
+- `lib.rs` and `harness.rs` — public API and shared CLI harness; app binaries supply their genesis-app constructor.
+- `commands/` — `setup`, `run` (including worker supervision), and `flush`, with command configuration and exit-code classification.
+- `runtime/` — exclusive process ownership and runtime scope/shutdown.
+- `ingress/` — public HTTP handlers and the single inclusion lane.
+- `egress/` — internal HTTP/WS API and DB-backed application-input feed.
+- `l1/` — safe-input reader, batch submitter, fee oracle, shared EIP-1559 estimation, and provider access.
+- `recovery/` — automatic startup repair, danger detector, and mempool flusher; the manual rebuild lives in `commands/setup/`.
+- `storage/` — each writer role's persistence operations, shared queries, and schema.
+- `http.rs` and `clock.rs` — shared HTTP errors/server setup and the crate-wide wall clock. `L1Config` lives in `l1/`.
 
 ## Key Concepts
 
@@ -185,8 +185,8 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Batch** — list of frames posted on-chain as one L1 transaction (SSZ-encoded).
 - **Inclusion lane** — the single ordering lane, with a latency-critical user-op regime and a slower L1-reconciliation regime ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)); the only writer of open batch/frame state ([I17](docs/invariants.md)) and the system's execution bottleneck.
 - **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Nonces are assigned by storage (structural `parent.nonce + 1`) when batches are closed; the submitter just reads them.
-- **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `RecoveryRequired` when any non-`Safe` danger status fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery or refusal can run.
-- **Fee oracle** — setup pins either a fixed exponent or a reviewed Uniswap V3 WETH/X TWAP tuple into deployment identity, and writes the first `log_gas_price` (+ observation stamp) in both modes. Setup requires a successful live quote; `run` performs no fee-source read before recovery/admission. Fixed mode has no worker; Uniswap launches a lazy refresher that immediately attempts a quote, persists successes, and retains the last price while logging and retrying transient source failures. The stamp is telemetry, not a runtime-admission or expiry gate. A shared-endpoint outage/stale view is already detected from L1 safe-head progress; a fee-source-only outage is an accepted economic residual (stale-low may subsidize DA, stale-high may reject users), not a canonical-correctness fault. Deterministic source misconfiguration, fatal arithmetic, and persistent storage faults remain terminal. The 10× margin lives in `batch_policy.log_slack`; it is a buffer rather than a bound on market movement, and frame fees stay immutable until the next frame opens.
+- **Danger detector** — polls `Storage::check_danger` and signals the process to stop so startup can recover or refuse. It reads local facts; it never writes the DB or talks to L1.
+- **Fee oracle** — setup pins and bootstraps a fixed price or Uniswap V3 TWAP source. The price informs future frame fees; an oracle-only outage is an accepted economic risk. The [threat model's actor table](docs/threat-model/README.md#actors-and-trust) owns the source assumptions and failure policy.
 - **Input reader** — ingests safe inputs from L1 InputBox and maintains the durable safe head, accepted-batch projection, and divergence marker in one atomic transaction (`sequencer/src/storage/l1_inputs.rs`); it hands the lane no in-memory cursor.
 - **L2 tx feed** — DB-backed application-input stream. HTTP snapshot headers
   provide `(EraId, RecoveryGeneration, ExecutedInputCount)`; WS validates that
@@ -211,8 +211,13 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - Rejections (`InvalidNonce`, `InvalidMaxFee`, `InsufficientFeeBalance`) produce no state mutation and are not persisted. These are protocol-level rejection semantics every app must implement: nonces prevent user-op replay, fees prevent spam against the sequencer's DA budget. ("Fee", not "gas" — the fee tracks DA; compute metering, if it ever exists, is a separate future concept.)
 - Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `application_inputs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is currently sampled from `batch_policy_derived.recommended_fee` at rotation; oracle bootstrap writes the price before any Tip can sample it, and `log_slack` applies the 10× margin in log space. This is present behavior, not a reason for the five-block clock policy; hoisting fee to the batch is a later design with its own trade-offs.
-- Wallet state (balances, nonces) is in-memory today — not persisted.
-- **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`. `chainId` and `verifyingContract` come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS` (validated against the RPC chain id at startup). All four fields must be present on both sides — both the sequencer and the on-chain scheduler construct the domain via `sequencer_core::build_input_domain`, the canonical shared constructor.
+- Wallet balances and nonces live in memory between checkpoints; restart restores
+  a dump and replays persisted application inputs.
+- **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`.
+  Setup pins the chain id and app address from `CARTESI_SEQUENCER_BLOCKCHAIN_ID`
+  and `CARTESI_SEQUENCER_APP_ADDRESS`, validating the chain id against RPC. All
+  four fields must be present on both sides; the sequencer and canonical
+  scheduler share `sequencer_core::build_input_domain`.
 
 ### InputBox payload classification
 
@@ -244,41 +249,23 @@ User ops are executed only through `sequencer_core::application::validate_and_ex
 
 `Application` requires `Send`, with neither `Clone` nor `Sync`. Dumps must be durable and immutable, and restored engines must remain independent after source deletion. The opaque app prefix may be a file or directory; checkpoint disposal uses ordinary recursive filesystem deletion. Canonical inspection belongs to the separate `CanonicalState` trait; the native sequencer serves the comparison file in the checkpoint. The [C binding guide](docs/protocol/c-application-binding.md) maps the contract to native engines.
 
-## Hot-Path Invariants
+## Ordering and Storage
 
-The hot-path rules are owned elsewhere; this section is only the map.
+Preserve single-lane deterministic ordering. Do not introduce extra concurrency
+in hot-path ordering logic without explicit approval.
 
-- Drain attribution, frame-clock monotonicity, the
-  content-identity check and the divergence freeze, history metadata, the
-  `WriteHead` cache, and the application-input sequence are registered in
-  [`docs/invariants.md`](docs/invariants.md) (the fail-loud check policy plus
-  I2, I3, I9, I10, I12–I18, I20) — that register owns them; do not restate
-  them here.
-- Command admission, terminal stop, the two-regime lane and its
-  acknowledgement rule, and role-local authority are owned by the
-  [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md)
-  (mechanisms 1, 2, and 4); startup recovery by
-  [`docs/recovery/README.md`](docs/recovery/README.md).
-- The frame-clock policy (five newly-safe blocks, one frame at the observed
-  tip, never interpolated, and its revisit trigger) is owned by
-  [`docs/protocol/scheduler-semantics.md`](docs/protocol/scheduler-semantics.md);
-  the no-preemption digestibility assumption by
-  [`docs/protocol/application-contract.md` §5](docs/protocol/application-contract.md#5-operational-capacity-for-l1-reconciliation).
-- Queue admission (`429 OVERLOADED`), batch closure, and every other API or
-  storage-model shape are owned by [`README.md`](README.md).
+The inclusion lane combines a latency-critical user-op regime with complete L1
+reconciliation. The [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md)
+owns that split, acknowledgement rules, runtime ownership, and command admission.
+The [scheduler contract](docs/protocol/scheduler-semantics.md#sequencer-frame-clock-policy)
+owns the five-safe-block frame clock; the [Application contract](docs/protocol/application-contract.md#5-operational-capacity-for-l1-reconciliation)
+owns the assumption that accumulated directs are digestible without preemption.
 
-One rule lives here because nothing else owns it: preserve single-lane
-deterministic ordering. Do not introduce extra concurrency in hot-path
-ordering logic without explicit approval.
-
-## Storage Invariants
-
-Owned by [`docs/invariants.md`](docs/invariants.md): the writer-role table
-(one writer role per fact), the `valid_*` view rule, `WriteHead` coherence
-(I17), history metadata (I18), the application-input sequence and its canonical offsets (I10, I20). The schema
-(`sequencer/src/storage/migrations/0001_schema.sql`) owns the write-once
-batch lifecycle, the Tip's uniqueness, and the user-op identity rule. Do not
-restate them here.
+Storage changes cross writer boundaries even when the SQL looks local. Read the
+[invariant register](docs/invariants.md) for writer ownership, `valid_*` reads,
+drain attribution, the content-identity/divergence freeze, `WriteHead` coherence,
+and application-history offsets. The [schema](sequencer/src/storage/migrations/0001_schema.sql)
+enforces write-once batch lifecycle, Tip uniqueness, and user-op identity.
 
 ## Type Boundaries
 
@@ -294,41 +281,35 @@ restate them here.
 ## HTTP Endpoints
 
 - **Ingress** (public-facing): `POST /tx`, `GET /fee`.
-- **Egress** (internal indexers/watchdog): `GET /ws/subscribe`, `GET /finalized_state`, `GET /finalized_state/inclusion_block`, `GET /latest_snapshot`, `GET /finalized_snapshot`, `GET /livez`, `GET /readyz`, `GET /healthz`. The snapshot/state endpoints are **operator-only** (no auth) and must not be exposed publicly; the streaming routes hold a GC lease for the response lifetime ([`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md)).
+- **Egress** (internal indexers/watchdog): application-input subscriptions,
+  snapshot/state downloads, and health probes. Snapshot/state endpoints have no
+  authentication and **must not be exposed publicly**. Downloads hold a GC lease
+  for their response lifetime ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
 
 Today both sides serve from one listener; the planned API split puts each side on its own port (same binary) so internal probes and subscribers can be firewalled from public submit traffic.
 
-Message shapes, caps, close codes, and health semantics are **owned by [`README.md`](README.md)** (the API contract) — do not restate them here.
+The [README API contract](README.md#api) owns routes, message shapes, caps,
+close codes, and health semantics.
 
-## Environment Variables
+## Command Configuration
 
-Split by subcommand (the phase split). **`setup`** (required):
+Configuration follows the command phases:
 
-- `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`
-- `CARTESI_SEQUENCER_BLOCKCHAIN_ID`
-- `CARTESI_SEQUENCER_APP_ADDRESS`
-- `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS` (the submitter address — `setup` is L1-read-only and never signs). **Must be a dedicated address**: `setup`'s detection gate refuses if the submitter's wallet nonce is unsettled, so reusing a busy address (e.g. the contract deployer, whose deploy-tx tail isn't safe at setup time) false-positives. The devnet uses anvil account 9 (`DEVNET_SEQUENCER_ADDRESS`), distinct from the account-0 deployer.
-- `CARTESI_SEQUENCER_CHECKPOINT_BLOCK` (optional, default `0` = genesis) — the trusted checkpoint machine's L1 inclusion block. `setup` refuses (typed `SetupRefuse`, exit 40 = run `setup --recovery`) if a previous instance left work past it; plain `setup` detects only, and loading a non-genesis checkpoint machine is `setup --recovery`.
+- Plain **`setup`** is L1-read-only and never signs. It pins chain/app/submitter
+  identity and the fee source. **`setup --recovery`** also needs the submitter
+  key to flush its outstanding transactions; see the [rebuild guide](docs/recovery/cockroach.md).
+- **`run`** takes the RPC endpoint and signing key (or key file). It reads the
+  pinned chain id, app address, and submitter address from the database.
 
-**`run`** (required) — chain id / app address / submitter address are read from the DB `setup` pinned, not from args:
+**Use a dedicated submitter address.** Plain setup refuses an unsettled wallet
+nonce, so sharing a busy contract-deployer address can trip the detection gate
+while its deployment transactions are not yet safe. The devnet uses Anvil
+account 9 (`DEVNET_SEQUENCER_ADDRESS`), separate from the account-0 deployer.
 
-- `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`
-- `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE`
-
-**Optional** (names only — defaults and semantics are **owned by
-[`sequencer/src/commands/config.rs`](sequencer/src/commands/config.rs)**; a
-defaults list here drifted once already): `CARTESI_SEQUENCER_HTTP_ADDR`, `CARTESI_SEQUENCER_DATA_DIR`,
-`CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`,
-`CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`, `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`,
-`CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (fixed default, independent of the margin;
-must be strictly below the danger threshold or startup refuses),
-`CARTESI_SEQUENCER_SECONDS_PER_BLOCK`, and the runtime-only
-`CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS`. Setup-only fee-oracle source knobs are
-(`CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE`,
-`CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS`,
-`CARTESI_SEQUENCER_WETH_ADDRESS`, `CARTESI_SEQUENCER_UNISWAP_V3_POOL`,
-`CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS` — mainnet/Sepolia default to
- pinned USDC pool presets; other chains require an explicit source).
+The [Running guide](README.md#running) gives invocation examples;
+[`commands/config.rs`](sequencer/src/commands/config.rs) owns environment-variable
+names, defaults, and validation. Check configuration there before documenting or
+changing it, including checkpoint and fee-source selection.
 
 ## Coding Conventions
 
@@ -343,23 +324,33 @@ must be strictly below the danger threshold or startup refuses),
 
 ## Documentation Practice
 
-The corpus has two tenses, kept strictly apart:
+Write for a reader building a mental model. Start with the purpose, input,
+result, and governing constraint; introduce implementation detail when it
+explains a necessary behavior. Keep an intentional baseline here so important
+concepts are discoverable before anyone knows to ask about them. Summaries
+should point to the owner of a contract rather than becoming a second copy.
 
-- **Living docs are timeless.** This file, `README.md`, `docs/protocol/`,
-  `docs/invariants.md`, `docs/recovery/`, `docs/snapshots/`,
-  `docs/threat-model/`, `docs/watchdog/`, and `docs/plans/` describe what is
-  true now and why — present tense, reasoning inline, no dates, no amendment
-  banners, no review codenames, no "previously/no longer". Each doc owns its
-  topic; others point at it rather than restating it.
-- **History lives only in `docs/review/` and commit messages.** A review
-  ledger is append-only while its review is open. When it closes, distill it:
-  promote conclusions into the living docs, record settled decisions and
-  refuted proposals in [`docs/review/register.md`](docs/review/register.md),
-  and delete the process narration. Conclusions with reasoning outlive the
-  path taken to them.
-- **Record deliberate absence once**, at the seam where someone would re-add
-  the mechanism, phrased as a positive design statement with its reason —
-  never as removal notices scattered across documents.
+Keep three kinds of material distinct:
+
+- **Current contracts and designs** describe what holds now and why. Use present
+  tense and reasoning inline, without amendment banners, review codenames, or
+  "previously/no longer" narration. Each topic has one owner. Some current
+  architecture documents live in `docs/plans/`; the directory name does not
+  make their established contracts optional.
+- **Active plans** name open decisions, dependencies, and remaining work. They
+  must distinguish proposed behavior from implemented contracts. On completion,
+  put the durable design in its owner and reduce the plan to its remaining work
+  and links.
+- **Historical evidence** lives in review ledgers, explicitly marked historical
+  documents, and commit history. A review ledger is append-only while open.
+  When it closes, promote conclusions into current docs, record settled and
+  refuted proposals in the [review register](docs/review/register.md), and remove
+  process narration. Retained superseded proposals must say they are historical
+  and link to the current contract; they are evidence, not instructions.
+
+**Record deliberate absence once**, at the seam where someone would re-add the
+mechanism, phrased as a positive design statement with its reason. Avoid removal
+notices scattered across documents.
 
 ## Testing Guidance
 
@@ -374,34 +365,30 @@ Focus tests on:
 
 Prefer black-box tests around `POST /tx` and commit outcomes for integration.
 
-Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a clear message if `anvil` is not on PATH. Install Foundry or use `nix develop`.
+Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a
+clear message if `anvil` is not on PATH. Use the configured Nix/direnv environment
+or install Foundry. `canonical-test` additionally needs libslirp.
 
-## Fast Start Commands
+## Shell and Commands
 
-See [`CLAUDE.md`](CLAUDE.md) for shell setup and the full command list. In short:
+Use the configured Nix/direnv environment for Foundry, TLA+, and other project
+tools. For noninteractive commands, prefer `direnv exec . <command>`. Rust is
+pinned to **1.95.0** in [`rust-toolchain.toml`](rust-toolchain.toml); verify both
+`cargo --version` and `rustc --version` in the environment you use. A Nix-provided
+Cargo or rustc may bypass rustup, so direnv alone does not guarantee the pinned
+compiler is selected. Correct the toolchain selection before interpreting build
+or dependency errors.
 
 ```bash
-cargo check
-cargo test --workspace --exclude canonical-test
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
+direnv exec . cargo check
+direnv exec . cargo test --workspace --exclude canonical-test
+direnv exec . cargo test -p sequencer --lib  # includes Anvil-backed tests
+direnv exec . cargo fmt --all
+direnv exec . cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Run server (two phases — `setup` once, then `run`; see `README.md` "Running"):
-
-```bash
-# setup (L1-read-only; takes the submitter ADDRESS, not the key)
-CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
-CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \
-CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
-CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
-cargo run -p wallet-sequencer -- setup
-
-# run (keyed; reads identity from the set-up DB)
-CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
-CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-cargo run -p wallet-sequencer -- run
-```
+The shared command harness is in [`sequencer/src/harness.rs`](sequencer/src/harness.rs).
+See [Running](README.md#running) for the two-phase `setup` / `run` workflow.
 
 ## Always / Ask First / Never
 
@@ -411,14 +398,15 @@ cargo run -p wallet-sequencer -- run
 - Preserve API error shape and status code mapping unless intentionally changing the API contract.
 - Add or update tests when logic changes.
 - Run at least `cargo check` before finishing.
-- Read `docs/recovery/` before touching recovery code, and `docs/threat-model/` before touching trust-boundary code.
+- Read the relevant recovery guide and both current TLA+ models before touching
+  recovery code, and the threat model before touching trust-boundary code.
 - Check [`docs/invariants.md`](docs/invariants.md) before changing anything it lists as load-bearing, and [`docs/review/register.md`](docs/review/register.md) for open findings in the code you're about to touch and for decisions already settled or refuted.
 
 ### Ask First
 
 - Changing tx wire format (`UserOp`, SSZ payload layout, EIP-712 domain fields).
 - Changing DB schema or migration strategy.
-- Altering rejection semantics (what consumes nonce/gas vs what is rejected).
+- Altering rejection semantics (what consumes nonce/fee vs what is rejected).
 - Introducing concurrency changes to commit ordering.
 - Changing chunk/frame/batch closure or ack semantics.
 
@@ -444,18 +432,23 @@ Before finishing a change, ensure:
 3. Formatting and lints are clean, or list any unresolved warnings explicitly.
 4. PR summary includes **what changed**, **why it changed**, and **risk / compatibility notes**.
 
-## Related Documents
+## Reading Routes
 
-- [`README.md`](README.md) — product framing, user-facing trust model, **API contract** (endpoint shapes, caps, close codes, health semantics).
-- [`CLAUDE.md`](CLAUDE.md) — shell setup, quick reference, pointer back here.
-- [`docs/protocol/`](docs/protocol/) — the authoritative protocol contracts: [`scheduler-semantics.md`](docs/protocol/scheduler-semantics.md) (the canonical acceptance algorithm, I1), [`application-contract.md`](docs/protocol/application-contract.md) (the `Application` trait contract), and [`c-application-binding.md`](docs/protocol/c-application-binding.md) (the native C binding).
-- [`docs/invariants.md`](docs/invariants.md) — register of cross-module invariants (what's load-bearing across files) + the fail-loud check policy.
-- [`docs/review/register.md`](docs/review/register.md) — the review register: open findings, settled decisions, refuted proposals (do-not-re-propose), and the review history table; the dated ledgers beside it carry the evidence the table points at.
-- [`docs/plans/`](docs/plans/) — the architecture decision record ([`2026-08-authority-boundary-adr.md`](docs/plans/2026-08-authority-boundary-adr.md)), active coordination tracks, and in-flight design handoffs.
-- [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
-- [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.
-- [`docs/snapshots/`](docs/snapshots/) — app snapshots: [`format.md`](docs/snapshots/format.md) (dump trait + wire format) and [`lifecycle.md`](docs/snapshots/lifecycle.md) (creation/acceptance/GC/lease design + crash-safety).
-- [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md) — production-like watchdog (Sepolia / mainnet; internal snapshot API).
-- [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md) — local dev: watchdog + `sequencer-devnet` on Anvil.
-- [`docs/watchdog/README.md`](docs/watchdog/README.md) — watchdog architecture, compare vs advance modes, test commands.
-- [`sequencer-core/`](sequencer-core/) — shared domain types and protocol contracts.
+Follow the rows that intersect the change. Each destination explains the
+cross-module consequences to check before editing; follow its links when the
+work reaches another boundary.
+
+| Work | Read first and why |
+|---|---|
+| Scheduler acceptance, batch nonces, direct-input ordering, or frame clock | [Scheduler semantics](docs/protocol/scheduler-semantics.md) — canonical algorithm and the implementations that must agree. |
+| Inclusion lane, storage writes, or runtime concurrency | [Invariant register](docs/invariants.md) — enforcement and consumers; [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md) — ownership, acknowledgement, admission, and terminal stop. |
+| Application implementation, execution, or native integration | [Application contract](docs/protocol/application-contract.md) — determinism, progress, failure, capacity, and checkpoints; [C binding](docs/protocol/c-application-binding.md) for native engines. |
+| Automatic recovery or danger detection | [Automatic recovery](docs/recovery/README.md), then [preemptive.tla](docs/recovery/preemptive.tla) and [admission.tla](docs/recovery/admission.tla) — repair ordering and the models' bounded guarantees. |
+| Manual rebuild after lost state or a sequencer bug | [Cockroach recovery](docs/recovery/cockroach.md) — trusted checkpoint, fixed input boundary, and fresh baseline. |
+| API, subscriber replay, or application-history coordinates | [README API contract](README.md#api) — wire behavior; [application history](docs/plans/application-history.md) — era, generation, offsets, and recovery boundaries. |
+| Snapshots, restart, export, retention, or watchdog checkpoints | [Snapshot lifecycle](docs/snapshots/lifecycle.md) — durable publication, accepted comparison points, leases, and GC; [wallet format](docs/snapshots/format.md) when changing wallet bytes. |
+| Trust boundaries, provider behavior, or hostile L1 input | [Threat model](docs/threat-model/README.md) — actor assumptions, supported failures, and residual risks. |
+| Submission fees or oracle pricing | [L1 fee policy](docs/l1-fee-policy.md) — estimation and replacement limits; [threat-model actor table](docs/threat-model/README.md#actors-and-trust) — oracle source and outage assumptions. |
+| Command setup or deployment configuration | [Running](README.md#running) and [config.rs](sequencer/src/commands/config.rs) — invocation, identity pinning, defaults, and validation. |
+| Watchdog development or operation | [Architecture](docs/watchdog/README.md); [local dev](docs/watchdog/getting-started.md) for Anvil; [operator deployment](docs/watchdog/operator-deployment.md) for Sepolia/mainnet. |
+| A new mechanism, simplification, or work spanning an active track | [Review register](docs/review/register.md) — relevant open findings and settled/refuted reasoning; [coordination tracks](docs/plans/2026-07-coordination-tracks.md) — remaining work and dependencies. Consult dated evidence when its reasoning is needed. |

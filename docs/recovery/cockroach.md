@@ -1,119 +1,131 @@
-# Cockroach recovery (`setup --recovery`)
+# Cockroach recovery: rebuild from L1
 
-When the local DB is lost or has diverged, the operator rebuilds from a trusted
-application checkpoint and L1 in a fresh data directory. This is a one-shot
-setup operation. [Standard recovery](README.md) instead keeps the database and
-invalidates an unaccepted suffix.
+Cockroach recovery (`setup --recovery`) creates a fresh sequencer starting state
+from a trusted application checkpoint and historical L1 inputs. Use it when the
+local database is lost or cannot be trusted, including after a sequencer bug has
+corrupted its state or produced malformed batches. **Find and fix the bug before
+rebuilding.** The operator initiates recovery; the command automates the rebuild.
 
-The [canonical scheduler fold](../../sequencer-core/src/scheduler/fold.rs)
-reconstructs the state. Its terminal drain also prepares the next local frame:
-the result is a **resume baseline**, which can be ahead of canonical application
-execution at the stopping block. It is not exposed as a finalized comparison
-checkpoint merely because the L1 inputs used to construct it are safe.
+The procedure is **flush → fold → fill**:
 
-## Data dictionary
+1. **Flush** outstanding submitter transactions and choose a fixed safe L1
+   stopping block.
+2. **Fold** the input history through the canonical scheduler, starting from the
+   trusted checkpoint. Every input receives its normal scheduler treatment:
+   accepted batches execute, malformed or rejected batches are skipped, and
+   direct inputs are queued and drained. Finally, drain every remaining direct
+   input through the stopping block.
+3. **Fill** a fresh database with the recovered application state and next batch
+   nonce, ready for `run`.
 
-| Symbol | Meaning | Source |
-|---|---|---|
-| `S` | Trusted application state at checkpoint block `B`. | Restored application dump. |
-| `A` | Last executed application safe block in `S`; pending directs are seeded from `(A, B]`. | Application progress in the dump. |
-| `B` | Checkpoint inclusion block. | Exported `checkpoint.toml`; must equal the configured checkpoint block. |
-| `N` | Scheduler's next batch nonce at `B`. | Exported receipt, checked against immutable `info.toml`. |
-| `C` | Post-flush safe stopping block. | Flusher result. |
-| `N'` | Next batch nonce after folding through `C`; the new batch-tree anchor. | Fold result. |
-| `K` | Application count after the terminal drain; first local history entry is `K`. | Recovered application progress. |
-| `E`, `g` | New UUIDv4 era and generation zero. | Atomic completed-baseline registration. |
+The result has accounted for the whole input prefix and carries no inherited
+speculative user-operation suffix. It does not need to reach the moving tip:
+normal operation handles inputs after the stopping block.
 
-The checkpoint contract requires `A < B`, checked at load. The sole exception
-is the known empty genesis checkpoint (`B = 0`, next nonce and app count zero).
-At a non-genesis `A = B`, a direct arriving after the accepted batch in block
-`B` can still be pending; the empty `(A, B]` seed would silently omit it.
-A recovery export carries a canonical application dump and a separate receipt;
-baseline downloads and ordinary optimistic snapshots have no such receipt.
+This is a **resume baseline**. The final drain can execute young direct inputs
+that the canonical scheduler still has queued at that block. The resumed frame
+covers them before new user operations; the baseline itself is not a canonical
+comparison checkpoint at that block.
 
-### Trusted checkpoint boundary
+[Standard recovery](README.md) instead uses the existing database to repair an
+optimistic suffix automatically. It assumes the local bookkeeping is trustworthy.
 
-The application state, resume nonce, and relationship between the checkpoint and
-L1 are operator-trusted. The receipt catches accidentally mixing an artifact,
-nonce, or configured inclusion block; it does not independently verify state
-against L1. A wrong checkpoint nonce, whether low or high, is outside the
-supported model. The content-identity check verifies newly observed acceptance
-after the baseline, not the opaque prefix or checkpoint correctness.
+## Run a rebuild
 
-An independent verification would need a trusted canonical-machine checkpoint
-or replay from an independently trusted origin. The infrastructure subscriber's
-application dump is not a substitute for that watchdog trust boundary.
+Stop the old sequencer and resolve the cause of the failure. Choose a trusted
+canonical application checkpoint; a recent one reduces replay work. Its state,
+inclusion block, and next batch nonce must agree. After a bug, establish that
+trust independently of the faulty local state, using a trusted canonical-machine
+checkpoint or replay from a trusted origin.
 
-## The procedure: flush → fold → fill
+The loader requires an application artifact, `info.toml`, and `checkpoint.toml`.
+The [recovery export workflow](../snapshots/lifecycle.md#http-and-recovery-exports)
+describes this bundle. An export receipt checks metadata agreement; it does not
+prove the checkpoint correct. An ordinary optimistic snapshot, a subscriber's
+dump, or a bare local `dumps/<id>/` directory is insufficient.
 
-1. **Load the checkpoint.** Restore `S`, read both metadata files, verify their
-   nonce agreement and the configured `B`, then derive `A` and require `A < B`
-   or the known empty genesis checkpoint.
-2. **Flush stranded transactions.** Consume unresolved wallet nonce slots and
-   wait for safe finality, obtaining `C`. The lost database cannot supply its
-   previous watermark, so the flush uses the provider's pool view. A dropped
-   transaction alive elsewhere can evade that view; a later accepted foreign or
-   mismatched landing after `C` freezes the new instance and requires another
-   rebuild. The trusted provider is fail-stop, not Byzantine.
-3. **Re-sync raw L1 inputs.** The safe head `H1` must cover `C`; it can be later.
-   Acceptance projection is deferred while the new local tree is absent.
-4. **Source disjoint fold ranges.** Seed external directs in `(A, B]`, then
-   replay all raw inputs in `(B, C]`. Sender classification excludes own batch
-   envelopes from the direct-input seed queue.
-5. **Fold and drain.** The scheduler processes the stream with expected nonce
-   `N`, then drains every remaining direct through `C`, producing `(S', N')`.
-   A young direct still waiting in the canonical scheduler may therefore already
-   be present in `S'`. The resumed frame covers it before executing new user ops.
-6. **Write the baseline artifact, then publish it.** First create and durably
-   sync the immutable dump. One SQLite transaction then creates history
-   `(E, 0, K, C)`, sets anchor `N'`, opens its parentless root frame at `C`,
-   registers the baseline artifact, and records `setup_complete`. It creates no
-   application-input rows for the collapsed prefix.
+With the deployment's [setup configuration](../../README.md#running) and
+batch-submitter signing key configured, use a fresh data directory:
 
-On the first `run` sync, acceptance starts at `N'` and scans only raw inputs
-whose block is **strictly greater than `C`**. Nonce filtering alone is unsound:
-a previously rejected future-nonce batch inside the old prefix could match the
-new expected nonce. The opaque prefix is never classified again.
+```sh
+cargo run -p wallet-sequencer -- setup --recovery \
+  --data-dir <fresh-data-dir> \
+  --checkpoint-block <block-from-receipt> \
+  --checkpoint-dump-dir <extracted-checkpoint>
+```
 
-Inputs in `(C, H1]` remain available to the inclusion lane. Its next complete
-reconciliation executes them once and records application entries beginning at
-`K`. Raw L1 input indices and application offsets remain separate coordinates.
+Recovery signs L1 transactions, so the key must match the configured submitter.
+After success, start `run` with that same data directory. A completed rebuild
+refuses another `setup --recovery`; failures before completion publish no partial
+baseline.
 
-## Recovery and retention
+## Implementation contract
 
-`C` is the immutable fallback reconciliation boundary. While valid frames
-survive, their latest `safe_block` gives the already-reconciled boundary. If
-standard recovery invalidates the original root, it falls back to `C`, so
-inputs represented by the baseline are never executed again. Canonical
-application rows belonging to invalidated batches are deleted atomically with
-the generation change and suffix invalidation.
+Read this section when changing checkpoint loading, replay, or baseline
+publication. The [scheduler contract](../protocol/scheduler-semantics.md) owns
+input interpretation; recovery uses that same scheduler implementation.
 
-Startup loads the latest surviving batch-close snapshot, falling back to the
-baseline. Admission requires a **rollback-safe checkpoint**: either that
-baseline or a retained accepted batch snapshot. An optimistic snapshot alone
-cannot satisfy this requirement because a cascade may discard its whole suffix.
+### Data dictionary
 
-Once an accepted post-baseline batch snapshot exists, standard recovery cannot
-invalidate it or return to the original baseline. GC can retire the baseline
-artifact, subject to download leases. Immutable baseline metadata remains.
-Snapshots with equal application counts remain distinct artifacts associated
-with distinct batches; acceptance and retention never infer identity from count.
+The replay boundaries are:
 
-## Crash-safety & idempotency
+| Value | Meaning |
+|---|---|
+| `S`, `B`, `N` | Trusted checkpoint state, inclusion block, and next batch nonce. |
+| `A` | Last executed application safe block reported by `S`. |
+| `C` | Fixed post-flush safe stopping block. |
+| `S'`, `N'` | Recovered state and next batch nonce. |
+| `K` | Application count in `S'`; the first later application input has offset `K`. |
 
-A completed rebuild refuses another `setup --recovery`. Before completion,
-there is no partially registered history or recovery root to resume:
+Loading checks the receipt's block against configured `B` and its nonce against
+`info.toml`. It requires `A < B`, except for known empty genesis (`B`, nonce, and
+application count all zero). At non-genesis `A = B`, a direct arriving after the
+accepted batch in block `B` could still be pending but disappear from the seed
+range. Checkpoint state and nonce remain operator-trusted; the later
+content-identity check does not verify this prefix.
 
-- A failure during artifact creation leaves setup incomplete.
-- A failed registration transaction leaves neither baseline history, root,
-  anchor update, snapshot row, nor completion marker; any durable file is an
-  orphan for cleanup.
-- A successful transaction establishes all those facts together. There are no
-  nullable baseline coordinates and no physical replay padding.
+### Flush and stopping block
 
-Early identity pinning and raw L1 ingestion can survive an incomplete attempt.
-They do not establish an application-history era. The process lock and setup
-admission exclude runtime serving before the complete baseline exists.
+The lost database cannot supply its previous wallet-nonce watermark. Flushing
+therefore depends on the provider's pool view. A transaction dropped there but
+alive elsewhere may escape; a later accepted foreign or mismatched landing
+freezes the rebuilt instance and requires another rebuild. The provider is
+trusted fail-stop, as specified in the [threat model](../threat-model/README.md).
+
+After flushing, raw L1 ingestion must reach at least `C`. It may advance farther,
+but the fold stops at `C`. Accepted-batch projection is deferred until the new
+baseline and batch tree exist.
+
+### Replay boundaries
+
+Seed the scheduler's pending-direct queue from `(A, B]`, excluding inputs sent by
+the batch submitter. Then replay **all raw inputs** in `(B, C]` in L1 order with
+expected nonce `N`. Drain the remaining directs through `C` to obtain `(S', N')`.
+The disjoint ranges preserve pending directs without executing the checkpoint's
+accepted batches again.
+
+On the first `run` sync, acceptance starts at nonce `N'` and scans only blocks
+**strictly after `C`**. Nonce filtering alone would let a previously rejected
+future-nonce batch in the old prefix be reinterpreted as accepted. Raw inputs
+ingested beyond `C` remain for normal reconciliation. Newly executed application
+inputs are recorded beginning at `K`; raw L1 indices and application offsets are
+separate coordinates.
+
+### Publish the baseline
+
+Write and durably sync the immutable application dump first. One SQLite
+transaction then registers a fresh UUIDv4 era at generation zero, count `K`,
+boundary `C`, anchor nonce `N'`, a parentless root frame at `C`, the snapshot, and
+`setup_complete`. The collapsed prefix creates no application-input rows.
+
+Artifact failure leaves setup incomplete; transaction failure leaves at most an
+orphan artifact. Identity pinning and raw L1 ingestion may survive an incomplete
+attempt, but the lock and setup admission prevent serving a partial baseline.
+
+`C` remains the fallback reconciliation boundary if standard recovery invalidates
+the root. The [history contract](../plans/application-history.md#era-baseline)
+owns these immutable coordinates; [snapshot lifecycle](../snapshots/lifecycle.md)
+owns restore selection, rollback-safe retention, and eventual baseline disposal.
 
 ## Code map
 
@@ -124,4 +136,3 @@ admission exclude runtime serving before the complete baseline exists.
 | Atomic baseline completion | [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs) |
 | Scheduler fold | [`scheduler/fold.rs`](../../sequencer-core/src/scheduler/fold.rs) |
 | Accepted-prefix boundary | [`storage/safe_accepted_batches.rs`](../../sequencer/src/storage/safe_accepted_batches.rs) |
-| Snapshot selection and GC | [`storage/snapshot_dumps.rs`](../../sequencer/src/storage/snapshot_dumps.rs) |

@@ -1,9 +1,9 @@
 # Snapshots
 
-Application snapshots are durable copies of the app's canonical state at a known
-point in the L2-tx stream. They let the inclusion lane resume on startup with a
-single *load-then-replay* instead of replaying all history, and they back the
-operator's watchdog (`/finalized_state`) and indexers (`/latest_snapshot`).
+Application snapshots are immutable, durable copies of application state at a
+known execution boundary. They let the inclusion lane resume with load and
+replay. A snapshot may contain optimistic state; L1 acceptance determines which
+artifact can back a canonical comparison or recovery export.
 
 Two documents, split by concern:
 
@@ -11,13 +11,12 @@ Two documents, split by concern:
   trait (`from_dump` / `create_dump` / `state_file_in_dump`) and
   the toy wallet's SSZ wire encoding. What a dump *is*.
 
-- **[`lifecycle.md`](lifecycle.md)** — the *lifecycle* and its rationale: take at
-  batch close, pending → finalized promotion (per-range, atomic with the drain),
-  garbage collection, HTTP leasing, recovery interaction, and the crash-safety
-  reasoning (including the promote/drain wedge and why the design closes it).
-  When and how dumps move through the system, and *why*.
+- **[`lifecycle.md`](lifecycle.md)** — creation at batch close, restart selection,
+  acceptance-derived comparison checkpoints, recovery exports, retention,
+  download leases, and crash safety. Acceptance is a separate durable fact;
+  artifacts are never promoted or rewritten.
 
-Related: [`../recovery/README.md`](../recovery/README.md) (danger-zone recovery,
-which clears cascade-doomed pendings), [`../../AGENTS.md`](../../AGENTS.md)
-(architecture), and the root [`../../README.md`](../../README.md) (endpoint
-shapes).
+For automatic startup repair, see [standard recovery](../recovery/README.md).
+For rebuilding after database loss or a sequencer bug, see
+[cockroach recovery](../recovery/cockroach.md). The root
+[README](../../README.md) owns endpoint shapes.
