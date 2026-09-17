@@ -26,9 +26,9 @@ Sequencer (off-chain)              Scheduler (on-chain)
 ```
 
 When things go well, the sequencer's chain and the scheduler's view converge.
-When batches are becoming stale on L1, the sequencer detects the doomed suffix
-and runs standard recovery. Terminal canonical divergence is the distinct
-content-identity case below.
+When batches risk becoming stale on L1, the sequencer stops serving and startup
+determines the required repair. A lost or untrustworthy local state instead
+requires an operator rebuild. Both recovery modes are described below.
 
 ## Trust Model
 
@@ -60,9 +60,24 @@ backstop, not proof that arbitrary application or scheduler divergence cannot
 exist, and it does not replace the watchdog. The mechanism and its bounds are
 recorded in [`docs/invariants.md`](docs/invariants.md) (I9 and I15).
 
-The third case is handled by the recovery subsystem. Batches that are too old when they reach L1 (`inclusion_block − safe_block ≥ MAX_WAIT_BLOCKS`) are skipped by the scheduler. This "staleness" poisons the nonce counter: all subsequent batches become unreachable regardless of their individual freshness. The sequencer detects this via a danger-zone threshold, preemptively goes offline, flushes the L1 mempool, and cascade-invalidates the doomed chain. See [`docs/recovery/`](docs/recovery/) for the full design, TLA+ formal verification, and design history.
+## Recovery
 
-The sequencer trusts its own code is bug-free. Recovery means recovery from liveness failures, which can legitimately happen even in the absence of bugs (infrastructure outages, network failures, gateway failure). Code-level bugs are a separate problem handled by tests and review. See [`docs/threat-model/README.md`](docs/threat-model/README.md) for the complete threat model applied across the codebase.
+**[Standard recovery](docs/recovery/README.md)** runs automatically at startup
+using the existing database. It handles liveness failures such as outages and
+extended downtime: reconcile L1 outcomes, invalidate the affected optimistic
+suffix, and resume from retained state. Stale batches do not consume the
+scheduler's expected nonce, so their successors cannot be accepted until recovery
+supplies a replacement at that nonce.
+
+**[Cockroach recovery](docs/recovery/cockroach.md)** is an operator-triggered
+rebuild when the local database is lost or cannot be trusted. This includes a
+sequencer bug that corrupted state or emitted malformed batches: fix the bug,
+choose a trusted canonical application checkpoint, then rebuild in a fresh data
+directory. The command processes historical L1 inputs through the canonical
+scheduler and prepares a baseline for resuming normal operation.
+
+The [threat model](docs/threat-model/README.md#self-trust) explains the boundary
+between normal operation's self-trust and manual repair after a bug.
 
 ## Failure Modes
 
@@ -70,7 +85,7 @@ The sequencer is designed to handle:
 
 - **L1 provider outages** — workers retry with exponential backoff. The inclusion lane and API continue operating locally. A wall-clock fallback detects when an outage pushes batches into the danger zone.
 - **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart can recover automatically: every boot derives any required recovery from SQLite and L1 safe state through startup recovery, never assuming the previous exit was clean. Terminal errors returned through a command bracket best-effort record their cause in `terminal_faults`; terminal runtime aborts leave only process diagnostics.
-- **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission; restart policy is the exit-code contract (a terminal exit means: do not restart, page an operator — the one manual remedy is a fresh-directory `setup --recovery` after canonical divergence).
+- **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission. A terminal exit requires operator investigation; rebuilding untrustworthy state follows the cockroach recovery procedure above.
 - **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. The recovery flusher consumes every pending nonce slot with a no-op so delayed "zombie" submissions cannot land later.
 
 ## Interfaces
@@ -91,10 +106,14 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 
 The sequencer runs in two phases. **`setup`** pins the
 deployment identity (including the reviewed fee-oracle source), does the initial L1 sync, and registers the genesis
-snapshot — run it once. It is L1-read-only: it takes the batch-submitter
+snapshot — run it once. Plain `setup` is L1-read-only: it takes the batch-submitter
 *address*, never the signing key. **`run`** boots the sequencer from the
 set-up DB, reading identity from it (so chain id / app address are not `run`
 arguments); it holds the signing key because it submits.
+
+For rebuilding from a trusted checkpoint, follow the
+[cockroach recovery procedure](docs/recovery/cockroach.md#run-a-rebuild).
+`setup --recovery` also needs the submitter key because it flushes transactions.
 
 ```bash
 # Phase A — set up the data dir (run once; idempotent).
@@ -310,21 +329,18 @@ docker pull ghcr.io/cartesi/sequencer-watchdog:vX
 
 ## Development
 
-```bash
-cargo check                                              # compile
-cargo test --workspace --exclude canonical-test          # test (canonical-test needs libslirp)
-cargo fmt --all                                          # format
-cargo clippy --all-targets --all-features -- -D warnings # lint
-```
-
-Some tests require [Foundry](https://getfoundry.sh) (`anvil` on PATH). They run by default and fail with a clear message if unavailable. This project uses Nix + direnv for tooling — `direnv allow` provides Foundry, TLA+, and other dependencies.
+The shared [development commands](AGENTS.md#shell-and-commands) cover Rust
+toolchain selection, Nix/direnv tooling, compilation, tests, formatting, and
+linting. Read the [testing guidance](AGENTS.md#testing-guidance) before choosing
+validation for a change; some tests require Anvil or libslirp.
 
 ## Further Reading
 
 - [`AGENTS.md`](AGENTS.md) — developer guide: architecture, conventions, duality, recovery, invariants, rules.
-- [`CLAUDE.md`](CLAUDE.md) — quick reference for shell setup and commands.
+- [`CLAUDE.md`](CLAUDE.md) — Claude entrypoint to the shared agent guide.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
-- [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.
+- [`docs/recovery/README.md`](docs/recovery/README.md) — automatic recovery, TLA+ formal verification, design history.
+- [`docs/recovery/cockroach.md`](docs/recovery/cockroach.md) — manual rebuild after lost state or a sequencer bug.
 - [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md) — step-by-step: run the watchdog with a local sequencer.
 - [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md) — watchdog on live L1 (Sepolia staging, mainnet production).
 - [`docs/watchdog/README.md`](docs/watchdog/README.md) — watchdog architecture, modules, and test commands.

@@ -1,8 +1,20 @@
 # Batch Recovery
 
-This document describes the recovery design for the sequencer: how the system detects that batches are failing to land on L1, how startup recovers to a consistent state, and where runtime authority begins. Two complementary bounded TLA+ models cover the design: [`preemptive.tla`](preemptive.tla) for batch/slot safety and [`admission.tla`](admission.tla) for startup phase ordering and admission. They do not currently model the external era/generation/base metadata or the canonical `application_inputs` projection or snapshot artifact/GC lifecycle; their crash atomicity is enforced by the SQLite transaction boundaries and schema triggers described below.
+There are two recovery paths:
 
-See `AGENTS.md` "Batch Staleness and Recovery" for quick-reference tables and function names.
+- **Standard recovery**, described on this page, runs automatically at startup.
+  It uses the existing database to repair an optimistic suffix that can no
+  longer be relied on and decides whether the sequencer can resume serving.
+- **[Cockroach recovery (`setup --recovery`)](cockroach.md)** is an operator-triggered
+  rebuild from a trusted canonical application checkpoint and L1. Use it after
+  database loss or unusable local state, including after fixing a sequencer bug.
+
+Two complementary bounded TLA+ models cover standard recovery:
+[`preemptive.tla`](preemptive.tla) for batch/slot safety and
+[`admission.tla`](admission.tla) for startup phase ordering and admission. They
+do not currently model the external era/generation/base metadata, the canonical
+`application_inputs` projection, or snapshot artifact/GC lifecycle; their crash
+atomicity is enforced by SQLite transaction boundaries and schema triggers.
 
 ## Runtime lifecycle at a glance
 
@@ -33,7 +45,8 @@ Batches form a tree where each node is a batch and edges point from child to par
 Batches have two identifiers:
 
 - **Index** (`batch_index`): monotonically increasing, unique, never reused. Creation order.
-- **Nonce** (`batch_nonce`): depth of the node in the tree. Assigned by the batch submitter to valid closed batches.
+- **Nonce** (`batch_nonce`): scheduler sequence number. Storage derives it as
+  `parent.nonce + 1`, or the deployment's anchor nonce for a parentless root.
 
 In normal operation the tree degenerates into a list -- index and nonce increase in lockstep. Branches appear only after recovery, when a suffix of the chain is invalidated and a new batch forks from the last valid ancestor.
 
@@ -49,9 +62,11 @@ The implementation handles the nonce-0 case **structurally**: `open_fresh_tip_in
 
 #### Cockroach recovery generalizes the root nonce (the anchor)
 
-Cockroach recovery (`setup --recovery`) rebuilds a wiped DB from a trusted checkpoint and must resume submitting at nonce `N'` without replaying history — so the rebuilt tree is rooted at `N'`, not 0. Rather than plant a fake "sentinel" batch at `N'-1`, the batch-tree anchor generalizes the structural root: a `batch_tree_anchor` singleton holds the nonce the parentless root carries (default `0`; recovery sets `N'`). The same `open_fresh_tip_in_tx` / `compute_next_nonce(parent = None)` path then roots `run`'s first tip at `N'`, and `trg_enforce_nonce_contiguity` validates the root against the anchor (exact match) instead of a hard-coded 0. There is **no sentinel batch row** — the root tip *is* the anchored batch. Normal deployments keep anchor `0` and are byte-identical. See [I16](../invariants.md) and the [cockroach-recovery design](#cockroach-recovery-setup---recovery) below.
-
-A sealed `N'-1` sentinel was considered and rejected: a valid closed batch at `N'-1` is a legal cascade pivot, so a runtime cascade could invalidate it and leave the tree re-rooting at 0 (ABORTed by the unchanged contiguity trigger) — an unguarded reliance on "the frontier never drops to `N'-1`". The anchor has no such hidden dependency.
+A fresh deployment roots its batch tree at nonce 0. Cockroach recovery roots it
+at the scheduler's next nonce after replay. The `batch_tree_anchor` preserves
+that starting nonce even if a later cascade removes the whole local branch.
+[I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)
+owns the root invariant and its enforcement.
 
 ## Coloring
 
@@ -372,25 +387,15 @@ Dead batches occupy `w_nonce` slots strictly below `walletNonce`. Recovery batch
 
 ## Cockroach recovery (`setup --recovery`)
 
-Everything above is **standard recovery**: the sequencer's own bookkeeping
-(the batch tree, pending dumps) lets startup cascade a doomed suffix and
-resume. The repair decision is automatic, not an operator-designed
-reconstruction: recovery crosses a process boundary, and the next boot
-inspects fresh facts regardless of how the prior process
-died. Admission and the terminal-fault black box are owned by
-[ADR mechanism 2](../plans/2026-08-authority-boundary-adr.md#2-fact-derived-admission-and-the-terminal-fault-black-box).
+Use [cockroach recovery](cockroach.md) when the database is lost or local state
+is unusable, including after a sequencer bug. Fix the bug first, then rebuild in
+a fresh data directory from a trusted, sufficiently advanced canonical
+application checkpoint and L1. The recovery guide owns checkpoint requirements,
+the replay procedure, and the resulting resume baseline.
 
-**Cockroach recovery** is the catastrophe path — the local DB is lost or has diverged (`CanonicalDivergence`, [I15](../invariants.md)). There is no tree to cascade; the operator supplies a fresh or explicitly wiped data directory and rebuilds canonical logical state from a trusted checkpoint plus L1. It is an operator-driven, one-shot `setup` mode, not a runtime action. There is no automated DB replacement, clone detection, distributed fencing, or partial-fill resume state machine. The summary:
-
-Given a trusted checkpoint machine `S` at block `B` (a finalized `dumps/<id>/` dir, carrying `N` = its resume nonce and `A` = its last-executed safe block), `setup --recovery --checkpoint-block B --checkpoint-dump-dir <dir>` runs **flush → fold → fill**:
-
-1. **Flush** the wallet nonce (keyed — recovery, unlike plain `setup`, signs) so every previous-instance batch resolves at safe depth `≤ C`, the post-flush safe head. Re-sync `safe_inputs` through `C`.
-2. **Fold** (the pure `sequencer-core` engine, shared with the on-chain scheduler so it is consistent by construction): seed the fridge from the `(A, B]` directs (drop batches — already in `S`), replay the `(B, C]` stream, drain the leftover fridge at `C`. Yields `(S', N')` = the advanced app state and the resume nonce.
-3. **Fill** a consistent DB: write the recovered application dump first, then atomically register its complete `(era, generation = 0, K, C)` history baseline, anchor `N'`, parentless root frame at `C`, snapshot, and `setup_complete`. The collapsed prefix creates no application rows. The first later application input has offset `K`; ordinary recovery falls back to immutable `C` if the root is invalidated. The terminal-drained baseline is a local restore point and is not automatically a canonical comparison checkpoint at `C`.
-
-During rebuild the accepted frontier is deferred until the baseline exists. The first `run` sync seeds expected nonce `N'` and scans only inputs after `C`, explicitly excluding the trusted prefix. Replaying the old prefix with a later expected nonce could reinterpret a rejected future-nonce batch as accepted. Checkpoint state and nonce remain operator-trusted; the export receipt checks metadata agreement rather than independently verifying the checkpoint. Rebuild is one-shot after completion. File-first creation plus atomic registration removes partial-baseline resume states; a failed transaction leaves only an orphan artifact. See [cockroach recovery](cockroach.md) for the full contract.
-
-The detect-and-refuse gate is the *trigger*: a fresh `setup` that finds a previous instance's batches past the checkpoint refuses with exit `40` (`EXIT_SETUP_NEEDS_RECOVERY`), pointing the operator here.
+Plain `setup` also directs the operator to this path when it detects a previous
+instance's batches past the checkpoint: it refuses with exit `40`
+(`EXIT_SETUP_NEEDS_RECOVERY`).
 
 ## Canonical divergence (terminal, outranks every arm)
 
