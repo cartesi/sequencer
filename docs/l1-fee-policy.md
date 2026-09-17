@@ -38,7 +38,7 @@ expectation to measure, not a bound this policy establishes.
 The danger detector stops normal operation when the configured danger
 threshold is reached. That bounds continued soft-confirmation issuance under
 the detector's assumptions; it does not bound inclusion or recovery duration.
-[Recovery](recovery/README.md#step-4-post-flush-state) requires all covered
+[Recovery](recovery/README.md#closed-batches-flush-sync-cascade) requires all covered
 wallet slots to resolve at safe depth before a cascade can proceed. The
 flusher's fixed headroom can also fail to replace an unmineable original.
 The sequencer remains offline until recovery succeeds or the operator acts.

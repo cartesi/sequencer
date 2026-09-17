@@ -43,9 +43,9 @@ pub struct TimingArgs {
     /// The danger threshold is MAX_WAIT_BLOCKS minus this margin.
     /// Must be less than MAX_WAIT_BLOCKS (validated at startup).
     ///
-    /// Default 300 (~1h at 12s/block) is sized to give operators meaningful
-    /// runway to investigate before the system gives up on the current
-    /// batches — see `docs/recovery/README.md` "Step 1: Danger threshold".
+    /// Default 300 gives ~1h of headroom before canonical expiry at 12s/block.
+    /// Detection starts recovery immediately; this is neither an operator
+    /// grace period nor a completion deadline. See `docs/recovery/README.md`.
     #[arg(
         long,
         env = "CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS",

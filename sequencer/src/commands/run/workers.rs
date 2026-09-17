@@ -184,7 +184,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
         std::fs::create_dir_all(&dumps_dir)?;
 
-        // Validate the rollback artifact and collect obsolete snapshots before admission.
+        // Validate rollback checkpoint metadata and collect obsolete snapshots before admission.
         super::startup_hygiene::run_snapshot_hygiene(&mut storage, &dumps_dir)?;
 
         // Prepare every remaining fallible or awaited dependency before the

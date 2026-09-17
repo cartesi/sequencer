@@ -157,10 +157,10 @@ impl MempoolFlusher {
     /// Flush the mempool by submitting no-op transactions for unresolved
     /// nonce slots, then waiting until every slot we ever used is safe.
     ///
-    /// `watermark` is the persisted wallet-nonce watermark — the highest
-    /// nonce this deployment ever broadcast, or `None` if nothing was ever
-    /// broadcast (or no DB survives, the cockroach-recovery best-effort
-    /// case). The loop runs until
+    /// `watermark` durably covers every wallet nonce this deployment may
+    /// have broadcast. Write-before-send can cover an unused slot. `None`
+    /// means no covered broadcasts, or a lost DB in cockroach recovery's
+    /// best-effort flush. The loop runs until
     ///
     /// ```text
     /// pending <= safe  &&  safe >= watermark + 1
