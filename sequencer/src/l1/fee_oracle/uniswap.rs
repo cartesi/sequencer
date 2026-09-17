@@ -6,7 +6,7 @@
 use alloy::contract::Error as ContractError;
 use alloy::providers::{DynProvider, Provider};
 use alloy::sol;
-use alloy_primitives::{Address, U256, Uint};
+use alloy_primitives::{Address, U256};
 use alloy_sol_types::Revert;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -229,106 +229,26 @@ pub(super) fn bootstrap_price_source_error(error: PriceSourceError) -> (bool, St
     }
 }
 
-/// Convert a Uniswap tick to fee-token smallest units per WETH.
+/// Estimate fee-token smallest units per WETH from a Uniswap tick.
+///
+/// Host pricing is approximate, with headroom supplied by `batch_policy.log_slack`.
+/// Ceiling rounds up the estimate, not an exact TickMath price. Recorded frame
+/// fees use the shared deterministic integer conversion.
 pub fn quote_x_per_weth_from_tick(
     tick: i32,
     weth_is_token0: bool,
 ) -> Result<U256, PriceSourceError> {
-    let sqrt_price_x96 = sqrt_ratio_at_tick(tick)?;
-    let square: Uint<512, 8> = sqrt_price_x96.widening_mul(sqrt_price_x96);
-    let q192: Uint<512, 8> = Uint::from(1u8) << 192;
-    let one_weth = Uint::<512, 8>::from(1_000_000_000_000_000_000u128);
-    let (numerator, denominator) = if weth_is_token0 {
-        (square * one_weth, q192)
-    } else {
-        (q192 * one_weth, square)
-    };
-    ceil_div_512(numerator, denominator)
-}
-
-fn sqrt_ratio_at_tick(tick: i32) -> Result<U256, PriceSourceError> {
     const MAX_TICK: i32 = 887_272;
-    if tick.unsigned_abs() > MAX_TICK as u32 {
+    if !(-MAX_TICK..=MAX_TICK).contains(&tick) {
         return Err(PriceSourceError::ArithmeticOverflow);
     }
-    let constants = [
-        "fffcb933bd6fad37aa2d162d1a594001",
-        "fff97272373d413259a46990580e213a",
-        "fff2e50f5f656932ef12357cf3c7fdcc",
-        "ffe5caca7e10e4e61c3624eaa0941cd0",
-        "ffcb9843d60f6159c9db58835c926644",
-        "ff973b41fa98c081472e6896dfb254c0",
-        "ff2ea16466c96a3843ec78b326b52861",
-        "fe5dee046a99a2a811c461f1969c3053",
-        "fcbe86c7900a88aedcffc83b479aa3a4",
-        "f987a7253ac413176f2b074cf7815e54",
-        "f3392b0822b70005940c7a398e4b70f3",
-        "e7159475a2c29b7443b29c7fa6e889d9",
-        "d097f3bdfd2022b8845ad8f792aa5825",
-        "a9f746462d870fdf8a65dc1f90e061e5",
-        "70d869a156d2a1b890bb3df62baf32f7",
-        "31be135f97d08fd981231505542fcfa6",
-        "9aa508b5b7a84e1c677de54f3e99bc9",
-        "5d6af8dedb81196699c329225ee604",
-        "2216e584f5fa1ea926041bedfe98",
-        "48a170391f7dc42444e8fa2",
-    ];
-    let abs = tick.unsigned_abs();
-    let mut ratio = if abs & 1 != 0 {
-        parse_u256(constants[0])?
-    } else {
-        U256::from_limbs([0, 0, 1, 0])
-    };
-    for (bit, constant) in constants.iter().enumerate().skip(1) {
-        if abs & (1 << bit) != 0 {
-            ratio = mul_shift_128(ratio, parse_u256(constant)?)?;
-        }
-    }
-    if tick > 0 {
-        ratio = U256::MAX / ratio;
-    }
-    // Q128.128 to Q64.96, rounding up as canonical TickMath does.
-    let shifted = ratio >> 32;
-    Ok(if ratio & U256::from((1u64 << 32) - 1) == U256::ZERO {
-        shifted
-    } else {
-        shifted
-            .checked_add(U256::from(1))
-            .ok_or(PriceSourceError::ArithmeticOverflow)?
-    })
-}
-
-fn parse_u256(value: &str) -> Result<U256, PriceSourceError> {
-    U256::from_str_radix(value, 16).map_err(|_| PriceSourceError::ArithmeticOverflow)
-}
-
-fn mul_shift_128(left: U256, right: U256) -> Result<U256, PriceSourceError> {
-    let shifted: Uint<512, 8> = left.widening_mul(right) >> 128;
-    let limbs = shifted.into_limbs();
-    if limbs[4..].iter().any(|limb| *limb != 0) {
+    let directed_tick = if weth_is_token0 { tick } else { -tick };
+    // The raw ratio already uses token smallest units; 1 WETH supplies 10^18 wei.
+    let quote = 1.0001_f64.powi(directed_tick) * 1e18;
+    if !quote.is_finite() || quote <= 0.0 {
         return Err(PriceSourceError::ArithmeticOverflow);
     }
-    Ok(U256::from_limbs([limbs[0], limbs[1], limbs[2], limbs[3]]))
-}
-
-fn ceil_div_512(
-    numerator: Uint<512, 8>,
-    denominator: Uint<512, 8>,
-) -> Result<U256, PriceSourceError> {
-    if denominator == Uint::ZERO {
-        return Err(PriceSourceError::ArithmeticOverflow);
-    }
-    let quotient = numerator / denominator;
-    let rounded = if numerator % denominator == Uint::ZERO {
-        quotient
-    } else {
-        quotient + Uint::from(1u8)
-    };
-    let limbs = rounded.into_limbs();
-    if limbs[4..].iter().any(|limb| *limb != 0) {
-        return Err(PriceSourceError::ArithmeticOverflow);
-    }
-    Ok(U256::from_limbs([limbs[0], limbs[1], limbs[2], limbs[3]]))
+    U256::try_from(quote.ceil()).map_err(|_| PriceSourceError::ArithmeticOverflow)
 }
 
 #[cfg(test)]
@@ -348,13 +268,10 @@ mod tests {
     }
 
     #[test]
-    fn negative_tick_uses_uniswap_rounding_direction() {
-        // The exact ratio is below one, so WETH as token1 (inverse quote) is
-        // above one WETH unit; this also exercises the negative TickMath path.
-        assert!(
-            quote_x_per_weth_from_tick(-1, false).unwrap()
-                > U256::from(1_000_000_000_000_000_000u128)
-        );
+    fn negative_tick_directionality_matches_token_order() {
+        let one_weth = U256::from(1_000_000_000_000_000_000u128);
+        assert!(quote_x_per_weth_from_tick(-1, true).unwrap() < one_weth);
+        assert!(quote_x_per_weth_from_tick(-1, false).unwrap() > one_weth);
     }
 
     #[test]
@@ -366,14 +283,14 @@ mod tests {
 
     #[test]
     fn out_of_range_ticks_overflow() {
-        assert!(matches!(
-            quote_x_per_weth_from_tick(887_273, true),
-            Err(PriceSourceError::ArithmeticOverflow)
-        ));
-        assert!(matches!(
-            quote_x_per_weth_from_tick(-887_273, false),
-            Err(PriceSourceError::ArithmeticOverflow)
-        ));
+        for tick in [-887_273, 887_273, i32::MIN, i32::MAX] {
+            for weth_is_token0 in [false, true] {
+                assert!(matches!(
+                    quote_x_per_weth_from_tick(tick, weth_is_token0),
+                    Err(PriceSourceError::ArithmeticOverflow)
+                ));
+            }
+        }
     }
 
     #[test]
@@ -454,8 +371,16 @@ mod tests {
 
     #[test]
     fn boundary_ticks_are_representable() {
-        assert!(quote_x_per_weth_from_tick(887_272, true).is_ok());
-        assert!(quote_x_per_weth_from_tick(-887_272, false).is_ok());
+        for weth_is_token0 in [false, true] {
+            let tick = if weth_is_token0 { 887_272 } else { -887_272 };
+            assert!(
+                quote_x_per_weth_from_tick(tick, weth_is_token0).unwrap() > U256::from(u128::MAX)
+            );
+            assert_eq!(
+                quote_x_per_weth_from_tick(-tick, weth_is_token0).unwrap(),
+                U256::from(1)
+            );
+        }
     }
 
     #[test]
@@ -466,19 +391,26 @@ mod tests {
     }
 
     #[test]
-    fn tick_math_matches_uniswap_canonical_sqrt_ratios() {
-        // Canonical TickMath.getSqrtRatioAtTick vectors from Uniswap v3-core.
-        assert_eq!(
-            sqrt_ratio_at_tick(0).unwrap(),
-            U256::from(79_228_162_514_264_337_593_543_950_336u128)
-        );
-        assert_eq!(
-            sqrt_ratio_at_tick(-887_272).unwrap(),
-            U256::from(4_295_128_739u64)
-        );
-        assert_eq!(
-            sqrt_ratio_at_tick(887_272).unwrap(),
-            U256::from_str_radix("1461446703485210103287273052203988822378723970342", 10).unwrap()
-        );
+    fn quotes_preserve_smallest_units_across_token_orders() {
+        // Decimal reference values: ~2063 USDC/WETH for a 6-decimal token,
+        // ~2.718 tokens/WETH for an 18-decimal token, and the largest quote.
+        for (directed_tick, expected) in [
+            (-200_000, 2_063_215_670.0),
+            (10_000, 2.718_145_926_825_225e18),
+            (887_272, 3.402_567_868_363_881e56),
+        ] {
+            for weth_is_token0 in [false, true] {
+                let tick = if weth_is_token0 {
+                    directed_tick
+                } else {
+                    -directed_tick
+                };
+                let quote = f64::from(quote_x_per_weth_from_tick(tick, weth_is_token0).unwrap());
+                assert!(
+                    (quote - expected).abs() <= expected * 1e-8,
+                    "tick {tick}, WETH token0 {weth_is_token0}: {quote} vs {expected}"
+                );
+            }
+        }
     }
 }

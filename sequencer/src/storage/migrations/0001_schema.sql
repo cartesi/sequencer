@@ -519,7 +519,7 @@ END;
 --   `gas_price` is denominated in "fee-token smallest units per L1 gas unit"
 --   (application-defined ERC-20 X; the wallet prototype starts with USDC).
 --   The L1 fee oracle converts base+priority gas (wei) via a pinned Uniswap V3
---   WETH/X TWAP and encodes the exact quote to log space. The tenfold safety
+--   WETH/X TWAP and encodes the approximate quote to log space. The tenfold safety
 --   margin lives in `log_slack` (not in the oracle). Local Anvil uses an
 --   explicit fixed exponent instead of Uniswap.
 --
