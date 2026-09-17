@@ -1,6 +1,6 @@
 # Sequencer
 
-A sequencer for Cartesi app-specific rollups. Provides low-latency soft confirmations for user operations, posts them to L1 in batches, and maintains a deterministic replay feed that matches the application's final execution order.
+A sequencer for Cartesi app-specific rollups. Provides low-latency soft confirmations for user operations, posts them to L1 in batches, and exposes its current application execution order for replica replay.
 
 **Security-critical infrastructure.** Handle every change with the care financial systems demand.
 
@@ -86,7 +86,7 @@ The sequencer is designed to handle:
 - **L1 provider outages** — workers retry with exponential backoff. The inclusion lane and API continue operating locally. A wall-clock fallback detects when an outage pushes batches into the danger zone.
 - **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart can recover automatically: every boot derives any required recovery from SQLite and L1 safe state through startup recovery, never assuming the previous exit was clean. Terminal errors returned through a command bracket best-effort record their cause in `terminal_faults`; terminal runtime aborts leave only process diagnostics.
 - **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission. A terminal exit requires operator investigation; rebuilding untrustworthy state follows the cockroach recovery procedure above.
-- **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. The recovery flusher consumes every pending nonce slot with a no-op so delayed "zombie" submissions cannot land later.
+- **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. Recovery waits until every covered wallet-nonce slot is consumed at safe depth, whether the original transaction or a flush no-op wins, so delayed "zombie" submissions cannot land later.
 
 ## Interfaces
 
@@ -96,7 +96,13 @@ Users submit signed operations via `POST /tx` (JSON). Operations are signed with
 
 ### Sequenced Transaction Feed
 
-Subscribers connect via `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>` (WebSocket). The feed delivers all sequenced transactions (user ops + direct inputs) in deterministic order, matching the on-chain execution order. This is the primary interface for downstream consumers (frontends, indexers). The endpoint is designed for a small number of indexer subscribers, which serve users directly.
+Subscribers restore an HTTP snapshot, then use one WebSocket stream to replay
+application inputs and follow the optimistic tip. Recovery can replace that
+history; the snapshot's era, generation, and input count bind a resume request
+to the state the consumer actually holds. The endpoint serves a small number of
+infrastructure subscribers, which serve users directly. See the
+[bootstrap workflow](docs/protocol/application-history.md#replica-bootstrap-and-resume)
+and [wire contract](#api).
 
 ### Batch Submission
 
@@ -187,6 +193,16 @@ Notes:
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
 - Browser wallets can call `POST /tx` and `GET /fee` from any origin with any request headers; preflight permits GET and POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
 
+Success response after inclusion:
+
+```json
+{
+  "ok": true,
+  "sender": "0x...",
+  "nonce": 0
+}
+```
+
 ### `GET /fee`
 
 Fee quote for setting signed user-op `max_fee` before `POST /tx`. All three fields are log-space exponents (base 129/128), the same encoding as `max_fee`. Inclusion rejects any op with `max_fee` below the open-frame `fee`.
@@ -205,7 +221,7 @@ Notes:
 
 ### `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>`
 
-WebSocket stream of canonical application inputs, replaying from the inclusive
+WebSocket stream of the current application history, replaying from the inclusive
 `next_input` offset and then following the optimistic tip. Fetch and restore
 `/latest_snapshot` first; its headers supply the complete subscription claim.
 After each successfully applied input at offset `X`, persist the claim with
@@ -235,16 +251,6 @@ Message shapes:
 { "kind": "direct_input", "offset": 11, "sender": "0x...", "block_number": 123, "block_timestamp": 1700000000, "transaction_hash": "0x...", "payload": "0x...", "input_index": 42, "batch_nonce": 4 }
 ```
 
-Success response:
-
-```json
-{
-  "ok": true,
-  "sender": "0x...",
-  "nonce": 0
-}
-```
-
 ### Operator snapshot endpoints (internal only)
 
 These serve application state to the operator's watchdog and indexers.
@@ -265,7 +271,7 @@ api split lands).
   adding a coherent `checkpoint.toml` receipt with its L1 inclusion block and
   next batch nonce for trusted recovery.
 
-All state/archive responses include `X-History-Era`, `X-Recovery-Generation`,
+Successful state/archive downloads include `X-History-Era`, `X-Recovery-Generation`,
 and `X-Executed-Input-Count`, selected atomically with the artifact lease.
 Streaming holds the lease until the response ends or the client disconnects.
 The accepted endpoints return `404` until a comparable checkpoint exists:
@@ -341,6 +347,8 @@ validation for a change; some tests require Anvil or libslirp.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
 - [`docs/recovery/README.md`](docs/recovery/README.md) — automatic recovery, TLA+ formal verification, design history.
 - [`docs/recovery/cockroach.md`](docs/recovery/cockroach.md) — manual rebuild after lost state or a sequencer bug.
+- [Application history and replay](docs/protocol/application-history.md) — progress, history identity, and replica bootstrap/resume.
+- [Snapshots](docs/snapshots/README.md) — engine checkpoints, lifecycle, accepted comparison, and wallet encoding.
 - [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md) — step-by-step: run the watchdog with a local sequencer.
 - [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md) — watchdog on live L1 (Sepolia staging, mainnet production).
 - [`docs/watchdog/README.md`](docs/watchdog/README.md) — watchdog architecture, modules, and test commands.

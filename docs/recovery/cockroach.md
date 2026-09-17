@@ -123,7 +123,7 @@ orphan artifact. Identity pinning and raw L1 ingestion may survive an incomplete
 attempt, but the lock and setup admission prevent serving a partial baseline.
 
 `C` remains the fallback reconciliation boundary if standard recovery invalidates
-the root. The [history contract](../plans/application-history.md#era-baseline)
+the root. The [history contract](../protocol/application-history.md#era-baseline)
 owns these immutable coordinates; [snapshot lifecycle](../snapshots/lifecycle.md)
 owns restore selection, rollback-safe retention, and eventual baseline disposal.
 

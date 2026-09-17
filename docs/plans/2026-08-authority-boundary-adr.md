@@ -170,8 +170,8 @@ standard-recovery transaction iff it invalidates at least one valid batch; a
 clean restart changes neither. The pair is an equality/discontinuity token,
 not an ordered counter. Snapshot headers and mandatory WS claims expose these coordinates. Every
 application row has its pre-execution count; recovery replaces only the current
-suffix. See the [history contract](application-history.md) and
-[Track 3 handoff](2026-07-track3-feed-replay-design.md).
+suffix. See the [history contract](../protocol/application-history.md) and
+[remaining integration gates](2026-07-track3-feed-replay-design.md).
 
 ## Performance posture
 

@@ -1,81 +1,11 @@
-# App Snapshot Format (Wallet Toy App)
+# Wallet snapshot format
 
-This document defines the on-disk snapshot format produced by the toy wallet
-app in `examples/app-core` via the `Application` trait's dump methods.
-
-## Scope
-
-This document covers two things:
-
-1. The trait shape that any `Application` implementation must satisfy to
-   participate in snapshot lifecycle (`from_dump`, `create_dump`,
-   `state_file_in_dump`).
-2. The wire format the toy wallet uses to encode its canonical state into
-   the dump's state file. Checkpoint ownership and durability are defined by
-the [Application contract](../protocol/application-contract.md#6-checkpoint-lifecycle).
-
-It does NOT define when snapshots are triggered, how the inclusion lane
-records and selects them, how the HTTP layer serves them, or recovery
-interactions. Those are layered above the trait and live in their own
-modules.
-
-## Trait Surface
-
-```rust
-trait Application: Send + Sized {
-    // ... other methods ...
-
-    fn from_dump(prefix: &Path) -> Result<Self, AppError>;
-    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError>;
-    fn state_file_in_dump(prefix: &Path) -> PathBuf;
-}
-```
-
-Contract:
-
-- `prefix` is an opaque app-owned path, which may be a file or directory.
-  All checkpoint-owned artifacts reside at or below it. The sequencer owns the
-  enclosing dump directory and its `info.toml`, and disposes of the checkpoint
-  by removing that directory recursively. No other resource cleanup is needed.
-- `create_dump` creates the absent `prefix` and makes the complete checkpoint
-  durable before returning. It may replace backing resources but preserves
-  logical state. Later execution cannot alter a checkpoint. Restored engines
-  are independent of one another and remain usable after source deletion.
-- `state_file_in_dump` is a pure function of `prefix`: callers may
-  compute it without loading the dump or instantiating the Application.
-  Each impl pins its own layout convention.
-- The bytes at `state_file_in_dump(prefix)` are the canonical state —
-  the bytes a watchdog running an independent canonical machine would
-  produce for the same logical state through inspect or a designated state
-  drive.
-  They must be deterministic: identical logical state must produce
-  byte-identical files across runs, hosts, and toolchains.
-- For implementations whose persistence representation IS the canonical
-  state (the toy wallet), `create_dump` writes the
-  same bytes that `state_file_in_dump` names — a single file with no
-  duplication. For implementations whose persistence is richer than the
-  canonical state (e.g. a Cartesi Machine wrapping app), `create_dump`
-  writes the full machine state alongside a separate canonical-state file
-  under the same prefix.
-
-The recovery checkpoint and canonical comparison representation differ by app:
-
-| Engine | Recovery checkpoint | Canonical comparison file |
-|---|---|---|
-| Toy wallet | SSZ wallet state | The same SSZ file, also returned by canonical inspect |
-| Cartesi Machine wrapper | Full multi-file machine state | Deterministic app-state projection stored alongside it |
-| Native DEX design | Fixed-memory state `M` plus any required resumable metadata | Canonical `M`, matching the designated drive in the canonical machine |
-
-The DEX row describes the integration requirement, not a verified private
-implementation. The current watchdog reads canonical inspect output; direct
-comparison against a canonical drive remains separate watchdog work. A native
-adapter does not need to implement the Rust canonical inspection trait to serve
-its checkpoint's comparison file.
-
-CoW is an implementation choice within checkpoint creation and restore. Shared
-physical extents are compatible with the contract; shared mutable bytes are
-not. The sequencer does not prescribe a filesystem clone primitive or expose
-engine flush/reopen steps.
+This document owns the wallet's application-state bytes, implemented by
+[`wallet_snapshot.rs`](../../examples/app-core/src/wallet_snapshot.rs).
+The [Application contract](../protocol/application-contract.md#6-checkpoint-lifecycle)
+owns the dump methods, durability, and independent restoration;
+[lifecycle.md](lifecycle.md) owns the enclosing artifact, metadata, selection,
+and retention.
 
 ## Toy Wallet Layout
 
@@ -87,6 +17,13 @@ and its canonical state coincide; one write per `create_dump`.
 {prefix}/
   state    SSZ-encoded WalletSnapshot bytes
 ```
+
+Here `prefix` is the app-owned `state` directory inside the sequencer's dump
+directory. Thus the wallet file is `dumps/<id>/state/state`. The surrounding
+`info.toml` and exported `checkpoint.toml` use the sequencer's metadata format
+version; that version does not identify the wallet's SSZ schema. Application
+progress is embedded in the wallet bytes. History identity and acceptance
+metadata come from the sequencer; see [application history](../protocol/application-history.md).
 
 ## Toy Wallet Wire Format
 
@@ -114,9 +51,6 @@ and its canonical state coincide; one write per `create_dump`.
   reflects, so it must live in the canonical state bytes (both the
   bare-metal and canonical-machine sides advance it identically).
 
-`last_executed_safe_block` was added before any environment was deployed; there
-is a single, unversioned schema today (see [Versioning](#versioning)).
-
 ### Determinism
 
 `WalletApp` stores balances and nonces in `HashMap`s, so iteration order
@@ -137,21 +71,16 @@ The decoder rejects:
 - Malformed SSZ bytes (any decode error from the SSZ library).
 - A snapshot containing two entries in `balances` with the same address.
 - A snapshot containing two entries in `nonces` with the same address.
+- Zero `executed_input_count` with a nonzero `last_executed_safe_block`.
 
-The duplicate-address checks exist to keep the encoded bytes canonical:
-without them, multiple distinct byte sequences could decode to the same
-logical state (the second entry would silently overwrite the first),
-breaking the property that watchdog-side and sequencer-side bytes are
-comparable.
+Duplicate checks prevent an entry from silently overwriting another during
+restore. The decoder accepts unique entries in any order; encoding the restored
+state sorts them. Deterministic emitted bytes do not imply that the decoder
+accepts only that ordering.
 
 ## Versioning
 
-There is a single, unversioned schema: `WalletSnapshot`. The encoded bytes carry
-no leading version tag, and — because there is no backward-compatibility
-requirement yet (no long-lived deployment whose dumps a newer binary must read) —
-the struct name carries no version suffix either. An earlier draft distinguished
-a `V1`/`V2` pair (the `last_executed_safe_block` field was added before any
-environment existed); that split was collapsed since no `V1` dumps ever survived.
+There is one SSZ schema, `WalletSnapshot`, with no leading version tag.
 
 If a future change ever needs to break the wire format against live dumps:
 
@@ -165,23 +94,7 @@ Until then, do not reorder, repurpose, or reinterpret existing fields in place.
 
 ## Trust Model
 
-The dump file is part of the sequencer's persistent data directory and
-shares its trust boundary. An attacker with write access to the data
-directory has already won; no integrity tag, checksum, or HMAC is
-included on the snapshot bytes for this reason. Consumers that obtain
-the bytes via a less trusted channel (e.g. a future peer-to-peer
-distribution mechanism) would need to add an outer integrity layer; the
-format itself does not provide one.
-
-## Out of Scope
-
-This document deliberately does not define:
-
-- When the inclusion lane decides to take a snapshot.
-- How dumps are registered, selected by acceptance, or
-  garbage-collected.
-- The on-the-wire archive format for streaming a dump over HTTP.
-- Inspect-state procedures on other implementations (Cartesi Machine,
-  bare-metal DEX).
-- Cross-implementation determinism test vectors (will land when a
-  second implementation of the wallet exists to validate against).
+The file shares the persistent data directory's
+[trust boundary](../threat-model/README.md). Its bytes contain no integrity tag,
+checksum, or HMAC. Distribution through a less trusted channel would require
+an outer integrity mechanism.

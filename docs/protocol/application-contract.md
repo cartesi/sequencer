@@ -34,6 +34,8 @@ Before an apply hook, the boundary computes the checked expected successor.
 After `Ok`, it asserts that the engine reports exactly that successor and
 returns the input's pre-execution count as its history offset. An engine may
 use `ApplicationProgress::advance` or implement the same transition natively.
+Adapters report the engine-owned progress rather than maintaining a separate
+count or clock mirror.
 Overflow fails before the hook runs. An error defines no successor: callers
 terminate the execution path and discard the instance, without attempting to
 roll back or inspect partially updated state.
@@ -55,6 +57,9 @@ Validation is read-only even though it may run on a different schedule during
 live execution, canonical execution, and replay. State changes happen through
 apply hooks; dump creation may change backing resources but preserves logical
 state.
+
+Wrapping an existing engine must preserve its transaction encoding,
+rejection/inclusion semantics, and canonical state bytes.
 
 `Application: Send + Sized` permits moving the engine to the lane's blocking
 worker. It requires neither `Sync` nor `Clone`: the lane owns one mutable
@@ -117,7 +122,8 @@ execution offsets, checked during catch-up.
 
 HTTP snapshot metadata and mandatory WS claims carry the history version and
 this count. Both restart and subscriber replay read the same current application
-sequence; see the [API contract](../../README.md).
+sequence. The [history guide](application-history.md) owns coordinates and
+replica bootstrap; the [API contract](../../README.md) owns wire shapes.
 
 ### 5. Operational capacity for L1 reconciliation
 
@@ -138,8 +144,18 @@ or measured checkpoint latency demonstrates the need.
 A **recovery checkpoint** contains everything needed to resume the engine.
 A **canonical comparison file** contains the deterministic state the watchdog
 compares against the canonical application. They may be the same file; a
-machine checkpoint may instead contain a separate app-state projection. The
-[format contract](../snapshots/format.md) describes three relevant layouts.
+machine checkpoint may instead contain a separate app-state projection.
+
+| Engine | Recovery checkpoint | Canonical comparison file |
+|---|---|---|
+| Wallet | SSZ wallet state | The same SSZ file, also returned by canonical inspect |
+| Cartesi Machine wrapper | Full multi-file machine state | Deterministic app-state projection stored alongside it |
+| Native DEX design | Fixed-memory state `M` plus required resumable metadata | Canonical `M`, matching the designated drive in the canonical machine |
+
+The DEX row describes an integration requirement, not a verified private
+implementation. The [watchdog guide](../watchdog/README.md) owns comparison
+transport and support; the [wallet format](../snapshots/format.md) owns its SSZ
+representation.
 
 - `create_dump(&mut self, prefix)` creates a checkpoint at an absent path,
   which may become a file or directory. On `Ok`, all files and directory
@@ -177,26 +193,3 @@ implementation. `CanonicalState::canonical_snapshot_bytes` is a separate
 inspection trait required by the shared Rust scheduler's inspection method and
 canonical harness, not by the native sequencer. Human-readable debugging state
 also stays on the concrete application.
-
-## Adapter migration
-
-1. Remove the capability parameters and mutable progress accessor. Return the
-   native count/clock pair from `progress()` without a Rust-side mirror.
-2. Advance both fields inside each successful native apply transition,
-   including no-ops. Keep validation pure and map its fatal failures to
-   `AppError`, with expected rejection as `Ok(ValidationOutcome::Reject(...))`.
-3. Change checkpoint creation to `&mut self` and establish durable, immutable
-   checkpoints with independent restores. Preserve existing canonical bytes.
-4. Implement `CanonicalState` only where canonical inspection needs it.
-   Remove any `Clone` or `Sync` added solely to satisfy the old host bounds;
-   justify `Send` against the native engine's ownership contract.
-5. Return the stable payload bound from `max_method_payload_bytes()` rather
-   than an associated constant. Keep checkpoint artifacts self-contained so
-   recursive filesystem deletion disposes of them without an application hook.
-
-Changing these Rust interfaces preserves transaction encoding, expected
-rejection semantics, snapshot bytes, scheduler ordering, and the database
-schema. Fatal `AppError` propagation is an intentional exception: validation
-and execution failures discard the engine rather than becoming a rejection
-or an included no-op. The host's terminal-versus-retryable classification
-still applies.
