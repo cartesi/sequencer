@@ -1,4 +1,4 @@
-# Dump / `Application` API — Design Draft (Track 6)
+# Historical dump / `Application` proposal (Track 6)
 
 **Status: superseded by the 2026-09-09 design decision.** Preserved as the
 original proposal; its public clone/flush machinery was not adopted. The

@@ -1,7 +1,7 @@
 # Watchdog Design Notes
 
 The watchdog is an independent off-chain safety monitor. It advances a
-canonical Cartesi Machine from L1 inputs, inspects the resulting SSZ snapshot,
+canonical Cartesi Machine from L1 inputs, inspects its application-state bytes,
 and byte-compares it with the sequencer's `GET /finalized_state` response at
 the same finalized `inclusion_block`.
 
@@ -30,7 +30,7 @@ Each tick:
 3. Exits cheaply if the finalized block is unchanged.
 4. Fetches L1 `InputAdded` logs for the open block range.
 5. Advances the CM, inspects state, fetches `GET /finalized_state`, and compares
-   raw SSZ bytes.
+   raw bytes (SSZ for the wallet).
 6. Writes a new checkpoint only after a successful compare.
 
 There is no advance-only mode. Advancing the CM is just an implementation step
@@ -48,7 +48,7 @@ safe-input sync. For every
 at/above-anchor landing the mirrored scheduler accepts, it requires a
 byte-identical valid local sealed batch at that nonce. A foreign or mismatched
 landing persists `canonical_divergence`, which freezes the accepted frontier
-and finalized-snapshot promotion
+and the selection of newer accepted comparison checkpoints
 ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
 The offending landing therefore normally never produces a newer
 `/finalized_state/inclusion_block` for the watchdog to compare. Under the

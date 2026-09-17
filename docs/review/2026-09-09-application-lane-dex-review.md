@@ -27,7 +27,7 @@ cherry-picked into the main implementation.
 
 The private DEX scheduler and native engine are still unavailable. Reference
 bridge tests verify the proposed seam, not private engine conformance. DEX
-conformance and the [Track 3 history API](../plans/2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff)
+conformance and the [Track 3 history API](../plans/2026-07-track3-feed-replay-design.md)
 remain follow-ups. This review establishes reference integration coverage;
 it does not establish that the Application surface is production-proven.
 

@@ -25,7 +25,10 @@ For **local development only** (Anvil + `sequencer-devnet`, CI smoke tests), use
                     └─────────────┘   └────────────────┘
 ```
 
-The watchdog never substitutes for the sequencer. It reads **finalized SSZ** the sequencer already committed and independently replays L1 through the canonical CM.
+The watchdog independently replays L1 through the canonical CM and compares
+application-state bytes with the sequencer's accepted checkpoint. The wallet
+uses SSZ. The [runtime contract](README.md#runtime-contract) explains block
+positioning and how the `/finalized_state` name relates to safe acceptance.
 
 ---
 
@@ -43,8 +46,12 @@ Verify snapshot API before CM bootstrap:
 
 ```bash
 curl -sS -o /dev/null -w "%{http_code}\n" "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
-# expect 200 when a finalized snapshot exists (404 = not promoted yet or wrong host)
+# expect 200 when a comparable checkpoint exists
 ```
+
+A genesis baseline is comparable immediately. A rebuilt baseline returns 404
+until a new batch is accepted; also check for a wrong host or tier. See
+[snapshot selection](../snapshots/lifecycle.md#acceptance-and-comparison).
 
 ### 2. Watchdog runtime (release image or local build)
 
@@ -156,7 +163,7 @@ Today `WalletApp::default()` / `WalletConfig::sepolia()` align with Sepolia stag
 | `CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS` | InputBox on that L1 ([Cartesi deployed contracts](https://docs.cartesi.io/cartesi-rollups/2.0/deployment/self-hosted.md); same lowercase normalization) |
 | `CARTESI_WATCHDOG_STATE_DIR` | Persistent volume on watchdog host. If the path embeds an address, use **lowercase** — Linux paths are case-sensitive and EIP-55 vs lowercase create sibling dirs |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | Bootstrap CM snapshot (`init` only) |
-| `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block that bootstrap snapshot represents (= finalized `inclusion_block` at bootstrap) |
+| `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | L1 block through which the trusted bootstrap CM has consumed all inputs; at or before the current comparison target |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | Chain id label for `status.prom` metrics (prefer set at `init`; optional auto-detect via `eth_chainId` when L1 endpoint is present at `init`) |
 | `CARTESI_WATCHDOG_METRICS_FILE` | Override path for the Prometheus textfile written by each `tick` |
 | `CARTESI_WATCHDOG_LUA_DEPS` | `.deps/lua` |
@@ -166,21 +173,31 @@ The sequencer discovers and pins `input_box_address` at startup; use the same va
 
 ### 5. Initialize watchdog state (first run on a live chain)
 
-On a long-lived deployment, **`CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0` is usually wrong** unless finalized state is still at genesis.
+The bootstrap must be a trusted **whole CM checkpoint** after all inputs
+through its declared L1 block. It need not match the sequencer's current
+comparison block: tick replays the gap. `SAFE_BLOCK=0` is valid for a genesis
+image even on an old deployment, but replaying the full history can be costly.
 
 Pick one:
 
-1. **Ops hands off** a CM snapshot directory + block number matching current finalized `inclusion_block`, or
+1. **Ops hands off** a trusted CM snapshot directory + its covered block number, or
 2. **Watchdog reuses** `CARTESI_WATCHDOG_STATE_DIR` from a prior run on this deployment, or
-3. **Replay from genesis** (only for new rollups / low block height — slow).
+3. **Replay from genesis** (potentially slow).
+
+The sequencer's `/finalized_state` comparison file and app-owned snapshot
+archives are different artifacts; neither is automatically a CM bootstrap.
+`init` trusts the supplied checkpoint and block without comparing them against
+the sequencer. If the first tick sees that same block, it exits idle. See
+[the detection boundary](design-notes.md#watchdog-state).
 
 Run `init` once to store the bootstrap CM snapshot into the watchdog state
 layout. Re-running `init` on a **complete** already-initialized state directory
 is a no-op success (exit `0`), matching `sequencer setup` — safe for process
-supervisors that always invoke init before tick. If `head.json` exists but
-`config.json` or the selected snapshot is missing/corrupt, `init` fails (exit
-`1`) and asks you to wipe `state_dir` and re-run — it will not certify an
-unusable state. The L1 RPC URL is not persisted — each `tick` reads
+supervisors that always invoke init before tick. It validates the saved
+metadata and that the selected snapshot directory is nonempty; it does not
+reload an existing CM checkpoint to prove it usable. Missing or malformed
+metadata and missing/empty snapshots fail with exit `1`. The L1 RPC URL is not
+persisted — each `tick` reads
 `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` so it can rotate without editing
 state. If `CARTESI_WATCHDOG_BLOCKCHAIN_ID` is unset at `init`, auto-detect also
 needs that endpoint present then (prefer setting the chain id explicitly):
@@ -202,8 +219,8 @@ budget.
    `checkpoints/<safe_block>/`.
 2. If `head.json` is missing: run `sequencer-watchdog init` with
    `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` and `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
-   set to a CM snapshot whose safe block equals the sequencer's current
-   finalized `inclusion_block`, then run `tick`.
+   set to a trusted CM checkpoint and its covered block, at or before the
+   current comparison target, then run `tick`.
 3. Schedule `sequencer-watchdog init && sequencer-watchdog tick` (init is a
    no-op when state is already complete).
 4. If `head.json` exists but `config.json` or the selected snapshot is
@@ -224,7 +241,7 @@ last-tick gauges — Prom already timestamps samples).
 
 Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` so `chain` is labeled. If unset,
 `init` queries `eth_chainId` from `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` and
-persists the result. At `tick`, the env var overrides a missing persisted value;
+persists the result. At `tick`, the env var takes precedence over the persisted value;
 the exit path never blocks on RPC (falls back to `unknown` only when neither
 source is set).
 
@@ -262,7 +279,7 @@ Prometheus push/pull) or on the process exit code. If the process is killed
 mid-tick, `status.prom` keeps the last completed value until the next run.
 
 ```bash
-sequencer-watchdog tick   # exit 0 = clean/idle, 1 = transient, 2 = divergence
+sequencer-watchdog tick   # 0 = passed/idle, 1 = retry or operator error, 2 = mismatch/regression
 ```
 
 `sequencer-watchdog` wraps `init` and `tick` with a non-blocking `flock` on
@@ -271,7 +288,8 @@ dies. Use the scheduler's non-overlap primitive as well (for example systemd or
 Kubernetes CronJob `concurrencyPolicy: Forbid`). A leftover `run.lock` path is
 only a lock handle; by itself it does not mean a lock is held.
 
-When `inclusion_block` ≤ the watchdog checkpoint, the runner only hits `/finalized_state/inclusion_block` and skips L1/CM work.
+An unchanged `inclusion_block` exits idle; a lower block reports
+`inclusion_block_regressed` and exits `2`. Both skip L1/CM work.
 
 ---
 
@@ -299,7 +317,7 @@ export CARTESI_WATCHDOG_APP_ADDRESS="0x..."
 export CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS="0x..."
 export CARTESI_WATCHDOG_STATE_DIR="/var/lib/watchdog/state-sepolia"
 export CARTESI_WATCHDOG_CM_SNAPSHOT_DIR="/path/to/canonical-machine-image-sepolia"
-export CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<finalized inclusion_block at bootstrap>"
+export CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK="<L1 block covered by the CM checkpoint>"
 export CARTESI_WATCHDOG_LUA_DEPS="/path/to/sequencer/.deps/lua"
 ```
 
@@ -308,7 +326,7 @@ export CARTESI_WATCHDOG_LUA_DEPS="/path/to/sequencer/.deps/lua"
 If your team runs the sequencer on Sepolia (not only the public endpoint):
 
 1. `sequencer` / release binary with Sepolia `CARTESI_SEQUENCER_*` (chain id, app address, batch submitter key, L1 RPC).
-2. Inclusion lane promotes finalized snapshots when L1 safe advances — required for `/finalized_state` 200.
+2. Safe accepted batches select comparison checkpoints; genesis is also comparable. A rebuilt baseline needs a new accepted batch before `/finalized_state` returns 200.
 3. Snapshot routes on an **internal** bind / port reachable by the watchdog host.
 4. Sequencer binary built with **`WalletApp::new(WalletConfig::sepolia())`** (see `sequencer-devnet` vs production binary choice in your release pipeline).
 
@@ -323,7 +341,7 @@ When the rollup runs on Ethereum mainnet, **reuse the same operator checklist ab
 | L1 RPC | Production-grade archive provider; rate limits matter for wide `getLogs` ranges |
 | Contracts | Mainnet InputBox, application, portals from production deployment manifest |
 | CM image | Build from production app/scheduler artifacts (mainnet wallet constants when defined in app-core) |
-| Schedule cadence | A cron/timer interval of 300s+ is fine; finalized promotion follows mainnet safe head |
+| Schedule cadence | Choose the alert delay you can tolerate; new comparison checkpoints follow safe batch acceptance |
 | Security | Stricter firewall between public ingress and internal snapshot tier; secrets management for RPC credentials |
 | Bootstrap | Almost always ops-provided CM snapshot or continued state dir — not genesis replay |
 
@@ -333,35 +351,35 @@ There is no `just devnet-for-watchdog` or automated harness on mainnet; treat Se
 
 ## Compare Cycle Behavior (All Live Chains)
 
-Same on Sepolia and mainnet:
-
-1. Load watchdog checkpoint from `head.json`.
-2. `GET /finalized_state/inclusion_block` — if unchanged, **stop** (cheap).
-3. If advanced: `eth_getLogs` on InputBox for `(last_block+1)..inclusion_block`.
-4. Advance CM incrementally; `inspect` → SSZ bytes.
-5. `GET /finalized_state` → SSZ bytes.
-6. Raw compare; emit `watchdog_event` + non-zero exit on mismatch.
-7. Write new CM checkpoint on success.
-
-Details: [`README.md`](README.md), [`docs/snapshots/lifecycle.md`](../snapshots/lifecycle.md).
+The [runtime contract](README.md#runtime-contract) is the same on Sepolia and
+mainnet: poll the comparison block, replay new inputs, compare bytes at the
+same block, then save a checkpoint. It defines idle, regression, and retry
+behavior when the comparison target moves during a tick.
 
 ---
 
 ## Checkpoint disk usage and backups
 
-Each successful promotion stores a full CM snapshot under
-`$CARTESI_WATCHDOG_STATE_DIR/checkpoints/<block>/`, and the watchdog **keeps only
-the selected one** — after the atomic `head.json` flip it deletes the
-checkpoint it superseded (crash-safe: `head.json` always names a complete
-checkpoint). Local disk therefore stays bounded at a single snapshot; no
-operator cleanup is required.
+Each successful comparison stores a full CM snapshot under
+`$CARTESI_WATCHDOG_STATE_DIR/checkpoints/<block>/`, then atomically replaces
+`head.json` and attempts to delete its predecessor. Pruning is best effort:
+failed or interrupted writes/prunes can leave extra directories, so disk use
+is not strictly bounded to one snapshot. The
+[checkpoint crash model](design-notes.md#checkpoint-crash-model) owns the
+pointer-swap sequence and its current lack of file/directory fsync.
 
-For backups / rollback history, schedule the watchdog tick (it runs one cycle and
-exits) and **after it exits** `aws s3 sync $CARTESI_WATCHDOG_STATE_DIR/checkpoints/
-s3://…` (without `--delete`). Because the process has exited there is no race
-with its store or prune, and omitting `--delete` **accumulates a per-block
-history in S3** while local disk stays at one snapshot. Restore feeds a chosen
-snapshot back through the watchdog/sequencer recovery workflow.
+Run tick and backup sequentially in the **same nonoverlapping scheduled job**,
+so the next tick cannot store or prune while backup is reading. For a complete
+watchdog-state backup, retain `config.json`, `head.json`, and the selected
+checkpoint together. Alternatively, syncing `checkpoints/` to object storage
+without deletion accumulates a per-block CM history; restore a chosen snapshot
+with its manifest's block through watchdog `init`.
+
+Sequencer recovery takes a native application archive with an acceptance
+receipt, exported by `/finalized_snapshot`. Do not treat a watchdog CM
+checkpoint as that archive. The
+[snapshot backup workflow](../snapshots/lifecycle.md#http-and-recovery-exports)
+owns this separate restore path.
 
 ## Sequencer restart policy
 
@@ -410,8 +428,8 @@ unclassified restart-with-backoff. Operational notes:
 |---------|----------------|
 | `/finalized_state` missing on public URL | Wrong tier — use internal `CARTESI_WATCHDOG_SEQUENCER_URL` |
 | `failed to load watchdog head` / missing `head.json` | Uninitialized or wiped `STATE_DIR` — see [Missing or corrupt head.json](#missing-or-corrupt-headjson-tick-exit-1) |
-| `state_mismatch` | CM image / wallet constants ≠ sequencer build; or wrong bootstrap block |
-| `inclusion_block_regressed` | Stale watchdog state vs sequencer finalized head |
+| `state_mismatch` | Sequencer/canonical-state disagreement; also verify CM image, wallet constants, and trusted bootstrap block |
+| `inclusion_block_regressed` | Watchdog checkpoint is ahead of the advertised comparison block; inspect deployment identity, bootstrap block, and sequencer recovery history before reinitializing |
 | Slow or failing `getLogs` | RPC range limits — watchdog uses same partition strategy as sequencer |
 | Transient `L1 RPC latest head lags target block` | Fallback RPC is behind the sequencer's finalized inclusion block; watchdog retries until the node has indexed through the target (avoids truncated `eth_getLogs` false mismatches) |
 | `inspect endpoint not implemented` | Rebuild CM image for the correct chain target |

@@ -27,7 +27,7 @@ Step-by-step guide for running the watchdog alongside a **local** `sequencer-dev
 | Process | Role |
 |---------|------|
 | **Anvil** | Local L1 with Cartesi rollups contracts pre-deployed (`just setup`) |
-| **sequencer-devnet** | Off-chain sequencer (wallet app, batches, snapshot promotion) |
+| **sequencer-devnet** | Off-chain sequencer (wallet app, batches, accepted comparison checkpoints) |
 | **watchdog** | Polls `/finalized_state/inclusion_block`, replays L1 inputs in CM, compares SSZ to `/finalized_state` |
 
 The sequencer exposes (operator-internal, same HTTP listener today):
@@ -109,9 +109,13 @@ A brand-new Anvil history still needs a **fresh** `$CARTESI_WATCHDOG_STATE_DIR`
 (e.g. `rm -rf /tmp/watchdog-state-devnet`) and a new `init` — old checkpoints
 won't match.
 
-### Wait for finalized snapshot
+### Check comparison availability
 
-The watchdog needs a **finalized** SSZ dump. Right after boot, the cheap endpoint may return **404** until the sequencer has promoted a snapshot.
+The watchdog needs a comparable checkpoint from `/finalized_state`. A fresh
+genesis setup already provides one at block zero. A rebuilt baseline is not a
+comparison checkpoint: after cockroach recovery these routes return **404**
+until a new batch is accepted. See
+[snapshot selection](../snapshots/lifecycle.md#acceptance-and-comparison).
 
 In another shell (use the printed `CARTESI_WATCHDOG_SEQUENCER_URL`):
 
@@ -119,7 +123,11 @@ In another shell (use the printed `CARTESI_WATCHDOG_SEQUENCER_URL`):
 curl -s "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
 ```
 
-When you see JSON like `{"inclusion_block":0,"executed_input_count":0}` (numbers may differ), the watchdog can compare. If it stays 404 for a long time, check sequencer logs in `tests/e2e/results/` and that L1 is mining (devnet Anvil auto-mines by default).
+JSON such as `{"inclusion_block":0,"executed_input_count":0}` confirms that the
+endpoint has a comparison checkpoint. A tick compares only after the reported
+block advances beyond its own CM checkpoint; an equal block exits idle.
+Unexpected 404 on a fresh devnet warrants checking the URL and sequencer logs
+in `tests/e2e/results/`.
 
 Optional — inspect SSZ size:
 
@@ -141,11 +149,17 @@ export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
 ./watchdog/sequencer-watchdog tick
 ```
 
-Success: exit **0**. If finalized has advanced, stderr ends in `compare pass complete`; if it has not, the tick exits idle after the cheap poll.
+Success: exit **0**. If the comparison block has advanced, stderr ends in
+`compare pass complete`; if it is unchanged, the tick exits idle after the
+cheap poll. `init` and an idle tick do not verify the bootstrap state.
 
-Exit codes from `sequencer-watchdog tick`: **0** clean (or idle — finalized unchanged), **1** transient failure (RPC/CM/network after retries), **2** deterministic divergence (`watchdog_event` emitted on stderr before exit). Each tick writes `$CARTESI_WATCHDOG_STATE_DIR/status.prom` — see [`README.md` — Metrics](README.md#metrics-statusprom).
+Exit codes from `sequencer-watchdog tick`: **0** comparison passed or idle,
+**1** retries exhausted or operator/configuration error, **2** state mismatch
+or inclusion-block regression (`watchdog_event` emitted on stderr). Each tick
+writes `$CARTESI_WATCHDOG_STATE_DIR/status.prom` — see
+[`README.md` — Metrics](README.md#metrics-statusprom).
 
-The watchdog tick runs **one cycle per process and exits** — re-run it on a timer/cron for continuous monitoring. When `inclusion_block` has not advanced since the watchdog checkpoint, the cycle **skips** L1/CM work (idle-cheap) and exits 0.
+The watchdog tick runs **one cycle per process and exits** — re-run it on a timer/cron for continuous monitoring.
 `sequencer-watchdog` takes a non-blocking `flock`; production schedulers should
 also prevent overlapping ticks with systemd or Kubernetes CronJob
 `concurrencyPolicy: Forbid`.
@@ -161,7 +175,7 @@ Local paths A–B do **not** apply to public L1. There is no `just devnet-for-wa
 | You spawn Anvil + `sequencer-devnet` | Sequencer already run by ops |
 | `canonical-machine-image` (devnet guest) | `canonical-machine-image-sepolia` (today); mainnet guest when released |
 | Snapshot HTTP on localhost | **Internal** operator network only |
-| Genesis bootstrap (`safe_block=0`) usual | Bootstrap must match **current** finalized `inclusion_block` |
+| Genesis bootstrap (`safe_block=0`) usual | Trusted CM checkpoint at or before the current comparison block; tick replays the gap |
 
 **Sepolia is the dress rehearsal for mainnet** — same checklist, alarms, checkpoint volume, and firewall rules; only chain IDs, RPC URLs, and contract addresses change.
 
@@ -200,9 +214,9 @@ See `watchdog/config.lua` for the full list.
 | `cartesi Lua module is required` | Install Cartesi Machine; use nix/direnv shell; ensure `cartesi-machine` on `PATH` |
 | `inspect endpoint not implemented` | Rebuild CM image: `just canonical-build-machine-image` |
 | CM inspect ~27 bytes / JSON in error | Stale image (old JSON inspect); rebuild: `just canonical-build-machine-image` |
-| HTTP 404 on `/finalized_state/inclusion_block` | Sequencer not promoted yet; wait or drive L1 + batches |
+| HTTP 404 on `/finalized_state/inclusion_block` | Wrong URL, or no comparable checkpoint after a rebuild; a new accepted batch makes the rebuilt history comparable |
 | `state_mismatch` at genesis | Wrong `CARTESI_WATCHDOG_CM_SNAPSHOT_*` or stale CM image vs sequencer build |
-| `inclusion_block_regressed` | Watchdog state ahead of sequencer (reset state dir or fix bootstrap block) |
+| `inclusion_block_regressed` | Watchdog checkpoint is ahead of the advertised comparison block; inspect deployment identity, bootstrap block, and sequencer recovery history before reinitializing |
 | `flock` lock conflict | Another tick is still running or the scheduler allows overlap. With the container `flock`, a leftover `run.lock` path alone is harmless. |
 | `could not determine which binary to run` | Use `just test-watchdog-compare-harness` (not bare `cargo run -p rollups-e2e`) |
 | Harness `87 vs 76` or `27 vs 76` byte mismatch | Stale CM image and/or wrong fixture; see [harness troubleshooting](README.md#troubleshooting-just-test-watchdog-compare-harness) |

@@ -1,8 +1,15 @@
 # Watchdog
 
-The watchdog is an off-chain safety process that compares the sequencer's
-**finalized SSZ state dump** against state produced by the canonical Cartesi
-Machine at the same L1 inclusion block.
+The watchdog independently replays L1 inputs in the canonical Cartesi Machine
+and compares its application-state bytes with the sequencer's accepted
+checkpoint at the same L1 block boundary. The wallet's comparison format is SSZ;
+the watchdog itself only compares bytes.
+
+The `/finalized_state` name refers to the sequencer's latest **safe, accepted
+batch checkpoint**, not Ethereum's `finalized` tag or a state the watchdog has
+already verified. [Snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)
+owns checkpoint selection and why that application state is comparable at a
+whole L1 block boundary.
 
 ## Documentation
 
@@ -12,6 +19,7 @@ Machine at the same L1 inclusion block.
 | **[`getting-started.md`](getting-started.md)** | **Local dev only** — Anvil + `sequencer-devnet`, harness smoke, two-terminal flow |
 | This file | Architecture, modules, runtime contract, checkpoints, test commands |
 | [`staging-drills.md`](staging-drills.md) | Webhook smoke, synthetic alarms, staging compare daemon |
+| [`design-notes.md`](design-notes.md) | Detection boundaries and checkpoint crash model |
 | [`sepolia.md`](sepolia.md) | Redirect → [`operator-deployment.md`](operator-deployment.md) |
 
 ### Quick start (pick your environment)
@@ -44,6 +52,143 @@ overlapping ticks
 (`flock`, systemd, or Kubernetes `concurrencyPolicy: Forbid`).
 
 Details: **[`getting-started.md`](getting-started.md)**.
+
+## Runtime Contract
+
+The watchdog consumes two operator-internal routes:
+
+- `GET /finalized_state/inclusion_block` — cheap JSON `{ inclusion_block, executed_input_count }` polled every compare tick.
+- `GET /finalized_state` — streams the comparison file (`application/octet-stream`); the watchdog reads its `X-Inclusion-Block` and `X-Executed-Input-Count` headers.
+
+The sequencer's genesis baseline is immediately comparable. A rebuilt baseline
+is a restore artifact; these routes return 404 until a new accepted batch
+provides a comparison checkpoint. The [snapshot lifecycle](../snapshots/lifecycle.md)
+owns availability, response metadata, and artifact leases.
+
+**Positioning is by L1 block.** If `inclusion_block` equals the watchdog
+checkpoint's `safe_block`, the tick exits idle: no state download, L1 fetch, or
+CM work. A lower block is a terminal `inclusion_block_regressed` event. For a
+higher block, the watchdog replays every InputBox input from `safe_block + 1`
+through that block, then downloads the comparison file. If its block header differs from the
+polled target, the tick retries rather than comparing different boundaries.
+
+The client parses `executed_input_count` but does not use it as a replay cursor
+or compare it between responses. It does not consume history era/generation
+headers or WebSocket events. Its independently replayed L1 checkpoint is
+separate from the snapshot-plus-feed protocol described in
+[Application history](../protocol/application-history.md).
+
+The CM's `state` inspect query must return exactly one report. The watchdog
+compares those bytes directly with the downloaded file, without decoding or
+canonicalizing either side.
+
+For the toy wallet app, SSZ encoding lives in `examples/app-core/src/wallet_snapshot.rs`
+and is shared by `WalletApp::create_dump`, `CanonicalState::canonical_snapshot_bytes`,
+and the canonical scheduler's `Inspect` handler (`examples/canonical-app`).
+
+## Checkpoints
+
+V1 persists the whole Cartesi Machine checkpoint, including scheduler state;
+it does not persist fetched L1 inputs. This is different from the sequencer's
+app-owned restore archives (`/latest_snapshot` and `/finalized_snapshot`) and
+from its comparison file (`/finalized_state`). The watchdog downloads neither
+archive.
+
+`manifest.json` records `safe_block` (the L1 block through which the CM has
+consumed all inputs), timestamp, and optionally the CM image hash. A new
+checkpoint directory is written first, then `head.json` is atomically replaced
+to point at it. [Design notes](design-notes.md#checkpoint-crash-model) own the
+state layout, best-effort pruning, and crash guarantees.
+
+`init` stores a trusted operator-provided CM snapshot and its declared block
+into this layout. That block may precede the sequencer's current comparison
+target: `tick` replays the intervening inputs. `init` does not compare against
+the sequencer, and a first tick at the same block exits idle; successful init
+or idle is not evidence of a state comparison. See the
+[accepted detection boundary](design-notes.md#watchdog-state).
+
+`tick` requires both `config.json` and `head.json`; it never bootstraps from env.
+`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` is not persisted in `config.json`, so
+operators can rotate RPC endpoints without rewriting watchdog state. It is
+required at `tick` for L1 reads, and optionally present at `init` when
+auto-detecting `CARTESI_WATCHDOG_BLOCKCHAIN_ID` via `eth_chainId` (prefer setting
+the chain id explicitly).
+
+Bootstrap inputs read by `init`:
+
+- `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR`
+- `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
+
+## How it runs
+
+The watchdog has two subcommands:
+
+```bash
+sequencer-watchdog init   # setup: writes config.json + head.json (idempotent if complete)
+sequencer-watchdog tick   # one compare cycle; schedule this
+```
+
+`tick` does one cycle per process, then exits — infra schedules re-runs
+(systemd timer / k8s CronJob) and reacts to the exit code. There is no daemon
+loop. `sequencer-watchdog` takes a non-blocking `flock` for `init`/`tick`;
+host scheduling should provide the same non-overlap guarantee. A tick follows
+the [runtime contract](#runtime-contract), writes a checkpoint only after a
+successful comparison, and emits `watchdog_event` on mismatch or regression.
+It atomically writes `status.prom` before exit.
+
+Runtime knobs:
+
+- `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`: current L1 JSON-RPC endpoint for tick (and optional at `init` for chain-id auto-detect).
+- `CARTESI_WATCHDOG_SEQUENCER_URL`: optional tick-time override of the URL persisted at `init` (useful when ephemeral ports change).
+- `CARTESI_WATCHDOG_BLOCKCHAIN_ID`: optional chain id label persisted at `init` for `status.prom` (prefer explicit; tick never queries `eth_chainId`).
+- `CARTESI_WATCHDOG_METRICS_FILE`: optional override for the Prometheus textfile path (default `$CARTESI_WATCHDOG_STATE_DIR/status.prom`).
+- `CARTESI_WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
+- `CARTESI_WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.
+
+## Metrics (`status.prom`)
+
+Each `tick` writes a [Prometheus textfile](https://github.com/prometheus/node_exporter#textfile-collector)
+before exiting. Operators scrape or push it from their side — the watchdog does
+not run an HTTP server.
+
+| Exit code | `state` label | Meaning |
+|-----------|---------------|---------|
+| `0` | `ok` | Compare passed, or idle (finalized unchanged) |
+| `1` | `warning` | Retryable failure after retries, or an operator/configuration error |
+| `2` | `failed` | State mismatch or inclusion-block regression |
+
+Gauges (labels `chain`, `app_address` on every series):
+
+- `cartesi_watchdog_status{state="ok|warning|failed"}` — exactly one series is `1`
+- `cartesi_watchdog_divergence_info{kind}` — only on exit `2`
+
+Exit codes map to `state` only (`0→ok`, `1→warning`, `2→failed`); we do not
+export a separate exit-code or last-tick gauge — Prometheus scrape/push already
+carries a sample timestamp.
+
+Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label. If unset,
+`init` queries `eth_chainId` from `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` and
+persists the result. At `tick`, the env var takes precedence over the persisted value;
+the exit path never blocks on RPC (defaults to `unknown` only when neither source
+is set). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../../tests/fixtures/watchdog_status_ok.prom),
+[`tests/fixtures/watchdog_status_failed.prom`](../../tests/fixtures/watchdog_status_failed.prom).
+
+Example after a clean tick:
+
+```prometheus
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="ok"} 1
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="warning"} 0
+cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="failed"} 0
+```
+
+Example Prometheus alert (pull or push gateway — operator choice):
+
+```promql
+cartesi_watchdog_status{state="failed"} == 1
+```
+
+Divergence playbook: **notify only**; manual intervention (see
+[`operator-deployment.md`](operator-deployment.md)).
 
 ## Host dependencies (`watchdog-lua-deps`)
 
@@ -112,7 +257,7 @@ Lua modules:
 - `metrics.lua`: Prometheus textfile (`status.prom`) built and written each tick.
 - `retry.lua`: bounded retry helper used by the runtime.
 - `runner.lua`: one compare cycle — cheap `/finalized_state/inclusion_block`
-  poll, then (when finalized advanced) L1 fetch, CM replay, SSZ compare,
+  poll, then (when the accepted checkpoint advances) L1 fetch, CM replay, byte comparison,
   checkpoint write.
 - `main.lua`: dispatches `init` and `tick`; `tick` exits `0`/`1`/`2` and writes `status.prom`.
 
@@ -134,136 +279,6 @@ this: its scan floor is the operator-supplied checkpoint
 (`CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`) or the last persisted `head.json`,
 and it performs no version witness. Do not copy the app-deployment floor into
 the Lua side without also porting the version witness that makes it sound.
-
-## Runtime Contract
-
-The sequencer exposes operator-internal snapshot routes (see `sequencer/src/egress/api/snapshot.rs`):
-
-- `GET /finalized_state/inclusion_block` — cheap JSON `{ inclusion_block, executed_input_count }` polled every compare tick.
-- `GET /finalized_state` — streams the finalized SSZ state file (`application/octet-stream`) with `X-Inclusion-Block` and `X-Executed-Input-Count` headers.
-
-**Idle optimization:** when `inclusion_block` has not advanced past the watchdog
-checkpoint's `safe_block`, the tick returns
-immediately — no `/finalized_state` download, no L1 `eth_getLogs`, no CM load/advance/inspect.
-
-The watchdog compares the finalized SSZ bytes with the bytes returned by CM
-inspect. It must not canonicalize either side before deciding pass/fail.
-
-For the toy wallet app, SSZ encoding lives in `examples/app-core/src/wallet_snapshot.rs`
-and is shared by `WalletApp::create_dump`, `CanonicalState::canonical_snapshot_bytes`,
-and the canonical scheduler's `Inspect` handler (`examples/canonical-app`).
-
-## Checkpoints
-
-V1 persists only the resulting Cartesi Machine checkpoint, not the fetched L1
-inputs.
-
-```text
-state_dir/
-  config.json
-  head.json
-  status.prom    # Prometheus textfile from the last tick (see Metrics below)
-  run.lock       # advisory lock handle; file existence is not lock state
-  checkpoints/
-    00000000000001234567/
-      snapshot/
-      manifest.json
-```
-
-`manifest.json` records `safe_block` (the L1 reference block the CM snapshot
-covers — the finalized `inclusion_block`), timestamp,
-and optionally the CM image hash. A new checkpoint directory is written first,
-then `head.json` is atomically replaced to point at it.
-
-`init` stores the operator-provided bootstrap CM snapshot into this layout. `tick`
-requires both `config.json` and `head.json`; it never bootstraps from env.
-`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` is not persisted in `config.json`, so
-operators can rotate RPC endpoints without rewriting watchdog state. It is
-required at `tick` for L1 reads, and optionally present at `init` when
-auto-detecting `CARTESI_WATCHDOG_BLOCKCHAIN_ID` via `eth_chainId` (prefer setting
-the chain id explicitly).
-
-- `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR`
-- `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
-
-## How it runs
-
-The watchdog has two subcommands:
-
-```bash
-sequencer-watchdog init   # setup: writes config.json + head.json (idempotent if complete)
-sequencer-watchdog tick   # one compare cycle; schedule this
-```
-
-`tick` does one cycle per process, then exits — infra schedules re-runs
-(systemd timer / k8s CronJob) and reacts to the exit code. There is no daemon
-loop. `sequencer-watchdog` takes a non-blocking `flock` for `init`/`tick`;
-host scheduling should provide the same non-overlap guarantee. Each tick:
-
-1. Loads the watchdog checkpoint from `head.json`.
-2. Polls `/finalized_state/inclusion_block`. If it has not advanced past a
-   watchdog checkpoint, exits `0` (idle). Otherwise:
-3. Streams and decodes `InputAdded` logs for the new block range.
-4. Replays each successful L1 partition into the in-process Cartesi Machine,
-   then inspects with query `state`.
-5. Byte-compares the SSZ report against `GET /finalized_state`; on match writes a
-   new checkpoint, on mismatch emits a `watchdog_event` and exits `2`.
-6. Atomically writes `$CARTESI_WATCHDOG_STATE_DIR/status.prom` (or
-   `CARTESI_WATCHDOG_METRICS_FILE`) before exit.
-
-Runtime knobs:
-
-- `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`: current L1 JSON-RPC endpoint for tick (and optional at `init` for chain-id auto-detect).
-- `CARTESI_WATCHDOG_SEQUENCER_URL`: optional tick-time override of the URL persisted at `init` (useful when ephemeral ports change).
-- `CARTESI_WATCHDOG_BLOCKCHAIN_ID`: optional chain id label persisted at `init` for `status.prom` (prefer explicit; tick never queries `eth_chainId`).
-- `CARTESI_WATCHDOG_METRICS_FILE`: optional override for the Prometheus textfile path (default `$CARTESI_WATCHDOG_STATE_DIR/status.prom`).
-- `CARTESI_WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
-- `CARTESI_WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.
-
-## Metrics (`status.prom`)
-
-Each `tick` writes a [Prometheus textfile](https://github.com/prometheus/node_exporter#textfile-collector)
-before exiting. Operators scrape or push it from their side — the watchdog does
-not run an HTTP server.
-
-| Exit code | `state` label | Meaning |
-|-----------|---------------|---------|
-| `0` | `ok` | Compare passed, or idle (finalized unchanged) |
-| `1` | `warning` | Transient failure after retries |
-| `2` | `failed` | Deterministic divergence |
-
-Gauges (labels `chain`, `app_address` on every series):
-
-- `cartesi_watchdog_status{state="ok|warning|failed"}` — exactly one series is `1`
-- `cartesi_watchdog_divergence_info{kind}` — only on exit `2`
-
-Exit codes map to `state` only (`0→ok`, `1→warning`, `2→failed`); we do not
-export a separate exit-code or last-tick gauge — Prometheus scrape/push already
-carries a sample timestamp.
-
-Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label. If unset,
-`init` queries `eth_chainId` from `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` and
-persists the result. At `tick`, the env var overrides a missing persisted value;
-the exit path never blocks on RPC (defaults to `unknown` only when neither source
-is set). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../../tests/fixtures/watchdog_status_ok.prom),
-[`tests/fixtures/watchdog_status_failed.prom`](../../tests/fixtures/watchdog_status_failed.prom).
-
-Example after a clean tick:
-
-```prometheus
-cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="ok"} 1
-cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="warning"} 0
-cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="failed"} 0
-```
-
-Example Prometheus alert (pull or push gateway — operator choice):
-
-```promql
-cartesi_watchdog_status{state="failed"} == 1
-```
-
-Divergence playbook: **notify only**; manual intervention (see
-[`operator-deployment.md`](operator-deployment.md)).
 
 ## Local Tests
 
