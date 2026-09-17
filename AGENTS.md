@@ -184,7 +184,7 @@ Paths below are relative to `sequencer/src/`:
 - **Frame** — ordering boundary; commits `safe_block` + user ops.
 - **Batch** — list of frames posted on-chain as one L1 transaction (SSZ-encoded).
 - **Inclusion lane** — the single ordering lane, with a latency-critical user-op regime and a slower L1-reconciliation regime ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)); the only writer of open batch/frame state ([I17](docs/invariants.md)) and the system's execution bottleneck.
-- **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Nonces are assigned by storage (structural `parent.nonce + 1`) when batches are closed; the submitter just reads them.
+- **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Storage assigns each batch's scheduler nonce at creation (`parent.nonce + 1`, or the deployment anchor for a root); the submitter reads it and selects L1 wallet nonces for submission.
 - **Danger detector** — polls `Storage::check_danger` and signals the process to stop so startup can recover or refuse. It reads local facts; it never writes the DB or talks to L1.
 - **Fee oracle** — setup pins and bootstraps a fixed price or Uniswap V3 TWAP source. The price informs future frame fees; an oracle-only outage is an accepted economic risk. The [threat model's actor table](docs/threat-model/README.md#actors-and-trust) owns the source assumptions and failure policy.
 - **Input reader** — ingests safe inputs from L1 InputBox and maintains the durable safe head, accepted-batch projection, and divergence marker in one atomic transaction (`sequencer/src/storage/l1_inputs.rs`); it hands the lane no in-memory cursor.

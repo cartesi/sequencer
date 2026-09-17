@@ -16,8 +16,8 @@ use super::l1_inputs::query_deployment_identity;
 use super::{DirectInputExecution, SafeInputRange};
 
 /// Insert a new batch. Nonce is derived from `parent_batch_index`:
-/// `parent.nonce + 1`, or 0 if `parent_batch_index` is None (genesis or
-/// post-cascade torn-state new Tip).
+/// `parent.nonce + 1`, or the deployment's anchor for a parentless root
+/// (genesis, cockroach recovery, or a fully invalidated branch).
 ///
 /// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
 /// The explicit form is used only by `initialize_open_state` to pin the
@@ -64,9 +64,7 @@ pub(super) fn insert_new_batch(
 fn compute_next_nonce(tx: &Transaction<'_>, parent_batch_index: Option<u64>) -> Result<u64> {
     match parent_batch_index {
         // A parentless root carries the deployment's batch-tree anchor nonce:
-        // 0 for a genesis deployment, N' for a cockroach-recovered one. This
-        // generalizes the old hard-coded 0; the `batch_tree_anchor` row defaults
-        // to 0, so genesis and post-cascade re-roots are unchanged. Mirrored by
+        // 0 for a genesis deployment, N' for a cockroach-recovered one. Mirrored by
         // `trg_enforce_nonce_contiguity`'s parentless arm.
         None => batch_tree_anchor_in(tx),
         Some(parent_bi) => {

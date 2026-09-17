@@ -97,7 +97,7 @@ impl Storage {
     /// warm resume and recovery batches use), so there is no cold-start drain.
     ///
     /// This unguarded form exists for test harnesses only. Production uses
-    /// `ensure_open_tip_for_recovery`, which reasserts the reducer facts in its
+    /// `ensure_open_tip_for_recovery`, which reasserts the startup facts in its
     /// write transaction. The lane only ever *loads* a Tip (fail-loud if
     /// absent); Cascade owns its own atomic reopen using the same mechanism.
     ///
@@ -471,7 +471,8 @@ pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
 }
 
 /// Capture the unaccounted range before creating its new frame, then attribute
-/// its external directs. Catch-up executes these rows before runtime admission.
+/// its external directs. After launch, lane catch-up executes these rows before
+/// processing queued user operations.
 fn insert_draining_tip_with_executions(
     tx: &Transaction<'_>,
     batch_index: Option<u64>,
