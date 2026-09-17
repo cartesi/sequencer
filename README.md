@@ -240,6 +240,9 @@ After each successfully applied input at offset `X`, persist the claim with
   including business failures and malformed-direct no-ops.
 - Recovery stops the process and disconnects subscribers. A reconnect must
   present its saved claim; offsets alone cannot distinguish a replaced suffix.
+- Shutdown or a feed read/send failure may disconnect without a WebSocket
+  Close frame. Resume from the saved claim after an unexpected disconnect;
+  a clean close is not required for safe replay.
 
 Message shapes:
 

@@ -371,7 +371,9 @@ by writer and are write-once (`0001_schema.sql`).
   same anchor via `open_fresh_tip_in_tx`'s `parent = None` path, after
   invalidating the old root — so only one *valid* parentless root ever exists,
   invalidated ones coexisting.
-- **Enforced by:** `trg_enforce_nonce_contiguity` — its parentless arm is an
+- **Enforced by:** the parent foreign key (enabled on every writer) rejects
+  dangling parents; `trg_enforce_nonce_contiguity` checks nonce succession.
+  Its parentless arm is an
   *exact* match `nonce == (SELECT nonce FROM batch_tree_anchor)` (tighter
   than a bare "must be 0"), plus an at-most-one-valid-parentless-root guard
   scoped to `invalidated_at_ms IS NULL`; `compute_next_nonce(None)` reads the

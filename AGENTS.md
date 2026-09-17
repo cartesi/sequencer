@@ -341,12 +341,11 @@ Keep three kinds of material distinct:
   must distinguish proposed behavior from implemented contracts. On completion,
   put the durable design in its owner and reduce the plan to its remaining work
   and links.
-- **Historical evidence** lives in review ledgers, explicitly marked historical
-  documents, and commit history. A review ledger is append-only while open.
-  When it closes, promote conclusions into current docs, record settled and
-  refuted proposals in the [review register](docs/review/register.md), and remove
-  process narration. Retained superseded proposals must say they are historical
-  and link to the current contract; they are evidence, not instructions.
+- **Review notes** are temporary working memory. Commit them when they help an
+  active review or handoff, then distill and delete them when that work ends.
+  The [review lifecycle](docs/review/README.md) owns the policy: unresolved work
+  stays in one register or active plan, durable reasoning in its current owner,
+  completed history in Git. Keep dated evidence only for a named ongoing use.
 
 **Record deliberate absence once**, at the seam where someone would re-add the
 mechanism, phrased as a positive design statement with its reason. Avoid removal
@@ -400,7 +399,7 @@ See [Running](README.md#running) for the two-phase `setup` / `run` workflow.
 - Run at least `cargo check` before finishing.
 - Read the relevant recovery guide and both current TLA+ models before touching
   recovery code, and the threat model before touching trust-boundary code.
-- Check [`docs/invariants.md`](docs/invariants.md) before changing anything it lists as load-bearing, and [`docs/review/register.md`](docs/review/register.md) for open findings in the code you're about to touch and for decisions already settled or refuted.
+- Check [`docs/invariants.md`](docs/invariants.md) before changing anything it lists as load-bearing, the owning design for its assumptions, and [`docs/review/register.md`](docs/review/register.md) for unresolved work in the code you're about to touch. Verify review claims against current code.
 
 ### Ask First
 
@@ -451,4 +450,4 @@ work reaches another boundary.
 | Submission fees or oracle pricing | [L1 fee policy](docs/l1-fee-policy.md) — estimation and replacement limits; [threat-model actor table](docs/threat-model/README.md#actors-and-trust) — oracle source and outage assumptions. |
 | Command setup or deployment configuration | [Running](README.md#running) and [config.rs](sequencer/src/commands/config.rs) — invocation, identity pinning, defaults, and validation. |
 | Watchdog development or operation | [Architecture](docs/watchdog/README.md); [local dev](docs/watchdog/getting-started.md) for Anvil; [operator deployment](docs/watchdog/operator-deployment.md) for Sepolia/mainnet. |
-| A new mechanism, simplification, or work spanning an active track | [Review register](docs/review/register.md) — relevant open findings and settled/refuted reasoning; [coordination tracks](docs/plans/2026-07-coordination-tracks.md) — remaining work and dependencies. Consult dated evidence when its reasoning is needed. |
+| A new mechanism, simplification, or work spanning an active track | Owning design and [invariants](docs/invariants.md) — reasons and assumptions; [review register](docs/review/register.md) — unresolved work; [coordination tracks](docs/plans/2026-07-coordination-tracks.md) — priorities and dependencies. Follow the [review lifecycle](docs/review/README.md) when recording conclusions. |

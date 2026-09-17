@@ -5,13 +5,15 @@ Scope: validate application-history commit
 a complete cold replica, and a same-host latency comparison against
 `91e25780854bb641c63135751f951f9f7ee1e744`.
 
+Retained for the [Track 3 integration gates](../plans/2026-07-track3-feed-replay-design.md):
+this is the wallet baseline against which native-engine and deployment results
+can be assessed. Replace or delete it when those decisions no longer use these
+measurements. It describes the named revisions, not ongoing validation of HEAD.
+
 ## Environment and canonical agreement
 
-The shared development flake was switched to emulator 0.20.0 using its previously
-recorded source, generated-files, and uarch hashes. The CLI, Lua module, and
-native library all resolved to the same Nix package. Existing unrelated Foundry
-edits were preserved; the shared flake lock was unchanged. This environment edit
-lives outside the sequencer repository.
+The CLI, Lua module, and native library used emulator 0.20.0 from the same Nix
+package in the shared development environment outside this repository.
 
 Rust 1.95.0, Lua 5.4.7, and Foundry 1.5.1 were used. A fresh devnet canonical
 image was built from this checkout with the pinned cross image and kernel;
@@ -34,14 +36,12 @@ All four selected canonical-machine gates passed:
 | `setup_recovery_round_trip_test` | Real `/finalized_snapshot` download, database wipe, `setup --recovery`, resumed execution, and independent CM comparison | 15.36 s |
 
 These are selected integration gates, not a claim that the entire E2E suite or
-private DEX adapter was tested. The existing 693-test host-suite result belongs
-to the implementation record in the register.
+private DEX adapter was tested.
 
 ## Cold replica
 
-Added `cold_replica_snapshot_backlog_live_recovery_test` and two small wallet
-replay helpers. The scenario passed in 18.12 seconds, including its test-owned
-120-second deadline. Its claims come from HTTP headers and consumed inputs,
+`cold_replica_snapshot_backlog_live_recovery_test` passed in 18.12 seconds,
+including its test-owned 120-second deadline. Its claims come from HTTP headers and consumed inputs,
 without querying storage for the consumer's history identity.
 
 The test restores a nonempty tar archive, deletes the downloaded source, and
@@ -58,17 +58,6 @@ The expected replacement branch retains the accepted prefix and replays only
 its retained L1 directs. Optimistic transfers disappear, and a new transfer at
 the recovered nonce succeeds.
 
-## Tooling fixes
-
-- `just doctor` preserves Lua's configured search paths, matching the production
-  watchdog. Its forced Linux-only environment variables hid the Nix Cartesi
-  module. The corrected doctor loads both lcurl and the new machine image.
-- Benchmark CLI/recipe defaults use `max_fee=2000`. The former 1200 default was
-  below the self-contained frame fee of 1356, rejecting every request. The stale
-  `--from-offset` help example was also corrected. An initial benchmark attempt
-  with 1200 was discarded during warmup; both compared revisions use an explicit
-  2000 limit.
-
 ## Latency comparison
 
 Four release-build runs used an ABBA order: baseline, current, current,
@@ -77,6 +66,8 @@ baseline. Each had 5 seconds of warmup and a 45-second measured window,
 explicit max fee of 2000, a 3-second request deadline, and a 5-second WS deadline.
 The host was an Apple M5 Max (18 logical CPUs, 36 GiB) running macOS 26.6.2.
 No builds, correctness tests, or injected network shaping ran during measurement.
+An initial attempt with max fee 1200 (below the frame fee of 1356) was discarded
+during warmup; all four compared runs used the explicit 2000 limit.
 
 Both exact revisions used their matching SDK/protocol and the same fresh machine
 image, Anvil fixture, and toolchain. Per-request latency excludes funding,

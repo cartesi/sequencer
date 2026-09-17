@@ -6,24 +6,14 @@
 //! All fees in the protocol (frame `fee_price`, user-op `max_fee`, DB `recommended_fee`)
 //! are represented as **log-space exponents** with base 129/128.
 //!
-//! An exponent `n` represents a linear value of `(129/128)^n` smallest-token-units.
-//! Exponent 0 = 1 unit (minimum, effectively free). There is no special sentinel.
+//! An exponent `n` nominally represents `(129/128)^n` smallest-token-units.
+//! [`fee_to_linear`] owns the exact integer conversion contract, including
+//! intermediate rounding and operation order. Exponent 0 is 1 unit; there is
+//! no special sentinel. The encoding uses two bytes and no floating point.
 //!
-//! This encoding:
-//! - Fits any token denomination in a u16 (range up to ~10⁷⁷)
-//! - Eliminates integer overflow in the DB (fee derivation becomes pure addition)
-//! - Compresses fees to 2 bytes on the wire
-//! - Gives ~0.78% precision per step
-//! - Uses **no floating-point arithmetic** — all conversions are pure integer ops
-//!
-//! The key trick: multiplying by 129/128 in integer math is `x + (x >> 7)`.
-//! Exponentiation uses a precomputed table of 15 entries with binary
-//! exponentiation (at most 15 fixed-point multiplications).
-//!
-//! The precomputed table and [`MAX_EXPONENT`] are generated at build time by
-//! `build.rs` using exact integer arithmetic (iterated fixed-point squaring).
-//! Any reimplementation (e.g. in C++) must use the same table values to
-//! guarantee bit-identical fee calculations. See `build.rs` for the algorithm.
+//! `build.rs` generates the 15-entry fixed-point table and [`MAX_EXPONENT`].
+//! Independent implementations must reproduce the conversion bit-for-bit:
+//! fee differences can change validation decisions and application state.
 
 use alloy_primitives::U256;
 
@@ -51,19 +41,27 @@ type U512 = alloy_primitives::Uint<512, 8>;
 
 /// Convert a log-space fee exponent to a linear [`U256`] value.
 ///
-/// `fee_to_linear(n)` = `floor((129/128)^n)`.
+/// Let `S = 2^64`. `build.rs` generates `T[0] = 129 * 2^57` and
+/// `T[i] = floor(T[i-1] * T[i-1] / S)` for `i = 1, …, 14`.
 ///
-/// Uses a precomputed table with binary exponentiation: at most 15 fixed-point
-/// multiplications, no floats.
+/// Start `R = S`. Visit bits `i = 0, …, 14` in ascending order; for each set bit
+/// of `n`, replace `R` with `floor(R * T[i] / S)`. Return `floor(R / S)`.
+/// Every multiplication widens its 256-bit operands to a 512-bit product
+/// before shifting right by 64. Intermediate flooring and accumulation order
+/// are part of the contract: using the same table in a different order, or
+/// computing the exact rational power and flooring only once, is not a
+/// compatible replacement.
 ///
 /// # Panics
 ///
-/// Panics if the result would overflow `U256` (exponent > [`MAX_EXPONENT`]).
+/// Panics for `n > MAX_EXPONENT`. The bound protects the full fixed-point
+/// accumulator, including its 64 fractional bits, rather than just the final
+/// integer result.
 pub fn fee_to_linear(log_fee: u16) -> U256 {
     fee_to_linear_fixed(log_fee) >> FRAC_BITS
 }
 
-/// Compute `(129/128)^n` in fixed-point representation (64 fractional bits).
+/// Compute the rounded fixed-point accumulator specified by [`fee_to_linear`].
 ///
 /// Used internally for higher-precision comparisons in binary search.
 fn fee_to_linear_fixed(log_fee: u16) -> U256 {
@@ -82,7 +80,9 @@ fn fee_to_linear_fixed(log_fee: u16) -> U256 {
 
 /// Convert a linear fee value to the nearest log-space exponent.
 ///
-/// `fee_from_linear(v)` = `round(log_{129/128}(v))`.
+/// Choose the exponent whose rounded fixed-point value is closest to `value`,
+/// breaking ties toward the smaller exponent. Values at or above
+/// `fee_to_linear(MAX_EXPONENT)` saturate to [`MAX_EXPONENT`].
 ///
 /// Returns 0 for `value <= 1` (since `(129/128)^0 = 1`).
 ///
