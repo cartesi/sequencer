@@ -58,6 +58,8 @@ exposure in an actual deployment was established by this review.
   passes. The worker drops its scope before signalling completion, so a simple
   worker-completion race does not explain the failure. Identify any remaining
   descriptor/process ownership before changing the assertion or lock behavior.
+  Reproduced during the 2026-09-18 stack closeout; isolated and full serial
+  runs passed. See the [current validation record](2026-09-18-stack-review-validation.md).
 - **Transient SQLite contention stops the submitter.** Read handles use a
   50 ms busy timeout; a storage/open failure escapes the submitter loop.
   BUSY/LOCKED are nonterminal but project to unclassified exit 1, causing

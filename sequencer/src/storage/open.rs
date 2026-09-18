@@ -71,8 +71,8 @@ impl Storage {
         })
     }
 
-    /// Create the schema and record its owning command in one migration
-    /// transaction. The complete history baseline is published later. On
+    /// Create the schema for setup or rebuild in one migration transaction.
+    /// The complete history baseline is published later. On
     /// an already-migrated database the hook does not run; callers must
     /// inspect the existing facts.
     pub(crate) fn initialize_for_command(

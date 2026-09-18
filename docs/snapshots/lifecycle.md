@@ -44,9 +44,10 @@ Setup similarly makes the baseline artifact durable before publishing the
 complete era baseline, recovery root when applicable, and setup-completion
 facts atomically.
 
-Restart selects the newest snapshot on the valid batch branch, or the baseline
-when no batch snapshot exists. The selected artifact and stored application
-count come from one row. Catch-up checks the restored engine's count and replays
+Restart requires the newest valid closed batch's snapshot, or the baseline
+when no valid closed batch exists. A missing required snapshot fails loud.
+The selected artifact and stored application count come from one row.
+Catch-up checks the restored engine's count and replays
 application inputs from that count. Invalidated branches are excluded by the
 same valid-batch relation used elsewhere.
 
@@ -56,6 +57,12 @@ The newest accepted batch determines the comparison checkpoint. Its snapshot
 must exist; storage refuses a missing required row instead of falling back to an
 older snapshot. Acceptance already includes scheduler validation and local
 content identity, so merely observing an own-sender L1 input is insufficient.
+
+A persisted canonical-divergence marker refuses accepted-checkpoint selection,
+including when a matching batch precedes a divergent acceptance in the same
+block. Selection checks the marker in the same SQLite transaction as its read
+and any download lease. Finalized endpoints return HTTP 503 before consulting
+conditional cache headers; they do not fall back to an older artifact.
 
 This selection is independent of the lane's L1 reconciliation cursor. A crash
 between reader ingestion and lane reconciliation cannot miss a promotion or
