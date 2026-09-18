@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Immutable era baseline and current application-history generation.
+//! Immutable era baseline and the preserved prefix at each recovery generation.
 
 #[cfg(test)]
 use rusqlite::OptionalExtension;
@@ -112,11 +112,18 @@ pub(super) fn next_executed_input_count_in(conn: &Connection) -> Result<Executed
     })))
 }
 
+/// Called after suffix deletion and before the replacement Tip attributes directs.
 pub(super) fn advance_recovery_generation_in(tx: &Transaction<'_>) -> Result<RecoveryGeneration> {
     let current = query_history_state(tx)?.version.recovery_generation.get();
     let next = current
         .checked_add(1)
         .expect("recovery generation exhausted");
+    let preserved = next_executed_input_count_in(tx)?;
+    tx.execute(
+        "INSERT INTO history_generation_cuts (recovery_generation, preserved_input_count) \
+         VALUES (?1, ?2)",
+        params![u64_to_i64(next), u64_to_i64(preserved.get())],
+    )?;
     let changed = tx.execute(
         "UPDATE history_state SET recovery_generation = ?1 WHERE singleton_id = 0",
         [u64_to_i64(next)],
@@ -125,6 +132,36 @@ pub(super) fn advance_recovery_generation_in(tx: &Transaction<'_>) -> Result<Rec
         return Err(rusqlite::Error::StatementChangedRows(changed));
     }
     Ok(RecoveryGeneration::new(next))
+}
+
+pub(super) fn preserved_input_count_in(
+    conn: &Connection,
+    from: RecoveryGeneration,
+    current: RecoveryGeneration,
+    head: ExecutedInputCount,
+) -> Result<ExecutedInputCount> {
+    assert!(
+        from <= current,
+        "compatibility starts after the current generation"
+    );
+    if from == current {
+        return Ok(head);
+    }
+    let (count, minimum): (i64, Option<i64>) = conn.query_row(
+        "SELECT COUNT(*), MIN(preserved_input_count) FROM history_generation_cuts \
+         WHERE recovery_generation > ?1 AND recovery_generation <= ?2",
+        params![u64_to_i64(from.get()), u64_to_i64(current.get())],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    // Unique integer generations plus the exact interval length prove that
+    // every intervening recovery contributed its cut, including empty batches.
+    assert_eq!(
+        i64_to_u64(count),
+        current.get() - from.get(),
+        "history generation lineage is incomplete"
+    );
+    let minimum = minimum.expect("a nonempty complete generation interval has a minimum");
+    Ok(head.min(ExecutedInputCount::new(i64_to_u64(minimum))))
 }
 
 #[cfg(test)]
@@ -194,3 +231,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod generation_tests;

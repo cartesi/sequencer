@@ -55,7 +55,9 @@ If the era baseline count is `K` and the current head is `H`, available entries
 occupy `[K, H)`. A claim at `H` waits for future entries; a claim below `K` or
 above `H` is refused. Identity is checked before position. Equal counts cannot
 authorize resuming a different era or generation, even if the consumer believes
-its state precedes the replaced suffix.
+its state precedes the replaced suffix. The compatibility query below can
+authorize rebinding a surviving checkpoint to the current version; WS itself
+continues to require exact identity.
 
 Automatic recovery invalidates a batch suffix, removes its current application
 rows, advances the generation, and opens the replacement Tip in one transaction.
@@ -64,6 +66,40 @@ batch, frame, and user-op source records remain; the invalidated flattened
 sequence is not separately retained. A repair that invalidates nothing leaves
 the generation unchanged. The [recovery guide](../recovery/README.md) owns
 repair selection and guards.
+
+### Checkpoint compatibility after standard recovery
+
+Each generation transition records the surviving application count after the
+invalidated rows are removed and before the replacement Tip adds any directs.
+This cut commits atomically with invalidation, the generation advance, and
+reopening. An invalidated empty batch still creates a transition with the old
+head as its cut; a repair that invalidates nothing creates neither. The cuts are
+immutable and retained for the era's lifetime.
+
+For a checkpoint saved in generation `g`, `/history` returns the current version
+at generation `G`, head `H`, and preserved count:
+
+```text
+P = min(H, cut[g+1], ..., cut[G])
+```
+
+For `g = G`, `P = H`. A checkpoint at count `X` is eligible to resume under the
+returned version exactly when `K <= X <= P`. Check each saved checkpoint using
+its own era and generation, then choose the newest eligible one. For cuts
+`0 -> 1: 3` and `1 -> 2: 5`, a generation-0 checkpoint at 4 is invalid, while a
+generation-1 checkpoint at 4 is eligible. Looking only at the latest cut would
+incorrectly reuse the former. Cuts and current history are read together; a
+missing intervening transition is an invariant failure, not permission to take
+the minimum over an incomplete ledger.
+
+The client owns checkpoint consistency: application state, projection, and claim
+must describe the same executed prefix. Once compatibility is established,
+persist the new version with the restored checkpoint before continuing. If
+another recovery wins the race with subscription, query again using that saved
+version. A stale response cannot weaken WS admission. The query proves prefix
+preservation under standard recovery's trusted local bookkeeping; it does not
+inspect client state or establish trust after a software bug. A new era requires
+the [manual projection recovery procedure](projection-replay.md#client-checkpoints).
 
 ### Era baseline
 
@@ -81,13 +117,14 @@ Genesis supplies the trusted block-zero comparison state. The
 [rebuild guide](../recovery/cockroach.md) owns checkpoint requirements and the
 fixed stopping boundary.
 
-## Three consumers of checkpoints
+## Consumers of checkpoints
 
 | Consumer | Starting point and continuation |
 |---|---|
 | Native restart | Load the newest surviving batch snapshot, or baseline, check the engine's count against its row, then replay current application inputs. |
 | Sequencer replica | Download `/latest_snapshot`, restore its application state, and subscribe using the matching history claim. This follows optimistic execution. |
 | Watchdog | Start from independently trusted canonical machine state and replay L1. Compare at the sequencer's accepted checkpoint; the replica feed does not establish independent trust. |
+| Application projection | Reconstruct additional transfer/order history using the era's historical L1 prefix, then join the application feed at the immutable baseline. The [projection replay contract](projection-replay.md) owns its checkpoint preparation and handoff. |
 
 A batch-close snapshot is identified by its local batch identity, not just its
 count or nonce. Recovery can reuse a nonce and empty batches can repeat a count.
@@ -109,19 +146,22 @@ explains block-boundary comparison and rollback retention. The
 3. Subscribe with the matching era, generation, and next-input count. Snapshot
    selection, headers, and lease share one transaction; recovery during the
    download can still invalidate the claim before subscription. Rebootstrap
-   if the server refuses that old identity.
+   if the server refuses that old era; within the same era, a compatible saved
+   checkpoint can instead be selected through `/history`.
 4. Require each entry's offset to equal the application's current count, then
    execute it through the shared execution boundary. Successful application
    advances the count by one. Persist the history identity with the replica's
    state so that a later resume cannot combine different histories.
 5. After an ordinary disconnect, reconnect with that saved identity and the
-   actual count. A history mismatch or unavailable prefix requires a current
-   snapshot. A count ahead of the server's head is an invalid claim to correct.
+   actual count. A generation mismatch permits the compatibility procedure
+   above. An unavailable prefix or lack of a compatible checkpoint requires a
+   current snapshot. A count ahead of the server's head is an invalid claim to correct.
 
 The [Rust SDK](../../sdk/rust-client/src/lib.rs) returns a `HistoryClaim` with
 its snapshot response and requires an explicit claim for subscriptions. The
 consumer owns restore, persistence, and reconnect. Fetching fresh identity
-metadata cannot authorize old application state.
+metadata alone cannot authorize old application state; an explicit compatibility
+result can authorize a saved prefix within the same era.
 
 One durable page reader handles both backlog and live delivery, so there is no
 separate cursor to switch at the live boundary. Each page reads identity,
@@ -144,6 +184,7 @@ writers become supported.
 | Coherent application pages | [`storage/egress/canonical.rs`](../../sequencer/src/storage/egress/canonical.rs) and its tests — source context, nonzero baselines, replacement offsets, concurrent recovery, gaps and SQL limits. |
 | Replay followed by live delivery | [`l2_tx_feed`](../../sequencer/src/egress/l2_tx_feed/) — bounded deep replay, identity refusals, shutdown and persistent faults; [`catch_up.rs`](../../sequencer/src/ingress/inclusion_lane/catch_up.rs) for native replay. |
 | Artifact and claim association | [`snapshot_endpoints.rs`](../../sequencer/src/integration_tests/snapshot_endpoints.rs) — headers, restore, archive contents, and lease lifetime. |
+| Checkpoint compatibility | [`storage/history.rs`](../../sequencer/src/storage/history.rs) and recovery tests — immutable cuts, complete lineage, and transaction rollback; [`recovery_compatibility.rs`](../../sequencer/src/integration_tests/historical_bootstrap/recovery_compatibility.rs) — saved projections across missed recoveries and HTTP lookup/WS admission races. |
 
 The [integration validation record](../review/2026-09-16-track3-validation.md)
 records wallet replica and canonical-machine evidence. Remaining consumer and
