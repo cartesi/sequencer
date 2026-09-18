@@ -406,8 +406,10 @@ and `X-Executed-Input-Count`, selected atomically with the artifact lease.
 Streaming holds the lease until the response ends or the client disconnects.
 The accepted endpoints return `404` until a comparable checkpoint exists:
 genesis is comparable at block zero; a rebuilt baseline is restorable but only
-a later accepted batch establishes a comparison point. Divergence blocks
-publication of the accepted checkpoint. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
+a later accepted batch establishes a comparison point. Known divergence makes
+all three finalized endpoints return `503 UNAVAILABLE`, including conditional
+state requests. The check shares the checkpoint-selection transaction, before
+any lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
 
 ## Storage Model
 

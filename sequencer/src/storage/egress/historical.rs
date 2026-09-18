@@ -21,8 +21,9 @@ use crate::storage::history::{
 };
 use crate::storage::l1_inputs::query_deployment_identity;
 use crate::storage::mutations::batch_tree_anchor_in;
-use crate::storage::safe_accepted_batches::canonical_divergence_in;
-use crate::storage::snapshot_dumps::{finalized_dump_in, has_rollback_safe_snapshot_in};
+use crate::storage::snapshot_dumps::{
+    FinalizedSelectionError, finalized_dump_in, has_rollback_safe_snapshot_in,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HistoricalReadError {
@@ -30,8 +31,8 @@ pub(crate) enum HistoricalReadError {
     Policy(#[from] HistoryPolicyError),
     #[error("{0}")]
     BadRequest(String),
-    #[error("canonical divergence prevents accepted checkpoint selection")]
-    CanonicalDivergence,
+    #[error(transparent)]
+    Checkpoint(#[from] FinalizedSelectionError),
     #[error("reading historical L1 inputs: {0}")]
     Storage(#[from] rusqlite::Error),
 }
@@ -60,12 +61,12 @@ impl Storage {
                     "from_generation exceeds the current recovery generation".to_owned(),
                 )));
             }
-            if canonical_divergence_in(tx)?.is_some() {
-                return Ok(Err(HistoricalReadError::CanonicalDivergence));
-            }
+            let accepted = match finalized_dump_in(tx) {
+                Ok(accepted) => accepted,
+                Err(error) => return Ok(Err(error.into())),
+            };
             let deployment =
                 query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-            let accepted = finalized_dump_in(tx)?;
             if accepted.is_none() {
                 assert!(
                     has_rollback_safe_snapshot_in(tx)?,
