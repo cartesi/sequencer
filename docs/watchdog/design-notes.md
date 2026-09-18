@@ -44,16 +44,18 @@ accepted-batch wire-identity detector, and neither mechanism subsumes the
 other.
 
 The content-identity check runs inside the input reader's atomic
-safe-input sync. For every
-at/above-anchor landing the mirrored scheduler accepts, it requires a
-byte-identical valid local sealed batch at that nonce. A foreign or mismatched
+safe-input sync. For every landing strictly after baseline block `C` that
+the mirrored scheduler accepts, it requires a byte-identical valid local sealed
+batch at that nonce. A foreign or mismatched
 landing persists `canonical_divergence`, which freezes the accepted frontier
-and the selection of newer accepted comparison checkpoints
+and prevents accepted comparison checkpoint selection
 ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
-The offending landing therefore normally never produces a newer
-`/finalized_state/inclusion_block` for the watchdog to compare. Under the
-unchanged-head optimization above, a watchdog tick legitimately exits idle. Distinct wire bytes can also be application-state
-equivalent, which a byte comparison of resulting snapshots would not expose.
+The prefix through `C` is opaque; historical landings are not reconsidered using
+the recovered nonce. Once the marker is committed, finalized endpoints refuse
+with HTTP 503, including when a matching batch preceded the divergent landing
+in the same block. The watchdog cannot compare that block through these routes.
+Distinct wire bytes can also be application-state equivalent, which a byte
+comparison of resulting snapshots would not expose.
 
 Conversely, the content-identity check shares the sequencer's off-chain acceptance predicate and does
 not independently replay application execution. The watchdog can catch
