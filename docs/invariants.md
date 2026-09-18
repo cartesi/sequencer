@@ -81,7 +81,7 @@ by writer and are write-once (`0001_schema.sql`).
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
 | recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion |
-| history metadata (setup/recovery) | `history_state` — complete era/application-count/L1-block baseline, generation bump in a non-empty standard-recovery cascade |
+| history metadata (setup/recovery) | `history_state` — complete era/application-count/L1-block baseline; generation advance and immutable preserved-prefix cut in a non-empty standard-recovery cascade |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
 | egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
 | setup | `deployment_identity` (pinned once), `batch_tree_anchor` (the root nonce, frozen once setup completes), the initial `dumps` + `snapshots` rows (genesis or rebuild registration, atomic with the complete history baseline), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
@@ -160,7 +160,7 @@ by writer and are write-once (`0001_schema.sql`).
 ### I5. Recovery removes exactly the invalidated application suffix
 
 - **Holds:** invalidating a batch deletes its `application_inputs` through the
-  schema trigger. The cascade, generation increment, and replacement Tip commit
+  schema trigger. The cascade, generation cut/increment, and replacement Tip commit
   together. Original source records and immutable snapshots remain; snapshot
   selection excludes invalidated batches and GC retires their unleased artifacts.
 - **Enforced by:** `cascade_and_reopen`, application-input constraints, valid views.
@@ -425,7 +425,10 @@ by writer and are write-once (`0001_schema.sql`).
   transaction. The history row is absent before this boundary. `K` and `C`
   remain immutable even after baseline artifact GC or recovery-root invalidation.
 - **Standard recovery:** one generation increment iff a valid batch is
-  invalidated, in the cascade transaction. Clean restart changes neither token.
+  invalidated, with an immutable cut at the count after suffix deletion and
+  before replacement directs. The entire transition commits in the cascade
+  transaction. Clean restart changes neither token. Every intervening cut is
+  required to authorize reusing a checkpoint from an older generation.
 - **Enforced by:** `complete_baseline_setup`, immutable history triggers,
   exact-`+1` generation trigger, and `cascade_and_reopen`.
 - **Depended on by:** mandatory snapshot-derived WS claims. Identity is validated

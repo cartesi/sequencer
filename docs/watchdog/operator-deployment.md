@@ -381,6 +381,15 @@ checkpoint as that archive. The
 [snapshot backup workflow](../snapshots/lifecycle.md#http-and-recovery-exports)
 owns this separate restore path.
 
+The [incident playbook](../recovery/cockroach.md#incident-playbook) covers
+selecting a sound state, validating a native recovery bundle, and recovering
+application-specific reader databases. It also identifies the CM-to-native
+export and retention requirements that operator backups must cover.
+Complete the application's
+[recovery readiness procedure and drill](../recovery/cockroach.md#recovery-readiness-before-deployment)
+before production deployment; a retained CM checkpoint is useful only with a
+known, tested path back to a running native application.
+
 ## Sequencer restart policy
 
 The sequencer's exit codes are the restart contract: 10
@@ -415,12 +424,13 @@ unclassified restart-with-backoff. Operational notes:
   also logs the latest row once at startup). Any death that did not return
   through the bracket — SIGKILL, OOM, a node reboot, a terminal runtime abort,
   a controller panic — leaves only the process logs.
-- **Canonical divergence is the one manual path**: the sequencer freezes
-  the acceptance frontier
-  ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)),
-  refuses every command on that data directory, and the remedy is a
-  fresh-directory `setup --recovery` (cockroach). You will typically learn
-  of it from the watchdog before the sequencer tells you.
+- **Untrustworthy local state requires manual recovery.** The reader's
+  content-identity divergence marker freezes the acceptance frontier and
+  blocks admission ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
+  A watchdog state mismatch independently signals application-state
+  disagreement. Diagnose the cause and follow the
+  [incident playbook](../recovery/cockroach.md#incident-playbook) for a
+  fresh-directory rebuild when needed; standard recovery does not repair bugs.
 
 ## Troubleshooting (live deployments)
 

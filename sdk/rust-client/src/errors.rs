@@ -84,3 +84,15 @@ pub enum SnapshotError {
     #[error("invalid snapshot metadata: {0}")]
     Metadata(String),
 }
+
+#[derive(Debug, Error)]
+pub enum HistoryReadError {
+    #[error("history request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error(transparent)]
+    History(#[from] sequencer_core::history::HistoryPolicyError),
+    #[error("history request rejected with status {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("invalid history response: {0}")]
+    Decode(#[from] serde_json::Error),
+}

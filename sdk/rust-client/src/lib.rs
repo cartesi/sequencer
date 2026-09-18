@@ -2,13 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 mod errors;
+mod history;
 
 pub use errors::{
-    ClientBuildError, GetFeeError, SnapshotError, SubmitRejected, SubmitTxError, SubscribeError,
+    ClientBuildError, GetFeeError, HistoryReadError, SnapshotError, SubmitRejected, SubmitTxError,
+    SubscribeError,
 };
 
 pub use sequencer_core::history::{
-    ExecutedInputCount, HistoryClaim, HistoryPolicyError, HistoryVersion,
+    EraId, ExecutedInputCount, HistoryBounds, HistoryClaim, HistoryPolicyError, HistoryVersion,
+    RecoveryGeneration,
+};
+pub use sequencer_core::history_api::{
+    AcceptedCheckpoint, HistoricalL1Input, HistoricalL1InputStart, HistoricalL1InputsPage,
+    HistoryBaseline, HistoryCompatibility, HistoryDeployment, HistoryInfo,
 };
 
 use sequencer_core::api::{FeeResponse, TxRequest, TxResponse};

@@ -353,7 +353,7 @@ fn baseline_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
     .optional()
 }
 
-fn finalized_dump_in(conn: &Connection) -> Result<Option<FinalizedDump>> {
+pub(super) fn finalized_dump_in(conn: &Connection) -> Result<Option<FinalizedDump>> {
     if let Some((batch_index, nonce, inclusion_block)) = latest_accepted_boundary_in(conn)? {
         let snapshot = snapshot_for_batch_in(conn, batch_index)?;
         return Ok(Some(FinalizedDump {

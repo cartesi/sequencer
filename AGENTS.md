@@ -197,7 +197,10 @@ Paths below are relative to `sequencer/src/`:
   mandatory offset with its source in `application_inputs`.
 - **History version** — `(EraId, RecoveryGeneration)`. Setup publishes a complete
   baseline with a fresh era; recovery increments the generation exactly once
-  iff it invalidates at least one valid batch. Subscription claims enforce both.
+  iff it invalidates at least one valid batch and records the preserved-prefix
+  cut in the same transaction. `/history` can check a saved checkpoint across
+  intervening generations; subscription claims still enforce both identifiers.
+  The [history contract](docs/protocol/application-history.md) owns compatibility.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
 - **Snapshot** — immutable artifact at every batch close, registered with its
   local batch identity and application count. Acceptance facts select the

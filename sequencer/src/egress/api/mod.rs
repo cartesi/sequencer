@@ -1,10 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Egress HTTP API routes: WebSocket subscribe + k8s-style health probes.
-//! Additional read endpoints will land here.
+//! Internal history, snapshot, WebSocket, and health endpoints.
 
 mod health;
+mod history;
 mod snapshot;
 mod state;
 mod subscribe;
@@ -31,6 +31,7 @@ pub(crate) fn router(
     shutdown: RuntimeScope,
     snapshot_release_scheduler: ReleaseScheduler,
 ) -> Router {
+    let history_router = history::router(snapshot_state.db_path.clone(), shutdown.clone());
     let subscribe_router = Router::new()
         .route("/ws/subscribe", get(subscribe::subscribe_l2_txs))
         .with_state(subscribe_state);
@@ -43,6 +44,7 @@ pub(crate) fn router(
 
     subscribe_router
         .merge(health_router)
+        .merge(history_router)
         .merge(snapshot::router(
             snapshot_state,
             shutdown,

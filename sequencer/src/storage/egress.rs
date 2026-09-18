@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Application replay entries shared by catch-up and consumer history reads.
+//! Application replay entries and the historical L1 prefix for consumer bootstrap.
 
 use alloy_primitives::{Address, B256};
 use rusqlite::{Result, Row};
@@ -12,6 +12,8 @@ use super::convert::{i64_to_u16, i64_to_u32, i64_to_u64};
 
 mod canonical;
 pub(crate) use canonical::HistoryReadError;
+mod historical;
+pub(crate) use historical::HistoricalReadError;
 
 #[derive(Debug, Clone)]
 pub(crate) enum L2TxContext {

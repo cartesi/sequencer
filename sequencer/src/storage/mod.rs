@@ -54,7 +54,7 @@ use thiserror::Error;
 
 #[cfg(test)]
 pub(crate) use egress::ApplicationInputRow;
-pub(crate) use egress::{HistoryReadError, L2TxContext};
+pub(crate) use egress::{HistoricalReadError, HistoryReadError, L2TxContext};
 pub use history::{DirectInputExecution, HistoryState};
 pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
 pub use open::Storage;

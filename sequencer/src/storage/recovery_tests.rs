@@ -11,6 +11,17 @@ use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::protocol::ProtocolTiming;
 
+fn generation_cuts(storage: &Storage) -> Vec<(i64, i64)> {
+    storage
+        .conn
+        .prepare("SELECT recovery_generation, preserved_input_count FROM history_generation_cuts ORDER BY recovery_generation")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 /// Exercise the same frame-advance-before-close sequence as the live lane.
 trait RecoveryFixture {
     fn close_batch_at(
@@ -577,6 +588,11 @@ mod recover_post_flush {
         let first = storage.recover_post_flush(1200).expect("first detect");
         assert_eq!(first, vec![0, 1]);
         assert_eq!(
+            generation_cuts(&storage),
+            [(1, 0)],
+            "empty invalidated batches still record the old head"
+        );
+        assert_eq!(
             storage
                 .history_state()
                 .expect("history after recovery")
@@ -598,6 +614,11 @@ mod recover_post_flush {
 
         let second = storage.recover_post_flush(1200).expect("second detect");
         assert!(second.is_empty());
+        assert_eq!(
+            generation_cuts(&storage),
+            [(1, 0)],
+            "a no-op must not add a cut"
+        );
         assert_eq!(
             storage
                 .history_state()
@@ -1061,6 +1082,7 @@ mod tip_staleness {
             0,
             "opening a missing Tip without invalidating history is not a recovery generation"
         );
+        assert!(generation_cuts(&storage).is_empty());
 
         let head = storage.open_state().expect("load open state");
         assert!(head.is_some(), "recovery should have opened a fresh batch");
@@ -1210,6 +1232,10 @@ mod tip_staleness {
             0,
             "the generation bump must roll back with the failed Tip reopen"
         );
+        assert!(
+            generation_cuts(&storage).is_empty(),
+            "the pre-reopen cut must roll back too"
+        );
         let invalidated_count: i64 = storage
             .conn
             .query_row(
@@ -1306,6 +1332,15 @@ mod tip_staleness {
             .recover_post_flush(1200)
             .expect("detect and recover");
         assert!(!invalidated.is_empty(), "should have invalidated batches");
+        assert_eq!(
+            generation_cuts(&storage),
+            [(1, 0)],
+            "replacement directs must not enlarge the preserved prefix"
+        );
+        assert_eq!(
+            storage.next_executed_input_count().unwrap(),
+            ExecutedInputCount::new(2)
+        );
 
         let after = all_ordered_l2_txs(&mut storage);
         let direct_payloads: Vec<&[u8]> = after

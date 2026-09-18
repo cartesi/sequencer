@@ -223,7 +223,13 @@ wall-clock aging alone can change the decision after inspection.
 Invalidation, history rewind, generation change, and Tip creation share one
 transaction. Invalidation removes the suffix's `application_inputs` projection;
 raw source facts remain. `RecoveryGeneration` increments once iff at least one
-valid batch was invalidated. Failed reopening rolls all of this back.
+valid batch was invalidated. Each advance appends an immutable generation cut:
+the surviving count after suffix deletion, before reopening can insert any
+replacement directs. Failed reopening rolls all of this back. The cuts let
+readers determine whether a saved checkpoint survived several recoveries;
+the [history contract](../protocol/application-history.md#checkpoint-compatibility-after-standard-recovery)
+owns that query. Invalidating an empty batch records the old head; a no-op repair
+records no transition.
 
 The new Tip follows the latest surviving batch, or uses the immutable root
 anchor if none survives. It attributes direct inputs after the surviving
