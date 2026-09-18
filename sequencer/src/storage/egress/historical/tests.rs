@@ -366,9 +366,9 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
         .unwrap();
     assert!(matches!(
         storage.history_info(None, None),
-        Err(HistoricalReadError::Checkpoint(FinalizedSelectionError::Storage(
-            rusqlite::Error::QueryReturnedNoRows
-        )))
+        Err(HistoricalReadError::Checkpoint(
+            FinalizedSelectionError::Storage(rusqlite::Error::QueryReturnedNoRows)
+        ))
     ));
 }
 

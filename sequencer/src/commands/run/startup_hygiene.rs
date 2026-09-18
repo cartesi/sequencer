@@ -184,6 +184,52 @@ mod tests {
     }
 
     #[test]
+    fn startup_resets_persisted_crash_leases_before_collecting_artifacts() {
+        let db = temp_db("startup-crash-leases");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let dumps = tempfile::tempdir().unwrap();
+        let baseline = dumps.path().join("baseline");
+        create_structured_dump(&baseline);
+        let baseline_id = storage
+            .insert_baseline_snapshot(&baseline, crate::storage::ExecutedInputCount::ZERO)
+            .unwrap();
+        let obsolete = dumps.path().join("obsolete");
+        create_structured_dump(&obsolete);
+        let obsolete_id = storage
+            .write(|tx| {
+                tx.execute(
+                    "UPDATE dumps SET lease_count = 1 WHERE id = ?1",
+                    [baseline_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO dumps(prefix, lease_count) VALUES (?1, 1)",
+                    [obsolete.to_str().unwrap()],
+                )?;
+                Ok(tx.last_insert_rowid())
+            })
+            .unwrap();
+        drop(storage);
+
+        let mut storage = Storage::open(&db.path).unwrap();
+        assert_eq!(storage.dump_lease_count(obsolete_id).unwrap(), Some(1));
+        assert!(storage.gc_unreferenced_dumps().unwrap().is_empty());
+        assert!(obsolete.exists(), "the persisted lease blocks ordinary GC");
+
+        run_snapshot_hygiene(&mut storage, dumps.path()).unwrap();
+
+        assert_eq!(storage.dump_lease_count(baseline_id).unwrap(), Some(0));
+        assert_eq!(storage.dump_lease_count(obsolete_id).unwrap(), None);
+        assert!(
+            baseline.exists(),
+            "the rollback baseline survives startup GC"
+        );
+        assert!(
+            !obsolete.exists(),
+            "startup collects the abandoned leased artifact"
+        );
+    }
+
+    #[test]
     fn snapshot_gc_at_startup_removes_unreferenced_rows() {
         let db = temp_db("gc-startup");
         let mut storage = Storage::open(db.path.as_str()).unwrap();

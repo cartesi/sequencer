@@ -756,6 +756,21 @@ mod tests {
     }
 
     #[test]
+    fn lease_release_cannot_underflow() {
+        let db = temp_db("lease-underflow");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let id = storage
+            .insert_baseline_snapshot(&prefix(0), ExecutedInputCount::ZERO)
+            .unwrap();
+        let error = storage.release_dump_lease(id).unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+        assert_eq!(storage.dump_lease_count(id).unwrap(), Some(0));
+    }
+
+    #[test]
     fn persistent_release_failure_reaches_reporter() {
         let db = temp_db("persistent-lease");
         let _storage = Storage::open(&db.path).unwrap();

@@ -163,7 +163,7 @@ fn recovery_publishes_at_checkpoint_or_later_including_genesis() {
             ]
             .concat(),
         };
-        let mut app = WalletApp::new(config.clone());
+        let mut app = WalletApp::new(config);
         if checkpoint_block != 0 {
             execute_direct_input(&mut app, &deposit(5, 100)).unwrap();
         }
