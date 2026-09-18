@@ -143,16 +143,18 @@ impl SequencerClient {
         serde_json::from_str::<FeeResponse>(&body).map_err(|e| GetFeeError::Decode(e.to_string()))
     }
 
-    /// Streams without the short transaction deadline; callers own download cancellation.
+    /// Bounds response headers by the request timeout; callers own body cancellation.
     pub async fn latest_snapshot(&self) -> Result<SnapshotResponse, SnapshotError> {
-        let response = self
+        let request = self
             .http_client
             .get(format!(
                 "{}/latest_snapshot",
                 self.endpoint.trim_end_matches('/')
             ))
-            .send()
-            .await?
+            .send();
+        let response = tokio::time::timeout(self.request_timeout, request)
+            .await
+            .map_err(|_| SnapshotError::HeadersTimeout)??
             .error_for_status()?;
         let header = |name| {
             response
@@ -303,6 +305,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_headers_keep_the_configured_request_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = SequencerClient::new(format!("http://{address}"))
+            .unwrap()
+            .with_request_timeout(Duration::from_millis(100));
+        let stalled_server = async {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        };
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = client.latest_snapshot() => result,
+                () = stalled_server => unreachable!(),
+            }
+        })
+        .await
+        .expect("an accepted connection with no headers must reach the configured deadline");
+        assert!(matches!(result, Err(SnapshotError::HeadersTimeout)));
+    }
+
+    #[tokio::test]
     async fn snapshot_body_outlives_the_transaction_request_timeout() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -317,12 +341,12 @@ mod tests {
                 received += count;
             }
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-History-Era: 00112233-4455-4677-8899-aabbccddeeff\r\nX-Recovery-Generation: 0\r\nX-Executed-Input-Count: 7\r\n\r\n").await.unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             stream.write_all(b"dump").await.unwrap();
         });
         let client = SequencerClient::new_with_timeout(
             format!("http://{address}"),
-            Duration::from_millis(30),
+            Duration::from_millis(100),
         )
         .unwrap();
         let snapshot = client.latest_snapshot().await.unwrap();
@@ -363,5 +387,40 @@ mod tests {
             matches!(map_subscribe_error(tokio_tungstenite::tungstenite::Error::Http(Box::new(response))),
             SubscribeError::History(actual) if actual == policy)
         );
+    }
+
+    #[tokio::test]
+    async fn subscription_below_nonzero_baseline_decodes_history_unavailable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+                request.push(byte[0]);
+                assert!(request.len() <= 8192);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /ws/subscribe?"));
+            assert!(request.contains("next_input=40 "));
+            stream.write_all(b"HTTP/1.1 409 Conflict\r\nX-History-Error: {\"code\":\"HISTORY_UNAVAILABLE\",\"available_from\":41}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let client = SequencerClient::new(format!("http://{address}")).unwrap();
+        let result = client
+            .subscribe(HistoryClaim {
+                version: HistoryVersion {
+                    era_id: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
+                    recovery_generation: RecoveryGeneration::new(0),
+                },
+                next_input: ExecutedInputCount::new(40),
+            })
+            .await;
+        assert!(matches!(result,
+            Err(SubscribeError::History(HistoryPolicyError::HistoryUnavailable { available_from }))
+                if available_from == ExecutedInputCount::new(41)));
+        server.await.unwrap();
     }
 }
