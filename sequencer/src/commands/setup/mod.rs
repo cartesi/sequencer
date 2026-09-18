@@ -28,6 +28,8 @@ use alloy_primitives::Address;
 use sequencer_core::application::{AppError, Application};
 use sequencer_core::scheduler::{FoldInput, SchedulerConfig, fold_replay};
 
+#[cfg(test)]
+mod checkpoint_tests;
 pub(crate) mod fill;
 
 use super::{ensure_deployment_identity, validate_rpc_chain_id};
@@ -37,7 +39,9 @@ use crate::commands::error::{
 };
 use crate::ingress::inclusion_lane::dump_info;
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
-use crate::recovery::{MempoolFlusher, assert_resync_caught_up};
+use crate::recovery::{
+    MempoolFlusher, RecoveryError, RecoveryRetryReason, assert_resync_caught_up,
+};
 use crate::storage::{self, DeploymentIdentity, FeeOracleIdentity};
 
 pub async fn setup<A, F>(config: SetupConfig, genesis_app: F) -> Result<(), CommandError>
@@ -495,8 +499,8 @@ fn source_fold_inputs<A>(
 /// The `setup --recovery` procedure: rebuild a freshly-wiped DB from
 /// a trusted checkpoint instead of refusing. Runs after the shared prefix
 /// (identity pinned, initial sync done); replaces the detection gate + genesis
-/// snapshot. Distinct, terminal error type ([`SetupRecoveryError`]) from
-/// `run`'s recovery — operator-driven, one-shot.
+/// snapshot. Invalid checkpoint/configuration failures are terminal; transient
+/// L1 failures leave setup incomplete for a fresh attempt.
 ///
 /// The `flush → fold → fill` steps are enumerated authoritatively in
 /// **[`docs/recovery/cockroach.md`](../../../docs/recovery/cockroach.md)** (spec,
@@ -547,6 +551,28 @@ where
         })?;
     let resynced_safe_block = require_resynced_safe_block(storage.current_safe_block()?)?;
     assert_resync_caught_up(resynced_safe_block, stop_block)?;
+
+    rebuild_from_checkpoint(checkpoint, identity, stop_block, storage, dumps_dir)
+}
+
+fn rebuild_from_checkpoint<A: Application + 'static>(
+    checkpoint: Checkpoint<A>,
+    identity: &DeploymentIdentity,
+    stop_block: u64,
+    storage: &mut storage::Storage,
+    dumps_dir: &std::path::Path,
+) -> Result<(), CommandError> {
+    // A valid checkpoint can outpace an honestly lagging RPC node. Labelling
+    // its state with an earlier C would let run execute its directs again.
+    if stop_block < checkpoint.checkpoint_block {
+        return Err(
+            RecoveryError::retry(RecoveryRetryReason::CheckpointAheadOfStop {
+                checkpoint_block: checkpoint.checkpoint_block,
+                stop_block,
+            })
+            .into(),
+        );
+    }
 
     // 4. Source the (A, B] direct seeds + the (B, C] replay stream.
     let submitter = identity.batch_submitter_address;

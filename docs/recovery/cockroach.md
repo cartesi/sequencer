@@ -9,7 +9,7 @@ rebuilding.** The operator initiates recovery; the command automates the rebuild
 The procedure is **flush → fold → fill**:
 
 1. **Flush** outstanding submitter transactions and choose a fixed safe L1
-   stopping block.
+   stopping block at or after the trusted checkpoint's inclusion block.
 2. **Fold** the input history through the canonical scheduler, starting from the
    trusted checkpoint. Every input receives its normal scheduler treatment:
    accepted batches execute, malformed or rejected batches are skipped, and
@@ -169,7 +169,9 @@ cargo run -p wallet-sequencer -- setup --recovery \
 Recovery signs L1 transactions, so the key must match the configured submitter.
 After success, start `run` with that same data directory. A completed rebuild
 refuses another `setup --recovery`; failures before completion publish no partial
-baseline.
+baseline. If the RPC node has not reached the checkpoint, recovery exits with
+retryable code 20. Synchronize that node and retry with the same checkpoint and
+incomplete data directory.
 
 ## Implementation contract
 
@@ -196,6 +198,11 @@ accepted batch in block `B` could still be pending but disappear from the seed
 range. Checkpoint state and nonce remain operator-trusted; the later
 content-identity check does not verify this prefix.
 
+The complete ordering is `A < B <= C`, with `A = B = 0` allowed for empty
+genesis. Before sourcing or executing the fold, recovery requires `B <= C`.
+Otherwise publishing the checkpoint state at an earlier baseline block could
+make normal reconciliation execute already-accounted direct inputs again.
+
 ### Flush and stopping block
 
 The lost database cannot supply its previous wallet-nonce watermark. Flushing
@@ -207,6 +214,13 @@ trusted fail-stop, as specified in the [threat model](../threat-model/README.md)
 After flushing, raw L1 ingestion must reach at least `C`. It may advance farther,
 but the fold stops at `C`. Accepted-batch projection is deferred until the new
 baseline and batch tree exist.
+
+A trusted checkpoint can be ahead of an honest replacement node that is still
+synchronizing. A successful flush only settles the wallet slots known to that
+node; it does not establish `C >= B`. If `C < B`, recovery refuses with retryable
+exit 20, even when the later re-sync head has reached `B`: that newer observation
+does not replace the fixed stopping block. It publishes no baseline and must be
+retried after the node catches up.
 
 ### Replay boundaries
 

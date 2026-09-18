@@ -76,6 +76,14 @@ pub enum RecoveryRetryReason {
         resynced_safe_block: u64,
         flush_observed_safe_block: u64,
     },
+    #[error(
+        "post-flush stopping block {stop_block} predates checkpoint block {checkpoint_block}; \
+         synchronize the RPC node and retry recovery"
+    )]
+    CheckpointAheadOfStop {
+        checkpoint_block: u64,
+        stop_block: u64,
+    },
     #[error("local recovery facts changed before phase execution: {status:?}")]
     StaleDecision { status: DangerStatus },
     #[error("the Tip was already open when the EnsureOpenTip phase ran")]
