@@ -5,6 +5,9 @@ mod cold_replica;
 pub mod test_cases;
 mod watchdog_compare;
 
+// Link the reference engine's C symbols for the EngineApp replica scenarios.
+use c_wallet_engine as _;
+
 use std::future::Future;
 use std::pin::Pin;
 

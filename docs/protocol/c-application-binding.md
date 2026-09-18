@@ -49,5 +49,8 @@ The same implementation may be compiled for native execution and the canonical
 machine. This does not establish equivalent behavior across targets: the
 application must preserve deterministic state and output bytes, including the
 checkpoint's canonical comparison file. Reference wallet ABI tests exercise
-the host integration; they do not establish private DEX conformance or
-equivalence between native and machine execution.
+the adapter contract; the `c_host_` process scenarios exercise snapshot replication,
+restart, both recovery paths, and canonical-machine comparison as described in
+the [build guide](../../bindings/c-app-engine/README.md#reference-wallet).
+These tests establish reference-wallet agreement for their workloads, not
+private DEX conformance.

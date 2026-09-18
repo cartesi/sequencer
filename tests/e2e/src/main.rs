@@ -4,7 +4,7 @@
 use libtest_mimic::{Arguments, Trial};
 use rollups_e2e::run_trial;
 use rollups_harness::{
-    ManagedSequencer, default_devnet_sequencer_config, devnet_sequencer_config_no_faketime,
+    ManagedSequencer, default_c_wallet_sequencer_config, default_devnet_sequencer_config,
 };
 
 fn main() {
@@ -16,20 +16,22 @@ fn main() {
         .map(|(name, scenario)| {
             Trial::test(name, move || {
                 let log_prefix = format!("rollups-e2e-{name}");
-                let spawn_config = if name == "watchdog_genesis_compare_test"
-                    || name == "deposit_transfer_withdrawal_test"
-                    || name == "watchdog_non_genesis_divergence_test"
-                {
-                    devnet_sequencer_config_no_faketime(log_prefix)
-                } else if name == "fixed_fee_oracle_sets_frame_fee_test" {
-                    let mut config = default_devnet_sequencer_config(log_prefix);
-                    // 100 → recommended fee 1456, under the wallet client's
-                    // DEFAULT_MAX_FEE (2500) so transfers still admit.
-                    config.fee_oracle_fixed_log_gas_price = Some(100);
-                    config
+                let mut spawn_config = if name.starts_with("c_host_") {
+                    default_c_wallet_sequencer_config(log_prefix)
                 } else {
                     default_devnet_sequencer_config(log_prefix)
                 };
+                let scenario_name = name.strip_prefix("c_host_").unwrap_or(name);
+                if scenario_name == "watchdog_genesis_compare_test"
+                    || scenario_name == "deposit_transfer_withdrawal_test"
+                    || scenario_name == "watchdog_non_genesis_divergence_test"
+                {
+                    spawn_config.faketime = false;
+                } else if scenario_name == "fixed_fee_oracle_sets_frame_fee_test" {
+                    // 100 → recommended fee 1456, under the wallet client's
+                    // DEFAULT_MAX_FEE (2500) so transfers still admit.
+                    spawn_config.fee_oracle_fixed_log_gas_price = Some(100);
+                }
                 run_trial(name, || async move {
                     let mut runtime = ManagedSequencer::spawn(spawn_config).await?;
                     let scenario_result = scenario(&mut runtime).await;

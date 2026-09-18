@@ -51,6 +51,13 @@ exposure in an actual deployment was established by this review.
 
 ## Bounded investigations and cleanup
 
+- **Intermittent process-lock test failure.** The macOS workspace suite can
+  report `Locked` at the final reacquisition in
+  `dropped_runtime_scope_keeps_lock_until_detached_worker_stops` in
+  [`workers.rs`](../../sequencer/src/commands/run/workers.rs); an isolated rerun
+  passes. The worker drops its scope before signalling completion, so a simple
+  worker-completion race does not explain the failure. Identify any remaining
+  descriptor/process ownership before changing the assertion or lock behavior.
 - **Transient SQLite contention stops the submitter.** Read handles use a
   50 ms busy timeout; a storage/open failure escapes the submitter loop.
   BUSY/LOCKED are nonterminal but project to unclassified exit 1, causing
@@ -111,11 +118,11 @@ replay; no new snapshot lifecycle is implied.
 
 ## Integration work owned elsewhere
 
-- [Track 3 integration gates](../plans/2026-07-track3-feed-replay-design.md):
-  native snapshot-to-live replication and representative deployment latency,
+- [Track 3 follow-ups](../plans/2026-07-track3-feed-replay-design.md):
+  private-engine snapshot-to-live replication and representative deployment latency,
   including checkpoint creation and complete L1-reconciliation turns.
 - [Track 6](../plans/2026-07-coordination-tracks.md#track-6--dump--application-api-redesign):
-  external engine/scheduler agreement, C-host end-to-end coverage, independent
+  external engine/scheduler agreement, application-specific recovery export, independent
   fee-conversion vectors, and consumer-driven ABI/checkpoint decisions.
 
 The [2026-09-16 validation record](2026-09-16-track3-validation.md) supports

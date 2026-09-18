@@ -107,3 +107,23 @@ notices and vouchers, rejection/no-op progress, dump round trips, independent
 instances, and fatal/error classification.
 `cargo test -p c-app-engine --lib` also checks mixed-output ordering, copying
 reused engine buffers, and full-width voucher values with a small ABI fixture.
+
+The `c_host_` scenarios in `rollups-e2e` launch the reference C host with generated
+devnet genesis, delete that source before startup, and exercise ordinary execution,
+clean restart, stale recovery, and checkpoint-based rebuild. Independent
+`EngineApp` replicas restore HTTP archives, discard the downloaded sources,
+follow backlog and live WS inputs, and check history identity across recovery.
+Ordinary execution and both recovery paths also compare the host against the
+canonical machine. Run them with:
+
+```sh
+just setup
+just ensure-machine-image
+cargo build --locked -p c-wallet-engine --bin c-wallet-genesis -p c-wallet-sequencer --bin c-wallet-sequencer -p rollups-e2e --bin rollups-e2e
+target/debug/rollups-e2e c_host_ --nocapture
+```
+
+`just test-rollups-e2e` includes these scenarios in CI. This covers the reference
+wallet across the C ABI; private engines still need their own integration and
+canonical comparison. Rebuilding from a native recovery archive does not test
+the application's canonical-machine-to-native exporter.
