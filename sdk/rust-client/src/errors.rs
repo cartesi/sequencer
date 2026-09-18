@@ -79,6 +79,8 @@ pub enum SubscribeError {
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {
+    #[error("snapshot response headers timed out")]
+    HeadersTimeout,
     #[error("snapshot request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("invalid snapshot metadata: {0}")]
