@@ -35,6 +35,14 @@ pub struct FinalizedDump {
     pub executed_input_count: ExecutedInputCount,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum FinalizedSelectionError {
+    #[error("canonical divergence prevents accepted checkpoint selection")]
+    CanonicalDivergence,
+    #[error("selecting finalized checkpoint: {0}")]
+    Storage(#[from] rusqlite::Error),
+}
+
 pub type ReleaseScheduler = Arc<dyn Fn(Box<dyn FnOnce() + Send + 'static>) + Send + Sync + 'static>;
 pub type PersistentReleaseFailureReporter = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
@@ -153,8 +161,10 @@ impl Storage {
 
     /// The latest accepted batch must have its own snapshot. A missing artifact
     /// is corruption, never a request to use an older accepted snapshot.
-    pub fn finalized_dump(&mut self) -> Result<Option<FinalizedDump>> {
-        self.read(|tx| finalized_dump_in(tx))
+    pub fn finalized_dump(
+        &mut self,
+    ) -> std::result::Result<Option<FinalizedDump>, FinalizedSelectionError> {
+        self.read(|tx| Ok(finalized_dump_in(tx)))?
     }
 
     pub fn latest_snapshot(&mut self) -> Result<Option<Snapshot>> {
@@ -173,15 +183,17 @@ impl Storage {
         &mut self,
         schedule: ReleaseScheduler,
         report_persistent_failure: PersistentReleaseFailureReporter,
-    ) -> Result<Option<FinalizedLease>> {
+    ) -> std::result::Result<Option<FinalizedLease>, FinalizedSelectionError> {
         let acquired = self.write(|tx| {
-            let Some(snapshot) = finalized_dump_in(tx)? else {
-                return Ok(None);
+            let snapshot = match finalized_dump_in(tx) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => return Ok(Ok(None)),
+                Err(error) => return Ok(Err(error)),
             };
             let history_version = query_history_state(tx)?.version;
             acquire_dump_lease_in(tx, snapshot.dump.id)?;
-            Ok(Some((snapshot, history_version)))
-        })?;
+            Ok(Ok(Some((snapshot, history_version))))
+        })??;
         Ok(acquired.map(|(snapshot, history_version)| FinalizedLease {
             inclusion_block: snapshot.inclusion_block,
             dump: LeasedDump {
@@ -353,7 +365,14 @@ fn baseline_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
     .optional()
 }
 
-pub(super) fn finalized_dump_in(conn: &Connection) -> Result<Option<FinalizedDump>> {
+pub(super) fn finalized_dump_in(
+    conn: &Connection,
+) -> std::result::Result<Option<FinalizedDump>, FinalizedSelectionError> {
+    // A matched batch can precede a divergent accepted batch in the same L1
+    // block. Its snapshot cannot represent that complete block boundary.
+    if super::safe_accepted_batches::canonical_divergence_in(conn)?.is_some() {
+        return Err(FinalizedSelectionError::CanonicalDivergence);
+    }
     if let Some((batch_index, nonce, inclusion_block)) = latest_accepted_boundary_in(conn)? {
         let snapshot = snapshot_for_batch_in(conn, batch_index)?;
         return Ok(Some(FinalizedDump {
@@ -548,7 +567,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             storage.finalized_dump(),
-            Err(rusqlite::Error::QueryReturnedNoRows)
+            Err(FinalizedSelectionError::Storage(
+                rusqlite::Error::QueryReturnedNoRows
+            ))
         ));
         assert!(matches!(
             storage.latest_snapshot(),

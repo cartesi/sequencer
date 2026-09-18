@@ -23,9 +23,11 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 
-use crate::http::{StorageTaskError, storage_task};
+use crate::http::{ApiError, StorageTaskError, storage_task};
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
-use crate::storage::{FinalizedLease, LeaseGuard, LeasedDump, ReleaseScheduler, Storage};
+use crate::storage::{
+    FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, ReleaseScheduler, Storage,
+};
 
 type BoxError = StorageTaskError;
 
@@ -89,7 +91,7 @@ async fn finalized_inclusion_block(State(state): State<Arc<SnapshotApiState>>) -
         })
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(err) => internal_error("read finalized inclusion block", err),
+        Err(err) => finalized_error("read finalized inclusion block", err),
     }
 }
 
@@ -105,7 +107,7 @@ async fn finalized_state(
     } = match acquire_finalized(&state).await {
         Ok(Some(leased)) => leased,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(err) => return internal_error("acquire finalized lease", err),
+        Err(err) => return finalized_error("acquire finalized lease", err),
     };
 
     let etag = format!("\"block-{inclusion_block}\"");
@@ -170,7 +172,7 @@ async fn finalized_snapshot(State(state): State<Arc<SnapshotApiState>>) -> Respo
             archive_response(&state, dump, Some(checkpoint))
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(err) => internal_error("acquire accepted snapshot lease", err),
+        Err(err) => finalized_error("acquire accepted snapshot lease", err),
     }
 }
 
@@ -366,6 +368,19 @@ fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
 fn internal_error(context: &str, err: impl std::fmt::Display) -> Response {
     tracing::warn!(error = %err, context, "snapshot endpoint failed");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+fn finalized_error(context: &str, err: StorageTaskError) -> Response {
+    if matches!(
+        err.downcast_ref::<FinalizedSelectionError>(),
+        Some(FinalizedSelectionError::CanonicalDivergence)
+    ) {
+        return ApiError::unavailable(
+            "canonical divergence prevents accepted checkpoint selection",
+        )
+        .into_response();
+    }
+    internal_error(context, err)
 }
 
 #[cfg(test)]

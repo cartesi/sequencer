@@ -62,7 +62,7 @@ pub use recovery::DangerStatus;
 pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
 pub use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
 pub use snapshot_dumps::{
-    DumpRow, FinalizedDump, FinalizedLease, LeaseGuard, LeasedDump,
+    DumpRow, FinalizedDump, FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump,
     PersistentReleaseFailureReporter, ReleaseScheduler, Snapshot,
 };
 

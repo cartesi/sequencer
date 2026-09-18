@@ -180,6 +180,103 @@ fn archive_state(bytes: &[u8]) -> Vec<u8> {
     .unwrap()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_block_divergence_refuses_every_finalized_endpoint() {
+    use crate::storage::test_helpers::{
+        default_protocol_timing, local_batch_payload, pin_test_deployment_identity,
+    };
+    use crate::storage::{ExecutedInputCount, SafeInputRange, StoredSafeInput};
+    use sequencer_core::batch::{Batch, Frame};
+    use sequencer_core::scheduler::{Scheduler, SchedulerConfig, SchedulerInput};
+    use ssz::Encode;
+
+    let db = temp_db("same-block-divergence-http");
+    let root = tempfile::tempdir().unwrap();
+    let submitter = alloy_primitives::Address::repeat_byte(1);
+    let mut storage = Storage::open(&db.path).unwrap();
+    pin_test_deployment_identity(&mut storage, submitter);
+    let mut head = storage
+        .initialize_open_state(5, SafeInputRange::empty_at(0))
+        .unwrap();
+    let prefix = write_state(root.path(), "local", b"local checkpoint", 1);
+    storage
+        .close_frame_and_batch_with_snapshot(&mut head, 5, &prefix, 0, ExecutedInputCount::ZERO)
+        .unwrap();
+    let snapshot = storage.latest_snapshot().unwrap().unwrap();
+    let inputs = vec![
+        StoredSafeInput {
+            sender: alloy_primitives::Address::repeat_byte(2),
+            payload: vec![42],
+            block_number: 6,
+        },
+        StoredSafeInput {
+            sender: submitter,
+            payload: local_batch_payload(&mut storage, 0),
+            block_number: 10,
+        },
+        StoredSafeInput {
+            sender: submitter,
+            payload: Batch {
+                nonce: 1,
+                frames: vec![Frame {
+                    safe_block: 6,
+                    fee_price: 0,
+                    user_ops: vec![],
+                }],
+            }
+            .as_ssz_bytes(),
+            block_number: 10,
+        },
+    ];
+    storage
+        .append_safe_inputs(10, &inputs, submitter, &default_protocol_timing())
+        .unwrap();
+    assert!(storage.canonical_divergence().unwrap().is_some());
+
+    // The foreign batch consumes the next nonce and drains a direct that the
+    // matching local batch did not: its snapshot is not the end of block 10.
+    let mut canonical = Scheduler::new(WalletApp::default(), SchedulerConfig::new(submitter));
+    for input in inputs {
+        canonical
+            .process_input(SchedulerInput {
+                sender: input.sender,
+                payload: input.payload,
+                inclusion_block: input.block_number,
+                domain: sequencer_core::build_input_domain(1, alloy_primitives::Address::ZERO),
+            })
+            .unwrap();
+    }
+    let (app, nonce) = canonical.finish();
+    assert_eq!(nonce, 2);
+    assert_eq!(app.executed_input_count().get(), 1);
+    assert_eq!(snapshot.executed_input_count, ExecutedInputCount::ZERO);
+
+    let server = start_server(&db.path).await.expect("test listener");
+    let client = reqwest::Client::new();
+    for (path, conditional) in [
+        ("/finalized_state/inclusion_block", false),
+        ("/finalized_state", false),
+        ("/finalized_state", true),
+        ("/finalized_snapshot", false),
+    ] {
+        let mut request = client.get(server.url(path));
+        if conditional {
+            request = request.header("If-None-Match", "\"block-10\"");
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{path}, conditional={conditional}"
+        );
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["code"],
+            "UNAVAILABLE"
+        );
+        assert_eq!(storage.dump_lease_count(snapshot.dump.id).unwrap(), Some(0));
+    }
+}
+
 /// Transient WAL lock contention vs. a real read failure.
 ///
 /// SQLite readers can see `SQLITE_BUSY` in WAL mode during last-connection
