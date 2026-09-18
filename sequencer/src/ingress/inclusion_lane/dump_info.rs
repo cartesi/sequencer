@@ -100,7 +100,7 @@ pub(crate) fn write_archive<W: io::Write>(
     let mut archive = tar::Builder::new(writer);
     archive.append_path_with_name(dump_dir.join(INFO_FILE), INFO_FILE)?;
     let state = app_prefix(dump_dir);
-    if state.is_dir() {
+    if std::fs::metadata(&state)?.is_dir() {
         archive.append_dir_all(APP_STATE_SUBDIR, state)?;
     } else {
         archive.append_path_with_name(state, APP_STATE_SUBDIR)?;
@@ -439,6 +439,14 @@ mod tests {
         }
         check::<false>();
         check::<true>();
+    }
+
+    #[test]
+    fn archive_propagates_missing_state_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        write_info(root.path(), &DumpInfo::at_baseline(0)).unwrap();
+        let error = write_archive(Vec::new(), root.path(), 0, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     fn sample() -> DumpInfo {
