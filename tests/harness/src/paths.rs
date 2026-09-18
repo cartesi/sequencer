@@ -39,29 +39,35 @@ pub fn devnet_machine_image_path() -> PathBuf {
     workspace_root().join(DEFAULT_DEVNET_MACHINE_IMAGE_PATH)
 }
 
-const DEVNET_SEQUENCER_BIN: &str = "wallet-sequencer-devnet";
-
 /// Resolve the `wallet-sequencer-devnet` binary built for the current Cargo invocation.
-///
-/// Prefers `CARGO_TARGET_DIR` (set by `cargo run` / `cargo test` in sandboxes and
-/// custom target dirs) over the workspace `target/debug/` tree, which may be stale
-/// when builds only run through Cargo with a redirected target directory.
 pub fn resolve_devnet_sequencer_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_WALLET_SEQUENCER_DEVNET") {
+    resolve_debug_bin(
+        "wallet-sequencer-devnet",
+        "CARGO_BIN_EXE_WALLET_SEQUENCER_DEVNET",
+    )
+}
+
+pub fn resolve_c_wallet_sequencer_bin() -> PathBuf {
+    resolve_debug_bin("c-wallet-sequencer", "CARGO_BIN_EXE_C_WALLET_SEQUENCER")
+}
+
+pub fn resolve_c_wallet_genesis_bin() -> PathBuf {
+    resolve_debug_bin("c-wallet-genesis", "CARGO_BIN_EXE_C_WALLET_GENESIS")
+}
+
+// Prefer the active Cargo target over a potentially stale workspace target/debug.
+fn resolve_debug_bin(binary: &str, override_env: &str) -> PathBuf {
+    if let Ok(path) = std::env::var(override_env) {
         let path = PathBuf::from(path);
         if path.exists() {
             return path;
         }
     }
     if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
-        let path = PathBuf::from(target)
-            .join("debug")
-            .join(DEVNET_SEQUENCER_BIN);
+        let path = PathBuf::from(target).join("debug").join(binary);
         if path.exists() {
             return path;
         }
     }
-    workspace_root()
-        .join("target/debug")
-        .join(DEVNET_SEQUENCER_BIN)
+    workspace_root().join("target/debug").join(binary)
 }

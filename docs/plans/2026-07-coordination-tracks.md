@@ -19,7 +19,7 @@ freely at this stage — no backward-compatibility constraints.
 **Current campaign order:**
 
 1. Merge the implemented egress API after repository review/checks. Bart can then integrate his client; adjust the API from concrete feedback without waiting for downstream completion.
-2. Extend reference C-bridge coverage in this repository. Application integrators/operators own private-engine validation, the canonical-to-native exporter and recovery drill, and representative capacity measurements before production use.
+2. Application integrators/operators validate the private engine, canonical-to-native exporter and recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
 3. Track 5 (fee LUT) only after the log-space-fees decision.
 
 Full restore archives now support file and directory application prefixes.
@@ -63,10 +63,10 @@ until the pending log-space-fees decision lands (with Bart).
 
 The [Application contract](../protocol/application-contract.md) owns execution,
 engine progress, and checkpoint semantics. The [C binding guide](../protocol/c-application-binding.md)
-maps that contract to native engines; its reference conformance suite is
-implemented. End-to-end native snapshot-to-live bootstrap remains an integration
-gate, alongside the private DEX engine when available. Reference bridge
-conformance cannot establish private-engine correctness.
+maps that contract to native engines. Its reference conformance suite and C-host
+process scenarios cover snapshot-to-live bootstrap, restart, standard recovery,
+and fresh-era rebuild with canonical comparison. Reference bridge conformance
+cannot establish private-engine correctness.
 
 Remaining checks need the actual consumer:
 
@@ -79,10 +79,10 @@ Remaining checks need the actual consumer:
   resume metadata from canonical execution. Add the integration check to the
   release validation once the actual artifacts are available; no generic trait
   or deployment gate currently enforces this requirement.
-- Exercise snapshot-to-live bootstrap and canonical comparison through the C
-  host in CI; its current smoke test builds and invokes `--help`. A reusable
-  conformance runner needs engine-supplied genesis and meaningful accepted and
-  rejected inputs. Compare canonical state files, not recovery-dump layouts.
+- Repeat snapshot-to-live bootstrap and canonical comparison with the private
+  engine's genesis and meaningful accepted/rejected inputs. The reference
+  `c_host_` scenarios supply the lifecycle pattern; compare canonical state
+  files, not recovery-dump layouts.
 - Verify the external scheduler's ordering, fee conversion, and recovery
   agreement. Publish independent-port fee vectors for the
   [current arithmetic](../../sequencer-core/src/fee.rs); a deferred LUT is a

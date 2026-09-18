@@ -65,7 +65,7 @@ test-sequencer:
 
 test-rollups-e2e: setup ensure-machine-image ensure-sepolia-machine-image
     just watchdog-lua-deps
-    cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p rollups-e2e --bin rollups-e2e
+    cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p c-wallet-engine --bin c-wallet-genesis -p c-wallet-sequencer --bin c-wallet-sequencer -p rollups-e2e --bin rollups-e2e
     cargo run -p rollups-e2e --bin rollups-e2e
 
 ensure-machine-image:

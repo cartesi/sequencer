@@ -3875,6 +3875,8 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "app-core",
+ "c-app-engine",
+ "c-wallet-engine",
  "ethereum_ssz",
  "futures",
  "libtest-mimic",

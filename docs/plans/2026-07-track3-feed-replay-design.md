@@ -19,7 +19,6 @@ concrete feedback. There are no live deployments requiring compatibility.
 
 | Follow-up | Owner | When it is needed |
 |---|---|---|
-| Native reference adapter snapshot-to-live and recovery coverage | Sequencer maintainers | Additional repository conformance coverage after merge; the wallet projection tests already exercise this API's replay and recovery contract. |
 | Private DEX scheduler, indexer, and database backups | Bart / application integration | After merge, while adopting the API. Verify complete checkpoint/claim association and scheduler replay; report missing fields or awkward workflow for adjustment. |
 | Canonical-to-native export and incident rehearsal | Application integration and operators, under Track 6 | Before relying on that application's recovery procedure in production. |
 | Ingress latency, indexing headroom, and recovery capacity | Sequencer/application maintainers and deployment operators | Before claiming support for the target deployment workload; measure historical serving alongside ordinary traffic. |
@@ -28,6 +27,14 @@ The [validation record](../review/2026-09-16-track3-validation.md) records the
 wallet's nonempty cold bootstrap, concurrent replay/live delivery, recovery and
 rebootstrap, canonical-machine gates, and local latency measurements. Those
 results do not establish private-engine conformance or target-deployment capacity.
+
+The reference C host has process coverage in the `c_host_` rollups E2E scenarios:
+generated genesis, source-independent `EngineApp` snapshot restore, concurrent
+backlog/live replay, clean restart, stale recovery, and a fresh-era rebuild.
+Ordinary execution and recovery compare against the canonical machine. The
+[C binding guide](../../bindings/c-app-engine/README.md#reference-wallet) owns
+the commands and scope. This closes the reference-host follow-up; the private
+engine and canonical-to-native exporter still require their own evidence.
 
 ## Application projections and recovery
 
@@ -83,8 +90,8 @@ replacement directs, empty/no-op invalidation, nonzero baselines, and rollback.
    identifying an unsound projection checkpoint, including one below new `K`,
    and restoring an earlier trusted backup or genesis. The API does not certify
    the client's projection.
-2. **Repository conformance and deployment readiness.** Extend native snapshot-to-live
-   validation and measure latency, historical serving cost, projection throughput,
+2. **Deployment readiness.** Validate the private native engine and measure
+   latency, historical serving cost, projection throughput,
    catch-up headroom, and recovery time. Track 6 independently owns the versioned
    canonical-machine exporter and native-state-unavailable drill.
 

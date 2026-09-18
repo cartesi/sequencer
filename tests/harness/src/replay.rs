@@ -63,10 +63,7 @@ impl ReplayWalletApp {
     }
 }
 
-pub(crate) fn apply_ws_message<A: Application>(
-    app: &mut A,
-    message: WsTxMessage,
-) -> HarnessResult<()> {
+pub fn apply_ws_message<A: Application>(app: &mut A, message: WsTxMessage) -> HarnessResult<()> {
     let expected = app.executed_input_count().get();
     if message.offset() != expected {
         return Err(std::io::Error::other(format!(

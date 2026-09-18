@@ -119,17 +119,17 @@ jobs:
           cartesi-machine-sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
           install-foundry: "true"
 
-      - name: Install faketime
+      - name: Install native test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y faketime libfaketime
+          sudo apt-get install -y faketime libfaketime libclang-dev
 
       - name: Build watchdog Lua deps
         run: |
           sudo apt-get install -y libcurl4-openssl-dev build-essential pkg-config
           just watchdog-lua-deps
 
-      - name: Run rollups E2E tests
+      - name: Run rollups E2E tests (Rust and C hosts)
         run: just test-rollups-e2e
 
       # Runs after the e2e step so the canonical machine image is already built;
