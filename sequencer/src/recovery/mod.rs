@@ -438,10 +438,10 @@ fn classify_signer_provider(
 ///   build), refused because re-running the same boot re-fails
 ///   identically. The discovery-time facts (wrong contract, pre-v3
 ///   InputBox) never reach this function: they arise in `InputReader::new`,
-///   which only `setup` calls and projects as a worker exit (register
-///   finding 32). In the live loop the same URL was already proven by this
-///   boot's initial sync, so a live `Bootstrap` restarts unclassified
-///   rather than poisoning the data directory.
+///   which only `setup` calls and currently projects as a live-worker exit
+///   rather than a deterministic configuration failure. In the live loop the
+///   same URL was already proven by this boot's initial sync, so a live
+///   `Bootstrap` restarts unclassified rather than poisoning the data directory.
 /// - `Join` (a non-panic loss of a storage task) is shutdown-path
 ///   cancellation in the live loop. During startup the runtime that would
 ///   cancel it is the one driving this boot, so an unexplained loss is

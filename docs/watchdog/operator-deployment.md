@@ -9,20 +9,20 @@ For **local development only** (Anvil + `sequencer-devnet`, CI smoke tests), use
 ## Two deployment tiers
 
 ```text
-                    ┌──────────────────────────────────────────────┐
-  Internet / users  │  Public ingress (POST /tx, GET /fee, WS)    │  ← benchmarks, wallets
-                    └──────────────────────┬───────────────────────┘
-                                      │
-                    ┌─────────────────▼───────────────────┐
-  Operator network  │  Sequencer process                 │
-                    │  + internal snapshot HTTP          │  ← watchdog ONLY here
-                    │    /finalized_state*             │
-                    └─────────┬───────────────┬─────────┘
-                              │               │
-                    ┌─────────▼───┐   ┌───────▼────────┐
-                    │  L1 (Sepolia │   │  Watchdog host │
-                    │   or mainnet)│   │  (compare)    │
-                    └─────────────┘   └────────────────┘
+                    ┌─────────────────────────────────────┐
+  Internet / users  │  Public ingress: POST /tx, GET /fee │  ← wallets
+                    └──────────────────┬──────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────┐
+  Operator network  │  Sequencer process                  │
+                    │  Internal WS, history, and health   │  ← indexers and probes
+                    │  Snapshots: /finalized_state*       │  ← watchdog
+                    └─────────┬─────────────────┬─────────┘
+                              │                 │
+                    ┌─────────▼────────┐ ┌──────▼─────────┐
+                    │ L1 (Sepolia      │ │ Watchdog host  │
+                    │ or mainnet)      │ │ (compare)      │
+                    └──────────────────┘ └────────────────┘
 ```
 
 The watchdog independently replays L1 through the canonical CM and compares

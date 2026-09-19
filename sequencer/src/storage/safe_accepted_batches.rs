@@ -387,115 +387,124 @@ mod tests {
         use sequencer_core::{batch::Batch, history::ExecutedInputCount};
         use ssz::Encode;
 
-        let db = temp_db("accepted-recovered-prefix");
-        let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild)
-            .expect("initialize rebuild");
-        let submitter = Address::repeat_byte(0x99);
-        let timing = default_protocol_timing();
-        pin_test_deployment_identity(&mut storage, submitter);
-        let old_future = Batch {
-            nonce: 1,
-            frames: vec![],
-        }
-        .as_ssz_bytes();
-        let old_accepted = Batch {
-            nonce: 0,
-            frames: vec![],
-        }
-        .as_ssz_bytes();
-        assert!(
-            timing
-                .scheduler_accepts(
-                    submitter,
-                    SafeInputView {
-                        safe_input_index: 0,
-                        sender: submitter,
-                        payload: &old_future,
-                        inclusion_block: 20,
-                    },
-                    0
-                )
-                .is_none()
-        );
-        assert!(
-            timing
-                .scheduler_accepts(
-                    submitter,
-                    SafeInputView {
-                        safe_input_index: 1,
-                        sender: submitter,
-                        payload: &old_accepted,
-                        inclusion_block: 30,
-                    },
-                    0
-                )
-                .is_some()
-        );
-        storage
-            .append_safe_inputs_with_timestamp(
-                30,
-                30,
-                &[
-                    StoredSafeInput {
-                        sender: submitter,
-                        payload: old_future,
-                        block_number: 20,
-                    },
-                    StoredSafeInput {
-                        sender: submitter,
-                        payload: old_accepted,
-                        block_number: 30,
-                    },
-                ],
-                submitter,
-                &timing,
-                FrontierMode::DeferUntilAnchorSet,
-            )
-            .expect("ingest opaque prefix");
-        storage
-            .write(|tx| {
-                super::super::history::initialize_history_in(tx, ExecutedInputCount::new(41), 30)?;
-                super::super::mutations::set_batch_tree_anchor_in(tx, 1)?;
-                super::super::ingress::open_recovery_tip_in_tx(tx, 30)
-            })
-            .expect("install recovered baseline");
-        let mut head = storage.open_state().expect("read root").expect("root");
-        storage
-            .close_frame_and_batch(&mut head, 30)
-            .expect("close resumed batch");
-        let payload = local_batch_payload(&mut storage, 1);
-        storage
-            .append_safe_inputs(
-                31,
-                &[StoredSafeInput {
-                    sender: submitter,
-                    payload,
-                    block_number: 31,
-                }],
-                submitter,
-                &timing,
-            )
-            .expect("accept post-baseline batch");
-        assert!(
+        // At C itself, the future nonce must precede nonce 0 in L1 order:
+        // it was rejected there and must not become accepted after the rebuild.
+        for old_future_block in [20, 30] {
+            let db = temp_db("accepted-recovered-prefix");
+            let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild)
+                .expect("initialize rebuild");
+            let submitter = Address::repeat_byte(0x99);
+            let timing = default_protocol_timing();
+            pin_test_deployment_identity(&mut storage, submitter);
+            let old_future = Batch {
+                nonce: 1,
+                frames: vec![],
+            }
+            .as_ssz_bytes();
+            let old_accepted = Batch {
+                nonce: 0,
+                frames: vec![],
+            }
+            .as_ssz_bytes();
+            assert!(
+                timing
+                    .scheduler_accepts(
+                        submitter,
+                        SafeInputView {
+                            safe_input_index: 0,
+                            sender: submitter,
+                            payload: &old_future,
+                            inclusion_block: old_future_block,
+                        },
+                        0
+                    )
+                    .is_none()
+            );
+            assert!(
+                timing
+                    .scheduler_accepts(
+                        submitter,
+                        SafeInputView {
+                            safe_input_index: 1,
+                            sender: submitter,
+                            payload: &old_accepted,
+                            inclusion_block: 30,
+                        },
+                        0
+                    )
+                    .is_some()
+            );
             storage
-                .canonical_divergence()
-                .expect("divergence")
-                .is_none()
-        );
-        let accepted = query_latest_safe_accepted_batch(&storage.conn)
-            .expect("accepted frontier")
-            .expect("resumed acceptance");
-        assert_eq!((accepted.safe_input_index, accepted.nonce), (2, 1));
-        assert_eq!(
+                .append_safe_inputs_with_timestamp(
+                    30,
+                    30,
+                    &[
+                        StoredSafeInput {
+                            sender: submitter,
+                            payload: old_future,
+                            block_number: old_future_block,
+                        },
+                        StoredSafeInput {
+                            sender: submitter,
+                            payload: old_accepted,
+                            block_number: 30,
+                        },
+                    ],
+                    submitter,
+                    &timing,
+                    FrontierMode::DeferUntilAnchorSet,
+                )
+                .expect("ingest opaque prefix");
             storage
-                .conn
-                .query_row("SELECT COUNT(*) FROM safe_accepted_batches", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ))
-                .expect("accepted count"),
-            1
-        );
+                .write(|tx| {
+                    super::super::history::initialize_history_in(
+                        tx,
+                        ExecutedInputCount::new(41),
+                        30,
+                    )?;
+                    super::super::mutations::set_batch_tree_anchor_in(tx, 1)?;
+                    super::super::ingress::open_recovery_tip_in_tx(tx, 30)
+                })
+                .expect("install recovered baseline");
+            let mut head = storage.open_state().expect("read root").expect("root");
+            storage
+                .close_frame_and_batch(&mut head, 30)
+                .expect("close resumed batch");
+            let payload = local_batch_payload(&mut storage, 1);
+            storage
+                .append_safe_inputs(
+                    31,
+                    &[StoredSafeInput {
+                        sender: submitter,
+                        payload,
+                        block_number: 31,
+                    }],
+                    submitter,
+                    &timing,
+                )
+                .expect("accept post-baseline batch");
+            assert!(
+                storage
+                    .canonical_divergence()
+                    .expect("divergence")
+                    .is_none(),
+                "reinterpreted future-nonce input at block {old_future_block}"
+            );
+            let accepted = query_latest_safe_accepted_batch(&storage.conn)
+                .expect("accepted frontier")
+                .expect("resumed acceptance");
+            assert_eq!((accepted.safe_input_index, accepted.nonce), (2, 1));
+            assert_eq!(
+                storage
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM safe_accepted_batches", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .expect("accepted count"),
+                1
+            );
+        }
     }
 
     fn insert_safe_input_zero(storage: &Storage) {
