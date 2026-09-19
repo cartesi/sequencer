@@ -188,37 +188,28 @@ Top-level layout follows the system's data flow. Each sequencer module correspon
 - **Danger detector** — background worker that polls `Storage::check_danger` on a fixed cadence and exits with `RecoveryRequired` when any non-`Safe` danger status fires. Never writes to the DB; never talks to L1. Crashes the process so startup recovery or refusal can run.
 - **Fee oracle** — setup pins either a fixed exponent or a reviewed Uniswap V3 WETH/X TWAP tuple into deployment identity, and writes the first `log_gas_price` (+ observation stamp) in both modes. Setup requires a successful live quote; `run` performs no fee-source read before recovery/admission. Fixed mode has no worker; Uniswap launches a lazy refresher that immediately attempts a quote, persists successes, and retains the last price while logging and retrying transient source failures. The stamp is telemetry, not a runtime-admission or expiry gate. A shared-endpoint outage/stale view is already detected from L1 safe-head progress; a fee-source-only outage is an accepted economic residual (stale-low may subsidize DA, stale-high may reject users), not a canonical-correctness fault. Deterministic source misconfiguration, fatal arithmetic, and persistent storage faults remain terminal. The 10× margin lives in `batch_policy.log_slack`; it is a buffer rather than a bound on market movement, and frame fees stay immutable until the next frame opens.
 - **Input reader** — ingests safe inputs from L1 InputBox and maintains the durable safe head, accepted-batch projection, and divergence marker in one atomic transaction (`sequencer/src/storage/l1_inputs.rs`); it hands the lane no in-memory cursor.
-- **L2 tx feed** — DB-backed ordered-tx stream used by WS subscribers. The
-  existing endpoint still paginates by the physical SQLite rowid cursor.
-  SQLite now also stores the canonical `ExecutedInputCount` attribution for
-  every application input; switching the public feed and history-version
-  handshake to that coordinate remains Track 3 API work.
-- **Application progress** — engine-owned, with protocol-defined semantics:
-  `(ExecutedInputCount, last_executed_safe_block)` embedded in every
-  application dump. Shared execution functions verify its transition and return the
-  input's pre-execution offset. SQLite records that offset atomically with the
-  corresponding valid replay row; only the WebSocket/HTTP projection remains
-  Track 3 work.
-- **History version** — `(EraId, RecoveryGeneration)`. The durable metadata
-  foundation is landed: a new baseline mints an immutable UUIDv4 era and starts
-  generation zero; standard recovery increments it exactly once iff its
-  transaction invalidates at least one valid batch. The current feed does not
-  expose or enforce the pair yet.
+- **L2 tx feed** — DB-backed application-input stream. HTTP snapshot headers
+  provide `(EraId, RecoveryGeneration, ExecutedInputCount)`; WS validates that
+  claim and replays inclusively before following the tip.
+- **Application progress** — engine-owned `(ExecutedInputCount,
+  last_executed_safe_block)`, embedded in every dump. Shared execution verifies
+  the transition and returns the pre-execution offset; storage commits that
+  mandatory offset with its source in `application_inputs`.
+- **History version** — `(EraId, RecoveryGeneration)`. Setup publishes a complete
+  baseline with a fresh era; recovery increments the generation exactly once
+  iff it invalidates at least one valid batch. Subscription claims enforce both.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
-- **Snapshot** — durable copy of the app's canonical state at one physical
-  replay cursor and one canonical `ExecutedInputCount`; *pending* at batch
-  close, *promoted* to finalized on L1 observation (per-range, atomically with
-  the drain), garbage-collected when superseded. Catch-up refuses if the
-  loaded app count, stored snapshot count, or per-row execution attributions
-  disagree. Lifecycle + rationale (incl. the promote/drain crash-safety):
-  [`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md).
+- **Snapshot** — immutable artifact at every batch close, registered with its
+  local batch identity and application count. Acceptance facts select the
+  recovery/watchdog checkpoint; the era baseline supplies the initial restore
+  point. Lifecycle and leases: [`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md).
 
 ## Domain Truths
 
 - API validates the EIP-712 signature and enqueues a `SignedUserOp`. Method payload decoding happens during application execution, not at ingress.
 - **Deposits are direct-input-only** (L1 → L2) and must not be represented as user ops.
 - Rejections (`InvalidNonce`, `InvalidMaxFee`, `InsufficientFeeBalance`) produce no state mutation and are not persisted. These are protocol-level rejection semantics every app must implement: nonces prevent user-op replay, fees prevent spam against the sequencer's DA budget. ("Fee", not "gas" — the fee tracks DA; compute metering, if it ever exists, is a separate future concept.)
-- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `sequenced_l2_txs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
+- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `application_inputs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is currently sampled from `batch_policy_derived.recommended_fee` at rotation; oracle bootstrap writes the price before any Tip can sample it, and `log_slack` applies the 10× margin in log space. This is present behavior, not a reason for the five-block clock policy; hoisting fee to the batch is a later design with its own trade-offs.
 - Wallet state (balances, nonces) is in-memory today — not persisted.
 - **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`. `chainId` and `verifyingContract` come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS` (validated against the RPC chain id at startup). All four fields must be present on both sides — both the sequencer and the on-chain scheduler construct the domain via `sequencer_core::build_input_domain`, the canonical shared constructor.
@@ -259,7 +250,7 @@ The hot-path rules are owned elsewhere; this section is only the map.
 
 - Drain attribution, frame-clock monotonicity, the
   content-identity check and the divergence freeze, history metadata, the
-  `WriteHead` cache, and the executed-inputs projection are registered in
+  `WriteHead` cache, and the application-input sequence are registered in
   [`docs/invariants.md`](docs/invariants.md) (the fail-loud check policy plus
   I2, I3, I9, I10, I12–I18, I20) — that register owns them; do not restate
   them here.
@@ -284,8 +275,7 @@ ordering logic without explicit approval.
 
 Owned by [`docs/invariants.md`](docs/invariants.md): the writer-role table
 (one writer role per fact), the `valid_*` view rule, `WriteHead` coherence
-(I17), history metadata (I18), the replay cursor and the executed-inputs
-projection (I10, I20). The schema
+(I17), history metadata (I18), the application-input sequence and its canonical offsets (I10, I20). The schema
 (`sequencer/src/storage/migrations/0001_schema.sql`) owns the write-once
 batch lifecycle, the Tip's uniqueness, and the user-op identity rule. Do not
 restate them here.
@@ -294,18 +284,17 @@ restate them here.
 
 - `SignedUserOp` — ingress/API signature domain (post-validation, pre-execution).
 - `ValidUserOp` — application execution domain (after validation boundary).
-- `SequencedL2Tx` — ordered replay/fanout domain (`UserOp | DirectInput`).
+- `SequencedL2Tx` — application input payload sum (`UserOp | DirectInput`).
 - `ExecutedInputCount` — canonical application-history boundary (`X` means the
   next input is entry `X`), never a SQLite cursor. Checked arithmetic only.
-- `ReplayL2TxRow` — crate-private named pairing of a physical DB cursor,
-  `SequencedL2Tx`, frame clock, and optional canonical attribution; do not
-  collapse these coordinates back into a positional tuple.
+- `ApplicationInputRow` — crate-private pairing of a mandatory application offset
+  and source context. Every row executes; batch envelopes stay in `safe_inputs`.
 - Keep DB-only helper types private to storage modules; prefer shared domain types at module boundaries.
 
 ## HTTP Endpoints
 
 - **Ingress** (public-facing): `POST /tx`, `GET /fee`.
-- **Egress** (internal indexers/watchdog): `GET /ws/subscribe`, `GET /finalized_state`, `GET /finalized_state/inclusion_block`, `GET /latest_snapshot`, `GET /livez`, `GET /readyz`, `GET /healthz`. The snapshot/state endpoints are **operator-only** (no auth) and must not be exposed publicly; the streaming routes hold a GC lease for the response lifetime ([`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md)).
+- **Egress** (internal indexers/watchdog): `GET /ws/subscribe`, `GET /finalized_state`, `GET /finalized_state/inclusion_block`, `GET /latest_snapshot`, `GET /finalized_snapshot`, `GET /livez`, `GET /readyz`, `GET /healthz`. The snapshot/state endpoints are **operator-only** (no auth) and must not be exposed publicly; the streaming routes hold a GC lease for the response lifetime ([`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md)).
 
 Today both sides serve from one listener; the planned API split puts each side on its own port (same binary) so internal probes and subscribers can be firewalled from public submit traffic.
 
@@ -465,7 +454,7 @@ Before finishing a change, ensure:
 - [`docs/plans/`](docs/plans/) — the architecture decision record ([`2026-08-authority-boundary-adr.md`](docs/plans/2026-08-authority-boundary-adr.md)), active coordination tracks, and in-flight design handoffs.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
 - [`docs/recovery/README.md`](docs/recovery/README.md) — recovery design, TLA+ formal verification, design history.
-- [`docs/snapshots/`](docs/snapshots/) — app snapshots: [`format.md`](docs/snapshots/format.md) (dump trait + wire format) and [`lifecycle.md`](docs/snapshots/lifecycle.md) (take/promote/GC/lease design + crash-safety).
+- [`docs/snapshots/`](docs/snapshots/) — app snapshots: [`format.md`](docs/snapshots/format.md) (dump trait + wire format) and [`lifecycle.md`](docs/snapshots/lifecycle.md) (creation/acceptance/GC/lease design + crash-safety).
 - [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md) — production-like watchdog (Sepolia / mainnet; internal snapshot API).
 - [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md) — local dev: watchdog + `sequencer-devnet` on Anvil.
 - [`docs/watchdog/README.md`](docs/watchdog/README.md) — watchdog architecture, compare vs advance modes, test commands.

@@ -58,9 +58,8 @@ CREATE INDEX IF NOT EXISTS idx_batches_valid_closed_by_nonce
     WHERE invalidated_at_ms IS NULL AND sealed_at_ms IS NOT NULL;
 
 -- ── Views ──────────────────────────────────────────────────────────────────
--- Readers over batch data go through the `valid_*` views (here and
--- `valid_sequenced_l2_txs` below), which encapsulate the "exclude invalidated
--- rows" filter; writers always target the base tables.
+-- Readers over batch data go through these `valid_*` views, which exclude
+-- invalidated rows; writers always target the base tables.
 CREATE VIEW IF NOT EXISTS valid_batches AS
     SELECT * FROM batches WHERE invalidated_at_ms IS NULL;
 
@@ -245,19 +244,6 @@ BEGIN
     SELECT RAISE(ABORT, 'user_ops can only be inserted into the current Tip');
 END;
 
--- Automatically sequence every user-op into the global replay order on insert.
--- Note: safe_inputs do NOT have an analogous trigger because their
--- batch_index/frame_in_batch are not known at INSERT time — safe inputs
--- are ingested by the input reader independently, and only assigned to a
--- frame when the frame is closed.  The Rust code inserts into
--- sequenced_l2_txs explicitly at frame-close time.
-CREATE TRIGGER IF NOT EXISTS trg_sequence_user_op AFTER INSERT ON user_ops
-BEGIN
-    INSERT INTO sequenced_l2_txs (
-        batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index
-    ) VALUES (NEW.batch_index, NEW.frame_in_batch, NEW.pos_in_frame, NULL);
-END;
-
 CREATE TABLE IF NOT EXISTS safe_inputs (
     safe_input_index INTEGER PRIMARY KEY,
     sender             BLOB NOT NULL CHECK (length(sender) = 20),
@@ -274,64 +260,28 @@ CREATE TABLE IF NOT EXISTS safe_inputs (
 CREATE INDEX IF NOT EXISTS idx_safe_inputs_sender
     ON safe_inputs(sender);
 
--- Global append-only replay order consumed by catch-up and feed readers.
--- It is a cache, containing the merged and flattened txs of safe_inputs and user_ops.
-CREATE TABLE IF NOT EXISTS sequenced_l2_txs (
-    offset               INTEGER PRIMARY KEY,
-    batch_index          INTEGER NOT NULL,
-    frame_in_batch       INTEGER NOT NULL,
-
-    -- User-op branch: references user_ops(..., pos_in_frame).
+-- Current application order. Recovery replaces only an invalidated suffix;
+-- immutable source payloads remain in their owning tables.
+CREATE TABLE IF NOT EXISTS application_inputs (
+    offset INTEGER PRIMARY KEY CHECK (typeof(offset) = 'integer' AND offset >= 0),
+    batch_index INTEGER NOT NULL,
+    frame_in_batch INTEGER NOT NULL,
     user_op_pos_in_frame INTEGER,
-
-    -- Direct-input branch: references safe_inputs(safe_input_index).
-    safe_input_index   INTEGER,
-
+    safe_input_index INTEGER,
     FOREIGN KEY(batch_index, frame_in_batch)
         REFERENCES frames(batch_index, frame_in_batch),
     FOREIGN KEY(batch_index, frame_in_batch, user_op_pos_in_frame)
         REFERENCES user_ops(batch_index, frame_in_batch, pos_in_frame),
-    FOREIGN KEY(safe_input_index)
-        REFERENCES safe_inputs(safe_input_index),
-
-    -- XOR invariant: row is either a sequenced user-op OR a drained direct input.
-    CHECK (
-        (user_op_pos_in_frame IS NOT NULL AND safe_input_index IS NULL) OR
-        (user_op_pos_in_frame IS NULL AND safe_input_index IS NOT NULL)
-    ),
-
-    -- At most one sequenced user-op row for each user-op key.
-    UNIQUE(batch_index, frame_in_batch, user_op_pos_in_frame)
-    -- A direct input may be sequenced more than once if its original batch is
-    -- invalidated and a recovery batch re-drains it. The read-side query filters
-    -- out rows from invalid batches, so only the latest valid drain is visible.
-    -- (No UNIQUE constraint on safe_input_index.)
+    FOREIGN KEY(safe_input_index) REFERENCES safe_inputs(safe_input_index),
+    CHECK ((user_op_pos_in_frame IS NOT NULL AND safe_input_index IS NULL)
+        OR (user_op_pos_in_frame IS NULL AND safe_input_index IS NOT NULL)),
+    UNIQUE(batch_index, frame_in_batch, user_op_pos_in_frame),
+    UNIQUE(safe_input_index)
 );
-
-CREATE TRIGGER IF NOT EXISTS trg_sequenced_l2_txs_target_must_be_tip
-BEFORE INSERT ON sequenced_l2_txs
-FOR EACH ROW
-WHEN NOT EXISTS (
-    SELECT 1 FROM batches
-    WHERE batch_index = NEW.batch_index
-      AND sealed_at_ms IS NULL
-      AND invalidated_at_ms IS NULL
-)
-BEGIN
-    SELECT RAISE(ABORT, 'sequenced_l2_txs can only target the current Tip');
-END;
-
-CREATE INDEX IF NOT EXISTS idx_sequenced_l2_txs_frame
-    ON sequenced_l2_txs(batch_index, frame_in_batch);
-
--- Partial index for efficient MAX(safe_input_index) lookups used to compute
--- the next undrained direct-input cursor at frame-close time.
-CREATE INDEX IF NOT EXISTS idx_sequenced_l2_txs_safe_input
-    ON sequenced_l2_txs(safe_input_index) WHERE safe_input_index IS NOT NULL;
-
-CREATE VIEW IF NOT EXISTS valid_sequenced_l2_txs AS
-SELECT * FROM sequenced_l2_txs
-WHERE batch_index NOT IN (SELECT batch_index FROM batches WHERE invalidated_at_ms IS NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_application_inputs_frame
+    ON application_inputs(batch_index, frame_in_batch);
+CREATE INDEX IF NOT EXISTS idx_safe_inputs_block
+    ON safe_inputs(block_number, safe_input_index);
 
 -- Derived log of batch submissions the scheduler would actually execute.
 -- Unlike a raw log of all safe submissions, this only contains the accepted
@@ -392,7 +342,7 @@ CREATE TABLE IF NOT EXISTS canonical_divergence (
 );
 
 -- I15 structural enforcement: while the divergence marker exists, the batch
--- tree, promotions, and the pending-snapshot pool are frozen in the engine
+-- tree and snapshot collection are frozen in the engine
 -- itself. Standard recovery is forbidden on a diverged frontier; the typed
 -- Rust refusals (the local-first startup recovery procedure plus guarded Tip/Cascade
 -- mutations and atomic runtime admission) remain the friendly error surface, but these
@@ -409,213 +359,67 @@ BEFORE UPDATE ON batches FOR EACH ROW
 WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
 BEGIN SELECT RAISE(ABORT, 'batch tree frozen: canonical divergence marker present'); END;
 
--- External history identity. One database serves exactly one era. The era is
--- minted with the baseline schema; standard recovery advances only the
--- generation. A rebuild's application-history base and durable safe-input
--- drain floor are unknown until the recovered finalized snapshot exists, so
--- they alone start NULL and fill together exactly once before setup completes.
+-- A complete immutable baseline is registered with its durable artifact.
+-- Only the recovery generation changes during this database's lifetime.
 CREATE TABLE IF NOT EXISTS history_state (
-    singleton_id                 INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    era_id                       BLOB    NOT NULL CHECK (
-        typeof(era_id) = 'blob'
-        AND length(era_id) = 16
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    era_id BLOB NOT NULL CHECK (
+        typeof(era_id) = 'blob' AND length(era_id) = 16
         AND substr(hex(era_id), 13, 1) = '4'
-        AND substr(hex(era_id), 17, 1) IN ('8', '9', 'A', 'B')
-    ),
-    era_created_at_ms            INTEGER NOT NULL CHECK (
-        typeof(era_created_at_ms) = 'integer'
-        AND era_created_at_ms >= 0
-    ),
-    recovery_generation          INTEGER NOT NULL CHECK (
-        typeof(recovery_generation) = 'integer'
-        AND recovery_generation >= 0
-    ),
-    base_executed_input_count    INTEGER CHECK (
-        base_executed_input_count IS NULL
-        OR (
-            typeof(base_executed_input_count) = 'integer'
-            AND base_executed_input_count >= 0
-        )
-    ),
-    base_safe_input_index        INTEGER CHECK (
-        base_safe_input_index IS NULL
-        OR (
-            typeof(base_safe_input_index) = 'integer'
-            AND base_safe_input_index >= 0
-        )
-    ),
-    CHECK (
-        (base_executed_input_count IS NULL AND base_safe_input_index IS NULL)
-        OR
-        (base_executed_input_count IS NOT NULL AND base_safe_input_index IS NOT NULL)
-    )
+        AND substr(hex(era_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    era_created_at_ms INTEGER NOT NULL CHECK (
+        typeof(era_created_at_ms) = 'integer' AND era_created_at_ms >= 0),
+    recovery_generation INTEGER NOT NULL CHECK (
+        typeof(recovery_generation) = 'integer' AND recovery_generation >= 0),
+    base_executed_input_count INTEGER NOT NULL CHECK (
+        typeof(base_executed_input_count) = 'integer' AND base_executed_input_count >= 0),
+    base_safe_block INTEGER NOT NULL CHECK (
+        typeof(base_safe_block) = 'integer' AND base_safe_block >= 0)
 );
-
 CREATE TRIGGER IF NOT EXISTS trg_history_state_single_insert
-BEFORE INSERT ON history_state
-FOR EACH ROW
-WHEN EXISTS (SELECT 1 FROM history_state WHERE singleton_id = 0)
-BEGIN
-    SELECT RAISE(ABORT, 'history state is inserted once per database');
-END;
-
+BEFORE INSERT ON history_state FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM history_state)
+BEGIN SELECT RAISE(ABORT, 'history state is inserted once per database'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_identity_write_once
-BEFORE UPDATE OF singleton_id, era_id, era_created_at_ms ON history_state
-FOR EACH ROW
-BEGIN
-    SELECT RAISE(ABORT, 'history era identity is write-once');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_history_base_write_once
-BEFORE UPDATE OF base_executed_input_count, base_safe_input_index ON history_state
-FOR EACH ROW
-WHEN OLD.base_executed_input_count IS NOT NULL
-  OR OLD.base_safe_input_index IS NOT NULL
-BEGIN
-    SELECT RAISE(ABORT, 'history base is write-once');
-END;
-
+BEFORE UPDATE OF singleton_id, era_id, era_created_at_ms,
+    base_executed_input_count, base_safe_block ON history_state FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'history baseline is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_generation_monotonic
-BEFORE UPDATE OF recovery_generation ON history_state
-FOR EACH ROW
+BEFORE UPDATE OF recovery_generation ON history_state FOR EACH ROW
 WHEN OLD.recovery_generation = 9223372036854775807
   OR NEW.recovery_generation != OLD.recovery_generation + 1
-BEGIN
-    SELECT RAISE(ABORT, 'recovery generation must advance by exactly one');
-END;
-
+BEGIN SELECT RAISE(ABORT, 'recovery generation must advance by exactly one'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_state_not_deletable
-BEFORE DELETE ON history_state
-FOR EACH ROW
-BEGIN
-    SELECT RAISE(ABORT, 'history state is write-once per database');
-END;
+BEFORE DELETE ON history_state FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'history state is write-once per database'); END;
 
--- Canonical application-history coordinates attached to physical replay rows.
---
--- `sequenced_l2_txs.offset` remains the append-only SQLite pagination cursor:
--- it may contain invalidated rows and rows that the application never executes
--- (our own batch submissions and cockroach-root cursor padding). This table is
--- the separate, sparse attribution saying which physical rows did execute and
--- at which `Application::executed_input_count` boundary.
---
--- The primary key makes attribution one-to-one per physical row. This is a
--- derived *current canonical projection*, not the audit log: invalidating a
--- batch atomically deletes its mappings while retaining the physical replay
--- rows. The replacement suffix can then reuse its canonical offsets, enforced
--- by the global logical UNIQUE constraint.
-CREATE TABLE IF NOT EXISTS executed_inputs (
-    sequenced_l2_tx_offset INTEGER PRIMARY KEY
-        REFERENCES sequenced_l2_txs(offset),
-    executed_input_offset  INTEGER NOT NULL CHECK (
-        typeof(executed_input_offset) = 'integer'
-        AND executed_input_offset >= 0
-    ),
-    UNIQUE(executed_input_offset)
-);
-
--- Invalidation structurally deletes mappings below, so this projection can
--- join the physical table directly without re-running the valid-batch filter.
-CREATE VIEW IF NOT EXISTS valid_executed_inputs AS
-SELECT
-    e.sequenced_l2_tx_offset,
-    e.executed_input_offset,
-    s.batch_index,
-    s.frame_in_batch,
-    s.user_op_pos_in_frame,
-    s.safe_input_index
-FROM executed_inputs e
-JOIN sequenced_l2_txs s ON s.offset = e.sequenced_l2_tx_offset;
-
--- Attribution is creation-time state, not a catch-up repair operation. The
--- Rust writer maps rows in their creation transaction; this backstop limits a
--- target to the current valid Tip and refuses physical-order rewrites.
-CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_target_must_be_tip
-BEFORE INSERT ON executed_inputs
-FOR EACH ROW
-WHEN NOT EXISTS (
-    SELECT 1
-    FROM sequenced_l2_txs s
-    JOIN batches b ON b.batch_index = s.batch_index
-    WHERE s.offset = NEW.sequenced_l2_tx_offset
-      AND b.sealed_at_ms IS NULL
-      AND b.invalidated_at_ms IS NULL
-)
-BEGIN
-    SELECT RAISE(ABORT, 'executed input must target the current valid Tip');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_requires_bound_base
-BEFORE INSERT ON executed_inputs
-FOR EACH ROW
-WHEN (SELECT base_executed_input_count FROM history_state WHERE singleton_id = 0) IS NULL
-BEGIN
-    SELECT RAISE(ABORT, 'executed input history base is not bound');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_physical_order
-BEFORE INSERT ON executed_inputs
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1 FROM executed_inputs
-    WHERE sequenced_l2_tx_offset >= NEW.sequenced_l2_tx_offset
-)
-BEGIN
-    SELECT RAISE(ABORT, 'executed input attributions must follow physical replay order');
-END;
-
--- Every new mapping consumes exactly the current canonical next offset:
--- max(the era base, MAX(current mapping) + 1). Invalidation deletes its suffix
--- mappings, naturally rewinding the next offset for the replacement suffix.
-CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_contiguous
-BEFORE INSERT ON executed_inputs
-FOR EACH ROW
-WHEN NEW.executed_input_offset != (
-    SELECT MAX(
-        base_executed_input_count,
-        COALESCE((SELECT MAX(executed_input_offset) + 1 FROM executed_inputs), 0)
-    )
-    FROM history_state
-    WHERE singleton_id = 0
-)
-BEGIN
-    SELECT RAISE(ABORT, 'executed input offset must equal canonical next count');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_executed_inputs_append_only_update
-BEFORE UPDATE ON executed_inputs
-FOR EACH ROW
-BEGIN
-    SELECT RAISE(ABORT, 'executed input attribution is append-only');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_protect_valid_executed_input_delete
-BEFORE DELETE ON executed_inputs
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1
-    FROM sequenced_l2_txs s
-    JOIN batches b ON b.batch_index = s.batch_index
-    WHERE s.offset = OLD.sequenced_l2_tx_offset
-      AND b.invalidated_at_ms IS NULL
-)
-BEGIN
-    SELECT RAISE(ABORT, 'valid executed input attribution cannot be deleted');
-END;
-
--- Recovery owns the only deletion path. The batch row is already invalid when
--- this AFTER trigger runs, so the guarded delete above permits exactly these
--- derived mappings to disappear in the same transaction as suffix invalidation.
-CREATE TRIGGER IF NOT EXISTS trg_drop_invalidated_executed_inputs
-AFTER UPDATE OF invalidated_at_ms ON batches
-FOR EACH ROW
+CREATE TRIGGER IF NOT EXISTS trg_application_inputs_target_must_be_tip
+BEFORE INSERT ON application_inputs FOR EACH ROW
+WHEN NOT EXISTS (SELECT 1 FROM batches WHERE batch_index = NEW.batch_index
+    AND sealed_at_ms IS NULL AND invalidated_at_ms IS NULL)
+BEGIN SELECT RAISE(ABORT, 'application input must target the current valid Tip'); END;
+CREATE TRIGGER IF NOT EXISTS trg_application_inputs_requires_baseline
+BEFORE INSERT ON application_inputs FOR EACH ROW
+WHEN NOT EXISTS (SELECT 1 FROM history_state)
+BEGIN SELECT RAISE(ABORT, 'application history baseline is missing'); END;
+CREATE TRIGGER IF NOT EXISTS trg_application_inputs_contiguous
+BEFORE INSERT ON application_inputs FOR EACH ROW
+WHEN NEW.offset != (SELECT MAX(base_executed_input_count,
+    COALESCE((SELECT MAX(offset) + 1 FROM application_inputs), 0))
+    FROM history_state WHERE singleton_id = 0)
+BEGIN SELECT RAISE(ABORT, 'application input offset must equal next count'); END;
+CREATE TRIGGER IF NOT EXISTS trg_application_inputs_immutable
+BEFORE UPDATE ON application_inputs FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'application inputs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_protect_valid_application_input_delete
+BEFORE DELETE ON application_inputs FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM batches WHERE batch_index = OLD.batch_index
+    AND invalidated_at_ms IS NULL)
+BEGIN SELECT RAISE(ABORT, 'valid application input cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS trg_drop_invalidated_application_inputs
+AFTER UPDATE OF invalidated_at_ms ON batches FOR EACH ROW
 WHEN OLD.invalidated_at_ms IS NULL AND NEW.invalidated_at_ms IS NOT NULL
-BEGIN
-    DELETE FROM executed_inputs
-    WHERE sequenced_l2_tx_offset IN (
-        SELECT offset FROM sequenced_l2_txs WHERE batch_index = NEW.batch_index
-    );
-END;
+BEGIN DELETE FROM application_inputs WHERE batch_index = NEW.batch_index; END;
 
 -- Terminal-fault black box: an append-only trail of terminal causes,
 -- best-effort recorded before death. DELIBERATELY NOT AN ADMISSION GATE:
@@ -683,14 +487,9 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
     )
 );
 
--- setup-complete marker. The `setup` subcommand
--- pins deployment identity, does the initial L1 sync, and registers the
--- genesis finalized snapshot; it inserts this singleton row as its LAST
--- write. `run` refuses to boot unless the row is present. Presence is the
--- single linearization point for "setup finished": it distinguishes a clean
--- setup from one that crashed midway (identity pinned and/or genesis
--- snapshot registered, but the marker absent), which every prior setup step
--- is individually idempotent enough to let `setup` re-run and complete.
+-- Setup publishes the complete baseline, snapshot, anchor, and this marker in
+-- one final transaction after artifact durability. Earlier identity/sync work
+-- can be retried; run cannot admit an incomplete setup.
 CREATE TABLE IF NOT EXISTS setup_complete (
     singleton_id    INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0)
@@ -805,38 +604,10 @@ FROM batch_policy;
 -- ---------------------------------------------------------------------------
 -- Snapshot dumps
 --
--- Three tables together implement the snapshot lifecycle:
---
---   * dumps                — master table: every on-disk dump has a row here,
---                            with a lease_count tracking in-flight readers
---                            (typically HTTP handlers streaming the dump).
---                            Rows are FK-referenced by pending_snapshots and
---                            finalized_snapshot via ON DELETE RESTRICT, so a
---                            dump can't be removed while still referenced.
---   * pending_snapshots    — one row per batch that has been closed and
---                            dumped, but not yet observed landed on L1. Keyed
---                            by nonce so the inclusion lane can match its own
---                            batches in the direct-input stream.
---   * finalized_snapshot   — single-row table holding the latest L1-finalized
---                            snapshot. INSERT OR REPLACE on promotion;
---                            consumers (the watchdog) read this row to learn
---                            which dump corresponds to the canonical state.
---
--- Garbage collection: dumps with lease_count = 0 AND no row in either
--- pending_snapshots or finalized_snapshot are eligible for filesystem +
--- DB-row removal. The Rust caller drives this; the FK constraints prevent
--- accidental deletion while a reference still exists.
---
--- Lifecycle:
---   * batch close:        INSERT into dumps; INSERT into pending_snapshots.
---   * batch observed:     INSERT OR REPLACE into finalized_snapshot; DELETE
---                         the promoted nonces from pending_snapshots in one tx.
---                         The previous finalized's dump becomes GC-eligible.
---   * cascade invalidate: DELETE from pending_snapshots; sweep dumps via GC.
---   * HTTP serving:       acquire/release lease_count to prevent GC during
---                         in-flight streams.
---   * startup:            UPDATE dumps SET lease_count = 0 (clear stale
---                         in-process leases from a crashed previous run).
+-- Immutable snapshots belong to one local batch, or to the era baseline.
+-- Acceptance is derived from safe_accepted_batches; it never mutates snapshots.
+-- Lease acquisition and garbage collection serialize in SQLite. Files are
+-- durable before insertion; database rows are deleted before filesystem cleanup.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS dumps (
@@ -846,39 +617,21 @@ CREATE TABLE IF NOT EXISTS dumps (
         CHECK (typeof(lease_count) = 'integer' AND lease_count >= 0)
 );
 
-CREATE TABLE IF NOT EXISTS pending_snapshots (
-    nonce                 INTEGER PRIMARY KEY CHECK (typeof(nonce) = 'integer' AND nonce >= 0),
-    dump_id               INTEGER NOT NULL REFERENCES dumps(id) ON DELETE RESTRICT,
-    l2_tx_index           INTEGER NOT NULL
-        CHECK (typeof(l2_tx_index) = 'integer' AND l2_tx_index >= 0),
+CREATE TABLE IF NOT EXISTS snapshots (
+    dump_id               INTEGER PRIMARY KEY REFERENCES dumps(id) ON DELETE RESTRICT,
+    batch_index           INTEGER UNIQUE REFERENCES batches(batch_index) ON DELETE RESTRICT,
     executed_input_count  INTEGER NOT NULL CHECK (
-        typeof(executed_input_count) = 'integer'
-        AND executed_input_count >= 0
+        typeof(executed_input_count) = 'integer' AND executed_input_count >= 0
     )
 );
+CREATE UNIQUE INDEX IF NOT EXISTS snapshots_single_baseline
+ON snapshots ((1)) WHERE batch_index IS NULL;
 
-CREATE TABLE IF NOT EXISTS finalized_snapshot (
-    singleton_id          INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    dump_id               INTEGER NOT NULL REFERENCES dumps(id) ON DELETE RESTRICT,
-    inclusion_block       INTEGER NOT NULL
-        CHECK (typeof(inclusion_block) = 'integer' AND inclusion_block >= 0),
-    l2_tx_index           INTEGER NOT NULL
-        CHECK (typeof(l2_tx_index) = 'integer' AND l2_tx_index >= 0),
-    executed_input_count  INTEGER NOT NULL CHECK (
-        typeof(executed_input_count) = 'integer'
-        AND executed_input_count >= 0
-    )
-);
+CREATE TRIGGER IF NOT EXISTS trg_snapshot_immutable
+BEFORE UPDATE ON snapshots
+BEGIN SELECT RAISE(ABORT, 'snapshot boundaries are immutable'); END;
 
--- I15 structural enforcement, snapshot half (batch-tree half lives next to
--- the canonical_divergence table): promotions and pending-pool clears are
--- frozen while the divergence marker exists.
-CREATE TRIGGER IF NOT EXISTS trg_promotion_frozen_on_divergence
-BEFORE INSERT ON finalized_snapshot FOR EACH ROW
+CREATE TRIGGER IF NOT EXISTS trg_snapshot_clear_frozen_on_divergence
+BEFORE DELETE ON snapshots FOR EACH ROW
 WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
-BEGIN SELECT RAISE(ABORT, 'promotion frozen: canonical divergence marker present'); END;
-
-CREATE TRIGGER IF NOT EXISTS trg_pending_clear_frozen_on_divergence
-BEFORE DELETE ON pending_snapshots FOR EACH ROW
-WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
-BEGIN SELECT RAISE(ABORT, 'pending-snapshot clear frozen: canonical divergence marker present'); END;
+BEGIN SELECT RAISE(ABORT, 'snapshot collection frozen: canonical divergence marker present'); END;

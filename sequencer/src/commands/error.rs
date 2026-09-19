@@ -407,16 +407,15 @@ pub enum SetupRecoveryError {
     AlreadySetUp,
     /// The checkpoint dump could not be loaded (missing/corrupt `info.toml`, or
     /// the app's `from_dump` failed). Operator must supply a valid **sequencer**
-    /// dump dir (`info.toml` + `state/`), not a watchdog CM checkpoint.
+    /// recovery export (`info.toml` + `checkpoint.toml` + `state/`), not a watchdog CM checkpoint.
     #[error("failed to load checkpoint dump at {path}: {message}")]
     CheckpointLoad { path: String, message: String },
-    /// The checkpoint's last-executed safe block `A` is not strictly before the
-    /// checkpoint block `B`. The fold reconstructs the `(A, B]` fridge, so
-    /// `A < B` must hold — otherwise the checkpoint dump and
-    /// `--checkpoint-block` describe inconsistent points.
+    /// Outside the known empty genesis checkpoint, A must precede B so the
+    /// recovery seed includes all potentially pending directs in block B.
     #[error(
-        "checkpoint last-executed safe block {executed_safe_block} (A) is not \
-         before checkpoint block {checkpoint_block} (B)"
+        "checkpoint last-executed safe block {executed_safe_block} (A) must precede \
+         checkpoint block {checkpoint_block} (B), except for empty genesis; \
+         equality can omit pending same-block directs"
     )]
     CheckpointNotBeforeBlock {
         executed_safe_block: u64,
@@ -429,58 +428,6 @@ pub enum SetupRecoveryError {
          internal storage invariant violation"
     )]
     MissingResyncedSafeHead,
-    /// A re-run of `setup --recovery` found a root tip from a *prior* (crashed
-    /// before setup completion) attempt whose nonce differs from this
-    /// attempt's resume nonce — a different checkpoint, or the same one after the
-    /// post-flush head `C` advanced. The half-recovered DB cannot be resumed
-    /// onto a tree rooted at the old nonce (the anchor would move but the
-    /// existing root tip would not, silently breaking I16). Wipe the data dir
-    /// and re-run.
-    #[error(
-        "partial recovery: existing root tip carries nonce {existing_root_nonce}, \
-         but this attempt resumes at {requested_nonce} — wipe the data dir and re-run"
-    )]
-    PartialRecoveryMismatch {
-        existing_root_nonce: u64,
-        requested_nonce: u64,
-    },
-    /// A re-run of `setup --recovery` found a root tip carrying *this* attempt's
-    /// resume nonce but **no finalized snapshot** — a prior attempt that crashed
-    /// between opening the root tip and writing the snapshot. It cannot be
-    /// resumed safely: a re-sync may have advanced `C` with new direct inputs
-    /// (which leave `N'` unchanged) that resuming would leave unsequenced, so the
-    /// snapshot cursor would lag the folded `S'` and `run` would drain+execute
-    /// them a second time (divergence). Wipe the data dir and re-run (the
-    /// one-shot recovery model).
-    #[error(
-        "partial recovery: root tip at nonce {root_nonce} exists with no finalized \
-         snapshot (crashed mid-fill) — wipe the data dir and re-run"
-    )]
-    PartialRecoveryIncomplete { root_nonce: u64 },
-    /// `setup --recovery` found a finalized snapshot but **no root tip**. A
-    /// completed cockroach fill always has both (the tip is opened in step 2,
-    /// before the snapshot in step 4), so this is residue from a *different*
-    /// deployment mode left in the data dir — a plain `setup` that registered the
-    /// genesis finalized snapshot and crashed before setup completion.
-    /// Folding `(S', N')` and then silently keeping the old snapshot would mark
-    /// setup complete over the genesis state instead of the recovered state. Wipe
-    /// the data dir and re-run `setup --recovery`.
-    #[error(
-        "setup --recovery found a finalized snapshot (block {existing_finalized_block}) \
-         with no root tip — residue from an incomplete plain `setup`; wipe the data \
-         dir and re-run"
-    )]
-    RecoveryOverResidualSnapshot { existing_finalized_block: u64 },
-    /// A plain (non-recovery) `setup` found a non-zero batch-tree anchor —
-    /// residue from a `setup --recovery` that crashed before completion. Booting
-    /// a genesis deployment over it would root the tree at the recovery nonce
-    /// instead of 0. Wipe the data dir, then run plain `setup` or re-run
-    /// `setup --recovery`.
-    #[error(
-        "plain setup found batch-tree anchor {anchor} (≠ 0) — leftover from an \
-         incomplete `setup --recovery`; wipe the data dir and re-run"
-    )]
-    GenesisOverRecoveryResidue { anchor: u64 },
 }
 
 /// `setup`'s read-only detection gate: the reasons a
@@ -1094,28 +1041,6 @@ mod tests {
             (
                 CommandError::from(SetupRecoveryError::AlreadySetUp),
                 "setup --recovery over an already set-up directory",
-            ),
-            // Partial-recovery residue: operator must wipe — terminal.
-            (
-                CommandError::from(SetupRecoveryError::PartialRecoveryMismatch {
-                    existing_root_nonce: 3,
-                    requested_nonce: 5,
-                }),
-                "partial-recovery residue at a different nonce",
-            ),
-            (
-                CommandError::from(SetupRecoveryError::GenesisOverRecoveryResidue { anchor: 7 }),
-                "genesis over recovery residue",
-            ),
-            (
-                CommandError::from(SetupRecoveryError::PartialRecoveryIncomplete { root_nonce: 3 }),
-                "an incomplete partial recovery",
-            ),
-            (
-                CommandError::from(SetupRecoveryError::RecoveryOverResidualSnapshot {
-                    existing_finalized_block: 0,
-                }),
-                "recovery over a residual snapshot",
             ),
             // A checkpoint predating genesis is operator misconfig — terminal
             // (30), not a recovery trigger (40).

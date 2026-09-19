@@ -54,7 +54,7 @@ struct Args {
     accounts_file: Option<String>,
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TRANSFER_AMOUNT)]
     transfer_amount: u64,
-    #[arg(long, default_value_t = 1200_u16)]
+    #[arg(long, default_value_t = 2000_u16)]
     max_fee: u16,
     #[arg(
         long,
@@ -79,9 +79,6 @@ struct Args {
     /// Max wait time (ms) for remaining WS events after workers finish (round-trip mode only).
     #[arg(long, default_value_t = 5_000_u64)]
     max_ws_wait_ms: u64,
-    /// Initial WS subscribe offset (round-trip mode only).
-    #[arg(long, default_value_t = 0_u64)]
-    from_offset: u64,
     /// Run a warmup phase before the first sweep step.
     #[arg(long, default_value_t = 0_u64)]
     warmup_secs: u64,
@@ -183,7 +180,6 @@ async fn main() -> BenchResult<()> {
 
     let max_workers = concurrencies.iter().copied().max().unwrap_or(1);
     let mut nonce_offsets = vec![0_u64; max_workers];
-    let mut ws_from_offset = args.from_offset;
     let mut total_accepted = 0_u64;
 
     // Warmup phase.
@@ -200,7 +196,6 @@ async fn main() -> BenchResult<()> {
             let warmup_config = RoundTripRunConfig {
                 endpoint: endpoint.clone(),
                 domain,
-                from_offset: ws_from_offset,
                 duration: warmup_duration,
                 concurrency: first_concurrency,
                 nonce_offsets: offsets_for_warmup,
@@ -213,7 +208,6 @@ async fn main() -> BenchResult<()> {
             for (i, advance) in warmup_report.nonce_advances.iter().enumerate() {
                 nonce_offsets[i] += advance;
             }
-            ws_from_offset = ws_from_offset.saturating_add(warmup_report.consumed_ws_events_total);
             println!(
                 "warmup complete: accepted={}, rejected={}",
                 warmup_report.accepted, warmup_report.rejected
@@ -254,7 +248,6 @@ async fn main() -> BenchResult<()> {
             let config = RoundTripRunConfig {
                 endpoint: endpoint.clone(),
                 domain,
-                from_offset: ws_from_offset,
                 duration,
                 concurrency,
                 nonce_offsets: offsets_for_step,
@@ -268,7 +261,6 @@ async fn main() -> BenchResult<()> {
                 for (i, advance) in report.nonce_advances.iter().enumerate() {
                     nonce_offsets[i] += advance;
                 }
-                ws_from_offset = ws_from_offset.saturating_add(report.consumed_ws_events_total);
 
                 print_round_trip_report(&report);
                 RtSweepRow::new(

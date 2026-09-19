@@ -8,28 +8,14 @@
 //! any writer role. Single-caller reads stay inline in the writer that owns
 //! them; only the reads reused by two or more roles live here.
 
+#[cfg(test)]
 use alloy_primitives::Address;
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
 
 use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64};
 use super::{BatchPolicy, WriteHead};
+#[cfg(test)]
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
-
-/// Highest `offset` in the valid (non-invalidated) ordered L2-tx stream,
-/// or 0 when the stream is empty. This is the global replay head — the
-/// cursor a snapshot taken "now" should record, so catch-up resumes
-/// strictly after it. Reads the same `valid_sequenced_l2_txs` view that
-/// catch-up pages through, so the snapshot cursor and the replay query
-/// always agree (and an empty batch correctly inherits the prior head
-/// rather than recording genesis).
-pub(super) fn valid_ordered_l2_tx_head(conn: &Connection) -> Result<u64> {
-    let head: Option<i64> = conn.query_row(
-        "SELECT MAX(offset) FROM valid_sequenced_l2_txs",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(head.map(i64_to_u64).unwrap_or(0))
-}
 
 // ── Write-head loading ───────────────────────────────────────────────────
 //
@@ -195,6 +181,7 @@ pub(super) fn query_batch_policy(conn: &Connection) -> Result<BatchPolicy> {
 // the row shape inside its own `query_map` closure and hands the fields to
 // this decoder rather than defining an intermediate struct.
 
+#[cfg(test)]
 pub(super) fn decode_l2_tx_row(
     kind: i64,
     sender: Option<Vec<u8>>,

@@ -27,3 +27,4 @@ ssz = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "process", "io-util", "signal"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+tar = "0.4"

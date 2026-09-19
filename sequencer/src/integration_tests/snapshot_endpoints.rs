@@ -67,7 +67,7 @@ async fn start_server(db_path: &str) -> Option<TestServer> {
     let tx_feed = L2TxFeed::new(
         db_path.to_string(),
         shutdown.clone(),
-        L2TxFeedConfig::new(alloy_primitives::Address::repeat_byte(0x7f)),
+        L2TxFeedConfig::default(),
     );
     let task = http::start_on_listener(
         listener,
@@ -92,7 +92,7 @@ async fn start_server(db_path: &str) -> Option<TestServer> {
 
 /// Build a structured dump dir mirroring production layout: the app's
 /// state under `state`, plus a minimal `info.toml`.
-fn write_state(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+fn write_state(dir: &Path, name: &str, bytes: &[u8], next_batch_nonce: u64) -> std::path::PathBuf {
     let dump_dir = dir.join(name);
     let app_prefix = dump_info::app_prefix(&dump_dir);
     std::fs::create_dir_all(&app_prefix).expect("mkdir dump");
@@ -101,43 +101,83 @@ fn write_state(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         &dump_dir,
         &dump_info::DumpInfo {
             format_version: dump_info::FORMAT_VERSION,
-            next_batch_nonce: 0,
-            l2_tx_index: 0,
-            promoted_inclusion_block: None,
+            next_batch_nonce,
         },
     )
     .expect("write info.toml");
     dump_dir
 }
 
-fn register_finalized(
+fn register_accepted(
     db_path: &str,
     dir: &Path,
     name: &str,
     bytes: &[u8],
     inclusion_block: u64,
-    l2_tx_index: u64,
 ) -> i64 {
-    let prefix = write_state(dir, name, bytes);
-    Storage::open(db_path)
-        .expect("open")
-        .insert_finalized_dump(&prefix, inclusion_block, l2_tx_index)
-        .expect("register finalized")
+    let mut storage = Storage::open(db_path).unwrap();
+    let sender = alloy_primitives::Address::repeat_byte(0x7f);
+    crate::storage::test_helpers::pin_test_deployment_identity(&mut storage, sender);
+    let mut head = storage.open_state().unwrap().unwrap_or_else(|| {
+        storage
+            .initialize_open_state(inclusion_block, crate::storage::SafeInputRange::empty_at(0))
+            .unwrap()
+    });
+    let nonce = storage.batch_nonce(head.batch_index).unwrap();
+    let prefix = write_state(dir, name, bytes, nonce + 1);
+    let index = head.batch_index;
+    let safe_block = head.safe_block;
+    storage
+        .close_frame_and_batch_with_snapshot(
+            &mut head,
+            safe_block,
+            &prefix,
+            index,
+            crate::storage::ExecutedInputCount::ZERO,
+        )
+        .unwrap();
+    crate::storage::test_helpers::seed_safe_inputs_with_batch_nonces(
+        &mut storage,
+        sender,
+        inclusion_block,
+        &[nonce],
+    );
+    storage.finalized_dump().unwrap().unwrap().dump.id
 }
 
-fn register_pending(
-    db_path: &str,
-    dir: &Path,
-    name: &str,
-    bytes: &[u8],
-    nonce: u64,
-    l2_tx_index: u64,
-) -> i64 {
-    let prefix = write_state(dir, name, bytes);
-    Storage::open(db_path)
-        .expect("open")
-        .insert_pending_dump(&prefix, nonce, l2_tx_index)
-        .expect("register pending")
+fn register_optimistic(db_path: &str, dir: &Path, name: &str, bytes: &[u8], nonce: u64) -> i64 {
+    let mut storage = Storage::open(db_path).unwrap();
+    let mut head = storage.open_state().unwrap().unwrap();
+    while storage.batch_nonce(head.batch_index).unwrap() <= nonce {
+        let current = storage.batch_nonce(head.batch_index).unwrap();
+        let dump_name = if current == nonce {
+            name.to_owned()
+        } else {
+            format!("intermediate-{current}")
+        };
+        let prefix = write_state(dir, &dump_name, bytes, current + 1);
+        let index = head.batch_index;
+        let safe_block = head.safe_block;
+        storage
+            .close_frame_and_batch_with_snapshot(
+                &mut head,
+                safe_block,
+                &prefix,
+                index,
+                crate::storage::ExecutedInputCount::ZERO,
+            )
+            .unwrap();
+    }
+    storage.latest_snapshot().unwrap().unwrap().dump.id
+}
+
+fn archive_state(bytes: &[u8]) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    tar::Archive::new(bytes).unpack(dir.path()).unwrap();
+    std::fs::read(WalletApp::state_file_in_dump(&dump_info::app_prefix(
+        dir.path(),
+    )))
+    .unwrap()
 }
 
 /// Transient WAL lock contention vs. a real read failure.
@@ -227,7 +267,7 @@ async fn finalized_state_round_trips_bytes_and_headers() {
     let db = temp_db("snap-finalized-roundtrip");
     let dir = tempfile::tempdir().expect("dumps dir");
     let state = b"the-canonical-finalized-state".to_vec();
-    let dump_id = register_finalized(db.path.as_str(), dir.path(), "fin", &state, 4242, 7);
+    let dump_id = register_accepted(db.path.as_str(), dir.path(), "fin", &state, 4242);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -240,7 +280,9 @@ async fn finalized_state_round_trips_bytes_and_headers() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.headers()["content-type"], "application/octet-stream");
     assert_eq!(resp.headers()["x-inclusion-block"], "4242");
-    assert_eq!(resp.headers()["x-l2-tx-index"], "7");
+    assert_eq!(resp.headers()["x-executed-input-count"], "0");
+    assert!(resp.headers().contains_key("x-history-era"));
+    assert_eq!(resp.headers()["x-recovery-generation"], "0");
     assert_eq!(resp.headers()["etag"], "\"block-4242\"");
     let body = resp.bytes().await.expect("body");
     assert_eq!(
@@ -259,7 +301,7 @@ async fn finalized_state_round_trips_bytes_and_headers() {
 async fn finalized_inclusion_block_returns_cheap_json() {
     let db = temp_db("snap-inclusion-block");
     let dir = tempfile::tempdir().expect("dumps dir");
-    register_finalized(db.path.as_str(), dir.path(), "fin", b"x", 999, 42);
+    register_accepted(db.path.as_str(), dir.path(), "fin", b"x", 999);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -271,14 +313,14 @@ async fn finalized_inclusion_block_returns_cheap_json() {
     let body = resp.bytes().await.expect("body");
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("\"inclusion_block\":999"), "got: {text}");
-    assert!(text.contains("\"l2_tx_index\":42"), "got: {text}");
+    assert!(text.contains("\"executed_input_count\":0"), "got: {text}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn endpoints_404_when_no_finalized_snapshot() {
     let db = temp_db("snap-404");
     // Migrate the schema (as startup does) but register no snapshot: the
-    // endpoints then see an empty `finalized_snapshot` and return 404.
+    // endpoints then see no registered snapshot and return 404.
     Storage::open(db.path.as_str()).expect("init schema");
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
@@ -304,7 +346,7 @@ async fn endpoints_404_when_no_finalized_snapshot() {
 async fn finalized_state_if_none_match_returns_304() {
     let db = temp_db("snap-etag");
     let dir = tempfile::tempdir().expect("dumps dir");
-    let dump_id = register_finalized(db.path.as_str(), dir.path(), "fin", b"abc", 500, 3);
+    let dump_id = register_accepted(db.path.as_str(), dir.path(), "fin", b"abc", 500);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -326,25 +368,11 @@ async fn finalized_state_if_none_match_returns_304() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn latest_snapshot_prefers_pending() {
+async fn latest_snapshot_prefers_newest_valid_batch() {
     let db = temp_db("snap-latest-pending");
     let dir = tempfile::tempdir().expect("dumps dir");
-    register_finalized(
-        db.path.as_str(),
-        dir.path(),
-        "fin",
-        b"finalized-bytes",
-        100,
-        5,
-    );
-    let pending_id = register_pending(
-        db.path.as_str(),
-        dir.path(),
-        "pend",
-        b"pending-bytes",
-        3,
-        11,
-    );
+    register_accepted(db.path.as_str(), dir.path(), "fin", b"finalized-bytes", 100);
+    let pending_id = register_optimistic(db.path.as_str(), dir.path(), "pend", b"pending-bytes", 3);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -353,10 +381,12 @@ async fn latest_snapshot_prefers_pending() {
         .await
         .expect("request");
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.headers()["x-l2-tx-index"], "11");
+    assert_eq!(resp.headers()["x-executed-input-count"], "0");
+    assert!(resp.headers().contains_key("x-history-era"));
+    assert_eq!(resp.headers()["x-recovery-generation"], "0");
     let body = resp.bytes().await.expect("body");
     assert_eq!(
-        body.as_ref(),
+        archive_state(body.as_ref()).as_slice(),
         b"pending-bytes",
         "serves the latest pending, not the finalized fallback"
     );
@@ -369,7 +399,7 @@ async fn finalized_state_streams_large_file() {
     let db = temp_db("snap-large");
     let dir = tempfile::tempdir().expect("dumps dir");
     let big = vec![0x5Au8; 8 * 1024 * 1024];
-    let dump_id = register_finalized(db.path.as_str(), dir.path(), "big", &big, 1, 1);
+    let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 1);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -396,7 +426,7 @@ async fn finalized_state_disconnect_mid_stream_releases_lease() {
     // 8 MiB so the body is still streaming (not fully in the socket buffer)
     // when we disconnect.
     let big = vec![0xABu8; 8 * 1024 * 1024];
-    let dump_id = register_finalized(db.path.as_str(), dir.path(), "big", &big, 7, 9);
+    let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 7);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -435,7 +465,7 @@ async fn finalized_state_concurrent_streams_count_and_release_independently() {
     let db = temp_db("snap-concurrent");
     let dir = tempfile::tempdir().expect("dumps dir");
     let big = vec![0xCDu8; 8 * 1024 * 1024];
-    let dump_id = register_finalized(db.path.as_str(), dir.path(), "big", &big, 1, 1);
+    let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 1);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -482,7 +512,7 @@ async fn live_stream_blocks_gc_until_it_drops() {
     let db = temp_db("snap-stream-blocks-gc");
     let dir = tempfile::tempdir().expect("dumps dir");
     let big = vec![0xABu8; 8 * 1024 * 1024];
-    let served_id = register_finalized(db.path.as_str(), dir.path(), "served", &big, 1, 1);
+    let served_id = register_accepted(db.path.as_str(), dir.path(), "served", &big, 1);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -498,13 +528,8 @@ async fn live_stream_blocks_gc_until_it_drops() {
     stream.next().await.expect("chunk").expect("ok");
     assert!(wait_for_lease(db.path.as_str(), served_id, 1).await);
 
-    // Promote a new finalized so the dump being streamed becomes unreferenced.
-    {
-        let prefix = write_state(dir.path(), "new", b"new-finalized");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-        storage.insert_pending_dump(&prefix, 0, 2).expect("pending");
-        storage.promote_finalized(0, 2).expect("promote");
-    }
+    // Acceptance advances independently of the lane's L1 reconciliation.
+    register_accepted(db.path.as_str(), dir.path(), "new", b"new-finalized", 2);
 
     // GC must skip the superseded dump while the stream holds its lease.
     let removed = {
@@ -540,7 +565,7 @@ async fn finalized_state_missing_registered_artifact_aborts_process() {
     }
     let db = temp_db("snap-missing-artifact");
     let dir = tempfile::tempdir().expect("dumps dir");
-    register_finalized(db.path.as_str(), dir.path(), "fin", b"bytes", 1, 1);
+    register_accepted(db.path.as_str(), dir.path(), "fin", b"bytes", 1);
     // The durable row promises the artifact exists. This is a terminal
     // invariant failure, so the process stops before HTTP or lease cleanup.
     std::fs::remove_file(WalletApp::state_file_in_dump(&dump_info::app_prefix(
@@ -556,17 +581,10 @@ async fn finalized_state_missing_registered_artifact_aborts_process() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn latest_snapshot_falls_back_to_finalized_when_no_pending() {
+async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
     let db = temp_db("snap-latest-fallback");
     let dir = tempfile::tempdir().expect("dumps dir");
-    let fin_id = register_finalized(
-        db.path.as_str(),
-        dir.path(),
-        "fin",
-        b"finalized-bytes",
-        100,
-        5,
-    );
+    let fin_id = register_accepted(db.path.as_str(), dir.path(), "fin", b"finalized-bytes", 100);
     // No pending registered.
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
@@ -576,9 +594,15 @@ async fn latest_snapshot_falls_back_to_finalized_when_no_pending() {
         .await
         .expect("request");
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(resp.headers()["x-l2-tx-index"], "5");
+    assert_eq!(resp.headers()["x-executed-input-count"], "0");
+    assert!(resp.headers().contains_key("x-history-era"));
+    assert_eq!(resp.headers()["x-recovery-generation"], "0");
     let body = resp.bytes().await.expect("body");
-    assert_eq!(body.as_ref(), b"finalized-bytes", "falls back to finalized");
+    assert_eq!(
+        archive_state(body.as_ref()).as_slice(),
+        b"finalized-bytes",
+        "restores finalized artifact"
+    );
 
     assert!(wait_for_lease(db.path.as_str(), fin_id, 0).await);
 }
@@ -672,7 +696,7 @@ async fn cors_permits_browser_preflight_on_fee() {
 async fn cors_is_limited_to_ingress_and_covers_rejections() {
     let db = temp_db("cors-route-scope");
     let dumps = tempfile::tempdir().expect("snapshot directory");
-    let dump_id = register_finalized(&db.path, dumps.path(), "finalized", b"canonical", 0, 0);
+    let dump_id = register_accepted(&db.path, dumps.path(), "finalized", b"canonical", 1);
     let Some(server) = start_server(db.path.as_str()).await else {
         return;
     };
@@ -714,4 +738,81 @@ async fn cors_is_limited_to_ingress_and_covers_rejections() {
         let _ = response.bytes().await.expect("response body");
     }
     assert!(wait_for_lease(&db.path, dump_id, 0).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained() {
+    let db = temp_db("snapshot-archive-roundtrip");
+    let dir = tempfile::tempdir().unwrap();
+    let app = WalletApp::default();
+    let encoded = app_core::wallet_snapshot::encode(&app);
+    register_accepted(&db.path, dir.path(), "accepted", &encoded, 1);
+    let Some(server) = start_server(&db.path).await else {
+        return;
+    };
+    let client =
+        sequencer_rust_client::SequencerClient::new(format!("http://{}", server.addr)).unwrap();
+    let snapshot = client.latest_snapshot().await.unwrap();
+    let claim = snapshot.claim;
+    assert_eq!(
+        snapshot.response.headers()["content-type"],
+        "application/x-tar"
+    );
+    let bytes = snapshot.response.bytes().await.unwrap();
+    let restored_dir = tempfile::tempdir().unwrap();
+    tar::Archive::new(bytes.as_ref())
+        .unpack(restored_dir.path())
+        .unwrap();
+    let restored = WalletApp::from_dump(&dump_info::app_prefix(restored_dir.path())).unwrap();
+    assert_eq!(restored.executed_input_count(), claim.next_input);
+    assert!(!restored_dir.path().join("checkpoint.toml").exists());
+    let mut stream = client.subscribe(claim).await.unwrap();
+    stream.close(None).await.unwrap();
+
+    let export = reqwest::get(server.url("/finalized_snapshot"))
+        .await
+        .unwrap();
+    assert_eq!(export.headers()["x-inclusion-block"], "1");
+    let export_dir = tempfile::tempdir().unwrap();
+    tar::Archive::new(export.bytes().await.unwrap().as_ref())
+        .unpack(export_dir.path())
+        .unwrap();
+    let receipt = dump_info::read_checkpoint_info(export_dir.path()).unwrap();
+    assert_eq!(receipt.inclusion_block, 1);
+    assert_eq!(receipt.next_batch_nonce, 1);
+    assert_eq!(
+        dump_info::read_info(export_dir.path())
+            .unwrap()
+            .next_batch_nonce,
+        receipt.next_batch_nonce
+    );
+    assert_eq!(
+        WalletApp::from_dump(&dump_info::app_prefix(export_dir.path()))
+            .unwrap()
+            .progress(),
+        app.progress()
+    );
+    assert!(
+        !dir.path().join("accepted/checkpoint.toml").exists(),
+        "export must leave immutable local artifacts unchanged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_disconnect_releases_both_stream_and_producer_lease_owners() {
+    let db = temp_db("archive-disconnect");
+    let dir = tempfile::tempdir().unwrap();
+    let id = register_accepted(&db.path, dir.path(), "large", &vec![1; 8 * 1024 * 1024], 1);
+    let Some(server) = start_server(&db.path).await else {
+        return;
+    };
+    let response = reqwest::get(server.url("/latest_snapshot")).await.unwrap();
+    let mut stream = response.bytes_stream();
+    stream.next().await.unwrap().unwrap();
+    assert!(wait_for_lease(&db.path, id, 1).await);
+    drop(stream);
+    assert!(
+        wait_for_lease(&db.path, id, 0).await,
+        "disconnected archive producer must terminate and release its lease"
+    );
 }

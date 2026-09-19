@@ -701,7 +701,7 @@ test("main tick writes status.prom through exit path", function()
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 5, l2_tx_index = 0 }
+                return { inclusion_block = 5, executed_input_count = 0 }
             end,
         },
         machine = fake_machine("{}"),
@@ -827,7 +827,7 @@ test("successful idle compare writes ok status prom", function()
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 5, l2_tx_index = 0 }
+                return { inclusion_block = 5, executed_input_count = 0 }
             end,
         },
         machine = fake_machine("{}"),
@@ -886,12 +886,12 @@ test("tick writes status.prom into watchdog state dir", function()
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 2, l2_tx_index = 0 }
+                return { inclusion_block = 2, executed_input_count = 0 }
             end,
             get_finalized_state = function()
                 return {
                     inclusion_block = 2,
-                    l2_tx_index = 0,
+                    executed_input_count = 0,
                     state = '{"a":1}',
                 }
             end,
@@ -1074,12 +1074,12 @@ test("runner happy path replays inputs and writes checkpoint", function()
         checkpoint = checkpoint_mod,
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 12, l2_tx_index = 0 }
+                return { inclusion_block = 12, executed_input_count = 0 }
             end,
             get_finalized_state = function()
                 return {
                     inclusion_block = 12,
-                    l2_tx_index = 0,
+                    executed_input_count = 0,
                     state = '{"ok":true}',
                 }
             end,
@@ -1123,12 +1123,12 @@ test("runner advances CM as streamed input chunks arrive", function()
         checkpoint = checkpoint_mod,
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 12, l2_tx_index = 0 }
+                return { inclusion_block = 12, executed_input_count = 0 }
             end,
             get_finalized_state = function()
                 return {
                     inclusion_block = 12,
-                    l2_tx_index = 0,
+                    executed_input_count = 0,
                     state = '{"ok":true}',
                 }
             end,
@@ -1181,12 +1181,12 @@ test("runner advances CM over empty streamed partitions", function()
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 12, l2_tx_index = 0 }
+                return { inclusion_block = 12, executed_input_count = 0 }
             end,
             get_finalized_state = function()
                 return {
                     inclusion_block = 12,
-                    l2_tx_index = 0,
+                    executed_input_count = 0,
                     state = '{"ok":true}',
                 }
             end,
@@ -1226,12 +1226,12 @@ test("runner returns state mismatch payload", function()
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 2, l2_tx_index = 0 }
+                return { inclusion_block = 2, executed_input_count = 0 }
             end,
             get_finalized_state = function()
                 return {
                     inclusion_block = 2,
-                    l2_tx_index = 0,
+                    executed_input_count = 0,
                     state = '{"a":1}',
                 }
             end,
@@ -1379,7 +1379,7 @@ test("runner returns transient error when L1 RPC head lags target block", functi
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 10, l2_tx_index = 0 }
+                return { inclusion_block = 10, executed_input_count = 0 }
             end,
         },
         rpc = {
@@ -1408,12 +1408,12 @@ test("runner returns transient error when finalized inclusion_block moves during
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 1, l2_tx_index = 0 }
+                return { inclusion_block = 1, executed_input_count = 0 }
             end,
             get_finalized_state = function()
                 return {
                     inclusion_block = 2,
-                    l2_tx_index = 0,
+                    executed_input_count = 0,
                     state = string.char(1),
                 }
             end,
@@ -1441,7 +1441,7 @@ test("runner skips compare cycle when finalized inclusion_block is unchanged", f
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 5, l2_tx_index = 0 }
+                return { inclusion_block = 5, executed_input_count = 0 }
             end,
             get_finalized_state = function()
                 error("get_finalized_state must not run when inclusion_block is unchanged")
@@ -1469,12 +1469,12 @@ test("runner returns sequencer inclusion_block regression payload", function()
         },
         sequencer = {
             get_finalized_inclusion_block = function()
-                return { inclusion_block = 4, l2_tx_index = 0 }
+                return { inclusion_block = 4, executed_input_count = 0 }
             end,
             get_finalized_state = function()
                 return {
                     inclusion_block = 4,
-                    l2_tx_index = 0,
+                    executed_input_count = 0,
                     state = "{}",
                 }
             end,
@@ -1493,7 +1493,7 @@ test("sequencer client reads finalized inclusion_block", function()
         assert_eq(url, "http://sequencer/finalized_state/inclusion_block")
         return {
             status = 200,
-            body = '{"inclusion_block":7,"l2_tx_index":3}',
+            body = '{"inclusion_block":7,"executed_input_count":3}',
             headers = {},
         }
     end
@@ -1501,7 +1501,7 @@ test("sequencer client reads finalized inclusion_block", function()
     function json.decode(body)
         return {
             inclusion_block = 7,
-            l2_tx_index = 3,
+            executed_input_count = 3,
         }
     end
 
@@ -1509,7 +1509,7 @@ test("sequencer client reads finalized inclusion_block", function()
     local head, err = client:get_finalized_inclusion_block()
     assert(head, err)
     assert_eq(head.inclusion_block, 7)
-    assert_eq(head.l2_tx_index, 3)
+    assert_eq(head.executed_input_count, 3)
 end)
 
 test("sequencer client reads finalized SSZ body and headers", function()
@@ -1521,7 +1521,7 @@ test("sequencer client reads finalized SSZ body and headers", function()
             body = "raw-state",
             headers = {
                 ["x-inclusion-block"] = "9",
-                ["x-l2-tx-index"] = "1",
+                ["x-executed-input-count"] = "1",
             },
         }
     end
@@ -1534,7 +1534,7 @@ test("sequencer client reads finalized SSZ body and headers", function()
     local state, err = client:get_finalized_state()
     assert(state, err)
     assert_eq(state.inclusion_block, 9)
-    assert_eq(state.l2_tx_index, 1)
+    assert_eq(state.executed_input_count, 1)
     assert_eq(state.state, "raw-state")
 end)
 

@@ -4,7 +4,7 @@
 //! External history identity and version coordinates.
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, str::FromStr};
 use thiserror::Error;
 
 /// Boundary before the next canonical application input executes.
@@ -44,10 +44,8 @@ impl ExecutedInputCount {
 
 /// One durable setup/rebuild era.
 ///
-/// The bytes must carry the RFC 4122 UUIDv4 version and variant bits. Display
-/// uses the canonical lowercase hyphenated representation. The wire (text /
-/// JSON) codec deliberately does not exist yet: Track 3 owns the wire
-/// projection and adds it beside its consumer when that lands.
+/// The bytes must carry the RFC 4122 UUIDv4 version and variant bits. Text and
+/// JSON use the canonical lowercase hyphenated representation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EraId([u8; 16]);
 
@@ -95,6 +93,33 @@ impl fmt::Display for EraId {
     }
 }
 
+impl FromStr for EraId {
+    type Err = EraIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 36 || [8, 13, 18, 23].iter().any(|&i| value.as_bytes()[i] != b'-') {
+            return Err(EraIdParseError::InvalidText);
+        }
+        let hex = value.replace('-', "");
+        let bytes = alloy_primitives::hex::decode(hex).map_err(|_| EraIdParseError::InvalidText)?;
+        Self::try_from(bytes.as_slice())
+    }
+}
+
+impl Serialize for EraId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for EraId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Debug for EraId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("EraId").field(&self.to_string()).finish()
@@ -103,6 +128,8 @@ impl fmt::Debug for EraId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum EraIdParseError {
+    #[error("era id must be a hyphenated UUIDv4")]
+    InvalidText,
     #[error("era id blob has length {actual}, expected 16")]
     InvalidByteLength { actual: usize },
     #[error("era id is not UUID version 4")]
@@ -129,11 +156,70 @@ impl RecoveryGeneration {
 }
 
 /// Equality/discontinuity token for locally available application history.
-/// Like [`EraId`], its wire form is Track 3's to define beside its consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Consumers must claim both fields when resuming application history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HistoryVersion {
     pub era_id: EraId,
     pub recovery_generation: RecoveryGeneration,
+}
+
+/// The history a consumer holds and the next application input it can execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryClaim {
+    pub version: HistoryVersion,
+    pub next_input: ExecutedInputCount,
+}
+
+/// One coherent view of the locally available canonical history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryBounds {
+    pub version: HistoryVersion,
+    pub available_from: ExecutedInputCount,
+    pub head: ExecutedInputCount,
+}
+
+impl HistoryBounds {
+    /// Validate identity before position: equal counts cannot resume a different
+    /// history. Every count in the inclusive range is admissible; `head` waits
+    /// for the next input.
+    pub fn validate(&self, claim: HistoryClaim) -> Result<(), HistoryPolicyError> {
+        assert!(
+            self.available_from <= self.head,
+            "available history base exceeds its head"
+        );
+        if claim.version.era_id != self.version.era_id {
+            return Err(HistoryPolicyError::EraChanged {
+                current: self.version,
+            });
+        }
+        if claim.version.recovery_generation != self.version.recovery_generation {
+            return Err(HistoryPolicyError::StaleGeneration {
+                current: self.version,
+            });
+        }
+        if claim.next_input < self.available_from {
+            return Err(HistoryPolicyError::HistoryUnavailable {
+                available_from: self.available_from,
+            });
+        }
+        if claim.next_input > self.head {
+            return Err(HistoryPolicyError::AheadOfHead { head: self.head });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HistoryPolicyError {
+    #[error("history era changed")]
+    EraChanged { current: HistoryVersion },
+    #[error("history generation changed")]
+    StaleGeneration { current: HistoryVersion },
+    #[error("requested input precedes locally available history")]
+    HistoryUnavailable { available_from: ExecutedInputCount },
+    #[error("requested input is ahead of the history head")]
+    AheadOfHead { head: ExecutedInputCount },
 }
 
 #[cfg(test)]
@@ -145,6 +231,32 @@ mod tests {
         0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
         0x00,
     ];
+
+    #[test]
+    fn era_and_claim_json_preserve_their_exact_identity() {
+        let era: EraId = "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap();
+        assert_eq!(
+            serde_json::to_string(&era).unwrap(),
+            "\"00112233-4455-4677-8899-aabbccddeeff\""
+        );
+        let claim = HistoryClaim {
+            version: HistoryVersion {
+                era_id: era,
+                recovery_generation: RecoveryGeneration::new(7),
+            },
+            next_input: ExecutedInputCount::new(u64::MAX),
+        };
+        assert_eq!(
+            serde_json::from_str::<HistoryClaim>(&serde_json::to_string(&claim).unwrap()).unwrap(),
+            claim
+        );
+        assert!(
+            "00112233-4455-1677-8899-aabbccddeeff"
+                .parse::<EraId>()
+                .is_err()
+        );
+        assert!("00112233445546778899aabbccddeeff".parse::<EraId>().is_err());
+    }
 
     #[test]
     fn era_id_displays_canonical_lowercase_hyphenated_form() {
@@ -180,5 +292,112 @@ mod tests {
             ExecutedInputCount::new(7).checked_add(5),
             Some(ExecutedInputCount::new(12))
         );
+    }
+
+    fn history_bounds(base: u64, head: u64) -> HistoryBounds {
+        HistoryBounds {
+            version: HistoryVersion {
+                era_id: EraId::from_bytes(CANONICAL_BYTES).unwrap(),
+                recovery_generation: RecoveryGeneration::new(4),
+            },
+            available_from: ExecutedInputCount::new(base),
+            head: ExecutedInputCount::new(head),
+        }
+    }
+
+    #[test]
+    fn history_claim_checks_era_before_generation_and_position() {
+        let bounds = history_bounds(41, 45);
+        let mut other_era = CANONICAL_BYTES;
+        other_era[0] ^= 1;
+        let other_era = EraId::from_bytes(other_era).unwrap();
+        for (generation, next_input) in [(4, 43), (3, 0), (u64::MAX, u64::MAX)] {
+            assert_eq!(
+                bounds.validate(HistoryClaim {
+                    version: HistoryVersion {
+                        era_id: other_era,
+                        recovery_generation: RecoveryGeneration::new(generation),
+                    },
+                    next_input: ExecutedInputCount::new(next_input),
+                }),
+                Err(HistoryPolicyError::EraChanged {
+                    current: bounds.version,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn history_claim_requires_equal_generation_before_checking_position() {
+        let bounds = history_bounds(41, 45);
+        for generation in [0, 3, 5, u64::MAX] {
+            for next_input in [0, 43, u64::MAX] {
+                assert_eq!(
+                    bounds.validate(HistoryClaim {
+                        version: HistoryVersion {
+                            recovery_generation: RecoveryGeneration::new(generation),
+                            ..bounds.version
+                        },
+                        next_input: ExecutedInputCount::new(next_input),
+                    }),
+                    Err(HistoryPolicyError::StaleGeneration {
+                        current: bounds.version,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_claim_rejects_unavailable_and_future_counts() {
+        let bounds = history_bounds(41, 45);
+        for next_input in [0, 40, 46, u64::MAX] {
+            let expected = if next_input < 41 {
+                HistoryPolicyError::HistoryUnavailable {
+                    available_from: bounds.available_from,
+                }
+            } else {
+                HistoryPolicyError::AheadOfHead { head: bounds.head }
+            };
+            assert_eq!(
+                bounds.validate(HistoryClaim {
+                    version: bounds.version,
+                    next_input: ExecutedInputCount::new(next_input),
+                }),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn history_claim_accepts_the_full_inclusive_range_without_a_depth_cap() {
+        for (base, head, next_input) in [
+            (0, 0, 0),
+            (41, 45, 41),
+            (41, 45, 43),
+            (41, 45, 45),
+            (0, 100_001, 0),
+            (i64::MAX as u64, i64::MAX as u64 + 1, i64::MAX as u64 + 1),
+            (u64::MAX, u64::MAX, u64::MAX),
+        ] {
+            let bounds = history_bounds(base, head);
+            assert_eq!(
+                bounds.validate(HistoryClaim {
+                    version: bounds.version,
+                    next_input: ExecutedInputCount::new(next_input),
+                }),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "available history base exceeds its head")]
+    fn incoherent_history_bounds_fail_loud() {
+        let bounds = history_bounds(42, 41);
+        let _ = bounds.validate(HistoryClaim {
+            version: bounds.version,
+            next_input: ExecutedInputCount::new(41),
+        });
     }
 }

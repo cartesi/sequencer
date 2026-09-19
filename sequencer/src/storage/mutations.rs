@@ -11,9 +11,7 @@ use alloy_primitives::Address;
 use rusqlite::{Connection, Result, Transaction, params};
 
 use super::convert::{i64_to_u64, u64_to_i64};
-use super::history::{
-    ExecutedInputMapping, attach_executed_inputs_in, next_executed_input_count_in,
-};
+use super::history::next_executed_input_count_in;
 use super::l1_inputs::query_deployment_identity;
 use super::{DirectInputExecution, SafeInputRange};
 
@@ -162,9 +160,7 @@ pub(super) fn batch_tree_anchor_in(conn: &Connection) -> Result<u64> {
     Ok(i64_to_u64(anchor))
 }
 
-/// Insert one `sequenced_l2_txs` row per safe-input index in `range` for the
-/// given (batch, frame). Used by ingress (frame close) and recovery (re-drain
-/// after cascade invalidation).
+/// Commit the exact direct inputs executed while opening a frame.
 pub(super) fn persist_frame_direct_sequence(
     tx: &Transaction<'_>,
     batch_index: u64,
@@ -172,17 +168,16 @@ pub(super) fn persist_frame_direct_sequence(
     range: SafeInputRange,
     executions: &[DirectInputExecution],
 ) -> Result<()> {
-    let expected = derive_direct_input_executions_in(tx, range)?;
     assert_eq!(
-        executions, expected,
-        "direct execution attributions must cover exactly the non-submitter drained rows from the canonical next count"
+        executions,
+        derive_direct_input_executions_in(tx, range)?,
+        "direct executions must cover the complete external-input range at the next application count"
     );
-    persist_frame_direct_sequence_inner(tx, batch_index, frame_in_batch, range, executions)
+    persist_direct_executions(tx, batch_index, frame_in_batch, executions)
 }
 
-/// Sequence a production startup/recovery Tip's leading direct range, deriving
-/// its complete application attribution from the persisted deployment identity
-/// and current canonical application boundary.
+/// Startup fixes the replay sequence before the engine is restored. Admission
+/// succeeds only after catch-up applies every committed application input.
 pub(super) fn persist_frame_direct_sequence_derived(
     tx: &Transaction<'_>,
     batch_index: u64,
@@ -190,81 +185,27 @@ pub(super) fn persist_frame_direct_sequence_derived(
     range: SafeInputRange,
 ) -> Result<()> {
     let executions = derive_direct_input_executions_in(tx, range)?;
-    persist_frame_direct_sequence_inner(tx, batch_index, frame_in_batch, range, &executions)
+    persist_direct_executions(tx, batch_index, frame_in_batch, &executions)
 }
 
-/// Sequence physical cursor rows that intentionally represent no newly
-/// executed application inputs. Cockroach-root padding uses this because the
-/// recovered snapshot already contains their effects; test fixtures use it
-/// when exercising only the physical ordering layer.
-pub(super) fn persist_frame_direct_sequence_physical_only(
+fn persist_direct_executions(
     tx: &Transaction<'_>,
     batch_index: u64,
     frame_in_batch: u32,
-    range: SafeInputRange,
-) -> Result<()> {
-    persist_frame_direct_sequence_inner(tx, batch_index, frame_in_batch, range, &[])
-}
-
-fn persist_frame_direct_sequence_inner(
-    tx: &Transaction<'_>,
-    batch_index: u64,
-    frame_in_batch: u32,
-    range: SafeInputRange,
     executions: &[DirectInputExecution],
 ) -> Result<()> {
-    if range.is_empty() {
-        assert!(
-            executions.is_empty(),
-            "empty safe-input range cannot carry execution attributions"
-        );
-        return Ok(());
-    }
-
-    let mut previous_safe_input_index = None;
-    for execution in executions {
-        assert!(
-            execution.safe_input_index >= range.start() && execution.safe_input_index < range.end(),
-            "direct execution attribution lies outside its drained range"
-        );
-        if let Some(previous) = previous_safe_input_index {
-            assert!(
-                execution.safe_input_index > previous,
-                "direct execution attributions must be strictly ordered by safe-input index"
-            );
-        }
-        previous_safe_input_index = Some(execution.safe_input_index);
-    }
-
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO sequenced_l2_txs (batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
-         VALUES (?1, ?2, NULL, ?3)",
+        "INSERT INTO application_inputs (offset, batch_index, frame_in_batch, safe_input_index)
+         VALUES (?1, ?2, ?3, ?4)",
     )?;
-    let mut executions = executions.iter().peekable();
-    let mut mappings = Vec::with_capacity(executions.len());
-    for safe_input_index in range.start()..range.end() {
+    for execution in executions {
         stmt.execute(params![
+            u64_to_i64(execution.executed_input_offset.get()),
             u64_to_i64(batch_index),
             i64::from(frame_in_batch),
-            u64_to_i64(safe_input_index),
+            u64_to_i64(execution.safe_input_index)
         ])?;
-        if executions
-            .peek()
-            .is_some_and(|execution| execution.safe_input_index == safe_input_index)
-        {
-            let execution = executions.next().expect("peeked direct execution");
-            mappings.push(ExecutedInputMapping {
-                sequenced_l2_tx_offset: i64_to_u64(tx.last_insert_rowid()),
-                executed_input_offset: execution.executed_input_offset,
-            });
-        }
     }
-    assert!(
-        executions.next().is_none(),
-        "not every direct execution attribution was persisted"
-    );
-    drop(stmt);
-    attach_executed_inputs_in(tx, &mappings)?;
     Ok(())
 }
 

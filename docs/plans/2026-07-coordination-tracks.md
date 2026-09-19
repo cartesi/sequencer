@@ -14,7 +14,7 @@ freely at this stage — no backward-compatibility constraints.
 |---|-------|-------|--------|
 | 1 | WS context fields + L1 provenance (PR #26) | Stephen | **done** — merged to main |
 | 2 | Restore `docs/review/` ledger + this plan | us | **done** |
-| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **storage foundation landed; public API open** — the [Track 3 ordered handoff](2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff) exclusively owns its sequence and decision gates |
+| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **implemented** — canonical application history, snapshot restore archives, mandatory WS claims, typed refusals, and SDK cutover; [remaining integration gates](2026-07-track3-feed-replay-design.md#5-acceptance-evidence-and-remaining-work) |
 | 4 | Storage decode policy | us | **done** — fail-loud for contract-impossible values; the named `saturating_query_bound` only where clamping preserves the predicate (policy lives in `storage/convert.rs` + the invariants check policy) |
 | 5 | Fee exponentiation LUT | us | **deferred** — decided exact-floor if built (the table *is* the spec, algorithm-free; replay continuity across the upgrade explicitly not preserved); a separate pending design decision may make log-space fees defunct — revisit after syncing with Bart |
 | 6 | Dump / `Application` API redesign | us + Bart | **revised interface implemented** — [Application contract](../protocol/application-contract.md); native bridge conformance is a separate integration branch |
@@ -23,48 +23,34 @@ freely at this stage — no backward-compatibility constraints.
 
 **Current campaign order:**
 
-1. Land the authority-boundary + durable-history-foundation branch (squashed,
-   review complete — ready for its PR against main).
-2. Implement Track 3's public protocol on a focused successor branch.
-3. Validate Track 6 against the reference C bridge, then the private DEX engine when shared.
-4. Track 5 (fee LUT) only after the log-space-fees decision.
+1. Validate Track 6 against the reference C bridge, then the private DEX engine when shared.
+2. Exercise native-engine snapshot bootstrap and remeasure feed latency in the representative environment.
+3. Track 5 (fee LUT) only after the log-space-fees decision.
 
-Deferred (revisit with libdex rollout): multi-file/tar snapshot serving
-(`docs/snapshots/lifecycle.md` known limitation), pending-snapshot-pool cap.
+Full restore archives now support file and directory application prefixes.
+Additional snapshot retention or transport mechanisms require a measured consumer need.
 
 ## Track 3 — Feed & replay protocol redesign
 
-The current protocol grew ad hoc; the redesign is type-first and covers the
-whole consumer data-access story: paginated finalized-history endpoints plus
-the live subscription, composable without races. The
-[design doc](2026-07-track3-feed-replay-design.md) owns the requirements and
-the ordered implementation handoff; the storage/recovery foundation
-(era/generation metadata, canonical `ExecutedInputCount` attribution,
-snapshot/catch-up verification) is landed, while `GET /history-version`,
-replay routes, gold-boundary projection, and WS v2 remain open.
+Infrastructure subscribers download an application-defined snapshot over HTTP,
+restore their application, and use one WS stream for both canonical backlog and
+live inputs. The [design](2026-07-track3-feed-replay-design.md) owns the history
+claims, typed refusals, resource bounds, and fresh-snapshot recovery workflow.
+Raw `/inputs` and separate HTTP transaction replay are outside this feature.
+The watchdog retains its independent trusted-state/L1 comparison workflow.
 
-Settled decisions the implementation must respect:
+The implemented path uses one current `application_inputs` projection for catch-up
+and egress. Snapshot headers identify the same leased artifact being downloaded;
+WS claims name an era, generation, and inclusive next-input count. A valid
+available backlog is replayable without a total catch-up cap, with bounded pages,
+queues, and subscribers. Recovery refuses old claims before delivering inputs.
 
-- **Feed coordinate:** `Application::executed_input_count()`, not SQLite
-  rowid. An application at count `X` subscribes at `X`, consumes entry `X`,
-  advances to `X + 1`. Standard recovery may reuse suffix offsets under a new
-  generation; cockroach recovery records the folded count `K` as the era's
-  available-history base, and requests below `K` fail with `available_from`
-  plus the bootstrap recipe.
-- **Discontinuity detection is pull-based.** A crash or danger-detector exit
-  cannot send a farewell frame, so the load-bearing contract is the required
-  subscription claim `{era_id, recovery_generation, offset}` plus a
-  current-pair endpoint; in-band disconnect errors are best-effort only.
-  Bart confirmed the scalar generation contract (2026-07-28); the `EraId`
-  generalization and changed-era bootstrap behavior still need his consumer
-  review and are not attributed to that confirmation.
-- **Event framing:** per-row denormalized context (as shipped in PR #26);
-  no `FrameSealed`/`BatchSealed` boundary events unless a consumer
-  demonstrates the row context cannot express its need.
-- **Clock:** application time is safe-block based. Direct inputs execute at
-  their exact inclusion block; user ops at their frame's safe block.
-  `block_timestamp` may ride as provenance but is never an application
-  transition input (see the application contract).
+The former physical replay cursor and sparse attribution design are superseded
+by the [application-history design](application-history.md). The wallet's cold
+replica and canonical recovery/watchdog gates have a
+[validation record](../review/2026-09-16-track3-validation.md). Native-engine
+bootstrap and representative latency measurements remain integration gates;
+no additional protocol layer is assumed for them.
 
 ## Track 5 — Fee exponentiation LUT (deferred)
 

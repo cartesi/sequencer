@@ -15,7 +15,7 @@
 //! - `recovery` — cascade invalidation, recovery-batch open, danger checks
 //! - `admin` — operator policy alpha tuning
 //! - `fee_oracle` — L1 fee-oracle gas-price updates
-//! - `snapshot_dumps` — pending/finalized snapshot lifecycle, lease counts
+//! - `snapshot_dumps` — immutable snapshots, derived acceptance, lease counts
 //! - `history` — write-once era/base metadata and recovery generation
 //! - `lifecycle` — command-admission facts + the terminal-fault black box
 //!
@@ -52,7 +52,9 @@ pub(crate) use convert::is_persistent_storage_error;
 use std::time::SystemTime;
 use thiserror::Error;
 
-pub(crate) use egress::OrderedL2TxRow;
+#[cfg(test)]
+pub(crate) use egress::ApplicationInputRow;
+pub(crate) use egress::{HistoryReadError, L2TxContext};
 pub use history::{DirectInputExecution, HistoryState};
 pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
 pub use open::Storage;
@@ -60,8 +62,8 @@ pub use recovery::DangerStatus;
 pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
 pub use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
 pub use snapshot_dumps::{
-    DumpRow, FinalizedDump, FinalizedLease, LeaseGuard, LeasedDump, PendingDump,
-    PersistentReleaseFailureReporter, ReleaseScheduler,
+    DumpRow, FinalizedDump, FinalizedLease, LeaseGuard, LeasedDump,
+    PersistentReleaseFailureReporter, ReleaseScheduler, Snapshot,
 };
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
@@ -72,6 +74,13 @@ pub struct StoredSafeInput {
     pub payload: Vec<u8>,
     /// Chain block number where this input was included (e.g. InputAdded event block).
     pub block_number: u64,
+}
+
+/// A sender-classified L1 direct input ready for application execution.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredDirectInput {
+    pub safe_input_index: u64,
+    pub input: sequencer_core::l2_tx::DirectInput,
 }
 
 /// One InputBox event with the L1 provenance persisted for feed consumers.

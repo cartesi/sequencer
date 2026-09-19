@@ -81,7 +81,7 @@ Users submit signed operations via `POST /tx` (JSON). Operations are signed with
 
 ### Sequenced Transaction Feed
 
-Subscribers connect via `GET /ws/subscribe?from_offset=<u64>` (WebSocket). The feed delivers all sequenced transactions (user ops + direct inputs) in deterministic order, matching the on-chain execution order. This is the primary interface for downstream consumers (frontends, indexers). The endpoint is designed for a small number of indexer subscribers, which serve users directly.
+Subscribers connect via `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>` (WebSocket). The feed delivers all sequenced transactions (user ops + direct inputs) in deterministic order, matching the on-chain execution order. This is the primary interface for downstream consumers (frontends, indexers). The endpoint is designed for a small number of indexer subscribers, which serve users directly.
 
 ### Batch Submission
 
@@ -184,18 +184,27 @@ Notes:
 - `200` while an open frame exists (the admitted runtime always has one).
 - `503` with code `UNAVAILABLE` during shutdown, or if no open frame exists.
 
-### `GET /ws/subscribe?from_offset=<u64>`
+### `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>`
 
-WebSocket stream of sequenced L2 transactions from persisted order.
+WebSocket stream of canonical application inputs, replaying from the inclusive
+`next_input` offset and then following the optimistic tip. Fetch and restore
+`/latest_snapshot` first; its headers supply the complete subscription claim.
+After each successfully applied input at offset `X`, persist the claim with
+`next_input = X + 1` alongside the replica state.
 
-Notes:
-
-- `from_offset` is optional and defaults to `0`.
-- messages are JSON text frames.
-- binary fields are hex-encoded (`0x`-prefixed).
-- direct-input `block_timestamp` values are Unix seconds.
-- the current runtime enforces a subscriber cap of `64` and a catch-up cap of `50000` events.
-- if the requested catch-up window exceeds that cap, the server upgrades and then immediately closes the socket with close code `1008` (`POLICY`) and reason `catch-up window exceeded: live_start_offset=<u64>`; reconnecting at that offset starts from the current live head.
+- All three query fields are required. Missing or malformed fields return HTTP `400`.
+- An era or generation mismatch, an unavailable prefix, or a position ahead of
+  the head returns HTTP `409` before upgrade. The JSON body and `X-History-Error`
+  header carry the same typed refusal: `ERA_CHANGED`, `STALE_GENERATION`,
+  `HISTORY_UNAVAILABLE`, or `AHEAD_OF_HEAD`. Rebootstrap on a history mismatch.
+- A claim exactly at the head waits for the next input. Replay uses bounded
+  pages and queues, with no total catch-up limit. The subscriber cap is `64`.
+- Messages are JSON text frames; binary fields are `0x`-prefixed hex.
+  Direct-input `block_timestamp` values are Unix seconds.
+- Batch envelopes are absent. Offsets count executed application inputs,
+  including business failures and malformed-direct no-ops.
+- Recovery stops the process and disconnects subscribers. A reconnect must
+  present its saved claim; offsets alone cannot distinguish a replaced suffix.
 
 Message shapes:
 
@@ -224,18 +233,26 @@ These serve application state to the operator's watchdog and indexers.
 (gated by network controls today; bound to a separate internal port once the
 api split lands).
 
-- `GET /finalized_state/inclusion_block` — cheap JSON the watchdog polls to
-  detect advance: `{ "inclusion_block": <u64>, "l2_tx_index": <u64> }`. `404`
-  if no finalized snapshot exists.
-- `GET /finalized_state` — streams the L1-finalized state file
-  (`application/octet-stream`); headers `X-Inclusion-Block`, `X-L2-Tx-Index`,
-  and `ETag: "block-<n>"` (send `If-None-Match` for a `304`).
-- `GET /latest_snapshot` — streams the latest snapshot (latest pending if any,
-  else finalized) for indexers that fetch state then subscribe at
-  `X-L2-Tx-Index`.
+- `GET /finalized_state/inclusion_block` — cheap JSON the watchdog polls:
+  `{ "inclusion_block": <u64>, "executed_input_count": <u64> }`.
+- `GET /finalized_state` — streams the accepted checkpoint's comparison file
+  (`application/octet-stream`), with `X-Inclusion-Block`,
+  `X-Executed-Input-Count`, and `ETag: "block-<n>"` (`If-None-Match` supports `304`).
+  The watchdog compares at the end of that L1 block.
+- `GET /latest_snapshot` — streams a restorable tar archive of the newest valid
+  batch-close snapshot, or the era baseline. Includes immutable `info.toml`
+  and the application's opaque `state` file or directory.
+- `GET /finalized_snapshot` — streams the accepted snapshot as a tar archive,
+  adding a coherent `checkpoint.toml` receipt with its L1 inclusion block and
+  next batch nonce for trusted recovery.
 
-Both streaming routes hold a GC lease on the dump for the response lifetime,
-released even on client disconnect.
+All state/archive responses include `X-History-Era`, `X-Recovery-Generation`,
+and `X-Executed-Input-Count`, selected atomically with the artifact lease.
+Streaming holds the lease until the response ends or the client disconnects.
+The accepted endpoints return `404` until a comparable checkpoint exists:
+genesis is comparable at block zero; a rebuilt baseline is restorable but only
+a later accepted batch establishes a comparison point. Divergence blocks
+publication of the accepted checkpoint. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
 
 ## Storage Model
 
@@ -243,8 +260,10 @@ released even on client disconnect.
 - `frames`: frame boundaries within each batch
 - `frames.fee`: committed fee for each frame
 - `user_ops`: included user operations
-- `sequenced_l2_txs`: append-only ordered replay rows (`UserOp` xor `DirectInput`); inserting into `user_ops` also appends the corresponding replay row via trigger `trg_sequence_user_op`
-- `safe_inputs`: direct-input payload stream
+- `application_inputs`: current application sequence keyed by mandatory pre-execution offset; each row references a user op or an external direct input and its owning batch/frame
+- `safe_inputs`: every raw InputBox observation, including batch envelopes
+- `history_state`: immutable era baseline (application count and accounted L1 block) plus recovery generation
+- `snapshots` and `dumps`: immutable batch-close/baseline artifacts and streaming leases; accepted status is derived from `safe_accepted_batches`
 - `batch_policy`: singleton knobs and constants for DA-style batch sizing and fee derivation; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target`. A batch closes on whichever fires first: the derived `batch_size_target` byte budget or the `max_batch_open` wall-clock deadline (an inclusion-lane setting, `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS`, not a `batch_policy` column). Setup writes the first `log_gas_price` (and observation stamp) for both Fixed and Uniswap modes, failing if the initial Uniswap quote cannot be read. Fixed local pricing has no oracle worker; Uniswap starts from the persisted price and refreshes lazily via the setup-pinned WETH/fee-token TWAP source, retaining that price across transient source failures. `log_slack = log(10)` applies the 10× safety margin in log space. Fees are app-token smallest units — initially USDC (6 decimals) for the wallet prototype — not a protocol-level USDC invariant.
 
 ## Project Layout
@@ -281,7 +300,7 @@ docker pull ghcr.io/cartesi/sequencer-watchdog:vX
 
 ## Prototype Limits
 
-- The `Application` trait exposes snapshot dump/load capability (format in `docs/snapshots/format.md`). The inclusion lane drives the snapshot lifecycle — dump at batch close, promote to finalized on L1 observation, and garbage-collect superseded dumps — and at startup rebuilds application state by loading the latest snapshot and replaying the persisted L2-tx stream from that snapshot's offset. The lifecycle and its rationale (per-range atomic promotion, GC, leasing, crash-safety) are documented in `docs/snapshots/lifecycle.md`. The snapshot is served to the operator's watchdog/indexers over internal-only HTTP routes (`/finalized_state`, `/finalized_state/inclusion_block`, `/latest_snapshot`) — no auth, gated by network-level access control until the planned per-port api split lands.
+- The `Application` trait defines dump/load behavior ([format](docs/snapshots/format.md)). Every batch close registers a durable snapshot atomically with the seal. Restart restores the latest valid snapshot and replays application inputs from its count. Acceptance determines the recovery checkpoint and garbage-collection frontier without mutating artifact metadata. [Snapshot lifecycle](docs/snapshots/lifecycle.md) documents leases and crash ordering.
 - Schema and migrations are still in prototype mode and may change.
 
 ## Local Test Prerequisites

@@ -148,7 +148,7 @@ impl Storage {
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN f.fee  ELSE NULL END AS fee,
                 CASE WHEN s.safe_input_index   IS NOT NULL THEN d.payload      ELSE NULL END AS payload,
                 CASE WHEN s.safe_input_index   IS NOT NULL THEN d.block_number ELSE NULL END AS block_number
-            FROM valid_sequenced_l2_txs s
+            FROM application_inputs s
             LEFT JOIN user_ops u
               ON u.batch_index    = s.batch_index
              AND u.frame_in_batch = s.frame_in_batch
@@ -999,11 +999,11 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_test_protocol();
 
-        // Local batch 0 (first frame safe_block=100) and batch 1 (first frame
+        // Local batch 0 (first frame safe_block=1900) and batch 1 (first frame
         // safe_block=1900). Their landings carry the real wire bytes so the
         // content-identity check accepts them.
         let mut head = storage
-            .initialize_open_state(100, SafeInputRange::empty_at(0))
+            .initialize_open_state(1900, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
             .close_frame_and_batch(&mut head, 1900)
@@ -1012,7 +1012,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 1900)
             .expect("close 1");
 
-        // Non-stale landing of batch 0 (block 200 - safe_block 100 < 1200).
+        // Non-stale landing of batch 0 (block 1950 - safe_block 1900 < 1200).
         let non_stale_payload = local_batch_payload(&mut storage, 0);
         // Stale copy at nonce 1 (safe_block=100, block 2000 → age >= 1200):
         // a scheduler no-op, so its content is never compared — synthetic
@@ -1025,7 +1025,7 @@ mod tests {
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: non_stale_payload,
-                block_number: 200,
+                block_number: 1950,
             },
             StoredSafeInput {
                 sender: SENDER_A,

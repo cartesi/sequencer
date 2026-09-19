@@ -184,8 +184,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
         std::fs::create_dir_all(&dumps_dir)?;
 
-        // Authority-neutral snapshot repair before the boundary; the five
-        // order-critical steps are documented in `startup_hygiene`.
+        // Validate the rollback artifact and collect obsolete snapshots before admission.
         super::startup_hygiene::run_snapshot_hygiene(&mut storage, &dumps_dir)?;
 
         // Prepare every remaining fallible or awaited dependency before the
@@ -227,18 +226,13 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         );
         detector.preflight_storage()?;
 
-        let tx_feed = L2TxFeed::new(
-            db_path.clone(),
-            shutdown.clone(),
-            L2TxFeedConfig::new(l1_config.identity.batch_submitter_address),
-        );
+        let tx_feed = L2TxFeed::new(db_path.clone(), shutdown.clone(), L2TxFeedConfig::default());
 
         // Configuration ends here: the remaining values are exactly what
         // `launch` hands to the workers, so the config structs never cross
         // the authority boundary.
         let lane_config =
-            InclusionLaneConfig::new(l1_config.identity.batch_submitter_address, dumps_dir)
-                .with_max_batch_open(run_config.max_batch_open());
+            InclusionLaneConfig::new(dumps_dir).with_max_batch_open(run_config.max_batch_open());
         let api_config = ApiConfig::new(domain, A::max_method_payload_bytes());
         let listener = tokio::net::TcpListener::bind(&run_config.http_addr).await?;
         let bound_addr = listener.local_addr()?;
@@ -911,7 +905,13 @@ mod tests {
         )
         .expect("open storage");
         storage
-            .insert_initial_finalized_dump(&finalized, 0, 0, 0, 0)
+            .complete_baseline_setup(
+                &finalized,
+                sequencer_core::history::ExecutedInputCount::ZERO,
+                0,
+                0,
+                false,
+            )
             .expect("register finalized dump");
         storage
             .append_safe_inputs(0, &[], submitter_address, &timing)
@@ -919,7 +919,6 @@ mod tests {
         storage
             .initialize_open_state(0, crate::storage::SafeInputRange::empty_at(0))
             .expect("initialize Tip");
-        storage.complete_setup().expect("complete setup");
         drop(storage);
 
         // One identity literal feeds both the reader and the L1 bundle, so

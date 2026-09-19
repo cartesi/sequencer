@@ -168,15 +168,14 @@ mod tests {
         let mut storage = Storage::initialize_for_command(&db_path, LifecycleCommand::Setup)
             .expect("initialize setup");
         storage
-            .insert_initial_finalized_dump(
-                &std::path::Path::new(&data_dir).join("finalized"),
+            .complete_baseline_setup(
+                &std::path::Path::new(&data_dir).join("baseline"),
+                sequencer_core::history::ExecutedInputCount::ZERO,
                 0,
                 0,
-                0,
-                0,
+                false,
             )
-            .expect("register finalized snapshot");
-        storage.complete_setup().expect("complete setup");
+            .expect("complete setup");
         drop(storage);
 
         let constructions = Arc::new(AtomicUsize::new(0));

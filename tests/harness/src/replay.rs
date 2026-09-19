@@ -4,7 +4,9 @@
 use alloy_primitives::{Address, U256};
 use app_core::application::{WalletApp, WalletConfig};
 use sequencer_core::api::WsTxMessage;
-use sequencer_core::application::{Application, execute_direct_input, execute_valid_user_op};
+use sequencer_core::application::{
+    Application, CanonicalState, execute_direct_input, execute_valid_user_op,
+};
 use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
 
 use crate::HarnessResult;
@@ -14,6 +16,16 @@ pub struct ReplayWalletApp {
 }
 
 impl ReplayWalletApp {
+    pub fn from_dump(prefix: &std::path::Path) -> HarnessResult<Self> {
+        Ok(Self {
+            app: WalletApp::from_dump(prefix)?,
+        })
+    }
+
+    pub fn canonical_snapshot_bytes(&self) -> HarnessResult<Vec<u8>> {
+        Ok(self.app.canonical_snapshot_bytes()?)
+    }
+
     pub fn devnet() -> Self {
         Self {
             app: WalletApp::new(WalletConfig::devnet()),
@@ -55,6 +67,14 @@ pub(crate) fn apply_ws_message<A: Application>(
     app: &mut A,
     message: WsTxMessage,
 ) -> HarnessResult<()> {
+    let expected = app.executed_input_count().get();
+    if message.offset() != expected {
+        return Err(std::io::Error::other(format!(
+            "WS history gap: expected input {expected}, got {}",
+            message.offset()
+        ))
+        .into());
+    }
     match message {
         WsTxMessage::DirectInput {
             sender,

@@ -72,21 +72,20 @@ don't.
 ### Writer roles
 
 One writer role per fact. Reads over batch data go through the `valid_*`
-views (`valid_batches`, `valid_closed_batches`, `valid_open_batch`,
-`valid_sequenced_l2_txs`), which encapsulate the "exclude invalidated rows"
+views (`valid_batches`, `valid_closed_batches`, `valid_open_batch`), which encapsulate the "exclude invalidated rows"
 filter; writers target the base tables. The batch lifecycle columns partition
 by writer and are write-once (`0001_schema.sql`).
 
 | Writer | Writes |
 |---|---|
-| inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `sequenced_l2_txs`, `executed_inputs`, `dumps`/`pending_snapshots` (batch close), `finalized_snapshot` (promotion only — setup registers the initial row) |
+| inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
-| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, scoped `pending_snapshots` clear, derived `executed_inputs` suffix deletion |
-| history metadata (setup/recovery) | `history_state` — era/generation at baseline, generation bump in a non-empty standard-recovery cascade, rebuild application base + safe-input drain floor at initial finalized-snapshot registration |
+| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion |
+| history metadata (setup/recovery) | `history_state` — complete era/application-count/L1-block baseline, generation bump in a non-empty standard-recovery cascade |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
 | egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
-| setup | `deployment_identity` (pinned once), `batch_tree_anchor` (the root nonce, frozen once setup completes), the initial `dumps` + `finalized_snapshot` rows (genesis or rebuild registration, atomic with the history bases), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
-| snapshot GC (the lane after a promotion, `run`'s startup hygiene) | unreferenced `dumps` row deletion (`gc_unreferenced_dumps`) |
+| setup | `deployment_identity` (pinned once), `batch_tree_anchor` (the root nonce, frozen once setup completes), the initial `dumps` + `snapshots` rows (genesis or rebuild registration, atomic with the complete history baseline), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
+| snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | unreferenced `dumps` row deletion (`gc_unreferenced_dumps`) |
 | command brackets (run, setup, flush) | `terminal_faults` (append-only, best-effort at settlement) |
 | admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
 | fee oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
@@ -106,7 +105,7 @@ by writer and are write-once (`0001_schema.sql`).
   the canonical fold and the predicate diverge exactly and only there.)
 - **Enforced by:** review + the duality test. No structural mechanism.
 - **Depended on by:** everything — the gold frontier, recovery's cascade pivot,
-  promotion, soft-confirmation honesty.
+  checkpoint selection, soft-confirmation honesty.
 - **Breaks:** silent permanent scheduler/sequencer divergence.
 - The expected-nonce fold is homed next to `scheduler_accepts` as
   `advance_expected_batch_nonce`; `decide_submit_start` consumes it, while
@@ -123,7 +122,7 @@ by writer and are write-once (`0001_schema.sql`).
   several below-threshold observations. Frame K's wire content is therefore
   "directs ≤ S_K, then ops validated on top"; a clock tick with no directs is
   an empty-prefix instance of the same rule. That leading direct prefix is
-  recoverable from `sequenced_l2_txs` plus `frames.safe_block` alone.
+  recoverable from `application_inputs` plus `frames.safe_block` alone.
 - **Enforced by:** `close_frame_in` ordering; lane convention.
 - **Depended on by:** the duality (scheduler's drain-before-ops equals the
   flattened replay order); catch-up; the feed.
@@ -150,75 +149,57 @@ by writer and are write-once (`0001_schema.sql`).
   within-batch monotonicity check; "if the frontier batch is fresh, all are".
 - **Breaks:** I4's guarantee evaporates; danger detection mis-orders.
 
-### I4. Tip-only cascade ⇒ every closed batch is gold
+### I4. Closed-frontier danger takes precedence over Tip danger
 
-- **Holds:** `check_danger` checks `ClosedBatchInDanger` **before**
-  `TipInDanger`; with I3, the closed frontier is always at least as old as the
-  Tip, so the Tip arm can only fire when no non-gold closed batch exists.
-- **Enforced by:** the arm order in `Storage::check_danger`
-  (`storage/recovery.rs`) + I3.
-- **Depended on by:** the dispatch table's meaning (a `RecoverTip` boot may
-  skip the flush *because* nothing closed is doomed). **Not load-bearing for
-  the pending clear**: the clear is scoped to `nonce >= pivot.nonce` in
-  `cascade_and_reopen`, so a valid in-flight closed batch's pending survives
-  any cascade by construction, regardless of arm order.
-- **Breaks:** a Tip-only cascade while a closed batch is doomed would leave
-  the doomed batch un-cascaded until the next detector cycle (liveness lag,
-  not the old crash-loop).
+- **Holds:** `check_danger` checks `ClosedBatchInDanger` before `TipInDanger`.
+  With monotonic frame clocks, the closed frontier is at least as old as the Tip.
+- **Enforced by:** arm order in `storage/recovery.rs` and I3.
+- **Depended on by:** dispatch: a Tip-only recovery can skip flushing because
+  there is no doomed closed work.
 
-### I5. Pending-clear is scoped to the cascade and runs in its transaction
+### I5. Recovery removes exactly the invalidated application suffix
 
-- **Holds:** recovery deletes only pending rows with `nonce >=
-  pivot.nonce`, atomically with the cascade and the full-backlog tip reopen
-  (`cascade_and_reopen`, `storage/recovery.rs`).
-- **Enforced by:** the single `write` tx + the scoped
-  `clear_pending_dumps_from_nonce_in`.
-- **Depended on by:** catch-up never loading a cascaded batch's state
-  (cleared rows), and promotion never hitting a deleted row for a batch that
-  stayed valid (surviving rows) — the `lifecycle.md` §6/§8 wedge is
-  unrepresentable.
-- **Breaks:** widening the delete re-arms the promote-wedge crash-loop;
-  narrowing it lets catch-up resume from a cascaded batch's state.
+- **Holds:** invalidating a batch deletes its `application_inputs` through the
+  schema trigger. The cascade, generation increment, and replacement Tip commit
+  together. Original source records and immutable snapshots remain; snapshot
+  selection excludes invalidated batches and GC retires their unleased artifacts.
+- **Enforced by:** `cascade_and_reopen`, application-input constraints, valid views.
+- **Breaks:** loading invalidated state or leaving a hole in current history.
 
-### I6. A committed promotion implies an advanced drain
+### I6. The frame clock accounts for a complete L1 interval
 
-- **Holds:** promotion is folded into the drain's transaction
-  (`close_frame_only_with_executions`), together with canonical
-  direct-input attribution.
-- **Enforced by:** the single `write` tx in `storage/ingress.rs`; the
-  standalone `Storage::promote_finalized` is `#[cfg(test)] pub(crate)`.
-- **Depended on by:** crash-safety of the safe-frontier walk
-  (`lifecycle.md` §5–§6).
-- **Breaks:** restart re-processes the range and re-promotes a deleted pending
-  row — crash-loop.
+- **Holds:** the surviving latest frame clock, floored by baseline block `C`,
+  identifies the completely accounted L1 prefix. Reconciliation executes all
+  external directs in the newly safe interval before committing its next frame
+  and application rows. Envelopes-only intervals advance the clock with no rows.
+- **Enforced by:** complete-block ingestion; the lane's indivisible reconciliation
+  turn; storage range and execution-receipt checks. Batch closure preserves the
+  current frame clock.
+- **Breaks:** skipping or double-applying directs after restart/recovery.
 
-### I7. A committed batch close has a promotable pending row
+### I7. Every committed batch close has an immutable snapshot
 
-- **Holds:** seal + next-Tip open + `pending_snapshots` insert commit together
-  (`close_frame_and_batch_with_pending_dump`).
-- **Enforced by:** single transaction; `create_dump` happens before, on disk.
-- **Depended on by:** promotion (`promote_finalized_in` hard-fails on a missing
-  row).
-- **Breaks:** promotion wedge at the sealed batch's landing.
+- **Holds:** file creation precedes the transaction sealing the batch, opening
+  the next Tip, and registering its snapshot by local `batch_index` and count.
+- **Enforced by:** `close_batch_with_snapshot` and
+  `close_frame_and_batch_with_snapshot`. Selection requires the exact expected
+  batch's snapshot; a missing artifact fails loud.
+- **Breaks:** losing the accepted recovery/watchdog checkpoint.
 
-### I8. Always-load: a finalized snapshot and a valid Tip exist before the lane starts
+### I8. A rollback-safe snapshot and valid Tip exist before the lane starts
 
-- **Holds:** cold start registers the genesis dump as finalized and opens the
-  genesis Tip; recovery reopens the Tip atomically across cascades.
-- **Enforced by:** `setup` atomically registers the genesis finalized snapshot
-  before its completion fact; startup recovery refuses a missing finalized
-  fact, opens a missing Tip only through `ensure_open_tip_for_recovery`,
-  and recovery's cascade reopens in-transaction. `PreparedRuntime::prepare`
-  reasserts the snapshot artifact before admission.
-- **Depended on by:** catch-up's unconditional load path
-  (`CatchUpError::NoSnapshot` is fail-loud, not a branch); the lane's
-  `NoOpenTip` fail-loud load.
-- **Breaks:** startup crash (loud — by design).
+- **Holds:** setup publishes the complete durable baseline before completion;
+  recovery retains the newest accepted snapshot, or that baseline until first
+  acceptance. A rebuilt baseline is a restore point, not a comparison at `C`.
+- **Enforced by:** `complete_baseline_setup`, recovery admission, atomic Tip
+  reopen, and `PreparedRuntime::prepare` artifact checks.
+- **Depended on by:** unconditional snapshot restore and catch-up.
+- **Breaks:** startup fails loud instead of inventing state.
 
 ### I9. Acceptance identity: "accepted nonce N" means "our valid batch N"
 
 - **Holds:** by nonce **and content** — the **content-identity check**: every
-  landing at/above the batch-tree anchor that the off-chain
+  landing strictly after baseline block `C` that the off-chain
   `scheduler_accepts` simulation accepts is compared against the local valid
   closed batch at that nonce — `keccak256(landed bytes)` vs the hash stamped at
   seal by the same encode path the submitter broadcasts. The exhaustive local
@@ -235,7 +216,7 @@ by writer and are write-once (`0001_schema.sql`).
   detection — the content-identity check in
   `populate_safe_accepted_batches`, which on violation persists the
   `canonical_divergence` marker and freezes the frontier (I15).
-- **Depended on by:** the gold frontier, cascade pivot selection, promotion,
+- **Depended on by:** the gold frontier, cascade pivot selection, checkpoint selection,
   local-state ↔ canonical-state agreement.
 - **Breaks:** would be silent divergence (a zombie replay of our own stale tx
   winning a nonce slot; a power-loss re-seal at the same nonce with different
@@ -258,32 +239,24 @@ by writer and are write-once (`0001_schema.sql`).
   soft confirmations issued inside that window are built on already-diverged
   state — bounded, and those confirmations are rollbackable by design.
 
-### I10. Replay-offset sentinel: `0` means "from genesis"
+### I10. Replay uses an inclusive application-history boundary
 
-- **Holds:** `valid_ordered_l2_tx_head` returns 0 on an empty stream, and
-  catch-up pages with `offset > cursor` — sound because `sequenced_l2_txs`
-  rowids start at 1 and rows are never deleted (invalidated rows are filtered,
-  not removed), so offsets are globally increasing and 0 is never a real
-  offset.
-- **Enforced by:** SQLite rowid semantics + append-only convention.
-- **Depended on by:** catch-up, the feed cursor, snapshot `l2_tx_index`.
-- **Breaks:** first transaction skipped or double-applied on replay.
-- **Scope:** this is the current physical SQLite replay cursor. It is not the
-  canonical `Application::executed_input_count()` feed coordinate. The
-  canonical mapping is durable, but the public feed has not changed from rowid
-  pagination yet.
+- **Holds:** `ExecutedInputCount = X` means input `X` executes next. Current
+  rows cover `[K, H)`; snapshots at `X` replay with `offset >= X`. `H` waits.
+- **Enforced by:** integer primary key, contiguous insertion, coherent versioned
+  pages, and pre-execution catch-up count checks.
+- **Depended on by:** restart and replica resume without skipping or duplication.
 
-### I11. Own-batch safe inputs are sequenced but never executed or fanned out
+### I11. Batch envelopes remain outside application history
 
-- **Holds:** batch-submitter-sent safe inputs enter `sequenced_l2_txs` like any
-  drained input, but are skipped by sender at catch-up replay
-  (`catch_up.rs`), at live execution (`execute_safe_inputs_chunk`), and at WS
-  delivery (feed filter).
-- **Enforced by:** sender checks at each consumer (three places — keep them in
-  sync).
-- **Depended on by:** replay correctness (a batch payload must never execute as
-  a deposit); feed consumers' state.
-- **Breaks:** batch bytes applied as a direct input — divergence.
+- **Holds:** `safe_inputs` retains every InputBox observation. The storage/lane
+  boundary selects external directs by the setup-pinned submitter address;
+  only those inputs and included user ops enter `application_inputs`.
+- **Enforced by:** classified direct reads and complete receipt validation at
+  append. Startup/recovery derive the initial direct rows before catch-up,
+  which must execute them successfully before admission. Replay and WS need
+  no envelope filter because every row executes.
+- **Depended on by:** application replay and replicated state correctness.
 
 ### I12. Safe head advances only on real observation; `synced_at_ms` is genuine progress time
 
@@ -335,11 +308,10 @@ by writer and are write-once (`0001_schema.sql`).
   fails the content-identity check writes the `canonical_divergence`
   singleton **in the same transaction** as the sync that detected it, and
   `populate_safe_accepted_batches` returns early whenever the marker exists —
-  so no acceptance row, no promotion, and no gold-frontier advance can ever
+  so no acceptance row or gold-frontier advance can ever
   happen past a detected divergence.
 - **Enforced by:** the `trg_*_frozen_on_divergence` trigger family
-  (`0001_schema.sql`) — specifically batch-tree writes, promotions, and
-  pending-snapshot clears RAISE in the engine while the marker exists. This is
+  (`0001_schema.sql`) — specifically batch-tree writes and snapshot collection RAISE in the engine while the marker exists. This is
   the immediate persisted freeze for those named tables, not a general
   user-op hot-path barrier. The accepted frontier itself has no trigger: its
   single writer refuses past the marker — the guard at the top of
@@ -358,8 +330,7 @@ by writer and are write-once (`0001_schema.sql`).
   reading `check_danger` on its poll interval (`DANGER_DETECTOR_POLL_INTERVAL`). Independently, the inclusion lane's existing time-gated
   SQLite read returns `SafeFrontierState::CanonicalDivergence` instead of an
   `Open` frontier when the marker is already present. The lane then exits
-  with a terminal error, causing the supervisor to abort, before direct execution,
-  promotion, or the five-block rotation decision. This is opportunistic
+  with a terminal error, causing the supervisor to abort, before direct execution or the five-block rotation decision. This is opportunistic
   refusal at an existing read, not another detector or a timing guarantee.
   One bounded dequeue chunk (`max_user_ops_per_chunk`) is the fast-turn limit, so rejected traffic cannot
   starve the read once its time gate is due. There is deliberately no
@@ -367,32 +338,26 @@ by writer and are write-once (`0001_schema.sql`).
 - **Race bound:** a lane turn that already read `Open` may finish if the reader
   commits divergence concurrently. Preventing that would require a lock or
   transaction spanning application execution. Existing freeze triggers stop
-  conflicting batch-tree/promotion writes; the detector and next typed read
+  conflicting batch-tree writes; the detector and next typed read
   stop the process. A chunk committed before either runtime observation may
   acknowledge and later roll back.
-- **Watchdog boundary:** the freeze stops finalized promotion before the
+- **Watchdog boundary:** the freeze blocks accepted-checkpoint publication before the
   offending landing becomes a comparable sequencer checkpoint. Because the
   watchdog skips replay when the finalized inclusion block is unchanged, it
   does not subsume this wire-identity detector. Conversely, the check does
   not subsume the watchdog's broader independent application-state
   comparison.
 - **Depended on by:** standard recovery never running on a diverged frontier
-  (a flush+cascade there would compound the divergence); the lane never
-  promoting a diverged landing; the remedy being cockroach recovery only.
+  (a flush+cascade there would compound the divergence); egress never
+  publishing a diverged landing; the remedy being cockroach recovery only.
 - **Breaks:** silent permanent scheduler/sequencer divergence — the
   theft-equivalent failure.
-- **Anchor-aware frontier:** the content-identity check fires
-  only at/above the batch-tree **anchor** ([I16](#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)).
-  `populate_safe_accepted_batches` seeds its initial expected nonce from the
-  anchor (0 for genesis — unchanged; `N'` for a cockroach-recovered deployment),
-  so L1 landings *below* `N'` are skipped by nonce-mismatch — they are **trusted
-  collapsed history**, folded into the recovered checkpoint `S'`, not foreign.
-  This only affects the empty-frontier seed; a running sequencer (non-empty,
-  append-only `safe_accepted_batches`) always resumes from `latest_accepted`, so
-  its foreign/zombie detection is byte-identical. `setup --recovery` itself
-  *defers* frontier population entirely (`InputReader::set_frontier_mode(DeferUntilAnchorSet)`):
-  its syncs run against an empty tree, so a frontier built then would falsely
-  diverge — `run`'s first sync populates it once the anchor is set.
+- **Baseline-aware frontier:** accepted-batch scanning starts strictly after
+  the immutable baseline L1 block `C`, seeded with anchor nonce `N'`. The whole
+  prefix is opaque, including previously rejected future-nonce batches; it must
+  never be reinterpreted using a later expected nonce. Subsequent scans resume
+  after the last acceptance. Rebuild defers the projection until the complete
+  baseline and anchor are published.
 
 ### I16. The batch tree has exactly one valid parentless root, carrying the deployment's anchor nonce
 
@@ -400,8 +365,9 @@ by writer and are write-once (`0001_schema.sql`).
   `parent.nonce + 1`, except the single parentless root, which carries the
   `batch_tree_anchor` nonce — `0` for a genesis deployment, `N'` for a
   cockroach-recovered one (`setup --recovery` writes the anchor before the
-  `setup_complete` marker). `run`'s first tip *is* that root (there is no
-  separate sentinel batch). A fully-torn cascade re-roots parentless at the
+  `setup_complete` marker). The first Tip is that root (there is no separate sentinel batch): plain
+  setup leaves its creation to startup recovery; rebuild creates it at `C` in
+  the baseline transaction. A fully-torn cascade re-roots parentless at the
   same anchor via `open_fresh_tip_in_tx`'s `parent = None` path, after
   invalidating the old root — so only one *valid* parentless root ever exists,
   invalidated ones coexisting.
@@ -415,8 +381,9 @@ by writer and are write-once (`0001_schema.sql`).
   `valid_closed_batches` with `nonce >= frontier_nonce`, where `frontier_nonce`
   defaults to the anchor (`= N'`) while `safe_accepted_batches` is still empty
   after recovery, so the submitter starts at `N'` rather than 0; the recovery
-  fill roots the rebuilt tree at `N'` without replaying history. (`N'` is trusted
-  checkpoint metadata, not re-verified at setup — see
+  fill roots the rebuilt tree at `N'` without replaying history. (`N'` is fold-derived from trusted
+  checkpoint nonce `N`; wrong-low and wrong-high `N` are outside the supported
+  checkpoint model — see
   [`docs/recovery/cockroach.md`](recovery/cockroach.md#data-dictionary).)
 - **Breaks:** a tree mis-anchored at the wrong nonce ⇒ `run`'s first batch
   carries a nonce the scheduler rejects ⇒ the sequencer is wedged (never
@@ -436,9 +403,8 @@ by writer and are write-once (`0001_schema.sql`).
   the `Storage::append_executed_user_ops_chunk`/attributed `close_*` update
   ordering; and the Tip,
   frame-position, FK, and PK constraints that fail loud on dangerous stale
-  cache writes. Direct-input uniqueness still depends on the lane's drain
-  cursor discipline because invalidated-history re-drain forbids a global
-  `safe_input_index` uniqueness constraint.
+  cache writes. Direct-input uniqueness is enforced in the current application sequence;
+  invalidation removes the old row before recovery can reuse its source.
 - **Depended on by:** the hot path avoiding a redundant SQLite re-read on every
   chunk; batch-size/frame counters; safe-block drain attribution; every storage
   method that trusts the passed head.
@@ -450,56 +416,22 @@ by writer and are write-once (`0001_schema.sql`).
   simplify the lane, but is an independent benchmarked change rather than part
   of the lane-reconciliation cutover.
 
-### I18. History metadata changes atomically with the history fact it describes
+### I18. History identity is published with the complete baseline
 
-- **Holds:** an authority-bearing initial setup/rebuild baseline creates the
-  schema, one immutable UUIDv4 `EraId`, and `RecoveryGeneration = 0` in one
-  `synchronous=FULL` transaction. Plain
-  setup starts with both bases zero; rebuild starts with
-  `base_executed_input_count = NULL` and `base_safe_input_index = NULL`
-  because neither the folded application nor its recovery-root cursor exists
-  yet.
-- **Standard recovery:** `cascade_and_reopen` advances the generation exactly
-  once in its transaction iff it invalidates at least one valid batch. A
-  missing-Tip ensure or any other no-invalidation path leaves it unchanged.
-- **Cockroach bind:** fill derives `K` from
-  `S'.executed_input_count()` and captures the recovery root's exclusive
-  safe-input cursor after sequencing its `<= C` padding. It binds both values
-  in the same transaction that registers the initial finalized snapshot.
-  `complete_setup` refuses while either base remains NULL or the finalized
-  snapshot is absent. The pair is write-once. On retry, a matching root Tip
-  plus that atomically bound snapshot/base pair is authoritative; it is not
-  re-compared with a later fold.
-- **Durable drain floor:** the next-undrained cursor is the maximum of
-  `base_safe_input_index` and `MAX(valid safe_input_index) + 1`. Standard
-  recovery may invalidate the cockroach root and thereby remove its padding
-  from the valid view, but can never make inputs already represented by `S'`
-  drainable or executable again. NULL is interpreted as zero only while
-  setup has not completed (only a pre-completion rebuild fill can present a
-  NULL floor: plain setup binds base 0 in its baseline transaction, and
-  completion refuses while the base is NULL).
-- **Coordinate separation:** `K` is an application-history boundary. It is
-  deliberately independent of snapshot `l2_tx_index` and the current rowid
-  feed cursor, which may include sequenced-but-not-executed cursor-padding
-  rows. The per-input projection is now durable, but the current public feed
-  still uses the physical cursor; its API/WS projection remains deferred.
-- **Enforced by:** `baseline_migration` (`storage/open.rs`), the immutable-era,
-  write-once-base, and exact-`+1` schema triggers; `cascade_and_reopen`
-  (`storage/recovery.rs`); `insert_initial_finalized_dump`
-  (`storage/snapshot_dumps.rs`); and `complete_setup`
-  (`storage/lifecycle.rs`).
-- **Depended on by:** standard-recovery discontinuity detection, honest
-  post-cockroach history availability, the canonical offset projection, and
-  the future Track 3 history-version/API protocol.
-- **Breaks:** a client can mistake a rolled-back soft suffix for unchanged
-  history, or a rebuilt deployment can advertise an unavailable/incorrect
-  numeric prefix. Either silently diverges a mirror.
-- **Operational boundary:** cockroach recovery remains an explicit
-  fresh/wiped-directory operator action. Retaining an early incomplete DB
-  reuses its still-unexposed era; a fail-loud partial-fill refusal requires a
-  wipe/retry and therefore a new unexposed era. No automated replacement,
-  clone detection, distributed fencing, or general resume state machine is
-  implied.
+- **Holds:** file-first setup publishes `(EraId, generation=0, K, C, N')`, the
+  baseline snapshot, any recovery root, and setup completion in one FULL
+  transaction. The history row is absent before this boundary. `K` and `C`
+  remain immutable even after baseline artifact GC or recovery-root invalidation.
+- **Standard recovery:** one generation increment iff a valid batch is
+  invalidated, in the cascade transaction. Clean restart changes neither token.
+- **Enforced by:** `complete_baseline_setup`, immutable history triggers,
+  exact-`+1` generation trigger, and `cascade_and_reopen`.
+- **Depended on by:** mandatory snapshot-derived WS claims. Identity is validated
+  before the requested count, including for empty history.
+- **Breaks:** a client silently resumes a replaced suffix or inaccessible prefix.
+- **Operational boundary:** rebuilding uses a fresh/wiped data directory.
+  Checkpoint state, inclusion block, and next nonce are trusted operator inputs;
+  neither clone detection nor distributed fencing is implied.
 
 ### Do-not-simplify (deliberate shapes that look like cleanup targets)
 
@@ -511,18 +443,12 @@ like a simplification and would break a registered invariant:
 - **Don't reorder `check_danger`'s arms** or merge its two `find_*` helpers
   into one that consults the Tip first — the closed-frontier-first order is
   the dispatch table's meaning (I4).
-- **Don't "deduplicate" promotion out of the drain transaction** — a
-  standalone promotion re-opens the promote-wedge crash loop (I6).
-- **Don't filter own-batch rows out of `valid_sequenced_l2_txs`** — the
-  drain cursor is `MAX(safe_input_index)+1` over those very rows; a view
-  filter would rewind it and re-drain. Sender filtering stays at the
-  consumers (I11).
-- **Don't replace the rowid offset with count-based pagination** —
-  invalidated-batch holes and the 0-sentinel depend on current physical
-  behavior (I10).
-- **Don't move snapshot GC off the promotion path** to an idle loop or a
-  dedicated worker — promotion-coupled GC is starvation-proof and
-  single-writer by design (`docs/snapshots/lifecycle.md`).
+- **Don't derive application order from L1 positions** — optimistic user ops
+  precede their envelope and have no general one-to-one L1 mapping.
+- **Don't retain a numeric resume offset without its history identity** —
+  recovery deliberately reuses suffix counts (I18).
+- **Don't discard a valid snapshot beyond the accepted frontier** — that exact
+  batch can become the next required recovery checkpoint (I7).
 - **Don't add internal retry loops to the flusher/submitter for provider
   errors** — the orchestrator respawn is the retry mechanism; internal
   retries mask exactly the failures the danger machinery routes on.
@@ -545,7 +471,7 @@ like a simplification and would break a registered invariant:
   self-trusted; progress ownership does not require a Rust-side mirror.
 - **Depended on by:** the canonical scheduler, inclusion lane, catch-up,
   recovery fold, cockroach base `K`, durable execution attribution, and the
-  future Track 3 API projection.
+  versioned replica protocol.
 - **Breaks:** an input can be applied without advancing history, an offset can
   advance twice, or recovery can derive the wrong checkpoint clock — silent
   application-history divergence.
@@ -553,56 +479,27 @@ like a simplification and would break a registered invariant:
   A failing hook is not rolled back; every production caller terminates that
   path and discards the instance.
 
-### I20. Canonical execution offsets are an atomic projection of valid history
+### I20. Application history is committed with its execution receipts
 
-- **Holds:** `sequenced_l2_txs` remains the append-only physical replay/audit
-  log. `executed_inputs` is a separate sparse projection for the current valid
-  history: every user op and non-batch-submitter direct input that executes has
-  exactly one mapping from its physical row to the pre-execution
-  `ExecutedInputCount`; batch envelopes and cockroach-root cursor-padding rows
-  have none. Current mappings occupy the contiguous logical interval `[K, H)`.
-- **Creation atomicity:** a user-op chunk inserts its `user_ops`, trigger-created
-  physical rows, and explicit execution mappings in the same FULL transaction
-  that authorizes acknowledgements. A slow reconciliation turn inserts its
-  direct physical rows, mappings, frame rotation, and any snapshot promotion
-  in one transaction. The lane carries offsets attached to executed values, so
-  an included input cannot be persisted without its receipt.
-- **Recovery semantics:** suffix invalidation retains physical audit rows but
-  deletes their derived mappings in the same transaction that advances
-  `RecoveryGeneration` and opens the replacement Tip. This rewinds `H`
-  naturally; replacement inputs reuse the suffix offsets under the new
-  generation. The global logical UNIQUE constraint and next-offset trigger
-  make a duplicate, gap, or out-of-order creation fail loud. Cockroach padding
-  stays outside the projection, and the durable safe-input floor prevents it
-  from being attributed later.
-- **Snapshot/replay agreement:** every pending/finalized snapshot row stores
-  both physical `l2_tx_index` and canonical `executed_input_count`. Snapshot
-  registration asserts its count equals storage-derived `H`; startup compares
-  the loaded application's count with the row; catch-up then checks each
-  physical row's expected mapping before executing it, and replays each
-  user op with the persisted `frames.fee`, so the fee charged at replay is
-  the one inclusion-time execution used (catch-up re-executes through
-  `execute_valid_user_op` and does not re-validate).
-  Missing, extra, or wrong mappings are terminal invariant failures, never
-  repaired/backfilled.
-- **Enforced by:** `ExecutedInputCount` receipts
-  (`sequencer-core/src/application/mod.rs`); attributed lane/storage APIs
-  (`ingress/inclusion_lane/`, `storage/ingress.rs`,
-  `storage/mutations.rs`); `executed_inputs` constraints and invalidation
-  trigger (`storage/migrations/0001_schema.sql`); storage-derived `H`
-  (`storage/history.rs`); snapshot count checks
-  (`storage/snapshot_dumps.rs`); and pre-execution catch-up checks
-  (`ingress/inclusion_lane/catch_up.rs`).
-- **Depended on by:** restart determinism, standard-recovery rollback/reuse,
-  post-cockroach continuation at `K`, snapshot coherence, and the future
-  canonical-offset HTTP/WS protocol.
-- **Breaks:** the same numeric offset can name the wrong application input, or
-  a restart can apply a different prefix than live execution—silent mirror or
-  canonical-state divergence.
-- **Performance boundary:** deriving `H` is a covering lookup over the logical
-  UNIQUE index. Recovery deletes only its doomed projection suffix; it does
-  not scan invalid physical history on every hot-path insertion. Direct
-  execution receipt accumulation and classification live in the already-slow
-  L1 reconciliation regime; the user-op hot path adds one chunk-level mapping
-  query and inserts inside its existing durability transaction, not another
-  fsync or actor.
+- **Holds:** `application_inputs` contains every current included user op and
+  external direct exactly once, keyed by mandatory pre-execution count. Its
+  source reference, owning batch/frame, and payload tables reconstruct replay.
+  There are no entries for batch envelopes or the opaque baseline prefix.
+- **Creation atomicity:** user-op source rows and application rows commit in the
+  same FULL chunk transaction that authorizes acknowledgements. Direct inputs
+  commit with the complete frame rotation, after checking all execution receipts.
+  Startup/recovery create leading direct rows before restoring the engine;
+  successful catch-up is required before admitting that sequence.
+- **Recovery:** source records remain, while invalidation deletes the current
+  suffix. Replacement rows reuse counts under the incremented generation.
+- **Snapshot/replay agreement:** a batch-close snapshot records storage-derived
+  `H`; the restored engine must report the same count. Each replay row must
+  match the engine's next count and executes with its persisted frame fee/clock
+  (or the direct input's source block). Missing rows or count mismatches fail
+  loud; they are never repaired or backfilled.
+- **Enforced by:** shared execution receipts, storage append APIs, PK/FK/XOR/
+  uniqueness and contiguous-offset triggers, coherent canonical pages, and
+  catch-up checks.
+- **Performance boundary:** head discovery uses the integer primary-key maximum;
+  replay seeks directly by offset and joins bounded source rows. Neither scans
+  invalidated history. Chunk insertion adds no durability transaction or actor.

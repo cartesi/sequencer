@@ -7,15 +7,20 @@
 
 use std::sync::Arc;
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::warn;
 
+use crate::egress::l2_tx_feed::Subscription;
 use crate::egress::l2_tx_feed::{BroadcastTxMessage, L2TxFeed, SubscribeError};
-use crate::http::WS_CATCHUP_WINDOW_EXCEEDED_REASON;
+use crate::http::ApiError;
+use axum::{Json, http::StatusCode};
+use sequencer_core::history::{
+    EraId, ExecutedInputCount, HistoryClaim, HistoryVersion, RecoveryGeneration,
+};
 
 use super::SubscribeState;
 
@@ -24,7 +29,9 @@ const MAX_INBOUND_WS_FRAME_SIZE: usize = 8 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SubscribeQuery {
-    from_offset: Option<u64>,
+    era_id: EraId,
+    recovery_generation: RecoveryGeneration,
+    next_input: ExecutedInputCount,
 }
 
 pub(crate) async fn subscribe_l2_txs(
@@ -36,68 +43,50 @@ pub(crate) async fn subscribe_l2_txs(
         return err.into_response();
     }
 
-    let from_offset = query.from_offset.unwrap_or(0);
+    let claim = HistoryClaim {
+        version: HistoryVersion {
+            era_id: query.era_id,
+            recovery_generation: query.recovery_generation,
+        },
+        next_input: query.next_input,
+    };
     let permit = match state.try_acquire_ws_subscriber_permit() {
         Ok(permit) => permit,
         Err(err) => return err.into_response(),
     };
     let tx_feed = state.tx_feed.clone();
-    let ws_max_catchup_events = state.ws_max_catchup_events;
+    let subscription = match tx_feed.subscribe_from(claim).await {
+        Ok(subscription) => subscription,
+        Err(SubscribeError::History(error)) => {
+            // WebSocket clients may stop reading after the HTTP headers. Keep
+            // the structured refusal available even when its body arrives later.
+            let policy = serde_json::to_string(&error).expect("history policy serializes");
+            return (
+                StatusCode::CONFLICT,
+                [("X-History-Error", policy)],
+                Json(error),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            warn!(%error, "ws subscription unavailable");
+            return ApiError::unavailable("subscription unavailable").into_response();
+        }
+    };
 
     ws.max_message_size(MAX_INBOUND_WS_MESSAGE_SIZE)
         .max_frame_size(MAX_INBOUND_WS_FRAME_SIZE)
-        .on_upgrade(move |socket| {
-            run_ws_session(tx_feed, socket, from_offset, permit, ws_max_catchup_events)
-        })
+        .on_upgrade(move |socket| run_ws_session(tx_feed, socket, subscription, permit))
         .into_response()
 }
 
 async fn run_ws_session(
     tx_feed: L2TxFeed,
     mut socket: WebSocket,
-    from_offset: u64,
+    mut subscription: Subscription,
     _subscriber_permit: OwnedSemaphorePermit,
-    ws_max_catchup_events: u64,
 ) {
     let shutdown = tx_feed.runtime_scope();
-    let mut subscription = match tx_feed
-        .subscribe_from(from_offset, ws_max_catchup_events)
-        .await
-    {
-        Ok(subscription) => subscription,
-        Err(SubscribeError::CatchUpWindowExceeded {
-            requested_offset,
-            live_start_offset,
-            max_catchup_events,
-        }) => {
-            warn!(
-                requested_offset,
-                live_start_offset,
-                max_catchup_events,
-                "ws catch-up window exceeded; closing subscriber"
-            );
-            let reason = format!(
-                "{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset={live_start_offset}"
-            );
-            close_with_frame(&mut socket, close_code::POLICY, reason.as_str()).await;
-            return;
-        }
-        Err(SubscribeError::OpenStorage { source }) => {
-            warn!(error = %source, "ws subscription failed to open replay storage");
-            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
-            return;
-        }
-        Err(SubscribeError::LoadHeadOffset { source }) => {
-            warn!(error = %source, "ws subscription failed to read replay head");
-            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
-            return;
-        }
-        Err(SubscribeError::Join { source }) => {
-            warn!(error = %source, "ws subscription preparation was cancelled");
-            close_with_frame(&mut socket, close_code::ERROR, "subscription unavailable").await;
-            return;
-        }
-    };
 
     loop {
         tokio::select! {
@@ -132,17 +121,6 @@ async fn run_ws_session(
     if let Err(err) = subscription.finish().await {
         warn!(error = %err, "tx feed subscription cleanup failed");
     }
-}
-
-async fn close_with_frame(socket: &mut WebSocket, code: u16, reason: &str) {
-    let _ = send_ws_message(
-        socket,
-        Message::Close(Some(CloseFrame {
-            code,
-            reason: reason.into(),
-        })),
-    )
-    .await;
 }
 
 async fn send_ws_event(socket: &mut WebSocket, event: &BroadcastTxMessage) -> Result<(), ()> {

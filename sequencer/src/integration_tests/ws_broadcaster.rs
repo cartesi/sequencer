@@ -4,17 +4,18 @@
 use std::io::ErrorKind;
 use std::time::{Duration, SystemTime};
 
+use crate::storage::{ApplicationInputRow, L2TxContext};
 use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
 use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
 use futures_util::{SinkExt, StreamExt};
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
-use sequencer::http::{self, ApiConfig, WS_CATCHUP_WINDOW_EXCEEDED_REASON};
+use sequencer::http::{self, ApiConfig};
 use sequencer::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::WsTxMessage;
-use sequencer_core::l2_tx::SequencedL2Tx;
+use sequencer_core::history::{EraId, ExecutedInputCount, HistoryClaim, HistoryPolicyError};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 use sequencer_rust_client::SequencerClient;
 use tokio::sync::{mpsc, oneshot};
@@ -33,7 +34,7 @@ async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
     let Some(runtime) = start_test_server(db.path.as_str()).await else {
         return;
     };
-    let url = ws_subscribe_url(runtime.addr, 0);
+    let url = ws_subscribe_url(&db.path, runtime.addr, 0);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
         .await
         .expect("timeout connecting websocket")
@@ -45,27 +46,27 @@ async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
 
     shutdown_runtime(runtime).await;
 
-    // DB offsets (SQLite rowid) start at 1.
-    assert_ws_message_matches_tx(first, &expected[0], 1);
-    assert_ws_message_matches_tx(second, &expected[1], 2);
+    // Application offsets start at zero.
+    assert_ws_message_matches_tx(first, &expected[0], 0);
+    assert_ws_message_matches_tx(second, &expected[1], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_subscribe_resumes_from_given_offset() {
     let db = temp_db("ws-subscribe-resume");
     seed_ordered_txs(db.path.as_str());
-    // Resume from DB offset 1 — should get items with offset > 1.
+    // Resume inclusively at application input 1.
     let expected = load_ordered_l2_txs_page(db.path.as_str(), 1, 1);
     assert_eq!(
         expected.len(),
         1,
-        "resume snapshot must contain one event at offset 2"
+        "resume snapshot must contain one event at offset 1"
     );
 
     let Some(runtime) = start_test_server(db.path.as_str()).await else {
         return;
     };
-    let url = ws_subscribe_url(runtime.addr, 1);
+    let url = ws_subscribe_url(&db.path, runtime.addr, 1);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
         .await
         .expect("timeout connecting websocket")
@@ -76,7 +77,7 @@ async fn ws_subscribe_resumes_from_given_offset() {
 
     shutdown_runtime(runtime).await;
 
-    assert_ws_message_matches_tx(first, &expected[0], 2);
+    assert_ws_message_matches_tx(first, &expected[0], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -90,7 +91,7 @@ async fn ws_subscribe_receives_live_events_after_subscribing() {
     };
 
     // Subscribe at the current DB head to exercise live-only delivery.
-    let url = ws_subscribe_url(runtime.addr, base_offset);
+    let url = ws_subscribe_url(&db.path, runtime.addr, base_offset);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
         .await
         .expect("timeout connecting websocket")
@@ -108,7 +109,7 @@ async fn ws_subscribe_receives_live_events_after_subscribing() {
 
     shutdown_runtime(runtime).await;
 
-    assert_ws_message_matches_tx(live, &expected[0], base_offset + 1);
+    assert_ws_message_matches_tx(live, &expected[0], base_offset);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,7 +122,7 @@ async fn ws_subscribe_fanout_delivers_live_event_to_multiple_subscribers() {
         return;
     };
 
-    let url = ws_subscribe_url(runtime.addr, base_offset);
+    let url = ws_subscribe_url(&db.path, runtime.addr, base_offset);
     let (mut ws_a, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url.as_str()))
         .await
         .expect("timeout connecting websocket A")
@@ -146,23 +147,21 @@ async fn ws_subscribe_fanout_delivers_live_event_to_multiple_subscribers() {
 
     shutdown_runtime(runtime).await;
 
-    assert_ws_message_matches_tx(event_a, &expected[0], base_offset + 1);
-    assert_ws_message_matches_tx(event_b, &expected[0], base_offset + 1);
+    assert_ws_message_matches_tx(event_a, &expected[0], base_offset);
+    assert_ws_message_matches_tx(event_b, &expected[0], base_offset);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_subscribe_replies_with_pong_on_ping() {
     let db = temp_db("ws-subscribe-ping-pong");
     seed_ordered_txs(db.path.as_str());
-    // Use a far-future offset so this test validates ping/pong without
-    // interleaving replay/live tx frames.
-    let from_offset = u64::MAX;
+    let from_offset = ordered_l2_tx_count(&db.path);
 
     let Some(runtime) = start_test_server(db.path.as_str()).await else {
         return;
     };
 
-    let url = ws_subscribe_url(runtime.addr, from_offset);
+    let url = ws_subscribe_url(&db.path, runtime.addr, from_offset);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
         .await
         .expect("timeout connecting websocket")
@@ -189,11 +188,11 @@ async fn ws_subscribe_rejects_when_subscriber_limit_is_reached() {
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
 
-    let Some(runtime) = start_test_server_with_limits(db.path.as_str(), 1, 50_000).await else {
+    let Some(runtime) = start_test_server_with_limits(db.path.as_str(), 1).await else {
         return;
     };
 
-    let url = ws_subscribe_url(runtime.addr, base_offset);
+    let url = ws_subscribe_url(&db.path, runtime.addr, base_offset);
     let (ws_a, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url.as_str()))
         .await
         .expect("timeout connecting websocket A")
@@ -215,73 +214,30 @@ async fn ws_subscribe_rejects_when_subscriber_limit_is_reached() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_closes_when_catchup_window_exceeds_limit() {
-    let db = temp_db("ws-catchup-limit");
-    seed_ordered_txs(db.path.as_str());
-    append_drained_direct_input(db.path.as_str(), vec![0xbb]);
-
-    let Some(runtime) = start_test_server_with_limits(db.path.as_str(), 64, 1).await else {
+async fn ws_subscribe_requires_a_valid_history_claim_before_upgrade() {
+    let db = temp_db("ws-history-claims");
+    seed_ordered_txs(&db.path);
+    let Some(runtime) = start_test_server(&db.path).await else {
         return;
     };
-
-    let url = ws_subscribe_url(runtime.addr, 1);
-    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
-        .await
-        .expect("timeout connecting websocket")
-        .expect("connect websocket");
-
-    let frame = recv_raw_message(&mut ws).await;
-    match frame {
-        Message::Close(Some(close_frame)) => {
-            assert_eq!(
-                close_frame.code,
-                tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
-            );
-            let prefix = format!("{WS_CATCHUP_WINDOW_EXCEEDED_REASON}: live_start_offset=");
-            let reason = close_frame.reason.as_str();
-            assert!(
-                reason.starts_with(WS_CATCHUP_WINDOW_EXCEEDED_REASON),
-                "close reason must retain the stable prefix: {reason}"
-            );
-            let live_start_offset = reason
-                .strip_prefix(prefix.as_str())
-                .expect("close reason carries live_start_offset")
-                .parse::<u64>()
-                .expect("live_start_offset is a u64");
-            assert_eq!(live_start_offset, 3);
-        }
-        other => panic!("expected close frame for catch-up limit, got {other:?}"),
-    }
-
-    drop(ws);
+    let client = SequencerClient::new(format!("http://{}", runtime.addr)).unwrap();
+    let mut start = history_claim(&db.path, 3);
+    assert!(matches!(client.subscribe(start).await,
+        Err(sequencer_rust_client::SubscribeError::History(HistoryPolicyError::AheadOfHead { head })) if head.get() == 2));
+    start.next_input = ExecutedInputCount::ZERO;
+    start.version.era_id =
+        EraId::from_bytes([0x11, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]).unwrap();
+    assert!(matches!(
+        client.subscribe(start).await,
+        Err(sequencer_rust_client::SubscribeError::History(
+            HistoryPolicyError::EraChanged { .. }
+        ))
+    ));
+    let legacy = connect_async(format!("ws://{}/ws/subscribe?from_offset=0", runtime.addr)).await;
+    assert!(
+        matches!(legacy, Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status().as_u16() == 400)
+    );
     shutdown_runtime(runtime).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_subscribe_allows_catchup_exactly_at_limit() {
-    let db = temp_db("ws-catchup-boundary");
-    seed_ordered_txs(db.path.as_str());
-    let expected = load_ordered_l2_txs_page(db.path.as_str(), 0, 2);
-    assert_eq!(expected.len(), 2, "seeded replay must contain two txs");
-
-    let Some(runtime) = start_test_server_with_limits(db.path.as_str(), 64, 2).await else {
-        return;
-    };
-
-    let url = ws_subscribe_url(runtime.addr, 0);
-    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
-        .await
-        .expect("timeout connecting websocket")
-        .expect("connect websocket");
-
-    let first = recv_tx_message(&mut ws).await;
-    let second = recv_tx_message(&mut ws).await;
-    drop(ws);
-
-    shutdown_runtime(runtime).await;
-
-    assert_ws_message_matches_tx(first, &expected[0], 1);
-    assert_ws_message_matches_tx(second, &expected[1], 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -293,7 +249,7 @@ async fn ws_subscribe_closes_on_oversized_inbound_message() {
         return;
     };
 
-    let url = ws_subscribe_url(runtime.addr, u64::MAX);
+    let url = ws_subscribe_url(&db.path, runtime.addr, ordered_l2_tx_count(&db.path));
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
         .await
         .expect("timeout connecting websocket")
@@ -320,6 +276,10 @@ async fn ws_subscribe_closes_on_oversized_inbound_message() {
 
 fn seed_ordered_txs(db_path: &str) {
     let mut storage = Storage::open(db_path).expect("open storage");
+    crate::storage::test_helpers::pin_test_deployment_identity(
+        &mut storage,
+        Address::repeat_byte(0x7f),
+    );
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -350,7 +310,7 @@ fn seed_ordered_txs(db_path: &str) {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            Address::ZERO,
+            Address::repeat_byte(0x7f),
             &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
@@ -386,7 +346,7 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
                 payload,
                 block_number: safe_block,
             }],
-            Address::ZERO,
+            Address::repeat_byte(0x7f),
             &sequencer_core::protocol::ProtocolTiming {
                 max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
                 preemptive_margin_blocks: 75,
@@ -426,13 +386,12 @@ fn snapshot_state_file(prefix: &std::path::Path) -> std::path::PathBuf {
 }
 
 async fn start_test_server(db_path: &str) -> Option<WsServerRuntime> {
-    start_test_server_with_limits(db_path, 64, 50_000).await
+    start_test_server_with_limits(db_path, 64).await
 }
 
 async fn start_test_server_with_limits(
     db_path: &str,
     ws_max_subscribers: usize,
-    ws_max_catchup_events: u64,
 ) -> Option<WsServerRuntime> {
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(value) => value,
@@ -454,8 +413,6 @@ async fn start_test_server_with_limits(
         L2TxFeedConfig {
             idle_poll_interval: Duration::from_millis(2),
             page_size: 64,
-            // Sentinel submitter: this fixture seeds no own-batch rows.
-            ..L2TxFeedConfig::new(alloy_primitives::Address::repeat_byte(0x7f))
         },
     );
     let task = http::start_on_listener(
@@ -465,7 +422,6 @@ async fn start_test_server_with_limits(
         tx_feed,
         ApiConfig {
             ws_max_subscribers,
-            ws_max_catchup_events,
             ..ApiConfig::new(
                 Eip712Domain {
                     name: None,
@@ -540,35 +496,38 @@ fn decode_hex_prefixed(value: &str) -> Vec<u8> {
     alloy_primitives::hex::decode(value).expect("decode hex")
 }
 
-fn ws_subscribe_url(addr: std::net::SocketAddr, from_offset: u64) -> String {
+fn ws_subscribe_url(db_path: &str, addr: std::net::SocketAddr, from_offset: u64) -> String {
     let endpoint = format!("http://{addr}");
     let client = SequencerClient::new(endpoint).expect("build sequencer client");
-    client.ws_subscribe_url(from_offset)
+    client.ws_subscribe_url(history_claim(db_path, from_offset))
 }
 
 fn ordered_l2_tx_count(db_path: &str) -> u64 {
     let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
     storage
-        .ordered_l2_tx_head_offset()
-        .expect("query ordered l2 head offset")
+        .next_executed_input_count()
+        .expect("query application head")
+        .get()
 }
 
-fn load_ordered_l2_txs_page(db_path: &str, from_offset: u64, limit: usize) -> Vec<SequencedL2Tx> {
+fn load_ordered_l2_txs_page(
+    db_path: &str,
+    from_offset: u64,
+    limit: usize,
+) -> Vec<ApplicationInputRow> {
     let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
     storage
-        .ordered_l2_txs_page_from(from_offset, limit)
+        .canonical_history_page(history_claim(db_path, from_offset), limit)
         .expect("load ordered l2 tx page")
-        .into_iter()
-        .map(|row| row.tx)
-        .collect()
+        .rows
 }
 
 fn assert_ws_message_matches_tx(
     actual: WsTxMessage,
-    expected: &SequencedL2Tx,
+    expected: &ApplicationInputRow,
     expected_offset: u64,
 ) {
-    match (actual, expected) {
+    match (actual, &expected.context) {
         (
             WsTxMessage::UserOp {
                 offset,
@@ -577,7 +536,7 @@ fn assert_ws_message_matches_tx(
                 data,
                 ..
             },
-            SequencedL2Tx::UserOp(expected),
+            L2TxContext::UserOp { tx: expected, .. },
         ) => {
             assert_eq!(offset, expected_offset);
             assert_eq!(
@@ -595,7 +554,7 @@ fn assert_ws_message_matches_tx(
                 payload,
                 ..
             },
-            SequencedL2Tx::Direct(expected),
+            L2TxContext::DirectInput { tx: expected, .. },
         ) => {
             assert_eq!(offset, expected_offset);
             assert_eq!(
@@ -611,5 +570,16 @@ fn assert_ws_message_matches_tx(
         (actual, expected) => {
             panic!("ws message type mismatch; actual={actual:?}, expected={expected:?}")
         }
+    }
+}
+
+fn history_claim(db_path: &str, next: u64) -> HistoryClaim {
+    HistoryClaim {
+        version: Storage::open_read_only(db_path)
+            .unwrap()
+            .history_state()
+            .unwrap()
+            .version,
+        next_input: ExecutedInputCount::new(next),
     }
 }

@@ -8,7 +8,7 @@ use sequencer_core::application::AppError;
 use thiserror::Error;
 
 use super::dump_info::CreateDumpDirError;
-use super::snapshot::{GcError, StampError, TakeDumpError};
+use super::snapshot::{GcError, TakeDumpError};
 
 #[derive(Debug, Error)]
 pub enum InclusionLaneError {
@@ -42,8 +42,6 @@ pub enum InclusionLaneError {
     LoadFromDump(AppError),
     #[error("snapshot garbage collection failed")]
     Gc(#[from] GcError),
-    #[error("stamping promotion metadata into the finalized dump failed")]
-    PromotionStamp(#[from] StampError),
     #[error(
         "no open Tip at lane startup; the runtime must establish it via \
          guarded startup recovery before starting the lane"
@@ -61,12 +59,11 @@ impl InclusionLaneError {
             }
             Self::LoadFromDump(source) => referenced_snapshot_app_error_is_terminal(source),
             Self::Snapshot(source) => take_dump_error_is_terminal(source),
-            Self::Gc(GcError::Storage(source))
-            | Self::PromotionStamp(StampError::Storage(source)) => {
+            Self::Gc(GcError::Storage(source)) => {
                 crate::storage::is_persistent_storage_error(source)
             }
             Self::CanonicalDivergence { .. } | Self::NoOpenTip => true,
-            Self::ChannelClosed | Self::PromotionStamp(StampError::Io(_)) => false,
+            Self::ChannelClosed => false,
         }
     }
 }
@@ -92,6 +89,8 @@ fn take_dump_error_is_terminal(source: &TakeDumpError) -> bool {
 
 #[derive(Debug, Error)]
 pub enum CatchUpError {
+    #[error(transparent)]
+    History(#[from] sequencer_core::history::HistoryPolicyError),
     #[error("cannot load resume snapshot")]
     LoadSnapshot {
         #[source]
@@ -116,15 +115,6 @@ pub enum CatchUpError {
     #[error("snapshot executed-input count mismatch: application={application}, storage={storage}")]
     SnapshotExecutionCountMismatch { application: u64, storage: u64 },
     #[error(
-        "physical replay row {db_offset} ({kind}) has execution offset {stored:?}, expected {expected:?}"
-    )]
-    ExecutionOffsetMismatch {
-        db_offset: u64,
-        kind: &'static str,
-        expected: Option<u64>,
-        stored: Option<u64>,
-    },
-    #[error(
         "no snapshot registered before lane catch-up; \
          runtime must ensure a genesis dump exists at first startup"
     )]
@@ -140,9 +130,9 @@ impl CatchUpError {
             Self::ReplayUserOp { source } | Self::ReplayDirectInput { source } => {
                 app_error_is_terminal(source)
             }
-            Self::NoSnapshot
-            | Self::SnapshotExecutionCountMismatch { .. }
-            | Self::ExecutionOffsetMismatch { .. } => true,
+            Self::History(_) | Self::NoSnapshot | Self::SnapshotExecutionCountMismatch { .. } => {
+                true
+            }
         }
     }
 }
@@ -213,9 +203,6 @@ mod tests {
             InclusionLaneError::Snapshot(TakeDumpError::CreateDump(CreateDumpDirError::Io(
                 std::io::Error::other("dump directory unavailable"),
             ))),
-            InclusionLaneError::PromotionStamp(StampError::Io(std::io::Error::other(
-                "metadata unavailable",
-            ))),
         ];
 
         for error in errors {
@@ -242,9 +229,6 @@ mod tests {
                 rusqlite::Error::QueryReturnedNoRows,
             )),
             InclusionLaneError::Gc(GcError::Storage(rusqlite::Error::QueryReturnedNoRows)),
-            InclusionLaneError::PromotionStamp(StampError::Storage(
-                rusqlite::Error::QueryReturnedNoRows,
-            )),
         ];
 
         for error in errors {

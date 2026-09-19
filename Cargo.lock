@@ -3882,6 +3882,7 @@ dependencies = [
  "sequencer-core",
  "sequencer-rust-client",
  "serde_json",
+ "tar",
  "tempfile",
  "tokio",
  "tracing-subscriber",
@@ -3899,14 +3900,17 @@ dependencies = [
  "ethereum_ssz",
  "futures-util",
  "k256",
+ "reqwest 0.12.28",
  "rusqlite",
  "sequencer-core",
  "sequencer-rust-client",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "toml",
 ]
 
 [[package]]
@@ -4287,6 +4291,7 @@ dependencies = [
  "sequencer-rust-client",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

@@ -27,7 +27,7 @@ const FUNDING_ESTIMATE_TXS_PER_WORKER: u64 = 100_000;
     name = "round_trip_latency",
     about = "round-trip latency benchmark",
     version,
-    after_help = "Examples:\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 30 --concurrency 16 --max-fee 0 --from-offset 0\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 60 --concurrency 16 --evaluate"
+    after_help = "Examples:\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 30 --concurrency 16 --max-fee 2000\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 60 --concurrency 16 --evaluate"
 )]
 struct Args {
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
@@ -46,14 +46,12 @@ struct Args {
     accounts_file: Option<String>,
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TRANSFER_AMOUNT)]
     transfer_amount: u64,
-    #[arg(long, default_value_t = 0_u64)]
-    from_offset: u64,
     #[arg(long, default_value_t = 45_u64)]
     duration_secs: u64,
     /// Number of concurrent workers (one wallet per worker).
     #[arg(long, default_value_t = 1_usize)]
     concurrency: usize,
-    #[arg(long, default_value_t = 1200_u16)]
+    #[arg(long, default_value_t = 2000_u16)]
     max_fee: u16,
     #[arg(long, default_value_t = 3_000_u64)]
     request_timeout_ms: u64,
@@ -113,12 +111,11 @@ async fn main() -> BenchResult<()> {
         .unwrap_or_else(|| args.endpoint.clone());
 
     println!(
-        "round-trip config: endpoint={}, self_contained={}, domain_chain_id={}, domain_verifying_contract={}, from_offset={}, duration={}s, concurrency={}, max_fee={}, workload={}",
+        "round-trip config: endpoint={}, self_contained={}, domain_chain_id={}, domain_verifying_contract={}, duration={}s, concurrency={}, max_fee={}, workload={}",
         endpoint,
         args.self_contained,
         domain.chain_id,
         domain.verifying_contract,
-        args.from_offset,
         args.duration_secs,
         effective_concurrency,
         args.max_fee,
@@ -132,7 +129,6 @@ async fn main() -> BenchResult<()> {
         )
     });
 
-    let mut ws_from_offset = args.from_offset;
     let mut nonce_offsets = vec![0_u64; effective_concurrency];
 
     if args.warmup_secs > 0 {
@@ -143,7 +139,6 @@ async fn main() -> BenchResult<()> {
         let warmup_config = RoundTripRunConfig {
             endpoint: endpoint.clone(),
             domain,
-            from_offset: ws_from_offset,
             duration: Duration::from_secs(args.warmup_secs),
             concurrency: effective_concurrency,
             nonce_offsets: nonce_offsets.clone(),
@@ -157,7 +152,6 @@ async fn main() -> BenchResult<()> {
         for (i, advance) in warmup_report.nonce_advances.iter().enumerate() {
             nonce_offsets[i] += advance;
         }
-        ws_from_offset = ws_from_offset.saturating_add(warmup_report.consumed_ws_events_total);
         println!(
             "warmup complete: accepted={}, rejected={}",
             warmup_report.accepted, warmup_report.rejected
@@ -167,7 +161,6 @@ async fn main() -> BenchResult<()> {
     let config = RoundTripRunConfig {
         endpoint,
         domain,
-        from_offset: ws_from_offset,
         duration: Duration::from_secs(args.duration_secs),
         concurrency: effective_concurrency,
         nonce_offsets,
@@ -220,7 +213,6 @@ async fn main() -> BenchResult<()> {
             "domain_version": DOMAIN_VERSION,
             "domain_chain_id": domain.chain_id,
             "domain_verifying_contract": domain.verifying_contract.to_string(),
-            "from_offset": args.from_offset,
             "duration_secs": args.duration_secs,
             "warmup_secs": args.warmup_secs,
             "concurrency": effective_concurrency,

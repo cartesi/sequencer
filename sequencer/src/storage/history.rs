@@ -1,42 +1,25 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Current-era history metadata persisted as one SQLite singleton.
+//! Immutable era baseline and current application-history generation.
 
-use rusqlite::{Connection, Result, types::Type};
+#[cfg(test)]
+use rusqlite::OptionalExtension;
+use rusqlite::{Connection, Result, Transaction, params, types::Type};
 use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
 
 use super::Storage;
-use super::convert::{i64_to_u64, u64_to_i64};
+use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
 
-/// Durable metadata for the history served by this database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryState {
     pub version: HistoryVersion,
     pub era_created_at_ms: u64,
-    /// `None` only while an admitted cockroach rebuild has not yet registered
-    /// its recovered finalized application state.
-    pub base_executed_input_count: Option<u64>,
-    /// Exclusive `safe_inputs` cursor below which this era must never drain.
-    /// `None` has the same narrow pre-fill rebuild meaning as the application
-    /// base above; the two fields bind atomically.
-    pub base_safe_input_index: Option<u64>,
+    pub base_executed_input_count: u64,
+    /// L1 prefix already accounted for by the era's initial application state.
+    pub base_safe_block: u64,
 }
 
-/// One sparse attribution from SQLite's physical replay log to the canonical
-/// application-history coordinate consumed by that row.
-///
-/// Physical rows that do not execute in the application (our own submitted
-/// batches and cockroach-root padding) deliberately have no mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ExecutedInputMapping {
-    pub sequenced_l2_tx_offset: u64,
-    pub executed_input_offset: ExecutedInputCount,
-}
-
-/// One safe input from a drained physical range that actually executed in the
-/// application. The range may also contain intentionally-unmapped rows, so the
-/// caller supplies only these sparse attributions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectInputExecution {
     pub safe_input_index: u64,
@@ -44,16 +27,10 @@ pub struct DirectInputExecution {
 }
 
 impl Storage {
-    /// Read the current era, recovery generation, and locally available base.
     pub fn history_state(&self) -> Result<HistoryState> {
         query_history_state(&self.conn)
     }
 
-    /// Boundary before the next canonical application input executes.
-    ///
-    /// This is derived, never independently advanced: the maximum of the era's
-    /// recovered base and one past the greatest valid execution attribution.
-    /// Invalidating a suffix therefore rolls the value back automatically.
     pub fn next_executed_input_count(&mut self) -> Result<ExecutedInputCount> {
         self.read(|tx| next_executed_input_count_in(tx))
     }
@@ -61,8 +38,8 @@ impl Storage {
 
 pub(super) fn query_history_state(conn: &Connection) -> Result<HistoryState> {
     conn.query_row(
-        "SELECT era_id, era_created_at_ms, recovery_generation, \
-                base_executed_input_count, base_safe_input_index \
+        "SELECT era_id, era_created_at_ms, recovery_generation,
+                base_executed_input_count, base_safe_block
            FROM history_state WHERE singleton_id = 0",
         [],
         |row| {
@@ -76,292 +53,144 @@ pub(super) fn query_history_state(conn: &Connection) -> Result<HistoryState> {
                     recovery_generation: RecoveryGeneration::new(i64_to_u64(row.get(2)?)),
                 },
                 era_created_at_ms: i64_to_u64(row.get(1)?),
-                base_executed_input_count: row.get::<_, Option<i64>>(3)?.map(i64_to_u64),
-                base_safe_input_index: row.get::<_, Option<i64>>(4)?.map(i64_to_u64),
+                base_executed_input_count: i64_to_u64(row.get(3)?),
+                base_safe_block: i64_to_u64(row.get(4)?),
             })
         },
     )
 }
 
-/// Derive the next canonical application coordinate from durable facts.
-pub(super) fn next_executed_input_count_in(conn: &Connection) -> Result<ExecutedInputCount> {
-    let base = query_history_state(conn)?
-        .base_executed_input_count
-        .expect("application history base is unbound outside rebuild fill");
-    let greatest_valid: Option<i64> = conn.query_row(
-        "SELECT MAX(executed_input_offset) FROM executed_inputs",
-        [],
-        |row| row.get(0),
-    )?;
-    let after_valid = greatest_valid.map_or(0, |offset| {
-        i64_to_u64(offset)
-            .checked_add(1)
-            .expect("executed input offset overflow: contract-impossible")
-    });
-    Ok(ExecutedInputCount::new(base.max(after_valid)))
-}
-
-/// Attach a sequence of explicit application offsets inside the physical-row
-/// creation transaction. The schema enforces contiguous canonical offsets,
-/// including offset reuse after suffix invalidation.
-pub(super) fn attach_executed_inputs_in(
-    tx: &rusqlite::Transaction<'_>,
-    mappings: &[ExecutedInputMapping],
+pub(super) fn initialize_history_in(
+    tx: &Transaction<'_>,
+    base: ExecutedInputCount,
+    base_safe_block: u64,
 ) -> Result<()> {
-    if mappings.is_empty() {
+    #[cfg(test)]
+    if let Some(existing) = query_history_state(tx).optional()? {
+        // Test fixtures initialize genesis when opening their schema. Production
+        // creates this row only with the complete durable baseline.
+        assert_eq!(
+            existing.base_executed_input_count,
+            base.get(),
+            "history base differs"
+        );
+        assert_eq!(
+            existing.base_safe_block, base_safe_block,
+            "L1 prefix differs"
+        );
         return Ok(());
     }
-
-    let mut stmt = tx.prepare_cached(
-        "INSERT INTO executed_inputs \
-         (sequenced_l2_tx_offset, executed_input_offset) VALUES (?1, ?2)",
-    )?;
-    for mapping in mappings {
-        stmt.execute(rusqlite::params![
-            u64_to_i64(mapping.sequenced_l2_tx_offset),
-            u64_to_i64(mapping.executed_input_offset.get()),
-        ])?;
-    }
-    Ok(())
-}
-
-/// Bind the era's locally-available application base and durable safe-input
-/// drain floor to the snapshot that establishes them. Genesis is already
-/// initialized to zero by the baseline migration; rebuild starts with both
-/// `NULL` and reaches this function with the folded application's absolute
-/// count plus the recovery root's exclusive safe-input cursor.
-pub(super) fn bind_history_base_in(
-    tx: &rusqlite::Transaction<'_>,
-    base_executed_input_count: u64,
-    base_safe_input_index: u64,
-) -> Result<()> {
-    let current = query_history_state(tx)?;
-    match (
-        current.base_executed_input_count,
-        current.base_safe_input_index,
-    ) {
-        (Some(current_count), Some(current_safe_input_index)) => {
-            assert_eq!(
-                current_count, base_executed_input_count,
-                "history base differs from the initial finalized application state"
-            );
-            assert_eq!(
-                current_safe_input_index, base_safe_input_index,
-                "safe-input floor differs from the initial finalized application state"
-            );
-            return Ok(());
-        }
-        (None, None) => {}
-        _ => unreachable!("history base pair cannot be partially bound"),
-    }
-
-    let changed = tx.execute(
-        "UPDATE history_state \
-         SET base_executed_input_count = ?1, base_safe_input_index = ?2 \
-         WHERE singleton_id = 0 \
-           AND base_executed_input_count IS NULL \
-           AND base_safe_input_index IS NULL",
-        rusqlite::params![
-            u64_to_i64(base_executed_input_count),
-            u64_to_i64(base_safe_input_index)
+    let mut bytes: [u8; EraId::BYTE_LEN] =
+        tx.query_row("SELECT randomblob(16)", [], |row| row.get(0))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let era = EraId::from_bytes(bytes).expect("UUID bits were set above");
+    tx.execute(
+        "INSERT INTO history_state
+         (singleton_id, era_id, era_created_at_ms, recovery_generation,
+          base_executed_input_count, base_safe_block) VALUES (0, ?1, ?2, 0, ?3, ?4)",
+        params![
+            era.as_bytes().as_slice(),
+            now_unix_ms(),
+            u64_to_i64(base.get()),
+            u64_to_i64(base_safe_block)
         ],
     )?;
-    if changed != 1 {
-        return Err(rusqlite::Error::StatementChangedRows(changed));
-    }
     Ok(())
 }
 
-/// Durable lower bound for safe-input draining. A NULL floor is usable as zero
-/// only while a rebuild's setup has not completed: that is the one interval
-/// in which the recovery root must be populated before its cursor can be
-/// bound. Everywhere else NULL is a storage invariant violation and fails
-/// loud.
-pub(super) fn safe_input_floor_in(conn: &Connection) -> Result<u64> {
-    let state = query_history_state(conn)?;
-    match state.base_safe_input_index {
-        Some(floor) => Ok(floor),
-        None => {
-            assert!(
-                state.base_executed_input_count.is_none(),
-                "history base pair cannot be partially bound"
-            );
-            // A NULL floor exists only during a pre-completion rebuild
-            // fill: plain setup binds base 0 in its baseline transaction, and
-            // completion refuses while the base is NULL — so the completion
-            // fact alone decides legality (the black box is never read for
-            // decisions).
-            let setup_complete: bool = conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM setup_complete WHERE singleton_id = 0)",
-                [],
-                |row| row.get(0),
-            )?;
-            assert!(
-                !setup_complete,
-                "NULL safe-input floor outside pre-completion rebuild fill"
-            );
-            Ok(0)
-        }
-    }
+pub(super) fn next_executed_input_count_in(conn: &Connection) -> Result<ExecutedInputCount> {
+    let base = query_history_state(conn)?.base_executed_input_count;
+    let greatest: Option<i64> =
+        conn.query_row("SELECT MAX(offset) FROM application_inputs", [], |row| {
+            row.get(0)
+        })?;
+    Ok(ExecutedInputCount::new(greatest.map_or(base, |offset| {
+        i64_to_u64(offset)
+            .checked_add(1)
+            .expect("application input count overflow")
+    })))
 }
 
-/// Advance the current era's soft-history reality by exactly one. The schema
-/// independently rejects skips and rewrites; the caller composes this helper
-/// into the same transaction as suffix invalidation and Tip reopening.
-pub(super) fn advance_recovery_generation_in(
-    tx: &rusqlite::Transaction<'_>,
-) -> Result<RecoveryGeneration> {
-    let current: i64 = tx.query_row(
-        "SELECT recovery_generation FROM history_state WHERE singleton_id = 0",
-        [],
-        |row| row.get(0),
-    )?;
+pub(super) fn advance_recovery_generation_in(tx: &Transaction<'_>) -> Result<RecoveryGeneration> {
+    let current = query_history_state(tx)?.version.recovery_generation.get();
     let next = current
         .checked_add(1)
-        .expect("recovery generation exhausted SQLite INTEGER: contract-impossible");
+        .expect("recovery generation exhausted");
     let changed = tx.execute(
         "UPDATE history_state SET recovery_generation = ?1 WHERE singleton_id = 0",
-        [next],
+        [u64_to_i64(next)],
     )?;
     if changed != 1 {
         return Err(rusqlite::Error::StatementChangedRows(changed));
     }
-    Ok(RecoveryGeneration::new(i64_to_u64(next)))
+    Ok(RecoveryGeneration::new(next))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::temp_db;
-    use crate::storage::{LifecycleCommand, Storage};
+    use crate::storage::{LifecycleCommand, test_helpers::temp_db};
 
     #[test]
-    fn history_schema_enforces_write_once_identity_and_base() {
-        let db = temp_db("history-write-once");
-        let storage = Storage::open(db.path.as_str()).expect("initialize generic history");
-        let original = storage.history_state().expect("read history");
+    fn complete_baseline_is_immutable_and_survives_restart() {
+        let db = temp_db("history-baseline");
+        let mut storage =
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+        assert!(matches!(
+            storage.history_state(),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        storage
+            .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(41), 70))
+            .unwrap();
+        let state = storage.history_state().unwrap();
+        for sql in [
+            "UPDATE history_state SET era_id = era_id",
+            "UPDATE history_state SET base_executed_input_count = 42",
+            "UPDATE history_state SET base_safe_block = 71",
+            "DELETE FROM history_state",
+        ] {
+            assert!(storage.conn.execute(sql, []).is_err(), "{sql}");
+        }
         drop(storage);
-
-        let conn = Storage::open_connection(db.path.as_str()).expect("open raw connection");
-        assert!(
-            conn.execute(
-                "UPDATE history_state SET era_id = era_id WHERE singleton_id = 0",
-                [],
-            )
-            .is_err(),
-            "era identity must reject even a same-value rewrite"
-        );
-        assert!(
-            conn.execute(
-                "UPDATE history_state SET base_executed_input_count = 1 \
-                 WHERE singleton_id = 0",
-                [],
-            )
-            .is_err(),
-            "the initialized genesis base must be immutable"
-        );
-        assert!(
-            conn.execute(
-                "UPDATE history_state SET base_safe_input_index = 1 \
-                 WHERE singleton_id = 0",
-                [],
-            )
-            .is_err(),
-            "the initialized genesis safe-input floor must be immutable"
-        );
-        assert!(
-            conn.execute("DELETE FROM history_state WHERE singleton_id = 0", [])
-                .is_err(),
-            "the current era singleton must not be deletable"
-        );
-
-        let reopened = Storage::open_read_only(db.path.as_str()).expect("reopen");
-        assert_eq!(reopened.history_state().expect("read history"), original);
+        let mut reopened = Storage::open(&db.path).unwrap();
+        assert_eq!(reopened.history_state().unwrap(), state);
+        assert_eq!(reopened.next_executed_input_count().unwrap().get(), 41);
     }
 
     #[test]
-    fn rebuild_base_is_set_once_and_generation_advances_only_by_one() {
-        let db = temp_db("history-rebuild-transitions");
-        let storage = Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
-            .expect("initialize rebuild");
+    fn generation_advances_exactly_once_and_transaction_rollback_preserves_it() {
+        let db = temp_db("history-generation");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let original = storage.history_state().unwrap();
+        let result: Result<()> = storage.write(|tx| {
+            advance_recovery_generation_in(tx)?;
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        assert!(result.is_err());
+        assert_eq!(storage.history_state().unwrap(), original);
+        storage.write(advance_recovery_generation_in).unwrap();
         assert_eq!(
             storage
                 .history_state()
-                .expect("read pending rebuild")
-                .base_executed_input_count,
-            None
+                .unwrap()
+                .version
+                .recovery_generation
+                .get(),
+            1
         );
-        assert_eq!(
+        assert!(
             storage
-                .history_state()
-                .expect("read pending rebuild")
-                .base_safe_input_index,
-            None
-        );
-        drop(storage);
-
-        let conn = Storage::open_connection(db.path.as_str()).expect("open raw connection");
-        assert!(
-            conn.execute(
-                "UPDATE history_state SET base_executed_input_count = 41 \
-                 WHERE singleton_id = 0",
-                [],
-            )
-            .is_err(),
-            "the application base cannot bind without its safe-input floor"
-        );
-        conn.execute(
-            "UPDATE history_state \
-             SET base_executed_input_count = 41, base_safe_input_index = 7 \
-             WHERE singleton_id = 0",
-            [],
-        )
-        .expect("set rebuild base pair once");
-        assert!(
-            conn.execute(
-                "UPDATE history_state SET base_executed_input_count = 42 \
-                 WHERE singleton_id = 0",
-                [],
-            )
-            .is_err(),
-            "rebuild base must not be rewritten"
+                .conn
+                .execute("UPDATE history_state SET recovery_generation = 3", [])
+                .is_err()
         );
         assert!(
-            conn.execute(
-                "UPDATE history_state SET base_safe_input_index = 8 \
-                 WHERE singleton_id = 0",
-                [],
-            )
-            .is_err(),
-            "rebuild safe-input floor must not be rewritten"
-        );
-
-        conn.execute(
-            "UPDATE history_state SET recovery_generation = 1 WHERE singleton_id = 0",
-            [],
-        )
-        .expect("advance generation by one");
-        assert!(
-            conn.execute(
-                "UPDATE history_state SET recovery_generation = 3 WHERE singleton_id = 0",
-                [],
-            )
-            .is_err(),
-            "generation must not skip"
-        );
-        conn.execute(
-            "UPDATE history_state SET recovery_generation = 2 WHERE singleton_id = 0",
-            [],
-        )
-        .expect("advance generation by one again");
-
-        let reopened = Storage::open_read_only(db.path.as_str()).expect("reopen");
-        let state = reopened.history_state().expect("read history");
-        assert_eq!(state.base_executed_input_count, Some(41));
-        assert_eq!(state.base_safe_input_index, Some(7));
-        assert_eq!(
-            state.version.recovery_generation,
-            RecoveryGeneration::new(2)
+            storage
+                .conn
+                .execute("UPDATE history_state SET recovery_generation = 0", [])
+                .is_err()
         );
     }
 }

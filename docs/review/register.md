@@ -48,14 +48,12 @@ remaining dated ledgers stay valid.
    "application internal error"; the reason stays on the lane error and the
    log.
 6. **WS session hygiene** — a mid-session transient read error tears down
-   with no close frame; a beyond-head `from_offset` idles forever (currently
-   e2e-pinned as intended — decide the contract, then re-pin).
-7. **WS invalidation/rollback contract** — `/ws/subscribe` still pages by
-   physical rowid with no `HistoryVersion` claim, so a cursor-resumed
-   subscriber silently keeps invalidated rows across recovery. Interim
-   consumer rule: treat any socket drop as a potential discontinuity.
-   Closure is exclusively owned by the
-   [Track 3 handoff](../plans/2026-07-track3-feed-replay-design.md#7-ordered-implementation-handoff).
+   without a close frame. Ahead-of-head admission is closed (2026-09-16): a
+   typed HTTP409 refuses it before upgrade.
+7. **Closed** (2026-09-16): mandatory era/generation/application-count claims
+   reject resume across recovery; snapshot headers provide cold-bootstrap
+   coordinates. Current application suffix replacement is atomic with the
+   generation bump. See the [Track 3 contract](../plans/2026-07-track3-feed-replay-design.md).
 8. **Fee-determinism contract under-specified** — the LSB-first
    floor-after-each-multiply order is implemented but not stated as contract
    (`sequencer-core/src/fee.rs`). Load-bearing for the C++ scheduler port;
@@ -65,11 +63,11 @@ remaining dated ledgers stay valid.
 9. **`trg_enforce_nonce_contiguity` NULL hole** — a dangling parent makes
     the comparison NULL and the trigger silent; mitigated by `foreign_keys=ON`
     on every writer connection, but the trigger itself is not NULL-safe.
-10. **`seal_and_open_next_batch` takes an unchecked `next_safe_block`**
-    (assert equality with the head or drop the parameter). (The bare
-    `close_frame_and_batch` is `#[cfg(test)]` as of 2026-09-03.)
-11. **Write-only columns** `safe_accepted_batches.{first_frame_safe_block,
-    inclusion_block}` have no production reader — drop or mark audit-only.
+10. **Closed** (2026-09-16): batch sealing asserts that the next frame retains
+    the durable Tip clock; complete L1 reconciliation owns clock advancement.
+11. **Partially closed** (2026-09-16): `safe_accepted_batches.inclusion_block`
+    drives accepted snapshot selection and export. `first_frame_safe_block`
+    remains audit-only and may be removed in a separate cleanup.
 12. **`direct_q` is unbounded in the shared scheduler** — an adversarial
     deposit flood is bounded in time (force-drain) but not bytes; a
     per-input cap or byte budget closes a (very expensive) guest-OOM vector.
@@ -258,11 +256,9 @@ Statuses swept 2026-08-22 and updated through 2026-09-04.
   insufficient-balance silent no-op and replay-determinism pins; the
   young-never-submitted-batch cascade-policy pin; the `recover_aging_tip`
   torn/no-Tip entry; the cascade-with-backward-clock pin.
-- **The batch-close failure half of I7**: pre-insert a `dumps` row with a
-  colliding prefix so the seal transaction fails on UNIQUE, and assert the
-  batch stays the open Tip. Companion state variant: delete the directory
-  under a DB-referenced snapshot row and assert the loud terminal shape
-  (the WAL-rewind *cause* stays unsimulable).
+- **Closed** (2026-09-16): I7's colliding-artifact test asserts that failed
+  snapshot registration rolls back the seal, successor Tip, and cached head.
+  Snapshot endpoint tests cover referenced artifact deletion as a terminal fault.
 - **Harness levers to build with their tests**: pending-tx capture +
   re-inject (`txpool_content`/raw-tx before `drop_all_pending_txs`, then
   `eth_sendRawTransaction`) → unlocks the zombie e2e, the headline
@@ -288,6 +284,15 @@ Statuses swept 2026-08-22 and updated through 2026-09-04.
 ## Settled decisions
 
 Each entry: the decision, its reason, and where the reasoning now lives.
+
+- **Application-only current history** (2026-09-16): retain every raw L1 input
+  and original batch/frame/user-op record, but replace the invalidated flattened
+  application suffix. The recovered prefix is opaque. Mandatory offsets and
+  versioned claims replace the mixed replay log and sparse mapping. Acceptance
+  facts select immutable per-batch snapshots without promotion or restamping;
+  per-batch cadence and end-of-block watchdog comparison remain. The complete
+  model lives in [application history](../plans/application-history.md), I5–I11,
+  I18/I20, and the snapshot lifecycle.
 
 - **No architectural restructure** (2026-06-10): one file per writer role,
   `*_in(tx)` free functions composing into larger transactions,
@@ -374,7 +379,7 @@ Each entry: the decision, its reason, and where the reasoning now lives.
   state-file check would violate that lifecycle contract → snapshot handlers,
   command error classification, and genesis harness tests.
 - **Execution-offset continuity has one enforcement point** (2026-09-07):
-  the SQLite trigger rejects a noncanonical offset inside the physical-row
+  the SQLite trigger rejects a noncanonical offset inside the application-input
   transaction. The duplicate Rust loop was removed; rollback, invalidation,
   and offset-reuse tests remain → I20.
 - **Module homing** (2026-08-19): command brackets in `commands/` (with
@@ -665,7 +670,7 @@ these codes; their concepts now live here:
 | R3 | `synchronous=FULL` decision | `storage/open.rs` |
 | R4 | exit-code contract | `commands/error.rs`, runbook |
 | R5 | fail-loud check policy | invariants check policy |
-| F1–F10 | 2026-06 correctness findings | settled above; F7 = the open "WS invalidation/rollback contract" finding |
+| F1–F10 | 2026-06 correctness findings | settled above; F7 = the closed "WS invalidation/rollback contract" finding |
 | I1–I20 | invariants (stable, still in use) | `docs/invariants.md` |
 | D1–D11, H1–H14, S-A, P1–P8 | 2026-08-18 defects / harvest / structural fix / premise items | settled above + ADR |
 | WP1–WP11 | 2026-06 work packages (all landed) | settled above |
@@ -700,3 +705,5 @@ for `2026-06-10-correctness-review.md`, `2026-06-10-simplification.md`,
 | 2026-09-07 | PR #28 premise review and maintainer-approved simplification | Ordered recovery replaces the phase driver; diagnosed terminal runtime faults abort immediately; ordinary shutdown and snapshot leases remain; reader drain race and duplicate offset check fixed | Current ADR and recovery design; finding 33 and settled decisions above. Validation: 692 host tests, seven targeted restart/outage E2Es, workspace check, strict Clippy, formatting, and admission TLC passed. The broader stale-batch recovery E2E reached its watchdog comparison but was blocked by the host Lua emulator 0.21 loading the pinned 0.20 image (archive version mismatch); no protocol pin was changed. |
 | 2026-09-09 | Application, inclusion lane, and public DEX integration branch | Native progress ownership, typed validation failures, mutable independent checkpoints, optional canonical inspection, and lane bookkeeping simplified; ingress CORS and Lua 5.4 parity restored. Reference C bridge port kept separate. | [Application/lane review](2026-09-09-application-lane-dex-review.md); current Application and snapshot contracts. Workspace check, strict Clippy, 697 host tests, and 62 watchdog tests passed; private DEX conformance remains unverified. |
 | 2026-09-11 | Reference C bridge port and review boundary | Keep the current Application contract, runtime payload bound, paired progress, filesystem-owned checkpoint disposal, and host failure fixes together. Engine-dependent API refinements and external-engine conformance remain follow-ups. | Settled decisions and owed tests above; [C binding guide](../protocol/c-application-binding.md), Application contract, and snapshot lifecycle. |
+| 2026-09-16 | Application-history and Track 3 implementation, with independent storage/recovery/snapshot review | Replaced mixed replay and sparse attribution with current application inputs; complete atomic baselines; acceptance-derived immutable snapshots; HTTP restore/recovery archives and mandatory WS claims. Review narrowed equal-block recovery to empty genesis to avoid losing same-block pending directs. | [History design](../plans/application-history.md), current invariants/API/snapshot/recovery docs. Validation: 693 workspace tests, strict Clippy, formatting, 62 watchdog tests, admission TLC (155 distinct states), and the Anvil recovery/old-claim refusal gate passed. Full canonical watchdog comparison remains blocked by the local emulator 0.21 vs repository 0.20 environment; no pin changed. |
+| 2026-09-16 | Track 3 integration validation | Nonempty HTTP cold replica, concurrent backlog/live consumption, stale recovery/rebootstrap, and four real canonical-machine gates pass under emulator 0.20. Tooling fixes preserve Lua paths and make benchmark fee defaults admissible. | [Validation and latency evidence](2026-09-16-track3-validation.md); native bridge/DEX and representative deployment latency remain separate gates. |

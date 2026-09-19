@@ -1,6 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use sequencer_core::history::HistoryPolicyError;
 use thiserror::Error;
 
 use crate::storage::{
@@ -24,14 +25,17 @@ pub enum SubscribeError {
         #[source]
         source: tokio::task::JoinError,
     },
-    #[error(
-        "catch-up window exceeded: requested offset {requested_offset}, live start {live_start_offset}, max {max_catchup_events}"
-    )]
-    CatchUpWindowExceeded {
-        requested_offset: u64,
-        live_start_offset: u64,
-        max_catchup_events: u64,
-    },
+    #[error(transparent)]
+    History(#[from] HistoryPolicyError),
+}
+
+impl From<crate::storage::HistoryReadError> for SubscribeError {
+    fn from(error: crate::storage::HistoryReadError) -> Self {
+        match error {
+            crate::storage::HistoryReadError::Policy(error) => Self::History(error),
+            crate::storage::HistoryReadError::Storage(source) => Self::LoadHeadOffset { source },
+        }
+    }
 }
 
 impl SubscribeError {
@@ -40,13 +44,15 @@ impl SubscribeError {
             Self::OpenStorage { source } => open_error_is_persistent(source),
             Self::LoadHeadOffset { source } => is_persistent_storage_error(source),
             Self::Join { source } => source.is_panic(),
-            Self::CatchUpWindowExceeded { .. } => false,
+            Self::History(_) => false,
         }
     }
 }
 
 #[derive(Debug, Error)]
 pub enum SubscriptionError {
+    #[error(transparent)]
+    History(HistoryPolicyError),
     #[error("cannot open subscription storage")]
     OpenStorage {
         #[source]
@@ -68,6 +74,7 @@ pub enum SubscriptionError {
 impl SubscriptionError {
     pub(super) fn is_persistent_storage_invariant(&self) -> bool {
         match self {
+            Self::History(_) => false,
             Self::OpenStorage { source } => open_error_is_persistent(source),
             Self::LoadReplay { source, .. } => is_persistent_storage_error(source),
             Self::Join { source } => source.is_panic(),

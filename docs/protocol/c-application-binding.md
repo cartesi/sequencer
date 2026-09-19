@@ -19,8 +19,8 @@ linking, genesis, host commands, and the reference wallet under `examples/`.
   defines record layout, statuses, pointer ownership, and call lifetimes. An
   engine archive and its generated Rust bindings must agree on that header.
 - [Snapshot lifecycle](../snapshots/lifecycle.md) owns checkpoint registration,
-  promotion, reader leases, and garbage collection. The application owns its
-  checkpoint representation within the supplied prefix.
+  acceptance-derived selection, reader leases, and garbage collection. The
+  application owns its checkpoint representation within the supplied prefix.
 
 ## Execution and ownership
 
