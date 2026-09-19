@@ -80,7 +80,7 @@ by writer and are write-once (`0001_schema.sql`).
 |---|---|
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
-| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion |
+| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
 | history metadata (setup/recovery) | `history_state` — complete era/application-count/L1-block baseline and generation; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
 | egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
