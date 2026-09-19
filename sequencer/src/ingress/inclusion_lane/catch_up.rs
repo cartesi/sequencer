@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Restore the application's committed history suffix before runtime admission.
+//! Replay committed application history after launch, before processing new user ops.
 
 use std::path::PathBuf;
 

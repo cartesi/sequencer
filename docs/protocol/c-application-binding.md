@@ -38,10 +38,12 @@ output and diagnostic buffers; the adapter copies them before reuse.
 
 Fee fields carry base-129/128 exponents. The shared max-fee comparison operates
 in log space; an application checking balances or charging fees uses a linear
-amount. The reference conversion lives in
-[`sequencer-core/src/fee.rs`](../../sequencer-core/src/fee.rs). Native and
-canonical execution must agree on that conversion, since different amounts can
-change rejection decisions and resulting balances.
+amount. The exact conversion contract lives on `fee_to_linear` in
+[`sequencer-core/src/fee.rs`](../../sequencer-core/src/fee.rs): ports must match
+the table, intermediate flooring, and ascending bit order, not just the nominal
+exponential formula. [`build.rs`](../../sequencer-core/build.rs) generates the
+table and exponent bound. Native and canonical execution must agree on the
+conversion, since different amounts can change rejection decisions and balances.
 
 The same implementation may be compiled for native execution and the canonical
 machine. This does not establish equivalent behavior across targets: the

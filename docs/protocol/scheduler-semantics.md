@@ -181,7 +181,7 @@ history is no longer locally available.
 
 The durable `application_inputs` sequence uses these same offsets. HTTP
 snapshots carry the history version and application count; WS subscriptions
-must claim both before inclusive replay. See the [history contract](../plans/application-history.md).
+must claim both before inclusive replay. See the [history contract](application-history.md).
 
 ---
 

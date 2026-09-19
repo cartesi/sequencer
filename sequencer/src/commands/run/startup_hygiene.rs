@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Startup clears stale leases, validates the rollback checkpoint, then collects
+//! Startup clears stale leases, checks rollback checkpoint metadata, then collects
 //! obsolete snapshots and orphan directories before workers are admitted.
 
 use crate::commands::error::CommandError;

@@ -1,56 +1,77 @@
 # Recovery Design History
 
-This directory preserves the optimistic recovery design -- an alternative to the preemptive approach documented in the parent [`README.md`](../README.md). Both designs are sound. We preferred preemptive for its operational properties.
+This directory preserves the **historical optimistic recovery design** and its
+counterexample. It is not the production recovery procedure. The
+[current recovery guide](../README.md) owns automatic recovery; the
+[cockroach guide](../cockroach.md) owns manual rebuilding.
 
-## The Optimistic Design
+## The optimistic alternative
 
-In the optimistic design, the sequencer keeps accepting user operations and building batches while recovery plays out in the background. If a batch goes stale, the system detects it when the batch becomes Silver (safe on L1), cascade-invalidates, and submits recovery batches -- all while the sequencer continues serving soft confirmations.
+The sequencer would keep accepting user operations and building batches while
+recovery ran concurrently. The retained [model](optimistic.tla) permits a
+cascade only when the first unresolved batch is **Silver** (included in a safe
+L1 block) and stale by its **inclusion block**. Recovery replaces the suffix and
+resets the next wallet nonce to the next unconsumed L1 slot. Submitted batches
+from the invalidated suffix may remain in the network as zombies competing with
+new recovery batches.
 
-The TLA+ spec [`optimistic.tla`](optimistic.tla) models this design with a scheduler, wallet nonces, zombie batches (invalidated batches still in the L1 mempool), and adversarial L1 inclusion. At each `w_nonce` slot where a zombie and a recovery batch compete, L1 non-deterministically picks one (wallet-nonce mutual exclusion).
+The recorded bounded check reported 194M states with no invariant violations
+after the Silver-only fix. This is model evidence, not a proof of production
+recovery or its completion time. Bounds are in [`optimistic.cfg`](optimistic.cfg).
 
-**Verified**: 194M states, 0 violations (after the Silver-only fix below).
+## The counterexample: invalidating before slot resolution
 
-## The Silver-Only Constraint
+The rejected variant allowed an unresolved frontier to be invalidated based on
+its current age, before its L1 outcome was settled. The danger was **cascading
+and reusing wallet-nonce slots**, not detecting danger early.
 
-Both designs share a critical constraint: **recovery must wait for the frontier batch to be Silver before cascade-invalidating.**
+Take `MAX_WAIT_BLOCKS = 2` and three original batches:
 
-This constraint was discovered through the optimistic model. The original design allowed staleness detection on Pending or Bronze batches (a "short-circuit" for faster recovery). TLA+ found a counterexample:
-
-Three batches with `MAX_WAIT_BLOCKS = 2`:
-
+```text
+batch nonce    0   1   2
+safe_block     0   0   1
+wallet nonce   0   1   2
 ```
-batch  bn=0  bn=1  bn=2
-sb     0     0     1
-wn     0     1     2
-```
 
-With `currentSafeBlock = 2`, `bn=1` is stale by current block, `bn=2` is fresh. If we cascade from `bn=1`, both become zombies. Recovery creates a new `bn=1` at `wn=1`.
+Assume batch 0 is already accepted. At `currentSafeBlock = 2`, batch 1 is old
+enough to be stale if included now, while batch 2 is still fresh. If recovery
+invalidates batches 1 and 2 while they are pending, it can submit a fresh
+replacement batch 1 at wallet nonce 1.
 
-At L1 slot 1, zombie `bn=1` and recovery `bn=1` compete (same `w_nonce`):
+At L1 slot 1, the original and replacement compete:
 
-- **Zombie wins**: scheduler sees it, stale, skip. Nonce poisoned. Safe.
-- **Recovery wins**: zombie `bn=1` dies (never reaches L1). Recovery accepted. `schedulerExpected` advances to 2. Zombie `bn=2(wn=2)` is fresh (`inclusion_block - safe_block = 1 < 2`), matches expected nonce -> **accepted**. The scheduler executes invalidated batch data.
+- **Original wins:** the scheduler sees the stale batch and leaves its expected
+  batch nonce at 1. The original batch 2 then fails the nonce check.
+- **Replacement wins:** the original batch 1 cannot land. The fresh replacement
+  advances the scheduler's expected nonce to 2. If the original batch 2 lands
+  in block 2, its age is `2 - 1 < 2` and its nonce matches: the scheduler accepts
+  data the sequencer already invalidated.
 
-The two protection layers (wallet-nonce mutual exclusion and nonce poisoning) undercut each other: mutual exclusion kills the batch that nonce poisoning needs.
+Wallet-nonce mutual exclusion removed the stale batch that the nonce-poisoning
+argument depended on. The retained optimistic model's `Resolve` therefore
+requires a Silver frontier that is stale by inclusion: that original batch is
+already on safe L1 and cannot be displaced by a replacement.
 
-The fix: only detect staleness when the frontier is Silver (safe on L1, immutable). The scheduler is guaranteed to see it before any recovery batch.
+## Why production uses preemptive recovery
 
-## Why We Chose Preemptive
+Production closes intake and performs recovery offline. For closed-batch
+recovery, the flush consumes every covered wallet-nonce slot at safe depth,
+**whether the original transaction or a no-op wins**, then re-syncs the accepted
+prefix before cascading. It does not require the original frontier batch to
+become Silver. An unsubmitted open Tip has no wallet slot to settle.
 
-Both designs are sound once Silver-only detection is enforced. The difference is operational:
+This gives recovery a sequential procedure and stops new soft confirmations
+while submission uncertainty is being resolved. The optimistic alternative
+keeps serving through that interval and may add confirmations that a later
+cascade revokes.
 
-**Both designs wait.** Any recovery design must wait for the frontier to become Silver before cascading. In the optimistic design, the sequencer keeps issuing soft confirmations during this wait -- confirmations that will be invalidated when the cascade fires. In the preemptive design, the sequencer goes offline before the cascade, so no doomed soft confirmations are issued.
+The tradeoff is downtime. Flush completion requires L1 progress; fee headroom
+does not guarantee replacement or establish a deadline. The
+[current recovery guide](../README.md) owns the safety conditions, and the
+[L1 fee policy](../../l1-fee-policy.md) owns the accepted liveness limits.
 
-**Preemptive is simpler to reason about.** The optimistic design has concurrent actors: the batch submitter, the inclusion lane, L1 mempool competition, and recovery all interleave. The preemptive design is sequential: stop, flush, recover, resume. Each step has clear preconditions and postconditions.
-
-**Preemptive eliminates mempool races.** The flush resolves all `w_nonce` slot uncertainty before recovery runs. Recovery operates on fully-finalized L1 state. No zombie mutual exclusion needed.
-
-**The cost is downtime.** Preemptive recovery takes the sequencer offline for the duration of the flush + safe finality wait (~15-20 minutes on Ethereum). For a rare event (a batch approaching the 4-hour staleness deadline), this is acceptable.
-
-## Running the Spec
+## Running the historical model
 
 ```bash
-tlc -workers auto -deadlock docs/recovery/history/optimistic.tla    # ~3min
+tlc -workers auto -deadlock docs/recovery/history/optimistic.tla
 ```
-
-Bounds are in `optimistic.cfg`.

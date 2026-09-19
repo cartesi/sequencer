@@ -154,8 +154,8 @@ by writer and are write-once (`0001_schema.sql`).
 - **Holds:** `check_danger` checks `ClosedBatchInDanger` before `TipInDanger`.
   With monotonic frame clocks, the closed frontier is at least as old as the Tip.
 - **Enforced by:** arm order in `storage/recovery.rs` and I3.
-- **Depended on by:** dispatch: a Tip-only recovery can skip flushing because
-  there is no doomed closed work.
+- **Depended on by:** dispatch: closed-frontier danger selects flush before
+  a Tip-only repair can be selected. The Tip itself has no L1 footprint.
 
 ### I5. Recovery removes exactly the invalidated application suffix
 
@@ -296,8 +296,8 @@ by writer and are write-once (`0001_schema.sql`).
   raises through `WalletNonceWatermarkSink` before its first send;
   `MempoolFlusher::flush_and_wait` likewise before its no-ops, and refuses to
   complete until `safe >= watermark + 1`.
-- **Depended on by:** flush completeness, TLA+ Implementation Constraint 1,
-  cascade soundness (I9).
+- **Depended on by:** [flush completeness](recovery/README.md#closed-batches-flush-sync-cascade)
+  and cascade soundness (I9).
 - **Breaks:** zombie txs evade the flush — a dropped-locally but
   network-surviving batch tx re-lands at a slot the recovery batch reuses,
   and the scheduler executes invalidated content.
@@ -371,7 +371,9 @@ by writer and are write-once (`0001_schema.sql`).
   same anchor via `open_fresh_tip_in_tx`'s `parent = None` path, after
   invalidating the old root — so only one *valid* parentless root ever exists,
   invalidated ones coexisting.
-- **Enforced by:** `trg_enforce_nonce_contiguity` — its parentless arm is an
+- **Enforced by:** the parent foreign key (enabled on every writer) rejects
+  dangling parents; `trg_enforce_nonce_contiguity` checks nonce succession.
+  Its parentless arm is an
   *exact* match `nonce == (SELECT nonce FROM batch_tree_anchor)` (tighter
   than a bare "must be 0"), plus an at-most-one-valid-parentless-root guard
   scoped to `invalidated_at_ms IS NULL`; `compute_next_nonce(None)` reads the

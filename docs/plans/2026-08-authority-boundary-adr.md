@@ -2,10 +2,8 @@
 
 The architecture decision record for how authority — over speculative state,
 promises, process lifetime, and recovery admission — is owned in the
-sequencer. The mechanisms below are landed; the decision history and the
-review trail that shaped them live in
-[`../review/register.md`](../review/register.md) and the review history it
-records.
+sequencer. The mechanisms and their reasons below describe the current design;
+Git preserves the earlier proposals and review history.
 
 ## Context
 
@@ -57,18 +55,23 @@ The lock is released only after every runtime-owned child has actually
 stopped; a dropped `JoinHandle` detaches rather than stops, so each worker
 and nested blocking task retains its own lock clone until its closure ends.
 This prevents two processes on one data directory; it is not distributed
-fencing. Cleanup polls every worker concurrently, so one hung drain cannot
-hide another worker's terminal exit. Ordinary shutdown has no hard deadline.
+fencing. Fresh runtime channels and complete worker shutdown separate runs;
+an internal fencing epoch would need a new use case such as overlapping
+runtimes or same-process hot replacement. Cleanup polls every worker
+concurrently, so one hung drain cannot hide another worker's terminal exit.
+Ordinary shutdown has no hard deadline.
 The reader can cancel a pending RPC read, but awaits any started SQLite
 append before joining, so the final clean-exit divergence check sees every
 committed sync.
 
-Runtime construction is prepare → admit → launch: every fallible or awaited
-operation happens while zero tasks exist; final admission checks one
+Runtime construction is prepare → admit → launch: fallible or awaited
+dependency preparation happens before workers launch; final admission checks one
 consistent fact set; launch spawns every worker in one infallible,
 non-yielding block, consuming the single-use `RuntimeAdmission` witness. A
 preparation failure cannot leave a partially launched runtime, and no
-refusal or retry can mint the witness.
+refusal or retry can mint the witness. This boundary does not promise that
+worker initialization succeeds: application restore and catch-up run inside
+the launched lane.
 
 ### 2. Fact-derived admission and the terminal-fault black box
 
@@ -92,15 +95,23 @@ Every fault whose evidence the boot path reads re-refuses before the first
 soft confirmation; the residual window is recorded in the threat model.
 The honesty backstops (rollbackable soft confirmations, the watchdog
 byte-compare, and the divergence freeze) do not depend on a boot gate.
+A durable gate on the previous verdict would require operator acknowledgement
+without adding evidence about the current facts. A full integrity sweep would
+still miss semantic faults outside its read set. Revisit admission checks for
+a specific detectable fault, rather than treating a previous verdict as proof.
 
 ### 3. Ordered startup recovery
 
 Normal `run` startup inspects local terminal facts, syncs L1, selects a repair
 from current facts, and checks the result. The flush branch orders flush →
 sync through the returned safe block → cascade explicitly. There is no
-phase driver or progress ledger; the flush witness is a local value.
+phase driver or progress ledger; the flush witness is a local value. A restart
+must obtain fresh flush/sync evidence; persisting a phase would let it skip
+work based on an earlier attempt's observation.
 Setup/rebuild, maintenance flush, and normal-run recovery retain distinct
-typed controllers. The dispatch table, boot-local witnesses, and final
+typed controllers because they establish different facts; a universal
+controller would represent combinations none of those commands needs.
+The dispatch table, boot-local witnesses, and final
 admission check are owned by
 [`docs/recovery/README.md`](../recovery/README.md);
 [`admission.tla`](../recovery/admission.tla) verifies the controller ordering.
@@ -145,17 +156,14 @@ write-before-broadcast watermark authorizes an L1 submission; committed
 version-checked application-input rows authorize the feed output. Effects handed to the network before process termination may still
 complete remotely.
 
-## Rejected alternatives
-
-`RunEpoch` (an internal fencing epoch); `EffectGate` / `LiveKernel` (a
-universal effect mutex or actor); a generic command controller (one reducer
-over setup/rebuild/run/maintenance); a
-per-chunk divergence query, provider call, or reader mailbox on the hot
-path; a durable recovery-phase ledger; a durable boot gate on terminal
-verdicts. Each argument, its evidence, and its revisit trigger live in the
-review register's refuted list
-([`../review/register.md`](../review/register.md#refuted--do-not-re-propose-without-new-evidence));
-do not re-propose without new evidence.
+A global effect mutex or actor would duplicate these owners and put authority
+into an additional in-memory coordination layer. A per-chunk divergence read
+would see only already-detected accepted-batch divergence, not establish that
+every soft confirmation will become canonical; adding a provider call would
+also couple acknowledgement latency to L1 availability. The supported reaction
+and race bound belong to [I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen).
+Revisit this boundary if a new effect needs authority that its existing owner
+cannot establish, or the supported guarantee changes.
 
 ## External history
 
@@ -170,17 +178,16 @@ standard-recovery transaction iff it invalidates at least one valid batch; a
 clean restart changes neither. The pair is an equality/discontinuity token,
 not an ordered counter. Snapshot headers and mandatory WS claims expose these coordinates. Every
 application row has its pre-execution count; recovery replaces only the current
-suffix. See the [history contract](application-history.md) and
-[Track 3 handoff](2026-07-track3-feed-replay-design.md).
+suffix. See the [history contract](../protocol/application-history.md) and
+[remaining integration gates](2026-07-track3-feed-replay-design.md).
 
 ## Performance posture
 
-The product contract is `POST /tx` acknowledgement under 500 ms. Same-host
-release sweeps across the cutover found no material regression: ACK p99 at
-or below ~50 ms through concurrency 256 with zero rejections, concurrency-1
-HTTP ACK p50 around 13 ms (submit-to-matching-WS-event p50 roughly double —
-name which metric "round-trip" means). Same-host numbers are method-specific
-regression evidence, never capacity claims: at high concurrency the load
-clients contend with the sequencer, so the plateau is machine saturation. A
-separate-machine load generator is required for capacity measurement, and
-round-trip remeasurement belongs with the public history/API projection.
+The product contract is `POST /tx` acknowledgement under 500 ms; the
+[benchmark specification](../../tests/benchmarks/BENCHMARK_SPEC.md) defines
+the evaluation conditions. The [retained comparison](../review/2026-09-16-track3-validation.md)
+records exact revisions, workload, and same-host ACK/WS measurements. They are
+regression evidence: client/host contention and excluded startup or backlog
+work prevent interpreting them as deployment capacity. Representative latency,
+including checkpoint and L1-reconciliation overlap, remains an
+[integration gate](2026-07-track3-feed-replay-design.md#remaining-integration-gates).
