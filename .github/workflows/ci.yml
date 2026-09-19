@@ -138,6 +138,15 @@ jobs:
       - name: Watchdog Lua CM e2e
         run: just test-watchdog-e2e
 
+      - name: Upload E2E failure logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: rollups-e2e-logs-${{ github.run_attempt }}
+          path: tests/e2e/results/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
   watchdog-docker:
     name: Watchdog Docker image smoke
     runs-on: ubuntu-latest
