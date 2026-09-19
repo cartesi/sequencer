@@ -208,8 +208,12 @@ If it fails, refuse the export and select an eligible earlier checkpoint or
 genesis.
 
 Honest live sequencing establishes this condition: a frame's safe block precedes
-its L1 inclusion, so all directs it covers have already arrived. The canonical
-scheduler also accepts equality, however. After faulty sequencing, a batch at
+its L1 inclusion, so all directs it covers have already arrived. The overdue-direct
+backstop preserves it too: by the time a block's directs are overdue, that whole
+block has been observed. The FIFO drain executes all equally aged directs from
+that block and all older ones, so advancing `A` leaves none of them pending.
+
+The canonical scheduler also accepts equality. After faulty sequencing, a batch at
 block 10 can execute at clock 10 before another direct in that block arrives.
 An empty batch at block 11 advances the nonce without draining that direct.
 The truthful checkpoint has `A=10 < B=11`, yet seeding `(A,B]` would omit it.

@@ -167,6 +167,12 @@ Most queue sizes, polling intervals, and safety limits are now internal runtime 
 
 ## API
 
+JSON `sender` fields in successful `POST /tx` responses and WebSocket messages
+use EIP-55 checksum casing. Address fields in `/history` and `sender` fields in
+`/historical-l1-inputs` use lowercase hex. Clients must compare decoded 20-byte
+addresses and use one normalized encoding for account or projection keys across
+these routes.
+
 ### `POST /tx`
 
 Request shape:
@@ -262,11 +268,6 @@ Readers that maintain additional transfer/order history can reconstruct it from
 L1 and then join the application feed. The
 [projection replay contract](docs/protocol/projection-replay.md) describes
 bootstrap, client checkpoints, pending directs, and terminal drain.
-
-WS `sender` strings use EIP-55 checksum casing; address fields in `/history`
-and `sender` strings in `/historical-l1-inputs` use lowercase hex. Clients must
-compare decoded 20-byte addresses and use one normalized encoding for projection
-keys across these feeds.
 
 `GET /history` returns one coherent view of the deployment, current application
 history, immutable era baseline, and latest accepted checkpoint. Optional

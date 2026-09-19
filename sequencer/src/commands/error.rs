@@ -411,8 +411,10 @@ pub enum SetupRecoveryError {
     /// recovery export (`info.toml` + `checkpoint.toml` + `state/`), not a watchdog CM checkpoint.
     #[error("failed to load checkpoint dump at {path}: {message}")]
     CheckpointLoad { path: String, message: String },
-    /// Outside the known empty genesis checkpoint, A must precede B so the
-    /// recovery seed includes all potentially pending directs in block B.
+    /// Outside empty genesis, A must precede B: equality can exclude pending
+    /// directs in B from the seed range. A < B alone does not certify queue
+    /// eligibility; the exporter must also verify no pending direct is at or
+    /// below A (docs/recovery/cockroach.md).
     #[error(
         "checkpoint last-executed safe block {executed_safe_block} (A) must precede \
          checkpoint block {checkpoint_block} (B), except for empty genesis; \
