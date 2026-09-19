@@ -366,8 +366,8 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
         .unwrap();
     assert!(matches!(
         storage.history_info(None, None),
-        Err(HistoricalReadError::Storage(
-            rusqlite::Error::QueryReturnedNoRows
+        Err(HistoricalReadError::Checkpoint(
+            FinalizedSelectionError::Storage(rusqlite::Error::QueryReturnedNoRows)
         ))
     ));
 }
@@ -385,7 +385,9 @@ fn canonical_divergence_cannot_be_advertised_as_an_accepted_receipt() {
         .unwrap();
     assert!(matches!(
         storage.history_info(None, None),
-        Err(HistoricalReadError::CanonicalDivergence)
+        Err(HistoricalReadError::Checkpoint(
+            FinalizedSelectionError::CanonicalDivergence
+        ))
     ));
 }
 

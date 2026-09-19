@@ -259,6 +259,48 @@ mod tests {
     }
 
     #[test]
+    fn history_policy_errors_preserve_literal_wire_codes_and_fields() {
+        let current = HistoryVersion {
+            era_id: CANONICAL.parse().unwrap(),
+            recovery_generation: RecoveryGeneration::new(7),
+        };
+        for (error, json) in [
+            (
+                HistoryPolicyError::EraChanged { current },
+                serde_json::json!({
+                    "code": "ERA_CHANGED",
+                    "current": { "era_id": CANONICAL, "recovery_generation": 7 }
+                }),
+            ),
+            (
+                HistoryPolicyError::StaleGeneration { current },
+                serde_json::json!({
+                    "code": "STALE_GENERATION",
+                    "current": { "era_id": CANONICAL, "recovery_generation": 7 }
+                }),
+            ),
+            (
+                HistoryPolicyError::HistoryUnavailable {
+                    available_from: ExecutedInputCount::new(41),
+                },
+                serde_json::json!({ "code": "HISTORY_UNAVAILABLE", "available_from": 41 }),
+            ),
+            (
+                HistoryPolicyError::AheadOfHead {
+                    head: ExecutedInputCount::new(50),
+                },
+                serde_json::json!({ "code": "AHEAD_OF_HEAD", "head": 50 }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(error).unwrap(), json);
+            assert_eq!(
+                serde_json::from_value::<HistoryPolicyError>(json).unwrap(),
+                error
+            );
+        }
+    }
+
+    #[test]
     fn era_id_displays_canonical_lowercase_hyphenated_form() {
         let era = EraId::from_bytes(CANONICAL_BYTES).expect("canonical UUIDv4");
         assert_eq!(era.to_string(), CANONICAL);

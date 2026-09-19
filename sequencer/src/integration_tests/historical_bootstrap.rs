@@ -294,6 +294,14 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
     let era = metadata.history.version.era_id;
     assert_eq!(metadata.history.available_from.get(), 7);
     assert_eq!(metadata.history.head.get(), 7);
+    assert!(matches!(
+        client.subscribe(HistoryClaim {
+            version: metadata.history.version,
+            next_input: ExecutedInputCount::new(6),
+        }).await,
+        Err(sequencer_rust_client::SubscribeError::History(HistoryPolicyError::HistoryUnavailable { available_from }))
+            if available_from == metadata.history.available_from
+    ));
     assert_eq!(metadata.baseline.l1_stop_block, STOP);
     assert_eq!(metadata.baseline.l1_end_input_index, 8);
     assert_eq!(metadata.baseline.next_batch_nonce, reference_nonce);

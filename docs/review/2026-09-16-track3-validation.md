@@ -5,6 +5,13 @@ Scope: validate application-history commit
 a complete cold replica, and a same-host latency comparison against
 `91e25780854bb641c63135751f951f9f7ee1e744`.
 
+These are the measured pre-rebase revisions. Their stack counterparts are
+`799a5d3` → `3e5b971` and `91e2578` → `71b3b35`; the validation/test commit
+`4fc010c` became `7f3229f`. The latter stack includes upstream changes, so these
+measurements must not be attributed to its rebased trees. The latency baseline
+already contains the initial versioned-history foundation; it isolates the
+subsequent application-history refactor, not the cost of the complete stack.
+
 Retained for the [Track 3 integration gates](../plans/2026-07-track3-feed-replay-design.md):
 this is the wallet baseline against which native-engine and deployment results
 can be assessed. Replace or delete it when those decisions no longer use these

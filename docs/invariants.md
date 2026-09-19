@@ -80,12 +80,12 @@ by writer and are write-once (`0001_schema.sql`).
 |---|---|
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
-| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion |
-| history metadata (setup/recovery) | `history_state` — complete era/application-count/L1-block baseline; generation advance and immutable preserved-prefix cut in a non-empty standard-recovery cascade |
+| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
+| history metadata (setup/recovery) | `history_state` — complete era/application-count/L1-block baseline and generation; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
 | egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
-| setup | `deployment_identity` (pinned once), `batch_tree_anchor` (the root nonce, frozen once setup completes), the initial `dumps` + `snapshots` rows (genesis or rebuild registration, atomic with the complete history baseline), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
-| snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | unreferenced `dumps` row deletion (`gc_unreferenced_dumps`) |
+| setup | `deployment_identity` (pinned once), `batch_tree_anchor` (the root nonce, frozen once setup completes), the initial `dumps` + `snapshots` rows and rebuild root `batches`/`frames` (atomic with the complete history baseline), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
+| snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | obsolete `snapshots` and unreferenced `dumps` row deletion (`gc_unreferenced_dumps`), including a superseded baseline artifact |
 | command brackets (run, setup, flush) | `terminal_faults` (append-only, best-effort at settlement) |
 | admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
 | fee oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
@@ -224,9 +224,11 @@ by writer and are write-once (`0001_schema.sql`).
   remedy is cockroach recovery.
 - **Completeness boundary:** the check completely enforces the accepted-batch
   identity predicate above; it is intentionally not a general canonical/application
-  divergence oracle. It trusts collapsed history below the anchor and the
-  checkpoint application state, shares `scheduler_accepts` (including its
-  documented self-trust omissions), and does not independently detect bugs in
+  divergence oracle. The entire L1 prefix through baseline block `C` is opaque,
+  including previously rejected future-nonce batches; the check trusts the
+  checkpoint state and continuation nonce instead of reinterpreting that prefix.
+  It shares `scheduler_accepts` (including its documented self-trust omissions),
+  and does not independently detect bugs in
   direct-input/user-op execution. A wrong-high cockroach checkpoint nonce is a
   known example that can escape it. Absence of the marker therefore does not
   prove global agreement. Conversely, a structurally malformed foreign landing
@@ -253,9 +255,11 @@ by writer and are write-once (`0001_schema.sql`).
   boundary selects external directs by the setup-pinned submitter address;
   only those inputs and included user ops enter `application_inputs`.
 - **Enforced by:** classified direct reads and complete receipt validation at
-  append. Startup/recovery derive the initial direct rows before catch-up,
-  which must execute them successfully before admission. Replay and WS need
-  no envelope filter because every row executes.
+  append. Standard startup recovery attributes undrained directs to the new Tip;
+  lane catch-up executes them before processing queued user operations. Manual
+  rebuild represents the folded prefix through `C` in its baseline snapshot,
+  with no application-history rows for that prefix. Replay and WS need no
+  envelope filter because every row executes.
 - **Depended on by:** application replay and replicated state correctness.
 
 ### I12. Safe head advances only on real observation; `synced_at_ms` is genuine progress time
@@ -341,9 +345,12 @@ by writer and are write-once (`0001_schema.sql`).
   conflicting batch-tree writes; the detector and next typed read
   stop the process. A chunk committed before either runtime observation may
   acknowledge and later roll back.
-- **Watchdog boundary:** the freeze blocks accepted-checkpoint publication before the
-  offending landing becomes a comparable sequencer checkpoint. Because the
-  watchdog skips replay when the finalized inclusion block is unchanged, it
+- **Watchdog boundary:** accepted-checkpoint selection checks for divergence
+  in the same transaction as selection and any download lease, refusing while
+  the marker is present. A matching batch
+  before a divergent acceptance in the same L1 block cannot represent that
+  block's final state. Because the watchdog skips replay when the finalized
+  inclusion block is unchanged, it
   does not subsume this wire-identity detector. Conversely, the check does
   not subsume the watchdog's broader independent application-state
   comparison.
@@ -429,10 +436,14 @@ by writer and are write-once (`0001_schema.sql`).
   before replacement directs. The entire transition commits in the cascade
   transaction. Clean restart changes neither token. Every intervening cut is
   required to authorize reusing a checkpoint from an older generation.
-- **Enforced by:** `complete_baseline_setup`, immutable history triggers,
-  exact-`+1` generation trigger, and `cascade_and_reopen`.
-- **Depended on by:** mandatory snapshot-derived WS claims. Identity is validated
-  before the requested count, including for empty history.
+- **Enforced by:** `complete_baseline_setup`, immutable baseline and
+  `history_generation_cuts` triggers, the exact-`+1` generation trigger requiring
+  its cut, and `cascade_and_reopen`. `preserved_input_count_in` asserts that
+  every intervening generation has a cut before computing compatibility.
+- **Depended on by:** mandatory snapshot-derived WS claims and `/history`
+  checkpoint compatibility across standard recoveries. Identity is validated
+  before the requested count, including for empty history. Cuts remain available
+  for the era's lifetime; their absence must never authorize a partial minimum.
 - **Breaks:** a client silently resumes a replaced suffix or inaccessible prefix.
 - **Operational boundary:** rebuilding uses a fresh/wiped data directory.
   Checkpoint state, inclusion block, and next nonce are trusted operator inputs;

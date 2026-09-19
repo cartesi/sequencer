@@ -386,8 +386,9 @@ pub enum BootstrapError {
 }
 
 /// Terminal failures of the `setup --recovery` procedure — the ones
-/// an operator must resolve (the flush and the post-flush re-sync reuse the
-/// transient [`RecoveryError`] paths instead). All map to [`EXIT_TERMINAL`]:
+/// an operator must resolve (flush, post-flush re-sync, and a stopping block
+/// behind the checkpoint use the transient [`RecoveryError`] paths instead).
+/// All map to [`EXIT_TERMINAL`]:
 /// a plain restart re-runs the same bad inputs and re-fails identically.
 #[derive(Debug, Error)]
 pub enum SetupRecoveryError {
@@ -432,11 +433,10 @@ pub enum SetupRecoveryError {
 
 /// `setup`'s read-only detection gate: the reasons a
 /// fresh `setup` refuses because a *previous* instance left work past the
-/// checkpoint. Because plain setup has already initialized a genesis baseline,
-/// the remedy is to wipe that uncompleted data dir and run `setup --recovery`
-/// which flushes/folds the outstanding batches; a plain `setup` restart
-/// re-detects and re-refuses (hence [`EXIT_SETUP_NEEDS_RECOVERY`], not the
-/// auto-recovery class 10).
+/// checkpoint. The gate runs before baseline publication and leaves setup
+/// incomplete. Rebuild in a fresh data directory with `setup --recovery` to
+/// flush/fold the outstanding batches; a plain `setup` restart re-detects and
+/// re-refuses (hence [`EXIT_SETUP_NEEDS_RECOVERY`], not auto-recovery class 10).
 ///
 /// Both variants carry diagnostic fields for the refusal log line.
 #[derive(Debug, Error)]
@@ -838,6 +838,13 @@ mod tests {
                     flush_observed_safe_block: 2,
                 }),
                 "a resync behind the flush's observed view",
+            ),
+            (
+                recovery_retry(RecoveryRetryReason::CheckpointAheadOfStop {
+                    checkpoint_block: 901,
+                    stop_block: 899,
+                }),
+                "a valid manual recovery checkpoint ahead of the RPC stopping block",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::Identity(

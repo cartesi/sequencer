@@ -76,7 +76,10 @@ Remaining checks need the actual consumer:
   for production readiness: the old native state is unavailable, the exported
   bundle restores correctly, and execution after rebuild matches the canonical
   machine. For the DEX, pin the designated state drive/memory region and derive
-  resume metadata from canonical execution. Add the integration check to the
+  resume metadata from canonical execution. The exporter must check
+  [pending-direct eligibility](../recovery/cockroach.md#checkpoint-eligibility)
+  and the drill must exercise refusal and earlier-checkpoint fallback, alongside
+  eligible pending-queue recovery. Add the integration check to the
   release validation once the actual artifacts are available; no generic trait
   or deployment gate currently enforces this requirement.
 - Repeat snapshot-to-live bootstrap and canonical comparison with the private

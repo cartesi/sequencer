@@ -67,8 +67,10 @@ blocking production diagnostics would require revisiting that assumption
   batch/frame spine is re-inspected by the runtime danger detector within
   seconds of launch. The accepted residual is narrow: corrupt payload bytes
   in rows at/below the lane's resume checkpoint re-trip only when the WS
-  feed pages them (bounded by its catch-up window) or the submitter
-  re-encodes a pending batch, and a fault with no durable evidence (a panic
+  feed pages them or the submitter re-encodes a pending batch. The feed can
+  read the whole available history from era base `K` in bounded pages, with no
+  total catch-up limit; this detection path requires a subscriber to read the
+  affected rows. A fault with no durable evidence (a panic
   whose trigger does not recur) does not re-trip at all. The window is
   entered by restarting after a terminal exit (including supervisors that
   restart regardless of exit status), and
@@ -76,7 +78,7 @@ blocking production diagnostics would require revisiting that assumption
   rollbackable soft confirmations, the watchdog byte-compare, and the I15
   divergence freeze.
 - **Adversarial mempool:** reorder, delay, drop, selective inclusion by builders
-- **Zombie transactions:** a submitted batch may sit in a private mempool indefinitely and land long after we believed it was gone. Two load-bearing defenses: the recovery flusher consumes every wallet-nonce slot this deployment ever used (anchored by the persisted watermark, I14) so zombies cannot claim them; and the content-identity check (I9/I15) compares every at/above-anchor *simulated-accepted* landing against the valid closed batch we sealed at that nonce. A foreign or byte-different landing records divergence when it becomes safe and is ingested, freezes the accepted frontier, and requires cockroach recovery. This is trust-boundary validation of external input (the mempool replaying our own stale transactions at times we don't control), not defense-in-depth against self-bugs or a general canonical-state oracle. In cockroach recovery the watermark does not survive the wipe, so that flush is best-effort by construction; the content-identity check is what keeps the residual zombie detected-and-frozen rather than silent (see [the flush boundary](../recovery/cockroach.md#flush-and-stopping-block)).
+- **Zombie transactions:** a submitted batch may sit in a private mempool indefinitely and land long after we believed it was gone. Two load-bearing defenses: the recovery flusher consumes every wallet-nonce slot this deployment ever used (anchored by the persisted watermark, I14) so zombies cannot claim them; and the content-identity check (I9/I15) compares every *simulated-accepted* landing strictly after baseline block `C` against the valid closed batch we sealed at that nonce. The complete prefix through `C` is opaque and is never reinterpreted using the recovered nonce. A foreign or byte-different landing records divergence when it becomes safe and is ingested, freezes the accepted frontier, and requires cockroach recovery. This is trust-boundary validation of external input (the mempool replaying our own stale transactions at times we don't control), not defense-in-depth against self-bugs or a general canonical-state oracle. In cockroach recovery the watermark does not survive the wipe, so that flush is best-effort by construction; the content-identity check is what keeps the residual zombie detected-and-frozen rather than silent (see [the flush boundary](../recovery/cockroach.md#flush-and-stopping-block)).
 - L1 reorgs up to safe depth
 - Malicious `POST /tx` callers: malformed signatures, spoofed sender, replay across chains or apps, nonce manipulation
 - Malicious direct-input senders: arbitrary payload, any intent; sender authenticity is guaranteed by InputBox

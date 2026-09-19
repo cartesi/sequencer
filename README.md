@@ -234,6 +234,8 @@ After each successfully applied input at offset `X`, persist the claim with
   `HISTORY_UNAVAILABLE`, or `AHEAD_OF_HEAD`. Rebootstrap on a history mismatch.
 - A claim exactly at the head waits for the next input. Replay uses bounded
   pages and queues, with no total catch-up limit. The subscriber cap is `64`.
+- Before upgrade, capacity exhaustion returns `429 OVERLOADED`; shutdown or an
+  operational subscription failure returns `503 UNAVAILABLE`.
 - Messages are JSON text frames; binary fields are `0x`-prefixed hex.
   Direct-input `block_timestamp` values are Unix seconds.
 - Batch envelopes are absent. Offsets count executed application inputs,
@@ -260,6 +262,11 @@ Readers that maintain additional transfer/order history can reconstruct it from
 L1 and then join the application feed. The
 [projection replay contract](docs/protocol/projection-replay.md) describes
 bootstrap, client checkpoints, pending directs, and terminal drain.
+
+WS `sender` strings use EIP-55 checksum casing; address fields in `/history`
+and `sender` strings in `/historical-l1-inputs` use lowercase hex. Clients must
+compare decoded 20-byte addresses and use one normalized encoding for projection
+keys across these feeds.
 
 `GET /history` returns one coherent view of the deployment, current application
 history, immutable era baseline, and latest accepted checkpoint. Optional
@@ -406,8 +413,23 @@ and `X-Executed-Input-Count`, selected atomically with the artifact lease.
 Streaming holds the lease until the response ends or the client disconnects.
 The accepted endpoints return `404` until a comparable checkpoint exists:
 genesis is comparable at block zero; a rebuilt baseline is restorable but only
-a later accepted batch establishes a comparison point. Divergence blocks
-publication of the accepted checkpoint. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
+a later accepted batch establishes a comparison point. Known divergence makes
+all three finalized endpoints return `503 UNAVAILABLE`, including conditional
+state requests. The check shares the checkpoint-selection transaction, before
+any lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
+
+### Health probes (internal only)
+
+- `GET /livez` returns `200` whenever the handler responds, with an empty body.
+- `GET /readyz` returns `200` while the inclusion-lane receiver is open and
+  shutdown has not been requested; otherwise `503`. Its body is empty.
+- `GET /healthz` uses the same status as `/readyz` and returns JSON:
+  `{ "status": "ok", "inclusion_lane": "ok" }`. `status` becomes `"degraded"`
+  for either failure condition; `inclusion_lane` becomes `"stopped"` only when
+  its receiver is closed, so it can remain `"ok"` during shutdown.
+
+These probes cover process reachability, the lane channel, and shutdown state.
+They do not certify L1 freshness, submitter balance, or canonical agreement.
 
 ## Storage Model
 

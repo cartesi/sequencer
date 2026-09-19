@@ -532,6 +532,9 @@ impl BatchPoster for EthereumBatchPoster {
             if evm_advance.msgSender != self.config.batch_submitter_address {
                 continue;
             }
+            // This dedicated key emits our own well-formed batches. A decode
+            // failure is evidence to investigate under self-trust, not an
+            // untrusted direct input to skip (docs/threat-model/README.md).
             let batch: Batch = ssz::Decode::from_ssz_bytes(evm_advance.payload.as_ref())
                 .map_err(|err| BatchPosterError::Provider(format!("{err:?}")))?;
             observed_nonces.push(batch.nonce);

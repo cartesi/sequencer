@@ -23,9 +23,11 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 
-use crate::http::{StorageTaskError, storage_task};
+use crate::http::{ApiError, StorageTaskError, storage_task};
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
-use crate::storage::{FinalizedLease, LeaseGuard, LeasedDump, ReleaseScheduler, Storage};
+use crate::storage::{
+    FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, ReleaseScheduler, Storage,
+};
 
 type BoxError = StorageTaskError;
 
@@ -89,7 +91,7 @@ async fn finalized_inclusion_block(State(state): State<Arc<SnapshotApiState>>) -
         })
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(err) => internal_error("read finalized inclusion block", err),
+        Err(err) => finalized_error("read finalized inclusion block", err),
     }
 }
 
@@ -105,7 +107,7 @@ async fn finalized_state(
     } = match acquire_finalized(&state).await {
         Ok(Some(leased)) => leased,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(err) => return internal_error("acquire finalized lease", err),
+        Err(err) => return finalized_error("acquire finalized lease", err),
     };
 
     let etag = format!("\"block-{inclusion_block}\"");
@@ -119,7 +121,7 @@ async fn finalized_state(
     let history = leased.history_version;
     let LeasedDump { guard, .. } = leased;
 
-    match File::open(&path).await {
+    match comparison_io(File::open(&path).await, &path) {
         Ok(file) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -131,17 +133,10 @@ async fn finalized_state(
                 "X-Recovery-Generation",
                 history.recovery_generation.get().to_string(),
             )
-            .body(stream_body(file, guard))
+            .body(stream_body(file, guard, path))
             .expect("snapshot response headers are well-formed"),
         // `guard` is a local here; on this error path it drops → lease released.
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                abort_terminal(format!(
-                    "durable finalized snapshot artifact missing: {path:?}"
-                ));
-            }
-            internal_error("open finalized state file", err)
-        }
+        Err(err) => internal_error("open finalized state file", err),
     }
 }
 
@@ -170,7 +165,7 @@ async fn finalized_snapshot(State(state): State<Arc<SnapshotApiState>>) -> Respo
             archive_response(&state, dump, Some(checkpoint))
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(err) => internal_error("acquire accepted snapshot lease", err),
+        Err(err) => finalized_error("acquire accepted snapshot lease", err),
     }
 }
 
@@ -247,11 +242,41 @@ fn state_file_path(state: &SnapshotState, prefix: &Path) -> PathBuf {
         .unwrap_or_else(|_| abort_terminal("application snapshot path callback panicked"))
 }
 
-fn stream_body(file: File, guard: LeaseGuard) -> Body {
+fn stream_body(file: File, guard: LeaseGuard, path: PathBuf) -> Body {
     Body::from_stream(ReaderStream::new(GuardedReader {
-        file,
+        file: ComparisonReader { reader: file, path },
         _guard: Arc::new(guard),
     }))
+}
+
+fn comparison_io<T>(result: std::io::Result<T>, path: &Path) -> std::io::Result<T> {
+    if let Err(error) = &result
+        && dump_info::referenced_artifact_io_is_terminal(error)
+    {
+        abort_terminal(format!(
+            "durable comparison artifact is unusable: {}: {error}",
+            path.display()
+        ));
+    }
+    result
+}
+
+struct ComparisonReader<R> {
+    reader: R,
+    path: PathBuf,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ComparisonReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.reader)
+            .poll_read(cx, buf)
+            .map(|result| comparison_io(result, &this.path))
+    }
 }
 
 /// Do not turn a producer failure into a successful truncated archive response.
@@ -368,10 +393,94 @@ fn internal_error(context: &str, err: impl std::fmt::Display) -> Response {
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
+fn finalized_error(context: &str, err: StorageTaskError) -> Response {
+    if matches!(
+        err.downcast_ref::<FinalizedSelectionError>(),
+        Some(FinalizedSelectionError::CanonicalDivergence)
+    ) {
+        return ApiError::unavailable(
+            "canonical divergence prevents accepted checkpoint selection",
+        )
+        .into_response();
+    }
+    internal_error(context, err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::test_helpers::temp_db;
+
+    async fn read_corrupt_comparison(path: &Path) {
+        let db = temp_db("corrupt-comparison-path");
+        let mut storage = Storage::open(&db.path).unwrap();
+        storage
+            .insert_baseline_snapshot(path, crate::storage::ExecutedInputCount::ZERO)
+            .unwrap();
+        let state = Arc::new(SnapshotApiState {
+            snapshot: SnapshotState {
+                db_path: db.path,
+                state_file_in_dump: Path::to_path_buf,
+            },
+            shutdown: RuntimeScope::default(),
+            release_scheduler: Arc::new(|release| release()),
+        });
+        let response = finalized_state(State(state), HeaderMap::new()).await;
+        // Unix can open a directory successfully: the structural error first
+        // appears when the response body reads it.
+        let _ = axum::body::to_bytes(response.into_body(), 1024).await;
+        panic!("corrupt comparison artifact did not abort");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn comparison_directory_aborts_when_streamed() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "egress::api::snapshot::tests::comparison_directory_aborts_when_streamed",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        read_corrupt_comparison(root.path()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn comparison_file_parent_aborts_on_open() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "egress::api::snapshot::tests::comparison_file_parent_aborts_on_open",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("file");
+        std::fs::write(&parent, b"not a directory").unwrap();
+        read_corrupt_comparison(&parent.join("comparison")).await;
+    }
+
+    #[tokio::test]
+    async fn comparison_operational_read_error_remains_nonterminal() {
+        struct Unavailable;
+        impl AsyncRead for Unavailable {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )))
+            }
+        }
+        let mut reader = ComparisonReader {
+            reader: Unavailable,
+            path: PathBuf::from("temporarily-unavailable"),
+        };
+        let error = tokio::io::AsyncReadExt::read(&mut reader, &mut [0; 1])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]

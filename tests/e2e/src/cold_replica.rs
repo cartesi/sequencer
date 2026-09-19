@@ -12,6 +12,7 @@ use rollups_harness::replay::apply_ws_message;
 use rollups_harness::{ManagedSequencer, ReplayWalletApp, TestSigner, WsClient};
 use sequencer_core::api::WsTxMessage;
 use sequencer_core::application::Application;
+use sequencer_core::fee::fee_to_linear;
 use sequencer_rust_client::{
     HistoryClaim, HistoryPolicyError, SequencerClient, SnapshotResponse, SubscribeError,
 };
@@ -230,12 +231,30 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     assert!(recovered.executed_input_count().get() < replica.executed_input_count().get());
 
     let mut alice_l2 = runtime.wallet_l2(TestSigner::from_default(1)?)?;
-    alice_l2.set_next_nonce(recovered_reference.current_user_nonce(alice_address));
-    alice_l2.transfer(bob_address, U256::from(6_000)).await?;
+    let expected_nonce = recovered_reference.current_user_nonce(alice_address);
+    let balance_before = recovered_reference.current_user_balance(alice_address);
+    // The fixed oracle keeps this quote valid across frame rotations. Derive the
+    // expected debit before receiving the event so wrong feed fees cannot agree by replay.
+    let quote = client.get_fee().await?;
+    assert_eq!(quote.fee, quote.recommended_fee);
+    let amount = U256::from(6_000);
+    let expected_balance = balance_before - amount - fee_to_linear(quote.fee);
+    alice_l2.set_next_nonce(expected_nonce);
+    alice_l2.transfer(bob_address, amount).await?;
     let resumed = recovered_ws.expect_user_op_from(alice_address).await?;
+    assert!(matches!(resumed, WsTxMessage::UserOp { fee, nonce, .. }
+        if fee == quote.fee && nonce == expected_nonce));
     apply_ws_message(&mut recovered, resumed.clone())?;
     recovered_reference.apply(resumed)?;
     assert_same_state(&mut recovered, &recovered_reference)?;
+    assert_eq!(
+        recovered_reference.current_user_nonce(alice_address),
+        expected_nonce + 1
+    );
+    assert_eq!(
+        recovered_reference.current_user_balance(alice_address),
+        expected_balance
+    );
     assert_eq!(
         recovered_reference.current_user_balance(bob_address),
         U256::from(6_000)

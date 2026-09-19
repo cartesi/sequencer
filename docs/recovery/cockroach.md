@@ -9,7 +9,7 @@ rebuilding.** The operator initiates recovery; the command automates the rebuild
 The procedure is **flush → fold → fill**:
 
 1. **Flush** outstanding submitter transactions and choose a fixed safe L1
-   stopping block.
+   stopping block at or after the trusted checkpoint's inclusion block.
 2. **Fold** the input history through the canonical scheduler, starting from the
    trusted checkpoint. Every input receives its normal scheduler treatment:
    accepted batches execute, malformed or rejected batches are skipped, and
@@ -45,7 +45,8 @@ The application runbook must name:
 - How to select and preserve a trusted CM checkpoint and its exact L1 boundary.
 - The command extracting the application state, count/clock, and next scheduler
   nonce into the bundle accepted by `setup --recovery`, including supported
-  checkpoint boundaries and the loader's `A < B` requirement below.
+  checkpoint boundaries and verification of the
+  [pending-direct eligibility condition](#checkpoint-eligibility) below.
 - Artifact locations, access/backup procedures, validation commands, and the
   commands to rebuild, restart, compare, and resume affected readers.
 - A rehearsed fallback to an earlier trusted checkpoint or genesis if the
@@ -56,6 +57,9 @@ pinned deployment data, and L1 access, while the old native database and dumps
 are unavailable. Run the actual exporter and restore its output; check the
 native application bytes/progress and scheduler nonce against the canonical
 source. Exercise directs pending at the checkpoint and inputs arriving after it.
+The exporter must refuse a checkpoint with a pending direct at or below its
+application clock, even when `A < B`; rehearse the earlier-checkpoint/genesis
+fallback. Also cover an eligible nonempty queue whose directs are all above `A`.
 Run `setup --recovery` in a fresh directory, resume sequencing, and compare
 against independent canonical execution after a new batch is accepted. The
 terminal-drained baseline itself need not equal canonical state at `C`.
@@ -95,9 +99,11 @@ latest possible sound checkpoint is not a prerequisite for recovery.
    state without establishing that all earlier executions were correct.
 4. **Prepare a restorable native bundle.** Validate the candidate's restored
    application state, embedded count/clock, and next batch nonce against the
-   canonical reference at block `B`. Keep the artifact and its boundary metadata
-   together and record how its trust was established. The receipt alone is not
-   evidence that a faulty sequencer executed correctly.
+   canonical reference at block `B`. Verify its pending-direct queue meets
+   [checkpoint eligibility](#checkpoint-eligibility); otherwise choose an
+   eligible earlier checkpoint or genesis. Keep the artifact and its boundary
+   metadata together and record how its trust was established. The receipt alone
+   is not evidence that a faulty sequencer executed correctly.
 5. **Rebuild in a fresh directory.** Use the invocation below. Recovery chooses
    its post-flush stopping block `C`, replays from the trusted checkpoint, and
    publishes a new era. Preserve that baseline artifact and its metadata for
@@ -169,7 +175,9 @@ cargo run -p wallet-sequencer -- setup --recovery \
 Recovery signs L1 transactions, so the key must match the configured submitter.
 After success, start `run` with that same data directory. A completed rebuild
 refuses another `setup --recovery`; failures before completion publish no partial
-baseline.
+baseline. If the RPC node has not reached the checkpoint, recovery exits with
+retryable code 20. Synchronize that node and retry with the same checkpoint and
+incomplete data directory.
 
 ## Implementation contract
 
@@ -189,12 +197,38 @@ The replay boundaries are:
 | `S'`, `N'` | Recovered state and next batch nonce. |
 | `K` | Application count in `S'`; the first later application input has offset `K`. |
 
+### Checkpoint eligibility
+
+At the exact end-of-block boundary `B`, the canonical scheduler must have **no
+pending direct with inclusion block `<= A`**. The checkpoint therefore already
+accounts for every direct through `A`; all remaining directs are reconstructed
+from `(A, B]`. The exporter must inspect the canonical queue to establish this
+condition, including when validating a retained native artifact against the CM.
+If it fails, refuse the export and select an eligible earlier checkpoint or
+genesis.
+
+Honest live sequencing establishes this condition: a frame's safe block precedes
+its L1 inclusion, so all directs it covers have already arrived. The canonical
+scheduler also accepts equality, however. After faulty sequencing, a batch at
+block 10 can execute at clock 10 before another direct in that block arrives.
+An empty batch at block 11 advances the nonce without draining that direct.
+The truthful checkpoint has `A=10 < B=11`, yet seeding `(A,B]` would omit it.
+Application-state equality and `A < B` alone cannot establish eligibility.
+
 Loading checks the receipt's block against configured `B` and its nonce against
 `info.toml`. It requires `A < B`, except for known empty genesis (`B`, nonce, and
 application count all zero). At non-genesis `A = B`, a direct arriving after the
 accepted batch in block `B` could still be pending but disappear from the seed
-range. Checkpoint state and nonce remain operator-trusted; the later
-content-identity check does not verify this prefix.
+range. The bundle contains no scheduler queue evidence, so the loader cannot
+verify the pending-direct condition. Eligibility, checkpoint state, and nonce
+remain operator-trusted; the later content-identity check does not verify this
+prefix. Exporter enforcement belongs to the application's required recovery
+integration, not the generic loader.
+
+The complete ordering is `A < B <= C`, with `A = B = 0` allowed for empty
+genesis. Before sourcing or executing the fold, recovery requires `B <= C`.
+Otherwise publishing the checkpoint state at an earlier baseline block could
+make normal reconciliation execute already-accounted direct inputs again.
 
 ### Flush and stopping block
 
@@ -208,13 +242,20 @@ After flushing, raw L1 ingestion must reach at least `C`. It may advance farther
 but the fold stops at `C`. Accepted-batch projection is deferred until the new
 baseline and batch tree exist.
 
+A trusted checkpoint can be ahead of an honest replacement node that is still
+synchronizing. A successful flush only settles the wallet slots known to that
+node; it does not establish `C >= B`. If `C < B`, recovery refuses with retryable
+exit 20, even when the later re-sync head has reached `B`: that newer observation
+does not replace the fixed stopping block. It publishes no baseline and must be
+retried after the node catches up.
+
 ### Replay boundaries
 
 Seed the scheduler's pending-direct queue from `(A, B]`, excluding inputs sent by
 the batch submitter. Then replay **all raw inputs** in `(B, C]` in L1 order with
 expected nonce `N`. Drain the remaining directs through `C` to obtain `(S', N')`.
-The disjoint ranges preserve pending directs without executing the checkpoint's
-accepted batches again.
+For an [eligible checkpoint](#checkpoint-eligibility), the disjoint ranges
+preserve pending directs without executing its accepted batches again.
 
 On the first `run` sync, acceptance starts at nonce `N'` and scans only blocks
 **strictly after `C`**. Nonce filtering alone would let a previously rejected

@@ -3,8 +3,6 @@
 
 //! Immutable era baseline and the preserved prefix at each recovery generation.
 
-#[cfg(test)]
-use rusqlite::OptionalExtension;
 use rusqlite::{Connection, Result, Transaction, params, types::Type};
 use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
 
@@ -65,21 +63,6 @@ pub(super) fn initialize_history_in(
     base: ExecutedInputCount,
     base_safe_block: u64,
 ) -> Result<()> {
-    #[cfg(test)]
-    if let Some(existing) = query_history_state(tx).optional()? {
-        // Test fixtures initialize genesis when opening their schema. Production
-        // creates this row only with the complete durable baseline.
-        assert_eq!(
-            existing.base_executed_input_count,
-            base.get(),
-            "history base differs"
-        );
-        assert_eq!(
-            existing.base_safe_block, base_safe_block,
-            "L1 prefix differs"
-        );
-        return Ok(());
-    }
     let mut bytes: [u8; EraId::BYTE_LEN] =
         tx.query_row("SELECT randomblob(16)", [], |row| row.get(0))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -182,13 +165,33 @@ mod tests {
             .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(41), 70))
             .unwrap();
         let state = storage.history_state().unwrap();
-        for sql in [
-            "UPDATE history_state SET era_id = era_id",
-            "UPDATE history_state SET base_executed_input_count = 42",
-            "UPDATE history_state SET base_safe_block = 71",
-            "DELETE FROM history_state",
+        let duplicate = storage
+            .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(41), 70))
+            .expect_err("even identical baseline values cannot initialize another era");
+        assert_eq!(
+            duplicate.to_string(),
+            "history state is inserted once per database"
+        );
+        for (sql, expected) in [
+            (
+                "UPDATE history_state SET era_id = X'00000000000040008000000000000001'",
+                "history baseline is immutable",
+            ),
+            (
+                "UPDATE history_state SET base_executed_input_count = 42",
+                "history baseline is immutable",
+            ),
+            (
+                "UPDATE history_state SET base_safe_block = 71",
+                "history baseline is immutable",
+            ),
+            (
+                "DELETE FROM history_state",
+                "history state is write-once per database",
+            ),
         ] {
-            assert!(storage.conn.execute(sql, []).is_err(), "{sql}");
+            let error = storage.conn.execute(sql, []).expect_err(sql);
+            assert_eq!(error.to_string(), expected, "{sql}");
         }
         drop(storage);
         let mut reopened = Storage::open(&db.path).unwrap();

@@ -56,6 +56,7 @@ fn decode_progress(bytes: &[u8], app_name: &str) -> Result<ApplicationProgress, 
 struct TestApp {
     nonces: HashMap<Address, u32>,
     progress: ApplicationProgress,
+    fail_dump: bool,
     /// Test-only scheduling seam used to keep a rejected queue saturated long
     /// enough to distinguish one bounded turn from an unbounded drain.
     reject_user_ops_after: Option<Duration>,
@@ -113,6 +114,9 @@ impl Application for TestApp {
     }
 
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
+        if self.fail_dump {
+            return Err(std::io::Error::other("injected application dump failure").into());
+        }
         std::fs::create_dir(prefix)?;
         std::fs::write(Self::state_file_in_dump(prefix), b"")?;
         Ok(())
@@ -1953,6 +1957,44 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         "after restart the snapshot counter should reach 4 (resumed 3 + 1 new op); observed {observed:?}. \
          A counter of 1 means the lane loaded genesis (0) and skipped the pending batch's txs."
     );
+}
+
+#[test]
+fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
+    let db = temp_db("application-dump-failure");
+    let mut storage = Storage::open(&db.path).unwrap();
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .unwrap();
+    let dumps = tempfile::tempdir().unwrap();
+    let mut app = TestApp::default();
+    register_genesis_snapshot(&mut app, &mut storage, dumps.path());
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 0, dumps.path())
+        .unwrap();
+    let snapshot = storage.latest_snapshot().unwrap().unwrap();
+    let tip = head.batch_index;
+    let dump_count = storage.list_dump_rows().unwrap().len();
+
+    app.fail_dump = true;
+    let error = super::snapshot::close_batch_with_snapshot(
+        &mut app,
+        &mut storage,
+        &mut head,
+        0,
+        dumps.path(),
+    )
+    .expect_err("an application dump failure must precede the batch seal");
+    assert!(matches!(
+        error,
+        super::snapshot::TakeDumpError::CreateDump(super::dump_info::CreateDumpDirError::App(
+            AppError::Io(ref source)
+        )) if source.to_string() == "injected application dump failure"
+    ));
+    assert_eq!(head.batch_index, tip);
+    assert_eq!(storage.open_state().unwrap().unwrap().batch_index, tip);
+    assert_eq!(storage.latest_batch_index().unwrap(), Some(tip));
+    assert_eq!(storage.latest_snapshot().unwrap().unwrap(), snapshot);
+    assert_eq!(storage.list_dump_rows().unwrap().len(), dump_count);
 }
 
 #[test]
