@@ -61,24 +61,38 @@ fn snapshot_gc_at_startup(storage: &mut crate::storage::Storage) -> Result<usize
 /// - **crash-during-GC**: SQLite row was deleted but the filesystem
 ///   delete either wasn't reached or failed.
 ///
-/// Filesystem-only — no SQLite writes here. Failures log and
-/// continue (the next startup retries). The post-`require_rollback_snapshot`
-/// ordering matters: the genesis dump's dir is in
-/// `list_dump_rows` by the time this runs, so we never delete it.
+/// Filesystem-only — no SQLite writes here. Resolve all retained paths before
+/// deleting anything: setup and run may spell the same directory differently.
+/// Resolution failures stop the sweep; deletion failures log and retry next
+/// startup. The baseline is already registered when this runs.
 fn sweep_orphan_dumps(
     storage: &mut crate::storage::Storage,
     dumps_dir: &std::path::Path,
 ) -> Result<usize, CommandError> {
-    let known: std::collections::HashSet<std::path::PathBuf> = storage
+    let known = storage
         .list_dump_rows()?
         .into_iter()
-        .map(|row| row.prefix)
-        .collect();
+        .map(|row| {
+            std::fs::canonicalize(&row.prefix).map_err(|source| {
+                CommandError::ReferencedSnapshotArtifact {
+                    path: row.prefix,
+                    source,
+                }
+            })
+        })
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
     let mut removed = 0;
     for entry in std::fs::read_dir(dumps_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if known.contains(&path) {
+        let retained = match std::fs::canonicalize(&path) {
+            Ok(resolved) => known.contains(&resolved),
+            // GC or an earlier orphan deletion can leave an unregistered
+            // dangling symlink. Retained references already resolved above.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => return Err(err.into()),
+        };
+        if retained {
             continue;
         }
         match delete_dump_dir(&path) {
@@ -181,6 +195,180 @@ mod tests {
 
         let removed = sweep_orphan_dumps(&mut storage, dumps_dir.path()).unwrap();
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn sweep_preserves_mixed_references_across_path_spellings() {
+        for spelling in [
+            "relative-to-absolute",
+            "absolute-to-relative",
+            "stored-dot",
+            "sweep-dot",
+        ] {
+            let db = temp_db(spelling);
+            let mut storage = Storage::open(&db.path).unwrap();
+            // Avoid changing the process-wide cwd while other tests are running.
+            let root = tempfile::tempdir_in(".").unwrap();
+            let relative = std::path::PathBuf::from(root.path().file_name().unwrap()).join("dumps");
+            std::fs::create_dir(&relative).unwrap();
+            let absolute = relative.canonicalize().unwrap();
+            let (stored_dir, sweep_dir) = match spelling {
+                "relative-to-absolute" => (relative.clone(), absolute.clone()),
+                "absolute-to-relative" => (absolute.clone(), relative),
+                "stored-dot" => (std::path::Path::new(".").join(&relative), relative),
+                "sweep-dot" => (relative.clone(), std::path::Path::new(".").join(relative)),
+                _ => unreachable!(),
+            };
+            let tracked = absolute.join("tracked");
+            create_structured_dump(&tracked);
+            storage
+                .insert_baseline_snapshot(
+                    &stored_dir.join("tracked"),
+                    crate::storage::ExecutedInputCount::ZERO,
+                )
+                .unwrap();
+            // A literal match must not hide the other row's aliased spelling.
+            let literal_match = sweep_dir.join("literal-match");
+            create_structured_dump(&literal_match);
+            storage
+                .write(|tx| {
+                    tx.execute(
+                        "INSERT INTO dumps(prefix) VALUES (?1)",
+                        [literal_match.to_str().unwrap()],
+                    )
+                })
+                .unwrap();
+            let orphan = absolute.join("orphan");
+            create_structured_dump(&orphan);
+
+            assert_eq!(
+                sweep_orphan_dumps(&mut storage, &sweep_dir).unwrap(),
+                1,
+                "{spelling}"
+            );
+
+            assert!(tracked.join("info.toml").is_file(), "{spelling}");
+            assert!(literal_match.join("info.toml").is_file(), "{spelling}");
+            assert!(!orphan.exists(), "{spelling}");
+            assert_eq!(storage.list_dump_rows().unwrap().len(), 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_preserves_symlinked_parent_and_dump_aliases() {
+        for stored_via_alias in [false, true] {
+            let db = temp_db("sweep-symlinks");
+            let mut storage = Storage::open(&db.path).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let dumps = root.path().join("dumps");
+            std::fs::create_dir(&dumps).unwrap();
+            let parent_alias = root.path().join("parent-alias");
+            std::os::unix::fs::symlink(&dumps, &parent_alias).unwrap();
+            let tracked = dumps.join("tracked");
+            create_structured_dump(&tracked);
+            let dump_alias = dumps.join("dump-alias");
+            std::os::unix::fs::symlink(&tracked, &dump_alias).unwrap();
+            let stored = if stored_via_alias {
+                parent_alias.join("dump-alias")
+            } else {
+                tracked.clone()
+            };
+            storage
+                .insert_baseline_snapshot(&stored, crate::storage::ExecutedInputCount::ZERO)
+                .unwrap();
+            let orphan = dumps.join("orphan");
+            create_structured_dump(&orphan);
+            let sweep_dir = if stored_via_alias {
+                &dumps
+            } else {
+                &parent_alias
+            };
+
+            assert_eq!(sweep_orphan_dumps(&mut storage, sweep_dir).unwrap(), 1);
+
+            assert!(tracked.join("info.toml").is_file());
+            assert!(dump_alias.join("info.toml").is_file());
+            assert!(stored.join("info.toml").is_file());
+            assert!(!orphan.exists());
+        }
+    }
+
+    #[test]
+    fn sweep_resolves_every_reference_before_deleting_any_artifact() {
+        let db = temp_db("sweep-unresolved-reference");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let dumps = tempfile::tempdir().unwrap();
+        let tracked = dumps.path().join("tracked");
+        create_structured_dump(&tracked);
+        storage
+            .insert_baseline_snapshot(
+                &dumps.path().join(".").join("tracked"),
+                crate::storage::ExecutedInputCount::ZERO,
+            )
+            .unwrap();
+        let missing = dumps.path().join("missing");
+        storage
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO dumps(prefix) VALUES (?1)",
+                    [missing.to_str().unwrap()],
+                )
+            })
+            .unwrap();
+        let orphan = dumps.path().join("orphan");
+        create_structured_dump(&orphan);
+
+        let error = sweep_orphan_dumps(&mut storage, dumps.path()).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            CommandError::ReferencedSnapshotArtifact { path, source }
+                if path == &missing && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert_eq!(error.exit_code(), crate::commands::error::EXIT_TERMINAL);
+        assert!(tracked.join("info.toml").is_file());
+        assert!(
+            orphan.join("info.toml").is_file(),
+            "resolution precedes deletion"
+        );
+        assert_eq!(storage.list_dump_rows().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_orphan_symlinks_without_following_them() {
+        let db = temp_db("sweep-orphan-symlinks");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir(&dumps).unwrap();
+        let tracked = dumps.join("tracked");
+        create_structured_dump(&tracked);
+        storage
+            .insert_baseline_snapshot(&tracked, crate::storage::ExecutedInputCount::ZERO)
+            .unwrap();
+        let outside = root.path().join("outside");
+        create_structured_dump(&outside);
+        let orphan = dumps.join("orphan");
+        create_structured_dump(&orphan);
+        for (name, target) in [
+            ("orphan-alias", orphan),
+            ("dangling", root.path().join("missing")),
+            ("outside-alias", outside.clone()),
+        ] {
+            std::os::unix::fs::symlink(target, dumps.join(name)).unwrap();
+        }
+
+        assert_eq!(sweep_orphan_dumps(&mut storage, &dumps).unwrap(), 4);
+        assert!(tracked.join("info.toml").is_file());
+        assert!(outside.join("info.toml").is_file());
+        let remaining: Vec<_> = std::fs::read_dir(&dumps)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining, vec![std::ffi::OsString::from("tracked")]);
+        assert_eq!(storage.list_dump_rows().unwrap().len(), 1);
     }
 
     #[test]
