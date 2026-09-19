@@ -135,10 +135,13 @@ of all checkpoint resources. Filesystem deletion failure leaves a harmless
 orphan for the startup sweep. The reverse ordering would leave a durable row pointing at missing
 state and is forbidden. Startup clears leases left by the dead process,
 checks the rollback checkpoint's `info.toml` and format version, collects obsolete
-rows, and sweeps orphan directories before workers start. The sweep resolves
-every retained artifact path before deleting orphans and compares resolved paths
-so alternate spellings and symlinks preserve the same artifact. Application
-restoration runs afterward in the launched inclusion lane, before processing new
-user ops; the metadata check does not validate the application bytes. Missing or
-corrupt referenced artifacts fail loud when read or restored; operational
-filesystem errors retain their normal error classification.
+rows, and sweeps orphan directories before workers start. On supported Linux and
+macOS hosts, the sweep reads every retained artifact's filesystem object identity
+(device and inode) before deleting any orphans. Comparing those identities
+preserves alternate spellings, symlinks, and mount aliases of the same artifact.
+Retained identity lookup failures stop the sweep before deletion: missing
+references or structural I/O errors are terminal; operational I/O errors retain
+their normal classification. Application restoration runs afterward in the launched inclusion
+lane, before processing new user ops; the metadata check does not validate the
+application bytes. Missing or corrupt referenced artifacts also fail loud when
+read or restored.

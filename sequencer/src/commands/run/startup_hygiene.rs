@@ -4,6 +4,8 @@
 //! Startup clears stale leases, checks rollback checkpoint metadata, then collects
 //! obsolete snapshots and orphan directories before workers are admitted.
 
+use std::os::unix::fs::MetadataExt;
+
 use crate::commands::error::CommandError;
 use crate::ingress::inclusion_lane::dump_info::{self, delete_dump_dir};
 
@@ -61,7 +63,7 @@ fn snapshot_gc_at_startup(storage: &mut crate::storage::Storage) -> Result<usize
 /// - **crash-during-GC**: SQLite row was deleted but the filesystem
 ///   delete either wasn't reached or failed.
 ///
-/// Filesystem-only — no SQLite writes here. Resolve all retained paths before
+/// Filesystem-only — no SQLite writes here. Read all retained identities before
 /// deleting anything: setup and run may spell the same directory differently.
 /// Resolution failures stop the sweep; deletion failures log and retry next
 /// startup. The baseline is already registered when this runs.
@@ -73,11 +75,9 @@ fn sweep_orphan_dumps(
         .list_dump_rows()?
         .into_iter()
         .map(|row| {
-            std::fs::canonicalize(&row.prefix).map_err(|source| {
-                CommandError::ReferencedSnapshotArtifact {
-                    path: row.prefix,
-                    source,
-                }
+            dump_identity(&row.prefix).map_err(|source| CommandError::ReferencedSnapshotArtifact {
+                path: row.prefix,
+                source,
             })
         })
         .collect::<Result<std::collections::HashSet<_>, _>>()?;
@@ -85,8 +85,8 @@ fn sweep_orphan_dumps(
     for entry in std::fs::read_dir(dumps_dir)? {
         let entry = entry?;
         let path = entry.path();
-        let retained = match std::fs::canonicalize(&path) {
-            Ok(resolved) => known.contains(&resolved),
+        let retained = match dump_identity(&path) {
+            Ok(identity) => known.contains(&identity),
             // GC or an earlier orphan deletion can leave an unregistered
             // dangling symlink. Retained references already resolved above.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
@@ -107,6 +107,12 @@ fn sweep_orphan_dumps(
         }
     }
     Ok(removed)
+}
+
+fn dump_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+    // Canonical paths can still differ across mount aliases and macOS firmlinks.
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(test)]
@@ -292,6 +298,61 @@ mod tests {
             assert!(stored.join("info.toml").is_file());
             assert!(!orphan.exists());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_preserves_mixed_firmlink_and_literal_references() {
+        let db = temp_db("sweep-firmlink-alias");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let dumps = root.path().join("dumps");
+        std::fs::create_dir(&dumps).unwrap();
+        let alias =
+            std::path::Path::new("/System/Volumes/Data").join(dumps.strip_prefix("/").unwrap());
+        let tracked = dumps.join("tracked");
+        create_structured_dump(&tracked);
+        storage
+            .insert_baseline_snapshot(&tracked, crate::storage::ExecutedInputCount::ZERO)
+            .unwrap();
+
+        // This alias survives realpath resolution, unlike an ordinary symlink.
+        let listed = alias.join("tracked");
+        assert_ne!(
+            tracked.canonicalize().unwrap(),
+            listed.canonicalize().unwrap()
+        );
+        let stored_metadata = std::fs::metadata(&tracked).unwrap();
+        let listed_metadata = std::fs::metadata(&listed).unwrap();
+        assert_eq!(
+            (stored_metadata.dev(), stored_metadata.ino()),
+            (listed_metadata.dev(), listed_metadata.ino())
+        );
+
+        // The sets overlap literally, so a global disjoint-set guard is insufficient.
+        let literal_match = alias.join("literal-match");
+        create_structured_dump(&literal_match);
+        storage
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO dumps(prefix) VALUES (?1)",
+                    [literal_match.to_str().unwrap()],
+                )
+            })
+            .unwrap();
+        let orphan = dumps.join("orphan");
+        create_structured_dump(&orphan);
+
+        let removed = sweep_orphan_dumps(&mut storage, &alias).unwrap();
+
+        assert!(
+            tracked.join("info.toml").is_file(),
+            "the referenced artifact must survive its mount alias"
+        );
+        assert!(literal_match.join("info.toml").is_file());
+        assert!(!orphan.exists());
+        assert_eq!(removed, 1);
+        assert_eq!(storage.list_dump_rows().unwrap().len(), 2);
     }
 
     #[test]
