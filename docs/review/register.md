@@ -60,6 +60,18 @@ exposure in an actual deployment was established by this review.
   descriptor/process ownership before changing the assertion or lock behavior.
   Reproduced during the 2026-09-18 stack closeout; isolated and full serial
   runs passed. See the [current validation record](2026-09-18-stack-review-validation.md).
+- **Intermittent C-host recovery WebSocket reset.** At `dc4dd78` on
+  2026-09-19, `c_host_recovery_after_stale_batches_test` failed an expected
+  message receive with `Connection reset without closing handshake` in the
+  [push run](https://github.com/cartesi/sequencer/actions/runs/35456024614/job/105931662252).
+  The [PR run](https://github.com/cartesi/sequencer/actions/runs/35456514750/job/105934071941)
+  passed all 49 scenarios on the same source tree. The failed run retained no
+  child-process log artifact, so the reset's cause is unclassified. CI now
+  uploads `tests/e2e/results/*.log` on failure. On recurrence, use those logs
+  to identify the server's last events and the failing receive before changing
+  timeouts, teardown, or retry behavior. Evidence: the
+  [recovery scenario](../../tests/e2e/src/test_cases.rs) and
+  [WS receive helper](../../tests/harness/src/ws.rs).
 - **Transient SQLite contention stops the submitter.** Read handles use a
   50 ms busy timeout; a storage/open failure escapes the submitter loop.
   BUSY/LOCKED are nonterminal but project to unclassified exit 1, causing
