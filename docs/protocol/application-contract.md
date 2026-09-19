@@ -193,3 +193,30 @@ implementation. `CanonicalState::canonical_snapshot_bytes` is a separate
 inspection trait required by the shared Rust scheduler's inspection method and
 canonical harness, not by the native sequencer. Human-readable debugging state
 also stays on the concrete application.
+
+### 7. Canonical recovery integration
+
+Every supported production application must provide a reproducible mapping from
+a trusted canonical machine checkpoint and pinned deployment configuration to
+its native recovery artifact. All logical state needed for future application
+execution, including progress, must be recoverable this way. Native caches and
+backing resources may be reconstructed; indispensable mutable application state
+cannot exist only in the sequencer's local storage.
+
+For the native DEX integration, the native application state is the designated
+canonical machine drive/memory region. The integration must pin its location,
+layout, and extraction procedure for each supported image. Other applications
+may require a different mapping. The recovery bundle also needs the exact L1
+boundary and next scheduler nonce, obtained from trusted canonical execution;
+these are separate from merely extracting application bytes.
+
+Each integration supplies a versioned export command and operator procedure,
+and demonstrates recovery from a non-genesis canonical checkpoint before
+production use. The [recovery readiness requirements](../recovery/cockroach.md#recovery-readiness-before-deployment)
+own the procedure and drill. This is an integration/release requirement, not a
+claim that the private engine or current tooling has passed it.
+
+Canonical extraction belongs to application-specific recovery tooling. The
+runtime `Application` trait stays independent of machine image layouts and host
+export tooling; requiring a method to compile would establish its availability,
+not the correctness or operational readiness of the recovery path.

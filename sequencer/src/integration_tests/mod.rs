@@ -5,5 +5,6 @@ mod batch_submitter;
 mod chain_id_validation;
 mod common;
 mod e2e_sequencer;
+mod historical_bootstrap;
 mod snapshot_endpoints;
 mod ws_broadcaster;

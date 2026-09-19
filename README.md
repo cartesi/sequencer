@@ -254,6 +254,133 @@ Message shapes:
 { "kind": "direct_input", "offset": 11, "sender": "0x...", "block_number": 123, "block_timestamp": 1700000000, "transaction_hash": "0x...", "payload": "0x...", "input_index": 42, "batch_nonce": 4 }
 ```
 
+### History metadata and historical L1 inputs (internal only)
+
+Readers that maintain additional transfer/order history can reconstruct it from
+L1 and then join the application feed. The
+[projection replay contract](docs/protocol/projection-replay.md) describes
+bootstrap, client checkpoints, pending directs, and terminal drain.
+
+`GET /history` returns one coherent view of the deployment, current application
+history, immutable era baseline, and latest accepted checkpoint. Optional
+`era_id=<uuid>` requires the selected era; a mismatch returns `409 ERA_CHANGED`.
+Example immediately after a rebuild:
+
+```json
+{
+  "deployment": {
+    "chain_id": 31337,
+    "app_address": "0x1111111111111111111111111111111111111111",
+    "input_box_address": "0x2222222222222222222222222222222222222222",
+    "app_deployment_block": 1,
+    "batch_submitter_address": "0x3333333333333333333333333333333333333333"
+  },
+  "history": {
+    "version": {
+      "era_id": "22222222-2222-4222-8222-222222222222",
+      "recovery_generation": 0
+    },
+    "available_from": 7,
+    "head": 7
+  },
+  "baseline": {
+    "l1_stop_block": 1240,
+    "l1_end_input_index": 8,
+    "next_batch_nonce": 2
+  },
+  "accepted_checkpoint": null,
+  "compatibility": null
+}
+```
+
+- `history.available_from` is baseline application count `K`; entries `[K,head)`
+  are available through WS. Counts include all executed application inputs.
+- `baseline` describes the fixed L1 stopping block `C`, exclusive InputBox end
+  `R`, and scheduler nonce after recovery's terminal drain. It survives generation
+  changes and baseline artifact GC. It is distinct from the moving safe head.
+- `accepted_checkpoint`, when available, has `inclusion_block`,
+  `executed_input_count`, and `next_batch_nonce`, under `history.version`.
+  Genesis supplies the zero checkpoint; a rebuilt baseline is not itself an
+  accepted checkpoint. The metadata does not lease or download a native artifact
+  and does not certify a client projection. A known divergence returns `503`.
+- `compatibility` is `null` unless `from_generation=<u64>` is supplied together
+  with `era_id`. It then contains `from_generation` and `preserved_input_count`:
+  the prefix that survived every standard recovery since that generation,
+  bounded by the current head. A future generation or missing era returns
+  `400 BAD_REQUEST`; an era mismatch takes precedence over the generation bound.
+
+For example, `GET /history?era_id=<uuid>&from_generation=0` can return
+`"compatibility": {"from_generation": 0, "preserved_input_count": 3}`.
+A saved checkpoint from that era/generation is reusable when its count `X`
+satisfies `K <= X <= 3`. The boundary is inclusive: the checkpoint has executed
+entries before `X`, and resumes at entry `X`. Each checkpoint must be checked
+using its own saved generation. With no intervening recovery, the bound is the
+current head. The [history contract](docs/protocol/application-history.md#checkpoint-compatibility-after-standard-recovery)
+defines the calculation and trust boundary.
+
+Restore an eligible checkpoint, persist the response's current history version
+with it, and subscribe using that version and its actual count. A recovery
+between lookup and subscription still returns `STALE_GENERATION`; repeat the
+lookup using the version associated with the restored state. Compatibility does
+not certify the client's application or projection implementation, and cannot
+cross a cockroach recovery's new era.
+
+`GET /historical-l1-inputs` requires `era_id` and exactly one starting selector:
+
+- `next_input_index=<u64>`: inclusive per-application InputBox index, starting at 0.
+- `after_block=<u64>`: initially seek to the first input strictly after that block;
+  continue using the returned `next_input_index`.
+
+The endpoint serves only `[0,R)` through the selected era's `C`. A response to
+`next_input_index=5&limit=1` can be:
+
+```json
+{
+  "era_id": "22222222-2222-4222-8222-222222222222",
+  "l1_stop_block": 1240,
+  "end_input_index": 8,
+  "next_input_index": 6,
+  "items": [{
+    "input_index": 5,
+    "sender": "0x3333333333333333333333333333333333333333",
+    "payload": "0x00",
+    "block_number": 1230,
+    "block_timestamp": 1700014760,
+    "transaction_hash": "0x4444444444444444444444444444444444444444444444444444444444444444"
+  }]
+}
+```
+
+Records preserve original inner payloads and authenticated senders, including
+malformed/rejected batches; they are not complete `EvmAdvance` envelopes. Indices
+are contiguous and ordered. Binary values are hex; timestamps are Unix seconds.
+Clients must preserve integer precision. A page may split a block.
+
+Optional `limit` defaults to 256 and accepts 1–256. Pages target 1 MiB of raw
+payloads; a larger first input is returned alone, intact. Hex encoding increases
+wire size, so this is not a hard response-size limit. Eight historical responses
+can be in flight; a permit remains held through body delivery or cancellation.
+SQLite read transactions end before network delivery. These limits bound memory
+by the page target or largest single input, not total history length.
+
+Only `next_input_index == end_input_index` means EOF; a short page does not.
+Requesting `next_input_index=R` or `after_block=C` returns an empty completed page.
+Generation changes do not invalidate historical pages; an era change does.
+
+Malformed/unknown query fields, invalid selectors/limits, or positions above
+`R`/`C` return the existing `400 BAD_REQUEST` JSON shape. An era mismatch returns
+the existing `409 ERA_CHANGED` history-policy body before semantic position
+checks. Capacity exhaustion returns `429 OVERLOADED`; shutdown or an operational
+read failure returns `503 UNAVAILABLE`. Interrupted bodies are failed pages.
+Missing durable rows or other storage invariant failures follow the process's
+terminal fault policy, never a successful partial page.
+
+The Rust SDK exposes `history(expected_era, from_generation)` and
+`historical_l1_inputs(era, start, limit)` with typed metadata and era refusals.
+Both use the configured request deadline, including body transfer; callers may
+increase it for large historical inputs. The client owns replay, persistence,
+checkpoint selection, and subscription.
+
 ### Operator snapshot endpoints (internal only)
 
 These serve application state to the operator's watchdog and indexers.

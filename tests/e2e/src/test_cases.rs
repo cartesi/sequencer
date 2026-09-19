@@ -11,9 +11,10 @@ use rollups_harness::{
     WsClient, sign_user_op_hex,
 };
 use sequencer_core::api::{TxRequest, WsTxMessage};
+use sequencer_core::application::Application;
 use sequencer_core::fee::fee_to_linear;
 use sequencer_core::user_op::UserOp;
-use sequencer_rust_client::SequencerClient;
+use sequencer_rust_client::{HistoryPolicyError, SequencerClient, SubscribeError};
 
 const NO_WS_MESSAGE_WAIT: Duration = Duration::from_secs(1);
 
@@ -153,6 +154,22 @@ struct ExpectedWalletState {
 pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
     vec![
         (
+            "c_host_cold_replica_snapshot_backlog_live_recovery_test",
+            |runtime| Box::pin(crate::cold_replica::run_c(runtime)),
+        ),
+        ("c_host_setup_recovery_round_trip_test", |runtime| {
+            Box::pin(run_setup_recovery_round_trip_test::<c_app_engine::EngineApp>(runtime))
+        }),
+        ("c_host_deposit_transfer_withdrawal_test", |runtime| {
+            Box::pin(run_deposit_transfer_withdrawal_test(runtime))
+        }),
+        ("c_host_recovery_after_stale_batches_test", |runtime| {
+            Box::pin(run_recovery_after_stale_batches_test(runtime))
+        }),
+        ("c_host_restart_and_replay_test", |runtime| {
+            Box::pin(run_restart_and_replay_test(runtime))
+        }),
+        (
             "cold_replica_snapshot_backlog_live_recovery_test",
             |runtime| Box::pin(crate::cold_replica::run(runtime)),
         ),
@@ -197,7 +214,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
         }),
         ("setup_recovery_round_trip_test", |runtime| {
-            Box::pin(run_setup_recovery_round_trip_test(runtime))
+            Box::pin(run_setup_recovery_round_trip_test::<
+                app_core::application::WalletApp,
+            >(runtime))
         }),
         ("sequencer_outage_pre_danger_no_recovery_test", |runtime| {
             Box::pin(run_sequencer_outage_pre_danger_no_recovery_test(runtime))
@@ -878,6 +897,33 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
         replay_before_restart.last_executed_safe_block(),
         "mirror safe-block clock must match the pre-restart live replay clock",
     );
+
+    // Reading the persisted feed alone does not prove the restarted engine
+    // restored its balances and nonce. Require a fresh execution at nonce 1.
+    let mut resumed_alice = runtime.wallet_l2(alice)?;
+    resumed_alice.set_next_nonce(1);
+    resumed_alice.transfer(bob_address, U256::from(1)).await?;
+    let resumed = ws_after_restart.expect_user_op_from(alice_address).await?;
+    replay_after_restart.apply(resumed.clone())?;
+    replay_before_restart.apply(resumed)?;
+    assert_eq!(
+        replay_after_restart.canonical_snapshot_bytes()?,
+        replay_before_restart.canonical_snapshot_bytes()?
+    );
+    assert_wallet_state(
+        &replay_after_restart,
+        ExpectedWalletState {
+            address: alice_address,
+            balance: expected_alice - U256::from(1) - gas,
+            nonce: 2,
+        },
+        ExpectedWalletState {
+            address: bob_address,
+            balance: expected_bob + U256::from(1),
+            nonce: 1,
+        },
+        4,
+    );
     Ok(())
 }
 
@@ -1368,7 +1414,9 @@ async fn drive_promotion_and_capture(
     runtime.capture_finalized_checkpoint().await
 }
 
-async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
+async fn run_setup_recovery_round_trip_test<A: Application>(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
     runtime.set_max_batch_open_seconds(Some(5));
     runtime.restart().await?;
 
@@ -1399,6 +1447,10 @@ async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> S
     // Drive the batch to seal + be accepted + promoted, and capture the
     // resulting finalized snapshot as the recovery checkpoint.
     let checkpoint = drive_promotion_and_capture(runtime).await?;
+    let old_claim = SequencerClient::new(runtime.endpoint())?
+        .latest_snapshot()
+        .await?
+        .claim;
     eprintln!(
         "recovery checkpoint: B={} N={}",
         checkpoint.checkpoint_block, checkpoint.resume_nonce
@@ -1417,19 +1469,33 @@ async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> S
     runtime.set_mine_l1_during_boot(true);
     runtime.respawn().await?;
 
-    // Recovery booted (the respawn above succeeded — `setup --recovery` rebuilt
-    // the DB and `run` started clean). Now prove the fold preserved Alice's
-    // logical state: a transfer at her *continuing* nonce (1) is accepted. The
-    // sequencer validates it against the recovered state S' — a lost nonce would
-    // be rejected (wrong nonce), a lost balance rejected (insufficient funds).
-    // So acceptance is the end-to-end proof that the checkpoint's balances +
-    // nonces were folded into the rebuilt DB. (The local `replay` can't verify
-    // S' directly — the wiped pre-recovery transfer isn't re-fed — so the
-    // sequencer's own acceptance is the authority here.)
+    // A rebuilt database cannot authorize the old replica, even when its
+    // numerical generation/count match. Restore and subscribe in the new era.
+    let client = SequencerClient::new(runtime.endpoint())?;
+    assert!(matches!(
+        client.subscribe(old_claim).await,
+        Err(SubscribeError::History(
+            HistoryPolicyError::EraChanged { .. }
+        ))
+    ));
+    let (mut restored, fresh_claim) =
+        crate::cold_replica::restore::<A>(client.latest_snapshot().await?).await?;
+    assert_ne!(fresh_claim.version.era_id, old_claim.version.era_id);
+    assert_eq!(fresh_claim.version.recovery_generation.get(), 0);
+    assert!(fresh_claim.next_input.get() > 0);
+    crate::cold_replica::assert_same_state(&mut restored, &replay)?;
+    let mut resumed_ws = WsClient::connect(&client, fresh_claim).await?;
+
+    // A continuing nonce exercises the recovered host's state as well as the
+    // independently restored replica and the retained reference history.
     let mut alice_l2_after = runtime.wallet_l2(alice)?;
     alice_l2_after.set_next_nonce(1);
     let post_transfer = U256::from(70_000_u64);
     alice_l2_after.transfer(bob_address, post_transfer).await?;
+    let message = resumed_ws.expect_user_op_from(alice_address).await?;
+    rollups_harness::replay::apply_ws_message(&mut restored, message.clone())?;
+    replay.apply(message)?;
+    crate::cold_replica::assert_same_state(&mut restored, &replay)?;
 
     // Explicit recovery-correctness assertions, beyond the structural
     // `assert_schema_invariants` (which checks `0..`-from-anchor contiguity):
@@ -1458,8 +1524,7 @@ async fn run_setup_recovery_round_trip_test(runtime: &mut ManagedSequencer) -> S
     // from genesis — the pre-wipe batches (nonce < N') plus the post-recovery
     // batches at the resume nonce N' — so agreement proves the fold-rebuilt state
     // S' and the resumed submission both land exactly on the canonical chain
-    // state. The local `replay` can't check this (the wiped history is never
-    // re-fed), so the watchdog's independent CM is the authority.
+    // state. This checks native execution against the independent CM target.
     let floor_inclusion_block = runtime.finalized_inclusion_block().await?.unwrap_or(0);
     let batches_before = runtime.count_batches()?;
     for _ in 0..TRANSFERS_TO_FORCE_BATCH_CLOSE {

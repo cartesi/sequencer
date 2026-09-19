@@ -45,6 +45,9 @@ pub const DEFAULT_TEST_LOGS_DIR: &str = "tests/e2e/results";
 #[derive(Debug, Clone)]
 pub struct ManagedSequencerConfig {
     pub sequencer_bin: PathBuf,
+    /// Optional genesis tool invoked as `<binary> <absent-prefix> devnet` for
+    /// initial setup. Its output is deleted before `run` and never regenerated.
+    pub genesis_bin: Option<PathBuf>,
     pub log_prefix: String,
     pub logs_dir: PathBuf,
     /// When false, the child runs without libfaketime (for tests that never
@@ -178,10 +181,19 @@ pub struct ManagedSequencer {
 pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> ManagedSequencerConfig {
     ManagedSequencerConfig {
         sequencer_bin: paths::resolve_devnet_sequencer_bin(),
+        genesis_bin: None,
         log_prefix: log_prefix.into(),
         logs_dir: PathBuf::from(DEFAULT_TEST_LOGS_DIR),
         faketime: true,
         fee_oracle_fixed_log_gas_price: None,
+    }
+}
+
+pub fn default_c_wallet_sequencer_config(log_prefix: impl Into<String>) -> ManagedSequencerConfig {
+    ManagedSequencerConfig {
+        sequencer_bin: paths::resolve_c_wallet_sequencer_bin(),
+        genesis_bin: Some(paths::resolve_c_wallet_genesis_bin()),
+        ..default_devnet_sequencer_config(log_prefix)
     }
 }
 
@@ -203,6 +215,10 @@ impl ManagedSequencer {
         } else {
             paths::resolve_from_workspace(&config.sequencer_bin)
         };
+        let genesis_bin = config
+            .genesis_bin
+            .as_ref()
+            .map(paths::resolve_from_workspace);
         let log_prefix = config.log_prefix;
         let rollups = DevnetRollupsStack::spawn(log_prefix.as_str(), logs_dir.as_path()).await?;
 
@@ -243,6 +259,7 @@ impl ManagedSequencer {
             // Default batch-open deadline on first boot.
             None,
             config.fee_oracle_fixed_log_gas_price,
+            genesis_bin.as_deref(),
         )
         .await?;
 
@@ -1102,6 +1119,7 @@ impl ManagedSequencer {
             self.recovery_setup.as_ref(),
             self.max_batch_open_seconds,
             self.fee_oracle_fixed_log_gas_price,
+            None,
         )
         .await?;
         self.child = child;
@@ -1249,6 +1267,7 @@ async fn spawn_sequencer_process(
     recovery: Option<&RecoverySetupParams>,
     max_batch_open_seconds: Option<u64>,
     fee_oracle_fixed_log_gas_price: Option<u16>,
+    genesis_bin: Option<&Path>,
 ) -> HarnessResult<SpawnedSequencerProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;
     let log_path = timestamped_log_path(logs_dir, log_prefix);
@@ -1287,6 +1306,41 @@ async fn spawn_sequencer_process(
     let chain_id = chain_id_override.unwrap_or(DEVNET_CHAIN_ID);
     let bin = path_as_str(sequencer_bin)?.to_owned();
 
+    let genesis_dir = if let Some(genesis_bin) = genesis_bin {
+        let dir = TempDir::new()?;
+        let mut command = Command::new(genesis_bin);
+        command
+            .kill_on_drop(true)
+            .arg(dir.path().join("state"))
+            .arg("devnet");
+        let output = tokio::time::timeout(DEFAULT_SEQUENCER_START_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                io_other(format!(
+                    "genesis tool '{}' timed out",
+                    genesis_bin.display()
+                ))
+            })?
+            .map_err(|err| {
+                io_other(format!(
+                    "failed to run genesis tool '{}': {err}",
+                    genesis_bin.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(io_other(format!(
+                "genesis tool '{}' failed: status={}: {}",
+                genesis_bin.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Some(dir)
+    } else {
+        None
+    };
+
     // libfaketime is applied via env vars (not the `faketime` wrapper binary),
     // which the file-based FAKETIME_TIMESTAMP_FILE mechanism reads on every
     // time call (FAKETIME_NO_CACHE=1) so tests can shift the clock at runtime.
@@ -1305,6 +1359,10 @@ async fn spawn_sequencer_process(
     // (e.g. a chain-id mismatch) surfaces here as a non-zero exit, just as it
     // surfaced from the monolithic boot before the split.
     let mut setup_cmd = Command::new(&bin);
+    setup_cmd.env_remove("CARTESI_SEQUENCER_STATE_FILE");
+    if let Some(dir) = &genesis_dir {
+        setup_cmd.arg("--state-file").arg(dir.path().join("state"));
+    }
     if let (Some(lib), Some(rc)) = (libfaketime_path, faketime_rc_path) {
         apply_faketime_env(&mut setup_cmd, lib, rc)?;
     }
@@ -1396,10 +1454,16 @@ async fn spawn_sequencer_process(
         ))
         .into());
     }
+    if let Some(dir) = genesis_dir {
+        // Neither startup nor later recovery may depend on the original source.
+        dir.close()
+            .map_err(|err| io_other(format!("remove initial genesis after setup: {err}")))?;
+    }
 
     // Phase B — `run` (re-spawned on every restart; reads identity from the
     // setup DB).
     let mut run_cmd = Command::new(&bin);
+    run_cmd.env_remove("CARTESI_SEQUENCER_STATE_FILE");
     if let (Some(lib), Some(rc)) = (libfaketime_path, faketime_rc_path) {
         apply_faketime_env(&mut run_cmd, lib, rc)?;
     }

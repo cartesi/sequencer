@@ -7,8 +7,11 @@
 use std::time::Duration;
 
 use alloy_primitives::U256;
+use app_core::application::WalletApp;
+use rollups_harness::replay::apply_ws_message;
 use rollups_harness::{ManagedSequencer, ReplayWalletApp, TestSigner, WsClient};
 use sequencer_core::api::WsTxMessage;
+use sequencer_core::application::Application;
 use sequencer_rust_client::{
     HistoryClaim, HistoryPolicyError, SequencerClient, SnapshotResponse, SubscribeError,
 };
@@ -17,12 +20,20 @@ use crate::ScenarioResult;
 use crate::test_cases::advance_live_frame_until_covers;
 
 pub(crate) async fn run(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
-    tokio::time::timeout(Duration::from_secs(120), run_scenario(runtime))
+    run_with::<WalletApp>(runtime).await
+}
+
+pub(crate) async fn run_c(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
+    run_with::<c_app_engine::EngineApp>(runtime).await
+}
+
+async fn run_with<A: Application>(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
+    tokio::time::timeout(Duration::from_secs(120), run_scenario::<A>(runtime))
         .await
         .map_err(|_| "cold replica scenario exceeded its 120-second deadline")?
 }
 
-async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
+async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
     let client = SequencerClient::new(runtime.endpoint())?;
     let genesis = client.latest_snapshot().await?;
     assert_eq!(genesis.claim.next_input.get(), 0);
@@ -61,11 +72,11 @@ async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
     // after snapshot selection and before archive restoration or subscription.
     alice_l2.transfer(bob_address, U256::from(1_000)).await?;
     record(&mut reference_ws, &mut reference, &mut history).await?;
-    let (mut replica, downloaded_claim) = restore(snapshot).await?;
+    let (mut replica, downloaded_claim) = restore::<A>(snapshot).await?;
     assert_eq!(downloaded_claim, original_claim);
     let snapshot_reference = replay_prefix(&history, snapshot_count)?;
-    assert_same_state(&replica, &snapshot_reference)?;
-    assert!(replica.executed_input_count() < reference.executed_input_count());
+    assert_same_state(&mut replica, &snapshot_reference)?;
+    assert!(replica.executed_input_count().get() < reference.executed_input_count());
 
     let backlog_deposit = alice_l1
         .mint_and_deposit_supported_token(U256::from(70_000))
@@ -92,8 +103,8 @@ async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
         ScenarioResult::Ok(())
     };
     let consumer = async {
-        replica.apply(replica_ws.next_message().await?)?;
-        assert!(replica.executed_input_count() < backlog_head);
+        apply_ws_message(&mut replica, replica_ws.next_message().await?)?;
+        assert!(replica.executed_input_count().get() < backlog_head);
         first_replayed
             .send(())
             .map_err(|_| "producer dropped the replay barrier")?;
@@ -101,7 +112,7 @@ async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
         consume_until(&mut replica_ws, &mut replica, catch_up_target).await
     };
     futures::try_join!(producer, consumer)?;
-    assert_same_state(&replica, &reference)?;
+    assert_same_state(&mut replica, &reference)?;
     replica_ws
         .expect_no_message_for(Duration::from_millis(100))
         .await?;
@@ -121,15 +132,47 @@ async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
         reference.executed_input_count(),
     )
     .await?;
-    assert_same_state(&replica, &reference)?;
+    assert_same_state(&mut replica, &reference)?;
     assert!(replica.last_executed_safe_block() > clock_before_live);
     assert_eq!(
-        replica.current_user_balance(bob_address),
+        reference.current_user_balance(bob_address),
         U256::from(15_000)
     );
 
+    // Preserve the replica's claim across a clean restart, then make the
+    // restarted host execute against its restored nonempty snapshot and suffix.
+    let restart_claim = HistoryClaim {
+        next_input: replica.executed_input_count(),
+        ..downloaded_claim
+    };
+    drop(replica_ws);
+    drop(reference_ws);
+    runtime.stop().await?;
+    runtime.respawn().await?;
+    let client = SequencerClient::new(runtime.endpoint())?;
+    let mut replica_ws = WsClient::connect(&client, restart_claim).await?;
+    let mut reference_ws = WsClient::connect(&client, restart_claim).await?;
+    replica_ws
+        .expect_no_message_for(Duration::from_millis(100))
+        .await?;
+    let mut alice_l2 = runtime.wallet_l2(TestSigner::from_default(1)?)?;
+    alice_l2.set_next_nonce(reference.current_user_nonce(alice_address));
+    alice_l2.transfer(bob_address, U256::from(6_000)).await?;
+    record(&mut reference_ws, &mut reference, &mut history).await?;
+    consume_until(
+        &mut replica_ws,
+        &mut replica,
+        reference.executed_input_count(),
+    )
+    .await?;
+    assert_same_state(&mut replica, &reference)?;
+    assert_eq!(
+        reference.current_user_balance(bob_address),
+        U256::from(21_000)
+    );
+
     let stale_claim = HistoryClaim {
-        next_input: sequencer_rust_client::ExecutedInputCount::new(replica.executed_input_count()),
+        next_input: replica.executed_input_count(),
         ..downloaded_claim
     };
     drop(replica_ws);
@@ -151,7 +194,7 @@ async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
             HistoryPolicyError::StaleGeneration { .. }
         ))
     ));
-    let (mut recovered, fresh_claim) = restore(client.latest_snapshot().await?).await?;
+    let (mut recovered, fresh_claim) = restore::<A>(client.latest_snapshot().await?).await?;
     assert_eq!(fresh_claim.version.era_id, original_claim.version.era_id);
     assert_eq!(
         fresh_claim.version.recovery_generation.get(),
@@ -162,7 +205,7 @@ async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
     // Reconstruct the expected replacement branch independently: the accepted
     // prefix survives, optimistic user ops disappear, and L1 directs replay.
     let mut recovered_reference = replay_prefix(&history, snapshot_count)?;
-    assert_same_state(&recovered, &recovered_reference)?;
+    assert_same_state(&mut recovered, &recovered_reference)?;
     for message in &history[snapshot_count as usize..] {
         if let WsTxMessage::DirectInput { .. } = message {
             let mut direct = message.clone();
@@ -179,19 +222,22 @@ async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
         recovered_reference.executed_input_count(),
     )
     .await?;
-    assert_same_state(&recovered, &recovered_reference)?;
-    assert_eq!(recovered.current_user_balance(bob_address), U256::ZERO);
-    assert!(recovered.executed_input_count() < replica.executed_input_count());
+    assert_same_state(&mut recovered, &recovered_reference)?;
+    assert_eq!(
+        recovered_reference.current_user_balance(bob_address),
+        U256::ZERO
+    );
+    assert!(recovered.executed_input_count().get() < replica.executed_input_count().get());
 
     let mut alice_l2 = runtime.wallet_l2(TestSigner::from_default(1)?)?;
     alice_l2.set_next_nonce(recovered_reference.current_user_nonce(alice_address));
     alice_l2.transfer(bob_address, U256::from(6_000)).await?;
     let resumed = recovered_ws.expect_user_op_from(alice_address).await?;
-    recovered.apply(resumed.clone())?;
+    apply_ws_message(&mut recovered, resumed.clone())?;
     recovered_reference.apply(resumed)?;
-    assert_same_state(&recovered, &recovered_reference)?;
+    assert_same_state(&mut recovered, &recovered_reference)?;
     assert_eq!(
-        recovered.current_user_balance(bob_address),
+        recovered_reference.current_user_balance(bob_address),
         U256::from(6_000)
     );
     recovered_ws
@@ -200,7 +246,9 @@ async fn run_scenario(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
     Ok(())
 }
 
-async fn restore(snapshot: SnapshotResponse) -> ScenarioResult<(ReplayWalletApp, HistoryClaim)> {
+pub(crate) async fn restore<A: Application>(
+    snapshot: SnapshotResponse,
+) -> ScenarioResult<(A, HistoryClaim)> {
     let claim = snapshot.claim;
     assert_eq!(
         snapshot.response.headers()["Content-Type"],
@@ -210,8 +258,8 @@ async fn restore(snapshot: SnapshotResponse) -> ScenarioResult<(ReplayWalletApp,
     let directory = tempfile::tempdir()?;
     tar::Archive::new(archive.as_ref()).unpack(directory.path())?;
     assert!(directory.path().join("info.toml").is_file());
-    let app = ReplayWalletApp::from_dump(&directory.path().join("state"))?;
-    assert_eq!(app.executed_input_count(), claim.next_input.get());
+    let app = A::from_dump(&directory.path().join("state"))?;
+    assert_eq!(app.executed_input_count(), claim.next_input);
     // Subsequent replay also checks that restoring does not retain a dependency
     // on the downloaded source directory.
     directory.close()?;
@@ -229,15 +277,15 @@ async fn record(
     Ok(())
 }
 
-async fn consume_until(
+async fn consume_until<A: Application>(
     ws: &mut WsClient,
-    app: &mut ReplayWalletApp,
+    app: &mut A,
     target: u64,
 ) -> ScenarioResult<()> {
-    while app.executed_input_count() < target {
-        app.apply(ws.next_message().await?)?;
+    while app.executed_input_count().get() < target {
+        apply_ws_message(app, ws.next_message().await?)?;
     }
-    assert_eq!(app.executed_input_count(), target);
+    assert_eq!(app.executed_input_count().get(), target);
     Ok(())
 }
 
@@ -249,17 +297,29 @@ fn replay_prefix(history: &[WsTxMessage], count: u64) -> ScenarioResult<ReplayWa
     Ok(app)
 }
 
-fn assert_same_state(actual: &ReplayWalletApp, expected: &ReplayWalletApp) -> ScenarioResult<()> {
+pub(crate) fn assert_same_state<A: Application>(
+    actual: &mut A,
+    expected: &ReplayWalletApp,
+) -> ScenarioResult<()> {
     assert_eq!(
-        actual.executed_input_count(),
+        actual.executed_input_count().get(),
         expected.executed_input_count()
     );
     assert_eq!(
         actual.last_executed_safe_block(),
         expected.last_executed_safe_block()
     );
+    let progress = actual.progress();
+    let directory = tempfile::tempdir()?;
+    let checkpoint = directory.path().join("checkpoint");
+    actual.create_dump(&checkpoint)?;
     assert_eq!(
-        actual.canonical_snapshot_bytes()?,
+        actual.progress(),
+        progress,
+        "checkpoint creation preserves state"
+    );
+    assert_eq!(
+        std::fs::read(A::state_file_in_dump(&checkpoint))?,
         expected.canonical_snapshot_bytes()?,
         "all wallet state, including balances, nonces, config, count, and clock"
     );

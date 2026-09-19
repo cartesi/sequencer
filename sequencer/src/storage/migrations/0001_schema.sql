@@ -376,6 +376,19 @@ CREATE TABLE IF NOT EXISTS history_state (
     base_safe_block INTEGER NOT NULL CHECK (
         typeof(base_safe_block) = 'integer' AND base_safe_block >= 0)
 );
+-- One cut for each transition, measured after invalidation removes the old
+-- suffix and before reopening attributes replacement direct inputs.
+CREATE TABLE IF NOT EXISTS history_generation_cuts (
+    recovery_generation INTEGER PRIMARY KEY CHECK (recovery_generation > 0),
+    preserved_input_count INTEGER NOT NULL CHECK (
+        typeof(preserved_input_count) = 'integer' AND preserved_input_count >= 0)
+);
+CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_immutable
+BEFORE UPDATE ON history_generation_cuts FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'history generation cuts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_not_deletable
+BEFORE DELETE ON history_generation_cuts FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'history generation cuts are retained throughout the era'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_state_single_insert
 BEFORE INSERT ON history_state FOR EACH ROW
 WHEN EXISTS (SELECT 1 FROM history_state)
@@ -388,7 +401,9 @@ CREATE TRIGGER IF NOT EXISTS trg_history_generation_monotonic
 BEFORE UPDATE OF recovery_generation ON history_state FOR EACH ROW
 WHEN OLD.recovery_generation = 9223372036854775807
   OR NEW.recovery_generation != OLD.recovery_generation + 1
-BEGIN SELECT RAISE(ABORT, 'recovery generation must advance by exactly one'); END;
+  OR NOT EXISTS (SELECT 1 FROM history_generation_cuts
+                 WHERE recovery_generation = NEW.recovery_generation)
+BEGIN SELECT RAISE(ABORT, 'recovery generation must advance by exactly one with a recorded cut'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_state_not_deletable
 BEFORE DELETE ON history_state FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'history state is write-once per database'); END;

@@ -478,9 +478,9 @@ fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resul
 ///    state. Accepted batch snapshots survive; before any acceptance the
 ///    baseline supplies the rollback-safe restore point.
 /// 3. **Advance `RecoveryGeneration`** exactly once when the cascade
-///    invalidated any valid batch. This is the externally visible statement
-///    that the current era's soft-history reality changed; composing it here
-///    makes generation and invalidation inseparable across crashes.
+///    invalidated any valid batch, recording the surviving application count
+///    before replacement directs can reuse its offsets. Cut, generation, and
+///    invalidation remain inseparable across crashes.
 /// 4. **Reopen the Tip** the cascade just invalidated (or one a torn crash
 ///    left missing), atomically with the cascade. Same mechanism the
 ///    runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
