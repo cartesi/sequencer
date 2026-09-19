@@ -209,6 +209,10 @@ layout, and extraction procedure for each supported image. Other applications
 may require a different mapping. The recovery bundle also needs the exact L1
 boundary and next scheduler nonce, obtained from trusted canonical execution;
 these are separate from merely extracting application bytes.
+The exporter must also verify the canonical pending-direct queue satisfies
+[checkpoint eligibility](../recovery/cockroach.md#checkpoint-eligibility).
+An accurate application clock and `A < B` do not prove that condition after
+faulty sequencing.
 
 Each integration supplies a versioned export command and operator procedure,
 and demonstrates recovery from a non-genesis canonical checkpoint before

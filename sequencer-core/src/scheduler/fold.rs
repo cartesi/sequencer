@@ -44,8 +44,10 @@ pub struct FoldInput {
 ///   `B` and its scheduler nonce `N` (metadata — the bare-metal app cannot
 ///   recompute it, so the engine is *told* it via `resume_at`).
 /// - `seeds`: directs reconstructed from `(A, B]`, with sequencer-sourced
-///   batches already dropped by the caller (their content is already in `S`,
-///   their frames' safe blocks `≤ A`). Must arrive in ascending L1 order.
+///   batches already dropped by the caller. The checkpoint must account for
+///   every direct through its application clock `A`: the exporter verifies no
+///   pending canonical direct has inclusion block `<= A`. `A < B` alone cannot
+///   establish this after faulty sequencing. Seeds arrive in ascending L1 order.
 /// - `replay`: the full `(B, C]` stream (batches + directs) in L1 order. The
 ///   scheduler classifies each input (batch iff `sender == sequencer_address`),
 ///   force-executes overdue directs on arrival, applies accepted batches,
@@ -515,6 +517,81 @@ mod tests {
             replay,
             100,
         );
+    }
+
+    #[test]
+    fn earlier_checkpoint_recovers_a_direct_hidden_below_a_later_checkpoint_clock() {
+        let feed = |scheduler: &mut Scheduler<FoldApp>, inputs: Vec<FoldInput>| {
+            for input in inputs {
+                scheduler
+                    .process_input(SchedulerInput {
+                        sender: input.sender,
+                        inclusion_block: input.inclusion_block,
+                        domain: domain(),
+                        payload: input.payload,
+                    })
+                    .expect("canonical execution");
+            }
+        };
+        let mut canonical = Scheduler::new(FoldApp::default(), config());
+        feed(
+            &mut canonical,
+            vec![
+                direct(DIRECT_SENDER, 5, 1),
+                cover_batch(9, 0, 5),
+                direct(DIRECT_SENDER, 9, 2),
+            ],
+        );
+
+        let checkpoint = canonical.app.clone();
+        let checkpoint_nonce = canonical.next_expected_batch_nonce();
+        let a = checkpoint.last_executed_safe_block();
+        assert_eq!(a, 5);
+        assert!(
+            canonical
+                .direct_q
+                .iter()
+                .all(|input| input.inclusion_block > a),
+            "the earlier checkpoint is eligible, with a nonempty seed queue"
+        );
+        assert_eq!(canonical.queued_direct_len(), 1);
+
+        // Equality is canonically valid even though honest live sequencing
+        // cannot submit a batch into its own already-safe block.
+        let replay = vec![
+            direct(DIRECT_SENDER, 10, 3),
+            cover_batch(10, 1, 10),
+            direct(DIRECT_SENDER, 10, 4),
+            empty_batch(11, 2),
+        ];
+        feed(&mut canonical, replay.clone());
+        let later_a = canonical.app.last_executed_safe_block();
+        assert_eq!(later_a, 10);
+        assert!(later_a < 11, "the later checkpoint passes the scalar bound");
+        assert_eq!(canonical.next_expected_batch_nonce(), 3);
+        assert_eq!(canonical.app.executed_directs, vec![1, 2, 3]);
+        assert_eq!(canonical.queued_direct_len(), 1);
+        assert_eq!(canonical.direct_q[0].payload, vec![4]);
+        assert_eq!(canonical.direct_q[0].inclusion_block, later_a);
+        // Its pending direct is excluded by (A,B], so the exporter must refuse
+        // this later checkpoint. Recovery can use the eligible earlier one.
+
+        canonical.drain_covered_at(11).expect("terminal drain");
+        let (expected, expected_nonce) = canonical.finish();
+        let (recovered, recovered_nonce) = fold_replay(
+            checkpoint,
+            checkpoint_nonce,
+            config(),
+            domain(),
+            vec![direct(DIRECT_SENDER, 9, 2)],
+            replay,
+            11,
+        )
+        .expect("recovery from eligible checkpoint");
+        assert_eq!(recovered.executed_directs, vec![1, 2, 3, 4]);
+        assert_eq!(recovered.executed_directs, expected.executed_directs);
+        assert_eq!(recovered.progress(), expected.progress());
+        assert_eq!(recovered_nonce, expected_nonce);
     }
 
     #[test]

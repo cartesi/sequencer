@@ -423,6 +423,8 @@ impl<A: Application> Checkpoint<A> {
     /// Load `S` from the dump dir, derive `A` and `N`, and enforce the load-time
     /// precondition `A < B`, except for the known empty genesis checkpoint.
     /// Equality otherwise hides pending directs later in the same block.
+    /// The exporter must separately verify no canonical direct at or below A
+    /// remains queued; this bundle carries no queue evidence to check here.
     fn load(dir: &std::path::Path, checkpoint_block: u64) -> Result<Self, SetupRecoveryError> {
         let load_err = |message: String| SetupRecoveryError::CheckpointLoad {
             path: dir.display().to_string(),
@@ -503,7 +505,7 @@ fn source_fold_inputs<A>(
 /// L1 failures leave setup incomplete for a fresh attempt.
 ///
 /// The `flush → fold → fill` steps are enumerated authoritatively in
-/// **[`docs/recovery/cockroach.md`](../../../docs/recovery/cockroach.md)** (spec,
+/// **[`docs/recovery/cockroach.md`](../../../../docs/recovery/cockroach.md)** (spec,
 /// data dictionary `A`/`B`/`C`/`N`/`N'`, and code map) and anchored inline below
 /// (`// 1.`…`// 6.`). Read the doc before editing this function.
 ///
