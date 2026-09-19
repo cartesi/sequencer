@@ -66,8 +66,11 @@ share a count, and generations can reuse replaced offsets.
 
 Such a backup contains core state and projection at count `X`, inclusion block
 `B`, next scheduler nonce `N`, and the application's own clock `A`. The
-[manual recovery contract](../recovery/cockroach.md#replay-boundaries) requires
-`A < B`, except known empty genesis, and `B <= C` for the target rebuild:
+[manual recovery contract](../recovery/cockroach.md#checkpoint-eligibility)
+requires no pending canonical direct at or below `A`, as well as `A < B`
+(except known empty genesis) and `B <= C` for the target rebuild. Establish
+queue eligibility against the canonical checkpoint; application-state equality
+and the scalar bounds alone cannot prove it after faulty sequencing:
 
 1. Independently establish trust in the backup, projection implementation, and
    checkpoint boundary under the [incident playbook](../recovery/cockroach.md#application-specific-reader-state).
