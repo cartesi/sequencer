@@ -495,6 +495,7 @@ validation for a change; some tests require Anvil or libslirp.
 
 ## Further Reading
 
+- [`docs/app-developers/README.md`](docs/app-developers/README.md) — **application developers start here**: adopting the sequencer in a Cartesi application, without sequencer-internals background.
 - [`AGENTS.md`](AGENTS.md) — developer guide: architecture, conventions, duality, recovery, invariants, rules.
 - [`CLAUDE.md`](CLAUDE.md) — Claude entrypoint to the shared agent guide.
 - [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
