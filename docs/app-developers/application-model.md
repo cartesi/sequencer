@@ -176,14 +176,56 @@ nonce and fee, so the operation is included: the nonce is consumed, the fee is
 charged, the transfer does nothing, and no notice is emitted. The same holds
 for a payload your decoder cannot parse — it is an included no-op.
 
-Why so strict? Rejections are decided off-chain and leave no trace on L1. If
-"insufficient balance for the transfer" were a rejection, the machine —
-replaying the batch later — would have to reach the same verdict at the same
-point, and any subtle difference would fork the state. Limiting rejection to
-two cheap, well-defined checks keeps the two hosts trivially in agreement. It
-also means a user cannot spam failing operations for free.
+Why so strict?
 
-Two rules follow:
+- **A rejection is free for the caller** — no fee, no nonce, no trace. If
+  validation had to evaluate what the operation *does*, anyone could make the
+  sequencer run arbitrary application logic at no cost. Validation is
+  therefore limited to checks that are cheap and independent of the payload.
+  A failing operation that is *included* has paid for itself.
+- **The fee is the only thing validation must guarantee.** Once an operation
+  is included, its bytes go to L1 at the sequencer's expense whatever the
+  business outcome. Validation exists to ensure that cost is recoverable.
+- **The rejection reasons are protocol vocabulary**, not application
+  vocabulary: wrong nonce, fee cap too low, cannot pay the fee. There is no
+  reason code for "your order would not fill".
+- The machine runs the same validation when it executes a batch. The smaller
+  that predicate, the less there is to keep identical between the two hosts.
+
+### Fee first, then the effect
+
+A natural question: should validation also account for what the operation
+will do to the balance? A user holds 100, the fee is 5, and they sign a
+transfer of 98. Afterwards they could not have paid the fee.
+
+Validation checks **only** that the sender can pay the fee — `100 ≥ 5`,
+accept. The ordering inside *apply* is what makes that sufficient:
+
+1. consume the nonce;
+2. charge the fee — balance is now 95;
+3. run the operation against **what is left** — a transfer of 98 fails, so it
+   is an included no-op.
+
+Because the fee is taken before the operation runs, the operation's effect can
+never make the fee unpayable. The user keeps 95, has paid 5, and their nonce
+has moved on. Nothing else runs between validate and apply, so the balance
+validation saw is the balance apply charges; the wallet example treats "a
+validated operation cannot pay its fee" as an engine fault, not a rejection.
+
+Two refinements:
+
+- "Can pay the fee" means the balance that is actually **free** in current
+  state. If your application locks funds — open orders, pending withdrawals —
+  locked funds do not count. That is existing state, not the effect of the
+  operation being validated, so it belongs in validation.
+- Developers coming from Ethereum expect a transfer of `value` to be invalid
+  unless the balance covers `value + gas`. The model here is closer to a
+  *reverted* transaction: included, fee paid, no effect. Spare users that cost
+  in the frontend — check `amount + fee ≤ balance` against your indexer (or
+  run the engine's apply on a copy of the state) before asking for a
+  signature.
+
+Two rules follow from the three outcomes:
 
 - **Never turn bad input into a fatal error.** Payload bytes come from
   whoever signed or posted them. An engine that throws on unparseable input
