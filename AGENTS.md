@@ -161,6 +161,7 @@ signing, and SSZ batch encoding.
 - `examples/c-wallet-sequencer/` — binary composing the C-engine host with the reference wallet engine.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.
 - `examples/canonical-test/` — e2e test harness for the canonical app.
+- `cartesi-tools/` — vendored guest and guest-test tooling (`libcmt-sys`, `trolley`, `testsi`, `types`); provenance in its README.
 - `sdk/rust-client/` — Rust client library for the sequencer API.
 - `tests/{benchmarks,e2e,harness}/` — test infrastructure.
 
@@ -369,7 +370,9 @@ Prefer black-box tests around `POST /tx` and commit outcomes for integration.
 
 Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a
 clear message if `anvil` is not on PATH. Use the configured Nix/direnv environment
-or install Foundry. `canonical-test` additionally needs libslirp.
+or install Foundry. `canonical-test` additionally needs the Cartesi Machine
+library named by `LIBCARTESI_PATH`/`INCLUDECARTESI_PATH` (the devshell exports
+both) and libslirp.
 
 ## Shell and Commands
 

@@ -1,0 +1,12 @@
+[package]
+name = "libcmt-sys"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+description = "Raw bindings to the vendored libcmt (machine-guest-tools v0.18.0) guest library"
+publish = false
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72"

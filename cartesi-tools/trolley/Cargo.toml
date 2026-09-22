@@ -1,0 +1,11 @@
+[package]
+name = "trolley"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+description = "Safe Rust rollup-guest API over libcmt"
+publish = false
+
+[dependencies]
+libcmt-sys = { workspace = true }
+types = { workspace = true }

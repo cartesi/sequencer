@@ -389,7 +389,7 @@ async fn prove_cm_inspect_genesis(
 
     let status = Command::new("cartesi-machine")
         .current_dir(workspace)
-        .arg("--no-rollback")
+        .arg("--no-revert")
         .arg(format!("--load={},sharing:none", machine_image.display()))
         .arg(format!(
             "--cmio-inspect-state=query:{},report:{}",
