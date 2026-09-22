@@ -1,364 +1,251 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+--- Watchdog commands (docs/watchdog/README.md#commands):
+---
+---   init    store a trusted bootstrap machine; persist the configuration
+---   tick    one compare cycle; exit 0 ok/idle, 1 warning, 2 divergence latched
+---   status  JSON summary of the state directory
+---   clear   --block <B> --reason <text>: archive the latched divergence at B
+---   replay  --from <dir> --from-block <A> --to-block <B> --out <dir>:
+---           re-derive canonical state into a new directory
+
 package.path = "./?.lua;./?/init.lua;" .. package.path
+do
+    local deps_dir = os.getenv("CARTESI_WATCHDOG_LUA_DEPS")
+    if deps_dir and deps_dir ~= "" then
+        package.cpath = deps_dir .. "/?.so;" .. package.cpath
+    end
+end
 
+local bootstrap = require("watchdog.bootstrap")
 local config = require("watchdog.config")
-local checkpoint = require("watchdog.checkpoint")
-local http_mod = require("watchdog.http")
-local json_mod = require("watchdog.json")
-local jsonrpc = require("watchdog.jsonrpc")
-local machine_cartesi = require("watchdog.machine_cartesi")
+local errors = require("watchdog.errors")
+local incident = require("watchdog.incident")
+local json = require("watchdog.json").new()
 local metrics = require("watchdog.metrics")
-local retry = require("watchdog.retry")
-local runner = require("watchdog.runner")
-local sequencer_reader = require("watchdog.sequencer_reader")
-local state = require("watchdog.state")
+local replay = require("watchdog.replay")
+local store_mod = require("watchdog.store")
+local tick = require("watchdog.tick")
 
-local EXIT_OK = 0
-local EXIT_TRANSIENT = 1
-local EXIT_DIVERGENCE = 2
+local EXIT_OK, EXIT_WARNING, EXIT_DIVERGENCE = 0, 1, 2
 
-local function prepend_deps_cpath()
-    local deps = os.getenv("CARTESI_WATCHDOG_LUA_DEPS")
-    if deps and deps ~= "" then
-        package.cpath = deps .. "/?.so;" .. package.cpath
+local function now()
+    return os.date("!%Y-%m-%dT%H:%M:%SZ")
+end
+
+local function log(fmt, ...)
+    io.stderr:write("watchdog: " .. string.format(fmt, ...) .. "\n")
+end
+
+--- Production collaborators; tests substitute their own.
+local function real_factory()
+    local http
+    local factory = {}
+    function factory.http()
+        http = http or require("watchdog.http").new()
+        return http
     end
-end
-
-local function load_machine(_cfg)
-    return machine_cartesi.new()
-end
-
-local function log_step(message)
-    io.stderr:write("watchdog_step " .. tostring(message) .. "\n")
-end
-
-local function is_table_with_kind(value)
-    return type(value) == "table" and type(value.kind) == "string"
-end
-
-local function is_terminal_error(value)
-    if not is_table_with_kind(value) then
-        return false
+    function factory.machine()
+        return require("watchdog.machine").new()
     end
-    return value.kind == "state_mismatch"
-        or value.kind == "inclusion_block_regressed"
-end
-
---- Missing/corrupt `head.json` (and similar load failures) are operator/state
---- errors: retrying cannot create a checkpoint. Fail the tick once so
---- `status.prom` is written promptly instead of burning retry budget.
-local function is_operator_state_error(value)
-    return tostring(value):find("failed to load watchdog head", 1, true) ~= nil
-end
-
-local function emit_watchdog_event(json, payload, deps)
-    if deps and type(deps.on_watchdog_event) == "function" then
-        deps.on_watchdog_event(payload)
-    end
-    io.stderr:write("watchdog_event " .. json.encode(payload) .. "\n")
-end
-
-local function divergence_kind_from_payload(payload)
-    if type(payload) == "table" and type(payload.kind) == "string" then
-        return payload.kind
-    end
-    return nil
-end
-
-local function resolve_init_blockchain_id(cfg, env, deps)
-    if cfg.blockchain_id ~= nil and cfg.blockchain_id ~= "" then
-        return cfg.blockchain_id
-    end
-
-    env = env or os.getenv
-    local l1_rpc_url = env("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT")
-    if l1_rpc_url == nil or l1_rpc_url == "" then
-        return nil
-    end
-
-    local rpc_factory = deps and deps.rpc_factory or nil
-    return metrics.query_chain_id_from_rpc(l1_rpc_url, rpc_factory)
-end
-
-local function write_tick_metrics(cfg, exit_code, payload, env)
-    local ok, err = metrics.write_tick_status({
-        cfg = cfg,
-        env = env or os.getenv,
-        exit_code = exit_code,
-        chain_id = cfg and cfg.blockchain_id or nil,
-        app_address = cfg and cfg.app_address or nil,
-        divergence_kind = divergence_kind_from_payload(payload),
-    })
-    if not ok then
-        io.stderr:write("watchdog metrics write failed: " .. tostring(err) .. "\n")
-    end
-end
-
-local function default_machine_deps(cfg)
-    return {
-        machine = load_machine(cfg),
-        log_step = log_step,
-    }
-end
-
-local function default_deps(cfg)
-    local http = http_mod.new()
-    local json = json_mod.new()
-    local deps = default_machine_deps(cfg)
-    deps.http = http
-    deps.rpc = jsonrpc.new(http, json, cfg.l1_rpc_url)
-    deps.sequencer = sequencer_reader.new(http, json, cfg.sequencer_url)
-    return deps, json
-end
-
-local function shell_quote(value)
-    value = tostring(value)
-    return "'" .. value:gsub("'", "'\\''") .. "'"
-end
-
---- True when `path` is a non-empty directory (CM snapshot must have content).
-local function directory_nonempty(path)
-    local quoted = shell_quote(path)
-    local ok = os.execute("test -d " .. quoted .. " && test -n \"$(ls -A " .. quoted .. " 2>/dev/null)\"")
-    return ok == true or ok == 0
-end
-
---- Require a complete, tick-usable state before reporting idempotent init success.
---- A valid head.json alone is not enough — config.json or the selected snapshot
---- may be missing/corrupt after a partial wipe.
-local function validate_initialized_state(state_dir, existing, json)
-    local persisted, cfg_err = state.read_json(state_dir, "config.json", json)
-    if not persisted then
-        return nil,
-            "incomplete watchdog state: missing or unreadable config.json ("
-                .. tostring(cfg_err)
-                .. ")"
-    end
-    local ok, validate_err = pcall(config.validate_persisted, persisted)
-    if not ok then
-        return nil, "incomplete watchdog state: " .. tostring(validate_err)
-    end
-    if type(existing.snapshot_dir) ~= "string" or existing.snapshot_dir == "" then
-        return nil, "incomplete watchdog state: head has no snapshot_dir"
-    end
-    if not directory_nonempty(existing.snapshot_dir) then
-        return nil,
-            "incomplete watchdog state: missing or empty snapshot at "
-                .. tostring(existing.snapshot_dir)
-    end
-    return true
-end
-
-local function run_init(cfg, deps)
-    deps = deps or default_machine_deps(cfg)
-    local json = json_mod.new()
-
-    local existing, load_err = checkpoint.load(cfg.state_dir)
-    if existing then
-        local usable, why = validate_initialized_state(cfg.state_dir, existing, json)
-        if not usable then
-            return nil, tostring(why) .. "; wipe state_dir and re-run init"
+    function factory.l1(cfg)
+        if not cfg.rpc_url then
+            errors.operator("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT is required")
         end
-        -- Idempotent like `sequencer setup`: complete state → no-op success so
-        -- process supervisors can run init unconditionally.
-        return {
-            ok = true,
-            already_initialized = true,
-            safe_block = existing.safe_block,
-        }
+        local rpc = require("watchdog.jsonrpc").new(factory.http(), json, cfg.rpc_url)
+        return require("watchdog.l1").new(rpc, cfg)
     end
-    if load_err ~= "missing " .. checkpoint.HEAD_FILE then
-        return nil, "failed to load watchdog head: " .. tostring(load_err)
+    function factory.sequencer(cfg)
+        return require("watchdog.sequencer").new(factory.http(), json, cfg.sequencer_url)
     end
-
-    local init_env = deps and deps.env or os.getenv
-    local resolved_chain = resolve_init_blockchain_id(cfg, init_env, deps)
-    if resolved_chain ~= nil and resolved_chain ~= "" then
-        cfg.blockchain_id = resolved_chain
-    end
-
-    local ok, err = state.write_json_atomic(cfg.state_dir, "config.json", config.persisted(cfg), json)
-    if not ok then
-        return nil, err
-    end
-
-    local machine = deps.machine or load_machine(cfg)
-    if type(deps.log_step) == "function" then
-        deps.log_step("load bootstrap CM snapshot")
-    end
-    local instance, load_snapshot_err = machine:load(cfg.cm_snapshot_dir, cfg.cm_snapshot_safe_block)
-    if not instance then
-        return nil, load_snapshot_err
-    end
-
-    if type(deps.log_step) == "function" then
-        deps.log_step("persist initial watchdog checkpoint")
-    end
-    local written, write_err = checkpoint.write(cfg.state_dir, cfg.cm_snapshot_safe_block, function(snapshot_dir)
-        return machine:dump(instance, snapshot_dir, cfg.cm_snapshot_safe_block)
-    end, {
-        created_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        cm_image_hash = cfg.cm_image_hash,
-    })
-    if not written then
-        return nil, write_err
-    end
-
-    return {
-        ok = true,
-        safe_block = cfg.cm_snapshot_safe_block,
-    }
+    return factory
 end
 
-local function load_tick_config(env)
-    local json = json_mod.new()
-    local state_dir = config.load_state_dir(env)
-    local persisted, err = state.read_json(state_dir, "config.json", json)
-    if not persisted then
-        error("failed to load config.json: " .. tostring(err))
-    end
-    return config.from_persisted(state_dir, persisted, env)
-end
-
-local function run_compare_cycle(cfg, deps)
-    deps = deps or select(1, default_deps(cfg))
-    local json = json_mod.new()
-    local result, err = retry.with_retries(function()
-        local ok, value, run_err = pcall(runner.run_once, cfg, deps)
-        if not ok then
-            return nil, value
+local function parse_flags(argv)
+    local flags = {}
+    local i = 2
+    while i <= #argv do
+        local key, value = argv[i]:match("^%-%-([%w-]+)=(.*)$")
+        if not key then
+            key = argv[i]:match("^%-%-([%w-]+)$")
+            if not key or argv[i + 1] == nil then
+                errors.operator("unexpected argument %q", argv[i])
+            end
+            i = i + 1
+            value = argv[i]
         end
-        return value, run_err
-    end, {
-        attempts = cfg.retry_attempts,
-        delay_sec = cfg.retry_delay_sec,
-        should_retry = function(retry_err)
-            return not is_terminal_error(retry_err) and not is_operator_state_error(retry_err)
-        end,
-    })
-    if result == nil then
-        if is_terminal_error(err) then
-            emit_watchdog_event(json, err, deps)
-            return EXIT_DIVERGENCE, err
-        end
-        return EXIT_TRANSIENT, err
+        flags[key] = value
+        i = i + 1
     end
-    return EXIT_OK, result
+    return flags
 end
 
-local function run_tick(cfg, deps)
-    return run_compare_cycle(cfg, deps)
+local function flag(flags, name)
+    return flags[name] or errors.operator("--%s is required", name)
 end
 
-local function usage()
-    return "usage: watchdog <init|tick>"
-end
-
-local function load_or_error(loader)
-    local ok, value = pcall(loader)
-    if not ok then
-        return nil, value
+local function block_flag(flags, name)
+    local value = math.tointeger(tonumber(flag(flags, name)))
+    if not value or value < 0 then
+        errors.operator("--%s must be a non-negative integer", name)
     end
     return value
 end
 
-local function exit_for_result(command, exit_code, err, cfg, env)
-    if command == "tick" then
-        write_tick_metrics(cfg, exit_code, err, env)
+local function open_store(state_dir)
+    local lfs = require("lfs")
+    if lfs.attributes(state_dir, "mode") ~= "directory" then
+        local ok, err = lfs.mkdir(state_dir)
+        if not ok then
+            errors.operator("cannot create state directory %s: %s", state_dir, tostring(err))
+        end
     end
-    if exit_code == EXIT_DIVERGENCE then
-        os.exit(EXIT_DIVERGENCE)
-    end
-    if exit_code == EXIT_TRANSIENT then
-        io.stderr:write("watchdog " .. command .. " failed: " .. tostring(err) .. "\n")
-        os.exit(EXIT_TRANSIENT)
-    end
-    os.exit(EXIT_OK)
+    return store_mod.open(state_dir, json)
 end
 
--- One compare cycle per `tick` process. Infra (systemd timer / k8s CronJob)
--- schedules re-runs and reacts to status.prom / the exit code; the watchdog
--- itself does not loop.
-local function main(argv, opts)
-    argv = argv or arg or {}
+local function read_config(store, env)
+    local document = store:read_json("config.json")
+    if not document then
+        errors.operator("%s is not initialized; run init", store.dir)
+    end
+    return config.load(store.dir, document, env)
+end
+
+local commands = {}
+
+function commands.init(_, env, factory)
+    local cfg = config.from_init_env(env)
+    local store = open_store(cfg.state_dir)
+    local result = bootstrap.run(cfg, { store = store, machine = factory.machine(), l1 = factory.l1(cfg) })
+    log("init: %s; head at block %d (%d inputs)", result.kind, result.head.block, result.head.input_count)
+    return EXIT_OK
+end
+
+function commands.status(_, env)
+    local state_dir = config.state_dir(env)
+    local store = open_store(state_dir)
+    local document = store:read_json("config.json")
+    local head = store:head()
+    local marker = incident.marker(store)
+    return EXIT_OK, {
+        state_dir = state_dir,
+        initialized = document ~= nil,
+        config = document,
+        head = head and { block = head.block, input_count = head.input_count },
+        latched = marker ~= nil,
+        divergence = marker,
+        last_tick = store:read_json("last_tick.json"),
+    }
+end
+
+function commands.clear(flags, env)
+    local state_dir = config.state_dir(env)
+    local archive = incident.clear(open_store(state_dir), block_flag(flags, "block"), flag(flags, "reason"), now())
+    log("clear: incident archived at %s", archive)
+    return EXIT_OK, { archived = archive }
+end
+
+function commands.replay(flags, env, factory)
+    local cfg = read_config(open_store(config.state_dir(env)), env)
+    local result = replay.run(cfg, { machine = factory.machine(), l1 = factory.l1(cfg) }, {
+        from_dir = flag(flags, "from"),
+        from_block = block_flag(flags, "from-block"),
+        to_block = block_flag(flags, "to-block"),
+        out_dir = flag(flags, "out"),
+    })
+    return EXIT_OK, result
+end
+
+--- Runs the tick and always records its outcome: `last_tick.json` for
+--- `status`, and `status.prom` for alerting.
+function commands.tick(_, env, factory)
+    local report = { exit_code = EXIT_WARNING }
+    local store
+    local ok, err = pcall(function()
+        store = open_store(config.state_dir(env))
+        local cfg = read_config(store, env)
+        report.chain_id, report.app_address = cfg.chain_id, cfg.app_address
+        local outcome = tick.run(cfg, {
+            store = store,
+            machine = factory.machine(),
+            sequencer = factory.sequencer(cfg),
+            l1 = factory.l1(cfg),
+            now = now,
+        })
+        report.outcome = outcome.kind
+        if outcome.kind == "latched" or outcome.kind == "diverged" then
+            report.exit_code = EXIT_DIVERGENCE
+            report.divergence_kind = outcome.incident.kind
+            if outcome.kind == "diverged" then
+                io.stderr:write("watchdog_event " .. json.encode(outcome.incident) .. "\n")
+            end
+            log("tick: divergence %s latched at block %d; see `status`, runbook: docs/watchdog/incident-runbook.md",
+                outcome.incident.kind, outcome.incident.target_block)
+        else
+            report.exit_code = EXIT_OK
+            if outcome.kind == "agreed" then
+                log("tick: sequencer agrees at block %d (from block %d)", outcome.head.block, outcome.previous.block)
+            else
+                log("tick: idle at block %d", outcome.head.block)
+            end
+        end
+    end)
+    if not ok then
+        local class, message = errors.classify(err)
+        report.outcome, report.message = class, message
+        log("tick: %s failure: %s", class, message)
+    end
+
+    report.timestamp = os.time()
+    if store then
+        local head_ok, head = pcall(store.head, store)
+        report.checked_block = head_ok and head and head.block or nil
+        store:write_json({
+            finished_at = os.date("!%Y-%m-%dT%H:%M:%SZ", report.timestamp),
+            exit_code = report.exit_code,
+            outcome = report.outcome,
+            message = report.message,
+            checked_block = report.checked_block,
+        }, "last_tick.json")
+    end
+    local metrics_path = config.metrics_file(env) or (store and store:path("status.prom"))
+    if metrics_path then
+        store_mod.write_file_atomic(metrics_path, metrics.render(report))
+    else
+        log("tick: no state directory or CARTESI_WATCHDOG_METRICS_FILE; status.prom not written")
+    end
+    return report.exit_code
+end
+
+local main = {}
+
+--- Run one command; returns its exit code. `opts` (for tests): env,
+--- factory, stdout.
+function main.run(argv, opts)
     opts = opts or {}
-    local injected_env = opts.env
-    local injected_deps = opts.deps
-    prepend_deps_cpath()
-
-    local command = argv[1]
-    if command == "init" then
-        local cfg, cfg_err = load_or_error(function()
-            return config.load_init()
-        end)
-        if not cfg then
-            io.stderr:write("watchdog init failed: " .. tostring(cfg_err) .. "\n")
-            os.exit(EXIT_TRANSIENT)
-        end
-        local ok, result, err = pcall(run_init, cfg)
-        if not ok then
-            io.stderr:write("watchdog init failed: " .. tostring(result) .. "\n")
-            os.exit(EXIT_TRANSIENT)
-        end
-        if not result then
-            io.stderr:write("watchdog init failed: " .. tostring(err) .. "\n")
-            os.exit(EXIT_TRANSIENT)
-        end
-        if result.already_initialized then
-            io.stderr:write(
-                "watchdog init already complete — nothing to do state_dir="
-                    .. tostring(cfg.state_dir)
-                    .. "\n"
-            )
-        end
-        os.exit(EXIT_OK)
+    local name = argv[1]
+    local command = commands[name]
+    if not command then
+        log("usage: sequencer-watchdog <init|tick|status|clear|replay> [flags]")
+        return EXIT_WARNING
     end
-
-    if command == "tick" then
-        local cfg, cfg_err = load_or_error(function()
-            return load_tick_config(injected_env)
-        end)
-        if not cfg then
-            io.stderr:write("watchdog tick failed: " .. tostring(cfg_err) .. "\n")
-            write_tick_metrics(nil, EXIT_TRANSIENT, cfg_err, injected_env)
-            os.exit(EXIT_TRANSIENT)
-        end
-        local ok, exit_code, err = pcall(run_tick, cfg, injected_deps)
-        if not ok then
-            io.stderr:write("watchdog tick failed: " .. tostring(exit_code) .. "\n")
-            write_tick_metrics(cfg, EXIT_TRANSIENT, exit_code, injected_env)
-            os.exit(EXIT_TRANSIENT)
-        end
-        if not exit_code then
-            exit_code = EXIT_TRANSIENT
-        end
-        exit_for_result(command, exit_code, err, cfg, injected_env)
+    local ok, exit_code, output = pcall(function()
+        return command(parse_flags(argv), opts.env, opts.factory or real_factory())
+    end)
+    if not ok then
+        local class, message = errors.classify(exit_code)
+        log("%s: %s failure: %s", name, class, message)
+        return EXIT_WARNING
     end
-
-    io.stderr:write(usage() .. "\n")
-    os.exit(EXIT_TRANSIENT)
+    if output ~= nil then
+        (opts.stdout or io.stdout):write(json.encode(output), "\n")
+    end
+    return exit_code
 end
 
-local function invoked_as_script()
-    return type(arg) == "table"
-        and type(arg[0]) == "string"
-        and arg[0]:match("watchdog[/\\]main%.lua$") ~= nil
+if type(arg) == "table" and type(arg[0]) == "string" and arg[0]:match("watchdog[/\\]main%.lua$") then
+    os.exit(main.run(arg), true)
 end
 
-if invoked_as_script() then
-    main(arg)
-end
-
-return {
-    main = main,
-    run_init = run_init,
-    run_tick = run_tick,
-    run_compare_cycle = run_compare_cycle,
-    load_tick_config = load_tick_config,
-    EXIT_OK = EXIT_OK,
-    EXIT_TRANSIENT = EXIT_TRANSIENT,
-    EXIT_DIVERGENCE = EXIT_DIVERGENCE,
-    write_tick_metrics = write_tick_metrics,
-}
+return main

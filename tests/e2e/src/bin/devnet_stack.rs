@@ -72,6 +72,7 @@ async fn main() -> HarnessResult<()> {
         machine_image.display()
     );
     eprintln!("export CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=0");
+    eprintln!("export CARTESI_WATCHDOG_STATE_SOURCE=inspect");
     eprintln!(
         "export CARTESI_WATCHDOG_LUA_DEPS={}/.deps/lua",
         paths::workspace_root().display()

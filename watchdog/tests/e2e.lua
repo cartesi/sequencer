@@ -1,301 +1,280 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
---
--- Real watchdog end-to-end checks against cartesi-machine (and optionally a
--- live sequencer). Run from repo root:
---   lua5.4 watchdog/tests/e2e.lua
--- or:
---   just test-watchdog-e2e
+
+--- Watchdog tests against the real Cartesi Machine. The test guest
+--- (watchdog/test-guest) drives every rollup host outcome; the reference
+--- `cartesi-machine` CLI is the oracle for the executor. Run from the repo
+--- root with the canonical and test guest images built:
+---   lua5.4 watchdog/tests/e2e.lua [name filter]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
+package.cpath = (os.getenv("CARTESI_WATCHDOG_LUA_DEPS") or ".deps/lua") .. "/?.so;" .. package.cpath
 
-local checkpoint = require("watchdog.checkpoint")
-local machine_cartesi = require("watchdog.machine_cartesi")
-local runner = require("watchdog.runner")
-local log = dofile("watchdog/tests/e2e_log.lua")
+local abi = require("watchdog.abi")
+local bootstrap = require("watchdog.bootstrap")
+local config = require("watchdog.config")
+local incident = require("watchdog.incident")
+local json = require("watchdog.json").new()
+local l1_mod = require("watchdog.l1")
+local machine = require("watchdog.machine").new()
+local replay = require("watchdog.replay")
+local store_mod = require("watchdog.store")
+local support = require("watchdog.tests.support")
+local tick = require("watchdog.tick")
 
-local MACHINE_IMAGE = "examples/canonical-app/out/canonical-machine-image"
-local GENESIS_SAFE_BLOCK = 0
+local GUEST_IMAGE = "watchdog/test-guest/out/test-machine-image"
+local WALLET_IMAGE = "examples/canonical-app/out/canonical-machine-image-sepolia"
+local STATE_LENGTH = 64 * 1024
 
-local scenarios = {}
-local failures = 0
-local skips = 0
-local machine_cartesi_probe = nil
-
-local function assert_true(value, message)
-    if not value then
-        error(message or "assertion failed", 2)
-    end
+local function absolute(path)
+    local dir = io.popen("pwd"):read("l")
+    return dir .. "/" .. path
 end
 
-local function command_exists(name)
-    local ok = os.execute("command -v " .. name .. " >/dev/null 2>&1")
-    return ok == true or ok == 0
+local function require_image(path)
+    assert(support.exists(path .. "/config.json"), "missing machine image " .. path
+        .. "; build it (watchdog/test-guest/justfile build-image, or just canonical-build-machine-image-sepolia)")
+    return absolute(path)
 end
 
-local function path_is_dir(path)
-    local ok, err, code = os.rename(path, path)
-    if ok then
-        return true
-    end
-    if code == 13 then
-        return true
-    end
-    return false, err
+local runner = support.runner()
+local test, eq, raises = runner.test, support.eq, support.raises
+
+local function now()
+    return "2026-09-22T12:00:00Z"
 end
 
-local function temp_dir(prefix)
-    -- Keep os.tmpname()'s full path (under the system temp dir) so scratch dirs
-    -- land in TMPDIR, not the repo root. Stripping the dir left them in cwd.
-    local base = os.tmpname()
-    os.remove(base)
-    local dir = string.format("%s-%s", base, prefix)
-    local ok = os.execute('mkdir -p "' .. dir .. '"')
-    if ok ~= true and ok ~= 0 then
-        error("mkdir failed for " .. dir)
-    end
-    return dir
+--- The raw input the i-th (0-based) test input carries.
+local function input(i, payload)
+    return support.evm_advance({ block = i + 1, index = i, payload = payload })
 end
 
-local function make_step_logger(scenario, total)
-    local index = 0
-    return function(message)
-        index = index + 1
-        log.step(scenario, index, total, message)
+--- The guest's NVRAM after accepting `payloads` (see test-guest/README.md).
+local function guest_state(payloads)
+    local total, last = 0, ""
+    for _, payload in ipairs(payloads) do
+        total, last = total + #payload, payload
     end
+    local head = string.pack("<I8I8I4", #payloads, total, #last) .. last
+    return head .. string.rep("\0", STATE_LENGTH - #head)
 end
 
-local function run_scenario(name, fn)
-    log.banner(name)
-    local ok, result = pcall(fn)
-    if not ok then
-        failures = failures + 1
-        log.fail(name, result)
-        return
-    end
-    if result == "skip" then
-        skips = skips + 1
-        return
-    end
-    log.pass(name)
+local function hex(bytes)
+    return abi.hex_from_bytes(bytes)
 end
 
-local function skip(scenario, reason)
-    log.skip(scenario, reason)
-    return "skip"
-end
-
--- Toolchain prerequisites are hard requirements, not skips: in CI a missing
--- dep must fail the run, never pass vacuously. (The genuinely-optional
--- live-sequencer scenario still skips on its own, below.)
-local function require_cartesi_machine()
-    if not command_exists("cartesi-machine") then
-        error("cartesi-machine not on PATH (install via nix develop / Cartesi tools)", 0)
-    end
-end
-
-local function require_machine_image()
-    if not path_is_dir(MACHINE_IMAGE) then
-        error(
-            "canonical machine image missing at " .. MACHINE_IMAGE .. " (run: just canonical-build-machine-image)",
-            0
-        )
-    end
-end
-
--- A missing in-process cartesi binding is the exact failure that must not pass
--- silently in CI (the prerequisites scenario does not cover it). Probe is
--- cached so the machine is only loaded once.
-local function require_machine_cartesi_binding()
-    if machine_cartesi_probe == nil then
-        local machine = machine_cartesi.new()
-        local instance, err = machine:load(MACHINE_IMAGE)
-        if instance then
-            machine_cartesi_probe = { ok = true }
-        else
-            machine_cartesi_probe = {
-                ok = false,
-                err = "machine_cartesi binding unavailable on this host: " .. tostring(err),
-            }
+--- Run `payloads` through our executor from `image`; returns the statuses and
+--- the working machine's root hash.
+local function execute(image, payloads)
+    local work = support.tmpdir()
+    local executor = machine.open(image, work .. "/working")
+    local statuses = {}
+    for i, payload in ipairs(payloads) do
+        local status = executor:advance(input(i - 1, payload))
+        statuses[i] = status
+        if status.kind ~= "accepted" and status.kind ~= "rejected" then
+            break
         end
     end
-    if not machine_cartesi_probe.ok then
-        error(machine_cartesi_probe.err, 0)
+    executor:close()
+    return statuses, machine.root_hash(work .. "/working"), work .. "/working"
+end
+
+--- The reference CLI's final root hash for the same inputs.
+local function oracle(image, payloads)
+    local dir = support.tmpdir()
+    for i, payload in ipairs(payloads) do
+        support.write(string.format("%s/input-%d.bin", dir, i - 1), input(i - 1, payload))
     end
+    local command = string.format("cartesi-machine --load=%s --remote-spawn --remote-shutdown "
+        .. "--cmio-advance-state=input:%s/input-%%i.bin,input_index_begin:0,input_index_end:%d,"
+        .. "check_outputs_merkle_root:false,output:,rejected_output:,output_proof:,report:,"
+        .. "outputs_merkle_root:,outputs_merkle_root_proof: --final-hash=%s/final.bin >%s/cli.log 2>&1",
+        image, dir, #payloads, dir, dir)
+    os.execute(command)
+    local final = support.read(dir .. "/final.bin")
+    assert(final and #final == 32, "CLI oracle produced no final hash; see " .. dir .. "/cli.log")
+    return final
 end
 
-table.insert(scenarios, {
-    name = "prerequisites",
-    fn = function()
-        local scenario = "prerequisites"
-        log.step(scenario, 1, 3, "check cartesi-machine is on PATH")
-        if not command_exists("cartesi-machine") then
-            error("cartesi-machine not on PATH")
-        end
-        log.step(scenario, 2, 3, "check canonical machine image directory exists")
-        if not path_is_dir(MACHINE_IMAGE) then
-            error("missing machine image at " .. MACHINE_IMAGE)
-        end
-        log.step(scenario, 3, 3, "record paths used by later scenarios")
-        log.info("machine image: " .. MACHINE_IMAGE)
-        log.info("genesis safe_block: " .. tostring(GENESIS_SAFE_BLOCK))
-    end,
-})
+-- ── Executor against the reference CLI ───────────────────────────────────
 
-table.insert(scenarios, {
-    name = "cm-inspect-state-query",
-    fn = function()
-        local scenario = "cm-inspect-state-query"
-        require_cartesi_machine()
-        require_machine_image()
-        require_machine_cartesi_binding()
+test("executor matches the CLI when inputs are accepted", function()
+    local image = require_image(GUEST_IMAGE)
+    local payloads = { "hello", "world!" }
+    local statuses, root = execute(image, payloads)
+    eq(statuses[2].kind, "accepted")
+    eq(hex(root), hex(oracle(image, payloads)))
+end)
 
-        log.step(scenario, 1, 4, "create machine_cartesi adapter")
-        local machine = machine_cartesi.new()
+test("executor reverts a rejected input exactly like the CLI", function()
+    local image = require_image(GUEST_IMAGE)
+    local statuses, root, working = execute(image, { "hello", "reject", "world!" })
+    eq(statuses[2].kind, "rejected")
+    eq(statuses[3].kind, "accepted")
+    eq(hex(root), hex(oracle(image, { "hello", "reject", "world!" })))
+    -- The guest scribbles 0xFF before rejecting; none of it may survive.
+    eq(machine.state_bytes(working, { kind = "range", label = "state" }), guest_state({ "hello", "world!" }))
+end)
 
-        log.step(scenario, 2, 4, "load genesis snapshot from " .. MACHINE_IMAGE)
-        local instance = assert(machine:load(MACHINE_IMAGE), "load snapshot failed")
+test("executor leaves an exception as a permanent fixed point, like the CLI", function()
+    local image = require_image(GUEST_IMAGE)
+    local statuses, root, working = execute(image, { "hello", "exception", "world!" })
+    eq(#statuses, 2)
+    eq(statuses[2].kind, "exception")
+    eq(statuses[2].message, "test-guest exception")
+    eq(hex(root), hex(oracle(image, { "hello", "exception", "world!" })))
+    raises("operator", "not waiting for an input", function()
+        machine.state_bytes(working, { kind = "range", label = "state" })
+    end)
+end)
 
-        log.step(scenario, 3, 4, "run --cmio-inspect-state with query=state (no new inputs)")
-        local report, inspect_err = machine:inspect_state(instance)
-        assert_true(report, "inspect failed: " .. tostring(inspect_err))
+test("executor reports a halt with the guest's exit code, like the CLI", function()
+    local image = require_image(GUEST_IMAGE)
+    local statuses, root = execute(image, { "hello", "halt", "world!" })
+    eq(statuses[2].kind, "halted")
+    eq(statuses[2].exit_code, 7)
+    eq(hex(root), hex(oracle(image, { "hello", "halt", "world!" })))
+end)
 
-        log.step(scenario, 4, 4, "validate inspect report is SSZ (not legacy JSON)")
-        if report:find("inspect endpoint not implemented", 1, true) then
-            return skip(
-                scenario,
-                "machine image dapp is stale; rebuild with: just canonical-build-machine-image"
-            )
-        end
-        if report:sub(1, 1) == "{" then
-            return skip(
-                scenario,
-                "machine image still returns JSON export_state; rebuild with: just canonical-build-machine-image"
-            )
-        end
-        assert_true(#report >= 76, "inspect SSZ report too short: " .. tostring(#report))
-        log.info("inspect report bytes=" .. tostring(#report))
-    end,
-})
+-- ── State sources ─────────────────────────────────────────────────────────
 
-table.insert(scenarios, {
-    name = "compare-runner-with-sequencer",
-    fn = function()
-        local scenario = "compare-runner-with-sequencer"
-        local sequencer_url = os.getenv("CARTESI_WATCHDOG_E2E_SEQUENCER_URL")
-        if not sequencer_url or sequencer_url == "" then
-            return skip(
-                scenario,
-                "set CARTESI_WATCHDOG_E2E_SEQUENCER_URL to a live sequencer base URL to run this scenario"
-            )
-        end
-        require_cartesi_machine()
-        require_machine_image()
-        require_machine_cartesi_binding()
+test("range and inspect sources read the same guest state", function()
+    local image = require_image(GUEST_IMAGE)
+    local _, _, working = execute(image, { "hello", "report me", "world!" })
+    local range = machine.state_bytes(working, { kind = "range", label = "state" })
+    eq(range, guest_state({ "hello", "report me", "world!" }))
+    eq(machine.state_bytes(working, { kind = "inspect" }), range)
+    -- Inspecting runs on a private copy; the stored machine is untouched.
+    local before = machine.root_hash(working)
+    machine.state_bytes(working, { kind = "inspect" })
+    eq(hex(machine.root_hash(working)), hex(before))
+end)
 
-        local http_mod = require("watchdog.http")
-        local jsonrpc = require("watchdog.jsonrpc")
-        local sequencer_reader = require("watchdog.sequencer_reader")
-        local json = require("watchdog.json").new()
-        local main_mod = require("watchdog.main")
+test("an unknown range label is an operator error", function()
+    local image = require_image(GUEST_IMAGE)
+    raises("operator", 'no flash drive or NVRAM carries the label "missing"', function()
+        machine.check_source(image, { kind = "range", label = "missing" })
+    end)
+end)
 
-        local state_dir = temp_dir("watchdog-e2e-compare")
-        log.step(scenario, 1, 2, "prepare watchdog deps (sequencer=" .. sequencer_url .. ")")
-        log.step(scenario, 2, 2, "run compare runner against live sequencer + CM")
+test("the canonical wallet image answers the inspect query with its golden genesis state", function()
+    local image = require_image(WALLET_IMAGE)
+    local golden = abi.bytes_from_hex(support.read("tests/fixtures/wallet_snapshot_empty.hex"):gsub("%s", ""))
+    eq(hex(machine.state_bytes(image, { kind = "inspect" })), hex(golden))
+end)
 
-        local http = http_mod.new()
-        local cfg = {
-            sequencer_url = sequencer_url,
-            state_dir = state_dir,
-            cm_snapshot_dir = MACHINE_IMAGE,
-            cm_snapshot_safe_block = GENESIS_SAFE_BLOCK,
-            l1_rpc_url = os.getenv("CARTESI_WATCHDOG_E2E_BLOCKCHAIN_HTTP_ENDPOINT") or "http://127.0.0.1:8545",
-            input_box_address = os.getenv("CARTESI_WATCHDOG_E2E_CONTRACTS_INPUT_BOX_ADDRESS")
-                or "0x0000000000000000000000000000000000000000",
-            app_address = os.getenv("CARTESI_WATCHDOG_E2E_APP_ADDRESS")
-                or "0x1111111111111111111111111111111111111111",
-            long_block_range_error_codes = { "-32005" },
-            retry_attempts = 1,
-            retry_delay_sec = 0,
-        }
+-- ── Full commands over the test guest ─────────────────────────────────────
 
-        assert_true(main_mod.run_init(cfg, {
-            machine = machine_cartesi.new(),
-        }), "watchdog init failed")
-
-        local step_no = 0
-        local result, err = runner.run_once(cfg, {
-            http = http,
-            rpc = jsonrpc.new(http, json, cfg.l1_rpc_url),
-            sequencer = sequencer_reader.new(http, json, sequencer_url),
-            machine = machine_cartesi.new(),
-            log_step = function(message)
-                step_no = step_no + 1
-                log.step(scenario .. "/runner", step_no, 12, message)
-            end,
-        })
-
-        assert_true(result, "compare run failed: " .. tostring(err))
-        log.info(string.format(
-            "compare ok: safe_block=%s input_count=%s",
-            tostring(result.safe_block),
-            tostring(result.input_count)
-        ))
-    end,
-})
-
-table.insert(scenarios, {
-    name = "machine-cartesi-store-reload-advance",
-    fn = function()
-        local scenario = "machine-cartesi-store-reload-advance"
-        require_cartesi_machine()
-        require_machine_image()
-        require_machine_cartesi_binding()
-
-        local checkpoint_dir = temp_dir("watchdog-e2e-store-reload")
-
-        -- Advance the in-process CM one block from `source_dir` and store a
-        -- checkpoint at `block` via checkpoint.write (the production store path).
-        local function advance_and_store(source_dir, prev_block, block)
-            local machine = machine_cartesi.new()
-            local instance = assert(machine:load(source_dir, prev_block), "load failed")
-            assert(machine:advance(instance, {}, { from_block = prev_block + 1, to_block = block }))
-            return checkpoint.write(checkpoint_dir, block, function(snapshot_dir)
-                return machine:dump(instance, snapshot_dir, block)
-            end, { created_at = "2026-01-01T00:00:00Z" })
-        end
-
-        log.step(scenario, 1, 4, "advance genesis -> block 1 and store a checkpoint")
-        assert_true(advance_and_store(MACHINE_IMAGE, GENESIS_SAFE_BLOCK, 1), "first store failed")
-
-        log.step(scenario, 2, 4, "reload the stored block-1 snapshot and advance -> block 2")
-        local reloaded = checkpoint.load(checkpoint_dir)
-        assert_true(reloaded and reloaded.safe_block == 1, "checkpoint at block 1 missing")
-        assert_true(advance_and_store(reloaded.snapshot_dir, 1, 2), "reload + store failed")
-
-        log.step(scenario, 3, 4, "load current checkpoint metadata (block 1 should be GC'd)")
-        local current = checkpoint.load(checkpoint_dir)
-        assert_true(current and current.safe_block == 2, "current safe_block mismatch")
-
-        log.step(scenario, 4, 4, "verify snapshot directory exists")
-        assert_true(path_is_dir(current.snapshot_dir), "stored snapshot directory missing")
-    end,
-})
-
-log.info("starting watchdog real end-to-end suite (" .. #scenarios .. " scenarios)")
-for _, scenario in ipairs(scenarios) do
-    run_scenario(scenario.name, scenario.fn)
+local function deployment(inputs, source)
+    local image = require_image(GUEST_IMAGE)
+    local rpc = support.fake_rpc(inputs, { template_hash = "0x" .. hex(machine.root_hash(image)) })
+    local l1 = l1_mod.new(rpc, { input_box_address = support.INPUT_BOX, app_address = support.APP,
+        chain_id = support.CHAIN_ID })
+    local store = store_mod.open(support.tmpdir(), json)
+    local cfg = {
+        state_dir = store.dir,
+        sequencer_url = "http://sequencer",
+        input_box_address = support.INPUT_BOX,
+        app_address = support.APP,
+        state_source = config.parse_state_source(source or "range:state"),
+        long_block_range_error_codes = l1_mod.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
+        bootstrap_dir = image,
+        bootstrap_block = 0,
+    }
+    bootstrap.run(cfg, { store = store, machine = machine, l1 = l1 })
+    return cfg, store, l1
 end
 
-io.write("\n[watchdog-e2e] ───────────────────────────────────────────────────────\n")
-io.write(string.format(
-    "[watchdog-e2e] SUMMARY: %d passed, %d skipped, %d failed (of %d scenarios)\n",
-    #scenarios - failures - skips,
-    skips,
-    failures,
-    #scenarios
-))
-
-if failures > 0 then
-    os.exit(1)
+local function guest_inputs(...)
+    local inputs = {}
+    for i, payload in ipairs({ ... }) do
+        inputs[i] = { block = i, payload = payload }
+    end
+    return inputs
 end
+
+local function run_tick(cfg, store, l1, sequencer_state)
+    return tick.run(cfg, { store = store, machine = machine, l1 = l1, now = now,
+        sequencer = support.fake_sequencer(sequencer_state) })
+end
+
+local function digest(payloads)
+    return machine.sha256(guest_state(payloads))
+end
+
+test("tick agrees, advances the durable head, and prunes the old one", function()
+    local cfg, store, l1 = deployment(guest_inputs("hello", "reject", "world!"))
+    local first = store:head()
+    local outcome = run_tick(cfg, store, l1, { block = 3, sha256 = digest({ "hello", "world!" }) })
+    eq(outcome.kind, "agreed")
+    eq(outcome.head.input_count, 3)
+    eq(#store:checkpoints(), 1)
+    eq(support.exists(first.dir), false)
+    eq(run_tick(cfg, store, l1, { block = 3 }).kind, "idle")
+end)
+
+test("tick agrees through the inspect source", function()
+    local cfg, store, l1 = deployment(guest_inputs("hello"), "inspect")
+    eq(run_tick(cfg, store, l1, { block = 1, sha256 = digest({ "hello" }) }).kind, "agreed")
+end)
+
+test("tick latches a mismatch with the canonical machine and a byte diff", function()
+    local cfg, store, l1 = deployment(guest_inputs("hello", "world!"))
+    local wrong = guest_state({ "hello", "WORLD!" })
+    local outcome = run_tick(cfg, store, l1, { block = 2, sha256 = machine.sha256(wrong), bytes = wrong })
+    eq(outcome.kind, "diverged")
+    local marker = incident.marker(store)
+    eq(marker.kind, "state_mismatch")
+    eq(marker.canonical_sha256, digest({ "hello", "world!" }))
+    eq(marker.evidence.comparison.first_difference, 20)
+    eq(marker.evidence.comparison.differing_pages, 1)
+    eq(machine.state_bytes(store:path("incident", "canonical"), cfg.state_source), guest_state({ "hello", "world!" }))
+    eq(store:head().block, 0)
+end)
+
+test("tick latches a dead canonical machine and replay reproduces the stop", function()
+    local cfg, store, l1 = deployment(guest_inputs("hello", "halt", "world!"))
+    eq(run_tick(cfg, store, l1, { block = 3, sha256 = digest({ "hello", "world!" }) }).kind, "diverged")
+    local marker = incident.marker(store)
+    eq(marker.kind, "canonical_machine_dead")
+    eq(marker.stop.status, "halted")
+    eq(marker.stop.description, "halt with exit code 7")
+    eq(marker.stop.input_index, 1)
+
+    local out = support.tmpdir() .. "/replayed"
+    local result = replay.run({ chain_id = support.CHAIN_ID, state_source = cfg.state_source },
+        { machine = machine, l1 = l1 },
+        { from_dir = cfg.bootstrap_dir, from_block = 0, to_block = 3, out_dir = out })
+    eq(result.stop.input_index, 1)
+end)
+
+test("replay re-derives the digest a tick agreed on", function()
+    local cfg, store, l1 = deployment(guest_inputs("hello", "reject", "world!"))
+    run_tick(cfg, store, l1, { block = 3, sha256 = digest({ "hello", "world!" }) })
+    local out = support.tmpdir() .. "/replayed"
+    local result = replay.run({ chain_id = support.CHAIN_ID, state_source = cfg.state_source },
+        { machine = machine, l1 = l1 },
+        { from_dir = cfg.bootstrap_dir, from_block = 0, to_block = 3, out_dir = out })
+    eq(result.sha256, digest({ "hello", "world!" }))
+    eq(result.input_count, 3)
+end)
+
+test("init refuses a bootstrap machine that is not the template", function()
+    local image = require_image(GUEST_IMAGE)
+    local rpc = support.fake_rpc({}, { template_hash = "0x" .. string.rep("00", 32) })
+    local store = store_mod.open(support.tmpdir(), json)
+    raises("operator", "differs from the on-chain template hash", function()
+        bootstrap.run({
+            state_source = { kind = "range", label = "state" },
+            input_box_address = support.INPUT_BOX,
+            app_address = support.APP,
+            long_block_range_error_codes = l1_mod.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
+            bootstrap_dir = image,
+            bootstrap_block = 0,
+        }, { store = store, machine = machine, l1 = l1_mod.new(rpc, { input_box_address = support.INPUT_BOX,
+            app_address = support.APP, chain_id = support.CHAIN_ID }) })
+    end)
+end)
+
+os.exit(runner.run(arg[1]) and 0 or 1)
