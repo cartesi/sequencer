@@ -1,197 +1,178 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+--- Watchdog configuration. `init` reads the environment once and persists the
+--- deployment identity and the state source in `config.json`; every later
+--- command reads that file. Only the two endpoints, which operators rotate,
+--- come from the environment at run time.
+
+local errors = require("watchdog.errors")
+local l1 = require("watchdog.l1")
+
 local config = {}
 
-config.VERSION = 1
+config.VERSION = 2
 
-local function required(name, env)
-    local value = env[name]
+local function getter(env)
+    if type(env) == "table" then
+        return function(name)
+            return env[name]
+        end
+    end
+    return env or os.getenv
+end
+
+local function optional(get, name)
+    local value = get(name)
     if value == nil or value == "" then
-        error(name .. " is required")
+        return nil
     end
     return value
 end
 
-local function optional_number(name, default, env)
-    local value = env[name]
-    if value == nil or value == "" then
-        return default
-    end
-    local parsed = tonumber(value)
-    if not parsed then
-        error(name .. " must be a number")
-    end
-    return parsed
+local function required(get, name)
+    return optional(get, name) or errors.operator("%s is required", name)
 end
 
-local function optional_required_number(value_name, number_name, env)
-    if env[value_name] == nil or env[value_name] == "" then
-        return nil
+local function absolute_path(value, name)
+    if value:sub(1, 1) ~= "/" then
+        errors.operator("%s must be an absolute path, got %q", name, value)
     end
-    local value = env[number_name]
-    if value == nil or value == "" then
-        error(number_name .. " is required when " .. value_name .. " is set")
-    end
-    return optional_number(number_name, nil, env)
+    return (value:gsub("/+$", ""))
 end
 
-local function split_csv(value)
-    local out = {}
-    for part in tostring(value or ""):gmatch("[^,]+") do
-        table.insert(out, part)
+local function block_number(value, name)
+    local number = math.tointeger(tonumber(value))
+    if not number or number < 0 then
+        errors.operator("%s must be a non-negative integer, got %q", name, tostring(value))
     end
-    return out
+    return number
 end
 
-local function normalize_env(env)
-    env = env or os.getenv
-    if type(env) == "function" then
-        local getenv = env
-        env = setmetatable({}, {
-            __index = function(_, key)
-                return getenv(key)
-            end,
-        })
-    end
-    return env
-end
-
---- Canonicalize an Ethereum address to `0x` + lowercase hex (no EIP-55).
---- Mixed checksum / lowercase forms of the same address must compare equal.
+--- `0x` + lowercase hex; checksum casing must not matter.
 function config.normalize_address(value, name)
-    name = name or "address"
-    if type(value) ~= "string" or value == "" then
-        error(name .. " must be a non-empty address string")
-    end
-    local raw = value:gsub("^0[xX]", ""):lower()
+    local raw = tostring(value):gsub("^0[xX]", ""):lower()
     if #raw ~= 40 or raw:match("^[0-9a-f]+$") == nil then
-        error(name .. " must be a 20-byte hex address")
+        errors.operator("%s must be a 20-byte hex address, got %q", name, tostring(value))
     end
     return "0x" .. raw
 end
 
-function config.load_state_dir(env)
-    env = normalize_env(env)
-    return required("CARTESI_WATCHDOG_STATE_DIR", env)
+--- `inspect`, or `range:<label>` for a whole labeled flash drive or NVRAM.
+function config.parse_state_source(value)
+    if value == "inspect" then
+        return { kind = "inspect" }
+    end
+    local label = type(value) == "string" and value:match("^range:([a-z][a-z0-9-]*)$")
+    if label then
+        return { kind = "range", label = label }
+    end
+    errors.operator("CARTESI_WATCHDOG_STATE_SOURCE must be `inspect` or `range:<label>`, got %q", tostring(value))
 end
 
-function config.load_init(env)
-    env = normalize_env(env)
+function config.format_state_source(source)
+    return source.kind == "range" and ("range:" .. source.label) or source.kind
+end
 
-    -- The watchdog has one job: compare the sequencer's finalized state against
-    -- a canonical CM re-derivation. One cycle per process; infra schedules it.
+local function error_codes(value)
+    if value == nil then
+        return l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
+    end
+    local codes = {}
+    for code in value:gmatch("[^,%s]+") do
+        codes[#codes + 1] = code
+    end
+    if #codes == 0 then
+        errors.operator("CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES lists no codes")
+    end
+    return codes
+end
+
+--- Everything `init` needs. `chain_id` is nil unless pinned in the
+--- environment; init then takes it from the RPC.
+function config.from_init_env(env)
+    local get = getter(env)
+    local chain_id = optional(get, "CARTESI_WATCHDOG_BLOCKCHAIN_ID")
     return {
-        version = config.VERSION,
-        sequencer_url = required("CARTESI_WATCHDOG_SEQUENCER_URL", env),
+        state_dir = absolute_path(required(get, "CARTESI_WATCHDOG_STATE_DIR"), "CARTESI_WATCHDOG_STATE_DIR"),
+        sequencer_url = required(get, "CARTESI_WATCHDOG_SEQUENCER_URL"),
+        rpc_url = required(get, "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT"),
+        chain_id = chain_id and block_number(chain_id, "CARTESI_WATCHDOG_BLOCKCHAIN_ID"),
         input_box_address = config.normalize_address(
-            required("CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS", env),
+            required(get, "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS"),
             "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS"
         ),
         app_address = config.normalize_address(
-            required("CARTESI_WATCHDOG_APP_ADDRESS", env),
+            required(get, "CARTESI_WATCHDOG_APP_ADDRESS"),
             "CARTESI_WATCHDOG_APP_ADDRESS"
         ),
-        input_added_topic = env.CARTESI_WATCHDOG_INPUT_ADDED_TOPIC,
-        state_dir = required("CARTESI_WATCHDOG_STATE_DIR", env),
-        cm_snapshot_dir = required("CARTESI_WATCHDOG_CM_SNAPSHOT_DIR", env),
-        cm_snapshot_safe_block = optional_required_number(
-            "CARTESI_WATCHDOG_CM_SNAPSHOT_DIR",
-            "CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK",
-            env
+        state_source = config.parse_state_source(required(get, "CARTESI_WATCHDOG_STATE_SOURCE")),
+        long_block_range_error_codes = error_codes(optional(get, "CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES")),
+        bootstrap_dir = absolute_path(
+            required(get, "CARTESI_WATCHDOG_CM_SNAPSHOT_DIR"),
+            "CARTESI_WATCHDOG_CM_SNAPSHOT_DIR"
         ),
-        cm_image_hash = env.CARTESI_WATCHDOG_CM_IMAGE_HASH,
-        blockchain_id = env.CARTESI_WATCHDOG_BLOCKCHAIN_ID,
-        metrics_file = env.CARTESI_WATCHDOG_METRICS_FILE,
-        retry_attempts = optional_number("CARTESI_WATCHDOG_RETRY_ATTEMPTS", 3, env),
-        retry_delay_sec = optional_number("CARTESI_WATCHDOG_RETRY_DELAY_SEC", 5, env),
-        long_block_range_error_codes = split_csv(
-            env.CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES or "-32005,-32012,-32600,-32602,-32616"
+        bootstrap_block = block_number(
+            required(get, "CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK"),
+            "CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK"
         ),
     }
 end
 
-local function required_field(data, name)
-    local value = data[name]
-    if value == nil or value == "" then
-        error("config.json missing " .. name)
-    end
-    return value
-end
-
-local function optional_field_number(data, name, default)
-    local value = data[name]
-    if value == nil then
-        return default
-    end
-    if type(value) ~= "number" then
-        error("config.json " .. name .. " must be a number")
-    end
-    return value
-end
-
+--- The `config.json` document.
 function config.persisted(cfg)
     return {
         version = config.VERSION,
         sequencer_url = cfg.sequencer_url,
+        chain_id = cfg.chain_id,
         input_box_address = cfg.input_box_address,
         app_address = cfg.app_address,
-        input_added_topic = cfg.input_added_topic,
-        cm_image_hash = cfg.cm_image_hash,
-        blockchain_id = cfg.blockchain_id,
-        retry_attempts = cfg.retry_attempts,
-        retry_delay_sec = cfg.retry_delay_sec,
+        state_source = config.format_state_source(cfg.state_source),
         long_block_range_error_codes = cfg.long_block_range_error_codes,
     }
 end
 
---- Validate a persisted config.json object (no tick-time env required).
---- Raises on missing/invalid fields; used by idempotent init before exit 0.
-function config.validate_persisted(data)
-    if type(data) ~= "table" then
-        error("config.json is not an object")
-    end
-    if data.version ~= config.VERSION then
-        error("unsupported config.json version: " .. tostring(data.version))
-    end
-    required_field(data, "sequencer_url")
-    required_field(data, "input_box_address")
-    required_field(data, "app_address")
-    return true
+--- Whether a persisted document describes the same deployment and source.
+function config.same_identity(a, b)
+    return a.chain_id == b.chain_id
+        and a.input_box_address == b.input_box_address
+        and a.app_address == b.app_address
+        and a.state_source == b.state_source
 end
 
-function config.from_persisted(state_dir, data, env)
-    env = normalize_env(env)
-    if data.version ~= config.VERSION then
-        error("unsupported config.json version: " .. tostring(data.version))
+--- The run-time configuration from a persisted document plus the endpoint
+--- environment. `rpc_url` stays nil when unset; commands that read L1 require it.
+function config.load(state_dir, document, env)
+    local get = getter(env)
+    if type(document) ~= "table" or document.version ~= config.VERSION then
+        errors.operator("%s/config.json is not a version %d watchdog config; wipe the state directory and re-run init",
+            state_dir, config.VERSION)
+    end
+    local codes = document.long_block_range_error_codes
+    if type(codes) ~= "table" or #codes == 0 then
+        errors.operator("config.json lists no long_block_range_error_codes")
     end
     return {
-        version = config.VERSION,
         state_dir = state_dir,
-        sequencer_url = (env.CARTESI_WATCHDOG_SEQUENCER_URL ~= nil and env.CARTESI_WATCHDOG_SEQUENCER_URL ~= "")
-            and env.CARTESI_WATCHDOG_SEQUENCER_URL
-            or required_field(data, "sequencer_url"),
-        l1_rpc_url = required("CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT", env),
-        input_box_address = config.normalize_address(
-            required_field(data, "input_box_address"),
-            "config.json input_box_address"
-        ),
-        app_address = config.normalize_address(
-            required_field(data, "app_address"),
-            "config.json app_address"
-        ),
-        input_added_topic = data.input_added_topic,
-        cm_image_hash = data.cm_image_hash,
-        blockchain_id = (env.CARTESI_WATCHDOG_BLOCKCHAIN_ID ~= nil and env.CARTESI_WATCHDOG_BLOCKCHAIN_ID ~= "")
-            and env.CARTESI_WATCHDOG_BLOCKCHAIN_ID
-            or data.blockchain_id,
-        metrics_file = env.CARTESI_WATCHDOG_METRICS_FILE,
-        retry_attempts = optional_field_number(data, "retry_attempts", 3),
-        retry_delay_sec = optional_field_number(data, "retry_delay_sec", 5),
-        long_block_range_error_codes = data.long_block_range_error_codes or {},
+        sequencer_url = optional(get, "CARTESI_WATCHDOG_SEQUENCER_URL") or document.sequencer_url,
+        rpc_url = optional(get, "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT"),
+        chain_id = block_number(document.chain_id, "config.json chain_id"),
+        input_box_address = config.normalize_address(document.input_box_address, "config.json input_box_address"),
+        app_address = config.normalize_address(document.app_address, "config.json app_address"),
+        state_source = config.parse_state_source(document.state_source),
+        long_block_range_error_codes = codes,
     }
 end
 
-config.load = config.load_init
+--- Where `tick` writes `status.prom`, when not in the state directory.
+function config.metrics_file(env)
+    return optional(getter(env), "CARTESI_WATCHDOG_METRICS_FILE")
+end
+
+--- The state directory, the one setting every command shares.
+function config.state_dir(env)
+    local get = getter(env)
+    return absolute_path(required(get, "CARTESI_WATCHDOG_STATE_DIR"), "CARTESI_WATCHDOG_STATE_DIR")
+end
 
 return config

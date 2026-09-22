@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Production CLI wrapper for watchdog subcommands.
+# Production CLI wrapper for the watchdog commands (init, tick, status, clear,
+# replay). Commands that write the state directory hold its lock; `status` and
+# `replay` only read it, so they stay available while a tick runs.
 set -euo pipefail
 
 if [[ "${CARTESI_WATCHDOG_PRINT_RELEASE_INFO:-0}" == "1" ]]; then
@@ -51,7 +53,7 @@ export LUA_PATH_5_4="${_new_path}"
 
 cd "${lua_root}"
 
-if [[ "$#" -gt 0 && ( "$1" == "init" || "$1" == "tick" ) ]]; then
+if [[ "$#" -gt 0 && ( "$1" == "init" || "$1" == "tick" || "$1" == "clear" ) ]]; then
   : "${CARTESI_WATCHDOG_STATE_DIR:?CARTESI_WATCHDOG_STATE_DIR is required}"
   mkdir -p "$CARTESI_WATCHDOG_STATE_DIR"
   exec 9>"$CARTESI_WATCHDOG_STATE_DIR/run.lock"

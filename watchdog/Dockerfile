@@ -2,7 +2,7 @@
 # Build args RELEASE_TAG, GIT_COMMIT, and cartesi-machine pins must match toolchain-pins.env
 # and the canonical-machine-image-* tarballs produced in the same release.
 
-# cartesi-machine v0.20.x libs require glibc >= 2.38 (bookworm is 2.36).
+# cartesi-machine v0.21 libs require glibc >= 2.38 (bookworm is 2.36).
 ARG DEBIAN_VERSION=trixie-slim
 FROM debian:${DEBIAN_VERSION} AS build
 
@@ -14,8 +14,8 @@ ARG CARTESI_MACHINE_DEB_SHA256_ARM64
 ARG TARGETARCH
 
 # wget + ca-certificates fetch the cartesi-machine .deb; gcc/pkg-config + Lua
-# headers compile the vendored lcurl.so. lua-curl is vendored in-tree under
-# watchdog/third_party/lua-curl/src, so the build needs no network for it.
+# headers compile the vendored native modules (lcurl.so, lfs.so) from
+# watchdog/third_party, so the build needs no network for them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
@@ -48,7 +48,7 @@ RUN case "${TARGETARCH}" in \
     && cp -a /tmp/cm/usr/lib/lua/5.4/. /out/lib/lua/5.4/ \
     && cp -a /tmp/cm/usr/share/lua/5.4/. /out/share/lua/5.4/ \
     && cp /tmp/cm/usr/lib/libcartesi*.so /out/lib/ \
-    && cp /build/.deps/lua/lcurl.so /out/lib/lcurl.so
+    && cp /build/.deps/lua/lcurl.so /build/.deps/lua/lfs.so /out/lib/
 
 FROM debian:${DEBIAN_VERSION}
 
@@ -75,16 +75,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /out/bin/cartesi-machine /usr/local/bin/cartesi-machine
 COPY --from=build /out/share/cartesi-machine /usr/local/share/cartesi-machine
-COPY --from=build /out/lib/lcurl.so /opt/watchdog/lib/lcurl.so
+COPY --from=build /out/lib/lcurl.so /out/lib/lfs.so /opt/watchdog/lib/
 COPY --from=build /out/lib/lua/5.4/ /usr/local/lib/lua/5.4/
 COPY --from=build /out/share/lua/5.4/ /usr/local/share/lua/5.4/
 COPY --from=build /out/share/lua/5.4/ /usr/share/lua/5.4/
 COPY --from=build /out/lib/libcartesi*.so /usr/local/lib/
 
-COPY watchdog /opt/watchdog/lua/watchdog
+COPY watchdog/*.lua /opt/watchdog/lua/watchdog/
 COPY watchdog/third_party/json.lua /opt/watchdog/lua/watchdog/third_party/json.lua
-# Shared cross-stack fixtures (watchdog/tests/run.lua expects repo-root tests/fixtures/).
-COPY tests/fixtures /opt/watchdog/lua/tests/fixtures
 COPY watchdog/sequencer-watchdog /usr/local/bin/sequencer-watchdog
 
 RUN chmod +x /usr/local/bin/sequencer-watchdog /usr/local/bin/cartesi-machine \
