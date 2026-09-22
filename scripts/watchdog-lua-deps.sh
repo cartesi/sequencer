@@ -77,7 +77,7 @@ build_module() {
         return 0
     fi
     if [[ -z "${lua_cflags}" ]]; then
-        echo "watchdog-lua-deps: Lua headers not found; install lua5.4-dev or set LUA_INC" >&2
+        echo "watchdog-lua-deps: Lua headers not found; install the Lua 5.4 headers (liblua5.4-dev) or set LUA_INC" >&2
         exit 1
     fi
     echo "watchdog-lua-deps: compiling vendored ${module}.so" >&2

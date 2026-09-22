@@ -89,7 +89,8 @@ local function error_codes(value)
 end
 
 --- Everything `init` needs. `chain_id` is nil unless pinned in the
---- environment; init then takes it from the RPC.
+--- environment; init then takes it from the RPC. The InputBox is derived from
+--- the application at init.
 function config.from_init_env(env)
     local get = getter(env)
     local chain_id = optional(get, "CARTESI_WATCHDOG_BLOCKCHAIN_ID")
@@ -98,10 +99,6 @@ function config.from_init_env(env)
         sequencer_url = required(get, "CARTESI_WATCHDOG_SEQUENCER_URL"),
         rpc_url = required(get, "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT"),
         chain_id = chain_id and block_number(chain_id, "CARTESI_WATCHDOG_BLOCKCHAIN_ID"),
-        input_box_address = config.normalize_address(
-            required(get, "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS"),
-            "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS"
-        ),
         app_address = config.normalize_address(
             required(get, "CARTESI_WATCHDOG_APP_ADDRESS"),
             "CARTESI_WATCHDOG_APP_ADDRESS"
@@ -128,6 +125,7 @@ function config.persisted(cfg)
         input_box_address = cfg.input_box_address,
         app_address = cfg.app_address,
         state_source = config.format_state_source(cfg.state_source),
+        bootstrap_block = cfg.bootstrap_block,
         long_block_range_error_codes = cfg.long_block_range_error_codes,
     }
 end
@@ -135,7 +133,6 @@ end
 --- Whether a persisted document describes the same deployment and source.
 function config.same_identity(a, b)
     return a.chain_id == b.chain_id
-        and a.input_box_address == b.input_box_address
         and a.app_address == b.app_address
         and a.state_source == b.state_source
 end
@@ -160,14 +157,18 @@ function config.load(state_dir, document, env)
         input_box_address = config.normalize_address(document.input_box_address, "config.json input_box_address"),
         app_address = config.normalize_address(document.app_address, "config.json app_address"),
         state_source = config.parse_state_source(document.state_source),
+        bootstrap_block = block_number(document.bootstrap_block, "config.json bootstrap_block"),
         long_block_range_error_codes = codes,
     }
 end
 
 --- Where `tick` writes `status.prom`, when not in the state directory.
 function config.metrics_file(env)
-    return optional(getter(env), "CARTESI_WATCHDOG_METRICS_FILE")
+    local path = optional(getter(env), "CARTESI_WATCHDOG_METRICS_FILE")
+    return path and absolute_path(path, "CARTESI_WATCHDOG_METRICS_FILE")
 end
+
+config.absolute_path = absolute_path
 
 --- The state directory, the one setting every command shares.
 function config.state_dir(env)

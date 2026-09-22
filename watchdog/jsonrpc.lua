@@ -36,10 +36,17 @@ function jsonrpc.new(http, json, url)
         if not response then
             return nil, http_err
         end
-        if response.status < 200 or response.status >= 300 then
-            return nil, string.format("%s: HTTP %d", method, response.status)
-        end
         local ok, decoded = pcall(json.decode, response.body)
+        if response.status < 200 or response.status >= 300 then
+            -- Providers also send JSON-RPC errors, range limits included, with
+            -- an HTTP error status; keep them visible, as alloy does.
+            local rpc_error = ok and type(decoded) == "table" and decoded.error
+            if type(rpc_error) == "table" then
+                return nil, string.format("%s: HTTP %d: %s: %s", method, response.status,
+                    tostring(rpc_error.code), tostring(rpc_error.message))
+            end
+            return nil, string.format("%s: HTTP %d: %s", method, response.status, response.body:sub(1, 200))
+        end
         if not ok or type(decoded) ~= "table" or decoded.id ~= id then
             return nil, method .. ": malformed JSON-RPC response"
         end

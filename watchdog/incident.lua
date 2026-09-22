@@ -1,12 +1,14 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- The divergence latch. A divergence writes its evidence into `incident/`
---- and then, last, `incident/divergence.json`: the marker is the latch. While
---- it exists every tick exits 2 without work, until an operator clears it with
---- `clear`, which archives the incident instead of deleting anything. Clearing
---- is always safe: if the cause persists, the next tick latches again. The
---- incident runbook (docs/watchdog/incident-runbook.md) owns the procedure.
+--- The divergence latch. A divergence writes its local evidence into
+--- `incident/` and then `incident/divergence.json`: the marker is the latch.
+--- The sequencer's comparison file is fetched afterwards, as best effort, so
+--- a slow download never delays the latch. While the marker exists every tick
+--- exits 2 without work, until an operator clears it with `clear`, which
+--- archives the incident instead of deleting anything. Clearing is always
+--- safe: if the cause persists, the next tick latches again. The incident
+--- runbook (docs/watchdog/incident-runbook.md) owns the procedure.
 
 local lfs = require("lfs")
 local errors = require("watchdog.errors")
@@ -17,9 +19,17 @@ local MARKER = "divergence.json"
 local CHUNK = 1 << 20
 local PAGE = 4096
 
---- The latched incident's marker, or nil.
+--- The latched incident's marker, or nil. A marker that exists but cannot be
+--- read (torn by a crash; JSON files are not fsynced) still latches.
 function incident.marker(store)
-    return store:read_json("incident", MARKER)
+    if not store:exists("incident", MARKER) then
+        return nil
+    end
+    local ok, marker = pcall(store.read_json, store, "incident", MARKER)
+    if not ok or type(marker) ~= "table" then
+        return { kind = "unreadable_marker" }
+    end
+    return marker
 end
 
 --- Discard an interrupted latch (`incident/` without a marker) so the next
@@ -32,7 +42,8 @@ end
 
 --- Offset of the first differing byte and the number of differing 4 KiB
 --- pages of two files, streamed; a length difference counts from the shorter
---- end. Nil when the files are identical.
+--- end. `{ identical = true }` when the bytes agree: then the digests were
+--- wrong, not the state.
 function incident.compare_files(path_a, path_b)
     local a = assert(io.open(path_a, "rb"))
     local b = assert(io.open(path_b, "rb"))
@@ -66,6 +77,7 @@ function incident.compare_files(path_a, path_b)
     if first then
         return { first_difference = first, differing_pages = pages }
     end
+    return { identical = true }
 end
 
 --- Latch a divergence. `event` becomes the marker (plus `detected_at` and
@@ -73,13 +85,14 @@ end
 ---   machine            a stored machine directory to keep as incident/canonical
 ---   publish            function(from, to) that durably moves a stored machine
 ---   canonical_bytes    the canonical comparison bytes
----   sequencer          client whose comparison file is downloaded as evidence,
+---   sequencer          client whose comparison file is fetched after the latch,
 ---                      kept only if it still describes `event.target_block`
 function incident.latch(store, event, evidence, now)
     store:remove("incident")
     store:mkdir("incident")
     event.detected_at = now
     local recorded = {}
+    event.evidence = recorded
 
     if evidence.machine then
         evidence.publish(evidence.machine, store:path("incident", "canonical"))
@@ -91,26 +104,27 @@ function incident.latch(store, event, evidence, now)
         assert(file:close())
         recorded.canonical_bytes = "incident/canonical.bin"
     end
+    store:write_json(event, "incident", MARKER)
+
     if evidence.sequencer then
         local path = store:path("incident", "sequencer.bin")
-        local downloaded, block = pcall(evidence.sequencer.download_state, evidence.sequencer, path)
+        local downloaded, block = pcall(evidence.sequencer.download_state, evidence.sequencer, path .. ".tmp")
         if downloaded and block == event.target_block then
+            assert(os.rename(path .. ".tmp", path))
             recorded.sequencer_bytes = "incident/sequencer.bin"
             if recorded.canonical_bytes then
                 recorded.comparison = incident.compare_files(store:path("incident", "canonical.bin"), path)
             end
         else
-            os.remove(path)
+            os.remove(path .. ".tmp")
             if downloaded then
                 recorded.sequencer_bytes_missing = string.format("the sequencer moved on to block %d", block)
             else
                 recorded.sequencer_bytes_missing = select(2, errors.classify(block))
             end
         end
+        store:write_json(event, "incident", MARKER)
     end
-
-    event.evidence = recorded
-    store:write_json(event, "incident", MARKER)
     return event
 end
 
@@ -120,14 +134,15 @@ function incident.clear(store, block, reason, now)
     if marker == nil then
         errors.operator("no divergence is latched")
     end
-    if marker.target_block ~= block then
+    -- An unreadable marker has no block to check; the operator names one.
+    if marker.kind ~= "unreadable_marker" and marker.target_block ~= block then
         errors.operator("the latched divergence is for block %s, not %s; nothing cleared",
             tostring(marker.target_block), tostring(block))
     end
     store:write_json({ cleared_at = now, reason = reason }, "incident", "resolution.json")
     store:mkdir("incidents")
-    local stamp = marker.detected_at:gsub("[^%w]", "")
-    local id = string.format("%s-%s-%d", stamp, marker.kind, marker.target_block)
+    local stamp = (marker.detected_at or now):gsub("[^%w]", "")
+    local id = string.format("%s-%s-%d", stamp, marker.kind, block)
     local archive = store:path("incidents", id)
     if lfs.attributes(archive) then
         errors.operator("incident archive %s already exists", archive)

@@ -114,10 +114,6 @@ function machine.new(cartesi)
         m:rename_stored(from_dir, to_dir)
     end
 
-    function api.remove(dir)
-        cartesi.new():remove_stored(dir)
-    end
-
     function api.root_hash(dir)
         local m = load(dir, SHARING_NONE)
         local root = m:get_root_hash()

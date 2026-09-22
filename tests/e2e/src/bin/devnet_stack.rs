@@ -59,10 +59,6 @@ async fn main() -> HarnessResult<()> {
     );
     eprintln!("export CARTESI_WATCHDOG_BLOCKCHAIN_ID={DEVNET_CHAIN_ID}");
     eprintln!(
-        "export CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS={}",
-        runtime.input_box_address()
-    );
-    eprintln!(
         "export CARTESI_WATCHDOG_APP_ADDRESS={}",
         runtime.app_address()
     );
@@ -78,7 +74,7 @@ async fn main() -> HarnessResult<()> {
         paths::workspace_root().display()
     );
     eprintln!();
-    eprintln!("Wait for finalized snapshot (404 until promotion):");
+    eprintln!("The accepted checkpoint (genesis is comparable at block 0):");
     eprintln!(
         "  curl -s {}/finalized_state/inclusion_block",
         runtime.endpoint()
