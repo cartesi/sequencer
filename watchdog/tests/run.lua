@@ -30,7 +30,6 @@ end
 local function l1_reader(inputs, opts)
     local rpc = support.fake_rpc(inputs, opts)
     return l1_mod.new(rpc, {
-        input_box_address = support.INPUT_BOX,
         app_address = support.APP,
         chain_id = support.CHAIN_ID,
     }), rpc
@@ -130,6 +129,27 @@ test("l1 counts no inputs before the InputBox exists, but refuses an empty addre
     end)
 end)
 
+test("l1 derives the InputBox from the application and refuses other data availability", function()
+    local reader = l1_reader({})
+    eq(reader:input_box_address(), support.INPUT_BOX)
+    reader = l1_reader({}, { availability = "deadbeef" .. string.rep("0", 64) })
+    raises("operator", "does not take its inputs from an InputBox alone", function()
+        reader:input_box_address()
+    end)
+end)
+
+test("jsonrpc keeps a JSON-RPC error sent with an HTTP error status", function()
+    local jsonrpc = require("watchdog.jsonrpc")
+    local http = {
+        post = function()
+            local body = '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"range too large"}}'
+            return { status = 400, body = body }
+        end,
+    }
+    local _, err = jsonrpc.new(http, json, "http://l1"):get_logs({ from_block = 1, to_block = 2, topics = {} })
+    eq(err, "eth_getLogs: HTTP 400: -32602: range too large")
+end)
+
 test("l1 requires the safe head to reach the target", function()
     local reader = l1_reader({}, { safe_head = 10 })
     reader:require_safe_head(10)
@@ -170,7 +190,6 @@ local function init_env(overrides)
         CARTESI_WATCHDOG_STATE_DIR = "/var/lib/watchdog",
         CARTESI_WATCHDOG_SEQUENCER_URL = "http://sequencer:3000",
         CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT = "http://l1:8545",
-        CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS = "0x9999999999999999999999999999999999999999",
         CARTESI_WATCHDOG_APP_ADDRESS = "0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD",
         CARTESI_WATCHDOG_STATE_SOURCE = "range:state",
         CARTESI_WATCHDOG_CM_SNAPSHOT_DIR = "/images/canonical",
@@ -206,6 +225,7 @@ end)
 
 test("config round-trips through config.json and keeps endpoints at run time", function()
     local cfg = config.from_init_env(init_env({ CARTESI_WATCHDOG_BLOCKCHAIN_ID = "31337" }))
+    cfg.input_box_address = support.INPUT_BOX
     local document = json.decode(json.encode(config.persisted(cfg)))
     local loaded = config.load("/var/lib/watchdog", document, {
         CARTESI_WATCHDOG_SEQUENCER_URL = "http://rotated:3000",
@@ -213,6 +233,8 @@ test("config round-trips through config.json and keeps endpoints at run time", f
     eq(loaded.chain_id, 31337)
     eq(loaded.sequencer_url, "http://rotated:3000")
     eq(loaded.rpc_url, nil)
+    eq(loaded.bootstrap_block, 0)
+    eq(loaded.input_box_address, support.INPUT_BOX)
     eq(config.format_state_source(loaded.state_source), "range:state")
     assert(config.same_identity(document, config.persisted(cfg)))
     raises("operator", "not a version 2 watchdog config", function()
@@ -258,7 +280,7 @@ test("incident compares evidence files by offset and page", function()
     eq(result.first_difference, 5000)
     eq(result.differing_pages, 2)
     support.write(dir .. "/c", a)
-    eq(incident.compare_files(dir .. "/a", dir .. "/c"), nil)
+    eq(incident.compare_files(dir .. "/a", dir .. "/c").identical, true)
     support.write(dir .. "/short", a:sub(1, 100))
     eq(incident.compare_files(dir .. "/a", dir .. "/short").first_difference, 100)
 end)
@@ -277,6 +299,17 @@ test("incident clear archives only the named block's incident", function()
     end)
 end)
 
+test("incident treats an unreadable marker as latched and lets clear archive it", function()
+    local store = support.state_dir(json, 0, 0)
+    store:mkdir("incident")
+    support.write(store:path("incident", "divergence.json"), "")
+    eq(incident.marker(store).kind, "unreadable_marker")
+    incident.discard_interrupted(store)
+    eq(incident.marker(store).kind, "unreadable_marker")
+    incident.clear(store, 42, "torn marker", now())
+    eq(incident.marker(store), nil)
+end)
+
 test("incident discards an interrupted latch but keeps a complete one", function()
     local store = support.state_dir(json, 0, 0)
     store:mkdir("incident")
@@ -289,9 +322,13 @@ end)
 
 -- ── tick ──────────────────────────────────────────────────────────────────
 
-local function tick_with(store, inputs, sequencer_state, script, rpc_opts)
+local function tick_with(store, inputs, sequencer_state, script, rpc_opts, bootstrap_block)
     local reader = l1_reader(inputs, rpc_opts)
-    return tick.run({ chain_id = support.CHAIN_ID, state_source = { kind = "range", label = "state" } }, {
+    return tick.run({
+        chain_id = support.CHAIN_ID,
+        state_source = { kind = "range", label = "state" },
+        bootstrap_block = bootstrap_block or 0,
+    }, {
         store = store,
         machine = support.fake_machine(script),
         sequencer = support.fake_sequencer(sequencer_state),
@@ -368,10 +405,28 @@ test("tick continues past a rejected input", function()
     eq(outcome.kind, "agreed")
 end)
 
-test("tick latches an inclusion block regression", function()
+test("tick latches a regression below an agreed block", function()
     local store = support.state_dir(json, 11, 1, "a")
     eq(tick_with(store, payloads("a"), { block = 10 }).kind, "diverged")
     eq(incident.marker(store).kind, "inclusion_block_regressed")
+end)
+
+test("tick idles while the sequencer has not reached the bootstrap block", function()
+    local store = support.state_dir(json, 11, 1, "a")
+    local outcome = tick_with(store, payloads("a"), { block = 0 }, nil, nil, 11)
+    eq(outcome.kind, "idle")
+    eq(outcome.sequencer_block, 0)
+    eq(incident.marker(store), nil)
+end)
+
+test("tick finishes an interrupted prune of an older checkpoint", function()
+    local store = support.state_dir(json, 11, 1, "a")
+    local stale = store:checkpoint_dir(5, 0)
+    assert(require("lfs").mkdir(stale))
+    support.write(stale .. "/leftover", "half removed")
+    eq(tick_with(store, payloads("a", "b"), { block = 12, sha256 = "ab" }).kind, "agreed")
+    eq(#store:checkpoints(), 1)
+    eq(support.exists(stale), false)
 end)
 
 test("tick refuses an RPC for another chain and a missing head", function()
@@ -441,7 +496,7 @@ test("metrics match the golden status files", function()
         chain_id = 11155111,
         app_address = "0x4ce633ca2f0dd4b4ce6d2a1bcf0b8bd0db0f0ba0",
         timestamp = 1790000000,
-        checked_block = 123,
+        head_block = 123,
     }
     report.exit_code = 0
     eq(metrics.render(report), support.read("tests/fixtures/watchdog_status_ok.prom"))
@@ -488,8 +543,9 @@ end
 test("main tick exits 0/2 and records last_tick.json and status.prom", function()
     local main = require("watchdog.main")
     local store = support.state_dir(json, 11, 1, "a")
-    store:write_json(config.persisted(config.from_init_env(init_env({ CARTESI_WATCHDOG_BLOCKCHAIN_ID = "31337" }))),
-        "config.json")
+    local cfg = config.from_init_env(init_env({ CARTESI_WATCHDOG_BLOCKCHAIN_ID = "31337" }))
+    cfg.input_box_address = support.INPUT_BOX
+    store:write_json(config.persisted(cfg), "config.json")
     local env = { CARTESI_WATCHDOG_STATE_DIR = store.dir }
 
     local function run(argv, factory, stdout)
@@ -514,6 +570,14 @@ test("main tick exits 0/2 and records last_tick.json and status.prom", function(
     eq(run({ "clear", "--block", "12", "--reason", "drill" }), 1)
     eq(run({ "clear", "--block=13", "--reason=drill" }, nil, sink()), 0)
     eq(incident.marker(store), nil)
+end)
+
+test("main tick keeps exit 2 while latched even when nothing else can run", function()
+    local main = require("watchdog.main")
+    local store = support.state_dir(json, 11, 1, "a")
+    incident.latch(store, { kind = "state_mismatch", target_block = 12 }, {}, now())
+    eq(main.run({ "tick" }, { env = { CARTESI_WATCHDOG_STATE_DIR = store.dir }, factory = main_factory({}, {}) }), 2)
+    assert(support.read(store:path("status.prom")):find('kind="state_mismatch"} 1', 1, true))
 end)
 
 test("main tick without a state directory exits 1 and still reports", function()

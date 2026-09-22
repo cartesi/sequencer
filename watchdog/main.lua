@@ -149,10 +149,10 @@ end
 function commands.replay(flags, env, factory)
     local cfg = read_config(open_store(config.state_dir(env)), env)
     local result = replay.run(cfg, { machine = factory.machine(), l1 = factory.l1(cfg) }, {
-        from_dir = flag(flags, "from"),
+        from_dir = config.absolute_path(flag(flags, "from"), "--from"),
         from_block = block_flag(flags, "from-block"),
         to_block = block_flag(flags, "to-block"),
-        out_dir = flag(flags, "out"),
+        out_dir = config.absolute_path(flag(flags, "out"), "--out"),
     })
     return EXIT_OK, result
 end
@@ -164,15 +164,26 @@ function commands.tick(_, env, factory)
     local store
     local ok, err = pcall(function()
         store = open_store(config.state_dir(env))
-        local cfg = read_config(store, env)
-        report.chain_id, report.app_address = cfg.chain_id, cfg.app_address
-        local outcome = tick.run(cfg, {
-            store = store,
-            machine = factory.machine(),
-            sequencer = factory.sequencer(cfg),
-            l1 = factory.l1(cfg),
-            now = now,
-        })
+        -- A latch holds even when nothing else can run.
+        local latched = incident.marker(store)
+        local cfg_ok, cfg = pcall(read_config, store, env)
+        if cfg_ok then
+            report.chain_id, report.app_address = cfg.chain_id, cfg.app_address
+        end
+        local outcome
+        if latched then
+            outcome = { kind = "latched", incident = latched }
+        elseif not cfg_ok then
+            error(cfg, 0)
+        else
+            outcome = tick.run(cfg, {
+                store = store,
+                machine = factory.machine(),
+                sequencer = factory.sequencer(cfg),
+                l1 = factory.l1(cfg),
+                now = now,
+            })
+        end
         report.outcome = outcome.kind
         if outcome.kind == "latched" or outcome.kind == "diverged" then
             report.exit_code = EXIT_DIVERGENCE
@@ -180,12 +191,15 @@ function commands.tick(_, env, factory)
             if outcome.kind == "diverged" then
                 io.stderr:write("watchdog_event " .. json.encode(outcome.incident) .. "\n")
             end
-            log("tick: divergence %s latched at block %d; see `status`, runbook: docs/watchdog/incident-runbook.md",
-                outcome.incident.kind, outcome.incident.target_block)
+            log("tick: divergence %s latched at block %s; see `status`, runbook: docs/watchdog/incident-runbook.md",
+                outcome.incident.kind, tostring(outcome.incident.target_block))
         else
             report.exit_code = EXIT_OK
             if outcome.kind == "agreed" then
                 log("tick: sequencer agrees at block %d (from block %d)", outcome.head.block, outcome.previous.block)
+            elseif outcome.sequencer_block then
+                log("tick: idle at bootstrap block %d; the sequencer's accepted block %d has not reached it",
+                    outcome.head.block, outcome.sequencer_block)
             else
                 log("tick: idle at block %d", outcome.head.block)
             end
@@ -197,21 +211,29 @@ function commands.tick(_, env, factory)
         log("tick: %s failure: %s", class, message)
     end
 
+    -- Recording the outcome must never change it.
     report.timestamp = os.time()
     if store then
         local head_ok, head = pcall(store.head, store)
-        report.checked_block = head_ok and head and head.block or nil
-        store:write_json({
+        report.head_block = head_ok and head and head.block or nil
+        local written, write_err = pcall(store.write_json, store, {
             finished_at = os.date("!%Y-%m-%dT%H:%M:%SZ", report.timestamp),
             exit_code = report.exit_code,
             outcome = report.outcome,
             message = report.message,
-            checked_block = report.checked_block,
+            head_block = report.head_block,
         }, "last_tick.json")
+        if not written then
+            log("tick: cannot write last_tick.json: %s", select(2, errors.classify(write_err)))
+        end
     end
-    local metrics_path = config.metrics_file(env) or (store and store:path("status.prom"))
+    local path_ok, metrics_path = pcall(config.metrics_file, env)
+    metrics_path = path_ok and metrics_path or (store and store:path("status.prom"))
     if metrics_path then
-        store_mod.write_file_atomic(metrics_path, metrics.render(report))
+        local written, write_err = pcall(store_mod.write_file_atomic, metrics_path, metrics.render(report))
+        if not written then
+            log("tick: cannot write %s: %s", metrics_path, select(2, errors.classify(write_err)))
+        end
     else
         log("tick: no state directory or CARTESI_WATCHDOG_METRICS_FILE; status.prom not written")
     end

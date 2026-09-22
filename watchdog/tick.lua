@@ -8,12 +8,17 @@
 --- head only advances past a block the sequencer agreed with; anything else
 --- latches a divergence with its evidence.
 ---
+--- The accepted block regresses only relative to a block the sequencer agreed
+--- with. Until the first agreement the head is just the bootstrap machine, and
+--- a sequencer behind it has not reached it yet.
+---
 --- Outcomes: `latched` (already latched; no work), `idle` (nothing new),
 --- `agreed` (head advanced), `diverged` (newly latched). Failures raise.
 
 local canonical = require("watchdog.canonical")
 local errors = require("watchdog.errors")
 local incident = require("watchdog.incident")
+local store_mod = require("watchdog.store")
 
 local tick = {}
 
@@ -39,22 +44,23 @@ function tick.run(cfg, deps)
         return { kind = "diverged", incident = incident.latch(store, event, evidence, deps.now()) }
     end
 
-    local function regressed(block)
+    --- Nothing to compare at `block`, or a regression.
+    local function behind(block)
+        if block == head.block then
+            return { kind = "idle", head = head }
+        elseif head.block == cfg.bootstrap_block then
+            return { kind = "idle", head = head, sequencer_block = block }
+        end
         return diverge({ kind = "inclusion_block_regressed", target_block = block }, {})
     end
 
     local polled = sequencer:inclusion_block()
-    if polled == head.block then
-        return { kind = "idle", head = head }
-    elseif polled < head.block then
-        return regressed(polled)
+    if polled <= head.block then
+        return behind(polled)
     end
-
     local target = sequencer:digest()
-    if target.inclusion_block == head.block then
-        return { kind = "idle", head = head }
-    elseif target.inclusion_block < head.block then
-        return regressed(target.inclusion_block)
+    if target.inclusion_block <= head.block then
+        return behind(target.inclusion_block)
     end
 
     if deps.l1:chain_id() ~= cfg.chain_id then
@@ -89,9 +95,10 @@ function tick.run(cfg, deps)
 
     local published = store:checkpoint_dir(target.inclusion_block, advanced.input_count)
     machine.publish(working, published)
+    -- A plain tree removal: an interrupted one is finished by the next prune.
     for _, old in ipairs(store:checkpoints()) do
         if old.dir ~= published then
-            machine.remove(old.dir)
+            store_mod.remove_tree(old.dir)
         end
     end
     return {

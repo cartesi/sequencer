@@ -1,10 +1,29 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- Canonical execution: advance a checkpoint through the application's L1
---- inputs up to a block. `tick` and `replay` share it.
+--- Canonical execution: where it may start, and advancing a checkpoint
+--- through the application's L1 inputs up to a block. `init`, `tick`, and
+--- `replay` share it.
+
+local errors = require("watchdog.errors")
 
 local canonical = {}
+
+--- A trusted starting point: the stored machine `dir` said to have consumed
+--- every input through `block`. Returns `{ dir, block, input_count }`. The
+--- count is pinned at a block the RPC holds as safe; when no input precedes
+--- the block, the machine must be the application's template (its root hash is
+--- the on-chain template hash), so an image from other source or another
+--- network cannot start a canonical history.
+function canonical.trusted_start(machine, l1, dir, block)
+    l1:require_safe_head(block)
+    local input_count = l1:input_count_at(block)
+    if input_count == 0 and machine.root_hash(dir) ~= l1:template_hash() then
+        errors.operator("no input precedes block %d, so the machine at %s must be the application's template, "
+            .. "but its root hash differs from the on-chain template hash", block, dir)
+    end
+    return { dir = dir, block = block, input_count = input_count }
+end
 
 --- Advance `from` ({ dir, block, input_count }) to block `to_block` in
 --- `working_dir`. Returns the input count through `to_block`, or, when the

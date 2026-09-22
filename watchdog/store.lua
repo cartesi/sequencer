@@ -36,8 +36,9 @@ local function is_dir(path)
 end
 
 local function exists(path)
-    return lfs.attributes(path, "mode") ~= nil
+    return lfs.symlinkattributes(path, "mode") ~= nil
 end
+store.exists = exists
 
 local function mkdir(path)
     if not is_dir(path) then
