@@ -398,10 +398,14 @@ api split lands).
 
 - `GET /finalized_state/inclusion_block` — cheap JSON the watchdog polls:
   `{ "inclusion_block": <u64>, "executed_input_count": <u64> }`.
+- `GET /finalized_state/digest` — the SHA-256 of the accepted checkpoint's
+  comparison file, as lowercase hex, hashed under the same lease:
+  `{ "inclusion_block": <u64>, "executed_input_count": <u64>, "sha256": "<hex>" }`.
+  The watchdog replays to that block and compares digests.
 - `GET /finalized_state` — streams the accepted checkpoint's comparison file
   (`application/octet-stream`), with `X-Inclusion-Block`,
   `X-Executed-Input-Count`, and `ETag: "block-<n>"` (`If-None-Match` supports `304`).
-  The watchdog compares at the end of that L1 block.
+  The watchdog downloads it only as divergence evidence.
 - `GET /latest_snapshot` — streams a restorable tar archive of the newest valid
   batch-close snapshot, or the era baseline. Includes immutable `info.toml`
   and the application's opaque `state` file or directory.
@@ -415,7 +419,7 @@ Streaming holds the lease until the response ends or the client disconnects.
 The accepted endpoints return `404` until a comparable checkpoint exists:
 genesis is comparable at block zero; a rebuilt baseline is restorable but only
 a later accepted batch establishes a comparison point. Known divergence makes
-all three finalized endpoints return `503 UNAVAILABLE`, including conditional
+all four finalized endpoints return `503 UNAVAILABLE`, including conditional
 state requests. The check shares the checkpoint-selection transaction, before
 any lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
 
