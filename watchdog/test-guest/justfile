@@ -1,0 +1,54 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+cartesi_machine_version := `sed -n 's/^CARTESI_MACHINE_VERSION=v//p' ../../toolchain-pins.env`
+linux_kernel_filename := `grep '^CARTESI_LINUX_KERNEL_FILENAME=' ../../toolchain-pins.env | cut -d= -f2`
+
+# The kernel is the canonical image's; `just canonical download-deps` fetches
+# and verifies it.
+kernel_dir := "../../examples/canonical-app/out"
+linux_kernel := kernel_dir / linux_kernel_filename
+
+target := "riscv64gc-unknown-linux-musl"
+target_dir := "../../target"
+out_dir := "out"
+source_date_epoch := "0"
+dapp_binary := out_dir / "dapp"
+xhalt_binary := out_dir / "xhalt"
+rootfs_tar := out_dir / "test-guest-rootfs.tar"
+rootfs_ext2 := out_dir / "test-guest-rootfs.ext2"
+machine_image := out_dir / "test-machine-image"
+
+default:
+    @just --list --justfile {{justfile()}}
+
+build-guest:
+    mkdir -p {{out_dir}}
+    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_TARGET_DIR={{target_dir}} CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package watchdog-test-guest --bins --target {{target}} --release
+    cp {{target_dir}}/{{target}}/release/watchdog-test-guest {{dapp_binary}}
+    cp {{target_dir}}/{{target}}/release/xhalt {{xhalt_binary}}
+
+build-rootfs: build-guest
+    SOURCE_DATE_EPOCH={{source_date_epoch}} docker buildx build \
+      --platform linux/riscv64 \
+      --output type=tar,dest={{rootfs_tar}} \
+      --file Dockerfile \
+      .
+    xgenext2fs -f -z -B 4096 -i 4096 -r +4096 -a {{rootfs_tar}} -L rootfs {{rootfs_ext2}}
+
+# Stores the template at the first accept yield, with an all-zero NVRAM `state`.
+build-image: clean build-rootfs
+    test -s {{linux_kernel}} || { echo "missing {{linux_kernel}}; run 'just canonical download-deps'"; exit 1; }
+    cd {{kernel_dir}} && shasum -a 512 -c {{linux_kernel_filename}}.sha512 >/dev/null
+    cartesi-machine \
+      --assert-version={{cartesi_machine_version}} \
+      --ram-length=64Mi \
+      --ram-image={{linux_kernel}} \
+      --flash-drive=label:root,data_filename:{{rootfs_ext2}} \
+      --nvram=label:state,length:64Ki,user:dapp \
+      --append-init=WORKDIR="/dapp" \
+      --append-entrypoint="/dapp/dapp" \
+      --assert-rolling-template --final-hash \
+      --store={{machine_image}}
+
+clean:
+    rm -rf {{out_dir}}
