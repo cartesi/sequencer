@@ -18,6 +18,14 @@ images and re-`init` watchdog state directories. The kernel
 the emulator release and move with it. The development shell pins the same
 emulator through the parent flake.
 
+**A deployed application is pinned to its emulator version.** Its on-chain
+template hash is the root hash of a machine built with one emulator release,
+and the machine identifiers are part of that hash. A machine rebuilt with
+another release has a different root hash, and the old release's stored
+machines do not load. Every canonical machine for a deployment, the
+watchdog's included, must run the release its template was built with; moving
+to a new emulator release means a new application deployment.
+
 ## Rollup host semantics
 
 The reference host loop is the `cartesi-machine` CLI (`run_advance_state_epoch`
@@ -96,12 +104,31 @@ answering an inspect query:
   the native engine cannot reproduce into the range. Declare state drives with
   `mke2fs:false,mount:false`, or use an NVRAM.
 - **Labels.** User labels are stored in the machine config (`flash_drive[i].label`,
-  `nvram[i].label`). The automatic names `flashdriveN` and `nvramN` exist only as
-  device-tree aliases; `cartesi.util.find_drive` matches user labels only. The
-  CLI's NVRAM and drive init lines call the guest-tools `nvram`/`flashdrive`
-  helpers, which are glibc binaries and do not run on a musl (Alpine) rootfs.
+  `nvram[i].label`). The guest's device tree aliases both the user label and the
+  automatic name (`flashdriveN`, `nvramN`), but the config holds only the user
+  label, and `cartesi.util.find_drive` matches user labels only.
 - Read a range with `machine:read_memory(start, length)`. The stored file layout
   (`<start>-<length>.bin`) is an internal format; do not depend on it.
+
+## The guest side
+
+- **The guest–host interface is unchanged from v0.20.** Yield reasons, CMIO
+  buffer addresses, and ioctl numbers are the same; only the names moved to
+  `HTIF_*`. The revert root hash and the per-input cycle budget are host-side.
+  libcmt 0.18 bundles its ioctl header, so the guest build needs no kernel
+  headers.
+- **Some guest tools are glibc builds.** The `nvram`/`flashdrive` label helpers,
+  which the CLI's generated init script calls for every NVRAM and for flash
+  drives it formats, mounts, or chowns, and `xhalt`, which `cartesi-init` calls
+  to halt with the entrypoint's exit status, do not run on a musl (Alpine)
+  rootfs. Without `xhalt`, a failing entrypoint halts with payload 0. The
+  watchdog test guest ships musl stand-ins for both; the canonical wallet image
+  does not, so its panics halt with exit code 0.
+- **trolley has no exception call.** A guest that must raise a CMIO exception
+  does it through `libcmt-sys` directly (see `watchdog/test-guest`).
+- **The last input stays in the machine.** The CMIO receive buffer keeps it,
+  and it is part of the machine state: root hashes agree only for byte-identical
+  inputs, metadata included.
 
 ## Hashing
 
@@ -130,4 +157,5 @@ as a reference:
 - An inspect query is delivered even to a machine at an exception yield, and
   its own outcome is not reported.
 - `--remote-spawn` leaves machine servers running unless `--remote-shutdown` is
-  also given. `--no-rollback` no longer exists; use `--no-revert`.
+  also given. `--no-rollback` no longer exists; use `--no-revert`, which cannot
+  get past a rejected input: the emulator refuses the next advance.

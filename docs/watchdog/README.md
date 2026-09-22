@@ -1,386 +1,298 @@
 # Watchdog
 
-The watchdog independently replays L1 inputs in the canonical Cartesi Machine
-and compares its application-state bytes with the sequencer's accepted
-checkpoint at the same L1 block boundary. The wallet's comparison format is SSZ;
-the watchdog itself only compares bytes.
+The watchdog independently re-derives the application's canonical state from
+L1 and checks that the sequencer's accepted checkpoint holds the same state. It
+runs the canonical Cartesi Machine over the InputBox inputs, extracts the
+application state, and compares its SHA-256 with the digest the sequencer
+serves for the same L1 block. Its value is independence: the sequencer serves
+state from its own native execution, while the watchdog replays the canonical
+program with the rollup's own host semantics.
 
-The `/finalized_state` name refers to the sequencer's latest **safe, accepted
-batch checkpoint**, not Ethereum's `finalized` tag or a state the watchdog has
-already verified. [Snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)
-owns checkpoint selection and why that application state is comparable at a
-whole L1 block boundary.
+The sequencer's "finalized" routes serve its latest **safe, accepted batch
+checkpoint**, not Ethereum's `finalized` tag.
+[Snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison) owns
+checkpoint selection and why that state is comparable at a whole L1 block.
 
-## Documentation
+| Document | Audience |
+|---|---|
+| This file | How the watchdog works: contract, commands, configuration, state, metrics |
+| [`incident-runbook.md`](incident-runbook.md) | What to do when it latches a divergence, and the drills that practice it |
+| [`operator-deployment.md`](operator-deployment.md) | Deploying on a live chain (Sepolia, mainnet) |
+| [`getting-started.md`](getting-started.md) | Running it locally against a devnet |
+| [Cartesi Machine facts](../cartesi-machine.md) | Emulator behavior the watchdog depends on |
 
-| Doc | Audience |
-|-----|----------|
-| **[`operator-deployment.md`](operator-deployment.md)** | **Production-like** — Sepolia and mainnet: internal snapshot API, live L1, checkpoints (Sepolia = mainnet dress rehearsal) |
-| **[`getting-started.md`](getting-started.md)** | **Local dev only** — Anvil + `sequencer-devnet`, harness smoke, two-terminal flow |
-| This file | Architecture, modules, runtime contract, checkpoints, test commands |
-| [`staging-drills.md`](staging-drills.md) | Webhook smoke, synthetic alarms, staging compare daemon |
-| [`design-notes.md`](design-notes.md) | Detection boundaries and checkpoint crash model |
-| [`sepolia.md`](sepolia.md) | Redirect → [`operator-deployment.md`](operator-deployment.md) |
+## The tick
 
-### Quick start (pick your environment)
+`tick` runs one compare cycle and exits; a scheduler (systemd timer,
+Kubernetes CronJob) runs it periodically. There is no daemon and no in-tick
+retry: a failed tick's retry is the next scheduled one.
 
-**Sepolia / mainnet (operator):** [`operator-deployment.md`](operator-deployment.md) — shared checklist, internal URL, Sepolia CM image, mainnet notes.
+1. If a divergence is latched, exit 2 without work.
+2. The head is the newest checkpoint under `checkpoints/`.
+3. Poll `GET /finalized_state/inclusion_block`. Unchanged: exit 0 (idle).
+   Lower than the head: latch `inclusion_block_regressed`, unless the head is
+   still the bootstrap machine. A regression is relative to a block the
+   sequencer agreed with; a sequencer behind a never-agreed bootstrap block has
+   simply not reached it, and the tick idles.
+4. `GET /finalized_state/digest`. Its block B is the replay target, fixed
+   before any replay, so a long catch-up never chases a moving target.
+5. Check that the L1 RPC serves the configured chain and that its `safe` head
+   has reached B.
+6. Replay the InputBox inputs of blocks `(head, B]` on a clone of the head
+   (below), proving the L1 view complete (below).
+7. Extract the application state from the resulting machine and hash it.
+8. Equal digests: publish the machine as `checkpoints/<B>-<input count>` and
+   remove the previous head. Different: latch `state_mismatch`. A canonical
+   machine that stopped for good during replay latches
+   `canonical_machine_dead`.
 
-**Local devnet:**
+### Canonical execution
 
-One-time setup, then either a single automated check or an interactive run:
+The watchdog drives the machine in-process through the `cartesi` Lua module,
+with the reference rollup host semantics the `cartesi-machine` CLI and Dave
+implement ([details](../cartesi-machine.md#rollup-host-semantics)). It clones
+the head into a working directory and runs the machine in place on it; before
+each input it clones the working directory as a snapshot:
 
-```bash
-just setup && just canonical-build-machine-image && just watchdog-lua-deps
+- `RX_ACCEPTED`: the snapshot is discarded.
+- `RX_REJECTED`: the snapshot replaces the working directory, and its root
+  hash must equal the input's revert root hash.
+- exception, halt, any other manual yield, or cycle overflow: a permanent
+  fixed point. Nothing after it can ever run; the watchdog latches.
 
-# Path A — full smoke (Anvil + sequencer + CM + compare), one command:
-just test-watchdog-compare-harness
+On copy-on-write filesystems (APFS, btrfs, XFS with reflink) a clone costs
+metadata only; elsewhere it is a full sparse copy of the machine, which makes
+multi-GiB states slow. Conformance tests run the same inputs through the
+watchdog and the reference CLI and require equal root hashes.
 
-# Path B — two terminals: stack prints CARTESI_WATCHDOG_* exports, then init + tick:
-just devnet-for-watchdog          # terminal 1 — leave running
-# terminal 2: paste exports, then:
-export CARTESI_WATCHDOG_LUA_ROOT="$(pwd)"
-export CARTESI_WATCHDOG_LUA_BIN=lua5.4
-export CARTESI_WATCHDOG_LUA_DEPS=.deps/lua
-./watchdog/sequencer-watchdog init
-./watchdog/sequencer-watchdog tick
+### L1 completeness
+
+A provider that silently drops logs must fail the tick, not produce a false
+comparison. The reader requires InputBox indices to run contiguously from the
+head's input count, and checks the count it reached against
+`InputBox.getNumberOfInputs(app)` pinned at block B. Every input's payload must
+name the configured application and chain. Long log ranges are split on the
+provider error codes that mean "range too large", exactly like the Rust reader
+(shared vector: `tests/fixtures/l1_partition_vector.json`).
+
+**Scan floor.** The Rust reader starts at the application's deployment block,
+which is sound only because it also witnesses that the InputBox rejects inputs
+for undeployed applications. The watchdog starts at its bootstrap block and
+proves completeness from the InputBox count instead; do not copy the
+deployment-block floor without the witness.
+
+The reader holds one provider response at a time: each successful log range
+is decoded and fed to the machine before the next is fetched.
+
+## State sources
+
+`init` persists how the application state is extracted
+(`CARTESI_WATCHDOG_STATE_SOURCE`):
+
+- **`range:<label>`**: the whole flash drive or NVRAM whose user label is
+  `<label>`, all of its bytes including the zero tail, read without running the
+  guest. The sequencer's comparison file must be exactly those bytes. The
+  [application contract](../protocol/application-contract.md#6-checkpoint-lifecycle)
+  owns that obligation, including the flush rule for flash drives.
+- **`inspect`**: the inspect query `state`, which must end at `RX_ACCEPTED`
+  with exactly one report. It runs on a private copy of the stored machine,
+  which is then discarded. One report is at most 2 MiB (the CMIO buffer), so
+  this source only suits small states. The toy wallet uses it.
+
+## Commands
+
+| Command | Effect | Exit |
+|---|---|---|
+| `init` | Store the trusted bootstrap machine as the first checkpoint and write `config.json`. Idempotent on a complete state directory; refuses one initialized for another deployment or state source. | 0, or 1 |
+| `tick` | One compare cycle; writes `last_tick.json` and `status.prom`. | 0 ok or idle, 1 warning, 2 divergence latched |
+| `status` | JSON on stdout: config, head, latched divergence, last tick. Read-only; fails on a missing state directory. | 0, or 1 |
+| `clear --block B --reason TEXT` | Archive the divergence latched at block B into `incidents/`. Refuses any other block, except for an unreadable marker, which has none. | 0, or 1 |
+| `replay --from DIR --from-block A --to-block B --out DIR` | Re-derive canonical state from a stored machine into a new directory and print its digest. The machine must be a trusted start, like init's bootstrap; `--out` must not exist, and both paths are absolute. Reads the state directory's `config.json` and never writes it. | 0, or 1 |
+
+The `sequencer-watchdog` wrapper takes a non-blocking `flock` on
+`$CARTESI_WATCHDOG_STATE_DIR/run.lock` for `init`, `tick`, and `clear`;
+schedulers must also prevent overlapping ticks (systemd, or Kubernetes
+`concurrencyPolicy: Forbid`).
+
+`init` checks the bootstrap machine: it must wait for an input and yield the
+configured state source, and it must be a trusted start, which `replay`
+requires of its `--from` machine too. Its block must be safe on the RPC; its
+input count comes from `getNumberOfInputs` at that block, which needs an RPC
+with state there (an archive node for old blocks); and when no input precedes
+the block, the machine must be the application's template (its root hash
+equals the on-chain `getTemplateHash()`).
+
+Exit 1 covers three failure classes, which the log line and `last_tick.json`
+name: `transient` (the L1 RPC or the sequencer's HTTP API; the next tick may
+succeed), `operator` (configuration, the state directory, an image), and
+`internal` (anything else, including filesystem failures such as a full disk).
+Exit 2 means a divergence is latched and stays latched until `clear`.
+
+## Configuration
+
+`init` reads the environment and writes `config.json`, which later commands
+read: the chain id, the application, the InputBox it derives from the
+application, the state source, the bootstrap block, the sequencer URL, and the
+range-error codes. The bootstrap block matters after `init` too: it tells a
+never-agreed head from an agreed one (see [the tick](#the-tick)). The L1 RPC
+endpoint is never persisted.
+
+| Variable | Read by | Meaning |
+|---|---|---|
+| `CARTESI_WATCHDOG_STATE_DIR` | all | Absolute path of the state directory |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | init, tick, replay | L1 JSON-RPC endpoint; never persisted, so it can rotate |
+| `CARTESI_WATCHDOG_SEQUENCER_URL` | init (persisted); tick (optional override) | Sequencer operator API base URL |
+| `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | init (optional) | Expected chain id; defaults to the RPC's `eth_chainId` |
+| `CARTESI_WATCHDOG_APP_ADDRESS` | init | Application address; init derives the InputBox from its `getDataAvailability()`, as the sequencer does |
+| `CARTESI_WATCHDOG_STATE_SOURCE` | init | `inspect`, or `range:<label>` with a label matching `[a-z][a-z0-9-]*` |
+| `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | init | Absolute path of the trusted bootstrap machine |
+| `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | init | L1 block the bootstrap machine has consumed all inputs through |
+| `CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES` | init (optional) | Comma-separated provider codes that split log ranges; default `-32005,-32012,-32600,-32602,-32616` |
+| `CARTESI_WATCHDOG_METRICS_FILE` | tick (optional) | Absolute path to write `status.prom` to instead of the state directory |
+| `CARTESI_WATCHDOG_LUA_ROOT`, `CARTESI_WATCHDOG_LUA_BIN` | wrapper | Lua sources and interpreter (defaults suit the release image) |
+| `CARTESI_WATCHDOG_LUA_DEPS` | all | Directory of the native modules (`lcurl.so`, `lfs.so`) |
+| `CARTESI_WATCHDOG_PRINT_RELEASE_INFO` | wrapper | `1` prints the release's `RELEASE.json`, including its Cartesi Machine version, and exits |
+
+Changing a persisted setting means wiping the state directory and running
+`init` again.
+
+## State directory
+
+```text
+state/
+  config.json                      deployment identity and state source (init)
+  checkpoints/<block>-<count>/     stored machine the sequencer agreed with; the newest is the head
+  work/                            scratch for the running command
+  incident/                        the latched divergence and its evidence, if any
+  incidents/<id>/                  cleared incidents, with the operator's reason
+  last_tick.json, status.prom      the last tick's outcome
+  run.lock                         the wrapper's lock
 ```
 
-The `sequencer-watchdog` wrapper wraps `init`/`tick` with an advisory `flock`
-on `$CARTESI_WATCHDOG_STATE_DIR/run.lock`. Production schedulers must also prevent
-overlapping ticks
-(`flock`, systemd, or Kubernetes `concurrencyPolicy: Forbid`).
+A checkpoint's name carries its L1 block and the InputBox input count through
+that block. Checkpoints are published with the emulator's `sync_stored` and
+`rename_stored`, which fsync and rename atomically, so the head needs no
+pointer file and a crash leaves either the old head or the new one. Older
+checkpoints are removed after the new head is published; an interrupted
+removal is finished by the next agreeing tick. JSON files are atomic but not
+fsynced. A torn latch marker still latches (kind `unreadable_marker`); a lost
+one latches again on the next tick if the divergence persists; a lost tick
+record is rewritten. A `config.json` lost to a crash right after `init` means
+running `init` again; a torn one (`config.json is not valid JSON`) means wiping
+the state directory first. The watchdog stores whole machines, never the
+sequencer's restore archives.
 
-Details: **[`getting-started.md`](getting-started.md)**.
+## Divergence latch
 
-## Runtime Contract
+A divergence writes its local evidence into `incident/`, then
+`divergence.json`: the marker is the latch. For `state_mismatch` the evidence
+is the canonical machine at B, which waits for an input, and its comparison
+bytes; for `canonical_machine_dead`, the machine at its fixed point; a
+regression has none. It then fetches the sequencer's comparison file, if the sequencer is
+still at B, and adds the first differing offset and page count to the marker;
+byte-identical files are recorded as `identical`, which means the digests, not
+the states, disagreed. While latched, a tick exits 2 even when its
+configuration or endpoints are broken. The latching tick also
+prints the marker as one `watchdog_event <JSON>` line on stderr. The
+[incident runbook](incident-runbook.md) owns what to do next.
 
-The watchdog consumes two operator-internal routes:
+## Metrics
 
-- `GET /finalized_state/inclusion_block` — cheap JSON `{ inclusion_block, executed_input_count }` polled every compare tick.
-- `GET /finalized_state` — streams the comparison file (`application/octet-stream`); the watchdog reads its `X-Inclusion-Block` and `X-Executed-Input-Count` headers.
+Each tick writes a [Prometheus textfile](https://github.com/prometheus/node_exporter#textfile-collector)
+(`status.prom`); every series carries `chain` and `app_address` labels.
 
-The sequencer's genesis baseline is immediately comparable. A rebuilt baseline
-is a restore artifact; these routes return 404 until a new accepted batch
-provides a comparison checkpoint. The [snapshot lifecycle](../snapshots/lifecycle.md)
-owns availability, response metadata, and artifact leases.
+| Series | Meaning |
+|---|---|
+| `cartesi_watchdog_status{state="ok\|warning\|failed"}` | Exactly one is 1: exit 0, 1, or 2 |
+| `cartesi_watchdog_divergence_info{kind}` | Present while a divergence is latched |
+| `cartesi_watchdog_head_block` | The head's L1 block: the last block the sequencer agreed with, or the bootstrap block before the first agreement |
+| `cartesi_watchdog_last_tick_timestamp_seconds` | When the last tick finished |
 
-**Positioning is by L1 block.** If `inclusion_block` equals the watchdog
-checkpoint's `safe_block`, the tick exits idle: no state download, L1 fetch, or
-CM work. A lower block is a terminal `inclusion_block_regressed` event. For a
-higher block, the watchdog replays every InputBox input from `safe_block + 1`
-through that block, then downloads the comparison file. If its block header differs from the
-polled target, the tick retries rather than comparing different boundaries.
-
-The client parses `executed_input_count` but does not use it as a replay cursor
-or compare it between responses. It does not consume history era/generation
-headers or WebSocket events. Its independently replayed L1 checkpoint is
-separate from the snapshot-plus-feed protocol described in
-[Application history](../protocol/application-history.md).
-
-The CM's `state` inspect query must return exactly one report. The watchdog
-compares those bytes directly with the downloaded file, without decoding or
-canonicalizing either side.
-
-For the toy wallet app, SSZ encoding lives in `examples/app-core/src/wallet_snapshot.rs`
-and is shared by `WalletApp::create_dump`, `CanonicalState::canonical_snapshot_bytes`,
-and the canonical scheduler's `Inspect` handler (`examples/canonical-app`).
-
-## Checkpoints
-
-V1 persists the whole Cartesi Machine checkpoint, including scheduler state;
-it does not persist fetched L1 inputs. This is different from the sequencer's
-app-owned restore archives (`/latest_snapshot` and `/finalized_snapshot`) and
-from its comparison file (`/finalized_state`). The watchdog downloads neither
-archive.
-
-`manifest.json` records `safe_block` (the L1 block through which the CM has
-consumed all inputs), timestamp, and optionally the CM image hash. A new
-checkpoint directory is written first, then `head.json` is atomically replaced
-to point at it. [Design notes](design-notes.md#checkpoint-crash-model) own the
-state layout, best-effort pruning, and crash guarantees.
-
-`init` stores a trusted operator-provided CM snapshot and its declared block
-into this layout. That block may precede the sequencer's current comparison
-target: `tick` replays the intervening inputs. `init` does not compare against
-the sequencer, and a first tick at the same block exits idle; successful init
-or idle is not evidence of a state comparison. See the
-[accepted detection boundary](design-notes.md#watchdog-state).
-
-`tick` requires both `config.json` and `head.json`; it never bootstraps from env.
-`CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` is not persisted in `config.json`, so
-operators can rotate RPC endpoints without rewriting watchdog state. It is
-required at `tick` for L1 reads, and optionally present at `init` when
-auto-detecting `CARTESI_WATCHDOG_BLOCKCHAIN_ID` via `eth_chainId` (prefer setting
-the chain id explicitly).
-
-Bootstrap inputs read by `init`:
-
-- `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR`
-- `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`
-
-## How it runs
-
-The watchdog has two subcommands:
-
-```bash
-sequencer-watchdog init   # setup: writes config.json + head.json (idempotent if complete)
-sequencer-watchdog tick   # one compare cycle; schedule this
-```
-
-`tick` does one cycle per process, then exits — infra schedules re-runs
-(systemd timer / k8s CronJob) and reacts to the exit code. There is no daemon
-loop. `sequencer-watchdog` takes a non-blocking `flock` for `init`/`tick`;
-host scheduling should provide the same non-overlap guarantee. A tick follows
-the [runtime contract](#runtime-contract), writes a checkpoint only after a
-successful comparison, and emits `watchdog_event` on mismatch or regression.
-It atomically writes `status.prom` before exit.
-
-Runtime knobs:
-
-- `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT`: current L1 JSON-RPC endpoint for tick (and optional at `init` for chain-id auto-detect).
-- `CARTESI_WATCHDOG_SEQUENCER_URL`: optional tick-time override of the URL persisted at `init` (useful when ephemeral ports change).
-- `CARTESI_WATCHDOG_BLOCKCHAIN_ID`: optional chain id label persisted at `init` for `status.prom` (prefer explicit; tick never queries `eth_chainId`).
-- `CARTESI_WATCHDOG_METRICS_FILE`: optional override for the Prometheus textfile path (default `$CARTESI_WATCHDOG_STATE_DIR/status.prom`).
-- `CARTESI_WATCHDOG_RETRY_ATTEMPTS`: bounded retry attempts per run, default `3`.
-- `CARTESI_WATCHDOG_RETRY_DELAY_SEC`: delay between retry attempts, default `5`.
-
-## Metrics (`status.prom`)
-
-Each `tick` writes a [Prometheus textfile](https://github.com/prometheus/node_exporter#textfile-collector)
-before exiting. Operators scrape or push it from their side — the watchdog does
-not run an HTTP server.
-
-| Exit code | `state` label | Meaning |
-|-----------|---------------|---------|
-| `0` | `ok` | Compare passed, or idle (finalized unchanged) |
-| `1` | `warning` | Retryable failure after retries, or an operator/configuration error |
-| `2` | `failed` | State mismatch or inclusion-block regression |
-
-Gauges (labels `chain`, `app_address` on every series):
-
-- `cartesi_watchdog_status{state="ok|warning|failed"}` — exactly one series is `1`
-- `cartesi_watchdog_divergence_info{kind}` — only on exit `2`
-
-Exit codes map to `state` only (`0→ok`, `1→warning`, `2→failed`); we do not
-export a separate exit-code or last-tick gauge — Prometheus scrape/push already
-carries a sample timestamp.
-
-Set `CARTESI_WATCHDOG_BLOCKCHAIN_ID` at `init` for the `chain` label. If unset,
-`init` queries `eth_chainId` from `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` and
-persists the result. At `tick`, the env var takes precedence over the persisted value;
-the exit path never blocks on RPC (defaults to `unknown` only when neither source
-is set). Golden fixtures: [`tests/fixtures/watchdog_status_ok.prom`](../../tests/fixtures/watchdog_status_ok.prom),
-[`tests/fixtures/watchdog_status_failed.prom`](../../tests/fixtures/watchdog_status_failed.prom).
-
-Example after a clean tick:
-
-```prometheus
-cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="ok"} 1
-cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="warning"} 0
-cartesi_watchdog_status{app_address="0x4ce...",chain="11155111",state="failed"} 0
-```
-
-Example Prometheus alert (pull or push gateway — operator choice):
+A textfile-collector sample carries the scrape time, not the tick time, so a
+hung, killed, or lock-blocked tick leaves the previous `ok` in place. Alert on
+all three:
 
 ```promql
 cartesi_watchdog_status{state="failed"} == 1
+# Three missed ticks at a 5-minute interval:
+time() - cartesi_watchdog_last_tick_timestamp_seconds > 900
+# With a `for:` of a few tick intervals:
+cartesi_watchdog_status{state="warning"} == 1
 ```
 
-Divergence playbook: **notify only**; manual intervention (see
-[`operator-deployment.md`](operator-deployment.md)).
+Golden files: [`tests/fixtures/watchdog_status_ok.prom`](../../tests/fixtures/watchdog_status_ok.prom),
+[`tests/fixtures/watchdog_status_failed.prom`](../../tests/fixtures/watchdog_status_failed.prom).
 
-## Host dependencies (`watchdog-lua-deps`)
+## Detection boundary
 
-The watchdog cycle and any test that hits HTTP need a native **`lcurl.so`** built into `.deps/lua/`. JSON is pure Lua (no compile step).
+The watchdog and the sequencer's content-identity check catch different
+failures; neither subsumes the other.
 
-```bash
-just watchdog-lua-deps    # idempotent; writes .deps/lua/lcurl.so
-export CARTESI_WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"
-```
+The content-identity check runs inside the input reader's atomic safe-input
+sync. For every landing after baseline block `C` that the mirrored scheduler
+accepts, it requires a byte-identical valid local sealed batch at that nonce; a
+foreign or mismatched landing persists `canonical_divergence`, which freezes the
+accepted frontier
+([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
+The finalized routes then answer 503, so the watchdog cannot compare that
+block. The check shares the sequencer's acceptance predicate and does not
+replay application execution. The watchdog catches direct-input, user-op,
+scheduler, or application-state divergence once a comparable checkpoint is
+published.
 
-You also need **`cartesi-machine`** on `PATH` (in-process `cartesi`
-Lua module), **`lua`** (5.4 recommended), and a scheduler non-overlap
-guard. The release Docker image uses Linux `flock`; Nix also provides the
-same CLI on macOS/Linux via `nixpkgs#util-linux`:
+Accepted limit: a watchdog initialized while the sequencer already serves a
+wrong state at the bootstrap block idles until the next accepted block.
+Successful `init` or an idle tick is not evidence of a comparison.
 
-```bash
-nix shell nixpkgs#util-linux
-```
+## Why it is built this way
 
-### System packages
+- **Two state sources, one executable.** An inspect `state` handler is not a
+  reasonable contract for every application, and one report cannot exceed
+  2 MiB; an application that keeps its state in a machine memory range is
+  compared on that range. A library with application-supplied extraction hooks
+  waits for an application these two sources cannot serve.
+- **In-process execution, the CLI as oracle.** The optimizations (reflink
+  clones, in-place mapping) live in the emulator, and v0.21 enforces the
+  dangerous part of the host semantics itself (no input after a reject without
+  a revert). Running the CLI per tick would add process management and a full
+  machine store per tick for semantics we get anyway, so the watchdog mirrors
+  the CLI's `--revert-mode=stored` loop and tests against the CLI.
+- **Flat SHA-256 digests.** The comparison is an equality check between two
+  parties we operate, for states expected to reach several GiB. SHA-256 is the
+  cheapest on the sequencer and couples to nothing. A machine Merkle root
+  answers a different question, checking the sequencer against a machine
+  commitment without re-executing; it needs the sequencer to reimplement the
+  emulator's hash tree, and it waits for such a verifier. If the watchdog's
+  peak memory (about twice the range) binds, a two-level digest (SHA-256 over
+  the SHA-256 of fixed 64 MiB chunks) keeps it bounded.
 
-| OS | Packages |
-|----|----------|
-| Debian / Ubuntu / WSL | `libcurl4-openssl-dev` `liblua5.4-dev` `lua5.4` `build-essential` `util-linux` |
-| Fedora | `libcurl-devel` `lua-devel` `util-linux` |
-| Arch | `curl` `lua` `util-linux` |
+## Code map
 
-Verify before building:
+`watchdog/`:
 
-```bash
-pkg-config --exists libcurl && echo "libcurl ok"
-test -f /usr/include/lua5.4/lua.h && echo "lua headers ok"
-```
+- `main.lua`: command dispatch, exit codes, `last_tick.json` and `status.prom`.
+- `tick.lua`: one compare cycle. `canonical.lua`: advance a checkpoint through L1
+  inputs (shared by `tick` and `replay`). `bootstrap.lua`: `init`. `replay.lua`.
+- `machine.lua`: the in-process Cartesi Machine: executor with snapshot
+  semantics, machine status, state sources, publishing.
+- `l1.lua`, `abi.lua`, `jsonrpc.lua`: complete InputBox inputs from L1.
+- `sequencer.lua`, `http.lua`: the sequencer's operator routes over lua-curl.
+- `incident.lua`: the latch, evidence, and `clear`. `store.lua`: the state
+  directory. `config.lua`, `metrics.lua`, `errors.lua` (failure classes).
+- `sequencer-watchdog`: the production wrapper. `test-guest/`: a guest that
+  drives every host outcome, for tests.
 
-On Debian/Ubuntu, Lua headers live under **`/usr/include/lua5.4/`**, not `/usr/include/`. lua-cURLv3 is **vendored in-tree** under `watchdog/third_party/lua-curl/src`; `scripts/watchdog-lua-deps.sh` compiles it locally (no build-time download), discovering the Lua headers via `pkg-config` (override with `LUA_INC`).
+Native modules are vendored and built into `.deps/lua` by
+`just watchdog-lua-deps`: lua-curl (`lcurl.so`, needs libcurl) and
+LuaFileSystem (`lfs.so`). The `cartesi` module ships with the emulator.
 
-### Troubleshooting `just watchdog-lua-deps`
-
-| Message / error | Fix |
-|-----------------|-----|
-| `install libcurl dev package` | `sudo apt-get install -y libcurl4-openssl-dev` (or distro equivalent), then rerun `just watchdog-lua-deps` |
-| `install Lua headers` | `sudo apt-get install -y liblua5.4-dev` |
-| `fatal error: lua.h: No such file or directory` | Install `liblua5.4-dev`. If headers are present but build still fails, ensure you are on a tree where `scripts/watchdog-lua-deps.sh` passes **`LUA_INC`** (not `LUA_INCLUDE_DIR`) to make — see script in repo |
-| `built lcurl.so but lua cannot load it` | Lua version mismatch: build with the same `lua` you run (`lua -v` vs headers under `lua5.4`) |
-
-CI runs **`just test-watchdog`** (mocked HTTP), the divergence drill script, and watchdog rollups-e2e trials (`watchdog_genesis_compare_test`, non-genesis compare inside `deposit_transfer_withdrawal_test`, `watchdog_non_genesis_divergence_test`) plus a **`watchdog-docker`** image smoke job. Run **`just doctor`** locally before CM-backed work. Full local smoke: `just test-watchdog-compare-harness`.
-
-## V1 Shape
-
-The implementation lives in `watchdog/` and is intentionally split into small
-Lua modules:
-
-- `http.lua`: HTTP adapter via **lua-cURLv3** / `lcurl`, vendored in-tree and compiled by `just watchdog-lua-deps` (no build-time download).
-- `json.lua` / `third_party/json.lua`: pure-Lua JSON (RPC + structured watchdog events).
-- `jsonrpc.lua`: JSON-RPC request/response validation.
-- `l1_reader.lua`: partitioned `eth_getLogs` scanning, strict L1 log ordering,
-  and chunk callbacks so each successful provider response can be consumed and
-  discarded.
-- `abi.lua`: decoding for the `InputAdded` / `EvmAdvance` envelope.
-- `machine_runner.lua`: CM driver (`load`, `advance`, `inspect`, `dump`).
-- `machine_cartesi.lua`: in-process `cartesi` Lua module binding (production path).
-- `sequencer_reader.lua`: sequencer HTTP client (`GET /finalized_state/inclusion_block`, `GET /finalized_state`).
-- `compare.lua`: raw byte comparison.
-- `checkpoint.lua`: manifest-backed checkpoint persistence (`head.json` pointer).
-- `state.lua`: persisted `config.json`, atomic file writes, single-run state lock.
-- `metrics.lua`: Prometheus textfile (`status.prom`) built and written each tick.
-- `retry.lua`: bounded retry helper used by the runtime.
-- `runner.lua`: one compare cycle — cheap `/finalized_state/inclusion_block`
-  poll, then (when the accepted checkpoint advances) L1 fetch, CM replay, byte comparison,
-  checkpoint write.
-- `main.lua`: dispatches `init` and `tick`; `tick` exits `0`/`1`/`2` and writes `status.prom`.
-
-The L1 reader follows the Rust partition strategy from
-`sequencer/src/l1/partition.rs`: if an RPC provider rejects a large range, the
-range is split recursively and retried. Lua decodes and validates input
-envelopes, but it does not classify payload tags. Direct input vs batch
-submission remains scheduler logic inside the canonical machine.
-
-`l1_reader.lua` has the `InputAdded(address,uint256,bytes)` event topic baked in and
-filters logs by `topic0 = InputAdded` and `topic1 = app address`, matching the
-Rust reader's app-filtered InputBox scan.
-
-**Deliberate divergence — scan floor.** The Rust reader anchors its first scan
-at the *application's deployment block*, sound only because it also witnesses
-(via `InputBox.version()`) that the InputBox is rollups-contracts v3+, whose
-`addInput` reverts for not-yet-deployed apps. The watchdog does **not** mirror
-this: its scan floor is the operator-supplied checkpoint
-(`CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK`) or the last persisted `head.json`,
-and it performs no version witness. Do not copy the app-deployment floor into
-the Lua side without also porting the version witness that makes it sound.
-
-## Local Tests
+## Tests
 
 | Command | What it exercises |
-|---------|-------------------|
-| `just test-watchdog` | Lua unit tests (fake HTTP/RPC/CM; includes `status.prom` golden fixtures) |
-| `just test-watchdog-e2e` | Real CM: advance, inspect; optional live compare if `CARTESI_WATCHDOG_E2E_SEQUENCER_URL` set |
-| `just test-watchdog-compare-harness` | **Full E2E**: Anvil + devnet sequencer + `/finalized_state` + CM inspect + Lua `init`/`tick` |
-| `just test-rollups-e2e` | All rollups e2e scenarios; includes watchdog genesis/non-genesis compare plus `watchdog_non_genesis_divergence_test` (needs Sepolia CM image) |
-| `just test-watchdog-divergence-drill` | Synthetic divergence signal drill (`watchdog_event` + exit `2`) |
-| `just doctor` | Toolchain sanity: lua, cartesi-machine, lcurl, devnet CM image loadable via `machine_cartesi` |
-
-Prerequisites for CM-backed tests: see **[Host dependencies](#host-dependencies-watchdog-lua-deps)** above, then:
-
-```bash
-just doctor                          # fail fast before long harness runs
-just canonical-build-machine-image   # once, if out/ image is missing
-just canonical-build-machine-image-sepolia   # rollups-e2e divergence trial (auto-built by test-rollups-e2e)
-just watchdog-lua-deps
-export CARTESI_WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"
-```
-
-### Lua unit tests
-
-```bash
-just test-watchdog
-```
-
-Covers raw comparison, golden InputAdded ABI decoding, L1 ordering, recursive
-range partitioning, streamed L1 chunks, config, checkpoints, the compare runner
-(fakes), and retry behavior.
-
-### Lua CM end-to-end
-
-```bash
-just test-watchdog-e2e
-```
-
-Scenarios (verbose `step NN/NN` logging):
-
-- `prerequisites` — `cartesi-machine` on PATH and machine image present.
-- `cm-inspect-state-query` — real `--cmio-inspect-state` with query `state`.
-- `machine-cartesi-store-reload-advance` — store checkpoint snapshot, reload, advance again (in-process binding).
-- `compare-runner-with-sequencer` — skipped unless `CARTESI_WATCHDOG_E2E_SEQUENCER_URL` is set.
-
-Rebuild the machine image after changing the canonical scheduler/dapp. A stale
-image makes `cm-inspect-state-query` skip with `inspect endpoint not implemented`.
-
-### Rust compare harness (most complete integration test)
-
-```bash
-just test-watchdog-compare-harness
-```
-
-Spawns Anvil + rollups devnet + `sequencer-devnet`, proves CM inspect SSZ at
-genesis matches `wallet_snapshot::encode(WalletConfig::devnet())` (same as
-`tests/fixtures/wallet_snapshot_empty.hex` only for Sepolia `default()`), then runs
-`sequencer-watchdog init` and `sequencer-watchdog tick`.
-When `inclusion_block` is unchanged at genesis, the runner skips L1/CM work (idle-cheap);
-`deposit_transfer_withdrawal_test` drives a gold batch first so compare replays real L1 inputs.
-**Before first run (or after changing scheduler / SSZ / inspect code):**
-
-```bash
-just watchdog-lua-deps
-just canonical-build-machine-image   # not only ensure-machine-image — rebuild when the guest changed
-just test-watchdog-compare-harness
-```
-
-`ensure-machine-image` only checks that `examples/canonical-app/out/canonical-machine-image`
-exists; it does **not** detect a stale guest. If you pulled SSZ/inspect changes, rebuild the image.
-
-### Troubleshooting `just test-watchdog-compare-harness`
-
-| Symptom | Likely cause | Fix |
-|---------|----------------|-----|
-| `install libcurl dev package` / `lua.h: No such file` | Missing host deps for `lcurl.so` | [Host dependencies](#host-dependencies-watchdog-lua-deps) |
-| `could not determine which binary to run` | `rollups-e2e` crate has two bins | Use the just recipe, or `cargo run -p rollups-e2e --bin rollups-e2e -- …` |
-| `invalid utf-8` / timeout on step 1 (older trees) | Harness treated SSZ body as UTF-8 | Update `tests/e2e/src/watchdog_compare.rs` (current tree decodes binary + chunked bodies) |
-| `finalized_state bytes mismatch (len 87 vs expected 76)` | Wrong golden (Sepolia fixture vs devnet sequencer) and/or raw HTTP chunked framing | Harness expects **devnet** SSZ; `lcurl` decodes chunked responses automatically |
-| `CM inspect bytes mismatch (len 27 vs expected 76)` | **Stale CM image** still returns JSON `{"balances":{},"nonces":{}}` from pre-SSZ inspect | `just canonical-build-machine-image` then rerun harness |
-| `inspect endpoint not implemented` | Older guest without inspect handler | Same rebuild as above |
-| Harness passes step 1–2 but Lua compare fails | `CARTESI_WATCHDOG_LUA_DEPS` or checkpoint/bootstrap | Set `export CARTESI_WATCHDOG_LUA_DEPS="$(pwd)/.deps/lua"`; see [`getting-started.md`](getting-started.md) env table |
-
-Manual equivalent of the recipe:
-
-```bash
-cargo run -p rollups-e2e --bin rollups-e2e -- \
-  watchdog_genesis_compare_test --exact --nocapture
-```
-
-### Staging / operator drills
-
-See [`staging-drills.md`](staging-drills.md) for divergence signal and watchdog tick drills.
-
-## Related sequencer tests
-
-```bash
-cargo test -p sequencer --lib integration_tests::snapshot_endpoints -- --test-threads=1
-cargo test -p app-core wallet_snapshot -- --test-threads=1
-```
-
-HTTP integration-style coverage for snapshot routes lives in
-`sequencer/src/integration_tests/snapshot_endpoints.rs`; it stays inside the
-crate so raw server launch remains crate-private.
-SSZ golden bytes for the toy wallet live in `tests/fixtures/wallet_snapshot_empty.{hex,bin}`.
+|---|---|
+| `just test-watchdog` | Unit tests: every module against fakes, including the shared partition vector and metrics golden files |
+| `just watchdog lint` | `luacheck` |
+| `just test-watchdog-e2e` | The real emulator with the test guest: executor against the CLI oracle (accept, reject, exception, halt), both state sources, full ticks, `replay`, and the wallet image's golden genesis state. Builds the test guest image on first use; needs the sepolia canonical image |
+| `just test-rollups-e2e` | Devnet scenarios: the watchdog genesis compare and `watchdog_divergence_drill_test` on the Rust host, and the non-genesis compare through both hosts |
+| `just watchdog docker-smoke` | The release image: native modules, commands, and the lock |
+| `just doctor` | Toolchain: Lua, emulator, native modules, and the devnet image's state query |
