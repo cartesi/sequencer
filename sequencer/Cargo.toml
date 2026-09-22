@@ -34,6 +34,7 @@ ssz_derive = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 cartesi-rollups-contracts = { workspace = true }
 async-trait = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 app-core = { path = "../examples/app-core" }
