@@ -26,6 +26,8 @@ l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES = { "-32005", "-32012", "-32600", "-3260
 
 local GET_NUMBER_OF_INPUTS = "0x61a93c87" -- InputBox.getNumberOfInputs(address)
 local GET_TEMPLATE_HASH = "0x61b12c66" -- Application.getTemplateHash()
+local GET_DATA_AVAILABILITY = "0xf02478de" -- Application.getDataAvailability()
+local INPUT_BOX_AVAILABILITY = "\xb1\x2c\x9e\xde" -- DataAvailability.InputBox(address)
 
 local function address_word(address)
     return string.rep("0", 24) .. address:sub(3)
@@ -69,11 +71,12 @@ local function mentions_any(message, codes)
     return false
 end
 
---- `params`: input_box_address, app_address, chain_id, and optionally
---- long_block_range_error_codes.
+--- `params`: app_address, chain_id, and optionally input_box_address (derived
+--- from the application when absent) and long_block_range_error_codes.
 function l1.new(rpc, params)
     local codes = params.long_block_range_error_codes or l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
     local topics = { l1.INPUT_ADDED_TOPIC, "0x" .. address_word(params.app_address) }
+    local input_box = params.input_box_address
     local reader = {}
 
     local function rpc_value(value, err)
@@ -85,6 +88,29 @@ function l1.new(rpc, params)
 
     function reader:chain_id()
         return rpc_value(rpc:chain_id())
+    end
+
+    --- The InputBox the application reads, from its `getDataAvailability()`,
+    --- exactly as the sequencer derives it: a configured address could name
+    --- another release's InputBox, whose empty history would look complete.
+    function reader:input_box_address()
+        if input_box then
+            return input_box
+        end
+        local result = rpc_value(rpc:eth_call(params.app_address, GET_DATA_AVAILABILITY, "latest"))
+        if result == "0x" then
+            errors.operator("no application contract at %s", params.app_address)
+        end
+        local ok, address = pcall(function()
+            local availability = abi.decode_bytes(result)
+            assert(#availability == 36 and availability:sub(1, 4) == INPUT_BOX_AVAILABILITY)
+            return abi.decode_address_word(availability:sub(5, 36))
+        end)
+        if not ok then
+            errors.operator("application %s does not take its inputs from an InputBox alone", params.app_address)
+        end
+        input_box = address
+        return input_box
     end
 
     --- Fail unless the RPC's safe head has reached `block`.
@@ -99,11 +125,11 @@ function l1.new(rpc, params)
     --- InputBox is deployed there are none; an address that never holds a
     --- contract is a misconfiguration, not an empty history.
     function reader:input_count_at(block)
-        local result = rpc_value(rpc:eth_call(params.input_box_address,
-            GET_NUMBER_OF_INPUTS .. address_word(params.app_address), block))
+        local address = self:input_box_address()
+        local result = rpc_value(rpc:eth_call(address, GET_NUMBER_OF_INPUTS .. address_word(params.app_address), block))
         if result == "0x" then
-            if rpc_value(rpc:get_code(params.input_box_address, "latest")) == "0x" then
-                errors.operator("no contract at the InputBox address %s", params.input_box_address)
+            if rpc_value(rpc:get_code(address, "latest")) == "0x" then
+                errors.operator("no contract at the InputBox address %s", address)
             end
             return 0
         end
@@ -117,6 +143,9 @@ function l1.new(rpc, params)
     --- The template hash the application was deployed with, as raw bytes.
     function reader:template_hash()
         local result = rpc_value(rpc:eth_call(params.app_address, GET_TEMPLATE_HASH, "latest"))
+        if result == "0x" then
+            errors.operator("no application contract at %s", params.app_address)
+        end
         if type(result) ~= "string" or #result ~= 66 then
             errors.transient("getTemplateHash returned %s", tostring(result))
         end
@@ -150,7 +179,7 @@ function l1.new(rpc, params)
 
         local function scan(lo, hi)
             local logs, err = rpc:get_logs({
-                address = params.input_box_address,
+                address = self:input_box_address(),
                 from_block = lo,
                 to_block = hi,
                 topics = topics,

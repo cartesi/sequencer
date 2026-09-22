@@ -101,10 +101,6 @@ impl Watchdog {
                 DEVNET_CHAIN_ID.to_string(),
             )
             .env(
-                "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS",
-                runtime.input_box_address().to_string(),
-            )
-            .env(
                 "CARTESI_WATCHDOG_APP_ADDRESS",
                 runtime.app_address().to_string(),
             )

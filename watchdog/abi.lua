@@ -89,6 +89,18 @@ local function dynamic_bytes_at(hex, offset_word_index)
     return abi.bytes_from_hex(data_hex)
 end
 
+--- The bytes a returned dynamic `bytes` value encodes (an `eth_call` result).
+function abi.decode_bytes(encoded)
+    local hex = strip_0x(encoded)
+    assert_hex(hex)
+    return dynamic_bytes_at(hex, 0)
+end
+
+--- The address in a 32-byte ABI word.
+function abi.decode_address_word(word_bytes)
+    return address_from_word(abi.hex_from_bytes(word_bytes))
+end
+
 --- Decode `EvmAdvance(chainId, appContract, msgSender, blockNumber,
 --- blockTimestamp, prevRandao, index, payload)` calldata.
 function abi.decode_evm_advance(raw_input)

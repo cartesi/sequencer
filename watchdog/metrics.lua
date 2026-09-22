@@ -39,8 +39,8 @@ function metrics.state_for_exit_code(exit_code)
 end
 
 --- `report`: chain_id and app_address (nil when the config could not be
---- read), exit_code, timestamp (unix seconds), and optionally checked_block
---- (the head) and divergence_kind (while latched).
+--- read), exit_code, timestamp (unix seconds), and optionally head_block and
+--- divergence_kind (while latched).
 function metrics.render(report)
     local base = {
         chain = report.chain_id and tostring(report.chain_id) or "unknown",
@@ -62,10 +62,10 @@ function metrics.render(report)
         lines[#lines + 1] = "# TYPE cartesi_watchdog_divergence_info gauge"
         gauge("cartesi_watchdog_divergence_info", { kind = report.divergence_kind }, 1)
     end
-    if report.checked_block then
-        lines[#lines + 1] = "# HELP cartesi_watchdog_checked_block Newest L1 block the sequencer's state matched."
-        lines[#lines + 1] = "# TYPE cartesi_watchdog_checked_block gauge"
-        gauge("cartesi_watchdog_checked_block", nil, report.checked_block)
+    if report.head_block then
+        lines[#lines + 1] = "# HELP cartesi_watchdog_head_block L1 block of the watchdog's head checkpoint."
+        lines[#lines + 1] = "# TYPE cartesi_watchdog_head_block gauge"
+        gauge("cartesi_watchdog_head_block", nil, report.head_block)
     end
     lines[#lines + 1] = "# HELP cartesi_watchdog_last_tick_timestamp_seconds When the last tick finished."
     lines[#lines + 1] = "# TYPE cartesi_watchdog_last_tick_timestamp_seconds gauge"
