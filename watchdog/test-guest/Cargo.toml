@@ -1,0 +1,17 @@
+[package]
+name = "watchdog-test-guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cartesi Machine test guest exercising every rollup host outcome the watchdog must handle"
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+authors.workspace = true
+publish = false
+
+[dependencies]
+trolley = { workspace = true }
+# trolley has no exception call; see `raise_exception`.
+libcmt-sys = { workspace = true }
+libc = "0.2"

@@ -15,6 +15,7 @@ members = [
   "tests/benchmarks",
   "tests/harness",
   "tests/e2e",
+  "watchdog/test-guest",
   "cartesi-tools/libcmt-sys",
   "cartesi-tools/trolley",
   "cartesi-tools/testsi",
