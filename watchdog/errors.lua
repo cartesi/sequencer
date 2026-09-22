@@ -5,9 +5,12 @@
 --- anything else raised (a failed assertion, a Lua error) is an internal
 --- fault. Divergences are tick outcomes, never errors.
 ---
---- - transient: the environment (L1 RPC, sequencer HTTP, I/O) may recover by
----   the next scheduled tick.
---- - operator: configuration or state that only an operator can fix.
+--- - transient: the L1 RPC or the sequencer's HTTP API; it may recover by the
+---   next scheduled tick.
+--- - operator: configuration, the state directory, or an image: only an
+---   operator can fix it.
+--- - internal (anything else raised): a fault of the watchdog or its host,
+---   filesystem failures such as a full disk included.
 
 local errors = {}
 

@@ -93,9 +93,14 @@ local function block_flag(flags, name)
     return value
 end
 
-local function open_store(state_dir)
+--- The state directory; only commands that write it may create it, so a
+--- mistyped path fails `status` and `replay` instead of creating a directory.
+local function open_store(state_dir, create)
     local lfs = require("lfs")
     if lfs.attributes(state_dir, "mode") ~= "directory" then
+        if not create then
+            errors.operator("state directory %s does not exist", state_dir)
+        end
         local ok, err = lfs.mkdir(state_dir)
         if not ok then
             errors.operator("cannot create state directory %s: %s", state_dir, tostring(err))
@@ -116,7 +121,7 @@ local commands = {}
 
 function commands.init(_, env, factory)
     local cfg = config.from_init_env(env)
-    local store = open_store(cfg.state_dir)
+    local store = open_store(cfg.state_dir, true)
     local result = bootstrap.run(cfg, { store = store, machine = factory.machine(), l1 = factory.l1(cfg) })
     log("init: %s; head at block %d (%d inputs)", result.kind, result.head.block, result.head.input_count)
     return EXIT_OK
@@ -141,7 +146,8 @@ end
 
 function commands.clear(flags, env)
     local state_dir = config.state_dir(env)
-    local archive = incident.clear(open_store(state_dir), block_flag(flags, "block"), flag(flags, "reason"), now())
+    local store = open_store(state_dir, true)
+    local archive = incident.clear(store, block_flag(flags, "block"), flag(flags, "reason"), now())
     log("clear: incident archived at %s", archive)
     return EXIT_OK, { archived = archive }
 end
@@ -163,7 +169,7 @@ function commands.tick(_, env, factory)
     local report = { exit_code = EXIT_WARNING }
     local store
     local ok, err = pcall(function()
-        store = open_store(config.state_dir(env))
+        store = open_store(config.state_dir(env), true)
         -- A latch holds even when nothing else can run.
         local latched = incident.marker(store)
         local cfg_ok, cfg = pcall(read_config, store, env)
