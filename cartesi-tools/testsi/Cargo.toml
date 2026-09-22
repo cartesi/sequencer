@@ -1,0 +1,23 @@
+[package]
+name = "testsi"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+description = "Host-side test harness that drives a stored Cartesi Machine rollup image"
+publish = false
+
+[dependencies]
+testsi-macros = { path = "./testsi-macros" }
+types = { workspace = true }
+
+# Cartesi Machine v0.21 Rust bindings from cartesi/dave main, pinned by rev (no
+# version requirement: from a git source the crate reports Dave's workspace
+# version, not the bindings' 0.21.0). They link the prebuilt emulator named by
+# LIBCARTESI_PATH / INCLUDECARTESI_PATH (exported by the dev flake and by CI's
+# CM .deb install); `external_cartesi` makes a missing LIBCARTESI_PATH a build
+# error instead of a source-checkout fallback.
+cartesi-machine = { git = "https://github.com/cartesi/dave", rev = "79874c0a1b40678465daf533acc976c88301c6d4", features = ["external_cartesi"] }
+
+inventory = "0.3"
+libtest-mimic = "0.6"
+thiserror = "1.0"

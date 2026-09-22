@@ -30,6 +30,16 @@ jobs:
             liblua5.4-dev \
             libslirp-dev
 
+      # canonical-test links the emulator through testsi's cartesi-machine
+      # bindings, so the workspace build needs the pinned CM .deb and the
+      # LIBCARTESI_PATH / INCLUDECARTESI_PATH this action exports.
+      - name: Install cartesi-machine
+        uses: ./.github/actions/install-cartesi-machine
+        with:
+          version: ${{ env.CARTESI_MACHINE_VERSION }}
+          sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
+          sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

@@ -1,9 +1,11 @@
-# Stage 1: download `rollup-init`
+# Stage 1: download `cartesi-init`
 # -----------------------------------------------------------------------------
 FROM riscv64/debian:stable-slim AS extractor
 
-ARG MACHINE_EMULATOR_TOOLS_VERSION=0.17.2
-ARG TOOLS_SHA512="4af9911a5a76738d526bfc2b5462cf96c9dee98ec8b23f3ca91ac4849d5761765f471b5e2e8779809bc4a26d2799f8e744622864fa549ada5941e21d999ff4be"
+# Pairs with CARTESI_MACHINE_VERSION (toolchain-pins.env); keep the libcmt
+# vendored in cartesi-tools/libcmt-sys/libcmt at the same release.
+ARG MACHINE_EMULATOR_TOOLS_VERSION=0.18.0
+ARG TOOLS_SHA512="11a48b68545818a5e3b978e8c5339284ea7ac84acc44cc5b16550839c99066aaeec3c4107e043e653597613ebfb24fe0748984888af841341ce5bcb4dd01dae5"
 
 ADD https://github.com/cartesi/machine-guest-tools/releases/download/v${MACHINE_EMULATOR_TOOLS_VERSION}/machine-guest-tools_riscv64.deb /tmp/tools.deb
 
