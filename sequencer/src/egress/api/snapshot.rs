@@ -19,6 +19,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::{ReaderStream, SyncIoBridge};
@@ -63,6 +64,7 @@ pub(crate) fn router(
             "/finalized_state/inclusion_block",
             get(finalized_inclusion_block),
         )
+        .route("/finalized_state/digest", get(finalized_state_digest))
         .route("/latest_snapshot", get(latest_snapshot))
         .route("/finalized_snapshot", get(finalized_snapshot))
         .with_state(state)
@@ -93,6 +95,56 @@ async fn finalized_inclusion_block(State(state): State<Arc<SnapshotApiState>>) -
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => finalized_error("read finalized inclusion block", err),
     }
+}
+
+#[derive(Serialize)]
+struct DigestResponse {
+    inclusion_block: u64,
+    executed_input_count: u64,
+    sha256: String,
+}
+
+/// `GET /finalized_state/digest` — SHA-256 of the file `GET /finalized_state`
+/// streams, hashed under the same lease so the block and digest describe one
+/// checkpoint. The watchdog compares digests; the bytes are only evidence.
+async fn finalized_state_digest(State(state): State<Arc<SnapshotApiState>>) -> Response {
+    let FinalizedLease {
+        inclusion_block,
+        dump: leased,
+    } = match acquire_finalized(&state).await {
+        Ok(Some(leased)) => leased,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => return finalized_error("acquire finalized lease", err),
+    };
+    let path = state_file_path(&state.snapshot, &leased.prefix);
+    let executed_input_count = leased.executed_input_count.get();
+    let LeasedDump { guard, .. } = leased;
+    let scope = state.shutdown.clone();
+    let hashed = tokio::task::spawn_blocking(move || {
+        let _runtime_lifetime = scope;
+        let _lease = guard;
+        sha256_file(&path)
+    })
+    .await;
+    match hashed {
+        Ok(Ok(digest)) => Json(DigestResponse {
+            inclusion_block,
+            executed_input_count,
+            sha256: alloy_primitives::hex::encode(digest),
+        })
+        .into_response(),
+        Ok(Err(err)) => internal_error("hash finalized state file", err),
+        Err(err) if err.is_panic() => abort_terminal("comparison digest task panicked"),
+        Err(err) => internal_error("hash finalized state file", err),
+    }
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut file = comparison_io(std::fs::File::open(path), path)?;
+    let mut hasher = Sha256::new();
+    // The hasher never fails a write, so any error is the comparison file's.
+    comparison_io(std::io::copy(&mut file, &mut hasher), path)?;
+    Ok(hasher.finalize().into())
 }
 
 /// `GET /finalized_state` — stream the finalized state file (watchdog
@@ -480,6 +532,80 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    struct BaselineFixture {
+        _db: crate::storage::test_helpers::TestDb,
+        _root: tempfile::TempDir,
+        state: Arc<SnapshotApiState>,
+    }
+
+    fn baseline_state(name: &str, contents: &[u8]) -> BaselineFixture {
+        let db = temp_db(name);
+        let root = tempfile::tempdir().expect("snapshot root");
+        let dump_dir = root.path().join("dump");
+        std::fs::create_dir(&dump_dir).expect("create dump directory");
+        std::fs::write(dump_dir.join("state"), contents).expect("write comparison file");
+        let mut storage = Storage::open(&db.path).expect("open storage");
+        storage
+            .insert_baseline_snapshot(&dump_dir, crate::storage::ExecutedInputCount::ZERO)
+            .expect("insert baseline snapshot");
+        drop(storage);
+        let state = Arc::new(SnapshotApiState {
+            snapshot: SnapshotState {
+                db_path: db.path.clone(),
+                state_file_in_dump: |prefix| prefix.join("state"),
+            },
+            shutdown: RuntimeScope::default(),
+            release_scheduler: Arc::new(|release| release()),
+        });
+        BaselineFixture {
+            _db: db,
+            _root: root,
+            state,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digest_hashes_the_streamed_comparison_file() {
+        let contents = vec![0xab_u8; 3 * 1024 * 1024 + 17];
+        let fixture = baseline_state("digest-matches-stream", &contents);
+        let state = fixture.state.clone();
+
+        let response = finalized_state_digest(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("digest body");
+        let digest: serde_json::Value = serde_json::from_slice(&body).expect("digest JSON");
+        assert_eq!(digest["inclusion_block"], 0);
+        assert_eq!(digest["executed_input_count"], 0);
+
+        let streamed = finalized_state(State(state), HeaderMap::new()).await;
+        let bytes = axum::body::to_bytes(streamed.into_body(), contents.len() + 1)
+            .await
+            .expect("state body");
+        assert_eq!(bytes.as_ref(), contents.as_slice());
+        assert_eq!(
+            digest["sha256"],
+            alloy_primitives::hex::encode(Sha256::digest(&bytes))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digest_is_absent_without_a_comparable_checkpoint() {
+        let db = temp_db("digest-absent");
+        drop(Storage::open(&db.path).expect("open storage"));
+        let state = Arc::new(SnapshotApiState {
+            snapshot: SnapshotState {
+                db_path: db.path,
+                state_file_in_dump: |prefix| prefix.join("state"),
+            },
+            shutdown: RuntimeScope::default(),
+            release_scheduler: Arc::new(|release| release()),
+        });
+        let response = finalized_state_digest(State(state)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

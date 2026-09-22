@@ -91,7 +91,8 @@ These endpoints are operator-only and require network isolation:
   opaque `state` artifact. It may describe optimistic state.
 - `/finalized_state` streams only the canonical comparison file for the latest
   accepted checkpoint. `/finalized_state/inclusion_block` provides its block and
-  executed-input count for the watchdog.
+  executed-input count for the watchdog's idle poll, and
+  `/finalized_state/digest` adds the file's SHA-256 under the same lease.
 - `/finalized_snapshot` streams a complete recovery tar archive containing
   `info.toml`, `state`, and a generated `checkpoint.toml` acceptance receipt.
   The receipt supplies the accepted inclusion block and next batch nonce.
