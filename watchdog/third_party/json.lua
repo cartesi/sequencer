@@ -1,6 +1,8 @@
 --
 -- json.lua — vendored pure-Lua JSON (RPC + structured watchdog events).
 -- UPSTREAM: https://github.com/rxi/json.lua @ 0.1.2 (commit on master, MIT)
+-- LOCAL CHANGE: integers encode exactly (`%d`); upstream formats every number
+-- with `%.14g`, which rounds integers above 10^14.
 -- See LICENSE note in file header below.
 
 --
@@ -110,6 +112,9 @@ local function encode_number(val)
   -- Check for NaN, -inf and inf
   if val ~= val or val <= -math.huge or val >= math.huge then
     error("unexpected number value '" .. tostring(val) .. "'")
+  end
+  if math.type(val) == "integer" then
+    return string.format("%d", val)
   end
   return string.format("%.14g", val)
 end

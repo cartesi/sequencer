@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::Filter;
+use alloy_sol_types::SolEvent;
 use app_core::application::default_private_keys;
+use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use sequencer_rust_client::SequencerClient;
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
@@ -829,6 +833,24 @@ impl ManagedSequencer {
 
     pub fn input_box_address(&self) -> Address {
         self.rollups.input_box_address()
+    }
+
+    /// L1 blocks of the application's InputBox inputs, in input order.
+    pub async fn input_blocks(&self) -> HarnessResult<Vec<u64>> {
+        let provider = ProviderBuilder::new()
+            .connect(self.l1_endpoint())
+            .await
+            .map_err(|err| io_other(format!("failed to connect L1 provider: {err}")))?;
+        let filter = Filter::new()
+            .address(self.input_box_address())
+            .event_signature(InputAdded::SIGNATURE_HASH)
+            .topic1(self.app_address().into_word())
+            .from_block(0);
+        let logs = provider
+            .get_logs(&filter)
+            .await
+            .map_err(|err| io_other(format!("failed to read InputAdded logs: {err}")))?;
+        Ok(logs.iter().filter_map(|log| log.block_number).collect())
     }
 
     pub fn erc20_portal_address(&self) -> Address {
