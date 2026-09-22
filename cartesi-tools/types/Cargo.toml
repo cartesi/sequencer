@@ -1,0 +1,11 @@
+[package]
+name = "types"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2024"
+description = "Cartesi Rollups ABI types (inputs, outputs, portal deposits) shared by guest and host"
+publish = false
+
+[dependencies]
+alloy-sol-types = "1"
+alloy-primitives = "1"

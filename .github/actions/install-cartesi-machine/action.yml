@@ -1,0 +1,51 @@
+name: "Install cartesi-machine"
+description: "Install the pinned machine-emulator .deb and export LIBCARTESI_PATH / INCLUDECARTESI_PATH for the Rust bindings."
+
+inputs:
+  version:
+    description: "cartesi-machine release tag"
+    required: true
+  sha256-amd64:
+    description: "SHA-256 for the amd64 .deb"
+    required: true
+  sha256-arm64:
+    description: "SHA-256 for the arm64 .deb"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install cartesi-machine
+      shell: bash
+      run: |
+        set -euo pipefail
+        ARCH="$(dpkg --print-architecture)"
+        VERSION="${{ inputs.version }}"
+
+        case "${ARCH}" in
+          amd64)
+            DEB_SHA256="${{ inputs.sha256-amd64 }}"
+            ;;
+          arm64)
+            DEB_SHA256="${{ inputs.sha256-arm64 }}"
+            ;;
+          *)
+            echo "unsupported arch for machine-emulator: ${ARCH}" >&2
+            exit 1
+            ;;
+        esac
+
+        wget -O /tmp/machine-emulator.deb "https://github.com/cartesi/machine-emulator/releases/download/${VERSION}/machine-emulator_${ARCH}.deb"
+        echo "${DEB_SHA256}  /tmp/machine-emulator.deb" | sha256sum --check
+        sudo apt-get install -y /tmp/machine-emulator.deb
+        rm -f /tmp/machine-emulator.deb
+        cartesi-machine --version
+
+        # testsi's cartesi-machine bindings (cartesi/dave) link this prebuilt
+        # emulator; they build only with LIBCARTESI_PATH set (external_cartesi).
+        # The static archive references libslirp, so callers must also install
+        # libslirp-dev.
+        test -f /usr/lib/libcartesi.a
+        test -f /usr/include/cartesi-machine/cm.h
+        echo "LIBCARTESI_PATH=/usr/lib" >> "${GITHUB_ENV}"
+        echo "INCLUDECARTESI_PATH=/usr/include/cartesi-machine" >> "${GITHUB_ENV}"
