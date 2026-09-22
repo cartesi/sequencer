@@ -4,12 +4,13 @@
 --- `init`: store a trusted canonical machine as the first checkpoint and
 --- persist the configuration.
 ---
---- The bootstrap machine must wait for an input and yield the configured
---- state source. When no input precedes its block, it must also be the
---- application's template: its root hash must equal the on-chain template
---- hash. Init is idempotent on a complete state directory and refuses one
---- initialized for a different deployment or state source.
+--- The bootstrap machine must wait for an input, yield the configured state
+--- source, and be a trusted start (`canonical.trusted_start`). The InputBox is
+--- derived from the application. Init is idempotent on a complete state
+--- directory and refuses one initialized for a different deployment or state
+--- source.
 
+local canonical = require("watchdog.canonical")
 local config = require("watchdog.config")
 local errors = require("watchdog.errors")
 
@@ -45,13 +46,10 @@ function bootstrap.run(cfg, deps)
             cfg.chain_id, rpc_chain_id)
     end
     cfg.chain_id = rpc_chain_id
+    cfg.input_box_address = l1:input_box_address()
 
     machine.check_source(cfg.bootstrap_dir, cfg.state_source)
-    local input_count = l1:input_count_at(cfg.bootstrap_block)
-    if input_count == 0 and machine.root_hash(cfg.bootstrap_dir) ~= l1:template_hash() then
-        errors.operator("no input precedes block %d, so the bootstrap machine must be the application's "
-            .. "template, but its root hash differs from the on-chain template hash", cfg.bootstrap_block)
-    end
+    local input_count = canonical.trusted_start(machine, l1, cfg.bootstrap_dir, cfg.bootstrap_block).input_count
 
     local head = store:checkpoint_dir(cfg.bootstrap_block, input_count)
     machine.clone(cfg.bootstrap_dir, work .. "/bootstrap")

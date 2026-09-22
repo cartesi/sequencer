@@ -173,6 +173,11 @@ function support.fake_rpc(inputs, opts)
         return opts.input_box_code or "0x6080"
     end
     function rpc:eth_call(_, data, block)
+        if data == "0xf02478de" then
+            -- getDataAvailability(): DataAvailability.InputBox(INPUT_BOX), as `bytes`.
+            local availability = opts.availability or ("b12c9ede" .. address_word(support.INPUT_BOX))
+            return "0x" .. word(0x20) .. word(#availability // 2) .. availability .. string.rep("0", 56)
+        end
         if data:sub(1, 10) == "0x61a93c87" then
             if opts.input_box_from and block < opts.input_box_from then
                 return "0x"
@@ -226,9 +231,6 @@ function support.fake_machine(script)
     end
     function fake.publish(from, to)
         assert(os.rename(from, to))
-    end
-    function fake.remove(dir)
-        support.remove_tree(dir)
     end
     function fake.clone(from, to)
         assert(lfs.mkdir(to))
