@@ -170,7 +170,10 @@ of GC pauses on the sequencer host.
 ## Path C — TypeScript, Python, and other interpreter-hosted languages
 
 There is no ready path. These languages cannot be linked into a Rust process
-as a library, and the engine must run in two places. The realistic options:
+as a library, and the engine must run in two places. The realistic options
+follow; [`typescript.md`](typescript.md) works one of them out in full —
+a TypeScript engine and scheduler in the machine, and a process bridge on the
+sequencer host.
 
 ### C1. Port the engine, keep everything else
 

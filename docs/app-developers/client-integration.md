@@ -372,7 +372,8 @@ history starts), and `GET /historical-l1-inputs` pages every InputBox input up
 to that point. Those are raw batches and direct inputs, so the indexer runs
 them through **a scheduler** — the same ordering algorithm the machine runs —
 before handing them to your engine, then joins the feed at the baseline count.
-The contract is
+For a TypeScript indexer that is the scheduler from
+[`typescript.md`](typescript.md#2-the-scheduler), reused. The contract is
 [`projection-replay.md`](../protocol/projection-replay.md).
 
 Two operational rules:
