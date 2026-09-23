@@ -207,12 +207,15 @@ directory holding a full machine state plus the state file
 ([`docs/snapshots/format.md`](../snapshots/format.md)).
 
 Its appeal is that both hosts run one binary, in any language, so agreement is
-by construction. Its costs are substantial and unproven here: no such adapter
-exists; emulated execution has to fit the sub-second acknowledgement budget
-for every operation; validation must be runnable without committing state; and
-machine snapshots are taken on the same lane that serves users. Inside the
-machine you would also need the scheduler in front of your code (next
-section). Treat this as a research project, not a migration step.
+by construction, and the adapter is written once for every language. Its costs
+are substantial and unproven here: no such adapter exists; emulated execution
+has to fit the sub-second acknowledgement budget for every operation; the
+guest needs a second, host-mode front-end beside the scheduler; and a machine
+checkpoint — the whole memory image — is taken on the serving lane at every
+batch close. [`machine-hosted.md`](machine-hosted.md) works the design out in
+full and concludes that its surest value is as a conformance oracle for the
+other paths. Treat production use as a research project, not a migration
+step.
 
 ## The scheduler when your machine code is not Rust
 
