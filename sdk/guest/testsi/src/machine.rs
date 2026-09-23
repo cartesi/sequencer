@@ -6,13 +6,13 @@ use cartesi_machine::{
     constants::{break_reason, cmio::commands},
     types::cmio,
 };
+use rollups_types::alloy_primitives::{Address, U256};
 use std::{
     ops::ControlFlow,
     path::PathBuf,
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use types::alloy_primitives::{Address, U256};
 
 type Report = Vec<u8>;
 

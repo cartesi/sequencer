@@ -16,11 +16,11 @@ members = [
   "tests/harness",
   "tests/e2e",
   "watchdog/test-guest",
-  "cartesi-tools/libcmt-sys",
-  "cartesi-tools/trolley",
-  "cartesi-tools/testsi",
-  "cartesi-tools/testsi/testsi-macros",
-  "cartesi-tools/types",
+  "sdk/guest/libcmt-sys",
+  "sdk/guest/trolley",
+  "sdk/guest/testsi",
+  "sdk/guest/testsi/testsi-macros",
+  "sdk/guest/rollups-types",
 ]
 default-members = ["sequencer", "examples/wallet-sequencer"]
 
@@ -39,11 +39,11 @@ authors = [
 ]
 
 [workspace.dependencies]
-# ── Vendored Cartesi tooling (see cartesi-tools/README.md) ──
-libcmt-sys = { version = "0.1", path = "cartesi-tools/libcmt-sys" }
-trolley = { version = "0.1", path = "cartesi-tools/trolley" }
-testsi = { version = "0.1", path = "cartesi-tools/testsi" }
-types = { version = "0.1", path = "cartesi-tools/types" }
+# ── Guest SDK: canonical-guest crates (see sdk/guest/README.md) ──
+libcmt-sys = { version = "0.1", path = "sdk/guest/libcmt-sys" }
+trolley = { version = "0.1", path = "sdk/guest/trolley" }
+testsi = { version = "0.1", path = "sdk/guest/testsi" }
+rollups-types = { version = "0.1", path = "sdk/guest/rollups-types" }
 
 # ── Contracts (exact pin — the single place the version lives) ──
 cartesi-rollups-contracts = "=3.0.0-alpha.6"

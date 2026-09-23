@@ -1,8 +1,8 @@
 use crate::{InputMetadata, RollupError, RollupRequest, RollupResult};
 
 use core::ffi::c_void;
+use rollups_types::alloy_primitives::U256;
 use std::mem::MaybeUninit;
-use types::alloy_primitives::U256;
 
 pub struct RollupCmt {
     r: libcmt_sys::cmt_rollup_t,
@@ -129,7 +129,7 @@ impl crate::Rollup for RollupCmt {
         Ok((req.response_code, response))
     }
 
-    fn emit_voucher(&mut self, voucher: &types::Voucher) -> RollupResult<()> {
+    fn emit_voucher(&mut self, voucher: &rollups_types::Voucher) -> RollupResult<()> {
         let destination = voucher.destination;
         let value = voucher.value.to_be_bytes();
         let mut index = 0;
@@ -151,7 +151,7 @@ impl crate::Rollup for RollupCmt {
         cmt_ok("cmt_rollup_emit_voucher", rc)
     }
 
-    fn emit_notice(&mut self, notice: &types::Notice) -> RollupResult<()> {
+    fn emit_notice(&mut self, notice: &rollups_types::Notice) -> RollupResult<()> {
         let mut index = 0;
         let rc = unsafe {
             libcmt_sys::cmt_rollup_emit_notice(
