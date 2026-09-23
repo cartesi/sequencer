@@ -12,7 +12,7 @@ language-neutral. The tooling in this repository is not yet: read
 [What the repository gives you](#what-the-repository-gives-you) before
 estimating the work.
 
-The guide has four parts:
+The guide has five parts:
 
 | Document | Answers |
 |---|---|
@@ -20,6 +20,7 @@ The guide has four parts:
 | [`application-model.md`](application-model.md) | How must my application logic be reshaped? |
 | [`client-integration.md`](client-integration.md) | How do my frontend and backend talk to the sequencer? |
 | [`integration-paths.md`](integration-paths.md) | How does my TypeScript / Go / C++ / Rust code actually get hosted? |
+| [`typescript.md`](typescript.md) | What exactly would I have to write for an all-TypeScript application? |
 
 ## The idea in one minute
 
