@@ -113,15 +113,17 @@ the requirements in this guide exist to keep them identical.
 | The application interface | A Rust trait: [`Application`](../../sequencer-core/src/application/mod.rs) |
 | A complete worked example | The wallet: [`examples/app-core/`](../../examples/app-core/) (logic), [`examples/wallet-sequencer/`](../../examples/wallet-sequencer/) (sequencer binary), [`examples/canonical-app/`](../../examples/canonical-app/) (machine image) |
 | A client library | Rust only: [`sdk/rust-client/`](../../sdk/rust-client/) |
-| Bindings for other languages | None. No C ABI, TypeScript, or Go binding ships here; no adapter that hosts a Cartesi Machine as the sequencer-side application |
+| A C ABI for the sequencer host | [`bindings/c-app-engine/`](../../bindings/c-app-engine/README.md): a header any language with a C ABI can implement, a generic host binary, a reference wallet engine, and conformance tests |
+| Bindings for interpreted languages | None. No TypeScript or Python binding; no adapter that hosts a Cartesi Machine as the sequencer-side application |
 | A state watchdog | Provided: [`docs/watchdog/`](../watchdog/README.md). It compares the sequencer's state against the machine's and raises an alarm on divergence |
 
 In practice: a **Rust** application can follow the wallet example end to end. An
-application in **Go, C, or C++** can be adapted through a foreign-function shim
-that you write. A **TypeScript** (or Python, or any interpreter-hosted)
-application has no ready path today and needs either a port of its state
-machine or new hosting work. [`integration-paths.md`](integration-paths.md)
-lays out the options and their costs honestly.
+application in **Go, C, or C++** implements the C header, links its archive into
+the provided host, and still needs a small Rust wrapper inside the machine. A
+**TypeScript** (or Python, or any interpreter-hosted) application has no ready
+path today and needs either a port of its state machine or new hosting work.
+[`integration-paths.md`](integration-paths.md) lays out the options and their
+costs honestly.
 
 ## Deposits and other L1 inputs
 
@@ -155,6 +157,7 @@ Application logic:
 - [ ] State carries two counters (`executed_input_count`, `last_executed_safe_block`) and updates them on every applied input.
 - [ ] State serializes to deterministic bytes, identical in the machine and outside it.
 - [ ] The machine answers the `state` inspect query with exactly those bytes.
+- [ ] A tool turns a trusted machine checkpoint into a sequencer checkpoint (state, counters, next batch nonce), and the rebuild has been rehearsed.
 
 Clients:
 
@@ -162,7 +165,7 @@ Clients:
 - [ ] Frontend reads `GET /fee` before signing and uses its `suggested_max_fee`.
 - [ ] Frontend gets the user's next nonce from your indexer and tracks it locally.
 - [ ] UI distinguishes "soft-confirmed" from "final on L1".
-- [ ] Reads come from an indexer that follows the feed, not from the sequencer directly.
+- [ ] Reads come from an indexer that restores `/latest_snapshot`, subscribes with its history claim, and keeps the claim with its checkpoints — not from the sequencer directly.
 
 Hosting and operations:
 
@@ -185,6 +188,8 @@ Hosting and operations:
 | **Canonical** | What the machine computes from L1. The truth the sequencer tries to predict. |
 | **Fee exponent** | Fees travel as a small integer `n` meaning `(129/128)^n` token units. See [`application-model.md`](application-model.md#fees). |
 | **Checkpoint / dump** | A durable copy of your application state that the sequencer can restart from. |
+| **History claim** | `(era, recovery generation, next input)`: names exactly which version of the sequencer's history a replica holds. Required to subscribe to the feed. |
+| **Cockroach recovery** | Rebuilding the sequencer from a trusted machine checkpoint when its own data is lost or untrusted. Your application must supply the checkpoint conversion. |
 | **Watchdog** | An independent process that checks the sequencer's state against the machine's. |
 
 ## Going deeper
@@ -194,5 +199,8 @@ This guide restates the contracts in plain terms. The authoritative versions:
 - [`docs/protocol/application-contract.md`](../protocol/application-contract.md) — the exact contract your logic must satisfy.
 - [`docs/protocol/scheduler-semantics.md`](../protocol/scheduler-semantics.md) — the exact ordering algorithm.
 - [`README.md`](../../README.md) — the HTTP/WebSocket API contract, configuration, and trust model.
-- [`docs/snapshots/format.md`](../snapshots/format.md) — checkpoint layout and the canonical state file.
+- [`docs/protocol/application-history.md`](../protocol/application-history.md) — history coordinates and the replica bootstrap/resume procedure.
+- [`docs/protocol/c-application-binding.md`](../protocol/c-application-binding.md) — the C ABI for native engines.
+- [`docs/snapshots/lifecycle.md`](../snapshots/lifecycle.md) — checkpoint artifacts, acceptance, and retention; [`format.md`](../snapshots/format.md) for the wallet's bytes.
+- [`docs/recovery/cockroach.md`](../recovery/cockroach.md) — the rebuild procedure and what your application must provide for it.
 - [`docs/threat-model/README.md`](../threat-model/README.md) — what the sequencer is and is not trusted for.

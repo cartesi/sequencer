@@ -378,8 +378,28 @@ asks the machine for its state, and compares the two **byte for byte**. So:
 If everything needed to resume your engine *is* that canonical serialization
 (as in the wallet), the checkpoint is just that one file. If your engine needs
 more to resume — a database directory, a machine snapshot — the checkpoint is a
-directory holding that plus the canonical file. Layouts are described in
-[`docs/snapshots/format.md`](../snapshots/format.md).
+directory holding that plus the canonical file. Everything must live under the
+path you were given: the sequencer discards a checkpoint by deleting that
+directory, with no callback into your engine. Layouts are described in the
+[application contract](../protocol/application-contract.md#6-checkpoint-lifecycle).
+
+### Rebuilding from the machine
+
+The sequencer's checkpoints are its own; they can be lost with its disk, or
+become untrustworthy after a bug. The fallback is to rebuild the sequencer
+from the *machine's* state — a trusted canonical checkpoint at some L1 block —
+and let it re-derive everything after that block from L1. The sequencer cannot
+do the first step itself, because only you know where your state lives inside
+the machine. **Before production you must provide a tool that turns a machine
+checkpoint into a sequencer checkpoint** — your engine's state (from its
+designated drive or the `state` inspect), the two progress counters, and the
+scheduler's next batch nonce — and rehearse the rebuild from a non-genesis
+checkpoint. The tool must also refuse a checkpoint that still has an
+unexecuted deposit at or below the engine's clock; the
+[rebuild guide](../recovery/cockroach.md#checkpoint-eligibility) explains why
+that case exists and how to detect it. If your canonical state file is your
+whole checkpoint, as in the wallet, the conversion is nearly trivial; design
+for that if you can.
 
 ## Capacity
 
