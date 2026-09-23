@@ -14,7 +14,7 @@ app-core = { path = "../app-core" }
 sequencer-core = { path = "../../sequencer-core" }
 trolley = { workspace = true }
 alloy-primitives = { workspace = true }
-types = { workspace = true }
+rollups-types = { workspace = true }
 
 [dev-dependencies]
 k256 = { workspace = true }
