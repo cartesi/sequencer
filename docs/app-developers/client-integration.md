@@ -144,9 +144,13 @@ sig, err := crypto.Sign(hash, privateKey) // 65 bytes, v in {0,1} — accepted a
 ```
 
 Then `POST` the same JSON body as above. A Rust client covering `get_fee`,
-`submit_tx`, and `subscribe` is available in
-[`sdk/rust-client/`](../../sdk/rust-client/); the test harness signs with it in
-[`tests/harness/src/wallet.rs`](../../tests/harness/src/wallet.rs).
+`submit_tx`, `latest_snapshot`, `subscribe`, and the history routes is
+available in [`sdk/rust-client/`](../../sdk/rust-client/); the test harness
+signs with it in [`tests/harness/src/wallet.rs`](../../tests/harness/src/wallet.rs).
+
+Addresses in `POST /tx` responses and on the feed use EIP-55 checksum casing;
+the history routes use lowercase. Compare addresses as decoded bytes, and pick
+one normalized form for your own keys.
 
 ## Responses
 
@@ -261,11 +265,13 @@ frontend for anything valuable should show progress honestly:
 If the sequencer suffers a long outage, batches it could not post in time are
 discarded by the scheduler, and the operations in them **are rolled back** —
 as if they had never been submitted. The sequencer detects this ahead of time,
-stops accepting operations, and recovers on restart. The feed does not yet
-carry an explicit rollback signal, so an indexer must treat only operations in
-L1-finalized batches as irreversible, and should be able to rebuild from a
-snapshot. Design flows where a rolled-back soft confirmation would be costly —
-releasing goods, crediting an external system — to wait for L1.
+stops accepting operations, and recovers on restart. A recovery that rolls
+anything back advances the feed's **recovery generation**; a replica holding
+the old generation is refused when it reconnects and can ask exactly how much
+of its state survived (see [Reading state](#reading-state)). Nothing on the
+feed is irreversible until its batch is accepted on L1, so design flows where
+a rolled-back soft confirmation would be costly — releasing goods, crediting
+an external system — to wait for L1.
 
 Withdrawals are safe by construction: vouchers exist only in the machine and
 execute only after settlement.
@@ -298,8 +304,8 @@ served by an **indexer** you run, which follows the sequencer's feed:
                                          └─ runs the same application logic
 ```
 
-`GET /ws/subscribe?from_offset=<n>` streams every sequenced transaction in
-execution order, as JSON:
+`GET /ws/subscribe` streams every sequenced transaction in execution order,
+as JSON:
 
 ```json
 { "kind": "user_op", "offset": 10, "sender": "0x…", "nonce": 7, "fee": 131,
@@ -315,21 +321,69 @@ which operations were no-ops, the indexer applies each message to its own
 instance of your application logic — the same engine described in
 [`application-model.md`](application-model.md), used as a library. This is a
 real advantage of writing the engine as an I/O-free state machine: a TypeScript
-engine can run unchanged in a Node indexer.
+engine can run unchanged in a Node indexer. `offset` is the engine's
+`executed_input_count` before that input: check it equals your replica's count
+before applying, and apply through the same validate/apply entry points.
 
-To start an indexer without replaying from the beginning, fetch
-`GET /latest_snapshot` (your canonical state file), read the
-`X-L2-Tx-Index` response header, and subscribe from that offset.
+### Bootstrapping and resuming a replica
+
+The feed is the sequencer's *current* history, and recovery can replace its
+tail. So a subscription names exactly which history the replica holds — a
+**history claim** of three values — and the sequencer refuses claims that no
+longer match:
+
+| Claim field | Meaning |
+|---|---|
+| `era_id` | Which local history (a UUID minted at setup or at a rebuild) |
+| `recovery_generation` | How many rollbacks that history has had |
+| `next_input` | The replica's own `executed_input_count` |
+
+The procedure ([owned here](../protocol/application-history.md#replica-bootstrap-and-resume)):
+
+1. `GET /latest_snapshot` returns a tar archive containing the sequencer's
+   `info.toml` and your engine's checkpoint. Restore the engine from it.
+2. Read the response headers `X-History-Era`, `X-Recovery-Generation`, and
+   `X-Executed-Input-Count`; check the count against the restored engine.
+   That triple is the claim.
+3. `GET /ws/subscribe?era_id=…&recovery_generation=…&next_input=…`. All three
+   are required. Replay is inclusive from `next_input` and has no catch-up
+   limit; a claim at the head simply waits for the next input.
+4. After each applied input, persist the claim with `next_input + 1` together
+   with your state. Reconnect with the saved claim after any disconnect —
+   recovery disconnects everyone without a close frame.
+
+A refusal is an HTTP `409` before the upgrade, with a typed code:
+`ERA_CHANGED` (the sequencer was rebuilt — bootstrap again),
+`STALE_GENERATION` (a rollback happened), `HISTORY_UNAVAILABLE`, or
+`AHEAD_OF_HEAD`. On `STALE_GENERATION`, a replica that keeps checkpoints can
+ask `GET /history?era_id=…&from_generation=…` for `preserved_input_count`: any
+saved checkpoint with a count at or below it is still valid under the new
+generation, so you restore the newest such checkpoint instead of starting
+over. Keep the claim with every checkpoint you save; the count alone cannot
+tell two histories apart.
+
+### Indexers that need the full history
+
+A replica built this way knows the current state and everything after its
+snapshot. If your indexer must reconstruct history from before that — every
+transfer, every filled order — it can replay L1 itself: `GET /history` gives
+the era's baseline (the L1 block and input index where the sequencer's own
+history starts), and `GET /historical-l1-inputs` pages every InputBox input up
+to that point. Those are raw batches and direct inputs, so the indexer runs
+them through **a scheduler** — the same ordering algorithm the machine runs —
+before handing them to your engine, then joins the feed at the baseline count.
+The contract is
+[`projection-replay.md`](../protocol/projection-replay.md).
 
 Two operational rules:
 
-- **The feed and snapshot endpoints are operator-internal.** They have no
-  authentication and a small subscriber limit. Do not expose them to browsers
-  or the internet; put your indexer on the private network and expose *its*
-  API.
-- The feed replays a bounded window. An indexer that falls too far behind is
-  disconnected with the offset to resume from, and should rebuild from a
-  snapshot.
+- **The feed, snapshot, and history endpoints are operator-internal.** They
+  have no authentication and a small subscriber limit. Do not expose them to
+  browsers or the internet; put your indexer on the private network and
+  expose *its* API.
+- Replay is paged and bounded in memory, not in length; a replica can be
+  arbitrarily far behind within its era. What it cannot survive is a rebuild
+  (`ERA_CHANGED`), which always means bootstrapping again.
 
 `block_timestamp` and `transaction_hash` appear on the feed for display
 purposes. Your engine does not receive them and must not depend on them.

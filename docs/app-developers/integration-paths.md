@@ -52,21 +52,20 @@ recognized.
 |---|---|---|
 | Sequencer host | [`sequencer/`](../../sequencer/) — a library; your binary calls `sequencer::run_main` | Rust |
 | Host ↔ engine interface | [`Application`](../../sequencer-core/src/application/mod.rs) trait | Rust |
+| C ABI for the engine | [`application-engine.h`](../../bindings/c-app-engine/include/application-engine.h), the [`c-app-engine`](../../bindings/c-app-engine/README.md) adapter, and the `c-app-sequencer` host binary | C header; Rust adapter |
+| C reference engine + conformance tests | [`examples/c-wallet-engine/`](../../examples/c-wallet-engine/), [`examples/c-wallet-sequencer/`](../../examples/c-wallet-sequencer/) | Rust exporting C |
 | Scheduler | [`Scheduler<A>`](../../sequencer-core/src/scheduler/mod.rs), generic over `Application` | Rust |
 | Machine harness (rollup loop around the scheduler) | [`examples/canonical-app/`](../../examples/canonical-app/src/scheduler/mod.rs) | Rust |
 | Machine image build | [`examples/canonical-app/justfile`](../../examples/canonical-app/justfile) | — |
 | Reference engine | [`examples/app-core/`](../../examples/app-core/) (wallet) | Rust |
 | End-to-end tests of the pair | [`examples/canonical-test/`](../../examples/canonical-test/), [`tests/e2e/`](../../tests/e2e/) | Rust |
 
-Everything is Rust, and both hosts reach the engine through one Rust trait.
-Any non-Rust engine therefore needs an adapter on **both** sides. None ships
-here: there is no C ABI, no TypeScript or Go binding, and no adapter that runs
-a Cartesi Machine as the sequencer-side engine.
-
-> **Status.** A C ABI for the sequencer-side adapter — a header, a Rust shim
-> implementing `Application` over it, and a generic host binary — is being
-> developed on the `feature/application-c-bridge` branch. It is not part of
-> `main`, and it covers the sequencer host only.
+Both hosts reach the engine through one Rust trait. For languages with a C
+ABI, the repository provides the sequencer-host side of the adapter: a header
+your engine implements and a host binary that links it. The machine side
+still needs a few lines of Rust around the reference scheduler. There is no
+TypeScript or Python binding, and no adapter that runs a Cartesi Machine as
+the sequencer-side engine.
 
 ## Path A — Rust
 
@@ -81,13 +80,14 @@ The supported path. Follow the wallet example:
    ```rust
    #[tokio::main]
    async fn main() -> std::process::ExitCode {
-       sequencer::run_main(|| MyApp::genesis(MyConfig::mainnet())).await
+       sequencer::run_main(|| Ok(MyApp::genesis(MyConfig::mainnet()))).await
    }
    ```
 
-   The closure builds the genesis state and runs only during `setup`. The
-   resulting binary has the `setup`, `run`, and `flush-mempool` subcommands
-   described in the project [`README.md`](../../README.md#running).
+   The closure builds the genesis state and runs only during plain `setup`;
+   it returns a `Result` so an engine that loads genesis from a file can fail
+   cleanly. The resulting binary has the `setup`, `run`, and `flush-mempool`
+   subcommands described in the project [`README.md`](../../README.md#running).
 3. **Machine binary.** Equally short, as in
    [`canonical-app-devnet.rs`](../../examples/canonical-app/src/bin/canonical-app-devnet.rs):
 
@@ -108,50 +108,60 @@ architectures and the canonical state encoding.
 
 ## Path B — Go, C, C++, and other languages with a C ABI
 
-These languages can produce a static library with C-callable functions, so the
-engine can be linked into a Rust process. You write a thin Rust shim that
-implements `Application` by calling your library, and use that shim on both
-sides.
+These languages can produce a static library with C-callable functions. The
+repository defines the functions to export —
+[`application-engine.h`](../../bindings/c-app-engine/include/application-engine.h),
+one entry point per method in
+[`application-model.md`](application-model.md#from-a-request-loop-to-a-state-machine)
+plus open/destroy/drain-output — and ships the Rust side that calls them.
 
-**Sequencer host.** A Rust crate containing:
+**Sequencer host.** Nothing to write in Rust. Implement the header in your
+language, build a static archive for the host's architecture, and build the
+provided host binary against it:
 
-- `extern "C"` declarations for your engine's entry points — one per method in
-  [`application-model.md`](application-model.md#from-a-request-loop-to-a-state-machine),
-  plus create/restore/destroy;
-- a struct holding an opaque engine handle, with `impl Application` forwarding
-  each call and copying returned outputs into Rust-owned values;
-- a `main` that calls `sequencer::run_main`.
+```bash
+APPLICATION_ENGINE_LIB=/abs/path/libengine.a APPLICATION_ENGINE_HEADER=/abs/path/application-engine.h cargo build -p c-app-sequencer
+```
 
-**Machine.** The same shim crate, plus `CanonicalState` (call an engine
-function that returns the canonical bytes), wrapped in `run_scheduler_forever`
-exactly as in Path A, cross-compiled and linked against your library built for
-riscv64. The scheduler stays the reference Rust implementation; you do not
-reimplement ordering.
+The build needs libclang (bindings are generated from the header). Genesis
+state is produced by a tool of yours and passed as `--state-file` to plain
+`setup`; deployment configuration never crosses the ABI. The
+[build guide](../../bindings/c-app-engine/README.md) covers depending on the
+host from another repository and the conformance suite, which you should run
+against your engine before anything else.
 
-Rules for the boundary, which a casual FFI wrapper will get wrong:
+**Machine.** The adapter type `EngineApp` implements `Application`, so the
+reference scheduler can drive your engine inside the machine too — but the
+machine harness also needs `CanonicalState` (the bytes for the `state`
+inspect), which `EngineApp` does not implement. You write a small Rust
+wrapper: `EngineApp` plus a `CanonicalState` impl that obtains your canonical
+bytes, wrapped in `run_scheduler_forever` as in Path A, cross-compiled and
+linked against your archive built for riscv64. The repository's end-to-end
+tests exercise the C engine on the sequencer host against the *Rust* wallet
+image; running `EngineApp` inside a machine image is yours to validate.
 
-- **Map the three outcomes faithfully.** Your validation function needs three
-  distinct results: accept, reject (with the reason and its values), and
-  engine failure. Rejection becomes `Ok(ValidationOutcome::Reject(..))`;
-  failure becomes `Err(AppError)`. Never collapse failure into rejection.
-- **No unwinding across the boundary.** No C++ exceptions and no Go panics may
-  escape into Rust. Catch at the edge and return a failure status.
-- **Ownership is exclusive.** The host uses one engine at a time, moves it
-  between threads, and never calls it concurrently. The shim must be `Send`;
-  it needs neither `Sync` nor `Clone`. If your runtime pins state to a thread,
-  that needs solving inside the shim.
-- **Progress comes from the engine.** Return the two counters from the
-  engine's own state. Do not keep a second copy in Rust.
-- **Distinguish "checkpoint missing" from other I/O errors** on restore:
-  the host expects `AppError::Io` with kind `NotFound` for an absent
-  checkpoint, and uses the distinction at startup.
-- **Configuration does not cross the boundary.** Build genesis state with your
-  own tool and have the engine open it; the host only ever asks you to restore
-  from a path.
+The header documents its own rules in detail. The ones a casual
+implementation gets wrong:
+
+- **Three validation results**: `OK`, `INVALID` with a reason record, and a
+  failure status. Never report bad input as `INTERNAL_ERROR` — that is fatal
+  for the whole sequencer — and never report an engine fault as `INVALID`.
+- **Every entry point is total** over the bytes it is handed, and no
+  exception or panic may cross the ABI.
+- **One handle, one caller at a time**; it may move between threads.
+- **Progress is the engine's**: `application_engine_progress` reports the
+  count and clock from your own state.
+- **`NOT_FOUND` and `INVALID_DUMP`** on open must stay distinct from
+  `IO_ERROR`; startup uses the distinction.
+- **Outputs are drained** after each execution, exactly as many as it
+  reported, and buffers you hand out are copied before the next call.
+- **Checkpoints are durable before you return**, immutable afterwards, and
+  entirely under the given prefix; the sequencer deletes them itself.
 
 Go specifics: build the engine with `-buildmode=c-archive` and export the
-entry points through cgo. Confirm that your Go toolchain supports that build
-mode for `linux/riscv64` before committing to this path. The Go runtime brings
+header's functions through cgo; a Go panic must be recovered at every export.
+Confirm that your Go toolchain supports that build mode for `linux/riscv64`
+before committing to this path. The Go runtime brings
 its own scheduler and garbage collector into both processes; neither affects
 results if execution stays on one goroutine and avoids the pitfalls in
 [Determinism](application-model.md#determinism), but measure the latency impact
@@ -203,8 +213,8 @@ section). Treat this as a research project, not a migration step.
 
 ## The scheduler when your machine code is not Rust
 
-On Paths B and C2 the machine binary is a Rust program (scheduler + shim) with
-your engine linked in, so the reference scheduler is used as is.
+On Paths B and C2 the machine binary is a Rust program (scheduler + adapter)
+with your engine linked in, so the reference scheduler is used as is.
 
 If instead you want your existing in-machine program to keep owning the rollup
 loop, the scheduler's job has to be done in your language. That means
@@ -236,7 +246,7 @@ reusing the Rust scheduler; if you port it, port its tests first.
 | Chain id | `setup` environment | Read from each input's metadata |
 | Application address | `setup` environment | Read from each input's metadata |
 | Sequencer (batch submitter) L1 address | `setup` environment; `run` holds its key | Compiled into the image via `SchedulerConfig` |
-| Application parameters and genesis state | The genesis closure / genesis file | Compiled into the image |
+| Application parameters and genesis state | The genesis closure (Rust) or `--state-file` (C ABI) | Compiled into the image |
 | `MAX_WAIT_BLOCKS`, EIP-712 domain name and version | From `sequencer-core` | From `sequencer-core` — or your port |
 
 The sequencer's L1 address is part of the machine image, and therefore of the
@@ -276,5 +286,10 @@ that honors the exit-code contract, an L1 RPC endpoint, an indexer, and the
 watchdog. The project [`README.md`](../../README.md#running) covers
 configuration and exit codes;
 [`docs/watchdog/operator-deployment.md`](../watchdog/operator-deployment.md)
-covers production deployment. If the sequencer is down, users cannot transact
-quickly, but their funds are not at risk and deposits still land.
+covers production deployment. Before going live you also owe the rebuild
+drill: a versioned tool that converts a trusted machine checkpoint into a
+sequencer checkpoint, and a rehearsed `setup --recovery` from a non-genesis
+checkpoint ([`application-model.md`](application-model.md#rebuilding-from-the-machine),
+[`docs/recovery/cockroach.md`](../recovery/cockroach.md#recovery-readiness-before-deployment)).
+If the sequencer is down, users cannot transact quickly, but their funds are
+not at risk and deposits still land.
