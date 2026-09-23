@@ -1,17 +1,21 @@
-# cartesi-tools
+# Guest SDK
 
-Rust tooling for building and testing the canonical Cartesi Machine guest
-(`examples/canonical-app`, `examples/canonical-test`). Vendored in-tree; these
-crates are workspace members and are not published.
+The crates an application author uses on the canonical side: to build the
+Cartesi Machine guest (`examples/canonical-app`), to encode its rollup inputs
+and outputs, and to test the stored guest image (`examples/canonical-test`).
+The watchdog's test guest (`watchdog/test-guest`) uses them too. The client
+side of the SDK is `sdk/rust-client`. These crates are workspace members and
+are not published.
 
 ## Provenance
 
 - **Rust crates:** imported from
   [GCdePaula/cartesi-tools-rs](https://github.com/GCdePaula/cartesi-tools-rs)
   at rev `ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22`
-  (`guest/libcmt-sys`, `guest/trolley`, `host/testsi`, `types`; its examples
-  were not imported). Since then they have been updated here for Cartesi
-  Machine v0.21.0 and machine-guest-tools v0.18.0. Apache-2.0 licensed.
+  (`guest/libcmt-sys`, `guest/trolley`, `host/testsi`, and `types`, renamed
+  here to `rollups-types`; its examples were not imported). Since then they
+  have been updated here for Cartesi Machine v0.21.0 and machine-guest-tools
+  v0.18.0. Apache-2.0 licensed.
 - **libcmt C sources** (`libcmt-sys/libcmt/`): the `sys-utils/libcmt`
   `Makefile`, `include/` and `src/`, plus the top-level `LICENSE` (Apache-2.0)
   and `AUTHORS`, from
@@ -38,8 +42,9 @@ crates are workspace members and are not published.
   `testsi/Cargo.toml`. These link the prebuilt emulator named by
   `LIBCARTESI_PATH` / `INCLUDECARTESI_PATH`: the dev flake exports both, and so
   does CI when it installs the emulator `.deb`.
-- **`types`**: the Cartesi Rollups ABI types (`EvmAdvance` input, vouchers,
-  notices, portal deposit encodings), shared by the guest and host crates.
+- **`rollups-types`**: the Cartesi Rollups ABI types (`EvmAdvance` input,
+  vouchers, notices, portal deposit encodings), shared by the guest and host
+  crates; `examples/app-core` decodes portal deposits with it.
 
 ## Updating libcmt
 

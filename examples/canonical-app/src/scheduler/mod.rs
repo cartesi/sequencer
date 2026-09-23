@@ -10,13 +10,13 @@
 //! app's notices/vouchers/reports back to the rollup.
 
 use alloy_primitives::U256;
+use rollups_types::{Notice, Voucher};
 use sequencer_core::application::AppOutput;
 use sequencer_core::application::{Application, CanonicalState};
 use sequencer_core::scheduler::{
     InspectError, ProcessOutcome, Scheduler, SchedulerInput, input_domain,
 };
 use trolley::{Rollup, RollupRequest};
-use types::{Notice, Voucher};
 
 pub use sequencer_core::scheduler::{STATE_INSPECT_QUERY, SchedulerConfig};
 
@@ -161,11 +161,11 @@ mod tests {
             unimplemented!("mock rollup gio is not used in this test");
         }
 
-        fn emit_voucher(&mut self, _voucher: &types::Voucher) -> trolley::RollupResult<()> {
+        fn emit_voucher(&mut self, _voucher: &rollups_types::Voucher) -> trolley::RollupResult<()> {
             unimplemented!("mock rollup emit_voucher is not used in this test");
         }
 
-        fn emit_notice(&mut self, _notice: &types::Notice) -> trolley::RollupResult<()> {
+        fn emit_notice(&mut self, _notice: &rollups_types::Notice) -> trolley::RollupResult<()> {
             unimplemented!("mock rollup emit_notice is not used in this test");
         }
 

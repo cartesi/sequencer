@@ -6,10 +6,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, U256, address};
+use rollups_types::alloy_sol_types::SolCall;
+use rollups_types::{Erc20Deposit, Erc20Transfer};
 use ssz::Decode;
 use tracing::{error, warn};
-use types::alloy_sol_types::SolCall;
-use types::{Erc20Deposit, Erc20Transfer};
 
 use super::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
 use super::Method;
@@ -203,7 +203,7 @@ impl WalletApp {
     fn decode_portal_erc20_deposit(
         portal_address: Address,
         input: &sequencer_core::l2_tx::DirectInput,
-    ) -> Result<Option<Erc20Deposit>, types::Erc20DepositDecodeError> {
+    ) -> Result<Option<Erc20Deposit>, rollups_types::Erc20DepositDecodeError> {
         if input.sender != portal_address {
             return Ok(None);
         }
@@ -402,10 +402,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use alloy_primitives::{Address, U256, address};
+    use rollups_types::ERC20_DEPOSIT_PREFIX_BYTES;
+    use rollups_types::Erc20Transfer;
+    use rollups_types::alloy_sol_types::SolCall;
     use ssz_derive::{Decode, Encode};
-    use types::ERC20_DEPOSIT_PREFIX_BYTES;
-    use types::Erc20Transfer;
-    use types::alloy_sol_types::SolCall;
 
     use super::{ApplicationProgress, ExecutedInputCount, WalletApp, WalletConfig};
     use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};

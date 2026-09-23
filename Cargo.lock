@@ -758,9 +758,9 @@ dependencies = [
  "alloy-sol-types",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "rollups-types",
  "sequencer-core",
  "tracing",
- "types",
 ]
 
 [[package]]
@@ -1431,9 +1431,9 @@ dependencies = [
  "alloy-primitives",
  "app-core",
  "k256",
+ "rollups-types",
  "sequencer-core",
  "trolley",
- "types",
 ]
 
 [[package]]
@@ -1444,9 +1444,9 @@ dependencies = [
  "canonical-app",
  "ethereum_ssz",
  "k256",
+ "rollups-types",
  "sequencer-core",
  "testsi",
- "types",
 ]
 
 [[package]]
@@ -3869,6 +3869,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rollups-types"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4689,9 +4697,9 @@ dependencies = [
  "cartesi-machine",
  "inventory",
  "libtest-mimic",
+ "rollups-types",
  "testsi-macros",
  "thiserror 1.0.69",
- "types",
 ]
 
 [[package]]
@@ -5087,7 +5095,7 @@ name = "trolley"
 version = "0.1.0"
 dependencies = [
  "libcmt-sys",
- "types",
+ "rollups-types",
 ]
 
 [[package]]
@@ -5134,14 +5142,6 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "types"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
-]
 
 [[package]]
 name = "ucd-trie"

@@ -3,7 +3,7 @@
 FROM riscv64/debian:stable-slim AS extractor
 
 # Pairs with CARTESI_MACHINE_VERSION (toolchain-pins.env); keep the libcmt
-# vendored in cartesi-tools/libcmt-sys/libcmt at the same release.
+# vendored in sdk/guest/libcmt-sys/libcmt at the same release.
 ARG MACHINE_EMULATOR_TOOLS_VERSION=0.18.0
 ARG TOOLS_SHA512="11a48b68545818a5e3b978e8c5339284ea7ac84acc44cc5b16550839c99066aaeec3c4107e043e653597613ebfb24fe0748984888af841341ce5bcb4dd01dae5"
 

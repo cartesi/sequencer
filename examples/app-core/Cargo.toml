@@ -16,4 +16,4 @@ alloy-sol-types = { workspace = true }
 ssz = { workspace = true }
 ssz_derive = { workspace = true }
 tracing = { workspace = true }
-types = { workspace = true }
+rollups-types = { workspace = true }
