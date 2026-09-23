@@ -67,6 +67,11 @@ still needs a few lines of Rust around the reference scheduler. There is no
 TypeScript or Python binding, and no adapter that runs a Cartesi Machine as
 the sequencer-side engine.
 
+> An out-of-process JSON-RPC binding of the same contract, which would open
+> the sequencer host to any language with a socket, is sketched in
+> [`docs/plans/2026-09-remote-engine-protocol.md`](../plans/2026-09-remote-engine-protocol.md).
+> It is a proposal, not something you can build against.
+
 ## Path A — Rust
 
 The supported path. Follow the wallet example:

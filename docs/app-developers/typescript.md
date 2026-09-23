@@ -226,6 +226,9 @@ framed messages with it over a pipe or Unix socket. The bridge is
 application-independent — written once, it serves any engine in any language
 — but it is not provided in this repository.
 
+A JSON-RPC version of exactly this bridge — an "Engine API" for the
+sequencer — is sketched in
+[`docs/plans/2026-09-remote-engine-protocol.md`](../plans/2026-09-remote-engine-protocol.md).
 The messages mirror the trait one to one:
 
 | Request | Response | Trait method |
