@@ -12,7 +12,7 @@ language-neutral. The tooling in this repository is not yet: read
 [What the repository gives you](#what-the-repository-gives-you) before
 estimating the work.
 
-The guide has five parts:
+The guide has six parts:
 
 | Document | Answers |
 |---|---|
@@ -21,6 +21,7 @@ The guide has five parts:
 | [`client-integration.md`](client-integration.md) | How do my frontend and backend talk to the sequencer? |
 | [`integration-paths.md`](integration-paths.md) | How does my TypeScript / Go / C++ / Rust code actually get hosted? |
 | [`typescript.md`](typescript.md) | What exactly would I have to write for an all-TypeScript application? |
+| [`machine-hosted.md`](machine-hosted.md) | Could the sequencer just run my Cartesi Machine image? (Path C3, in depth) |
 
 ## The idea in one minute
 
