@@ -1,5 +1,5 @@
 use core::fmt;
-use types::alloy_primitives::{Address, U256};
+use rollups_types::alloy_primitives::{Address, U256};
 
 pub mod cmt;
 
@@ -75,7 +75,7 @@ pub trait Rollup {
     fn next_input(&mut self) -> RollupResult<RollupRequest>;
     fn revert(&mut self) -> !;
     fn gio(&mut self, domain: u16, id: &[u8]) -> RollupResult<(u16, Vec<u8>)>;
-    fn emit_voucher(&mut self, voucher: &types::Voucher) -> RollupResult<()>;
-    fn emit_notice(&mut self, notice: &types::Notice) -> RollupResult<()>;
+    fn emit_voucher(&mut self, voucher: &rollups_types::Voucher) -> RollupResult<()>;
+    fn emit_notice(&mut self, notice: &rollups_types::Notice) -> RollupResult<()>;
     fn emit_report(&mut self, report: &[u8]) -> RollupResult<()>;
 }

@@ -8,4 +8,4 @@ publish = false
 
 [dependencies]
 libcmt-sys = { workspace = true }
-types = { workspace = true }
+rollups-types = { workspace = true }

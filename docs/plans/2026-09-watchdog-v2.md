@@ -25,7 +25,7 @@ file keeps the remaining work.
 - **Guest exit codes.** The canonical image lacks a musl `xhalt`, so a
   panicking canonical application halts with payload 0 and the watchdog reports
   exit code 0. The test guest's `xhalt` can be shared.
-- **trolley exceptions.** Add an exception call to `cartesi-tools/trolley`; the
+- **trolley exceptions.** Add an exception call to `sdk/guest/trolley`; the
   test guest raises its exception through `libcmt-sys` meanwhile.
 
 ## Open questions for the DEX integration

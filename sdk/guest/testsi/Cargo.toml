@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 testsi-macros = { path = "./testsi-macros" }
-types = { workspace = true }
+rollups-types = { workspace = true }
 
 # Cartesi Machine v0.21 Rust bindings from cartesi/dave main, pinned by rev (no
 # version requirement: from a git source the crate reports Dave's workspace

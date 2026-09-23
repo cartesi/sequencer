@@ -2,7 +2,7 @@ use std::ops::Index;
 
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolCall;
-use types::*;
+use rollups_types::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
