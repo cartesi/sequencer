@@ -294,9 +294,13 @@ Successful `init` or an idle tick is not evidence of a comparison.
   cheapest on the sequencer and couples to nothing. A machine Merkle root
   answers a different question, checking the sequencer against a machine
   commitment without re-executing; it needs the sequencer to reimplement the
-  emulator's hash tree, and it waits for such a verifier. If the watchdog's
-  peak memory (about twice the range) binds, a two-level digest (SHA-256 over
-  the SHA-256 of fixed 64 MiB chunks) keeps it bounded.
+  emulator's hash tree, and it waits for such a verifier. Reading the range in
+  one `read_memory` call holds it twice for a moment (the emulator's buffer
+  and the Lua string). If that binds, read the range in chunks and stream the
+  same SHA-256: the protocol, the sequencer (which already streams its file),
+  and `sha256sum` on the evidence files stay as they are. The emulator exports
+  only one-shot hashes, so streaming needs an incremental SHA-256 module,
+  vendored and built like LuaFileSystem.
 - **Latch first, evidence after the signal.** Evidence for a multi-GiB state
   can take minutes and fail on a full disk; a divergence must neither wait for
   it nor be lost with it. The sequencer's file comes first because the

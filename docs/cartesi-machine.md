@@ -133,8 +133,11 @@ answering an inspect query:
 ## Hashing
 
 - `cartesi.sha256(data)` and `cartesi.keccak256(data)` hash a single Lua string
-  in one shot; there is no streaming hasher. Hashing a range in-process needs
-  the whole range as one string (about twice the range in peak memory).
+  in one shot, in place; neither the Lua module nor the C API exports a
+  streaming hasher.
+- `machine:read_memory(start, length)` fills a native buffer and copies it into
+  a new Lua string, so reading a whole range holds it twice for a moment. It
+  takes any start and length, so a range can be read in chunks.
 - The machine's own hash tree uses keccak256 by default (sha256 is
   configurable), with 32-byte leaves and 4 KiB pages. `get_node_hash(start,
   ceil_log2(length))` returns a range's Merkle root at the cost of rehashing

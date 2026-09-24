@@ -242,9 +242,10 @@ pub trait Application: Send + Sized {
     ///
     /// Implementations must also ensure that
     /// [`Application::state_file_in_dump`] points at a file in the dump
-    /// whose bytes equal what the canonical machine yields for the same
-    /// logical state: its whole labeled state range, or its `state` inspect
-    /// report (docs/protocol/application-contract.md, "Comparison bytes").
+    /// whose bytes equal what the canonical machine yields after the same
+    /// inputs, also for an engine restored with [`Application::from_dump`]:
+    /// its whole labeled state range, or its `state` inspect report
+    /// (docs/protocol/application-contract.md, "Comparison bytes").
     /// The recovery dump and canonical state file may be the same file when
     /// their representations coincide.
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError>;

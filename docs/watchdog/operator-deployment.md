@@ -164,8 +164,8 @@ per-input snapshot while a tick runs (nearly free on copy-on-write), plus
 incident evidence: the canonical machine at the divergence and two copies of
 the comparison bytes. Cleared incidents stay under `incidents/` until you
 remove them. With a `range` source, the watchdog also reads the whole range
-into memory and hashes it in one piece, which takes about twice the range in
-memory ([hashing](../cartesi-machine.md#hashing)).
+into memory in one call, which briefly takes about twice the range
+([hashing](../cartesi-machine.md#hashing)).
 
 Back up, from the state directory:
 
