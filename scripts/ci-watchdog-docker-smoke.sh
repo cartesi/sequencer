@@ -24,8 +24,8 @@ docker run --rm -e CARTESI_WATCHDOG_PRINT_RELEASE_INFO=1 "${image}" >/dev/null
 docker run --rm --entrypoint cartesi-machine "${image}" --version >/dev/null
 docker run --rm --entrypoint flock "${image}" --version >/dev/null
 docker run --rm --entrypoint lua5.4 "${image}" -e "require('cartesi'); print('cartesi ok')"
-# Validate the vendored lcurl build loads in the runtime image.
-docker run --rm --entrypoint lua5.4 "${image}" -e "require('lcurl'); print('lcurl ok')"
+# Validate the vendored native modules load in the runtime image.
+docker run --rm --entrypoint lua5.4 "${image}" -e "require('lcurl'); require('lfs'); print('native modules ok')"
 
 state_dir="$(mktemp -d)"
 lock_container=""
@@ -46,10 +46,16 @@ tick_output="$(
 )"
 tick_status=$?
 set -e
-if [[ "${tick_status}" -ne 1 || "${tick_output}" != *"failed to load config.json"* ]]; then
-  echo "expected unlocked tick to reach Lua and fail on missing config.json" >&2
+if [[ "${tick_status}" -ne 1 || "${tick_output}" != *"is not initialized; run init"* ]]; then
+  echo "expected unlocked tick to reach Lua and fail on an uninitialized state directory" >&2
   echo "status=${tick_status}" >&2
   echo "${tick_output}" >&2
+  exit 1
+fi
+
+status_output="$(docker run --rm -e CARTESI_WATCHDOG_STATE_DIR=/state -v "${state_dir}:/state" "${image}" status)"
+if [[ "${status_output}" != *'"initialized":false'* ]]; then
+  echo "expected status to report an uninitialized state directory: ${status_output}" >&2
   exit 1
 fi
 

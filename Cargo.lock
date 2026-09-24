@@ -758,16 +758,10 @@ dependencies = [
  "alloy-sol-types",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "rollups-types",
  "sequencer-core",
  "tracing",
- "types",
 ]
-
-[[package]]
-name = "ar"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d67af77d68a931ecd5cbd8a3b5987d63a1d1d1278f7f6a60ae33db485cdebb69"
 
 [[package]]
 name = "ark-ff"
@@ -1437,9 +1431,9 @@ dependencies = [
  "alloy-primitives",
  "app-core",
  "k256",
+ "rollups-types",
  "sequencer-core",
  "trolley",
- "types",
 ]
 
 [[package]]
@@ -1450,15 +1444,15 @@ dependencies = [
  "canonical-app",
  "ethereum_ssz",
  "k256",
+ "rollups-types",
  "sequencer-core",
  "testsi",
- "types",
 ]
 
 [[package]]
 name = "cartesi-machine"
 version = "2.0.0"
-source = "git+https://github.com/cartesi/dave?branch=feature%2Fbump-emulator-2-coutinho#317a88a32a1b4a6002d561f37bb833843df55cba"
+source = "git+https://github.com/cartesi/dave?rev=79874c0a1b40678465daf533acc976c88301c6d4#79874c0a1b40678465daf533acc976c88301c6d4"
 dependencies = [
  "base64",
  "cartesi-machine-sys",
@@ -1472,13 +1466,11 @@ dependencies = [
 [[package]]
 name = "cartesi-machine-sys"
 version = "2.0.0"
-source = "git+https://github.com/cartesi/dave?branch=feature%2Fbump-emulator-2-coutinho#317a88a32a1b4a6002d561f37bb833843df55cba"
+source = "git+https://github.com/cartesi/dave?rev=79874c0a1b40678465daf533acc976c88301c6d4#79874c0a1b40678465daf533acc976c88301c6d4"
 dependencies = [
  "bindgen",
- "cfg-if",
- "hex-literal 1.1.0",
  "link-cplusplus",
- "sha1",
+ "sha2",
 ]
 
 [[package]]
@@ -2485,18 +2477,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hex-literal"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
-
-[[package]]
-name = "hex-literal"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e712f64ec3850b98572bffac52e2c6f282b29fe6c5fa6d42334b30be438d95c1"
-
-[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2593,7 +2573,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -2984,16 +2963,8 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libcmt-sys"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22#ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22"
 dependencies = [
- "ar",
  "bindgen",
- "bytes",
- "hex-literal 0.4.1",
- "reqwest 0.12.28",
- "sha2",
- "tar",
- "xz2",
 ]
 
 [[package]]
@@ -3084,17 +3055,6 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
-name = "lzma-sys"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
-]
 
 [[package]]
 name = "macro-string"
@@ -3763,28 +3723,22 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
  "http",
  "http-body",
  "http-body-util",
  "hyper",
- "hyper-rustls",
  "hyper-util",
  "js-sys",
  "log",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
- "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -3794,7 +3748,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3913,6 +3866,14 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.28.0",
  "toml",
+]
+
+[[package]]
+name = "rollups-types"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
 ]
 
 [[package]]
@@ -4036,7 +3997,6 @@ checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4293,6 +4253,7 @@ dependencies = [
  "sequencer-rust-client",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "tempfile",
  "thiserror 2.0.19",
@@ -4732,20 +4693,18 @@ dependencies = [
 [[package]]
 name = "testsi"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22#ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22"
 dependencies = [
  "cartesi-machine",
  "inventory",
  "libtest-mimic",
+ "rollups-types",
  "testsi-macros",
  "thiserror 1.0.69",
- "types",
 ]
 
 [[package]]
 name = "testsi-macros"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22#ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5134,10 +5093,9 @@ dependencies = [
 [[package]]
 name = "trolley"
 version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22#ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22"
 dependencies = [
  "libcmt-sys",
- "types",
+ "rollups-types",
 ]
 
 [[package]]
@@ -5184,15 +5142,6 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "types"
-version = "0.1.0"
-source = "git+https://github.com/GCdePaula/cartesi-tools-rs?rev=ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22#ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
-]
 
 [[package]]
 name = "ucd-trie"
@@ -5418,6 +5367,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "watchdog-test-guest"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libcmt-sys",
+ "trolley",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5442,15 +5400,6 @@ name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -5652,15 +5601,6 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
-]
-
-[[package]]
-name = "xz2"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
-dependencies = [
- "lzma-sys",
 ]
 
 [[package]]

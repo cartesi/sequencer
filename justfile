@@ -41,11 +41,7 @@ test-watchdog:
 test-watchdog-e2e:
     just watchdog test-e2e
 
-# Verify divergence signal via main.lua (drill exits 2 like production).
-test-watchdog-divergence-drill: watchdog-lua-deps
-    @just watchdog test-divergence-drill
-
-# Build lcurl (lua-cURLv3) into .deps/lua; JSON is pure Lua under watchdog/third_party/.
+# Build the watchdog's vendored native Lua modules (lcurl, lfs) into .deps/lua.
 watchdog-lua-deps:
     @just watchdog lua-deps
 

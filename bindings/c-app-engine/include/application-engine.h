@@ -363,9 +363,10 @@ APPLICATION_ENGINE_API void application_engine_progress(const ApplicationEngine 
 /// Deletion must leave other checkpoints and independently restored engines usable. Filesystem
 /// CoW sharing is allowed when writes remain isolated.
 ///
-/// The file named by application_engine_state_file_in_dump must byte-equal the canonical build's
-/// deterministic inspection or designated state-drive representation for the same logical state.
-/// The bridge does not verify this cross-build equivalence.
+/// The file named by application_engine_state_file_in_dump must byte-equal what the canonical
+/// machine yields for the same logical state: its whole labeled state range, or its `state` inspect
+/// report (docs/protocol/application-contract.md, "Comparison bytes"). The bridge does not verify
+/// this cross-build equivalence.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_create_dump(ApplicationEngine *engine,
     const char *prefix) APPLICATION_ENGINE_NOEXCEPT;
 

@@ -150,12 +150,30 @@ machine checkpoint may instead contain a separate app-state projection.
 |---|---|---|
 | Wallet | SSZ wallet state | The same SSZ file, also returned by canonical inspect |
 | Cartesi Machine wrapper | Full multi-file machine state | Deterministic app-state projection stored alongside it |
-| Native DEX design | Fixed-memory state `M` plus required resumable metadata | Canonical `M`, matching the designated drive in the canonical machine |
+| Native DEX design | Fixed-memory state `M` plus required resumable metadata | `M` exactly as the canonical machine's labeled state range holds it |
 
 The DEX row describes an integration requirement, not a verified private
-implementation. The [watchdog guide](../watchdog/README.md) owns comparison
-transport and support; the [wallet format](../snapshots/format.md) owns its SSZ
-representation.
+implementation. The [watchdog guide](../watchdog/README.md#state-sources) owns
+how the comparison is transported and which state source a deployment uses;
+the [wallet format](../snapshots/format.md) owns its SSZ representation.
+
+**Comparison bytes.** The comparison file must byte-equal what the canonical
+machine yields after the same inputs, through the deployment's state source,
+whether the engine ran them uninterrupted or was restored with `from_dump` or
+rebuilt by recovery partway. For a range source, anything that shapes the
+range's layout (allocator state, hash seeds, capacity policy) belongs to the
+checkpoint and must not depend on the process:
+
+- **Range source**: the entire flash drive or NVRAM carrying the configured
+  user label, all of its configured length including any unused zero tail,
+  raw: no filesystem, header, or trimming. The guest must have written the
+  state into the range before it finishes each input. NVRAM has no page cache;
+  a flash drive goes through the guest page cache, so the guest must flush
+  (`fsync`, `msync(MS_SYNC)`, or `O_DIRECT`) first. The
+  [Cartesi Machine facts](../cartesi-machine.md#memory-ranges-for-application-state)
+  explain why the range must be raw.
+- **Inspect source**: the single report the canonical application returns for
+  the inspect query `state`.
 
 - `create_dump(&mut self, prefix)` creates a checkpoint at an absent path,
   which may become a file or directory. On `Ok`, all files and directory
@@ -168,9 +186,7 @@ representation.
   checkpoint or another restored instance. The restored engine must remain
   usable after the source checkpoint is garbage-collected.
 - `state_file_in_dump(prefix)` is a pure path function naming a single file,
-  possibly `prefix` itself. Its bytes match the canonical application's
-  deterministic comparison representation, whether obtained through inspect
-  or from a designated state drive.
+  possibly `prefix` itself. Its bytes are the comparison bytes above.
 - All checkpoint-owned artifacts reside at or below `prefix`, including the
   canonical comparison file. Disposal requires only ordinary filesystem
   deletion: the sequencer removes the enclosing directory, including its own

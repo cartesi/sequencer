@@ -162,6 +162,7 @@ signing, and SSZ batch encoding.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.
 - `examples/canonical-test/` — e2e test harness for the canonical app.
 - `sdk/rust-client/` — Rust client library for the sequencer API.
+- `sdk/guest/` — canonical-guest SDK: `trolley` (guest rollup API over `libcmt-sys`), `rollups-types` (rollups ABI encodings), and `testsi` (host-side guest image tests); provenance in its README.
 - `tests/{benchmarks,e2e,harness}/` — test infrastructure.
 
 ### Sequencer module layout
@@ -369,7 +370,9 @@ Prefer black-box tests around `POST /tx` and commit outcomes for integration.
 
 Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a
 clear message if `anvil` is not on PATH. Use the configured Nix/direnv environment
-or install Foundry. `canonical-test` additionally needs libslirp.
+or install Foundry. `canonical-test` additionally needs the Cartesi Machine
+library named by `LIBCARTESI_PATH`/`INCLUDECARTESI_PATH` (the devshell exports
+both) and libslirp.
 
 ## Shell and Commands
 
@@ -452,5 +455,6 @@ work reaches another boundary.
 | Trust boundaries, provider behavior, or hostile L1 input | [Threat model](docs/threat-model/README.md) — actor assumptions, supported failures, and residual risks. |
 | Submission fees or oracle pricing | [L1 fee policy](docs/l1-fee-policy.md) — estimation and replacement limits; [threat-model actor table](docs/threat-model/README.md#actors-and-trust) — oracle source and outage assumptions. |
 | Command setup or deployment configuration | [Running](README.md#running) and [config.rs](sequencer/src/commands/config.rs) — invocation, identity pinning, defaults, and validation. |
-| Watchdog development or operation | [Architecture](docs/watchdog/README.md); [local dev](docs/watchdog/getting-started.md) for Anvil; [operator deployment](docs/watchdog/operator-deployment.md) for Sepolia/mainnet. |
+| Watchdog development or operation | [Watchdog README](docs/watchdog/README.md) — contract, state sources, commands, and state; [incident runbook](docs/watchdog/incident-runbook.md) — what a latched divergence requires; [local dev](docs/watchdog/getting-started.md) for Anvil; [operator deployment](docs/watchdog/operator-deployment.md) for Sepolia/mainnet. |
+| Canonical guest, machine images, or a Cartesi Machine bump | [Cartesi Machine facts](docs/cartesi-machine.md) — version pinning, host semantics, storage, memory ranges, and the guest side. |
 | A new mechanism, simplification, or work spanning an active track | Owning design and [invariants](docs/invariants.md) — reasons and assumptions; [review register](docs/review/register.md) — unresolved work; [coordination tracks](docs/plans/2026-07-coordination-tracks.md) — priorities and dependencies. Follow the [review lifecycle](docs/review/README.md) when recording conclusions. |

@@ -1,16 +1,18 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Watchdog compare harness: Anvil + devnet sequencer + live CM inspect.
+//! Watchdog scenarios against a live devnet: Anvil, the wallet sequencer, and
+//! the canonical machine image. The watchdog runs through its production
+//! wrapper; the divergence drill walks the incident runbook
+//! (docs/watchdog/incident-runbook.md) with the real commands.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use app_core::application::{WalletApp, WalletConfig};
 use app_core::wallet_snapshot;
 use rollups_harness::{DEVNET_CHAIN_ID, ManagedSequencer, paths};
-use sequencer_core::application::Application;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
@@ -19,7 +21,6 @@ use crate::ScenarioResult;
 
 const DEVNET_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
 const SEPOLIA_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image-sepolia";
-const GENESIS_SAFE_BLOCK: &str = "0";
 
 fn require_cartesi_machine() {
     assert!(
@@ -33,34 +34,164 @@ fn require_cartesi_machine() {
     );
 }
 
+fn machine_image(relative: &str) -> ScenarioResult<PathBuf> {
+    let image = paths::workspace_root().join(relative);
+    if !image.is_dir() {
+        return Err(format!(
+            "machine image missing at {}; run: just canonical-build-machine-image(-sepolia)",
+            image.display()
+        )
+        .into());
+    }
+    Ok(image)
+}
+
+/// One watchdog state directory, bootstrapped from `image` at `block`, driven
+/// through the production `sequencer-watchdog` wrapper.
+struct Watchdog {
+    state_dir: PathBuf,
+    image: PathBuf,
+    block: u64,
+}
+
+impl Watchdog {
+    fn new(image: PathBuf, block: u64) -> ScenarioResult<Self> {
+        let state_dir = tempfile::tempdir()
+            .map_err(|err| format!("temp watchdog state dir: {err}"))?
+            .keep();
+        Ok(Self {
+            state_dir,
+            image,
+            block,
+        })
+    }
+
+    async fn run(
+        &self,
+        runtime: &ManagedSequencer,
+        args: &[&str],
+    ) -> ScenarioResult<std::process::Output> {
+        let workspace = paths::workspace_root();
+        let lua_deps = workspace.join(".deps/lua");
+        for module in ["lcurl.so", "lfs.so"] {
+            if !lua_deps.join(module).is_file() {
+                return Err(format!(
+                    "{module} missing in {}; run: just watchdog-lua-deps",
+                    lua_deps.display()
+                )
+                .into());
+            }
+        }
+        let mut command = Command::new(workspace.join("watchdog/sequencer-watchdog"));
+        command
+            .current_dir(&workspace)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("CARTESI_WATCHDOG_LUA_ROOT", &workspace)
+            .env("CARTESI_WATCHDOG_LUA_DEPS", &lua_deps)
+            .env("CARTESI_WATCHDOG_STATE_DIR", &self.state_dir)
+            .env("CARTESI_WATCHDOG_SEQUENCER_URL", runtime.endpoint())
+            .env(
+                "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT",
+                runtime.l1_endpoint(),
+            )
+            .env(
+                "CARTESI_WATCHDOG_BLOCKCHAIN_ID",
+                DEVNET_CHAIN_ID.to_string(),
+            )
+            .env(
+                "CARTESI_WATCHDOG_APP_ADDRESS",
+                runtime.app_address().to_string(),
+            )
+            .env("CARTESI_WATCHDOG_STATE_SOURCE", "inspect")
+            .env("CARTESI_WATCHDOG_CM_SNAPSHOT_DIR", &self.image)
+            .env(
+                "CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK",
+                self.block.to_string(),
+            );
+        let output = command
+            .output()
+            .await
+            .map_err(|err| format!("failed to run sequencer-watchdog: {err}"))?;
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        Ok(output)
+    }
+
+    /// Run a command that must exit with `code`; returns its stdout.
+    async fn expect(
+        &self,
+        runtime: &ManagedSequencer,
+        args: &[&str],
+        code: i32,
+    ) -> ScenarioResult<String> {
+        let output = self.run(runtime, args).await?;
+        if output.status.code() != Some(code) {
+            return Err(format!(
+                "sequencer-watchdog {} exited with {}, expected {code}",
+                args.join(" "),
+                output.status
+            )
+            .into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    async fn status(&self, runtime: &ManagedSequencer) -> ScenarioResult<serde_json::Value> {
+        let stdout = self.expect(runtime, &["status"], 0).await?;
+        serde_json::from_str(&stdout).map_err(|err| format!("status JSON: {err}: {stdout}").into())
+    }
+
+    fn wipe(&self) -> ScenarioResult<()> {
+        std::fs::remove_dir_all(&self.state_dir)
+            .map_err(|err| format!("wipe watchdog state: {err}").into())
+    }
+}
+
+/// The sequencer's accepted block and comparison-file digest.
+async fn sequencer_digest(runtime: &ManagedSequencer) -> ScenarioResult<(u64, String)> {
+    let url = format!("{}/finalized_state/digest", runtime.endpoint());
+    let (status, body, _) = http_get(&url)
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    if status != 200 {
+        return Err(format!(
+            "GET {url} returned HTTP {status}: {}",
+            body_snippet_for_error(&body)
+        )
+        .into());
+    }
+    let digest: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|err| format!("digest JSON: {err}"))?;
+    let block = digest["inclusion_block"]
+        .as_u64()
+        .ok_or("digest without inclusion_block")?;
+    let sha256 = digest["sha256"]
+        .as_str()
+        .ok_or("digest without sha256")?
+        .to_string();
+    Ok((block, sha256))
+}
+
+fn head_block(status: &serde_json::Value) -> Option<u64> {
+    status["head"]["block"].as_u64()
+}
+
 pub async fn run_watchdog_genesis_compare_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     require_cartesi_machine();
-
-    let workspace = paths::workspace_root();
-    let machine_image = workspace.join(DEVNET_MACHINE_IMAGE);
-    if !machine_image.is_dir() {
-        return Err(format!(
-            "canonical machine image missing at {}; run: just canonical-build-machine-image",
-            machine_image.display()
-        )
-        .into());
-    }
+    let image = machine_image(DEVNET_MACHINE_IMAGE)?;
 
     // `wallet-sequencer-devnet` uses `WalletConfig::devnet()` (not `default()` / Sepolia).
     let expected_snapshot = wallet_snapshot::encode(&WalletApp::new(WalletConfig::devnet()));
 
-    eprintln!("[watchdog-harness] step 1/6: wait for sequencer GET /finalized_state");
+    eprintln!("[watchdog-harness] step 1/4: the sequencer serves the devnet genesis state");
     let finalized_url = format!("{}/finalized_state", runtime.endpoint());
     let (_status, body, headers) =
         wait_for_finalized_state(finalized_url.as_str(), Duration::from_secs(30)).await?;
     let inclusion_block = header_u64(&headers, "x-inclusion-block")
         .ok_or("finalized_state response missing X-Inclusion-Block header")?;
-    eprintln!(
-        "[watchdog-harness] sequencer inclusion_block={inclusion_block} snapshot_bytes={}",
-        body.len()
-    );
     if body.as_slice() != expected_snapshot.as_slice() {
         return Err(format!(
             "finalized_state bytes mismatch (len {} vs expected {})",
@@ -70,9 +201,10 @@ pub async fn run_watchdog_genesis_compare_test(
         .into());
     }
 
-    eprintln!("[watchdog-harness] step 2/6: prove CM inspect SSZ on genesis image");
-    let inspect_state =
-        prove_cm_inspect_genesis(workspace.as_path(), machine_image.as_path()).await?;
+    eprintln!(
+        "[watchdog-harness] step 2/4: the canonical image answers the state query with the same bytes"
+    );
+    let inspect_state = cm_inspect_state(image.as_path()).await?;
     if inspect_state.as_slice() != expected_snapshot.as_slice() {
         return Err(format!(
             "CM inspect bytes mismatch (len {} vs expected {})",
@@ -82,47 +214,19 @@ pub async fn run_watchdog_genesis_compare_test(
         .into());
     }
 
-    eprintln!("[watchdog-harness] step 3/6: prepare watchdog state dir");
-    let state_dir = tempfile::tempdir()
-        .map_err(|err| format!("temp watchdog state dir: {err}"))?
-        .keep();
+    eprintln!("[watchdog-harness] step 3/4: init checks the image against the on-chain template");
+    let watchdog = Watchdog::new(image, 0)?;
+    watchdog.expect(runtime, &["init"], 0).await?;
 
-    eprintln!("[watchdog-harness] step 4/6: initialize watchdog state (machine_cartesi)");
-    run_lua_main_success(
-        runtime,
-        workspace.as_path(),
-        state_dir.as_path(),
-        machine_image.as_path(),
-        "init",
-    )
-    .await?;
-
-    eprintln!(
-        "[watchdog-harness] step 5/6: run production watchdog tick (genesis unchanged -> idle skip)"
-    );
-    // The Rust checks above prove sequencer/CM byte parity at genesis. The
-    // watchdog tick itself intentionally idles because init selected block 0
-    // and the sequencer finalized block is still 0; init is not a compare.
-    run_lua_main_success(
-        runtime,
-        workspace.as_path(),
-        state_dir.as_path(),
-        machine_image.as_path(),
-        "tick",
-    )
-    .await?;
-
-    eprintln!("[watchdog-harness] step 6/6: run a second tick (idempotent idle skip)");
-    run_lua_main_success(
-        runtime,
-        workspace.as_path(),
-        state_dir.as_path(),
-        machine_image.as_path(),
-        "tick",
-    )
-    .await?;
-
-    eprintln!("[watchdog-harness] compare pass completed successfully");
+    eprintln!("[watchdog-harness] step 4/4: ticks idle while the accepted block stays at genesis");
+    watchdog.expect(runtime, &["tick"], 0).await?;
+    watchdog.expect(runtime, &["tick"], 0).await?;
+    let status = watchdog.status(runtime).await?;
+    if head_block(&status) != Some(inclusion_block) || status["last_tick"]["outcome"] != "idle" {
+        return Err(
+            format!("expected an idle watchdog at block {inclusion_block}: {status}").into(),
+        );
+    }
     Ok(())
 }
 
@@ -130,266 +234,175 @@ pub async fn run_watchdog_non_genesis_compare_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     require_cartesi_machine();
+    let image = machine_image(DEVNET_MACHINE_IMAGE)?;
 
-    let workspace = paths::workspace_root();
-    let machine_image = workspace.join(DEVNET_MACHINE_IMAGE);
-    if !machine_image.is_dir() {
-        return Err(format!(
-            "canonical machine image missing at {}; run: just canonical-build-machine-image",
-            machine_image.display()
-        )
-        .into());
-    }
-
-    eprintln!("[watchdog-harness] step 1/4: wait for non-genesis GET /finalized_state");
+    eprintln!("[watchdog-harness] step 1/3: wait for a non-genesis accepted checkpoint");
     let finalized_url = format!("{}/finalized_state", runtime.endpoint());
-    let (_status, body, headers) = wait_for_non_genesis_finalized_state(
-        finalized_url.as_str(),
-        runtime,
-        Duration::from_secs(60),
-    )
-    .await?;
-    let inclusion_block = header_u64(&headers, "x-inclusion-block")
-        .ok_or("finalized_state response missing X-Inclusion-Block header")?;
-    eprintln!(
-        "[watchdog-harness] finalized non-genesis snapshot inclusion_block={inclusion_block} snapshot_bytes={}",
-        body.len()
-    );
+    wait_for_non_genesis_finalized_state(finalized_url.as_str(), runtime, Duration::from_secs(60))
+        .await?;
+    let (block, _) = sequencer_digest(runtime).await?;
 
-    let genesis_snapshot = wallet_snapshot::encode(&WalletApp::new(WalletConfig::devnet()));
-    if body.as_slice() == genesis_snapshot.as_slice() {
-        return Err(
-            "non-genesis finalized_state still matches empty devnet genesis snapshot".into(),
-        );
-    }
-    let decoded = wallet_snapshot::decode(body.as_slice())
-        .map_err(|err| format!("decode non-genesis finalized_state: {err}"))?;
-    if decoded.executed_input_count() == sequencer_core::history::ExecutedInputCount::ZERO {
-        return Err("expected non-genesis finalized_state executed_input_count > 0".into());
+    eprintln!("[watchdog-harness] step 2/3: init at genesis and replay to block {block}");
+    let watchdog = Watchdog::new(image, 0)?;
+    watchdog.expect(runtime, &["init"], 0).await?;
+    watchdog.expect(runtime, &["tick"], 0).await?;
+    let status = watchdog.status(runtime).await?;
+    let agreed = head_block(&status).ok_or("status without a head")?;
+    if agreed < block || status["last_tick"]["outcome"] != "agreed" {
+        return Err(format!("expected agreement at block {block} or later: {status}").into());
     }
 
-    eprintln!("[watchdog-harness] step 2/5: prepare watchdog state dir");
-    let state_dir = tempfile::tempdir()
-        .map_err(|err| format!("temp watchdog state dir: {err}"))?
-        .keep();
-
-    eprintln!("[watchdog-harness] step 3/5: initialize watchdog state (machine_cartesi)");
-    run_lua_main_success(
-        runtime,
-        workspace.as_path(),
-        state_dir.as_path(),
-        machine_image.as_path(),
-        "init",
-    )
-    .await?;
-
-    eprintln!("[watchdog-harness] step 4/5: run production watchdog tick");
-    run_lua_main_success(
-        runtime,
-        workspace.as_path(),
-        state_dir.as_path(),
-        machine_image.as_path(),
-        "tick",
-    )
-    .await?;
-
-    eprintln!(
-        "[watchdog-harness] step 5/5: run a second tick (idempotent re-run: unchanged finalized -> skip)"
-    );
-    run_lua_main_success(
-        runtime,
-        workspace.as_path(),
-        state_dir.as_path(),
-        machine_image.as_path(),
-        "tick",
-    )
-    .await?;
+    eprintln!("[watchdog-harness] step 3/3: a repeated tick is idle or agrees again");
+    watchdog.expect(runtime, &["tick"], 0).await?;
     Ok(())
 }
 
-pub async fn run_watchdog_non_genesis_divergence_test(
+/// The divergence runbook, end to end: a watchdog bootstrapped from the wrong
+/// machine latches a mismatch; `status` shows it; `clear` refuses the wrong
+/// block; `replay` from the trusted image reproduces the sequencer's digest,
+/// which places the fault on the watchdog; clearing without a fix re-latches;
+/// re-initializing from the trusted image agrees.
+pub async fn run_watchdog_divergence_drill_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     require_cartesi_machine();
+    let trusted = machine_image(DEVNET_MACHINE_IMAGE)?;
+    let wrong = machine_image(SEPOLIA_MACHINE_IMAGE)?;
 
-    let workspace = paths::workspace_root();
-    let mismatch_image = workspace.join(SEPOLIA_MACHINE_IMAGE);
-    if !mismatch_image.is_dir() {
-        return Err(format!(
-            "sepolia machine image missing at {}; run: just canonical-build-machine-image-sepolia",
-            mismatch_image.display()
-        )
-        .into());
-    }
-
-    eprintln!("[watchdog-harness] divergence step 1/3: wait for non-genesis GET /finalized_state");
     let finalized_url = format!("{}/finalized_state", runtime.endpoint());
-    let (_status, _body, headers) = wait_for_non_genesis_finalized_state(
-        finalized_url.as_str(),
-        runtime,
-        Duration::from_secs(60),
-    )
-    .await?;
-    let inclusion_block = header_u64(&headers, "x-inclusion-block")
-        .ok_or("finalized_state response missing X-Inclusion-Block header")?;
-    eprintln!("[watchdog-harness] divergence target inclusion_block={inclusion_block}");
-
-    eprintln!("[watchdog-harness] divergence step 2/3: initialize mismatched state and run tick");
-    let state_dir = tempfile::tempdir()
-        .map_err(|err| format!("temp watchdog state dir: {err}"))?
-        .keep();
-    run_lua_main_success(
-        runtime,
-        workspace.as_path(),
-        state_dir.as_path(),
-        mismatch_image.as_path(),
-        "init",
-    )
-    .await?;
-    let output = run_lua_main(
-        runtime,
-        workspace.as_path(),
-        state_dir.as_path(),
-        mismatch_image.as_path(),
-        "tick",
-    )
-    .await?;
-    let exit = output.status.code().unwrap_or(-1);
-    if exit != 2 {
-        return Err(format!(
-            "expected watchdog divergence exit 2, got {exit}; stderr: {}",
-            String::from_utf8_lossy(output.stderr.as_slice())
-        )
-        .into());
-    }
-
-    eprintln!("[watchdog-harness] divergence step 3/3: assert watchdog_event kind=state_mismatch");
-    let stderr = String::from_utf8_lossy(output.stderr.as_slice());
-    if !stderr.contains("watchdog_event") || !stderr.contains("\"kind\":\"state_mismatch\"") {
-        return Err(format!("missing state_mismatch watchdog_event in stderr: {stderr}").into());
-    }
-    Ok(())
-}
-
-fn compare_env(
-    runtime: &ManagedSequencer,
-    state_dir: &Path,
-    machine_image: &Path,
-    lua_deps: &Path,
-) -> Vec<(String, String)> {
-    vec![
-        (
-            "CARTESI_WATCHDOG_LUA_DEPS".into(),
-            lua_deps.to_string_lossy().into_owned(),
-        ),
-        (
-            "CARTESI_WATCHDOG_SEQUENCER_URL".into(),
-            runtime.endpoint().to_string(),
-        ),
-        (
-            "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT".into(),
-            runtime.l1_endpoint().to_string(),
-        ),
-        (
-            "CARTESI_WATCHDOG_BLOCKCHAIN_ID".into(),
-            DEVNET_CHAIN_ID.to_string(),
-        ),
-        (
-            "CARTESI_WATCHDOG_CONTRACTS_INPUT_BOX_ADDRESS".into(),
-            runtime.input_box_address().to_string(),
-        ),
-        (
-            "CARTESI_WATCHDOG_APP_ADDRESS".into(),
-            runtime.app_address().to_string(),
-        ),
-        (
-            "CARTESI_WATCHDOG_STATE_DIR".into(),
-            state_dir.to_string_lossy().into_owned(),
-        ),
-        (
-            "CARTESI_WATCHDOG_CM_SNAPSHOT_DIR".into(),
-            machine_image.to_string_lossy().into_owned(),
-        ),
-        (
-            "CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK".into(),
-            GENESIS_SAFE_BLOCK.into(),
-        ),
-    ]
-}
-
-async fn run_lua_main(
-    runtime: &mut ManagedSequencer,
-    workspace: &Path,
-    state_dir: &Path,
-    machine_image: &Path,
-    command_name: &str,
-) -> ScenarioResult<std::process::Output> {
-    let lua_deps = workspace.join(".deps/lua");
-    ensure_lcurl(lua_deps.as_path())?;
-    let mut command = Command::new(workspace.join("watchdog/sequencer-watchdog"));
-    command
-        .current_dir(workspace)
-        .arg(command_name)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command.env("CARTESI_WATCHDOG_LUA_ROOT", workspace);
-    for (key, value) in compare_env(runtime, state_dir, machine_image, lua_deps.as_path()) {
-        command.env(key, value);
-    }
-    command
-        .output()
+    wait_for_non_genesis_finalized_state(finalized_url.as_str(), runtime, Duration::from_secs(60))
+        .await?;
+    let (block, _) = sequencer_digest(runtime).await?;
+    let first_input_block = *runtime
+        .input_blocks()
         .await
-        .map_err(|err| format!("failed to run sequencer-watchdog: {err}").into())
-}
+        .map_err(|err| format!("read InputBox inputs: {err}"))?
+        .first()
+        .ok_or("no InputBox inputs before the accepted checkpoint")?;
+    eprintln!(
+        "[watchdog-harness] drill target block={block} first input block={first_input_block}"
+    );
 
-async fn run_lua_main_success(
-    runtime: &mut ManagedSequencer,
-    workspace: &Path,
-    state_dir: &Path,
-    machine_image: &Path,
-    command_name: &str,
-) -> ScenarioResult<()> {
-    let output = run_lua_main(runtime, workspace, state_dir, machine_image, command_name).await?;
-    if !output.status.success() {
+    eprintln!("[watchdog-harness] drill 1/7: init refuses a non-template image at genesis");
+    let refused = Watchdog::new(wrong.clone(), 0)?;
+    let output = refused.run(runtime, &["init"]).await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() != Some(1)
+        || !stderr.contains("differs from the on-chain template hash")
+    {
+        return Err(
+            format!("expected init to refuse the sepolia image at genesis: {stderr}").into(),
+        );
+    }
+
+    eprintln!(
+        "[watchdog-harness] drill 2/7: a wrong non-genesis bootstrap latches a state mismatch"
+    );
+    let watchdog = Watchdog::new(wrong, first_input_block)?;
+    watchdog.expect(runtime, &["init"], 0).await?;
+    watchdog.expect(runtime, &["tick"], 2).await?;
+    watchdog.expect(runtime, &["tick"], 2).await?;
+
+    eprintln!("[watchdog-harness] drill 3/7: status shows the latched incident and its evidence");
+    let status = watchdog.status(runtime).await?;
+    let divergence = &status["divergence"];
+    if status["latched"] != true
+        || divergence["kind"] != "state_mismatch"
+        || divergence["evidence"]["canonical_machine"] != "incident/canonical"
+    {
+        return Err(format!("unexpected latched status: {status}").into());
+    }
+    let latched_block = divergence["target_block"]
+        .as_u64()
+        .ok_or("marker without target_block")?;
+
+    eprintln!("[watchdog-harness] drill 4/7: clear refuses another block");
+    watchdog
+        .expect(
+            runtime,
+            &[
+                "clear",
+                "--block",
+                &(latched_block + 1).to_string(),
+                "--reason",
+                "drill",
+            ],
+            1,
+        )
+        .await?;
+
+    eprintln!(
+        "[watchdog-harness] drill 5/7: replay from the trusted image reproduces the sequencer"
+    );
+    let out = tempfile::tempdir().map_err(|err| format!("replay dir: {err}"))?;
+    let replayed = out.path().join("replayed");
+    let stdout = watchdog
+        .expect(
+            runtime,
+            &[
+                "replay",
+                "--from",
+                &trusted.to_string_lossy(),
+                "--from-block",
+                "0",
+                "--to-block",
+                &latched_block.to_string(),
+                "--out",
+                &replayed.to_string_lossy(),
+            ],
+            0,
+        )
+        .await?;
+    let replay: serde_json::Value =
+        serde_json::from_str(&stdout).map_err(|err| format!("replay JSON: {err}: {stdout}"))?;
+    // The marker records the digest the sequencer served for the latched block.
+    if replay["sha256"] != divergence["sequencer_sha256"] {
         return Err(format!(
-            "sequencer-watchdog {command_name} exited with {}; stderr: {}",
-            output.status,
-            String::from_utf8_lossy(output.stderr.as_slice())
+            "replay from the trusted image disagrees with the sequencer: {replay}"
         )
         .into());
     }
-    let stdout = String::from_utf8_lossy(output.stdout.as_slice());
-    if !stdout.is_empty() {
-        eprint!("{stdout}");
+
+    eprintln!("[watchdog-harness] drill 6/7: clearing without a fix re-latches");
+    watchdog
+        .expect(
+            runtime,
+            &[
+                "clear",
+                "--block",
+                &latched_block.to_string(),
+                "--reason",
+                "drill",
+            ],
+            0,
+        )
+        .await?;
+    watchdog.expect(runtime, &["tick"], 2).await?;
+
+    eprintln!("[watchdog-harness] drill 7/7: re-initializing from the trusted image agrees");
+    watchdog.wipe()?;
+    let fixed = Watchdog {
+        state_dir: watchdog.state_dir.clone(),
+        image: trusted,
+        block: 0,
+    };
+    fixed.expect(runtime, &["init"], 0).await?;
+    fixed.expect(runtime, &["tick"], 0).await?;
+    if fixed.status(runtime).await?["latched"] != false {
+        return Err("re-initialized watchdog is latched".into());
     }
     Ok(())
 }
 
-fn ensure_lcurl(lua_deps: &Path) -> ScenarioResult<()> {
-    let lcurl_so = lua_deps.join("lcurl.so");
-    if !lcurl_so.is_file() {
-        return Err(format!(
-            "lcurl.so missing at {}; run: just watchdog-lua-deps (needs libcurl + Lua dev headers)",
-            lcurl_so.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-async fn prove_cm_inspect_genesis(
-    workspace: &Path,
-    machine_image: &Path,
-) -> ScenarioResult<Vec<u8>> {
+/// The canonical image's answer to the `state` inspect query, via the CLI.
+async fn cm_inspect_state(machine_image: &Path) -> ScenarioResult<Vec<u8>> {
     let work_dir = tempfile::tempdir().map_err(|err| format!("temp cm work dir: {err}"))?;
     let query_path = work_dir.path().join("inspect-query.bin");
     let report_path = work_dir.path().join("inspect-report-0.bin");
     std::fs::write(query_path.as_path(), b"state")
         .map_err(|err| format!("write inspect query: {err}"))?;
-
     let status = Command::new("cartesi-machine")
-        .current_dir(workspace)
-        .arg("--no-rollback")
+        .arg("--no-revert")
         .arg(format!("--load={},sharing:none", machine_image.display()))
         .arg(format!(
             "--cmio-inspect-state=query:{},report:{}",
@@ -403,26 +416,7 @@ async fn prove_cm_inspect_genesis(
     if !status.success() {
         return Err(format!("cartesi-machine inspect exited with {status}").into());
     }
-
-    let report = std::fs::read(report_path.as_path())
-        .map_err(|err| format!("read inspect report: {err}"))?;
-    if report.starts_with(b"inspect endpoint not implemented".as_slice()) {
-        return Err(
-            "CM dapp is stale (inspect not implemented); rebuild with: just canonical-build-machine-image"
-                .into(),
-        );
-    }
-    // Pre-SSZ images returned JSON from export_state (~27 bytes for empty wallet).
-    if report.first() == Some(&b'{') {
-        return Err(format!(
-            "CM inspect returned JSON ({} bytes), expected SSZ; rebuild devnet image: \
-             just canonical-build-machine-image (report starts with {:?})",
-            report.len(),
-            String::from_utf8_lossy(&report[..report.len().min(40)])
-        )
-        .into());
-    }
-    Ok(report)
+    std::fs::read(report_path.as_path()).map_err(|err| format!("read inspect report: {err}").into())
 }
 
 async fn http_get(url: &str) -> std::io::Result<(u16, Vec<u8>, Vec<(String, String)>)> {

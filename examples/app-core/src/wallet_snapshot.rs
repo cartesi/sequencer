@@ -5,9 +5,9 @@
 //!
 //! [`encode`] and [`decode`] are the single source of truth used by
 //! [`WalletApp::create_dump`](crate::application::wallet::WalletApp::create_dump),
-//! CM `inspect_state`, and the watchdog's `/finalized_state` byte compare.
+//! CM `inspect_state`, and the watchdog's digest comparison.
 //!
-//! Golden bytes: `tests/fixtures/wallet_snapshot_empty.{hex,bin}` (shared with
+//! Golden bytes: `tests/fixtures/wallet_snapshot_empty.hex` (shared with
 //! Rust and Lua parity tests).
 
 use std::collections::HashMap;

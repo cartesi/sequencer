@@ -376,8 +376,8 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 runtime,
             ))
         }),
-        ("watchdog_non_genesis_divergence_test", |runtime| {
-            Box::pin(run_watchdog_non_genesis_divergence_test(runtime))
+        ("watchdog_divergence_drill_test", |runtime| {
+            Box::pin(run_watchdog_divergence_drill_test(runtime))
         }),
     ]
 }
@@ -390,11 +390,9 @@ async fn run_deposit_transfer_withdrawal_test(
     Ok(())
 }
 
-async fn run_watchdog_non_genesis_divergence_test(
-    runtime: &mut ManagedSequencer,
-) -> ScenarioResult<()> {
+async fn run_watchdog_divergence_drill_test(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
     prepare_non_genesis_watchdog_state(runtime).await?;
-    crate::watchdog_compare::run_watchdog_non_genesis_divergence_test(runtime).await?;
+    crate::watchdog_compare::run_watchdog_divergence_drill_test(runtime).await?;
     Ok(())
 }
 

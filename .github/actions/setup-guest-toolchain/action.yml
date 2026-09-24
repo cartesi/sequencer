@@ -80,29 +80,11 @@ runs:
         sudo apt-get install -y /tmp/xgenext2fs.deb
 
     - name: Install cartesi-machine
-      shell: bash
-      run: |
-        set -euo pipefail
-        ARCH="$(dpkg --print-architecture)"
-        VERSION="${{ inputs.cartesi-machine-version }}"
-
-        case "${ARCH}" in
-          amd64)
-            DEB_SHA256="${{ inputs.cartesi-machine-sha256-amd64 }}"
-            ;;
-          arm64)
-            DEB_SHA256="${{ inputs.cartesi-machine-sha256-arm64 }}"
-            ;;
-          *)
-            echo "unsupported arch for machine-emulator: ${ARCH}" >&2
-            exit 1
-            ;;
-        esac
-
-        wget -O /tmp/machine-emulator.deb "https://github.com/cartesi/machine-emulator/releases/download/${VERSION}/machine-emulator_${ARCH}.deb"
-        echo "${DEB_SHA256}  /tmp/machine-emulator.deb" | sha256sum --check
-        sudo apt-get install -y /tmp/machine-emulator.deb
-        cartesi-machine --version
+      uses: ./.github/actions/install-cartesi-machine
+      with:
+        version: ${{ inputs.cartesi-machine-version }}
+        sha256-amd64: ${{ inputs.cartesi-machine-sha256-amd64 }}
+        sha256-arm64: ${{ inputs.cartesi-machine-sha256-arm64 }}
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v4

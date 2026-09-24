@@ -15,6 +15,12 @@ members = [
   "tests/benchmarks",
   "tests/harness",
   "tests/e2e",
+  "watchdog/test-guest",
+  "sdk/guest/libcmt-sys",
+  "sdk/guest/trolley",
+  "sdk/guest/testsi",
+  "sdk/guest/testsi/testsi-macros",
+  "sdk/guest/rollups-types",
 ]
 default-members = ["sequencer", "examples/wallet-sequencer"]
 
@@ -33,12 +39,11 @@ authors = [
 ]
 
 [workspace.dependencies]
-# ── Git-pinned Cartesi tooling ───────────────────────────────
-libcmt-sys = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22" }
-trolley = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22" }
-testsi = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22" }
-types = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs", rev = "ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22" }
-cartesi-machine = { version = "2", git = "https://github.com/cartesi/dave", rev = "317a88a32a1b4a6002d561f37bb833843df55cba", features = ["download_uarch"] }
+# ── Guest SDK: canonical-guest crates (see sdk/guest/README.md) ──
+libcmt-sys = { version = "0.1", path = "sdk/guest/libcmt-sys" }
+trolley = { version = "0.1", path = "sdk/guest/trolley" }
+testsi = { version = "0.1", path = "sdk/guest/testsi" }
+rollups-types = { version = "0.1", path = "sdk/guest/rollups-types" }
 
 # ── Contracts (exact pin — the single place the version lives) ──
 cartesi-rollups-contracts = "=3.0.0-alpha.6"

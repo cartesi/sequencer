@@ -82,8 +82,10 @@ latest possible sound checkpoint is not a prerequisite for recovery.
 
 1. **Stop and preserve.** Stop the sequencer and prevent automatic restarts.
    Preserve its data directory, logs, and available archives before rebuilding.
-   Pause watchdog ticks while copying its selected checkpoint, manifest,
-   `head.json`, and configuration. Preserve affected client databases and their
+   Copy the watchdog state directory's `config.json`, its head under
+   `checkpoints/`, and its `incident/` evidence once `status` no longer shows
+   the evidence collection `running`; a latched watchdog does no other work,
+   so this needs no pause. Preserve affected client databases and their
    checkpoint metadata separately.
 2. **Establish the cause and reference.** Check deployment identity, canonical
    machine image, bootstrap boundary, and the reported comparison boundary.
@@ -93,7 +95,12 @@ latest possible sound checkpoint is not a prerequisite for recovery.
 3. **Select a sound application checkpoint.** The watchdog's durable head is
    its last successful comparison checkpoint, or its operator-trusted initial
    checkpoint if no comparison succeeded. A failed comparison does not replace
-   it; initialization and idle ticks are not successful comparisons. Use that
+   it; initialization and idle ticks are not successful comparisons. A latched
+   `state_mismatch` usually also keeps `incident/canonical` (its evidence
+   lists it), the canonical machine at the latched block, derived
+   independently of the sequencer, and
+   `sequencer-watchdog replay` re-derives one at any block from a trusted
+   machine ([incident runbook](../watchdog/incident-runbook.md)). Use that
    canonical state, or independently validate a retained candidate at the same
    exact L1 boundary. Current-state equality can establish a usable application
    state without establishing that all earlier executions were correct.
@@ -116,8 +123,8 @@ The watchdog stores a whole CM, including scheduler state; it does not save a
 native `/finalized_snapshot` archive. Use the application's rehearsed canonical
 export command to obtain the native bundle, or a retained native archive whose
 state and resume metadata can be validated against the canonical reference.
-The mapping is required even when it is a direct extraction of a designated
-drive. The generic watchdog does not implement that application-specific command.
+The mapping is required even when it is a direct extraction of the labeled
+state range. The generic watchdog does not implement that application-specific command.
 A comparison file alone need not contain everything an engine requires to restore.
 
 Retain verified native archives outside sequencer GC if they are the intended
