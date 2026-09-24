@@ -1,14 +1,17 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- The divergence latch. A divergence writes its local evidence into
---- `incident/` and then `incident/divergence.json`: the marker is the latch.
---- The sequencer's comparison file is fetched afterwards, as best effort, so
---- a slow download never delays the latch. While the marker exists every tick
---- exits 2 without work, until an operator clears it with `clear`, which
---- archives the incident instead of deleting anything. Clearing is always
---- safe: if the cause persists, the next tick latches again. The incident
---- runbook (docs/watchdog/incident-runbook.md) owns the procedure.
+--- The divergence latch. Latching creates `incident/` and writes the latch
+--- record `incident/divergence.json`, and nothing else: the directory is the
+--- latch, so a record lost to a crash or a full disk still latches (as
+--- `unreadable_marker`). The tick then signals the divergence, and only then
+--- collects evidence into `incident/`, each item on its own, with progress in
+--- `incident/evidence.json`: a slow or failed collection can neither delay
+--- nor undo the latch. While latched every tick exits 2 without work, until
+--- an operator clears it with `clear`, which archives the incident instead of
+--- deleting anything. Clearing is always safe: if the cause persists, the next
+--- tick latches again. The incident runbook (docs/watchdog/incident-runbook.md)
+--- owns the procedure.
 
 local lfs = require("lfs")
 local errors = require("watchdog.errors")
@@ -16,13 +19,14 @@ local errors = require("watchdog.errors")
 local incident = {}
 
 local MARKER = "divergence.json"
+local EVIDENCE = "evidence.json"
 local CHUNK = 1 << 20
 local PAGE = 4096
 
---- The latched incident's marker, or nil. A marker that exists but cannot be
---- read (torn by a crash; JSON files are not fsynced) still latches.
+--- The latched incident's record, or nil. An `incident/` whose record is
+--- missing or unreadable (JSON files are not fsynced) still latches.
 function incident.marker(store)
-    if not store:exists("incident", MARKER) then
+    if not store:exists("incident") then
         return nil
     end
     local ok, marker = pcall(store.read_json, store, "incident", MARKER)
@@ -32,24 +36,30 @@ function incident.marker(store)
     return marker
 end
 
---- Discard an interrupted latch (`incident/` without a marker) so the next
---- divergence can write its own evidence.
-function incident.discard_interrupted(store)
-    if store:exists("incident") and incident.marker(store) == nil then
-        store:remove("incident")
+--- The latched incident's evidence index, or nil when it has none.
+function incident.evidence(store)
+    local ok, index = pcall(store.read_json, store, "incident", EVIDENCE)
+    if not ok then
+        return { collection = "unreadable" }
     end
+    return index
 end
 
---- Offset of the first differing byte and the number of differing 4 KiB
---- pages of two files, streamed; a length difference counts from the shorter
---- end. `{ identical = true }` when the bytes agree: then the digests were
---- wrong, not the state.
-function incident.compare_files(path_a, path_b)
-    local a = assert(io.open(path_a, "rb"))
-    local b = assert(io.open(path_b, "rb"))
+--- Offset of the first byte where `bytes` and the file at `path` differ, and
+--- the number of differing 4 KiB pages, streaming the file; a length
+--- difference counts from the shorter end. `{ identical = true }` when they
+--- agree: then the digests were wrong, not the state.
+function incident.compare(bytes, path)
+    local file = assert(io.open(path, "rb"))
     local first, pages, offset = nil, 0, 0
     while true do
-        local ca, cb = a:read(CHUNK) or "", b:read(CHUNK) or ""
+        local cb, err = file:read(CHUNK)
+        if not cb and err then
+            file:close()
+            error(string.format("cannot read %s: %s", path, err), 0)
+        end
+        local ca = bytes:sub(offset + 1, offset + CHUNK)
+        cb = cb or ""
         if ca == "" and cb == "" then
             break
         end
@@ -72,60 +82,105 @@ function incident.compare_files(path_a, path_b)
         end
         offset = offset + math.max(#ca, #cb)
     end
-    a:close()
-    b:close()
+    file:close()
     if first then
         return { first_difference = first, differing_pages = pages }
     end
     return { identical = true }
 end
 
---- Latch a divergence. `event` becomes the marker (plus `detected_at` and
---- evidence fields). `evidence` may carry:
----   machine            a stored machine directory to keep as incident/canonical
----   publish            function(from, to) that durably moves a stored machine
----   canonical_bytes    the canonical comparison bytes
----   sequencer          client whose comparison file is fetched after the latch,
----                      kept only if it still describes `event.target_block`
-function incident.latch(store, event, evidence, now)
-    store:remove("incident")
-    store:mkdir("incident")
+--- Latch a divergence: create `incident/`, the latch, and write `event`, plus
+--- `detected_at`, as its record. Raises when `incident/` cannot be created;
+--- returns the reason when only the record could not be written.
+function incident.latch(store, event, now)
     event.detected_at = now
-    local recorded = {}
-    event.evidence = recorded
+    store:mkdir("incident")
+    local written, err = pcall(store.write_json, store, event, "incident", MARKER)
+    if not written then
+        return select(2, errors.classify(err))
+    end
+end
 
+--- Collect the latched `event`'s evidence, the one item nothing can re-derive
+--- first. `evidence` may carry:
+---   sequencer        client whose comparison file is kept if it still
+---                    describes `event.target_block`
+---   canonical_bytes  the canonical comparison bytes: compared with the
+---                    sequencer's file, then kept as canonical.bin
+---   machine          a stored machine directory, kept as incident/canonical
+---   publish          function(from, to) that durably moves a stored machine
+--- `incident/evidence.json` records each item as it ends: its path or result,
+--- or `<item>_missing` with the reason. Its `collection` is `running`, then
+--- `finished`; a latched tick marks a collection it finds `running` as
+--- `interrupted`. Final file names are complete by construction (renames);
+--- `*.tmp` files are partial. Never raises; returns the index.
+function incident.collect(store, event, evidence)
+    local index = { collection = "running" }
+    local function save()
+        pcall(store.write_json, store, index, "incident", EVIDENCE)
+    end
+    local function keep(item, fn)
+        local ok, value = pcall(fn)
+        if ok then
+            index[item] = value
+        else
+            index[item .. "_missing"] = string.format("%s: %s", errors.classify(value))
+        end
+        save()
+    end
+    save()
+    if evidence.sequencer then
+        keep("sequencer_bytes", function()
+            local path = store:path("incident", "sequencer.bin")
+            local ok, block = pcall(evidence.sequencer.download_state, evidence.sequencer, path .. ".tmp")
+            if not ok or block ~= event.target_block then
+                os.remove(path .. ".tmp")
+                if not ok then
+                    error(block, 0)
+                end
+                errors.transient("the sequencer moved on to block %d", block)
+            end
+            local renamed, err = os.rename(path .. ".tmp", path)
+            if not renamed then
+                os.remove(path .. ".tmp")
+                error(err, 0)
+            end
+            return "incident/sequencer.bin"
+        end)
+        if index.sequencer_bytes and evidence.canonical_bytes then
+            keep("comparison", function()
+                return incident.compare(evidence.canonical_bytes, store:path("incident", "sequencer.bin"))
+            end)
+        end
+    end
     if evidence.machine then
-        evidence.publish(evidence.machine, store:path("incident", "canonical"))
-        recorded.canonical_machine = "incident/canonical"
+        keep("canonical_machine", function()
+            evidence.publish(evidence.machine, store:path("incident", "canonical"))
+            return "incident/canonical"
+        end)
     end
     if evidence.canonical_bytes then
-        local file = assert(io.open(store:path("incident", "canonical.bin"), "wb"))
-        assert(file:write(evidence.canonical_bytes))
-        assert(file:close())
-        recorded.canonical_bytes = "incident/canonical.bin"
+        keep("canonical_bytes", function()
+            store:write_text(evidence.canonical_bytes, "incident", "canonical.bin")
+            return "incident/canonical.bin"
+        end)
     end
-    store:write_json(event, "incident", MARKER)
+    index.collection = "finished"
+    save()
+    return index
+end
 
-    if evidence.sequencer then
-        local path = store:path("incident", "sequencer.bin")
-        local downloaded, block = pcall(evidence.sequencer.download_state, evidence.sequencer, path .. ".tmp")
-        if downloaded and block == event.target_block then
-            assert(os.rename(path .. ".tmp", path))
-            recorded.sequencer_bytes = "incident/sequencer.bin"
-            if recorded.canonical_bytes then
-                recorded.comparison = incident.compare_files(store:path("incident", "canonical.bin"), path)
-            end
-        else
-            os.remove(path .. ".tmp")
-            if downloaded then
-                recorded.sequencer_bytes_missing = string.format("the sequencer moved on to block %d", block)
-            else
-                recorded.sequencer_bytes_missing = select(2, errors.classify(block))
-            end
-        end
-        store:write_json(event, "incident", MARKER)
+--- Mark a collection still `running` as `interrupted`; true if it was. Only a
+--- latched tick calls this, and the wrapper's lock lets it run only after the
+--- latching tick ended.
+function incident.mark_interrupted(store)
+    local index = incident.evidence(store)
+    if not (index and index.collection == "running") then
+        return false
     end
-    return event
+    index.collection = "interrupted"
+    store:write_json(index, "incident", EVIDENCE)
+    return true
 end
 
 --- Archive the latched incident for `block` with the operator's reason.

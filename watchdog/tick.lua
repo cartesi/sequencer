@@ -6,14 +6,19 @@
 --- The replay target is the block the sequencer's digest describes, fetched
 --- before replaying, so a long replay can never chase a moving target. The
 --- head only advances past a block the sequencer agreed with; anything else
---- latches a divergence with its evidence.
+--- latches a divergence and returns its evidence.
 ---
 --- The accepted block regresses only relative to a block the sequencer agreed
 --- with. Until the first agreement the head is just the bootstrap machine, and
 --- a sequencer behind it has not reached it yet.
 ---
+--- A divergence latches before anything else, and the tick reports it even
+--- when `incident/` cannot be created (`latch_error`) or only its record
+--- cannot be written (`record_error`; the latch holds). Its evidence is
+--- returned as `evidence`, for the caller to collect after it has signalled.
+---
 --- Outcomes: `latched` (already latched; no work), `idle` (nothing new),
---- `agreed` (head advanced), `diverged` (newly latched). Failures raise.
+--- `agreed` (head advanced), `diverged` (newly found). Failures raise.
 
 local canonical = require("watchdog.canonical")
 local errors = require("watchdog.errors")
@@ -30,7 +35,6 @@ function tick.run(cfg, deps)
     if latched then
         return { kind = "latched", incident = latched }
     end
-    incident.discard_interrupted(store)
     local work = store:reset_work()
 
     local head = store:head()
@@ -40,8 +44,14 @@ function tick.run(cfg, deps)
 
     local function diverge(event, evidence)
         event.agreed = { block = head.block, input_count = head.input_count }
-        evidence.publish = machine.publish
-        return { kind = "diverged", incident = incident.latch(store, event, evidence, deps.now()) }
+        local ok, record_error = pcall(incident.latch, store, event, deps.now())
+        if not ok then
+            return { kind = "diverged", incident = event, latch_error = select(2, errors.classify(record_error)) }
+        end
+        if evidence then
+            evidence.publish = machine.publish
+        end
+        return { kind = "diverged", incident = event, record_error = record_error, evidence = evidence }
     end
 
     --- Nothing to compare at `block`, or a regression.
@@ -51,7 +61,7 @@ function tick.run(cfg, deps)
         elseif head.block == cfg.bootstrap_block then
             return { kind = "idle", head = head, sequencer_block = block }
         end
-        return diverge({ kind = "inclusion_block_regressed", target_block = block }, {})
+        return diverge({ kind = "inclusion_block_regressed", target_block = block })
     end
 
     local polled = sequencer:inclusion_block()
