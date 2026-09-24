@@ -44,7 +44,8 @@ retry: a failed tick's retry is the next scheduled one.
 8. Equal digests: publish the machine as `checkpoints/<B>-<input count>` and
    remove the previous head. Different: latch `state_mismatch`. A canonical
    machine that stopped for good during replay latches
-   `canonical_machine_dead`.
+   `canonical_machine_dead`. A divergence is latched and reported before its
+   evidence is collected ([below](#divergence-latch)).
 
 ### Canonical execution
 
@@ -104,7 +105,7 @@ is decoded and fed to the machine before the next is fetched.
 | Command | Effect | Exit |
 |---|---|---|
 | `init` | Store the trusted bootstrap machine as the first checkpoint and write `config.json`. Idempotent on a complete state directory; refuses one initialized for another deployment or state source. | 0, or 1 |
-| `tick` | One compare cycle; writes `last_tick.json` and `status.prom`. | 0 ok or idle, 1 warning, 2 divergence latched |
+| `tick` | One compare cycle; writes `last_tick.json` and `status.prom`. | 0 ok or idle, 1 warning, 2 divergence |
 | `status` | JSON on stdout: config, head, latched divergence, last tick. Read-only; fails on a missing state directory. | 0, or 1 |
 | `clear --block B --reason TEXT` | Archive the divergence latched at block B into `incidents/`. Refuses any other block, except for an unreadable marker, which has none. | 0, or 1 |
 | `replay --from DIR --from-block A --to-block B --out DIR` | Re-derive canonical state from a stored machine into a new directory and print its digest. The machine must be a trusted start, like init's bootstrap; `--out` must not exist, and both paths are absolute. Reads the state directory's `config.json` and never writes it. | 0, or 1 |
@@ -126,7 +127,12 @@ Exit 1 covers three failure classes, which the log line and `last_tick.json`
 name: `transient` (the L1 RPC or the sequencer's HTTP API; the next tick may
 succeed), `operator` (configuration, the state directory, an image), and
 `internal` (anything else, including filesystem failures such as a full disk).
-Exit 2 means a divergence is latched and stays latched until `clear`.
+Exit 2 means a divergence: found by this tick, or latched earlier. It stays
+latched until `clear`. A tick that finds a divergence exits 2 even when it
+cannot create `incident/` (a full state directory); it logs the divergence as
+`NOT latched`, writes `last_tick.json` and a state-directory `status.prom` only
+if the directory still accepts them, and the next tick finds the divergence
+again if it persists.
 
 ## Configuration
 
@@ -163,7 +169,7 @@ state/
   config.json                      deployment identity and state source (init)
   checkpoints/<block>-<count>/     stored machine the sequencer agreed with; the newest is the head
   work/                            scratch for the running command
-  incident/                        the latched divergence and its evidence, if any
+  incident/                        the latched divergence: divergence.json, evidence.json, evidence files
   incidents/<id>/                  cleared incidents, with the operator's reason
   last_tick.json, status.prom      the last tick's outcome
   run.lock                         the wrapper's lock
@@ -175,26 +181,52 @@ that block. Checkpoints are published with the emulator's `sync_stored` and
 pointer file and a crash leaves either the old head or the new one. Older
 checkpoints are removed after the new head is published; an interrupted
 removal is finished by the next agreeing tick. JSON files are atomic but not
-fsynced. A torn latch marker still latches (kind `unreadable_marker`); a lost
-one latches again on the next tick if the divergence persists; a lost tick
-record is rewritten. A `config.json` lost to a crash right after `init` means
+fsynced. An `incident/` whose `divergence.json` is missing or torn still
+latches (kind `unreadable_marker`); a lost `incident/` latches again on the
+next tick if the divergence persists; a lost tick record is rewritten. Of the
+evidence, only the canonical machine is fsynced: after a host crash, check
+`canonical.bin` against `canonical_sha256`, and `sequencer.bin` against
+`sequencer_sha256` (or `canonical_sha256` when the comparison was
+`identical`). A `config.json` lost to a crash right after `init` means
 running `init` again; a torn one (`config.json is not valid JSON`) means wiping
 the state directory first. The watchdog stores whole machines, never the
 sequencer's restore archives.
 
 ## Divergence latch
 
-A divergence writes its local evidence into `incident/`, then
-`divergence.json`: the marker is the latch. For `state_mismatch` the evidence
-is the canonical machine at B, which waits for an input, and its comparison
-bytes; for `canonical_machine_dead`, the machine at its fixed point; a
-regression has none. It then fetches the sequencer's comparison file, if the sequencer is
-still at B, and adds the first differing offset and page count to the marker;
-byte-identical files are recorded as `identical`, which means the digests, not
-the states, disagreed. While latched, a tick exits 2 even when its
-configuration or endpoints are broken. The latching tick also
-prints the marker as one `watchdog_event <JSON>` line on stderr. The
-[incident runbook](incident-runbook.md) owns what to do next.
+A divergence is latched first, and alone: the tick creates `incident/` and
+writes the latch record `divergence.json` (kind, target block B, the agreed
+head P, and the digests or the stop). The directory is the latch, so a record
+lost to a crash or a full disk still latches, as `unreadable_marker`. The tick
+then records the divergence (the record as one `watchdog_event <JSON>` line on
+stderr, `last_tick.json` with exit code 2, and `status.prom`), and only then
+collects evidence; the process exits 2 once collection ends, so alert on the
+metrics, not on the exit status. While latched, a tick exits 2 even when its
+configuration or endpoints are broken.
+
+Evidence is collected in this order, each item on its own:
+
+| Item | Kept | Kinds |
+|---|---|---|
+| `sequencer_bytes` | `sequencer.bin`: the sequencer's comparison file, if it still serves B | `state_mismatch` |
+| `comparison` | Against the canonical bytes, when `sequencer_bytes` was kept: the 0-based offset of the first differing byte (`cmp -l` prints it plus one) and the number of differing 4 KiB pages; `identical` means the digests, not the states, disagreed | `state_mismatch` |
+| `canonical_machine` | `canonical/`: the canonical machine at B, waiting for an input, or at its fixed point | `state_mismatch`, `canonical_machine_dead` |
+| `canonical_bytes` | `canonical.bin`: the canonical comparison bytes | `state_mismatch` |
+
+`evidence.json` records each item as it ends: its path or result, or
+`<item>_missing` with the failure class and reason (`transient: …` when the
+sequencer is unreachable or has moved on, `internal: …` for a full disk). Its
+`collection` is `running`, then `finished`; a later tick that finds it still
+`running` marks it `interrupted`, and a torn index reads as `unreadable`.
+Files under their final names are complete, because each is renamed into
+place (until a host crash; see [State directory](#state-directory)); `*.tmp`
+files are partial. `status` shows the index as `divergence.evidence`. A
+regression has no evidence.
+
+The collecting tick holds the wrapper's lock, so `clear` reports
+`already locked` until it ends. The download has no overall deadline; killing
+the tick is safe. The [incident runbook](incident-runbook.md) owns what to do
+next.
 
 ## Metrics
 
@@ -265,6 +297,12 @@ Successful `init` or an idle tick is not evidence of a comparison.
   emulator's hash tree, and it waits for such a verifier. If the watchdog's
   peak memory (about twice the range) binds, a two-level digest (SHA-256 over
   the SHA-256 of fixed 64 MiB chunks) keeps it bounded.
+- **Latch first, evidence after the signal.** Evidence for a multi-GiB state
+  can take minutes and fail on a full disk; a divergence must neither wait for
+  it nor be lost with it. The sequencer's file comes first because the
+  watchdog can fetch it only while the sequencer still serves B, and the
+  sequencer removes it once it moves on; `replay` can always rebuild the
+  canonical side.
 
 ## Code map
 
@@ -277,7 +315,7 @@ Successful `init` or an idle tick is not evidence of a comparison.
   semantics, machine status, state sources, publishing.
 - `l1.lua`, `abi.lua`, `jsonrpc.lua`: complete InputBox inputs from L1.
 - `sequencer.lua`, `http.lua`: the sequencer's operator routes over lua-curl.
-- `incident.lua`: the latch, evidence, and `clear`. `store.lua`: the state
+- `incident.lua`: the latch, evidence collection, and `clear`. `store.lua`: the state
   directory. `config.lua`, `metrics.lua`, `errors.lua` (failure classes).
 - `sequencer-watchdog`: the production wrapper. `test-guest/`: a guest that
   drives every host outcome, for tests.

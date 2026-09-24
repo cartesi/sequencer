@@ -7,7 +7,8 @@
 ---     checkpoints/<block>-<count>/ stored machines the sequencer agreed with;
 ---                                  the newest is the head
 ---     work/                        scratch for the running command
----     incident/                    the latched divergence, if any
+---     incident/                    the latched divergence and its evidence,
+---                                  if any
 ---     incidents/<id>/              cleared incidents
 ---     last_tick.json, status.prom  the last tick's outcome
 ---
@@ -15,8 +16,9 @@
 --- through that block, and the machine layer publishes it with an atomic,
 --- fsynced rename: the head needs no pointer file. JSON files are written
 --- atomically but without fsync; each is either rebuilt by the next command
---- (a lost latch re-latches, a lost tick record is rewritten) or written once
---- by init, which is re-run after a crash.
+--- (a lost latch record still latches as `unreadable_marker`, a lost tick
+--- record is rewritten) or written once by init, which is re-run after a
+--- crash; `incident/evidence.json` is a best-effort index of the evidence.
 
 local lfs = require("lfs")
 local errors = require("watchdog.errors")
@@ -78,12 +80,22 @@ local function read_file(path)
     return data
 end
 
+--- Write `path` through `path.tmp` and a rename. A failed write removes the
+--- partial file, so a full disk is not left fuller.
 function store.write_file_atomic(path, data)
     local tmp = path .. ".tmp"
     local file = assert(io.open(tmp, "wb"))
-    assert(file:write(data))
-    assert(file:close())
-    assert(os.rename(tmp, path))
+    local written, write_err = file:write(data)
+    local closed, close_err = file:close()
+    if not (written and closed) then
+        os.remove(tmp)
+        error(string.format("cannot write %s: %s", tmp, tostring(write_err or close_err)), 0)
+    end
+    local renamed, rename_err = os.rename(tmp, path)
+    if not renamed then
+        os.remove(tmp)
+        error(rename_err, 0)
+    end
 end
 
 function store.open(dir, json)

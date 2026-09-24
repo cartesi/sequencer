@@ -270,24 +270,48 @@ end)
 
 -- ── incident ──────────────────────────────────────────────────────────────
 
-test("incident compares evidence files by offset and page", function()
+test("store removes its temporary file when a write fails", function()
+    local dir = support.tmpdir()
+    local open = io.open
+    -- luacheck: push ignore 122 (a stub for io.open, restored below)
+    io.open = function(path, mode)
+        local file = assert(open(path, mode))
+        return {
+            write = function()
+                return nil, "No space left on device"
+            end,
+            close = function()
+                return file:close()
+            end,
+        }
+    end
+    local ok, err = pcall(store_mod.write_file_atomic, dir .. "/f", "data")
+    io.open = open
+    -- luacheck: pop
+    eq(ok, false)
+    assert(err:find("No space left on device", 1, true), err)
+    eq(support.exists(dir .. "/f.tmp"), false)
+    eq(support.exists(dir .. "/f"), false)
+end)
+
+test("incident compares canonical bytes with a file by offset and page", function()
     local dir = support.tmpdir()
     local a = string.rep("\0", 10000)
     local b = a:sub(1, 5000) .. "x" .. a:sub(5002, 9000) .. "y" .. a:sub(9002)
-    support.write(dir .. "/a", a)
     support.write(dir .. "/b", b)
-    local result = incident.compare_files(dir .. "/a", dir .. "/b")
+    local result = incident.compare(a, dir .. "/b")
     eq(result.first_difference, 5000)
     eq(result.differing_pages, 2)
     support.write(dir .. "/c", a)
-    eq(incident.compare_files(dir .. "/a", dir .. "/c").identical, true)
+    eq(incident.compare(a, dir .. "/c").identical, true)
     support.write(dir .. "/short", a:sub(1, 100))
-    eq(incident.compare_files(dir .. "/a", dir .. "/short").first_difference, 100)
+    eq(incident.compare(a, dir .. "/short").first_difference, 100)
+    eq(incident.compare(a:sub(1, 100), dir .. "/c").first_difference, 100)
 end)
 
 test("incident clear archives only the named block's incident", function()
     local store = support.state_dir(json, 0, 0)
-    incident.latch(store, { kind = "state_mismatch", target_block = 7 }, {}, now())
+    incident.latch(store, { kind = "state_mismatch", target_block = 7 }, now())
     raises("operator", "is for block 7, not 8", function()
         incident.clear(store, 8, "wrong block", now())
     end)
@@ -299,25 +323,85 @@ test("incident clear archives only the named block's incident", function()
     end)
 end)
 
-test("incident treats an unreadable marker as latched and lets clear archive it", function()
+test("incident latches on the directory alone and lets clear archive it", function()
     local store = support.state_dir(json, 0, 0)
     store:mkdir("incident")
-    support.write(store:path("incident", "divergence.json"), "")
     eq(incident.marker(store).kind, "unreadable_marker")
-    incident.discard_interrupted(store)
+    support.write(store:path("incident", "divergence.json"), "")
     eq(incident.marker(store).kind, "unreadable_marker")
     incident.clear(store, 42, "torn marker", now())
     eq(incident.marker(store), nil)
 end)
 
-test("incident discards an interrupted latch but keeps a complete one", function()
+test("incident marks a collection still running as interrupted", function()
     local store = support.state_dir(json, 0, 0)
-    store:mkdir("incident")
-    incident.discard_interrupted(store)
-    eq(store:exists("incident"), false)
-    incident.latch(store, { kind = "state_mismatch", target_block = 1 }, {}, now())
-    incident.discard_interrupted(store)
-    eq(incident.marker(store).target_block, 1)
+    incident.latch(store, { kind = "state_mismatch", target_block = 1 }, now())
+    eq(incident.mark_interrupted(store), false)
+    store:write_json({ collection = "running", sequencer_bytes = "incident/sequencer.bin" }, "incident",
+        "evidence.json")
+    eq(incident.mark_interrupted(store), true)
+    eq(incident.evidence(store).collection, "interrupted")
+    eq(incident.evidence(store).sequencer_bytes, "incident/sequencer.bin")
+    eq(incident.mark_interrupted(store), false)
+end)
+
+test("incident collects the sequencer's bytes before anything local", function()
+    local store = support.state_dir(json, 0, 0)
+    local event = { kind = "state_mismatch", target_block = 7 }
+    incident.latch(store, event, now())
+    local working = support.tmpdir()
+    local sequencer = support.fake_sequencer({ block = 7, bytes = "aX" })
+    local download = sequencer.download_state
+    sequencer.download_state = function(self, path)
+        eq(support.exists(store:path("incident", "canonical")), false)
+        eq(support.exists(store:path("incident", "canonical.bin")), false)
+        eq(incident.evidence(store).collection, "running")
+        return download(self, path)
+    end
+    local index = incident.collect(store, event, {
+        sequencer = sequencer,
+        canonical_bytes = "ab",
+        machine = working,
+        publish = function(from, to)
+            assert(os.rename(from, to))
+        end,
+    })
+    eq(index.collection, "finished")
+    eq(index.sequencer_bytes, "incident/sequencer.bin")
+    eq(index.comparison.first_difference, 1)
+    eq(index.canonical_machine, "incident/canonical")
+    eq(index.canonical_bytes, "incident/canonical.bin")
+    eq(support.read(store:path("incident", "canonical.bin")), "ab")
+    eq(incident.evidence(store).collection, "finished")
+end)
+
+test("incident records a failed item with its reason and keeps collecting", function()
+    local store = support.state_dir(json, 0, 0)
+    local event = { kind = "state_mismatch", target_block = 7 }
+    incident.latch(store, event, now())
+    -- A directory where canonical.bin's temporary file goes makes its write fail.
+    store:mkdir("incident", "canonical.bin.tmp")
+    local index = incident.collect(store, event, {
+        sequencer = {
+            download_state = function(_, path)
+                support.write(path, "partial")
+                errors.transient("GET /finalized_state: connection refused")
+            end,
+        },
+        canonical_bytes = "ab",
+        machine = support.tmpdir(),
+        publish = function()
+            error("No space left on device", 0)
+        end,
+    })
+    eq(index.collection, "finished")
+    eq(index.sequencer_bytes_missing, "transient: GET /finalized_state: connection refused")
+    eq(index.comparison, nil)
+    eq(index.comparison_missing, nil)
+    eq(index.canonical_machine_missing, "internal: No space left on device")
+    assert(index.canonical_bytes_missing:find("canonical.bin.tmp", 1, true))
+    eq(support.exists(store:path("incident", "sequencer.bin.tmp")), false)
+    eq(incident.marker(store).target_block, 7)
 end)
 
 -- ── tick ──────────────────────────────────────────────────────────────────
@@ -335,6 +419,11 @@ local function tick_with(store, inputs, sequencer_state, script, rpc_opts, boots
         l1 = reader,
         now = now,
     })
+end
+
+--- Collect a diverged tick's evidence, as `main` does after signalling.
+local function collect_evidence(store, outcome)
+    return incident.collect(store, outcome.incident, outcome.evidence)
 end
 
 -- The fake machine appends each accepted payload's last byte to its state.
@@ -371,7 +460,10 @@ test("tick latches a state mismatch with evidence and keeps the head", function(
     eq(marker.target_block, 12)
     eq(marker.agreed.block, 11)
     eq(marker.canonical_sha256, "ab")
-    eq(marker.evidence.comparison.first_difference, 1)
+    -- The latch is written before any evidence.
+    eq(incident.evidence(store), nil)
+    eq(support.exists(store:path("incident", "canonical")), false)
+    eq(collect_evidence(store, outcome).comparison.first_difference, 1)
     eq(support.read(store:path("incident", "canonical", "state")), "ab")
     eq(store:head().block, 11)
     eq(tick_with(store, payloads("a", "b"), { block = 12, sha256 = "ab" }).kind, "latched")
@@ -379,8 +471,9 @@ end)
 
 test("tick records evidence as missing when the sequencer moved on", function()
     local store = support.state_dir(json, 11, 1, "a")
-    tick_with(store, payloads("a", "b"), { block = 12, sha256 = "zz", served_block = 13 })
-    eq(incident.marker(store).evidence.sequencer_bytes_missing, "the sequencer moved on to block 13")
+    collect_evidence(store, tick_with(store, payloads("a", "b"), { block = 12, sha256 = "zz", served_block = 13 }))
+    eq(incident.evidence(store).sequencer_bytes_missing, "transient: the sequencer moved on to block 13")
+    eq(support.exists(store:path("incident", "sequencer.bin.tmp")), false)
     eq(support.exists(store:path("incident", "sequencer.bin")), false)
 end)
 
@@ -390,6 +483,8 @@ test("tick latches a dead canonical machine at the input that stopped it", funct
         statuses = { { kind = "halted", exit_code = 7 } },
     })
     eq(outcome.kind, "diverged")
+    eq(outcome.evidence.machine ~= nil, true)
+    eq(outcome.evidence.canonical_bytes, nil)
     local marker = incident.marker(store)
     eq(marker.kind, "canonical_machine_dead")
     eq(marker.stop.status, "halted")
@@ -407,8 +502,43 @@ end)
 
 test("tick latches a regression below an agreed block", function()
     local store = support.state_dir(json, 11, 1, "a")
-    eq(tick_with(store, payloads("a"), { block = 10 }).kind, "diverged")
+    local outcome = tick_with(store, payloads("a"), { block = 10 })
+    eq(outcome.kind, "diverged")
+    eq(outcome.evidence, nil)
     eq(incident.marker(store).kind, "inclusion_block_regressed")
+end)
+
+test("tick reports a divergence it cannot latch", function()
+    local store = support.state_dir(json, 11, 1, "a")
+    local mkdir = store.mkdir
+    store.mkdir = function(self, name, ...)
+        if name == "incident" then
+            errors.operator("cannot create incident: Read-only file system")
+        end
+        return mkdir(self, name, ...)
+    end
+    local outcome = tick_with(store, payloads("a"), { block = 10 })
+    eq(outcome.kind, "diverged")
+    eq(outcome.latch_error, "cannot create incident: Read-only file system")
+    eq(outcome.incident.kind, "inclusion_block_regressed")
+    eq(incident.marker(store), nil)
+end)
+
+test("tick keeps the latch and its evidence when only the latch record cannot be written", function()
+    local store = support.state_dir(json, 11, 1, "a")
+    local write_json = store.write_json
+    store.write_json = function(self, value, ...)
+        if select(-1, ...) == "divergence.json" then
+            error("No space left on device", 0)
+        end
+        return write_json(self, value, ...)
+    end
+    local outcome = tick_with(store, payloads("a", "b"), { block = 12, sha256 = "aX", bytes = "aX" })
+    eq(outcome.kind, "diverged")
+    eq(outcome.latch_error, nil)
+    eq(outcome.record_error, "No space left on device")
+    eq(incident.marker(store).kind, "unreadable_marker")
+    eq(collect_evidence(store, outcome).canonical_machine, "incident/canonical")
 end)
 
 test("tick idles while the sequencer has not reached the bootstrap block", function()
@@ -566,6 +696,8 @@ test("main tick exits 0/2 and records last_tick.json and status.prom", function(
     eq(status.latched, true)
     eq(status.head.block, 12)
     eq(status.divergence.target_block, 13)
+    eq(status.divergence.evidence.collection, "finished")
+    eq(status.divergence.evidence.canonical_machine, "incident/canonical")
 
     eq(run({ "clear", "--block", "12", "--reason", "drill" }), 1)
     eq(run({ "clear", "--block=13", "--reason=drill" }, nil, sink()), 0)
@@ -575,9 +707,85 @@ end)
 test("main tick keeps exit 2 while latched even when nothing else can run", function()
     local main = require("watchdog.main")
     local store = support.state_dir(json, 11, 1, "a")
-    incident.latch(store, { kind = "state_mismatch", target_block = 12 }, {}, now())
+    incident.latch(store, { kind = "state_mismatch", target_block = 12 }, now())
+    store:write_json({ collection = "running" }, "incident", "evidence.json")
     eq(main.run({ "tick" }, { env = { CARTESI_WATCHDOG_STATE_DIR = store.dir }, factory = main_factory({}, {}) }), 2)
+    eq(incident.evidence(store).collection, "interrupted")
     assert(support.read(store:path("status.prom")):find('kind="state_mismatch"} 1', 1, true))
+end)
+
+--- A state directory initialized for `main` with its head at block 11.
+local function main_state_dir()
+    local store = support.state_dir(json, 11, 1, "a")
+    local cfg = config.from_init_env(init_env({ CARTESI_WATCHDOG_BLOCKCHAIN_ID = "31337" }))
+    cfg.input_box_address = support.INPUT_BOX
+    store:write_json(config.persisted(cfg), "config.json")
+    return store, { CARTESI_WATCHDOG_STATE_DIR = store.dir }
+end
+
+test("main tick keeps a divergence latched when its evidence cannot be kept", function()
+    local main = require("watchdog.main")
+    local store, env = main_state_dir()
+    local disk_full = { publish_error = "No space left on device" }
+
+    eq(main.run({ "tick" }, { env = env, factory = main_factory(payloads("a", "b"),
+        { block = 12, sha256 = "aX", bytes = "aX" }, disk_full) }), 2)
+    eq(incident.marker(store).kind, "state_mismatch")
+    assert(support.read(store:path("status.prom")):find('state="failed"} 1', 1, true))
+    local evidence = incident.evidence(store)
+    eq(evidence.collection, "finished")
+    eq(evidence.canonical_machine_missing, "internal: No space left on device")
+    eq(evidence.sequencer_bytes, "incident/sequencer.bin")
+    eq(evidence.canonical_bytes, "incident/canonical.bin")
+    -- An agreeing sequencer later does not clear the latch; only `clear` does.
+    eq(main.run({ "tick" }, { env = env, factory = main_factory(payloads("a", "b", "c"),
+        { block = 13, sha256 = "abc" }) }), 2)
+    eq(store:head().block, 11)
+end)
+
+test("main tick signals a divergence before collecting its evidence", function()
+    local main = require("watchdog.main")
+    local store, env = main_state_dir()
+    local factory = main_factory(payloads("a", "b"), { block = 12, sha256 = "aX", bytes = "aX" })
+    local signalled
+    factory.sequencer = function()
+        local sequencer = support.fake_sequencer({ block = 12, sha256 = "aX", bytes = "aX" })
+        local download = sequencer.download_state
+        sequencer.download_state = function(self, path)
+            signalled = store:read_json("last_tick.json").outcome == "diverged"
+                and support.read(store:path("status.prom")):find('state="failed"} 1', 1, true) ~= nil
+            return download(self, path)
+        end
+        return sequencer
+    end
+    eq(main.run({ "tick" }, { env = env, factory = factory }), 2)
+    eq(signalled, true)
+    eq(incident.evidence(store).comparison.first_difference, 1)
+end)
+
+test("main tick exits 2 for a divergence it cannot latch", function()
+    local main = require("watchdog.main")
+    local store, env = main_state_dir()
+    local latch = incident.latch
+    incident.latch = function()
+        errors.operator("cannot create incident: No space left on device")
+    end
+    local code = main.run({ "tick" }, { env = env, factory = main_factory(payloads("a", "b"),
+        { block = 12, sha256 = "aX", bytes = "aX" }) })
+    incident.latch = latch
+    eq(code, 2)
+    eq(store:read_json("last_tick.json").message,
+        "divergence not latched: cannot create incident: No space left on device")
+    assert(support.read(store:path("status.prom")):find('state="failed"} 1', 1, true))
+    eq(support.exists(store:path("incident")), false)
+end)
+
+test("main tick writes the state directory's status.prom when the metrics path is relative", function()
+    local main = require("watchdog.main")
+    local store, env = main_state_dir()
+    env.CARTESI_WATCHDOG_METRICS_FILE = "status.prom"
+    eq(main.run({ "tick" }, { env = env, factory = main_factory(payloads("a"), { block = 11 }) }), 0)
+    assert(support.read(store:path("status.prom")):find('state="ok"} 1', 1, true))
 end)
 
 test("main tick without a state directory exits 1 and still reports", function()
