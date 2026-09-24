@@ -373,9 +373,9 @@ APPLICATION_ENGINE_API void application_engine_progress(const ApplicationEngine 
 /// CoW sharing is allowed when writes remain isolated.
 ///
 /// The file named by application_engine_state_file_in_dump must byte-equal what the canonical
-/// machine yields for the same logical state: its whole labeled state range, or its `state` inspect
-/// report (docs/protocol/application-contract.md, "Comparison bytes"). The bridge does not verify
-/// this cross-build equivalence.
+/// machine yields after the same inputs, also for an engine restored from a dump: its whole labeled
+/// state range, or its `state` inspect report (docs/protocol/application-contract.md, "Comparison
+/// bytes"). The bridge does not verify this cross-build equivalence.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_create_dump(ApplicationEngine *engine,
     const char *prefix) APPLICATION_ENGINE_NOEXCEPT;
 
@@ -386,8 +386,7 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_create_dump(Ap
 /// file sits follows from the shape the engine gives a dump, which is why the engine answers
 /// rather than a host assuming. An engine whose dump is a directory answers with a file inside
 /// it, and one whose dump is the state image itself answers with the prefix unchanged.
-/// Its bytes must match the independent canonical build's deterministic comparison representation
-/// for the same logical state, as required by application_engine_create_dump.
+/// Its bytes are the comparison bytes that application_engine_create_dump requires.
 ///
 /// The storage is engine owned and thread local, overwritten by the next call on the same
 /// thread, so copy rather than retain the pointer. Being fallible, it also clears the last error
