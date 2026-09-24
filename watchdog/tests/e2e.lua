@@ -194,9 +194,14 @@ local function guest_inputs(...)
     return inputs
 end
 
+--- One tick; a divergence's evidence is collected afterwards, as `main` does.
 local function run_tick(cfg, store, l1, sequencer_state)
-    return tick.run(cfg, { store = store, machine = machine, l1 = l1, now = now,
+    local outcome = tick.run(cfg, { store = store, machine = machine, l1 = l1, now = now,
         sequencer = support.fake_sequencer(sequencer_state) })
+    if outcome.evidence then
+        incident.collect(store, outcome.incident, outcome.evidence)
+    end
+    return outcome
 end
 
 local function digest(payloads)
@@ -227,8 +232,10 @@ test("tick latches a mismatch with the canonical machine and a byte diff", funct
     local marker = incident.marker(store)
     eq(marker.kind, "state_mismatch")
     eq(marker.canonical_sha256, digest({ "hello", "world!" }))
-    eq(marker.evidence.comparison.first_difference, 20)
-    eq(marker.evidence.comparison.differing_pages, 1)
+    local evidence = incident.evidence(store)
+    eq(evidence.collection, "finished")
+    eq(evidence.comparison.first_difference, 20)
+    eq(evidence.comparison.differing_pages, 1)
     eq(machine.state_bytes(store:path("incident", "canonical"), cfg.state_source), guest_state({ "hello", "world!" }))
     eq(store:head().block, 0)
 end)
@@ -237,6 +244,7 @@ test("tick latches a dead canonical machine and replay reproduces the stop", fun
     local cfg, store, l1 = deployment(guest_inputs("hello", "halt", "world!"))
     eq(run_tick(cfg, store, l1, { block = 3, sha256 = digest({ "hello", "world!" }) }).kind, "diverged")
     local marker = incident.marker(store)
+    eq(incident.evidence(store).canonical_machine, "incident/canonical")
     eq(marker.kind, "canonical_machine_dead")
     eq(marker.stop.status, "halted")
     eq(marker.stop.description, "halt with exit code 7")

@@ -13,7 +13,7 @@ sequencer-watchdog status
 ```
 
 `status` prints the state directory's summary. Its `divergence` field is the
-latch marker:
+latch record, with the evidence index under `divergence.evidence`:
 
 | Field | Meaning |
 |---|---|
@@ -22,20 +22,47 @@ latch marker:
 | `agreed` (P) | The watchdog's head, which stays there: the last block the sequencer agreed with, or the trusted bootstrap block before the first agreement |
 | `canonical_sha256`, `sequencer_sha256` | Both digests, for `state_mismatch` |
 | `stop` | For `canonical_machine_dead`: the input index and block that stopped the machine, and how |
-| `evidence` | What was kept under `incident/` in the state directory |
+| `evidence` | What was kept under `incident/` in the state directory, and `collection` |
 
-Evidence under `incident/`:
+Evidence under `incident/`, each listed in `evidence` by its path, or as
+`<item>_missing` with the reason:
 
+- `sequencer.bin`: the sequencer's comparison file, when it still served
+  block B. `evidence.comparison` gives the 0-based offset of the first byte
+  where it differs from the canonical bytes (`cmp -l` prints it plus one) and
+  the number of differing 4 KiB pages.
+  `evidence.comparison.identical` means the bytes agree and only the digests
+  did not: the fault is in how the sequencer served its digest, not in either
+  execution.
 - `canonical/`: the canonical machine at B (a stored machine directory).
-- `canonical.bin`, `sequencer.bin`: both comparison byte strings, when the
-  sequencer still served block B. `evidence.comparison` gives the first
-  differing byte and the number of differing 4 KiB pages; `cmp -l` works on the
-  files directly. `evidence.comparison.identical` means the bytes agree and
-  only the digests did not: the fault is in how the sequencer served its
-  digest, not in either execution.
+- `canonical.bin`: the canonical comparison bytes; `cmp -l canonical.bin
+  sequencer.bin` works on the files directly.
 
-A marker of kind `unreadable_marker` was torn by a crash. Its evidence is still
-under `incident/`; `clear` accepts any block for it.
+`evidence.collection` tells whether the list is complete:
+
+| `collection` | Meaning |
+|---|---|
+| `running` | The latching tick is still collecting. It holds the wrapper's lock, so `clear` reports `already locked`; killing it is safe. If nothing holds the lock, the collection died and no tick has marked it yet: read it as `interrupted` |
+| `finished` | Every item that applies is listed, kept or missing; `comparison` only when `sequencer_bytes` was kept |
+| `interrupted` | The latching tick died while collecting. Files under their final names are complete; `*.tmp` files are partial |
+| `unreadable` | A crash tore the index. Files under their final names are still complete |
+| (no `evidence`) | The latching tick died before collecting anything, or the kind has none (`inclusion_block_regressed`) |
+
+Evidence files are renamed into place but not fsynced, except `canonical/`.
+After a host crash, check `sha256sum canonical.bin` against `canonical_sha256`,
+and `sequencer.bin` against `sequencer_sha256`, or against `canonical_sha256`
+when `comparison.identical`.
+
+A latch of kind `unreadable_marker` is an `incident/` whose record was lost or
+torn by a crash or a full disk. Its evidence, if any, is still under
+`incident/`; `clear` accepts any block for it.
+
+A log line `divergence <kind> detected at block B but NOT latched` means the
+tick could not even create `incident/` (a full state directory). Treat block B
+as latched and follow this runbook from the log line; fix the state directory,
+and the next tick finds the divergence again if it persists. A log line `the
+latch record could not be written` means `incident/` exists and the latch
+holds, as `unreadable_marker`; the log lines carry its kind and block.
 
 The log of the latching tick also carries the guest's console output, which
 for `canonical_machine_dead` usually includes the application's last message.
@@ -47,6 +74,15 @@ act on its soft confirmations, and after a real divergence new confirmations
 may not hold. A false alarm costs downtime; users can still reach the
 application through L1 direct inputs meanwhile. Keep it running only with
 evidence that the fault is on the watchdog's side (step 2).
+
+The latching tick fetches the sequencer's comparison file first, while
+`evidence.collection` is `running` without `sequencer_bytes`. A graceful stop
+of the sequencer stops it taking transactions at once but lets that download
+finish, so the stop can take as long as the download; a supervisor that kills
+the sequencer first leaves `sequencer_bytes_missing: transient: …`. Do not
+wait for the file: step 2's verdict comes from `replay`. To end the download
+now, kill the collecting watchdog tick. Preserve the sequencer's data
+directory before any restart (cockroach recovery, step 1).
 
 ## 2. Find the faulty side
 
@@ -98,7 +134,8 @@ regression; the watchdog idles.
 
 **Sequencer wrong.** Fix the bug, then rebuild the sequencer with
 [cockroach recovery](../recovery/cockroach.md) from a trusted canonical
-checkpoint: `incident/canonical` at B, or the head at P. Resume the sequencer,
+checkpoint: `incident/canonical` at B (or step 2's `replay --out` directory
+when `incident/canonical` is absent), or the head at P. Resume the sequencer,
 then clear the latch:
 
 ```bash
@@ -117,8 +154,10 @@ compares.
 
 `clear` archives the incident under `incidents/` with the reason; it never
 deletes evidence, and it refuses a block other than the latched one (an
-unreadable marker has no block, so any is accepted). Clearing is always safe:
-if the cause persists, the next tick latches again.
+unreadable marker has no block, so any is accepted). While an evidence
+collection is `running`, `clear` reports `already locked`; retry once it
+ends. Clearing is always safe: if the cause persists, the next tick latches
+again.
 
 ## Drills
 
@@ -127,6 +166,7 @@ if the cause persists, the next tick latches again.
 | Watchdog wrong (`state_mismatch`) | `watchdog_divergence_drill_test` in `just test-rollups-e2e` | init refusing a non-template image at genesis; a wrong non-genesis bootstrap latching; `status`; `clear` refusing another block; `replay` from the trusted image matching the sequencer; re-latching after a premature `clear`; re-`init` agreeing |
 | Canonical machine dead | `tick latches a dead canonical machine and replay reproduces the stop` in `just test-watchdog-e2e` | the latch at the stopping input, and `replay` reproducing the stop |
 | Sequencer wrong (`state_mismatch`) | `tick latches a mismatch with the canonical machine and a byte diff` in `just test-watchdog-e2e` | the evidence: canonical machine, both byte strings, and the first difference |
+| Evidence lost to a full disk | `main tick keeps a divergence latched when its evidence cannot be kept` in `just test-watchdog` | the latch and exit 2 surviving a failed evidence item, which `evidence` names |
 | `inclusion_block_regressed` | `tick latches a regression below an agreed block` and `tick idles while the sequencer has not reached the bootstrap block` in `just test-watchdog` | the latch, and idling instead behind a never-agreed bootstrap |
 
 Before production, run the first drill once against the staging deployment

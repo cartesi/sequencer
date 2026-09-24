@@ -83,7 +83,8 @@ latest possible sound checkpoint is not a prerequisite for recovery.
 1. **Stop and preserve.** Stop the sequencer and prevent automatic restarts.
    Preserve its data directory, logs, and available archives before rebuilding.
    Copy the watchdog state directory's `config.json`, its head under
-   `checkpoints/`, and its `incident/` evidence; a latched watchdog does no work,
+   `checkpoints/`, and its `incident/` evidence once `status` no longer shows
+   the evidence collection `running`; a latched watchdog does no other work,
    so this needs no pause. Preserve affected client databases and their
    checkpoint metadata separately.
 2. **Establish the cause and reference.** Check deployment identity, canonical
@@ -95,8 +96,9 @@ latest possible sound checkpoint is not a prerequisite for recovery.
    its last successful comparison checkpoint, or its operator-trusted initial
    checkpoint if no comparison succeeded. A failed comparison does not replace
    it; initialization and idle ticks are not successful comparisons. A latched
-   `state_mismatch` also keeps `incident/canonical`, the canonical machine at
-   the latched block, derived independently of the sequencer, and
+   `state_mismatch` usually also keeps `incident/canonical` (its evidence
+   lists it), the canonical machine at the latched block, derived
+   independently of the sequencer, and
    `sequencer-watchdog replay` re-derives one at any block from a trusted
    machine ([incident runbook](../watchdog/incident-runbook.md)). Use that
    canonical state, or independently validate a retained candidate at the same

@@ -199,8 +199,8 @@ end
 
 --- A machine facade whose stored machines are directories holding a
 --- `state` file. `script.statuses[i]` is the status of the i-th advanced
---- input (default `accepted`). `sha256` is the identity, so fake digests are
---- readable.
+--- input (default `accepted`). `script.publish_error` makes `publish` raise it.
+--- `sha256` is the identity, so fake digests are readable.
 function support.fake_machine(script)
     script = script or {}
     local fake = { advanced = 0 }
@@ -230,6 +230,9 @@ function support.fake_machine(script)
         return bytes
     end
     function fake.publish(from, to)
+        if script.publish_error then
+            error(script.publish_error, 0)
+        end
         assert(os.rename(from, to))
     end
     function fake.clone(from, to)
