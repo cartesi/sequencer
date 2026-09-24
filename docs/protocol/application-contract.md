@@ -158,8 +158,11 @@ how the comparison is transported and which state source a deployment uses;
 the [wallet format](../snapshots/format.md) owns its SSZ representation.
 
 **Comparison bytes.** The comparison file must byte-equal what the canonical
-machine yields for the same logical state, through the deployment's state
-source:
+machine yields after the same inputs, through the deployment's state source,
+whether the engine ran them uninterrupted or was restored with `from_dump` or
+rebuilt by recovery partway. For a range source, anything that shapes the
+range's layout (allocator state, hash seeds, capacity policy) belongs to the
+checkpoint and must not depend on the process:
 
 - **Range source**: the entire flash drive or NVRAM carrying the configured
   user label, all of its configured length including any unused zero tail,
