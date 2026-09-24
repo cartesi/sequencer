@@ -268,13 +268,15 @@ that tick runs as long as replaying the new inputs takes.
 
 Each tick writes `status.prom`, a Prometheus textfile, into the state directory
 or to `CARTESI_WATCHDOG_METRICS_FILE`; point that at the node_exporter
-textfile-collector directory, with a name ending in `.prom`. Alert on the three
+textfile-collector directory, with an absolute path ending in `.prom` (a
+relative one is logged and ignored). Alert on the three
 conditions in [metrics](README.md#metrics): a latched divergence (`failed`), a
 stale last-tick timestamp, and a `warning` that persists for a few intervals.
 
 Keep the watchdog's stderr. Each tick logs a `watchdog: tick: …` line with its
 outcome or failure class; a newly latched divergence also writes a
-`watchdog_event` JSON line, and the latching tick's log carries the guest's
+`watchdog_event` JSON line, then a `tick: evidence for block B: …` line once
+its evidence is collected, and the latching tick's log carries the guest's
 console output.
 
 ## Responding to alerts
@@ -282,7 +284,8 @@ console output.
 - **Divergence (`failed`).** Follow the [incident runbook](incident-runbook.md).
 - **Stale heartbeat.** No tick has finished recently: the scheduler stopped, a
   tick hangs or is still replaying a long range, or every run exits at the lock
-  because another process holds it.
+  because another process holds it, such as a latching tick still collecting
+  evidence (its divergence alert fires first).
 - **Sustained warning.** `sequencer-watchdog status` shows the last tick's
   `outcome`, which is the failure class (`transient`, `operator`, or
   `internal`), and its `message`; [troubleshooting](#troubleshooting-live-deployments)
