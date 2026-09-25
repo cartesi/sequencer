@@ -34,7 +34,7 @@ impl TxRequest {
         self.validate_payload_size(max_user_op_data_bytes)?;
 
         let signature = self.decode_signature()?;
-        let expected_sender = self.decode_address()?;
+        let expected_sender = parse_sender_address(&self.sender)?;
         let recovered_sender = recover_sender(&self.message, &signature, domain)?;
 
         if expected_sender != recovered_sender {
@@ -83,14 +83,20 @@ impl TxRequest {
         }
         parse_signature(&signature_bytes)
     }
+}
 
-    fn decode_address(&self) -> Result<Address, TxRequestError> {
-        let bytes = decode_hex_0x(self.sender.as_str()).map_err(TxRequestError::bad_request)?;
-        if bytes.len() != Self::ADDRESS_BYTES {
-            return Err(TxRequestError::bad_request("address must be 20 bytes"));
-        }
-        Ok(Address::from_slice(&bytes))
+/// Parse a sender the way `POST /tx` does: `0x` plus 40 hex digits in any
+/// letter case. EIP-55 checksums are not enforced; the signature, not the
+/// casing, binds a sender.
+pub fn parse_sender_address(value: &str) -> Result<Address, TxRequestError> {
+    if value.len() != TxRequest::ADDRESS_HEX_LEN {
+        return Err(TxRequestError::bad_request(format!(
+            "sender must be {} hex chars (0x + 20 bytes)",
+            TxRequest::ADDRESS_HEX_LEN
+        )));
     }
+    let bytes = decode_hex_0x(value).map_err(TxRequestError::bad_request)?;
+    Ok(Address::from_slice(&bytes))
 }
 
 #[derive(Debug, Error, Clone)]
@@ -142,6 +148,44 @@ impl FeeResponse {
     }
 }
 
+/// `GET /nonce` body. `next_nonce` is the value to sign into `UserOp.nonce`;
+/// [`TxResponse::nonce`] is instead the nonce an included op consumed.
+/// `sender` is echoed in EIP-55 casing, like `POST /tx` responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NonceResponse {
+    pub sender: String,
+    pub next_nonce: u32,
+}
+
+/// `GET /domain` body: the EIP-712 domain `POST /tx` verifies signatures
+/// against, keyed as `eth_signTypedData_v4` expects. Clients pin their own
+/// domain and assert it matches, as a wallet checks `eth_chainId`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainResponse {
+    pub name: String,
+    pub version: String,
+    pub chain_id: u64,
+    /// EIP-55 casing.
+    pub verifying_contract: String,
+}
+
+impl DomainResponse {
+    /// `None` unless the domain has exactly the shape
+    /// [`crate::build_input_domain`] produces: all four fields, no salt.
+    pub fn from_domain(domain: &Eip712Domain) -> Option<Self> {
+        if domain.salt.is_some() {
+            return None;
+        }
+        Some(Self {
+            name: domain.name.as_deref()?.to_owned(),
+            version: domain.version.as_deref()?.to_owned(),
+            chain_id: u64::try_from(domain.chain_id?).ok()?,
+            verifying_contract: domain.verifying_contract?.to_string(),
+        })
+    }
+}
+
 pub type WsTxMessage = BroadcastTxMessage;
 
 fn decode_hex_0x(value: &str) -> Result<Vec<u8>, String> {
@@ -177,4 +221,57 @@ fn parse_signature(bytes: &[u8]) -> Result<Signature, TxRequestError> {
             TxRequestError::invalid_signature("invalid signature")
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sender_parser_accepts_any_case_and_nothing_else() {
+        let address = Address::repeat_byte(0xab);
+        let lower = format!("{address:#x}");
+        for accepted in [lower.clone(), lower.to_uppercase().replacen("0X", "0x", 1)] {
+            assert_eq!(parse_sender_address(&accepted).unwrap(), address);
+        }
+        assert_eq!(
+            parse_sender_address(&address.to_checksum(None)).unwrap(),
+            address
+        );
+        for rejected in [
+            lower.trim_start_matches("0x"),
+            &lower[..lower.len() - 2],
+            &format!("{lower}00"),
+            &lower.replacen('a', "g", 1),
+            &lower.replacen("0x", "0X", 1),
+        ] {
+            assert!(
+                parse_sender_address(rejected).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn domain_response_uses_eip712_keys_and_requires_the_full_domain() {
+        let app = Address::repeat_byte(0xab);
+        let domain = crate::build_input_domain(31337, app);
+        let served = DomainResponse::from_domain(&domain).unwrap();
+        assert_eq!(
+            serde_json::to_value(&served).unwrap(),
+            serde_json::json!({
+                "name": crate::DOMAIN_NAME,
+                "version": crate::DOMAIN_VERSION,
+                "chainId": 31337,
+                "verifyingContract": app.to_checksum(None),
+            })
+        );
+
+        let mut partial = domain.clone();
+        partial.verifying_contract = None;
+        assert_eq!(DomainResponse::from_domain(&partial), None);
+        let mut salted = domain;
+        salted.salt = Some(alloy_primitives::B256::ZERO);
+        assert_eq!(DomainResponse::from_domain(&salted), None);
+    }
 }

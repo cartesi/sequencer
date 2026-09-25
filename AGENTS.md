@@ -284,7 +284,7 @@ enforces write-once batch lifecycle, Tip uniqueness, and user-op identity.
 
 ## HTTP Endpoints
 
-- **Ingress** (public-facing): `POST /tx`, `GET /fee`.
+- **Ingress** (public-facing): `POST /tx`, `GET /fee`, `GET /nonce`, `GET /domain`.
 - **Egress** (internal indexers/watchdog): application-input subscriptions,
   snapshot/state downloads, and health probes. Snapshot/state endpoints have no
   authentication and **must not be exposed publicly**. Downloads hold a GC lease

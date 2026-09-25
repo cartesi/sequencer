@@ -880,6 +880,10 @@ async fn api_quotes_open_frame_fee() {
         quoted.fee, 1356,
         "quoted fee must match the bootstrapped open-frame fee"
     );
+    let raw = reqwest::get(format!("http://{}/fee", runtime.addr))
+        .await
+        .expect("raw GET /fee");
+    assert_eq!(raw.headers()["cache-control"], "no-store");
     assert_eq!(
         quoted.recommended_fee, 1356,
         "bootstrapped recommended_fee matches the open-frame fee"
@@ -889,6 +893,63 @@ async fn api_quotes_open_frame_fee() {
         sequencer_core::fee::suggested_signing_max_fee(quoted.fee, quoted.recommended_fee),
         "suggested_max_fee is max(fee, recommended_fee) plus signing slack"
     );
+
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_serves_the_next_nonce_after_each_ack_and_the_signing_domain() {
+    let db = temp_db("nonce-endpoint");
+    let domain = test_domain();
+    let signing_key = SigningKey::from_bytes((&[11_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
+
+    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
+        return;
+    };
+    let endpoint = format!("http://{}", runtime.addr);
+    let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
+        .expect("build sequencer client");
+
+    // Sign only with a domain rebuilt from the served JSON: /tx accepting those
+    // signatures proves /domain is the domain it verifies against.
+    let served = client.get_domain().await.expect("GET /domain");
+    let domain = Eip712Domain {
+        name: Some(served.name.into()),
+        version: Some(served.version.into()),
+        chain_id: Some(U256::from(served.chain_id)),
+        verifying_contract: Some(served.verifying_contract.parse().expect("served address")),
+        salt: None,
+    };
+
+    for nonce in 0..2 {
+        let quoted = client.get_nonce(sender).await.expect("GET /nonce");
+        assert_eq!(quoted.sender, sender.to_checksum(None));
+        assert_eq!(
+            quoted.next_nonce, nonce,
+            "a read after the previous 200 must see that op"
+        );
+        let user_op = UserOp {
+            nonce,
+            max_fee: 1356,
+            data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
+                amount: U256::from(0_u64),
+            }))
+            .into(),
+        };
+        let request = TxRequest {
+            signature: sign_user_op_hex(&domain, &user_op, &signing_key),
+            sender: sender.to_string(),
+            message: user_op,
+        };
+        let (status, body) = client
+            .submit_tx_with_status(&request)
+            .await
+            .expect("submit tx");
+        assert_eq!(status, 200, "nonce {nonce}: {body}");
+    }
+    assert_eq!(client.get_nonce(sender).await.unwrap().next_nonce, 2);
 
     shutdown_runtime(runtime).await;
 }

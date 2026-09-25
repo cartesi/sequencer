@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Shared HTTP surface: error type + JSON response shape used by both
-//! ingress (`/tx`, `/fee`) and egress (`/ws/subscribe`, future routes), plus the
-//! `axum::serve` orchestration that wires the two side routers together.
+//! ingress (`/tx`, `/fee`, `/nonce`, `/domain`) and egress (`/ws/subscribe`,
+//! future routes), plus the `axum::serve` orchestration that wires the two
+//! side routers together.
 //!
 //! Today both sides serve from one listener; the planned api split puts each
 //! side on its own port (same binary, two listeners). When that lands, the
@@ -26,11 +27,11 @@ use tower_http::trace::TraceLayer;
 pub use crate::egress::api::SnapshotState;
 use crate::egress::api::SubscribeState;
 use crate::egress::l2_tx_feed::L2TxFeed;
-use crate::ingress::api::{FeeState, SubmitState};
+use crate::ingress::api::{ReadState, SubmitState};
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
 use crate::storage::ReleaseScheduler;
-use sequencer_core::api::{TxRequest, TxRequestError};
+use sequencer_core::api::{DomainResponse, TxRequest, TxRequestError};
 
 #[derive(Debug, Error, Clone)]
 pub enum ApiError {
@@ -211,7 +212,7 @@ async fn run_snapshot_release_supervisor(
 
 // ── Blocking storage tasks ─────────────────────────────────────────────────
 //
-// Shared by ingress (`GET /fee`) and egress snapshot handlers. Classify
+// Shared by ingress (`GET /fee`, `GET /nonce`) and egress snapshot handlers. Classify
 // inside the blocking task: cancellation of the HTTP request must not
 // discard a persistent fault discovered by work that already started.
 
@@ -307,14 +308,19 @@ pub(crate) fn start_on_listener(
         tx_sender: tx_sender.clone(),
         shutdown: shutdown.clone(),
     });
+    // Serve exactly the domain `/tx` verifies against. Production builds it
+    // with `build_input_domain`, which always sets all four fields.
+    let served_domain = DomainResponse::from_domain(&config.domain)
+        .expect("API domain must carry name, version, chainId, and verifyingContract");
     let submit_state = Arc::new(SubmitState::new(
         tx_sender,
         config.domain,
         config.max_user_op_data_bytes,
         shutdown.clone(),
     ));
-    let fee_state = Arc::new(FeeState::new(
+    let read_state = Arc::new(ReadState::new(
         snapshot_state.db_path.clone(),
+        served_domain,
         shutdown.clone(),
     ));
     let subscribe_state = Arc::new(SubscribeState::new(
@@ -322,7 +328,7 @@ pub(crate) fn start_on_listener(
         tx_feed,
         config.ws_max_subscribers,
     ));
-    let app: Router = crate::ingress::api::router(submit_state, fee_state)
+    let app: Router = crate::ingress::api::router(submit_state, read_state)
         .merge(crate::egress::api::router(
             subscribe_state,
             health_state,

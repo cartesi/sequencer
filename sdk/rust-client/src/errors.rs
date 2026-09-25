@@ -57,14 +57,23 @@ pub enum SubmitRejected {
     Decode(String),
 }
 
+/// A failed read from a public ingress query route: `/fee`, `/nonce`, or
+/// `/domain`.
 #[derive(Debug, Error)]
-pub enum GetFeeError {
-    #[error("fee request failed: {0}")]
-    Transport(#[from] SubmitTxError),
-    #[error("/fee rejected with status {status}: {body}")]
-    Http { status: u16, body: String },
-    #[error("invalid /fee success body: {0}")]
-    Decode(String),
+pub enum QueryError {
+    #[error("{route} request failed: {source}")]
+    Transport {
+        route: &'static str,
+        source: SubmitTxError,
+    },
+    #[error("{route} rejected with status {status}: {body}")]
+    Http {
+        route: &'static str,
+        status: u16,
+        body: String,
+    },
+    #[error("invalid {route} success body: {reason}")]
+    Decode { route: &'static str, reason: String },
 }
 
 #[derive(Debug, Error)]

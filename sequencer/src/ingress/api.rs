@@ -8,14 +8,27 @@
 //!   perspective: 200 means included.
 //! - `GET /fee` — quote the open-frame fee, recommended fee, and a suggested
 //!   `max_fee` so a wallet can sign before submitting.
+//! - `GET /nonce?sender=` — the nonce `sender` must sign next, derived from the
+//!   user ops the lane has committed.
+//! - `GET /domain` — the EIP-712 domain signatures are verified against.
+//!
+//! `/fee` and `/nonce` query SQLite on a read-only connection, never the lane:
+//! WAL readers do not block its writes.
+//!
+//! Admission checks only what the lane cannot cheaply check itself: payload
+//! size and the signature. Nonce and `max_fee` are left to the lane. A stale
+//! op costs it an in-memory comparison and no transaction, whereas an ingress
+//! pre-check would add a SQLite read to every honest submit, and a future
+//! nonce or a fresh address bypasses it. Revisit if persistent `429`s trace
+//! back to stale-nonce floods.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alloy_sol_types::Eip712Domain;
 use axum::Router;
-use axum::extract::{Json, State};
-use axum::http::{Method, StatusCode};
+use axum::extract::{Json, Query, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -27,8 +40,11 @@ use crate::http::{ApiError, storage_task};
 use crate::ingress::inclusion_lane::PendingUserOp;
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::Storage;
-use sequencer_core::api::{FeeResponse, TxRequest, TxResponse};
+use sequencer_core::api::{
+    DomainResponse, FeeResponse, NonceResponse, TxRequest, TxResponse, parse_sender_address,
+};
 use sequencer_core::user_op::SignedUserOp;
+use serde::Deserialize;
 
 /// State for the submit endpoint. Kept narrow — only what `/tx` actually needs.
 #[derive(Clone)]
@@ -63,17 +79,23 @@ impl SubmitState {
     }
 }
 
-/// State for `GET /fee`. Reads the open-frame fee from SQLite; the inclusion
-/// lane remains the sole writer of that fact.
+/// State for the public read routes. `/fee` reads the open frame and the fee
+/// policy; `/nonce` reads lane-written user ops filtered by batch validity;
+/// `/domain` is fixed for the process.
 #[derive(Clone)]
-pub(crate) struct FeeState {
+pub(crate) struct ReadState {
     db_path: String,
+    domain: DomainResponse,
     shutdown: RuntimeScope,
 }
 
-impl FeeState {
-    pub(crate) fn new(db_path: String, shutdown: RuntimeScope) -> Self {
-        Self { db_path, shutdown }
+impl ReadState {
+    pub(crate) fn new(db_path: String, domain: DomainResponse, shutdown: RuntimeScope) -> Self {
+        Self {
+            db_path,
+            domain,
+            shutdown,
+        }
     }
 
     fn reject_if_shutting_down(&self) -> Result<(), ApiError> {
@@ -86,11 +108,17 @@ impl FeeState {
 }
 
 /// Build the ingress router. Caller wires it into an `axum::serve` listener.
-pub(crate) fn router(submit: Arc<SubmitState>, fee: Arc<FeeState>) -> Router {
+pub(crate) fn router(submit: Arc<SubmitState>, read: Arc<ReadState>) -> Router {
     Router::new()
         .route("/tx", post(submit_tx))
         .with_state(submit)
-        .merge(Router::new().route("/fee", get(get_fee)).with_state(fee))
+        .merge(
+            Router::new()
+                .route("/fee", get(get_fee))
+                .route("/nonce", get(get_nonce))
+                .route("/domain", get(get_domain))
+                .with_state(read),
+        )
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -127,7 +155,7 @@ async fn submit_tx(
     .into_response())
 }
 
-async fn get_fee(State(state): State<Arc<FeeState>>) -> Result<Response, ApiError> {
+async fn get_fee(State(state): State<Arc<ReadState>>) -> Result<Response, ApiError> {
     state.reject_if_shutting_down()?;
     let db_path = state.db_path.clone();
     let result = storage_task(state.shutdown.clone(), "read fee quote", move |_scope| {
@@ -137,7 +165,7 @@ async fn get_fee(State(state): State<Arc<FeeState>>) -> Result<Response, ApiErro
     .await;
     match result {
         Ok(Some((fee, recommended_fee))) => {
-            Ok(Json(FeeResponse::quote(fee, recommended_fee)).into_response())
+            Ok(no_store(Json(FeeResponse::quote(fee, recommended_fee))))
         }
         Ok(None) => Err(ApiError::unavailable("no open frame")),
         Err(err) => {
@@ -145,6 +173,58 @@ async fn get_fee(State(state): State<Arc<FeeState>>) -> Result<Response, ApiErro
             Err(ApiError::internal_error("fee unavailable"))
         }
     }
+}
+
+#[derive(Deserialize)]
+struct NonceQuery {
+    sender: String,
+}
+
+const INVALID_NONCE_QUERY: &str = "expected ?sender=<0x-prefixed 20-byte hex address>";
+
+async fn get_nonce(
+    State(state): State<Arc<ReadState>>,
+    query: Result<Query<NonceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, ApiError> {
+    state.reject_if_shutting_down()?;
+    let sender = query
+        .ok()
+        .and_then(|Query(query)| parse_sender_address(&query.sender).ok())
+        .ok_or_else(|| ApiError::bad_request(INVALID_NONCE_QUERY))?;
+    let db_path = state.db_path.clone();
+    let result = storage_task(
+        state.shutdown.clone(),
+        "read next user nonce",
+        move |_scope| {
+            let mut storage = Storage::open_read_only(&db_path)?;
+            Ok(storage.next_user_nonce(sender)?)
+        },
+    )
+    .await;
+    match result {
+        Ok(next_nonce) => Ok(no_store(Json(NonceResponse {
+            sender: sender.to_string(),
+            next_nonce,
+        }))),
+        Err(err) => {
+            tracing::warn!(error = %err, "GET /nonce failed");
+            Err(ApiError::internal_error("nonce unavailable"))
+        }
+    }
+}
+
+async fn get_domain(State(state): State<Arc<ReadState>>) -> Json<DomainResponse> {
+    Json(state.domain.clone())
+}
+
+/// Quotes go stale within blocks and nonces can go down after recovery, so
+/// intermediaries must not serve them from cache.
+fn no_store(body: impl IntoResponse) -> Response {
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        body,
+    )
+        .into_response()
 }
 
 /// Normalize JSON-extractor failures into fixed client-facing messages.
@@ -279,7 +359,7 @@ mod tests {
     async fn get_fee_rejects_when_shutdown_has_started() {
         let shutdown = RuntimeScope::default();
         shutdown.request_shutdown();
-        let state = Arc::new(FeeState::new("unused.db".into(), shutdown));
+        let state = read_state("unused.db".into(), shutdown);
 
         let err = get_fee(State(state))
             .await
@@ -293,10 +373,10 @@ mod tests {
         let db = TempDir::new().expect("create temp dir");
         let db_path = db.path().join("sequencer.db");
         let _storage = Storage::open(&db_path.to_string_lossy()).expect("create db");
-        let state = Arc::new(FeeState::new(
+        let state = read_state(
             db_path.to_string_lossy().into_owned(),
             RuntimeScope::default(),
-        ));
+        );
 
         let err = get_fee(State(state))
             .await
@@ -329,15 +409,99 @@ mod tests {
         .expect("inject impossible policy row");
         drop(conn);
 
-        let state = Arc::new(FeeState::new(
+        let state = read_state(
             db_path.to_string_lossy().into_owned(),
             RuntimeScope::default(),
-        ));
+        );
         let result = get_fee(State(state)).await;
         panic!(
             "terminal fee fault returned instead of aborting: {:?}",
             result.as_ref().err().map(ApiError::status)
         );
+    }
+
+    fn read_state(db_path: String, shutdown: RuntimeScope) -> Arc<ReadState> {
+        let domain = sequencer_core::build_input_domain(31337, Address::repeat_byte(0xab));
+        Arc::new(ReadState::new(
+            db_path,
+            DomainResponse::from_domain(&domain).expect("complete domain"),
+            shutdown,
+        ))
+    }
+
+    fn nonce_query(
+        uri: &str,
+    ) -> Result<Query<NonceQuery>, axum::extract::rejection::QueryRejection> {
+        Query::try_from_uri(&uri.parse().expect("test URI"))
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("JSON body")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_nonce_for_an_unseen_sender_is_zero_and_uncacheable() {
+        let db = TempDir::new().expect("create temp dir");
+        let db_path = db.path().join("sequencer.db");
+        let _storage = Storage::open(&db_path.to_string_lossy()).expect("create db");
+        let state = read_state(
+            db_path.to_string_lossy().into_owned(),
+            RuntimeScope::default(),
+        );
+        let sender = Address::repeat_byte(0xcd);
+        let lowercase = format!("{sender:#x}");
+
+        let response = get_nonce(
+            State(state),
+            nonce_query(&format!("/nonce?sender={lowercase}")),
+        )
+        .await
+        .expect("an unseen sender is an ordinary answer, not a storage fault");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            json_body(response).await,
+            serde_json::json!({ "sender": sender.to_checksum(None), "next_nonce": 0 })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_nonce_rejects_a_missing_or_malformed_sender() {
+        let state = read_state("unused.db".into(), RuntimeScope::default());
+        for uri in [
+            "/nonce",
+            "/nonce?address=0x0000000000000000000000000000000000000000",
+            "/nonce?sender=0000000000000000000000000000000000000000",
+            "/nonce?sender=0x00",
+            "/nonce?sender=0xzz00000000000000000000000000000000000000",
+        ] {
+            let err = get_nonce(State(state.clone()), nonce_query(uri))
+                .await
+                .expect_err(uri);
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(err.to_string(), INVALID_NONCE_QUERY, "{uri}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_nonce_rejects_when_shutdown_has_started() {
+        let shutdown = RuntimeScope::default();
+        shutdown.request_shutdown();
+        let state = read_state("unused.db".into(), shutdown);
+
+        let err = get_nonce(
+            State(state),
+            nonce_query("/nonce?sender=0x0000000000000000000000000000000000000000"),
+        )
+        .await
+        .expect_err("nonce should be rejected during shutdown");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     fn sign_user_op_hex(
