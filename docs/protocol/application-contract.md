@@ -76,10 +76,11 @@ These outcomes have different protocol meanings:
   not persisted. `InvalidReason` covers nonce mismatch, insufficient max fee,
   and insufficient fee balance.
 - A successfully applied input is included even if the business operation
-  fails or is ignored. It advances progress. The wallet charges the fee and
-  consumes the nonce for a malformed method or failed transfer after
-  validation; malformed direct inputs are included no-ops. These semantics
-  must agree with the canonical application.
+  fails or is ignored. It advances progress, and an included user op consumes
+  its sender's nonce ([below](#user-nonces)). The wallet also charges the fee
+  for a malformed method or failed transfer after validation; malformed direct
+  inputs are included no-ops. These semantics must agree with the canonical
+  application.
 - `AppError`, whether `Internal` or `Io`, is fatal in validation and execution.
   It must not be disguised as a client rejection or an included no-op.
   Fatal here means discarding the engine: the host still distinguishes a
@@ -89,6 +90,30 @@ These outcomes have different protocol meanings:
 Every input executed successfully live must execute successfully against the
 same prior state on replay. The sequencer persists included inputs and replays
 them on restart. It does not recover an instance after a failed hook.
+
+#### User nonces
+
+Every application follows one nonce rule. The sequencer relies on it:
+`GET /nonce` derives a sender's next nonce from the user ops it persisted,
+without asking the engine.
+
+- A genesis state starts every account at nonce 0.
+- Validation accepts an op only when its nonce equals the sender's expected
+  nonce.
+- Each included user op, business failures included, advances its sender's
+  expected nonce by exactly one. Nothing else changes a nonce: not direct
+  inputs, not other senders' ops.
+- Nonces are `u32`. An op carrying `u32::MAX` has no successor and is never
+  included.
+
+Under this rule a sender's expected nonce is one past its latest included op.
+The exception is a sender with no op since the era baseline. A genesis
+baseline puts it at 0, but a [rebuilt baseline](../recovery/cockroach.md)
+carries nonces the rebuilt database has no ops for, so `GET /nonce` reads 0
+until that sender's first op. An engine outside the rule (gapped or keyed
+nonces, a deposit that resets one) makes `GET /nonce` quote nonces the engine
+rejects; one that includes an op at `u32::MAX` trips a fail-loud storage
+invariant.
 
 ### 3. The safe-block clock — `last_executed_safe_block`
 

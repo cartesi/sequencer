@@ -165,7 +165,8 @@ impl WalletApp {
     }
 
     // Wallet-specific read queries (not on the Application trait — the
-    // sequencer never asks; app-specific query surface belongs to the app).
+    // sequencer never asks: it derives nonces from persisted ops under the
+    // contract's nonce rule, and app-specific query surface belongs to the app).
     pub fn current_user_nonce(&self, sender: Address) -> u32 {
         self.expected_nonce(&sender)
     }
