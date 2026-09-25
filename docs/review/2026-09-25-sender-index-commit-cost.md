@@ -1,8 +1,10 @@
-# Sender-index cost on the chunk commit — 2026-09-25
+# Sender-index costs — 2026-09-25
 
 Scope: how much `idx_user_ops_sender_nonce`, which serves `GET /nonce`, adds to
 the inclusion lane's chunk commit, and how a lane-written per-sender table
-compares. Measured on the storage write path committed in `29fa9fb`.
+compares; then what a `GET /nonce` read costs, including after recovery leaves
+invalidated rows behind. The write side was measured on the storage path
+committed in `29fa9fb`, the read side on `6b2a233`.
 
 Retained for the register entry on the
 [sender index](register.md#known-optimizations). Replace it with a
@@ -63,6 +65,32 @@ with it, and 34 or 39 MiB with the projection (1,000 senders or all new).
 - In absolute terms the index adds about 12 µs per included op on average and
   up to about 8 ms at p99 per commit, against the 500 ms ack target.
 
+## Read cost
+
+A second throwaway test built a history in which one sender has 10 valid ops,
+then N soft-confirmed ops that a cascade invalidated (`insert_invalid_batch`),
+then one resubmitted valid op. Its next nonce is 11, and the lookup walks the N
+invalidated index entries above that before finding a valid row. A second
+sender with 10 valid ops is the baseline. The table gives averages over
+repeated calls. "Warm" reuses one read-only connection; "per request" opens a
+fresh one each time, as the handler does.
+
+| Invalidated rows above the sender's nonce | Warm query | Per request |
+|---|---|---|
+| none (baseline sender) | 1.5 µs | 0.20 ms |
+| 100 | 12 µs | 0.21 ms |
+| 1,000 | 0.11 ms | 0.33 ms |
+| 10,000 | 1.1 ms | 1.5 ms |
+| 100,000 | 16 ms | 16 ms |
+
+- Opening the connection (file open, schema parse, cold caches) is about
+  0.2 ms, roughly a hundred times the query itself.
+- The walk costs about 0.11 µs per invalidated row. Only rows above the
+  sender's current nonce are walked, so the cost is the sender's own rolled-back
+  volume, and it shrinks as the sender resubmits past its old high-water mark.
+  Accumulating it takes cascades, which come from liveness failures rather than
+  anything a client can trigger.
+
 ## Limits
 
 - One machine with a cheap `fsync`. Where `fsync` dominates the commit, the
@@ -71,3 +99,6 @@ with it, and 34 or 39 MiB with the projection (1,000 senders or all new).
   lane turn costs more than the commit alone, so the index is a smaller share
   of it.
 - The projection figures omit the rewind it would need on recovery.
+- The read test kept every invalidated row in one batch, so the validity probe
+  always hit a cached `batches` row. Rows spread over many batches cost a
+  little more per row.
