@@ -212,11 +212,11 @@ pub unsafe extern "C" fn application_engine_validate_user_op(
                         },
                     },
                 },
-                // The caller owns the max-fee guard and this entry point never checks it, so the
-                // app cannot produce this reason. Reporting it would be a lie about which union
+                // The caller owns these guards and this entry point never checks them, so the app
+                // cannot produce these reasons. Reporting one would be a lie about which union
                 // member carries the diagnostics.
-                InvalidReason::InvalidMaxFee { .. } => {
-                    set_error("the app reported a caller-owned max fee rejection");
+                InvalidReason::InvalidMaxFee { .. } | InvalidReason::NonceExhausted => {
+                    set_error("the app reported a caller-owned rejection");
                     return sys::APPLICATION_ENGINE_STATUS_INTERNAL_ERROR;
                 }
             };
