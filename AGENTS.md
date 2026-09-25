@@ -212,6 +212,7 @@ Paths below are relative to `sequencer/src/`:
 - API validates the EIP-712 signature and enqueues a `SignedUserOp`. Method payload decoding happens during application execution, not at ingress.
 - **Deposits are direct-input-only** (L1 → L2) and must not be represented as user ops.
 - Rejections (`InvalidNonce`, `InvalidMaxFee`, `InsufficientFeeBalance`) produce no state mutation and are not persisted. These are protocol-level rejection semantics every app must implement: nonces prevent user-op replay, fees prevent spam against the sequencer's DA budget. ("Fee", not "gas" — the fee tracks DA; compute metering, if it ever exists, is a separate future concept.)
+- **The user-nonce rule is contract, not wallet detail:** accounts start at 0, an op must carry exactly the expected nonce, each included op advances it by one, and direct inputs never touch it. `GET /nonce` derives from persisted user ops under this rule instead of asking the app ([application contract](docs/protocol/application-contract.md#user-nonces)).
 - Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `application_inputs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
 - Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is currently sampled from `batch_policy_derived.recommended_fee` at rotation; oracle bootstrap writes the price before any Tip can sample it, and `log_slack` applies the 10× margin in log space. This is present behavior, not a reason for the five-block clock policy; hoisting fee to the batch is a later design with its own trade-offs.
 - Wallet balances and nonces live in memory between checkpoints; restart restores
@@ -239,7 +240,7 @@ Implementors of the `Application` trait must respect these contracts. The shared
 The sequencer persists every included user op and every ingested direct input. On restart, catch-up replays them in order against a fresh `Application` instance to rebuild state. **Any input that succeeded live must succeed on replay.**
 
 - `apply_direct_input` and `apply_valid_user_op` must not return `AppError::Internal` for any byte sequence that previously executed successfully. The canonical scheduler, catch-up, and recovery fold treat `Internal` as fatal: no canonical successor is defined.
-- Validation returns `Accept`, `Reject(InvalidReason)`, or fatal `AppError`. A rejected op changes no state. Included business failures and malformed direct-input no-ops still advance progress; do not turn them into validation rejections. See the application contract for the wallet's nonce/fee semantics.
+- Validation returns `Accept`, `Reject(InvalidReason)`, or fatal `AppError`. A rejected op changes no state. Included business failures and malformed direct-input no-ops still advance progress; do not turn them into validation rejections. See the application contract for the nonce rule and the wallet's fee semantics.
 - `validate_user_op` must be pure over the current app state. No side effects, no time dependence, no randomness.
 
 ### No implicit state

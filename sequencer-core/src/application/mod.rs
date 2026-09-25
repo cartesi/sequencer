@@ -156,9 +156,10 @@ pub trait Application: Send + Sized {
     /// Zero permits only empty method payloads.
     fn max_method_payload_bytes() -> usize;
 
-    /// Pure validation predicate over current app state: nonce match
-    /// (user replay protection) and fee-balance coverage. Must not
-    /// mutate state. [`validate_and_execute_user_op`] enforces the protocol
+    /// Pure validation predicate over current app state: the op's nonce
+    /// equals the sender's expected nonce (user replay protection), and the
+    /// sender covers the fee. Must not mutate state.
+    /// [`validate_and_execute_user_op`] enforces the protocol
     /// `max_fee >= current_fee` guard before calling here. Rejection leaves
     /// the app unchanged; `AppError` is fatal and defines no successor.
     fn validate_user_op(
@@ -169,8 +170,10 @@ pub trait Application: Send + Sized {
     ) -> Result<ValidationOutcome, AppError>;
 
     /// Apply a validated user op and advance progress exactly once on success,
-    /// using `safe_block` for the clock. Included business failures and no-ops
-    /// also advance progress. `AppError` is fatal: callers discard the instance.
+    /// using `safe_block` for the clock. Also advance the sender's nonce by
+    /// exactly one; the sequencer derives `GET /nonce` from this rule (see the
+    /// application contract). Included business failures and no-ops also
+    /// advance both. `AppError` is fatal: callers discard the instance.
     /// Execution callers use [`execute_valid_user_op`] to check the transition.
     fn apply_valid_user_op(
         &mut self,
@@ -180,8 +183,9 @@ pub trait Application: Send + Sized {
 
     /// Apply a direct input and advance progress exactly once on success,
     /// using its L1 block number for the clock. Ignored or malformed inputs
-    /// still count. Execution callers use [`execute_direct_input`] to check
-    /// the transition; `AppError` requires discarding the instance.
+    /// still count. Never changes a user nonce. Execution callers use
+    /// [`execute_direct_input`] to check the transition; `AppError` requires
+    /// discarding the instance.
     fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError>;
 
     /// Return the progress embedded in the application's logical state.
