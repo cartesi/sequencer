@@ -10,7 +10,7 @@ For **local development only** (Anvil + `sequencer-devnet`, CI smoke tests), use
 
 ```text
                     ┌─────────────────────────────────────┐
-  Internet / users  │  Public ingress: POST /tx, GET /fee │  ← wallets
+  Internet / users  │  Public ingress: /tx + read routes  │  ← wallets
                     └──────────────────┬──────────────────┘
                                        │
                     ┌──────────────────▼──────────────────┐

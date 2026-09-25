@@ -4324,8 +4324,10 @@ dependencies = [
 name = "sequencer-rust-client"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "reqwest 0.12.28",
  "sequencer-core",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",

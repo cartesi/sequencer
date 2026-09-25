@@ -10,8 +10,10 @@ readme = "../../README.md"
 authors.workspace = true
 
 [dependencies]
+alloy-primitives = { workspace = true }
 sequencer-core = { path = "../../sequencer-core" }
 reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
