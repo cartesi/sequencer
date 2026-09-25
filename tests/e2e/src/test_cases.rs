@@ -901,6 +901,7 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
     // Reading the persisted feed alone does not prove the restarted engine
     // restored its balances and nonce. Require a fresh execution at nonce 1.
     let mut resumed_alice = runtime.wallet_l2(alice)?;
+    assert_eq!(resumed_alice.served_next_nonce().await?, 1);
     resumed_alice.set_next_nonce(1);
     resumed_alice.transfer(bob_address, U256::from(1)).await?;
     let resumed = ws_after_restart.expect_user_op_from(alice_address).await?;
@@ -1363,9 +1364,15 @@ async fn run_recovery_after_stale_batches_test(
 
     // Step 8: Verify new work succeeds after recovery.
     let mut alice_l2_fresh = runtime.wallet_l2(alice)?;
+    assert_eq!(
+        alice_l2_fresh.served_next_nonce().await?,
+        0,
+        "GET /nonce must fall back with the invalidated transfer"
+    );
     alice_l2_fresh
         .transfer(bob_address, post_recovery_transfer)
         .await?;
+    assert_eq!(alice_l2_fresh.served_next_nonce().await?, 1);
     replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
 
     assert_eq!(
@@ -1489,9 +1496,18 @@ async fn run_setup_recovery_round_trip_test<A: Application>(
     // A continuing nonce exercises the recovered host's state as well as the
     // independently restored replica and the retained reference history.
     let mut alice_l2_after = runtime.wallet_l2(alice)?;
+    // Known gap: the rebuilt database has no ops for the folded prefix, so a
+    // sender idle since the rebuild reads 0 (application contract, "User
+    // nonces"). Flip this when setup seeds baseline nonces.
+    assert_eq!(alice_l2_after.served_next_nonce().await?, 0);
     alice_l2_after.set_next_nonce(1);
     let post_transfer = U256::from(70_000_u64);
     alice_l2_after.transfer(bob_address, post_transfer).await?;
+    assert_eq!(
+        alice_l2_after.served_next_nonce().await?,
+        2,
+        "stored nonces are absolute, so one op in the new era makes it exact"
+    );
     let message = resumed_ws.expect_user_op_from(alice_address).await?;
     rollups_harness::replay::apply_ws_message(&mut restored, message.clone())?;
     replay.apply(message)?;
@@ -1745,6 +1761,11 @@ async fn run_sequencer_outage_danger_zone_tip_cascade_test(
         replay_after.current_user_nonce(alice_address),
         0,
         "nonce must reset when Tip cascade rolls back the user op",
+    );
+    assert_eq!(
+        runtime.wallet_l2(alice)?.served_next_nonce().await?,
+        0,
+        "GET /nonce must reset with the cascaded Tip",
     );
 
     ws_after.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;

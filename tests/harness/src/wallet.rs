@@ -254,6 +254,16 @@ impl WalletL2Client {
         self.next_nonce = nonce;
     }
 
+    /// What `GET /nonce` reports for this signer. Scenarios compare it with
+    /// an independent replay oracle instead of signing with it.
+    pub async fn served_next_nonce(&self) -> HarnessResult<u32> {
+        Ok(self
+            .client
+            .get_nonce(self.signer.address())
+            .await?
+            .next_nonce)
+    }
+
     pub async fn transfer(&mut self, to: Address, amount: U256) -> HarnessResult<TxResponse> {
         self.submit_method(Method::Transfer(Transfer { amount, to }))
             .await
