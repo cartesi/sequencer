@@ -157,6 +157,10 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
         .expect_no_message_for(Duration::from_millis(100))
         .await?;
     let mut alice_l2 = runtime.wallet_l2(TestSigner::from_default(1)?)?;
+    assert_eq!(
+        alice_l2.served_next_nonce().await?,
+        reference.current_user_nonce(alice_address)
+    );
     alice_l2.set_next_nonce(reference.current_user_nonce(alice_address));
     alice_l2.transfer(bob_address, U256::from(6_000)).await?;
     record(&mut reference_ws, &mut reference, &mut history).await?;
@@ -239,6 +243,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     assert_eq!(quote.fee, quote.recommended_fee);
     let amount = U256::from(6_000);
     let expected_balance = balance_before - amount - fee_to_linear(quote.fee);
+    assert_eq!(alice_l2.served_next_nonce().await?, expected_nonce);
     alice_l2.set_next_nonce(expected_nonce);
     alice_l2.transfer(bob_address, amount).await?;
     let resumed = recovered_ws.expect_user_op_from(alice_address).await?;
