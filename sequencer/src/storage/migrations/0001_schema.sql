@@ -235,6 +235,7 @@ CREATE TABLE IF NOT EXISTS user_ops (
 -- pruned, so without this index every public read would scan all history.
 -- It is the chunk commit's costliest index: sender-keyed entries land on
 -- scattered leaves, dirtying about one WAL page per distinct sender per chunk.
+-- Measured cost and alternatives: docs/review/register.md, "Known optimizations".
 CREATE INDEX IF NOT EXISTS idx_user_ops_sender_nonce
     ON user_ops(sender, nonce);
 
