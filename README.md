@@ -241,7 +241,7 @@ Notes:
 - Keep one op in flight per sender: sign `next_nonce`, submit, and increment on `200`. Concurrent submits from one sender are unsupported; they can reach the sequencer out of order and be rejected. After a submit times out, a `next_nonce` above the op's nonce means it was included; an unchanged one is inconclusive, since the op may still be queued, so resubmit the same signed op rather than signing a new one at that nonce.
 - `next_nonce` of 4294967295 (`u32::MAX`) means the account is exhausted: that nonce has no successor, so `POST /tx` rejects an op carrying it.
 - The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, query again rather than incrementing.
-- After an operator rebuild from a checkpoint (`setup --recovery`), a sender with no op since the rebuild reads 0 even when its nonce in the rebuilt baseline is higher. A `422` bad-nonce rejection names the expected nonce (`bad nonce: expected N, got M`).
+- After an operator rebuild from a checkpoint (`setup --recovery`), a sender with no surviving op since the rebuild reads 0 even when its nonce in the rebuilt baseline is higher; this includes a sender whose post-rebuild ops a later recovery invalidated. A `422` bad-nonce rejection names the expected nonce (`bad nonce: expected N, got M`).
 - Responses carry `Cache-Control: no-store`. `503` with code `UNAVAILABLE` during shutdown.
 
 ### `GET /domain`
@@ -252,7 +252,7 @@ The EIP-712 domain `POST /tx` verifies signatures against, keyed as `eth_signTyp
 { "name": "CartesiAppSequencer", "version": "1", "chainId": 31337, "verifyingContract": "0x..." }
 ```
 
-Clients pin their own domain and assert that it matches this one, the way a wallet checks `eth_chainId`. Do not sign with a served domain unchecked: `chainId` and `verifyingContract` are what keep a signature from replaying on another deployment, and the name and version are the same everywhere.
+Clients pin their own domain and assert that it matches this one, the way a wallet checks `eth_chainId`. `chainId` is a JSON number, exact in JavaScript below 2^53. That covers every chain browser wallets accept (MetaMask refuses IDs above 4503599627370476); a larger ID fails closed, because a signature over a rounded `chainId` recovers a different sender at `POST /tx`. Do not sign with a served domain unchecked: `chainId` and `verifyingContract` are what keep a signature from replaying on another deployment, and the name and version are the same everywhere.
 
 ### `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>`
 

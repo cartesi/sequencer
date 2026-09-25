@@ -109,10 +109,11 @@ without asking the engine.
   validation; an account that reaches it is exhausted.
 
 Under this rule a sender's expected nonce is one past its latest included op.
-The exception is a sender with no op since the era baseline. A genesis
-baseline puts it at 0, but a [rebuilt baseline](../recovery/cockroach.md)
+The exception is a sender with no surviving op since the era baseline. A
+genesis baseline puts it at 0, but a [rebuilt baseline](../recovery/cockroach.md)
 carries nonces the rebuilt database has no ops for, so `GET /nonce` reads 0
-until that sender's first op. An engine outside the rule (gapped or keyed
+until that sender's first op, and again if a later recovery invalidates all of
+its post-rebuild ops. An engine outside the rule (gapped or keyed
 nonces, a deposit that resets one) makes `GET /nonce` quote nonces the engine
 rejects.
 
