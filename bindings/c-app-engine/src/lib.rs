@@ -190,7 +190,7 @@ impl Application for EngineApp {
                     available: U256::from_be_bytes(balance.available.bytes),
                 }
             }
-            // Max-fee rejection belongs to the shared execution boundary.
+            // Max-fee and exhausted-nonce rejections belong to the shared execution boundary.
             other => {
                 return Err(internal(format!(
                     "engine reported unsupported invalid reason {other}"

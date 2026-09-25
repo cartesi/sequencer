@@ -25,10 +25,11 @@ a reference wallet integration.
 | `progress() -> ApplicationProgress` | Return the count/clock pair from the engine by value. |
 
 Execution callers use `validate_and_execute_user_op`, `execute_valid_user_op`,
-and `execute_direct_input`. The first enforces `max_fee >= current_fee` before
-app validation. App validation checks the nonce and fee balance; a rejection
-is not persisted. Trusted replay uses the stored `ValidUserOp`, whose fee and
-sender were established at inclusion, without validating a second time.
+and `execute_direct_input`. The first enforces `max_fee >= current_fee` and
+rejects the exhausted nonce `u32::MAX` before app validation. App validation
+checks the nonce and fee balance; a rejection is not persisted. Trusted replay
+uses the stored `ValidUserOp`, whose fee and sender were established at
+inclusion, without validating a second time.
 
 Before an apply hook, the boundary computes the checked expected successor.
 After `Ok`, it asserts that the engine reports exactly that successor and
@@ -73,8 +74,8 @@ rules.
 These outcomes have different protocol meanings:
 
 - A validation rejection changes no state, consumes no nonce or fee, and is
-  not persisted. `InvalidReason` covers nonce mismatch, insufficient max fee,
-  and insufficient fee balance.
+  not persisted. `InvalidReason` covers nonce mismatch, an exhausted nonce,
+  insufficient max fee, and insufficient fee balance.
 - A successfully applied input is included even if the business operation
   fails or is ignored. It advances progress, and an included user op consumes
   its sender's nonce ([below](#user-nonces)). The wallet also charges the fee
@@ -103,8 +104,9 @@ without asking the engine.
 - Each included user op, business failures included, advances its sender's
   expected nonce by exactly one. Nothing else changes a nonce: not direct
   inputs, not other senders' ops.
-- Nonces are `u32`. An op carrying `u32::MAX` has no successor and is never
-  included.
+- Nonces are `u32`. `u32::MAX` has no successor, so the shared execution
+  boundary rejects an op carrying it (`NonceExhausted`) before app
+  validation; an account that reaches it is exhausted.
 
 Under this rule a sender's expected nonce is one past its latest included op.
 The exception is a sender with no op since the era baseline. A genesis
@@ -112,8 +114,7 @@ baseline puts it at 0, but a [rebuilt baseline](../recovery/cockroach.md)
 carries nonces the rebuilt database has no ops for, so `GET /nonce` reads 0
 until that sender's first op. An engine outside the rule (gapped or keyed
 nonces, a deposit that resets one) makes `GET /nonce` quote nonces the engine
-rejects; one that includes an op at `u32::MAX` trips a fail-loud storage
-invariant.
+rejects.
 
 ### 3. The safe-block clock — `last_executed_safe_block`
 

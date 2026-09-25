@@ -53,8 +53,8 @@
 /// Nonces follow one rule, which the host relies on to serve each sender's next nonce from the
 /// ops it persisted: a genesis state starts every account at 0, validation accepts only the
 /// sender's expected nonce, each executed user op advances its sender's nonce by exactly one, and
-/// nothing else changes a nonce. An op at UINT32_MAX has no successor and is never executed. See
-/// docs/protocol/application-contract.md.
+/// nothing else changes a nonce. UINT32_MAX has no successor, so the caller rejects an op carrying
+/// it before validation. See docs/protocol/application-contract.md.
 ///
 /// Fees are uint16_t exponents with base 129/128, denominated in the fee token's smallest unit.
 /// The conversion is defined by sequencer-core/src/fee.rs and its build.rs-generated table:
@@ -173,6 +173,7 @@ typedef enum ApplicationEngineInvalidReason {
     APPLICATION_ENGINE_INVALID_NONCE = 0,            ///< Nonce or account binding, read `nonce`.
     APPLICATION_ENGINE_INVALID_MAX_FEE = 1,          ///< The caller-owned max fee guard, read `max_fee`.
     APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE = 2, ///< Cannot cover the frame fee, read `fee_balance`.
+    APPLICATION_ENGINE_NONCE_EXHAUSTED = 3,          ///< The caller-owned UINT32_MAX nonce guard, no values.
 } ApplicationEngineInvalidReason;
 
 /// @brief Diagnostics for APPLICATION_ENGINE_INVALID_NONCE.
@@ -296,8 +297,9 @@ APPLICATION_ENGINE_API void application_engine_destroy(ApplicationEngine *engine
 /// @param out_invalid Why the op was refused, written whole and only on INVALID.
 /// @returns OK, INVALID with diagnostics, IO_ERROR, or INTERNAL_ERROR.
 /// @details A rejection reports itself through out_invalid and leaves the last error message
-/// empty; IO_ERROR and INTERNAL_ERROR carry an error message. The max-fee guard belongs to the
-/// caller and is never checked here, so APPLICATION_ENGINE_INVALID_MAX_FEE never comes back. Queued
+/// empty; IO_ERROR and INTERNAL_ERROR carry an error message. The max-fee and exhausted-nonce
+/// guards belong to the caller and are never checked here, so APPLICATION_ENGINE_INVALID_MAX_FEE
+/// and APPLICATION_ENGINE_NONCE_EXHAUSTED never come back. Queued
 /// outputs are left alone, only an execution touches them.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_validate_user_op(const ApplicationEngine *engine,
     const ApplicationEngineEthereumAddress *sender, const ApplicationEngineUserOp *user_op, uint16_t current_fee,
