@@ -50,6 +50,12 @@
 /// Validation acceptance, state transitions, progress, and outputs must agree with the canonical
 /// application. Rejection diagnostics and error messages need not be identical across builds.
 ///
+/// Nonces follow one rule, which the host relies on to serve each sender's next nonce from the
+/// ops it persisted: a genesis state starts every account at 0, validation accepts only the
+/// sender's expected nonce, each executed user op advances its sender's nonce by exactly one, and
+/// nothing else changes a nonce. UINT32_MAX has no successor, so the caller rejects an op carrying
+/// it before validation. See docs/protocol/application-contract.md.
+///
 /// Fees are uint16_t exponents with base 129/128, denominated in the fee token's smallest unit.
 /// The conversion is defined by sequencer-core/src/fee.rs and its build.rs-generated table:
 /// integer fixed-point arithmetic with 64 fractional bits, including its rounding and exponent
@@ -142,8 +148,9 @@ typedef struct ApplicationEngineUserOp {
 } ApplicationEngineUserOp;
 
 /// @brief A user op that already passed validation, as the caller sequenced it.
-/// @details Not the signed op: execution consumes the nonce the state expects, and the max fee
-/// went with the guard the caller already settled, leaving the fee the frame charges.
+/// @details Not the signed op: execution consumes the nonce the state expects, advancing it by
+/// exactly one, and the max fee went with the guard the caller already settled, leaving the fee
+/// the frame charges.
 typedef struct ApplicationEngineValidUserOp {
     ApplicationEngineEthereumAddress sender; ///< The recovered signer.
     uint16_t fee;                            ///< The charged frame fee exponent, base 129/128.
@@ -166,6 +173,7 @@ typedef enum ApplicationEngineInvalidReason {
     APPLICATION_ENGINE_INVALID_NONCE = 0,            ///< Nonce or account binding, read `nonce`.
     APPLICATION_ENGINE_INVALID_MAX_FEE = 1,          ///< The caller-owned max fee guard, read `max_fee`.
     APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE = 2, ///< Cannot cover the frame fee, read `fee_balance`.
+    APPLICATION_ENGINE_NONCE_EXHAUSTED = 3,          ///< The caller-owned UINT32_MAX nonce guard, no values.
 } ApplicationEngineInvalidReason;
 
 /// @brief Diagnostics for APPLICATION_ENGINE_INVALID_NONCE.
@@ -289,14 +297,15 @@ APPLICATION_ENGINE_API void application_engine_destroy(ApplicationEngine *engine
 /// @param out_invalid Why the op was refused, written whole and only on INVALID.
 /// @returns OK, INVALID with diagnostics, IO_ERROR, or INTERNAL_ERROR.
 /// @details A rejection reports itself through out_invalid and leaves the last error message
-/// empty; IO_ERROR and INTERNAL_ERROR carry an error message. The max-fee guard belongs to the
-/// caller and is never checked here, so APPLICATION_ENGINE_INVALID_MAX_FEE never comes back. Queued
+/// empty; IO_ERROR and INTERNAL_ERROR carry an error message. The max-fee and exhausted-nonce
+/// guards belong to the caller and are never checked here, so APPLICATION_ENGINE_INVALID_MAX_FEE
+/// and APPLICATION_ENGINE_NONCE_EXHAUSTED never come back. Queued
 /// outputs are left alone, only an execution touches them.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_validate_user_op(const ApplicationEngine *engine,
     const ApplicationEngineEthereumAddress *sender, const ApplicationEngineUserOp *user_op, uint16_t current_fee,
     ApplicationEngineInvalid *out_invalid) APPLICATION_ENGINE_NOEXCEPT;
 
-/// @brief Execute a validated user op, consuming the current expected nonce.
+/// @brief Execute a validated user op, advancing its sender's expected nonce by exactly one.
 /// @param engine The engine handle.
 /// @param user_op The validated op to execute.
 /// @param safe_block The covering frame safe block, folded into the clock as max(clock, it).
@@ -319,7 +328,7 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_valid_
 /// @param out_output_count How many outputs this input left waiting, written only on OK.
 /// @returns OK, IO_ERROR, or INTERNAL_ERROR. An error requires discarding the instance.
 /// @details An input the engine rejects is a counted no-op and still reports OK, the same way a
-/// rejected user op does. Outputs behave as they do for a user op.
+/// rejected user op does. Outputs behave as they do for a user op. It never changes a nonce.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_direct_input(ApplicationEngine *engine,
     const ApplicationEngineDirectInput *input, uint64_t *out_output_count) APPLICATION_ENGINE_NOEXCEPT;
 

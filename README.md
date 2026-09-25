@@ -92,7 +92,7 @@ The sequencer is designed to handle:
 
 ### User Operations
 
-Users submit signed operations via `POST /tx` (JSON). Operations are signed with EIP-712 using the rollup's chain ID and app address. The sequencer validates the signature, executes the operation against the current app state, and returns a soft confirmation. `GET /fee` quotes the live frame fee, the next-frame recommendation, and a suggested `max_fee` a wallet can sign.
+Users submit signed operations via `POST /tx` (JSON). Operations are signed with EIP-712 using the rollup's chain ID and app address. The sequencer validates the signature, executes the operation against the current app state, and returns a soft confirmation. To sign, a wallet reads `GET /fee` (the live frame fee, the next-frame recommendation, and a suggested `max_fee`), `GET /nonce?sender=` (the nonce to sign next), and `GET /domain` (the EIP-712 domain, to assert against the one it pins).
 
 ### Sequenced Transaction Feed
 
@@ -167,8 +167,9 @@ Most queue sizes, polling intervals, and safety limits are now internal runtime 
 
 ## API
 
-JSON `sender` fields in successful `POST /tx` responses and WebSocket messages
-use EIP-55 checksum casing. Address fields in `/history` and `sender` fields in
+JSON `sender` fields in successful `POST /tx` and `GET /nonce` responses and
+WebSocket messages, and `verifyingContract` in `GET /domain`, use EIP-55
+checksum casing. Address fields in `/history` and `sender` fields in
 `/historical-l1-inputs` use lowercase hex. Clients must compare decoded 20-byte
 addresses and use one normalized encoding for account or projection keys across
 these routes.
@@ -197,7 +198,7 @@ Notes:
 - payload size is bounded at ingress; oversized requests are rejected before entering the hot path.
 - overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
-- Browser wallets can call `POST /tx` and `GET /fee` from any origin with any request headers; preflight permits GET and POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
+- Browser wallets can call `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` from any origin with any request headers; preflight permits GET and POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
 
 Success response after inclusion:
 
@@ -222,8 +223,36 @@ Notes:
 - `fee` is frozen for the lifetime of the open frame (the live inclusion check).
 - `recommended_fee` is what the next frame will sample at rotation (currently after five newly-safe L1 blocks, best-effort).
 - `suggested_max_fee` is `max(fee, recommended_fee)` plus 1.5× log-space slack. Wallets can copy this into signed `max_fee`; the user pays the frame fee, not this cap. Clients that want their own policy can ignore it and combine the two facts themselves.
-- `200` while an open frame exists (the admitted runtime always has one).
+- `200` while an open frame exists (the admitted runtime always has one). Responses carry `Cache-Control: no-store`.
 - `503` with code `UNAVAILABLE` during shutdown, or if no open frame exists.
+
+### `GET /nonce?sender=<address>`
+
+The nonce to sign into `sender`'s next user op.
+
+```json
+{ "sender": "0xAbC...", "next_nonce": 7 }
+```
+
+Notes:
+
+- `sender` is parsed like the `POST /tx` field: `0x` plus 40 hex digits in any case, echoed in EIP-55 casing. A missing or malformed parameter is `400` with code `BAD_REQUEST`.
+- `next_nonce` is one past the sender's latest included op, or 0 if it has none. It counts soft-confirmed ops: an op acknowledged with `200` before this request is counted. (The `nonce` in a `POST /tx` response or WS message is instead the nonce that op consumed.)
+- Keep one op in flight per sender: sign `next_nonce`, submit, and increment on `200`. Concurrent submits from one sender are unsupported; they can reach the sequencer out of order and be rejected. After a submit times out, a `next_nonce` above the op's nonce means it was included; an unchanged one is inconclusive, since the op may still be queued, so resubmit the same signed op rather than signing a new one at that nonce.
+- `next_nonce` of 4294967295 (`u32::MAX`) means the account is exhausted: that nonce has no successor, so `POST /tx` rejects an op carrying it.
+- The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, query again rather than incrementing.
+- After an operator rebuild from a checkpoint (`setup --recovery`), a sender with no surviving op since the rebuild reads 0 even when its nonce in the rebuilt baseline is higher; this includes a sender whose post-rebuild ops a later recovery invalidated. A `422` bad-nonce rejection names the expected nonce (`bad nonce: expected N, got M`).
+- Responses carry `Cache-Control: no-store`. `503` with code `UNAVAILABLE` during shutdown.
+
+### `GET /domain`
+
+The EIP-712 domain `POST /tx` verifies signatures against, keyed as `eth_signTypedData_v4` expects:
+
+```json
+{ "name": "CartesiAppSequencer", "version": "1", "chainId": 31337, "verifyingContract": "0x..." }
+```
+
+Clients pin their own domain and assert that it matches this one, the way a wallet checks `eth_chainId`. `chainId` is a JSON number, exact in JavaScript below 2^53. That covers every chain browser wallets accept (MetaMask refuses IDs above 4503599627370476); a larger ID fails closed, because a signature over a rounded `chainId` recovers a different sender at `POST /tx`. Do not sign with a served domain unchecked: `chainId` and `verifyingContract` are what keep a signature from replaying on another deployment, and the name and version are the same everywhere.
 
 ### `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>`
 
@@ -450,7 +479,7 @@ They do not certify L1 freshness, submitter balance, or canonical agreement.
 - `examples/wallet-sequencer/`: binary crate composing the sequencer library with the placeholder wallet app
 - `sequencer/src/http.rs`: shared HTTP error type, JSON error shape, and `axum::serve` orchestration
 - `sequencer/src/runtime/`: process lock and shutdown scope; command bootstrap and config live in `commands/`, the shared clock in `clock.rs`, and EIP-712 domain construction in `sequencer-core/`
-- `sequencer/src/ingress/`: public-facing — `POST /tx` and `GET /fee` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)
+- `sequencer/src/ingress/`: public-facing — `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)
 - `sequencer/src/egress/`: internal read path — WS subscribe + health probes (`api/`) and the DB-backed ordered-L2Tx feed (`l2_tx_feed/`)
 - `sequencer/src/l1/`: L1 client surface — input reader, batch submitter, fee oracle, shared EIP-1559 estimation, provider, partition helper
 - `sequencer/src/recovery/`: preemptive recovery startup, runtime danger detector, mempool flusher

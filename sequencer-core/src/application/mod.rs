@@ -119,6 +119,8 @@ pub enum InvalidReason {
         max_fee: u16,
         base_fee: u16,
     },
+    /// The op carried `u32::MAX`, a nonce with no successor.
+    NonceExhausted,
     /// Sender cannot pay the frame fee. "Fee" (not "gas"): the current fee
     /// tracks DA usage; compute metering, if it ever exists, will be a
     /// separate concept.
@@ -137,6 +139,7 @@ impl fmt::Display for InvalidReason {
             Self::InvalidMaxFee { max_fee, base_fee } => {
                 write!(f, "max fee {max_fee} below base fee {base_fee}")
             }
+            Self::NonceExhausted => write!(f, "nonce {} has no successor", u32::MAX),
             Self::InsufficientFeeBalance {
                 required,
                 available,
@@ -156,10 +159,11 @@ pub trait Application: Send + Sized {
     /// Zero permits only empty method payloads.
     fn max_method_payload_bytes() -> usize;
 
-    /// Pure validation predicate over current app state: nonce match
-    /// (user replay protection) and fee-balance coverage. Must not
-    /// mutate state. [`validate_and_execute_user_op`] enforces the protocol
-    /// `max_fee >= current_fee` guard before calling here. Rejection leaves
+    /// Pure validation predicate over current app state: the op's nonce
+    /// equals the sender's expected nonce (user replay protection), and the
+    /// sender covers the fee. Must not mutate state.
+    /// [`validate_and_execute_user_op`] enforces the protocol guards
+    /// (`max_fee >= current_fee`, nonce below `u32::MAX`) before calling here. Rejection leaves
     /// the app unchanged; `AppError` is fatal and defines no successor.
     fn validate_user_op(
         &self,
@@ -169,8 +173,10 @@ pub trait Application: Send + Sized {
     ) -> Result<ValidationOutcome, AppError>;
 
     /// Apply a validated user op and advance progress exactly once on success,
-    /// using `safe_block` for the clock. Included business failures and no-ops
-    /// also advance progress. `AppError` is fatal: callers discard the instance.
+    /// using `safe_block` for the clock. Also advance the sender's nonce by
+    /// exactly one; the sequencer derives `GET /nonce` from this rule (see the
+    /// application contract). Included business failures and no-ops also
+    /// advance both. `AppError` is fatal: callers discard the instance.
     /// Execution callers use [`execute_valid_user_op`] to check the transition.
     fn apply_valid_user_op(
         &mut self,
@@ -180,8 +186,9 @@ pub trait Application: Send + Sized {
 
     /// Apply a direct input and advance progress exactly once on success,
     /// using its L1 block number for the clock. Ignored or malformed inputs
-    /// still count. Execution callers use [`execute_direct_input`] to check
-    /// the transition; `AppError` requires discarding the instance.
+    /// still count. Never changes a user nonce. Execution callers use
+    /// [`execute_direct_input`] to check the transition; `AppError` requires
+    /// discarding the instance.
     fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError>;
 
     /// Return the progress embedded in the application's logical state.
@@ -254,7 +261,7 @@ pub trait CanonicalState {
     fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError>;
 }
 
-/// Validate and execute a live user op: protocol guard, app validation, execution.
+/// Validate and execute a live user op: protocol guards, app validation, execution.
 ///
 /// Live inclusion and the canonical scheduler use this boundary. Trusted
 /// replay uses [`execute_valid_user_op`] with the persisted validation result.
@@ -271,6 +278,11 @@ pub fn validate_and_execute_user_op<A: Application>(
             max_fee: user_op.max_fee,
             base_fee: current_fee,
         }));
+    }
+    // Protocol invariant: the nonce rule gives `u32::MAX` no successor, so no
+    // app state can include an op carrying it.
+    if user_op.nonce == u32::MAX {
+        return Ok(ExecutionOutcome::Invalid(InvalidReason::NonceExhausted));
     }
 
     if let ValidationOutcome::Reject(reason) = app.validate_user_op(sender, user_op, current_fee)? {
@@ -503,6 +515,19 @@ mod tests {
                 base_fee: 1
             })
         ));
+        assert_eq!(app.applied, 0);
+    }
+
+    #[test]
+    fn protocol_exhausted_nonce_guard_precedes_application_validation() {
+        let mut app = ProgressApp::new(0);
+        app.fail_validation = true;
+        let mut exhausted = user_op();
+        exhausted.nonce = u32::MAX;
+        assert_eq!(
+            validate_and_execute_user_op(&mut app, Address::ZERO, &exhausted, 0, 9).unwrap(),
+            ExecutionOutcome::Invalid(InvalidReason::NonceExhausted)
+        );
         assert_eq!(app.applied, 0);
     }
 

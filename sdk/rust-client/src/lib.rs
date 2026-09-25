@@ -5,7 +5,7 @@ mod errors;
 mod history;
 
 pub use errors::{
-    ClientBuildError, GetFeeError, HistoryReadError, SnapshotError, SubmitRejected, SubmitTxError,
+    ClientBuildError, HistoryReadError, QueryError, SnapshotError, SubmitRejected, SubmitTxError,
     SubscribeError,
 };
 
@@ -18,7 +18,8 @@ pub use sequencer_core::history_api::{
     HistoryBaseline, HistoryCompatibility, HistoryDeployment, HistoryInfo,
 };
 
-use sequencer_core::api::{FeeResponse, TxRequest, TxResponse};
+use alloy_primitives::Address;
+use sequencer_core::api::{DomainResponse, FeeResponse, NonceResponse, TxRequest, TxResponse};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -123,24 +124,53 @@ impl SequencerClient {
         serde_json::from_str::<TxResponse>(&body).map_err(|e| SubmitRejected::Decode(e.to_string()))
     }
 
-    pub async fn get_fee(&self) -> Result<FeeResponse, GetFeeError> {
-        let url = format!("{}/fee", self.endpoint.trim_end_matches('/'));
+    pub async fn get_fee(&self) -> Result<FeeResponse, QueryError> {
+        self.get_json("/fee", "").await
+    }
+
+    /// The nonce `sender` signs next. A hint for one op in flight: re-query
+    /// after a `422` bad-nonce rejection, since recovery can lower it.
+    pub async fn get_nonce(&self, sender: Address) -> Result<NonceResponse, QueryError> {
+        self.get_json("/nonce", &format!("?sender={sender:#x}"))
+            .await
+    }
+
+    /// The EIP-712 domain the sequencer verifies against. Compare it with a
+    /// pinned domain; never sign with it unchecked.
+    pub async fn get_domain(&self) -> Result<DomainResponse, QueryError> {
+        self.get_json("/domain", "").await
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        route: &'static str,
+        query: &str,
+    ) -> Result<T, QueryError> {
+        let url = format!("{}{route}{query}", self.endpoint.trim_end_matches('/'));
+        let transport = |source| QueryError::Transport { route, source };
         let response = self
             .http_client
             .get(&url)
             .timeout(self.request_timeout)
             .send()
             .await
-            .map_err(map_reqwest_error)?;
+            .map_err(|e| transport(map_reqwest_error(e)))?;
         let status = response.status().as_u16();
         let body = response
             .text()
             .await
-            .map_err(|e| SubmitTxError::IoRead(e.to_string()))?;
+            .map_err(|e| transport(SubmitTxError::IoRead(e.to_string())))?;
         if status != 200 {
-            return Err(GetFeeError::Http { status, body });
+            return Err(QueryError::Http {
+                route,
+                status,
+                body,
+            });
         }
-        serde_json::from_str::<FeeResponse>(&body).map_err(|e| GetFeeError::Decode(e.to_string()))
+        serde_json::from_str::<T>(&body).map_err(|e| QueryError::Decode {
+            route,
+            reason: e.to_string(),
+        })
     }
 
     /// Bounds response headers by the request timeout; callers own body cancellation.
@@ -300,7 +330,10 @@ mod tests {
         .expect("fee request must retain its deadline independently of snapshot streaming");
         assert!(matches!(
             result,
-            Err(GetFeeError::Transport(SubmitTxError::TimeoutRead))
+            Err(QueryError::Transport {
+                source: SubmitTxError::TimeoutRead,
+                ..
+            })
         ));
     }
 

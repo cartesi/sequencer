@@ -231,6 +231,14 @@ CREATE TABLE IF NOT EXISTS user_ops (
     FOREIGN KEY(batch_index, frame_in_batch) REFERENCES frames(batch_index, frame_in_batch)
 );
 
+-- `GET /nonce` reads a sender's latest op in a valid batch. Rows are never
+-- pruned, so without this index every public read would scan all history.
+-- It is the chunk commit's costliest index: sender-keyed entries land on
+-- scattered leaves, dirtying about one WAL page per distinct sender per chunk.
+-- Measured cost and alternatives: docs/review/register.md, "Known optimizations".
+CREATE INDEX IF NOT EXISTS idx_user_ops_sender_nonce
+    ON user_ops(sender, nonce);
+
 CREATE TRIGGER IF NOT EXISTS trg_user_ops_target_must_be_tip
 BEFORE INSERT ON user_ops
 FOR EACH ROW

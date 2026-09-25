@@ -165,7 +165,8 @@ impl WalletApp {
     }
 
     // Wallet-specific read queries (not on the Application trait — the
-    // sequencer never asks; app-specific query surface belongs to the app).
+    // sequencer never asks: it derives nonces from persisted ops under the
+    // contract's nonce rule, and app-specific query surface belongs to the app).
     pub fn current_user_nonce(&self, sender: Address) -> u32 {
         self.expected_nonce(&sender)
     }
@@ -441,6 +442,29 @@ mod tests {
                 base_fee: 2
             })
         );
+    }
+
+    #[test]
+    fn an_exhausted_nonce_is_rejected_instead_of_overflowing() {
+        use sequencer_core::application::{ExecutionOutcome, validate_and_execute_user_op};
+
+        let mut app = WalletApp::new(WalletConfig::default());
+        let sender = Address::from_slice(&[0x11; 20]);
+        app.balances.insert(sender, U256::from(10_u64));
+        app.nonces.insert(sender, u32::MAX);
+        let user_op = UserOp {
+            nonce: u32::MAX,
+            max_fee: 0,
+            data: Vec::<u8>::new().into(),
+        };
+
+        let result = validate_and_execute_user_op(&mut app, sender, &user_op, 0, 0)
+            .expect("an exhausted nonce is a rejection, not a fault");
+        assert_eq!(
+            result,
+            ExecutionOutcome::Invalid(InvalidReason::NonceExhausted)
+        );
+        assert_eq!(app.current_user_nonce(sender), u32::MAX);
     }
 
     #[test]

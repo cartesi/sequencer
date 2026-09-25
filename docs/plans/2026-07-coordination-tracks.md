@@ -94,6 +94,15 @@ Remaining checks need the actual consumer:
 - Decide output storage, checkpoint layout, ABI version negotiation, generated
   bindings, and linker policy from concrete engine requirements. The current
   drain protocol and path callback remain the contract until then.
+- Make `GET /nonce` exact for senders idle since a rebuilt baseline; today
+  they read 0 ([application contract](../protocol/application-contract.md#user-nonces)).
+  Proposed: an `Application` nonce query plus an enumeration method. Setup
+  already holds the baseline engine when it publishes the baseline, so it can
+  enumerate it into a write-once `baseline_nonces` table in the same
+  transaction, the user-nonce counterpart of `batch_tree_anchor`. The point
+  query also lets the shared execution boundary check the one-step nonce
+  advance per op, as it checks progress. Both need C ABI exports and the
+  engine owner's agreement.
 
 Additional checkpoint primitives or asynchronous scheduling need a measured
 requirement. Any future microbatch priority scheme must preserve per-account

@@ -6,7 +6,9 @@
 //!
 //! The lane also reads classified external directs and the open
 //! state (resumed on startup) — those reads live here too because they're driven
-//! by the lane's flow, not by an L1 ingress event.
+//! by the lane's flow, not by an L1 ingress event. The public ingress reads
+//! live here too: the fee quote and the next user nonce, derived from the
+//! lane's user-op rows.
 
 use std::path::Path;
 
@@ -18,7 +20,8 @@ use super::StoredSafeInput;
 #[cfg(test)]
 use super::convert::external_u64_to_i64;
 use super::convert::{
-    from_unix_ms, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms, u64_to_i64,
+    from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms,
+    u64_to_i64,
 };
 use super::history::{next_executed_input_count_in, query_history_state};
 use super::mutations::{
@@ -36,6 +39,12 @@ use super::{
     SafeInputRange, Storage, WriteHead,
 };
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
+
+const LAST_VALID_USER_NONCE_SQL: &str = "SELECT u.nonce FROM user_ops u
+     WHERE u.sender = ?1
+       AND EXISTS (SELECT 1 FROM valid_batches b WHERE b.batch_index = u.batch_index)
+     ORDER BY u.nonce DESC
+     LIMIT 1";
 
 impl Storage {
     /// First L1 input beyond the latest surviving frame's accounted block,
@@ -58,6 +67,26 @@ impl Storage {
             };
             let policy = query_batch_policy(tx)?;
             Ok(Some((head.frame_fee, policy.recommended_fee)))
+        })
+    }
+
+    /// The nonce `sender` must sign next: one past its latest user op in a
+    /// valid batch, or 0 without one. Exact under the application contract's
+    /// nonce rule, except that a sender idle since a rebuilt baseline reads 0.
+    ///
+    /// Invalidated batches keep their rows, and resubmission after a cascade
+    /// reuses their nonces, so the validity filter is load-bearing.
+    pub fn next_user_nonce(&mut self, sender: Address) -> Result<u32> {
+        self.read(|tx| {
+            let last_nonce: Option<i64> = tx
+                .prepare_cached(LAST_VALID_USER_NONCE_SQL)?
+                .query_row(params![sender.as_slice()], |row| row.get(0))
+                .optional()?;
+            Ok(last_nonce.map_or(0, |nonce| {
+                i64_to_u32(nonce)
+                    .checked_add(1)
+                    .expect("included user nonce u32::MAX has no successor: contract-impossible")
+            }))
         })
     }
 
@@ -1538,5 +1567,102 @@ mod tests {
         assert!(crate::storage::test_helpers::all_ordered_l2_txs(&mut storage).is_empty());
         storage.close_frame_and_batch(&mut head, 10).unwrap();
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
+    }
+
+    fn included_user_op_from(sender: Address, nonce: u32, offset: u64) -> IncludedUserOp {
+        let mut included = included_user_op(nonce, offset);
+        included.pending.signed.sender = sender;
+        included
+    }
+
+    #[test]
+    fn next_user_nonce_follows_the_latest_valid_op_across_a_cascade() {
+        let alice = Address::repeat_byte(0xa1);
+        let bob = Address::repeat_byte(0xb0);
+        let db = temp_db("next-user-nonce");
+        let mut storage = Storage::open(&db.path).unwrap();
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .unwrap();
+        assert_eq!(storage.next_user_nonce(alice).unwrap(), 0, "unseen sender");
+
+        storage
+            .append_executed_user_ops_chunk(
+                &mut head,
+                &[
+                    included_user_op_from(alice, 0, 0),
+                    included_user_op_from(alice, 1, 1),
+                    included_user_op_from(bob, 0, 2),
+                ],
+            )
+            .unwrap();
+        storage.close_frame_and_batch(&mut head, 0).unwrap();
+        storage
+            .append_executed_user_ops_chunk(
+                &mut head,
+                &[
+                    included_user_op_from(alice, 2, 3),
+                    included_user_op_from(alice, 3, 4),
+                ],
+            )
+            .unwrap();
+        assert_eq!(storage.next_user_nonce(alice).unwrap(), 4);
+        assert_eq!(storage.next_user_nonce(bob).unwrap(), 1);
+
+        // A cascade rolls Alice back; her invalidated rows stay for audit.
+        storage.insert_invalid_batch(head.batch_index).unwrap();
+        assert_eq!(storage.next_user_nonce(alice).unwrap(), 2);
+        assert_eq!(storage.next_user_nonce(bob).unwrap(), 1);
+
+        // Resubmitting nonce 2 leaves a duplicate (sender, nonce) pair across
+        // the invalid and valid batches; only the valid one counts.
+        storage
+            .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+            .unwrap();
+        storage.ensure_open_tip().unwrap();
+        let mut head = storage.open_state().unwrap().unwrap();
+        let offset = storage.next_executed_input_count().unwrap().get();
+        storage
+            .append_executed_user_ops_chunk(&mut head, &[included_user_op_from(alice, 2, offset)])
+            .unwrap();
+        assert_eq!(storage.next_user_nonce(alice).unwrap(), 3);
+        let raw_max: i64 = storage
+            .conn
+            .query_row(
+                "SELECT MAX(nonce) FROM user_ops WHERE sender = ?1",
+                [alice.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            raw_max, 3,
+            "an unfiltered MAX would still report the rolled-back op"
+        );
+    }
+
+    #[test]
+    fn next_user_nonce_seeks_the_sender_index_without_sorting() {
+        let db = temp_db("next-user-nonce-plan");
+        let storage = Storage::open(&db.path).unwrap();
+        let plan: Vec<String> = storage
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::LAST_VALID_USER_NONCE_SQL
+            ))
+            .unwrap()
+            .query_map([Address::ZERO.as_slice()], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("idx_user_ops_sender_nonce"),
+            "nonce lookup must seek the sender index:\n{plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "index order must serve ORDER BY:\n{plan}"
+        );
     }
 }

@@ -6,7 +6,6 @@ use std::time::{Duration, SystemTime};
 
 use crate::storage::{ApplicationInputRow, L2TxContext};
 use alloy_primitives::{Address, Signature};
-use alloy_sol_types::Eip712Domain;
 use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
 use futures_util::{SinkExt, StreamExt};
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
@@ -423,13 +422,7 @@ async fn start_test_server_with_limits(
         ApiConfig {
             ws_max_subscribers,
             ..ApiConfig::new(
-                Eip712Domain {
-                    name: None,
-                    version: None,
-                    chain_id: None,
-                    verifying_contract: None,
-                    salt: None,
-                },
+                sequencer_core::build_input_domain(1, alloy_primitives::Address::ZERO),
                 MAX_METHOD_PAYLOAD_BYTES,
             )
         },

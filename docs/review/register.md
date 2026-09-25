@@ -109,6 +109,52 @@ exposure in an actual deployment was established by this review.
   attempt's flush witness. Use the [recovery model](../recovery/README.md) to
   bound a scenario and assess whether existing component tests suffice.
 
+## Known optimizations
+
+Performance headroom with a known mechanism, not defects. Each entry names its
+measurement, or the lack of one, and the trigger for acting. Checked 2026-09-25
+at `6b2a233`.
+
+- **Sender index on the chunk commit.** `idx_user_ops_sender_nonce` lets
+  `GET /nonce` seek a sender instead of scanning history, but it is the chunk
+  commit's costliest index. In the
+  [2026-09-25 measurement](2026-09-25-sender-index-commit-cost.md) it raised
+  the mean 64-op commit from 0.27 to 1.0 ms and p99 from 1.1 to 9 ms. It stays:
+  any sender-keyed durable structure pays about the same once the sender
+  population is large, and a derived index needs no recovery maintenance. If
+  lane persistence becomes the throughput limit, the alternatives are a
+  lane-written sender-to-next-nonce table, cheaper only while the sender
+  population fits in a few pages and needing a rewind on invalidation, and
+  moving checkpoints off the lane (next entry). Such a table is also where
+  rebuilt-baseline nonces could be seeded; see
+  [Track 6](../plans/2026-07-coordination-tracks.md#track-6--dump--application-api-redesign).
+  On the read side, the lookup walks the sender's invalidated entries above its
+  current nonce: about 0.11 µs each, 16 ms at 100,000, bounded by that sender's
+  own rolled-back volume. A covering `(sender, nonce, batch_index)` index would
+  skip the table fetch per entry. Revisit with a measurement on production-like
+  Linux storage, or when lane throughput is the limit. Evidence:
+  [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql),
+  [`storage/ingress.rs`](../../sequencer/src/storage/ingress.rs).
+- **Checkpoints run inside the lane's commit.** No connection sets
+  `wal_autocheckpoint`, so SQLite's default 1,000-page checkpoint runs inline in
+  the `COMMIT` of whichever writer crosses it, usually the lane. It is the p99
+  tail in the measurement above, with or without the sender index. The candidate
+  is to disable autocheckpoint on the lane's connection and run `PASSIVE`
+  checkpoints from a background connection; the risk to bound is WAL growth
+  while readers hold snapshots. Unmeasured beyond that record. Evidence:
+  [`storage/open.rs`](../../sequencer/src/storage/open.rs).
+- **Per-request read connections.** `/fee`, `/nonce`, `/history`, and the
+  finalized-state routes open a fresh read-only connection per request, so each
+  pays a file open, a schema parse on its first statement, and cold page and
+  statement caches: about 0.2 ms per request against about 2 µs for the nonce
+  query itself ([measurement](2026-09-25-sender-index-commit-cost.md#read-cost)).
+  A small pool of long-lived read connections would remove that cost. Separately,
+  `current_fee_quote` builds a full `WriteHead`, including two `COUNT(*)` scans
+  of the Tip's user ops, to return two numbers; that cost is bounded by batch
+  size and unmeasured. Evidence:
+  [`ingress/api.rs`](../../sequencer/src/ingress/api.rs),
+  [`storage/queries.rs`](../../sequencer/src/storage/queries.rs).
+
 ## Verification gaps
 
 These are specific behaviors whose coverage remains incomplete, not a mandate

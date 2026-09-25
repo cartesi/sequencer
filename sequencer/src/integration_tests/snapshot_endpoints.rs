@@ -28,13 +28,7 @@ use tokio::sync::mpsc;
 use super::common::temp_db;
 
 fn dummy_domain() -> Eip712Domain {
-    Eip712Domain {
-        name: None,
-        version: None,
-        chain_id: None,
-        verifying_contract: None,
-        salt: None,
-    }
+    sequencer_core::build_input_domain(1, alloy_primitives::Address::ZERO)
 }
 
 /// Holds the server task + channel alive for the duration of a test.
@@ -816,6 +810,28 @@ async fn cors_is_limited_to_ingress_and_covers_rejections() {
         .await
         .expect("GET /fee");
     assert_eq!(fee.headers()["access-control-allow-origin"], "*");
+
+    for (route, status) in [
+        (
+            "/nonce?sender=0x00000000000000000000000000000000000000aa",
+            200,
+        ),
+        ("/nonce?sender=0xaa", 400),
+        ("/domain", 200),
+    ] {
+        let response = client
+            .get(server.url(route))
+            .header("Origin", "https://wallet.example")
+            .send()
+            .await
+            .expect("ingress read");
+        assert_eq!(response.status().as_u16(), status, "{route}");
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "*",
+            "{route}"
+        );
+    }
 
     for route in ["/livez", "/finalized_state"] {
         let response = client

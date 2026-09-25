@@ -25,7 +25,7 @@ What we are protecting:
 | Batch-submitter private key | Private | Held in operator infra. Not reachable by the network. |
 | Sequencer's own code | Trusted during normal operation | Tests/review prevent bugs; runtime invariant checks fail loud. Bugs require diagnosis and correction, followed by an operator rebuild if local state cannot be trusted. See "self-trust" below. |
 | **L1 mempool and block builders** | **Fully adversarial** | May reorder, delay, drop, or selectively include submitted transactions. Private mempools mean "dropped" is indistinguishable from "delayed indefinitely." |
-| HTTP clients at `POST /tx` and `GET /fee` | Untrusted | Arbitrary public callers. May submit malformed, malicious, or replay payloads. `GET /fee` is an intentional public quote of the open-frame fee. |
+| HTTP clients at `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` | Untrusted | Arbitrary public callers. May submit malformed, malicious, or replay payloads. The `GET` routes are intentional public reads: the open-frame fee, any sender's pending nonce (already public once its batches land on L1), and the signing domain. |
 | WebSocket subscribers at `/ws/subscribe` | Internal, but untrusted for data-exposure | Intended for internal indexers. Treat as public for what is exposed. |
 | Direct-input senders on L1 | Untrusted | Arbitrary L1 accounts calling InputBox. May submit any calldata. |
 
