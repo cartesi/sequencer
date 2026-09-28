@@ -605,6 +605,68 @@ impl ManagedSequencer {
         Ok(anchor as u64)
     }
 
+    /// The rebuilt baseline's L1 stop block `C` (`history_state.base_safe_block`),
+    /// read from the run DB read-only.
+    pub fn baseline_safe_block(&self) -> HarnessResult<u64> {
+        let db_path = self.data_dir_path.join("sequencer.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path.as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+        let block: i64 = conn
+            .query_row(
+                "SELECT base_safe_block FROM history_state WHERE singleton_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| io_other(format!("read history_state: {err}")))?;
+        Ok(block as u64)
+    }
+
+    /// Nonces of this app's batch submissions from the devnet submitter included
+    /// in L1 blocks `(after_block, through_block]`, in L1 order. Read from the
+    /// InputBox logs, independent of any sequencer database.
+    pub async fn l1_batch_nonces(
+        &self,
+        after_block: u64,
+        through_block: u64,
+    ) -> HarnessResult<Vec<u64>> {
+        use alloy::contract::Event;
+        use alloy::sol_types::{SolCall, SolEvent};
+        use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
+        use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
+
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect(self.l1_endpoint())
+            .await
+            .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
+        let mut logs: Vec<(InputAdded, alloy::rpc::types::Log)> =
+            Event::new_sol(&provider, &self.input_box_address())
+                .from_block(after_block + 1)
+                .to_block(through_block)
+                .event(InputAdded::SIGNATURE)
+                .topic1(self.app_address().into_word())
+                .query()
+                .await
+                .map_err(|err| io_other(format!("query InputAdded logs: {err}")))?;
+        logs.sort_by_key(|(_, log)| (log.block_number, log.log_index));
+
+        let mut nonces = Vec::new();
+        for (event, _) in logs {
+            let advance = EvmAdvanceCall::abi_decode(&event.input)
+                .map_err(|err| io_other(format!("decode EvmAdvance: {err}")))?;
+            if advance.msgSender != app_core::application::DEVNET_SEQUENCER_ADDRESS {
+                continue;
+            }
+            let batch =
+                <sequencer_core::batch::Batch as ssz::Decode>::from_ssz_bytes(&advance.payload)
+                    .map_err(|err| io_other(format!("decode batch: {err:?}")))?;
+            nonces.push(batch.nonce);
+        }
+        Ok(nonces)
+    }
+
     /// The canonical-divergence marker (I9/I15) from the run DB, or `None`
     /// when the frontier is healthy. A recovery/resync e2e asserts this is `None`
     /// to prove the content-identity check did NOT spuriously freeze the frontier
