@@ -1515,15 +1515,31 @@ async fn run_setup_recovery_round_trip_test<A: Application>(
 
     // Explicit recovery-correctness assertions, beyond the structural
     // `assert_schema_invariants` (which checks `0..`-from-anchor contiguity):
-    //   1. the rebuilt tree is anchored at the checkpoint's resume nonce N' (I16);
+    //   1. the rebuilt tree is anchored at N' (I16): the checkpoint's N plus the
+    //      batches accepted in (B, C], counted from L1;
     //   2. recovery's resync did NOT spuriously freeze the frontier — the I15
     //      content-identity false-positive against below-anchor collapsed history
     //      is otherwise a silent failure, invisible at the e2e level (the same
     //      silence the (C, H1] bug shipped behind).
+    // The 5 s timer keeps closing batches until the stop, so whether one lands
+    // after B varies run to run. Counting consecutive nonces from N mirrors the
+    // scheduler's acceptance; batches this fresh cannot be stale.
+    let stop_block = runtime.baseline_safe_block()?;
+    let mut resume_nonce = checkpoint.resume_nonce;
+    for nonce in runtime
+        .l1_batch_nonces(checkpoint.checkpoint_block, stop_block)
+        .await?
+    {
+        if nonce == resume_nonce {
+            resume_nonce += 1;
+        }
+    }
+    eprintln!("recovery fold: C={stop_block} N'={resume_nonce}");
     assert_eq!(
         runtime.batch_tree_anchor()?,
-        checkpoint.resume_nonce,
-        "the rebuilt tree must be anchored at the checkpoint resume nonce N'"
+        resume_nonce,
+        "the rebuilt tree must be anchored at N', the checkpoint nonce plus the \
+         batches accepted after the checkpoint block"
     );
     assert_eq!(
         runtime.canonical_divergence()?,
