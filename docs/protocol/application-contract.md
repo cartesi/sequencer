@@ -25,9 +25,10 @@ a reference wallet integration.
 | `progress() -> ApplicationProgress` | Return the count/clock pair from the engine by value. |
 
 Execution callers use `validate_and_execute_user_op`, `execute_valid_user_op`,
-and `execute_direct_input`. The first enforces `max_fee >= current_fee` and
-rejects the exhausted nonce `u32::MAX` before app validation. App validation
-checks the nonce and fee balance; a rejection is not persisted. Trusted replay
+and `execute_direct_input`. The first enforces `max_fee >= current_fee` before
+app validation and rejects an accepted op at the exhausted nonce `u32::MAX`
+after it. App validation checks the nonce and fee balance; a rejection is not
+persisted. Trusted replay
 uses the stored `ValidUserOp`, whose fee and sender were established at
 inclusion, without validating a second time.
 
@@ -104,9 +105,10 @@ without asking the engine.
 - Each included user op, business failures included, advances its sender's
   expected nonce by exactly one. Nothing else changes a nonce: not direct
   inputs, not other senders' ops.
-- Nonces are `u32`. `u32::MAX` has no successor, so the shared execution
-  boundary rejects an op carrying it (`NonceExhausted`) before app
-  validation; an account that reaches it is exhausted.
+- Nonces are `u32`. `u32::MAX` has no successor, so an account that reaches
+  it is exhausted: when app validation accepts an op at `u32::MAX`, the shared
+  execution boundary rejects it (`NonceExhausted`). Any other op carrying
+  `u32::MAX` fails app validation with the expected nonce.
 
 Under this rule a sender's expected nonce is one past its latest included op.
 The exception is a sender with no surviving op since the era baseline. A

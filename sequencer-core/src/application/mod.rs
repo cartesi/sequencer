@@ -119,7 +119,7 @@ pub enum InvalidReason {
         max_fee: u16,
         base_fee: u16,
     },
-    /// The op carried `u32::MAX`, a nonce with no successor.
+    /// The sender's expected nonce is `u32::MAX`, which has no successor.
     NonceExhausted,
     /// Sender cannot pay the frame fee. "Fee" (not "gas"): the current fee
     /// tracks DA usage; compute metering, if it ever exists, will be a
@@ -162,9 +162,10 @@ pub trait Application: Send + Sized {
     /// Pure validation predicate over current app state: the op's nonce
     /// equals the sender's expected nonce (user replay protection), and the
     /// sender covers the fee. Must not mutate state.
-    /// [`validate_and_execute_user_op`] enforces the protocol guards
-    /// (`max_fee >= current_fee`, nonce below `u32::MAX`) before calling here. Rejection leaves
-    /// the app unchanged; `AppError` is fatal and defines no successor.
+    /// [`validate_and_execute_user_op`] enforces the protocol
+    /// `max_fee >= current_fee` guard before calling here, and rejects an
+    /// accepted op at nonce `u32::MAX` after. Rejection leaves the app
+    /// unchanged; `AppError` is fatal and defines no successor.
     fn validate_user_op(
         &self,
         sender: Address,
@@ -279,14 +280,15 @@ pub fn validate_and_execute_user_op<A: Application>(
             base_fee: current_fee,
         }));
     }
-    // Protocol invariant: the nonce rule gives `u32::MAX` no successor, so no
-    // app state can include an op carrying it.
-    if user_op.nonce == u32::MAX {
-        return Ok(ExecutionOutcome::Invalid(InvalidReason::NonceExhausted));
-    }
 
     if let ValidationOutcome::Reject(reason) = app.validate_user_op(sender, user_op, current_fee)? {
         return Ok(ExecutionOutcome::Invalid(reason));
+    }
+    // Protocol invariant: the nonce rule gives `u32::MAX` no successor. Checked
+    // after validation so any other op carrying it gets the app's bad-nonce
+    // diagnostics; only a sender actually at `u32::MAX` is exhausted.
+    if user_op.nonce == u32::MAX {
+        return Ok(ExecutionOutcome::Invalid(InvalidReason::NonceExhausted));
     }
 
     let valid = ValidUserOp {
@@ -519,14 +521,25 @@ mod tests {
     }
 
     #[test]
-    fn protocol_exhausted_nonce_guard_precedes_application_validation() {
-        let mut app = ProgressApp::new(0);
-        app.fail_validation = true;
+    fn protocol_exhausted_nonce_guard_follows_application_validation() {
         let mut exhausted = user_op();
         exhausted.nonce = u32::MAX;
+
+        let mut app = ProgressApp::new(0);
+        app.reject = true;
+        assert!(
+            matches!(
+                validate_and_execute_user_op(&mut app, Address::ZERO, &exhausted, 0, 9).unwrap(),
+                ExecutionOutcome::Invalid(InvalidReason::InvalidNonce { .. })
+            ),
+            "an app rejection keeps its bad-nonce diagnostics"
+        );
+
+        let mut app = ProgressApp::new(0);
         assert_eq!(
             validate_and_execute_user_op(&mut app, Address::ZERO, &exhausted, 0, 9).unwrap(),
-            ExecutionOutcome::Invalid(InvalidReason::NonceExhausted)
+            ExecutionOutcome::Invalid(InvalidReason::NonceExhausted),
+            "an op the app accepts at u32::MAX is still never included"
         );
         assert_eq!(app.applied, 0);
     }
