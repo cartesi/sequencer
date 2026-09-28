@@ -465,6 +465,17 @@ mod tests {
             ExecutionOutcome::Invalid(InvalidReason::NonceExhausted)
         );
         assert_eq!(app.current_user_nonce(sender), u32::MAX);
+
+        app.nonces.insert(sender, 5);
+        let result = validate_and_execute_user_op(&mut app, sender, &user_op, 0, 0).unwrap();
+        assert_eq!(
+            result,
+            ExecutionOutcome::Invalid(InvalidReason::InvalidNonce {
+                expected: 5,
+                got: u32::MAX
+            }),
+            "a sender that is not exhausted gets the expected nonce"
+        );
     }
 
     #[test]

@@ -54,7 +54,7 @@
 /// ops it persisted: a genesis state starts every account at 0, validation accepts only the
 /// sender's expected nonce, each executed user op advances its sender's nonce by exactly one, and
 /// nothing else changes a nonce. UINT32_MAX has no successor, so the caller rejects an op carrying
-/// it before validation. See docs/protocol/application-contract.md.
+/// it even when validation accepts it. See docs/protocol/application-contract.md.
 ///
 /// Fees are uint16_t exponents with base 129/128, denominated in the fee token's smallest unit.
 /// The conversion is defined by sequencer-core/src/fee.rs and its build.rs-generated table:
