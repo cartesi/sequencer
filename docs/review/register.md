@@ -13,7 +13,8 @@ Selected next work from the QA report assessment, checked on 2026-09-24 against
 `7e471454f4b9f55a245d10b922f81d3daa40e443`. Evidence includes current source and
 selected archived reproducers/logs; the archived devnet/OOM campaigns were not
 rerun. `cargo check --locked` and all 23 focused scheduler tests passed with
-Rust 1.95. The design directions below are proposed work, not current behavior.
+Rust 1.95. Each entry describes current behavior; its direction and next steps
+are proposed work.
 
 ### Bound the canonical direct-input fridge
 
@@ -90,9 +91,10 @@ HTTP use; URL acceptance alone is not evidence that TLS works.
 [`http.rs`](../../sequencer/src/http.rs) serves both routers on one listener.
 Publishing that listener wholesale also exposes unauthenticated internal state
 and snapshot routes. Next: finish the planned per-side bind configuration and
-verify public submission/fee routes and internal routes are isolated. Keep
-network access controls as the deployment boundary; no new authentication
-subsystem is implied. The [API contract](../../README.md#api) owns the routes.
+verify that every public route in the [API contract](../../README.md#api) (today
+`POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain`) is on the public
+listener and no internal route is. Keep network access controls as the
+deployment boundary; no new authentication subsystem is implied.
 
 ### Fix the pinned test framework's cycle target
 
