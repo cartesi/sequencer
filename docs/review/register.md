@@ -2,11 +2,65 @@
 
 Current follow-ups, maintained under the [review lifecycle](README.md).
 Contracts and settled design reasons belong to their owners; completed review
-history is in Git. Entries below were checked against code and test sources on
-2026-09-17 at `85f033b0768de527312ff876a29bca67ee2f9316`. This was a source audit,
-not a new run of every cited test. Recheck an entry before acting on it.
+history is in Git. Unless separately stamped, entries were checked against code
+and test sources on 2026-09-17 at `85f033b0768de527312ff876a29bca67ee2f9316`.
+That was a source audit, not a new run of every cited test. Recheck an entry
+before acting on it.
 
-## Confirmed discrepancies
+## QA follow-ups
+
+Selected next work from the QA report assessment, checked on 2026-09-24 against
+`7e471454f4b9f55a245d10b922f81d3daa40e443`. Evidence includes current source and
+selected archived reproducers/logs; the archived devnet/OOM campaigns were not
+rerun. `cargo check --locked` and all 23 focused scheduler tests passed with
+Rust 1.95. Each entry describes current behavior; its direction and next steps
+are proposed work.
+
+### Bound the canonical direct-input fridge
+
+The shared [scheduler](../../sequencer-core/src/scheduler/mod.rs) retains raw
+direct payloads without a byte budget. The age backstop does not bound memory,
+and HTTP controls cannot limit canonical L1 traffic. QA's guest/node OOM
+evidence supports investigating this independently of the toy wallet's state
+growth; its workload-specific thresholds are not deployment capacity bounds.
+
+Direction: use application-defined, deterministic format/sender rules to avoid
+retaining irrelevant bytes, and a generous fixed capacity pinned per deployment.
+Filtering or compacting must preserve valid deposits and agree across canonical
+execution, live prediction, application-history progress, and recovery. Define
+capacity in protocol bytes/slots, not allocator-dependent memory usage.
+
+Size against the cheapest accepted L1 inputs, including transaction batching,
+actual batch-inclusion delays and the backstop window. The five-block local
+frame tick is not a canonical drain interval. Include temporary allocations,
+application execution and accumulated outputs in the guest budget.
+
+Overflow must preserve valid deposits and have deterministic, non-catastrophic
+behavior; uninterrupted service and soft confirmations need not survive it.
+Early FIFO execution is a candidate, not a settled algorithm: it can reorder
+still-fresh delayed batches. Decide whether incompatible batches are rejected
+or overflow is detected as an exceptional ordering event that stops optimistic
+service and requires cockroach recovery. Matching batch bytes/nonce alone does
+not reveal this divergence. Silent loss of valid deposits is not a recovery
+strategy.
+
+Next: settle that transition and measure headroom, then exercise delayed fresh
+batches, same-block overflow, outages, and replay/rebuild agreement. Preserve
+the [checkpoint eligibility rule](../recovery/cockroach.md#checkpoint-eligibility):
+forcing one direct while leaving another from the same block queued can require
+an earlier checkpoint or genesis. The [scheduler contract](../protocol/scheduler-semantics.md)
+and [application contract](../protocol/application-contract.md) own the boundaries
+the implementation must update together.
+
+### Validate batch-open and danger timing together
+
+[`RunConfig`](../../sequencer/src/commands/config.rs) accepts any positive
+`max_batch_open_seconds`, while `protocol_timing()` validates only the separate
+timing fields. Incompatible settings can repeatedly recover a low-volume open
+batch before its seal deadline. Next: validate their relationship at the runtime
+configuration boundary, with checked units and an explicit submission margin;
+test refusal and a valid low-volume closure. This guard cannot guarantee timely
+L1 inclusion.
 
 ### Batch-size accounting omits SSZ overhead
 
@@ -23,6 +77,36 @@ Evidence: [`SignedUserOp`](../../sequencer-core/src/user_op.rs),
 Next: compare the intended bound with serialized batches across payload/frame
 counts, then correct the estimate and check the separately configured
 `batch_policy.log_user_op_bytes` used for fee accounting.
+
+### Support HTTPS and WSS in the Rust SDK
+
+The [client constructor](../../sdk/rust-client/src/lib.rs) rejects every HTTPS
+endpoint, leaving its HTTPS-to-WSS URL branch unreachable. Next: support both
+HTTP/HTTPS and their WS/WSS counterparts, verify the dependency TLS features,
+and exercise certificate-verified requests and subscriptions. Preserve local
+HTTP use; URL acceptance alone is not evidence that TLS works.
+
+### Separate public ingress and internal egress listeners
+
+[`http.rs`](../../sequencer/src/http.rs) serves both routers on one listener.
+Publishing that listener wholesale also exposes unauthenticated internal state
+and snapshot routes. Next: finish the planned per-side bind configuration and
+verify that every public route in the [API contract](../../README.md#api) (today
+`POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain`) is on the public
+listener and no internal route is. Keep network access controls as the
+deployment boundary; no new authentication subsystem is implied.
+
+### Fix the pinned test framework's cycle target
+
+The pinned `testsi::run_machine_increment` passes constant `1 << 28` to an
+absolute-cycle-target API. Long runs can stop advancing and report a timeout
+caused by the driver. Evidence: [the pinned source](https://github.com/GCdePaula/cartesi-tools-rs/blob/ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22/host/testsi/src/machine.rs#L159)
+and the [workspace dependency](../../Cargo.toml). Next: fix the target progression
+in that tooling, update the pin, and verify guest progress past the old target
+before relying on long-run capacity measurements. This is an upstream tooling
+task needed by sequencer validation.
+
+## Confirmed discrepancies
 
 ### Setup misclassifies some deterministic L1 configuration failures
 
@@ -81,12 +165,6 @@ exposure in an actual deployment was established by this review.
   [`storage/open.rs`](../../sequencer/src/storage/open.rs),
   [`submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs),
   [`commands/error.rs`](../../sequencer/src/commands/error.rs).
-- **Canonical direct-input queue capacity.** The shared
-  [`Scheduler`](../../sequencer-core/src/scheduler/mod.rs) retains queued
-  payloads without a byte budget. Force-drain bounds age in the observed L1
-  timeline, not bytes. Determine the supported L1-window volume and guest
-  memory cost before claiming an OOM vulnerability or proposing a limit.
-  Dropping or capping canonical inputs would change protocol semantics.
 - **Overlapping admission policies.** The generic
   [`lifecycle` preflight](../../sequencer/src/storage/lifecycle.rs) contains
   setup/rebuild branches, but production calls it only for run/flush.
