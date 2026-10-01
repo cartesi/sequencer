@@ -148,8 +148,9 @@ image; running `EngineApp` inside a machine image is yours to validate.
 The header documents its own rules in detail. The ones a casual
 implementation gets wrong:
 
-- **Three validation results**: `OK`, `INVALID` with a reason record, and a
-  failure status. Never report bad input as `INTERNAL_ERROR` — that is fatal
+- **Three validation results**: `OK`, `INVALID` with a reason record (wrong
+  nonce or insufficient fee balance — the fee-cap and exhausted-nonce reasons
+  are the host's and never come from an engine), and a failure status. Never report bad input as `INTERNAL_ERROR` — that is fatal
   for the whole sequencer — and never report an engine fault as `INVALID`.
 - **Every entry point is total** over the bytes it is handed, and no
   exception or panic may cross the ABI.

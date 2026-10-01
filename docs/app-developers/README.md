@@ -72,7 +72,7 @@ block them (see [Deposits](#deposits-and-other-l1-inputs)).
 
 | Area | Before | With the sequencer |
 |---|---|---|
-| How users transact | L1 transaction to `InputBox.addInput` | EIP-712 signed message, `POST /tx` to the sequencer (`GET /fee` for the fee cap to sign) |
+| How users transact | L1 transaction to `InputBox.addInput` | EIP-712 signed message, `POST /tx` to the sequencer (`GET /nonce` and `GET /fee` supply the nonce and fee cap to sign) |
 | Who the machine sees as sender | `msg_sender` of the input is the user | `msg_sender` of a batch is the **sequencer**; each user is identified by their recovered signature |
 | Replay protection | L1 account nonce, for free | A per-user **nonce kept in your application state** |
 | Cost to the user | L1 gas | A **fee charged by your application**, in your application's token |
@@ -150,7 +150,7 @@ instantly.
 Application logic:
 
 - [ ] State transition logic is separated from I/O (no HTTP rollup loop inside it).
-- [ ] Every user has a nonce in application state; an operation with the wrong nonce is rejected without changing anything.
+- [ ] Every user has a nonce in application state that follows the protocol's rule (starts at 0, exact match required, +1 per included operation, nothing else touches it); an operation with the wrong nonce is rejected without changing anything.
 - [ ] A fee is charged per operation, in a token your application holds balances of; an operation the sender cannot pay for is rejected without changing anything.
 - [ ] Validation is a pure read. All mutation happens in the apply step.
 - [ ] A malformed or failing operation is an **included no-op** (nonce consumed, fee charged), never a crash.
@@ -165,7 +165,8 @@ Clients:
 
 - [ ] Frontend signs the `UserOp` typed data and posts to `/tx`.
 - [ ] Frontend reads `GET /fee` before signing and uses its `suggested_max_fee`.
-- [ ] Frontend gets the user's next nonce from your indexer and tracks it locally.
+- [ ] Frontend reads `GET /nonce` for the next nonce, keeps one operation in flight per sender, and re-queries after a nonce rejection.
+- [ ] Frontend pins its EIP-712 domain and checks it against `GET /domain`.
 - [ ] UI distinguishes "soft-confirmed" from "final on L1".
 - [ ] Reads come from an indexer that restores `/latest_snapshot`, subscribes with its history claim, and keeps the claim with its checkpoints — not from the sequencer directly.
 

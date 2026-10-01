@@ -9,7 +9,7 @@ from an application's point of view.
 
 | Task | Before | With the sequencer |
 |---|---|---|
-| Send a transaction | `InputBox.addInput(app, payload)` as an L1 transaction | `GET /fee`, sign typed data, `POST /tx` |
+| Send a transaction | `InputBox.addInput(app, payload)` as an L1 transaction | `GET /nonce` and `GET /fee`, sign typed data, `POST /tx` |
 | Wallet prompt | "Confirm transaction" with gas | "Sign message" — no gas, no ETH needed |
 | Know it worked | Wait for L1, then for the node | HTTP `200` in under a second |
 | Deposit | Portal transaction on L1 | **Unchanged** |
@@ -22,7 +22,7 @@ A user operation is three fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `nonce` | `uint32` | The sender's next nonce in your application (starts at 0) |
+| `nonce` | `uint32` | The sender's next nonce (starts at 0); read it from `GET /nonce` |
 | `max_fee` | `uint16` | The highest fee exponent the user accepts |
 | `data` | `bytes` | Your application payload |
 
@@ -43,6 +43,13 @@ exactly — field names, order, and integer widths. A mismatch does not produce 
 helpful error: the signature simply recovers to some other address and the
 request fails with `INVALID_SIGNATURE`.
 
+`GET /domain` returns the domain the sequencer verifies against, in the shape
+`eth_signTypedData_v4` expects. Use it as a **check, not a source**: keep
+`chainId` and `verifyingContract` pinned in your frontend's configuration and
+compare, the way a wallet checks `eth_chainId`. Those two values are exactly
+what stops a signature from being valid on another deployment; a frontend
+that signs whatever domain a server hands it has given that protection away.
+
 ### TypeScript (viem)
 
 ```ts
@@ -60,28 +67,37 @@ export async function submitUserOp(opts: {
   sequencerUrl: string;      // e.g. https://sequencer.example.com
   chainId: number;
   appAddress: Hex;
-  nonce: number;
   data: Hex;                 // your encoded payload
 }) {
   const wallet = createWalletClient({ transport: custom(window.ethereum) });
   const [sender] = await wallet.requestAddresses();
+  const get = (path: string) => fetch(`${opts.sequencerUrl}${path}`).then((r) => r.json());
 
-  // Ask the sequencer what to sign as the fee cap (see "Choosing max_fee").
-  const quote = await fetch(`${opts.sequencerUrl}/fee`).then((r) => r.json());
+  // The domain is pinned here; the sequencer's copy is only checked against it.
+  const domain = {
+    name: "CartesiAppSequencer",
+    version: "1",
+    chainId: opts.chainId,
+    verifyingContract: opts.appAddress,
+  } as const;
+  const served = await get("/domain");
+  if (
+    served.chainId !== domain.chainId ||
+    served.verifyingContract.toLowerCase() !== domain.verifyingContract.toLowerCase()
+  ) throw new Error("sequencer serves a different deployment");
+
+  // What to sign: the next nonce and the fee cap (see "Nonces", "Choosing max_fee").
+  const { next_nonce } = await get(`/nonce?sender=${sender}`);
+  const quote = await get("/fee");
   const message = {
-    nonce: opts.nonce,
+    nonce: next_nonce as number,
     max_fee: quote.suggested_max_fee as number,
     data: opts.data,
   };
 
   const signature = await wallet.signTypedData({
     account: sender,
-    domain: {
-      name: "CartesiAppSequencer",
-      version: "1",
-      chainId: opts.chainId,
-      verifyingContract: opts.appAddress,
-    },
+    domain,
     types,
     primaryType: "UserOp",
     message,
@@ -105,7 +121,8 @@ Request notes:
   `27/28` or `0/1`.
 - `sender` is required and must equal the address the signature recovers to.
 - `nonce` and `max_fee` are JSON numbers; `data` is `0x`-prefixed hex.
-- `POST /tx` and `GET /fee` accept browser requests from any origin.
+- `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` accept browser
+  requests from any origin.
 
 ### Go
 
@@ -143,12 +160,13 @@ hash, _, err := apitypes.TypedDataAndHash(typed)
 sig, err := crypto.Sign(hash, privateKey) // 65 bytes, v in {0,1} — accepted as is
 ```
 
-Then `POST` the same JSON body as above. A Rust client covering `get_fee`,
-`submit_tx`, `latest_snapshot`, `subscribe`, and the history routes is
-available in [`sdk/rust-client/`](../../sdk/rust-client/); the test harness
+Then `POST` the same JSON body as above. A Rust client covering `get_nonce`,
+`get_fee`, `get_domain`, `submit_tx`, `latest_snapshot`, `subscribe`, and the
+history routes is available in [`sdk/rust-client/`](../../sdk/rust-client/); the test harness
 signs with it in [`tests/harness/src/wallet.rs`](../../tests/harness/src/wallet.rs).
 
-Addresses in `POST /tx` responses and on the feed use EIP-55 checksum casing;
+Addresses in `/tx`, `/nonce`, and `/domain` responses and on the feed use
+EIP-55 checksum casing;
 the history routes use lowercase. Compare addresses as decoded bytes, and pick
 one normalized form for your own keys.
 
@@ -166,7 +184,7 @@ Errors share one shape: `{ "ok": false, "code": "<CODE>", "message": "<text>" }`
 | 400 | `BAD_REQUEST` | Malformed JSON, wrong hex lengths, payload over your application's size limit | Fix the request; do not retry |
 | 400 | `INVALID_SIGNATURE` | Signature invalid, or recovers to an address other than `sender` | Check domain values and type definition |
 | 413 | `PAYLOAD_TOO_LARGE` | HTTP body too large | Fix the request |
-| 422 | `EXECUTION_REJECTED` | Your application's validation rejected it: wrong nonce, `max_fee` below the current fee, or not enough balance for the fee | Read `message`; refresh the nonce or fetch `/fee` again; re-sign |
+| 422 | `EXECUTION_REJECTED` | Validation rejected it: wrong or exhausted nonce, `max_fee` below the current fee, or not enough balance for the fee | Read `message`; fetch `/nonce` or `/fee` again; re-sign |
 | 429 | `OVERLOADED` | The sequencer's queue is full | Back off and retry the same signed request |
 | 503 | `UNAVAILABLE` | The sequencer is shutting down or restarting | Retry with backoff |
 | 500 | `INTERNAL_ERROR` | Sequencer fault | Retry with backoff; alert if persistent |
@@ -182,18 +200,43 @@ from your indexer afterwards.
 
 ## Nonces
 
-The sequencer has no "get nonce" endpoint — the nonce lives in your
-application's state, and the sequencer does not interpret that state. Provide
-it from your indexer (which sees every included operation and its nonce on the
-feed), and have the frontend:
+`GET /nonce?sender=<address>` returns the nonce to sign next:
 
-1. fetch the next nonce when the session starts;
-2. increment locally after each `200`;
-3. on `422` with a nonce message (`bad nonce: expected 7, got 5`), resynchronize.
+```json
+{ "sender": "0xAbC…", "next_nonce": 7 }
+```
 
-Operations from one sender must be submitted in nonce order. Wait for each
-response before sending the next; an operation that arrives ahead of its
-predecessor is rejected.
+It is one past the sender's latest included operation — soft-confirmed ones
+count — or `0` for a sender with none. The sequencer derives it from its own
+record of included operations, which is possible because every application
+follows [the same nonce rule](application-model.md#nonces). Note the two
+meanings: `next_nonce` here is the value to sign; the `nonce` in a `POST /tx`
+response or a feed message is the value that operation consumed.
+
+How to use it:
+
+1. Keep **one operation in flight per sender**. Fetch `next_nonce`, sign,
+   submit, and on `200` increment locally or fetch again. Operations submitted
+   concurrently from one sender can arrive out of order and be rejected.
+2. After a `422` nonce rejection, fetch again rather than guessing. The
+   message also names the expected value (`bad nonce: expected 7, got 5`).
+3. If a submit **times out**, do not sign a different operation at the same
+   nonce. A `next_nonce` above the operation's nonce means it was included;
+   an unchanged one is inconclusive, because the operation may still be
+   queued. Resubmit the same signed operation.
+
+What the value is not:
+
+- It is a hint, not a reservation, and it can go **down**: a recovery that
+  rolls back soft-confirmed operations rolls their nonces back with them.
+- After an operator rebuild of the sequencer from a checkpoint, a sender who
+  has not transacted since reads `0` even though its real nonce is higher.
+  The `422` from the first attempt carries the right value, so a client that
+  follows rule 2 recovers by itself. The application is the authority: your
+  indexer's replica of the engine holds the true nonce if you need it without
+  a failed attempt.
+- `4294967295` means the account is exhausted and can never transact again.
+  Out of reach in practice, but it is not an ordinary nonce.
 
 ## Choosing `max_fee`
 
@@ -392,7 +435,7 @@ purposes. Your engine does not receive them and must not depend on them.
 ## Backends and bots
 
 A backend that transacts on its own behalf (a market maker, a keeper) is just
-another client: hold a key, read `/fee`, sign typed data, `POST /tx`, track
-the nonce.
+another client: hold a key, read `/nonce` and `/fee`, sign typed data,
+`POST /tx`.
 Because responses arrive in milliseconds, submit sequentially per account and
 treat `429` as backpressure.

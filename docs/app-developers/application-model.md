@@ -101,11 +101,25 @@ On L1, replay protection is free: the account nonce stops anyone from
 resubmitting a transaction. A signed message sent over HTTP has no such
 protection, so **your application state must hold a nonce per sender**.
 
-- Each sender starts at nonce `0`.
-- `validateUserOp` rejects an operation whose `nonce` differs from the sender's
-  expected nonce.
-- `applyUserOp` increments the sender's nonce — always, even when the operation
-  then fails for business reasons.
+The rule is fixed by the protocol rather than left to each application,
+because the sequencer answers `GET /nonce` from its own record of included
+operations, without asking your engine:
+
+- Every account starts at nonce `0`.
+- `validateUserOp` accepts an operation only when its `nonce` equals the
+  sender's expected nonce.
+- `applyUserOp` advances the sender's nonce by exactly one — always, even when
+  the operation then fails for business reasons.
+- Nothing else changes a nonce: not a direct input, not another sender's
+  operation.
+
+An engine with a different scheme — gaps, a nonce per key or per market, a
+deposit that resets one — makes the sequencer quote nonces the engine then
+rejects.
+
+Nonces are 32-bit. The last value, `4294967295`, has no successor, so the host
+refuses an operation carrying it even when your validation accepts it. Your
+engine does not check for this; an account simply cannot go past it.
 
 `ValidUserOp` carries no nonce field: applying an operation consumes whatever
 nonce the state currently expects.
@@ -166,7 +180,7 @@ the most important rule on this page.
 
 | Outcome | When | Effect on state | What the user sees |
 |---|---|---|---|
-| **Rejected** | Validation says no: wrong nonce, fee above `max_fee`, cannot pay the fee | **None.** Nonce not consumed, nothing charged, nothing recorded | HTTP `422` with the reason |
+| **Rejected** | Validation says no: wrong or exhausted nonce, fee above `max_fee`, cannot pay the fee | **None.** Nonce not consumed, nothing charged, nothing recorded | HTTP `422` with the reason |
 | **Included** | Validation passed | Nonce consumed, fee charged, counters advance — **even if the operation then fails** | HTTP `200` |
 | **Fatal** | The engine itself is broken (a bug, corrupted state, disk failure) | Undefined; the host discards the engine and stops | Sequencer outage |
 
@@ -187,8 +201,8 @@ Why so strict?
   is included, its bytes go to L1 at the sequencer's expense whatever the
   business outcome. Validation exists to ensure that cost is recoverable.
 - **The rejection reasons are protocol vocabulary**, not application
-  vocabulary: wrong nonce, fee cap too low, cannot pay the fee. There is no
-  reason code for "your order would not fill".
+  vocabulary: wrong nonce, exhausted nonce, fee cap too low, cannot pay the
+  fee. There is no reason code for "your order would not fill".
 - The machine runs the same validation when it executes a batch. The smaller
   that predicate, the less there is to keep identical between the two hosts.
 

@@ -70,9 +70,9 @@ Where:
 
 - `progress` is `{ executed_input_count, last_executed_safe_block }`.
 - `reason` is one of `invalid_nonce` (`expected`, `got`) or
-  `insufficient_fee_balance` (`required`, `available`). `invalid_max_fee` is
-  never produced by an engine — the protocol guard belongs to the sequencer —
-  but is reserved so the vocabulary matches `InvalidReason`.
+  `insufficient_fee_balance` (`required`, `available`). `invalid_max_fee` and
+  `nonce_exhausted` are never produced by an engine — those guards belong to
+  the sequencer — but are reserved so the vocabulary matches `InvalidReason`.
 - An output is `{ kind: "notice", payload }` or
   `{ kind: "voucher", destination, value, payload }`, in emission order.
 - `state_file_name` is the path, relative to a dump prefix, of the canonical
@@ -123,7 +123,10 @@ gets the schema right and any of these wrong is not compliant.
 8. **Timeouts are policy the sequencer owns**, per method, and a timeout is a
    failure (rule 3), because slow and hung are indistinguishable and the
    500 ms acknowledgement budget makes "slow" already a fault.
-9. **Capabilities are exchanged once** at connect. The engine reports its
+9. **The engine follows the [user-nonce rule](../protocol/application-contract.md#user-nonces).**
+   The sequencer serves `GET /nonce` from its own records and never asks the
+   engine; no method here exposes nonces.
+10. **Capabilities are exchanged once** at connect. The engine reports its
    payload bound; the sequencer pins it at `setup` beside the deployment
    identity and refuses at `run` if it changed, since batch sizing and
    ingress admission depend on it.

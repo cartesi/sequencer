@@ -138,6 +138,7 @@ function executeUserOp(domain, frame, op): Output[] {
   if (!sender) return [];
   if (op.maxFee < frame.feePrice) return [];     // protocol guard → skip
   if (engine.validateUserOp(sender, op, frame.feePrice).kind === "reject") return [];
+  if (op.nonce === 0xffffffff) return [];        // exhausted nonce → skip
   return engine.applyUserOp(
     { sender, fee: frame.feePrice, data: op.data }, frame.safeBlock);
 }
@@ -148,7 +149,10 @@ function applyDirect(d: QueuedDirect): Output[] {
 }
 ```
 
-A skipped operation changes nothing: no nonce, no fee, no counter. After every
+The exhausted-nonce guard comes *after* validation, so an operation that
+merely carries `0xffffffff` at the wrong time is skipped as a wrong nonce and
+only an account genuinely at that value is refused. A skipped operation
+changes nothing: no nonce, no fee, no counter. After every
 successful apply, assert that the engine's counters moved by exactly one input
 and that the clock is `max(previous, block)`; the reference does, and stops if
 they did not.
@@ -243,9 +247,11 @@ The messages mirror the trait one to one:
 What the TypeScript side of that must get right:
 
 - One request at a time, answered in order. No concurrency inside the engine.
-- `reject` carries one of the three protocol reasons and its values
+- `reject` carries a protocol reason and its values
   ([`application-model.md`](application-model.md#the-three-outcomes)). An
-  exception is `fatal`, never `reject`.
+  engine produces only wrong-nonce and insufficient-fee-balance; the fee-cap
+  and exhausted-nonce guards belong to the host. An exception is `fatal`,
+  never `reject`.
 - `create_dump` must be durable before it answers: write the files,
   `fsyncSync` each file, then `fsyncSync` the directory and its parent. It
   must fail if the path already exists.
