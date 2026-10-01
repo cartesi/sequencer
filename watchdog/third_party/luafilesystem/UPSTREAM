@@ -1,0 +1,15 @@
+LuaFileSystem (lfs native module).
+
+URL:     https://github.com/lunarmodules/luafilesystem
+Tag:     v1_9_0
+Tarball: https://github.com/lunarmodules/luafilesystem/archive/refs/tags/v1_9_0.tar.gz
+SHA-256: 1142c1876e999b3e28d1c236bf21ffd9b023018e336ac25120fb5373aade1450
+License: MIT (see LICENSE in this directory)
+
+Vendored in-tree: only `src/lfs.c` and `src/lfs.h`, unmodified. The watchdog
+uses it for directory listing, creation, and removal, so it never shells out
+for filesystem work. `scripts/watchdog-lua-deps.sh` compiles `src/lfs.c` into
+`.deps/lua/lfs.so`; there is no build-time download.
+
+Updating: replace `src/` and LICENSE from a newer upstream tag, and update the
+lines above.

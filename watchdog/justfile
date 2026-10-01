@@ -1,35 +1,43 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set working-directory := ".."
 
+lua := env("CARTESI_WATCHDOG_LUA_BIN", "lua5.4")
+test_guest_image := "watchdog/test-guest/out/test-machine-image"
+
 default:
     @just --list --justfile {{source_file()}}
 
-test:
-    "${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}" watchdog/tests/run.lua
+# Unit tests: every module against fakes (no Cartesi Machine needed).
+test: lua-deps
+    {{lua}} watchdog/tests/run.lua
 
-test-e2e:
-    "${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}" watchdog/tests/e2e.lua
+# Real Cartesi Machine tests: executor vs the reference CLI, state sources, full ticks.
+test-e2e: lua-deps test-guest-image
+    @test -d examples/canonical-app/out/canonical-machine-image-sepolia || { \
+        echo "missing the sepolia canonical image; run: just canonical-build-machine-image-sepolia"; exit 1; }
+    {{lua}} watchdog/tests/e2e.lua
 
-test-divergence-drill: lua-deps
-    @bash scripts/test-watchdog-divergence-drill.sh
+lint:
+    cd watchdog && luacheck --no-color *.lua tests/*.lua
 
+# Build the vendored native Lua modules (lcurl, lfs) into .deps/lua.
 lua-deps:
     @bash scripts/watchdog-lua-deps.sh
+
+# The test guest image (built once; `just --justfile watchdog/test-guest/justfile build-image` rebuilds).
+test-guest-image:
+    @test -f {{test_guest_image}}/config.json || just --justfile watchdog/test-guest/justfile build-image
 
 docker-smoke:
     @bash scripts/ci-watchdog-docker-smoke.sh
 
-doctor:
-    @command -v "${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}" >/dev/null || { echo "doctor: Lua 5.4 not on PATH"; exit 1; }
+doctor: lua-deps
+    @command -v {{lua}} >/dev/null || { echo "doctor: Lua 5.4 not on PATH"; exit 1; }
     @command -v cartesi-machine >/dev/null || { echo "doctor: cartesi-machine not on PATH"; exit 1; }
     @test -d examples/canonical-app/out/canonical-machine-image || { \
-        echo "doctor: missing devnet machine image; run: just canonical-build-machine-image"; \
-        exit 1; \
-    }
-    @test -f .deps/lua/lcurl.so || { \
-        echo "doctor: missing .deps/lua/lcurl.so; run: just watchdog-lua-deps"; \
-        exit 1; \
-    }
-    @"${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}" -e "package.cpath = '.deps/lua/?.so;' .. package.cpath; require('lcurl'); print('doctor: lcurl ok')"
-    @"${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}" -e "package.path = './?.lua;./?/init.lua;' .. package.path; local m=require('watchdog.machine_cartesi').new(); local inst,err=m:load('examples/canonical-app/out/canonical-machine-image'); if not inst then error('doctor: machine_cartesi cannot load devnet image: '..tostring(err)) end; print('doctor: machine_cartesi load ok')"
+        echo "doctor: missing devnet machine image; run: just canonical-build-machine-image"; exit 1; }
+    @{{lua}} -e "package.path='./?.lua;'..package.path; package.cpath='.deps/lua/?.so;'..package.cpath; \
+        require('lcurl'); require('lfs'); \
+        require('watchdog.machine').new().check_source(os.getenv('PWD')..'/examples/canonical-app/out/canonical-machine-image', { kind = 'inspect' }); \
+        print('doctor: native modules load; the devnet image answers the state query')"
     @echo "doctor: watchdog toolchain ok"

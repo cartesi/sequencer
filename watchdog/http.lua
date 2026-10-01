@@ -1,114 +1,122 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- HTTP client via in-tree lua-curl / lcurl (libcurl on the host).
+--- HTTP client over the vendored lua-curl (`lcurl`). Requests return a
+--- response table, or `nil, message` when no response arrived.
+---
+--- Small requests share a total timeout. Downloads stream to a file and are
+--- bounded by a stall limit instead, since their size is the application's.
 
 local http = {}
 
-local function parse_response_headers(header_lines)
+local REQUEST_TIMEOUT_SEC = 30
+local CONNECT_TIMEOUT_SEC = 10
+local STALL_BYTES_PER_SEC = 1024
+local STALL_SEC = 60
+
+local function parse_headers(lines)
     local headers = {}
-    for _, line in ipairs(header_lines) do
-        local name, value = line:match("^([^:]+):%s*(.+)$")
-        if name and value then
+    for _, line in ipairs(lines) do
+        local name, value = line:match("^([^:]+):%s*(.-)%s*$")
+        if name then
             headers[name:lower()] = value
         end
     end
     return headers
 end
 
-function http.format_request_error(method, url, err)
-    return string.format("%s %s failed: %s", method, url, tostring(err))
-end
-
-local function request_method(opts)
-    if opts.method then
-        return opts.method
-    end
-    if opts.post then
-        return "POST"
-    end
-    return "GET"
-end
-
-function http.new_curl()
-    local ok, curl = pcall(require, "cURL")
+function http.new()
+    local ok, curl = pcall(require, "lcurl")
     if not ok then
-        ok, curl = pcall(require, "lcurl")
-    end
-    if not ok then
-        error(
-            "lua-curl binding not found; run: just watchdog-lua-deps "
-                .. "(requires libcurl dev headers on the host)"
-        )
+        error("lua-curl module `lcurl` not found; run: just watchdog-lua-deps")
     end
 
     local client = {}
 
-    local function perform_request(opts)
-        local chunks = {}
-        local header_lines = {}
-        local header_list = {}
+    -- `opts`: url, method, body, headers, timeout (total seconds, nil for a
+    -- stall-bounded download), write (receives each body chunk).
+    local function perform(opts)
+        local header_lines, header_list = {}, {}
         for key, value in pairs(opts.headers or {}) do
-            table.insert(header_list, key .. ": " .. value)
+            header_list[#header_list + 1] = key .. ": " .. value
         end
-
         local easy = curl.easy({
             url = opts.url,
-            post = opts.post,
-            postfields = opts.postfields,
             httpheader = header_list,
-            timeout = 30,
+            connecttimeout = CONNECT_TIMEOUT_SEC,
             writefunction = function(chunk)
-                table.insert(chunks, chunk)
+                opts.write(chunk)
                 return #chunk
             end,
             headerfunction = function(line)
                 local trimmed = line:gsub("\r?\n$", "")
                 if trimmed ~= "" then
-                    table.insert(header_lines, trimmed)
+                    header_lines[#header_lines + 1] = trimmed
                 end
                 return #line
             end,
         })
-
-        local ok_perform, err = pcall(function()
-            easy:perform()
-        end)
-        if not ok_perform then
-            easy:close()
-            return nil, http.format_request_error(request_method(opts), opts.url, err)
+        if opts.body then
+            easy:setopt_post(true)
+            easy:setopt_postfields(opts.body)
         end
-
-        local status = easy:getinfo_response_code()
+        if opts.timeout then
+            easy:setopt_timeout(opts.timeout)
+        else
+            easy:setopt_low_speed_limit(STALL_BYTES_PER_SEC)
+            easy:setopt_low_speed_time(STALL_SEC)
+        end
+        local performed, err = pcall(easy.perform, easy)
+        local status = performed and easy:getinfo_response_code() or nil
         easy:close()
-        return {
-            status = status,
-            body = table.concat(chunks),
-            headers = parse_response_headers(header_lines),
-        }
+        if not performed then
+            return nil, string.format("%s %s failed: %s", opts.body and "POST" or "GET", opts.url, tostring(err))
+        end
+        return { status = status, headers = parse_headers(header_lines) }
     end
 
-    function client.post(_self, url, body, headers)
-        return perform_request({
-            url = url,
-            post = true,
-            postfields = body,
-            headers = headers,
-        })
+    local function buffered(opts)
+        local chunks = {}
+        opts.write = function(chunk)
+            chunks[#chunks + 1] = chunk
+        end
+        opts.timeout = opts.timeout or REQUEST_TIMEOUT_SEC
+        local response, err = perform(opts)
+        if response then
+            response.body = table.concat(chunks)
+        end
+        return response, err
     end
 
-    function client.get(_self, url, headers)
-        return perform_request({
+    function client:get(url, opts)
+        opts = opts or {}
+        return buffered({ url = url, headers = opts.headers, timeout = opts.timeout })
+    end
+
+    function client:post(url, body, headers)
+        return buffered({ url = url, body = body, headers = headers })
+    end
+
+    --- Stream the body into `path`. For a non-2xx status the response also
+    --- carries the body's first bytes, for the error message.
+    function client:download(url, path)
+        local file = assert(io.open(path, "wb"))
+        local response, err = perform({
             url = url,
-            headers = headers,
+            write = function(chunk)
+                assert(file:write(chunk))
+            end,
         })
+        assert(file:close())
+        if response and (response.status < 200 or response.status >= 300) then
+            local body = assert(io.open(path, "rb"))
+            response.body = body:read(512) or ""
+            body:close()
+        end
+        return response, err
     end
 
     return client
-end
-
-function http.new()
-    return http.new_curl()
 end
 
 return http

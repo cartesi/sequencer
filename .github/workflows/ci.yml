@@ -28,7 +28,19 @@ jobs:
             libfaketime \
             lua5.4 \
             liblua5.4-dev \
+            lua-check \
+            libcurl4-openssl-dev \
             libslirp-dev
+
+      # canonical-test links the emulator through testsi's cartesi-machine
+      # bindings, so the workspace build needs the pinned CM .deb and the
+      # LIBCARTESI_PATH / INCLUDECARTESI_PATH this action exports.
+      - name: Install cartesi-machine
+        uses: ./.github/actions/install-cartesi-machine
+        with:
+          version: ${{ env.CARTESI_MACHINE_VERSION }}
+          sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
+          sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -53,11 +65,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Watchdog Lua tests
-        run: lua5.4 watchdog/tests/run.lua
+      - name: Watchdog Lua lint
+        run: cd watchdog && luacheck --no-color *.lua tests/*.lua
 
-      - name: Watchdog divergence drill
-        run: bash scripts/test-watchdog-divergence-drill.sh
+      - name: Watchdog Lua unit tests
+        run: |
+          bash scripts/watchdog-lua-deps.sh
+          lua5.4 watchdog/tests/run.lua
 
       - name: Test
         timeout-minutes: 15
@@ -132,9 +146,8 @@ jobs:
       - name: Run rollups E2E tests (Rust and C hosts)
         run: just test-rollups-e2e
 
-      # Runs after the e2e step so the canonical machine image is already built;
-      # exercises the in-process machine_cartesi binding incl. store -> reload -> advance,
-      # which the Rust harness never loads (its compare passes only load the genesis image).
+      # Runs after the e2e step so the canonical images already exist. Builds the
+      # watchdog test guest and checks the executor against the reference CLI.
       - name: Watchdog Lua CM e2e
         run: just test-watchdog-e2e
 

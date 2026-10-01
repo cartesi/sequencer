@@ -1,197 +1,76 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-local state = require("watchdog.state")
+--- The Prometheus textfile (`status.prom`) every tick writes before exiting.
+--- A textfile-collector sample carries the scrape time, not the tick time, so
+--- the file includes its own completion timestamp: a hung or skipped tick is
+--- visible as a stale `cartesi_watchdog_last_tick_timestamp_seconds`.
 
 local metrics = {}
 
-metrics.STATUS_FILE = "status.prom"
-metrics.METRIC_STATUS = "cartesi_watchdog_status"
+local STATES = { "ok", "warning", "failed" }
 
-local function normalize_env(env)
-    if env == nil then
-        return os.getenv
-    end
-    if type(env) == "function" then
-        return env
-    end
-    return function(name)
-        return env[name]
-    end
+local function escape(value)
+    return (tostring(value):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"))
 end
 
-local function escape_label(value)
-    value = tostring(value)
-    value = value:gsub("\\", "\\\\")
-    value = value:gsub('"', '\\"')
-    value = value:gsub("\n", "\\n")
-    return value
-end
-
-local function base_labels(opts)
-    local labels = {}
-    local chain = opts.chain_id
-    if chain == nil or chain == "" then
-        chain = "unknown"
+local function labels(base, extra)
+    local all = {}
+    for key, value in pairs(base) do
+        all[key] = value
     end
-    labels.chain = tostring(chain)
-
-    local app_address = opts.app_address
-    if app_address == nil or app_address == "" then
-        app_address = "unknown"
-    else
-        -- Match config.normalize_address: labels must not depend on EIP-55 casing.
-        app_address = tostring(app_address):lower()
+    for key, value in pairs(extra or {}) do
+        all[key] = value
     end
-    labels.app_address = app_address
-    return labels
-end
-
-local function label_string(labels)
     local keys = {}
-    for key in pairs(labels) do
-        table.insert(keys, key)
+    for key in pairs(all) do
+        keys[#keys + 1] = key
     end
     table.sort(keys)
-
     local parts = {}
     for _, key in ipairs(keys) do
-        table.insert(parts, key .. '="' .. escape_label(labels[key]) .. '"')
+        parts[#parts + 1] = string.format('%s="%s"', key, escape(all[key]))
     end
     return "{" .. table.concat(parts, ",") .. "}"
 end
 
-local function gauge_line(name, labels, value)
-    return name .. label_string(labels) .. " " .. tostring(value)
-end
-
 function metrics.state_for_exit_code(exit_code)
-    if exit_code == 2 then
-        return "failed"
-    end
-    if exit_code == 1 then
-        return "warning"
-    end
-    return "ok"
+    return exit_code == 2 and "failed" or exit_code == 1 and "warning" or "ok"
 end
 
-local function resolve_chain_id_from_opts(opts)
-    if opts.chain_id ~= nil and opts.chain_id ~= "" then
-        return tostring(opts.chain_id)
-    end
-
-    local cfg = opts.cfg
-    if cfg and cfg.blockchain_id ~= nil and cfg.blockchain_id ~= "" then
-        return tostring(cfg.blockchain_id)
-    end
-
-    local getenv = normalize_env(opts.env)
-    local from_env = getenv("CARTESI_WATCHDOG_BLOCKCHAIN_ID")
-    if from_env ~= nil and from_env ~= "" then
-        return tostring(from_env)
-    end
-
-    return nil
-end
-
-function metrics.resolve_chain_id(opts)
-    return resolve_chain_id_from_opts(opts)
-end
-
-function metrics.query_chain_id_from_rpc(l1_rpc_url, rpc_factory)
-    if l1_rpc_url == nil or l1_rpc_url == "" then
-        return nil
-    end
-
-    local ok, chain = pcall(function()
-        local rpc
-        if type(rpc_factory) == "function" then
-            rpc = rpc_factory(l1_rpc_url)
-        else
-            local http_mod = require("watchdog.http")
-            local json_mod = require("watchdog.json")
-            local jsonrpc = require("watchdog.jsonrpc")
-            rpc = jsonrpc.new(http_mod.new(), json_mod.new(), l1_rpc_url)
-        end
-        return rpc:get_chain_id()
-    end)
-    if ok and chain ~= nil then
-        return tostring(chain)
-    end
-    return nil
-end
-
-function metrics.resolve_path(cfg, env)
-    local getenv = normalize_env(env)
-    local configured = getenv("CARTESI_WATCHDOG_METRICS_FILE")
-    if configured ~= nil and configured ~= "" then
-        return configured
-    end
-    if cfg and cfg.metrics_file and cfg.metrics_file ~= "" then
-        return cfg.metrics_file
-    end
-    if cfg and cfg.state_dir and cfg.state_dir ~= "" then
-        return cfg.state_dir .. "/" .. metrics.STATUS_FILE
-    end
-    local state_dir = getenv("CARTESI_WATCHDOG_STATE_DIR")
-    if state_dir == nil or state_dir == "" then
-        return nil, "CARTESI_WATCHDOG_STATE_DIR is required"
-    end
-    return state_dir .. "/" .. metrics.STATUS_FILE
-end
-
-function metrics.build_prom(opts)
-    assert(type(opts) == "table", "opts is required")
-    assert(type(opts.exit_code) == "number", "exit_code is required")
-
-    local labels = base_labels(opts)
-    local active_state = metrics.state_for_exit_code(opts.exit_code)
-
-    local lines = {
-        "# HELP " .. metrics.METRIC_STATUS .. " Current watchdog compare state (1 = active).",
-        "# TYPE " .. metrics.METRIC_STATUS .. " gauge",
-        gauge_line(metrics.METRIC_STATUS, {
-            chain = labels.chain,
-            app_address = labels.app_address,
-            state = "ok",
-        }, active_state == "ok" and 1 or 0),
-        gauge_line(metrics.METRIC_STATUS, {
-            chain = labels.chain,
-            app_address = labels.app_address,
-            state = "warning",
-        }, active_state == "warning" and 1 or 0),
-        gauge_line(metrics.METRIC_STATUS, {
-            chain = labels.chain,
-            app_address = labels.app_address,
-            state = "failed",
-        }, active_state == "failed" and 1 or 0),
+--- `report`: chain_id and app_address (nil when the config could not be
+--- read), exit_code, timestamp (unix seconds), and optionally head_block and
+--- divergence_kind (while latched).
+function metrics.render(report)
+    local base = {
+        chain = report.chain_id and tostring(report.chain_id) or "unknown",
+        app_address = report.app_address or "unknown",
     }
-
-    if opts.divergence_kind and opts.divergence_kind ~= "" then
-        table.insert(lines, "# HELP cartesi_watchdog_divergence_info Divergence kind from the last tick (1 = present).")
-        table.insert(lines, "# TYPE cartesi_watchdog_divergence_info gauge")
-        table.insert(lines, gauge_line("cartesi_watchdog_divergence_info", {
-            chain = labels.chain,
-            app_address = labels.app_address,
-            kind = opts.divergence_kind,
-        }, 1))
+    local state = metrics.state_for_exit_code(report.exit_code)
+    local lines = {
+        "# HELP cartesi_watchdog_status Outcome of the last tick (1 = current state).",
+        "# TYPE cartesi_watchdog_status gauge",
+    }
+    local function gauge(name, extra, value)
+        lines[#lines + 1] = name .. labels(base, extra) .. " " .. tostring(value)
     end
-
+    for _, name in ipairs(STATES) do
+        gauge("cartesi_watchdog_status", { state = name }, name == state and 1 or 0)
+    end
+    if report.divergence_kind then
+        lines[#lines + 1] = "# HELP cartesi_watchdog_divergence_info Latched divergence kind (1 = latched)."
+        lines[#lines + 1] = "# TYPE cartesi_watchdog_divergence_info gauge"
+        gauge("cartesi_watchdog_divergence_info", { kind = report.divergence_kind }, 1)
+    end
+    if report.head_block then
+        lines[#lines + 1] = "# HELP cartesi_watchdog_head_block L1 block of the watchdog's head checkpoint."
+        lines[#lines + 1] = "# TYPE cartesi_watchdog_head_block gauge"
+        gauge("cartesi_watchdog_head_block", nil, report.head_block)
+    end
+    lines[#lines + 1] = "# HELP cartesi_watchdog_last_tick_timestamp_seconds When the last tick finished."
+    lines[#lines + 1] = "# TYPE cartesi_watchdog_last_tick_timestamp_seconds gauge"
+    gauge("cartesi_watchdog_last_tick_timestamp_seconds", nil, report.timestamp)
     return table.concat(lines, "\n") .. "\n"
-end
-
-function metrics.write_tick_status(opts)
-    local path, path_err = metrics.resolve_path(opts.cfg, opts.env)
-    if not path then
-        return nil, path_err
-    end
-    local body = metrics.build_prom({
-        exit_code = opts.exit_code,
-        chain_id = resolve_chain_id_from_opts(opts),
-        app_address = opts.app_address or (opts.cfg and opts.cfg.app_address) or nil,
-        divergence_kind = opts.divergence_kind,
-    })
-    return state.write_file_atomic(path, body)
 end
 
 return metrics

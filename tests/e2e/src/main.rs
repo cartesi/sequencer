@@ -24,7 +24,7 @@ fn main() {
                 let scenario_name = name.strip_prefix("c_host_").unwrap_or(name);
                 if scenario_name == "watchdog_genesis_compare_test"
                     || scenario_name == "deposit_transfer_withdrawal_test"
-                    || scenario_name == "watchdog_non_genesis_divergence_test"
+                    || scenario_name == "watchdog_divergence_drill_test"
                 {
                     spawn_config.faketime = false;
                 } else if scenario_name == "fixed_fee_oracle_sets_frame_fee_test" {

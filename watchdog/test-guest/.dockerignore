@@ -1,0 +1,5 @@
+# The build context needs only the rootfs inputs, not stale images in out/.
+*
+!nvram.sh
+!out/dapp
+!out/xhalt

@@ -10,13 +10,13 @@ use app_core::application::{
 use canonical_app::SchedulerConfig;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
+use rollups_types::Erc20Transfer;
+use rollups_types::alloy_primitives::Signature;
+use rollups_types::alloy_primitives::{Address, U256, address};
+use rollups_types::alloy_sol_types::{Eip712Domain, SolCall, SolStruct};
 use sequencer_core::batch::{Batch, Frame, WireUserOp};
 use sequencer_core::user_op::UserOp;
 use testsi::{InputBuilder, Machine, MachineBuilder, OutputsForInput, TestResult};
-use types::Erc20Transfer;
-use types::alloy_primitives::Signature;
-use types::alloy_primitives::{Address, U256, address};
-use types::alloy_sol_types::{Eip712Domain, SolCall, SolStruct};
 
 testsi::testsi_main!();
 
@@ -428,7 +428,7 @@ fn batch_with_frame_fee(
 }
 
 fn encode_erc20_deposit_payload(token: Address, sender: Address, value: U256) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(types::ERC20_DEPOSIT_PREFIX_BYTES);
+    let mut payload = Vec::with_capacity(rollups_types::ERC20_DEPOSIT_PREFIX_BYTES);
     payload.extend_from_slice(token.as_slice());
     payload.extend_from_slice(sender.as_slice());
     payload.extend_from_slice(value.to_be_bytes::<32>().as_slice());
