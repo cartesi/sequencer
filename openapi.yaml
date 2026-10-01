@@ -1,0 +1,1114 @@
+openapi: 3.1.0
+info:
+  title: Cartesi Sequencer API
+  version: 0.1.0
+  summary: HTTP and WebSocket API of the app-specific DeFi sequencer.
+  description: |
+    The sequencer serves two groups of routes from one listener:
+
+    - **Ingress** (public): submit signed user operations and read what a
+      wallet needs to sign them. CORS allows any origin on these routes.
+    - **Egress** (internal): application-input subscription, history
+      metadata, snapshot/state downloads, and health probes. These routes
+      have **no authentication and must not be exposed publicly**; gate them
+      with network access controls.
+
+    Address casing differs by route. `sender` in `POST /tx` and `GET /nonce`
+    responses and WebSocket messages, and `verifyingContract` in
+    `GET /domain`, use EIP-55 checksum casing. Address fields in `/history`
+    and `sender` in `/historical-l1-inputs` use lowercase hex. Compare decoded
+    20-byte addresses.
+
+    All `u64` values are JSON numbers; clients must preserve integer
+    precision.
+
+    The README's API section owns the wire contract; this document mirrors it.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://127.0.0.1:3000
+    description: Default listen address (`CARTESI_SEQUENCER_HTTP_ADDR`).
+tags:
+  - name: ingress
+    description: Public routes for wallets and submitters.
+  - name: history
+    description: Internal. Application-history subscription, metadata, and historical L1 inputs.
+  - name: snapshots
+    description: Internal. Operator state and snapshot downloads for the watchdog and indexers.
+  - name: health
+    description: Internal. Liveness and readiness probes.
+
+paths:
+  /tx:
+    post:
+      tags: [ingress]
+      operationId: submitTx
+      summary: Submit a signed user operation
+      description: |
+        Verifies the EIP-712 signature, enqueues the op for the inclusion
+        lane, and waits for the lane's commit acknowledgement. `200` means the
+        op is included (soft-confirmed).
+
+        The raw request body is capped at 4096 bytes. `message.data` is
+        additionally bounded by the application's maximum method payload size.
+        Nonce and `max_fee` are checked by the inclusion lane, not at
+        admission.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxRequest"
+            example:
+              message:
+                nonce: 0
+                max_fee: 1409
+                data: "0x00"
+              signature: "0x1b2c3d4e5f60718293a4b5c6d7e8f9011b2c3d4e5f60718293a4b5c6d7e8f9011b2c3d4e5f60718293a4b5c6d7e8f9011b2c3d4e5f60718293a4b5c6d7e8f9011b"
+              sender: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+      responses:
+        "200":
+          description: The op was included.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxResponse"
+        "400":
+          description: |
+            Malformed request (`BAD_REQUEST`: invalid JSON, missing content
+            type, wrong hex lengths, oversized `message.data`) or a signature
+            that does not recover `sender` (`INVALID_SIGNATURE`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                badRequest:
+                  value: { ok: false, code: BAD_REQUEST, message: invalid JSON }
+                invalidSignature:
+                  value: { ok: false, code: INVALID_SIGNATURE, message: sender mismatch }
+        "413":
+          description: The request body exceeds the body cap.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { ok: false, code: PAYLOAD_TOO_LARGE, message: request body too large }
+        "422":
+          description: |
+            The application rejected the op; no state changed and nothing was
+            persisted. Reasons: bad nonce, exhausted nonce, `max_fee` below
+            the open-frame fee, or insufficient balance for the fee. After a
+            bad-nonce rejection, query `GET /nonce` again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                badNonce:
+                  value: { ok: false, code: EXECUTION_REJECTED, message: "bad nonce: expected 7, got 6" }
+                maxFee:
+                  value: { ok: false, code: EXECUTION_REJECTED, message: max fee 1300 below base fee 1356 }
+        "429":
+          description: The inclusion-lane queue is full.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { ok: false, code: OVERLOADED, message: queue full }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /fee:
+    get:
+      tags: [ingress]
+      operationId: getFee
+      summary: Fee quote for signing `max_fee`
+      description: |
+        All three fields are log-space exponents (base 129/128), the same
+        encoding as `max_fee`. Inclusion rejects any op with `max_fee` below
+        the open-frame `fee`.
+      responses:
+        "200":
+          description: Current quote.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeeResponse"
+              example: { fee: 1356, recommended_fee: 1356, suggested_max_fee: 1409 }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Shutting down, or no open frame exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { ok: false, code: UNAVAILABLE, message: no open frame }
+
+  /nonce:
+    get:
+      tags: [ingress]
+      operationId: getNonce
+      summary: Next nonce a sender must sign
+      description: |
+        `next_nonce` is one past the sender's latest included op, or 0 if it
+        has none. It counts soft-confirmed ops. The value is a hint, not a
+        reservation: it can go down after automatic recovery, and after an
+        operator rebuild a sender with no surviving op reads 0.
+        `4294967295` means the account is exhausted.
+      parameters:
+        - name: sender
+          in: query
+          required: true
+          description: "`0x` plus 40 hex digits, any letter case."
+          schema:
+            $ref: "#/components/schemas/Address"
+      responses:
+        "200":
+          description: The sender's next nonce.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NonceResponse"
+              example: { sender: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266", next_nonce: 7 }
+        "400":
+          description: Missing or malformed `sender`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                ok: false
+                code: BAD_REQUEST
+                message: "expected ?sender=<0x-prefixed 20-byte hex address>"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /domain:
+    get:
+      tags: [ingress]
+      operationId: getDomain
+      summary: EIP-712 domain signatures are verified against
+      description: |
+        Keyed as `eth_signTypedData_v4` expects. Clients should pin their own
+        domain and assert that it matches rather than sign with the served
+        domain unchecked.
+      responses:
+        "200":
+          description: The verification domain.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainResponse"
+              example:
+                name: CartesiAppSequencer
+                version: "1"
+                chainId: 31337
+                verifyingContract: "0xaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaB"
+
+  /ws/subscribe:
+    get:
+      tags: [history]
+      operationId: subscribe
+      summary: WebSocket stream of application inputs
+      description: |
+        Replays the current application history from the inclusive
+        `next_input` offset, then follows the optimistic tip. Fetch and
+        restore `/latest_snapshot` first; its headers supply the claim.
+
+        After the upgrade, the server sends JSON text frames shaped as
+        `BroadcastTxMessage`. The subscriber cap is 64. Shutdown or a feed
+        failure may disconnect without a Close frame; resume from the saved
+        claim.
+      parameters:
+        - name: era_id
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/EraId"
+        - name: recovery_generation
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/U64"
+        - name: next_input
+          in: query
+          required: true
+          description: Inclusive offset of the first input to receive.
+          schema:
+            $ref: "#/components/schemas/U64"
+        - name: Upgrade
+          in: header
+          required: true
+          schema:
+            type: string
+            const: websocket
+        - name: Connection
+          in: header
+          required: true
+          schema:
+            type: string
+            const: Upgrade
+      responses:
+        "101":
+          description: |
+            Switching protocols. Subsequent text frames are
+            `BroadcastTxMessage` JSON documents.
+        "400":
+          description: |
+            Missing or malformed query fields, or not a WebSocket upgrade
+            request. The body is plain text, not the JSON error shape.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "409":
+          description: |
+            The claim does not match the current history. Rebootstrap on an
+            era or generation mismatch.
+          headers:
+            X-History-Error:
+              description: The same refusal as the body, JSON-encoded.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoryPolicyError"
+        "429":
+          description: Subscriber limit reached.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { ok: false, code: OVERLOADED, message: ws subscriber limit reached }
+        "503":
+          $ref: "#/components/responses/Unavailable"
+      x-websocket-messages:
+        server:
+          $ref: "#/components/schemas/BroadcastTxMessage"
+
+  /history:
+    get:
+      tags: [history]
+      operationId: getHistory
+      summary: Deployment, history, baseline, and accepted-checkpoint metadata
+      description: |
+        One coherent view. `compatibility` is `null` unless `from_generation`
+        is supplied together with `era_id`. Unknown query fields are rejected.
+      parameters:
+        - name: era_id
+          in: query
+          required: false
+          description: Require this era; a mismatch returns `409 ERA_CHANGED`.
+          schema:
+            $ref: "#/components/schemas/EraId"
+        - name: from_generation
+          in: query
+          required: false
+          description: Requires `era_id`. A generation ahead of the current one is `400`.
+          schema:
+            $ref: "#/components/schemas/U64"
+      responses:
+        "200":
+          description: History metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoryInfo"
+              example:
+                deployment:
+                  chain_id: 31337
+                  app_address: "0x1111111111111111111111111111111111111111"
+                  input_box_address: "0x2222222222222222222222222222222222222222"
+                  app_deployment_block: 1
+                  batch_submitter_address: "0x3333333333333333333333333333333333333333"
+                history:
+                  version:
+                    era_id: 22222222-2222-4222-8222-222222222222
+                    recovery_generation: 0
+                  available_from: 7
+                  head: 7
+                baseline:
+                  l1_stop_block: 1240
+                  l1_end_input_index: 8
+                  next_batch_nonce: 2
+                accepted_checkpoint: null
+                compatibility: null
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/HistoryConflict"
+        "503":
+          description: Shutting down, known canonical divergence, or an operational read failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { ok: false, code: UNAVAILABLE, message: history read unavailable }
+
+  /historical-l1-inputs:
+    get:
+      tags: [history]
+      operationId: getHistoricalL1Inputs
+      summary: Page through the era's immutable L1 input prefix
+      description: |
+        Serves InputBox inputs `[0, end_input_index)` through the era's
+        `l1_stop_block`. Provide exactly one of `next_input_index` or
+        `after_block`; continue with the returned `next_input_index`. Only
+        `next_input_index == end_input_index` means EOF; a short page does
+        not. Pages target 1 MiB of raw payloads; a larger first input is
+        returned alone. At most eight responses are in flight. Unknown query
+        fields are rejected.
+      parameters:
+        - name: era_id
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/EraId"
+        - name: next_input_index
+          in: query
+          required: false
+          description: Inclusive per-application InputBox index, starting at 0.
+          schema:
+            $ref: "#/components/schemas/U64"
+        - name: after_block
+          in: query
+          required: false
+          description: Seek to the first input strictly after this L1 block.
+          schema:
+            $ref: "#/components/schemas/U64"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 256
+            default: 256
+      responses:
+        "200":
+          description: One page of historical inputs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoricalL1InputsPage"
+              example:
+                era_id: 22222222-2222-4222-8222-222222222222
+                l1_stop_block: 1240
+                end_input_index: 8
+                next_input_index: 6
+                items:
+                  - input_index: 5
+                    sender: "0x3333333333333333333333333333333333333333"
+                    payload: "0x00"
+                    block_number: 1230
+                    block_timestamp: 1700014760
+                    transaction_hash: "0x4444444444444444444444444444444444444444444444444444444444444444"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/HistoryConflict"
+        "429":
+          description: Historical response limit reached.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { ok: false, code: OVERLOADED, message: historical response limit reached }
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /finalized_state/inclusion_block:
+    get:
+      tags: [snapshots]
+      operationId: getFinalizedInclusionBlock
+      summary: Accepted checkpoint coordinates
+      description: Cheap read the watchdog polls; no lease is taken.
+      responses:
+        "200":
+          description: The accepted checkpoint's L1 inclusion block and application count.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InclusionBlockResponse"
+        "404":
+          $ref: "#/components/responses/NoCheckpoint"
+        "500":
+          $ref: "#/components/responses/EmptyInternalError"
+        "503":
+          $ref: "#/components/responses/Divergence"
+
+  /finalized_state:
+    get:
+      tags: [snapshots]
+      operationId: getFinalizedState
+      summary: Download the accepted checkpoint's comparison file
+      description: |
+        Streams the application's canonical state file. The download holds a
+        GC lease until the response ends or the client disconnects.
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          description: Exact `"block-<n>"` ETag from a previous response.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The comparison file.
+          headers:
+            ETag:
+              description: '`"block-<inclusion_block>"`.'
+              schema:
+                type: string
+            X-Inclusion-Block:
+              $ref: "#/components/headers/XInclusionBlock"
+            X-Executed-Input-Count:
+              $ref: "#/components/headers/XExecutedInputCount"
+            X-History-Era:
+              $ref: "#/components/headers/XHistoryEra"
+            X-Recovery-Generation:
+              $ref: "#/components/headers/XRecoveryGeneration"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The ETag matches; no body.
+        "404":
+          $ref: "#/components/responses/NoCheckpoint"
+        "500":
+          $ref: "#/components/responses/EmptyInternalError"
+        "503":
+          $ref: "#/components/responses/Divergence"
+
+  /latest_snapshot:
+    get:
+      tags: [snapshots]
+      operationId: getLatestSnapshot
+      summary: Download the newest restorable snapshot
+      description: |
+        Streams a tar archive of the newest valid batch-close snapshot, or the
+        era baseline: `info.toml` plus the application's opaque `state` file
+        or directory. The snapshot may still be optimistic. Its headers supply
+        the complete `/ws/subscribe` claim.
+      responses:
+        "200":
+          description: The snapshot archive.
+          headers:
+            X-Executed-Input-Count:
+              $ref: "#/components/headers/XExecutedInputCount"
+            X-History-Era:
+              $ref: "#/components/headers/XHistoryEra"
+            X-Recovery-Generation:
+              $ref: "#/components/headers/XRecoveryGeneration"
+          content:
+            application/x-tar:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: No snapshot exists. Empty body.
+        "500":
+          $ref: "#/components/responses/EmptyInternalError"
+
+  /finalized_snapshot:
+    get:
+      tags: [snapshots]
+      operationId: getFinalizedSnapshot
+      summary: Download the accepted snapshot with its checkpoint receipt
+      description: |
+        Streams the accepted snapshot as a tar archive, adding a
+        `checkpoint.toml` receipt with its L1 inclusion block and next batch
+        nonce for trusted recovery.
+      responses:
+        "200":
+          description: The snapshot archive.
+          headers:
+            X-Inclusion-Block:
+              $ref: "#/components/headers/XInclusionBlock"
+            X-Executed-Input-Count:
+              $ref: "#/components/headers/XExecutedInputCount"
+            X-History-Era:
+              $ref: "#/components/headers/XHistoryEra"
+            X-Recovery-Generation:
+              $ref: "#/components/headers/XRecoveryGeneration"
+          content:
+            application/x-tar:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/NoCheckpoint"
+        "500":
+          $ref: "#/components/responses/EmptyInternalError"
+        "503":
+          $ref: "#/components/responses/Divergence"
+
+  /livez:
+    get:
+      tags: [health]
+      operationId: livez
+      summary: Liveness probe
+      responses:
+        "200":
+          description: The process is serving requests. Empty body.
+
+  /readyz:
+    get:
+      tags: [health]
+      operationId: readyz
+      summary: Readiness probe
+      responses:
+        "200":
+          description: The inclusion lane is open and shutdown has not been requested. Empty body.
+        "503":
+          description: Shutting down, or the inclusion lane has stopped. Empty body.
+
+  /healthz:
+    get:
+      tags: [health]
+      operationId: healthz
+      summary: Health report
+      description: |
+        Same status as `/readyz`. Does not certify L1 freshness, submitter
+        balance, or canonical agreement.
+      responses:
+        "200":
+          description: Healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+              example: { status: ok, inclusion_lane: ok }
+        "503":
+          description: Degraded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+              example: { status: degraded, inclusion_lane: stopped }
+
+components:
+  headers:
+    CacheControlNoStore:
+      description: Always `no-store`.
+      schema:
+        type: string
+        const: no-store
+    XInclusionBlock:
+      description: L1 block at which the accepted checkpoint's batch was included.
+      schema:
+        type: string
+        pattern: "^[0-9]+$"
+    XExecutedInputCount:
+      description: Application inputs executed by the artifact; the `next_input` to subscribe from.
+      schema:
+        type: string
+        pattern: "^[0-9]+$"
+    XHistoryEra:
+      description: Era of the artifact's history version.
+      schema:
+        $ref: "#/components/schemas/EraId"
+    XRecoveryGeneration:
+      description: Recovery generation of the artifact's history version.
+      schema:
+        type: string
+        pattern: "^[0-9]+$"
+
+  responses:
+    BadRequest:
+      description: Malformed or unknown query fields, or invalid selectors.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unavailable:
+      description: Shutting down, or an operational failure.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example: { ok: false, code: UNAVAILABLE, message: sequencer shutting down }
+    InternalError:
+      description: Internal failure. The message is fixed and carries no internal detail.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    EmptyInternalError:
+      description: Internal failure. Empty body.
+    NoCheckpoint:
+      description: No comparable accepted checkpoint exists yet. Empty body.
+    Divergence:
+      description: Known canonical divergence prevents accepted-checkpoint selection.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            ok: false
+            code: UNAVAILABLE
+            message: canonical divergence prevents accepted checkpoint selection
+    HistoryConflict:
+      description: The requested era is not the current era.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/HistoryPolicyError"
+
+  schemas:
+    U64:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 18446744073709551615
+
+    Address:
+      type: string
+      pattern: "^0x[0-9a-fA-F]{40}$"
+      description: 20-byte address as `0x`-prefixed hex.
+
+    HexBytes:
+      type: string
+      pattern: "^0x([0-9a-fA-F]{2})*$"
+      description: "`0x`-prefixed hex bytes."
+
+    Hash32:
+      type: string
+      pattern: "^0x[0-9a-fA-F]{64}$"
+
+    EraId:
+      type: string
+      format: uuid
+      description: UUIDv4 in lowercase hyphenated form, identifying one setup/rebuild era.
+
+    UserOp:
+      type: object
+      required: [nonce, max_fee, data]
+      description: The EIP-712 message the user signs.
+      properties:
+        nonce:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: Must equal the sender's expected nonce.
+        max_fee:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: Log-space fee exponent (base 129/128) the user is willing to pay.
+        data:
+          allOf:
+            - $ref: "#/components/schemas/HexBytes"
+          description: SSZ-encoded method payload.
+
+    TxRequest:
+      type: object
+      required: [message, signature, sender]
+      properties:
+        message:
+          $ref: "#/components/schemas/UserOp"
+        signature:
+          type: string
+          pattern: "^0x[0-9a-fA-F]{130}$"
+          description: 65-byte EIP-712 signature (`r || s || v`).
+        sender:
+          allOf:
+            - $ref: "#/components/schemas/Address"
+          description: Must match the signer recovered from `signature`.
+
+    TxResponse:
+      type: object
+      required: [ok, sender, nonce]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        sender:
+          allOf:
+            - $ref: "#/components/schemas/Address"
+          description: EIP-55 casing.
+        nonce:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: The nonce the included op consumed.
+
+    FeeResponse:
+      type: object
+      required: [fee, recommended_fee, suggested_max_fee]
+      properties:
+        fee:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: Fee frozen on the open frame; the live inclusion check.
+        recommended_fee:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: Fee the next frame will sample at rotation.
+        suggested_max_fee:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: |
+            `max(fee, recommended_fee)` plus 1.5x log-space slack; a value to
+            copy into `max_fee`. The user pays the frame fee, not this cap.
+
+    NonceResponse:
+      type: object
+      required: [sender, next_nonce]
+      properties:
+        sender:
+          allOf:
+            - $ref: "#/components/schemas/Address"
+          description: EIP-55 casing.
+        next_nonce:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: Value to sign into `UserOp.nonce`.
+
+    DomainResponse:
+      type: object
+      required: [name, version, chainId, verifyingContract]
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        chainId:
+          $ref: "#/components/schemas/U64"
+        verifyingContract:
+          allOf:
+            - $ref: "#/components/schemas/Address"
+          description: Application address, EIP-55 casing.
+
+    ErrorResponse:
+      type: object
+      required: [ok, code, message]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        code:
+          type: string
+          enum:
+            - BAD_REQUEST
+            - PAYLOAD_TOO_LARGE
+            - INVALID_SIGNATURE
+            - EXECUTION_REJECTED
+            - UNAVAILABLE
+            - INTERNAL_ERROR
+            - OVERLOADED
+        message:
+          type: string
+
+    HistoryVersion:
+      type: object
+      required: [era_id, recovery_generation]
+      description: Identity of locally available application history; claim both fields when resuming.
+      properties:
+        era_id:
+          $ref: "#/components/schemas/EraId"
+        recovery_generation:
+          $ref: "#/components/schemas/U64"
+
+    HistoryBounds:
+      type: object
+      required: [version, available_from, head]
+      properties:
+        version:
+          $ref: "#/components/schemas/HistoryVersion"
+        available_from:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Baseline application count; entries `[available_from, head)` are available through WS.
+        head:
+          $ref: "#/components/schemas/U64"
+
+    HistoryDeployment:
+      type: object
+      required:
+        - chain_id
+        - app_address
+        - input_box_address
+        - app_deployment_block
+        - batch_submitter_address
+      properties:
+        chain_id:
+          $ref: "#/components/schemas/U64"
+        app_address:
+          $ref: "#/components/schemas/Address"
+        input_box_address:
+          $ref: "#/components/schemas/Address"
+        app_deployment_block:
+          $ref: "#/components/schemas/U64"
+        batch_submitter_address:
+          $ref: "#/components/schemas/Address"
+
+    HistoryBaseline:
+      type: object
+      required: [l1_stop_block, l1_end_input_index, next_batch_nonce]
+      properties:
+        l1_stop_block:
+          $ref: "#/components/schemas/U64"
+        l1_end_input_index:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Exclusive end of the per-application InputBox prefix through the stop block.
+        next_batch_nonce:
+          $ref: "#/components/schemas/U64"
+
+    AcceptedCheckpoint:
+      type: object
+      required: [inclusion_block, executed_input_count, next_batch_nonce]
+      properties:
+        inclusion_block:
+          $ref: "#/components/schemas/U64"
+        executed_input_count:
+          $ref: "#/components/schemas/U64"
+        next_batch_nonce:
+          $ref: "#/components/schemas/U64"
+
+    HistoryCompatibility:
+      type: object
+      required: [from_generation, preserved_input_count]
+      properties:
+        from_generation:
+          $ref: "#/components/schemas/U64"
+        preserved_input_count:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: |
+            Checkpoint counts up to and including this boundary preserve
+            their input prefix across every recovery since `from_generation`.
+
+    HistoryInfo:
+      type: object
+      required: [deployment, history, baseline, accepted_checkpoint, compatibility]
+      properties:
+        deployment:
+          $ref: "#/components/schemas/HistoryDeployment"
+        history:
+          $ref: "#/components/schemas/HistoryBounds"
+        baseline:
+          $ref: "#/components/schemas/HistoryBaseline"
+        accepted_checkpoint:
+          oneOf:
+            - $ref: "#/components/schemas/AcceptedCheckpoint"
+            - type: "null"
+        compatibility:
+          oneOf:
+            - $ref: "#/components/schemas/HistoryCompatibility"
+            - type: "null"
+
+    HistoryPolicyError:
+      description: Typed refusal of a history claim, discriminated by `code`.
+      oneOf:
+        - type: object
+          required: [code, current]
+          properties:
+            code:
+              type: string
+              const: ERA_CHANGED
+            current:
+              $ref: "#/components/schemas/HistoryVersion"
+        - type: object
+          required: [code, current]
+          properties:
+            code:
+              type: string
+              const: STALE_GENERATION
+            current:
+              $ref: "#/components/schemas/HistoryVersion"
+        - type: object
+          required: [code, available_from]
+          properties:
+            code:
+              type: string
+              const: HISTORY_UNAVAILABLE
+            available_from:
+              $ref: "#/components/schemas/U64"
+        - type: object
+          required: [code, head]
+          properties:
+            code:
+              type: string
+              const: AHEAD_OF_HEAD
+            head:
+              $ref: "#/components/schemas/U64"
+
+    HistoricalL1Input:
+      type: object
+      required:
+        - input_index
+        - sender
+        - payload
+        - block_number
+        - block_timestamp
+        - transaction_hash
+      properties:
+        input_index:
+          $ref: "#/components/schemas/U64"
+        sender:
+          allOf:
+            - $ref: "#/components/schemas/Address"
+          description: Authenticated InputBox sender, lowercase hex.
+        payload:
+          allOf:
+            - $ref: "#/components/schemas/HexBytes"
+          description: Original inner payload, including malformed or rejected batches.
+        block_number:
+          $ref: "#/components/schemas/U64"
+        block_timestamp:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Unix seconds.
+        transaction_hash:
+          $ref: "#/components/schemas/Hash32"
+
+    HistoricalL1InputsPage:
+      type: object
+      required: [era_id, l1_stop_block, end_input_index, next_input_index, items]
+      properties:
+        era_id:
+          $ref: "#/components/schemas/EraId"
+        l1_stop_block:
+          $ref: "#/components/schemas/U64"
+        end_input_index:
+          $ref: "#/components/schemas/U64"
+        next_input_index:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Equality with `end_input_index` is the only EOF signal.
+        items:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/HistoricalL1Input"
+
+    InclusionBlockResponse:
+      type: object
+      required: [inclusion_block, executed_input_count]
+      properties:
+        inclusion_block:
+          $ref: "#/components/schemas/U64"
+        executed_input_count:
+          $ref: "#/components/schemas/U64"
+
+    HealthStatus:
+      type: object
+      required: [status, inclusion_lane]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        inclusion_lane:
+          type: string
+          enum: [ok, stopped]
+          description: "`stopped` only when the lane's receiver is closed; stays `ok` during shutdown."
+
+    BroadcastTxMessage:
+      description: |
+        One application input from the `/ws/subscribe` feed, discriminated by
+        `kind`. Offsets count executed application inputs.
+      oneOf:
+        - $ref: "#/components/schemas/BroadcastUserOp"
+        - $ref: "#/components/schemas/BroadcastDirectInput"
+      discriminator:
+        propertyName: kind
+        mapping:
+          user_op: "#/components/schemas/BroadcastUserOp"
+          direct_input: "#/components/schemas/BroadcastDirectInput"
+
+    BroadcastUserOp:
+      type: object
+      required: [kind, offset, sender, nonce, fee, data, safe_block, batch_nonce]
+      properties:
+        kind:
+          type: string
+          const: user_op
+        offset:
+          $ref: "#/components/schemas/U64"
+        sender:
+          allOf:
+            - $ref: "#/components/schemas/Address"
+          description: EIP-55 casing.
+        nonce:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: Signed nonce of the op; a mirror must apply the op under exactly this nonce.
+        fee:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: Log-space fee exponent (base 129/128) of the covering frame.
+        data:
+          $ref: "#/components/schemas/HexBytes"
+        safe_block:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Safe L1 block committed by the covering frame.
+        batch_nonce:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Nonce of the batch containing the covering frame.
+
+    BroadcastDirectInput:
+      type: object
+      required:
+        - kind
+        - offset
+        - sender
+        - block_number
+        - payload
+        - input_index
+        - batch_nonce
+        - block_timestamp
+        - transaction_hash
+      properties:
+        kind:
+          type: string
+          const: direct_input
+        offset:
+          $ref: "#/components/schemas/U64"
+        sender:
+          allOf:
+            - $ref: "#/components/schemas/Address"
+          description: EIP-55 casing.
+        block_number:
+          $ref: "#/components/schemas/U64"
+        payload:
+          $ref: "#/components/schemas/HexBytes"
+        input_index:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Per-application InputBox index.
+        batch_nonce:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Nonce of the batch that drained this direct input.
+        block_timestamp:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: Unix seconds of the containing L1 block.
+        transaction_hash:
+          $ref: "#/components/schemas/Hash32"
