@@ -228,6 +228,11 @@ paths:
         `next_input` offset, then follows the optimistic tip. Fetch and
         restore `/latest_snapshot` first; its headers supply the claim.
 
+        The request is a standard RFC 6455 upgrade: `Upgrade: websocket`, a
+        `Connection` header containing `upgrade`, `Sec-WebSocket-Key`, and
+        `Sec-WebSocket-Version: 13`. Use a WebSocket client; these headers
+        are not modelled as parameters.
+
         After the upgrade, the server sends JSON text frames shaped as
         `BroadcastTxMessage`. The subscriber cap is 64. Shutdown or a feed
         failure may disconnect without a Close frame; resume from the saved
@@ -249,18 +254,6 @@ paths:
           description: Inclusive offset of the first input to receive.
           schema:
             $ref: "#/components/schemas/U64"
-        - name: Upgrade
-          in: header
-          required: true
-          schema:
-            type: string
-            const: websocket
-        - name: Connection
-          in: header
-          required: true
-          schema:
-            type: string
-            const: Upgrade
       responses:
         "101":
           description: |
@@ -268,8 +261,8 @@ paths:
             `BroadcastTxMessage` JSON documents.
         "400":
           description: |
-            Missing or malformed query fields, or not a WebSocket upgrade
-            request. The body is plain text, not the JSON error shape.
+            Missing or malformed query fields, or a missing or invalid
+            upgrade header. The body is plain text, not the JSON error shape.
           content:
             text/plain:
               schema:
