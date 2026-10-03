@@ -481,6 +481,7 @@ paths:
           headers:
             ETag:
               description: '`"block-<inclusion_block>"`.'
+              required: true
               schema:
                 type: string
             X-Inclusion-Block:
@@ -616,25 +617,30 @@ components:
   headers:
     CacheControlNoStore:
       description: Always `no-store`.
+      required: true
       schema:
         type: string
         const: no-store
     XInclusionBlock:
       description: L1 block at which the accepted checkpoint's batch was included.
+      required: true
       schema:
         type: string
         pattern: "^[0-9]+$"
     XExecutedInputCount:
       description: Application inputs executed by the artifact; the `next_input` to subscribe from.
+      required: true
       schema:
         type: string
         pattern: "^[0-9]+$"
     XHistoryEra:
       description: Era of the artifact's history version.
+      required: true
       schema:
         $ref: "#/components/schemas/EraId"
     XRecoveryGeneration:
       description: Recovery generation of the artifact's history version.
+      required: true
       schema:
         type: string
         pattern: "^[0-9]+$"
