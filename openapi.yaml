@@ -276,17 +276,26 @@ paths:
                 type: string
         "409":
           description: |
-            The claim does not match the current history. Rebootstrap on an
-            era or generation mismatch.
+            The claim does not match the current history. `code` names the
+            refusal; each variant's description gives the client action.
           headers:
             X-History-Error:
               description: The same refusal as the body, JSON-encoded.
+              required: true
               schema:
                 type: string
+                contentMediaType: application/json
+                contentSchema:
+                  $ref: "#/components/schemas/HistoryPolicyError"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HistoryPolicyError"
+              example:
+                code: STALE_GENERATION
+                current:
+                  era_id: 22222222-2222-4222-8222-222222222222
+                  recovery_generation: 1
         "429":
           description: Subscriber limit reached.
           content:
@@ -665,11 +674,18 @@ components:
             code: UNAVAILABLE
             message: canonical divergence prevents accepted checkpoint selection
     HistoryConflict:
-      description: The requested era is not the current era.
+      description: |
+        The requested era is not the current era. These routes refuse only
+        on era; a generation change does not invalidate their results.
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/HistoryPolicyError"
+            $ref: "#/components/schemas/HistoryEraChanged"
+          example:
+            code: ERA_CHANGED
+            current:
+              era_id: 22222222-2222-4222-8222-222222222222
+              recovery_generation: 0
 
   schemas:
     U64:
@@ -922,38 +938,64 @@ components:
     HistoryPolicyError:
       description: Typed refusal of a history claim, discriminated by `code`.
       oneOf:
-        - type: object
-          required: [code, current]
-          properties:
-            code:
-              type: string
-              const: ERA_CHANGED
-            current:
-              $ref: "#/components/schemas/HistoryVersion"
-        - type: object
-          required: [code, current]
-          properties:
-            code:
-              type: string
-              const: STALE_GENERATION
-            current:
-              $ref: "#/components/schemas/HistoryVersion"
-        - type: object
-          required: [code, available_from]
-          properties:
-            code:
-              type: string
-              const: HISTORY_UNAVAILABLE
-            available_from:
-              $ref: "#/components/schemas/U64"
-        - type: object
-          required: [code, head]
-          properties:
-            code:
-              type: string
-              const: AHEAD_OF_HEAD
-            head:
-              $ref: "#/components/schemas/U64"
+        - $ref: "#/components/schemas/HistoryEraChanged"
+        - $ref: "#/components/schemas/HistoryStaleGeneration"
+        - $ref: "#/components/schemas/HistoryUnavailable"
+        - $ref: "#/components/schemas/HistoryAheadOfHead"
+      discriminator:
+        propertyName: code
+        mapping:
+          ERA_CHANGED: "#/components/schemas/HistoryEraChanged"
+          STALE_GENERATION: "#/components/schemas/HistoryStaleGeneration"
+          HISTORY_UNAVAILABLE: "#/components/schemas/HistoryUnavailable"
+          AHEAD_OF_HEAD: "#/components/schemas/HistoryAheadOfHead"
+
+    HistoryEraChanged:
+      type: object
+      required: [code, current]
+      description: The claimed era is not the current era. Rebootstrap from a current snapshot.
+      properties:
+        code:
+          type: string
+          const: ERA_CHANGED
+        current:
+          $ref: "#/components/schemas/HistoryVersion"
+
+    HistoryStaleGeneration:
+      type: object
+      required: [code, current]
+      description: |
+        Same era, older recovery generation. Select a compatible saved
+        checkpoint through `GET /history?era_id=&from_generation=`, or
+        rebootstrap.
+      properties:
+        code:
+          type: string
+          const: STALE_GENERATION
+        current:
+          $ref: "#/components/schemas/HistoryVersion"
+
+    HistoryUnavailable:
+      type: object
+      required: [code, available_from]
+      description: The claimed offset precedes locally available history. Restore a current snapshot.
+      properties:
+        code:
+          type: string
+          const: HISTORY_UNAVAILABLE
+        available_from:
+          $ref: "#/components/schemas/U64"
+
+    HistoryAheadOfHead:
+      type: object
+      required: [code, head]
+      description: The claimed offset exceeds the head (`next_input > head`). The claim is invalid and must be corrected.
+      properties:
+        code:
+          type: string
+          const: AHEAD_OF_HEAD
+        head:
+          $ref: "#/components/schemas/U64"
 
     HistoricalL1Input:
       type: object
