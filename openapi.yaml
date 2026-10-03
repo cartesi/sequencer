@@ -690,7 +690,7 @@ components:
   schemas:
     U64:
       type: integer
-      format: int64
+      format: uint64
       minimum: 0
       maximum: 18446744073709551615
 
@@ -720,11 +720,13 @@ components:
       properties:
         nonce:
           type: integer
+          format: uint32
           minimum: 0
           maximum: 4294967295
           description: Must equal the sender's expected nonce.
         max_fee:
           type: integer
+          format: uint16
           minimum: 0
           maximum: 65535
           description: Log-space fee exponent (base 129/128) the user is willing to pay.
@@ -761,6 +763,7 @@ components:
           description: EIP-55 casing.
         nonce:
           type: integer
+          format: uint32
           minimum: 0
           maximum: 4294967295
           description: The nonce the included op consumed.
@@ -771,16 +774,19 @@ components:
       properties:
         fee:
           type: integer
+          format: uint16
           minimum: 0
           maximum: 65535
           description: Fee frozen on the open frame; the live inclusion check.
         recommended_fee:
           type: integer
+          format: uint16
           minimum: 0
           maximum: 65535
           description: Fee the next frame will sample at rotation.
         suggested_max_fee:
           type: integer
+          format: uint16
           minimum: 0
           maximum: 65535
           description: |
@@ -797,6 +803,7 @@ components:
           description: EIP-55 casing.
         next_nonce:
           type: integer
+          format: uint32
           minimum: 0
           maximum: 4294967295
           description: Value to sign into `UserOp.nonce`.
@@ -1095,11 +1102,13 @@ components:
           description: EIP-55 casing.
         nonce:
           type: integer
+          format: uint32
           minimum: 0
           maximum: 4294967295
           description: Signed nonce of the op; a mirror must apply the op under exactly this nonce.
         fee:
           type: integer
+          format: uint16
           minimum: 0
           maximum: 65535
           description: Log-space fee exponent (base 129/128) of the covering frame.
