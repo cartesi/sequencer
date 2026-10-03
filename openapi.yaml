@@ -22,10 +22,16 @@ info:
     All `u64` values are JSON numbers; clients must preserve integer
     precision.
 
-    The README's API section owns the wire contract; this document mirrors it.
+    Errors use `ErrorResponse` unless a response says otherwise.
+
+    The README's API section owns the wire contract and its client guidance;
+    this document renders it for tooling, and the two change together.
   license:
     name: Apache-2.0
     identifier: Apache-2.0
+externalDocs:
+  description: README API contract
+  url: https://github.com/cartesi/sequencer/blob/main/README.md#api
 servers:
   - url: http://127.0.0.1:3000
     description: Default listen address (`CARTESI_SEQUENCER_HTTP_ADDR`).

@@ -293,7 +293,9 @@ enforces write-once batch lifecycle, Tip uniqueness, and user-op identity.
 Today both sides serve from one listener; the planned API split puts each side on its own port (same binary) so internal probes and subscribers can be firewalled from public submit traffic.
 
 The [README API contract](README.md#api) owns routes, message shapes, caps,
-close codes, and health semantics.
+close codes, and health semantics. [`openapi.yaml`](openapi.yaml) is its
+machine-readable rendering for client generation and documentation tools;
+change both in the same patch.
 
 ## Command Configuration
 
@@ -448,7 +450,7 @@ work reaches another boundary.
 | Application implementation, execution, or native integration | [Application contract](docs/protocol/application-contract.md) — determinism, progress, failure, capacity, and checkpoints; [C binding](docs/protocol/c-application-binding.md) for native engines. |
 | Automatic recovery or danger detection | [Automatic recovery](docs/recovery/README.md), then [preemptive.tla](docs/recovery/preemptive.tla) and [admission.tla](docs/recovery/admission.tla) — repair ordering and the models' bounded guarantees. |
 | Manual rebuild after lost state or a sequencer bug | [Cockroach recovery](docs/recovery/cockroach.md) — trusted checkpoint, fixed input boundary, and fresh baseline. |
-| API, subscriber replay, or application-history coordinates | [README API contract](README.md#api) — wire behavior; [application history](docs/protocol/application-history.md) — era, generation, offsets, and recovery boundaries. |
+| API, subscriber replay, or application-history coordinates | [README API contract](README.md#api) — wire behavior, with [`openapi.yaml`](openapi.yaml) changed alongside it; [application history](docs/protocol/application-history.md) — era, generation, offsets, and recovery boundaries. |
 | Snapshots, restart, export, retention, or watchdog checkpoints | [Snapshot lifecycle](docs/snapshots/lifecycle.md) — durable publication, accepted comparison points, leases, and GC; [wallet format](docs/snapshots/format.md) when changing wallet bytes. |
 | Trust boundaries, provider behavior, or hostile L1 input | [Threat model](docs/threat-model/README.md) — actor assumptions, supported failures, and residual risks. |
 | Submission fees or oracle pricing | [L1 fee policy](docs/l1-fee-policy.md) — estimation and replacement limits; [threat-model actor table](docs/threat-model/README.md#actors-and-trust) — oracle source and outage assumptions. |
