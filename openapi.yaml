@@ -20,7 +20,9 @@ info:
     20-byte addresses.
 
     All `u64` values are JSON numbers; clients must preserve integer
-    precision.
+    precision. Integer formats are OpenAPI Format Registry names (`uint16`,
+    `uint32`, `uint64`); map `uint64` to an unsigned 64-bit type in
+    generators that do not know it.
 
     Errors use `ErrorResponse` unless a response says otherwise.
 
@@ -399,9 +401,10 @@ paths:
         larger first input is returned alone. At most eight responses are in
         flight. An interrupted body is a failed page.
 
-        Unknown query fields are rejected. An era mismatch (`409`) is
-        reported before the limit and position checks (`400`). Recovery
-        generation changes do not invalidate pages; an era change does.
+        Malformed or unknown query fields and selector errors are `400`
+        first. An era mismatch (`409`) then precedes the limit-range and
+        position-bound checks (`400`). Recovery generation changes do not
+        invalidate pages; an era change does.
       parameters:
         - name: era_id
           in: query
@@ -1011,7 +1014,11 @@ components:
     HistoryEraChanged:
       type: object
       required: [code, current]
-      description: The claimed era is not the current era. Rebootstrap from a current snapshot.
+      description: |
+        The claimed era is not the current era. Old-era results cannot be
+        resumed or spliced into the new era: a replica rebootstraps from a
+        current snapshot, and a projection re-establishes correspondence with
+        the new baseline.
       properties:
         code:
           type: string
@@ -1023,9 +1030,9 @@ components:
       type: object
       required: [code, current]
       description: |
-        Same era, older recovery generation. Select a compatible saved
-        checkpoint through `GET /history?era_id=&from_generation=`, or
-        rebootstrap.
+        Same era, different recovery generation (normally an older one).
+        Select a compatible saved checkpoint through
+        `GET /history?era_id=&from_generation=`, or rebootstrap.
       properties:
         code:
           type: string

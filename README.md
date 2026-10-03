@@ -277,15 +277,20 @@ After each successfully applied input at offset `X`, persist the claim with
 `next_input = X + 1` alongside the replica state.
 
 - All three query fields are required. Missing or malformed fields, or missing
-  WebSocket upgrade headers, return HTTP `400` with a plain-text body.
+  or invalid WebSocket upgrade headers, return HTTP `400` with a plain-text body.
 - An era or generation mismatch, an unavailable prefix, or a position ahead of
   the head returns HTTP `409` before upgrade. The JSON body and `X-History-Error`
   header carry the same typed refusal: `ERA_CHANGED`, `STALE_GENERATION`,
-  `HISTORY_UNAVAILABLE`, or `AHEAD_OF_HEAD`. Rebootstrap on a history mismatch.
+  `HISTORY_UNAVAILABLE`, or `AHEAD_OF_HEAD`. Rebootstrap on `ERA_CHANGED` or
+  `HISTORY_UNAVAILABLE`. On `STALE_GENERATION`, a compatible saved checkpoint
+  can first be selected through `/history` (below). `AHEAD_OF_HEAD` is an
+  invalid claim to correct.
 - A claim exactly at the head waits for the next input. Replay uses bounded
   pages and queues, with no total catch-up limit. The subscriber cap is `64`.
-- Before upgrade, capacity exhaustion returns `429 OVERLOADED`; shutdown or an
-  operational subscription failure returns `503 UNAVAILABLE`.
+- Before upgrade, checks run in order: query and upgrade headers (`400`),
+  shutdown (`503 UNAVAILABLE`), the subscriber cap (`429 OVERLOADED`), then the
+  claim (`409`, or `503 UNAVAILABLE` on an operational subscription failure).
+  At capacity, a stale claim sees `429` until a slot frees.
 - Messages are JSON text frames; binary fields are `0x`-prefixed hex.
   Direct-input `block_timestamp` values are Unix seconds.
 - Batch envelopes are absent. Offsets count executed application inputs,
@@ -456,6 +461,8 @@ api split lands).
 Successful state/archive downloads include `X-History-Era`, `X-Recovery-Generation`,
 and `X-Executed-Input-Count`, selected atomically with the artifact lease.
 Streaming holds the lease until the response ends or the client disconnects.
+Bodies stream without `Content-Length`; a failure after the headers aborts the
+transfer, so treat an incomplete body as a failed download.
 The accepted endpoints return `404` until a comparable checkpoint exists:
 genesis is comparable at block zero; a rebuilt baseline is restorable but only
 a later accepted batch establishes a comparison point. Known divergence makes
@@ -470,8 +477,9 @@ any lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecyc
   shutdown has not been requested; otherwise `503`. Its body is empty.
 - `GET /healthz` uses the same status as `/readyz` and returns JSON:
   `{ "status": "ok", "inclusion_lane": "ok" }`. `status` becomes `"degraded"`
-  for either failure condition; `inclusion_lane` becomes `"stopped"` only when
-  its receiver is closed, so it can remain `"ok"` during shutdown.
+  for either failure condition; `inclusion_lane` becomes `"stopped"` once its
+  receiver is closed. The lane closes it soon after shutdown is requested, so it
+  can still read `"ok"` early in a shutdown.
 
 These probes cover process reachability, the lane channel, and shutdown state.
 They do not certify L1 freshness, submitter balance, or canonical agreement.
