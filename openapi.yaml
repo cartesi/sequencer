@@ -200,7 +200,7 @@ paths:
     get:
       tags: [ingress]
       operationId: getDomain
-      summary: EIP-712 domain signatures are verified against
+      summary: EIP-712 domain that `POST /tx` verifies signatures against
       description: |
         Keyed as `eth_signTypedData_v4` expects. Clients should pin their own
         domain and assert that it matches rather than sign with the served
@@ -216,7 +216,7 @@ paths:
                 name: CartesiAppSequencer
                 version: "1"
                 chainId: 31337
-                verifyingContract: "0xaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaB"
+                verifyingContract: "0x1111111111111111111111111111111111111111"
 
   /ws/subscribe:
     get:
@@ -441,7 +441,9 @@ paths:
       description: Cheap read the watchdog polls; no lease is taken.
       responses:
         "200":
-          description: The accepted checkpoint's L1 inclusion block and application count.
+          description: |
+            The accepted checkpoint's L1 inclusion block and executed
+            application input count. Block `0` is the genesis checkpoint.
           content:
             application/json:
               schema:
@@ -615,7 +617,9 @@ components:
         type: string
         const: no-store
     XInclusionBlock:
-      description: L1 block at which the accepted checkpoint's batch was included.
+      description: |
+        L1 block whose end the accepted checkpoint represents: where its batch
+        was included, or `0` for the genesis checkpoint.
       required: true
       schema:
         type: string
@@ -710,7 +714,10 @@ components:
     EraId:
       type: string
       format: uuid
-      description: UUIDv4 in lowercase hyphenated form, identifying one setup/rebuild era.
+      pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+      description: |
+        Hyphenated UUIDv4 identifying one setup/rebuild era. The server
+        emits lowercase and accepts hex digits in either case.
 
     UserOp:
       type: object
@@ -1071,7 +1078,10 @@ components:
         inclusion_lane:
           type: string
           enum: [ok, stopped]
-          description: "`stopped` only when the lane's receiver is closed; stays `ok` during shutdown."
+          description: |
+            `stopped` once the lane's receiver is closed. The lane stops soon
+            after shutdown is requested, so this can still read `ok` early in
+            a shutdown.
 
     BroadcastTxMessage:
       description: |
