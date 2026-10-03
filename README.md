@@ -167,6 +167,19 @@ Most queue sizes, polling intervals, and safety limits are now internal runtime 
 
 ## API
 
+This section owns the wire contract. [`openapi.yaml`](openapi.yaml) renders it
+as OpenAPI 3.1 for client generation and documentation tools; change both
+together.
+
+Errors use one JSON shape, `{ "ok": false, "code": "<CODE>", "message": "<text>" }`,
+with these codes: `400` `BAD_REQUEST` or `INVALID_SIGNATURE`, `413`
+`PAYLOAD_TOO_LARGE`, `422` `EXECUTION_REJECTED`, `429` `OVERLOADED`, `500`
+`INTERNAL_ERROR`, and `503` `UNAVAILABLE`. A `500` message is fixed and carries
+no internal detail. Exceptions: history-policy `409` bodies carry the typed
+refusal (`{ "code": "ERA_CHANGED", ... }`), the `/ws/subscribe` pre-upgrade
+`400` is plain text, snapshot-route `404` and `500` responses have empty bodies,
+and the health probes use their own shapes.
+
 JSON `sender` fields in successful `POST /tx` and `GET /nonce` responses and
 WebSocket messages, and `verifyingContract` in `GET /domain`, use EIP-55
 checksum casing. Address fields in `/history` and `sender` fields in
@@ -195,7 +208,8 @@ Notes:
 - `signature` must be 65 bytes.
 - `sender` is required and must match the recovered signer.
 - `message.data` is SSZ-encoded method payload bytes.
-- payload size is bounded at ingress; oversized requests are rejected before entering the hot path.
+- size is bounded at ingress, before the hot path: the raw request body is capped at 4096 bytes (`413 PAYLOAD_TOO_LARGE`), and `message.data` at the application's maximum method payload size (`400 BAD_REQUEST`).
+- the inclusion lane checks nonce, `max_fee`, and fee balance. A rejected op returns `422 EXECUTION_REJECTED` and persists nothing.
 - overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
 - Browser wallets can call `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` from any origin with any request headers; preflight permits GET and POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
@@ -242,7 +256,7 @@ Notes:
 - `next_nonce` of 4294967295 (`u32::MAX`) means the account is exhausted: that nonce has no successor, so `POST /tx` can include no further op from it.
 - The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, query again rather than incrementing.
 - After an operator rebuild from a checkpoint (`setup --recovery`), a sender with no surviving op since the rebuild reads 0 even when its nonce in the rebuilt baseline is higher; this includes a sender whose post-rebuild ops a later recovery invalidated. A `422` bad-nonce rejection names the expected nonce (`bad nonce: expected N, got M`).
-- Responses carry `Cache-Control: no-store`. `503` with code `UNAVAILABLE` during shutdown.
+- Successful responses carry `Cache-Control: no-store`. `503` with code `UNAVAILABLE` during shutdown.
 
 ### `GET /domain`
 
@@ -262,7 +276,8 @@ WebSocket stream of the current application history, replaying from the inclusiv
 After each successfully applied input at offset `X`, persist the claim with
 `next_input = X + 1` alongside the replica state.
 
-- All three query fields are required. Missing or malformed fields return HTTP `400`.
+- All three query fields are required. Missing or malformed fields, or missing
+  WebSocket upgrade headers, return HTTP `400` with a plain-text body.
 - An era or generation mismatch, an unavailable prefix, or a position ahead of
   the head returns HTTP `409` before upgrade. The JSON body and `X-History-Error`
   header carry the same typed refusal: `ERA_CHANGED`, `STALE_GENERATION`,

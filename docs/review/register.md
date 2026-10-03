@@ -108,6 +108,13 @@ exposure in an actual deployment was established by this review.
   and a restarted recovery must rederive facts without reusing the previous
   attempt's flush witness. Use the [recovery model](../recovery/README.md) to
   bound a scenario and assess whether existing component tests suffice.
+- **OpenAPI drift.** [`openapi.yaml`](../../openapi.yaml) is hand-maintained
+  beside the [API contract](../../README.md#api). No linter or test checks it
+  against the routes or serde wire types; only the change-together rule in
+  [AGENTS.md](../../AGENTS.md#http-endpoints) keeps them aligned. Next: run an
+  OpenAPI linter once. If a generated client or documentation site comes to
+  depend on the file, add CI linting and a test that compares its paths with
+  the routers and validates serialized wire types against its schemas.
 
 ## Known optimizations
 
