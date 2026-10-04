@@ -295,7 +295,8 @@ Today both sides serve from one listener; the planned API split puts each side o
 The [README API contract](README.md#api) owns routes, message shapes, caps,
 close codes, and health semantics. [`openapi.yaml`](openapi.yaml) is its
 machine-readable rendering for client generation and documentation tools;
-change both in the same patch.
+change both in the same patch. CI lints it; run
+`direnv exec . redocly lint openapi.yaml` locally.
 
 ## Command Configuration
 
