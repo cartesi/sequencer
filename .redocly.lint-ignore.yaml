@@ -1,0 +1,16 @@
+# This file instructs Redocly's linter to ignore the rules contained for specific parts of your API.
+# See https://redocly.com/docs/cli/ for more information.
+openapi.yaml:
+  # These routes have no client errors.
+  operation-4xx-response:
+    - '#/paths/~1fee/get/responses'
+    - '#/paths/~1domain/get/responses'
+    - '#/paths/~1livez/get/responses'
+    - '#/paths/~1readyz/get/responses'
+    - '#/paths/~1healthz/get/responses'
+  # A WebSocket upgrade succeeds with 101.
+  operation-2xx-response:
+    - '#/paths/~1ws~1subscribe/get/responses'
+  # Referenced from the x-websocket-messages extension, which linters do not follow.
+  no-unused-components:
+    - '#/components/schemas/BroadcastTxMessage'

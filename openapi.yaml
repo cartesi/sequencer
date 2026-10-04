@@ -31,6 +31,7 @@ info:
   license:
     name: Apache-2.0
     identifier: Apache-2.0
+security: []
 externalDocs:
   description: README API contract
   url: https://github.com/cartesi/sequencer/blob/main/README.md#api
