@@ -13,9 +13,6 @@ file keeps the remaining work.
 
 ## Remaining work
 
-- **CI on GitHub.** The workflow changes (emulator install for the `rust`
-  job, native module build, `luacheck`, the test guest build in the
-  `rollups-e2e` job) have not run on GitHub; their commands pass locally.
 - **Staging drill.** Run the divergence drill once against staging with the
   operators who will be paged ([runbook](../watchdog/incident-runbook.md#drills)).
 - **Measure at scale.** Per-input snapshot and per-tick clone costs on the
