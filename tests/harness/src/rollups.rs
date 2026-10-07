@@ -29,6 +29,12 @@ const DEFAULT_ANVIL_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_ANVIL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_ANVIL_SLOTS_IN_EPOCH: u64 = 1;
 const LIVE_L1_BLOCK_INTERVAL_SECONDS: u64 = 1;
+/// Every block in the rollups-contracts dump carries the frozen timestamp of
+/// its release build, and Anvil reports `safe` / `finalized` one / two epochs
+/// behind `latest`. Mining two epochs plus one block right after load gives
+/// both tags wall-clock timestamps, so the sequencer's L1-staleness gate sees
+/// a fresh view regardless of how many transactions the caller sends next.
+const FRESH_L1_BLOCKS_AFTER_LOAD: u64 = 2 * DEFAULT_ANVIL_SLOTS_IN_EPOCH + 1;
 const DEVNET_MOCK_ERC20_DEPLOYER_PRIVATE_KEY: &str =
     "0x59c6995e998f97a5a0044976f1d86dbce6c5bb4f80a8b5148f7f4f6d0d0c0abc";
 const DEVNET_MOCK_ERC20_DEPLOYER_FUNDING_WEI: u64 = 1_000_000_000_000_000;
@@ -214,7 +220,7 @@ impl ManagedAnvil {
 
         wait_for_rpc_readiness(endpoint.as_str(), &mut child, DEFAULT_ANVIL_START_TIMEOUT).await?;
 
-        Ok(Self {
+        let anvil = Self {
             child,
             shutdown_timeout: DEFAULT_ANVIL_SHUTDOWN_TIMEOUT,
             endpoint,
@@ -222,7 +228,15 @@ impl ManagedAnvil {
             input_box_address,
             application_factory_address,
             erc20_portal_address,
-        })
+        };
+        if let Err(err) = anvil
+            .mine_blocks_with_interval(FRESH_L1_BLOCKS_AFTER_LOAD, LIVE_L1_BLOCK_INTERVAL_SECONDS)
+            .await
+        {
+            let _ = anvil.shutdown().await;
+            return Err(err);
+        }
+        Ok(anvil)
     }
 
     fn log_path(&self) -> &Path {
