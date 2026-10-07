@@ -173,10 +173,12 @@ function support.fake_rpc(inputs, opts)
         return opts.input_box_code or "0x6080"
     end
     function rpc:eth_call(_, data, block)
-        if data == "0xf02478de" then
-            -- getDataAvailability(): DataAvailability.InputBox(INPUT_BOX), as `bytes`.
-            local availability = opts.availability or ("b12c9ede" .. address_word(support.INPUT_BOX))
-            return "0x" .. word(0x20) .. word(#availability // 2) .. availability .. string.rep("0", 56)
+        if data == "0x00aace9a" then
+            -- getInputBox(): the InputBox address as one ABI word.
+            if opts.input_box_revert then
+                return nil, "eth_call: 3: execution reverted"
+            end
+            return opts.input_box_word or ("0x" .. address_word(support.INPUT_BOX))
         end
         if data:sub(1, 10) == "0x61a93c87" then
             if opts.input_box_from and block < opts.input_box_from then

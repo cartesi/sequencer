@@ -494,6 +494,29 @@ paths:
         "503":
           $ref: "#/components/responses/Divergence"
 
+  /finalized_state/digest:
+    get:
+      tags: [snapshots]
+      operationId: getFinalizedStateDigest
+      summary: SHA-256 of the accepted checkpoint's comparison file
+      description: |
+        Hashes the file `GET /finalized_state` streams, under the same GC
+        lease, so the block, input count and digest describe one checkpoint.
+        The watchdog compares digests; the file itself is only evidence.
+      responses:
+        "200":
+          description: The accepted checkpoint's coordinates and file digest.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DigestResponse"
+        "404":
+          $ref: "#/components/responses/NoCheckpoint"
+        "500":
+          $ref: "#/components/responses/EmptyInternalError"
+        "503":
+          $ref: "#/components/responses/Divergence"
+
   /finalized_state:
     get:
       tags: [snapshots]
@@ -1120,6 +1143,19 @@ components:
           $ref: "#/components/schemas/U64"
         executed_input_count:
           $ref: "#/components/schemas/U64"
+
+    DigestResponse:
+      type: object
+      required: [inclusion_block, executed_input_count, sha256]
+      properties:
+        inclusion_block:
+          $ref: "#/components/schemas/U64"
+        executed_input_count:
+          $ref: "#/components/schemas/U64"
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Lowercase hex, no `0x` prefix.
 
     HealthStatus:
       type: object

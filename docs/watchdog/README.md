@@ -149,7 +149,7 @@ endpoint is never persisted.
 | `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | init, tick, replay | L1 JSON-RPC endpoint; never persisted, so it can rotate |
 | `CARTESI_WATCHDOG_SEQUENCER_URL` | init (persisted); tick (optional override) | Sequencer operator API base URL |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | init (optional) | Expected chain id; defaults to the RPC's `eth_chainId` |
-| `CARTESI_WATCHDOG_APP_ADDRESS` | init | Application address; init derives the InputBox from its `getDataAvailability()`, as the sequencer does |
+| `CARTESI_WATCHDOG_APP_ADDRESS` | init | Application address; init derives the InputBox from its `getInputBox()`, as the sequencer does |
 | `CARTESI_WATCHDOG_STATE_SOURCE` | init | `inspect`, or `range:<label>` with a label matching `[a-z][a-z0-9-]*` |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | init | Absolute path of the trusted bootstrap machine |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | init | L1 block the bootstrap machine has consumed all inputs through |
