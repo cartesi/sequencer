@@ -8,12 +8,8 @@ use std::time::Duration;
 
 use alloy::eips::BlockNumberOrTag::Safe;
 use alloy::providers::Provider;
-use alloy::sol_types::SolInterface;
 use alloy_primitives::{Address, U256};
-use cartesi_rollups_contracts::application::Application;
-use cartesi_rollups_contracts::data_availability::DataAvailability::{
-    DataAvailabilityCalls, InputBoxAndEspressoCall, InputBoxCall,
-};
+use cartesi_rollups_contracts::i_application::IApplication;
 use cartesi_rollups_contracts::input_box::InputBox;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use tokio::task::JoinHandle;
@@ -165,13 +161,12 @@ impl InputReader {
         let provider =
             crate::l1::provider::create_provider(&config.rpc_url, config.allow_insecure_rpc)
                 .map_err(InputReaderError::Bootstrap)?;
-        let application = Application::new(config.app_address, &provider);
-        let data_availability = application
-            .getDataAvailability()
+        let application = IApplication::new(config.app_address, &provider);
+        let input_box_address = application
+            .getInputBox()
             .call()
             .await
             .map_err(map_contract_bootstrap_error)?;
-        let input_box_address = decode_input_box_address(&data_availability)?;
 
         // The scan genesis is the *application's* deployment block, not the
         // InputBox's: the InputBox usually predates the app by a large block
@@ -571,25 +566,6 @@ fn map_storage_task_join(err: tokio::task::JoinError, operation: &'static str) -
         InputReaderError::StorageTaskPanicked { operation }
     } else {
         InputReaderError::Join(err.to_string())
-    }
-}
-
-fn decode_input_box_address(data_availability: &[u8]) -> Result<Address, InputReaderError> {
-    let call = DataAvailabilityCalls::abi_decode(data_availability).map_err(|err| {
-        InputReaderError::Bootstrap(format!(
-            "application getDataAvailability returned invalid DataAvailability calldata: {err}"
-        ))
-    })?;
-
-    match call {
-        DataAvailabilityCalls::InputBox(InputBoxCall { inputBox }) => Ok(inputBox),
-        DataAvailabilityCalls::InputBoxAndEspresso(InputBoxAndEspressoCall {
-            inputBox,
-            fromBlock,
-            namespaceId,
-        }) => Err(InputReaderError::Bootstrap(format!(
-            "application getDataAvailability returned unsupported DataAvailability.InputBoxAndEspresso(inputBox={inputBox}, fromBlock={fromBlock}, namespaceId={namespaceId})"
-        ))),
     }
 }
 
@@ -1129,47 +1105,6 @@ mod tests {
                 .expect("read unchanged safe-progress timestamp"),
             Some(recorded_sync),
             "same-head polls must not refresh the safe-progress marker"
-        );
-    }
-
-    #[test]
-    fn decode_input_box_address_rejects_non_abi_payloads() {
-        let err = decode_input_box_address(&[0_u8; 19]).expect_err("short bytes should fail");
-        assert!(
-            err.to_string()
-                .contains("invalid DataAvailability calldata")
-        );
-
-        let err = decode_input_box_address(&[0x22; 20]).expect_err("raw address bytes should fail");
-        assert!(
-            err.to_string()
-                .contains("invalid DataAvailability calldata")
-        );
-    }
-
-    #[test]
-    fn decode_input_box_address_decodes_input_box_call() {
-        let expected = Address::from([0x22; 20]);
-        let encoded = InputBoxCall { inputBox: expected }.abi_encode();
-
-        let address = decode_input_box_address(&encoded).expect("InputBox call should decode");
-        assert_eq!(address, expected);
-    }
-
-    #[test]
-    fn decode_input_box_address_rejects_unsupported_variants() {
-        let encoded = InputBoxAndEspressoCall {
-            inputBox: Address::from([0x33; 20]),
-            fromBlock: U256::from(123_u64),
-            namespaceId: 42,
-        }
-        .abi_encode();
-
-        let err =
-            decode_input_box_address(&encoded).expect_err("InputBoxAndEspresso should be rejected");
-        assert!(
-            err.to_string()
-                .contains("unsupported DataAvailability.InputBoxAndEspresso")
         );
     }
 

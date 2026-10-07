@@ -69,6 +69,6 @@ insufficient motivation.
 Fee-policy tests must distinguish [geth's two-component replacement
 check](https://github.com/ethereum/go-ethereum/blob/master/core/txpool/legacypool/list.go)
 from [Anvil's gas-price replacement
-check](https://github.com/foundry-rs/foundry/blob/v1.4.3/crates/anvil/src/eth/pool/transactions.rs).
+check](https://github.com/foundry-rs/foundry/blob/v1.5.1/crates/anvil/src/eth/pool/transactions.rs).
 Anvil exercises the send and retry flow but does not establish geth's fee
 acceptance behavior.

@@ -27,7 +27,7 @@ inputs:
   foundry-version:
     description: "Foundry version tag"
     required: false
-    default: "v1.4.3"
+    default: "v1.5.1"
   rust-toolchain:
     description: "Rust toolchain version or channel"
     required: false
