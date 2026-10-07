@@ -229,10 +229,10 @@ impl ManagedAnvil {
             application_factory_address,
             erc20_portal_address,
         };
-        if let Err(err) = anvil
-            .mine_blocks_with_interval(FRESH_L1_BLOCKS_AFTER_LOAD, LIVE_L1_BLOCK_INTERVAL_SECONDS)
-            .await
-        {
+        // No interval: an `anvil_mine` interval permanently advances Anvil's
+        // clock, which would skew every later block against the faketime
+        // pairing in `ManagedSequencer::advance_wall_and_mine`.
+        if let Err(err) = anvil.anvil_mine(FRESH_L1_BLOCKS_AFTER_LOAD, None).await {
             let _ = anvil.shutdown().await;
             return Err(err);
         }
@@ -282,6 +282,14 @@ impl ManagedAnvil {
         block_count: u64,
         interval_seconds: u64,
     ) -> HarnessResult<()> {
+        self.anvil_mine(block_count, Some(interval_seconds)).await
+    }
+
+    async fn anvil_mine(
+        &self,
+        block_count: u64,
+        interval_seconds: Option<u64>,
+    ) -> HarnessResult<()> {
         if block_count == 0 {
             return Ok(());
         }
@@ -291,7 +299,7 @@ impl ManagedAnvil {
             .await
             .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
         provider
-            .anvil_mine(Some(block_count), Some(interval_seconds))
+            .anvil_mine(Some(block_count), interval_seconds)
             .await
             .map_err(|err| {
                 io_other(format!(
