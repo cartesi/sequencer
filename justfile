@@ -12,8 +12,8 @@ mod bench 'tests/benchmarks/justfile'
 # plus the forge-built MockERC20 fixture. Consumed by tests/harness — and
 # through it e2e, benchmarks, and the watchdog compare harness — so the
 # pins and the setup recipe live here at the root, not in any one consumer.
-rollups_contracts_version := "3.0.0-alpha.6"
-anvil_dump_name := "rollups-contracts-" + rollups_contracts_version + "-anvil-v1.4.3"
+rollups_contracts_version := "3.0.0-alpha.10"
+anvil_dump_name := "cartesi-rollups-contracts-" + rollups_contracts_version + "-anvil-1.5.1"
 anvil_dump_dir := "tests/.deps/" + anvil_dump_name
 anvil_dump_tar := "tests/.deps/" + anvil_dump_name + ".tar.gz"
 anvil_dump_url := "https://github.com/cartesi/rollups-contracts/releases/download/v" + rollups_contracts_version + "/" + anvil_dump_name + ".tar.gz"
@@ -21,7 +21,7 @@ root_anvil_dump_tar := anvil_dump_name + ".tar.gz"
 # The release publishes no checksum file, so the hash is pinned here
 # (trust-on-first-use, same model as toolchain-pins.env) to catch a
 # replaced/corrupted release asset.
-anvil_dump_sha256 := "b140e31db2b04bb99c733fdf153718cd252335370f4b355849e2cbb3121fc30f"
+anvil_dump_sha256 := "fb38dc6e1faf238a152453dfd351ae5899d99fd35e9c675b4dce97cd6b05a68b"
 
 default:
     @just --list

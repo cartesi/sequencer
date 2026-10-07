@@ -25,8 +25,8 @@ rusqlite_migration = "2.6.0"
 alloy-primitives = { workspace = true }
 alloy-sol-types = { workspace = true }
 alloy = { workspace = true, features = ["contract", "network", "reqwest", "rpc-types", "sol-types", "json-rpc", "signer-local", "signers"] }
-alloy-network-primitives = "1.8"
-alloy-transport = "1.8"
+alloy-network-primitives = "2.5"
+alloy-transport = "2.5"
 url = "2.5"
 thiserror = { workspace = true }
 ssz = { workspace = true }

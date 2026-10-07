@@ -11,12 +11,9 @@ use alloy::providers::ext::AnvilApi;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{BlockNumberOrTag, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolCall;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use app_core::application::{WalletConfig, default_private_keys};
 use cartesi_rollups_contracts::application_factory::ApplicationFactory::{self, WithdrawalConfig};
-use cartesi_rollups_contracts::data_availability::DataAvailability::InputBoxCall;
-use serde::Deserialize;
 use tokio::process::{Child, Command};
 
 use crate::HarnessResult;
@@ -155,9 +152,9 @@ impl ManagedAnvil {
     async fn spawn(log_prefix: &str, logs_dir: &Path) -> HarnessResult<Self> {
         let state_dir = paths::resolved_anvil_state_dir();
         let state_path = state_dir.join("state.json");
-        let input_box_path = state_dir.join("deployments/31337/InputBox.json");
-        let application_factory_path = state_dir.join("deployments/31337/ApplicationFactory.json");
-        let erc20_portal_path = state_dir.join("deployments/31337/ERC20Portal.json");
+        let input_box_path = state_dir.join("deployments/31337/InputBox.txt");
+        let application_factory_path = state_dir.join("deployments/31337/ApplicationFactory.txt");
+        let erc20_portal_path = state_dir.join("deployments/31337/Erc20Portal.txt");
 
         ensure_exists(
             state_path.as_path(),
@@ -189,7 +186,7 @@ impl ManagedAnvil {
         let application_factory_address =
             read_deployment_address(application_factory_path.as_path(), "ApplicationFactory")?;
         let erc20_portal_address =
-            read_deployment_address(erc20_portal_path.as_path(), "ERC20Portal")?;
+            read_deployment_address(erc20_portal_path.as_path(), "Erc20Portal")?;
 
         fs::create_dir_all(logs_dir)?;
         let log_path = timestamped_log_path(logs_dir, &format!("{log_prefix}-anvil"));
@@ -315,26 +312,10 @@ impl ManagedAnvil {
     }
 }
 
+/// Reads a plaintext `deployments/<chain>/<Contract>.txt` artifact (the
+/// address alone); upstream deprecated the JSON siblings.
 fn read_deployment_address(path: &Path, contract_name: &str) -> HarnessResult<Address> {
-    #[derive(Deserialize)]
-    struct DeploymentInfo {
-        address: String,
-        #[serde(rename = "contractName")]
-        contract_name: String,
-    }
-
-    let deployment: DeploymentInfo = serde_json::from_str(&fs::read_to_string(path)?)
-        .map_err(|err| io_other(format!("failed to parse {}: {err}", path.display())))?;
-    if deployment.contract_name != contract_name {
-        return Err(io_other(format!(
-            "expected {} deployment in {}, found {}",
-            contract_name,
-            path.display(),
-            deployment.contract_name
-        ))
-        .into());
-    }
-    deployment.address.parse().map_err(|err| {
+    fs::read_to_string(path)?.trim().parse().map_err(|err| {
         io_other(format!(
             "invalid {} address in {}: {err}",
             contract_name,
@@ -530,11 +511,6 @@ async fn deploy_devnet_application(
 
     let factory = ApplicationFactory::new(application_factory_address, &provider);
     let template_hash = load_template_hash(paths::devnet_machine_image_path().as_path())?;
-    let data_availability: Bytes = InputBoxCall {
-        inputBox: input_box_address,
-    }
-    .abi_encode()
-    .into();
     // Withdrawals disabled: a zero guardian can never `foreclose()`, so the
     // InputBox's v3 `notForeclosed` gate on `addInput` stays permanently open,
     // and no withdrawal output builder is needed for the placeholder wallet.
@@ -549,7 +525,7 @@ async fn deploy_devnet_application(
         Address::ZERO,
         app_owner,
         template_hash,
-        data_availability,
+        input_box_address,
         withdrawal_config,
     );
     let application_address = create_application

@@ -304,7 +304,7 @@ Use Sepolia to validate **the same procedure** you will run on mainnet: internal
 | Chain ID | `11155111` |
 | Public user ingress (tx demos only) | e.g. `https://eth-sepolia.rollups.cartesi.io/v2` — **may not** serve `/finalized_state` |
 | Application instance | Per deployment (confirm with ops; demos have used `0x4CE633CA71071818cD73187765ee60F696dae083`) |
-| InputBox (rollups v3.0.0-alpha.6, deterministic cross-chain address) | Confirm against the [v3.0.0-alpha.6 release deployment addresses](https://github.com/cartesi/rollups-contracts/releases/tag/v3.0.0-alpha.6) (`0x346B3df038FE9f8380071eC6514D5a83aD143939` on Sepolia) |
+| InputBox (rollups v3.0.0-alpha.10, deterministic cross-chain address) | Confirm against the [v3.0.0-alpha.10 release deployment addresses](https://github.com/cartesi/rollups-contracts/releases/tag/v3.0.0-alpha.10) (`0xEbE9f4Dfc04ae10bBeE663859c3dc5A23f94eA3C` on Sepolia) |
 | CM image | `just canonical-build-machine-image-sepolia` |
 | Tx / deposit demos | `tests/scripts/demo_sepolia.py` (copy `.env` locally; never commit secrets) |
 

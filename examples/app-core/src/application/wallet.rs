@@ -62,11 +62,11 @@ pub struct WalletApp {
     execution_progress: ApplicationProgress,
 }
 
-/// Rollups-contracts v3.0.0-alpha.6 ERC20Portal. The contracts deploy at
+/// Rollups-contracts v3.0.0-alpha.10 Erc20Portal. The contracts deploy at
 /// deterministic addresses, identical on every chain — this same value serves
 /// Sepolia and the devnet Anvil dump (which is why `devnet()` reuses it).
 pub const SEPOLIA_ERC20_PORTAL_ADDRESS: Address =
-    address!("0x22E57511C30CcE6CDaa742E13CE3b774fDC663b1");
+    address!("0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419");
 pub const SEPOLIA_USDC_ADDRESS: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
 pub const DEVNET_MOCK_USDC_ADDRESS: Address =
     address!("0x95d0c8A7d11342299807A2Fc19ac44C2321cCc68");

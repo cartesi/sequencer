@@ -11,7 +11,7 @@ use alloy::sol;
 use alloy_primitives::{Address, Signature, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
 use app_core::application::{Method, Transfer, Withdrawal, default_private_keys};
-use cartesi_rollups_contracts::erc20_portal::ERC20Portal;
+use cartesi_rollups_contracts::erc20_portal::Erc20Portal;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer_core::api::{TxRequest, TxResponse};
@@ -186,9 +186,9 @@ impl WalletL1Client {
             })?;
         ensure_success(approve_receipt.status(), "mock ERC20 approve")?;
 
-        let portal = ERC20Portal::new(self.erc20_portal_address, &self.provider);
+        let portal = Erc20Portal::new(self.erc20_portal_address, &self.provider);
         let deposit_receipt = portal
-            .depositERC20Tokens(
+            .depositErc20Tokens(
                 token_address,
                 self.app_address,
                 amount,

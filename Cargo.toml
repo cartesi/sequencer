@@ -41,11 +41,12 @@ types = { version = "0.1", git = "https://github.com/GCdePaula/cartesi-tools-rs"
 cartesi-machine = { version = "2", git = "https://github.com/cartesi/dave", rev = "317a88a32a1b4a6002d561f37bb833843df55cba", features = ["download_uarch"] }
 
 # ── Contracts (exact pin — the single place the version lives) ──
-cartesi-rollups-contracts = "=3.0.0-alpha.6"
+cartesi-rollups-contracts = "=3.0.0-alpha.10"
 
-# ── Alloy family (must stay on the 1.x line: the contracts crate
-#    requires alloy ^1.0; feature lists are member-specific) ──
-alloy = "1.8"
+# ── Alloy family (must stay on the 2.x line: the contracts crate
+#    requires alloy ^2; the alloy-core crates below stay on 1.x;
+#    feature lists are member-specific) ──
+alloy = "2.5"
 alloy-primitives = { version = "1.6", features = ["serde", "k256"] }
 alloy-sol-types = "1.6"
 
