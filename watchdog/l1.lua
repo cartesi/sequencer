@@ -26,8 +26,7 @@ l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES = { "-32005", "-32012", "-32600", "-3260
 
 local GET_NUMBER_OF_INPUTS = "0x61a93c87" -- InputBox.getNumberOfInputs(address)
 local GET_TEMPLATE_HASH = "0x61b12c66" -- Application.getTemplateHash()
-local GET_DATA_AVAILABILITY = "0xf02478de" -- Application.getDataAvailability()
-local INPUT_BOX_AVAILABILITY = "\xb1\x2c\x9e\xde" -- DataAvailability.InputBox(address)
+local GET_INPUT_BOX = "0x00aace9a" -- Application.getInputBox()
 
 local function address_word(address)
     return string.rep("0", 24) .. address:sub(3)
@@ -90,24 +89,34 @@ function l1.new(rpc, params)
         return rpc_value(rpc:chain_id())
     end
 
-    --- The InputBox the application reads, from its `getDataAvailability()`,
+    --- The InputBox the application reads, from its `getInputBox()`,
     --- exactly as the sequencer derives it: a configured address could name
     --- another release's InputBox, whose empty history would look complete.
     function reader:input_box_address()
         if input_box then
             return input_box
         end
-        local result = rpc_value(rpc:eth_call(params.app_address, GET_DATA_AVAILABILITY, "latest"))
+        local result, err = rpc:eth_call(params.app_address, GET_INPUT_BOX, "latest")
+        -- A revert at `latest` is deterministic, not a provider hiccup: the
+        -- application predates `getInputBox()` (rollups-contracts < 3.0.0-alpha.7).
+        if result == nil and tostring(err):find("execution reverted", 1, true) then
+            errors.operator(
+                "application %s reverted getInputBox(); it predates rollups-contracts 3.0.0-alpha.7"
+                    .. " and must be redeployed",
+                params.app_address
+            )
+        end
+        result = rpc_value(result, err)
         if result == "0x" then
             errors.operator("no application contract at %s", params.app_address)
         end
         local ok, address = pcall(function()
-            local availability = abi.decode_bytes(result)
-            assert(#availability == 36 and availability:sub(1, 4) == INPUT_BOX_AVAILABILITY)
-            return abi.decode_address_word(availability:sub(5, 36))
+            local word = abi.bytes_from_hex(result)
+            assert(#word == 32)
+            return abi.decode_address_word(word)
         end)
         if not ok then
-            errors.operator("application %s does not take its inputs from an InputBox alone", params.app_address)
+            errors.operator("application %s returned a malformed getInputBox() result", params.app_address)
         end
         input_box = address
         return input_box

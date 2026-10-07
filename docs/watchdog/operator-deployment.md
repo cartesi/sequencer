@@ -311,7 +311,7 @@ load the state directory's machines and cannot reproduce the template.
 | Item | Value |
 |---|---|
 | Chain id | `11155111` |
-| InputBox | `0x346B3df038FE9f8380071eC6514D5a83aD143939`: rollups-contracts v3.0.0-alpha.6, the version the root `justfile` pins, deploys it at the same address on every chain, the devnet included |
+| InputBox | `0xEbE9f4Dfc04ae10bBeE663859c3dc5A23f94eA3C`: rollups-contracts v3.0.0-alpha.10, the version the root `justfile` pins, deploys it at the same address on every chain, the devnet included |
 | Canonical image | `canonical-machine-image-sepolia-vX.tar.gz`, or `just canonical-build-machine-image-sepolia`. Its guest runs `WalletConfig::sepolia()`, the configuration of the release `wallet-sequencer` binary |
 | State source | `inspect` |
 | Application | Per deployment |
