@@ -351,16 +351,22 @@ impl InputReader {
         let current_safe_block = current_safe_head.block_number;
         let (previous_safe_block, expected_start) = self.scan_cursor().await?;
 
-        // The next block to scan: one past the persisted safe head, or the
-        // app's deployment block on the very first sync (no input can exist
-        // before it).
-        let start_block = previous_safe_block.map_or(self.app_deployment_block, |b| b + 1);
+        // The next block to scan: one past the persisted safe head, never
+        // earlier than the app's deployment block (no input can exist before
+        // it). The persisted head itself may sit below that block: setup
+        // right after deployment observes a safe head that still trails it.
+        let start_block = previous_safe_block
+            .map_or(self.app_deployment_block, |b| b + 1)
+            .max(self.app_deployment_block);
 
-        // Nothing new to scan. On the first observation we still persist the
-        // real safe head so storage distinguishes "observed L1" from "no L1
-        // view yet".
+        // Nothing to scan. A new safe head is still persisted — on the first
+        // observation so storage distinguishes "observed L1" from "no L1 view
+        // yet", and below the deployment block so the L1 view keeps
+        // advancing. Neither consults the InputBox, which on a fresh chain may
+        // not exist yet at that height.
         if current_safe_block < start_block {
-            return Ok(previous_safe_block.is_none().then_some(SafeInputUpdate {
+            let advanced = previous_safe_block.is_none_or(|b| current_safe_block > b);
+            return Ok(advanced.then_some(SafeInputUpdate {
                 head: current_safe_head,
                 inputs: Vec::new(),
             }));
@@ -1059,6 +1065,59 @@ mod tests {
             Err(other) => panic!("expected bootstrap error, got {other:?}"),
             Ok(_) => panic!("invalid RPC URL should fail during bootstrap"),
         }
+    }
+
+    /// Setup right after app deployment persists a safe head that trails the
+    /// deployment block. Later syncs must keep advancing the head without
+    /// scanning or consulting the InputBox below the deployment block — on a
+    /// fresh devnet the InputBox itself may not exist at those heights (here
+    /// it has no code at all, so any count call would fail).
+    #[tokio::test]
+    async fn advance_once_below_app_deployment_block_skips_input_box() {
+        require_anvil();
+
+        let anvil = Anvil::default()
+            .block_time(1)
+            .args(["--slots-in-an-epoch", "1"])
+            .timeout(30_000)
+            .spawn();
+        let db_file = NamedTempFile::new().expect("temp file");
+        let mut reader = test_reader(
+            db_file.path().to_string_lossy().into_owned(),
+            anvil.endpoint_url().to_string(),
+            1_000,
+            Duration::from_secs(1),
+        );
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect(anvil.endpoint_url().to_string().as_str())
+            .await
+            .expect("connect provider");
+
+        reader.advance_once(&provider).await.expect("first sync");
+        let first = reader
+            .current_safe_block()
+            .await
+            .expect("read")
+            .expect("first sync records the observed safe head");
+
+        while latest_safe_head(&provider)
+            .await
+            .expect("safe head")
+            .block_number
+            <= first
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        reader
+            .advance_once(&provider)
+            .await
+            .expect("a sync below the deployment block must not query the InputBox");
+        let second = reader.current_safe_block().await.expect("read");
+        assert!(
+            second.is_some_and(|b| b > first && b < 1_000),
+            "safe head should advance below the deployment block: {first} -> {second:?}"
+        );
     }
 
     #[tokio::test]
