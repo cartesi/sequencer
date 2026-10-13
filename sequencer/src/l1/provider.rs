@@ -15,7 +15,8 @@ use alloy::{
     transports::http::{Http, reqwest, reqwest::Url},
 };
 use alloy_transport::{
-    RpcError, TransportError, TransportErrorKind, TransportFut, layers::RetryBackoffLayer,
+    RpcError, TransportError, TransportErrorKind, TransportFut,
+    layers::{RateLimitRetryPolicy, RetryBackoffLayer, RetryPolicy},
 };
 use tower::{Layer, Service};
 use url::Host;
@@ -28,9 +29,21 @@ use url::Host;
 // per sync, the startup sync included. Revisit with measured latencies of our
 // filtered query on hosted providers.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_RATE_LIMIT_RETRIES: u32 = 5;
-const INITIAL_BACKOFF_MS: u64 = 200;
-const COMPUTE_UNITS_PER_SEC: u64 = 500;
+/// Resends of one request that [`RateLimitOnly`] lets through, a second apart
+/// (alloy's backoff is not exponential) unless the server asks for a wait of up
+/// to [`MAX_RETRY_WAIT`], so a resend lands in a fresh window of a per-second
+/// cap.
+const MAX_RESENDS: u32 = 2;
+const RESEND_BACKOFF_MS: u64 = 1_000;
+/// The longest server-requested wait a resend honors.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(5);
+/// `-32005` ("limit exceeded") rejections that only a narrower `eth_getLogs`
+/// range clears; alloy resends every `-32005` as an Infura rate limit.
+const NARROWING_ONLY_REJECTIONS: &[&str] = &[
+    "query returned more than",        // Infura result-count cap
+    "Too many logs requested",         // Nethermind JsonRpc.MaxLogsPerResponse
+    "exceeds maximum RPC range limit", // Besu --rpc-max-logs-range
+];
 
 fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
     let url = Url::parse(url).map_err(|e| format!("invalid RPC URL: {e}"))?;
@@ -66,17 +79,61 @@ fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
     let transport = Http::with_client(http_client, url);
     let is_local = transport.guess_local();
 
-    let retry = RetryBackoffLayer::new(
-        MAX_RATE_LIMIT_RETRIES,
-        INITIAL_BACKOFF_MS,
-        COMPUTE_UNITS_PER_SEC,
-    );
-
     // Innermost, so the retry layer and every caller see redacted errors.
     Ok(RpcClient::builder()
-        .layer(retry)
+        .layer(retry_layer())
         .layer(redact)
         .transport(transport, is_local))
+}
+
+/// The retry layer every L1 client shares. `u64::MAX` compute units per second
+/// turns off alloy's compute-unit queueing, which models a provider plan we do
+/// not know: each worker builds its own client and keeps about one request in
+/// flight.
+fn retry_layer() -> RetryBackoffLayer<RateLimitOnly> {
+    RetryBackoffLayer::new_with_policy(
+        MAX_RESENDS,
+        RESEND_BACKOFF_MS,
+        u64::MAX,
+        RateLimitOnly::default(),
+    )
+}
+
+/// alloy's rate-limit policy minus the resends that cannot help: a
+/// server-requested wait over [`MAX_RETRY_WAIT`] (alloy honors up to 300 s per
+/// resend and logs it only at TRACE), and a [`NARROWING_ONLY_REJECTIONS`]
+/// `-32005`, which would cost each failing `eth_getLogs` split two more full
+/// queries. A refused error reaches the caller at once instead of sleeping:
+/// worker loops retry on their next tick, the `eth_getLogs` partition narrows
+/// the range at once (`l1/partition.rs`), and a one-shot command fails.
+///
+/// Liveness and visibility only: which inputs are accepted is decided by the
+/// reader's witnesses, whatever was resent. Assumes the listed wordings; a
+/// reworded rejection is resent like any other `-32005`, wasteful but never
+/// stuck. Revisit
+/// when a crawl is seen failing on refused waits, or when alloy changes its
+/// `-32005` rule or its hint clamp.
+#[derive(Clone, Copy, Debug, Default)]
+struct RateLimitOnly(RateLimitRetryPolicy);
+
+impl RetryPolicy for RateLimitOnly {
+    fn should_retry(&self, error: &TransportError) -> bool {
+        let narrowing_only = error.as_error_resp().is_some_and(|payload| {
+            payload.code == -32005
+                && NARROWING_ONLY_REJECTIONS
+                    .iter()
+                    .any(|wording| payload.message.contains(wording))
+        });
+        let long_wait = self
+            .0
+            .backoff_hint(error)
+            .is_some_and(|wait| wait > MAX_RETRY_WAIT);
+        !narrowing_only && !long_wait && self.0.should_retry(error)
+    }
+
+    fn backoff_hint(&self, error: &TransportError) -> Option<Duration> {
+        self.0.backoff_hint(error)
+    }
 }
 
 /// Whether a parsed URL host refers to a loopback address.
@@ -273,6 +330,115 @@ pub async fn create_verified_signer_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::rpc::json_rpc::ErrorPayload;
+    use alloy::transports::mock::{Asserter, MockTransport};
+    use alloy_transport::{RpcError, TransportErrorKind};
+
+    fn error_response(code: i64, message: &'static str) -> TransportError {
+        RpcError::ErrorResp(ErrorPayload {
+            code,
+            message: message.into(),
+            data: None,
+        })
+    }
+
+    // ── Retry policy: resend rate limits only, briefly ────────
+
+    #[test]
+    fn the_retry_policy_resends_rate_limits_only() {
+        let policy = RateLimitOnly::default();
+        for retried in [
+            error_response(429, "Too Many Requests"),
+            error_response(-32005, "Rate limit exceeded"),
+            error_response(-32005, "project ID request rate exceeded"),
+            TransportErrorKind::http_error(503, String::new()),
+            TransportErrorKind::http_error_with_retry_after(
+                429,
+                "Too Many Requests".into(),
+                Some(Duration::from_secs(2)),
+            ),
+        ] {
+            assert!(policy.should_retry(&retried), "{retried}");
+        }
+        let backoff = serde_json::value::to_raw_value(
+            &serde_json::json!({ "rate": { "backoff_seconds": 30 } }),
+        )
+        .unwrap();
+        for sent_once in [
+            // Log caps that only a narrower range clears.
+            error_response(
+                -32005,
+                "query returned more than 10000 results. Try with this block range [0x15ef3c0, 0x15ef4ff].",
+            ),
+            error_response(
+                -32005,
+                "Too many logs requested. Max logs per response is 20000.",
+            ),
+            error_response(-32005, "Requested range exceeds maximum RPC range limit"),
+            // A longer wait is the caller's next tick.
+            TransportErrorKind::http_error_with_retry_after(
+                429,
+                "Too Many Requests".into(),
+                Some(Duration::from_secs(30)),
+            ),
+            RpcError::ErrorResp(ErrorPayload {
+                code: -32005,
+                message: "project ID request rate exceeded".into(),
+                data: Some(backoff),
+            }),
+            // A hang or a dead endpoint is never resent.
+            TransportErrorKind::custom_str("operation timed out"),
+        ] {
+            assert!(!policy.should_retry(&sent_once), "{sent_once}");
+        }
+    }
+
+    fn mocked_client(asserter: &Asserter) -> RpcClient {
+        RpcClient::builder()
+            .layer(retry_layer())
+            .transport(MockTransport::new(asserter.clone()), true)
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_is_sent_three_times() {
+        let asserter = Asserter::new();
+        for _ in 0..3 {
+            asserter.push_failure(ErrorPayload {
+                code: 429,
+                message: "Too Many Requests".into(),
+                data: None,
+            });
+        }
+        let error = mocked_client(&asserter)
+            .request_noparams::<alloy_primitives::U64>("eth_blockNumber")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Max retries exceeded"),
+            "{error}"
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_narrowing_only_rejection_reaches_the_caller_unretried() {
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32005,
+            message: "query returned more than 10000 results".into(),
+            data: None,
+        });
+        // A resend would find the queue empty and fail differently.
+        let error = mocked_client(&asserter)
+            .request_noparams::<alloy_primitives::U64>("eth_getLogs")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_error_resp().map(|payload| payload.code),
+            Some(-32005)
+        );
+        assert!(asserter.read_q().is_empty());
+    }
 
     // ── Regression: URL scheme enforcement ────────────────
 

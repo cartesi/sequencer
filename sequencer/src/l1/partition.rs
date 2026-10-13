@@ -102,8 +102,10 @@ pub(crate) async fn get_input_added_events_ordered(
 /// that vary and overlap with rate limits, and a timeout carries no code, so
 /// every failure narrows. This protects liveness only: completeness is the
 /// reader's index-contiguity and count witnesses, whatever ranges were asked.
-/// Assumes one block's logs fit one response. A persistent failure costs one
-/// left spine, `ceil(log2 width) + 1` sequential queries. The watchdog's
+/// Assumes one block's logs fit one response; revisit if a single-block query
+/// fails persistently on a healthy provider. A persistent failure costs one
+/// left spine, `ceil(log2 width) + 1` sequential queries, each sent up to three
+/// times when the client resends a rate limit (`l1/provider.rs`). The watchdog's
 /// `reader:inputs` (`watchdog/l1.lua`) applies the same rule, and
 /// `tests/fixtures/l1_partition_vector.json` pins both.
 async fn bisect<T, E, F, Fut>(start: u64, end: u64, mut fetch: F) -> Result<Vec<T>, (u64, E)>

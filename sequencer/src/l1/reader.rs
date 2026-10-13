@@ -619,6 +619,9 @@ fn provider_error(
 /// against the same address re-fails identically. (A contract revert arrives
 /// as `TransportError(RpcError::ErrorResp)`, so matching on the outer
 /// variant alone would misfile "wrong contract" as "L1 unreachable".)
+/// Classify with alloy's full `RateLimitRetryPolicy`, not the client's
+/// narrower resend policy (`l1/provider.rs`): a rate limit the client declined
+/// to resend is still transient.
 fn map_contract_bootstrap_error(err: alloy::contract::Error) -> InputReaderError {
     use alloy::transports::RpcError;
     use alloy::transports::layers::{RateLimitRetryPolicy, RetryPolicy};
@@ -1296,6 +1299,22 @@ mod tests {
         // surface it as retryable (FirstBootRequiresL1), not as a terminal
         // Bootstrap misconfig.
         let err = map_contract_bootstrap_error(error_resp(-32005, "exceeded project rate limit"));
+        assert!(matches!(err, InputReaderError::Provider(_)), "got {err:?}");
+
+        // One whose requested wait the client refused to sleep through stays
+        // transient too.
+        let err = map_contract_bootstrap_error(alloy::contract::Error::TransportError(
+            alloy::transports::RpcError::ErrorResp(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32005,
+                message: "project ID request rate exceeded".into(),
+                data: Some(
+                    serde_json::value::to_raw_value(
+                        &serde_json::json!({ "rate": { "backoff_seconds": 30 } }),
+                    )
+                    .expect("raw json"),
+                ),
+            }),
+        ));
         assert!(matches!(err, InputReaderError::Provider(_)), "got {err:?}");
 
         // A contract revert also arrives as ErrorResp — that one IS terminal:
