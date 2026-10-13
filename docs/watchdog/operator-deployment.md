@@ -172,12 +172,13 @@ Back up, from the state directory:
 - the newest `checkpoints/<block>-<count>/`, the head: the stored machine at
   L1 block `<block>`, after `<count>` InputBox inputs, which the sequencer
   agreed with (or the trusted bootstrap, before the first agreement);
-- `incident/` while a divergence is latched, and `incidents/`.
+- `incident/` while a divergence is latched, and `incidents/`;
+- `config.json`: `init` refuses a directory whose agreed head has lost it.
 
-`init` writes `config.json`, so it needs no backup. Checkpoints are published
-atomically, so the newest one is complete once a tick has finished. Run the
-backup after the tick in the same scheduled job: the next tick removes the
-previous head as soon as it publishes a new one. Names are zero-padded, so the
+Checkpoints are published atomically, so the newest one is complete once a
+tick has finished. Run the backup after the tick in the same scheduled job: the
+next tick removes the previous head as soon as it publishes a new one. Names
+are zero-padded, so the
 last one in sorted order is the newest. Stored machines are sparse files; copy
 them with a sparse-aware tool (`cp --sparse=always`, `rsync --sparse`,
 `tar --sparse`). Keep copies outside `checkpoints/`, which must hold nothing
@@ -382,15 +383,17 @@ a crash loop.
 
 ## Troubleshooting (live deployments)
 
-The wrapper prints the lock message itself; the watchdog prints the others
-after the command and failure class, as in
+The wrapper prints the lock and `flock` messages, and the missing-directory
+message for `clear`, itself; the watchdog prints the others after the command
+and failure class, as in
 `watchdog: tick: transient failure: <message>`.
 
 | Message | Cause |
 |---|---|
 | `watchdog state is already locked: <dir>/run.lock` | Another `init`, `tick`, or `clear` holds the state directory, so the scheduler overlaps runs |
 | `flock is required (util-linux)` | Install util-linux; the wrapper needs `flock` for its lock |
-| `state directory <dir> does not exist` | `status` or `replay` with a wrong `CARTESI_WATCHDOG_STATE_DIR` |
+| `state directory <dir> does not exist` | `status`, `replay`, or `clear` with a wrong `CARTESI_WATCHDOG_STATE_DIR` |
+| `<dir> has checkpoint <path> but no config.json; restore config.json or wipe the directory` | `config.json` was lost beside an agreed head; restore it from backup, or wipe and re-run `init` |
 | `<dir>/config.json is not valid JSON` | A crash tore `config.json` right after `init`; wipe the state directory and re-run `init` |
 | `<dir> is not initialized; run init` | `tick` or `replay` on an empty state directory: a missing volume or a changed `CARTESI_WATCHDOG_STATE_DIR` |
 | `<dir>/config.json is not a version 2 watchdog config; wipe the state directory and re-run init` | See [upgrades](#upgrades) |

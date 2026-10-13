@@ -616,6 +616,42 @@ test("bootstrap requires the template when no input precedes the block", functio
     eq(store:exists("config.json"), false)
 end)
 
+test("bootstrap validates an existing config like tick would", function()
+    local store = store_mod.open(support.tmpdir(), json)
+    bootstrap_with(store, {})
+    local document = store:read_json("config.json")
+    document.long_block_range_error_codes = {}
+    store:write_json(document, "config.json")
+    raises("operator", "lists no long_block_range_error_codes", function()
+        bootstrap_with(store, {})
+    end)
+end)
+
+test("bootstrap refuses to delete an agreed head beside a missing config", function()
+    local store = support.state_dir(json, 9, 2, "agreed")
+    raises("operator", "but no config.json", function()
+        bootstrap_with(store, { CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK = "5" })
+    end)
+    eq(store:head().block, 9)
+end)
+
+test("bootstrap refuses a snapshot inside the directory it replaces", function()
+    local store = store_mod.open(support.tmpdir(), json)
+    local cfg = config.from_init_env(init_env({}))
+    cfg.state_dir = store.dir
+    cfg.bootstrap_dir = store:path("checkpoints", "copied")
+    raises("operator", "which init replaces", function()
+        bootstrap.run(cfg, { store = store, machine = support.fake_machine(), l1 = l1_reader({}) })
+    end)
+end)
+
+test("bootstrap restarts an interrupted init", function()
+    local store = support.state_dir(json, 5, 0, "partial")
+    local result = bootstrap_with(store, { CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK = "5" }, { { block = 3 } })
+    eq(result.kind, "initialized")
+    eq(store:head().input_count, 1)
+end)
+
 test("bootstrap refuses a pinned chain id the RPC does not serve", function()
     local store = store_mod.open(support.tmpdir(), json)
     raises("operator", "CARTESI_WATCHDOG_BLOCKCHAIN_ID is 5", function()
@@ -706,6 +742,11 @@ test("main tick exits 0/2 and records last_tick.json and status.prom", function(
     eq(run({ "clear", "--block", "12", "--reason", "drill" }), 1)
     eq(run({ "clear", "--block=13", "--reason=drill" }, nil, sink()), 0)
     eq(incident.marker(store), nil)
+
+    local missing = store.dir .. "-mistyped"
+    eq(main.run({ "clear", "--block=13", "--reason=drill" },
+        { env = { CARTESI_WATCHDOG_STATE_DIR = missing }, stdout = sink() }), 1)
+    eq(require("lfs").attributes(missing, "mode"), nil)
 end)
 
 test("main tick keeps exit 2 while latched even when nothing else can run", function()

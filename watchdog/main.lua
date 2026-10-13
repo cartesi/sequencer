@@ -93,8 +93,8 @@ local function block_flag(flags, name)
     return value
 end
 
---- The state directory; only commands that write it may create it, so a
---- mistyped path fails `status` and `replay` instead of creating a directory.
+--- The state directory; only `init` and `tick` may create it, so a mistyped
+--- path fails `status`, `replay` and `clear` instead of creating a directory.
 local function open_store(state_dir, create)
     local lfs = require("lfs")
     if lfs.attributes(state_dir, "mode") ~= "directory" then
@@ -149,7 +149,7 @@ end
 
 function commands.clear(flags, env)
     local state_dir = config.state_dir(env)
-    local store = open_store(state_dir, true)
+    local store = open_store(state_dir)
     local archive = incident.clear(store, block_flag(flags, "block"), flag(flags, "reason"), now())
     log("clear: incident archived at %s", archive)
     return EXIT_OK, { archived = archive }
