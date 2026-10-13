@@ -91,7 +91,12 @@ where
             last_seed_block.is_none_or(|prev| seed.inclusion_block >= prev),
             "fold seeds must arrive in ascending inclusion-block order"
         );
-        // SC-3: seeds are reconstructed `(A, B]` *directs* — enqueue_direct skips
+        assert!(
+            seed.inclusion_block <= stop_block,
+            "fold seed at block {} is above stop block {stop_block}",
+            seed.inclusion_block,
+        );
+        // Seeds are reconstructed `(A, B]` *directs* — enqueue_direct skips
         // sender classification, so a mis-sourced `sender == sequencer_address`
         // row would be silently filed as a direct instead of a batch (a wrong
         // S'). Fail loud, matching the ordering/range asserts above.
@@ -123,6 +128,13 @@ where
             last_replay_block.is_none_or(|prev| input.inclusion_block >= prev),
             "fold replay inputs must arrive in ascending inclusion-block order"
         );
+        // A batch above C would execute without leaving anything in the fridge
+        // for the post-drain check below to catch.
+        assert!(
+            input.inclusion_block <= stop_block,
+            "fold replay input at block {} is above stop block {stop_block}",
+            input.inclusion_block,
+        );
         last_replay_block = Some(input.inclusion_block);
         scheduler.process_input(SchedulerInput {
             sender: input.sender,
@@ -137,10 +149,8 @@ where
     // starts past C with no fridge, would otherwise never see them.
     scheduler.drain_covered_at(stop_block)?;
 
-    // Fail loud on a dropped direct: after draining at C the fridge MUST be
-    // empty. A non-empty fridge means an input arrived with `inclusion_block > C`
-    // (seed or replay) — outside the fold's range — which `finish` would
-    // otherwise discard silently, yielding a wrong `S'`.
+    // Backstop for the range asserts above: after draining at C the fridge
+    // must be empty, or `finish` would discard a direct silently.
     assert_eq!(
         scheduler.queued_direct_len(),
         0,
@@ -429,11 +439,11 @@ mod tests {
     // --- fail-loud contract guards (always-on, not debug-only) ---
 
     #[test]
-    #[should_panic(expected = "undrained at stop block")]
+    #[should_panic(expected = "is above stop block")]
     fn replay_input_past_stop_block_panics_instead_of_silently_dropping() {
-        // A direct at block 50 with C = 30: never covered, never overdue, so it
-        // lingers in the fridge after step 5. The booting run would never see it,
-        // so a silent drop would diverge `S'` — the guard must catch it.
+        // A direct at block 50 with C = 30 would never be drained by step 5, and
+        // the booting run would never see it. The range assert rejects it before
+        // it reaches the fridge.
         let replay = vec![direct(DIRECT_SENDER, 50, 0xDD)];
         let _ = fold_replay(
             FoldApp::default(),
@@ -442,6 +452,37 @@ mod tests {
             domain(),
             Vec::new(),
             replay,
+            30,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "fold replay input at block 50 is above stop block 30")]
+    fn replay_batch_past_stop_block_panics() {
+        // A batch leaves nothing in the fridge, so only the range assert sees it.
+        let replay = vec![empty_batch(50, 0)];
+        let _ = fold_replay(
+            FoldApp::default(),
+            0,
+            config(),
+            domain(),
+            Vec::new(),
+            replay,
+            30,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "fold seed at block 50 is above stop block 30")]
+    fn seed_past_stop_block_panics() {
+        let seeds = vec![direct(DIRECT_SENDER, 50, 0x01)];
+        let _ = fold_replay(
+            FoldApp::default(),
+            0,
+            config(),
+            domain(),
+            seeds,
+            Vec::new(),
             30,
         );
     }
