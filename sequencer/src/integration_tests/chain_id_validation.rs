@@ -122,7 +122,9 @@ async fn run_refuses_when_setup_incomplete() {
     assert!(
         matches!(
             result,
-            Err(CommandError::Bootstrap(BootstrapError::SetupNotComplete))
+            Err(CommandError::Bootstrap(
+                BootstrapError::SetupNotComplete { .. }
+            ))
         ),
         "expected SetupNotComplete, got: {result:?}"
     );

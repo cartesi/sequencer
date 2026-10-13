@@ -227,6 +227,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_and_flush_on_a_missing_data_dir_exit_30_without_creating_it() {
+        use crate::commands::test_support::SweepTestApp;
+
+        for command in ["run", "flush-mempool"] {
+            let parent = tempfile::tempdir().expect("create parent dir");
+            let mistyped = parent.path().join("mistyped");
+            let cli = Cli::try_parse_from([
+                "sequencer",
+                command,
+                "--data-dir",
+                mistyped.to_str().expect("utf8 path"),
+                "--eth-rpc-url",
+                "http://127.0.0.1:1",
+                "--batch-submitter-private-key",
+                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            ])
+            .expect("parse command");
+
+            let exit = dispatch::<SweepTestApp, _>(cli.command, || Ok(SweepTestApp)).await;
+
+            assert_eq!(exit, std::process::ExitCode::from(30), "{command}");
+            assert!(
+                !mistyped.exists(),
+                "{command} must not create a missing data dir"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn top_level_command_panic_maps_to_terminal_exit() {
         let result = tokio::spawn(async {
             panic!("trusted-code invariant failure");

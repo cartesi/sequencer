@@ -48,10 +48,10 @@ where
     A: Application + 'static,
 {
     // ── Gate + identity ──────────────────────────────────────
-    std::fs::create_dir_all(&config.data_dir)?;
-    // Exclusive process ownership, ahead of every read. The controller keeps
-    // its own clone through durable settlement; runtime-owned tasks separately
-    // retain clones until they stop.
+    super::require_data_dir(&config.data_dir)?;
+    // Exclusive process ownership, ahead of every read of the directory's
+    // contents. The controller keeps its own clone through durable
+    // settlement; runtime-owned tasks separately retain clones until they stop.
     let process_lock = process_lock::ProcessLock::acquire(&config.data_dir)?;
     let db_path = config.db_path();
     let timing = config.protocol_timing()?;
@@ -60,8 +60,8 @@ where
     // RPC: canonical divergence and the two-sided setup-completion rule.
     // Divergence is never reinterpreted as a provider failure.
     warn_on_previous_terminal_fault(&db_path);
-    preflight_lifecycle_command(&db_path, LifecycleCommand::Run)?;
-    let identity = load_setup_identity(&db_path)?;
+    preflight_lifecycle_command(&config.data_dir, LifecycleCommand::Run)?;
+    let identity = load_setup_identity(&config.data_dir)?;
 
     // `run` holds the signing key (it submits). The key's address must match
     // the pinned submitter address — running with the wrong key against a DB

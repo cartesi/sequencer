@@ -12,10 +12,11 @@ use crate::ingress::inclusion_lane::dump_info::{self, delete_dump_dir};
 /// Repair interrupted artifact creation/collection before starting workers.
 pub(super) fn run_snapshot_hygiene(
     storage: &mut crate::storage::Storage,
+    data_dir: &str,
     dumps_dir: &std::path::Path,
 ) -> Result<(), CommandError> {
     storage.reset_dump_leases()?;
-    require_rollback_snapshot(storage)?;
+    require_rollback_snapshot(storage, data_dir)?;
     let gc_removed = snapshot_gc_at_startup(storage)?;
     let sweep_removed = sweep_orphan_dumps(storage, dumps_dir)?;
     tracing::debug!(
@@ -26,10 +27,15 @@ pub(super) fn run_snapshot_hygiene(
     Ok(())
 }
 
-fn require_rollback_snapshot(storage: &mut crate::storage::Storage) -> Result<(), CommandError> {
-    let snapshot = storage.rollback_snapshot()?.ok_or(CommandError::Bootstrap(
-        crate::commands::error::BootstrapError::SetupNotComplete,
-    ))?;
+fn require_rollback_snapshot(
+    storage: &mut crate::storage::Storage,
+    data_dir: &str,
+) -> Result<(), CommandError> {
+    let snapshot = storage.rollback_snapshot()?.ok_or_else(|| {
+        CommandError::Bootstrap(crate::commands::error::BootstrapError::SetupNotComplete {
+            data_dir: data_dir.to_string(),
+        })
+    })?;
     dump_info::read_info(&snapshot.dump.prefix).map_err(|source| {
         CommandError::ReferencedSnapshotArtifact {
             path: snapshot.dump.prefix,
@@ -132,7 +138,7 @@ mod tests {
             .insert_baseline_snapshot(&missing, crate::storage::ExecutedInputCount::ZERO)
             .expect("register missing fixture");
 
-        let err = require_rollback_snapshot(&mut storage)
+        let err = require_rollback_snapshot(&mut storage, "/data")
             .expect_err("a durable DB reference cannot point at a missing artifact");
 
         assert!(matches!(
@@ -155,7 +161,7 @@ mod tests {
             .insert_baseline_snapshot(&corrupt, crate::storage::ExecutedInputCount::ZERO)
             .expect("register corrupt fixture");
 
-        let err = require_rollback_snapshot(&mut storage)
+        let err = require_rollback_snapshot(&mut storage, "/data")
             .expect_err("corrupt durable metadata cannot be retried as operational I/O");
 
         assert!(matches!(
@@ -464,7 +470,7 @@ mod tests {
         assert!(storage.gc_unreferenced_dumps().unwrap().is_empty());
         assert!(obsolete.exists(), "the persisted lease blocks ordinary GC");
 
-        run_snapshot_hygiene(&mut storage, dumps.path()).unwrap();
+        run_snapshot_hygiene(&mut storage, "/data", dumps.path()).unwrap();
 
         assert_eq!(storage.dump_lease_count(baseline_id).unwrap(), Some(0));
         assert_eq!(storage.dump_lease_count(obsolete_id).unwrap(), None);

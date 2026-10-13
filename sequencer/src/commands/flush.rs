@@ -21,14 +21,14 @@ use crate::recovery::MempoolFlusher;
 use crate::storage::{self, LifecycleCommand};
 
 pub async fn flush_mempool(config: FlushConfig) -> Result<(), CommandError> {
-    std::fs::create_dir_all(&config.data_dir)?;
+    super::require_data_dir(&config.data_dir)?;
     // Exclusive process ownership: a flush must never broadcast beside a
     // live sequencer (or another flush) reading the same watermark.
     let _process_lock = crate::runtime::process_lock::ProcessLock::acquire(&config.data_dir)?;
     let db_path = config.db_path();
 
-    super::preflight_lifecycle_command(&db_path, LifecycleCommand::MaintenanceFlush)?;
-    let identity = load_setup_identity(&db_path)?;
+    super::preflight_lifecycle_command(&config.data_dir, LifecycleCommand::MaintenanceFlush)?;
+    let identity = load_setup_identity(&config.data_dir)?;
 
     // The signing key must match the pinned submitter — flushing under the
     // wrong key would settle the wrong account's nonce.

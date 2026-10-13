@@ -35,14 +35,43 @@ use alloy_primitives::Address;
 
 pub(crate) const INPUT_READER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+fn setup_not_complete(data_dir: &str) -> CommandError {
+    BootstrapError::SetupNotComplete {
+        data_dir: data_dir.to_string(),
+    }
+    .into()
+}
+
+/// Only `setup` creates a data directory, so a mistyped path refuses here
+/// instead of becoming an empty directory that holds a lock file. Only real
+/// absence means "not set up"; an unreadable path stays an I/O error.
+fn require_data_dir(data_dir: &str) -> Result<(), CommandError> {
+    let io_error = |kind, detail: &dyn std::fmt::Display| {
+        CommandError::from(std::io::Error::new(
+            kind,
+            format!("data dir {data_dir}: {detail}"),
+        ))
+    };
+    match std::fs::metadata(data_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(io_error(
+            std::io::ErrorKind::NotADirectory,
+            &"not a directory",
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(setup_not_complete(data_dir)),
+        Err(err) => Err(io_error(err.kind(), &err)),
+    }
+}
+
 fn preflight_lifecycle_command(
-    db_path: &str,
+    data_dir: &str,
     command: LifecycleCommand,
 ) -> Result<(), CommandError> {
-    if !std::path::Path::new(db_path).try_exists()? {
-        return Err(BootstrapError::SetupNotComplete.into());
+    let db_path = config::db_path_in(data_dir);
+    if !std::path::Path::new(&db_path).try_exists()? {
+        return Err(setup_not_complete(data_dir));
     }
-    let storage = storage::Storage::open_read_only(db_path)?;
+    let storage = storage::Storage::open_read_only(&db_path)?;
     storage.preflight_lifecycle_command(command)?;
     Ok(())
 }
@@ -133,15 +162,14 @@ pub(crate) fn batch_submitter_address_from_private_key(
 /// A missing completion fact — or a completion fact without an identity (a
 /// corrupt/incomplete setup) — is a terminal `SetupNotComplete`: the operator must
 /// (re-)run `setup`, not retry `run`.
-pub(crate) fn load_setup_identity(db_path: &str) -> Result<DeploymentIdentity, CommandError> {
-    let storage = storage::Storage::open_read_only(db_path)?;
+pub(crate) fn load_setup_identity(data_dir: &str) -> Result<DeploymentIdentity, CommandError> {
+    let storage = storage::Storage::open_read_only(&config::db_path_in(data_dir))?;
     if !storage.is_setup_complete()? {
-        return Err(BootstrapError::SetupNotComplete.into());
+        return Err(setup_not_complete(data_dir));
     }
-    match storage.deployment_identity()? {
-        Some(identity) => Ok(identity),
-        None => Err(BootstrapError::SetupNotComplete.into()),
-    }
+    storage
+        .deployment_identity()?
+        .ok_or_else(|| setup_not_complete(data_dir))
 }
 
 /// Verify that the RPC's `eth_chainId` matches the configured chain id.
@@ -253,7 +281,7 @@ fn deployment_identity_mismatch_fields(
 mod tests {
     use super::{
         BootstrapError, CommandError, IdentityError, batch_submitter_address_from_private_key,
-        deployment_identity_mismatch_fields, ensure_deployment_identity,
+        deployment_identity_mismatch_fields, ensure_deployment_identity, require_data_dir,
         require_deployment_identity_match,
     };
     use crate::recovery::{RecoveryError, RecoveryRetryReason};
@@ -427,5 +455,31 @@ mod tests {
             !message.contains(secret),
             "private key material must not be reflected in startup errors"
         );
+    }
+
+    #[test]
+    fn missing_data_dir_refusal_names_the_path() {
+        let parent = tempfile::tempdir().expect("create parent dir");
+        let mistyped = parent.path().join("mistyped");
+        let mistyped = mistyped.to_str().expect("utf8 path");
+
+        let err = require_data_dir(mistyped).expect_err("a missing data dir must refuse");
+
+        assert!(matches!(
+            err,
+            CommandError::Bootstrap(BootstrapError::SetupNotComplete { .. })
+        ));
+        assert!(err.to_string().contains(mistyped), "{err}");
+    }
+
+    #[test]
+    fn a_data_dir_that_is_a_file_is_an_io_error_not_missing_setup() {
+        let file = tempfile::NamedTempFile::new().expect("create file");
+        let path = file.path().to_str().expect("utf8 path");
+
+        let err = require_data_dir(path).expect_err("a file is not a data dir");
+
+        assert!(matches!(err, CommandError::Io(_)), "{err:?}");
+        assert!(err.to_string().contains(path), "{err}");
     }
 }

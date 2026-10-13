@@ -262,7 +262,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         | BootstrapError::FeeOracleMisconfig { .. }
         | BootstrapError::FeeOracleFatal { .. }
         | BootstrapError::SignerMisconfig { .. }
-        | BootstrapError::SetupNotComplete
+        | BootstrapError::SetupNotComplete { .. }
         | BootstrapError::CheckpointBeforeAppDeployment { .. }
         | BootstrapError::SetupRecovery(_)
         | BootstrapError::Identity(IdentityError::Mismatch { .. } | IdentityError::OrphanedState) => {
@@ -340,8 +340,8 @@ pub enum BootstrapError {
     /// has not completed — its completion fact is absent (setup never ran, or
     /// crashed midway), or its outputs are incomplete. The
     /// operator must run `setup` first; restarting `run` cannot self-heal.
-    #[error("setup has not completed for this data dir — run `setup` first")]
-    SetupNotComplete,
+    #[error("setup has not completed for data dir {data_dir} — run `setup` first")]
+    SetupNotComplete { data_dir: String },
     /// Another live process holds the exclusive data-directory lock
     /// (`process_lock`). Retry-safe: the lock is what prevents concurrent
     /// harm, and an orchestrated restart racing the previous owner's drain
@@ -1017,7 +1017,9 @@ mod tests {
                 "canonical divergence at startup recovery",
             ),
             (
-                CommandError::Bootstrap(BootstrapError::SetupNotComplete),
+                CommandError::Bootstrap(BootstrapError::SetupNotComplete {
+                    data_dir: "/data".to_string(),
+                }),
                 "a data directory whose setup never completed",
             ),
             (
