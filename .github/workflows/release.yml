@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0-alpha.1)"
+        description: "Existing release tag to rebuild (e.g. v0.1.0-alpha.1)"
         required: true
         type: string
       prerelease:
@@ -38,8 +38,12 @@ jobs:
             target: aarch64-unknown-linux-gnu
 
     steps:
+      # A push builds the pushed commit; a dispatch builds the named tag, fully
+      # qualified so a branch or SHA input cannot stand in and a missing tag fails.
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
 
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
@@ -88,7 +92,7 @@ jobs:
           cp "target/${TARGET}/release/wallet-sequencer" "package/wallet-sequencer-${TAG}-linux-${ARCH}/wallet-sequencer"
           bash scripts/generate-release-manifest.sh \
             --tag "${TAG}" \
-            --git-sha "${GITHUB_SHA}" \
+            --git-sha "$(git rev-parse HEAD)" \
             --output "package/wallet-sequencer-${TAG}-linux-${ARCH}/RELEASE.json"
 
           cat > "package/wallet-sequencer-${TAG}-linux-${ARCH}/RUNNING.md" <<'EOF'
@@ -124,8 +128,12 @@ jobs:
     name: Build canonical machine images
     runs-on: ubuntu-latest
     steps:
+      # A push builds the pushed commit; a dispatch builds the named tag, fully
+      # qualified so a branch or SHA input cannot stand in and a missing tag fails.
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
 
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
@@ -171,8 +179,12 @@ jobs:
     name: Build and push watchdog image
     runs-on: ubuntu-latest
     steps:
+      # A push builds the pushed commit; a dispatch builds the named tag, fully
+      # qualified so a branch or SHA input cannot stand in and a missing tag fails.
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
 
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
@@ -207,6 +219,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve release commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push watchdog image
         uses: docker/build-push-action@v6
         env:
@@ -221,7 +237,7 @@ jobs:
             docker.io/cartesi/sequencer-watchdog:${{ inputs.tag || github.ref_name }}
           build-args: |
             RELEASE_TAG=${{ inputs.tag || github.ref_name }}
-            GIT_COMMIT=${{ github.sha }}
+            GIT_COMMIT=${{ steps.commit.outputs.sha }}
             CARTESI_MACHINE_VERSION=${{ env.CARTESI_MACHINE_VERSION }}
             CARTESI_MACHINE_DEB_SHA256_AMD64=${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
             CARTESI_MACHINE_DEB_SHA256_ARM64=${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
@@ -236,8 +252,12 @@ jobs:
       - build-canonical-machine-image
       - build-watchdog-image
     steps:
+      # A push builds the pushed commit; a dispatch builds the named tag, fully
+      # qualified so a branch or SHA input cannot stand in and a missing tag fails.
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
 
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
@@ -257,7 +277,7 @@ jobs:
           find dist -type f -name '*.tar.gz' -exec cp -v '{}' out/ \;
           bash scripts/generate-release-manifest.sh \
             --tag "${TAG}" \
-            --git-sha "${GITHUB_SHA}" \
+            --git-sha "$(git rev-parse HEAD)" \
             --output "out/release-manifest-${TAG}.json"
 
       - name: Generate checksums
@@ -270,7 +290,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+          prerelease: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || (github.event_name == 'push' && contains(github.ref_name, '-')) }}
           fail_on_unmatched_files: true
           files: |
             out/*.tar.gz
