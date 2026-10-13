@@ -8,7 +8,6 @@
 //! and assert the lease lifecycle — held while streaming, released on
 //! completion, 304, and crucially on mid-stream client disconnect.
 
-use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -45,15 +44,10 @@ impl TestServer {
     }
 }
 
-async fn start_server(db_path: &str) -> Option<TestServer> {
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(value) => value,
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            eprintln!("skipping snapshot endpoint test: cannot bind test listener");
-            return None;
-        }
-        Err(err) => panic!("bind test listener: {err}"),
-    };
+async fn start_server(db_path: &str) -> TestServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
     let addr = listener.local_addr().expect("listener addr");
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
     let shutdown = RuntimeScope::default();
@@ -76,12 +70,12 @@ async fn start_server(db_path: &str) -> Option<TestServer> {
             },
         },
     );
-    Some(TestServer {
+    TestServer {
         addr,
         _rx,
         _shutdown: shutdown,
         _task: task,
-    })
+    }
 }
 
 /// Build a structured dump dir mirroring production layout: the app's
@@ -245,7 +239,7 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
     assert_eq!(app.executed_input_count().get(), 1);
     assert_eq!(snapshot.executed_input_count, ExecutedInputCount::ZERO);
 
-    let server = start_server(&db.path).await.expect("test listener");
+    let server = start_server(&db.path).await;
     let client = reqwest::Client::new();
     for (path, conditional) in [
         ("/finalized_state/inclusion_block", false),
@@ -359,9 +353,7 @@ async fn finalized_state_round_trips_bytes_and_headers() {
     let dir = tempfile::tempdir().expect("dumps dir");
     let state = b"the-canonical-finalized-state".to_vec();
     let dump_id = register_accepted(db.path.as_str(), dir.path(), "fin", &state, 4242);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::Client::new()
         .get(server.url("/finalized_state"))
@@ -393,9 +385,7 @@ async fn finalized_inclusion_block_returns_cheap_json() {
     let db = temp_db("snap-inclusion-block");
     let dir = tempfile::tempdir().expect("dumps dir");
     register_accepted(db.path.as_str(), dir.path(), "fin", b"x", 999);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::get(server.url("/finalized_state/inclusion_block"))
         .await
@@ -413,9 +403,7 @@ async fn endpoints_404_when_no_finalized_snapshot() {
     // Migrate the schema (as startup does) but register no snapshot: the
     // endpoints then see no registered snapshot and return 404.
     Storage::open(db.path.as_str()).expect("init schema");
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let finalized = reqwest::get(server.url("/finalized_state"))
         .await
@@ -438,9 +426,7 @@ async fn finalized_state_if_none_match_returns_304() {
     let db = temp_db("snap-etag");
     let dir = tempfile::tempdir().expect("dumps dir");
     let dump_id = register_accepted(db.path.as_str(), dir.path(), "fin", b"abc", 500);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::Client::new()
         .get(server.url("/finalized_state"))
@@ -464,9 +450,7 @@ async fn latest_snapshot_prefers_newest_valid_batch() {
     let dir = tempfile::tempdir().expect("dumps dir");
     register_accepted(db.path.as_str(), dir.path(), "fin", b"finalized-bytes", 100);
     let pending_id = register_optimistic(db.path.as_str(), dir.path(), "pend", b"pending-bytes", 3);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::get(server.url("/latest_snapshot"))
         .await
@@ -491,9 +475,7 @@ async fn finalized_state_streams_large_file() {
     let dir = tempfile::tempdir().expect("dumps dir");
     let big = vec![0x5Au8; 8 * 1024 * 1024];
     let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 1);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::get(server.url("/finalized_state"))
         .await
@@ -518,9 +500,7 @@ async fn finalized_state_disconnect_mid_stream_releases_lease() {
     // when we disconnect.
     let big = vec![0xABu8; 8 * 1024 * 1024];
     let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 7);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::Client::new()
         .get(server.url("/finalized_state"))
@@ -557,9 +537,7 @@ async fn finalized_state_concurrent_streams_count_and_release_independently() {
     let dir = tempfile::tempdir().expect("dumps dir");
     let big = vec![0xCDu8; 8 * 1024 * 1024];
     let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 1);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     // Two concurrent readers of the same finalized dump.
     let client = reqwest::Client::new();
@@ -604,9 +582,7 @@ async fn live_stream_blocks_gc_until_it_drops() {
     let dir = tempfile::tempdir().expect("dumps dir");
     let big = vec![0xABu8; 8 * 1024 * 1024];
     let served_id = register_accepted(db.path.as_str(), dir.path(), "served", &big, 1);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     // Open a stream and keep it alive.
     let resp = reqwest::Client::new()
@@ -663,9 +639,7 @@ async fn finalized_state_missing_registered_artifact_aborts_process() {
         &dir.path().join("fin"),
     )))
     .expect("remove state file");
-    let server = start_server(db.path.as_str())
-        .await
-        .expect("missing-artifact abort probe needs a real listener");
+    let server = start_server(db.path.as_str()).await;
 
     let _ = reqwest::get(server.url("/finalized_state")).await;
     panic!("missing registered snapshot returned instead of aborting");
@@ -677,9 +651,7 @@ async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
     let dir = tempfile::tempdir().expect("dumps dir");
     let fin_id = register_accepted(db.path.as_str(), dir.path(), "fin", b"finalized-bytes", 100);
     // No pending registered.
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::get(server.url("/latest_snapshot"))
         .await
@@ -701,9 +673,7 @@ async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
 #[tokio::test]
 async fn cors_permits_browser_preflight_on_tx() {
     let db = temp_db("cors-preflight");
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::Client::new()
         .request(reqwest::Method::OPTIONS, server.url("/tx"))
@@ -745,9 +715,7 @@ async fn cors_permits_browser_preflight_on_tx() {
 #[tokio::test]
 async fn cors_permits_browser_preflight_on_fee() {
     let db = temp_db("cors-fee-preflight");
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
 
     let resp = reqwest::Client::new()
         .request(reqwest::Method::OPTIONS, server.url("/fee"))
@@ -788,9 +756,7 @@ async fn cors_is_limited_to_ingress_and_covers_rejections() {
     let db = temp_db("cors-route-scope");
     let dumps = tempfile::tempdir().expect("snapshot directory");
     let dump_id = register_accepted(&db.path, dumps.path(), "finalized", b"canonical", 1);
-    let Some(server) = start_server(db.path.as_str()).await else {
-        return;
-    };
+    let server = start_server(db.path.as_str()).await;
     let client = reqwest::Client::new();
     let rejected = client
         .post(server.url("/tx"))
@@ -860,9 +826,7 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
     let app = WalletApp::default();
     let encoded = app_core::wallet_snapshot::encode(&app);
     register_accepted(&db.path, dir.path(), "accepted", &encoded, 1);
-    let Some(server) = start_server(&db.path).await else {
-        return;
-    };
+    let server = start_server(&db.path).await;
     let client =
         sequencer_rust_client::SequencerClient::new(format!("http://{}", server.addr)).unwrap();
     let snapshot = client.latest_snapshot().await.unwrap();
@@ -916,9 +880,7 @@ async fn archive_disconnect_releases_both_stream_and_producer_lease_owners() {
     let db = temp_db("archive-disconnect");
     let dir = tempfile::tempdir().unwrap();
     let id = register_accepted(&db.path, dir.path(), "large", &vec![1; 8 * 1024 * 1024], 1);
-    let Some(server) = start_server(&db.path).await else {
-        return;
-    };
+    let server = start_server(&db.path).await;
     let response = reqwest::get(server.url("/latest_snapshot")).await.unwrap();
     let mut stream = response.bytes_stream();
     stream.next().await.unwrap().unwrap();

@@ -1,7 +1,6 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use std::io::ErrorKind;
 use std::time::Duration;
 
 use crate::storage::{ApplicationInputRow, L2TxContext};
@@ -204,9 +203,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
     // Fund the sender so the user-op passes the balance check.
     bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
 
-    let Some(mut runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let mut runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint.clone(), Duration::from_secs(2))
@@ -299,9 +296,7 @@ async fn api_rejects_signature_with_wrong_hex_length() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -332,9 +327,7 @@ async fn api_rejects_sender_with_wrong_hex_length() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -362,9 +355,7 @@ async fn api_rejects_oversized_json_body_before_parsing() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server_with_max_body(db.path.as_str(), domain, 256).await else {
-        return;
-    };
+    let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 256).await;
 
     let oversized_json = format!(
         r#"{{"message":{{"nonce":0,"max_fee":0,"data":"0x"}},"signature":"0x{}","sender":null,"pad":"{}"}}"#,
@@ -391,10 +382,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await
-    else {
-        return;
-    };
+    let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await;
 
     let malformed_json =
         r#"{"message":{"nonce":0,"max_fee":0,"data":"0x"},"signature":"0x00","sender":"0x1234""#;
@@ -433,10 +421,7 @@ async fn api_rejects_missing_content_type_with_fixed_message() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await
-    else {
-        return;
-    };
+    let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await;
 
     // Valid JSON body, but sent without Content-Type: application/json.
     let (status, body) = post_raw_body_no_content_type(runtime.addr, "{}").await;
@@ -455,11 +440,7 @@ async fn api_returns_429_when_queue_is_full() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) =
-        start_api_only_server(db.path.as_str(), domain.clone(), 128 * 1024, 1).await
-    else {
-        return;
-    };
+    let runtime = start_api_only_server(db.path.as_str(), domain.clone(), 128 * 1024, 1).await;
 
     let request = make_valid_request(&domain);
     let request_json = serde_json::to_string(&request).expect("serialize valid request");
@@ -491,9 +472,7 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -543,10 +522,7 @@ async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await
-    else {
-        return;
-    };
+    let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await;
 
     // Empty object — valid JSON, missing every required field.
     let (status, body) = post_raw_json(runtime.addr, "{}").await;
@@ -601,9 +577,7 @@ async fn api_payload_size_check_fires_before_signature_recovery() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain).await;
 
     // Hand-craft a request: oversized data + correctly-shaped but garbage
     // signature. The 65-byte signature passes `validate_hex_lengths`, so the
@@ -659,9 +633,7 @@ async fn api_rejects_signature_with_invalid_parity_byte() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -711,9 +683,7 @@ async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -771,9 +741,7 @@ async fn api_rejects_user_op_with_nonce_gap() {
     let sender = address_from_signing_key(&signing_key);
     bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -828,9 +796,7 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
     // for the boundary case.
     const FRAME_FEE_BOUNDARY: u16 = 1356;
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -868,9 +834,7 @@ async fn api_quotes_open_frame_fee() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -905,9 +869,7 @@ async fn api_serves_the_next_nonce_after_each_ack_and_the_signing_domain() {
     let sender = address_from_signing_key(&signing_key);
     bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
@@ -969,9 +931,7 @@ async fn api_rejects_user_op_when_balance_below_fee_cost() {
     // No deposit for `sender` → balance = 0.
     bootstrap_open_frame(db.path.as_str());
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
@@ -1019,9 +979,7 @@ async fn api_concurrent_same_nonce_leaves_exactly_one_committed() {
     let sender = address_from_signing_key(&signing_key);
     bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(10_000_000_u64))]);
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let user_op = UserOp {
         nonce: 0,
@@ -1081,9 +1039,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     // Seed an additional safe direct input (arbitrary payload) for the restart-replay test.
     seed_safe_direct_input(db.path.as_str(), 10, vec![0xaa]);
 
-    let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
-        return;
-    };
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
     let endpoint = format!("http://{}", runtime.addr);
     let client = SequencerClient::new_with_timeout(endpoint.clone(), Duration::from_secs(2))
@@ -1125,9 +1081,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
 
     shutdown_runtime(runtime).await;
 
-    let Some(restarted) = start_full_server(db.path.as_str(), domain).await else {
-        return;
-    };
+    let restarted = start_full_server(db.path.as_str(), domain).await;
 
     let restarted_endpoint = format!("http://{}", restarted.addr);
     let restarted_client =
@@ -1172,7 +1126,7 @@ impl Drop for FullServerRuntime {
     }
 }
 
-async fn start_full_server(db_path: &str, domain: Eip712Domain) -> Option<FullServerRuntime> {
+async fn start_full_server(db_path: &str, domain: Eip712Domain) -> FullServerRuntime {
     start_full_server_with_max_body(db_path, domain, 128 * 1024).await
 }
 
@@ -1180,17 +1134,10 @@ async fn start_full_server_with_max_body(
     db_path: &str,
     domain: Eip712Domain,
     max_body_bytes: usize,
-) -> Option<FullServerRuntime> {
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(value) => value,
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            eprintln!(
-                "skipping e2e integration test: cannot bind test listener in this environment"
-            );
-            return None;
-        }
-        Err(err) => panic!("bind test listener: {err}"),
-    };
+) -> FullServerRuntime {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
     let addr = listener.local_addr().expect("read listener addr");
 
     let mut storage = Storage::open(db_path).expect("open storage");
@@ -1272,13 +1219,13 @@ async fn start_full_server_with_max_body(
         },
     );
 
-    Some(FullServerRuntime {
+    FullServerRuntime {
         addr,
         shutdown,
         server_task: Some(server_task),
         lane_handle: Some(lane_handle),
         _parked_rx: None,
-    })
+    }
 }
 
 async fn start_api_only_server(
@@ -1286,15 +1233,10 @@ async fn start_api_only_server(
     domain: Eip712Domain,
     max_body_bytes: usize,
     queue_capacity: usize,
-) -> Option<FullServerRuntime> {
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(value) => value,
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            eprintln!("skipping api overload test: cannot bind test listener in this environment");
-            return None;
-        }
-        Err(err) => panic!("bind test listener: {err}"),
-    };
+) -> FullServerRuntime {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
     let addr = listener.local_addr().expect("read listener addr");
 
     let _storage = Storage::open(db_path).expect("open storage");
@@ -1327,13 +1269,13 @@ async fn start_api_only_server(
         },
     );
 
-    Some(FullServerRuntime {
+    FullServerRuntime {
         addr,
         shutdown,
         server_task: Some(server_task),
         lane_handle: None,
         _parked_rx: Some(rx),
-    })
+    }
 }
 
 async fn shutdown_runtime(mut runtime: FullServerRuntime) {

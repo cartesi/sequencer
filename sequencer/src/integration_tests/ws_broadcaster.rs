@@ -1,7 +1,6 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use std::io::ErrorKind;
 use std::time::{Duration, SystemTime};
 
 use crate::storage::{ApplicationInputRow, L2TxContext};
@@ -30,9 +29,7 @@ async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
     let expected = load_ordered_l2_txs_page(db.path.as_str(), 0, 2);
     assert_eq!(expected.len(), 2, "seeded replay must contain two txs");
 
-    let Some(runtime) = start_test_server(db.path.as_str()).await else {
-        return;
-    };
+    let runtime = start_test_server(db.path.as_str()).await;
     let url = ws_subscribe_url(&db.path, runtime.addr, 0);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
         .await
@@ -62,9 +59,7 @@ async fn ws_subscribe_resumes_from_given_offset() {
         "resume snapshot must contain one event at offset 1"
     );
 
-    let Some(runtime) = start_test_server(db.path.as_str()).await else {
-        return;
-    };
+    let runtime = start_test_server(db.path.as_str()).await;
     let url = ws_subscribe_url(&db.path, runtime.addr, 1);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
         .await
@@ -85,9 +80,7 @@ async fn ws_subscribe_receives_live_events_after_subscribing() {
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
 
-    let Some(runtime) = start_test_server(db.path.as_str()).await else {
-        return;
-    };
+    let runtime = start_test_server(db.path.as_str()).await;
 
     // Subscribe at the current DB head to exercise live-only delivery.
     let url = ws_subscribe_url(&db.path, runtime.addr, base_offset);
@@ -117,9 +110,7 @@ async fn ws_subscribe_fanout_delivers_live_event_to_multiple_subscribers() {
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
 
-    let Some(runtime) = start_test_server(db.path.as_str()).await else {
-        return;
-    };
+    let runtime = start_test_server(db.path.as_str()).await;
 
     let url = ws_subscribe_url(&db.path, runtime.addr, base_offset);
     let (mut ws_a, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url.as_str()))
@@ -156,9 +147,7 @@ async fn ws_subscribe_replies_with_pong_on_ping() {
     seed_ordered_txs(db.path.as_str());
     let from_offset = ordered_l2_tx_count(&db.path);
 
-    let Some(runtime) = start_test_server(db.path.as_str()).await else {
-        return;
-    };
+    let runtime = start_test_server(db.path.as_str()).await;
 
     let url = ws_subscribe_url(&db.path, runtime.addr, from_offset);
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
@@ -187,9 +176,7 @@ async fn ws_subscribe_rejects_when_subscriber_limit_is_reached() {
     seed_ordered_txs(db.path.as_str());
     let base_offset = ordered_l2_tx_count(db.path.as_str());
 
-    let Some(runtime) = start_test_server_with_limits(db.path.as_str(), 1).await else {
-        return;
-    };
+    let runtime = start_test_server_with_limits(db.path.as_str(), 1).await;
 
     let url = ws_subscribe_url(&db.path, runtime.addr, base_offset);
     let (ws_a, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url.as_str()))
@@ -216,9 +203,7 @@ async fn ws_subscribe_rejects_when_subscriber_limit_is_reached() {
 async fn ws_subscribe_requires_a_valid_history_claim_before_upgrade() {
     let db = temp_db("ws-history-claims");
     seed_ordered_txs(&db.path);
-    let Some(runtime) = start_test_server(&db.path).await else {
-        return;
-    };
+    let runtime = start_test_server(&db.path).await;
     let client = SequencerClient::new(format!("http://{}", runtime.addr)).unwrap();
     let mut start = history_claim(&db.path, 3);
     assert!(matches!(client.subscribe(start).await,
@@ -244,9 +229,7 @@ async fn ws_subscribe_closes_on_oversized_inbound_message() {
     let db = temp_db("ws-oversized-inbound");
     seed_ordered_txs(db.path.as_str());
 
-    let Some(runtime) = start_test_server(db.path.as_str()).await else {
-        return;
-    };
+    let runtime = start_test_server(db.path.as_str()).await;
 
     let url = ws_subscribe_url(&db.path, runtime.addr, ordered_l2_tx_count(&db.path));
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(url))
@@ -384,24 +367,17 @@ fn snapshot_state_file(prefix: &std::path::Path) -> std::path::PathBuf {
     prefix.join("state")
 }
 
-async fn start_test_server(db_path: &str) -> Option<WsServerRuntime> {
+async fn start_test_server(db_path: &str) -> WsServerRuntime {
     start_test_server_with_limits(db_path, 64).await
 }
 
 async fn start_test_server_with_limits(
     db_path: &str,
     ws_max_subscribers: usize,
-) -> Option<WsServerRuntime> {
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(value) => value,
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            eprintln!(
-                "skipping ws integration test: cannot bind test listener in this environment"
-            );
-            return None;
-        }
-        Err(err) => panic!("bind test listener: {err}"),
-    };
+) -> WsServerRuntime {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
     let addr = listener.local_addr().expect("read listener addr");
 
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
@@ -432,11 +408,11 @@ async fn start_test_server_with_limits(
         },
     );
 
-    Some(WsServerRuntime {
+    WsServerRuntime {
         addr,
         shutdown,
         server_task: Some(task),
-    })
+    }
 }
 
 async fn shutdown_runtime(mut runtime: WsServerRuntime) {
