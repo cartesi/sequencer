@@ -22,7 +22,7 @@ use sequencer::storage::{DeploymentIdentity, FeeOracleIdentity, Storage, StoredS
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::application::Application;
 use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
-use sequencer_core::user_op::UserOp;
+use sequencer_core::user_op::{SignedUserOp, UserOp};
 use sequencer_rust_client::SequencerClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -440,17 +440,10 @@ async fn api_returns_429_when_queue_is_full() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let runtime = start_api_only_server(db.path.as_str(), domain.clone(), 128 * 1024, 1).await;
+    let runtime = start_server_with_full_queue(db.path.as_str(), domain.clone()).await;
 
     let request = make_valid_request(&domain);
     let request_json = serde_json::to_string(&request).expect("serialize valid request");
-    let first = tokio::spawn({
-        let body = request_json.clone();
-        let addr = runtime.addr;
-        async move { post_raw_json(addr, body.as_str()).await }
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     let (status, body) = post_raw_json(runtime.addr, request_json.as_str()).await;
     assert_eq!(status, 429, "expected 429 for queue-full overload: {body}");
     assert!(
@@ -462,7 +455,6 @@ async fn api_returns_429_when_queue_is_full() {
         "expected OVERLOADED code for queue-full overload: {body}"
     );
 
-    first.abort();
     shutdown_runtime(runtime).await;
 }
 
@@ -1228,19 +1220,31 @@ async fn start_full_server_with_max_body(
     }
 }
 
-async fn start_api_only_server(
-    db_path: &str,
-    domain: Eip712Domain,
-    max_body_bytes: usize,
-    queue_capacity: usize,
-) -> FullServerRuntime {
+/// Serves the API over a lane queue of capacity one that already holds a
+/// parked op and is never drained, so every `/tx` finds it full.
+async fn start_server_with_full_queue(db_path: &str, domain: Eip712Domain) -> FullServerRuntime {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
     let addr = listener.local_addr().expect("read listener addr");
 
     let _storage = Storage::open(db_path).expect("open storage");
-    let (tx, rx) = mpsc::channel::<PendingUserOp>(queue_capacity);
+    let (tx, rx) = mpsc::channel::<PendingUserOp>(1);
+    let (respond_to, _) = tokio::sync::oneshot::channel();
+    tx.try_send(PendingUserOp {
+        signed: SignedUserOp {
+            sender: Address::ZERO,
+            signature: Signature::test_signature(),
+            user_op: UserOp {
+                nonce: 0,
+                max_fee: 0,
+                data: Vec::new().into(),
+            },
+        },
+        respond_to,
+        received_at: std::time::SystemTime::now(),
+    })
+    .expect("park one op in the lane queue");
     let shutdown = RuntimeScope::default();
     let tx_feed = L2TxFeed::new(
         db_path.to_string(),
@@ -1257,10 +1261,7 @@ async fn start_api_only_server(
         tx,
         shutdown.clone(),
         tx_feed,
-        ApiConfig {
-            max_body_bytes,
-            ..ApiConfig::new(domain, MAX_METHOD_PAYLOAD_BYTES)
-        },
+        ApiConfig::new(domain, MAX_METHOD_PAYLOAD_BYTES),
         http::SnapshotState {
             db_path: db_path.to_string(),
             state_file_in_dump: |dump_dir| {

@@ -961,6 +961,17 @@ impl ManagedSequencer {
         self.rollups.drop_all_pending_txs().await
     }
 
+    /// Wait until the sequencer's batch submitter has a transaction in the
+    /// mempool. With auto-mining off, that is the batch submission held out
+    /// of the chain.
+    pub async fn wait_for_pending_batch_submission(&self) -> HarnessResult<()> {
+        // Several idle ticks of the submitter (5 s by default).
+        const TIMEOUT: Duration = Duration::from_secs(30);
+        self.rollups
+            .wait_for_pending_tx_from(app_core::application::DEVNET_SEQUENCER_ADDRESS, TIMEOUT)
+            .await
+    }
+
     /// Advance both the sequencer's wall clock and the L1 chain by `duration`,
     /// maintaining the block-time coupling invariant (`seconds_per_block`,
     /// default 12 for Ethereum mainnet parity).

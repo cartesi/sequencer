@@ -270,13 +270,9 @@ async fn submitter_re_enters_immediately_after_productive_tick() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submitter_recovers_from_transient_poster_error_without_exiting() {
-    // Design of the test:
-    //
-    //   t=0ms   Submitter starts. Tick 1 calls submit_batches, which returns
-    //           a Provider error (the first of N injected failures).
-    //   t=0ms   Loop maps Err(Poster) → TickOutcome::Transient → sleep idle_poll.
-    //   t~80ms  Tick 2 runs. submit_batches succeeds, batch 0 recorded.
-    //   t=250ms Test asserts: exactly 1 submission AND loop is still alive.
+    // Tick 1 gets an injected Provider error and sleeps one idle interval;
+    // tick 2 submits batch 0. The test waits for that submission, then
+    // watches a few more ticks: exactly one submission, loop still alive.
     //
     // Regressions this catches:
     //   - Propagating Poster errors as fatal (loop would exit; handle would
@@ -291,9 +287,7 @@ async fn submitter_recovers_from_transient_poster_error_without_exiting() {
     mock.fail_next_n_submits(1);
     let shutdown = RuntimeScope::default();
     let config = BatchSubmitterConfig {
-        // Short poll interval so the retry sleep completes well within the
-        // test window. Still long enough that accidentally always-sleeping
-        // would delay the single submission past the assertion.
+        // Short poll interval so the retry after the failure comes quickly.
         idle_poll_interval_ms: 50,
     };
     let submitter = BatchSubmitter::new(
@@ -306,7 +300,16 @@ async fn submitter_recovers_from_transient_poster_error_without_exiting() {
         .start(shutdown.clone())
         .expect("start batch submitter");
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while mock.submissions().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no submission within 5 s after a transient Poster error",
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A few more ticks, so a duplicate submission would show up.
+    tokio::time::sleep(Duration::from_millis(3 * 50)).await;
 
     assert!(
         !handle.is_finished(),

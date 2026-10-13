@@ -126,6 +126,25 @@ impl DevnetRollupsStack {
         self.anvil.drop_all_pending_txs().await
     }
 
+    /// Wait until `sender` has a transaction in Anvil's mempool, i.e. its
+    /// pending nonce is ahead of its latest one.
+    pub async fn wait_for_pending_tx_from(
+        &self,
+        sender: Address,
+        timeout: Duration,
+    ) -> HarnessResult<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.anvil.has_pending_tx_from(sender).await? {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(
+                    io_other(format!("no pending tx from {sender} within {timeout:?}")).into(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(self) -> HarnessResult<()> {
         self.anvil.shutdown().await
     }
@@ -309,6 +328,24 @@ impl ManagedAnvil {
             .await
             .map_err(|err| io_other(format!("failed to drop all pending txs: {err}")))?;
         Ok(())
+    }
+
+    async fn has_pending_tx_from(&self, sender: Address) -> HarnessResult<bool> {
+        let provider = ProviderBuilder::new()
+            .connect(self.endpoint.as_str())
+            .await
+            .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
+        let latest = provider
+            .get_transaction_count(sender)
+            .latest()
+            .await
+            .map_err(|err| io_other(format!("failed to read latest nonce of {sender}: {err}")))?;
+        let pending = provider
+            .get_transaction_count(sender)
+            .pending()
+            .await
+            .map_err(|err| io_other(format!("failed to read pending nonce of {sender}: {err}")))?;
+        Ok(pending > latest)
     }
 }
 

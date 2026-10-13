@@ -3071,10 +3071,6 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
     // Enough transfers to trigger at least one size-based batch close.
     // Matches 's sizing (≈100 B/op × 150 ops ≈ 15 KB > 12 KB target).
     const TRANSFERS_TO_FORCE_BATCH_CLOSE: usize = 150;
-    // After the last transfer, wait for the submitter's next tick so it
-    // picks up the closed batch and sends the L1 tx to the (now-held)
-    // mempool. Default `idle_poll_interval` is 5 s.
-    const WAIT_FOR_SUBMITTER_TICK: Duration = Duration::from_secs(7);
 
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
@@ -3115,9 +3111,9 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
         replay_before.apply(ws.expect_user_op_from(alice_address).await?)?;
     }
 
-    // Give the submitter tick time to fire and put the batch-submission
-    // tx into the (held) mempool.
-    tokio::time::sleep(WAIT_FOR_SUBMITTER_TICK).await;
+    // Wait for the submitter's tick to put the batch-submission tx into the
+    // (held) mempool.
+    runtime.wait_for_pending_batch_submission().await?;
 
     let batches_after_close = runtime.count_batches()?;
     assert!(
@@ -3904,9 +3900,6 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
     const PAST_STALE: Duration = blocks_as_duration(PAST_STALE_BLOCKS);
     // Force a size-triggered batch close. Same sizing as .
     const TRANSFERS_TO_FORCE_CLOSE: usize = 150;
-    // Submitter idle_poll_interval = 5 s; allow one tick for the batch
-    // to enter the (held) mempool.
-    const WAIT_FOR_SUBMITTER_TICK: Duration = Duration::from_secs(7);
 
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
@@ -3939,9 +3932,9 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
             replay_before.apply(ws.expect_user_op_from(alice_address).await?)?;
         }
 
-        // Let the submitter tick fire and put the (nonce-0) batch's L1
-        // tx into the held mempool.
-        tokio::time::sleep(WAIT_FOR_SUBMITTER_TICK).await;
+        // Wait for the submitter's tick to put the (nonce-0) batch's L1 tx
+        // into the held mempool.
+        runtime.wait_for_pending_batch_submission().await?;
     }
 
     runtime.stop().await?;
