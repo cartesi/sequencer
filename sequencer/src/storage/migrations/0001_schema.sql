@@ -268,6 +268,16 @@ CREATE TABLE IF NOT EXISTS safe_inputs (
 CREATE INDEX IF NOT EXISTS idx_safe_inputs_sender
     ON safe_inputs(sender);
 
+-- The InputBox record is append-only: its rows are the source of every
+-- replayed direct input and of the acceptance scan (I11). Direct reads filter by
+-- sender, so a changed or missing undrained row would execute silently.
+CREATE TRIGGER IF NOT EXISTS trg_safe_inputs_immutable
+BEFORE UPDATE ON safe_inputs FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'safe inputs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_safe_inputs_not_deletable
+BEFORE DELETE ON safe_inputs FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'safe inputs are retained for the database lifetime'); END;
+
 -- Current application order. Recovery replaces only an invalidated suffix;
 -- immutable source payloads remain in their owning tables.
 CREATE TABLE IF NOT EXISTS application_inputs (

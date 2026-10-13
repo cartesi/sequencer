@@ -290,7 +290,10 @@ fn missing_raw_input_is_an_invariant_fault() {
     );
     storage
         .conn
-        .execute("DELETE FROM safe_inputs WHERE safe_input_index=1", [])
+        .execute_batch(
+            "DROP TRIGGER trg_safe_inputs_not_deletable; \
+             DELETE FROM safe_inputs WHERE safe_input_index=1;",
+        )
         .unwrap();
     let _ = page(&mut storage, 0, 3);
 }

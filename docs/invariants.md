@@ -257,9 +257,10 @@ by writer and are write-once (`0001_schema.sql`).
 - **Holds:** `safe_inputs` retains every InputBox observation. The storage/lane
   boundary selects external directs by the setup-pinned submitter address;
   only those inputs and included user ops enter `application_inputs`.
-- **Enforced by:** classified direct reads and complete receipt validation at
-  append. Standard startup recovery attributes undrained directs to the new Tip;
-  lane catch-up executes them before processing queued user operations. Manual
+- **Enforced by:** append-only `safe_inputs` triggers; classified direct reads
+  and complete receipt validation at append. Standard startup recovery
+  attributes undrained directs to the new Tip; lane catch-up executes them
+  before processing queued user operations. Manual
   rebuild represents the folded prefix through `C` in its baseline snapshot,
   with no application-history rows for that prefix. Replay and WS need no
   envelope filter because every row executes.

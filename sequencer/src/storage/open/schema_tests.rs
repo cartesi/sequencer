@@ -10,10 +10,10 @@ use rusqlite::params;
 use sequencer_core::protocol::ProtocolTiming;
 
 use super::super::test_helpers::{
-    RecoveryFixture, SENDER_A, local_batch_payload, open_temp_storage,
-    temp_db_with_default_deployment_identity as temp_db,
+    RecoveryFixture, SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
+    open_temp_storage, temp_db_with_default_deployment_identity as temp_db,
 };
-use crate::storage::{SafeInputRange, Storage};
+use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
 
 #[test]
 fn schema_rejects_second_valid_tip() {
@@ -645,4 +645,50 @@ fn schema_rejects_safe_input_with_wrong_transaction_hash_length() {
         format!("{err:?}").contains("CHECK constraint failed"),
         "expected CHECK constraint error on transaction_hash length, got: {err:?}",
     );
+}
+
+#[test]
+fn schema_rejects_safe_input_update_and_delete() {
+    let db = crate::test_support::temp_db("safe-inputs-append-only");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let inputs = vec![
+        StoredSafeInput {
+            sender: SENDER_B,
+            payload: vec![0x01],
+            block_number: 10,
+        },
+        StoredSafeInput {
+            sender: SENDER_B,
+            payload: vec![0x02],
+            block_number: 10,
+        },
+    ];
+    storage
+        .append_safe_inputs(10, inputs.as_slice(), SENDER_A, &default_protocol_timing())
+        .expect("seed safe inputs");
+
+    let update = storage
+        .conn
+        .execute(
+            "UPDATE safe_inputs SET payload = X'03' WHERE safe_input_index = 1",
+            [],
+        )
+        .expect_err("a stored input must not change");
+    assert!(
+        update.to_string().contains("safe inputs are immutable"),
+        "{update}"
+    );
+    // Index 0 is a hole below the head, which no production reader detects.
+    let delete = storage
+        .conn
+        .execute("DELETE FROM safe_inputs WHERE safe_input_index = 0", [])
+        .expect_err("a stored input must not disappear");
+    assert!(delete.to_string().contains("retained"), "{delete}");
+
+    assert_eq!(storage.safe_input_end_exclusive().expect("end"), 2);
+    let mut out = Vec::new();
+    storage
+        .fill_safe_inputs(SafeInputRange::new(0, 2), &mut out)
+        .expect("read back");
+    assert_eq!(out, inputs);
 }
