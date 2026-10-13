@@ -234,9 +234,9 @@ impl Storage {
 /// The two-sided completion rule — the one command-ordering fact:
 /// setup/rebuild never restart over a completed setup (completion is
 /// once-per-database), run and maintenance never start before one exists.
-/// Only the run/maintenance side has a production caller; setup and
-/// rebuild admit through `crate::commands::setup`, which checks the same
-/// fact itself.
+/// Run and maintenance reach it through `preflight_lifecycle_command`;
+/// setup and rebuild inside `complete_baseline_setup`'s transaction, after
+/// `crate::commands::setup` has checked the same fact up front.
 fn require_command_fits_completion(
     conn: &rusqlite::Connection,
     command: LifecycleCommand,

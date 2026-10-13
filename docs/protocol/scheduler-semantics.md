@@ -28,6 +28,12 @@ address, never by a tag byte** ([`process_input`](../../sequencer-core/src/sched
 | `== sequencer_address` | a **batch** (SSZ-encoded `Batch`) | folded through the acceptance algorithm below |
 | anything else | a **direct input** (deposit) | appended to the *fridge* (the direct-input FIFO), drained later |
 
+`sequencer_address` is deployment data compiled into the canonical machine. It
+must equal the batch-submitter address that `setup` pins; nothing checks this
+at runtime. If they differ, the machine treats every sequencer batch as a
+direct input while the sequencer's own acceptance view still reports the
+batches accepted, so only a watchdog comparison reveals it.
+
 The payload is opaque to classification; app-specific decoding happens inside
 the `Application::apply_direct_input` hook, reached through
 the shared `execute_direct_input` boundary (see the

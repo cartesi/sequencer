@@ -243,8 +243,9 @@ make normal reconciliation execute already-accounted direct inputs again.
 
 ### Flush and stopping block
 
-The lost database cannot supply its previous wallet-nonce watermark. Flushing
-therefore depends on the provider's pool view. A transaction dropped there but
+Recovery reads the wallet-nonce watermark from the fresh data directory, so the
+previous database's watermark is not used, even when that database survives.
+Flushing therefore depends on the provider's pool view. A transaction dropped there but
 alive elsewhere may escape; a later accepted foreign or mismatched landing
 freezes the rebuilt instance and requires another rebuild. The provider is
 trusted fail-stop, as specified in the [threat model](../threat-model/README.md).
