@@ -486,7 +486,8 @@ pub struct RunConfig {
     #[arg(
         long,
         env = "CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS",
-        default_value = "5000"
+        default_value = "5000",
+        value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub batch_submitter_idle_poll_interval_ms: u64,
 
@@ -962,6 +963,19 @@ mod tests {
         let message = err.to_string();
         assert!(
             message.contains("--seconds-per-block") || message.contains("seconds_per_block"),
+            "error must name the offending field, got: {message}"
+        );
+    }
+
+    #[test]
+    fn run_rejects_zero_batch_submitter_idle_poll_interval() {
+        let mut args: Vec<&str> = RUN_ARGS.to_vec();
+        args.extend([TEST_KEY, "--batch-submitter-idle-poll-interval-ms", "0"]);
+        let message = Cli::try_parse_from(args)
+            .expect_err("a zero idle poll would spin the submitter against the RPC")
+            .to_string();
+        assert!(
+            message.contains("--batch-submitter-idle-poll-interval-ms"),
             "error must name the offending field, got: {message}"
         );
     }
