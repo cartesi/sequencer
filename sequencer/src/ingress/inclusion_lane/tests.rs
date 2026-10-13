@@ -2039,3 +2039,128 @@ fn context_tx(context: crate::storage::L2TxContext) -> SequencedL2Tx {
         crate::storage::L2TxContext::DirectInput { tx, .. } => SequencedL2Tx::Direct(tx),
     }
 }
+
+/// Requests shutdown while the lane executes a direct input, so the request
+/// lands after the loop's shutdown check and before the queue is read.
+#[derive(Default)]
+struct ShutdownOnDirectApp {
+    progress: ApplicationProgress,
+    shutdown: Option<RuntimeScope>,
+}
+
+impl Application for ShutdownOnDirectApp {
+    fn max_method_payload_bytes() -> usize {
+        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    }
+
+    fn validate_user_op(
+        &self,
+        _sender: Address,
+        _user_op: &UserOp,
+        _current_fee: u16,
+    ) -> Result<ValidationOutcome, AppError> {
+        Ok(ValidationOutcome::Accept)
+    }
+
+    fn apply_valid_user_op(
+        &mut self,
+        _user_op: &ValidUserOp,
+        safe_block: u64,
+    ) -> Result<AppOutputs, AppError> {
+        self.progress.advance(safe_block);
+        Ok(Vec::new())
+    }
+
+    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.request_shutdown();
+        }
+        self.progress.advance(input.block_number);
+        Ok(Vec::new())
+    }
+
+    fn progress(&self) -> ApplicationProgress {
+        self.progress
+    }
+
+    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
+        Ok(Self::default())
+    }
+
+    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
+        std::fs::create_dir(prefix)?;
+        std::fs::write(Self::state_file_in_dump(prefix), b"")?;
+        Ok(())
+    }
+
+    fn state_file_in_dump(prefix: &Path) -> PathBuf {
+        prefix.join("state")
+    }
+}
+
+/// A lane with its queue already closed and one direct input due at the first
+/// frame-clock tick.
+fn lane_with_closed_queue_and_due_direct(
+    name: &str,
+    request_shutdown_on_direct: bool,
+) -> (
+    tempfile::TempDir,
+    InclusionLane<ShutdownOnDirectApp>,
+    RuntimeScope,
+) {
+    let db = temp_db(name);
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
+    storage
+        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .expect("seed observed safe head");
+    storage.ensure_open_tip().expect("establish open tip");
+    storage
+        .append_safe_inputs(
+            5,
+            &[StoredSafeInput {
+                sender: Address::ZERO,
+                payload: vec![0xaa],
+                block_number: 5,
+            }],
+            SENDER_A,
+            &default_protocol_timing(),
+        )
+        .expect("append a direct at the first clock tick");
+
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    let shutdown = RuntimeScope::default();
+    let lane = InclusionLane {
+        rx,
+        shutdown: shutdown.clone(),
+        app: ShutdownOnDirectApp {
+            progress: ApplicationProgress::default(),
+            shutdown: request_shutdown_on_direct.then(|| shutdown.clone()),
+        },
+        storage,
+        config: default_test_config(),
+    };
+    (db._dir, lane, shutdown)
+}
+
+#[test]
+fn lane_stops_cleanly_when_its_queue_closes_during_shutdown() {
+    let (_dir, mut lane, shutdown) =
+        lane_with_closed_queue_and_due_direct("closed-queue-during-shutdown", true);
+
+    let result = lane.run_forever(ExecutedInputCount::ZERO);
+
+    assert!(shutdown.is_shutdown_requested());
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[test]
+fn lane_reports_a_closed_queue_without_shutdown() {
+    let (_dir, mut lane, _shutdown) =
+        lane_with_closed_queue_and_due_direct("closed-queue-without-shutdown", false);
+
+    let result = lane.run_forever(ExecutedInputCount::ZERO);
+
+    assert!(matches!(result, Err(InclusionLaneError::ChannelClosed)));
+}

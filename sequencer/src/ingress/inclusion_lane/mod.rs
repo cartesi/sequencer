@@ -147,7 +147,15 @@ impl<A: Application + 'static> InclusionLane<A> {
             }
 
             self.maybe_advance_safe_frontier(&mut lane_state, &mut safe_inputs)?;
-            let turn = self.run_fast_turn(&mut lane_state.head, &mut included)?;
+            let turn = match self.run_fast_turn(&mut lane_state.head, &mut included) {
+                // The HTTP router owns every sender and drops them when its
+                // graceful shutdown completes, which can land after the check
+                // above.
+                Err(InclusionLaneError::ChannelClosed) if self.shutdown.is_shutdown_requested() => {
+                    return Ok(());
+                }
+                turn => turn?,
+            };
 
             if turn.hit_batch_target() || should_close_batch_by_time(&lane_state.head, &self.config)
             {

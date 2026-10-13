@@ -15,7 +15,7 @@ use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::http::{self, ApiConfig};
 use sequencer::ingress::inclusion_lane::{
-    InclusionLane, InclusionLaneConfig, InclusionLaneError, PendingUserOp, dump_info,
+    InclusionLane, InclusionLaneConfig, PendingUserOp, dump_info,
 };
 use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{DeploymentIdentity, FeeOracleIdentity, Storage, StoredSafeInput};
@@ -1286,11 +1286,11 @@ async fn shutdown_runtime(mut runtime: FullServerRuntime) {
             .await
             .expect("wait for inclusion lane")
             .expect("join inclusion lane task");
-        let ok =
-            lane_result.is_ok() || matches!(lane_result, Err(InclusionLaneError::ChannelClosed));
+        // The router may close the lane's queue before the lane sees the
+        // shutdown request; the lane still stops cleanly.
         assert!(
-            ok,
-            "expected clean shutdown (Ok or ChannelClosed), got {lane_result:?}"
+            lane_result.is_ok(),
+            "expected clean lane shutdown, got {lane_result:?}"
         );
     }
     if let Some(task) = runtime.server_task.take() {
