@@ -91,14 +91,18 @@ counts, then correct the estimate and check the separately configured
   timeouts, teardown, or retry behavior. Evidence: the
   [recovery scenario](../../tests/e2e/src/test_cases.rs) and
   [WS receive helper](../../tests/harness/src/ws.rs).
-- **Transient SQLite contention stops the submitter.** Read handles use a
-  50 ms busy timeout; a storage/open failure escapes the submitter loop.
-  BUSY/LOCKED are nonterminal but project to unclassified exit 1, causing
-  respawn/recovery under a restarting supervisor. Frequency and benefit of
-  local retry are unmeasured. Check contention before choosing a bounded
+- **Transient SQLite contention stops the submitter and the input reader**
+  (input-reader half checked 2026-10-13 at `1a9615d`).
+  Submitter read handles use a 50 ms busy timeout; the input reader opens
+  writer handles (5 s busy timeout) for its cursor read and its append. In
+  both, a storage/open failure escapes the worker loop. BUSY/LOCKED are
+  nonterminal but project to unclassified exit 1, causing respawn/recovery
+  under a restarting supervisor. Frequency and benefit of local retry are
+  unmeasured. Check contention for both workers before choosing a bounded
   retry or timeout change; preserve other errors. Evidence:
   [`storage/open.rs`](../../sequencer/src/storage/open.rs),
   [`submitter/worker.rs`](../../sequencer/src/l1/submitter/worker.rs),
+  [`l1/reader.rs`](../../sequencer/src/l1/reader.rs),
   [`commands/error.rs`](../../sequencer/src/commands/error.rs).
 - **Overlapping admission policies.** The generic
   [`lifecycle` preflight](../../sequencer/src/storage/lifecycle.rs) contains
@@ -196,6 +200,31 @@ at `6b2a233`.
   exceed the deployment's disk budget. Evidence:
   [`inclusion_lane/snapshot.rs`](../../sequencer/src/ingress/inclusion_lane/snapshot.rs)
   (added 2026-10-13 at `462e4d1`).
+- **Bounded ingestion for syncs without a lane** (checked 2026-10-13 at
+  `1a9615d`). A reader tick fetches `[cursor, safe]` whole, holds every event in
+  memory (decoded event plus raw log, roughly twice the input bytes;
+  unmeasured) and commits once; one failed single-block `get_logs` restarts the
+  span. In `run` the span stays under `l1_read_stale_after_blocks`. Setup,
+  startup syncs after downtime and `setup --recovery` have no bound: a fresh
+  database scans every input since the app's deployment, our batches included
+  (the InputBox caps an encoded input at 64 KiB). Current histories are
+  megabytes, and rerunning on a larger host is the fallback. The known
+  mechanism commits per block window without archive state. When the received
+  indices are contiguous from the stored count and the last one sits at block
+  `b`, the stored and received inputs in blocks before `b` are complete,
+  because InputBox indices follow L1 order. Commit those at head `b - 1`, with
+  that block's header timestamp and without refreshing `synced_at_ms` (I12),
+  and hold the inputs at `b` for the next window; an empty window commits
+  nothing; the window that reaches the sampled safe head keeps today's count
+  check; reject logs outside the requested window; a later failure still
+  returns an error. A window end is never committed on contiguity alone: the
+  lane would stamp frames past a dropped tail input. The recovery fold still
+  loads every input after its checkpoint. Act when `safe_inputs` payload bytes
+  approach a quarter of the recovery host's memory, when a recovery sync fails
+  on a transient mid-crawl, or when the reader becomes a crate shared with
+  another node. Evidence: [`l1/reader.rs`](../../sequencer/src/l1/reader.rs),
+  [`l1/partition.rs`](../../sequencer/src/l1/partition.rs),
+  [`storage/l1_inputs.rs`](../../sequencer/src/storage/l1_inputs.rs).
 
 ## Verification gaps
 
