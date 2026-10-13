@@ -2,6 +2,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 cartesi_machine_version := `sed -n 's/^CARTESI_MACHINE_VERSION=v//p' ../../toolchain-pins.env`
 linux_kernel_filename := `grep '^CARTESI_LINUX_KERNEL_FILENAME=' ../../toolchain-pins.env | cut -d= -f2`
+linux_kernel_sha512 := `grep '^CARTESI_LINUX_KERNEL_SHA512=' ../../toolchain-pins.env | cut -d= -f2`
 
 # The kernel is the canonical image's; `just canonical download-deps` fetches
 # and verifies it.
@@ -38,7 +39,7 @@ build-rootfs: build-guest
 # Stores the template at the first accept yield, with an all-zero NVRAM `state`.
 build-image: clean build-rootfs
     test -s {{linux_kernel}} || { echo "missing {{linux_kernel}}; run 'just canonical download-deps'"; exit 1; }
-    cd {{kernel_dir}} && shasum -a 512 -c {{linux_kernel_filename}}.sha512 >/dev/null
+    echo "{{linux_kernel_sha512}}  {{linux_kernel}}" | shasum -a 512 -c - >/dev/null
     cartesi-machine \
       --assert-version={{cartesi_machine_version}} \
       --ram-length=64Mi \

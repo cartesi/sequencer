@@ -40,6 +40,10 @@ if [[ "${CARTESI_LINUX_KERNEL_FILENAME}" != *"${CARTESI_LINUX_IMAGE_RELEASE}"* ]
   fail "CARTESI_LINUX_KERNEL_FILENAME=${CARTESI_LINUX_KERNEL_FILENAME} does not include ${CARTESI_LINUX_IMAGE_RELEASE}"
 fi
 
+if [[ ! "${CARTESI_LINUX_KERNEL_SHA512:-}" =~ ^[0-9a-f]{128}$ ]]; then
+  fail "CARTESI_LINUX_KERNEL_SHA512 must be 128 lowercase hex characters"
+fi
+
 canonical_just="${root}/examples/canonical-app/justfile"
 if [[ ! -f "${canonical_just}" ]]; then
   fail "missing ${canonical_just}"
