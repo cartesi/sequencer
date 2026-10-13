@@ -78,13 +78,14 @@ Next: compare the intended bound with serialized batches across payload/frame
 counts, then correct the estimate and check the separately configured
 `batch_policy.log_user_op_bytes` used for fee accounting.
 
-### Support HTTPS and WSS in the Rust SDK
+### Support HTTPS in the Rust SDK
 
 The [client constructor](../../sdk/rust-client/src/lib.rs) rejects every HTTPS
-endpoint, leaving its HTTPS-to-WSS URL branch unreachable. Next: support both
-HTTP/HTTPS and their WS/WSS counterparts, verify the dependency TLS features,
-and exercise certificate-verified requests and subscriptions. Preserve local
-HTTP use; URL acceptance alone is not evidence that TLS works.
+endpoint, leaving its HTTPS-to-WSS URL branch unreachable. Next: support HTTPS
+for the ingress routes, verify the dependency TLS features, and exercise
+certificate-verified requests. Preserve local HTTP use; URL acceptance alone is
+not evidence that TLS works. WSS is out of scope: the WS feed's wire format
+waits for the new client sync (rechecked 2026-10-13 at `1a9615d`).
 
 ### Separate public ingress and internal egress listeners
 
@@ -95,16 +96,6 @@ verify that every public route in the [API contract](../../README.md#api) (today
 `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain`) is on the public
 listener and no internal route is. Keep network access controls as the
 deployment boundary; no new authentication subsystem is implied.
-
-### Fix the pinned test framework's cycle target
-
-The pinned `testsi::run_machine_increment` passes constant `1 << 28` to an
-absolute-cycle-target API. Long runs can stop advancing and report a timeout
-caused by the driver. Evidence: [the pinned source](https://github.com/GCdePaula/cartesi-tools-rs/blob/ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22/host/testsi/src/machine.rs#L159)
-and the [workspace dependency](../../Cargo.toml). Next: fix the target progression
-in that tooling, update the pin, and verify guest progress past the old target
-before relying on long-run capacity measurements. This is an upstream tooling
-task needed by sequencer validation.
 
 ## Confirmed discrepancies
 
@@ -122,15 +113,21 @@ and `classify_input_reader` in [startup recovery](../../sequencer/src/recovery/m
 Next: classify failures by the setup phase and pin the external exit code;
 preserve genuinely transient provider failures.
 
-### Startup logs the full RPC URL
+### Logs and watchdog state carry the full RPC URL
 
 The `sequencer startup` event includes `eth_rpc_url` verbatim. Operator URLs can
 carry credentials in userinfo, paths, or query parameters; private-key
-redaction does not cover this field.
+redaction does not cover this field. Transport errors also embed the URL:
+reqwest's error text, stringified by the reader, poster, flusher and fee
+oracle, and the watchdog's `http.lua` request error, which reaches stderr,
+`last_tick.json` and `status` (rechecked 2026-10-13 at `1a9615d`).
 
-Evidence: [`commands/run/mod.rs`](../../sequencer/src/commands/run/mod.rs).
-Next: omit the field or define a safe endpoint representation, and check
-diagnostic/help paths with a synthetic credential-bearing URL. No credential
+Evidence: [`commands/run/mod.rs`](../../sequencer/src/commands/run/mod.rs),
+[`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs),
+[`l1/provider.rs`](../../sequencer/src/l1/provider.rs),
+[`watchdog/http.lua`](../../watchdog/http.lua).
+Next: redact once at each provider boundary, and check diagnostic/help paths
+and watchdog state with a synthetic credential-bearing URL. No credential
 exposure in an actual deployment was established by this review.
 
 ## Bounded investigations and cleanup
@@ -167,10 +164,11 @@ exposure in an actual deployment was established by this review.
   [`commands/error.rs`](../../sequencer/src/commands/error.rs).
 - **Overlapping admission policies.** The generic
   [`lifecycle` preflight](../../sequencer/src/storage/lifecycle.rs) contains
-  setup/rebuild branches, but production calls it only for run/flush.
-  [`setup`](../../sequencer/src/commands/setup/mod.rs) has its own admission
-  path with an intentionally tested already-complete no-op. Consolidate or
-  narrow the unused branches when next changing admission; there is no
+  setup/rebuild branches, but production calls it only for run/flush; setup
+  and rebuild reach the shared completion rule only inside
+  `complete_baseline_setup`. [`setup`](../../sequencer/src/commands/setup/mod.rs)
+  has its own admission path with an intentionally tested already-complete
+  no-op. Consolidate when the shared recovery tool reshapes setup; there is no
   demonstrated conflicting live route.
 - **Fee-observation visibility.**
   [`log_gas_price_updated_at_ms`](../../sequencer/src/storage/fee_oracle.rs)
@@ -178,7 +176,10 @@ exposure in an actual deployment was established by this review.
   inspection suffices or a real consumer needs exposure before adding an
   endpoint or removing the stamp. The accepted
   [oracle outage policy](../threat-model/README.md#actors-and-trust) is an
-  economic tradeoff, independent of whether a health field exposes age.
+  economic tradeoff, independent of whether a health field exposes age. The
+  oracle rewrites the stamp on every successful poll, unchanged price included,
+  so a stale stamp means failing polls. That is one FULL-sync commit per
+  successful poll, an estimated (unmeasured) cost under 0.1% of writer time.
 - **Recovery across external effects.** Model/storage tests do not replace
   process-level zombie re-injection or a restart between flush completion and
   cascade commit. Before adding harness machinery, identify the missing
