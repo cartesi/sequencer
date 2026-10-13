@@ -86,8 +86,6 @@ pub enum RecoveryRetryReason {
     },
     #[error("local recovery facts changed before phase execution: {status:?}")]
     StaleDecision { status: DangerStatus },
-    #[error("the Tip was already open when the EnsureOpenTip phase ran")]
-    TipAlreadyOpen,
     #[error("runtime preparation outlived its clean admission decision ({decision})")]
     AdmissionChanged { decision: &'static str },
 }
@@ -102,6 +100,11 @@ pub enum RecoveryRefusalReason {
     MissingRecoveryCheckpoint,
     #[error("post-sync recovery has no persisted safe head")]
     MissingSafeHead,
+    /// A Tip appeared between the no-Tip inspection and the `EnsureOpenTip`
+    /// transaction. Under the process lock nothing else writes, so this is a
+    /// lock violation or an inspection bug; retrying would admit over it.
+    #[error("the Tip was already open when the EnsureOpenTip phase ran")]
+    TipAlreadyOpen,
     /// The `EnsureOpenTip` transaction violated its open-Tip postcondition.
     #[error("the EnsureOpenTip phase left no valid open Tip")]
     TipMissingAfterOpen,
@@ -495,7 +498,7 @@ fn classify_mutation(error: RecoveryMutationError) -> RecoveryError {
             RecoveryError::retry(RecoveryRetryReason::StaleDecision { status: actual })
         }
         RecoveryMutationError::TipAlreadyOpen => {
-            RecoveryError::retry(RecoveryRetryReason::TipAlreadyOpen)
+            RecoveryError::refuse(RecoveryRefusalReason::TipAlreadyOpen)
         }
         RecoveryMutationError::TipMissingAfterOpen => {
             RecoveryError::refuse(RecoveryRefusalReason::TipMissingAfterOpen)
@@ -617,7 +620,7 @@ mod tests {
             WalletNonceWatermarkError::Storage(rusqlite::Error::QueryReturnedNoRows),
         )));
 
-        assert_retry(classify_mutation(RecoveryMutationError::TipAlreadyOpen));
+        assert_refuse(classify_mutation(RecoveryMutationError::TipAlreadyOpen));
         assert_refuse(classify_mutation(
             RecoveryMutationError::TipMissingAfterOpen,
         ));

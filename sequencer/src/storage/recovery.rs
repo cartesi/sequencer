@@ -112,9 +112,8 @@ pub(crate) enum RecoveryMutationError {
     },
     #[error("cannot open the Tip without a recovery checkpoint")]
     MissingRecoveryCheckpoint,
-    /// `EnsureOpenTip` found a valid open Tip already present. A
-    /// stale no-Tip decision, not a danger change; unreachable under the
-    /// process lock, and retryable if it ever fires.
+    /// `EnsureOpenTip` found a valid open Tip already present. Unreachable
+    /// under the process lock, so it refuses startup.
     #[error("the Tip was already open when the EnsureOpenTip phase ran")]
     TipAlreadyOpen,
     /// `EnsureOpenTip` left no valid open Tip after opening one. This broken

@@ -164,7 +164,7 @@ mod guarded_phases {
 
         let error = storage
             .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
-            .expect_err("stale no-Tip decision must be rejected");
+            .expect_err("an unexpected open Tip must be rejected");
         assert!(matches!(error, RecoveryMutationError::TipAlreadyOpen));
         assert_eq!(open_tip_count(&storage), 1);
     }

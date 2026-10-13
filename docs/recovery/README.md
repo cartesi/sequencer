@@ -216,7 +216,9 @@ the same suspected prediction alive without solving that cycle.
 `EnsureOpenTip` is a separate action. Its transaction requires `Safe`, no Tip,
 no divergence, and a rollback-safe checkpoint. It opens the Tip without
 invalidating history. Guarded writes matter even without concurrent writers:
-wall-clock aging alone can change the decision after inspection.
+wall-clock aging alone can change the decision after inspection, which retries.
+An open Tip found by the guard refuses instead: aging cannot create one, so
+only another writer or an inspection bug can.
 
 ### Atomic history change and replay
 
