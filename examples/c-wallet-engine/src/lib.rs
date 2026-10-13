@@ -48,25 +48,36 @@ fn set_error(message: impl AsRef<str>) {
     });
 }
 
-/// Preserve missing/corrupt artifact classification across the ABI; diagnostics are not parsed.
+/// Validation and execution: NOT_FOUND and INVALID_DUMP are lifecycle-only statuses.
 fn report(error: &AppError, what: &str) -> sys::ApplicationEngineStatus {
     match error {
         AppError::Io(err) => {
             set_error(format!("{what} failed: {err}"));
-            match err.kind() {
-                std::io::ErrorKind::NotFound => sys::APPLICATION_ENGINE_STATUS_NOT_FOUND,
-                std::io::ErrorKind::InvalidData
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::NotADirectory
-                | std::io::ErrorKind::IsADirectory => sys::APPLICATION_ENGINE_STATUS_INVALID_DUMP,
-                _ => sys::APPLICATION_ENGINE_STATUS_IO_ERROR,
-            }
+            sys::APPLICATION_ENGINE_STATUS_IO_ERROR
         }
         other => {
             set_error(format!("{what} failed: {other:?}"));
             sys::APPLICATION_ENGINE_STATUS_INTERNAL_ERROR
         }
     }
+}
+
+/// Dump loading and creation: preserve missing/corrupt artifact classification across the ABI;
+/// diagnostics are not parsed.
+fn report_lifecycle(error: &AppError, what: &str) -> sys::ApplicationEngineStatus {
+    let AppError::Io(err) = error else {
+        return report(error, what);
+    };
+    let status = match err.kind() {
+        std::io::ErrorKind::NotFound => sys::APPLICATION_ENGINE_STATUS_NOT_FOUND,
+        std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::NotADirectory
+        | std::io::ErrorKind::IsADirectory => sys::APPLICATION_ENGINE_STATUS_INVALID_DUMP,
+        _ => return report(error, what),
+    };
+    set_error(format!("{what} failed: {err}"));
+    status
 }
 
 /// Borrow a path the way the C API carries it, raw bytes rather than text.
@@ -151,7 +162,7 @@ pub unsafe extern "C" fn application_engine_from_dump(
             set_error(format!("from_dump failed: {reason}"));
             sys::APPLICATION_ENGINE_STATUS_INVALID_DUMP
         }
-        Err(err) => report(&err, "from_dump"),
+        Err(err) => report_lifecycle(&err, "from_dump"),
     }
 }
 
@@ -390,7 +401,7 @@ pub unsafe extern "C" fn application_engine_create_dump(
     let prefix = unsafe { path_from(prefix) };
     match engine.app.create_dump(&prefix) {
         Ok(()) => sys::APPLICATION_ENGINE_STATUS_OK,
-        Err(err) => report(&err, "create_dump"),
+        Err(err) => report_lifecycle(&err, "create_dump"),
     }
 }
 

@@ -67,7 +67,19 @@ fn internal(reason: impl Into<String>) -> AppError {
     }
 }
 
+/// Validation, execution and draining. NOT_FOUND and INVALID_DUMP describe
+/// lifecycle failures only, so here they break the contract and are fatal.
 fn check(status: i32, operation: &str) -> Result<(), AppError> {
+    check_status(status, operation, false)
+}
+
+/// `from_dump` and `create_dump`, where a missing or invalid dump is an
+/// operational I/O failure.
+fn check_lifecycle(status: i32, operation: &str) -> Result<(), AppError> {
+    check_status(status, operation, true)
+}
+
+fn check_status(status: i32, operation: &str, lifecycle: bool) -> Result<(), AppError> {
     if status == sys::APPLICATION_ENGINE_STATUS_OK {
         return Ok(());
     }
@@ -77,8 +89,8 @@ fn check(status: i32, operation: &str) -> Result<(), AppError> {
     );
     let kind = match status {
         sys::APPLICATION_ENGINE_STATUS_IO_ERROR => std::io::ErrorKind::Other,
-        sys::APPLICATION_ENGINE_STATUS_NOT_FOUND => std::io::ErrorKind::NotFound,
-        sys::APPLICATION_ENGINE_STATUS_INVALID_DUMP => std::io::ErrorKind::InvalidData,
+        sys::APPLICATION_ENGINE_STATUS_NOT_FOUND if lifecycle => std::io::ErrorKind::NotFound,
+        sys::APPLICATION_ENGINE_STATUS_INVALID_DUMP if lifecycle => std::io::ErrorKind::InvalidData,
         _ => return Err(internal(reason)),
     };
     Err(AppError::Io(std::io::Error::new(kind, reason)))
@@ -257,7 +269,7 @@ impl Application for EngineApp {
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
         let prefix = path_to_cstring(prefix);
         let mut engine = std::ptr::null_mut();
-        check(
+        check_lifecycle(
             unsafe { sys::application_engine_from_dump(prefix.as_ptr(), &mut engine) },
             "from_dump",
         )?;
@@ -270,7 +282,7 @@ impl Application for EngineApp {
 
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
         let prefix = path_to_cstring(prefix);
-        check(
+        check_lifecycle(
             unsafe { sys::application_engine_create_dump(self.engine, prefix.as_ptr()) },
             "create_dump",
         )

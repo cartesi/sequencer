@@ -111,3 +111,24 @@ fn drain_preserves_output_order_and_copies_reused_payloads() {
         ]
     );
 }
+
+#[test]
+fn lifecycle_statuses_are_fatal_outside_dump_lifecycle_calls() {
+    for status in [
+        sys::APPLICATION_ENGINE_STATUS_NOT_FOUND,
+        sys::APPLICATION_ENGINE_STATUS_INVALID_DUMP,
+    ] {
+        assert!(matches!(
+            check(status, "execute_direct_input"),
+            Err(AppError::Internal { .. })
+        ));
+        assert!(matches!(
+            check_lifecycle(status, "from_dump"),
+            Err(AppError::Io(_))
+        ));
+    }
+    assert!(matches!(
+        check(sys::APPLICATION_ENGINE_STATUS_IO_ERROR, "drain_output"),
+        Err(AppError::Io(_))
+    ));
+}
