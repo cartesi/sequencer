@@ -76,10 +76,10 @@ pub const SEPOLIA_SEQUENCER_ADDRESS: Address =
 /// deliberately distinct from the deployer/funder (anvil account 0).
 ///
 /// A dedicated submitter is a load-bearing assumption of `setup`'s detection
-/// gate: step 1 refuses when the submitter's wallet nonce is
-/// unsettled (`pending > safe`). The deployer has a non-zero nonce from
-/// contract creations whose tail isn't safe at setup time, so reusing it as
-/// the submitter false-positives. Account 9 starts at nonce 0. Kept in sync
+/// gate: step 1 refuses when the submitter's wallet nonce is unsettled
+/// (`pending > safe`), so the submitter must not share a key with the
+/// deployer or with an e2e wallet whose transactions may be in flight.
+/// Account 9 starts at nonce 0. Kept in sync
 /// with the harness submitter key (`tests/harness` uses `default_private_keys`
 /// index 9) and `canonical-test`'s batch sender.
 pub const DEVNET_SEQUENCER_ADDRESS: Address =

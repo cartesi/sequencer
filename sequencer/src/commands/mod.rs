@@ -211,7 +211,9 @@ pub(crate) fn load_setup_identity(data_dir: &str) -> Result<DeploymentIdentity, 
 /// Treated as fatal on mismatch *and* on RPC error: pinning a wrong or
 /// unverified chain id into storage would poison subsequent L1-unreachable
 /// boots and issue soft confirmations against the wrong chain. Caller is
-/// expected to retry on `ChainIdRpc`.
+/// expected to retry on `ChainIdRpc`. A URL the client refuses (malformed, or
+/// plaintext to a remote host without the opt-in) takes the reader's terminal
+/// class: the reader would refuse it identically one step later.
 pub(crate) async fn validate_rpc_chain_id(
     eth_rpc_url: &str,
     expected: u64,
@@ -219,7 +221,11 @@ pub(crate) async fn validate_rpc_chain_id(
 ) -> Result<(), CommandError> {
     use alloy::providers::Provider;
     let check_provider = crate::l1::provider::create_provider(eth_rpc_url, allow_insecure)
-        .map_err(|e| CommandError::Io(std::io::Error::other(e)))?;
+        .map_err(|message| {
+            BootstrapError::SetupInputReader(crate::l1::reader::InputReaderError::Bootstrap(
+                message,
+            ))
+        })?;
     match check_provider.get_chain_id().await {
         Ok(rpc_chain_id) if rpc_chain_id != expected => {
             Err(CommandError::Bootstrap(BootstrapError::ChainIdMismatch {

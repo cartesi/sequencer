@@ -1438,10 +1438,10 @@ async fn spawn_sequencer_process(
     let log_path = timestamped_log_path(logs_dir, log_prefix);
 
     // Dedicated batch submitter = anvil account 9 (NOT the deployer/funder,
-    // account 0). `setup`'s detection gate refuses when the
-    // submitter's wallet nonce is unsettled; the deployer's deploy-tx tail is
-    // not safe at setup time, so reusing it false-positives. Account 9 starts
-    // at nonce 0. Must match `DEVNET_SEQUENCER_ADDRESS` (app-core); a debug
+    // account 0). `setup`'s detection gate refuses when the submitter's wallet
+    // nonce is unsettled, so the submitter must not share a key with the
+    // deployer or with an e2e wallet whose transactions are in flight. Account
+    // 9 starts at nonce 0. Must match `DEVNET_SEQUENCER_ADDRESS` (app-core); an
     // assert below pins that. Account 9 is the highest standard funded anvil
     // account, so it stays clear of the e2e wallets (0–3) and the bench
     // workload (indices 0..concurrency).

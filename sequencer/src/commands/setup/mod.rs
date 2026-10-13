@@ -9,9 +9,11 @@
 //! transaction is the single linearization point for "A finished":
 //!
 //! 1. Validate protocol timing; create the data dir + `dumps/`.
-//! 2. Require L1: discover the InputBox address + app deployment block from the app
-//!    contract, validate the RPC chain id. (No cached-identity fallback —
-//!    this is first-boot; an unreachable L1 is a retryable refusal.)
+//! 2. Require L1: validate the RPC chain id, sample the safe head, discover the
+//!    InputBox address + app deployment block from the app contract, and refuse
+//!    (retryably) until that deployment is at or below the sampled safe head.
+//!    (No cached-identity fallback — this is first-boot; an unreachable L1 is a
+//!    retryable refusal.)
 //! 3. Resolve the fee source, pin the complete deployment identity (chain id,
 //!    app address, InputBox address, app deployment block, batch-submitter
 //!    **address**, and fee-oracle identity), and persist the first price.
@@ -38,7 +40,7 @@ use crate::commands::error::{
     BootstrapError, CommandError, IdentityError, SetupRecoveryError, SetupRefuse, WorkerExit,
 };
 use crate::ingress::inclusion_lane::dump_info;
-use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError};
+use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError, sample_safe_block};
 use crate::recovery::{
     MempoolFlusher, RecoveryError, RecoveryRetryReason, assert_resync_caught_up,
 };
@@ -100,25 +102,41 @@ where
         .map_err(|err| super::io_error_at("dumps dir", &dumps_dir, err))?;
 
     // ── L1 discovery (required) ──────────────────────────────
+    // The chain check comes first, so a wrong-chain endpoint is reported as
+    // such rather than as a missing contract.
+    validate_rpc_chain_id(
+        &config.eth_rpc_url,
+        config.chain_id,
+        config.allow_insecure_rpc,
+    )
+    .await?;
+
     let input_reader_config = InputReaderConfig {
         rpc_url: config.eth_rpc_url.clone(),
         allow_insecure_rpc: config.allow_insecure_rpc,
         app_address: config.app_address,
         poll_interval: super::INPUT_READER_POLL_INTERVAL,
-        // `validate_rpc_chain_id` below re-checks this against the live RPC; the
+        // `validate_rpc_chain_id` above checked this against the live RPC; the
         // reader's own check then verifies every sync provider serves it too.
         expected_chain_id: config.chain_id,
     };
-    let mut input_reader = match InputReader::new(
-        db_path.clone(),
-        input_reader_config,
-        config.batch_submitter_address,
-        timing,
-        process_lock.clone(),
-    )
-    .await
-    {
-        Ok(reader) => reader,
+    // Safe is sampled before discovery reads the deployment block at latest: a
+    // later sample could approve a deployment that a reorg in between moved.
+    let discovered = async {
+        let safe_block = sample_safe_block(&config.eth_rpc_url, config.allow_insecure_rpc).await?;
+        let reader = InputReader::new(
+            db_path.clone(),
+            input_reader_config,
+            config.batch_submitter_address,
+            timing,
+            process_lock.clone(),
+        )
+        .await?;
+        Ok::<_, InputReaderError>((safe_block, reader))
+    }
+    .await;
+    let (safe_before_discovery, mut input_reader) = match discovered {
+        Ok(discovered) => discovered,
         Err(InputReaderError::Provider(e)) => {
             // First boot needs L1 to discover + pin identity. Retryable: the
             // operator brings L1 up and re-runs `setup`.
@@ -127,13 +145,7 @@ where
         }
         Err(source) => return Err(BootstrapError::SetupInputReader(source).into()),
     };
-
-    validate_rpc_chain_id(
-        &config.eth_rpc_url,
-        config.chain_id,
-        config.allow_insecure_rpc,
-    )
-    .await?;
+    require_deployment_safe(input_reader.app_deployment_block(), safe_before_discovery)?;
 
     // Resolve and validate the complete fee source while setup still owns all
     // address-bearing configuration. `run` later reads only this pinned tuple.
@@ -799,6 +811,26 @@ fn existing_sqlite_schema_is_empty(
     Ok(object_count == 0)
 }
 
+/// Setup pins the application's deployment block, the reader's scan floor, only
+/// once it is at or below a safe head sampled before the block was read. Until
+/// then a reorg could move the deployment earlier, and the reader would advance
+/// its safe head over blocks below the pinned floor without reading the inputs
+/// they hold, which the scheduler then drains: divergence. Assumes safe blocks
+/// are permanent and that `block.number` is the RPC block number
+/// (`docs/threat-model/README.md`, L1 chain semantics).
+fn require_deployment_safe(
+    app_deployment_block: u64,
+    safe_block: u64,
+) -> Result<(), IdentityError> {
+    if app_deployment_block > safe_block {
+        return Err(IdentityError::DeploymentNotYetSafe {
+            app_deployment_block,
+            safe_block,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,6 +838,19 @@ mod tests {
     use crate::storage::StoredSafeInput;
     use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
     use crate::test_support::temp_db;
+
+    #[test]
+    fn setup_pins_only_a_safe_deployment() {
+        assert!(matches!(
+            require_deployment_safe(10, 9),
+            Err(IdentityError::DeploymentNotYetSafe {
+                app_deployment_block: 10,
+                safe_block: 9
+            })
+        ));
+        require_deployment_safe(10, 10).expect("a deployment at the safe head is final");
+        require_deployment_safe(10, 11).expect("a deployment below the safe head is final");
+    }
 
     #[test]
     fn checkpoint_load_requires_an_export_receipt_matching_the_artifact_and_block() {
@@ -1081,8 +1126,9 @@ mod tests {
         check_fixed_log_gas_price(&db.path, -1356).expect("the floor itself is accepted");
     }
 
-    /// Setup's L1 discovery uses the startup polarity: a malformed RPC URL
-    /// re-fails identically, so it is terminal; an unreachable RPC is not.
+    /// Setup's L1 discovery uses the startup polarity: a URL the client refuses
+    /// re-fails identically, so it is terminal; an unreachable RPC fails at the
+    /// chain-id read (`ChainIdRpc`) and is retried.
     #[tokio::test]
     async fn setup_l1_failures_exit_by_startup_phase() {
         use crate::commands::error::{EXIT_RESTART_TRANSIENT, EXIT_TERMINAL};
@@ -1137,6 +1183,23 @@ mod tests {
             EXIT_RESTART_TRANSIENT,
             "{unreachable:?}"
         );
+
+        // Called directly: clap would read CARTESI_SEQUENCER_ALLOW_INSECURE_RPC
+        // from the environment.
+        let plaintext_remote =
+            crate::commands::validate_rpc_chain_id("http://example.invalid:8545", 31337, false)
+                .await
+                .expect_err("plaintext to a remote host needs the opt-in");
+        assert!(
+            matches!(
+                plaintext_remote,
+                CommandError::Bootstrap(BootstrapError::SetupInputReader(
+                    InputReaderError::Bootstrap(_)
+                ))
+            ),
+            "{plaintext_remote:?}"
+        );
+        assert_eq!(plaintext_remote.exit_code(), EXIT_TERMINAL);
     }
 
     /// `setup --recovery`'s flush signs L1 no-ops with the recovery key, so it

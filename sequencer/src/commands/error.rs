@@ -278,7 +278,9 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         // `FeeOracleTransient` is documented "may self-heal", which is this
         // class's definition.
         BootstrapError::ChainIdRpc { .. }
-        | BootstrapError::Identity(IdentityError::FirstBootRequiresL1)
+        | BootstrapError::Identity(
+            IdentityError::FirstBootRequiresL1 | IdentityError::DeploymentNotYetSafe { .. },
+        )
         | BootstrapError::DetectionNonceRead { .. }
         | BootstrapError::DataDirLocked { .. }
         | BootstrapError::FeeOracleTransient { .. }
@@ -319,7 +321,8 @@ pub enum BootstrapError {
     OpenStorage(#[from] StorageOpenError),
     #[error("RPC chain ID {rpc} does not match the expected chain ID {config}")]
     ChainIdMismatch { rpc: u64, config: u64 },
-    /// `eth_chainId` failed on a reachable RPC. We treat this as fatal
+    /// `eth_chainId` failed. It is setup's first L1 read, so an unreachable
+    /// RPC on first boot lands here. We treat this as fatal
     /// rather than warn-and-continue: proceeding with an unverified chain id
     /// would pin a possibly-wrong deployment identity and poison subsequent
     /// L1-unreachable boots, in addition to issuing soft confirmations
@@ -378,8 +381,9 @@ pub enum BootstrapError {
     /// Startup recovery (or refusal) failed before runtime workers started.
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
-    /// An input-reader failure in setup's L1 discovery or initial sync,
-    /// classified by [`InputReaderError::is_retryable_at_startup`].
+    /// An input-reader failure in setup's L1 discovery (the chain-id check's
+    /// client, the safe-head sample, the reader) or initial sync, classified by
+    /// [`InputReaderError::is_retryable_at_startup`].
     #[error("setup L1 input reader: {0}")]
     SetupInputReader(InputReaderError),
     /// Deployment-identity guards — see [`IdentityError`].
@@ -527,11 +531,24 @@ pub enum SetupRefuse {
 /// state from one deployment with another.
 #[derive(Debug, Error)]
 pub enum IdentityError {
-    /// L1 unreachable AND no cached identity in the DB. We need at least one
+    /// An L1 read after the chain-id check (the safe-head sample or discovery)
+    /// failed AND there is no cached identity in the DB. We need at least one
     /// (live L1 query OR a prior boot's pinned identity) to safely bind this
     /// sequencer to a deployment. Operator: bring up L1 and retry.
     #[error("first boot requires L1: no cached deployment identity and L1 is unreachable")]
     FirstBootRequiresL1,
+    /// The application's deployment block is above the L1 safe head sampled
+    /// before discovery read it, so a reorg could still move it. Setup pins
+    /// only a safe deployment. Operator: retry once the safe head reaches it.
+    #[error(
+        "application deployment block {app_deployment_block} is above the L1 safe head \
+         {safe_block} sampled before discovery; setup pins only a safe deployment, retry once \
+         the safe head reaches it"
+    )]
+    DeploymentNotYetSafe {
+        app_deployment_block: u64,
+        safe_block: u64,
+    },
     /// The DB has persisted state but no pinned identity. Binding the current
     /// config now would silently inherit an unknown deployment's data.
     /// Operator: confirm provenance or wipe the DB.
@@ -920,6 +937,15 @@ mod tests {
                     IdentityError::FirstBootRequiresL1,
                 )),
                 "a first boot without L1",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::Identity(
+                    IdentityError::DeploymentNotYetSafe {
+                        app_deployment_block: 10,
+                        safe_block: 9,
+                    },
+                )),
+                "a setup before the deployment is safe",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::ChainIdRpc {

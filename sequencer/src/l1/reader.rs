@@ -153,8 +153,10 @@ pub struct InputReader {
     /// The application's deployment block — the first block that can contain
     /// an `InputAdded` event for this app. Sound as the scan floor because the
     /// v3 InputBox reverts `addInput` for an app contract that does not exist
-    /// yet (`ApplicationNotDeployed`); [`Self::new`] verifies the InputBox is
-    /// v3+ before trusting this bound.
+    /// yet (`ApplicationNotDeployed`) and setup pins it only once it is at or
+    /// below a safe head, so no reorg can move the deployment earlier. The
+    /// first scan from an empty store proves the floor: indices contiguous from
+    /// 0 and the InputBox count at the scanned safe head.
     app_deployment_block: u64,
     db_path: String,
     /// Scheduler-acceptance identity — passed into
@@ -201,8 +203,8 @@ impl InputReader {
         // InputBox's: the InputBox usually predates the app by a large block
         // gap, and scanning that gap degenerates into a long paginated
         // `get_logs` crawl on range-capped providers. Skipping it is sound
-        // only because the v3 InputBox refuses inputs for apps that do not
-        // exist yet — witnessed below via `version()`.
+        // because the v3 InputBox refuses inputs for apps that do not exist
+        // yet; `version()` below refuses an older box before any scan.
         let app_deployment_block = application
             .getDeploymentBlockNumber()
             .call()
@@ -384,8 +386,9 @@ impl InputReader {
 
         // The next block to scan: one past the persisted safe head, never
         // earlier than the app's deployment block (no input can exist before
-        // it). The persisted head itself may sit below that block: setup
-        // right after deployment observes a safe head that still trails it.
+        // it). The persisted head sits below that block only when a provider's
+        // safe head trails the one setup sampled, since setup pins the
+        // deployment block only once it is safe.
         let start_block = previous_safe_block
             .map_or(self.app_deployment_block, |b| b + 1)
             .max(self.app_deployment_block);
@@ -639,7 +642,10 @@ fn map_contract_bootstrap_error(what: &str, err: alloy::contract::Error) -> Inpu
 
 /// Why the reader refuses pre-v3 InputBoxes: the scan genesis is the app's
 /// deployment block, sound only under v3's "no inputs for a not-yet-deployed
-/// app" rule.
+/// app" rule. With one consistent node the first scan would also catch an
+/// older box's earlier inputs, but only as a retryable inconsistent response
+/// that blames the provider; this check names the cause and refuses
+/// terminally, and still holds if the provider is not one consistent node.
 const INPUT_BOX_V3_REQUIRED: &str = "rollups-contracts v3+ InputBox required \
      (v2 accepts inputs for not-yet-deployed apps, which would invalidate the \
      app-deployment scan genesis)";
@@ -841,6 +847,18 @@ async fn input_count_at_block(
             )
         })?;
     u256_to_u64(count, "InputBox getNumberOfInputs")
+}
+
+/// The L1 safe block, sampled by setup before discovery reads the deployment
+/// block at latest: a deployment at or below it cannot reorg to an earlier
+/// block.
+pub(crate) async fn sample_safe_block(
+    rpc_url: &str,
+    allow_insecure_rpc: bool,
+) -> Result<u64, InputReaderError> {
+    let provider = crate::l1::provider::create_provider(rpc_url, allow_insecure_rpc)
+        .map_err(InputReaderError::Bootstrap)?;
+    Ok(latest_safe_head(&provider).await?.block_number)
 }
 
 async fn latest_safe_head(provider: &impl Provider) -> Result<SafeHead, InputReaderError> {
@@ -1116,11 +1134,11 @@ mod tests {
         }
     }
 
-    /// Setup right after app deployment persists a safe head that trails the
-    /// deployment block. Later syncs must keep advancing the head without
-    /// scanning or consulting the InputBox below the deployment block — on a
-    /// fresh devnet the InputBox itself may not exist at those heights (here
-    /// it has no code at all, so any count call would fail).
+    /// A safe head below the deployment block (a provider trailing the head
+    /// setup sampled, or an identity seeded ahead of the chain) keeps
+    /// advancing without scanning or consulting the InputBox — on a fresh
+    /// devnet the InputBox itself may not exist at those heights (here it has
+    /// no code at all, so any count call would fail).
     #[tokio::test]
     async fn advance_once_below_app_deployment_block_skips_input_box() {
         require_anvil();

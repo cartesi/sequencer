@@ -46,18 +46,35 @@ impl DevnetRollupsStack {
     pub async fn spawn(log_prefix: &str, logs_dir: &Path) -> HarnessResult<Self> {
         let anvil = ManagedAnvil::spawn(log_prefix, logs_dir).await?;
         let mock_erc20_address = deploy_devnet_mock_erc20(anvil.endpoint.as_str()).await?;
-        let app_address = deploy_devnet_application(
+        let (app_address, deployment_block) = deploy_devnet_application(
             anvil.endpoint.as_str(),
             anvil.application_factory_address,
             anvil.input_box_address,
         )
         .await?;
 
-        Ok(Self {
+        let stack = Self {
             anvil,
             app_address,
             mock_erc20_address,
-        })
+        };
+        // `setup` pins only a deployment at or below the L1 safe head
+        // (`DeploymentNotYetSafe`); Anvil's safe head trails latest by
+        // `--slots-in-an-epoch` blocks. Mined as one burst; the interval keeps
+        // timestamps distinct.
+        let safe = stack.l1_safe_block_number().await?;
+        stack
+            .mine_live_l1_blocks(deployment_block.saturating_sub(safe))
+            .await?;
+        let safe = stack.l1_safe_block_number().await?;
+        if safe < deployment_block {
+            return Err(io_other(format!(
+                "Anvil safe head {safe} did not reach the application deployment block \
+                 {deployment_block}"
+            ))
+            .into());
+        }
+        Ok(stack)
     }
 
     pub fn l1_endpoint(&self) -> &str {
@@ -534,11 +551,12 @@ async fn deploy_mock_erc20_from_default_funder(endpoint: &str) -> HarnessResult<
     })
 }
 
+/// The application's address and its deployment block.
 async fn deploy_devnet_application(
     endpoint: &str,
     application_factory_address: Address,
     input_box_address: Address,
-) -> HarnessResult<Address> {
+) -> HarnessResult<(Address, u64)> {
     let private_key = default_private_keys()
         .first()
         .ok_or_else(|| io_other("missing default Anvil private key"))?;
@@ -598,8 +616,11 @@ async fn deploy_devnet_application(
     if !receipt.status() {
         return Err(io_other("application deployment transaction reverted").into());
     }
+    let deployment_block = receipt
+        .block_number
+        .ok_or_else(|| io_other("application deployment receipt missing block number"))?;
 
-    Ok(application_address)
+    Ok((application_address, deployment_block))
 }
 
 fn load_template_hash(machine_image_path: &Path) -> HarnessResult<B256> {

@@ -80,10 +80,11 @@ reader. The shared vector `tests/fixtures/l1_partition_vector.json` pins both
 rules on both sides.
 
 **Scan floor.** The Rust reader starts at the application's deployment block,
-which is sound only because it also witnesses that the InputBox rejects inputs
-for undeployed applications. The watchdog starts at its bootstrap block and
-proves completeness from the InputBox count instead; do not copy the
-deployment-block floor without the witness.
+which is sound because setup pins that block only once it is safe and the
+reader's first scan proves, from index 0 and the InputBox count, that no input
+precedes it. The watchdog starts at its bootstrap block and proves completeness
+from the InputBox count instead; do not copy the deployment-block floor without
+that witness.
 
 The reader holds one provider response at a time: each successful log range
 is decoded and fed to the machine before the next is fetched.

@@ -3805,11 +3805,10 @@ async fn run_provider_outage_input_reader_retries_after_reconnect_test(
 // Distinct from `run_first_boot_l1_unreachable_never_synced_refuses_boot_test`
 // (already covered): that test exercises the run reducer's wall-clock fallback,
 // which only runs after setup has succeeded once (so deployment identity is
-// pinned). This test targets
-// the earlier failure: the
-// `InputReader::new` discovery step where the sequencer asks L1 for the
-// InputBox address. With no deployment identity, that call has no
-// fallback and the boot fails before recovery logic runs.
+// pinned). This test targets the earlier failure: setup's L1 discovery, which
+// first checks the chain id and then asks L1 for the InputBox address. With no
+// deployment identity, those reads have no fallback and the boot fails before
+// recovery logic runs.
 //
 // The harness simulates "no deployment identity" by `reset_database()` after
 // a normal boot has populated it (truly first-ever boot would also lack
@@ -3826,8 +3825,8 @@ async fn run_first_boot_no_identity_l1_unreachable_refuses_boot_test(
     runtime.stop().await?;
     runtime.reset_database()?;
 
-    // Route through a disconnected proxy so InputReader::new fails with
-    // a provider error.
+    // Route through a disconnected proxy so setup's first L1 read (the chain
+    // id) fails with a provider error.
     let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
     runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
     proxy.disconnect();

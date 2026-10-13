@@ -172,9 +172,12 @@ by writer and are write-once (`0001_schema.sql`).
   identifies the completely accounted L1 prefix. Reconciliation executes all
   external directs in the newly safe interval before committing its next frame
   and application rows. Envelopes-only intervals advance the clock with no rows.
-- **Enforced by:** complete-block ingestion; the lane's indivisible reconciliation
-  turn; storage range and execution-receipt checks. Batch closure preserves the
-  current frame clock.
+- **Enforced by:** complete-block ingestion: every committed `safe_inputs` /
+  `l1_safe_head` pair holds every input through its head, witnessed by index
+  contiguity plus the InputBox count at that head (`l1/reader.rs`), above a
+  scan floor setup pins only once the deployment is safe; the lane's
+  indivisible reconciliation turn; storage range and execution-receipt checks.
+  Batch closure preserves the current frame clock.
 - **Breaks:** skipping or double-applying directs after restart/recovery.
 
 ### I7. Every committed batch close has an immutable snapshot

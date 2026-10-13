@@ -225,7 +225,7 @@ Choose the bootstrap:
 
   ```bash
   cast call "$CARTESI_WATCHDOG_APP_ADDRESS" 'getDeploymentBlockNumber()(uint256)' \
-      --rpc-url "$CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT"
+      --block safe --rpc-url "$CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT"
   ```
 
   No input precedes that block, so `init` checks the image against the
@@ -365,6 +365,11 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   re-detection windows, serving traffic in between. There, the crash-loop
   bound is your alerting, not the restart policy: page immediately on
   `lastState.terminated.exitCode == 30` (and on signal exits / 134).
+- **A fresh deployment needs a setup retry budget.** `setup` exits 20 until
+  the L1 safe head reaches the application's deployment block, about one to
+  two epochs on Ethereum (6.4–12.8 min); give a setup Job or unit a longer
+  retry budget (a Kubernetes Job's default backoffLimit 6 allows about
+  10.5 min).
 - **After an unclean death (OOM, node reboot, SIGKILL) no action is
   needed**: the next start re-derives everything from facts. For
   postmortems, the `terminal_faults` table records the cause of every

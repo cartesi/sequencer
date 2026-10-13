@@ -135,6 +135,8 @@ CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac09...f2ff80 \
 cargo run -p wallet-sequencer -- run
 ```
 
+`setup` exits 20 (retryable) until the application's deployment block is at or below the L1 safe head, so no reorg can move the block it pins; on Ethereum that is a one-time wait of an epoch or two after deployment, and on Anvil `--slots-in-an-epoch` mined blocks (one in the repo's devnet stack, which sets it to 1; Anvil's default is 32).
+
 A third subcommand, **`flush-mempool`**, settles the batch-submitter wallet
 nonce on demand (keyed operator tool). It is flush-only: it requires a
 completed setup and no canonical divergence, and it never performs
