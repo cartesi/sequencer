@@ -13,7 +13,7 @@ use cartesi_rollups_contracts::i_application::IApplication;
 use cartesi_rollups_contracts::input_box::InputBox;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::l1::partition::{
     GetLogsError, decode_evm_advance_input, get_input_added_events_ordered,
@@ -50,12 +50,14 @@ pub enum InputReaderError {
     /// loop logs and re-ticks.
     #[error("provider/transport: {0}")]
     Provider(String),
-    /// The provider answered, but with data that contradicts itself or the
-    /// InputBox's own accounting: an index gap or count mismatch, missing log
-    /// provenance, an undecodable or self-inconsistent `EvmAdvance` payload.
-    /// Retryable — a consistent node returns a coherent
-    /// set on the next tick — but logged as its own alarm: a *persistent* one
-    /// means the endpoint is broken or lying, not slow.
+    /// The provider answered, but with data that contradicts itself, the
+    /// InputBox's own accounting, the pinned identity, or the stored inputs:
+    /// an index gap or count mismatch, missing log provenance, an undecodable
+    /// or self-inconsistent `EvmAdvance` payload, one for another chain or
+    /// application, or an on-chain count below the stored one. Retryable — a
+    /// consistent node returns a coherent set on the next tick — but logged as
+    /// its own alarm: a *persistent* one means the endpoint is broken or lying,
+    /// or, for a count below the stored one, local state may be.
     #[error("inconsistent L1 response: {0}")]
     InconsistentL1Response(String),
     /// The provider serves a different chain than the pinned identity.
@@ -89,7 +91,9 @@ impl InputReaderError {
             // provenance.
             Self::ChainIdMismatch { .. } | Self::StorageTaskPanicked { .. } => true,
             // Transport/L1-consistency errors self-heal on a healthy
-            // endpoint; `Bootstrap` is a preflight-phase fact (a live-worker
+            // endpoint, except a count below the stored one, which may be
+            // local state and is retried as an alarm (see the variant doc);
+            // `Bootstrap` is a preflight-phase fact (a live-worker
             // appearance restarts unclassified rather than poisoning); a
             // non-panic inner-task join is shutdown-path cancellation.
             Self::Provider(_)
@@ -344,8 +348,8 @@ impl InputReader {
                 Err(err @ InputReaderError::InconsistentL1Response(_)) => {
                     tracing::warn!(
                         error = %err,
-                        "L1 provider served an inconsistent response — will retry; \
-                         if persistent, the RPC endpoint is the suspect"
+                        "inconsistent L1 response — will retry; if persistent, suspect \
+                         the RPC endpoint first, then local state"
                     );
                 }
                 Err(err) if err.is_retryable() => {
@@ -371,6 +375,13 @@ impl InputReader {
         Ok(())
     }
 
+    /// Reads `[cursor, safe]` as one span for one commit, with the InputBox
+    /// count at `safe` as its completeness witness: a commit at a lower head
+    /// would rest on index contiguity alone, which a dropped tail input passes
+    /// (I6). In `run` the span stays under about `l1_read_stale_after_blocks`,
+    /// since the danger detector stops `run` first; setup, rebuild and startup
+    /// syncs read the whole gap, from the app's deployment on a fresh database.
+    /// Bounding those is a known optimization in `docs/review/register.md`.
     async fn read_safe_inputs(
         &mut self,
         provider: &impl Provider,
@@ -399,6 +410,19 @@ impl InputReader {
         // advancing. Neither consults the InputBox, which on a fresh chain may
         // not exist yet at that height.
         if current_safe_block < start_block {
+            // A head behind the persisted one is environmental (a lagging,
+            // resyncing or repointed endpoint) and is held as no progress; log
+            // it, or only the stale-view danger check surfaces it, hours later.
+            if let Some(persisted_safe_block) = previous_safe_block
+                && current_safe_block < persisted_safe_block
+            {
+                warn!(
+                    provider_safe_block = current_safe_block,
+                    persisted_safe_block,
+                    "L1 provider safe head is behind the persisted safe head — \
+                     endpoint lagging or repointed; holding the persisted head"
+                );
+            }
             let advanced = previous_safe_block.is_none_or(|b| current_safe_block > b);
             return Ok(advanced.then_some(SafeInputUpdate {
                 head: current_safe_head,
@@ -420,13 +444,23 @@ impl InputReader {
         )
         .await?;
 
+        // The InputBox count at a block past the persisted head cannot be below
+        // what storage already holds. No `get_logs` answer can heal that, and
+        // the endpoint is not the only suspect, so fail before scanning.
+        if onchain_count < expected_start {
+            return Err(InputReaderError::InconsistentL1Response(format!(
+                "InputBox input count at block {current_safe_block} is {onchain_count}, below \
+                 the {expected_start} inputs already stored: L1 disagrees with local state \
+                 (endpoint on another fork, reorg below the safe head, or corrupt local \
+                 storage), not a get_logs omission"
+            )));
+        }
+
         // No new inputs in `[start_block, current_safe_block]` — advance the
         // safe head without scanning. On range-capped providers the skipped
         // `get_logs` crawl is hundreds of paginated queries for a long span
         // (first sync of a quiet app, restart after downtime), while the count
-        // above is a single call. Strict equality only: a count *below* what we
-        // hold is an impossible overcount and must fall through to the
-        // completeness check, which fails loud on it.
+        // above is a single call.
         if onchain_count == expected_start {
             debug!(
                 block_range = %format!("{}..={}", start_block, current_safe_block),
@@ -469,7 +503,12 @@ impl InputReader {
         let mut batch = Vec::with_capacity(events.len());
         let mut onchain_indices = Vec::with_capacity(events.len());
         for (event, log) in events {
-            let (onchain_index, input) = ingest_input_added(&event, &log)?;
+            let (onchain_index, input) = ingest_input_added(
+                &event,
+                &log,
+                self.config.app_address,
+                self.config.expected_chain_id,
+            )?;
             onchain_indices.push(onchain_index);
             batch.push(input);
         }
@@ -486,14 +525,11 @@ impl InputReader {
         // deposit `≤` the safe head would be persisted as complete and only
         // caught on the *next* input, after the lane may have stamped frames
         // past it (divergence).
-        let received_count = u64::try_from(batch.len()).map_err(|_| {
-            InputReaderError::Provider("InputAdded result count exceeds u64".to_string())
-        })?;
-        let received_total = expected_start.checked_add(received_count).ok_or_else(|| {
-            InputReaderError::Provider(
-                "InputAdded result count overflows the safe-input index space".to_string(),
-            )
-        })?;
+        let received_count = u64::try_from(batch.len())
+            .expect("InputAdded result count exceeds u64: contract-impossible");
+        let received_total = expected_start
+            .checked_add(received_count)
+            .expect("safe-input index space overflow: contract-impossible");
         check_input_count_complete(current_safe_block, received_total, onchain_count)?;
 
         info!(
@@ -715,14 +751,18 @@ fn u256_to_u64(value: U256, what: &str) -> Result<u64, InputReaderError> {
 
 /// Decode one `InputAdded` log into the row we persist, plus the on-chain
 /// index the contiguity witness checks. Pure — unit tests drive it with
-/// synthetic `(InputAdded, Log)` pairs, no provider required. Mirrors the
-/// watchdog's `decode_and_validate_log`: the row mixes provenances (block
-/// number and tx hash from the log, everything else from the `EvmAdvance`
-/// payload), so the two fields both sides carry — block number and index —
-/// are cross-checked here.
+/// synthetic `(InputAdded, Log)` pairs, no provider required. The row mixes
+/// provenances (block number and tx hash from the log, everything else from
+/// the `EvmAdvance` payload), so the fields both sides carry — block number
+/// and index — are cross-checked. The payload's chain and application must be
+/// the pinned ones too: the canonical scheduler derives its signing domain from
+/// them, while the sequencer substitutes the pinned identity. The watchdog's
+/// `reader:inputs` (`watchdog/l1.lua`) checks the same fields.
 fn ingest_input_added(
     event: &InputAdded,
     log: &alloy::rpc::types::Log,
+    app_address: Address,
+    chain_id: u64,
 ) -> Result<(u64, IngestedSafeInput), InputReaderError> {
     let onchain_index = u256_to_u64(event.index, "InputAdded index")?;
 
@@ -754,6 +794,20 @@ fn ingest_input_added(
             event.index, evm_advance.index
         )));
     }
+    if evm_advance.chainId != U256::from(chain_id) {
+        return Err(InputReaderError::InconsistentL1Response(format!(
+            "InputAdded index {} carries chain id {} in its EvmAdvance payload, but the \
+             pinned chain is {chain_id}",
+            event.index, evm_advance.chainId
+        )));
+    }
+    if evm_advance.appContract != app_address {
+        return Err(InputReaderError::InconsistentL1Response(format!(
+            "InputAdded index {} is for application {} in its EvmAdvance payload, but the \
+             pinned application is {app_address}",
+            event.index, evm_advance.appContract
+        )));
+    }
     let block_timestamp = u256_to_u64(evm_advance.blockTimestamp, "EvmAdvance block timestamp")?;
 
     Ok((
@@ -775,7 +829,9 @@ fn ingest_input_added(
 /// gap means the provider returned an incomplete `get_logs` set (a clamped or
 /// lagging-replica response — see `docs/threat-model/README.md`); the
 /// retryable [`InconsistentL1Response`] refuses to persist the hole — a
-/// consistent provider returns the full set on the next tick.
+/// consistent provider returns the full set on the next tick. `expected_start`
+/// is a stored count (at most `i64::MAX`), so the index arithmetic cannot
+/// overflow.
 ///
 /// [`InconsistentL1Response`]: InputReaderError::InconsistentL1Response
 fn check_input_index_contiguity(
@@ -783,14 +839,11 @@ fn check_input_index_contiguity(
     onchain_indices: &[u64],
 ) -> Result<(), InputReaderError> {
     for (offset, &index) in onchain_indices.iter().enumerate() {
-        let offset = u64::try_from(offset).map_err(|_| {
-            InputReaderError::Provider("InputAdded result offset exceeds u64".to_string())
-        })?;
-        let expected = expected_start.checked_add(offset).ok_or_else(|| {
-            InputReaderError::Provider(
-                "InputAdded indices overflow the safe-input index space".to_string(),
-            )
-        })?;
+        let offset = u64::try_from(offset)
+            .expect("InputAdded result offset exceeds u64: contract-impossible");
+        let expected = expected_start
+            .checked_add(offset)
+            .expect("InputAdded expected index overflow: contract-impossible");
         if index != expected {
             return Err(InputReaderError::InconsistentL1Response(format!(
                 "non-contiguous InputBox index: expected {expected}, got {index} — \
@@ -1268,11 +1321,17 @@ mod tests {
     }
 
     #[test]
-    fn input_index_contiguity_rejects_index_space_overflow() {
-        let err = check_input_index_contiguity(u64::MAX, &[u64::MAX, u64::MAX])
-            .expect_err("the expected index must not saturate at u64::MAX");
+    #[should_panic(expected = "contract-impossible")]
+    fn input_index_contiguity_never_saturates_the_index_space() {
+        let _ = check_input_index_contiguity(u64::MAX, &[u64::MAX, u64::MAX]);
+    }
+
+    #[test]
+    fn input_index_contiguity_rejects_a_duplicated_input() {
+        let err = check_input_index_contiguity(7, &[7, 7, 8])
+            .expect_err("a repeated index must be rejected");
         assert!(
-            matches!(&err, InputReaderError::Provider(m) if m.contains("overflow")),
+            matches!(&err, InputReaderError::InconsistentL1Response(m) if m.contains("expected 8, got 7")),
             "got {err:?}"
         );
     }
@@ -1300,9 +1359,13 @@ mod tests {
     }
 
     #[test]
-    fn input_count_complete_rejects_an_impossible_overcount() {
-        // We somehow hold more than the chain reports — also fail loud.
-        assert!(check_input_count_complete(100, 11, 10).is_err());
+    fn input_count_complete_rejects_logs_beyond_the_count() {
+        // The scan returned more inputs than the count pinned at the same
+        // block — also fail loud.
+        assert!(matches!(
+            check_input_count_complete(100, 11, 10),
+            Err(InputReaderError::InconsistentL1Response(_))
+        ));
     }
 
     #[test]
@@ -1372,10 +1435,19 @@ mod tests {
     // ── ingest_input_added: pure decode of one (InputAdded, Log) pair ──
 
     fn evm_advance_payload(block_number: u64, index: u64) -> Vec<u8> {
+        evm_advance_payload_for(31337, Address::ZERO, block_number, index)
+    }
+
+    fn evm_advance_payload_for(
+        chain_id: u64,
+        app_contract: Address,
+        block_number: u64,
+        index: u64,
+    ) -> Vec<u8> {
         use alloy::sol_types::SolCall;
         cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall {
-            chainId: U256::from(31337_u64),
-            appContract: Address::ZERO,
+            chainId: U256::from(chain_id),
+            appContract: app_contract,
             msgSender: Address::repeat_byte(0x11),
             blockNumber: U256::from(block_number),
             blockTimestamp: U256::from(1_700_000_000_u64),
@@ -1420,7 +1492,8 @@ mod tests {
     fn ingest_input_added_accepts_a_consistent_pair() {
         let tx = alloy_primitives::B256::repeat_byte(0xcc);
         let (event, log) = input_added_pair(5, evm_advance_payload(90, 5), Some(90), Some(tx));
-        let (onchain_index, input) = ingest_input_added(&event, &log).expect("consistent pair");
+        let (onchain_index, input) =
+            ingest_input_added(&event, &log, Address::ZERO, 31337).expect("consistent pair");
         assert_eq!(onchain_index, 5);
         assert_eq!(input.block_number, 90);
         assert_eq!(input.block_timestamp, 1_700_000_000);
@@ -1433,14 +1506,16 @@ mod tests {
     fn ingest_input_added_rejects_missing_log_provenance() {
         let tx = alloy_primitives::B256::repeat_byte(0xcc);
         let (event, log) = input_added_pair(5, evm_advance_payload(90, 5), None, Some(tx));
-        let err = ingest_input_added(&event, &log).expect_err("missing block_number");
+        let err = ingest_input_added(&event, &log, Address::ZERO, 31337)
+            .expect_err("missing block_number");
         assert!(
             matches!(&err, InputReaderError::InconsistentL1Response(m) if m.contains("block_number")),
             "got {err:?}"
         );
 
         let (event, log) = input_added_pair(5, evm_advance_payload(90, 5), Some(90), None);
-        let err = ingest_input_added(&event, &log).expect_err("missing transaction_hash");
+        let err = ingest_input_added(&event, &log, Address::ZERO, 31337)
+            .expect_err("missing transaction_hash");
         assert!(
             matches!(&err, InputReaderError::InconsistentL1Response(m) if m.contains("transaction_hash")),
             "got {err:?}"
@@ -1451,9 +1526,10 @@ mod tests {
     fn ingest_input_added_rejects_log_payload_block_number_mismatch() {
         let tx = alloy_primitives::B256::repeat_byte(0xcc);
         // Payload claims block 91, the log says 90 — the same self-contradiction
-        // the watchdog's `decode_and_validate_log` raises (and retries) on.
+        // the watchdog's `reader:inputs` (`watchdog/l1.lua`) raises, transiently.
         let (event, log) = input_added_pair(5, evm_advance_payload(91, 5), Some(90), Some(tx));
-        let err = ingest_input_added(&event, &log).expect_err("block number mismatch");
+        let err = ingest_input_added(&event, &log, Address::ZERO, 31337)
+            .expect_err("block number mismatch");
         assert!(
             matches!(&err, InputReaderError::InconsistentL1Response(m)
                 if m.contains("block number mismatch")),
@@ -1467,7 +1543,8 @@ mod tests {
         // The input-completeness witness reads the index from the topic; the watchdog reads it
         // from the payload. The cross-check keeps the two provably aligned.
         let (event, log) = input_added_pair(5, evm_advance_payload(90, 6), Some(90), Some(tx));
-        let err = ingest_input_added(&event, &log).expect_err("index mismatch");
+        let err =
+            ingest_input_added(&event, &log, Address::ZERO, 31337).expect_err("index mismatch");
         assert!(
             matches!(&err, InputReaderError::InconsistentL1Response(m)
                 if m.contains("index mismatch")),
@@ -1476,10 +1553,44 @@ mod tests {
     }
 
     #[test]
+    fn ingest_input_added_rejects_a_payload_for_another_chain_or_application() {
+        let tx = alloy_primitives::B256::repeat_byte(0xcc);
+        let (event, log) = input_added_pair(
+            5,
+            evm_advance_payload_for(1, Address::ZERO, 90, 5),
+            Some(90),
+            Some(tx),
+        );
+        let err = ingest_input_added(&event, &log, Address::ZERO, 31337)
+            .expect_err("a payload for another chain");
+        assert!(
+            matches!(&err, InputReaderError::InconsistentL1Response(m)
+                if m.contains("chain id 1") && m.contains("pinned chain is 31337")),
+            "got {err:?}"
+        );
+
+        let other_app = Address::repeat_byte(0x22);
+        let (event, log) = input_added_pair(
+            5,
+            evm_advance_payload_for(31337, other_app, 90, 5),
+            Some(90),
+            Some(tx),
+        );
+        let err = ingest_input_added(&event, &log, Address::ZERO, 31337)
+            .expect_err("a payload for another application");
+        assert!(
+            matches!(&err, InputReaderError::InconsistentL1Response(m)
+                if m.contains(&other_app.to_string())),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn ingest_input_added_rejects_undecodable_payload() {
         let tx = alloy_primitives::B256::repeat_byte(0xcc);
         let (event, log) = input_added_pair(5, vec![0xde, 0xad], Some(90), Some(tx));
-        let err = ingest_input_added(&event, &log).expect_err("undecodable payload");
+        let err = ingest_input_added(&event, &log, Address::ZERO, 31337)
+            .expect_err("undecodable payload");
         assert!(
             matches!(&err, InputReaderError::InconsistentL1Response(m)
                 if m.contains("decode EvmAdvance")),
@@ -1748,5 +1859,206 @@ mod tests {
             None,
             "a failed completeness witness must not persist a safe head"
         );
+    }
+
+    #[tokio::test]
+    async fn advance_once_refuses_an_onchain_count_below_stored_without_scanning() {
+        let db_file = NamedTempFile::new().expect("temp file");
+        let db_path = db_file.path().to_string_lossy().into_owned();
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        storage
+            .append_safe_inputs(
+                5,
+                &[crate::storage::StoredSafeInput {
+                    sender: Address::repeat_byte(0x11),
+                    payload: vec![0xaa],
+                    block_number: 5,
+                }],
+                Address::ZERO,
+                &test_timing(),
+            )
+            .expect("seed one stored direct input");
+        drop(storage);
+        let mut reader = test_reader(
+            db_path,
+            "http://127.0.0.1:0".to_string(),
+            3,
+            Duration::from_secs(1),
+        );
+
+        // chainId, safe head 7, count 0 at block 7 — nothing queued for
+        // eth_getLogs, so a scan would surface as a Provider error instead.
+        let asserter = alloy::transports::mock::Asserter::new();
+        asserter.push_success(&alloy_primitives::U64::from(31337_u64));
+        asserter.push_success(&mock_safe_block(7));
+        asserter.push_success(&abi_u256(0));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = reader
+            .advance_once(&provider)
+            .await
+            .expect_err("a count below the stored total must fail loud");
+        assert!(
+            matches!(&err, InputReaderError::InconsistentL1Response(m)
+                if m.contains("below the 1 inputs already stored")),
+            "got {err:?}"
+        );
+        assert_eq!(reader.current_safe_block().await.expect("read"), Some(5));
+    }
+
+    /// A mocked provider that records every JSON-RPC request, for tests that
+    /// pin which block a read targets (the asserter answers by position only).
+    fn recording_provider(
+        asserter: &alloy::transports::mock::Asserter,
+    ) -> (
+        alloy::providers::DynProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use alloy::providers::Provider;
+        use alloy::rpc::json_rpc::{RequestPacket, ResponsePacket};
+        use alloy::transports::{TransportError, TransportFut, mock::MockTransport};
+
+        #[derive(Clone)]
+        struct Recording {
+            inner: MockTransport,
+            requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        }
+        impl tower::Service<RequestPacket> for Recording {
+            type Response = ResponsePacket;
+            type Error = TransportError;
+            type Future = TransportFut<'static>;
+            fn poll_ready(
+                &mut self,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), TransportError>> {
+                self.inner.poll_ready(cx)
+            }
+            fn call(&mut self, request: RequestPacket) -> Self::Future {
+                self.requests
+                    .lock()
+                    .expect("request log")
+                    .push(serde_json::to_value(&request).expect("request serializes"));
+                self.inner.call(request)
+            }
+        }
+
+        let requests = std::sync::Arc::default();
+        let transport = Recording {
+            inner: MockTransport::new(asserter.clone()),
+            requests: std::sync::Arc::clone(&requests),
+        };
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_client(alloy::rpc::client::RpcClient::new(transport, true))
+            .erased();
+        (provider, requests)
+    }
+
+    fn requests_for<'a>(
+        requests: &'a [serde_json::Value],
+        method: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        requests
+            .iter()
+            .filter(|request| request["method"] == method)
+            .collect()
+    }
+
+    /// A count read anywhere but the sampled safe block would let the skip
+    /// advance the head past inputs it never scanned.
+    #[tokio::test]
+    async fn advance_once_pins_the_count_and_the_scan_to_the_sampled_safe_block() {
+        use alloy::sol_types::SolEvent;
+
+        let db_file = NamedTempFile::new().expect("temp file");
+        let db_path = db_file.path().to_string_lossy().into_owned();
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        storage
+            .append_safe_inputs(9, &[], Address::ZERO, &test_timing())
+            .expect("seed a persisted safe head");
+        drop(storage);
+
+        // Count 1 at the safe head: the scan runs over [10, 20].
+        let mut reader = test_reader(
+            db_path.clone(),
+            "http://127.0.0.1:0".into(),
+            3,
+            Duration::from_secs(1),
+        );
+        let asserter = alloy::transports::mock::Asserter::new();
+        let (event, mut log) = input_added_pair(
+            0,
+            evm_advance_payload(15, 0),
+            Some(15),
+            Some(alloy_primitives::B256::repeat_byte(0xaa)),
+        );
+        log.inner.data = event.encode_log_data();
+        asserter.push_success(&alloy_primitives::U64::from(31337_u64));
+        asserter.push_success(&mock_safe_block(20));
+        asserter.push_success(&abi_u256(1));
+        asserter.push_success(&vec![log]);
+        let (provider, requests) = recording_provider(&asserter);
+        reader.advance_once(&provider).await.expect("advance_once");
+        {
+            let requests = requests.lock().expect("request log");
+            let calls = requests_for(&requests, "eth_call");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["params"][1], serde_json::json!("0x14"));
+            let scans = requests_for(&requests, "eth_getLogs");
+            assert_eq!(scans.len(), 1);
+            assert_eq!(scans[0]["params"][0]["fromBlock"], serde_json::json!("0xa"));
+            assert_eq!(scans[0]["params"][0]["toBlock"], serde_json::json!("0x14"));
+        }
+
+        // Count equal to the stored total at the next safe head: no scan.
+        let asserter = alloy::transports::mock::Asserter::new();
+        asserter.push_success(&mock_safe_block(30));
+        asserter.push_success(&abi_u256(1));
+        let (provider, requests) = recording_provider(&asserter);
+        reader.advance_once(&provider).await.expect("advance_once");
+        let requests = requests.lock().expect("request log");
+        let calls = requests_for(&requests, "eth_call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["params"][1], serde_json::json!("0x1e"));
+        assert!(requests_for(&requests, "eth_getLogs").is_empty());
+    }
+
+    #[tokio::test]
+    async fn advance_once_ingests_a_reordered_response_in_l1_order() {
+        use alloy::sol_types::SolEvent;
+
+        let db_file = NamedTempFile::new().expect("temp file");
+        let db_path = db_file.path().to_string_lossy().into_owned();
+        let mut reader = test_reader(
+            db_path.clone(),
+            "http://127.0.0.1:0".into(),
+            3,
+            Duration::from_secs(1),
+        );
+        let logs: Vec<_> = [(1_u64, 16_u64), (0, 15)]
+            .into_iter()
+            .map(|(index, block)| {
+                let (event, mut log) = input_added_pair(
+                    index,
+                    evm_advance_payload(block, index),
+                    Some(block),
+                    Some(alloy_primitives::B256::repeat_byte(0xaa)),
+                );
+                log.inner.data = event.encode_log_data();
+                log
+            })
+            .collect();
+        let asserter = alloy::transports::mock::Asserter::new();
+        asserter.push_success(&alloy_primitives::U64::from(31337_u64));
+        asserter.push_success(&mock_safe_block(20));
+        asserter.push_success(&abi_u256(2));
+        asserter.push_success(&logs);
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        reader
+            .advance_once(&provider)
+            .await
+            .expect("a reordered response is complete");
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        assert_eq!(storage.safe_input_end_exclusive().expect("count"), 2);
     }
 }
