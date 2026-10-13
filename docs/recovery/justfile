@@ -8,9 +8,10 @@ check-admission:
 check-preemptive:
     {{tlc}} -workers auto -deadlock preemptive.tla
 
-# Check the optimistic recovery spec (~3min)
+# Check the historical optimistic design (~3min). A dev analysis tool for
+# revisiting that design, not a check of the current procedure.
 check-optimistic:
     {{tlc}} -workers auto -deadlock history/optimistic.tla
 
-# Check all specs
-check-all: check-admission check-preemptive check-optimistic
+# Check the specs of the current recovery procedure
+check-all: check-admission check-preemptive
