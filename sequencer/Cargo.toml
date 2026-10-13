@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tar = "0.4"
 tracing = { workspace = true }
+tower = "0.5"
 tower-http = { version = "0.6.8", features = ["trace", "cors"] }
 rusqlite = { workspace = true }
 rusqlite_migration = "2.6.0"
@@ -26,7 +27,6 @@ alloy-primitives = { workspace = true }
 alloy-sol-types = { workspace = true }
 alloy = { workspace = true, features = ["contract", "network", "reqwest", "rpc-types", "sol-types", "json-rpc", "signer-local", "signers"] }
 alloy-transport = "2.5"
-tower = "0.5"
 url = "2.5"
 thiserror = { workspace = true }
 ssz = { workspace = true }

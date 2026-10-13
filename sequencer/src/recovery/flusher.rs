@@ -18,6 +18,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::l1::eip1559::{estimate_fees, pad_gas_estimate};
+use crate::l1::provider::error_chain;
 use crate::l1::watermark::{
     StorageWatermarkSink, WalletNonceWatermarkError, WalletNonceWatermarkSink,
 };
@@ -272,7 +273,7 @@ impl MempoolFlusher {
             .provider
             .get_block_by_number(BlockNumberOrTag::Safe)
             .await
-            .map_err(|e| FlushError::Provider(e.to_string()))?
+            .map_err(|e| FlushError::Provider(error_chain(&e)))?
             .ok_or_else(|| FlushError::Provider("no safe block available".to_string()))?;
         Ok(block.header.number)
     }
@@ -312,7 +313,7 @@ impl MempoolFlusher {
             .block(BlockNumberOrTag::Latest.into())
             .await
             .map(pad_gas_estimate)
-            .map_err(|e| FlushError::Provider(e.to_string()))?;
+            .map_err(|e| FlushError::Provider(error_chain(&e)))?;
 
         debug!(
             from_nonce,
@@ -338,7 +339,7 @@ impl MempoolFlusher {
                     debug!(nonce, tx_hash = %pending.tx_hash(), gas, "flush no-op submitted");
                 }
                 Err(e) => {
-                    let message = e.to_string();
+                    let message = error_chain(&e);
                     warn!(nonce, error = %message, "flush no-op send failed");
                     send_failures.push((nonce, message));
                 }
@@ -377,7 +378,7 @@ impl MempoolFlusher {
             .get_transaction_count(self.address)
             .block_id(block.into())
             .await
-            .map_err(|e| FlushError::Provider(e.to_string()))
+            .map_err(|e| FlushError::Provider(error_chain(&e)))
     }
 }
 

@@ -761,7 +761,7 @@ async fn read_submitter_nonce_views(
         .block_id(BlockNumberOrTag::Pending.into())
         .await
         .map_err(|e| BootstrapError::DetectionNonceRead {
-            message: e.to_string(),
+            message: crate::l1::provider::error_chain(&e),
         })?;
     let safe_tag = match safe_block {
         Some(block) => BlockNumberOrTag::Number(block),
@@ -772,7 +772,7 @@ async fn read_submitter_nonce_views(
         .block_id(safe_tag.into())
         .await
         .map_err(|e| BootstrapError::DetectionNonceRead {
-            message: e.to_string(),
+            message: crate::l1::provider::error_chain(&e),
         })?;
     Ok((pending, safe))
 }

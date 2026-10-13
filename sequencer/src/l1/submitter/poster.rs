@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::l1::eip1559::{Eip1559Fees, estimate_fees, pad_gas_estimate};
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
+use crate::l1::provider::error_chain;
 use crate::l1::watermark::{WalletNonceWatermarkError, WalletNonceWatermarkSink};
 use crate::runtime::shutdown::RuntimeScope;
 use std::collections::BTreeMap;
@@ -329,9 +330,9 @@ impl EthereumBatchPoster {
 /// Label a provider failure with the call that failed.
 fn provider_error(
     operation: impl std::fmt::Display,
-    err: impl std::fmt::Display,
+    err: impl std::error::Error + 'static,
 ) -> BatchPosterError {
-    BatchPosterError::Provider(format!("{operation}: {err}"))
+    BatchPosterError::Provider(format!("{operation}: {}", error_chain(&err)))
 }
 
 /// The node already holds our tx at this nonce and this send does not beat
@@ -526,7 +527,7 @@ impl BatchPoster for EthereumBatchPoster {
             latest,
         )
         .await
-        .map_err(|err| BatchPosterError::Provider(format!("get_input_added_events: {err}")))?;
+        .map_err(|err| BatchPosterError::Provider(error_chain(&err)))?;
 
         let mut observed_nonces = Vec::new();
         for (event, _log) in events {
@@ -677,7 +678,7 @@ mod tests {
     fn pending_tx_conflict_survives_operation_label() {
         let BatchPosterError::Provider(message) = super::provider_error(
             format_args!("eth_sendRawTransaction nonce=3"),
-            "replacement transaction underpriced",
+            std::io::Error::other("replacement transaction underpriced"),
         ) else {
             panic!("provider_error builds a Provider error");
         };

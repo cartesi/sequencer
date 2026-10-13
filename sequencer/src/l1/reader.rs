@@ -18,6 +18,7 @@ use tracing::{debug, info};
 use crate::l1::partition::{
     GetLogsError, decode_evm_advance_input, get_input_added_events_ordered,
 };
+use crate::l1::provider::error_chain;
 use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{FrontierMode, IngestedSafeInput, Storage, StorageOpenError};
@@ -194,7 +195,7 @@ impl InputReader {
             .getInputBox()
             .call()
             .await
-            .map_err(map_contract_bootstrap_error)?;
+            .map_err(|err| map_contract_bootstrap_error("IApplication.getInputBox", err))?;
 
         // The scan genesis is the *application's* deployment block, not the
         // InputBox's: the InputBox usually predates the app by a large block
@@ -206,7 +207,9 @@ impl InputReader {
             .getDeploymentBlockNumber()
             .call()
             .await
-            .map_err(map_contract_bootstrap_error)?
+            .map_err(|err| {
+                map_contract_bootstrap_error("IApplication.getDeploymentBlockNumber", err)
+            })?
             .try_into()
             .map_err(|_| {
                 InputReaderError::Bootstrap(
@@ -446,9 +449,7 @@ impl InputReader {
         )
         .await
         .map_err(|err| match err {
-            GetLogsError::Rpc { .. } => {
-                InputReaderError::Provider(format!("get_input_added_events: {err}"))
-            }
+            GetLogsError::Rpc { .. } => InputReaderError::Provider(error_chain(&err)),
             GetLogsError::MissingLogPosition { .. } | GetLogsError::Decode { .. } => {
                 InputReaderError::InconsistentL1Response(err.to_string())
             }
@@ -605,9 +606,9 @@ fn map_storage_task_join(err: tokio::task::JoinError, operation: &'static str) -
 /// Label a provider failure with the call that failed.
 fn provider_error(
     operation: impl std::fmt::Display,
-    err: impl std::fmt::Display,
+    err: impl std::error::Error + 'static,
 ) -> InputReaderError {
-    InputReaderError::Provider(format!("{operation}: {err}"))
+    InputReaderError::Provider(format!("{operation}: {}", error_chain(&err)))
 }
 
 /// Bootstrap-time `eth_call` classification. Retryable when we could not
@@ -622,7 +623,7 @@ fn provider_error(
 /// Classify with alloy's full `RateLimitRetryPolicy`, not the client's
 /// narrower resend policy (`l1/provider.rs`): a rate limit the client declined
 /// to resend is still transient.
-fn map_contract_bootstrap_error(err: alloy::contract::Error) -> InputReaderError {
+fn map_contract_bootstrap_error(what: &str, err: alloy::contract::Error) -> InputReaderError {
     use alloy::transports::RpcError;
     use alloy::transports::layers::{RateLimitRetryPolicy, RetryPolicy};
     match &err {
@@ -630,9 +631,9 @@ fn map_contract_bootstrap_error(err: alloy::contract::Error) -> InputReaderError
             if matches!(rpc, RpcError::Transport(_) | RpcError::NullResp)
                 || RateLimitRetryPolicy::default().should_retry(rpc) =>
         {
-            InputReaderError::Provider(err.to_string())
+            InputReaderError::Provider(format!("{what}: {}", error_chain(&err)))
         }
-        _ => InputReaderError::Bootstrap(err.to_string()),
+        _ => InputReaderError::Bootstrap(format!("{what}: {}", error_chain(&err))),
     }
 }
 
@@ -653,7 +654,7 @@ async fn verify_input_box_v3<P: Provider>(
     let input_box_address = *input_box.address();
     let version =
         input_box.version().call().await.map_err(|err| {
-            match map_contract_bootstrap_error(err) {
+            match map_contract_bootstrap_error("InputBox.version", err) {
                 retryable @ InputReaderError::Provider(_) => retryable,
                 terminal => InputReaderError::Bootstrap(format!(
                     "InputBox at {input_box_address} does not report a version() — \
@@ -1072,9 +1073,12 @@ mod tests {
 
         let result = reader.sync_to_current_safe_head().await;
 
+        // The first call names itself and keeps the transport cause.
         assert!(
-            matches!(&result, Err(InputReaderError::Provider(message)) if message.starts_with("eth_chainId: ")),
-            "{result:?}"
+            matches!(&result, Err(InputReaderError::Provider(message))
+                if message.starts_with("eth_chainId: error sending request")
+                    && message.contains("Connect")),
+            "got {result:?}"
         );
 
         let mut storage =
@@ -1298,28 +1302,34 @@ mod tests {
         // A JSON-RPC-level rate limit (Infura -32005) is transient: setup must
         // surface it as retryable (FirstBootRequiresL1), not as a terminal
         // Bootstrap misconfig.
-        let err = map_contract_bootstrap_error(error_resp(-32005, "exceeded project rate limit"));
+        let err = map_contract_bootstrap_error(
+            "test call",
+            error_resp(-32005, "exceeded project rate limit"),
+        );
         assert!(matches!(err, InputReaderError::Provider(_)), "got {err:?}");
 
         // One whose requested wait the client refused to sleep through stays
         // transient too.
-        let err = map_contract_bootstrap_error(alloy::contract::Error::TransportError(
-            alloy::transports::RpcError::ErrorResp(alloy::rpc::json_rpc::ErrorPayload {
-                code: -32005,
-                message: "project ID request rate exceeded".into(),
-                data: Some(
-                    serde_json::value::to_raw_value(
-                        &serde_json::json!({ "rate": { "backoff_seconds": 30 } }),
-                    )
-                    .expect("raw json"),
-                ),
-            }),
-        ));
+        let err = map_contract_bootstrap_error(
+            "test call",
+            alloy::contract::Error::TransportError(alloy::transports::RpcError::ErrorResp(
+                alloy::rpc::json_rpc::ErrorPayload {
+                    code: -32005,
+                    message: "project ID request rate exceeded".into(),
+                    data: Some(
+                        serde_json::value::to_raw_value(
+                            &serde_json::json!({ "rate": { "backoff_seconds": 30 } }),
+                        )
+                        .expect("raw json"),
+                    ),
+                },
+            )),
+        );
         assert!(matches!(err, InputReaderError::Provider(_)), "got {err:?}");
 
         // A contract revert also arrives as ErrorResp — that one IS terminal:
         // re-running against the same (wrong) address re-fails identically.
-        let err = map_contract_bootstrap_error(error_resp(3, "execution reverted"));
+        let err = map_contract_bootstrap_error("test call", error_resp(3, "execution reverted"));
         assert!(matches!(err, InputReaderError::Bootstrap(_)), "got {err:?}");
     }
 

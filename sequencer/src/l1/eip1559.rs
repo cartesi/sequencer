@@ -37,14 +37,14 @@ pub async fn estimate_fees(provider: &DynProvider) -> Result<Eip1559Fees, String
             &[utils::EIP1559_FEE_ESTIMATION_REWARD_PERCENTILE],
         )
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::l1::provider::error_chain(&err))?;
 
     let base_fee_per_gas = match history.latest_block_base_fee() {
         Some(base_fee) if base_fee != 0 => base_fee,
         _ => provider
             .get_block_by_number(BlockNumberOrTag::Latest)
             .await
-            .map_err(|err| err.to_string())?
+            .map_err(|err| crate::l1::provider::error_chain(&err))?
             .and_then(|block| block.header.base_fee_per_gas())
             .ok_or_else(|| "RPC does not support EIP-1559 base fees".to_string())?
             .into(),

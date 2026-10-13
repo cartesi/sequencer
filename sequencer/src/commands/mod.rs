@@ -229,7 +229,7 @@ pub(crate) async fn validate_rpc_chain_id(
         }
         Ok(_) => Ok(()),
         Err(e) => Err(CommandError::Bootstrap(BootstrapError::ChainIdRpc {
-            message: e.to_string(),
+            message: crate::l1::provider::error_chain(&e),
         })),
     }
 }

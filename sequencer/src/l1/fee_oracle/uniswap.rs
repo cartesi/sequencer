@@ -91,7 +91,7 @@ impl UniswapV3PriceSource {
         let rpc_chain_id = provider
             .get_chain_id()
             .await
-            .map_err(|err| PriceSourceError::Provider(err.to_string()))?;
+            .map_err(|err| PriceSourceError::Provider(crate::l1::provider::error_chain(&err)))?;
         if rpc_chain_id != config.chain_id {
             return Err(PriceSourceError::ChainIdMismatch {
                 rpc: rpc_chain_id,
@@ -101,7 +101,7 @@ impl UniswapV3PriceSource {
         let code = provider
             .get_code_at(config.pool)
             .await
-            .map_err(|err| PriceSourceError::Provider(err.to_string()))?;
+            .map_err(|err| PriceSourceError::Provider(crate::l1::provider::error_chain(&err)))?;
         if code.is_empty() {
             return Err(PriceSourceError::MissingPoolCode(config.pool));
         }
@@ -190,8 +190,8 @@ impl TokenPriceSource for UniswapV3PriceSource {
     }
 }
 
-fn provider_error(error: impl std::fmt::Display) -> PriceSourceError {
-    PriceSourceError::Provider(error.to_string())
+fn provider_error(error: ContractError) -> PriceSourceError {
+    PriceSourceError::Provider(crate::l1::provider::error_chain(&error))
 }
 
 /// Exact Uniswap V3 Oracle reason for an `observe` window that exceeds history.
@@ -208,7 +208,7 @@ fn is_old_observation_reason(reason: &str) -> bool {
 fn classify_observe_error(error: ContractError) -> PriceSourceError {
     classify_decoded_observe_revert(
         error.as_decoded_error::<Revert>().as_ref(),
-        error.to_string(),
+        crate::l1::provider::error_chain(&error),
     )
 }
 
