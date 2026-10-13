@@ -119,6 +119,10 @@ its post-rebuild ops. An engine outside the rule (gapped or keyed
 nonces, a deposit that resets one) makes `GET /nonce` quote nonces the engine
 rejects.
 
+The rule keeps every account's nonce in state forever. A batch-scoped
+alternative makes replay state prunable and lets the fee move to the batch; it
+is a [deferred design](../plans/2026-10-batch-scoped-replay-protection.md).
+
 ### 3. The safe-block clock — `last_executed_safe_block`
 
 The clock is the maximum block carried by an executed input: frame `safe_block`

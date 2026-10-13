@@ -13,14 +13,14 @@ freely at this stage — no backward-compatibility constraints.
 | # | Track | Owner | Status |
 |---|-------|-------|--------|
 | 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **repository API implemented; post-merge adoption and deployment work remain** — [follow-up sequence](2026-07-track3-feed-replay-design.md#follow-up-sequence) and [ownership](2026-07-track3-feed-replay-design.md#merge-scope-and-follow-up-ownership) |
-| 5 | Fee exponentiation LUT | us | **deferred** — decided exact-floor if built (the table *is* the spec, algorithm-free; replay continuity across the upgrade explicitly not preserved); a separate pending design decision may make log-space fees defunct — revisit after syncing with Bart |
+| 5 | Fee exponentiation LUT | us | **unblocked, needs Bart** — fees stay in log space; the batch-level alternative is deferred with [batch-scoped replay protection](2026-10-batch-scoped-replay-protection.md). Shape decided: exact-floor table, algorithm-free; a consensus change agreed with Bart before implementation |
 | 6 | Dump / `Application` API redesign | us + Bart | **interface and reference C binding implemented** — [Application contract](../protocol/application-contract.md); native-engine integration gates remain |
 
 **Current campaign order:**
 
 1. Merge the implemented egress API after repository review/checks. Bart can then integrate his client; adjust the API from concrete feedback without waiting for downstream completion.
 2. Application integrators/operators validate the private engine, canonical-to-native exporter and recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
-3. Track 5 (fee LUT) only after the log-space-fees decision.
+3. Track 5 (fee LUT) after a sync with Bart, batched with other guest-image changes.
 
 Full restore archives now support file and directory application prefixes.
 Additional snapshot retention or transport mechanisms require a measured consumer need.
@@ -43,7 +43,7 @@ representative deployment latency remain open after merge; they are not egress
 API merge prerequisites. Other transport or retention mechanisms require a
 measured need.
 
-## Track 5 — Fee exponentiation LUT (deferred)
+## Track 5 — Fee exponentiation LUT
 
 `fee_to_linear` is consensus-critical (scheduler fold, guest agreement, app
 fee charging) and must be bit-identical across the Rust sequencer, the
@@ -56,8 +56,10 @@ If built, the shape is decided: a full lookup table of exact
 550 KB). The checked-in table *is* the cross-implementation spec artifact
 (algorithm-free, golden-hash-tested); `build.rs` verifies rather than
 generates; C++ consumes the same file byte-identically; and replay
-continuity across the upgrade is explicitly not preserved. Do not implement
-until the pending log-space-fees decision lands (with Bart).
+continuity across the upgrade is explicitly not preserved. Fees stay in log
+space; [batch-scoped replay protection](2026-10-batch-scoped-replay-protection.md)
+records the deferred design that would move the fee to the batch. Agree the
+table with Bart and ship it with the other guest-image changes.
 
 ## Track 6 — Dump / `Application` API redesign
 
