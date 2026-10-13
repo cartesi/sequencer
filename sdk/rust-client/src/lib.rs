@@ -219,11 +219,14 @@ impl SequencerClient {
         })
     }
 
+    /// Bounds the handshake by the request timeout; callers own the stream.
     pub async fn subscribe(&self, claim: HistoryClaim) -> Result<SubscribeStream, SubscribeError> {
         let url = self.ws_subscribe_url(claim);
-        let (stream, _response) = connect_async(url.as_str())
-            .await
-            .map_err(map_subscribe_error)?;
+        let (stream, _response) =
+            tokio::time::timeout(self.request_timeout, connect_async(url.as_str()))
+                .await
+                .map_err(|_| SubscribeError::HandshakeTimeout)?
+                .map_err(map_subscribe_error)?;
         Ok(stream)
     }
 }
@@ -386,6 +389,37 @@ mod tests {
         assert_eq!(snapshot.claim.next_input.get(), 7);
         assert_eq!(snapshot.response.bytes().await.unwrap().as_ref(), b"dump");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_handshake_keeps_the_configured_request_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = SequencerClient::new(format!("http://{address}"))
+            .unwrap()
+            .with_request_timeout(Duration::from_millis(100));
+        let claim = HistoryClaim {
+            version: HistoryVersion {
+                era_id: "00112233-4455-4677-8899-aabbccddeeff"
+                    .parse::<EraId>()
+                    .unwrap(),
+                recovery_generation: RecoveryGeneration::new(0),
+            },
+            next_input: ExecutedInputCount::new(0),
+        };
+        let stalled_server = async {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        };
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = client.subscribe(claim) => result.map(|_| ()),
+                () = stalled_server => unreachable!(),
+            }
+        })
+        .await
+        .expect("an accepted connection with no handshake must reach the configured deadline");
+        assert!(matches!(result, Err(SubscribeError::HandshakeTimeout)));
     }
 
     #[test]

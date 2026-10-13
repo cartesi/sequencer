@@ -84,6 +84,8 @@ pub enum SubscribeError {
     InvalidEndpoint(String),
     #[error("ws connect failed: {0}")]
     Connect(String),
+    #[error("ws handshake timed out")]
+    HandshakeTimeout,
 }
 
 #[derive(Debug, Error)]
