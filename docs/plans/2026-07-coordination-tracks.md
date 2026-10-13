@@ -18,7 +18,7 @@ freely at this stage — no backward-compatibility constraints.
 
 **Current campaign order:**
 
-1. Merge the implemented egress API after repository review/checks. Bart can then integrate his client; adjust the API from concrete feedback without waiting for downstream completion.
+1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; adjust the API from concrete feedback. A shared recovery tool, still to be designed, will produce both the sequencer's and the client's startup state from a checkpoint.
 2. Application integrators/operators validate the private engine, canonical-to-native exporter and recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
 3. Track 5 (fee LUT) after a sync with Bart, batched with other guest-image changes.
 
@@ -37,7 +37,8 @@ Readers whose projections contain information absent from the latest application
 state can use the implemented fixed-prefix historical L1 API and checkpoint
 metadata. The [projection contract](../protocol/projection-replay.md) owns that
 workflow; the history contract owns implemented checkpoint compatibility across
-standard recoveries. The [integration plan](2026-07-track3-feed-replay-design.md)
+standard recoveries. The planned shared recovery tool supersedes the
+cross-rebuild part of that workflow, so it receives bug fixes only. The [integration plan](2026-07-track3-feed-replay-design.md)
 owns follow-up requirements and their owners. Native-engine integration and
 representative deployment latency remain open after merge; they are not egress
 API merge prerequisites. Other transport or retention mechanisms require a

@@ -19,7 +19,7 @@ concrete feedback. There are no live deployments requiring compatibility.
 
 | Follow-up | Owner | When it is needed |
 |---|---|---|
-| Private DEX scheduler, indexer, and database backups | Bart / application integration | After merge, while adopting the API. Verify complete checkpoint/claim association and scheduler replay; report missing fields or awkward workflow for adjustment. |
+| Private DEX indexer and database backups | Bart / application integration | While adopting the API. Report missing fields or awkward workflow for adjustment. |
 | Canonical-to-native export and incident rehearsal | Application integration and operators, under Track 6 | Before relying on that application's recovery procedure in production. |
 | Ingress latency, indexing headroom, and recovery capacity | Sequencer/application maintainers and deployment operators | Before claiming support for the target deployment workload; measure historical serving alongside ordinary traffic. |
 
@@ -76,20 +76,19 @@ replacement directs, empty/no-op invalidation, nonzero baselines, and rollback.
 |---|---|
 | Historical bootstrap | Implemented: replay the complete fixed prefix and join the feed at `K`, including after a nonzero rebuild. |
 | Standard recovery | Implemented: choose the nearest retained checkpoint whose prefix survived every intervening generation change, then restore/resubscribe. |
-| Cockroach reader recovery | Core replay/metadata workflow and reference checkpoint restore implemented; Bart's actual checkpoint preparation, incident validation, and fallback rehearsal remain. |
+| Cockroach reader recovery | Core replay/metadata workflow and reference checkpoint restore implemented. Superseded for clients by the planned shared recovery tool; bug fixes only, with no client follow-up. |
 | Stable coordinates | Existing era/generation/application count for claims; separate InputBox indices for raw paging. Counts alone do not certify cross-era compatibility. |
 | Bounded serving cost | Page/item/response bounds implemented; representative bootstrap must preserve the ingress latency target and demonstrate catch-up headroom. |
 | Operational readiness | Each production application supplies its canonical-to-native exporter, runbook, and non-genesis recovery drill under Track 6. |
 
 ### Follow-up sequence
 
-1. **Consumer adoption after merge.** Bart integrates accepted-boundary checkpoint
-   preparation and scheduler replay using the implemented API. Sequencer
-   maintainers address concrete feedback as it arrives; downstream completion
-   is not a prerequisite for repository delivery. Before production use, rehearse
-   identifying an unsound projection checkpoint, including one below new `K`,
-   and restoring an earlier trusted backup or genesis. The API does not certify
-   the client's projection.
+1. **Consumer adoption.** Bart's client follows the feed and treats cockroach
+   recoveries as out of scope. A planned shared recovery tool will produce both
+   the sequencer's and the client's startup state from a checkpoint, so clients
+   never resume across a rebuild; new client work should not build on the
+   projection-replay path, which receives bug fixes only. Sequencer maintainers
+   address concrete feedback as it arrives.
 2. **Deployment readiness.** Validate the private native engine and measure
    latency, historical serving cost, projection throughput,
    catch-up headroom, and recovery time. Track 6 independently owns the versioned
