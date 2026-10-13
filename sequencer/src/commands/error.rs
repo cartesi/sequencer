@@ -1118,6 +1118,22 @@ mod tests {
                 "the flush's persistent watermark failure",
             ),
             (
+                CommandError::from(FlushError::UnsignableTransaction("no signer".into())),
+                "a flush no-op the submit provider cannot sign",
+            ),
+            (
+                recovery_refuse(RecoveryFailure::Flush(FlushError::UnsignableTransaction(
+                    "no signer".into(),
+                ))),
+                "the same unsignable no-op under startup recovery",
+            ),
+            (
+                submitter_worker(BatchSubmitterError::Poster(
+                    BatchPosterError::UnsignableTransaction("no signer".into()),
+                )),
+                "a batch transaction the submit provider cannot sign",
+            ),
+            (
                 recovery_refuse(RecoveryFailure::Flush(FlushError::Watermark(
                     persistent_watermark(),
                 ))),

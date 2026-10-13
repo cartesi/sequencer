@@ -30,7 +30,7 @@ pub(crate) async fn connect_uniswap(
     allow_insecure_rpc: bool,
     uniswap: UniswapConfig,
 ) -> Result<(DynProvider, UniswapV3PriceSource), UniswapConnectError> {
-    let provider = crate::l1::provider::create_provider(rpc_url, allow_insecure_rpc)
+    let provider = crate::l1::provider::create_read_provider(rpc_url, allow_insecure_rpc)
         .map_err(UniswapConnectError::Misconfig)?;
     match UniswapV3PriceSource::connect(provider.clone(), uniswap).await {
         Ok(token) => Ok((provider, token)),

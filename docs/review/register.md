@@ -70,6 +70,15 @@ counts, then correct the estimate and check the separately configured
 
 ## Bounded investigations and cleanup
 
+- **Confirmation watches outlive an RPC outage** (checked 2026-10-13). alloy's
+  watch timeout reaps only transactions it has not yet seen
+  (`alloy-provider` `heart.rs`), so if the endpoint dies after a batch
+  transaction was seen, the poster's watch waits out the outage instead of
+  failing. The heartbeat logs each failed poll at ERROR, and shutdown still
+  cancels the wait. Under the fail-stop model this costs nothing, since nothing
+  useful can happen meanwhile. Revisit on a partial failure where block polling
+  stalls while the endpoint otherwise serves; the fix is an outer timeout around
+  the watch. Evidence: [`submitter/poster.rs`](../../sequencer/src/l1/submitter/poster.rs).
 - **Intermittent process-lock test failure.** The macOS workspace suite can
   report `Locked` at the final reacquisition in
   `dropped_runtime_scope_keeps_lock_until_detached_worker_stops` in

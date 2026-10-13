@@ -32,7 +32,6 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use alloy::providers::DynProvider;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -45,6 +44,7 @@ use crate::ingress::inclusion_lane::{
 };
 use crate::l1::L1Config;
 use crate::l1::fee_oracle::FeeOracle;
+use crate::l1::provider::KeyedProviders;
 use crate::l1::reader::{InputReader, InputReaderError};
 use crate::l1::submitter::{
     BatchPosterConfig, BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError,
@@ -206,9 +206,9 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             seconds_per_block: timing.seconds_per_block,
             expected_chain_id: l1_config.identity.chain_id,
         };
-        let provider = build_batch_submitter_provider(&l1_config)?;
+        let providers = build_batch_submitter_providers(&l1_config)?;
         let poster = Arc::new(EthereumBatchPoster::new(
-            provider,
+            providers,
             poster_config,
             shutdown.clone(),
         ));
@@ -662,17 +662,19 @@ async fn wait_for_fee_oracle_shutdown(
     WorkerStop::from_shutdown(handle.await).map_err(WorkerExit::FeeOracle)
 }
 
-// Built once during preparation (sync, raw `create_signer_provider`). The
-// submitter is long-lived, so a one-shot startup chain-id check would go stale; the
-// keyed-write guard instead lives in `EthereumBatchPoster::submit_batches`,
-// which re-confirms the chain id immediately before every productive send.
-// The key was already verified against the pinned submitter, so a build
-// failure here is a bad RPC URL / client misconfiguration — the same
-// deterministic terminal class as every signer misconfig.
-fn build_batch_submitter_provider(l1: &L1Config) -> Result<DynProvider, CommandError> {
-    crate::l1::provider::create_signer_provider(
+// Built once during preparation (sync, raw `create_keyed_providers`), signing
+// for the pinned chain. The submitter is long-lived, so a one-shot startup
+// chain-id check would go stale; the keyed-write guard instead lives in
+// `EthereumBatchPoster::submit_batches`, which re-confirms the chain id
+// immediately before every productive send. The key was already verified
+// against the pinned submitter, so a build failure here is a bad RPC URL /
+// client misconfiguration — the same deterministic terminal class as every
+// signer misconfig.
+fn build_batch_submitter_providers(l1: &L1Config) -> Result<KeyedProviders, CommandError> {
+    crate::l1::provider::create_keyed_providers(
         &l1.eth_rpc_url,
         l1.batch_submitter_private_key.expose_secret(),
+        l1.identity.chain_id,
         l1.allow_insecure_rpc,
     )
     .map_err(|message| {

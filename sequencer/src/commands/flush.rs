@@ -57,11 +57,11 @@ async fn flush_mempool_admitted(
     // Wrong-chain RPC guard: flush broadcasts keyed L1 txs, so —
     // like `setup` and `run` — it must confirm the RPC's chain id matches the
     // pinned one before signing, or it would burn submitter nonce slots on the
-    // wrong chain. `create_verified_signer_provider` folds that check into the
+    // wrong chain. `create_verified_keyed_providers` folds that check into the
     // signer build (the one guarded keyed-write entry point); a mismatch is
     // terminal (operator misconfig), an RPC error retryable (flush needs L1
     // reachable anyway).
-    let provider = crate::l1::provider::create_verified_signer_provider(
+    let providers = crate::l1::provider::create_verified_keyed_providers(
         &config.eth_rpc_url,
         key.expose_secret(),
         identity.chain_id,
@@ -70,7 +70,7 @@ async fn flush_mempool_admitted(
     .await
     .map_err(CommandError::from)?;
     let safe_block = MempoolFlusher::flush_to_safe(
-        provider,
+        providers,
         identity.batch_submitter_address,
         config.seconds_per_block,
         db_path,

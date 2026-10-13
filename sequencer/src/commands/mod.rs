@@ -220,7 +220,7 @@ pub(crate) async fn validate_rpc_chain_id(
     allow_insecure: bool,
 ) -> Result<(), CommandError> {
     use alloy::providers::Provider;
-    let check_provider = crate::l1::provider::create_provider(eth_rpc_url, allow_insecure)
+    let check_provider = crate::l1::provider::create_read_provider(eth_rpc_url, allow_insecure)
         .map_err(|message| {
             BootstrapError::SetupInputReader(crate::l1::reader::InputReaderError::Bootstrap(
                 message,

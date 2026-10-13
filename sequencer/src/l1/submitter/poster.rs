@@ -5,10 +5,7 @@
 //! Re-estimates fees each tick without carrying a fee floor from earlier attempts.
 //! Fee policy, accepted liveness limits, and revisit criteria: `docs/l1-fee-policy.md`.
 
-use alloy::providers::{
-    DynProvider, PendingTransactionBuilder, PendingTransactionConfig, PendingTransactionError,
-    Provider,
-};
+use alloy::providers::{PendingTransactionConfig, PendingTransactionError, Provider};
 use alloy::rpc::types::BlockNumberOrTag;
 use async_trait::async_trait;
 use cartesi_rollups_contracts::input_box::InputBox;
@@ -19,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::l1::eip1559::{Eip1559Fees, estimate_fees, pad_gas_estimate};
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
-use crate::l1::provider::error_chain;
+use crate::l1::provider::{KeyedProviders, SendError, error_chain};
 use crate::l1::watermark::{WalletNonceWatermarkError, WalletNonceWatermarkSink};
 use crate::runtime::shutdown::RuntimeScope;
 use std::collections::BTreeMap;
@@ -66,6 +63,10 @@ pub enum BatchPosterError {
     },
     #[error("runtime shutdown cancelled L1 submission")]
     Shutdown,
+    /// The submit provider could not sign a batch transaction this poster
+    /// built: a field is missing. A defect, not a condition a retry heals.
+    #[error("batch transaction not signable: {0}")]
+    UnsignableTransaction(String),
     #[error(transparent)]
     Watermark(#[from] WalletNonceWatermarkError),
 }
@@ -75,7 +76,9 @@ impl BatchPosterError {
         // Exhaustive on purpose: a new variant must decide its terminality
         // here, not silently default to restartable.
         match self {
-            Self::ChainIdMismatch { .. } | Self::WalletNonceRangeUnrepresentable { .. } => true,
+            Self::ChainIdMismatch { .. }
+            | Self::WalletNonceRangeUnrepresentable { .. }
+            | Self::UnsignableTransaction(_) => true,
             Self::Watermark(source) => source.is_persistent_invariant(),
             Self::Provider(_) | Self::Shutdown => false,
         }
@@ -144,7 +147,7 @@ impl PendingSince {
 
 #[derive(Clone)]
 pub struct EthereumBatchPoster {
-    provider: DynProvider,
+    providers: KeyedProviders,
     config: BatchPosterConfig,
     /// Wallet nonces this process has attempted that Latest has not yet
     /// passed. Observability only — nothing reads it to decide a price. Pruned
@@ -161,9 +164,13 @@ pub struct EthereumBatchPoster {
 }
 
 impl EthereumBatchPoster {
-    pub fn new(provider: DynProvider, config: BatchPosterConfig, shutdown: RuntimeScope) -> Self {
+    pub fn new(
+        providers: KeyedProviders,
+        config: BatchPosterConfig,
+        shutdown: RuntimeScope,
+    ) -> Self {
         Self {
-            provider,
+            providers,
             config,
             shutdown,
             pending: Arc::new(Mutex::new(BTreeMap::new())),
@@ -233,7 +240,8 @@ impl EthereumBatchPoster {
     }
 
     async fn latest_account_nonce(&self) -> Result<u64, BatchPosterError> {
-        self.provider
+        self.providers
+            .read
             .get_transaction_count(self.config.batch_submitter_address)
             .block_id(BlockNumberOrTag::Latest.into())
             .await
@@ -245,7 +253,7 @@ impl EthereumBatchPoster {
         payload: Vec<u8>,
         nonce: u64,
         fees: &Eip1559Fees,
-    ) -> Result<PendingTransactionBuilder<alloy::network::Ethereum>, BatchPosterError> {
+    ) -> Result<TxHash, BatchPosterError> {
         #[cfg(test)]
         {
             if let Some(message) = self
@@ -257,9 +265,10 @@ impl EthereumBatchPoster {
                 return Err(BatchPosterError::Provider(message));
             }
         }
-        let input_box = InputBox::new(self.config.l1_submit_address, &self.provider);
+        let input_box = InputBox::new(self.config.l1_submit_address, &self.providers.read);
         let call = input_box
             .addInput(self.config.app_address, payload.into())
+            .from(self.config.batch_submitter_address)
             .max_fee_per_gas(fees.max_fee_per_gas)
             .max_priority_fee_per_gas(fees.max_priority_fee_per_gas)
             // Estimate at Latest and without the nonce. Anvil applies
@@ -269,17 +278,24 @@ impl EthereumBatchPoster {
             // estimates, so only local/CI runs are affected).
             .block(BlockNumberOrTag::Latest.into());
 
-        // Pin the padded estimate before the send. With gas and both fee
-        // fields set, the GasFiller is Finished, so this estimate replaces
-        // the filler's rather than adding a round-trip.
+        // The submit provider fills only the pinned chain id and the
+        // signature, so every other field is set here.
         let gas =
             pad_gas_estimate(call.estimate_gas().await.map_err(|err| {
                 provider_error(format_args!("eth_estimateGas nonce={nonce}"), err)
             })?);
 
-        call.gas(gas).nonce(nonce).send().await.map_err(|err| {
-            provider_error(format_args!("eth_sendRawTransaction nonce={nonce}"), err)
-        })
+        let tx = call.gas(gas).nonce(nonce).into_transaction_request();
+        self.providers
+            .submit
+            .send(tx)
+            .await
+            .map_err(|err| match err {
+                SendError::Unsignable(message) => BatchPosterError::UnsignableTransaction(message),
+                SendError::Rpc(err) => {
+                    provider_error(format_args!("eth_sendRawTransaction nonce={nonce}"), err)
+                }
+            })
     }
 
     /// Wait serially for each tx to reach `confirmation_depth + 1`
@@ -293,7 +309,7 @@ impl EthereumBatchPoster {
             let watch = PendingTransactionConfig::new(*tx_hash)
                 .with_required_confirmations(self.config.confirmation_depth.saturating_add(1))
                 .with_timeout(Some(timeout))
-                .with_provider(self.provider.root().clone());
+                .with_provider(self.providers.read.root().clone());
             match watch.watch().await {
                 Ok(_) => {
                     info!(
@@ -400,17 +416,18 @@ impl BatchPoster for EthereumBatchPoster {
             return Ok(SubmitBatchesOutcome::Submitted(Vec::new()));
         }
 
-        // Keyed-write chain-id gate (review): re-confirm the RPC still serves the
-        // pinned chain immediately before any productive send. The submitter is
-        // long-lived — its signing provider is built once at spawn and the
-        // boot-time / reader chain-id checks are one-shot — so a load-balanced
-        // RPC that fails over to another chain mid-life would otherwise burn
-        // submitter nonce slots on the wrong chain. Reached only when there is
-        // something to send (the empty early-return above), so idle ticks add no
-        // RPC load. A mismatch is terminal (lifted out of the transient bucket by
-        // the submitter run-loop); a transient RPC error retries like any blip.
+        // Keyed-write chain-id gate: re-confirm the RPC still serves the pinned
+        // chain immediately before any productive send. Signatures carry the
+        // pinned id, so no send can land on another chain; but the submitter is
+        // long-lived, and a load-balanced RPC that fails over to another chain
+        // mid-life would feed this tick that chain's nonce and fees, and the
+        // watermark its nonce. Reached only when there is something to send (the
+        // empty early-return above), so idle ticks add no RPC load. A mismatch
+        // is terminal (lifted out of the transient bucket by the submitter
+        // run-loop); a transient RPC error retries like any blip.
         let rpc_chain_id = self
-            .provider
+            .providers
+            .read
             .get_chain_id()
             .await
             .map_err(|err| provider_error("eth_chainId", err))?;
@@ -422,7 +439,7 @@ impl BatchPoster for EthereumBatchPoster {
         }
 
         // This tick's market price, used as-is for every send.
-        let fees = estimate_fees(&self.provider)
+        let fees = estimate_fees(&self.providers.read)
             .await
             .map_err(BatchPosterError::Provider)?;
         let first_nonce = self.latest_account_nonce().await?;
@@ -454,8 +471,7 @@ impl BatchPoster for EthereumBatchPoster {
             )
             .await
             {
-                Ok(pending) => {
-                    let tx_hash = *pending.tx_hash();
+                Ok(tx_hash) => {
                     debug!(
                         tx_nonce = nonce,
                         %tx_hash,
@@ -504,7 +520,8 @@ impl BatchPoster for EthereumBatchPoster {
         from_block: u64,
     ) -> Result<Vec<u64>, BatchPosterError> {
         let latest = self
-            .provider
+            .providers
+            .read
             .get_block_number()
             .await
             .map_err(|err| provider_error("eth_blockNumber", err))?;
@@ -520,7 +537,7 @@ impl BatchPoster for EthereumBatchPoster {
         // canonical (block, tx_index, log_index) order — the same the reader
         // relies on for its contiguity check.
         let events = get_input_added_events_ordered(
-            &self.provider,
+            &self.providers.read,
             self.config.app_address,
             &self.config.l1_submit_address,
             start_block,
@@ -827,14 +844,16 @@ mod tests {
     async fn submit_batches_raises_watermark_before_any_send() {
         require_anvil();
         let anvil = Anvil::default().spawn();
-        let provider =
-            crate::l1::provider::create_signer_provider(&anvil.endpoint(), SUBMITTER_KEY, false)
-                .expect("signer provider");
-        let poster = EthereumBatchPoster::new(
-            provider.clone(),
-            poster_config(&anvil),
-            RuntimeScope::default(),
-        );
+        let providers = crate::l1::provider::create_keyed_providers(
+            &anvil.endpoint(),
+            SUBMITTER_KEY,
+            anvil.chain_id(),
+            false,
+        )
+        .expect("keyed providers");
+        let provider = providers.read.clone();
+        let poster =
+            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
 
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -881,16 +900,21 @@ mod tests {
     async fn submit_batches_refuses_on_wrong_chain_before_any_work() {
         require_anvil();
         let anvil = Anvil::default().spawn();
-        let provider =
-            crate::l1::provider::create_signer_provider(&anvil.endpoint(), SUBMITTER_KEY, false)
-                .expect("signer provider");
+        let providers = crate::l1::provider::create_keyed_providers(
+            &anvil.endpoint(),
+            SUBMITTER_KEY,
+            anvil.chain_id(),
+            false,
+        )
+        .expect("keyed providers");
+        let provider = providers.read.clone();
 
         let wrong_chain_id = anvil.chain_id() + 1;
         let config = BatchPosterConfig {
             expected_chain_id: wrong_chain_id,
             ..poster_config(&anvil)
         };
-        let poster = EthereumBatchPoster::new(provider.clone(), config, RuntimeScope::default());
+        let poster = EthereumBatchPoster::new(providers, config, RuntimeScope::default());
 
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -1001,14 +1025,16 @@ mod tests {
     async fn submit_batches_waits_when_mempool_already_holds_the_tx() {
         require_anvil();
         let anvil = Anvil::default().arg("--no-mining").timeout(30_000).spawn();
-        let provider =
-            crate::l1::provider::create_signer_provider(&anvil.endpoint(), SUBMITTER_KEY, false)
-                .expect("signer provider");
-        let poster = EthereumBatchPoster::new(
-            provider.clone(),
-            poster_config(&anvil),
-            RuntimeScope::default(),
-        );
+        let providers = crate::l1::provider::create_keyed_providers(
+            &anvil.endpoint(),
+            SUBMITTER_KEY,
+            anvil.chain_id(),
+            false,
+        )
+        .expect("keyed providers");
+        let provider = providers.read.clone();
+        let poster =
+            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
         let sink = RecordingWatermarkSink::passing();
 
         let base_nonce = provider
@@ -1068,14 +1094,16 @@ mod tests {
     async fn submit_batches_reports_submitted_once_confirmed() {
         require_anvil();
         let anvil = Anvil::default().timeout(30_000).spawn();
-        let provider =
-            crate::l1::provider::create_signer_provider(&anvil.endpoint(), SUBMITTER_KEY, false)
-                .expect("signer provider");
-        let poster = EthereumBatchPoster::new(
-            provider.clone(),
-            poster_config(&anvil),
-            RuntimeScope::default(),
-        );
+        let providers = crate::l1::provider::create_keyed_providers(
+            &anvil.endpoint(),
+            SUBMITTER_KEY,
+            anvil.chain_id(),
+            false,
+        )
+        .expect("keyed providers");
+        let provider = providers.read.clone();
+        let poster =
+            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
         let sink = RecordingWatermarkSink::passing();
 
         let base_nonce = provider
@@ -1111,14 +1139,16 @@ mod tests {
     async fn submit_batches_waits_on_underpriced_replacement_rejection() {
         require_anvil();
         let anvil = Anvil::default().arg("--no-mining").timeout(30_000).spawn();
-        let provider =
-            crate::l1::provider::create_signer_provider(&anvil.endpoint(), SUBMITTER_KEY, false)
-                .expect("signer provider");
-        let poster = EthereumBatchPoster::new(
-            provider.clone(),
-            poster_config(&anvil),
-            RuntimeScope::default(),
-        );
+        let providers = crate::l1::provider::create_keyed_providers(
+            &anvil.endpoint(),
+            SUBMITTER_KEY,
+            anvil.chain_id(),
+            false,
+        )
+        .expect("keyed providers");
+        let provider = providers.read.clone();
+        let poster =
+            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
         let sink = RecordingWatermarkSink::passing();
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -1147,14 +1177,15 @@ mod tests {
     async fn submit_batches_still_errors_on_other_send_failures() {
         require_anvil();
         let anvil = Anvil::default().arg("--no-mining").timeout(30_000).spawn();
-        let provider =
-            crate::l1::provider::create_signer_provider(&anvil.endpoint(), SUBMITTER_KEY, false)
-                .expect("signer provider");
-        let poster = EthereumBatchPoster::new(
-            provider.clone(),
-            poster_config(&anvil),
-            RuntimeScope::default(),
-        );
+        let providers = crate::l1::provider::create_keyed_providers(
+            &anvil.endpoint(),
+            SUBMITTER_KEY,
+            anvil.chain_id(),
+            false,
+        )
+        .expect("keyed providers");
+        let poster =
+            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
         let sink = RecordingWatermarkSink::passing();
 
         poster.fail_next_send_with_for_test("test-injected send failure");
@@ -1173,14 +1204,16 @@ mod tests {
     async fn submit_batches_keeps_sending_new_payloads_past_a_waiting_nonce() {
         require_anvil();
         let anvil = Anvil::default().arg("--no-mining").timeout(30_000).spawn();
-        let provider =
-            crate::l1::provider::create_signer_provider(&anvil.endpoint(), SUBMITTER_KEY, false)
-                .expect("signer provider");
-        let poster = EthereumBatchPoster::new(
-            provider.clone(),
-            poster_config(&anvil),
-            RuntimeScope::default(),
-        );
+        let providers = crate::l1::provider::create_keyed_providers(
+            &anvil.endpoint(),
+            SUBMITTER_KEY,
+            anvil.chain_id(),
+            false,
+        )
+        .expect("keyed providers");
+        let provider = providers.read.clone();
+        let poster =
+            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
         let sink = RecordingWatermarkSink::passing();
 
         let base_nonce = provider

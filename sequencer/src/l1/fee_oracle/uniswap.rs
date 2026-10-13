@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn runtime_source_derives_canonical_token_order_without_rpc() {
-        let provider = crate::l1::provider::create_provider("http://127.0.0.1:1", false)
+        let provider = crate::l1::provider::create_read_provider("http://127.0.0.1:1", false)
             .expect("provider construction is local");
         let source = UniswapV3PriceSource::from_setup_validated(
             provider,

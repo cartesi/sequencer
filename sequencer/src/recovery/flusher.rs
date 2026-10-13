@@ -10,7 +10,7 @@
 //! slots reach safe finality, the recovery procedure can read fully-finalized L1 state.
 
 use alloy::network::TransactionBuilder;
-use alloy::providers::{DynProvider, Provider};
+use alloy::providers::Provider;
 use alloy::rpc::types::BlockNumberOrTag;
 use alloy_primitives::{Address, U256};
 use std::time::Duration;
@@ -18,7 +18,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::l1::eip1559::{estimate_fees, pad_gas_estimate};
-use crate::l1::provider::error_chain;
+use crate::l1::provider::{KeyedProviders, SendError, error_chain};
 use crate::l1::watermark::{
     StorageWatermarkSink, WalletNonceWatermarkError, WalletNonceWatermarkSink,
 };
@@ -27,6 +27,10 @@ use crate::l1::watermark::{
 pub enum FlushError {
     #[error("provider/transport: {0}")]
     Provider(String),
+    /// The submit provider could not sign a no-op this flusher built: a field
+    /// is missing. A defect, not a condition a retry heals.
+    #[error("flush no-op not signable: {0}")]
+    UnsignableTransaction(String),
     #[error(transparent)]
     Watermark(#[from] WalletNonceWatermarkError),
 }
@@ -37,13 +41,14 @@ impl FlushError {
         // here, not silently default to restartable.
         match self {
             Self::Watermark(source) => source.is_persistent_invariant(),
+            Self::UnsignableTransaction(_) => true,
             Self::Provider(_) => false,
         }
     }
 }
 
 pub struct MempoolFlusher {
-    provider: DynProvider,
+    providers: KeyedProviders,
     address: Address,
     confirmation_timeout: Duration,
     safe_poll_interval: Duration,
@@ -115,7 +120,7 @@ fn send_failures_error(failures: &[(u64, String)]) -> FlushError {
 }
 
 impl MempoolFlusher {
-    /// Build a flusher over `provider` plus the DB-backed watermark sink, run
+    /// Build a flusher over `providers` plus the DB-backed watermark sink, run
     /// the watermark-anchored flush, and return the observed safe block `C`.
     ///
     /// This is the flush-acquire core shared by all three keyed-flush sites
@@ -126,21 +131,21 @@ impl MempoolFlusher {
     /// [`FlushError`] maps into `CommandError`/`RecoveryError` via the existing
     /// `From` impls) and this owns the sink build + `flush_and_wait`.
     pub(crate) async fn flush_to_safe(
-        provider: DynProvider,
+        providers: KeyedProviders,
         submitter_address: Address,
         seconds_per_block: u64,
         db_path: impl Into<String>,
         watermark: Option<u64>,
     ) -> Result<u64, FlushError> {
-        let flusher = Self::new(provider, submitter_address, seconds_per_block);
+        let flusher = Self::new(providers, submitter_address, seconds_per_block);
         let sink = StorageWatermarkSink::new(db_path);
         flusher.flush_and_wait(watermark, &sink).await
     }
 
-    pub fn new(provider: DynProvider, address: Address, seconds_per_block: u64) -> Self {
+    pub fn new(providers: KeyedProviders, address: Address, seconds_per_block: u64) -> Self {
         let (confirmation_timeout, safe_poll_interval) = derive_timeouts(seconds_per_block);
         Self {
-            provider,
+            providers,
             address,
             confirmation_timeout,
             safe_poll_interval,
@@ -270,7 +275,8 @@ impl MempoolFlusher {
     /// Block number of the current L1 safe head.
     async fn safe_block_number(&self) -> Result<u64, FlushError> {
         let block = self
-            .provider
+            .providers
+            .read
             .get_block_by_number(BlockNumberOrTag::Safe)
             .await
             .map_err(|e| FlushError::Provider(error_chain(&e)))?
@@ -284,7 +290,7 @@ impl MempoolFlusher {
             return Ok(());
         }
 
-        let estimate = estimate_fees(&self.provider)
+        let estimate = estimate_fees(&self.providers.read)
             .await
             .map_err(FlushError::Provider)?;
         // Fresh estimates cannot guarantee replacement: a falling tip can
@@ -308,7 +314,8 @@ impl MempoolFlusher {
             .with_to(self.address)
             .with_value(U256::ZERO);
         let gas = self
-            .provider
+            .providers
+            .read
             .estimate_gas(tx_base.clone())
             .block(BlockNumberOrTag::Latest.into())
             .await
@@ -334,11 +341,14 @@ impl MempoolFlusher {
                 .with_max_fee_per_gas(max_fee)
                 .with_max_priority_fee_per_gas(priority_fee);
 
-            match self.provider.send_transaction(tx).await {
-                Ok(pending) => {
-                    debug!(nonce, tx_hash = %pending.tx_hash(), gas, "flush no-op submitted");
+            match self.providers.submit.send(tx).await {
+                Ok(tx_hash) => {
+                    debug!(nonce, %tx_hash, gas, "flush no-op submitted");
                 }
-                Err(e) => {
+                Err(SendError::Unsignable(message)) => {
+                    return Err(FlushError::UnsignableTransaction(message));
+                }
+                Err(SendError::Rpc(e)) => {
                     let message = error_chain(&e);
                     warn!(nonce, error = %message, "flush no-op send failed");
                     send_failures.push((nonce, message));
@@ -374,7 +384,8 @@ impl MempoolFlusher {
     }
 
     async fn nonce_at(&self, block: BlockNumberOrTag) -> Result<u64, FlushError> {
-        self.provider
+        self.providers
+            .read
             .get_transaction_count(self.address)
             .block_id(block.into())
             .await
@@ -588,19 +599,30 @@ mod tests {
             .spawn()
     }
 
-    /// Create a signer provider from an Anvil private key.
-    fn signer_provider(anvil: &alloy::node_bindings::AnvilInstance) -> DynProvider {
+    /// Keyed providers for Anvil's first account, dialing `endpoint`.
+    fn keyed_providers_at(
+        anvil: &alloy::node_bindings::AnvilInstance,
+        endpoint: &str,
+    ) -> KeyedProviders {
         let key_hex = alloy_primitives::hex::encode(anvil.first_key().to_bytes());
-        crate::l1::provider::create_signer_provider(
-            anvil.endpoint_url().as_str(),
+        crate::l1::provider::create_keyed_providers(
+            endpoint,
             &format!("0x{key_hex}"),
+            anvil.chain_id(),
             false,
         )
-        .expect("create signer provider")
+        .expect("create keyed providers")
+    }
+
+    fn keyed_providers(anvil: &alloy::node_bindings::AnvilInstance) -> KeyedProviders {
+        keyed_providers_at(anvil, anvil.endpoint_url().as_str())
     }
 
     /// Mine blocks at a fixed interval until the token is dropped.
-    fn start_miner(provider: DynProvider, interval: Duration) -> tokio::sync::oneshot::Sender<()> {
+    fn start_miner(
+        provider: alloy::providers::DynProvider,
+        interval: Duration,
+    ) -> tokio::sync::oneshot::Sender<()> {
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             loop {
@@ -617,18 +639,21 @@ mod tests {
     }
 
     /// Send a 0-ETH self-transfer at a specific nonce (without waiting for inclusion).
-    async fn send_tx_at_nonce(provider: &DynProvider, addr: Address, nonce: u64) {
-        let fees = provider
+    async fn send_tx_at_nonce(providers: &KeyedProviders, addr: Address, nonce: u64) {
+        let fees = providers
+            .read
             .estimate_eip1559_fees()
             .await
             .expect("estimate fees");
         let tx = alloy::rpc::types::TransactionRequest::default()
+            .with_from(addr)
             .with_to(addr)
             .with_value(U256::ZERO)
+            .with_gas_limit(21_000)
             .with_nonce(nonce)
             .with_max_fee_per_gas(fees.max_fee_per_gas)
             .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
-        let _ = provider.send_transaction(tx).await.expect("send tx");
+        providers.submit.send(tx).await.expect("send tx");
     }
 
     #[tokio::test]
@@ -636,7 +661,8 @@ mod tests {
         require_anvil();
 
         let anvil = spawn_anvil();
-        let provider = signer_provider(&anvil);
+        let providers = keyed_providers(&anvil);
+        let provider = providers.read.clone();
         let addr = anvil.addresses()[0];
 
         // Mine a few blocks so safe head advances past genesis.
@@ -647,7 +673,7 @@ mod tests {
                 .expect("mine");
         }
 
-        let flusher = MempoolFlusher::new(provider, addr, 12);
+        let flusher = MempoolFlusher::new(providers.clone(), addr, 12);
         // No pending txs — should return immediately.
         flusher
             .flush_and_wait(None, &NoopWatermarkSink)
@@ -660,12 +686,13 @@ mod tests {
         require_anvil();
 
         let anvil = spawn_anvil();
-        let provider = signer_provider(&anvil);
+        let providers = keyed_providers(&anvil);
+        let provider = providers.read.clone();
         let addr = anvil.addresses()[0];
 
         // Send 3 txs into the mempool (unmined).
         for nonce in 0..3 {
-            send_tx_at_nonce(&provider, addr, nonce).await;
+            send_tx_at_nonce(&providers, addr, nonce).await;
         }
 
         // Verify: pending=3, safe=0.
@@ -687,7 +714,7 @@ mod tests {
         let _miner = start_miner(provider.clone(), Duration::from_millis(100));
 
         // Run the flusher — it should resolve all 3 nonces to safe.
-        let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
+        let flusher = MempoolFlusher::new(providers.clone(), addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -714,7 +741,8 @@ mod tests {
         require_anvil();
 
         let anvil = spawn_anvil();
-        let provider = signer_provider(&anvil);
+        let providers = keyed_providers(&anvil);
+        let provider = providers.read.clone();
         let addr = anvil.addresses()[0];
 
         // Models the zombie: the persisted watermark says slot 0 was
@@ -724,7 +752,7 @@ mod tests {
         // a zombie; the anchored flush must consume slot 0 with a no-op
         // and wait for it to reach safe depth.
         let _miner = start_miner(provider.clone(), Duration::from_millis(100));
-        let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
+        let flusher = MempoolFlusher::new(providers.clone(), addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
         let observed_safe_block = tokio::time::timeout(
             Duration::from_secs(10),
@@ -754,9 +782,10 @@ mod tests {
         require_anvil();
 
         let anvil = spawn_anvil();
-        let provider = signer_provider(&anvil);
+        let providers = keyed_providers(&anvil);
+        let provider = providers.read.clone();
         let addr = anvil.addresses()[0];
-        let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
+        let flusher = MempoolFlusher::new(providers.clone(), addr, 12)
             .with_timeouts(Duration::from_millis(300), Duration::from_millis(50));
 
         assert!(
@@ -765,7 +794,7 @@ mod tests {
         );
 
         // The original tx, not a flush no-op, consumes the slot.
-        send_tx_at_nonce(&provider, addr, 0).await;
+        send_tx_at_nonce(&providers, addr, 0).await;
         let _: serde_json::Value = provider
             .raw_request("evm_mine".into(), ())
             .await
@@ -781,12 +810,13 @@ mod tests {
         require_anvil();
 
         let anvil = spawn_anvil();
-        let provider = signer_provider(&anvil);
+        let providers = keyed_providers(&anvil);
+        let provider = providers.read.clone();
         let addr = anvil.addresses()[0];
 
         // Send 2 txs and mine them (latest but not safe).
         for nonce in 0..2 {
-            send_tx_at_nonce(&provider, addr, nonce).await;
+            send_tx_at_nonce(&providers, addr, nonce).await;
         }
         let _: serde_json::Value = provider
             .raw_request("evm_mine".into(), ())
@@ -811,7 +841,7 @@ mod tests {
         let _miner = start_miner(provider.clone(), Duration::from_millis(100));
 
         // Flusher should wait for safe finality (no new txs to submit).
-        let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
+        let flusher = MempoolFlusher::new(providers.clone(), addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -857,7 +887,8 @@ mod tests {
         // Direct-to-Anvil provider: the test uses this to seed pending
         // mempool state and inspect the chain. Bypasses the proxy so the
         // seeding itself isn't affected by disconnect.
-        let direct_provider = signer_provider(&anvil);
+        let direct = keyed_providers(&anvil);
+        let direct_provider = direct.read.clone();
         let addr = anvil.addresses()[0];
 
         // Proxy in front of Anvil — this is what the flusher dials. Anvil's
@@ -868,17 +899,11 @@ mod tests {
             .await
             .expect("spawn proxy");
 
-        let key_hex = alloy_primitives::hex::encode(anvil.first_key().to_bytes());
-        let proxied_provider = crate::l1::provider::create_signer_provider(
-            proxy.endpoint().as_str(),
-            &format!("0x{key_hex}"),
-            false,
-        )
-        .expect("create signer provider through proxy");
+        let proxied = keyed_providers_at(&anvil, proxy.endpoint().as_str());
 
         // Seed: submit a tx at wallet-nonce 0 into Anvil's mempool (auto-
         // mining is off, so it stays pending). The flusher now has work.
-        send_tx_at_nonce(&direct_provider, addr, 0).await;
+        send_tx_at_nonce(&direct, addr, 0).await;
         let pending = direct_provider
             .get_transaction_count(addr)
             .block_id(BlockNumberOrTag::Pending.into())
@@ -889,7 +914,7 @@ mod tests {
         // Disconnect the proxy. The flusher's provider can no longer reach
         // Anvil — any RPC call sees a torn-down TCP connection.
         proxy.disconnect();
-        let flusher = MempoolFlusher::new(proxied_provider.clone(), addr, 12)
+        let flusher = MempoolFlusher::new(proxied.clone(), addr, 12)
             .with_timeouts(Duration::from_secs(2), Duration::from_millis(200));
 
         // `flush_and_wait` must fail fast (no internal retry loop). Wrap in
@@ -916,7 +941,7 @@ mod tests {
         // A fresh flusher (a respawn would build a new one from scratch).
         // It should now read nonces, replace the pending tx with a bumped-
         // fee no-op (or let the original land), wait for safe, and return.
-        let flusher_after = MempoolFlusher::new(proxied_provider, addr, 12)
+        let flusher_after = MempoolFlusher::new(proxied, addr, 12)
             .with_timeouts(Duration::from_secs(5), Duration::from_millis(200));
         tokio::time::timeout(
             Duration::from_secs(15),

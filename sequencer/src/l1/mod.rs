@@ -31,7 +31,7 @@ pub struct L1Config {
     /// The pinned deployment identity, verbatim from the DB. Carried whole so
     /// keyed-write paths (e.g. the preemptive-recovery flush) can re-confirm
     /// the RPC's chain id right before signing via
-    /// [`crate::l1::provider::create_verified_signer_provider`].
+    /// [`crate::l1::provider::create_verified_keyed_providers`].
     pub identity: crate::storage::DeploymentIdentity,
     pub eth_rpc_url: String,
     pub batch_submitter_private_key: SubmitterKey,

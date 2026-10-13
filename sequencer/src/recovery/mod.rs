@@ -232,7 +232,7 @@ impl RecoveryL1 for StartupL1<'_> {
     }
 
     async fn flush(&mut self) -> Result<u64, RecoveryError> {
-        let provider = crate::l1::provider::create_verified_signer_provider(
+        let providers = crate::l1::provider::create_verified_keyed_providers(
             &self.l1_config.eth_rpc_url,
             self.l1_config.batch_submitter_private_key.expose_secret(),
             self.l1_config.identity.chain_id,
@@ -246,7 +246,7 @@ impl RecoveryL1 for StartupL1<'_> {
             storage.wallet_nonce_watermark().map_err(classify_storage)?
         };
         MempoolFlusher::flush_to_safe(
-            provider,
+            providers,
             self.l1_config.identity.batch_submitter_address,
             self.protocol.seconds_per_block,
             self.db_path,
@@ -631,6 +631,9 @@ mod tests {
         }
 
         assert_retry(classify_flush(FlushError::Provider("offline".into())));
+        assert_refuse(classify_flush(FlushError::UnsignableTransaction(
+            "no signer".into(),
+        )));
         assert_refuse(classify_flush(FlushError::Watermark(
             WalletNonceWatermarkError::Storage(rusqlite::Error::QueryReturnedNoRows),
         )));

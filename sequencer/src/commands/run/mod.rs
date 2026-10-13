@@ -180,7 +180,7 @@ where
                 pool,
                 twap_window_secs,
             };
-            let provider = crate::l1::provider::create_provider(
+            let provider = crate::l1::provider::create_read_provider(
                 &config.eth_rpc_url,
                 config.allow_insecure_rpc,
             )

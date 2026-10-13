@@ -1,13 +1,20 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! RPC clients for the one configured L1 endpoint: read providers for every
+//! query, and keyed writers that also hold a submit provider for signed sends.
+//! Every client shares the https rule, URL redaction and the rate-limit-only
+//! retry.
+
 use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use alloy::{
+    primitives::TxHash,
     providers::{DynProvider, Provider, ProviderBuilder},
+    rpc::types::TransactionRequest,
     rpc::{
         client::RpcClient,
         json_rpc::{RequestPacket, ResponsePacket},
@@ -21,14 +28,17 @@ use alloy_transport::{
 };
 use url::Host;
 
-// Per-attempt HTTP timeout, shared by every L1 client. alloy never resends a
-// timeout, and the `eth_getLogs` partition (`l1/partition.rs`) splits on it like
-// on any failure, so a query too heavy to answer in time narrows until it fits.
-// 60 s favors finishing heavy but healthy queries over noticing a hung endpoint:
-// a persistently hanging `eth_getLogs` costs about `(log2(range) + 1) × 60 s`
-// per sync, the startup sync included. Revisit with measured latencies of our
-// filtered query on hosted providers.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-attempt HTTP deadline, connect through body, shared by every L1 client.
+/// alloy never resends a timeout, and the `eth_getLogs` partition
+/// (`l1/partition.rs`) splits on it like on any failure, so a query too heavy
+/// to answer in time narrows until it fits. 35 s is geth's default server cap
+/// (a 30 s write timeout, answered with `-32002` at 29.9 s) plus room for
+/// connect, TLS and transfer: every answer a default geth gives arrives, and a
+/// hung request costs at most this. An anchor, not a measurement: on a server
+/// with a longer cap (Erigon's is 30 min), a filtered `eth_getLogs` slower
+/// than 35 s is split instead of awaited. Revisit with measured latencies of
+/// our filtered query on hosted providers, or on seeing healthy queries split.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 /// Resends of one request that [`RateLimitOnly`] lets through, a second apart
 /// (alloy's backoff is not exponential) unless the server asks for a wait of up
 /// to [`MAX_RETRY_WAIT`], so a resend lands in a fresh window of a per-second
@@ -70,13 +80,28 @@ fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
         );
     }
 
-    // No redirects: a JSON-RPC endpoint has no reason to send one, and following
-    // it could downgrade an https endpoint to plaintext past the rule above.
+    // Otherwise reqwest's defaults: a 90 s idle pool and TCP keepalive (each
+    // worker reuses its connection within seconds, and hyper drops one the
+    // server closed while idle), and no connect or read timeout (the attempt
+    // deadline bounds both). HTTP/1.1 because every worker keeps one request in
+    // flight, and a timed-out HTTP/1.1 request closes its own connection; over
+    // HTTP/2 a dead shared connection would need keep-alive PINGs to be
+    // evicted. Pinned here, since any crate enabling reqwest's `http2` feature
+    // would otherwise turn it on for this client too. No redirects: a JSON-RPC
+    // endpoint has no reason to send one, and following it could downgrade an
+    // https endpoint to plaintext past the rule above.
     let http_client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        .http1_only()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "failed to build the HTTP client (on Linux it needs the system's CA \
+                 certificates): {}",
+                error_chain(&e)
+            )
+        })?;
 
     let transport = Http::with_client(http_client, url.clone());
     let is_local = transport.guess_local();
@@ -299,35 +324,98 @@ fn redact_url(error: TransportError, needles: &[String]) -> TransportError {
     }
 }
 
-/// Create a read-only provider with retry and timeout. `allow_insecure` opts
-/// into plaintext RPC against a non-loopback host — see [`create_client`].
-pub fn create_provider(url: &str, allow_insecure: bool) -> Result<DynProvider, String> {
-    let client = create_client(url, allow_insecure)?;
-    let provider = ProviderBuilder::new().connect_client(client);
-    Ok(provider.erased())
+/// A read provider: every L1 query, with no transaction fillers.
+/// `allow_insecure` opts into plaintext RPC against a non-loopback host — see
+/// [`create_client`].
+pub fn create_read_provider(url: &str, allow_insecure: bool) -> Result<DynProvider, String> {
+    Ok(read_provider(create_client(url, allow_insecure)?))
 }
 
-/// Create a provider with a wallet signer, retry, and timeout. `allow_insecure`
+fn read_provider(client: RpcClient) -> DynProvider {
+    ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .connect_client(client)
+        .erased()
+}
+
+/// The providers of a keyed L1 writer (the batch poster, the mempool flusher).
+/// `read` serves all of its queries: the chain-id gate, fees, nonces, gas
+/// estimates and confirmation watches. `submit` only broadcasts transactions
+/// the writer fully specified, signed for the pinned chain. Both ride one
+/// client while the sequencer has one endpoint; a separate submit endpoint (a
+/// private relay) would change only [`create_keyed_providers`].
+#[derive(Clone, Debug)]
+pub struct KeyedProviders {
+    pub read: DynProvider,
+    pub submit: Submitter,
+}
+
+/// Signs and broadcasts transactions, and nothing else. Its provider fills only
+/// the pinned chain id and the signature, so nonce, gas and fees always come
+/// from the caller: nothing allocates a nonce outside write-before-broadcast,
+/// and the endpoint's own chain id never reaches a signature.
+#[derive(Clone, Debug)]
+pub struct Submitter(DynProvider);
+
+/// Why [`Submitter::send`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    /// The transaction could not be signed locally — a field the caller must
+    /// set is missing. A defect in the caller, never a transient condition.
+    #[error("transaction not signable: {0}")]
+    Unsignable(String),
+    /// The endpoint did not accept the broadcast.
+    #[error(transparent)]
+    Rpc(TransportError),
+}
+
+impl Submitter {
+    /// Sign `tx` and send it with `eth_sendRawTransaction`, returning its hash.
+    /// Resending the same signed bytes is chain-idempotent: at most one copy
+    /// mines, and a resend after an accepted send is answered "already known".
+    pub async fn send(&self, tx: TransactionRequest) -> Result<TxHash, SendError> {
+        match self.0.send_transaction(tx).await {
+            Ok(pending) => Ok(*pending.tx_hash()),
+            Err(RpcError::LocalUsageError(error)) => Err(SendError::Unsignable(error.to_string())),
+            Err(error) => Err(SendError::Rpc(error)),
+        }
+    }
+}
+
+fn keyed_providers(client: RpcClient, signer: PrivateKeySigner, chain_id: u64) -> KeyedProviders {
+    let submit = ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .with_chain_id(chain_id)
+        .wallet(signer)
+        .connect_client(client.clone())
+        .erased();
+    KeyedProviders {
+        read: read_provider(client),
+        submit: Submitter(submit),
+    }
+}
+
+/// Create a keyed writer's providers, signing for `chain_id`. `allow_insecure`
 /// opts into plaintext RPC against a non-loopback host — see [`create_client`].
-pub fn create_signer_provider(
+pub fn create_keyed_providers(
     url: &str,
     private_key: &str,
+    chain_id: u64,
     allow_insecure: bool,
-) -> Result<DynProvider, String> {
+) -> Result<KeyedProviders, String> {
     let client = create_client(url, allow_insecure)?;
     let signer =
         PrivateKeySigner::from_str(private_key).map_err(|_| "invalid private key".to_string())?;
-    let provider = ProviderBuilder::new().wallet(signer).connect_client(client);
-    Ok(provider.erased())
+    Ok(keyed_providers(client, signer, chain_id))
 }
 
-/// Failure modes of [`create_verified_signer_provider`], split so callers can
+/// Failure modes of [`create_verified_keyed_providers`], split so callers can
 /// project them onto the right exit class: a chain mismatch is a terminal
 /// operator misconfig, an RPC failure is retryable, a build failure is a bad
 /// URL/key.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifiedSignerProviderError {
-    /// The signing provider could not be built (bad URL or private key).
+    /// The providers could not be built (bad URL or private key).
     #[error("{0}")]
     Create(String),
     /// The chain-id query itself failed — the RPC is unreachable (retryable).
@@ -338,23 +426,22 @@ pub enum VerifiedSignerProviderError {
     ChainIdMismatch { rpc: u64, expected: u64 },
 }
 
-/// Create a signing provider, but only after confirming the RPC serves
-/// `expected_chain_id`. The guarded constructor for **keyed L1 writers**: it
-/// folds the wrong-chain check and the signer build into one call so a keyed
-/// path cannot broadcast onto the wrong chain by forgetting to validate first.
-/// The chain id is queried on the very provider that will sign, immediately
-/// before it is returned and before any transaction is sent — so it also closes
-/// the window where a long-lived process's earlier (boot-time / one-shot) check
-/// has gone stale because a load-balanced RPC failed over to another chain.
-pub async fn create_verified_signer_provider(
+/// [`create_keyed_providers`], but only after confirming the endpoint serves
+/// `expected_chain_id`. Signatures carry the pinned id whatever the endpoint
+/// says; this check, made right before a one-shot flush starts, keeps another
+/// chain's nonces and fees out of it. The flush itself does not recheck, so a
+/// chain swap behind the same URL during a flush is the residual the threat
+/// model accepts for the reader.
+pub async fn create_verified_keyed_providers(
     url: &str,
     private_key: &str,
     expected_chain_id: u64,
     allow_insecure: bool,
-) -> Result<DynProvider, VerifiedSignerProviderError> {
-    let provider = create_signer_provider(url, private_key, allow_insecure)
+) -> Result<KeyedProviders, VerifiedSignerProviderError> {
+    let providers = create_keyed_providers(url, private_key, expected_chain_id, allow_insecure)
         .map_err(VerifiedSignerProviderError::Create)?;
-    let rpc_chain_id = provider
+    let rpc_chain_id = providers
+        .read
         .get_chain_id()
         .await
         .map_err(|e| VerifiedSignerProviderError::ChainIdRpc(error_chain(&e)))?;
@@ -364,7 +451,7 @@ pub async fn create_verified_signer_provider(
             expected: expected_chain_id,
         });
     }
-    Ok(provider)
+    Ok(providers)
 }
 
 #[cfg(test)]
@@ -489,7 +576,7 @@ mod tests {
             "the error kind is kept: {error:?}"
         );
 
-        let error = create_verified_signer_provider(
+        let error = create_verified_keyed_providers(
             "http://user:hunter2@127.0.0.1:1/v2/not-a-real-api-key?key=query-secret",
             ANVIL_KEY_0,
             1,
@@ -616,7 +703,10 @@ mod tests {
             rpc_endpoint_origin("http://127.0.0.1:8545"),
             "http://127.0.0.1:8545"
         );
-        assert_eq!(rpc_endpoint_origin("http://[::1]:8545/"), "http://[::1]:8545");
+        assert_eq!(
+            rpc_endpoint_origin("http://[::1]:8545/"),
+            "http://[::1]:8545"
+        );
         assert_eq!(
             rpc_endpoint_origin("https://rpc.example:8443/v2/k#fragment"),
             "https://rpc.example:8443"
@@ -790,14 +880,14 @@ mod tests {
     // ── Regression: private-key parse error must not echo bytes ────
 
     #[test]
-    fn create_signer_provider_does_not_echo_key_bytes_on_invalid_hex() {
+    fn keyed_providers_do_not_echo_key_bytes_on_invalid_hex() {
         // A malformed key that would otherwise cause alloy's error Display to
         // embed a character from the input. The fix replaced {e} with a fixed
         // string. Assert the error is the fixed string exactly — not a prefix
         // match — so a future change that re-adds interpolation is caught.
         let bad_key =
             "0xZZZZ_zzzz_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff";
-        let err = create_signer_provider("http://127.0.0.1:8545", bad_key, false)
+        let err = create_keyed_providers("http://127.0.0.1:8545", bad_key, 31337, false)
             .expect_err("malformed hex key must be rejected");
         assert_eq!(
             err, "invalid private key",
@@ -811,19 +901,19 @@ mod tests {
     }
 
     #[test]
-    fn create_signer_provider_does_not_echo_key_bytes_on_odd_length() {
+    fn keyed_providers_do_not_echo_key_bytes_on_odd_length() {
         // Odd-length hex would trigger a different error variant. Same
         // invariant: fixed error message, no key bytes leaked.
         let bad_key = "0xabc";
-        let err = create_signer_provider("http://127.0.0.1:8545", bad_key, false)
+        let err = create_keyed_providers("http://127.0.0.1:8545", bad_key, 31337, false)
             .expect_err("odd-length hex key must be rejected");
         assert_eq!(err, "invalid private key");
     }
 
     #[test]
-    fn create_signer_provider_accepts_valid_key() {
+    fn keyed_providers_accept_a_valid_key() {
         let good_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        create_signer_provider("http://127.0.0.1:8545", good_key, false)
+        create_keyed_providers("http://127.0.0.1:8545", good_key, 31337, false)
             .expect("valid key must be accepted");
     }
 
@@ -846,7 +936,7 @@ mod tests {
     const ANVIL_KEY_0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     #[tokio::test]
-    async fn verified_signer_provider_gates_on_chain_id() {
+    async fn verified_keyed_providers_gate_on_chain_id() {
         use alloy::node_bindings::Anvil;
 
         require_anvil();
@@ -854,14 +944,14 @@ mod tests {
         let chain_id = anvil.chain_id();
 
         // Matching chain id → a usable signing provider.
-        create_verified_signer_provider(&anvil.endpoint(), ANVIL_KEY_0, chain_id, false)
+        create_verified_keyed_providers(&anvil.endpoint(), ANVIL_KEY_0, chain_id, false)
             .await
-            .expect("matching chain id yields a verified signer provider");
+            .expect("matching chain id yields verified keyed providers");
 
         // Wrong pinned chain id → terminal ChainIdMismatch, before any signing,
         // surfacing the served id vs the pinned one.
         let err =
-            create_verified_signer_provider(&anvil.endpoint(), ANVIL_KEY_0, chain_id + 1, false)
+            create_verified_keyed_providers(&anvil.endpoint(), ANVIL_KEY_0, chain_id + 1, false)
                 .await
                 .expect_err("a mismatched pinned chain id must be rejected before signing");
         assert!(
@@ -873,5 +963,110 @@ mod tests {
             "expected ChainIdMismatch {{ rpc: {chain_id}, expected: {} }}, got {err:?}",
             chain_id + 1
         );
+    }
+
+    // ── Read and submit providers ─────────────────────────────
+
+    /// A transport answering from `asserter` that records each request's
+    /// method and params.
+    fn recording_client(
+        asserter: &Asserter,
+    ) -> (RpcClient, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        #[derive(Clone)]
+        struct Recording {
+            inner: MockTransport,
+            requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        }
+        impl tower::Service<RequestPacket> for Recording {
+            type Response = ResponsePacket;
+            type Error = TransportError;
+            type Future = TransportFut<'static>;
+            fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TransportError>> {
+                self.inner.poll_ready(cx)
+            }
+            fn call(&mut self, request: RequestPacket) -> Self::Future {
+                self.requests
+                    .lock()
+                    .expect("request log")
+                    .push(serde_json::to_value(&request).expect("request serializes"));
+                self.inner.call(request)
+            }
+        }
+        let requests = Arc::default();
+        let transport = Recording {
+            inner: MockTransport::new(asserter.clone()),
+            requests: Arc::clone(&requests),
+        };
+        (RpcClient::new(transport, true), requests)
+    }
+
+    fn complete_transfer(from: alloy_primitives::Address) -> TransactionRequest {
+        use alloy::network::TransactionBuilder;
+        TransactionRequest::default()
+            .with_from(from)
+            .with_to(from)
+            .with_value(alloy_primitives::U256::ZERO)
+            .with_gas_limit(21_000)
+            .with_nonce(7)
+            .with_max_fee_per_gas(2_000_000_000)
+            .with_max_priority_fee_per_gas(1_000_000_000)
+    }
+
+    #[tokio::test]
+    async fn the_submitter_sends_one_raw_transaction_signed_for_the_pinned_chain() {
+        use alloy::consensus::TxEnvelope;
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = PrivateKeySigner::from_str(ANVIL_KEY_0).unwrap();
+        let from = signer.address();
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy_primitives::B256::repeat_byte(0x01));
+        let (client, requests) = recording_client(&asserter);
+        let providers = keyed_providers(client, signer, 4242);
+
+        providers
+            .submit
+            .send(complete_transfer(from))
+            .await
+            .expect("a complete transaction is sent");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0]["method"], "eth_sendRawTransaction");
+        let raw: alloy_primitives::Bytes =
+            serde_json::from_value(requests[0]["params"][0].clone()).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut raw.as_ref()).expect("a signed envelope");
+        let TxEnvelope::Eip1559(signed) = envelope else {
+            panic!("an EIP-1559 transaction, got {envelope:?}");
+        };
+        assert_eq!(
+            signed.tx().chain_id,
+            4242,
+            "the pinned id, never the endpoint's"
+        );
+        assert_eq!(signed.tx().nonce, 7);
+        let signer_address = signed
+            .signature()
+            .recover_address_from_prehash(&signed.signature_hash())
+            .expect("a recoverable signature");
+        assert_eq!(signer_address, from);
+    }
+
+    #[tokio::test]
+    async fn the_submitter_refuses_an_incomplete_transaction_without_rpc() {
+        let signer = PrivateKeySigner::from_str(ANVIL_KEY_0).unwrap();
+        let from = signer.address();
+        let (client, requests) = recording_client(&Asserter::new());
+        let providers = keyed_providers(client, signer, 4242);
+
+        let mut incomplete = complete_transfer(from);
+        incomplete.nonce = None;
+        let error = providers
+            .submit
+            .send(incomplete)
+            .await
+            .expect_err("no filler may pick a nonce");
+        assert!(matches!(error, SendError::Unsignable(_)), "{error:?}");
+        assert!(requests.lock().unwrap().is_empty());
     }
 }

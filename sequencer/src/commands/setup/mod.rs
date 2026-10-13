@@ -667,7 +667,7 @@ async fn flush_wallet_nonce(
     // so re-confirm the RPC serves the pinned chain right before building the
     // signer (the earlier `validate_rpc_chain_id` may have gone stale). Same
     // guarded constructor the runtime flush and `flush-mempool` use.
-    let provider = crate::l1::provider::create_verified_signer_provider(
+    let providers = crate::l1::provider::create_verified_keyed_providers(
         &config.eth_rpc_url,
         key.expose_secret(),
         config.chain_id,
@@ -677,7 +677,7 @@ async fn flush_wallet_nonce(
     .map_err(CommandError::from)?;
     let watermark = storage.wallet_nonce_watermark()?;
     let stop_block = MempoolFlusher::flush_to_safe(
-        provider,
+        providers,
         identity.batch_submitter_address,
         seconds_per_block,
         config.db_path(),
@@ -751,7 +751,7 @@ fn run_detection_gate(
 /// a TOCTOU gap. `None` (no safe head persisted — not expected after a
 /// successful sync) falls back to the `Safe` tag.
 ///
-/// Builds a provider from the RPC URL via the same `create_provider` the input
+/// Builds a provider from the RPC URL via the same `create_read_provider` the input
 /// reader uses (the reader holds no long-lived provider — it builds one per
 /// pass), so no second persistent connection is introduced. Both reads are the
 /// batch-submitter's `eth_getTransactionCount`; an RPC failure here is
@@ -766,7 +766,7 @@ async fn read_submitter_nonce_views(
     use alloy::providers::Provider;
     use alloy::rpc::types::BlockNumberOrTag;
 
-    let provider = crate::l1::provider::create_provider(eth_rpc_url, allow_insecure)
+    let provider = crate::l1::provider::create_read_provider(eth_rpc_url, allow_insecure)
         .map_err(|message| BootstrapError::DetectionNonceRead { message })?;
     let pending = provider
         .get_transaction_count(batch_submitter)

@@ -194,7 +194,7 @@ impl InputReader {
         process_lock: ProcessLock,
     ) -> Result<Self, InputReaderError> {
         let provider =
-            crate::l1::provider::create_provider(&config.rpc_url, config.allow_insecure_rpc)
+            crate::l1::provider::create_read_provider(&config.rpc_url, config.allow_insecure_rpc)
                 .map_err(InputReaderError::Bootstrap)?;
         let application = IApplication::new(config.app_address, &provider);
         let input_box_address = application
@@ -308,7 +308,7 @@ impl InputReader {
     }
 
     pub(crate) async fn sync_to_current_safe_head(&mut self) -> Result<(), InputReaderError> {
-        let provider = crate::l1::provider::create_provider(
+        let provider = crate::l1::provider::create_read_provider(
             &self.config.rpc_url,
             self.config.allow_insecure_rpc,
         )
@@ -317,7 +317,7 @@ impl InputReader {
     }
 
     async fn run_forever(self, shutdown: ShutdownSignal) -> Result<(), InputReaderError> {
-        let provider = crate::l1::provider::create_provider(
+        let provider = crate::l1::provider::create_read_provider(
             &self.config.rpc_url,
             self.config.allow_insecure_rpc,
         )
@@ -909,7 +909,7 @@ pub(crate) async fn sample_safe_block(
     rpc_url: &str,
     allow_insecure_rpc: bool,
 ) -> Result<u64, InputReaderError> {
-    let provider = crate::l1::provider::create_provider(rpc_url, allow_insecure_rpc)
+    let provider = crate::l1::provider::create_read_provider(rpc_url, allow_insecure_rpc)
         .map_err(InputReaderError::Bootstrap)?;
     Ok(latest_safe_head(&provider).await?.block_number)
 }
