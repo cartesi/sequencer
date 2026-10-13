@@ -120,7 +120,6 @@ where
             allow_insecure_rpc: config.allow_insecure_rpc,
             app_address: l1_config.identity.app_address,
             poll_interval: INPUT_READER_POLL_INTERVAL,
-            long_block_range_error_codes: config.long_block_range_error_codes.clone(),
             expected_chain_id: l1_config.identity.chain_id,
         },
         l1_config.identity.input_box_address,

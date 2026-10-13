@@ -33,8 +33,6 @@ pub struct InputReaderConfig {
     pub allow_insecure_rpc: bool,
     pub app_address: Address,
     pub poll_interval: Duration,
-    /// Error codes that trigger `get_logs` retries with a shorter block range.
-    pub long_block_range_error_codes: Vec<String>,
     /// The chain id `setup` pinned (`run`) / is pinning (`setup`). The reader
     /// verifies the provider actually serves this chain on its first successful
     /// contact — the RPC URL is an operator CLI/env arg that may be repointed
@@ -445,15 +443,14 @@ impl InputReader {
             &self.input_box_address,
             start_block,
             current_safe_block,
-            self.config.long_block_range_error_codes.as_slice(),
         )
         .await
         .map_err(|err| match err {
-            GetLogsError::Rpc(e) => {
-                InputReaderError::Provider(format!("get_input_added_events: {e}"))
+            GetLogsError::Rpc { .. } => {
+                InputReaderError::Provider(format!("get_input_added_events: {err}"))
             }
-            inconsistent @ GetLogsError::MissingBlockNumber { .. } => {
-                InputReaderError::InconsistentL1Response(inconsistent.to_string())
+            GetLogsError::MissingLogPosition { .. } | GetLogsError::Decode { .. } => {
+                InputReaderError::InconsistentL1Response(err.to_string())
             }
         })?;
 
@@ -884,7 +881,6 @@ mod tests {
                 allow_insecure_rpc: false,
                 app_address: Address::ZERO,
                 poll_interval,
-                long_block_range_error_codes: Vec::new(),
                 // Anvil's default chain id — tests that drive a real provider go
                 // through the chain-id check in `advance_once`.
                 expected_chain_id: 31337,
@@ -1010,7 +1006,6 @@ mod tests {
                 allow_insecure_rpc: false,
                 app_address: Address::ZERO,
                 poll_interval: Duration::from_secs(1),
-                long_block_range_error_codes: Vec::new(),
                 expected_chain_id: 999_999,
             },
             Address::ZERO,
@@ -1099,7 +1094,6 @@ mod tests {
                 allow_insecure_rpc: false,
                 app_address: Address::ZERO,
                 poll_interval: Duration::from_secs(1),
-                long_block_range_error_codes: Vec::new(),
                 expected_chain_id: 31337,
             },
             Address::ZERO,

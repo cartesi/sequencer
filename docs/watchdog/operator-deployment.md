@@ -48,9 +48,8 @@ InputBox, `eth_getCode`, and `eth_call` at past blocks: `init` reads the
 InputBox count at the bootstrap block, and every comparison reads it at the
 comparison block ([L1 completeness](README.md#l1-completeness)). Use an archive
 node when the bootstrap block, or a block you `replay` from, is older than the
-state your provider keeps. Long log ranges are split when the provider answers
-with one of the codes `-32005,-32012,-32600,-32602,-32616`; if yours uses
-another, set `CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES` at `init`.
+state your provider keeps. A log query that fails over more than one block is
+split in half and retried; one that fails on a single block fails the tick.
 
 ## Runtime
 

@@ -72,9 +72,10 @@ A provider that silently drops logs must fail the tick, not produce a false
 comparison. The reader requires InputBox indices to run contiguously from the
 head's input count, and checks the count it reached against
 `InputBox.getNumberOfInputs(app)` pinned at block B. Every input's payload must
-name the configured application and chain. Long log ranges are split on the
-provider error codes that mean "range too large", exactly like the Rust reader
-(shared vector: `tests/fixtures/l1_partition_vector.json`).
+name the configured application and chain. A log query that fails over more
+than one block is split in half and retried, and one that fails on a single
+block fails the tick, exactly like the Rust reader (shared vector:
+`tests/fixtures/l1_partition_vector.json`).
 
 **Scan floor.** The Rust reader starts at the application's deployment block,
 which is sound only because it also witnesses that the InputBox rejects inputs
@@ -138,10 +139,10 @@ again if it persists.
 
 `init` reads the environment and writes `config.json`, which later commands
 read: the chain id, the application, the InputBox it derives from the
-application, the state source, the bootstrap block, the sequencer URL, and the
-range-error codes. The bootstrap block matters after `init` too: it tells a
-never-agreed head from an agreed one (see [the tick](#the-tick)). The L1 RPC
-endpoint is never persisted, and failure messages name no request URL.
+application, the state source, the bootstrap block, and the sequencer URL. The
+bootstrap block matters after `init` too: it tells a never-agreed head from an
+agreed one (see [the tick](#the-tick)). The L1 RPC endpoint is never persisted,
+and failure messages name no request URL.
 
 | Variable | Read by | Meaning |
 |---|---|---|
@@ -153,7 +154,6 @@ endpoint is never persisted, and failure messages name no request URL.
 | `CARTESI_WATCHDOG_STATE_SOURCE` | init | `inspect`, or `range:<label>` with a label matching `[a-z][a-z0-9-]*` |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` | init | Absolute path of the trusted bootstrap machine |
 | `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` | init | L1 block the bootstrap machine has consumed all inputs through |
-| `CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES` | init (optional) | Comma-separated provider codes that split log ranges; default `-32005,-32012,-32600,-32602,-32616` |
 | `CARTESI_WATCHDOG_METRICS_FILE` | tick (optional) | Absolute path to write `status.prom` to instead of the state directory |
 | `CARTESI_WATCHDOG_LUA_ROOT`, `CARTESI_WATCHDOG_LUA_BIN` | wrapper | Lua sources and interpreter (defaults suit the release image) |
 | `CARTESI_WATCHDOG_LUA_DEPS` | all | Directory of the native modules (`lcurl.so`, `lfs.so`) |

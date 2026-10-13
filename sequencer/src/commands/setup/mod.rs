@@ -105,7 +105,6 @@ where
         allow_insecure_rpc: config.allow_insecure_rpc,
         app_address: config.app_address,
         poll_interval: super::INPUT_READER_POLL_INTERVAL,
-        long_block_range_error_codes: config.long_block_range_error_codes.clone(),
         // `validate_rpc_chain_id` below re-checks this against the live RPC; the
         // reader's own check then verifies every sync provider serves it too.
         expected_chain_id: config.chain_id,

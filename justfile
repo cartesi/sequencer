@@ -55,7 +55,7 @@ test-watchdog-compare-harness: setup watchdog-lua-deps ensure-machine-image
     cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p rollups-e2e --bin rollups-e2e
     cargo run -p rollups-e2e --bin rollups-e2e -- watchdog_genesis_compare_test --exact --nocapture
 
-# Run sequencer tests sequentially so partition static config (init) is not shared across parallel tests.
+# Run sequencer tests sequentially.
 test-sequencer:
     cargo test -p sequencer -- --test-threads=1
 

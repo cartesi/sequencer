@@ -8,8 +8,9 @@
 --- contiguously from `first_index`, and the InputBox's own count at `to`
 --- (read with `getNumberOfInputs` pinned at that block) equals the next index.
 --- A provider that silently truncates a log range therefore fails the tick
---- instead of producing a false comparison. Long ranges are split on the
---- provider error codes that mean "range too large", like the Rust reader.
+--- instead of producing a false comparison. A log query that fails over more
+--- than one block is split in half, left first, like the Rust reader; one that
+--- fails on a single block fails the tick.
 
 local abi = require("watchdog.abi")
 local errors = require("watchdog.errors")
@@ -18,11 +19,6 @@ local jsonrpc = require("watchdog.jsonrpc")
 local l1 = {}
 
 l1.INPUT_ADDED_TOPIC = "0xc05d337121a6e8605c6ec0b72aa29c4210ffe6e5b9cefdd6a7058188a8f66f98"
-
--- Bare codes, matching the sequencer's DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES.
--- `-32005` / `-32012` are provider-overloaded (rate-limit vs range); both sides
--- accept that.
-l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES = { "-32005", "-32012", "-32600", "-32602", "-32616" }
 
 local GET_NUMBER_OF_INPUTS = "0x61a93c87" -- InputBox.getNumberOfInputs(address)
 local GET_TEMPLATE_HASH = "0x61b12c66" -- Application.getTemplateHash()
@@ -61,19 +57,9 @@ local function sort_logs(logs)
     end)
 end
 
-local function mentions_any(message, codes)
-    for _, code in ipairs(codes) do
-        if tostring(message):find(code, 1, true) then
-            return true
-        end
-    end
-    return false
-end
-
 --- `params`: app_address, chain_id, and optionally input_box_address (derived
---- from the application when absent) and long_block_range_error_codes.
+--- from the application when absent).
 function l1.new(rpc, params)
-    local codes = params.long_block_range_error_codes or l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
     local topics = { l1.INPUT_ADDED_TOPIC, "0x" .. address_word(params.app_address) }
     local input_box = params.input_box_address
     local reader = {}
@@ -194,7 +180,7 @@ function l1.new(rpc, params)
                 topics = topics,
             })
             if logs == nil then
-                if lo < hi and mentions_any(err, codes) then
+                if lo < hi then
                     local mid = lo + (hi - lo) // 2
                     scan(lo, mid)
                     if not stopped then

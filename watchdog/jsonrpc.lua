@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 --- Minimal Ethereum JSON-RPC client. Calls return `result` or `nil, message`:
---- the L1 reader inspects provider error codes to split long log ranges.
+--- the L1 reader splits a log range whose query failed.
 
 local jsonrpc = {}
 

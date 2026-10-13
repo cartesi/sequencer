@@ -178,7 +178,6 @@ local function deployment(inputs, source)
         input_box_address = support.INPUT_BOX,
         app_address = support.APP,
         state_source = config.parse_state_source(source or "range:state"),
-        long_block_range_error_codes = l1_mod.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
         bootstrap_dir = image,
         bootstrap_block = 0,
     }
@@ -277,7 +276,6 @@ test("init refuses a bootstrap machine that is not the template", function()
             state_source = { kind = "range", label = "state" },
             input_box_address = support.INPUT_BOX,
             app_address = support.APP,
-            long_block_range_error_codes = l1_mod.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES,
             bootstrap_dir = image,
             bootstrap_block = 0,
         }, { store = store, machine = machine, l1 = l1_mod.new(rpc, { input_box_address = support.INPUT_BOX,

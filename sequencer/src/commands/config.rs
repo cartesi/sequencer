@@ -364,9 +364,6 @@ pub struct SetupConfig {
         default_value_t = false
     )]
     pub allow_insecure_rpc: bool,
-    /// Error codes that trigger `get_logs` retries with a shorter block range.
-    #[arg(long, env = "CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::l1::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
-    pub long_block_range_error_codes: Vec<String>,
     /// Expected chain ID. Validated against the RPC at setup and pinned.
     #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_ID")]
     pub chain_id: u64,
@@ -494,9 +491,6 @@ pub struct RunConfig {
         default_value_t = false
     )]
     pub allow_insecure_rpc: bool,
-    /// Error codes that trigger `get_logs` retries with a shorter block range.
-    #[arg(long, env = "CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES", value_delimiter = ',', default_values = crate::l1::partition::DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES)]
-    pub long_block_range_error_codes: Vec<String>,
     #[command(flatten)]
     key: KeyArgs,
 
@@ -872,21 +866,6 @@ mod tests {
         assert!(
             Cli::try_parse_from(args).is_err(),
             "run must reject --chain-id (read from DB now)"
-        );
-    }
-
-    #[test]
-    fn run_uses_default_block_range_retry_codes() {
-        let config = run_config_from(&[]);
-        assert_eq!(
-            config.long_block_range_error_codes,
-            vec![
-                "-32005".to_string(),
-                "-32012".to_string(),
-                "-32600".to_string(),
-                "-32602".to_string(),
-                "-32616".to_string()
-            ]
         );
     }
 

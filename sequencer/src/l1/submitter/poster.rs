@@ -41,8 +41,6 @@ pub struct BatchPosterConfig {
     /// Assumed L1 block time in seconds, used to derive a conservative
     /// confirmation timeout for watched batch-submission txs.
     pub seconds_per_block: u64,
-    /// Error codes that trigger `get_logs` retries with a shorter block range.
-    pub long_block_range_error_codes: Vec<String>,
     /// The pinned deployment chain id. Re-confirmed against the RPC immediately
     /// before every productive send (`submit_batches`), so a long-lived
     /// submitter whose load-balanced RPC fails over to another chain refuses to
@@ -526,7 +524,6 @@ impl BatchPoster for EthereumBatchPoster {
             &self.config.l1_submit_address,
             start_block,
             latest,
-            self.config.long_block_range_error_codes.as_slice(),
         )
         .await
         .map_err(|err| BatchPosterError::Provider(format!("get_input_added_events: {err}")))?;
@@ -812,7 +809,6 @@ mod tests {
             // keep it short so --no-mining ticks return promptly on timeout.
             confirmation_depth: 0,
             seconds_per_block: 1,
-            long_block_range_error_codes: vec![],
             expected_chain_id: anvil.chain_id(),
         }
     }

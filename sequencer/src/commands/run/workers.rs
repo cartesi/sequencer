@@ -204,7 +204,6 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             start_block: l1_config.identity.app_deployment_block,
             confirmation_depth: run_config.batch_submitter_confirmation_depth,
             seconds_per_block: timing.seconds_per_block,
-            long_block_range_error_codes: run_config.long_block_range_error_codes.clone(),
             expected_chain_id: l1_config.identity.chain_id,
         };
         let provider = build_batch_submitter_provider(&l1_config)?;
@@ -899,7 +898,6 @@ mod tests {
                 allow_insecure_rpc: false,
                 app_address: identity.app_address,
                 poll_interval: crate::commands::INPUT_READER_POLL_INTERVAL,
-                long_block_range_error_codes: run_config.long_block_range_error_codes.clone(),
                 expected_chain_id: identity.chain_id,
             },
             identity.input_box_address,

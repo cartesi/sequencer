@@ -20,12 +20,13 @@ use alloy_transport::{
 use tower::{Layer, Service};
 use url::Host;
 
-// Public Ethereum providers (Infura, Alchemy) commonly take 30–60s on heavy
-// `eth_getLogs` queries under load. The partition-retry helper in
-// `l1/partition.rs` only kicks on RPC error codes (e.g. -32005), not on
-// transport timeouts — a request that silently chews past the timeout slips
-// past partitioning. 60s is long enough that hitting it signals a genuine
-// problem rather than a slow query.
+// Per-attempt HTTP timeout, shared by every L1 client. alloy never resends a
+// timeout, and the `eth_getLogs` partition (`l1/partition.rs`) splits on it like
+// on any failure, so a query too heavy to answer in time narrows until it fits.
+// 60 s favors finishing heavy but healthy queries over noticing a hung endpoint:
+// a persistently hanging `eth_getLogs` costs about `(log2(range) + 1) × 60 s`
+// per sync, the startup sync included. Revisit with measured latencies of our
+// filtered query on hosted providers.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RATE_LIMIT_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 200;

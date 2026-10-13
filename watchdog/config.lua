@@ -7,7 +7,6 @@
 --- come from the environment at run time.
 
 local errors = require("watchdog.errors")
-local l1 = require("watchdog.l1")
 
 local config = {}
 
@@ -74,20 +73,6 @@ function config.format_state_source(source)
     return source.kind == "range" and ("range:" .. source.label) or source.kind
 end
 
-local function error_codes(value)
-    if value == nil then
-        return l1.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES
-    end
-    local codes = {}
-    for code in value:gmatch("[^,%s]+") do
-        codes[#codes + 1] = code
-    end
-    if #codes == 0 then
-        errors.operator("CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES lists no codes")
-    end
-    return codes
-end
-
 --- Everything `init` needs. `chain_id` is nil unless pinned in the
 --- environment; init then takes it from the RPC. The InputBox is derived from
 --- the application at init.
@@ -104,7 +89,6 @@ function config.from_init_env(env)
             "CARTESI_WATCHDOG_APP_ADDRESS"
         ),
         state_source = config.parse_state_source(required(get, "CARTESI_WATCHDOG_STATE_SOURCE")),
-        long_block_range_error_codes = error_codes(optional(get, "CARTESI_WATCHDOG_LONG_BLOCK_RANGE_ERROR_CODES")),
         bootstrap_dir = absolute_path(
             required(get, "CARTESI_WATCHDOG_CM_SNAPSHOT_DIR"),
             "CARTESI_WATCHDOG_CM_SNAPSHOT_DIR"
@@ -126,7 +110,6 @@ function config.persisted(cfg)
         app_address = cfg.app_address,
         state_source = config.format_state_source(cfg.state_source),
         bootstrap_block = cfg.bootstrap_block,
-        long_block_range_error_codes = cfg.long_block_range_error_codes,
     }
 end
 
@@ -145,10 +128,6 @@ function config.load(state_dir, document, env)
         errors.operator("%s/config.json is not a version %d watchdog config; wipe the state directory and re-run init",
             state_dir, config.VERSION)
     end
-    local codes = document.long_block_range_error_codes
-    if type(codes) ~= "table" or #codes == 0 then
-        errors.operator("config.json lists no long_block_range_error_codes")
-    end
     return {
         state_dir = state_dir,
         sequencer_url = optional(get, "CARTESI_WATCHDOG_SEQUENCER_URL") or document.sequencer_url,
@@ -158,7 +137,6 @@ function config.load(state_dir, document, env)
         app_address = config.normalize_address(document.app_address, "config.json app_address"),
         state_source = config.parse_state_source(document.state_source),
         bootstrap_block = block_number(document.bootstrap_block, "config.json bootstrap_block"),
-        long_block_range_error_codes = codes,
     }
 end
 

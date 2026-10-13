@@ -23,9 +23,8 @@ pub mod watermark;
 /// It is not a funnel: the per-component configs (`InputReaderConfig`,
 /// `BatchPosterConfig`, `UniswapConfig`) are built directly from the same
 /// two sources — `identity` carries deployment values, and `RunConfig`
-/// carries the per-client tuning knobs (`long_block_range_error_codes`,
-/// poll intervals, confirmation depth) that belong to each client, not to
-/// the L1 endpoint. Homed here (not with the command configs): L1-domain
+/// carries the per-client tuning knobs (poll intervals, confirmation depth)
+/// that belong to each client, not to the L1 endpoint. Homed here (not with the command configs): L1-domain
 /// identity consumed by mechanisms below the command layer.
 #[derive(Debug, Clone)]
 pub struct L1Config {

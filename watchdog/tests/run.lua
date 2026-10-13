@@ -194,13 +194,10 @@ end)
 
 test("l1 splits log ranges exactly like the shared Rust partition vector", function()
     local vector = json.decode(support.read("tests/fixtures/l1_partition_vector.json"))
-    for i, code in ipairs(vector.long_block_range_error_codes) do
-        eq(l1_mod.DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES[i], code, "default code " .. i)
-    end
     for _, scenario in ipairs(vector.scenarios) do
         local failures = {}
         for _, f in ipairs(scenario.fail_ranges) do
-            failures[f.from .. ":" .. f.to] = f.message
+            failures[f.from .. ":" .. f.to] = "injected failure"
         end
         local reader, rpc = l1_reader({}, {
             fail = function(lo, hi)
@@ -242,7 +239,6 @@ test("config reads init settings and normalizes addresses", function()
     eq(cfg.state_source.label, "state")
     eq(cfg.bootstrap_block, 0)
     eq(cfg.chain_id, nil)
-    eq(#cfg.long_block_range_error_codes, 5)
 end)
 
 test("config rejects relative paths, bad sources, and missing settings", function()
@@ -271,6 +267,10 @@ test("config round-trips through config.json and keeps endpoints at run time", f
     eq(loaded.input_box_address, support.INPUT_BOX)
     eq(config.format_state_source(loaded.state_source), "range:state")
     assert(config.same_identity(document, config.persisted(cfg)))
+    -- A state directory initialized while range splits were keyed on error
+    -- codes still loads; the retired field is ignored.
+    document.long_block_range_error_codes = { "-32005" }
+    config.load("/var/lib/watchdog", document, {})
     raises("operator", "not a version 2 watchdog config", function()
         document.version = 1
         config.load("/var/lib/watchdog", document, {})
@@ -679,9 +679,9 @@ test("bootstrap validates an existing config like tick would", function()
     local store = store_mod.open(support.tmpdir(), json)
     bootstrap_with(store, {})
     local document = store:read_json("config.json")
-    document.long_block_range_error_codes = {}
+    document.bootstrap_block = -1
     store:write_json(document, "config.json")
-    raises("operator", "lists no long_block_range_error_codes", function()
+    raises("operator", "config.json bootstrap_block must be a non-negative integer", function()
         bootstrap_with(store, {})
     end)
 end)
