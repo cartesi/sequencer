@@ -10,7 +10,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::Eip712Domain;
-use app_core::application::{Method, Transfer, Withdrawal, default_private_keys};
+use app_core::application::{Method, Transfer, Withdrawal};
 use cartesi_rollups_contracts::erc20_portal::Erc20Portal;
 use k256::ecdsa::SigningKey;
 use sequencer_core::api::{TxRequest, TxResponse};
@@ -18,6 +18,7 @@ use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
 
 use crate::HarnessResult;
+use crate::default_private_keys;
 use crate::util::io_other;
 
 const DEFAULT_SEQUENCER_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);

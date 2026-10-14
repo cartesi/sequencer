@@ -3,10 +3,10 @@
 
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::Eip712Domain;
-use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, Method, Transfer, default_private_keys};
+use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, Method, Transfer};
 use clap::ValueEnum;
 use k256::ecdsa::SigningKey;
-use rollups_harness::{address_from_signing_key, sign_user_op_hex};
+use rollups_harness::{address_from_signing_key, default_private_keys, sign_user_op_hex};
 use sequencer_core::api::TxRequest;
 use sequencer_core::fee::fee_to_linear;
 use sequencer_core::user_op::UserOp;

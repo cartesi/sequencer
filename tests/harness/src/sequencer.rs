@@ -10,13 +10,13 @@ use std::time::Duration;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
 use alloy_sol_types::SolEvent;
-use app_core::application::default_private_keys;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use sequencer_rust_client::SequencerClient;
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 
 use crate::HarnessResult;
+use crate::default_private_keys;
 use crate::paths;
 use crate::rollups::{DEVNET_CHAIN_ID, DEVNET_SECONDS_PER_BLOCK, DevnetRollupsStack};
 use crate::util::{
@@ -1470,12 +1470,7 @@ async fn spawn_sequencer_process(
     // account, so it stays clear of the e2e wallets (0–3) and the bench
     // workload (indices 0..concurrency).
     const DEVNET_SUBMITTER_ACCOUNT_INDEX: usize = 9;
-    let batch_submitter_key = default_private_keys()
-        .get(DEVNET_SUBMITTER_ACCOUNT_INDEX)
-        .cloned()
-        .unwrap_or_else(|| {
-            "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6".to_string()
-        });
+    let batch_submitter_key = default_private_keys()[DEVNET_SUBMITTER_ACCOUNT_INDEX].clone();
     // `setup` takes the submitter *address* (it never signs); `run` takes the
     // key. Derive the address from the key so the harness configures both
     // consistently.

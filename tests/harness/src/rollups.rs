@@ -12,11 +12,12 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{BlockNumberOrTag, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy_primitives::{Address, B256, Bytes, U256};
-use app_core::application::{WalletConfig, default_private_keys};
+use app_core::application::WalletConfig;
 use cartesi_rollups_contracts::application_factory::ApplicationFactory::{self, WithdrawalConfig};
 use tokio::process::{Child, Command};
 
 use crate::HarnessResult;
+use crate::default_private_keys;
 use crate::paths;
 use crate::util::{
     build_local_endpoint, ensure_exists, io_other, path_as_str, send_graceful_terminate,
