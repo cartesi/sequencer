@@ -117,12 +117,6 @@ clippy:
 
 verify: fmt-check check test clippy
 
-ci:
-    cargo check --workspace --all-targets --locked
-    cargo build --workspace --all-targets --locked
-    cargo fmt --all -- --check
-    cargo test --workspace --all-targets --all-features --locked
-
 run addr="127.0.0.1:3000" data_dir="sequencer-data":
     rm -rf {{data_dir}}
     CARTESI_SEQUENCER_HTTP_ADDR={{addr}} CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p wallet-sequencer --release
