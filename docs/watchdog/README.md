@@ -141,7 +141,7 @@ read: the chain id, the application, the InputBox it derives from the
 application, the state source, the bootstrap block, the sequencer URL, and the
 range-error codes. The bootstrap block matters after `init` too: it tells a
 never-agreed head from an agreed one (see [the tick](#the-tick)). The L1 RPC
-endpoint is never persisted.
+endpoint is never persisted, and failure messages name no request URL.
 
 | Variable | Read by | Meaning |
 |---|---|---|

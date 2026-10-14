@@ -26,6 +26,7 @@ alloy-primitives = { workspace = true }
 alloy-sol-types = { workspace = true }
 alloy = { workspace = true, features = ["contract", "network", "reqwest", "rpc-types", "sol-types", "json-rpc", "signer-local", "signers"] }
 alloy-transport = "2.5"
+tower = "0.5"
 url = "2.5"
 thiserror = { workspace = true }
 ssz = { workspace = true }

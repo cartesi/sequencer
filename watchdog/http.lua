@@ -2,7 +2,8 @@
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 --- HTTP client over the vendored lua-curl (`lcurl`). Requests return a
---- response table, or `nil, message` when no response arrived.
+--- response table, or `nil, message` when no response arrived. The message
+--- names the method, never the URL: the L1 RPC URL carries provider credentials.
 ---
 --- Small requests share a total timeout. Downloads stream to a file and are
 --- bounded by a stall limit instead, since their size is the application's.
@@ -70,7 +71,7 @@ function http.new()
         local status = performed and easy:getinfo_response_code() or nil
         easy:close()
         if not performed then
-            return nil, string.format("%s %s failed: %s", opts.body and "POST" or "GET", opts.url, tostring(err))
+            return nil, string.format("%s failed: %s", opts.body and "POST" or "GET", tostring(err))
         end
         return { status = status, headers = parse_headers(header_lines) }
     end

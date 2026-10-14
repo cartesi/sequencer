@@ -120,5 +120,5 @@ does not describe the new one: remove `$CARTESI_WATCHDOG_STATE_DIR` and run
 | `CM inspect bytes mismatch (len <N> vs expected <M>)` | The devnet image is older than the wallet code; rebuild it with `just canonical-build-machine-image` |
 | `watchdog state is already locked: <dir>/run.lock` | Another `init`, `tick`, or `clear` is running |
 | `flock is required (util-linux)` | Use the devshell, or install util-linux |
-| `sequencer /finalized_state/inclusion_block: GET <url> failed: …` | The devnet stack stopped, or the exports come from an earlier run |
+| `sequencer /finalized_state/inclusion_block: GET failed: …` | The devnet stack stopped, or the exports come from an earlier run |
 | `divergence inclusion_block_regressed latched at block 0` | The state directory comes from an earlier devnet run; remove it and run `init` again |

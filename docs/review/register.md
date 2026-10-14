@@ -104,23 +104,6 @@ and `classify_input_reader` in [startup recovery](../../sequencer/src/recovery/m
 Next: classify failures by the setup phase and pin the external exit code;
 preserve genuinely transient provider failures.
 
-### Logs and watchdog state carry the full RPC URL
-
-The `sequencer startup` event includes `eth_rpc_url` verbatim. Operator URLs can
-carry credentials in userinfo, paths, or query parameters; private-key
-redaction does not cover this field. Transport errors also embed the URL:
-reqwest's error text, stringified by the reader, poster, flusher and fee
-oracle, and the watchdog's `http.lua` request error, which reaches stderr,
-`last_tick.json` and `status` (rechecked 2026-10-13 at `1a9615d`).
-
-Evidence: [`commands/run/mod.rs`](../../sequencer/src/commands/run/mod.rs),
-[`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs),
-[`l1/provider.rs`](../../sequencer/src/l1/provider.rs),
-[`watchdog/http.lua`](../../watchdog/http.lua).
-Next: redact once at each provider boundary, and check diagnostic/help paths
-and watchdog state with a synthetic credential-bearing URL. No credential
-exposure in an actual deployment was established by this review.
-
 ## Bounded investigations and cleanup
 
 - **Intermittent process-lock test failure.** The macOS workspace suite can

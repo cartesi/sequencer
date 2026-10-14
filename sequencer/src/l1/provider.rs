@@ -2,15 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use std::str::FromStr;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use alloy::{
     providers::{DynProvider, Provider, ProviderBuilder},
-    rpc::client::RpcClient,
+    rpc::{
+        client::RpcClient,
+        json_rpc::{RequestPacket, ResponsePacket},
+    },
     signers::local::PrivateKeySigner,
     transports::http::{Http, reqwest, reqwest::Url},
 };
-use alloy_transport::layers::RetryBackoffLayer;
+use alloy_transport::{
+    RpcError, TransportError, TransportErrorKind, TransportFut, layers::RetryBackoffLayer,
+};
+use tower::{Layer, Service};
 use url::Host;
 
 // Public Ethereum providers (Infura, Alchemy) commonly take 30–60s on heavy
@@ -44,7 +51,7 @@ fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
     }
     if remote_plaintext {
         tracing::warn!(
-            url = %url,
+            eth_rpc_origin = %url.origin().ascii_serialization(),
             "insecure plaintext RPC to a non-loopback host — explicitly allowed via allow-insecure-rpc"
         );
     }
@@ -54,6 +61,7 @@ fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
+    let redact = RedactUrlLayer(url.clone());
     let transport = Http::with_client(http_client, url);
     let is_local = transport.guess_local();
 
@@ -63,8 +71,10 @@ fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
         COMPUTE_UNITS_PER_SEC,
     );
 
+    // Innermost, so the retry layer and every caller see redacted errors.
     Ok(RpcClient::builder()
         .layer(retry)
+        .layer(redact)
         .transport(transport, is_local))
 }
 
@@ -83,6 +93,112 @@ fn is_loopback_host(host: Option<Host<&str>>) -> bool {
         Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
         None => false,
     }
+}
+
+/// The RPC URL as `scheme://host[:port]`, the only part safe to log: providers
+/// put credentials in the userinfo, path or query.
+pub fn rpc_origin(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(url) => url.origin().ascii_serialization(),
+        Err(_) => "<invalid URL>".to_owned(),
+    }
+}
+
+/// Strips the RPC URL from every transport error (see [`rpc_origin`]), so any
+/// caller may stringify a provider error. alloy's own DEBUG span
+/// (`ReqwestTransport`) still records the full URL; it is out of reach here.
+struct RedactUrlLayer(Url);
+
+impl<S> Layer<S> for RedactUrlLayer {
+    type Service = RedactUrl<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RedactUrl {
+            inner,
+            url: self.0.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RedactUrl<S> {
+    inner: S,
+    url: Url,
+}
+
+impl<S> Service<RequestPacket> for RedactUrl<S>
+where
+    S: Service<
+            RequestPacket,
+            Response = ResponsePacket,
+            Error = TransportError,
+            Future = TransportFut<'static>,
+        >,
+{
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: RequestPacket) -> Self::Future {
+        let response = self.inner.call(request);
+        let url = self.url.clone();
+        Box::pin(async move {
+            response
+                .await
+                .map_err(|err| redact_transport_error(err, &url))
+        })
+    }
+}
+
+/// reqwest's error text ends in `for url (<url>)`. alloy keeps it as a
+/// `reqwest::Error`, or formats it into the body of an error-status response
+/// whose body read failed.
+fn redact_transport_error(err: TransportError, url: &Url) -> TransportError {
+    let origin = url.origin().ascii_serialization();
+    let redact_body = |body: &str| redact_url_spans(&body.replace(url.as_str(), &origin), &origin);
+    match err {
+        RpcError::Transport(TransportErrorKind::Custom(source)) => {
+            match source.downcast::<reqwest::Error>() {
+                Ok(source) => TransportErrorKind::custom((*source).without_url()),
+                Err(source) => RpcError::Transport(TransportErrorKind::Custom(source)),
+            }
+        }
+        RpcError::Transport(TransportErrorKind::HttpError(mut error)) => {
+            error.body = redact_body(&error.body);
+            RpcError::Transport(TransportErrorKind::HttpError(error))
+        }
+        RpcError::Transport(TransportErrorKind::HttpErrorWithRetryAfter {
+            mut error,
+            retry_after,
+        }) => {
+            error.body = redact_body(&error.body);
+            RpcError::Transport(TransportErrorKind::HttpErrorWithRetryAfter { error, retry_after })
+        }
+        err => err,
+    }
+}
+
+/// The URL in reqwest's `for url (...)` is not the configured string: reqwest
+/// moves userinfo into a header, and a redirect names its target. Replace the
+/// whole span; an unclosed one is dropped.
+fn redact_url_spans(text: &str, origin: &str) -> String {
+    const MARKER: &str = "for url (";
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(MARKER) {
+        let url_start = start + MARKER.len();
+        redacted.push_str(&rest[..url_start]);
+        redacted.push_str(origin);
+        rest = rest[url_start..]
+            .find(')')
+            .map_or("", |end| &rest[url_start + end..]);
+    }
+    redacted.push_str(rest);
+    redacted
 }
 
 /// Create a read-only provider with retry and timeout. `allow_insecure` opts
@@ -316,6 +432,90 @@ mod tests {
             ),
             "expected ChainIdMismatch {{ rpc: {chain_id}, expected: {} }}, got {err:?}",
             chain_id + 1
+        );
+    }
+
+    // ── RPC URL redaction: credentials never reach error text ──
+
+    /// Nothing listens on port 1; loopback http needs no opt-in.
+    const SECRET_URL: &str = "http://user:PASSWORD@127.0.0.1:1/v3/PATHSECRET?key=QUERYSECRET";
+
+    fn assert_no_secret(text: &str) {
+        for secret in ["PASSWORD", "PATHSECRET", "QUERYSECRET"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn rpc_origin_keeps_only_scheme_host_and_port() {
+        assert_eq!(
+            rpc_origin("https://user:PASSWORD@rpc.example:8443/v3/PATHSECRET?key=QUERYSECRET#f"),
+            "https://rpc.example:8443"
+        );
+        assert_eq!(
+            rpc_origin("https://rpc.example/v3/PATHSECRET"),
+            "https://rpc.example"
+        );
+        assert_eq!(rpc_origin("http://[::1]:8545/"), "http://[::1]:8545");
+        assert_eq!(rpc_origin("PATHSECRET"), "<invalid URL>");
+    }
+
+    #[tokio::test]
+    async fn transport_errors_carry_no_rpc_url_secrets() {
+        let provider = create_provider(SECRET_URL, false).expect("loopback http is accepted");
+        let err = provider
+            .get_chain_id()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(
+            matches!(err, RpcError::Transport(TransportErrorKind::Custom(_))),
+            "{err:?}"
+        );
+        assert_no_secret(&format!("{err} {err:?}"));
+
+        let err = create_verified_signer_provider(SECRET_URL, ANVIL_KEY_0, 1, false)
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(
+            matches!(&err, VerifiedSignerProviderError::ChainIdRpc(_)),
+            "{err:?}"
+        );
+        assert_no_secret(&err.to_string());
+    }
+
+    #[test]
+    fn redaction_strips_the_url_from_an_error_status_body() {
+        let url = Url::parse(SECRET_URL).unwrap();
+        // reqwest reports the URL it sent, with the userinfo moved to a header.
+        let mut sent = url.clone();
+        sent.set_username("").unwrap();
+        sent.set_password(None).unwrap();
+        let body = format!(
+            "<failed to read response body: error decoding response body for url ({sent})>"
+        );
+        let err = redact_transport_error(TransportErrorKind::http_error(503, body), &url);
+        let text = err.to_string();
+        assert_no_secret(&text);
+        assert!(text.contains("for url (http://127.0.0.1:1)>"), "{text}");
+        assert!(
+            matches!(&err, RpcError::Transport(kind) if kind.is_retry_err()),
+            "a 503 stays retryable: {err:?}"
+        );
+    }
+
+    #[test]
+    fn redaction_replaces_every_url_span_and_drops_an_unclosed_one() {
+        let origin = "https://rpc.example";
+        assert_eq!(
+            redact_url_spans(
+                "a for url (https://other.example/PATHSECRET) b for url (x?key=QUERYSECRET) c",
+                origin
+            ),
+            "a for url (https://rpc.example) b for url (https://rpc.example) c"
+        );
+        assert_eq!(
+            redact_url_spans("cut for url (https://rpc.example/PATHSECRET", origin),
+            "cut for url (https://rpc.example"
         );
     }
 }

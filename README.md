@@ -143,6 +143,7 @@ Sync/Cascade or launches runtime workers.
 `setup` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS`.
 The submitter address must equal the `sequencer_address` compiled into the canonical machine; nothing checks this at runtime ([scheduler semantics](docs/protocol/scheduler-semantics.md#the-one-stream-the-one-classification)).
 `run` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `_FILE`); it refuses to boot until `setup` has completed.
+Logs show only the endpoint's `scheme://host[:port]`, since provider URLs carry credentials; `RUST_LOG=debug` on alloy's transport targets still prints the full URL.
 
 Optional: `CARTESI_SEQUENCER_HTTP_ADDR` (default `127.0.0.1:3000`, `run`), `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; `setup` creates it, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default `12`), `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (default `600`), `CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES` (default `-32005,-32012,-32600,-32602,-32616`), `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (alternative to `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY`; first line of the file is the key), `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
 

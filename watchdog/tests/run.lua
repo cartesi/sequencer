@@ -154,6 +154,36 @@ test("jsonrpc keeps a JSON-RPC error sent with an HTTP error status", function()
     eq(err, "eth_getLogs: HTTP 400: -32602: range too large")
 end)
 
+test("http and jsonrpc name no part of a failed request's URL", function()
+    local stub_error = "[CURL-EASY][COULDNT_CONNECT] Couldn't connect to server (7)"
+    local noop = function() end
+    local real = package.loaded.lcurl
+    -- luacheck: push ignore 122 (a stub for lcurl, restored below)
+    package.loaded.lcurl = {
+        easy = function()
+            return {
+                setopt_post = noop,
+                setopt_postfields = noop,
+                setopt_timeout = noop,
+                perform = function()
+                    error(stub_error, 0)
+                end,
+                close = noop,
+            }
+        end,
+    }
+    local client = require("watchdog.http").new()
+    package.loaded.lcurl = real
+    -- luacheck: pop
+    local url = "https://user:PASSWORD@rpc.example/v3/PATHSECRET?key=QUERYSECRET"
+    local response, err = client:post(url, "{}", {})
+    eq(response, nil)
+    eq(err, "POST failed: " .. stub_error)
+    eq(select(2, client:get(url)), "GET failed: " .. stub_error)
+    local _, rpc_err = require("watchdog.jsonrpc").new(client, json, url):call("eth_chainId", {})
+    eq(rpc_err, "eth_chainId: POST failed: " .. stub_error)
+end)
+
 test("l1 requires the safe head to reach the target", function()
     local reader = l1_reader({}, { safe_head = 10 })
     reader:require_safe_head(10)

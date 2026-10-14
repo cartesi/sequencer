@@ -34,7 +34,7 @@ function jsonrpc.new(http, json, url)
             params = params,
         }), { ["content-type"] = "application/json" })
         if not response then
-            return nil, http_err
+            return nil, method .. ": " .. tostring(http_err)
         end
         local ok, decoded = pcall(json.decode, response.body)
         if response.status < 200 or response.status >= 300 then

@@ -138,7 +138,7 @@ where
     tracing::info!(
         http_addr = %config.http_addr,
         data_dir = %config.data_dir,
-        eth_rpc_url = %l1_config.eth_rpc_url,
+        eth_rpc_origin = %crate::l1::provider::rpc_origin(&l1_config.eth_rpc_url),
         input_box_address = %l1_config.identity.input_box_address,
         app_deployment_block = l1_config.identity.app_deployment_block,
         chain_id = l1_config.identity.chain_id,
