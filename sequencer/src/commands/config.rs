@@ -154,8 +154,8 @@ pub enum FeeOracleMode {
 }
 
 impl FeeOracleArgs {
-    /// Resolve explicit overrides, public-chain presets, or the zero-price
-    /// local-development default. This is pure so invalid combinations fail
+    /// Resolve explicit overrides or the public-chain presets; an unknown chain
+    /// needs an explicit source. This is pure so invalid combinations fail
     /// before the inclusion lane can sample a fee.
     pub fn resolve(&self, chain_id: u64) -> Result<FeeOracleMode, String> {
         let has_uniswap_override = self.fee_token_address.is_some()
@@ -386,14 +386,11 @@ pub struct SetupConfig {
     /// without the secret) rather than the key itself.
     #[arg(long, env = "CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS", value_parser = parse_address)]
     pub batch_submitter_address: Address,
-    /// L1 inclusion block `B` of the trusted checkpoint machine this setup
-    /// boots from. Default `0` = genesis bootstrap. Used only as the lower
-    /// bound of `setup`'s read-only detection scan: if a previous instance
-    /// left any batch-submitter tx past `B` (or its wallet nonce is unsettled),
-    /// `setup` refuses and points the operator at recovery. PR3 does not yet
-    /// load a non-genesis checkpoint machine — that is `setup --recovery`;
-    /// here `B` only scopes detection, so `B > 0` against a genesis-style setup
-    /// merely narrows the scan.
+    /// L1 inclusion block `B` of the trusted checkpoint this setup boots from;
+    /// `0` is genesis. Plain `setup` uses `B` only as the lower bound of its
+    /// read-only detection scan: work a previous instance left past `B`, or an
+    /// unsettled wallet nonce, refuses with exit 40. `setup --recovery` loads the
+    /// checkpoint itself (`docs/recovery/cockroach.md`).
     #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_BLOCK", default_value_t = 0)]
     pub checkpoint_block: u64,
     /// Recovery mode (cockroach recovery): rebuild this freshly-wiped DB from a
