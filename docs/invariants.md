@@ -29,34 +29,12 @@ When you change anything listed under *enforced by*, re-check every line under
 - **Never absorb silently.** No `INSERT OR IGNORE`, saturating decode, or
   `unwrap_or_default` on data the contracts make impossible; use the loud
   variant of the same operation.
-- **Command admission is fact-derived; terminal runtime faults abort the
-  process.** Three facts (the kernel process lock, two-sided
-  `setup_complete`, `canonical_divergence`), no admission state machine, no
-  operator acknowledgement, and a verdict-neutral black box; the statement,
-  the accepted trade, and the termination policy are owned by the
-  [authority-boundary ADR](plans/2026-08-authority-boundary-adr.md)
-  (mechanisms 1 and 2). What this policy adds: telemetry writes are
-  verdict-neutral — a failed black-box record loses only the black-box copy,
-  and the exit code and logs still carry the verdict. Runtime aborts skip
-  settlement entirely. The [I15](#i15-divergence-marker-present--acceptance-frontier-frozen)
-  freeze applies immediately to its named tables; runtime reaction still
-  requires a worker to observe the committed marker.
-- **Maintenance is flush-only.** `flush-mempool` is an operator command,
-  not a startup-recovery alias: it settles the wallet nonce and never acquires
-  Sync/Cascade semantics. It requires completed setup and no divergence.
-  There is no verdict state for a flush to erase, and a successful wallet
-  flush proves nothing about the rest of the runtime.
-- **Normal run repair and admission share one selection policy.** Local
-  absorbing facts are inspected before fallible provider facts; startup
-  selects one repair and checks its result. The flush's safe-block witness
-  is boot-local, and Sync must catch the persisted view up through it before
-  Cascade. Final admission checks one consistent fact set and yields
-  the single-use `RuntimeAdmission` witness consumed by the infallible,
-  non-yielding launch; no refusal or retry can construct it, and raw worker
-  and HTTP launch surfaces are crate-private. Design:
-  [`docs/recovery/README.md`](recovery/README.md). Mutation and output
-  authorization remains role-local at the durable boundaries documented
-  below; public low-level storage helpers are not an authority API.
+- **Admission, terminal faults, the maintenance flush, and startup repair**
+  follow the [authority-boundary ADR](plans/2026-08-authority-boundary-adr.md)
+  (mechanisms 1–3) and the [recovery design](recovery/README.md). Raw worker
+  and HTTP launch surfaces are crate-private, and public low-level storage
+  helpers are not an authority API: mutation and output authorization stay
+  role-local at the durable boundaries this register lists.
 - An assertion must check a **real invariant** — true in every legitimate
   execution, including crash-recovery, replays, and clock steps — never an
   environmental assumption. (Cautionary tale: `sealed_at_ms >= created_at_ms`
