@@ -3,13 +3,11 @@
 
 use super::super::test_helpers::{
     RecoveryFixture, SENDER_A, all_ordered_l2_txs, default_protocol_timing, local_batch_payload,
-    make_stale_batch_payload, seed_closed_batches, seed_safe_inputs_with_batch_nonces,
-    temp_db_with_default_deployment_identity as temp_db,
+    make_stale_batch_payload, open_temp_storage, seed_closed_batches,
+    seed_safe_inputs_with_batch_nonces,
 };
 use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
-use crate::storage::{
-    DirectInputExecution, ExecutedInputCount, SafeInputRange, Storage, StoredSafeInput,
-};
+use crate::storage::{DirectInputExecution, ExecutedInputCount, SafeInputRange, Storage};
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::protocol::ProtocolTiming;
@@ -57,8 +55,7 @@ mod guarded_phases {
         Storage,
         ProtocolTiming,
     ) {
-        let db = temp_db(name);
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (db, mut storage) = open_temp_storage(name);
         let protocol = default_protocol_timing();
         let now_ms = crate::clock::unix_now_ms();
         storage
@@ -182,8 +179,7 @@ mod guarded_phases {
     }
 
     fn cascade_fixture(name: &str) -> (crate::storage::test_helpers::TestDb, Storage) {
-        let db = temp_db(name);
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (db, mut storage) = open_temp_storage(name);
         let protocol = default_protocol_timing();
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -263,8 +259,7 @@ mod guarded_phases {
 
     #[test]
     fn tip_guard_reasserts_the_exact_reducer_decision() {
-        let db = temp_db("guarded-tip-decision");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (db, mut storage) = open_temp_storage("guarded-tip-decision");
         let protocol = default_protocol_timing();
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -299,8 +294,7 @@ mod guarded_phases {
 
     #[test]
     fn tip_guard_refuses_missing_snapshot_without_tree_mutation() {
-        let db = temp_db("guarded-tip-no-snapshot");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("guarded-tip-no-snapshot");
         let protocol = default_protocol_timing();
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -334,8 +328,7 @@ mod invalid_batches {
 
     #[test]
     fn invalid_batches_excluded_from_latest_batch_index() {
-        let db = temp_db("invalid-latest-batch");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("invalid-latest-batch");
         seed_closed_batches(&mut storage, 3);
         assert_eq!(
             storage.latest_batch_index().expect("latest").unwrap(),
@@ -352,25 +345,12 @@ mod invalid_batches {
 
     #[test]
     fn invalid_batches_excluded_from_ordered_l2_txs() {
-        let db = temp_db("invalid-ordered-txs");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("invalid-ordered-txs");
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
-        let directs_0 = vec![StoredSafeInput {
-            sender: Address::ZERO,
-            payload: vec![0xaa],
-            block_number: 10,
-        }];
-        storage
-            .append_safe_inputs(
-                10,
-                directs_0.as_slice(),
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append");
+        storage.land(10, &[(Address::ZERO, vec![0xaa])]);
         storage
             .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
             .expect("close frame");
@@ -378,19 +358,7 @@ mod invalid_batches {
             .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
-        let directs_1 = vec![StoredSafeInput {
-            sender: Address::ZERO,
-            payload: vec![0xbb],
-            block_number: 20,
-        }];
-        storage
-            .append_safe_inputs(
-                20,
-                directs_1.as_slice(),
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append");
+        storage.land(20, &[(Address::ZERO, vec![0xbb])]);
         storage
             .close_frame_only(&mut head, 20, SafeInputRange::new(1, 2))
             .expect("close frame");
@@ -412,20 +380,12 @@ mod invalid_batches {
 
     #[test]
     fn invalid_batches_excluded_from_ordered_l2_txs_for_batch() {
-        let db = temp_db("invalid-ordered-for-batch");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("invalid-ordered-for-batch");
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
-        let directs = vec![StoredSafeInput {
-            sender: Address::ZERO,
-            payload: vec![0xaa],
-            block_number: 10,
-        }];
-        storage
-            .append_safe_inputs(10, directs.as_slice(), SENDER_A, &default_protocol_timing())
-            .expect("append");
+        storage.land(10, &[(Address::ZERO, vec![0xaa])]);
         storage
             .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
             .expect("close frame");
@@ -445,27 +405,15 @@ mod invalid_batches {
 
     #[test]
     fn invalid_batches_excluded_from_drained_direct_count() {
-        let db = temp_db("invalid-drained-count");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("invalid-drained-count");
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
-        let directs = vec![
-            StoredSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xaa],
-                block_number: 10,
-            },
-            StoredSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xbb],
-                block_number: 10,
-            },
-        ];
-        storage
-            .append_safe_inputs(10, directs.as_slice(), SENDER_A, &default_protocol_timing())
-            .expect("append");
+        storage.land(
+            10,
+            &[(Address::ZERO, vec![0xaa]), (Address::ZERO, vec![0xbb])],
+        );
         storage
             .close_frame_only(&mut head, 10, SafeInputRange::new(0, 2))
             .expect("close frame");
@@ -497,8 +445,7 @@ mod recover_post_flush {
 
     #[test]
     fn cascades_from_stale() {
-        let db = temp_db("detect-stale");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-stale");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -507,19 +454,7 @@ mod recover_post_flush {
             storage.close_batch_at(&mut head, 10).expect("close batch");
         }
 
-        let batch_submitter = Address::repeat_byte(0xAA);
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append safe input");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let invalidated = storage
             .recover_post_flush(1200)
             .expect("detect and recover");
@@ -532,8 +467,7 @@ mod recover_post_flush {
 
     #[test]
     fn is_idempotent() {
-        let db = temp_db("detect-idempotent");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-idempotent");
         let initial_history = storage.history_state().expect("initial history");
         assert_eq!(initial_history.version.recovery_generation.get(), 0);
 
@@ -542,19 +476,7 @@ mod recover_post_flush {
             .expect("initialize");
         storage.close_batch_at(&mut head, 10).expect("close batch");
 
-        let batch_submitter = Address::repeat_byte(0xAA);
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append safe input");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let first = storage.recover_post_flush(1200).expect("first detect");
         assert_eq!(first, vec![0, 1]);
         assert_eq!(
@@ -610,8 +532,7 @@ mod recover_post_flush {
         // is gold and a fresh `recover_post_flush` call should be a no-op —
         // the stale ancestor's safe-input must not false-match the
         // nonce-reused gen-2 batch.
-        let db = temp_db("post-flush-no-op-after-fresh-gen2");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("post-flush-no-op-after-fresh-gen2");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -620,19 +541,7 @@ mod recover_post_flush {
             .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
-        let batch_submitter = Address::repeat_byte(0xAA);
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append stale safe input");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         // Gen 1 cascade. Stale batch 0 + open Tip 1 invalidated; recovery
         // batch 2 opened with nonce reused (= 0).
         let first = storage.recover_post_flush(1200).expect("gen1 recovery");
@@ -653,18 +562,7 @@ mod recover_post_flush {
             .close_batch_at(&mut head, 1300)
             .expect("close recovery batch");
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                1310,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: landed,
-                    block_number: 1310,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append fresh safe input for recovery batch");
+        storage.land(1310, &[(SENDER_A, landed)]); // append fresh safe input for recovery batch
 
         // populate_safe_accepted_batches accepts the gen-2 batch (nonce 0 at
         // first_frame=1300, inclusion=1310 → inclusion-staleness 10 < MAX_WAIT).
@@ -681,8 +579,7 @@ mod recover_post_flush {
 
     #[test]
     fn detects_stale_reused_nonce_in_new_generation() {
-        let db = temp_db("detect-reused-stale");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-reused-stale");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -691,19 +588,8 @@ mod recover_post_flush {
             .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
-        let batch_submitter = Address::repeat_byte(0xAA);
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append gen1 stale safe input");
+        // Append gen1 stale safe input.
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let first = storage.recover_post_flush(1200).expect("gen1 recovery");
         assert_eq!(first, vec![0, 1]);
 
@@ -712,18 +598,8 @@ mod recover_post_flush {
             .close_batch_at(&mut head, 1210)
             .expect("close gen2 batch");
 
-        storage
-            .append_safe_inputs(
-                2410,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 1210),
-                    block_number: 2410,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append gen2 stale safe input");
+        // Append gen2 stale safe input.
+        storage.land(2410, &[(SENDER_A, make_stale_batch_payload(0, 1210))]);
         let second = storage.recover_post_flush(1200).expect("gen2 recovery");
         assert_eq!(
             second,
@@ -754,8 +630,7 @@ mod recover_post_flush {
         // batch; on no closed pivot it became a no-op, leaving the stale Tip
         // for the next danger trip to catch. Fix: fall through to a Tip
         // check against `danger_threshold` and cascade the Tip directly.
-        let db = temp_db("post-flush-tip-no-pivot");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("post-flush-tip-no-pivot");
 
         // S_closed = S_tip = 10 (lane rotated without a safe-block advance).
         let mut head = storage
@@ -765,27 +640,13 @@ mod recover_post_flush {
             .close_batch_at(&mut head, 10)
             .expect("close batch 0; open Tip with same safe_block=10");
 
-        let batch_submitter = Address::repeat_byte(0xAA);
         // Closed batch 0 landed fresh: inclusion_block=200 → inclusion-staleness 190
         // is well below MAX_WAIT, so populate accepts it as gold.
         // Then advance safe head to 1100: batch 0 age (gold) is irrelevant,
         // but Tip's age = 1100 - 10 = 1090 > danger_threshold (let's pass 1000).
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                200,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: landed,
-                    block_number: 200,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append fresh safe input — batch 0 becomes gold");
-        storage
-            .append_safe_inputs(1100, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head past Tip's danger threshold");
+        storage.land(200, &[(SENDER_A, landed)]); // append fresh safe input — batch 0 becomes gold
+        storage.advance_safe_head(1100); // advance safe head past Tip's danger threshold
 
         // Sanity: no closed batch is past gold (all gold).
         assert_eq!(
@@ -814,8 +675,7 @@ mod recover_post_flush {
     fn no_op_when_tip_age_below_danger_threshold() {
         // Negative companion to the above: closed batch is gold, Tip exists,
         // but Tip's age is below `danger_threshold`. Cascade must not fire.
-        let db = temp_db("post-flush-tip-below-danger");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("post-flush-tip-below-danger");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -824,24 +684,10 @@ mod recover_post_flush {
             .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
-        let batch_submitter = Address::repeat_byte(0xAA);
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                200,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: landed,
-                    block_number: 200,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append fresh safe input — batch 0 becomes gold");
+        storage.land(200, &[(SENDER_A, landed)]); // append fresh safe input — batch 0 becomes gold
         // current=500: Tip's age = 490, below threshold 1000.
-        storage
-            .append_safe_inputs(500, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head, but not past danger threshold");
+        storage.advance_safe_head(500); // advance safe head, but not past danger threshold
 
         let invalidated = storage
             .recover_post_flush(1000)
@@ -882,8 +728,7 @@ mod tip_staleness {
         // Scenario: sequencer opened batch 0 at safe_block=10, never closed it,
         // then stayed down until safe advanced to 1500 (>1200 past safe_block).
         // Recovery must invalidate the open batch.
-        let db = temp_db("open-batch-stale");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("open-batch-stale");
 
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -891,9 +736,7 @@ mod tip_staleness {
 
         // Advance the safe head so the open batch's first frame (safe_block=10)
         // is now stale: 1500 - 10 >= 1200.
-        storage
-            .append_safe_inputs(1500, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head past MAX_WAIT_BLOCKS");
+        storage.advance_safe_head(1500); // advance safe head past MAX_WAIT_BLOCKS
 
         let invalidated = storage
             .recover_aging_tip(1200)
@@ -924,16 +767,13 @@ mod tip_staleness {
         // Negative: open batch's first frame safe_block=10 with current safe=1100.
         // 1100 - 10 = 1090 < 1200. Must NOT cascade.
         // Catches false-positive regressions in `recover_aging_tip`.
-        let db = temp_db("open-batch-fresh");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("open-batch-fresh");
 
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize open state at safe_block=10");
 
-        storage
-            .append_safe_inputs(1100, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head below threshold");
+        storage.advance_safe_head(1100); // advance safe head below threshold
 
         let invalidated = storage
             .recover_aging_tip(1200)
@@ -955,16 +795,13 @@ mod tip_staleness {
     fn open_batch_exactly_at_threshold_is_invalidated() {
         // Boundary: 1210 - 10 = 1200, which is >= MAX_WAIT_BLOCKS.
         // The staleness comparison is `>=`, so this must invalidate.
-        let db = temp_db("open-batch-boundary");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("open-batch-boundary");
 
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
 
-        storage
-            .append_safe_inputs(1210, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head to exact threshold");
+        storage.advance_safe_head(1210); // advance safe head to exact threshold
 
         let invalidated = storage.recover_aging_tip(1200).expect("recover");
         assert_eq!(invalidated, vec![0], "boundary (>= threshold) invalidates");
@@ -973,16 +810,13 @@ mod tip_staleness {
     #[test]
     fn open_batch_one_block_below_threshold_is_not_invalidated() {
         // Boundary: 1209 - 10 = 1199 < 1200. One-block margin must NOT invalidate.
-        let db = temp_db("open-batch-below-boundary");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("open-batch-below-boundary");
 
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
 
-        storage
-            .append_safe_inputs(1209, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head to one block below threshold");
+        storage.advance_safe_head(1209); // advance safe head to one block below threshold
 
         let invalidated = storage.recover_aging_tip(1200).expect("recover");
         assert!(
@@ -997,8 +831,7 @@ mod tip_staleness {
         // (safe_accepted_batches is empty). Batch 1 is open and also stale.
         // `find_first_batch_in_danger` should return closed batch 0 at the
         // frontier (nonce 0, no acceptance yet) and cascade through batch 1.
-        let db = temp_db("closed-unsubmitted-and-open-stale");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("closed-unsubmitted-and-open-stale");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1008,9 +841,7 @@ mod tip_staleness {
             .expect("close batch 0");
 
         // Advance safe head so batch 0's first frame (safe_block=10) is stale.
-        storage
-            .append_safe_inputs(1500, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head past staleness");
+        storage.advance_safe_head(1500); // advance safe head past staleness
 
         let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(
@@ -1022,8 +853,7 @@ mod tip_staleness {
 
     #[test]
     fn opens_batch_after_torn_invalidation() {
-        let db = temp_db("detect-torn");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-torn");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1034,9 +864,7 @@ mod tip_staleness {
 
         storage.insert_invalid_batch(0).expect("invalidate 0");
         storage.insert_invalid_batch(1).expect("invalidate 1");
-        storage
-            .append_safe_inputs(10, &[], SENDER_A, &default_protocol_timing())
-            .expect("record observed safe head");
+        storage.advance_safe_head(10); // record observed safe head
 
         let invalidated = storage
             .recover_post_flush(1200)
@@ -1061,8 +889,7 @@ mod tip_staleness {
 
     #[test]
     fn rolls_back_when_cascade_update_aborts() {
-        let db = temp_db("detect-cascade-abort");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (db, mut storage) = open_temp_storage("detect-cascade-abort");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1072,9 +899,7 @@ mod tip_staleness {
             .expect("close batch 0");
 
         // Advance safe head so batch 0's first frame (safe_block=10) is stale.
-        storage
-            .append_safe_inputs(1500, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head past staleness");
+        storage.advance_safe_head(1500); // advance safe head past staleness
 
         storage
             .conn
@@ -1132,24 +957,12 @@ mod tip_staleness {
 
     #[test]
     fn rolls_back_generation_and_invalidation_when_tip_reopen_aborts() {
-        let db = temp_db("detect-tip-reopen-abort");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-tip-reopen-abort");
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .append_safe_inputs(
-                10,
-                &[StoredSafeInput {
-                    sender: Address::ZERO,
-                    payload: vec![0xd1],
-                    block_number: 10,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append mapped direct");
+        storage.land(10, &[(Address::ZERO, vec![0xd1])]); // append mapped direct
         storage
             .close_frame_only_with_executions(
                 &mut head,
@@ -1170,9 +983,7 @@ mod tip_staleness {
                 .expect("pre-recovery history head"),
             ExecutedInputCount::new(1)
         );
-        storage
-            .append_safe_inputs(1500, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head past staleness");
+        storage.advance_safe_head(1500); // advance safe head past staleness
 
         storage
             .conn
@@ -1249,32 +1060,15 @@ mod tip_staleness {
 
     #[test]
     fn recovery_redrains_direct_inputs_and_replay_sees_them_once() {
-        let db = temp_db("recovery-redrain-e2e");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("recovery-redrain-e2e");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
-        let deposits = vec![
-            StoredSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xd1],
-                block_number: 10,
-            },
-            StoredSafeInput {
-                sender: Address::ZERO,
-                payload: vec![0xd2],
-                block_number: 10,
-            },
-        ];
-        storage
-            .append_safe_inputs(
-                10,
-                deposits.as_slice(),
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append deposits");
+        storage.land(
+            10,
+            &[(Address::ZERO, vec![0xd1]), (Address::ZERO, vec![0xd2])],
+        ); // two deposits
         storage
             .close_frame_only(&mut head, 10, SafeInputRange::new(0, 2))
             .expect("close frame with deposits");
@@ -1286,18 +1080,7 @@ mod tip_staleness {
         assert_eq!(before.len(), 2, "both deposits should be visible");
 
         let batch_submitter = Address::repeat_byte(0xAA);
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append stale batch submission");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let invalidated = storage
             .recover_post_flush(1200)
             .expect("detect and recover");
@@ -1348,8 +1131,7 @@ mod tip_staleness {
         // into any frame must be sequenced into the recovery batch's first
         // frame after cascade. Complements  (re-drain from
         // invalidated) with the never-drained case.
-        let db = temp_db("recovery-includes-undrained");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("recovery-includes-undrained");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1359,18 +1141,7 @@ mod tip_staleness {
             .expect("close batch 0 with no deposits");
 
         let non_submitter = Address::repeat_byte(0xCC);
-        storage
-            .append_safe_inputs(
-                20,
-                &[StoredSafeInput {
-                    sender: non_submitter,
-                    payload: vec![0xde, 0xad],
-                    block_number: 20,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append undrained deposit");
+        storage.land(20, &[(non_submitter, vec![0xde, 0xad])]); // append undrained deposit
         let before = all_ordered_l2_txs(&mut storage);
         assert!(
             before.iter().all(|tx| !matches!(
@@ -1380,19 +1151,7 @@ mod tip_staleness {
             "undrained deposit must not be sequenced before drain",
         );
 
-        let batch_submitter = SENDER_A;
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append stale batch submission");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert!(!invalidated.is_empty(), "stale batch must cascade");
 
@@ -1420,8 +1179,7 @@ mod tip_staleness {
         // inputs → recovery batch opens with an empty first frame (aside
         // from the batch-submitter's own self-submission, which is drained
         // but carries no user-visible payload).
-        let db = temp_db("recovery-empty-first-frame");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("recovery-empty-first-frame");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1431,18 +1189,7 @@ mod tip_staleness {
             .expect("close batch 0");
 
         let batch_submitter = SENDER_A;
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append stale batch submission");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(invalidated, vec![0, 1]);
 
@@ -1468,8 +1215,7 @@ mod tip_staleness {
         // first-ever batch (nonce 0) goes stale before reaching
         // Gold. Cascade invalidates it; recovery opens a fresh batch that
         // reuses nonce 0 (no valid ancestor exists to advance the nonce).
-        let db = temp_db("first-batch-stale-nonce-zero");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (db, mut storage) = open_temp_storage("first-batch-stale-nonce-zero");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1478,19 +1224,7 @@ mod tip_staleness {
             .close_batch_at(&mut head, 10)
             .expect("close batch 0 (nonce 0)");
 
-        let batch_submitter = SENDER_A;
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append stale batch submission");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(
             invalidated,
@@ -1540,8 +1274,7 @@ mod tip_staleness {
         // Distinct from `is_idempotent` (idempotent back-to-back call on the
         // same Storage handle): this test drops and reopens Storage to model
         // a full restart over the persisted DB.
-        let db = temp_db("post-recovery-crash-idempotent");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (db, mut storage) = open_temp_storage("post-recovery-crash-idempotent");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1550,19 +1283,7 @@ mod tip_staleness {
             .close_batch_at(&mut head, 10)
             .expect("close batch 0");
 
-        let batch_submitter = SENDER_A;
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append stale submission");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         // First call: full recovery runs to completion and opens a new Tip.
         let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(invalidated, vec![0, 1]);
@@ -1609,9 +1330,7 @@ mod check_danger_zone {
         // `check_danger_zone` must return None: no unresolved batch is in
         // danger. Gold batches (accepted past the frontier) never participate,
         // and the open tip isn't old enough to trip the threshold.
-        let db = temp_db("danger-zone-gold");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let batch_submitter = Address::repeat_byte(0xAA);
+        let (_db, mut storage) = open_temp_storage("danger-zone-gold");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1621,24 +1340,11 @@ mod check_danger_zone {
             .expect("close batch 0");
 
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                20,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: landed,
-                    block_number: 20,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append safe input");
+        storage.land(20, &[(SENDER_A, landed)]);
         // Advance to a current safe block where batch 0 (safe_block=10) is
         // past threshold (1200-10=1190>=1125) but batch 1 (safe_block=100)
         // is still fresh (1200-100=1100<1125).
-        storage
-            .append_safe_inputs(1200, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe block");
+        storage.advance_safe_head(1200); // advance safe block
 
         let result =
             find_closed_frontier_batch_in_danger(&storage.conn, 1125).expect("check danger zone");
@@ -1658,16 +1364,13 @@ mod check_danger_zone {
         //
         // Scenario: only an open batch exists, aged past the danger
         // threshold. `check_danger_zone` returns None.
-        let db = temp_db("danger-zone-open-no-zombie");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("danger-zone-open-no-zombie");
 
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize open batch at safe_block=10");
 
-        storage
-            .append_safe_inputs(1200, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head past danger threshold");
+        storage.advance_safe_head(1200); // advance safe head past danger threshold
 
         let result =
             find_closed_frontier_batch_in_danger(&storage.conn, 1125).expect("check danger zone");
@@ -1690,16 +1393,13 @@ mod check_any_unresolved {
         // fallback relies on — if L1 is unreachable and an open batch may be
         // past the threshold, refuse to boot rather than accept user ops
         // into a batch that can't land.
-        let db = temp_db("any-unresolved-open-stale");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("any-unresolved-open-stale");
 
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize open batch at safe_block=10");
 
-        storage
-            .append_safe_inputs(1200, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head past threshold");
+        storage.advance_safe_head(1200); // advance safe head past threshold
 
         let result = find_first_batch_in_danger(&storage.conn, 1125)
             .expect("check any unresolved in danger");
@@ -1714,16 +1414,13 @@ mod check_any_unresolved {
     fn check_any_unresolved_does_not_flag_fresh_open_batch() {
         // Negative counterpart. Fresh open batch below threshold must not
         // trigger false positives in the unified check.
-        let db = temp_db("any-unresolved-open-fresh");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("any-unresolved-open-fresh");
 
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize open batch at safe_block=10");
 
-        storage
-            .append_safe_inputs(1100, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head below threshold");
+        storage.advance_safe_head(1100); // advance safe head below threshold
 
         let result = find_first_batch_in_danger(&storage.conn, 1125)
             .expect("check any unresolved in danger");
@@ -1735,9 +1432,7 @@ mod check_any_unresolved {
 
     #[test]
     fn check_danger_zone_triggers_on_frontier_batch() {
-        let db = temp_db("danger-zone-frontier");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let batch_submitter = Address::repeat_byte(0xAA);
+        let (_db, mut storage) = open_temp_storage("danger-zone-frontier");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1750,21 +1445,8 @@ mod check_any_unresolved {
             .expect("close batch 1");
 
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                20,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: landed,
-                    block_number: 20,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append safe input");
-        storage
-            .append_safe_inputs(1200, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe block");
+        storage.land(20, &[(SENDER_A, landed)]);
+        storage.advance_safe_head(1200); // advance safe block
 
         let result =
             find_closed_frontier_batch_in_danger(&storage.conn, 1125).expect("check danger zone");
@@ -1773,9 +1455,7 @@ mod check_any_unresolved {
 
     #[test]
     fn check_danger_zone_does_not_trigger_below_threshold() {
-        let db = temp_db("danger-zone-below");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let batch_submitter = Address::repeat_byte(0xAA);
+        let (_db, mut storage) = open_temp_storage("danger-zone-below");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1788,21 +1468,8 @@ mod check_any_unresolved {
             .expect("close batch 1");
 
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                20,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: landed,
-                    block_number: 20,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append safe input");
-        storage
-            .append_safe_inputs(1134, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe block");
+        storage.land(20, &[(SENDER_A, landed)]);
+        storage.advance_safe_head(1134); // advance safe block
 
         let result =
             find_closed_frontier_batch_in_danger(&storage.conn, 1125).expect("check danger zone");
@@ -1820,8 +1487,7 @@ mod check_any_unresolved {
         // pending-snapshot clear keys on the pivot's nonce. Both existing
         // find_*_in_danger tests use open-batch-only scenarios; the closed-over-Tip
         // preference (the helper's whole point) was unasserted.
-        let db = temp_db("danger-prefers-closed-frontier");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("danger-prefers-closed-frontier");
 
         // batch 0 (frame sb 10) → made gold below; batch 1 (frame sb 50) → the
         // closed frontier; batch 2 (Tip, frame sb 50) → open at the same safe
@@ -1838,18 +1504,7 @@ mod check_any_unresolved {
 
         // Make batch 0 gold: land its genuine bytes (accepted) → frontier → nonce 1.
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                20,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: landed,
-                    block_number: 20,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("land batch 0");
+        storage.land(20, &[(SENDER_A, landed)]); // land batch 0
         assert_eq!(
             storage
                 .submitter_frontier()
@@ -1861,9 +1516,7 @@ mod check_any_unresolved {
 
         // Advance the safe head so both batch 1 and the Tip (both sb 50) are aged:
         // 1200 - 50 = 1150 >= threshold 1125.
-        storage
-            .append_safe_inputs(1200, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance safe head");
+        storage.advance_safe_head(1200);
 
         let result = find_first_batch_in_danger(&storage.conn, 1125).expect("find first in danger");
         assert_eq!(
@@ -1881,26 +1534,14 @@ mod boundary {
 
     #[test]
     fn boundary_exactly_max_wait_is_stale() {
-        let db = temp_db("detect-boundary-exact");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-boundary-exact");
 
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage.close_batch_at(&mut head, 100).expect("close batch");
 
-        storage
-            .append_safe_inputs(
-                1300,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 100),
-                    block_number: 1300,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append safe input");
+        storage.land(1300, &[(SENDER_A, make_stale_batch_payload(0, 100))]);
         let invalidated = storage.recover_post_flush(1200).expect("detect");
         assert_eq!(invalidated, vec![0, 1], "exactly at max_wait must be stale");
         assert_eq!(storage.open_state().expect("load").unwrap().batch_index, 2);
@@ -1908,8 +1549,7 @@ mod boundary {
 
     #[test]
     fn boundary_one_below_max_wait_is_not_stale() {
-        let db = temp_db("detect-boundary-one-below");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-boundary-one-below");
 
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
@@ -1917,18 +1557,7 @@ mod boundary {
         storage.close_batch_at(&mut head, 100).expect("close batch");
 
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                1299,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: landed,
-                    block_number: 1299,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append safe input");
+        storage.land(1299, &[(SENDER_A, landed)]);
         let invalidated = storage.recover_post_flush(1200).expect("detect");
         assert!(
             invalidated.is_empty(),
@@ -1938,8 +1567,7 @@ mod boundary {
 
     #[test]
     fn all_batches_invalidated_frontier_zero() {
-        let db = temp_db("detect-frontier-zero");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-frontier-zero");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1948,18 +1576,7 @@ mod boundary {
             storage.close_batch_at(&mut head, 10).expect("close");
         }
 
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let inv = storage.recover_post_flush(1200).expect("detect");
         assert_eq!(inv, vec![0, 1, 2, 3]);
         assert!(storage.open_state().expect("open").is_some());
@@ -1967,26 +1584,14 @@ mod boundary {
 
     #[test]
     fn recovery_batch_itself_becomes_stale() {
-        let db = temp_db("detect-recovery-stale");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-recovery-stale");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage.close_batch_at(&mut head, 10).expect("close");
 
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append gen1");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]); // append gen1
         let inv1 = storage.recover_post_flush(1200).expect("recover gen1");
         assert_eq!(inv1, vec![0, 1]);
 
@@ -1995,18 +1600,7 @@ mod boundary {
             .close_batch_at(&mut head2, 1210)
             .expect("close gen2");
 
-        storage
-            .append_safe_inputs(
-                2410,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 1210),
-                    block_number: 2410,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append gen2");
+        storage.land(2410, &[(SENDER_A, make_stale_batch_payload(0, 1210))]); // append gen2
         let inv2 = storage.recover_post_flush(1200).expect("recover gen2");
         assert_eq!(inv2, vec![2, 3]);
         assert!(storage.open_state().expect("open").is_some());
@@ -2014,43 +1608,20 @@ mod boundary {
 
     #[test]
     fn multi_round_gen3_recovery() {
-        let db = temp_db("detect-gen3");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-gen3");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("init");
         storage.close_batch_at(&mut head, 10).expect("close");
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         storage.recover_post_flush(1200).expect("recover gen1");
 
         let mut head2 = storage.open_state().expect("load").unwrap();
         storage
             .close_batch_at(&mut head2, 1210)
             .expect("close gen2");
-        storage
-            .append_safe_inputs(
-                2410,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 1210),
-                    block_number: 2410,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append gen2");
+        storage.land(2410, &[(SENDER_A, make_stale_batch_payload(0, 1210))]); // append gen2
         storage.recover_post_flush(1200).expect("recover gen2");
 
         let mut head3 = storage.open_state().expect("load").unwrap();
@@ -2058,26 +1629,14 @@ mod boundary {
             .close_batch_at(&mut head3, 2410)
             .expect("close gen3");
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                2420,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: landed,
-                    block_number: 2420,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append gen3");
+        storage.land(2420, &[(SENDER_A, landed)]); // append gen3
         let inv3 = storage.recover_post_flush(1200).expect("recover gen3");
         assert!(inv3.is_empty(), "gen3 should be healthy");
     }
 
     #[test]
     fn large_cascade_50_batches() {
-        let db = temp_db("detect-large-cascade");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let (_db, mut storage) = open_temp_storage("detect-large-cascade");
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -2086,18 +1645,7 @@ mod boundary {
             storage.close_batch_at(&mut head, 10).expect("close");
         }
 
-        storage
-            .append_safe_inputs(
-                1210,
-                &[StoredSafeInput {
-                    sender: SENDER_A,
-                    payload: make_stale_batch_payload(0, 10),
-                    block_number: 1210,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append");
+        storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let inv = storage.recover_post_flush(1200).expect("detect");
         assert_eq!(inv.len(), 51);
     }
@@ -2216,9 +1764,7 @@ mod tree_invariants {
         // cascades (ancestor survives), cascades across accepted frontier,
         // torn cascades (no valid ancestor), and back-to-back generations.
         // Asserts tree invariants after each step.
-        let db = temp_db("tree-invariants-workload");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let batch_submitter = SENDER_A;
+        let (_db, mut storage) = open_temp_storage("tree-invariants-workload");
 
         // Phase 1: genesis + 4 rotations. Simple chain.
         let mut head = storage
@@ -2233,21 +1779,8 @@ mod tree_invariants {
 
         // Phase 2: cascade with a valid ancestor. Batch 0 is accepted first.
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                20,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: landed,
-                    block_number: 20,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append accepted");
-        storage
-            .append_safe_inputs(1400, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance past threshold");
+        storage.land(20, &[(SENDER_A, landed)]); // append accepted
+        storage.advance_safe_head(1400); // advance past threshold
         let inv = storage.recover_post_flush(1200).expect("recover");
         assert!(!inv.is_empty(), "partial cascade should invalidate");
         assert_tree_invariants(&mut storage);
@@ -2280,9 +1813,7 @@ mod tree_invariants {
         // cascade queries use `batch_index >= N` as a shortcut for
         // "subtree rooted at N". This test asserts the equivalence on a
         // realistic scenario with multiple cascade generations.
-        let db = temp_db("subtree-equivalence");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let batch_submitter = SENDER_A;
+        let (_db, mut storage) = open_temp_storage("subtree-equivalence");
 
         // Build: 5 batches, cascade from 2 (partial), 3 more, cascade from 1 (torn-ish).
         let mut head = storage
@@ -2292,21 +1823,8 @@ mod tree_invariants {
             storage.close_batch_at(&mut head, 100).expect("close");
         }
         let landed = local_batch_payload(&mut storage, 0);
-        storage
-            .append_safe_inputs(
-                20,
-                &[StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: landed,
-                    block_number: 20,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("append accepted");
-        storage
-            .append_safe_inputs(1400, &[], SENDER_A, &default_protocol_timing())
-            .expect("advance");
+        storage.land(20, &[(SENDER_A, landed)]); // append accepted
+        storage.advance_safe_head(1400); // advance
         let _ = storage.recover_post_flush(1200).expect("cascade 1");
 
         let mut head = storage.open_state().expect("load").unwrap();
@@ -2396,8 +1914,7 @@ mod recovery_snapshot_selection {
 
     #[test]
     fn cascade_hides_every_doomed_snapshot_and_retains_baseline() {
-        let db = temp_db("recovery-baseline-fallback");
-        let mut storage = Storage::open(&db.path).expect("open");
+        let (_db, mut storage) = open_temp_storage("recovery-baseline-fallback");
         let baseline_id = baseline(&mut storage);
         seed_closed_batches(&mut storage, 3);
         for index in 0..3 {
@@ -2407,9 +1924,7 @@ mod recovery_snapshot_selection {
             storage.latest_snapshot().unwrap().unwrap().dump.id,
             baseline_id
         );
-        storage
-            .append_safe_inputs(1500, &[], SENDER_A, &default_protocol_timing())
-            .expect("safe head");
+        storage.advance_safe_head(1500); // safe head
         assert_eq!(
             storage.recover_post_flush(1200).expect("cascade"),
             vec![0, 1, 2, 3]
@@ -2432,8 +1947,7 @@ mod recovery_snapshot_selection {
 
     #[test]
     fn accepted_snapshot_survives_cascade_after_baseline_gc_and_restart() {
-        let db = temp_db("recovery-accepted-fallback");
-        let mut storage = Storage::open(&db.path).expect("open");
+        let (db, mut storage) = open_temp_storage("recovery-accepted-fallback");
         let baseline_id = baseline(&mut storage);
         seed_closed_batches(&mut storage, 2);
         let accepted_id = batch_snapshot(&mut storage, 0);
@@ -2486,8 +2000,7 @@ mod recovery_snapshot_selection {
 
     #[test]
     fn an_optimistic_snapshot_alone_does_not_admit_recovery() {
-        let db = temp_db("recovery-optimistic-is-not-fallback");
-        let mut storage = Storage::open(&db.path).expect("open");
+        let (_db, mut storage) = open_temp_storage("recovery-optimistic-is-not-fallback");
         seed_closed_batches(&mut storage, 1);
         batch_snapshot(&mut storage, 0);
         let protocol = default_protocol_timing();

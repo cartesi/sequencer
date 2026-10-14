@@ -205,13 +205,18 @@ pub(crate) fn record_canonical_divergence(
         .expect("record canonical divergence");
 }
 
-/// Exercise the same frame-advance-before-close sequence as the live lane.
+/// Recovery-test plumbing over [`Storage`]. `land` and `advance_safe_head`
+/// append through the production path with [`SENDER_A`] as the submitter and
+/// default timing; every input lands at `safe_block`.
 pub(crate) trait RecoveryFixture {
+    /// Exercise the same frame-advance-before-close sequence as the live lane.
     fn close_batch_at(
         &mut self,
         head: &mut crate::storage::WriteHead,
         safe_block: u64,
     ) -> rusqlite::Result<()>;
+    fn land(&mut self, safe_block: u64, inputs: &[(Address, Vec<u8>)]);
+    fn advance_safe_head(&mut self, safe_block: u64);
 }
 impl RecoveryFixture for Storage {
     fn close_batch_at(
@@ -236,4 +241,31 @@ impl RecoveryFixture for Storage {
         }
         self.close_frame_and_batch(head, safe_block)
     }
+
+    #[track_caller]
+    fn land(&mut self, safe_block: u64, inputs: &[(Address, Vec<u8>)]) {
+        let inputs: Vec<StoredSafeInput> = inputs
+            .iter()
+            .map(|(sender, payload)| StoredSafeInput {
+                sender: *sender,
+                payload: payload.clone(),
+                block_number: safe_block,
+            })
+            .collect();
+        self.append_safe_inputs(safe_block, &inputs, SENDER_A, &default_protocol_timing())
+            .expect("append safe inputs");
+    }
+
+    #[track_caller]
+    fn advance_safe_head(&mut self, safe_block: u64) {
+        self.land(safe_block, &[]);
+    }
+}
+
+/// A storage over a fresh pinned database. Bind the [`TestDb`] as `_db`, never
+/// `_`: dropping it deletes the directory under the open connection.
+pub(crate) fn open_temp_storage(name: &str) -> (TestDb, Storage) {
+    let db = temp_db_with_default_deployment_identity(name);
+    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    (db, storage)
 }
