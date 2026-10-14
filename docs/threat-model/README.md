@@ -17,17 +17,92 @@ What we are protecting:
 
 | Actor | Trust | Capabilities |
 |-------|-------|--------------|
-| InputBox contract | Trusted | Authenticates `msg_sender` on `addInput`. Must be rollups-contracts **v3+**: the reader anchors its scan at the application's deployment block, sound only because the v3 InputBox reverts `addInput` for not-yet-deployed apps. Bootstrap witnesses this via `version()` and refuses pre-v3 boxes, and setup pins the deployment block only once it is at or below a safe head sampled before it was read, so no reorg can move the floor. Use correctly; do not model forgery. |
-| Our Ethereum node | Trusted, fail-stop | Inside our infra. May become unreachable; will never lie. |
-| RPC endpoint (`CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`) | Trusted, fail-stop — **must be one consistent node** | The code supports exactly **one** endpoint, shared by reader, submitter, poster, flusher, and fee oracle; no fallback tier exists yet. Behind a load-balanced fleet, lagging replicas can silently truncate `get_logs` ranges and desynchronize the flush/re-sync views. The reader fails loud on an incomplete InputAdded set: a per-app index contiguity check (right prefix) plus a `getNumberOfInputs` count witness pinned at the scanned safe block (complete prefix), so a dropped/clamped/truncated-tail input is detected before the safe head advances rather than silently skipped, and recovery refuses if the re-sync lags the flush view. (The count witness is fetched before the scan; when it matches the stored input count the reader advances the safe head without a `get_logs` crawl — same trust base, since a fail-stop node's pinned-block count cannot understate without lying.) Each ingested input's `EvmAdvance` chain id and application must also match the pinned identity, while the chain id itself is verified once per reader process; a mid-life chain swap behind the same URL that advances the head only through the count-equality skip is an accepted residual. The residual fleet exposure is a node that lies *consistently* about both its logs and its input count — outside the fail-stop model. A semi-trusted fallback tier (Infura/Alchemy) is future work. |
-| Operator env / CLI flags | Trusted, **mistakes foot-gun-guarded** | Setup configuration is authoritative — including the reviewed Uniswap V3 WETH/fee-token pool the fee oracle quotes. The complete source is pinned in deployment identity; run cannot replace it. The operator is trusted, not infallible: the supported operator-mistake class is *accidental concurrent or stale use of one data directory* — two processes on one dir (kernel process lock), a mistyped `--data-dir` (open refuses paths with no database). Deliberate operator subversion, copied-directory coordination, and distributed fencing remain out of scope (the lock is a cheap local foot-gun guard, not distributed fencing — [ADR mechanism 1](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership)); mechanisms defending this class are judged against this boundary rather than re-litigated per review. |
-| Uniswap V3 pool (fee oracle) | Semi-trusted L1 state | Spot manipulation of a deep pool is mitigated by a 30-minute TWAP plus 10× slack in `batch_policy.log_slack`. Residual risks: TWAP lag during real moves and thin/wrong pool misconfiguration. Multi-hop pricing is out of scope. Setup writes the first Uniswap quote under the same hard L1 requirement as the rest of setup; a failed quote leaves setup incomplete. `run` does not gate recovery or admission on another quote: it starts from the persisted `batch_policy.log_gas_price`, constructs the source from setup-validated identity without RPC, and launches a refresher that logs/retries transient quote failures indefinitely while retaining that price. `log_gas_price_updated_at_ms` records successful observation for telemetry; it is not an expiry gate. A shared-endpoint outage or stale view is already caught by safe-head progress, while a pool/`observe`-specific failure with a healthy input reader is accepted as an unbounded economic residual: stale-low pricing can subsidize DA/weaken the fee spam barrier and stale-high pricing can reject users, but neither changes canonical execution because the frame's persisted fee is immutable and enforced by both sides. The 10× slack is a margin, not a proof against arbitrary market movement. Deterministic setup-time source misconfiguration (`WrongTokenPair`, `MissingPoolCode`, chain-id mismatch), a TWAP tick outside the Uniswap range, and persistent storage faults remain terminal; a price above the representable range saturates at `MAX_EXPONENT`. |
-| Batch-submitter private key | Private | Held in operator infra. Not reachable by the network. |
-| Sequencer's own code | Trusted during normal operation | Tests/review prevent bugs; runtime invariant checks fail loud. Bugs require diagnosis and correction, followed by an operator rebuild if local state cannot be trusted. See "self-trust" below. |
-| **L1 mempool and block builders** | **Fully adversarial** | May reorder, delay, drop, or selectively include submitted transactions. Private mempools mean "dropped" is indistinguishable from "delayed indefinitely." |
-| HTTP clients at `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` | Untrusted | Arbitrary public callers. May submit malformed, malicious, or replay payloads. The `GET` routes are intentional public reads: the open-frame fee, the signing domain, and any sender's soft-confirmed nonce. The nonce is a live per-address count of included ops, published before their batches reach L1 (up to `max_batch_open`, 2 h by default); only the egress feed carries it otherwise. It reveals activity timing, not op contents, and moves only after the op is sequenced, so a watcher cannot front-run the op it counts. |
-| WebSocket subscribers at `/ws/subscribe` | Internal, but untrusted for data-exposure | Intended for internal indexers. Treat as public for what is exposed. |
-| Direct-input senders on L1 | Untrusted | Arbitrary L1 accounts calling InputBox. May submit any calldata. |
+| InputBox contract | Trusted | Authenticates `msg_sender` on `addInput`; must be rollups-contracts v3+ ([InputBox version](#inputbox-version)). |
+| Our Ethereum node | Trusted, fail-stop | Inside our infra; may become unreachable but never lies. |
+| RPC endpoint (`CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`) | Trusted, fail-stop — **must be one consistent node** | One endpoint serves every L1 client, with no fallback tier ([RPC endpoint](#rpc-endpoint)). |
+| Operator env / CLI flags | Trusted, **mistakes foot-gun-guarded** | Setup configuration, including the reviewed fee-oracle pool, is authoritative ([Operator mistakes](#operator-mistakes)). |
+| Uniswap V3 pool (fee oracle) | Semi-trusted L1 state | Prices L1 gas in the fee token; a stale or skewed price is an accepted economic risk ([Fee oracle](#fee-oracle)). |
+| Batch-submitter private key | Private | Held in operator infra, out of the network's reach. |
+| Sequencer's own code | Trusted during normal operation | Tests and review prevent bugs; runtime invariant checks fail loud ([Self-trust](#self-trust)). |
+| **L1 mempool and block builders** | **Fully adversarial** | May reorder, delay, drop, or selectively include submitted transactions; with private mempools, "dropped" is indistinguishable from "delayed indefinitely". |
+| HTTP clients at `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` | Untrusted | Arbitrary public callers that may submit malformed, malicious, or replay payloads; the `GET` routes are [public reads](#public-reads). |
+| WebSocket subscribers at `/ws/subscribe` | Internal, but untrusted for data-exposure | Intended for internal indexers; treat as public for what is exposed. |
+| Direct-input senders on L1 | Untrusted | Arbitrary L1 accounts calling InputBox with any calldata. |
+
+### InputBox version
+
+The reader's scan starts at the application's deployment block. That is sound
+only because a v3 InputBox reverts `addInput` for an application that does not
+exist yet; bootstrap checks `version()` and refuses an older box. Setup pins
+the block only once it is at or below a safe head sampled before the read, so
+no reorg can move the floor. Do not model InputBox forgery.
+
+### RPC endpoint
+
+The code supports exactly one endpoint, shared by the reader, submitter,
+poster, flusher, and fee oracle. Behind a load-balanced fleet, lagging replicas
+can silently truncate `get_logs` ranges and desynchronize the flush and re-sync
+views; recovery refuses if the re-sync lags the flush view.
+
+The reader fails loud on an incomplete `InputAdded` set
+([I6](../invariants.md#i6-the-frame-clock-accounts-for-a-complete-l1-interval)):
+index contiguity proves the right prefix, and the InputBox count pinned at the
+scanned safe block proves it complete. When that count equals the stored count,
+the reader advances without a `get_logs` crawl; a fail-stop node's pinned-block
+count cannot understate without lying.
+
+Each ingested input's `EvmAdvance` chain id and application must match the
+pinned identity; the endpoint's chain id is checked once per reader process.
+Two residuals are accepted: a mid-life chain swap behind the same URL that
+advances the head only through the count-equality skip, and a node that lies
+consistently about both its logs and its input count, outside the fail-stop
+model. A semi-trusted fallback tier (Infura/Alchemy) is future work;
+[L1 chain semantics](#l1-chain-semantics) says what to pin before adopting one.
+
+### Operator mistakes
+
+The operator is trusted, not infallible. The complete fee-oracle source is
+pinned in deployment identity, and `run` cannot replace it. The supported
+mistake class is accidental concurrent or stale use of one data directory: two
+processes on one directory (a kernel process lock) or a mistyped `--data-dir`
+(open refuses a path with no database). Deliberate subversion,
+copied-directory coordination, and distributed fencing are out of scope; the
+lock is a local foot-gun guard
+([ADR mechanism 1](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership)).
+Judge mechanisms for this class against this boundary.
+
+### Fee oracle
+
+A TWAP (30 minutes by default, pinned at setup) and the tenfold margin in
+`batch_policy.log_slack` ([formula](../../sequencer/src/storage/migrations/0001_schema.sql))
+mitigate spot manipulation of a deep pool. The margin does not bound arbitrary
+market movement. Residual risks are TWAP lag during real moves and a thin or
+wrong pool; multi-hop pricing is out of scope.
+
+Setup writes the first quote under the same hard L1 requirement as the rest of
+setup. `run` gates neither recovery nor admission on another quote: it starts
+from the persisted `log_gas_price`, builds the source from the pinned identity
+without RPC, and refreshes in the background, retrying transient failures
+indefinitely and keeping the last price. `log_gas_price_updated_at_ms` is
+telemetry, not an expiry gate.
+
+A shared-endpoint outage or stale view is already caught by safe-head progress.
+A pool-specific failure with a healthy reader is an accepted, unbounded economic
+risk: a stale-low price subsidizes DA and weakens the spam barrier, and a
+stale-high price rejects users. Neither changes canonical execution, because
+the frame's persisted fee is immutable and enforced by both sides. Setup-time
+source misconfiguration (`WrongTokenPair`, `MissingPoolCode`, chain-id
+mismatch), a TWAP tick outside the Uniswap range, and persistent storage faults
+are terminal; a price above the representable range saturates at `MAX_EXPONENT`.
+
+### Public reads
+
+The `GET` routes are intentional public reads: the open-frame fee, the signing
+domain, and any sender's soft-confirmed nonce. The nonce counts a sender's
+included ops before their batches reach L1 (up to `max_batch_open`, 2 h by
+default); otherwise only the egress feed carries it. It reveals activity
+timing, not op contents, and moves only after the op is sequenced, so a watcher
+cannot front-run the op it counts.
 
 ### Self-trust
 
