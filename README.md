@@ -513,45 +513,22 @@ They do not certify L1 freshness, submitter balance, or canonical agreement.
 
 ## Project Layout
 
-- `sequencer/src/lib.rs`: public crate surface (`run`, `RunConfig`) — the sequencer is a library; app crates build the binary (see `examples/wallet-sequencer/`)
-- `examples/wallet-sequencer/`: binary crate composing the sequencer library with the placeholder wallet app
-- `sequencer/src/http.rs`: shared HTTP error type, JSON error shape, and `axum::serve` orchestration
-- `sequencer/src/runtime/`: process lock and shutdown scope; command bootstrap and config live in `commands/`, the shared clock in `clock.rs`, and EIP-712 domain construction in `sequencer-core/`
-- `sequencer/src/ingress/`: public-facing — `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` (`api.rs`) and the inclusion lane (`inclusion_lane/`: hot-path loop, chunk/frame/batch rotation, catch-up, snapshot lifecycle)
-- `sequencer/src/egress/`: internal read path — WS subscribe + health probes (`api/`) and the DB-backed ordered-L2Tx feed (`l2_tx_feed/`)
-- `sequencer/src/l1/`: L1 client surface — input reader, batch submitter, fee oracle, shared EIP-1559 estimation, provider, partition helper
-- `sequencer/src/recovery/`: preemptive recovery startup, runtime danger detector, mempool flusher
-- `sequencer/src/storage/`: schema, migrations, SQLite persistence (split per writer role), and replay reads
-- `sequencer-core/src/`: shared domain types and interfaces (`Application`, `SignedUserOp`, `SequencedL2Tx`, feed message types)
-- `examples/app-core/src/`: wallet prototype implementing `Application`
-- [`bindings/c-app-engine/`](bindings/c-app-engine/README.md): reusable C ABI adapter and external static-archive integration guide
-- `bindings/c-app-sequencer/`: optional C-engine CLI host and external-archive binary
-- `examples/c-wallet-engine/`: reference wallet C ABI exports, genesis tool, and conformance tests
-- `examples/c-wallet-sequencer/`: binary composing the C-engine host with the reference wallet engine
-- `tests/benchmarks/`: benchmark harnesses and benchmark spec
+The sequencer is a library: an application crate composes it with its
+`Application` implementation into a binary, as
+[`examples/wallet-sequencer/`](examples/wallet-sequencer/) does with the
+placeholder wallet in [`examples/app-core/`](examples/app-core/). Native engines
+bind through the [C ABI adapter](bindings/c-app-engine/README.md). The
+[architecture map](AGENTS.md#architecture-map) covers the workspace and the
+sequencer's modules.
 
-Related docs:
-
-- C application binding: [`docs/protocol/c-application-binding.md`](docs/protocol/c-application-binding.md)
-- App snapshots (format + lifecycle): `docs/snapshots/`
-- Watchdog — local dev: [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md); Sepolia/mainnet: [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md)
-
-The watchdog ships as a multi-arch container image per release tag `vX`:
-
-```bash
-docker pull ghcr.io/cartesi/sequencer-watchdog:vX
-# mirror: docker.io/cartesi/sequencer-watchdog:vX
-```
+The watchdog ships as a multi-arch container image per release tag; the
+[operator deployment guide](docs/watchdog/operator-deployment.md) gives the
+image names and how to run it.
 
 ## Prototype Limits
 
 - The `Application` trait defines dump/load behavior ([format](docs/snapshots/format.md)). Every batch close registers a durable snapshot atomically with the seal. Restart restores the latest valid snapshot and replays application inputs from its count. Acceptance determines the recovery checkpoint and garbage-collection frontier without mutating artifact metadata. [Snapshot lifecycle](docs/snapshots/lifecycle.md) documents leases and crash ordering.
 - Schema and migrations are still in prototype mode and may change.
-
-## Local Test Prerequisites
-
-- Some `sequencer` tests spin up `Anvil`; install Foundry locally if you want the full test suite:
-- Self-contained benchmarks also spawn `Anvil` from a preloaded rollups state dump.
 
 ## Development
 
@@ -562,18 +539,9 @@ validation for a change; some tests require Anvil or libslirp.
 
 ## Further Reading
 
-- [`AGENTS.md`](AGENTS.md) — developer guide: architecture, conventions, duality, recovery, invariants, rules.
-- [`CLAUDE.md`](CLAUDE.md) — Claude entrypoint to the shared agent guide.
-- [`docs/threat-model/README.md`](docs/threat-model/README.md) — trust boundaries, in-scope and out-of-scope threats.
-- [`docs/recovery/README.md`](docs/recovery/README.md) — automatic recovery, TLA+ formal verification, design history.
-- [`docs/recovery/cockroach.md`](docs/recovery/cockroach.md) — manual rebuild after lost state or a sequencer bug.
-- [Application history and replay](docs/protocol/application-history.md) — progress, history identity, and replica bootstrap/resume.
-- [Snapshots](docs/snapshots/README.md) — engine checkpoints, lifecycle, accepted comparison, and wallet encoding.
-- [`docs/watchdog/getting-started.md`](docs/watchdog/getting-started.md) — step-by-step: run the watchdog with a local sequencer.
-- [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md) — watchdog on live L1 (Sepolia staging, mainnet production).
-- [`docs/watchdog/README.md`](docs/watchdog/README.md) — watchdog architecture, modules, and test commands.
-- [`sequencer-core/`](sequencer-core/) — shared domain types (`Application`, `SignedUserOp`, `Batch`, `Frame`).
-- [`examples/app-core/`](examples/app-core/) — placeholder wallet app implementing the `Application` trait.
+[`AGENTS.md`](AGENTS.md) is the developer guide: architecture, conventions, and
+rules. Its [Reading Routes](AGENTS.md#reading-routes) name the document that
+owns each contract.
 
 ## License
 

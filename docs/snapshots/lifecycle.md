@@ -4,6 +4,12 @@ Snapshots preserve application state at a declared execution boundary. Their
 contents and boundary are immutable. L1 acceptance is a separate durable fact:
 there is no promotion operation and no mutable finalized pointer.
 
+Keep three boundaries separate: the engine embeds its executed-input count and
+safe-block clock; SQLite associates an artifact with a local batch or era
+baseline; safe L1 acceptance selects a comparison checkpoint. Counts and clocks
+alone do not establish acceptance. The [history guide](../protocol/application-history.md)
+explains these coordinates.
+
 ## Artifact and boundary
 
 Every artifact is a sequencer-owned directory:
