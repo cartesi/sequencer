@@ -134,7 +134,7 @@ pub(super) fn populate_safe_accepted_batches(
     timing: &ProtocolTiming,
 ) -> Result<()> {
     const PAGE_SIZE: i64 = 256;
-    const SELECT_SQL: &str = "SELECT safe_input_index, payload, block_number \
+    const SELECT_SQL: &str = "SELECT safe_input_index, payload, block_number, transaction_hash \
                               FROM safe_inputs \
                               WHERE sender = ?1 AND safe_input_index > ?2 \
                                 AND block_number > ?3 \
@@ -190,7 +190,7 @@ pub(super) fn populate_safe_accepted_batches(
         // iterator borrows the prepared statement, so we can't INSERT on the
         // same connection while iterating. Once the page is collected and the
         // statement is dropped, the connection is free for inserts.
-        let page: Vec<(i64, Vec<u8>, i64)> = {
+        let page: Vec<(i64, Vec<u8>, i64, Vec<u8>)> = {
             let mut stmt = conn.prepare_cached(SELECT_SQL)?;
             stmt.query_map(
                 params![
@@ -199,7 +199,7 @@ pub(super) fn populate_safe_accepted_batches(
                     base_safe_block,
                     PAGE_SIZE
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?
             .collect::<Result<_>>()?
         };
@@ -210,7 +210,7 @@ pub(super) fn populate_safe_accepted_batches(
         let page_len = page.len() as i64;
 
         let mut insert_stmt = conn.prepare_cached(INSERT_SQL)?;
-        for (safe_input_index, payload, block_number) in &page {
+        for (safe_input_index, payload, block_number, transaction_hash) in &page {
             cursor = *safe_input_index;
             let input = SafeInputView {
                 safe_input_index: i64_to_u64(*safe_input_index),
@@ -226,12 +226,18 @@ pub(super) fn populate_safe_accepted_batches(
             // exactly here, where the simulated scheduler accepted the
             // landing. Rejected/stale/undecodable copies are scheduler
             // no-ops; their content is irrelevant by construction.
-            if let Some(kind) = content_identity_violation(conn, &accepted, payload.as_slice())? {
+            if let Some((kind, our_payload_hash)) =
+                content_identity_violation(conn, &accepted, payload.as_slice())?
+            {
                 record_canonical_divergence_in(conn, &accepted, kind)?;
                 tracing::error!(
                     nonce = accepted.nonce,
                     safe_input_index = accepted.safe_input_index,
                     kind = kind.as_str(),
+                    transaction_hash = %alloy_primitives::hex::encode_prefixed(transaction_hash),
+                    landed_payload_hash = %alloy_primitives::keccak256(payload),
+                    our_payload_hash = %our_payload_hash
+                        .map_or_else(|| "none".to_owned(), alloy_primitives::hex::encode_prefixed),
                     "CANONICAL DIVERGENCE: accepted L1 landing does not match \
                      our batch at this nonce; freezing the acceptance frontier \
                      — remedy is cockroach recovery (wipe + rebuild from L1)"
@@ -287,7 +293,7 @@ impl DivergenceKind {
 
 /// Content-identity check proper: compare a fully-accepted landing against
 /// our valid closed batch at the same nonce. `None` = identical (the normal
-/// case).
+/// case); a mismatch also returns our payload hash.
 ///
 /// Why content (not identity) suffices: accepted content-equal copies are
 /// effect-equal — which physical tx landed carries no semantic weight. The
@@ -297,7 +303,7 @@ fn content_identity_violation(
     conn: &Connection,
     accepted: &AcceptedBatch,
     landed_payload: &[u8],
-) -> Result<Option<DivergenceKind>> {
+) -> Result<Option<(DivergenceKind, Option<Vec<u8>>)>> {
     let ours: Option<Option<Vec<u8>>> = conn
         .query_row(
             "SELECT payload_hash FROM valid_closed_batches WHERE nonce = ?1",
@@ -306,7 +312,7 @@ fn content_identity_violation(
         )
         .optional()?;
     match ours {
-        None => Ok(Some(DivergenceKind::Foreign)),
+        None => Ok(Some((DivergenceKind::Foreign, None))),
         Some(None) => {
             // Sealed batches always carry a hash (stamped in the seal
             // UPDATE); a NULL here is an impossible state — fail loud.
@@ -328,7 +334,7 @@ fn content_identity_violation(
             if hash.as_slice() == landed.as_slice() {
                 Ok(None)
             } else {
-                Ok(Some(DivergenceKind::Mismatch))
+                Ok(Some((DivergenceKind::Mismatch, Some(hash))))
             }
         }
     }
