@@ -571,6 +571,8 @@ END;
 --   log_batch_size_target = log_base_gas - log_alpha - log_delta
 --   batch_size_target = base_gas / (alpha * delta). The inclusion lane converts
 --   to linear bytes via fee_to_linear() for its byte-count comparison.
+--   InputBox gas ≈ base_gas + delta × payload bytes; each op pays
+--   (1 + alpha) × delta per byte, so alpha × delta × batch_size_target = base_gas.
 --
 -- Batch size invariant (CHECK):
 --   log_base_gas - log_alpha - log_delta < log_max_batch_bytes
@@ -589,8 +591,7 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     -- Unix-ms of the last successful oracle (or Fixed setup) write.
     -- 0 means never written; completed setup guarantees a nonzero observation.
     log_gas_price_updated_at_ms INTEGER NOT NULL CHECK (log_gas_price_updated_at_ms >= 0),
-    -- log_{129/128}(10) = 296, rounded to the nearest exponent.
-    -- This tenfold price slack is applied in log space, not in the oracle.
+    -- log_{129/128}(10) = 296: the tenfold price slack (see the header).
     log_slack                INTEGER NOT NULL CHECK (log_slack >= 0),
 
     -- Constants (log-space):
@@ -633,7 +634,7 @@ VALUES (
 -- Derived view for reads. All outputs are log-space exponents (base 129/128).
 CREATE VIEW IF NOT EXISTS batch_policy_derived AS
 SELECT *,
-    -- Fee per user-op byte.
+    -- Fee per user op.
     log_gas_price + log_slack + log_one_plus_alpha + log_delta + log_user_op_bytes
         AS log_recommended_fee,
     -- Batch size target in log-space (convert via fee_to_linear for bytes).
