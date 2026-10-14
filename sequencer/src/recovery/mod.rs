@@ -430,38 +430,16 @@ fn classify_signer_provider(
     }
 }
 
-/// Input-reader errors met during the startup phases (`InitialSync` and
-/// `PostFlushSync`, both through `sync_to_current_safe_head`), classified
-/// at birth. `ChainIdMismatch` and `StorageTaskPanicked` are refused here
-/// and terminal in the live worker alike. Two variants are phase-dependent
-/// by design and differ from `InputReaderError::is_terminal_invariant`:
-///
-/// - `Bootstrap` here can only be the sync's `create_provider` failing on
-///   the configured RPC URL (parse, the plaintext-remote rule, client
-///   build), refused because re-running the same boot re-fails
-///   identically. The discovery-time facts (wrong contract, pre-v3
-///   InputBox) never reach this function: they arise in `InputReader::new`,
-///   which only `setup` calls and currently projects as a live-worker exit
-///   rather than a deterministic configuration failure. In the live loop the
-///   same URL was already proven by this boot's initial sync, so a live
-///   `Bootstrap` restarts unclassified rather than poisoning the data directory.
-/// - `Join` (a non-panic loss of a storage task) is shutdown-path
-///   cancellation in the live loop. During startup the runtime that would
-///   cancel it is the one driving this boot, so an unexplained loss is
-///   refused rather than retried blind.
-///
-/// Both halves are pinned.
+/// Input-reader errors met during the startup phases, classified at birth by
+/// [`InputReaderError::is_retryable_at_startup`]; storage keeps its provenance.
 fn classify_input_reader(error: InputReaderError) -> RecoveryError {
     match error {
-        error @ (InputReaderError::Provider(_) | InputReaderError::InconsistentL1Response(_)) => {
-            RecoveryError::retry(RecoveryFailure::InputReader(error))
-        }
         InputReaderError::OpenStorage(source) => classify_open(source),
         InputReaderError::Storage(source) => classify_storage(source),
-        error @ (InputReaderError::ChainIdMismatch { .. }
-        | InputReaderError::Bootstrap(_)
-        | InputReaderError::StorageTaskPanicked { .. }
-        | InputReaderError::Join(_)) => RecoveryError::refuse(RecoveryFailure::InputReader(error)),
+        error if error.is_retryable_at_startup() => {
+            RecoveryError::retry(RecoveryFailure::InputReader(error))
+        }
+        error => RecoveryError::refuse(RecoveryFailure::InputReader(error)),
     }
 }
 
@@ -534,6 +512,43 @@ mod tests {
             matches!(error, RecoveryError::Refuse(_)),
             "expected refusal, got {error:?}"
         );
+    }
+
+    /// The reader's predicate and the startup classifier agree on every
+    /// variant, including both storage polarities.
+    #[test]
+    fn startup_reader_polarity_has_one_owner() {
+        let busy = || sqlite_failure(rusqlite::ffi::ErrorCode::DatabaseBusy, 5);
+        let corrupt = || sqlite_failure(rusqlite::ffi::ErrorCode::NotADatabase, 26);
+        let errors: Vec<fn() -> InputReaderError> = vec![
+            || InputReaderError::Provider("offline".into()),
+            || InputReaderError::InconsistentL1Response("gap".into()),
+            || InputReaderError::ChainIdMismatch {
+                rpc: 1,
+                expected: 2,
+            },
+            || InputReaderError::Bootstrap("bad url".into()),
+            || InputReaderError::StorageTaskPanicked { operation: "sync" },
+            || InputReaderError::Join("lost".into()),
+        ];
+        let mut cases: Vec<InputReaderError> = errors.into_iter().map(|make| make()).collect();
+        cases.push(InputReaderError::Storage(busy()));
+        cases.push(InputReaderError::Storage(corrupt()));
+        cases.push(InputReaderError::OpenStorage(StorageOpenError::Sqlite(
+            busy(),
+        )));
+        cases.push(InputReaderError::OpenStorage(StorageOpenError::Sqlite(
+            corrupt(),
+        )));
+        for error in cases {
+            let expected = error.is_retryable_at_startup();
+            let description = error.to_string();
+            assert_eq!(
+                classify_input_reader(error).is_retryable(),
+                expected,
+                "{description}"
+            );
+        }
     }
 
     #[test]

@@ -99,6 +99,37 @@ impl InputReaderError {
             | Self::Join(_) => false,
         }
     }
+
+    /// Whether a failure in a startup sync (`InitialSync` and `PostFlushSync`,
+    /// both through `sync_to_current_safe_head`) is worth retrying.
+    /// `ChainIdMismatch` and `StorageTaskPanicked` are refused at startup and
+    /// terminal in the live worker alike. Two variants are phase-dependent by
+    /// design and differ from [`Self::is_terminal_invariant`]:
+    ///
+    /// - `Bootstrap` at startup can only be the sync's `create_provider`
+    ///   failing on the configured RPC URL (parse, the plaintext-remote rule,
+    ///   client build), refused because re-running the same boot re-fails
+    ///   identically. The discovery-time facts (wrong contract, pre-v3
+    ///   InputBox) arise in `InputReader::new`, which only `setup` calls and
+    ///   currently projects as a live-worker exit rather than a deterministic
+    ///   configuration failure. In the live loop the same URL was already
+    ///   proven by this boot's initial sync, so a live `Bootstrap` restarts
+    ///   unclassified rather than poisoning the data directory.
+    /// - `Join` (a non-panic loss of a storage task) is shutdown-path
+    ///   cancellation in the live loop. During startup the runtime that would
+    ///   cancel it is the one driving this boot, so an unexplained loss is
+    ///   refused rather than retried blind.
+    pub(crate) fn is_retryable_at_startup(&self) -> bool {
+        match self {
+            Self::Provider(_) | Self::InconsistentL1Response(_) => true,
+            Self::OpenStorage(source) => !crate::storage::is_persistent_storage_open_error(source),
+            Self::Storage(source) => !crate::storage::is_persistent_storage_error(source),
+            Self::ChainIdMismatch { .. }
+            | Self::Bootstrap(_)
+            | Self::StorageTaskPanicked { .. }
+            | Self::Join(_) => false,
+        }
+    }
 }
 
 impl InputReaderError {
