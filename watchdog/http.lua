@@ -1,12 +1,10 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- HTTP client over the vendored lua-curl (`lcurl`). Requests return a
---- response table, or `nil, message` when no response arrived. The message
---- names the method, never the URL: the L1 RPC URL carries provider credentials.
----
---- Small requests share a total timeout. Downloads stream to a file and are
---- bounded by a stall limit instead, since their size is the application's.
+--- HTTP client over the vendored lua-curl (`lcurl`). Requests return a response
+--- table, or `nil, message` naming the method but never the URL, which carries
+--- the L1 provider's credentials. Small requests share a total timeout; downloads
+--- stream to a file under a stall limit, since their size is the application's.
 
 local http = {}
 

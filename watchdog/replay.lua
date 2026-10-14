@@ -3,9 +3,7 @@
 
 --- `replay`: re-derive canonical state from a trusted stored machine into a
 --- new directory, with the same executor and L1 reader as `tick`, and report
---- its digest. It never touches the state directory. Incident triage uses it
---- to check whether the canonical side is reproducible, and to produce a
---- canonical checkpoint at a chosen block for recovery.
+--- its digest. It never touches the state directory.
 
 local canonical = require("watchdog.canonical")
 local errors = require("watchdog.errors")

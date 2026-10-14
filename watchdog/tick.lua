@@ -2,23 +2,6 @@
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 --- One compare cycle (docs/watchdog/README.md#the-tick).
----
---- The replay target is the block the sequencer's digest describes, fetched
---- before replaying, so a long replay can never chase a moving target. The
---- head only advances past a block the sequencer agreed with; anything else
---- latches a divergence and returns its evidence.
----
---- The accepted block regresses only relative to a block the sequencer agreed
---- with. Until the first agreement the head is just the bootstrap machine, and
---- a sequencer behind it has not reached it yet.
----
---- A divergence latches before anything else, and the tick reports it even
---- when `incident/` cannot be created (`latch_error`) or only its record
---- cannot be written (`record_error`; the latch holds). Its evidence is
---- returned as `evidence`, for the caller to collect after it has signalled.
----
---- Outcomes: `latched` (already latched; no work), `idle` (nothing new),
---- `agreed` (head advanced), `diverged` (newly found). Failures raise.
 
 local canonical = require("watchdog.canonical")
 local errors = require("watchdog.errors")
@@ -27,7 +10,11 @@ local store_mod = require("watchdog.store")
 
 local tick = {}
 
---- `deps`: store, machine, sequencer, l1, now().
+--- `deps`: store, machine, sequencer, l1, now(). Returns `{ kind }`: `latched`
+--- (no work), `idle`, `agreed` (head advanced), or `diverged`, latched before
+--- anything else and reported even with `latch_error` (`incident/` not created)
+--- or `record_error` (only its record not written); its `evidence` is for the
+--- caller to collect after it has signalled. Failures raise.
 function tick.run(cfg, deps)
     local store, machine, sequencer = deps.store, deps.machine, deps.sequencer
 
@@ -54,7 +41,8 @@ function tick.run(cfg, deps)
         return { kind = "diverged", incident = event, record_error = record_error, evidence = evidence }
     end
 
-    --- Nothing to compare at `block`, or a regression.
+    --- Nothing to compare at `block`, or a regression. Only an agreed block can
+    --- regress; a sequencer behind the never-agreed bootstrap head has not reached it.
     local function behind(block)
         if block == head.block then
             return { kind = "idle", head = head }
@@ -68,6 +56,7 @@ function tick.run(cfg, deps)
     if polled <= head.block then
         return behind(polled)
     end
+    -- The target is fixed before replaying, so a long replay never chases a moving one.
     local target = sequencer:digest()
     if target.inclusion_block <= head.block then
         return behind(target.inclusion_block)

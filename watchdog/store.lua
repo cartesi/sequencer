@@ -1,24 +1,10 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- The watchdog state directory:
----
----     config.json                  deployment identity and state source (init)
----     checkpoints/<block>-<count>/ stored machines the sequencer agreed with;
----                                  the newest is the head
----     work/                        scratch for the running command
----     incident/                    the latched divergence and its evidence,
----                                  if any
----     incidents/<id>/              cleared incidents
----     last_tick.json, status.prom  the last tick's outcome
----
---- A checkpoint's name carries its L1 block and the number of InputBox inputs
---- through that block, and the machine layer publishes it with an atomic,
---- fsynced rename: the head needs no pointer file. JSON files are written
---- atomically but without fsync; each is either rebuilt by the next command
---- (a lost latch record still latches as `unreadable_marker`, a lost tick
---- record is rewritten) or written once by init, which is re-run after a
---- crash; `incident/evidence.json` is a best-effort index of the evidence.
+--- The watchdog state directory (docs/watchdog/README.md#state-directory). A
+--- checkpoint's name carries its L1 block and InputBox input count, and the
+--- machine layer publishes it with an atomic, fsynced rename, so the head needs
+--- no pointer file.
 
 local lfs = require("lfs")
 local errors = require("watchdog.errors")
@@ -83,8 +69,8 @@ local function read_file(path)
     return data
 end
 
---- Write `path` through `path.tmp` and a rename. A failed write removes the
---- partial file, so a full disk is not left fuller.
+--- Write `path` through `path.tmp` and a rename, without fsync. A failed write
+--- removes the partial file, so a full disk is not left fuller.
 function store.write_file_atomic(path, data)
     local tmp = path .. ".tmp"
     local file = assert(io.open(tmp, "wb"))

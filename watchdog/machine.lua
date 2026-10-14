@@ -2,10 +2,7 @@
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 --- The canonical Cartesi Machine, driven in-process with the reference rollup
---- host semantics (docs/cartesi-machine.md#rollup-host-semantics): every input
---- runs on a clone-backed snapshot of the working checkpoint; a rejected input
---- restores the snapshot; any stop other than an accept is a permanent fixed
---- point. Checkpoints are stored machine directories published with fsync.
+--- host semantics (docs/cartesi-machine.md#rollup-host-semantics).
 
 local errors = require("watchdog.errors")
 

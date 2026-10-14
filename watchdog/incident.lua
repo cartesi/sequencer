@@ -1,17 +1,10 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- The divergence latch. Latching creates `incident/` and writes the latch
---- record `incident/divergence.json`, and nothing else: the directory is the
---- latch, so a record lost to a crash or a full disk still latches (as
---- `unreadable_marker`). The tick then signals the divergence, and only then
---- collects evidence into `incident/`, each item on its own, with progress in
---- `incident/evidence.json`: a slow or failed collection can neither delay
---- nor undo the latch. While latched every tick exits 2 without work, until
---- an operator clears it with `clear`, which archives the incident instead of
---- deleting anything. Clearing is always safe: if the cause persists, the next
---- tick latches again. The incident runbook (docs/watchdog/incident-runbook.md)
---- owns the procedure.
+--- The divergence latch, its evidence, and `clear`
+--- (docs/watchdog/README.md#divergence-latch). The `incident/` directory is the
+--- latch; evidence is collected only after the tick has signalled, so a slow or
+--- failed collection can neither delay nor undo the latch.
 
 local lfs = require("lfs")
 local errors = require("watchdog.errors")
@@ -109,11 +102,8 @@ end
 ---                    sequencer's file, then kept as canonical.bin
 ---   machine          a stored machine directory, kept as incident/canonical
 ---   publish          function(from, to) that durably moves a stored machine
---- `incident/evidence.json` records each item as it ends: its path or result,
---- or `<item>_missing` with the reason. Its `collection` is `running`, then
---- `finished`; a latched tick marks a collection it finds `running` as
---- `interrupted`. Final file names are complete by construction (renames);
---- `*.tmp` files are partial. Never raises; returns the index.
+--- Records each item in `incident/evidence.json` as it ends
+--- (docs/watchdog/README.md#divergence-latch). Never raises; returns the index.
 function incident.collect(store, event, evidence)
     local index = { collection = "running" }
     local function save()

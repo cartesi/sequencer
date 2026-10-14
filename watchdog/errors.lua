@@ -1,16 +1,9 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- Failure classes. Expected failures are raised as tables with a class;
---- anything else raised (a failed assertion, a Lua error) is an internal
---- fault. Divergences are tick outcomes, never errors.
----
---- - transient: the L1 RPC or the sequencer's HTTP API; it may recover by the
----   next scheduled tick.
---- - operator: configuration, the state directory, or an image: only an
----   operator can fix it.
---- - internal (anything else raised): a fault of the watchdog or its host,
----   filesystem failures such as a full disk included.
+--- Failure classes (docs/watchdog/README.md#commands): `transient`, `operator`,
+--- and `internal` for anything else raised, filesystem failures included.
+--- Divergences are tick outcomes, never errors.
 
 local errors = {}
 

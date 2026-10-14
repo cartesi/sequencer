@@ -1,16 +1,10 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- The application's InputBox inputs, read from L1 and proven complete.
----
---- `inputs(from, to, first_index, on_input)` yields every input of blocks
---- `from..to` in order, and guarantees there is no gap: indices run
---- contiguously from `first_index`, and the InputBox's own count at `to`
---- (read with `getNumberOfInputs` pinned at that block) equals the next index.
---- A provider that silently truncates a log range therefore fails the tick
---- instead of producing a false comparison. A log query that fails over more
---- than one block is split in half, left first, like the Rust reader; one that
---- fails on a single block fails the tick.
+--- The application's InputBox inputs, read from L1 and proven complete
+--- (docs/watchdog/README.md#l1-completeness). Range splitting and log order
+--- match the Rust reader (sequencer/src/l1/partition.rs), and
+--- tests/fixtures/l1_partition_vector.json pins both.
 
 local abi = require("watchdog.abi")
 local errors = require("watchdog.errors")

@@ -1,14 +1,8 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- Watchdog commands (docs/watchdog/README.md#commands):
----
----   init    store a trusted bootstrap machine; persist the configuration
----   tick    one compare cycle; exit 0 ok/idle, 1 warning, 2 divergence
----   status  JSON summary of the state directory
----   clear   --block <B> --reason <text>: archive the latched divergence at B
----   replay  --from <dir> --from-block <A> --to-block <B> --out <dir>:
----           re-derive canonical state into a new directory
+--- Command dispatch, exit codes, `last_tick.json` and `status.prom`
+--- (docs/watchdog/README.md#commands).
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 do

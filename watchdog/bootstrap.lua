@@ -1,14 +1,8 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- `init`: store a trusted canonical machine as the first checkpoint and
---- persist the configuration.
----
---- The bootstrap machine must wait for an input, yield the configured state
---- source, and be a trusted start (`canonical.trusted_start`). The InputBox is
---- derived from the application. Init is idempotent on a complete state
---- directory and refuses one initialized for a different deployment or state
---- source.
+--- `init`: store a trusted canonical machine as the first checkpoint and persist
+--- the configuration (docs/watchdog/README.md#commands).
 
 local canonical = require("watchdog.canonical")
 local config = require("watchdog.config")

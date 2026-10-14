@@ -1,10 +1,9 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- Watchdog tests against the real Cartesi Machine. The test guest
---- (watchdog/test-guest) drives every rollup host outcome; the reference
---- `cartesi-machine` CLI is the oracle for the executor. Run from the repo
---- root with the canonical and test guest images built:
+--- Watchdog tests against the real Cartesi Machine: the test guest drives every
+--- rollup host outcome, and the reference `cartesi-machine` CLI is the oracle.
+--- Run from the repo root with the canonical and test guest images built:
 ---   lua5.4 watchdog/tests/e2e.lua [name filter]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
