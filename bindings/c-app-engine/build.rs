@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Links the application's engine archive and generates the FFI declarations from its header.
-//!
 //! The two environment variables are the whole application-specific binding, documented in
-//! `README.md`. With none of them set this crate links no archive,
-//! and the binary that uses it supplies the engine instead.
+//! `README.md`. With none of them set this crate links no archive, and the binary that uses it
+//! supplies the engine instead.
 
 use std::env;
 use std::path::{Path, PathBuf};

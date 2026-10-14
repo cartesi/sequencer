@@ -1,23 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! `run`-side bootstrap guards after the setup/run split.
-//!
-//! `run` no longer takes `--chain-id` / `--app-address` — it reads the pinned
-//! deployment identity from the DB that `setup` created. These tests lock the
-//! refusal paths that protect that handoff, without needing the on-chain
-//! contracts that `setup`'s L1 discovery requires (those live in the full
-//! rollups-e2e harness):
-//!
-//!   - **No setup** → `BootstrapError::SetupNotComplete` (terminal; operator
-//!     must run `setup`). Fires before any L1 contact.
-//!   - **Wrong signing key** → `IdentityError::Mismatch { batch_submitter_address }`
-//!     (the key's address must match the pinned submitter). Fires before L1.
-//!   - **Wrong-chain RPC** → `ChainIdMismatch`: a reachable RPC
-//!     whose `eth_chainId` differs from the pinned chain id is refused. Needs
-//!     a live RPC, so it uses Anvil.
-//!   - **Matching-chain RPC** positive control: a matching chain must NOT
-//!     produce `ChainIdMismatch`.
+//! `run`'s bootstrap guards on the identity `setup` pinned: no setup, a key for
+//! another submitter, and a wrong-chain RPC (against Anvil) are refused, and a
+//! matching chain is not. Setup's on-chain discovery is covered by the e2e suite.
 
 use std::time::Duration;
 

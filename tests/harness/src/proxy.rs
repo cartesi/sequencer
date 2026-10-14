@@ -1,38 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! TCP proxy with programmatic `disconnect()` / `reconnect()` for outage
-//! simulation in tests.
-//!
-//! Layout:
-//!
-//! ```text
-//! Sequencer ──→ TcpProxy (127.0.0.1:proxy_port) ──→ Anvil (upstream)
-//!                       ↑
-//!                 disconnect() / reconnect()
-//!                 controlled from test code
-//! ```
-//!
-//! Behavior:
-//!
-//! - `disconnect()` flips an internal flag. All existing forwarded connections
-//!   are torn down (their forwarding tasks observe the flag and exit, dropping
-//!   the sockets). New connection attempts still succeed at the TCP accept
-//!   level, but are immediately closed. To the sequencer, this looks like the
-//!   upstream aggressively resets every connection — the same client-visible
-//!   behavior as a node that went down.
-//!
-//! - `reconnect()` flips the flag back. Subsequent connections forward
-//!   normally; the sequencer's next retry after backoff reconnects as if the
-//!   upstream is back.
-//!
-//! - Anvil (the real upstream) stays running behind the proxy the whole time,
-//!   so the test can bypass the proxy to mine blocks on it directly via a
-//!   separate client connected to the upstream port. That's how we simulate
-//!   "L1 advanced while the sequencer's gateway was down."
-//!
-//! The proxy listens on `127.0.0.1:0` by default, picking an ephemeral port
-//! the OS hands out; the actual port is read back via `endpoint()`.
+//! TCP proxy for L1 outage tests. `disconnect()` tears down every forwarded
+//! connection and closes new ones on accept, which the sequencer sees as a dead
+//! node; `reconnect()` resumes forwarding. Anvil keeps running upstream, so a test
+//! can mine on it directly (`upstream_addr`) while the sequencer is cut off.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

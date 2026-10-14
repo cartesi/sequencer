@@ -1,12 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Integration tests for the operator-only snapshot HTTP endpoints:
-//! `/finalized_state`, `/finalized_state/inclusion_block`, `/latest_snapshot`.
-//!
-//! These drive a real listener (so client disconnect is modelled faithfully)
-//! and assert the lease lifecycle — held while streaming, released on
-//! completion, 304, and crucially on mid-stream client disconnect.
+//! Operator snapshot endpoints over a real listener: the lease is held while
+//! streaming and released on completion, on 304, and on mid-stream disconnect.
 
 use std::net::SocketAddr;
 use std::path::Path;
