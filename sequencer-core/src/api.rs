@@ -138,13 +138,9 @@ pub struct FeeResponse {
     pub suggested_max_fee: u16,
 }
 
-/// Smallest log-space exponent `n` such that `(129/128)^n >= 3/2`.
-///
-/// Signing slack for [`FeeResponse::quote`]: wallets may over-estimate
-/// `max_fee` because the user pays the frame fee, not the signed cap. 1.5×
-/// sits on top of `max(open-frame fee, recommended_fee)` so a quote can
-/// survive a frame rotation. Distinct from `batch_policy.log_slack` (the 10×
-/// DA margin already baked into both inputs).
+/// Smallest log-space exponent `n` such that `(129/128)^n >= 3/2`: the signing
+/// slack in [`FeeResponse::quote`]. Distinct from `batch_policy.log_slack`, the
+/// 10× DA margin already in both inputs.
 const SUGGESTED_MAX_FEE_SLACK: u16 = 53;
 
 impl FeeResponse {

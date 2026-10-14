@@ -1,27 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Protocol timing parameters the sequencer mirrors from the scheduler, plus
-//! the sequencer-side tuning knobs that govern preemptive self-protection.
-//!
-//! [`ProtocolTiming`] is the single source of truth for time-based protocol
-//! rules:
-//!
-//! - **Scheduler-acceptance** timing (`is_scheduler_stale`, `scheduler_accepts`).
-//!   `max_wait_blocks` matches the on-chain scheduler exactly — mis-aligning
-//!   it would cause the sequencer's cached "gold frontier" to diverge from
-//!   the scheduler's actual accepted set.
-//! - **Preemptive-recovery** tuning (`danger_threshold`,
-//!   `l1_read_stale_after_blocks`, `seconds_per_block`). These do not exist
-//!   on the scheduler side; they control when the sequencer proactively
-//!   stops to avoid issuing soft confirmations against stale or unknowable
-//!   L1 state.
-//!
-//! The batch-submitter address is **not** part of `ProtocolTiming`. It's an
-//! identity, not a timing parameter; the validation in
-//! [`ProtocolTiming::try_new`] only relates timing fields to each other.
-//! Predicates that need the address (`scheduler_accepts`) take it as a
-//! parameter — see those methods.
+//! Protocol timing: the scheduler's staleness rule and its off-chain acceptance
+//! predicate, which must agree with the canonical fold (I1), plus sequencer-only
+//! knobs for when the sequencer stops issuing soft confirmations against stale
+//! or unknowable L1 state.
 
 use crate::batch::Batch;
 use alloy_primitives::Address;
@@ -323,11 +306,6 @@ impl ProtocolTiming {
     /// Returns `Some(AcceptedBatch)` iff the scheduler would accept the input
     /// at the given `expected_nonce`. The caller threads `expected_nonce`
     /// across a stream of inputs, advancing by one on each `Some`.
-    ///
-    /// `batch_submitter` is the address the scheduler accepts batches from —
-    /// kept as a parameter (rather than a struct field) because it's
-    /// orthogonal to timing and the validation in [`Self::try_new`] doesn't
-    /// touch it.
     ///
     /// Rejection paths (wrong sender, SSZ decode failure, stale by inclusion,
     /// nonce mismatch) return `None` without advancing — matching what the

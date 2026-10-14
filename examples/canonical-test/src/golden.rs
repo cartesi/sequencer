@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Golden guest cases from `tests/fixtures/consensus_vectors_v1.json`: pinned
-//! input payloads go into the built image unchanged (nothing is signed or
-//! encoded here) and its raw outputs must equal the pinned bytes. The vectors
-//! are never regenerated; a mismatch is a consensus change and a finding.
+//! payloads go into the built image unchanged (nothing is signed or encoded here)
+//! and its raw outputs must equal the pinned bytes; a mismatch is a finding.
 //! Reports are diagnostics, not consensus, and are not compared.
 
 use std::collections::BTreeMap;

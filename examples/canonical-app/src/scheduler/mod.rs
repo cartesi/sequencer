@@ -1,13 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Canonical-app harness around the scheduler library.
-//!
-//! The pure scheduler fold lives in [`sequencer_core::scheduler`]; this module
-//! is the I/O shell that drives it inside the RISC-V app. It pulls inputs off
-//! the `trolley` rollup, coerces host `U256` metadata into the scheduler's
-//! `u64` domain, feeds them through [`Scheduler::process_input`], and emits the
-//! app's notices/vouchers/reports back to the rollup.
+//! I/O shell that drives [`sequencer_core::scheduler`] inside the RISC-V guest:
+//! reads `trolley` rollup inputs, narrows `U256` metadata to the scheduler's `u64`
+//! domain, and emits the app's notices, vouchers and reports.
 
 use alloy_primitives::U256;
 use rollups_types::{Notice, Voucher};

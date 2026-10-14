@@ -1,14 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Canonical SSZ snapshot encoding for the toy wallet app.
-//!
-//! [`encode`] and [`decode`] are the single source of truth used by
-//! [`WalletApp::create_dump`](crate::application::wallet::WalletApp::create_dump),
-//! CM `inspect_state`, and the watchdog's digest comparison.
-//!
-//! Golden bytes: `tests/fixtures/wallet_snapshot_empty.hex` (shared with
-//! Rust and Lua parity tests).
+//! Canonical SSZ encoding of the toy wallet's state (layout owned by
+//! `docs/snapshots/format.md`). [`encode`] and [`decode`] are the only codec:
+//! `WalletApp::create_dump`, CM `inspect_state` and the watchdog digest use them.
+//! Golden bytes: `tests/fixtures/wallet_snapshot_empty.hex`, shared with Lua tests.
 
 use std::collections::BTreeMap;
 

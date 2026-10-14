@@ -1,19 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Log-space fee encoding with base 129/128 = 1 + 2⁻⁷.
-//!
-//! All fees in the protocol (frame `fee_price`, user-op `max_fee`, DB `recommended_fee`)
-//! are represented as **log-space exponents** with base 129/128.
-//!
-//! An exponent `n` nominally represents `(129/128)^n` smallest-token-units.
-//! [`fee_to_linear`] owns the exact integer conversion contract, including
-//! intermediate rounding and operation order. Exponent 0 is 1 unit; there is
-//! no special sentinel. The encoding uses two bytes and no floating point.
-//!
-//! `build.rs` generates the 15-entry fixed-point table and [`MAX_EXPONENT`].
-//! Independent implementations must reproduce the conversion bit-for-bit:
-//! fee differences can change validation decisions and application state.
+//! Log-space fees, base 129/128: exponent `n` nominally means `(129/128)^n`
+//! smallest token units (0 is 1 unit; no sentinel), for frame `fee_price`, user-op
+//! `max_fee` and the DB `recommended_fee`. [`fee_to_linear`] owns the exact integer
+//! conversion; ports must match it bit for bit, since fees decide validation and state.
 
 use alloy_primitives::U256;
 
