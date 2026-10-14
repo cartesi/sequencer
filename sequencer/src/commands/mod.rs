@@ -211,15 +211,18 @@ pub(crate) fn load_setup_identity(data_dir: &str) -> Result<DeploymentIdentity, 
 /// Treated as fatal on mismatch *and* on RPC error: pinning a wrong or
 /// unverified chain id into storage would poison subsequent L1-unreachable
 /// boots and issue soft confirmations against the wrong chain. Caller is
-/// expected to retry on `ChainIdRpc`. A URL the client refuses (malformed, or
-/// plaintext to a remote host without the opt-in) takes the reader's terminal
-/// class: the reader would refuse it identically one step later.
+/// expected to retry on `ChainIdRpc`. A redirect is refused as configuration
+/// (`RpcRedirect`, exit 30): the client follows none, so a retry gets the same
+/// answer. A URL the client refuses (malformed, or plaintext to a remote host
+/// without the opt-in) takes the reader's terminal class: the reader would
+/// refuse it identically one step later.
 pub(crate) async fn validate_rpc_chain_id(
     eth_rpc_url: &str,
     expected: u64,
     allow_insecure: bool,
 ) -> Result<(), CommandError> {
     use alloy::providers::Provider;
+    use alloy_transport::{HttpError, RpcError, TransportErrorKind};
     let check_provider = crate::l1::provider::create_read_provider(eth_rpc_url, allow_insecure)
         .map_err(|message| {
             BootstrapError::SetupInputReader(crate::l1::reader::InputReaderError::Bootstrap(
@@ -234,6 +237,17 @@ pub(crate) async fn validate_rpc_chain_id(
             }))
         }
         Ok(_) => Ok(()),
+        Err(RpcError::Transport(
+            TransportErrorKind::HttpError(HttpError { status, .. })
+            | TransportErrorKind::HttpErrorWithRetryAfter {
+                error: HttpError { status, .. },
+                ..
+            },
+        )) if (300..400).contains(&status) => {
+            Err(CommandError::Bootstrap(BootstrapError::RpcRedirect {
+                status,
+            }))
+        }
         Err(e) => Err(CommandError::Bootstrap(BootstrapError::ChainIdRpc {
             message: crate::l1::provider::error_chain(&e),
         })),

@@ -818,17 +818,7 @@ mod tests {
     /// a followed redirect succeeds, a refused one fails with the 308.
     #[tokio::test]
     async fn no_client_follows_a_redirect() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        async fn answer_once(listener: tokio::net::TcpListener, response: String) {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut request = [0_u8; 4096];
-            let _ = socket.read(&mut request).await.expect("read request");
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response");
-        }
+        use crate::test_support::answer_once;
 
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_address = target.local_addr().unwrap();

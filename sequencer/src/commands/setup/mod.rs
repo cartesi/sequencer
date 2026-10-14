@@ -1120,9 +1120,10 @@ mod tests {
     }
 
     /// Setup's L1 discovery uses the startup polarity: a URL the client refuses
-    /// re-fails identically, so it is terminal; an unreachable RPC fails at the
-    /// chain-id read (`ChainIdRpc`) and is retried. The fee-source connect
-    /// follows the runtime classification with setup's messages.
+    /// re-fails identically, so it is terminal, and so is an endpoint that
+    /// redirects the chain-id read; an unreachable RPC fails at the chain-id
+    /// read (`ChainIdRpc`) and is retried. The fee-source connect follows the
+    /// runtime classification with setup's messages.
     #[tokio::test]
     async fn setup_l1_failures_exit_by_startup_phase() {
         use crate::commands::error::{EXIT_RESTART_TRANSIENT, EXIT_TERMINAL};
@@ -1194,6 +1195,33 @@ mod tests {
             "{plaintext_remote:?}"
         );
         assert_eq!(plaintext_remote.exit_code(), EXIT_TERMINAL);
+
+        // The client follows no redirect, so a retry would get the same 308.
+        let endpoint = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind endpoint");
+        let endpoint_address = endpoint.local_addr().expect("endpoint address");
+        tokio::spawn(crate::test_support::answer_once(
+            endpoint,
+            "HTTP/1.1 308 Permanent Redirect\r\nLocation: http://127.0.0.1:1/\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+        ));
+        let redirect = crate::commands::validate_rpc_chain_id(
+            &format!("http://{endpoint_address}/"),
+            31337,
+            false,
+        )
+        .await
+        .expect_err("a redirect is not followed");
+        assert!(
+            matches!(
+                redirect,
+                CommandError::Bootstrap(BootstrapError::RpcRedirect { status: 308 })
+            ),
+            "{redirect:?}"
+        );
+        assert_eq!(redirect.exit_code(), EXIT_TERMINAL);
 
         use crate::l1::fee_oracle::UniswapConfig;
         use crate::l1::fee_oracle::uniswap::{PriceSourceError, UniswapV3PriceSource};

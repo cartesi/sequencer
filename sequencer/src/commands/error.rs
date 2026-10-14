@@ -289,6 +289,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         // Terminal: needs an operator (wrong config, divergence, or a DB that
         // was never set up).
         BootstrapError::ChainIdMismatch { .. }
+        | BootstrapError::RpcRedirect { .. }
         | BootstrapError::InvalidProtocolTiming(_)
         | BootstrapError::BatchOpenPastDanger { .. }
         | BootstrapError::FeeOracleMisconfig { .. }
@@ -329,6 +330,14 @@ pub enum BootstrapError {
     /// against the wrong chain's state. Operator should retry.
     #[error("could not query chain ID from RPC: {message}")]
     ChainIdRpc { message: String },
+    /// `eth_chainId` answered with a redirect. The client follows none
+    /// (`l1/provider.rs`), so every retry gets the same answer until the
+    /// operator configures the provider's final URL.
+    #[error(
+        "the RPC endpoint answered eth_chainId with HTTP {status}; redirects are not \
+         followed, so configure the provider's final URL"
+    )]
+    RpcRedirect { status: u16 },
     /// Protocol-level config (`preemptive_margin_blocks` vs `max_wait_blocks`,
     /// `l1_read_stale_after_blocks` vs `danger_threshold`) failed validation.
     /// See [`ProtocolTimingError`].
@@ -1152,6 +1161,10 @@ mod tests {
             (
                 CommandError::Bootstrap(BootstrapError::ChainIdMismatch { rpc: 1, config: 2 }),
                 "a chain-id mismatch at boot",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::RpcRedirect { status: 308 }),
+                "an RPC endpoint that redirects setup's chain-id read",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::InvalidProtocolTiming(

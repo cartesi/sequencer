@@ -65,6 +65,20 @@ pub(crate) async fn wait_until(timeout: Duration, mut predicate: impl FnMut() ->
     predicate()
 }
 
+/// Accept one connection on `listener`, read the request, and write
+/// `response` verbatim: a raw HTTP answer no client library would build.
+pub(crate) async fn answer_once(listener: tokio::net::TcpListener, response: String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut socket, _) = listener.accept().await.expect("accept");
+    let mut request = [0_u8; 4096];
+    let _ = socket.read(&mut request).await.expect("read request");
+    socket
+        .write_all(response.as_bytes())
+        .await
+        .expect("write response");
+}
+
 pub(crate) async fn shutdown_lane(
     shutdown: &RuntimeScope,
     handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
