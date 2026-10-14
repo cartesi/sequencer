@@ -413,7 +413,9 @@ mod tests {
     use sequencer_core::application::{
         AppError, AppOutput, Application, CanonicalState, InvalidReason, ValidationOutcome,
     };
-    use sequencer_core::application::{execute_direct_input, execute_valid_user_op};
+    use sequencer_core::application::{
+        ExecutionOutcome, execute_direct_input, execute_valid_user_op, validate_and_execute_user_op,
+    };
     use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
     use sequencer_core::user_op::UserOp;
 
@@ -807,6 +809,73 @@ mod tests {
             }
             other => panic!("expected withdrawal voucher, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn business_failures_after_fee_validation_charge_fee_and_consume_nonce() {
+        let sequencer = address!("0x9999999999999999999999999999999999999999");
+        let mut app = WalletApp::new(WalletConfig {
+            sequencer_address: sequencer,
+            ..WalletConfig::default()
+        });
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let funded = U256::from(100_u64);
+        app.balances.insert(sender, funded);
+        let fee: u16 = 10;
+        let fee_cost = sequencer_core::fee::fee_to_linear(fee);
+        let too_much = U256::from(1_000_u64);
+        // Selector 2 was the retired `Deposit { amount, to }` method, laid out
+        // like `Transfer`; an op shaped like it must not mint to `to`.
+        let mut retired_deposit = vec![2];
+        retired_deposit.extend(ssz::Encode::as_ssz_bytes(&Transfer {
+            amount: too_much,
+            to: recipient,
+        }));
+        let mut replay = app.clone();
+
+        for (i, data) in [
+            ssz::Encode::as_ssz_bytes(&super::Method::Transfer(Transfer {
+                amount: too_much,
+                to: recipient,
+            })),
+            ssz::Encode::as_ssz_bytes(&super::Method::Withdrawal(Withdrawal { amount: too_much })),
+            retired_deposit,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let nonce = u32::try_from(i).unwrap();
+            let safe_block = 10 + u64::from(nonce);
+            let user_op = UserOp {
+                nonce,
+                max_fee: fee,
+                data: data.clone().into(),
+            };
+            let ExecutionOutcome::Included(live) =
+                validate_and_execute_user_op(&mut app, sender, &user_op, fee, safe_block).unwrap()
+            else {
+                panic!("a fee-funded op is included even when its method fails");
+            };
+            // Restart catch-up replays the persisted op without validation.
+            let replayed =
+                execute_valid_user_op(&mut replay, &ValidUserOp { sender, fee, data }, safe_block)
+                    .unwrap();
+            assert_eq!(replayed, live);
+
+            assert!(live.outputs.is_empty());
+            let charged = fee_cost * U256::from(nonce + 1);
+            assert_eq!(app.current_user_nonce(sender), nonce + 1);
+            assert_eq!(app.current_user_balance(sender), funded - charged);
+            assert_eq!(app.current_user_balance(sequencer), charged);
+            assert_eq!(app.current_user_balance(recipient), U256::ZERO);
+            assert_eq!(app.executed_input_count().get(), u64::from(nonce) + 1);
+            assert_eq!(app.last_executed_safe_block(), safe_block);
+        }
+        assert_eq!(
+            replay.canonical_snapshot_bytes().unwrap(),
+            app.canonical_snapshot_bytes().unwrap()
+        );
     }
 
     #[test]
