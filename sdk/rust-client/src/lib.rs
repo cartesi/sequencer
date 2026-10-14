@@ -41,6 +41,8 @@ pub struct SequencerClient {
 }
 
 impl SequencerClient {
+    /// Accepts `http://` and `https://` endpoints; HTTPS verifies the server
+    /// certificate against the platform trust store.
     pub fn new(endpoint: impl Into<String>) -> Result<Self, ClientBuildError> {
         Self::new_with_timeout(endpoint, Duration::from_secs(3))
     }
@@ -50,7 +52,6 @@ impl SequencerClient {
         request_timeout: Duration,
     ) -> Result<Self, ClientBuildError> {
         let endpoint = endpoint.into();
-        // Validate URL format (must be http://)
         validate_http_url(&endpoint).map_err(ClientBuildError::InvalidEndpoint)?;
         let http_client = build_http_client(request_timeout)
             .map_err(|e| ClientBuildError::InvalidEndpoint(e.to_string()))?;
@@ -67,7 +68,8 @@ impl SequencerClient {
 
     pub fn host_port(&self) -> &str {
         self.endpoint
-            .strip_prefix("http://")
+            .strip_prefix("https://")
+            .or_else(|| self.endpoint.strip_prefix("http://"))
             .unwrap_or(&self.endpoint)
             .split('/')
             .next()
@@ -220,6 +222,8 @@ impl SequencerClient {
     }
 
     /// Bounds the handshake by the request timeout; callers own the stream.
+    /// The feed is plain `ws://`: a client built from an `https://` endpoint
+    /// cannot subscribe.
     pub async fn subscribe(&self, claim: HistoryClaim) -> Result<SubscribeStream, SubscribeError> {
         let url = self.ws_subscribe_url(claim);
         let (stream, _response) =
@@ -253,13 +257,14 @@ fn map_reqwest_error(err: reqwest::Error) -> SubmitTxError {
 }
 
 fn validate_http_url(http_url: &str) -> Result<(), String> {
-    let stripped = http_url
-        .trim_end_matches('/')
-        .strip_prefix("http://")
-        .ok_or_else(|| "only http:// URLs are supported".to_string())?;
+    let trimmed = http_url.trim_end_matches('/');
+    let stripped = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(|| "only http:// and https:// URLs are supported".to_string())?;
     let host = stripped.split('/').next().unwrap_or("");
     if host.is_empty() {
-        return Err("missing host in http URL".to_string());
+        return Err("missing host in endpoint URL".to_string());
     }
     Ok(())
 }
@@ -420,6 +425,63 @@ mod tests {
         .await
         .expect("an accepted connection with no handshake must reach the configured deadline");
         assert!(matches!(result, Err(SubscribeError::HandshakeTimeout)));
+    }
+
+    #[test]
+    fn endpoint_accepts_http_and_https_only() {
+        for endpoint in [
+            "http://127.0.0.1:3000",
+            "https://sequencer.example",
+            "https://sequencer.example:8443/base/",
+        ] {
+            assert!(SequencerClient::new(endpoint).is_ok(), "{endpoint}");
+        }
+        for endpoint in [
+            "sequencer.example",
+            "ws://sequencer.example",
+            "wss://sequencer.example",
+            "https://",
+            "https:///tx",
+        ] {
+            assert!(
+                matches!(
+                    SequencerClient::new(endpoint),
+                    Err(ClientBuildError::InvalidEndpoint(_))
+                ),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_port_strips_either_scheme() {
+        let https = SequencerClient::new("https://sequencer.example:8443/base").unwrap();
+        assert_eq!(https.host_port(), "sequencer.example:8443");
+        let http = SequencerClient::new("http://127.0.0.1:3000").unwrap();
+        assert_eq!(http.host_port(), "127.0.0.1:3000");
+    }
+
+    #[tokio::test]
+    async fn https_endpoint_opens_with_a_tls_client_hello() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client =
+            SequencerClient::new_with_timeout(format!("https://{address}"), Duration::from_secs(2))
+                .unwrap();
+        let server = async {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("an https request must open a connection")
+                .unwrap();
+            let mut record = [0; 3];
+            stream.read_exact(&mut record).await.unwrap();
+            record
+        };
+        let (result, record) = tokio::join!(client.get_fee(), server);
+        // A TLS handshake record starts 0x16 0x03; plaintext HTTP would send "GET".
+        assert_eq!(&record[..2], &[0x16, 0x03]);
+        assert!(matches!(result, Err(QueryError::Transport { .. })));
     }
 
     #[test]

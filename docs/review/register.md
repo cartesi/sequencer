@@ -78,15 +78,6 @@ Next: compare the intended bound with serialized batches across payload/frame
 counts, then correct the estimate and check the separately configured
 `batch_policy.log_user_op_bytes` used for fee accounting.
 
-### Support HTTPS in the Rust SDK
-
-The [client constructor](../../sdk/rust-client/src/lib.rs) rejects every HTTPS
-endpoint, leaving its HTTPS-to-WSS URL branch unreachable. Next: support HTTPS
-for the ingress routes, verify the dependency TLS features, and exercise
-certificate-verified requests. Preserve local HTTP use; URL acceptance alone is
-not evidence that TLS works. WSS is out of scope: the WS feed's wire format
-waits for the new client sync (rechecked 2026-10-13 at `1a9615d`).
-
 ### Separate public ingress and internal egress listeners
 
 [`http.rs`](../../sequencer/src/http.rs) serves both routers on one listener.
@@ -256,6 +247,7 @@ at the smallest useful boundary when working on that behavior.
 | Same-block directs | `multi_deposit_reconciliation_test` accumulates directs in separate blocks. Queue portal sends, mine once, assert equal receipt blocks, and verify canonical/WS order and attribution in the [E2E scenarios](../../tests/e2e/src/test_cases.rs). |
 | Wallet business failure | Mixed replay is covered. Pin insufficient transfer/withdrawal amounts after successful fee validation: fee/nonce/progress advance, the transfer/withdrawal has no further effect, and replay agrees. See the [wallet implementation](../../examples/app-core/src/application/wallet.rs) and [Application contract](../protocol/application-contract.md#2-replay-safety--rejection-inclusion-and-failure). |
 | Boot failure exits | Exit 20 now has a process assertion; exits 40/1 still need exact assertions in applicable setup/failure scenarios, so the supervisor receives the intended recovery/retry hint. Start in the [E2E scenarios](../../tests/e2e/src/test_cases.rs) and [exit contract](../../sequencer/src/commands/error.rs). |
+| SDK HTTPS | A test pins that `https://` endpoints open with a TLS ClientHello. Certificate rejection is untested; it relies on reqwest's rustls platform verifier, with no override in the SDK. Add a rejection test if the SDK gains custom roots. See the [client](../../sdk/rust-client/src/lib.rs). |
 | Uniswap-mode boot | Source-boundary tests pin setup validation, lazy runtime refresh, and transient quote retention. Existing sequencer E2Es use fixed mode. Decide whether a mock-pool boot scenario warrants its harness cost when changing oracle integration. |
 
 Warm restore already has state/cursor agreement tests and snapshot downloads
