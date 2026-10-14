@@ -11,7 +11,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::l1::eip1559::{Eip1559Fees, estimate_fees};
-use crate::l1::fee_oracle::math::{MathError, compute_x_units_per_gas, encode_log_gas_price};
+use crate::l1::fee_oracle::math;
 use crate::l1::fee_oracle::uniswap::{PriceSourceError, TokenPriceSource};
 use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
 use crate::runtime::shutdown::ShutdownSignal;
@@ -35,8 +35,6 @@ pub enum FeeOracleError {
     Transient(String),
     #[error("fee-oracle misconfiguration: {0}")]
     Misconfig(String),
-    #[error("fatal fee-oracle arithmetic failure: {0}")]
-    FatalMath(#[from] MathError),
 }
 
 impl FeeOracleError {
@@ -49,7 +47,7 @@ impl FeeOracleError {
             // The oracle's `Join` wraps its internal blocking storage task.
             // During a live worker exit that task can only have panicked;
             // ordinary shutdown cancels the enclosing refresh future instead.
-            Self::FatalMath(_) | Self::Misconfig(_) | Self::Join(_) => true,
+            Self::Misconfig(_) | Self::Join(_) => true,
             // A transient quote/transport failure self-heals.
             Self::Transient(_) => false,
         }
@@ -138,10 +136,10 @@ impl FeeOracle {
             .estimate_gas_fees()
             .await
             .map_err(FeeOracleError::Transient)?;
-        let quote = self.token.quote_x_per_weth().await?;
-        let linear =
-            compute_x_units_per_gas(fees.base_fee_per_gas, fees.max_priority_fee_per_gas, quote)?;
-        let log_gas_price = encode_log_gas_price(linear)?;
+        let directed_tick = self.token.directed_tick().await?;
+        let gas_price_wei = fees.base_fee_per_gas as f64 + fees.max_priority_fee_per_gas as f64;
+        let x_units_per_gas = math::x_units_per_gas(gas_price_wei, directed_tick);
+        let log_gas_price = math::log_gas_price_ceil(x_units_per_gas);
 
         let db_path = self.db_path.clone();
         let process_lock = self.process_lock.clone();
@@ -165,8 +163,8 @@ impl FeeOracle {
             tracing::info!(
                 base_fee = fees.base_fee_per_gas,
                 priority_fee = fees.max_priority_fee_per_gas,
-                quote_x_per_weth = %quote,
-                linear_x_per_gas = %linear,
+                directed_tick,
+                x_units_per_gas,
                 log_gas_price = refresh.log_gas_price,
                 "refreshed L1 fee oracle",
             );
@@ -174,8 +172,8 @@ impl FeeOracle {
             debug!(
                 base_fee = fees.base_fee_per_gas,
                 priority_fee = fees.max_priority_fee_per_gas,
-                quote_x_per_weth = %quote,
-                linear_x_per_gas = %linear,
+                directed_tick,
+                x_units_per_gas,
                 log_gas_price = refresh.log_gas_price,
                 "L1 fee oracle price unchanged",
             );
@@ -241,7 +239,6 @@ impl From<PriceSourceError> for FeeOracleError {
 mod tests {
     use super::*;
     use crate::storage::test_helpers::temp_db;
-    use alloy_primitives::U256;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -254,11 +251,11 @@ mod tests {
         }
     }
 
-    struct StaticToken(U256);
+    struct StaticToken(i32);
 
     #[async_trait]
     impl TokenPriceSource for StaticToken {
-        async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
+        async fn directed_tick(&self) -> Result<i32, PriceSourceError> {
             Ok(self.0)
         }
     }
@@ -300,12 +297,12 @@ mod tests {
 
     struct FailsAfterFirstToken {
         calls: Mutex<usize>,
-        ok: U256,
+        ok: i32,
     }
 
     #[async_trait]
     impl TokenPriceSource for FailsAfterFirstToken {
-        async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
+        async fn directed_tick(&self) -> Result<i32, PriceSourceError> {
             let mut calls = self.calls.lock().expect("lock");
             *calls += 1;
             if *calls == 1 {
@@ -320,7 +317,7 @@ mod tests {
 
     #[async_trait]
     impl TokenPriceSource for AlwaysFailToken {
-        async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
+        async fn directed_tick(&self) -> Result<i32, PriceSourceError> {
             Err(PriceSourceError::Provider("pool unavailable".into()))
         }
     }
@@ -329,20 +326,11 @@ mod tests {
 
     #[async_trait]
     impl TokenPriceSource for PendingToken {
-        async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
+        async fn directed_tick(&self) -> Result<i32, PriceSourceError> {
             if let Some(entered) = self.0.lock().expect("lock").take() {
                 let _ = entered.send(());
             }
             std::future::pending().await
-        }
-    }
-
-    struct OverflowToken;
-
-    #[async_trait]
-    impl TokenPriceSource for OverflowToken {
-        async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
-            Ok(U256::MAX)
         }
     }
 
@@ -354,15 +342,13 @@ mod tests {
         }
     }
 
-    fn sample_quote() -> U256 {
-        U256::from(1_800_000_000u64)
+    /// About 2063 USDC per WETH.
+    fn sample_tick() -> i32 {
+        -200_000
     }
 
     fn expected_log_price() -> u16 {
-        encode_log_gas_price(
-            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, sample_quote()).unwrap(),
-        )
-        .unwrap()
+        math::log_gas_price_ceil(math::x_units_per_gas(20e9, sample_tick()))
     }
 
     fn initialize_db(path: &str) {
@@ -385,7 +371,7 @@ mod tests {
         let oracle = oracle_with(
             &db.path,
             Box::new(StaticGas(sample_fees())),
-            Box::new(StaticToken(sample_quote())),
+            Box::new(StaticToken(sample_tick())),
         );
         assert_eq!(
             oracle.refresh_once().await.unwrap(),
@@ -425,7 +411,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 ok: sample_fees(),
             }),
-            Box::new(StaticToken(sample_quote())),
+            Box::new(StaticToken(sample_tick())),
         );
         assert_eq!(
             oracle.refresh_once().await.unwrap().log_gas_price,
@@ -447,7 +433,7 @@ mod tests {
             Box::new(StaticGas(sample_fees())),
             Box::new(FailsAfterFirstToken {
                 calls: Mutex::new(0),
-                ok: sample_quote(),
+                ok: sample_tick(),
             }),
         );
         assert_eq!(
@@ -461,12 +447,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arithmetic_overflow_is_fatal() {
-        let db = temp_db("fatal-fee-oracle");
-        let storage = Storage::open(&db.path).unwrap();
-        assert_eq!(storage.log_gas_price().unwrap(), 0);
-        drop(storage);
-
+    async fn extreme_price_saturates_at_max_exponent() {
+        let db = temp_db("saturating-fee-oracle");
+        initialize_db(&db.path);
         let oracle = oracle_with(
             &db.path,
             Box::new(StaticGas(Eip1559Fees {
@@ -474,15 +457,35 @@ mod tests {
                 max_priority_fee_per_gas: u128::MAX,
                 max_fee_per_gas: u128::MAX,
             })),
-            Box::new(OverflowToken),
+            Box::new(StaticToken(887_272)),
         );
-        let err = oracle.refresh_once().await.expect_err("overflow is fatal");
-        assert!(matches!(
-            err,
-            FeeOracleError::FatalMath(MathError::Overflow)
-        ));
-        let storage = Storage::open_read_only(&db.path).unwrap();
-        assert_eq!(storage.log_gas_price().unwrap(), 0);
+        let max = sequencer_core::fee::MAX_EXPONENT;
+        assert_eq!(oracle.refresh_once().await.unwrap().log_gas_price, max);
+        assert_eq!(
+            Storage::open_read_only(&db.path)
+                .unwrap()
+                .log_gas_price()
+                .unwrap(),
+            max
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_two_unit_price_is_charged_in_log_space() {
+        // 0.5 gwei with USDC at about $2500 is about 1.25 units per gas; the
+        // former whole-unit ceil charged 2 units (exponent 90).
+        let db = temp_db("sub-two-unit-fee-oracle");
+        initialize_db(&db.path);
+        let oracle = oracle_with(
+            &db.path,
+            Box::new(StaticGas(Eip1559Fees {
+                base_fee_per_gas: 500_000_000,
+                max_priority_fee_per_gas: 0,
+                max_fee_per_gas: 500_000_000,
+            })),
+            Box::new(StaticToken(-198_080)),
+        );
+        assert_eq!(oracle.refresh_once().await.unwrap().log_gas_price, 29);
     }
 
     #[tokio::test]
@@ -525,7 +528,7 @@ mod tests {
                 calls: Arc::clone(&gas_calls),
                 ok: sample_fees(),
             }),
-            Box::new(StaticToken(sample_quote())),
+            Box::new(StaticToken(sample_tick())),
         );
         let shutdown = ShutdownSignal::default();
         let mut handle = oracle.start(shutdown.clone());
@@ -579,7 +582,7 @@ mod tests {
                 calls: Mutex::new(0),
                 ok: sample_fees(),
             }),
-            Box::new(StaticToken(sample_quote())),
+            Box::new(StaticToken(sample_tick())),
         );
         let shutdown = ShutdownSignal::default();
         let mut handle = oracle.start(shutdown.clone());

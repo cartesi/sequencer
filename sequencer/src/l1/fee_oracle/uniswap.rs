@@ -6,7 +6,7 @@
 use alloy::contract::Error as ContractError;
 use alloy::providers::{DynProvider, Provider};
 use alloy::sol;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use alloy_sol_types::Revert;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -50,8 +50,9 @@ impl UniswapConfig {
 
 #[async_trait]
 pub trait TokenPriceSource: Send + Sync {
-    /// Fee-token smallest units quoted for one WETH (10^18 wei).
-    async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError>;
+    /// TWAP mean tick oriented so `1.0001^tick` is fee-token smallest units
+    /// per wei, within the Uniswap V3 tick range.
+    async fn directed_tick(&self) -> Result<i32, PriceSourceError>;
 }
 
 /// Read-only Uniswap V3 source. Validation must complete before use.
@@ -75,8 +76,8 @@ pub enum PriceSourceError {
     InsufficientObservations,
     #[error("invalid TWAP window of zero seconds")]
     ZeroTwapWindow,
-    #[error("TWAP arithmetic overflow")]
-    ArithmeticOverflow,
+    #[error("TWAP mean tick {0} is outside the Uniswap V3 tick range")]
+    TickOutOfRange(i32),
 }
 
 impl UniswapV3PriceSource {
@@ -156,10 +157,16 @@ impl UniswapV3PriceSource {
             .call()
             .await
             .map_err(classify_observe_error)?;
-        let start: i64 = observed.tickCumulatives[0]
+        let &[start, end] = observed.tickCumulatives.as_slice() else {
+            return Err(PriceSourceError::Provider(format!(
+                "observe returned {} tick cumulatives for a 2-point window",
+                observed.tickCumulatives.len()
+            )));
+        };
+        let start: i64 = start
             .try_into()
             .expect("Uniswap int56 tick cumulative fits i64");
-        let end: i64 = observed.tickCumulatives[1]
+        let end: i64 = end
             .try_into()
             .expect("Uniswap int56 tick cumulative fits i64");
         let delta = end
@@ -178,9 +185,8 @@ impl UniswapV3PriceSource {
 
 #[async_trait]
 impl TokenPriceSource for UniswapV3PriceSource {
-    async fn quote_x_per_weth(&self) -> Result<U256, PriceSourceError> {
-        let tick = self.mean_tick().await?;
-        quote_x_per_weth_from_tick(tick, self.weth_is_token0)
+    async fn directed_tick(&self) -> Result<i32, PriceSourceError> {
+        orient_tick(self.mean_tick().await?, self.weth_is_token0)
     }
 }
 
@@ -229,26 +235,14 @@ pub(super) fn bootstrap_price_source_error(error: PriceSourceError) -> (bool, St
     }
 }
 
-/// Estimate fee-token smallest units per WETH from a Uniswap tick.
-///
-/// Host pricing is approximate, with headroom supplied by `batch_policy.log_slack`.
-/// Ceiling rounds up the estimate, not an exact TickMath price. Recorded frame
-/// fees use the shared deterministic integer conversion.
-pub fn quote_x_per_weth_from_tick(
-    tick: i32,
-    weth_is_token0: bool,
-) -> Result<U256, PriceSourceError> {
+/// Orient a pool tick so `1.0001^tick` is fee-token smallest units per wei.
+/// The pool price is token1 per token0 in smallest units.
+fn orient_tick(tick: i32, weth_is_token0: bool) -> Result<i32, PriceSourceError> {
     const MAX_TICK: i32 = 887_272;
     if !(-MAX_TICK..=MAX_TICK).contains(&tick) {
-        return Err(PriceSourceError::ArithmeticOverflow);
+        return Err(PriceSourceError::TickOutOfRange(tick));
     }
-    let directed_tick = if weth_is_token0 { tick } else { -tick };
-    // The raw ratio already uses token smallest units; 1 WETH supplies 10^18 wei.
-    let quote = 1.0001_f64.powi(directed_tick) * 1e18;
-    if !quote.is_finite() || quote <= 0.0 {
-        return Err(PriceSourceError::ArithmeticOverflow);
-    }
-    U256::try_from(quote.ceil()).map_err(|_| PriceSourceError::ArithmeticOverflow)
+    Ok(if weth_is_token0 { tick } else { -tick })
 }
 
 #[cfg(test)]
@@ -256,41 +250,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tick_zero_quotes_one_weth_in_each_direction() {
-        assert_eq!(
-            quote_x_per_weth_from_tick(0, true).unwrap(),
-            U256::from(1_000_000_000_000_000_000u128)
-        );
-        assert_eq!(
-            quote_x_per_weth_from_tick(0, false).unwrap(),
-            U256::from(1_000_000_000_000_000_000u128)
-        );
-    }
-
-    #[test]
-    fn negative_tick_directionality_matches_token_order() {
-        let one_weth = U256::from(1_000_000_000_000_000_000u128);
-        assert!(quote_x_per_weth_from_tick(-1, true).unwrap() < one_weth);
-        assert!(quote_x_per_weth_from_tick(-1, false).unwrap() > one_weth);
-    }
-
-    #[test]
     fn pinned_usdc_pool_constants_are_distinct_pairs() {
         assert_ne!(MAINNET_WETH, MAINNET_USDC);
         assert_ne!(SEPOLIA_WETH, SEPOLIA_USDC);
         assert_ne!(MAINNET_USDC_WETH_005_POOL, SEPOLIA_USDC_WETH_005_POOL);
-    }
-
-    #[test]
-    fn out_of_range_ticks_overflow() {
-        for tick in [-887_273, 887_273, i32::MIN, i32::MAX] {
-            for weth_is_token0 in [false, true] {
-                assert!(matches!(
-                    quote_x_per_weth_from_tick(tick, weth_is_token0),
-                    Err(PriceSourceError::ArithmeticOverflow)
-                ));
-            }
-        }
     }
 
     #[test]
@@ -370,46 +333,21 @@ mod tests {
     }
 
     #[test]
-    fn boundary_ticks_are_representable() {
-        for weth_is_token0 in [false, true] {
-            let tick = if weth_is_token0 { 887_272 } else { -887_272 };
-            assert!(
-                quote_x_per_weth_from_tick(tick, weth_is_token0).unwrap() > U256::from(u128::MAX)
-            );
-            assert_eq!(
-                quote_x_per_weth_from_tick(-tick, weth_is_token0).unwrap(),
-                U256::from(1)
-            );
+    fn orient_tick_follows_token_order() {
+        for tick in [-887_272, -1, 0, 1, 887_272] {
+            assert_eq!(orient_tick(tick, true).unwrap(), tick);
+            assert_eq!(orient_tick(tick, false).unwrap(), -tick);
         }
     }
 
     #[test]
-    fn positive_tick_directionality_matches_token_order() {
-        let one_weth = U256::from(1_000_000_000_000_000_000u128);
-        assert!(quote_x_per_weth_from_tick(1, true).unwrap() > one_weth);
-        assert!(quote_x_per_weth_from_tick(1, false).unwrap() < one_weth);
-    }
-
-    #[test]
-    fn quotes_preserve_smallest_units_across_token_orders() {
-        // Decimal reference values: ~2063 USDC/WETH for a 6-decimal token,
-        // ~2.718 tokens/WETH for an 18-decimal token, and the largest quote.
-        for (directed_tick, expected) in [
-            (-200_000, 2_063_215_670.0),
-            (10_000, 2.718_145_926_825_225e18),
-            (887_272, 3.402_567_868_363_881e56),
-        ] {
+    fn out_of_range_ticks_are_rejected() {
+        for tick in [-887_273, 887_273, i32::MIN, i32::MAX] {
             for weth_is_token0 in [false, true] {
-                let tick = if weth_is_token0 {
-                    directed_tick
-                } else {
-                    -directed_tick
-                };
-                let quote = f64::from(quote_x_per_weth_from_tick(tick, weth_is_token0).unwrap());
-                assert!(
-                    (quote - expected).abs() <= expected * 1e-8,
-                    "tick {tick}, WETH token0 {weth_is_token0}: {quote} vs {expected}"
-                );
+                assert!(matches!(
+                    orient_tick(tick, weth_is_token0),
+                    Err(PriceSourceError::TickOutOfRange(t)) if t == tick
+                ));
             }
         }
     }

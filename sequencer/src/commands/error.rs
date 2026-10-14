@@ -352,8 +352,8 @@ pub enum BootstrapError {
     /// A live quote/transport failed while bootstrapping. It may self-heal.
     #[error("fee oracle bootstrap transient failure: {message}")]
     FeeOracleTransient { message: String },
-    /// Trusted-code join/arithmetic failures while setup persists the first
-    /// quote. These need operator attention but are not source misconfiguration.
+    /// Trusted-code join failures while setup persists the first quote. These
+    /// need operator attention but are not source misconfiguration.
     #[error("fatal fee oracle bootstrap failure: {message}")]
     FeeOracleFatal { message: String },
     /// The keyed signer provider could not be constructed (bad RPC URL or
@@ -772,11 +772,6 @@ impl From<FeeOracleError> for CommandError {
                     message: FeeOracleError::Join(message).to_string(),
                 })
             }
-            FeeOracleError::FatalMath(error) => {
-                CommandError::Bootstrap(BootstrapError::FeeOracleFatal {
-                    message: FeeOracleError::FatalMath(error).to_string(),
-                })
-            }
         }
     }
 }
@@ -784,7 +779,6 @@ impl From<FeeOracleError> for CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::l1::fee_oracle::math::MathError;
     use crate::l1::fee_oracle::worker::FeeOracleError;
     use crate::l1::provider::VerifiedSignerProviderError;
     use crate::l1::submitter::BatchPosterError;
@@ -1202,16 +1196,8 @@ mod tests {
                 "a persistent open failure during the startup sync",
             ),
             (
-                CommandError::from(FeeOracleError::FatalMath(MathError::Overflow)),
-                "fee-oracle fatal math at bootstrap",
-            ),
-            (
-                fee_oracle_worker(FeeOracleError::FatalMath(MathError::Overflow)),
-                "fee-oracle fatal math in the worker",
-            ),
-            (
-                fee_oracle_worker(FeeOracleError::FatalMath(MathError::ExceedsRepresentableRange)),
-                "fee-oracle out-of-range math in the worker",
+                CommandError::from(FeeOracleError::Join("storage task panicked".into())),
+                "a fee-oracle storage-task panic at bootstrap",
             ),
             (
                 CommandError::from(FeeOracleError::Misconfig("wrong pair".into())),

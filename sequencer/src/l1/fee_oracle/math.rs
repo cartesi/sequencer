@@ -1,150 +1,96 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integer-only conversion from L1 gas prices to fee-token gas prices.
+//! Host-side conversion from an L1 gas price and a Uniswap TWAP tick to the
+//! fee-token gas-price exponent. This is approximate f64 arithmetic: only the
+//! published frame fee is consensus, and `fee_to_linear` converts it exactly.
 
-use alloy_primitives::U256;
-use sequencer_core::fee::{FeeEncodeError, fee_from_linear_ceil};
+use sequencer_core::fee::MAX_EXPONENT;
 
-/// Encode a linear price without ever rounding it down.
-///
-/// Values above [`sequencer_core::fee::fee_to_linear`]`(`[`sequencer_core::fee::MAX_EXPONENT`]`)`
-/// fail rather than undercharge.
-pub fn encode_log_gas_price(linear: U256) -> Result<u16, MathError> {
-    fee_from_linear_ceil(linear).map_err(MathError::from)
+/// Fee-token smallest units per L1 gas. `directed_tick` orients the TWAP so
+/// `1.0001^directed_tick` is fee-token smallest units per wei. Pricing slack
+/// is applied by `batch_policy.log_slack`, so this stays the quoted gas cost.
+pub fn x_units_per_gas(gas_price_wei: f64, directed_tick: i32) -> f64 {
+    gas_price_wei * 1.0001_f64.powi(directed_tick)
 }
 
-/// Compute fee-token smallest units charged per L1 gas.
-///
-/// `quote_x_per_weth` is the number of fee-token smallest units for 1 WETH.
-/// The multiplication is checked and rounded up. Pricing slack is applied by
-/// `batch_policy.log_slack`, so this stays the actual quoted gas cost.
-pub fn compute_x_units_per_gas(
-    base_fee: u128,
-    priority_fee: u128,
-    quote_x_per_weth: U256,
-) -> Result<U256, MathError> {
-    let gas_price = U256::from(base_fee)
-        .checked_add(U256::from(priority_fee))
-        .ok_or(MathError::Overflow)?;
-    let numerator = gas_price
-        .checked_mul(quote_x_per_weth)
-        .ok_or(MathError::Overflow)?;
-    let quotient = numerator / U256::from(1_000_000_000_000_000_000u128);
-    if numerator % U256::from(1_000_000_000_000_000_000u128) == U256::ZERO {
-        Ok(quotient)
-    } else {
-        quotient
-            .checked_add(U256::from(1))
-            .ok_or(MathError::Overflow)
-    }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MathError {
-    #[error("integer arithmetic overflow")]
-    Overflow,
-    #[error("linear gas price exceeds the representable log-fee range")]
-    ExceedsRepresentableRange,
-}
-
-impl From<FeeEncodeError> for MathError {
-    fn from(error: FeeEncodeError) -> Self {
-        match error {
-            FeeEncodeError::ExceedsRepresentableRange { .. } => Self::ExceedsRepresentableRange,
-        }
-    }
+/// Round a linear price up to a base-129/128 exponent, clamped to
+/// `[0, MAX_EXPONENT]`. Near an exponent boundary the f64 ceil can land one
+/// step (0.78%) low; `log_slack` absorbs it.
+pub fn log_gas_price_ceil(x_units_per_gas: f64) -> u16 {
+    assert!(
+        x_units_per_gas >= 0.0,
+        "gas price {x_units_per_gas} is negative or NaN"
+    );
+    let exponent = (x_units_per_gas.ln() / (129.0_f64 / 128.0).ln()).ceil();
+    // ln(0) is -inf, which the clamp maps to the lower bound.
+    exponent.clamp(0.0, f64::from(MAX_EXPONENT)) as u16
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sequencer_core::fee::{MAX_EXPONENT, fee_to_linear};
+
+    const BASE: f64 = 129.0 / 128.0;
 
     #[test]
-    fn gas_price_charges_base_plus_priority_without_slack() {
-        // ETH ~= $1800, USDC has 6 decimals, and a 20 gwei paid gas price:
-        // 20e9 wei * 1.8e9 USDC-smallest/WETH / 1e18 = 36 USDC units.
-        assert_eq!(
-            compute_x_units_per_gas(19_000_000_000, 1_000_000_000, U256::from(1_800_000_000))
-                .unwrap(),
-            U256::from(36)
-        );
+    fn x_units_per_gas_matches_reference_quotes() {
+        // Per 1e18 wei: ~2063 USDC (6 decimals), ~2.718 of an 18-decimal token, the largest quote.
+        for (directed_tick, expected) in [
+            (-200_000, 2_063_215_670.0),
+            (10_000, 2.718_145_926_825_225e18),
+            (887_272, 3.402_567_868_363_881e56),
+        ] {
+            let quote = x_units_per_gas(1e18, directed_tick);
+            assert!(
+                (quote - expected).abs() <= expected * 1e-8,
+                "tick {directed_tick}: {quote} vs {expected}"
+            );
+        }
+        assert!(x_units_per_gas(1.0, -887_272) > 0.0);
     }
 
     #[test]
-    fn detects_multiplication_overflow() {
-        assert_eq!(
-            compute_x_units_per_gas(u128::MAX, u128::MAX, U256::MAX),
-            Err(MathError::Overflow)
-        );
+    fn log_gas_price_is_the_next_exponent_up_within_tolerance() {
+        for e in [1i32, 100, 1356, 10_000] {
+            let encoded = i32::from(log_gas_price_ceil(BASE.powi(e)));
+            assert!(
+                (encoded - e).abs() <= 1,
+                "exponent {e} encoded as {encoded}"
+            );
+        }
+        for v in [1.5, 36.0, 1e6, 123_456_789.0] {
+            let e = i32::from(log_gas_price_ceil(v));
+            assert!(BASE.powi(e) >= v * (1.0 - 1e-9));
+            assert!(BASE.powi(e - 1) < v * (1.0 + 1e-9));
+        }
     }
 
     #[test]
-    fn conservative_log_encoding_never_undercharges() {
-        let target = U256::from(123_456_789u64);
-        let encoded = encode_log_gas_price(target).unwrap();
-        assert!(fee_to_linear(encoded) >= target);
-        assert!(encoded == 0 || fee_to_linear(encoded - 1) < target);
+    fn sub_two_unit_price_rounds_in_log_space_not_to_whole_units() {
+        // The removed whole-unit ceil charged 2 units (exponent 90) for 1.25.
+        assert_eq!(log_gas_price_ceil(1.25), 29);
     }
 
     #[test]
-    fn encode_zero_and_exact_max_exponent() {
-        assert_eq!(encode_log_gas_price(U256::ZERO).unwrap(), 0);
+    fn prices_at_or_below_one_unit_floor_at_exponent_zero() {
+        assert_eq!(log_gas_price_ceil(0.0), 0);
+        assert_eq!(log_gas_price_ceil(0.5), 0);
+        assert_eq!(log_gas_price_ceil(1.0), 0);
+    }
+
+    #[test]
+    fn prices_above_the_representable_range_saturate() {
+        assert_eq!(log_gas_price_ceil(f64::MAX), MAX_EXPONENT);
         assert_eq!(
-            encode_log_gas_price(fee_to_linear(MAX_EXPONENT)).unwrap(),
+            log_gas_price_ceil(x_units_per_gas(2.0 * u128::MAX as f64, 887_272)),
             MAX_EXPONENT
         );
     }
 
     #[test]
-    fn encode_rejects_values_above_max_representable() {
-        assert_eq!(
-            encode_log_gas_price(fee_to_linear(MAX_EXPONENT) + U256::from(1u64)),
-            Err(MathError::ExceedsRepresentableRange)
-        );
-        assert_eq!(
-            encode_log_gas_price(U256::MAX),
-            Err(MathError::ExceedsRepresentableRange)
-        );
-    }
-
-    #[test]
-    fn encode_bumps_when_fee_from_linear_rounds_down() {
-        // Pick a linear value whose nearest exponent rounds down; ceiling
-        // encoding must choose the next exponent.
-        let mut target = U256::from(2u64);
-        let mut found = None;
-        for _ in 0..10_000 {
-            let rounded = sequencer_core::fee::fee_from_linear(target);
-            if fee_to_linear(rounded) < target && rounded < MAX_EXPONENT {
-                found = Some((target, rounded));
-                break;
-            }
-            target += U256::from(1u64);
-        }
-        let (target, rounded) = found.expect("find a rounding-down candidate");
-        let encoded = encode_log_gas_price(target).unwrap();
-        assert_eq!(encoded, rounded + 1);
-        assert!(fee_to_linear(encoded) >= target);
-    }
-
-    #[test]
-    fn compute_rounds_up_fractional_wei_quote() {
-        // 1 wei * 1 quote-unit = 1 — strictly less than 1e18, so ceil → 1.
-        assert_eq!(
-            compute_x_units_per_gas(1, 0, U256::from(1)).unwrap(),
-            U256::from(1)
-        );
-        // Exact multiple of 1e18 stays exact (no round-up).
-        assert_eq!(
-            compute_x_units_per_gas(1, 0, U256::from(1_000_000_000_000_000_000u128)).unwrap(),
-            U256::from(1)
-        );
-        // One extra quote unit pushes numerator over the next 1e18 boundary.
-        assert_eq!(
-            compute_x_units_per_gas(1, 0, U256::from(1_000_000_000_000_000_001u128)).unwrap(),
-            U256::from(2)
-        );
+    #[should_panic(expected = "negative or NaN")]
+    fn nan_price_fails_loud() {
+        log_gas_price_ceil(f64::NAN);
     }
 }
