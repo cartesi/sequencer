@@ -48,10 +48,12 @@ to the [register](register.md).
 
 ## Plan of attack
 
-Progress: W1, W2 and W3a have landed on `claude/repo-code-review-103cc5`. Each
-was followed by a devnet and watchdog e2e run and an adversarial review whose
-surviving findings were folded into their commits. W3a left the guest binary
-byte-identical. The input-reader review's commits (compared against the sling
+Progress: W1, W2, W3a and W3b have landed on `claude/repo-code-review-103cc5`.
+Each was followed by a devnet and watchdog e2e run and an adversarial review
+whose surviving findings were folded into their commits. W3a left the guest
+binary byte-identical. W3b moved the template hash once, with behavior pinned by
+consensus vectors; its hashes are in the
+[guest image record](2026-10-14-guest-image-refresh.md). The input-reader review's commits (compared against the sling
 reader, branch `claude/input-reader-review-fda7ad`) are folded in on top, adapted
 to this branch:
 
@@ -75,7 +77,9 @@ but refused as transient in Lua; both retry.
 
 Rules for every wave: behavior changes and refactors ship as separate patches,
 frozen code (see [Freeze list](#freeze-list)) gets bug fixes only, and
-wire/schema/ABI/guest-image changes wait for the contract wave.
+wire/schema/ABI changes and guest behavior changes wait for the contract wave. A
+guest-image move that preserves behavior may land earlier when the consensus
+vectors pass unchanged (W3b).
 
 ### Step 0: decisions (settled 2026-10-13)
 
@@ -156,18 +160,33 @@ the tag, and the register reflects the closures.
   - sequencer-core: B6 (private ProtocolTiming fields), B7, B8, C3 (dead fee inverses), C5.
   - sequencer: D2 (test fixtures out of `storage/ingress.rs`), D4, F4, F7, F10, H6, H7, H12, I7, E4 (pure move).
   - Examples: J1, J5, J10.
-  - Build: L5, L7, L10, L11, L13, L14 (L12 moved to Track 5 in W5). L3
-    (single CI run per push) waits: nightly runs as the flake net are undecided.
+  - Build: L1, L3 step 1, L5, L6, L7, L10 (shellcheck, luacheck, `just ci`
+    removed), L11, L13, L14 (the readme path; the tar and libtest-mimic
+    hoists). L12 moved to Track 5 in W5.
   - Scheduler-code refactors (B6–B8) compile into the guest. Run the canonical
     guest tests and the duality test for each, and expect the template hash to
     move.
   - Renames: rename the submitter's wallet `nonce` to `wallet_nonce` (N14); test literals for MAX_WAIT_BLOCKS (N16).
-  - From the input-reader integration: measure, then try dropping
-    `--test-threads=1` from `test-sequencer` (its stated reason, a partition
-    static, is gone; N18); consider classifying a 3xx at the chain-id check as
-    a configuration error instead of transient.
+  - From the input-reader integration: `test-sequencer` runs at the default
+    thread count (N18); a 3xx at setup's chain-id check is a configuration
+    error (exit 30).
+  - Added during W3b: the F1 and J9 decisions, the process-lock test flake's
+    cause (a child spawned by a concurrent test briefly holds a copy of the
+    lock's descriptor), consensus vectors, the remaining test-only `pub`
+    storage items behind `cfg(test)`, a Rust 1.99, dependency and nixpkgs
+    refresh, and a reproducible guest build: cross added `rust-src` only on a
+    later run, so the template hash depended on build-cache history.
+  - Also added: action pins checked offline in CI and audited upstream before
+    each release, the release published with the `gh` CLI so no third-party
+    code holds `contents: write`, the Node 20 actions bumped, and the runner
+    image pinned to `ubuntu-24.04`.
 - Exit: no `#[path]` test modules, one `test_support`, a benchmark crate of
-  about 3.3k lines, and no test-only public functions in production modules.
+  about 3.3k lines, and no `pub` test-only items in production modules. Test
+  fixtures live in `test_support` or `storage::test_helpers`; `#[cfg(test)]
+  pub(crate)` seams on private state and test constructors or doubles beside
+  their type (the worker test spawners, the poster's test hooks and mock,
+  `ProcessLock::test` and `acquire_released`, `SafeInputRange::empty_at`,
+  `DumpInfo::at_baseline`) stay where they are.
 
 ### W4: docs lean pass (docs only, about −1k doc and −350 comment lines)
 
@@ -189,16 +208,21 @@ the tag, and the register reflects the closures.
 The sub-batches double as the agenda for that sync; each ships separately.
 
 - **5a seam v1 (C ABI).** A1, A2, A7, A3 header trim, Track 6 (emit callback,
-  path suffix, ABI version getter, linker policy). N8 is deferred.
+  path suffix, ABI version getter, linker policy), and L10's
+  `undocumented_unsafe_blocks` lint with its SAFETY-comment decision for the
+  FFI crates. N8 is deferred.
 - **5b batch-format bump (wire).** `[u8; 65]` signature (N7), the full SSZ
   overhead fix (register), A8. Drain sealed batches first and land before the
-  first production deploy.
+  first production deploy; an undecodable batch from the submitter key is
+  terminal since W3b (F1), so the drain is load-bearing.
 - **5c guest-image batch (consensus, with the C++ port).**
   - C1 fee rule; B1 acceptance set (document as-is, or narrow); B9 empty batches.
   - Track 5 fee table, with L12, which Bart's port consumes byte-for-byte.
   - The fridge bound, serializable `SchedulerState` with a "scheduler" inspect
     query, and B13 guest reports.
-  - The BS1 setup cross-check and conformance vectors.
+  - The BS1 setup cross-check and conformance vectors, extending
+    `tests/fixtures/consensus_vectors_v1.json` (W3b) as a new versioned file.
+  - J5's strict-order snapshot decode, which changes what the guest accepts.
 
 ### W6: recovery tool lands (direction; roughly −5k net)
 
@@ -227,13 +251,16 @@ Step 0 settled the four that blocked planning. The rest, by the wave they gate:
 | W1 | Release posture (L1): SHA-pinned actions, job-level tokens, no caches in release | Adopt; dispatch rebuilds existing tags only |
 | W2 | Retry log level (H3, F2) | Verdict-driven: retries WARN, terminal ERROR |
 | W2 | Keep the `terminal_faults` black box (H9) | Keep; fix its forever-warn (HS1) |
-| W3b | Own-key undecodable batch (F1, disputed) | Terminal under self-trust, after a refactor patch; awaiting a decision, so W2 skipped it |
-| W3b | C-engine PermissionDenied (J9) | Operational, matching the native path; awaiting a decision, so W2 skipped it |
+| W3b | Own-key undecodable batch (F1, disputed) | Decided: terminal under self-trust (`UndecodableOwnBatch`; `run` aborts with SIGABRT 134, like any terminal runtime fault), after a refactor patch |
+| W3b | C-engine PermissionDenied (J9) | Decided: operational (exit 1), so native and C engines agree |
+| W3b | Guest-image move outside the contract wave (U0) | Decided: allowed for behavior-preserving commits behind the consensus vectors, as one contiguous batch |
+| W3b | Operator-visible renames and exit codes (U3, U4) | Decided: `wallet_nonce` log keys in their own commit; a 3xx at setup's chain-id check exits 30 |
+| W3b | CI supply chain (U5, U6) | Decided: every action pinned by SHA; cargo-deny blocks on sources, reports advisories without blocking, no schedule. Dependabot declined: it moves a pin without verifying the new code, so its PRs are either rubber-stamped, undoing the pin, or reviewed as carefully as a manual bump. Pins are bumped deliberately before each release instead; the procedure and this reason live in `scripts/verify-action-pins.sh`. Revisit if pins go stale unnoticed again, the set of actions grows, or someone can own a weekly review |
 | W4 | Contract owner: README or `openapi.yaml` (E9) | Moot for the frozen egress half; decide with the new sync |
 | W1 | `docs/recovery/history` TLA+ (N9) | Decided: drop it from `check-all`; it stays as a dev analysis tool |
-| W3 | CI double run (L3) | Undecided: the double run has caught flakes; nightly runs are the alternative |
+| W3 | CI double run (L3) | Decided: step 1, CI on pull requests plus pushes to `main` and `v*` tags, superseded PR runs cancelled. Nightly runs declined; revisit when one-off PR failures stop being a signal or someone owns a red nightly |
 | W4 | Chain-id failover (FS1) | Out of scope per "one consistent node"; reword with a revisit trigger |
-| W5 | Signature acceptance set (B1) | Document now; narrow to v∈{27,28} and low-s in the port's image |
+| W5 | Signature acceptance set (B1) | Document now; narrow to v∈{27,28} and low-s in the port's image. The vector table is pinned (W3b): both paths accept the high-s twin and any v ≥ 35 |
 | W5 | Out-of-range frame fee (C1) | Structural `FeeAboveMax` rejection |
 | W5 | Zero-frame batches (B9) | Reject only if the port forces a new image anyway |
 | W5 | `scheduler_accepts` mirrors gate d (B2, disputed) | Keep the omission; the trace found no reachable case |
@@ -260,13 +287,13 @@ Step 0 settled the four that blocked planning. The rest, by the wave they gate:
 | N11 generation on cascade | fixed | Generation advance plus 409 on reconnect (subscribe.rs:58-70) | Close; in-band notice belongs to the new sync |
 | N12 paginated replay and offset C | fixed | Pager, per-page revalidation, base K (canonical.rs:47-71) | Close; the historical half is frozen (E1) |
 | N13 nested `.DS_Store` | fixed | The unanchored `.gitignore:11` pattern matches nested paths | Close |
-| N14 nonce → index | decide | Collides with `batches.batch_index` | `wallet_nonce` rename now (W3b); see Decisions |
-| N16 MAX_WAIT_BLOCKS configurable | decide | Single constant (lib.rs:21); never changed | Status quo; test literals (W3b) |
+| N14 nonce → index | done | Collides with `batches.batch_index` | The submitter's account nonce is `wallet_nonce` (W3b); the batch nonce stays (see Decisions) |
+| N16 MAX_WAIT_BLOCKS configurable | done | Single constant (lib.rs:21); never changed | Status quo; tests take it from `sequencer_core` (W3b) |
 | N17 benchmark DB size and drain time | done | Only a memory report exists | Reported per sweep step (W3a) |
-| N18 cross-compilation and compile times | open | Guest image built twice in CI; 4 duplicate dependency stacks; no profile tuning | Measure (`--timings`), then L3, L4, L7, L13 (W3b) |
+| N18 cross-compilation and compile times | done | Guest image built twice in CI; 4 duplicate dependency stacks; no profile tuning | One CI run per push (L3), the guest image built once (L7), line-tables-only debuginfo (L13, `target/debug` −22%), parallel `test-sequencer`, one tungstenite stack (W3b) |
 | N19 logs under error | done | ANSI and key redaction done; causes now ride in Display, and `error_chain` renders dependency errors' causes; levels follow the verdict | W2 and the input-reader integration |
 | N20 hot-path clones | stale premise | No per-op clone that matters; fsync and checkpoints dominate | Close |
-| N21 supply chain | partially | Deps already hoisted; one unused dep; duplicates; no advisory gate | L4 (W2), L11 and L14 (W3b) |
+| N21 supply chain | done | Deps already hoisted; one unused dep; duplicates; no advisory gate | L4 (W2); cargo-deny (L11), hoists (L14), and held majors with their revisit triggers at their manifest lines (W3b) |
 | N22 Flashbots/fanout | decide | The poster reads from the same node; fanout only helps a >4 h propagation failure | Decline; record the reason (W4) |
 | N23 conditional snapshots | decide | Exact per-batch snapshots are load-bearing (snapshot_dumps.rs:325-330) | Keep per-batch; add timing (I5) |
 | N24 split servers | open | One merged router (http.rs:331-347) | W2 |
@@ -401,6 +428,17 @@ Each item was refuted or declined. Re-propose only with new evidence.
   head, a poster count witness, `getInputHash` as a content witness, and tests
   pinning read/submit routing. A separate submit (private relay) URL is
   deferred: `create_keyed_providers` is the seam.
+- W3b:
+  - Migrating the vendored guest crates (libcmt-sys, trolley, testsi) to edition
+    2024: they compile into the guest and are a documented vendored fork.
+  - Declaring every internal crate once in `[workspace.dependencies]` (L14b),
+    and `publish = false` in `[workspace.package]` (L14): each member would
+    opt in for nothing, since nothing here is published.
+  - Pointing rollups-types at the workspace alloy entries: a guest SDK crate
+    needs neither `serde` nor `k256`, and inheritance cannot remove features.
+  - Dependency majors: tower-http 0.7, bindgen 0.73 and tokio-tungstenite 0.30,
+    with reasons and revisit triggers at their manifest lines; k256 0.14 and
+    sha2 0.11 wait for alloy and RustCrypto.
 - Keep, despite looking heavy:
   - Exit-verdict projection, SYNCHRONOUS FULL, and schema triggers and typeof guards.
   - Per-batch exact snapshots, GC beyond the frontier, and the I1 duality test.
