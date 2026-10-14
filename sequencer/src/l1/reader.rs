@@ -309,14 +309,14 @@ impl InputReader {
             match result {
                 Ok(()) => {}
                 Err(err @ InputReaderError::InconsistentL1Response(_)) => {
-                    tracing::error!(
+                    tracing::warn!(
                         error = %err,
                         "L1 provider served an inconsistent response — will retry; \
                          if persistent, the RPC endpoint is the suspect"
                     );
                 }
                 Err(err) if err.is_retryable() => {
-                    tracing::error!(error = %err, "L1 provider error in input reader — will retry");
+                    tracing::warn!(error = %err, "L1 provider error in input reader — will retry");
                 }
                 Err(err) => return Err(err),
             }
@@ -492,7 +492,7 @@ impl InputReader {
         let rpc_chain_id = provider
             .get_chain_id()
             .await
-            .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+            .map_err(|e| provider_error("eth_chainId", e))?;
         if rpc_chain_id != self.config.expected_chain_id {
             return Err(InputReaderError::ChainIdMismatch {
                 rpc: rpc_chain_id,
@@ -573,6 +573,14 @@ fn map_storage_task_join(err: tokio::task::JoinError, operation: &'static str) -
     } else {
         InputReaderError::Join(err.to_string())
     }
+}
+
+/// Label a provider failure with the call that failed.
+fn provider_error(
+    operation: impl std::fmt::Display,
+    err: impl std::fmt::Display,
+) -> InputReaderError {
+    InputReaderError::Provider(format!("{operation}: {err}"))
 }
 
 /// Bootstrap-time `eth_call` classification. Retryable when we could not
@@ -795,7 +803,12 @@ async fn input_count_at_block(
         .block(alloy::eips::BlockId::number(block))
         .call()
         .await
-        .map_err(|e| InputReaderError::Provider(e.to_string()))?;
+        .map_err(|e| {
+            provider_error(
+                format_args!("InputBox.getNumberOfInputs at block {block}"),
+                e,
+            )
+        })?;
     u256_to_u64(count, "InputBox getNumberOfInputs")
 }
 
@@ -803,8 +816,10 @@ async fn latest_safe_head(provider: &impl Provider) -> Result<SafeHead, InputRea
     let block = provider
         .get_block(Safe.into())
         .await
-        .map_err(|e| InputReaderError::Provider(e.to_string()))?
-        .ok_or_else(|| InputReaderError::Provider("get_block returned None".to_string()))?;
+        .map_err(|e| provider_error("eth_getBlockByNumber(safe)", e))?
+        .ok_or_else(|| {
+            InputReaderError::Provider("eth_getBlockByNumber(safe) returned no block".to_string())
+        })?;
     Ok(SafeHead {
         block_number: block.header.number,
         block_timestamp: block.header.timestamp,
@@ -1029,7 +1044,10 @@ mod tests {
 
         let result = reader.sync_to_current_safe_head().await;
 
-        assert!(matches!(result, Err(InputReaderError::Provider(_))));
+        assert!(
+            matches!(&result, Err(InputReaderError::Provider(message)) if message.starts_with("eth_chainId: ")),
+            "{result:?}"
+        );
 
         let mut storage =
             Storage::open(db_file.path().to_string_lossy().as_ref()).expect("open storage");

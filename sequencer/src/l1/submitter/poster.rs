@@ -238,7 +238,7 @@ impl EthereumBatchPoster {
             .get_transaction_count(self.config.batch_submitter_address)
             .block_id(BlockNumberOrTag::Latest.into())
             .await
-            .map_err(|err| BatchPosterError::Provider(err.to_string()))
+            .map_err(|err| provider_error("eth_getTransactionCount(latest)", err))
     }
 
     async fn send_batch_at_nonce(
@@ -273,17 +273,14 @@ impl EthereumBatchPoster {
         // Pin the padded estimate before the send. With gas and both fee
         // fields set, the GasFiller is Finished, so this estimate replaces
         // the filler's rather than adding a round-trip.
-        let gas = pad_gas_estimate(
-            call.estimate_gas()
-                .await
-                .map_err(|err| BatchPosterError::Provider(err.to_string()))?,
-        );
+        let gas =
+            pad_gas_estimate(call.estimate_gas().await.map_err(|err| {
+                provider_error(format_args!("eth_estimateGas nonce={nonce}"), err)
+            })?);
 
-        call.gas(gas)
-            .nonce(nonce)
-            .send()
-            .await
-            .map_err(|err| BatchPosterError::Provider(err.to_string()))
+        call.gas(gas).nonce(nonce).send().await.map_err(|err| {
+            provider_error(format_args!("eth_sendRawTransaction nonce={nonce}"), err)
+        })
     }
 
     /// Wait serially for each tx to reach `confirmation_depth + 1`
@@ -318,12 +315,25 @@ impl EthereumBatchPoster {
                     );
                     return Ok(false);
                 }
-                Err(err) => return Err(BatchPosterError::Provider(err.to_string())),
+                Err(err) => {
+                    return Err(provider_error(
+                        format_args!("confirmation watch tx={tx_hash}"),
+                        err,
+                    ));
+                }
             }
         }
 
         Ok(true)
     }
+}
+
+/// Label a provider failure with the call that failed.
+fn provider_error(
+    operation: impl std::fmt::Display,
+    err: impl std::fmt::Display,
+) -> BatchPosterError {
+    BatchPosterError::Provider(format!("{operation}: {err}"))
 }
 
 /// The node already holds our tx at this nonce and this send does not beat
@@ -335,7 +345,7 @@ impl EthereumBatchPoster {
 /// Matched case-insensitively on the provider's error text.
 ///
 /// A client that words it differently falls back to the generic
-/// transient-error path — error log, idle-poll retry, and the tick aborted at
+/// transient-error path — warn log, idle-poll retry, and the tick aborted at
 /// that nonce, so newly closed batches behind it wait for it to clear. That
 /// is exactly what every rejected re-broadcast did before this classification
 /// existed; the classified path is what lets the rest of the suffix go out.
@@ -404,7 +414,7 @@ impl BatchPoster for EthereumBatchPoster {
             .provider
             .get_chain_id()
             .await
-            .map_err(|err| BatchPosterError::Provider(err.to_string()))?;
+            .map_err(|err| provider_error("eth_chainId", err))?;
         if rpc_chain_id != self.config.expected_chain_id {
             return Err(BatchPosterError::ChainIdMismatch {
                 rpc: rpc_chain_id,
@@ -498,7 +508,7 @@ impl BatchPoster for EthereumBatchPoster {
             .provider
             .get_block_number()
             .await
-            .map_err(|err| BatchPosterError::Provider(err.to_string()))?;
+            .map_err(|err| provider_error("eth_blockNumber", err))?;
         let start_block = from_block.max(self.config.start_block);
         if start_block > latest {
             return Ok(Vec::new());
@@ -665,6 +675,21 @@ mod tests {
         derive_confirmation_timeout, externalize_provider_call, is_pending_tx_conflict,
         mock::MockBatchPoster,
     };
+
+    #[test]
+    fn pending_tx_conflict_survives_operation_label() {
+        let BatchPosterError::Provider(message) = super::provider_error(
+            format_args!("eth_sendRawTransaction nonce=3"),
+            "replacement transaction underpriced",
+        ) else {
+            panic!("provider_error builds a Provider error");
+        };
+        assert!(
+            message.starts_with("eth_sendRawTransaction nonce=3: "),
+            "{message}"
+        );
+        assert!(super::is_pending_tx_conflict(&message), "{message}");
+    }
     use crate::l1::watermark::{WalletNonceWatermarkError, WalletNonceWatermarkSink};
     use crate::runtime::shutdown::RuntimeScope;
     use alloy::node_bindings::Anvil;

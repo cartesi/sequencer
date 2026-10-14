@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
-use tracing::{debug, error};
+use tracing::{debug, warn};
 
 use crate::l1::submitter::{
     BatchPoster, BatchPosterError, BatchSubmitterConfig, SubmitBatchesOutcome,
@@ -190,7 +190,14 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
                         let error = BatchSubmitterError::Poster(source);
                         return Err(error);
                     }
-                    error!(error = %source, "L1 provider error — will retry");
+                    match &source {
+                        // A SQLite fault, not the provider.
+                        BatchPosterError::Watermark(watermark) => warn!(
+                            error = %watermark,
+                            "wallet-nonce watermark write failed — will retry"
+                        ),
+                        _ => warn!(error = %source, "L1 provider error — will retry"),
+                    }
                     TickOutcome::Transient
                 }
                 Err(fatal) => return Err(fatal),
