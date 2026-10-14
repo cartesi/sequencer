@@ -74,8 +74,10 @@ head's input count, and checks the count it reached against
 `InputBox.getNumberOfInputs(app)` pinned at block B. Every input's payload must
 name the configured application and chain. A log query that fails over more
 than one block is split in half and retried, and one that fails on a single
-block fails the tick, exactly like the Rust reader (shared vector:
-`tests/fixtures/l1_partition_vector.json`).
+block fails the tick, exactly like the Rust reader. Logs sort by (block, tx
+index, log index), and a log missing any of them fails the tick, as in the Rust
+reader. The shared vector `tests/fixtures/l1_partition_vector.json` pins both
+rules on both sides.
 
 **Scan floor.** The Rust reader starts at the application's deployment block,
 which is sound only because it also witnesses that the InputBox rejects inputs
@@ -332,7 +334,7 @@ LuaFileSystem (`lfs.so`). The `cartesi` module ships with the emulator.
 
 | Command | What it exercises |
 |---|---|
-| `just test-watchdog` | Unit tests: every module against fakes, including the shared partition vector and metrics golden files |
+| `just test-watchdog` | Unit tests: every module against fakes, including the shared partition and log-sort vectors and metrics golden files |
 | `just watchdog lint` | `luacheck` |
 | `just test-watchdog-e2e` | The real emulator with the test guest: executor against the CLI oracle (accept, reject, exception, halt), both state sources, full ticks, `replay`, and the wallet image's golden genesis state. Builds the test guest image on first use; needs the sepolia canonical image |
 | `just test-rollups-e2e` | Devnet scenarios: the watchdog genesis compare and `watchdog_divergence_drill_test` on the Rust host, and the non-genesis compare through both hosts |

@@ -85,5 +85,26 @@
       "expect_calls": [[1, 4], [1, 2], [3, 4], [3, 3], [4, 4]],
       "expect_ok": false
     }
-  ]
+  ],
+  "log_sort": {
+    "unsorted": [
+      { "blockNumber": "0x10", "transactionIndex": "0x0", "logIndex": "0x10" },
+      { "blockNumber": "0x11", "transactionIndex": "0x1", "logIndex": "0x0" },
+      { "blockNumber": "0x9", "transactionIndex": "0x9", "logIndex": "0x0" },
+      { "blockNumber": "0x11", "transactionIndex": "0x0", "logIndex": "0x4" },
+      { "blockNumber": "0x10", "transactionIndex": "0x0", "logIndex": "0x5" }
+    ],
+    "expect_sorted": [
+      { "blockNumber": "0x9", "transactionIndex": "0x9", "logIndex": "0x0" },
+      { "blockNumber": "0x10", "transactionIndex": "0x0", "logIndex": "0x5" },
+      { "blockNumber": "0x10", "transactionIndex": "0x0", "logIndex": "0x10" },
+      { "blockNumber": "0x11", "transactionIndex": "0x0", "logIndex": "0x4" },
+      { "blockNumber": "0x11", "transactionIndex": "0x1", "logIndex": "0x0" }
+    ],
+    "refuse": [
+      { "missing": "blockNumber", "log": { "transactionIndex": "0x0", "logIndex": "0x0" } },
+      { "missing": "transactionIndex", "log": { "blockNumber": "0x2", "logIndex": "0x0" } },
+      { "missing": "logIndex", "log": { "blockNumber": "0x2", "transactionIndex": "0x0" } }
+    ]
+  }
 }

@@ -36,7 +36,7 @@ local function log_position(log, field)
     return value
 end
 
-local function sort_logs(logs)
+function l1.sort_logs(logs)
     local keys = {}
     for _, log in ipairs(logs) do
         keys[log] = {
@@ -190,7 +190,7 @@ function l1.new(rpc, params)
                 end
                 errors.transient("L1 RPC: %s", tostring(err))
             end
-            sort_logs(logs)
+            l1.sort_logs(logs)
             for _, log in ipairs(logs) do
                 local ok, input = pcall(abi.decode_input_added_log, log)
                 if not ok then

@@ -1651,6 +1651,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_log_without_a_position_is_an_inconsistent_response() {
+        let db_file = NamedTempFile::new().expect("temp file");
+        let mut reader = test_reader(
+            db_file.path().to_string_lossy().into_owned(),
+            "http://127.0.0.1:0".to_string(),
+            3,
+            Duration::from_secs(1),
+        );
+
+        // A mined log always carries its position: one without its tx index is
+        // the node's inconsistency, retried like any other.
+        let asserter = alloy::transports::mock::Asserter::new();
+        asserter.push_success(&alloy_primitives::U64::from(31337_u64));
+        asserter.push_success(&mock_safe_block(7));
+        asserter.push_success(&abi_u256(1));
+        let log: alloy::rpc::types::Log = alloy::rpc::types::Log {
+            block_number: Some(7),
+            log_index: Some(0),
+            ..Default::default()
+        };
+        asserter.push_success(&vec![log]);
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = reader
+            .advance_once(&provider)
+            .await
+            .expect_err("a log without its tx index must not be ordered");
+        assert!(
+            matches!(&err, InputReaderError::InconsistentL1Response(m)
+                if m.contains("transaction_index")),
+            "got {err:?}"
+        );
+        assert!(err.is_retryable(), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn advance_once_falls_through_and_fails_completeness_when_count_exceeds_stored() {
         let db_file = NamedTempFile::new().expect("temp file");
         let mut reader = test_reader(

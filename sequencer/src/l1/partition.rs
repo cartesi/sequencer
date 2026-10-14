@@ -73,14 +73,9 @@ pub(crate) async fn get_input_added_events_ordered(
     .await
     .map_err(|(block, source)| GetLogsError::Rpc { block, source })?;
 
-    let mut positioned = logs
+    into_l1_order(logs)?
         .into_iter()
-        .map(|log| Ok((l1_position(&log)?, log)))
-        .collect::<Result<Vec<_>, GetLogsError>>()?;
-    positioned.sort_by_key(|(position, _)| *position);
-    positioned
-        .into_iter()
-        .map(|(_, log)| {
+        .map(|log| {
             let event = InputAdded::decode_log_data(&log.inner.data).map_err(|source| {
                 GetLogsError::Decode {
                     transaction_hash: log.transaction_hash,
@@ -96,7 +91,9 @@ pub(crate) async fn get_input_added_events_ordered(
 /// Fetches `[start, end]`, splitting a range wider than one block in half on
 /// any failure and retrying, left half first, so results concatenate in block
 /// order. A single block's failure fails the whole call: callers never see a
-/// prefix.
+/// prefix. Depth-first, left-first worklist: a failure that cannot split
+/// short-circuits, so ranges after it are never queried, matching `scan` in
+/// `watchdog/l1.lua`.
 ///
 /// Providers cap ranges, result counts and response sizes under error codes
 /// that vary and overlap with rate limits, and a timeout carries no code, so
@@ -132,6 +129,21 @@ where
         }
     }
     Ok(out)
+}
+
+/// Sorts logs into L1 order `(block, tx index, log index)`, refusing a log whose
+/// block, tx index or log index is absent or null. `sort_logs` in
+/// `watchdog/l1.lua` applies the same rule, and the log-sort vector in
+/// `tests/fixtures/l1_partition_vector.json` pins both. A present but malformed
+/// value never reaches here: it fails `Log` deserialization and is split like a
+/// transport failure.
+fn into_l1_order(logs: Vec<Log>) -> Result<Vec<Log>, GetLogsError> {
+    let mut positioned = logs
+        .into_iter()
+        .map(|log| Ok((l1_position(&log)?, log)))
+        .collect::<Result<Vec<_>, GetLogsError>>()?;
+    positioned.sort_by_key(|(position, _)| *position);
+    Ok(positioned.into_iter().map(|(_, log)| log).collect())
 }
 
 fn l1_position(log: &Log) -> Result<(u64, u64, u64), GetLogsError> {
@@ -192,8 +204,83 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LogPosition {
+        block_number: Option<String>,
+        transaction_index: Option<String>,
+        log_index: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RefuseCase {
+        missing: String,
+        log: LogPosition,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LogSortVector {
+        unsorted: Vec<LogPosition>,
+        expect_sorted: Vec<LogPosition>,
+        refuse: Vec<RefuseCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
     struct PartitionVector {
         scenarios: Vec<PartitionScenario>,
+        log_sort: LogSortVector,
+    }
+
+    fn parse_hex_quantity(value: &Option<String>) -> Option<u64> {
+        value
+            .as_deref()
+            .map(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).expect("hex quantity"))
+    }
+
+    fn positioned_log(position: &LogPosition) -> Log {
+        Log {
+            block_number: parse_hex_quantity(&position.block_number),
+            transaction_index: parse_hex_quantity(&position.transaction_index),
+            log_index: parse_hex_quantity(&position.log_index),
+            ..Default::default()
+        }
+    }
+
+    fn position_of(log: &Log) -> (Option<u64>, Option<u64>, Option<u64>) {
+        (log.block_number, log.transaction_index, log.log_index)
+    }
+
+    /// The vector's log-sort section, which the watchdog's `tests/run.lua`
+    /// replays against its `sort_logs`. Its entries are distinct triples, because
+    /// Lua's `table.sort` is not stable.
+    #[test]
+    fn log_sort_vector_matches_watchdog() {
+        let vector: PartitionVector =
+            serde_json::from_str(PARTITION_VECTOR).expect("parse l1_partition_vector.json");
+        let log_sort = vector.log_sort;
+
+        let sorted = into_l1_order(log_sort.unsorted.iter().map(positioned_log).collect())
+            .expect("every unsorted log is fully positioned");
+        let expected: Vec<_> = log_sort
+            .expect_sorted
+            .iter()
+            .map(|position| position_of(&positioned_log(position)))
+            .collect();
+        assert_eq!(sorted.iter().map(position_of).collect::<Vec<_>>(), expected);
+
+        for case in log_sort.refuse {
+            let field = match case.missing.as_str() {
+                "blockNumber" => "block_number",
+                "transactionIndex" => "transaction_index",
+                "logIndex" => "log_index",
+                other => panic!("unknown refuse field {other}"),
+            };
+            let error = into_l1_order(vec![positioned_log(&case.log)])
+                .expect_err("a log missing a position field is refused");
+            assert!(
+                matches!(error, GetLogsError::MissingLogPosition { field: f, .. } if f == field),
+                "{field}: got {error:?}"
+            );
+        }
     }
 
     /// The vector the watchdog's `tests/run.lua` replays against its own

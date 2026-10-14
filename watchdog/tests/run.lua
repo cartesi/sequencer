@@ -214,6 +214,26 @@ test("l1 splits log ranges exactly like the shared Rust partition vector", funct
     end
 end)
 
+test("l1 orders and refuses logs exactly like the shared Rust log-sort vector", function()
+    local log_sort = json.decode(support.read("tests/fixtures/l1_partition_vector.json")).log_sort
+    local logs = {}
+    for i, log in ipairs(log_sort.unsorted) do
+        logs[i] = log
+    end
+    l1_mod.sort_logs(logs)
+    eq(#logs, #log_sort.expect_sorted, "sorted length")
+    for i, expected in ipairs(log_sort.expect_sorted) do
+        for _, field in ipairs({ "blockNumber", "transactionIndex", "logIndex" }) do
+            eq(logs[i][field], expected[field], "position " .. i .. " " .. field)
+        end
+    end
+    for _, case in ipairs(log_sort.refuse) do
+        raises("transient", "InputAdded log without a valid " .. case.missing, function()
+            l1_mod.sort_logs({ case.log })
+        end)
+    end
+end)
+
 -- ── config ────────────────────────────────────────────────────────────────
 
 local function init_env(overrides)
