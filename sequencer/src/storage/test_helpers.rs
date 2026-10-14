@@ -1,14 +1,16 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Shared test fixtures used by `#[cfg(test)]` modules in `storage/`.
+//! Storage-domain test fixtures: seeding, the recovery fixture trait and
+//! divergence markers. Crate-wide fixtures live in `crate::test_support`.
 
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::protocol::ProtocolTiming;
-use tempfile::TempDir;
 
-use super::{DeploymentIdentity, FeeOracleIdentity, SafeInputRange, Storage, StoredSafeInput};
+use super::{SafeInputRange, Storage, StoredSafeInput};
+// Transitional: callers still name these through `storage::test_helpers`.
+pub(crate) use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
 pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
@@ -23,41 +25,6 @@ pub(crate) fn default_protocol_timing() -> ProtocolTiming {
         l1_read_stale_after_blocks: 900,
         seconds_per_block: 12,
     }
-}
-
-pub(crate) struct TestDb {
-    pub _dir: TempDir,
-    pub path: String,
-}
-
-pub(crate) fn temp_db(name: &str) -> TestDb {
-    let dir = tempfile::Builder::new()
-        .prefix(format!("sequencer-{name}-").as_str())
-        .tempdir()
-        .expect("create temporary test directory");
-    let path = dir.path().join("sequencer.sqlite");
-    TestDb {
-        _dir: dir,
-        path: path.to_string_lossy().into_owned(),
-    }
-}
-
-/// Pin the trusted deployment identity a production setup establishes before
-/// any fresh-Tip attribution can classify safe inputs.
-pub(crate) fn pin_test_deployment_identity(
-    storage: &mut Storage,
-    batch_submitter_address: Address,
-) {
-    storage
-        .load_or_insert_deployment_identity(DeploymentIdentity {
-            chain_id: 1,
-            app_address: Address::repeat_byte(0x11),
-            input_box_address: Address::repeat_byte(0x22),
-            app_deployment_block: 0,
-            batch_submitter_address,
-            fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
-        })
-        .expect("pin test deployment identity");
 }
 
 /// Recovery-storage fixture with the same prerequisite ordering as setup:

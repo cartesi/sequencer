@@ -77,10 +77,11 @@ fn write_baseline_dump<A: Application>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
+    use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig};
     use crate::runtime::shutdown::RuntimeScope;
     use crate::storage::test_helpers::{pin_test_deployment_identity, temp_db};
     use crate::storage::{LifecycleCommand, Storage};
+    use crate::test_support::{shutdown_lane, wait_until};
     use alloy_primitives::{Address, U256};
     use app_core::application::{WalletApp, WalletConfig};
     use sequencer_core::application::{
@@ -587,28 +588,5 @@ mod tests {
         }
 
         shutdown_lane(&shutdown, handle).await;
-    }
-
-    async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
-        let started = tokio::time::Instant::now();
-        while started.elapsed() < timeout {
-            if predicate() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        predicate()
-    }
-
-    async fn shutdown_lane(
-        shutdown: &RuntimeScope,
-        handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
-    ) {
-        shutdown.request_shutdown();
-        let joined = tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("wait for lane shutdown");
-        let result = joined.expect("join lane task");
-        assert!(result.is_ok(), "lane should shut down cleanly: {result:?}");
     }
 }

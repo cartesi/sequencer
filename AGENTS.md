@@ -376,7 +376,9 @@ Test placement: unit tests are a child module of the code under test, inline
 `#[cfg(test)] mod tests` or `<module>/tests.rs` (or `<topic>_tests.rs`) once
 large, never `#[path]`. Cross-module in-process tests go in
 `sequencer/src/integration_tests/`; devnet, machine and binary tests go in the
-`tests/*` crates.
+`tests/*` crates. Shared fixtures live in `crate::test_support`;
+`storage::test_helpers` keeps the storage-domain ones (seeding, the recovery
+fixture trait, divergence markers).
 
 Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a
 clear message if `anvil` is not on PATH. Use the configured Nix/direnv environment

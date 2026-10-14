@@ -19,7 +19,7 @@ use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 
-use crate::test_support::{ReplayEvent, StubApp};
+use crate::test_support::{ReplayEvent, StubApp, shutdown_lane, wait_until};
 
 use super::catch_up::{catch_up_application_paged, catch_up_snapshot};
 use super::dequeue_and_execute_user_op_chunk;
@@ -669,29 +669,6 @@ fn read_frame_safe_blocks(db_path: &str) -> Vec<u64> {
         .expect("query frame clocks")
         .map(|value| u64::try_from(value.expect("read frame clock")).expect("nonnegative clock"))
         .collect()
-}
-
-async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
-    let started = tokio::time::Instant::now();
-    while started.elapsed() < timeout {
-        if predicate() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    predicate()
-}
-
-async fn shutdown_lane(
-    shutdown: &RuntimeScope,
-    handle: tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
-) {
-    shutdown.request_shutdown();
-    let joined = tokio::time::timeout(Duration::from_secs(2), handle)
-        .await
-        .expect("wait for lane shutdown");
-    let result = joined.expect("join lane task");
-    assert!(result.is_ok(), "lane should shut down cleanly: {result:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
