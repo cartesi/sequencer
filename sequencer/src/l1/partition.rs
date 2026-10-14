@@ -89,9 +89,10 @@ async fn get_input_added_events(
 ///
 /// Depth-first, left-first worklist (push right, then push left): the query
 /// order and the concatenation order match the watchdog's recursive `scan`
-/// (`watchdog/l1.lua`) and [`simulate_partitioned_get_logs`] exactly. A
-/// terminal error short-circuits — once one sub-range fails for good, the
-/// ranges after it are not queried.
+/// (`watchdog/l1.lua`) exactly; `tests/fixtures/l1_partition_vector.json`
+/// pins the query order and outcome on both sides. A terminal error
+/// short-circuits — once one sub-range fails for good, the ranges after it
+/// are not queried.
 async fn bisect_block_range<T, E, Fut>(
     start_block: u64,
     end_block: u64,
@@ -123,78 +124,6 @@ fn should_retry_with_partition(err: &ContractError, codes: &[String]) -> bool {
 
 fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) -> bool {
     codes.iter().any(|c| error_message.contains(c))
-}
-
-/// Simulates partitioned `eth_getLogs` bisect (same rules as `watchdog/l1_reader.lua`).
-/// `get_logs` returns `Ok` for a successful leaf query or `Err(message)` on RPC failure.
-/// Records every attempted `(from_block, to_block)` in call order.
-///
-/// Test-only parity model of [`get_input_added_events`]: the fixture
-/// (`tests/fixtures/l1_partition_vector.json`) drives this model on the Rust
-/// side and the *production* `for_each_log_chunk_partitioned` on the Lua side.
-#[cfg(test)]
-fn simulate_partitioned_get_logs<F>(
-    start_block: u64,
-    end_block: u64,
-    long_block_range_error_codes: &[String],
-    mut get_logs: F,
-) -> (Vec<(u64, u64)>, Result<(), String>)
-where
-    F: FnMut(u64, u64) -> Result<(), String>,
-{
-    if end_block < start_block {
-        return (Vec::new(), Ok(()));
-    }
-
-    fn go<F>(
-        start_block: u64,
-        end_block: u64,
-        long_block_range_error_codes: &[String],
-        get_logs: &mut F,
-        calls: &mut Vec<(u64, u64)>,
-    ) -> Result<(), String>
-    where
-        F: FnMut(u64, u64) -> Result<(), String>,
-    {
-        calls.push((start_block, end_block));
-        match get_logs(start_block, end_block) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                if start_block < end_block
-                    && error_message_matches_retry_codes(&err, long_block_range_error_codes)
-                {
-                    let middle = start_block + (end_block - start_block) / 2;
-                    go(
-                        start_block,
-                        middle,
-                        long_block_range_error_codes,
-                        get_logs,
-                        calls,
-                    )?;
-                    go(
-                        middle + 1,
-                        end_block,
-                        long_block_range_error_codes,
-                        get_logs,
-                        calls,
-                    )?;
-                    Ok(())
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    let mut calls = Vec::new();
-    let result = go(
-        start_block,
-        end_block,
-        long_block_range_error_codes,
-        &mut get_logs,
-        &mut calls,
-    );
-    (calls, result)
 }
 
 /// Total order for merged logs `(block, tx index, log index)` — matches Lua
@@ -267,8 +196,8 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES, decode_evm_advance_input,
-        error_message_matches_retry_codes, simulate_partitioned_get_logs, sort_logs_by_l1_order,
+        DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES, bisect_block_range, decode_evm_advance_input,
+        error_message_matches_retry_codes, sort_logs_by_l1_order,
     };
 
     const PARTITION_VECTOR: &str = include_str!(concat!(
@@ -338,30 +267,41 @@ mod tests {
         assert_eq!(vector.long_block_range_error_codes, expected);
     }
 
-    #[test]
-    fn partition_vector_simulation_matches_watchdog() {
+    #[tokio::test]
+    async fn partition_vector_bisect_matches_watchdog() {
         let vector = load_partition_vector();
+        let codes = vector.long_block_range_error_codes;
         for scenario in vector.scenarios {
-            let fails = fail_map(&scenario.fail_ranges);
-            let codes = vector.long_block_range_error_codes.clone();
-            let (calls, result) = simulate_partitioned_get_logs(
-                scenario.start_block,
-                scenario.end_block,
-                &codes,
-                |from, to| {
-                    if let Some(message) = fails.get(&(from, to)) {
-                        Err(message.clone())
-                    } else {
-                        Ok(())
-                    }
-                },
-            );
-
             let expected_calls: Vec<(u64, u64)> = scenario
                 .expect_calls
                 .iter()
                 .map(|pair| (pair[0], pair[1]))
                 .collect();
+            // An empty range never reaches the bisect: both production callers
+            // return before the fetch (reader `read_safe_inputs`, poster
+            // `observed_submitted_batch_nonces`), like the watchdog's `from <= to`.
+            if scenario.start_block > scenario.end_block {
+                assert!(
+                    expected_calls.is_empty() && scenario.expect_ok,
+                    "scenario {}",
+                    scenario.name
+                );
+                continue;
+            }
+
+            let fails = fail_map(&scenario.fail_ranges);
+            let mut calls = Vec::new();
+            let result: Result<Vec<()>, String> = bisect_block_range(
+                scenario.start_block,
+                scenario.end_block,
+                |err: &String| error_message_matches_retry_codes(err, &codes),
+                |from, to| {
+                    calls.push((from, to));
+                    std::future::ready(fails.get(&(from, to)).cloned().map_or(Ok(Vec::new()), Err))
+                },
+            )
+            .await;
+
             assert_eq!(calls, expected_calls, "scenario {}", scenario.name);
             assert_eq!(
                 result.is_ok(),
