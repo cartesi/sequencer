@@ -10,11 +10,9 @@
 //! slots reach safe finality, the recovery procedure can read fully-finalized L1 state.
 
 use alloy::network::TransactionBuilder;
-use alloy::providers::{
-    DynProvider, PendingTransactionConfig, PendingTransactionError, Provider, WatchTxError,
-};
+use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::BlockNumberOrTag;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -50,10 +48,11 @@ pub struct MempoolFlusher {
     safe_poll_interval: Duration,
 }
 
-/// Derive the flusher's watch/poll durations from the configured block time.
+/// Derive the flusher's wait and poll durations from the configured block time.
 ///
-/// `confirmation_timeout` is 10 blocks — long enough to survive one-off L1
-/// stalls but short enough to retry within a reasonable window.
+/// `confirmation_timeout` is 10 blocks, how long one pass waits for its slots
+/// to be mined before resubmitting: long enough to survive one-off L1 stalls,
+/// short enough to retry within a reasonable window.
 /// `safe_poll_interval` is one block — matches the natural cadence for
 /// `get_transaction_count(Safe)` to advance.
 ///
@@ -112,13 +111,6 @@ fn send_failures_error(failures: &[(u64, String)]) -> FlushError {
         "failed to submit {} flush no-op transaction(s): {samples}{suffix}",
         failures.len()
     ))
-}
-
-fn map_watch_error(err: PendingTransactionError) -> Result<bool, FlushError> {
-    match err {
-        PendingTransactionError::TxWatcher(WatchTxError::Timeout) => Ok(false),
-        other => Err(FlushError::Provider(other.to_string())),
-    }
 }
 
 impl MempoolFlusher {
@@ -181,10 +173,11 @@ impl MempoolFlusher {
     ///    though no-ops never exceed the existing watermark under the
     ///    invariant). These compete with any of our txs still in the
     ///    network; whichever wins, the slot advances.
-    /// 2. Watch each submitted no-op for L1 inclusion.
+    /// 2. Wait until every slot below the flush end is mined, by an original
+    ///    or a no-op: the slot, not a particular tx, is what must be consumed.
     /// 3. Sleep to let the safe head advance, then re-check the loop condition.
-    /// 4. If any watch times out, retry the outer loop (tx may have been dropped,
-    ///    or the original batch may be making progress instead).
+    /// 4. If the slots are not mined in time, retry the outer loop (a no-op may
+    ///    have been dropped or underpriced).
     ///
     /// Returns the L1 **safe block number** at which resolution was observed:
     /// the caller must not cascade until its own re-synced view reaches at
@@ -249,8 +242,8 @@ impl MempoolFlusher {
             attempt += 1;
 
             // Submit no-ops for every not-yet-mined slot up to the flush end.
-            // The full range goes out before watching any tx, so every
-            // unresolved slot gets a competing no-op attempt in this pass.
+            // The full range goes out before the wait, so every unresolved
+            // slot gets a competing no-op attempt in this pass.
             let latest_nonce = self.nonce_at(BlockNumberOrTag::Latest).await?;
             if latest_nonce < flush_end {
                 // Uniform write-before-broadcast; covers the no-ops we are
@@ -262,10 +255,9 @@ impl MempoolFlusher {
                     .expect("a non-empty flush range must have a highest nonce");
                 sink.raise_to(highest_nonce)?;
             }
-            let tx_hashes = self.submit_noops(latest_nonce, flush_end).await?;
+            self.submit_noops(latest_nonce, flush_end).await?;
 
-            // Watch each submitted tx for L1 inclusion.
-            if !self.watch_txs(&tx_hashes).await? {
+            if !self.wait_for_slots_mined(flush_end).await? {
                 continue;
             }
 
@@ -286,10 +278,9 @@ impl MempoolFlusher {
     }
 
     /// Submit 0-ETH self-transfers for nonces `from_nonce..to_nonce`.
-    /// Returns the tx hashes of successfully submitted transactions.
-    async fn submit_noops(&self, from_nonce: u64, to_nonce: u64) -> Result<Vec<B256>, FlushError> {
+    async fn submit_noops(&self, from_nonce: u64, to_nonce: u64) -> Result<(), FlushError> {
         if from_nonce >= to_nonce {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let estimate = estimate_fees(&self.provider)
@@ -333,7 +324,6 @@ impl MempoolFlusher {
             "submitting flush no-ops"
         );
 
-        let mut tx_hashes = Vec::new();
         let mut send_failures = Vec::new();
         for nonce in from_nonce..to_nonce {
             let tx = tx_base
@@ -345,9 +335,7 @@ impl MempoolFlusher {
 
             match self.provider.send_transaction(tx).await {
                 Ok(pending) => {
-                    let tx_hash = *pending.tx_hash();
-                    debug!(nonce, %tx_hash, gas, "flush no-op submitted");
-                    tx_hashes.push(tx_hash);
+                    debug!(nonce, tx_hash = %pending.tx_hash(), gas, "flush no-op submitted");
                 }
                 Err(e) => {
                     let message = e.to_string();
@@ -361,37 +349,27 @@ impl MempoolFlusher {
             return Err(send_failures_error(send_failures.as_slice()));
         }
 
-        Ok(tx_hashes)
+        Ok(())
     }
 
-    /// Watch submitted transactions for L1 inclusion.
-    /// Uses the same `PendingTransactionConfig::watch` pattern as the batch poster.
-    /// Returns `true` if all txs confirmed, `false` on timeout.
-    async fn watch_txs(&self, tx_hashes: &[B256]) -> Result<bool, FlushError> {
-        for tx_hash in tx_hashes {
-            let watch = PendingTransactionConfig::new(*tx_hash)
-                .with_required_confirmations(1)
-                .with_timeout(Some(self.confirmation_timeout))
-                .with_provider(self.provider.root().clone());
-            match watch.watch().await {
-                Ok(_) => {
-                    debug!(%tx_hash, "flush no-op included on L1");
-                }
-                Err(err @ PendingTransactionError::TxWatcher(WatchTxError::Timeout)) => {
-                    // This should not happen during normal L1 operation.
-                    // Possible causes: L1 congestion, tx dropped from mempool,
-                    // gas price too low to compete.
-                    error!(
-                        %tx_hash,
-                        timeout_secs = self.confirmation_timeout.as_secs(),
-                        "flush no-op timed out waiting for L1 inclusion — will retry"
-                    );
-                    return map_watch_error(err);
-                }
-                Err(err) => return map_watch_error(err),
+    /// Wait until the Latest nonce reaches `flush_end`, polling once per
+    /// block. Returns `false` when the confirmation timeout passes first.
+    async fn wait_for_slots_mined(&self, flush_end: u64) -> Result<bool, FlushError> {
+        let deadline = tokio::time::Instant::now() + self.confirmation_timeout;
+        loop {
+            if self.nonce_at(BlockNumberOrTag::Latest).await? >= flush_end {
+                return Ok(true);
             }
+            if tokio::time::Instant::now() >= deadline {
+                debug!(
+                    flush_end,
+                    timeout_secs = self.confirmation_timeout.as_secs(),
+                    "flush slots not mined before the timeout"
+                );
+                return Ok(false);
+            }
+            tokio::time::sleep(self.safe_poll_interval).await;
         }
-        Ok(true)
     }
 
     async fn nonce_at(&self, block: BlockNumberOrTag) -> Result<u64, FlushError> {
@@ -554,17 +532,6 @@ mod tests {
         assert!(message.contains("nonce 9: insufficient funds"));
         assert!(message.contains("and 1 more"));
         assert!(!message.contains("nonce 10"));
-    }
-
-    #[test]
-    fn watch_error_mapping_retries_only_timeouts() {
-        let timeout = map_watch_error(PendingTransactionError::TxWatcher(WatchTxError::Timeout))
-            .expect("timeout should be a retryable watch result");
-        assert!(!timeout, "timeout should ask the caller to retry");
-
-        let err = map_watch_error(PendingTransactionError::FailedToRegister)
-            .expect_err("non-timeout watcher failures must surface");
-        assert!(matches!(err, FlushError::Provider(_)));
     }
 
     // ── Timeouts derive from seconds_per_block ────────────────
@@ -778,6 +745,33 @@ mod tests {
         assert!(
             observed_safe_block > 0,
             "flush must report the safe block it observed resolution at"
+        );
+    }
+
+    #[tokio::test]
+    async fn slot_wait_counts_a_slot_mined_by_any_transaction() {
+        require_anvil();
+
+        let anvil = spawn_anvil();
+        let provider = signer_provider(&anvil);
+        let addr = anvil.addresses()[0];
+        let flusher = MempoolFlusher::new(provider.clone(), addr, 12)
+            .with_timeouts(Duration::from_millis(300), Duration::from_millis(50));
+
+        assert!(
+            !flusher.wait_for_slots_mined(1).await.expect("wait"),
+            "an unmined slot must time out"
+        );
+
+        // The original tx, not a flush no-op, consumes the slot.
+        send_tx_at_nonce(&provider, addr, 0).await;
+        let _: serde_json::Value = provider
+            .raw_request("evm_mine".into(), ())
+            .await
+            .expect("mine");
+        assert!(
+            flusher.wait_for_slots_mined(1).await.expect("wait"),
+            "a slot mined by any tx is consumed"
         );
     }
 
