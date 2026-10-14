@@ -12,7 +12,7 @@ authors.workspace = true
 [dependencies]
 alloy-primitives = { workspace = true }
 sequencer-core = { path = "../../sequencer-core" }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "query"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
