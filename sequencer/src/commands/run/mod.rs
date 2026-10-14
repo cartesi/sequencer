@@ -147,6 +147,12 @@ where
         max_wait_blocks = timing.max_wait_blocks,
         preemptive_margin_blocks = timing.preemptive_margin_blocks,
         danger_threshold = timing.danger_threshold(),
+        l1_read_stale_after_blocks = timing.l1_read_stale_after_blocks,
+        seconds_per_block = timing.seconds_per_block,
+        max_batch_open_seconds = config.max_batch_open_seconds,
+        batch_submitter_confirmation_depth = config.batch_submitter_confirmation_depth,
+        batch_submitter_idle_poll_interval_ms = config.batch_submitter_idle_poll_interval_ms,
+        fee_oracle_poll_interval_ms = config.fee_oracle.poll_interval_ms,
         "sequencer startup"
     );
 

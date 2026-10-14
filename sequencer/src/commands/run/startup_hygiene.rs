@@ -104,7 +104,13 @@ fn sweep_orphan_dumps(
             continue;
         }
         match delete_dump_dir(&path) {
-            Ok(()) => removed += 1,
+            Ok(()) => {
+                tracing::info!(
+                    ?path,
+                    "orphan dump sweep: deleted unregistered dump directory"
+                );
+                removed += 1;
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
