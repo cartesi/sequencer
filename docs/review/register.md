@@ -88,22 +88,6 @@ verify that every public route in the [API contract](../../README.md#api) (today
 listener and no internal route is. Keep network access controls as the
 deployment boundary; no new authentication subsystem is implied.
 
-## Confirmed discrepancies
-
-### Setup misclassifies some deterministic L1 configuration failures
-
-Setup wraps reader bootstrap failures as live-worker failures, yielding exit 1;
-normal-run startup classifies deterministic reader bootstrap failures as
-terminal, exit 30. Malformed RPC URLs exercise this distinction. Discovery
-failures such as a wrong InputBox also occur in setup, but run does not repeat
-that discovery. The impact is a misleading operator hint in a one-shot command.
-
-Evidence: [`setup`](../../sequencer/src/commands/setup/mod.rs),
-[`InputReaderError::is_terminal_invariant`](../../sequencer/src/l1/reader.rs),
-and `classify_input_reader` in [startup recovery](../../sequencer/src/recovery/mod.rs).
-Next: classify failures by the setup phase and pin the external exit code;
-preserve genuinely transient provider failures.
-
 ## Bounded investigations and cleanup
 
 - **Intermittent process-lock test failure.** The macOS workspace suite can

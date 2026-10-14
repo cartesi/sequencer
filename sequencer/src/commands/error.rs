@@ -265,6 +265,14 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
                 CommandFailureVerdict::Terminal
             }
         }
+        // Setup's reader failures take the startup polarity.
+        BootstrapError::SetupInputReader(source) => {
+            if source.is_retryable_at_startup() {
+                CommandFailureVerdict::Retryable
+            } else {
+                CommandFailureVerdict::Terminal
+            }
+        }
         // Transient: self-heal when the L1 view / provider recovers — or,
         // for the data-dir lock, when the previous owner finishes dying.
         // `FeeOracleTransient` is documented "may self-heal", which is this
@@ -354,6 +362,10 @@ pub enum BootstrapError {
     /// Startup recovery (or refusal) failed before runtime workers started.
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
+    /// An input-reader failure in setup's L1 discovery or initial sync,
+    /// classified by [`InputReaderError::is_retryable_at_startup`].
+    #[error("setup L1 input reader: {0}")]
+    SetupInputReader(InputReaderError),
     /// Deployment-identity guards — see [`IdentityError`].
     #[error(transparent)]
     Identity(#[from] IdentityError),
@@ -845,10 +857,26 @@ mod tests {
         ]
     }
 
+    fn setup_reader(error: InputReaderError) -> CommandError {
+        CommandError::Bootstrap(BootstrapError::SetupInputReader(error))
+    }
+
     /// Class 20: restart; a transient refusal that self-heals when the L1
     /// view or the provider recovers.
     fn transient() -> Vec<Row> {
         vec![
+            (
+                setup_reader(InputReaderError::Provider("offline".into())),
+                "an unreachable provider during setup's L1 sync",
+            ),
+            (
+                setup_reader(InputReaderError::InconsistentL1Response("gap".into())),
+                "an inconsistent L1 response during setup's L1 sync",
+            ),
+            (
+                setup_reader(InputReaderError::Storage(busy())),
+                "busy storage during setup's L1 sync",
+            ),
             (
                 danger(DangerStatus::L1ViewStale),
                 "a stale L1 view at runtime",
@@ -930,7 +958,29 @@ mod tests {
     /// Class 30: do not restart; page. The state cannot self-heal, so the
     /// black box records the cause (`is_terminal`) for exactly these rows.
     fn terminal() -> Vec<Row> {
-        let mut rows: Vec<Row> = vec![];
+        let mut rows: Vec<Row> = vec![
+            (
+                setup_reader(InputReaderError::Bootstrap("invalid RPC URL".into())),
+                "a malformed RPC URL or wrong InputBox at setup",
+            ),
+            (
+                setup_reader(InputReaderError::ChainIdMismatch {
+                    rpc: 1,
+                    expected: 2,
+                }),
+                "a wrong-chain RPC at setup",
+            ),
+            (
+                setup_reader(InputReaderError::Join("lost".into())),
+                "a lost sync task at setup",
+            ),
+            (
+                setup_reader(InputReaderError::Storage(
+                    rusqlite::Error::QueryReturnedNoRows,
+                )),
+                "persistent storage failure during setup's L1 sync",
+            ),
+        ];
         // A key file that is missing, unreadable, not a file, or not text is
         // the same operator mistake as bad key content one call later, and
         // must not differ from it by 29 in the exit code.

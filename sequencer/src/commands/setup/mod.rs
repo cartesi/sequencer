@@ -123,14 +123,10 @@ where
         Err(InputReaderError::Provider(e)) => {
             // First boot needs L1 to discover + pin identity. Retryable: the
             // operator brings L1 up and re-runs `setup`.
-            tracing::error!(error = %e, "L1 unreachable during setup — cannot discover identity");
+            tracing::warn!(error = %e, "L1 unreachable during setup — cannot discover identity");
             return Err(IdentityError::FirstBootRequiresL1.into());
         }
-        Err(source) => {
-            return Err(CommandError::Worker(WorkerExit::InputReader(
-                crate::commands::error::WorkerStop::Source(source),
-            )));
-        }
+        Err(source) => return Err(BootstrapError::SetupInputReader(source).into()),
     };
 
     validate_rpc_chain_id(
@@ -266,11 +262,7 @@ where
     input_reader
         .sync_to_current_safe_head()
         .await
-        .map_err(|e| {
-            CommandError::Worker(WorkerExit::InputReader(
-                crate::commands::error::WorkerStop::Source(e),
-            ))
-        })?;
+        .map_err(BootstrapError::SetupInputReader)?;
 
     // ── Branch: recovery rebuild vs the genesis-style detect-and-refuse ──
     let mut storage = storage::Storage::open(&db_path)?;
@@ -1054,6 +1046,64 @@ mod tests {
     /// `setup --recovery`'s flush signs L1 no-ops with the recovery key, so it
     /// must match the pinned batch-submitter — otherwise it would settle some
     /// other account's nonce while recovery never settles the intended wallet.
+    /// Setup's L1 discovery uses the startup polarity: a malformed RPC URL
+    /// re-fails identically, so it is terminal; an unreachable RPC is not.
+    #[tokio::test]
+    async fn setup_l1_failures_exit_by_startup_phase() {
+        use crate::commands::error::{EXIT_RESTART_TRANSIENT, EXIT_TERMINAL};
+        use crate::harness::{Cli, Command};
+        use clap::Parser;
+
+        async fn setup_with(rpc_url: &str) -> CommandError {
+            let data_dir = tempfile::tempdir().expect("data dir");
+            let cli = Cli::try_parse_from([
+                "sequencer",
+                "setup",
+                "--data-dir",
+                data_dir.path().to_str().expect("utf8 path"),
+                "--eth-rpc-url",
+                rpc_url,
+                "--chain-id",
+                "31337",
+                "--app-address",
+                "0x1111111111111111111111111111111111111111",
+                "--batch-submitter-address",
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            ])
+            .expect("parse setup");
+            let Command::Setup(config) = cli.command else {
+                panic!("expected setup subcommand");
+            };
+            setup(
+                *config,
+                || -> Result<crate::commands::test_support::SweepTestApp, AppError> {
+                    unreachable!("setup fails before building the genesis app")
+                },
+            )
+            .await
+            .expect_err("setup cannot discover L1")
+        }
+
+        let malformed = setup_with("not a url").await;
+        assert!(
+            matches!(
+                malformed,
+                CommandError::Bootstrap(BootstrapError::SetupInputReader(
+                    InputReaderError::Bootstrap(_)
+                ))
+            ),
+            "{malformed:?}"
+        );
+        assert_eq!(malformed.exit_code(), EXIT_TERMINAL);
+
+        let unreachable = setup_with("http://127.0.0.1:1").await;
+        assert_eq!(
+            unreachable.exit_code(),
+            EXIT_RESTART_TRANSIENT,
+            "{unreachable:?}"
+        );
+    }
+
     /// The guard is pure and runs first, so a wrong key is refused before any L1
     /// contact (the RPC here is unreachable) or DB write.
     #[tokio::test]

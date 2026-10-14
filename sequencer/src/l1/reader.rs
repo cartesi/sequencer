@@ -100,21 +100,20 @@ impl InputReaderError {
         }
     }
 
-    /// Whether a failure in a startup sync (`InitialSync` and `PostFlushSync`,
-    /// both through `sync_to_current_safe_head`) is worth retrying.
+    /// Whether a failure in a startup phase is worth retrying: setup's
+    /// discovery and initial sync, and run's `InitialSync` and
+    /// `PostFlushSync` (both through `sync_to_current_safe_head`).
     /// `ChainIdMismatch` and `StorageTaskPanicked` are refused at startup and
     /// terminal in the live worker alike. Two variants are phase-dependent by
     /// design and differ from [`Self::is_terminal_invariant`]:
     ///
-    /// - `Bootstrap` at startup can only be the sync's `create_provider`
-    ///   failing on the configured RPC URL (parse, the plaintext-remote rule,
-    ///   client build), refused because re-running the same boot re-fails
-    ///   identically. The discovery-time facts (wrong contract, pre-v3
-    ///   InputBox) arise in `InputReader::new`, which only `setup` calls and
-    ///   currently projects as a live-worker exit rather than a deterministic
-    ///   configuration failure. In the live loop the same URL was already
-    ///   proven by this boot's initial sync, so a live `Bootstrap` restarts
-    ///   unclassified rather than poisoning the data directory.
+    /// - `Bootstrap` at startup is a deterministic configuration failure,
+    ///   refused because re-running re-fails identically: the configured RPC
+    ///   URL (parse, the plaintext-remote rule, client build) or, in setup's
+    ///   discovery ([`InputReader::new`]), a wrong contract or a pre-v3
+    ///   InputBox. In the live loop the same URL was already proven by this
+    ///   boot's initial sync, so a live `Bootstrap` restarts unclassified
+    ///   rather than poisoning the data directory.
     /// - `Join` (a non-panic loss of a storage task) is shutdown-path
     ///   cancellation in the live loop. During startup the runtime that would
     ///   cancel it is the one driving this boot, so an unexplained loss is
