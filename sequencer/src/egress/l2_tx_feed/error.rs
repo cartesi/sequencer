@@ -16,7 +16,7 @@ pub enum SubscribeError {
         source: StorageOpenError,
     },
     #[error("cannot read canonical history: {source}")]
-    LoadHeadOffset {
+    ReadHistory {
         #[source]
         source: rusqlite::Error,
     },
@@ -33,7 +33,7 @@ impl From<crate::storage::HistoryReadError> for SubscribeError {
     fn from(error: crate::storage::HistoryReadError) -> Self {
         match error {
             crate::storage::HistoryReadError::Policy(error) => Self::History(error),
-            crate::storage::HistoryReadError::Storage(source) => Self::LoadHeadOffset { source },
+            crate::storage::HistoryReadError::Storage(source) => Self::ReadHistory { source },
         }
     }
 }
@@ -42,7 +42,7 @@ impl SubscribeError {
     pub(super) fn is_persistent_storage_invariant(&self) -> bool {
         match self {
             Self::OpenStorage { source } => open_error_is_persistent(source),
-            Self::LoadHeadOffset { source } => is_persistent_storage_error(source),
+            Self::ReadHistory { source } => is_persistent_storage_error(source),
             Self::Join { source } => source.is_panic(),
             Self::History(_) => false,
         }
