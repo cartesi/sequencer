@@ -20,6 +20,8 @@ toml = { workspace = true }
 tar = { workspace = true }
 tracing = { workspace = true }
 tower = "0.5"
+# 0.7 waits until reqwest requires it, or two copies ship. 0.7 also drops the
+# CORS `Vary` header under our constant config: pin `.vary(...)` and test it.
 tower-http = { version = "0.6.8", features = ["trace", "cors"] }
 rusqlite = { workspace = true }
 rusqlite_migration = "2.6.0"

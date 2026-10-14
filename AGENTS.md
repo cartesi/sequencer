@@ -396,7 +396,10 @@ release install from it); verify both `cargo --version` and `rustc --version` in
 the environment you use. A Nix-provided
 Cargo or rustc may bypass rustup, so direnv alone does not guarantee the pinned
 compiler is selected. Correct the toolchain selection before interpreting build
-or dependency errors.
+or dependency errors. On Apple Silicon, `cross` builds the guest with the
+channel's `x86_64-unknown-linux-gnu` toolchain, which rustup installs only with
+`--force-non-host`; after a channel bump run
+`rustup toolchain install <channel>-x86_64-unknown-linux-gnu --profile minimal --force-non-host`.
 
 ```bash
 direnv exec . cargo check

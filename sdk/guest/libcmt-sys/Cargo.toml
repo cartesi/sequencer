@@ -9,4 +9,7 @@ publish = false
 [dependencies]
 
 [build-dependencies]
+# Its output compiles into the canonical guest: bump it as a guest-image change
+# of its own, with the generated bindings diffed for riscv64 and the host. 0.73
+# changed layout and bitfield code generation.
 bindgen = "0.72"

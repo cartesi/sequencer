@@ -11,7 +11,8 @@ authors.workspace = true
 
 [build-dependencies]
 # Generates the FFI declarations from the engine header at build time. It decides how this host
-# reads every record crossing the seam, so a bump changes the ABI interpretation.
+# reads every record crossing the seam, so a bump changes the ABI interpretation. 0.73 changed
+# layout and bitfield code generation; take it with seam v1.
 bindgen = "0.72"
 
 [dependencies]

@@ -26,6 +26,38 @@ machines do not load. Every canonical machine for a deployment, the
 watchdog's included, must run the release its template was built with; moving
 to a new emulator release means a new application deployment.
 
+**What moves the template hash.** The hash covers every byte of the stored
+machine, so it moves when any input to the image moves, even when behavior does
+not:
+
+- the emulator release and its kernel (`toolchain-pins.env`);
+- the rootfs: the guest Dockerfile, `machine-guest-tools`, and `xgenext2fs`;
+- the dapp binary: the `rust-toolchain.toml` channel, every `Cargo.lock` entry
+  in `canonical-app`'s build graph, the cross image digest in
+  `examples/canonical-app/Cross.toml`, and `CROSS_VERSION`. The build graph
+  includes the proc macros and build-dependencies that only run on the host
+  (`syn`, `bindgen` for libcmt, `ruint` for the fee table): each crate's
+  metadata hash covers its dependencies, so a version bump anywhere in the
+  graph renames downstream symbols and shifts code layout. The host half of
+  the graph is `x86_64-unknown-linux-gnu`, cross's container, whatever the
+  machine; `cargo tree -p canonical-app --target all -e normal,build` lists a
+  superset from any machine, and an update outside it leaves the binary
+  byte-identical;
+- any source change in a guest crate (`sequencer-core`, `sdk/guest/*`,
+  `examples/app-core`, `examples/canonical-app`), even in code the guest never
+  calls: recompiling a crate shifts its constants and code layout.
+
+The checkout path does not enter the hash, and `just canonical-print-build-hashes`
+prints all four inputs to compare. A move that is meant to preserve behavior is
+checked against [`tests/fixtures/consensus_vectors_v1.json`](../tests/fixtures/consensus_vectors_v1.json),
+which pins the consensus bytes (EIP-712 hashes, signature recovery, SSZ, fee
+table, output payloads) natively and, through `canonical-test`'s golden cases,
+in the built image, where each signature variant is checked for running as the
+signer or not. The fixture is never regenerated: a mismatch is a behavior
+change to explain. A release that moves the hash says so, and deployed
+applications keep their old image, which the watchdog checks against the
+on-chain hash.
+
 ## Rollup host semantics
 
 The reference host loop is the `cartesi-machine` CLI (`run_advance_state_epoch`
