@@ -15,10 +15,6 @@ use std::path::Path;
 use alloy_primitives::Address;
 use rusqlite::{OptionalExtension, Result, Transaction, params};
 
-#[cfg(test)]
-use super::StoredSafeInput;
-#[cfg(test)]
-use super::convert::external_u64_to_i64;
 use super::convert::{
     from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms,
     u64_to_i64,
@@ -144,14 +140,6 @@ impl Storage {
         })
     }
 
-    /// Open the rebuilt root at the baseline's L1 stop block. Its prefix is
-    /// represented by the baseline artifact and contributes no replay rows.
-    #[cfg(test)]
-    pub(crate) fn open_recovery_tip(&mut self, stop_block: u64) -> Result<()> {
-        external_u64_to_i64(stop_block, "recovery checkpoint block")?;
-        self.write(|tx| open_recovery_tip_in_tx(tx, stop_block))
-    }
-
     /// Snapshot the current L1 reconciliation state. A canonical-divergence
     /// marker outranks and withholds the otherwise-usable frontier.
     ///
@@ -213,78 +201,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Replace `out`'s contents with the safe-input rows in `range`. Asserts
-    /// contiguity — gaps in `safe_input_index` are a bug, not a runtime
-    /// condition.
-    #[cfg(test)]
-    pub(crate) fn fill_safe_inputs(
-        &mut self,
-        range: SafeInputRange,
-        out: &mut Vec<StoredSafeInput>,
-    ) -> Result<()> {
-        out.clear();
-        if range.is_empty() {
-            return Ok(());
-        }
-
-        const SQL: &str = "
-            SELECT safe_input_index, sender, payload, block_number
-            FROM safe_inputs
-            WHERE safe_input_index >= ?1 AND safe_input_index < ?2
-            ORDER BY safe_input_index ASC
-        ";
-        let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(
-            params![u64_to_i64(range.start()), u64_to_i64(range.end())],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )?;
-
-        let mut fetched_count = 0_u64;
-        for (offset, row) in rows.enumerate() {
-            let (index_i64, sender, payload, block_number_i64) = row?;
-            let index = i64_to_u64(index_i64);
-            let offset = u64::try_from(offset)
-                .expect("safe-input result offset exceeds u64: contract-impossible");
-            let expected = range
-                .start()
-                .checked_add(offset)
-                .expect("safe-input expected index overflow: contract-impossible");
-
-            assert_eq!(
-                index, expected,
-                "non-contiguous safe-input index: expected {expected}, found {index}"
-            );
-
-            out.push(StoredSafeInput {
-                sender: Address::from_slice(sender.as_slice()),
-                payload,
-                block_number: i64_to_u64(block_number_i64),
-            });
-            fetched_count = fetched_count
-                .checked_add(1)
-                .expect("safe-input fetched count overflow: contract-impossible");
-        }
-
-        let fetched_end = range
-            .start()
-            .checked_add(fetched_count)
-            .expect("safe-input fetched range overflow: contract-impossible");
-        assert_eq!(
-            fetched_end,
-            range.end(),
-            "safe-input range {range:?} not fully populated"
-        );
-
-        Ok(())
-    }
-
     /// Persist a chunk of user ops into the open frame and bump `head`'s
     /// counters.
     ///
@@ -309,33 +225,6 @@ impl Storage {
         next_head.increment_batch_user_op_count(user_ops.len());
         self.write(|tx| {
             insert_executed_user_ops_batch(
-                tx,
-                head.batch_index,
-                head.frame_in_batch,
-                head.open_frame_user_op_count,
-                user_ops,
-            )
-        })?;
-        *head = next_head;
-        Ok(())
-    }
-
-    /// Physical-only fixture writer. Production must use
-    /// [`Storage::append_executed_user_ops_chunk`] so creation and canonical
-    /// execution attribution commit atomically.
-    #[cfg(test)]
-    pub fn append_user_ops_chunk(
-        &mut self,
-        head: &mut WriteHead,
-        user_ops: &[PendingUserOp],
-    ) -> Result<()> {
-        if user_ops.is_empty() {
-            return Ok(());
-        }
-        let mut next_head = *head;
-        next_head.increment_batch_user_op_count(user_ops.len());
-        self.write(|tx| {
-            insert_user_ops_batch(
                 tx,
                 head.batch_index,
                 head.frame_in_batch,
@@ -675,32 +564,6 @@ fn open_successor_frame_in(
     Ok((policy, next_frame_in_batch))
 }
 
-/// Fixture insertion of source operations and their application positions.
-#[cfg(test)]
-fn insert_user_ops_batch(
-    tx: &Transaction<'_>,
-    batch_index: u64,
-    frame_in_batch: u32,
-    frame_pos_start: u32,
-    user_ops: &[PendingUserOp],
-) -> Result<()> {
-    let mut next = next_executed_input_count_in(tx)?;
-    insert_user_op_iter(
-        tx,
-        batch_index,
-        frame_in_batch,
-        frame_pos_start,
-        user_ops.iter(),
-    )?;
-    for position in 0..user_ops.len() {
-        tx.execute("INSERT INTO application_inputs (offset,batch_index,frame_in_batch,user_op_pos_in_frame) VALUES (?1,?2,?3,?4)",
-            params![u64_to_i64(next.get()),u64_to_i64(batch_index),i64::from(frame_in_batch),
-                i64::from(frame_pos_start.checked_add(u32::try_from(position).unwrap()).unwrap())])?;
-        next = next.checked_next().expect("input count overflow");
-    }
-    Ok(())
-}
-
 fn insert_user_op_iter<'a>(
     tx: &Transaction<'_>,
     batch_index: u64,
@@ -955,23 +818,9 @@ mod tests {
             .expect("initialize open state");
         head.open_frame_user_op_count = u32::MAX;
 
-        let (respond_to, _response) = oneshot::channel();
-        let pending = PendingUserOp {
-            signed: SignedUserOp {
-                sender: Address::ZERO,
-                signature: Signature::test_signature(),
-                user_op: UserOp {
-                    nonce: 0,
-                    max_fee: u16::MAX,
-                    data: vec![].into(),
-                },
-            },
-            respond_to,
-            received_at: SystemTime::now(),
-        };
-
+        let included = included_user_op(0, 0);
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = storage.append_user_ops_chunk(&mut head, &[pending]);
+            let _ = storage.append_executed_user_ops_chunk(&mut head, &[included]);
         }));
         assert!(panic.is_err(), "counter overflow must fail loud");
 
@@ -1145,8 +994,8 @@ mod tests {
     }
 
     #[test]
-    fn recovery_checkpoint_block_uses_query_and_persistence_boundaries() {
-        let db = temp_db("recovery-checkpoint-boundaries");
+    fn saturated_block_bound_counts_every_representable_block() {
+        let db = temp_db("saturated-block-bound");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage
             .append_safe_inputs(
@@ -1168,11 +1017,6 @@ mod tests {
             boundary, 1,
             "a saturated upper predicate must include every representable block"
         );
-
-        let err = storage
-            .open_recovery_tip(i64::MAX as u64 + 1)
-            .expect_err("unrepresentable persisted checkpoint must be refused");
-        assert!(matches!(err, rusqlite::Error::ToSqlConversionFailure(_)));
     }
 
     #[test]

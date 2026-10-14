@@ -9,7 +9,7 @@ use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
 use futures_util::{SinkExt, StreamExt};
 use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use sequencer::http::{self, ApiConfig};
-use sequencer::ingress::inclusion_lane::{PendingUserOp, SequencerError};
+use sequencer::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, SequencerError};
 use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::WsTxMessage;
@@ -278,8 +278,15 @@ fn seed_ordered_txs(db_path: &str) {
         received_at: SystemTime::now(),
     };
 
+    let executed_input_offset = storage.next_executed_input_count().expect("next offset");
     storage
-        .append_user_ops_chunk(&mut head, &[pending])
+        .append_executed_user_ops_chunk(
+            &mut head,
+            &[IncludedUserOp {
+                pending,
+                executed_input_offset,
+            }],
+        )
         .expect("append user-op chunk");
     storage
         .append_safe_inputs(

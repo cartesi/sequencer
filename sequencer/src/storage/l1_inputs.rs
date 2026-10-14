@@ -449,8 +449,8 @@ fn insert_safe_inputs_batch(
 #[cfg(test)]
 mod tests {
     use crate::storage::{
-        DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput, SafeInputRange,
-        Storage, StoredSafeInput,
+        DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput, Storage,
+        StoredSafeInput,
         test_helpers::{SENDER_A, SENDER_B, default_protocol_timing},
     };
     use crate::test_support::temp_db;
@@ -468,17 +468,12 @@ mod tests {
     }
 
     #[test]
-    fn safe_input_api_uses_half_open_intervals() {
+    fn safe_input_end_exclusive_counts_appended_inputs() {
         let db = temp_db("safe-input-api");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_protocol_timing();
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 0);
-        let mut out = Vec::new();
-        storage
-            .fill_safe_inputs(SafeInputRange::new(0, 0), &mut out)
-            .expect("query empty interval");
-        assert!(out.is_empty());
 
         let inserted = vec![
             StoredSafeInput {
@@ -497,16 +492,12 @@ mod tests {
             .expect("insert safe directs");
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 2);
-
-        storage
-            .fill_safe_inputs(SafeInputRange::new(0, 2), &mut out)
-            .expect("query full interval");
-        assert_eq!(out, inserted);
-
-        storage
-            .fill_safe_inputs(SafeInputRange::new(1, 1), &mut out)
-            .expect("query empty half-open interval");
-        assert!(out.is_empty());
+        assert_eq!(
+            storage
+                .safe_inputs_in_block_range(9, 10)
+                .expect("read back"),
+            inserted
+        );
     }
 
     #[test]

@@ -339,10 +339,6 @@ impl WriteHead {
         self.open_frame_user_op_count = next_frame_count;
     }
 
-    pub fn open_frame_has_user_ops(&self) -> bool {
-        self.open_frame_user_op_count > 0
-    }
-
     pub fn advance_frame(&mut self, policy: BatchPolicy, safe_block: u64) {
         self.frame_in_batch = self
             .frame_in_batch

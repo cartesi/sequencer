@@ -686,9 +686,10 @@ fn schema_rejects_safe_input_update_and_delete() {
     assert!(delete.to_string().contains("retained"), "{delete}");
 
     assert_eq!(storage.safe_input_end_exclusive().expect("end"), 2);
-    let mut out = Vec::new();
-    storage
-        .fill_safe_inputs(SafeInputRange::new(0, 2), &mut out)
-        .expect("read back");
-    assert_eq!(out, inputs);
+    assert_eq!(
+        storage
+            .safe_inputs_in_block_range(9, 10)
+            .expect("read back"),
+        inputs
+    );
 }
