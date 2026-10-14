@@ -1658,104 +1658,24 @@ mod tree_invariants {
     use crate::storage::convert::{i64_to_u64, u64_to_i64};
     use rusqlite::params;
 
-    /// Check the tree invariants that should hold at every quiescent state:
-    ///   - Every valid batch has `nonce = parent.nonce + 1`, or `nonce = 0`
-    ///     with `parent_batch_index IS NULL` (genesis/post-torn-cascade).
-    ///   - Every `parent_batch_index` either is NULL or references an
-    ///     existing batch (FK handles this, but we assert explicitly).
-    ///   - Walking up `parent_batch_index` from any valid batch terminates
-    ///     at a NULL-parent row within `batch_index` hops (no cycles).
-    ///   - The valid path is strictly contiguous in `nonce`: the set of
-    ///     nonces among valid batches is `{0, 1, ..., max_valid_nonce}`.
-    ///   - At most one `valid_open_batch` row exists.
-    fn assert_tree_invariants(storage: &mut Storage) {
-        // 1. Nonce = parent.nonce + 1 (or nonce=0 for NULL parent).
-        let mut stmt = storage
-            .conn
-            .prepare(
-                "SELECT b.batch_index, b.parent_batch_index, b.nonce, p.nonce \
-                 FROM batches b LEFT JOIN batches p ON p.batch_index = b.parent_batch_index",
-            )
-            .expect("prepare");
-        let rows: Vec<(i64, Option<i64>, i64, Option<i64>)> = stmt
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .expect("query")
-            .collect::<rusqlite::Result<_>>()
-            .expect("collect");
-        drop(stmt);
-        for (bi, parent, nonce, parent_nonce) in &rows {
-            match (parent, parent_nonce) {
-                (None, _) => assert_eq!(
-                    *nonce, 0,
-                    "batch {bi}: NULL parent must have nonce 0, got {nonce}"
-                ),
-                (Some(_), None) => panic!("batch {bi}: parent exists but parent row missing"),
-                (Some(_), Some(pn)) => assert_eq!(
-                    *nonce,
-                    pn + 1,
-                    "batch {bi}: nonce={nonce}, expected parent.nonce+1 = {}",
-                    pn + 1
-                ),
-            }
-        }
-
-        // 2. At most one valid open batch.
-        let open_count: i64 = storage
-            .conn
-            .query_row("SELECT COUNT(*) FROM valid_open_batch", [], |row| {
-                row.get(0)
-            })
-            .expect("count open");
-        assert!(open_count <= 1, "more than one valid Tip: {open_count}");
-
-        // 3. Valid-path nonce contiguity: nonces on the valid chain are 0..N.
-        let mut valid_nonces: Vec<i64> = storage
+    /// The schema triggers check parent links, the root and the single Tip on
+    /// every write; invalidation is an UPDATE no trigger checks, so assert the
+    /// valid spine here. The e2e harness asserts the same on the binary's DB.
+    fn assert_valid_spine_from_anchor(storage: &mut Storage) {
+        let anchor = u64_to_i64(storage.batch_tree_anchor().expect("anchor"));
+        let nonces: Vec<i64> = storage
             .conn
             .prepare("SELECT nonce FROM valid_batches ORDER BY nonce ASC")
             .expect("prepare")
-            .query_map([], |row| row.get::<_, i64>(0))
+            .query_map([], |row| row.get(0))
             .expect("query")
             .collect::<rusqlite::Result<_>>()
             .expect("collect");
-        // There can be multiple valid batches with the SAME nonce only if
-        // they live on different branches — but we don't allow that; valid
-        // batches form a strict chain. So dedup-and-equal means contiguous.
-        valid_nonces.sort();
-        valid_nonces.dedup();
-        for (i, &n) in valid_nonces.iter().enumerate() {
-            assert_eq!(
-                n, i as i64,
-                "valid nonces not contiguous: got {valid_nonces:?}"
-            );
-        }
-
-        // 4. Parent walk terminates at NULL in ≤ batch_index hops for every valid row.
-        for (bi, _, _, _) in &rows {
-            let mut cur: i64 = *bi;
-            let bi_u = i64_to_u64(*bi);
-            for _ in 0..=bi_u {
-                let parent: Option<i64> = storage
-                    .conn
-                    .query_row(
-                        "SELECT parent_batch_index FROM batches WHERE batch_index = ?1",
-                        params![cur],
-                        |row| row.get(0),
-                    )
-                    .expect("parent lookup");
-                match parent {
-                    None => break,
-                    Some(p) => {
-                        assert!(
-                            p < cur,
-                            "batch {bi}: parent-walk went backward ({p} >= {cur}) — cycle?"
-                        );
-                        cur = p;
-                    }
-                }
-            }
-        }
+        let expected: Vec<i64> = (anchor..).take(nonces.len()).collect();
+        assert_eq!(
+            nonces, expected,
+            "valid spine must be contiguous from anchor {anchor}"
+        );
     }
 
     #[test]
@@ -1763,17 +1683,18 @@ mod tree_invariants {
         // Exercises every mutating code path: genesis, rotations, partial
         // cascades (ancestor survives), cascades across accepted frontier,
         // torn cascades (no valid ancestor), and back-to-back generations.
-        // Asserts tree invariants after each step.
+        // Every write is checked by the schema triggers (an ABORT fails its
+        // expect); the valid spine is asserted after each step.
         let (_db, mut storage) = open_temp_storage("tree-invariants-workload");
 
         // Phase 1: genesis + 4 rotations. Simple chain.
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
-        assert_tree_invariants(&mut storage);
+        assert_valid_spine_from_anchor(&mut storage);
         for _ in 0..4 {
             storage.close_batch_at(&mut head, 100).expect("close");
-            assert_tree_invariants(&mut storage);
+            assert_valid_spine_from_anchor(&mut storage);
         }
         // Tree: 0(Gold sentinel in concept)→1→2→3→4 (Tip)
 
@@ -1783,13 +1704,13 @@ mod tree_invariants {
         storage.advance_safe_head(1400); // advance past threshold
         let inv = storage.recover_post_flush(1200).expect("recover");
         assert!(!inv.is_empty(), "partial cascade should invalidate");
-        assert_tree_invariants(&mut storage);
+        assert_valid_spine_from_anchor(&mut storage);
 
         // Phase 3: more rotations after partial cascade.
         let mut head = storage.open_state().expect("load").unwrap();
         for _ in 0..3 {
             storage.close_batch_at(&mut head, 1500).expect("close gen2");
-            assert_tree_invariants(&mut storage);
+            assert_valid_spine_from_anchor(&mut storage);
         }
 
         // Phase 4: torn cascade — invalidate everything including batch 0.
@@ -1798,13 +1719,13 @@ mod tree_invariants {
             storage.insert_invalid_batch(bi).expect("invalidate");
         }
         storage.recover_post_flush(1200).expect("recover from torn");
-        assert_tree_invariants(&mut storage);
+        assert_valid_spine_from_anchor(&mut storage);
 
         // Phase 5: rotations after torn cascade — new Tip has parent=NULL, nonce=0.
         let mut head = storage.open_state().expect("load").unwrap();
         for _ in 0..5 {
             storage.close_batch_at(&mut head, 2000).expect("close gen3");
-            assert_tree_invariants(&mut storage);
+            assert_valid_spine_from_anchor(&mut storage);
         }
     }
 
