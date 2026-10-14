@@ -253,22 +253,6 @@ impl Storage {
     pub fn batch_nonce(&mut self, batch_index: u64) -> Result<u64> {
         self.read(|tx| batch_nonce_in(tx, batch_index))
     }
-
-    #[cfg(test)]
-    pub(crate) fn insert_batch_snapshot(&mut self, prefix: &Path, batch_index: u64) -> Result<i64> {
-        self.write(|tx| {
-            insert_batch_snapshot_in(tx, prefix, batch_index, next_executed_input_count_in(tx)?)
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_baseline_snapshot(
-        &mut self,
-        prefix: &Path,
-        count: ExecutedInputCount,
-    ) -> Result<i64> {
-        self.write(|tx| insert_baseline_snapshot_in(tx, prefix, count))
-    }
 }
 
 pub(super) fn insert_baseline_snapshot_in(

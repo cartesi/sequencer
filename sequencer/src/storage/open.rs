@@ -115,14 +115,6 @@ impl Storage {
         })
     }
 
-    /// Test-only: return a raw `Connection` with the same pragmas as
-    /// [`Storage::open`]. Used by tests that need to reach past the typed API
-    /// (e.g., rewinding `synced_at_ms`, installing failure triggers).
-    #[cfg(test)]
-    pub fn open_connection(path: &str) -> std::result::Result<Connection, StorageOpenError> {
-        open_writer_connection(path)
-    }
-
     /// Run `f` inside a Deferred transaction, commit on success. For pure reads.
     ///
     /// Using Deferred rather than Immediate matches SQLite's default — readers
@@ -163,7 +155,7 @@ impl Storage {
 
 /// Open a read-write connection with WAL + `FULL` sync (`SYNCHRONOUS_PRAGMA`) +
 /// 5s busy timeout.
-fn open_writer_connection(path: &str) -> Result<Connection, StorageOpenError> {
+pub(super) fn open_writer_connection(path: &str) -> Result<Connection, StorageOpenError> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;

@@ -4,17 +4,26 @@
 //! Storage-domain test fixtures: seeding, the recovery fixture trait and
 //! divergence markers. Crate-wide fixtures live in `crate::test_support`.
 
-use alloy_primitives::Address;
-use sequencer_core::l2_tx::SequencedL2Tx;
+use std::path::Path;
+
+use alloy_primitives::{Address, B256};
+use rusqlite::params;
+use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 use sequencer_core::protocol::ProtocolTiming;
 
-use super::convert::from_unix_ms;
+use super::convert::{from_unix_ms, i64_to_u16, i64_to_u64, now_unix_ms, u64_to_i64};
+use super::history::next_executed_input_count_in;
 use super::ingress::{
     insert_tip_rows, open_fresh_tip_in_tx, open_successor_frame_in, seal_and_open_next_batch,
 };
 use super::mutations::persist_frame_direct_sequence_derived;
 use super::queries::{load_current_write_head, query_batch_policy};
-use super::{BatchPolicy, SafeInputRange, Storage, StoredSafeInput, WriteHead};
+use super::recovery::{recover_aging_tip_inner, recover_post_flush_inner};
+use super::snapshot_dumps::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
+use super::{
+    BatchPolicy, ExecutedInputCount, FrontierMode, IngestedSafeInput, SafeInputRange, Storage,
+    StorageOpenError, StoredSafeInput, WriteHead,
+};
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
@@ -101,6 +110,216 @@ impl Storage {
     /// The batch-tree anchor nonce (default 0).
     pub(crate) fn batch_tree_anchor(&mut self) -> rusqlite::Result<u64> {
         self.read(|tx| super::mutations::batch_tree_anchor_in(tx))
+    }
+}
+
+/// Seeding and inspection levers. Each bypasses the guard, provenance or
+/// wall clock its production counterpart enforces.
+impl Storage {
+    /// A raw connection with [`Storage::open`]'s pragmas, for tests that reach
+    /// past the typed API (rewinding `synced_at_ms`, installing failure
+    /// triggers).
+    pub(crate) fn open_connection(path: &str) -> Result<rusqlite::Connection, StorageOpenError> {
+        super::open::open_writer_connection(path)
+    }
+
+    /// Append safe inputs at the current wall clock, with zero provenance.
+    pub(crate) fn append_safe_inputs(
+        &mut self,
+        safe_block: u64,
+        inputs: &[StoredSafeInput],
+        batch_submitter: Address,
+        timing: &ProtocolTiming,
+    ) -> rusqlite::Result<()> {
+        self.append_safe_inputs_with_timestamp(
+            safe_block,
+            i64_to_u64(now_unix_ms()) / 1000,
+            inputs,
+            batch_submitter,
+            timing,
+            FrontierMode::Populate,
+        )
+    }
+
+    /// [`Storage::append_safe_inputs`] at an explicit L1 timestamp of
+    /// `safe_block`. `frontier` gates the `safe_accepted_batches` update.
+    pub(crate) fn append_safe_inputs_with_timestamp(
+        &mut self,
+        safe_block: u64,
+        safe_block_timestamp: u64,
+        inputs: &[StoredSafeInput],
+        batch_submitter: Address,
+        timing: &ProtocolTiming,
+        frontier: FrontierMode,
+    ) -> rusqlite::Result<()> {
+        let rows: Vec<IngestedSafeInput> = inputs.iter().map(synthetic_row).collect();
+        self.append_ingested_safe_inputs_with_timestamp(
+            safe_block,
+            safe_block_timestamp,
+            rows.as_slice(),
+            batch_submitter,
+            timing,
+            frontier,
+        )
+    }
+
+    /// Highest valid `batch_index` (the open batch included), or `None`.
+    pub(crate) fn latest_batch_index(&mut self) -> rusqlite::Result<Option<u64>> {
+        let value: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(batch_index) FROM valid_batches", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(value.map(i64_to_u64))
+    }
+
+    /// The sequenced L2 txs of one batch; `[]` for an invalidated batch.
+    /// Production replay pages the valid stream by offset, never per batch.
+    pub(crate) fn ordered_l2_txs_for_batch(
+        &mut self,
+        batch_index: u64,
+    ) -> rusqlite::Result<Vec<SequencedL2Tx>> {
+        const SQL: &str = "
+            SELECT
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END AS kind,
+                CASE
+                    WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.sender
+                    WHEN s.safe_input_index IS NOT NULL THEN d.sender
+                    ELSE NULL
+                END AS sender,
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.data ELSE NULL END AS data,
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN f.fee  ELSE NULL END AS fee,
+                CASE WHEN s.safe_input_index   IS NOT NULL THEN d.payload      ELSE NULL END AS payload,
+                CASE WHEN s.safe_input_index   IS NOT NULL THEN d.block_number ELSE NULL END AS block_number
+            FROM application_inputs s
+            LEFT JOIN user_ops u
+              ON u.batch_index    = s.batch_index
+             AND u.frame_in_batch = s.frame_in_batch
+             AND u.pos_in_frame   = s.user_op_pos_in_frame
+            LEFT JOIN frames f
+              ON f.batch_index    = s.batch_index
+             AND f.frame_in_batch = s.frame_in_batch
+            LEFT JOIN safe_inputs d
+              ON d.safe_input_index = s.safe_input_index
+            WHERE s.batch_index = ?1
+            ORDER BY s.offset ASC
+        ";
+        let mut stmt = self.conn.prepare_cached(SQL)?;
+        let rows = stmt.query_map(params![u64_to_i64(batch_index)], |row| {
+            Ok(decode_l2_tx_row(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    }
+
+    /// Mark one batch invalid; leaves an already-invalid row alone.
+    pub(crate) fn insert_invalid_batch(&mut self, batch_index: u64) -> rusqlite::Result<()> {
+        let now_ms = now_unix_ms();
+        self.conn.execute(
+            "UPDATE batches SET invalidated_at_ms = ?1 \
+             WHERE batch_index = ?2 AND invalidated_at_ms IS NULL",
+            params![now_ms, u64_to_i64(batch_index)],
+        )?;
+        Ok(())
+    }
+
+    /// The unguarded twin of `recover_post_flush_for_recovery`.
+    pub(crate) fn recover_post_flush(
+        &mut self,
+        danger_threshold: u64,
+    ) -> rusqlite::Result<Vec<u64>> {
+        self.write(|tx| recover_post_flush_inner(tx, danger_threshold))
+    }
+
+    /// The unguarded twin of `recover_aging_tip_for_recovery`.
+    pub(crate) fn recover_aging_tip(
+        &mut self,
+        danger_threshold: u64,
+    ) -> rusqlite::Result<Vec<u64>> {
+        self.write(|tx| recover_aging_tip_inner(tx, danger_threshold))
+    }
+
+    pub(crate) fn insert_batch_snapshot(
+        &mut self,
+        prefix: &Path,
+        batch_index: u64,
+    ) -> rusqlite::Result<i64> {
+        self.write(|tx| {
+            insert_batch_snapshot_in(tx, prefix, batch_index, next_executed_input_count_in(tx)?)
+        })
+    }
+
+    pub(crate) fn insert_baseline_snapshot(
+        &mut self,
+        prefix: &Path,
+        count: ExecutedInputCount,
+    ) -> rusqlite::Result<i64> {
+        self.write(|tx| insert_baseline_snapshot_in(tx, prefix, count))
+    }
+
+    /// Pin the oracle's observation stamp instead of the wall clock.
+    pub(crate) fn set_log_gas_price_updated_at_ms_for_test(
+        &mut self,
+        updated_at_ms: u64,
+    ) -> rusqlite::Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE batch_policy SET log_gas_price_updated_at_ms = ?1 WHERE singleton_id = 0",
+            params![u64_to_i64(updated_at_ms)],
+        )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed));
+        }
+        Ok(())
+    }
+}
+
+/// A provenance-free [`StoredSafeInput`] as a row with explicit zero
+/// provenance.
+fn synthetic_row(input: &StoredSafeInput) -> IngestedSafeInput {
+    IngestedSafeInput {
+        sender: input.sender,
+        payload: input.payload.clone(),
+        block_number: input.block_number,
+        block_timestamp: 0,
+        transaction_hash: B256::ZERO,
+    }
+}
+
+fn decode_l2_tx_row(
+    kind: i64,
+    sender: Option<Vec<u8>>,
+    data: Option<Vec<u8>>,
+    fee: Option<i64>,
+    payload: Option<Vec<u8>>,
+    block_number: Option<i64>,
+) -> SequencedL2Tx {
+    let sender_bytes = sender.expect("ordered replay row: missing sender");
+    assert_eq!(
+        sender_bytes.len(),
+        20,
+        "ordered replay row: sender must be 20 bytes"
+    );
+    if kind == 0 {
+        SequencedL2Tx::UserOp(ValidUserOp {
+            sender: Address::from_slice(sender_bytes.as_slice()),
+            // Replay uses the persisted frame fee (log-space exponent) to mirror canonical execution.
+            fee: i64_to_u16(fee.expect("ordered replay row: missing fee")),
+            data: data.expect("ordered replay row: missing data"),
+        })
+    } else {
+        SequencedL2Tx::Direct(DirectInput {
+            sender: Address::from_slice(sender_bytes.as_slice()),
+            block_number: i64_to_u64(
+                block_number.expect("ordered replay row: missing block_number"),
+            ),
+            payload: payload.expect("ordered replay row: missing payload"),
+        })
     }
 }
 

@@ -8,8 +8,6 @@
 //! (current safe block, safe-input bounds, last safe-progress timestamp).
 
 use alloy_primitives::Address;
-#[cfg(test)]
-use alloy_primitives::B256;
 use rusqlite::{OptionalExtension, Result, Transaction, params};
 
 use super::Storage;
@@ -34,22 +32,6 @@ type FeeOracleIdentitySql = (
     Option<Vec<u8>>,
     Option<i64>,
 );
-
-/// Test-fixture conversion: a provenance-free [`StoredSafeInput`] becomes a
-/// row with explicit zero provenance. Production writes go through
-/// [`Storage::append_ingested_safe_inputs_with_timestamp`] with real
-/// provenance only — one honest row model, no trait shim (the old
-/// `SafeInputRecord` shim was churn-avoidance, not a contract).
-#[cfg(test)]
-fn synthetic_row(input: &StoredSafeInput) -> IngestedSafeInput {
-    IngestedSafeInput {
-        sender: input.sender,
-        payload: input.payload.clone(),
-        block_number: input.block_number,
-        block_timestamp: 0,
-        transaction_hash: B256::ZERO,
-    }
-}
 
 impl Storage {
     /// `MAX(safe_input_index) + 1` (or 0 if empty). The exclusive bound on the
@@ -149,57 +131,6 @@ impl Storage {
             });
         }
         Ok(out)
-    }
-
-    /// Test seed: [`Storage::append_safe_inputs_with_timestamp`] at the
-    /// current wall clock. See
-    /// [`Storage::append_ingested_safe_inputs_with_timestamp`] for the
-    /// operation's contract.
-    #[cfg(test)]
-    pub(crate) fn append_safe_inputs(
-        &mut self,
-        safe_block: u64,
-        inputs: &[StoredSafeInput],
-        batch_submitter: Address,
-        timing: &ProtocolTiming,
-    ) -> Result<()> {
-        self.append_safe_inputs_with_timestamp(
-            safe_block,
-            i64_to_u64(now_unix_ms()) / 1000,
-            inputs,
-            batch_submitter,
-            timing,
-            FrontierMode::Populate,
-        )
-    }
-
-    /// Same as [`Storage::append_safe_inputs`], but records the L1 timestamp
-    /// of `safe_block`. Test seed only: synthetic inputs receive explicit zero
-    /// provenance via [`synthetic_row`]; the production write path is
-    /// [`Storage::append_ingested_safe_inputs_with_timestamp`].
-    ///
-    /// `frontier` gates the `safe_accepted_batches` update — see
-    /// [`FrontierMode`]. Everything except `setup --recovery`'s interim syncs
-    /// uses [`FrontierMode::Populate`].
-    #[cfg(test)]
-    pub(crate) fn append_safe_inputs_with_timestamp(
-        &mut self,
-        safe_block: u64,
-        safe_block_timestamp: u64,
-        inputs: &[StoredSafeInput],
-        batch_submitter: Address,
-        timing: &ProtocolTiming,
-        frontier: FrontierMode,
-    ) -> Result<()> {
-        let rows: Vec<IngestedSafeInput> = inputs.iter().map(synthetic_row).collect();
-        self.append_ingested_safe_inputs_with_timestamp(
-            safe_block,
-            safe_block_timestamp,
-            rows.as_slice(),
-            batch_submitter,
-            timing,
-            frontier,
-        )
     }
 
     /// Production input-reader path — the one write of the safe-input stream.

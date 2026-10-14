@@ -51,20 +51,6 @@ impl Storage {
         }
         Ok(())
     }
-
-    /// Test-only: pin the observation stamp without going through wall-clock now.
-    #[cfg(test)]
-    pub fn set_log_gas_price_updated_at_ms_for_test(&mut self, updated_at_ms: u64) -> Result<()> {
-        use super::convert::u64_to_i64;
-        let changed = self.conn.execute(
-            "UPDATE batch_policy SET log_gas_price_updated_at_ms = ?1 WHERE singleton_id = 0",
-            params![u64_to_i64(updated_at_ms)],
-        )?;
-        if changed != 1 {
-            return Err(rusqlite::Error::StatementChangedRows(changed));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

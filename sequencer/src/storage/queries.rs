@@ -8,14 +8,10 @@
 //! any writer role. Single-caller reads stay inline in the writer that owns
 //! them; only the reads reused by two or more roles live here.
 
-#[cfg(test)]
-use alloy_primitives::Address;
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
 
 use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64};
 use super::{BatchPolicy, WriteHead};
-#[cfg(test)]
-use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
 
 // ── Write-head loading ───────────────────────────────────────────────────
 //
@@ -173,45 +169,6 @@ pub(super) fn query_batch_policy(conn: &Connection) -> Result<BatchPolicy> {
         recommended_fee,
         batch_size_target,
     })
-}
-
-// ── Ordered L2-tx row decoding ───────────────────────────────────────────
-//
-// Used by egress paging and the per-batch replay reader. Each caller builds
-// the row shape inside its own `query_map` closure and hands the fields to
-// this decoder rather than defining an intermediate struct.
-
-#[cfg(test)]
-pub(super) fn decode_l2_tx_row(
-    kind: i64,
-    sender: Option<Vec<u8>>,
-    data: Option<Vec<u8>>,
-    fee: Option<i64>,
-    payload: Option<Vec<u8>>,
-    block_number: Option<i64>,
-) -> SequencedL2Tx {
-    let sender_bytes = sender.expect("ordered replay row: missing sender");
-    assert_eq!(
-        sender_bytes.len(),
-        20,
-        "ordered replay row: sender must be 20 bytes"
-    );
-    if kind == 0 {
-        SequencedL2Tx::UserOp(ValidUserOp {
-            sender: Address::from_slice(sender_bytes.as_slice()),
-            // Replay uses the persisted frame fee (log-space exponent) to mirror canonical execution.
-            fee: i64_to_u16(fee.expect("ordered replay row: missing fee")),
-            data: data.expect("ordered replay row: missing data"),
-        })
-    } else {
-        SequencedL2Tx::Direct(DirectInput {
-            sender: Address::from_slice(sender_bytes.as_slice()),
-            block_number: i64_to_u64(
-                block_number.expect("ordered replay row: missing block_number"),
-            ),
-            payload: payload.expect("ordered replay row: missing payload"),
-        })
-    }
 }
 
 #[cfg(test)]

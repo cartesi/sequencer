@@ -335,38 +335,6 @@ impl Storage {
         tx.commit()?;
         Ok(invalidated)
     }
-
-    /// Mark a single batch as invalid. Test-only seeder — production code goes
-    /// through [`Storage::recover_post_flush_for_recovery`] or
-    /// [`Storage::recover_aging_tip_for_recovery`].
-    /// Idempotent: leaves already-invalid rows alone.
-    #[cfg(test)]
-    pub(crate) fn insert_invalid_batch(&mut self, batch_index: u64) -> Result<()> {
-        let now_ms = now_unix_ms();
-        self.conn.execute(
-            "UPDATE batches SET invalidated_at_ms = ?1 \
-             WHERE batch_index = ?2 AND invalidated_at_ms IS NULL",
-            params![now_ms, u64_to_i64(batch_index)],
-        )?;
-        Ok(())
-    }
-
-    /// Test-only unguarded Cascade primitive. Production calls
-    /// [`Storage::recover_post_flush_for_recovery`]; the design rationale
-    /// lives on [`recover_post_flush_inner`], the shared body.
-    #[cfg(test)]
-    pub fn recover_post_flush(&mut self, danger_threshold: u64) -> Result<Vec<u64>> {
-        self.write(|tx| recover_post_flush_inner(tx, danger_threshold))
-    }
-
-    /// Test-only unguarded primitive; production calls
-    /// [`Storage::recover_aging_tip_for_recovery`], which transactionally
-    /// reasserts the exact startup decision. Design rationale on
-    /// [`recover_aging_tip_inner`], the shared body.
-    #[cfg(test)]
-    pub fn recover_aging_tip(&mut self, danger_threshold: u64) -> Result<Vec<u64>> {
-        self.write(|tx| recover_aging_tip_inner(tx, danger_threshold))
-    }
 }
 
 pub(super) fn inspect_recovery_in(
@@ -445,7 +413,10 @@ fn refuse_divergence(danger: DangerStatus) -> std::result::Result<(), RecoveryMu
 /// has since crossed the danger threshold. Cascade and reopening share `tx`.
 ///
 /// Returns the newly-invalidated batch indices (empty if none).
-fn recover_post_flush_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Result<Vec<u64>> {
+pub(super) fn recover_post_flush_inner(
+    tx: &Transaction<'_>,
+    danger_threshold: u64,
+) -> Result<Vec<u64>> {
     // Path 1: any closed batch past gold cascades unconditionally.
     let pivot = match first_non_gold_closed_batch(tx)? {
         Some(batch_index) => Some(batch_index),
@@ -463,7 +434,10 @@ fn recover_post_flush_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Resu
 ///
 /// Returns the newly-invalidated batch indices (empty if Tip is fresh,
 /// `[tip_index]` when the Tip was cascaded).
-fn recover_aging_tip_inner(tx: &Transaction<'_>, danger_threshold: u64) -> Result<Vec<u64>> {
+pub(super) fn recover_aging_tip_inner(
+    tx: &Transaction<'_>,
+    danger_threshold: u64,
+) -> Result<Vec<u64>> {
     let pivot = find_tip_batch_in_danger(tx, danger_threshold)?;
     cascade_and_reopen(tx, pivot)
 }
