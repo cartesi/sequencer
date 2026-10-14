@@ -14,6 +14,8 @@ pub mod history_api;
 pub mod l2_tx;
 pub mod protocol;
 pub mod scheduler;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod user_op;
 
 /// Maximum number of L1 blocks a batch can wait before the scheduler considers it stale.

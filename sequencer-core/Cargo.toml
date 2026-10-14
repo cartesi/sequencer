@@ -16,9 +16,15 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 ssz = { workspace = true }
 ssz_derive = { workspace = true }
+k256 = { workspace = true, optional = true }
+
+[features]
+# Test-only signing helpers (src/test_support.rs) for other crates' tests.
+# Only test crates enable it; the guest build never does.
+test-support = ["dep:k256"]
 
 [dev-dependencies]
-# Scheduler unit tests sign EIP-712 user-ops to exercise signature recovery.
+# Tests sign EIP-712 user-ops through crate::test_support.
 k256 = { workspace = true }
 serde_json = { workspace = true }
 
