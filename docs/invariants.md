@@ -108,7 +108,7 @@ by writer and are write-once (`0001_schema.sql`).
   adjacent clocks are valid. The [frame-clock policy](protocol/scheduler-semantics.md#sequencer-frame-clock-policy)
   says when the lane advances the clock, including the anchoring exception
   for bootstrap and recovery.
-- **Enforced by:** lane flow + `append_safe_inputs`' monotonicity asserts
+- **Enforced by:** lane flow + `append_ingested_safe_inputs_with_timestamp`'s monotonicity asserts
   (`storage/l1_inputs.rs`) +
   `ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS`
   (`sequencer-core/src/protocol.rs`). The lane's frontier time gate
@@ -237,8 +237,8 @@ by writer and are write-once (`0001_schema.sql`).
 ### I12. Safe head advances only on real observation; `synced_at_ms` is genuine progress time
 
 - **Holds:** the reader early-returns when the fetched head doesn't advance;
-  `append_safe_inputs` asserts monotonicity and stamps `synced_at_ms` only on
-  commit.
+  `append_ingested_safe_inputs_with_timestamp` asserts monotonicity and stamps
+  `synced_at_ms` only on commit.
 - **Enforced by:** reader floor check + asserts (`storage/l1_inputs.rs`).
 - **Depended on by:** the wall-clock danger arms (`L1ViewStale`,
   `EstimatedBatchInDanger`) — their baseline must be true progress time, or

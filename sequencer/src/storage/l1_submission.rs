@@ -21,10 +21,10 @@ impl Storage {
     /// is expected to accept, derived from `safe_accepted_batches`.
     ///
     /// The scheduler-accepted frontier is maintained by
-    /// [`Storage::append_safe_inputs`], so this is a pure read.
+    /// `Storage::append_ingested_safe_inputs_with_timestamp`, so this is a pure read.
     ///
     /// **Precondition:** at least one safe-head observation must have been
-    /// recorded (via [`Storage::append_safe_inputs`]). In production this is
+    /// recorded (by `Storage::append_ingested_safe_inputs_with_timestamp`). In production this is
     /// always true because the startup recovery procedure completes InitialSync and
     /// refuses admission unless its persisted view is usable. Tests must seed
     /// an observation explicitly; a fresh DB returns `QueryReturnedNoRows`.

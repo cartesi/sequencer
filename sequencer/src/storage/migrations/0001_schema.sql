@@ -14,8 +14,8 @@
 -- The **Tip** is the one batch currently accepting ops: sealed_at_ms IS NULL
 -- AND invalidated_at_ms IS NULL. A partial unique index enforces at-most-one.
 --
--- `nonce` is structural: equal to `parent.nonce + 1`, or 0 for genesis (parent
--- NULL). Enforced by trigger on INSERT. The scheduler's view of a batch's
+-- `nonce` is structural: equal to `parent.nonce + 1`, or the batch-tree anchor's
+-- nonce for the parentless root (0 at genesis). Enforced by trigger on INSERT. The scheduler's view of a batch's
 -- identity; reused across recovery cascades (new Tip forks from last valid
 -- ancestor, inheriting nonce via the +1 rule).
 -- ---------------------------------------------------------------------------
@@ -292,8 +292,8 @@ CREATE INDEX IF NOT EXISTS idx_safe_inputs_block
 -- Derived log of batch submissions the scheduler would actually execute.
 -- Unlike a raw log of all safe submissions, this only contains the accepted
 -- prefix: batches whose nonce matched the expected sequence and were not stale.
--- Maintained atomically by Storage::append_safe_inputs (via
--- populate_safe_accepted_batches), which simulates the scheduler's
+-- Maintained atomically by Storage::append_ingested_safe_inputs_with_timestamp
+-- (via populate_safe_accepted_batches), which simulates the scheduler's
 -- acceptance logic over new safe_inputs rows.
 CREATE TABLE IF NOT EXISTS safe_accepted_batches (
     safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),

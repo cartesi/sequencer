@@ -164,11 +164,11 @@ pub struct InputReader {
     app_deployment_block: u64,
     db_path: String,
     /// Scheduler-acceptance identity — passed into
-    /// [`Storage::append_safe_inputs`] so the persisted scheduler-accepted
-    /// frontier filters by the right sender.
+    /// `Storage::append_ingested_safe_inputs_with_timestamp` so the persisted
+    /// scheduler-accepted frontier filters by the right sender.
     batch_submitter: Address,
     /// Protocol timing used to keep `safe_accepted_batches` consistent with
-    /// every `append_safe_inputs` write.
+    /// every safe-input write.
     timing: ProtocolTiming,
     /// Whether each sync also populates the scheduler-accepted frontier
     /// ([`FrontierMode::Populate`] normally; `setup --recovery` defers it — see

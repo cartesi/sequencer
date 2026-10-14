@@ -407,7 +407,7 @@ fn first_non_gold_closed_batch(conn: &Connection) -> Result<Option<u64>> {
 /// spine, so an existing closed frontier is at least as old as the Tip.
 ///
 /// Reads `safe_accepted_batches`, which is maintained atomically with each
-/// [`Storage::append_safe_inputs`] call.
+/// `Storage::append_ingested_safe_inputs_with_timestamp` call.
 pub(super) fn find_first_batch_in_danger(conn: &Connection, threshold: u64) -> Result<Option<u64>> {
     if let Some(batch_index) = find_closed_frontier_batch_in_danger(conn, threshold)? {
         return Ok(Some(batch_index));

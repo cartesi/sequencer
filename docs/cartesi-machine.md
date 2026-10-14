@@ -199,5 +199,5 @@ as a reference:
 - An inspect query is delivered even to a machine at an exception yield, and
   its own outcome is not reported.
 - `--remote-spawn` leaves machine servers running unless `--remote-shutdown` is
-  also given. `--no-rollback` no longer exists; use `--no-revert`, which cannot
-  get past a rejected input: the emulator refuses the next advance.
+  also given. `--no-revert` cannot get past a rejected input: the emulator
+  refuses the next advance.

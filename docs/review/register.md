@@ -117,7 +117,7 @@ counts, then correct the estimate and check the separately configured
   is persisted, with no production reader. Decide whether operator SQL
   inspection suffices or a real consumer needs exposure before adding an
   endpoint or removing the stamp. The accepted
-  [oracle outage policy](../threat-model/README.md#actors-and-trust) is an
+  [oracle outage policy](../threat-model/README.md#fee-oracle) is an
   economic tradeoff, independent of whether a health field exposes age. The
   oracle rewrites the stamp on every successful poll, unchanged price included,
   so a stale stamp means failing polls. That is one FULL-sync commit per
