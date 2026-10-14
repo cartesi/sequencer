@@ -14,7 +14,11 @@ use super::process_lock::ProcessLock;
 /// Logging is best-effort: an operator-supplied blocking subscriber can delay
 /// this call. No worker drain or durable settlement precedes process abort.
 pub(crate) fn abort_terminal(error: impl std::fmt::Display) -> ! {
-    tracing::error!(error = %error, "terminal runtime failure; aborting process");
+    tracing::error!(
+        error = %error,
+        exit = "SIGABRT(134): terminal, do not restart",
+        "terminal runtime failure; aborting process"
+    );
     std::process::abort()
 }
 

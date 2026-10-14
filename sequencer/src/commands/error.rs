@@ -69,7 +69,8 @@ pub enum CommandError {
 // diagnosed terminal runtime fault immediately exits via `abort()` (SIGABRT/134),
 // bypassing this projection deliberately;
 // supervisors must treat 134 from the sequencer as terminal-class
-// (`docs/watchdog/operator-deployment.md` says how).
+// (`docs/watchdog/operator-deployment.md` says how). The exit line's level
+// follows the verdict (`CommandFailureVerdict::logs_at_error`).
 
 /// Restart with backoff; a recovery boot is expected next (it may take 15+
 /// min: flush + safe-finality wait). Startup probes must accommodate it.
@@ -111,6 +112,26 @@ impl CommandFailureVerdict {
     /// exits 30: do not restart, page an operator).
     pub(crate) const fn is_terminal(self) -> bool {
         matches!(self, Self::Terminal)
+    }
+
+    /// Exit-line severity: ERROR when the cause is a fault or unknown, WARN
+    /// when the verdict names a planned procedure (a recovery boot, a retry,
+    /// `setup --recovery`). Alert on the exit code, not the level.
+    pub(crate) const fn logs_at_error(self) -> bool {
+        matches!(self, Self::Terminal | Self::Unclassified)
+    }
+
+    /// The supervisor action this verdict asks for, named on the exit line.
+    pub(crate) const fn supervisor_action(self) -> &'static str {
+        match self {
+            Self::ExpectedRecovery => "restart; a recovery boot follows",
+            Self::Retryable => "restart with backoff; alert if it persists",
+            Self::Terminal => "do not restart; page an operator",
+            Self::SetupRecoveryRequired => {
+                "do not restart; wipe the data dir and run setup --recovery"
+            }
+            Self::Unclassified => "restart with backoff",
+        }
     }
 
     const fn exit_code(self) -> u8 {
@@ -1268,6 +1289,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The exhaustive match makes a sixth verdict a compile error until its
+    /// exit-line level is chosen here.
+    #[test]
+    fn exit_line_logs_at_error_only_for_terminal_and_unclassified() {
+        use CommandFailureVerdict::*;
+        let at_error = |verdict: CommandFailureVerdict| match verdict {
+            Terminal | Unclassified => true,
+            ExpectedRecovery | Retryable | SetupRecoveryRequired => false,
+        };
+        let all = [
+            ExpectedRecovery,
+            Retryable,
+            Terminal,
+            SetupRecoveryRequired,
+            Unclassified,
+        ];
+        for verdict in all {
+            assert_eq!(verdict.logs_at_error(), at_error(verdict), "{verdict:?}");
+        }
+        let actions: std::collections::BTreeSet<_> = all
+            .iter()
+            .map(|verdict| verdict.supervisor_action())
+            .collect();
+        assert_eq!(actions.len(), all.len());
     }
 
     /// The wire values a supervisor matches on, as integers: a renumbered

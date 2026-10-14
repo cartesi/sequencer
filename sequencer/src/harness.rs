@@ -87,6 +87,7 @@ fn project_dispatch_join(
         Err(join) if join.is_panic() => {
             tracing::error!(
                 error = %join,
+                verdict = ?crate::commands::error::CommandFailureVerdict::Terminal,
                 exit_code = crate::commands::error::EXIT_TERMINAL,
                 "sequencer command panicked — trusted-code invariant failure"
             );
@@ -95,6 +96,7 @@ fn project_dispatch_join(
         Err(join) => {
             tracing::error!(
                 error = %join,
+                verdict = ?crate::commands::error::CommandFailureVerdict::Unclassified,
                 exit_code = crate::commands::error::EXIT_UNCLASSIFIED,
                 "sequencer command task failed"
             );
@@ -125,8 +127,15 @@ where
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
+            let verdict = err.failure_verdict();
             let code = err.exit_code();
-            tracing::error!(error = %err, exit_code = code, "sequencer exiting");
+            let action = verdict.supervisor_action();
+            // tracing needs a constant level per callsite, hence the branch.
+            if verdict.logs_at_error() {
+                tracing::error!(?verdict, supervisor_action = action, exit_code = code, error = %err, "sequencer exiting");
+            } else {
+                tracing::warn!(?verdict, supervisor_action = action, exit_code = code, error = %err, "sequencer exiting");
+            }
             std::process::ExitCode::from(code)
         }
     }

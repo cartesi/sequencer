@@ -356,6 +356,10 @@ re-detects fail-loud when the faulty state is next read, so the supervisor's
 handling of 30 and SIGABRT (stop and page, do not auto-restart) is what bounds
 a crash loop.
 
+The final `sequencer exiting` line logs at ERROR for exits 30 and 1, and at
+WARN for 10, 20 and 40, with `verdict` and `supervisor_action` fields; the
+SIGABRT line says so. Alert on the exit status, not the log level.
+
 - **Supervisor recipes.** systemd can act on the code directly:
   `RestartPreventExitStatus=30 ABRT` (SIGABRT/134 is terminal-class too).
   Kubernetes Deployments restart regardless of exit code, and there is no
