@@ -1,30 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Integer conversions between Rust domain types and SQLite `INTEGER` columns,
-//! plus `SystemTime` ↔ `i64` Unix-ms conversions.
-//!
-//! Two conversion families with opposite postures, per the fail-loud check
-//! policy in `docs/invariants.md`:
-//!
-//! - **Contract-bound conversions fail loud.** Domain values (indices, nonces,
-//!   block numbers, offsets, fees) are non-negative and far below `i64::MAX`
-//!   by schema `CHECK`s, triggers, or writer-side types. An out-of-range value
-//!   can only mean DB corruption, tampering, or a sequencer bug; saturating it
-//!   would fabricate a plausible value and let the divergence externalize (a
-//!   signed batch, a feed event, a wrong recovery pivot). These panic to stop
-//!   the operation before externalization. A persistent violation is not
-//!   repaired by restart and may require inspection or cockroach recovery;
-//!   fail-loud is a safety property, not a self-healing claim.
-//! - **Clock and query-bound conversions saturate.** Wall-clock time is
-//!   environmental, not an invariant: a far-future clock clamps to
-//!   `i64::MAX` rather than aborting. Untrusted or config-sourced SQL bounds
-//!   go through [`saturating_query_bound`], where clamping preserves the
-//!   comparison semantics exactly. Sign remains contract-bound even for clock
-//!   *columns*: every timestamp writer is u64-clock-sourced (floored at 0), so
-//!   [`from_unix_ms`] fail-louds on a negative stored value — a sign check is
-//!   a real invariant, unlike cross-column timestamp ordering checks, which
-//!   once wedged recovery and are deliberately left unenforced.
+//! Domain integers and `SystemTime` <-> SQLite `INTEGER`. Contract-bound values
+//! (indices, nonces, blocks, offsets, fees, a stored timestamp's sign) panic out
+//! of range, since a saturated value could reach a signed batch or the feed.
+//! Clock writes and untrusted query bounds saturate (`docs/invariants.md`).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

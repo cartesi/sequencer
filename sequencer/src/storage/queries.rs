@@ -1,12 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Read-side helpers shared across writer-role files.
-//!
-//! These take a `&Connection` (or `&Transaction`, which derefs) rather than
-//! `&mut Storage`, so they can compose inside a larger transaction built by
-//! any writer role. Single-caller reads stay inline in the writer that owns
-//! them; only the reads reused by two or more roles live here.
+//! Read helpers shared by two or more writer roles. They take `&Connection` so
+//! they compose inside any writer's transaction; single-caller reads stay with the
+//! writer that owns them.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
 

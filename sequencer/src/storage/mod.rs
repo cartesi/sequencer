@@ -1,31 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! SQLite-backed storage for the sequencer.
-//!
-//! [`Storage`] is the single entry point. Methods are clustered by caller role
-//! across sibling files, mostly one file per writer:
-//!
-//! - `ingress` — inclusion lane: user-op append, frame/batch close
-//! - `egress` — era-pinned historical L1 pages for consumer bootstrap (read-only)
-//! - `l1_inputs` — input reader: safe-input ingestion, L1 head, deployment identity
-//! - `l1_submission` — submitter frontier, pending batches, wallet-nonce
-//!   watermark and batch-tree anchor; the seal path reuses its batch encoder
-//! - `recovery` — cascade invalidation, recovery-batch open, danger checks
-//! - `fee_oracle` — L1 fee-oracle gas-price updates
-//! - `snapshot_dumps` — immutable snapshots, derived acceptance, lease counts
-//! - `history` — write-once era/base metadata, recovery generation, and the
-//!   canonical application-history reader
-//! - `lifecycle` — command-admission facts + the terminal-fault black box
-//!
-//! Cross-writer helpers are split by concern:
-//!
-//! - `convert` — int width + time conversions
-//! - `queries` — shared read helpers (`query_*`, `load_current_write_head`)
-//! - `mutations` — shared write helpers (`insert_new_batch`, `seal_batch`, …)
-//!
-//! The schema and `valid_*` views live in `migrations/0001_schema.sql`. See
-//! `docs/recovery/README.md` for the recovery design and TLA+ specs.
+//! SQLite storage. [`Storage`] is the single entry point; each writer role's
+//! methods live in its own sibling file (writer table: `docs/invariants.md`),
+//! shared reads in `queries` and shared writes in `mutations`. The schema and
+//! `valid_*` views live in `migrations/0001_schema.sql`.
 
 mod convert;
 mod egress;

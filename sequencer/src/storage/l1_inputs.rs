@@ -1,11 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Input reader writer: ingests L1 InputBox events into `safe_inputs`,
-//! advances `l1_safe_head`, and pins the deployment identity.
-//!
-//! Also exposes the read-side queries the input reader and other callers need
-//! (current safe block, safe-input bounds, last safe-progress timestamp).
+//! Input-reader storage: ingest InputBox events into `safe_inputs`, advance
+//! `l1_safe_head`, pin the deployment identity, and serve the safe-head reads.
 
 use alloy_primitives::Address;
 use rusqlite::{OptionalExtension, Result, Transaction, params};

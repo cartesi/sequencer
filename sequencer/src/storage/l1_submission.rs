@@ -1,16 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! The submitter's storage half: the frontier lookup, the SSZ-encoded
-//! pending-batch list the submitter pulls each tick, and the wallet-nonce
-//! watermark raised before every broadcast.
-//!
-//! `load_batch_frames_in` is also the seal path's encoder, so the hash stamped
-//! at seal and the submitted bytes come from one encode path. Nonces are
-//! assigned when a Tip is inserted (`mutations::insert_new_batch`);
-//! `safe_accepted_batches` is maintained by `populate_safe_accepted_batches`
-//! as safe inputs are appended, from the batch-tree anchor that
-//! `complete_baseline_setup` sets.
+//! The submitter's storage half: frontier lookup, the SSZ-encoded pending-batch
+//! list, and the wallet-nonce watermark. `load_batch_frames_in` is also the seal
+//! path's encoder, so the hash stamped at seal and the submitted bytes come from
+//! one encode path.
 
 use rusqlite::{Result, params};
 

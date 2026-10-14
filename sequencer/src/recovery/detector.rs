@@ -1,23 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Runtime danger detector.
-//!
-//! A tiny background task that, every `poll_interval`, asks [`Storage::check_danger`]
-//! whether recovery or refusal is needed. If so, the task exits with
-//! [`DetectorExit::RecoveryRequired`] — the runtime turns that into a
-//! deliberate non-error process shutdown, the orchestrator respawns, and the
-//! local-first startup recovery procedure takes over.
-//!
-//! This is its own worker (not part of the batch submitter) because the two
-//! concerns are orthogonal: the submitter makes progress on L1, which involves
-//! slow confirmations; the detector just reads the DB + wall clock at a fixed
-//! cadence. Keeping them separate means one never delays the other, and each
-//! stays a ~20-line state machine.
-//!
-//! Detection is eventually consistent with the input reader: a transition into
-//! danger may lag by up to one `poll_interval`. The preemptive margin absorbs
-//! this bounded lag.
+//! Runtime danger detector: every `poll_interval` it reads [`Storage::check_danger`]
+//! and exits with [`DetectorExit::RecoveryRequired`] on any non-`Safe` status. It
+//! is its own worker so slow L1 submission never delays detection; the preemptive
+//! margin absorbs its lag of up to one interval behind the input reader.
 
 use std::time::Duration;
 

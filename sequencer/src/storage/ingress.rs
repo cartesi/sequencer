@@ -1,14 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Inclusion-lane writer: opens the initial batch/frame, appends user-op chunks,
-//! and rotates frame/batch boundaries on the hot path.
-//!
-//! The lane also reads classified external directs and the open
-//! state (resumed on startup) — those reads live here too because they're driven
-//! by the lane's flow, not by an L1 ingress event. The public ingress reads
-//! live here too: the fee quote and the next user nonce, derived from the
-//! lane's user-op rows.
+//! Inclusion-lane storage: open the first batch and frame, append user-op chunks,
+//! rotate frames and batches, and the lane-driven reads (classified directs, open
+//! state). The public `/fee` and `/nonce` reads live here too, since they derive
+//! from the lane's rows.
 
 use std::path::Path;
 

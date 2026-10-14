@@ -1,29 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! The command-admission facts and the terminal-fault black box.
-//!
-//! Admission is governed by facts, each with one owner:
-//!
-//! - concurrent owners: the kernel process lock (`crate::runtime`);
-//! - command ordering: two-sided `setup_complete` — run and maintenance
-//!   preflight it here and never start before one; setup and rebuild check
-//!   it in their own admission (`crate::commands::setup`) and never restart
-//!   over a completed one;
-//! - the one absorbing refusal: `canonical_divergence`, checked at every
-//!   entry — its only exit is a fresh-directory cockroach rebuild;
-//! - restart policy after a terminal fault: the exit-code contract
-//!   (`crate::commands::error`), which the supervisor is expected to honor;
-//!   there is no database gate. Standard recovery needs no intervention at
-//!   all: every run boots through the fact-derived recovery procedure.
-//!
-//! The black box (`terminal_faults`) is for operators and postmortems: the
-//! cause of a terminal death, best-effort recorded before the process
-//! exits, traveling with the data directory. Nothing branches on it — `run`
-//! logs the latest row at startup unless a later completed setup resolved
-//! it, operators read it after the fact —
-//! and its writes are verdict-neutral: a failed record loses only the
-//! black-box copy; the exit code and logs still carry the verdict.
+//! Command-admission facts and the `terminal_faults` black box: an append-only,
+//! best-effort record of terminal causes for operators that nothing branches on.
+//! Admission design: authority-boundary ADR, mechanism 2.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;

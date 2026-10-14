@@ -1,11 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Write-side helpers shared across writer-role files.
-//!
-//! Like [`super::queries`] these take `&Transaction` so they compose inside a
-//! larger atomic unit. The two consumers today are ingress (batch/frame close
-//! + re-drain) and recovery (opening a recovery batch after cascade).
+//! Write helpers shared across writer roles. Like [`super::queries`], they take a
+//! `&Transaction` so they compose inside a larger atomic unit.
 
 use alloy_primitives::Address;
 use rusqlite::{Connection, Result, Transaction, params};

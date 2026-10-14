@@ -1,27 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Materialized view of the scheduler-accepted batches.
-//!
-//! `safe_accepted_batches` caches the prefix of submitted batches that the
-//! on-chain scheduler would accept, based on an off-chain simulation of its
-//! acceptance rules (see [`sequencer_core::protocol::ProtocolTiming`]).
-//!
-//! Maintenance contract: the view is advanced atomically with each
-//! [`super::Storage::append_safe_inputs`] write while no divergence exists. A
-//! foreign/mismatched accepted landing atomically commits the terminal marker
-//! and freezes this projection; later safe-head advances remain paired with
-//! that marker rather than further acceptance rows. No caller should populate
-//! this view directly.
-//!
-//! Readers:
-//! - batch submitter frontier / danger reads (`submitter_frontier`,
-//!   `check_danger`)
-//! - recovery cascade (`find_closed_frontier_batch_in_danger`)
-//! - wall-clock and stalled-safe-head danger estimates
-//!
-//! The only writer is [`populate_safe_accepted_batches`], invoked from
-//! `append_ingested_safe_inputs_with_timestamp` inside its transaction.
+//! `safe_accepted_batches`: the prefix of submitted batches the on-chain scheduler
+//! would accept, simulated with `ProtocolTiming::scheduler_accepts`. Its only
+//! writer is [`populate_safe_accepted_batches`], inside the input reader's append
+//! transaction; a divergence marker freezes it (I15).
 
 use alloy_primitives::Address;
 use rusqlite::{Connection, OptionalExtension, Result, params};
