@@ -9,6 +9,11 @@ use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, Recover
 use super::Storage;
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
 
+mod canonical;
+#[cfg(test)]
+pub(crate) use canonical::ApplicationInputRow;
+pub(crate) use canonical::{HistoryReadError, L2TxContext};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryState {
     pub version: HistoryVersion,

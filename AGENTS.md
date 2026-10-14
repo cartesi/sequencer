@@ -321,7 +321,7 @@ changing it, including checkpoint and fee-source selection.
 
 ## Coding Conventions
 
-- Prefer small, composable functions at module boundaries (`ingress::api` → `ingress::inclusion_lane` → `storage::ingress`; `egress::l2_tx_feed` ← `storage::egress`).
+- Prefer small, composable functions at module boundaries (`ingress::api` → `ingress::inclusion_lane` → `storage::ingress`; `egress::l2_tx_feed` ← `storage::history`).
 - Keep application validation and execution deterministic for a given input/state. No `SystemTime::now()`, `HashMap` iteration order, or floating-point in consensus paths.
 - Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe. An error that wraps a cause ends its Display with `: {source}`, because log sinks print Display only. A dependency error whose Display omits its cause (reqwest names only the request kind) is rendered with `l1::provider::error_chain` where it becomes text, in a `String` variant or a log field; it appends only causes the line does not already hold, so it is also safe on our own wrappers of such an error. A failure logs at its verdict's level: ERROR when the cause is a fault or unknown (terminal, unclassified), WARN when the verdict names a planned procedure (a recovery boot, a retry, `setup --recovery`).
 - Avoid introducing heavy dependencies without strong reason.

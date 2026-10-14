@@ -4,18 +4,18 @@
 //! SQLite-backed storage for the sequencer.
 //!
 //! [`Storage`] is the single entry point. Methods are clustered by caller role
-//! across sibling files — mostly "one file per writer", plus one read-only
-//! batch-aggregate file that two roles share:
+//! across sibling files, mostly one file per writer:
 //!
 //! - `ingress` — inclusion lane: user-op append, frame/batch close
-//! - `egress` — WS feed and catch-up replay (read-only)
+//! - `egress` — era-pinned historical L1 pages for consumer bootstrap (read-only)
 //! - `l1_inputs` — input reader: safe-input ingestion, L1 head, deployment identity
 //! - `l1_submission` — submitter frontier, pending batches, wallet-nonce
 //!   watermark and batch-tree anchor; the seal path reuses its batch encoder
 //! - `recovery` — cascade invalidation, recovery-batch open, danger checks
 //! - `fee_oracle` — L1 fee-oracle gas-price updates
 //! - `snapshot_dumps` — immutable snapshots, derived acceptance, lease counts
-//! - `history` — write-once era/base metadata and recovery generation
+//! - `history` — write-once era/base metadata, recovery generation, and the
+//!   canonical application-history reader
 //! - `lifecycle` — command-admission facts + the terminal-fault black box
 //!
 //! Cross-writer helpers are split by concern:
@@ -50,10 +50,11 @@ pub(crate) use convert::is_persistent_storage_error;
 use std::time::SystemTime;
 use thiserror::Error;
 
+pub(crate) use egress::HistoricalReadError;
 #[cfg(test)]
-pub(crate) use egress::ApplicationInputRow;
-pub(crate) use egress::{HistoricalReadError, HistoryReadError, L2TxContext};
+pub(crate) use history::ApplicationInputRow;
 pub use history::{DirectInputExecution, HistoryState};
+pub(crate) use history::{HistoryReadError, L2TxContext};
 pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
 pub use open::Storage;
 pub use recovery::DangerStatus;

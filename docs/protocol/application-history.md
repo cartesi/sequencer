@@ -181,7 +181,7 @@ writers become supported.
 | Boundary | Code and tests |
 |---|---|
 | Coordinates and claim ordering | [`sequencer-core/src/history.rs`](../../sequencer-core/src/history.rs) — identity before position, inclusive head, checked counts. |
-| Coherent application pages | [`storage/egress/canonical.rs`](../../sequencer/src/storage/egress/canonical.rs) and its tests — source context, nonzero baselines, replacement offsets, concurrent recovery, gaps and SQL limits. |
+| Coherent application pages | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs) and its tests — source context, nonzero baselines, replacement offsets, concurrent recovery, gaps and SQL limits. |
 | Replay followed by live delivery | [`l2_tx_feed`](../../sequencer/src/egress/l2_tx_feed/) — bounded deep replay, identity refusals, shutdown and persistent faults; [`catch_up.rs`](../../sequencer/src/ingress/inclusion_lane/catch_up.rs) for native replay. |
 | Artifact and claim association | [`snapshot_endpoints.rs`](../../sequencer/src/integration_tests/snapshot_endpoints.rs) — headers, restore, archive contents, and lease lifetime. |
 | Checkpoint compatibility | [`storage/history.rs`](../../sequencer/src/storage/history.rs) and recovery tests — immutable cuts, complete lineage, and transaction rollback; [`recovery_compatibility.rs`](../../sequencer/src/integration_tests/historical_bootstrap/recovery_compatibility.rs) — saved projections across missed recoveries and HTTP lookup/WS admission races. |

@@ -225,7 +225,7 @@ pub(crate) fn seed_closed_batches(storage: &mut Storage, count: u64) {
 }
 
 /// Pull every valid sequenced L2 tx out of storage, dropping the offset.
-/// Test-only convenience around `ordered_l2_txs_page_from`.
+/// Test-only convenience around `canonical_history_page`.
 pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
     let bounds = storage.history_bounds().expect("history bounds");
     storage
@@ -240,8 +240,8 @@ pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
         .rows
         .into_iter()
         .map(|row| match row.context {
-            super::egress::L2TxContext::UserOp { tx, .. } => SequencedL2Tx::UserOp(tx),
-            super::egress::L2TxContext::DirectInput { tx, .. } => SequencedL2Tx::Direct(tx),
+            super::L2TxContext::UserOp { tx, .. } => SequencedL2Tx::UserOp(tx),
+            super::L2TxContext::DirectInput { tx, .. } => SequencedL2Tx::Direct(tx),
         })
         .collect()
 }
