@@ -76,10 +76,9 @@ Scheduler-acceptance semantics exist in exactly three implementations that must 
 2. the off-chain acceptance predicate — `ProtocolTiming::scheduler_accepts` ([`sequencer-core/src/protocol.rs`](sequencer-core/src/protocol.rs)), which feeds `safe_accepted_batches`;
 3. the inclusion lane's live prediction (drain + execution order).
 
-The submitter's expected-nonce scan also depends on this agreement. The
-[scheduler contract](docs/protocol/scheduler-semantics.md#the-three-implementations-and-why-they-agree)
-maps the implementations and the deliberate storage-local copy. Changing one
-requires checking the others.
+[I1](docs/invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)
+maps them and their one deliberate difference. Changing one requires checking
+the others.
 
 Two mechanical facts the agreement rests on:
 
