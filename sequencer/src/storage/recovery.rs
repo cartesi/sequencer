@@ -638,5 +638,4 @@ fn has_valid_open_batch(tx: &Connection) -> Result<bool> {
 }
 
 #[cfg(test)]
-#[path = "recovery_tests.rs"]
 mod tests;

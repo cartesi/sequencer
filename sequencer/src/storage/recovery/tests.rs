@@ -1,3 +1,6 @@
+// (c) Cartesi and individual authors (see AUTHORS)
+// SPDX-License-Identifier: Apache-2.0 (see LICENSE)
+
 use super::super::test_helpers::{
     SENDER_A, all_ordered_l2_txs, default_protocol_timing, local_batch_payload,
     make_stale_batch_payload, seed_closed_batches, seed_safe_inputs_with_batch_nonces,

@@ -372,6 +372,12 @@ Focus tests on:
 
 Prefer black-box tests around `POST /tx` and commit outcomes for integration.
 
+Test placement: unit tests are a child module of the code under test, inline
+`#[cfg(test)] mod tests` or `<module>/tests.rs` (or `<topic>_tests.rs`) once
+large, never `#[path]`. Cross-module in-process tests go in
+`sequencer/src/integration_tests/`; devnet, machine and binary tests go in the
+`tests/*` crates.
+
 Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a
 clear message if `anvil` is not on PATH. Use the configured Nix/direnv environment
 or install Foundry. `canonical-test` additionally needs the Cartesi Machine
