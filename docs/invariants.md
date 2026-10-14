@@ -421,29 +421,6 @@ by writer and are write-once (`0001_schema.sql`).
   Checkpoint state, inclusion block, and next nonce are trusted operator inputs;
   neither clone detection nor distributed fencing is implied.
 
-### Do-not-simplify (deliberate shapes that look like cleanup targets)
-
-The refactorer-facing mirror of the register above — each of these *looks*
-like a simplification and would break a registered invariant:
-
-- **Don't move filesystem work into `storage/snapshot_dumps.rs`** — the
-  module boundary *is* the GC crash-ordering guarantee (I13).
-- **Don't reorder `check_danger`'s arms** or merge its two `find_*` helpers
-  into one that consults the Tip first — the closed-frontier-first order is
-  the dispatch table's meaning (I4).
-- **Don't derive application order from L1 positions** — optimistic user ops
-  precede their envelope and have no general one-to-one L1 mapping.
-- **Don't retain a numeric resume offset without its history identity** —
-  recovery deliberately reuses suffix counts (I18).
-- **Don't discard a valid snapshot beyond the accepted frontier** — that exact
-  batch can become the next required recovery checkpoint (I7).
-- **Don't add internal retry loops to the flusher/submitter for provider
-  errors** — the orchestrator respawn is the retry mechanism; internal
-  retries mask exactly the failures the danger machinery routes on.
-- **Don't unify the two staleness references** (inclusion-relative vs
-  current-relative) — deliberately different formulas for different
-  questions.
-
 ### I19. Application progress follows the shared execution contract
 
 - **Holds:** `ApplicationProgress` is the pair
@@ -491,3 +468,26 @@ like a simplification and would break a registered invariant:
 - **Performance boundary:** head discovery uses the integer primary-key maximum;
   replay seeks directly by offset and joins bounded source rows. Neither scans
   invalidated history. Chunk insertion adds no durability transaction or actor.
+
+## Do-not-simplify (deliberate shapes that look like cleanup targets)
+
+The refactorer-facing mirror of the register above — each of these *looks*
+like a simplification and would break a registered invariant:
+
+- **Don't move filesystem work into `storage/snapshot_dumps.rs`** — the
+  module boundary *is* the GC crash-ordering guarantee (I13).
+- **Don't reorder `check_danger`'s arms** or merge its two `find_*` helpers
+  into one that consults the Tip first — the closed-frontier-first order is
+  the dispatch table's meaning (I4).
+- **Don't derive application order from L1 positions** — optimistic user ops
+  precede their envelope and have no general one-to-one L1 mapping.
+- **Don't retain a numeric resume offset without its history identity** —
+  recovery deliberately reuses suffix counts (I18).
+- **Don't discard a valid snapshot beyond the accepted frontier** — that exact
+  batch can become the next required recovery checkpoint (I7).
+- **Don't add internal retry loops to the flusher/submitter for provider
+  errors** — the orchestrator respawn is the retry mechanism; internal
+  retries mask exactly the failures the danger machinery routes on.
+- **Don't unify the two staleness references** (inclusion-relative vs
+  current-relative) — deliberately different formulas for different
+  questions.
