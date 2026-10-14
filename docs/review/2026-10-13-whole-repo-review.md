@@ -48,11 +48,11 @@ to the [register](register.md).
 
 ## Plan of attack
 
-Progress: W1, W2, W3a and W3b have landed on `claude/repo-code-review-103cc5`.
+Progress: W1, W2, W3a, W3b and W4 have landed on `claude/repo-code-review-103cc5`.
 Each was followed by a devnet and watchdog e2e run and an adversarial review
 whose surviving findings were folded into their commits. W3a left the guest
-binary byte-identical. W3b moved the template hash once, with behavior pinned by
-consensus vectors; its hashes are in the
+binary byte-identical. W3b and W4 moved the template hash, with behavior pinned
+by consensus vectors; the hashes are in the
 [guest image record](2026-10-14-guest-image-refresh.md). The input-reader review's commits (compared against the sling
 reader, branch `claude/input-reader-review-fda7ad`) are folded in on top, adapted
 to this branch:
@@ -202,6 +202,23 @@ the tag, and the register reflects the closures.
   implemented and mark it pending; making it normative binds Bart's port (5c).
 - Independent docs patches can land beside any wave; the bulk waits for W3 so
   the text describes final code.
+- **Landed** (about −1.2k net lines: −450 docs, −725 comments, −40 code):
+  - The style rule heads AGENTS.md's Documentation Practice, as norms with no
+    CI check. AGENTS.md is 347 lines and 3.6k words (from 478 and 5.1k): the
+    230-line target would have deleted rules homed only there.
+  - The porter spec replaces scheduler-semantics.md (309 → 216 lines), with
+    the pending rules listed in the register; I1, I3 and I15 tightened.
+  - Threat-model essays moved into subsections; the 09-18 and 09-19 records
+    retired; the egress freeze recorded in the coordination plan.
+  - Module headers within the 1–4-line cap across the sequencer, guest crates
+    and watchdog, except `fold.rs` (W6) and `sequencer-core/build.rs` (W5).
+  - `advance_expected_batch_nonce` moved from `sequencer-core` into the
+    submitter: a resume heuristic, not a scheduler mirror (B5).
+  - README's Running example uses account 9 and a fixed fee, and its variable
+    list matches `config.rs`.
+  - Skipped as already fixed: N7, N9 (W1 kept the model as a dev tool), most of
+    G7/G8/H13/I8. N1's deletions wait for the recovery tool. The ~22 remaining
+    non-guarantee phrases follow the new rule when their owner is next edited.
 
 ### W5: contract wave (needs a sync with Bart before any change)
 
@@ -259,8 +276,8 @@ Step 0 settled the four that blocked planning. The rest, by the wave they gate:
 | W4 | Contract owner: README or `openapi.yaml` (E9) | Moot for the frozen egress half; decide with the new sync |
 | W1 | `docs/recovery/history` TLA+ (N9) | Decided: drop it from `check-all`; it stays as a dev analysis tool |
 | W3 | CI double run (L3) | Decided: step 1, CI on pull requests plus pushes to `main` and `v*` tags, superseded PR runs cancelled. Nightly runs declined; revisit when one-off PR failures stop being a signal or someone owns a red nightly |
-| W4 | Chain-id failover (FS1) | Out of scope per "one consistent node"; reword with a revisit trigger |
-| W5 | Signature acceptance set (B1) | Document now; narrow to v∈{27,28} and low-s in the port's image. The vector table is pinned (W3b): both paths accept the high-s twin and any v ≥ 35 |
+| W4 | Chain-id failover (FS1) | Decided: out of scope per "one consistent node"; revisit when a fallback RPC tier lands. The poster's per-send recheck stays, since a swapped chain would raise the durable watermark |
+| W5 | Signature acceptance set (B1) | Documented as pending in the porter spec (W4); narrow to v∈{27,28} and low-s in the port's image. The vector table is pinned (W3b): both paths accept the high-s twin and any v ≥ 35 |
 | W5 | Out-of-range frame fee (C1) | Structural `FeeAboveMax` rejection |
 | W5 | Zero-frame batches (B9) | Reject only if the port forces a new image anyway |
 | W5 | `scheduler_accepts` mirrors gate d (B2, disputed) | Keep the omission; the trace found no reachable case |
@@ -297,7 +314,7 @@ Step 0 settled the four that blocked planning. The rest, by the wave they gate:
 | N22 Flashbots/fanout | decide | The poster reads from the same node; fanout only helps a >4 h propagation failure | Decline; record the reason (W4) |
 | N23 conditional snapshots | decide | Exact per-batch snapshots are load-bearing (snapshot_dumps.rs:325-330) | Keep per-batch; add timing (I5) |
 | N24 split servers | open | One merged router (http.rs:331-347) | W2 |
-| N25 verbose docs | open | Rules exist; length and repetition drift | W4 |
+| N25 verbose docs | done | Rules exist; length and repetition drift | One fact, one home and size caps adopted, about −1.2k lines (W4) |
 | AI1 BUSY/LOCKED classifier test | fixed | Classifier tests exist at every layer | Close |
 | AI2 watchdog config validation | partially | Residual needs a hand-edited `config.json` | M3 (W1) |
 | AI3 watchdog snapshot validity | fixed | `check_source` plus `trusted_start` (bootstrap.lua:51-52) | Close |
@@ -439,6 +456,9 @@ Each item was refuted or declined. Re-propose only with new evidence.
   - Dependency majors: tower-http 0.7, bindgen 0.73 and tokio-tungstenite 0.30,
     with reasons and revisit triggers at their manifest lines; k256 0.14 and
     sha2 0.11 wait for alloy and RustCrypto.
+- W4: a CI check for the documentation size caps (norms first; revisit if
+  drift returns), and bounding archive downloads per connection (the
+  endpoints are operator-only, and resource exhaustion is out of scope).
 - Keep, despite looking heavy:
   - Exit-verdict projection, SYNCHRONOUS FULL, and schema triggers and typeof guards.
   - Per-batch exact snapshots, GC beyond the frontier, and the I1 duality test.
