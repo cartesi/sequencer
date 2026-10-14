@@ -418,11 +418,13 @@ pub enum BootstrapError {
     SetupRecovery(#[from] SetupRecoveryError),
 }
 
-/// Terminal failures of the `setup --recovery` procedure — the ones
-/// an operator must resolve (flush, post-flush re-sync, and a stopping block
-/// behind the checkpoint use the transient [`RecoveryError`] paths instead).
-/// All map to [`EXIT_TERMINAL`]:
-/// a plain restart re-runs the same bad inputs and re-fails identically.
+/// Terminal failures of the `setup --recovery` procedure — the ones an
+/// operator must resolve. All map to [`EXIT_TERMINAL`]: a plain restart
+/// re-runs the same bad inputs and re-fails identically. Other failures take
+/// other paths: the flush as [`BootstrapError::Flush`], the post-flush
+/// re-sync as a [`WorkerExit::InputReader`] exit, and a re-sync behind the
+/// flush or a stopping block behind the checkpoint as a retryable
+/// [`RecoveryError`].
 #[derive(Debug, Error)]
 pub enum SetupRecoveryError {
     /// Cross-field config validation failed (recovery missing its dump dir /
