@@ -8,8 +8,8 @@ use benchmarks::{
     default_json_output_path, parse_address, print_round_trip_report,
     resolve_external_benchmark_domain, run_round_trip_benchmark,
     runtime::{
-        DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_SEQUENCER_BIN, MemorySampler, benchmark_domain,
-        bootstrap_funded_workload, managed_sequencer_config,
+        DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RESULTS_DIR, DEFAULT_SEQUENCER_BIN,
+        MemorySampler, benchmark_domain, bootstrap_funded_workload, managed_sequencer_config,
     },
     write_json_output,
 };
@@ -72,7 +72,7 @@ async fn main() -> BenchResult<()> {
     let effective_concurrency = args.concurrency.max(1);
     let json_out = args.json_out.clone().or_else(|| {
         args.self_contained
-            .then(|| default_json_output_path("round-trip-latency"))
+            .then(|| default_json_output_path(DEFAULT_RESULTS_DIR, "round-trip-latency"))
     });
     let workload = WorkloadConfig {
         kind: args.workload,

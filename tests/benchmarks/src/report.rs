@@ -45,12 +45,12 @@ where
     Ok(())
 }
 
-pub fn default_json_output_path(prefix: &str) -> String {
+pub fn default_json_output_path(results_dir: &str, prefix: &str) -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or(0);
-    format!("{}/{prefix}-{ts}.json", runtime::DEFAULT_RESULTS_DIR)
+    format!("{results_dir}/{prefix}-{ts}.json")
 }
 
 pub fn print_ack_report(report: &AckRunReport) {

@@ -95,10 +95,10 @@ async fn main() -> BenchResult<()> {
     } else {
         "ack-sweep"
     };
-    let json_out = args.json_out.clone().or_else(|| {
-        args.self_contained
-            .then(|| default_json_output_path(json_prefix))
-    });
+    let json_out = args
+        .json_out
+        .clone()
+        .unwrap_or_else(|| default_json_output_path(&args.results_dir, json_prefix));
     let concurrencies = resolve_concurrency_list(&args)?;
     if concurrencies.is_empty() {
         return Err(std::io::Error::other("concurrency list cannot be empty").into());
@@ -335,29 +335,27 @@ async fn main() -> BenchResult<()> {
         println!("sweep csv: {}", csv_path.display());
         benchmarks::print_rt_sweep_report(&report);
 
-        if let Some(path) = json_out.as_ref() {
-            let config_json = json!({
-                "endpoint": endpoint,
-                "self_contained": args.self_contained,
-                "domain_name": DOMAIN_NAME,
-                "domain_version": DOMAIN_VERSION,
-                "domain_chain_id": domain.chain_id,
-                "domain_verifying_contract": domain.verifying_contract.to_string(),
-                "duration_secs": args.duration_secs,
-                "max_fee": args.max_fee,
-                "results_dir": args.results_dir,
-                "network_profile": NETWORK_PROFILE,
-                "workload": args.workload.as_str(),
-                "accounts_file": args.accounts_file,
-                "transfer_amount": args.transfer_amount,
-                "concurrency_list": concurrencies,
-                "csv_path": csv_path,
-                "max_ws_wait_ms": args.max_ws_wait_ms,
-                "warmup_secs": args.warmup_secs,
-            });
-            write_json_output(Path::new(path), "rt_sweep", &config_json, &report)?;
-            println!("sweep json: {path}");
-        }
+        let config_json = json!({
+            "endpoint": endpoint,
+            "self_contained": args.self_contained,
+            "domain_name": DOMAIN_NAME,
+            "domain_version": DOMAIN_VERSION,
+            "domain_chain_id": domain.chain_id,
+            "domain_verifying_contract": domain.verifying_contract.to_string(),
+            "duration_secs": args.duration_secs,
+            "max_fee": args.max_fee,
+            "results_dir": args.results_dir,
+            "network_profile": NETWORK_PROFILE,
+            "workload": args.workload.as_str(),
+            "accounts_file": args.accounts_file,
+            "transfer_amount": args.transfer_amount,
+            "concurrency_list": concurrencies,
+            "csv_path": csv_path,
+            "max_ws_wait_ms": args.max_ws_wait_ms,
+            "warmup_secs": args.warmup_secs,
+        });
+        write_json_output(Path::new(&json_out), "rt_sweep", &config_json, &report)?;
+        println!("sweep json: {json_out}");
     } else {
         // ACK mode (default).
         let mut rows = Vec::new();
@@ -451,28 +449,26 @@ async fn main() -> BenchResult<()> {
         println!("sweep csv: {}", csv_path.display());
         print_sweep_report(&report);
 
-        if let Some(path) = json_out.as_ref() {
-            let config_json = json!({
-                "endpoint": endpoint,
-                "self_contained": args.self_contained,
-                "domain_name": DOMAIN_NAME,
-                "domain_version": DOMAIN_VERSION,
-                "domain_chain_id": domain.chain_id,
-                "domain_verifying_contract": domain.verifying_contract.to_string(),
-                "duration_secs": args.duration_secs,
-                "max_fee": args.max_fee,
-                "results_dir": args.results_dir,
-                "network_profile": NETWORK_PROFILE,
-                "workload": args.workload.as_str(),
-                "accounts_file": args.accounts_file,
-                "transfer_amount": args.transfer_amount,
-                "concurrency_list": concurrencies,
-                "csv_path": csv_path,
-                "warmup_secs": args.warmup_secs,
-            });
-            write_json_output(Path::new(path), "sweep", &config_json, &report)?;
-            println!("sweep json: {path}");
-        }
+        let config_json = json!({
+            "endpoint": endpoint,
+            "self_contained": args.self_contained,
+            "domain_name": DOMAIN_NAME,
+            "domain_version": DOMAIN_VERSION,
+            "domain_chain_id": domain.chain_id,
+            "domain_verifying_contract": domain.verifying_contract.to_string(),
+            "duration_secs": args.duration_secs,
+            "max_fee": args.max_fee,
+            "results_dir": args.results_dir,
+            "network_profile": NETWORK_PROFILE,
+            "workload": args.workload.as_str(),
+            "accounts_file": args.accounts_file,
+            "transfer_amount": args.transfer_amount,
+            "concurrency_list": concurrencies,
+            "csv_path": csv_path,
+            "warmup_secs": args.warmup_secs,
+        });
+        write_json_output(Path::new(&json_out), "sweep", &config_json, &report)?;
+        println!("sweep json: {json_out}");
     }
 
     Ok(())

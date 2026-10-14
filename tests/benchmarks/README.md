@@ -62,7 +62,7 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
 ## Benchmarks
 
 - `round_trip_latency`: measures submit-to-broadcast latency (`POST /tx` to the matching `GET /ws/subscribe` event) for accepted txs. Drains existing WS backlog before timing so stale history does not pollute the window.
-- `sweep`: runs a concurrency sweep — ack latency (`POST /tx` acknowledgement) by default, or round-trip with `--round-trip` — and emits a CSV plus capacity summary. Reports separate first-of-each markers:
+- `sweep`: runs a concurrency sweep — ack latency (`POST /tx` acknowledgement) by default, or round-trip with `--round-trip` — and writes its rows and capacity summary to `ack-sweep-<ts>.json` or `rt-sweep-<ts>.json` under `--results-dir` (or to `--json-out`), plus a CSV of the rows. Reports separate first-of-each markers:
   - first rejection of any kind
   - first HTTP non-`200`
   - first `429`

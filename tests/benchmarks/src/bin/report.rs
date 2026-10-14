@@ -25,10 +25,7 @@ fn main() -> BenchResult<()> {
     let baseline_rt = load_latest::<RoundTripRunReport>(dir, "round-trip-latency-", ".json");
     let rt_sweep = load_latest::<RtSweepRunReport>(dir, "rt-sweep-", ".json");
 
-    // Load sweep data: prefer capacity-sweep-self.json (full multi-level sweep),
-    // then fall back to ack-sweep-*.json.
-    let capacity_sweep = load_latest::<SweepRunReport>(dir, "capacity-sweep-self", ".json")
-        .or_else(|| load_latest_multi_row_sweep(dir));
+    let capacity_sweep = load_latest_multi_row_sweep(dir);
 
     // For baseline ACK latency, extract c=1 row from the latest ack-sweep file.
     // This is what bench-ack-self produces (sweep --concurrency-list 1).

@@ -35,9 +35,9 @@ bench-rt-sweep-self duration="45" max_fee="2000" conc_list="1 2 4 8" extra="": e
     cargo build -p wallet-sequencer --release
     cargo run -p benchmarks --bin sweep --release -- --round-trip --self-contained --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency-list "{{conc_list}}" --accounts-file {{accounts_file}} {{extra}}
 
-bench-capacity-sweep-self duration="45" max_fee="2000" conc_list="1 2 4 8 16 32 64 128 256 512" out="tests/benchmarks/results/capacity-sweep-self.json" extra="": ensure-machine-image
+bench-capacity-sweep-self duration="45" max_fee="2000" conc_list="1 2 4 8 16 32 64 128 256 512" extra="": ensure-machine-image
     cargo build -p wallet-sequencer --release
-    cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency-list {{conc_list}} --json-out {{out}} --accounts-file {{accounts_file}} {{extra}}
+    cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs {{duration}} --max-fee {{max_fee}} --concurrency-list {{conc_list}} --accounts-file {{accounts_file}} {{extra}}
 
 bench-report results_dir="tests/benchmarks/results":
     cargo run -p benchmarks --bin report --release -- --results-dir {{results_dir}}
