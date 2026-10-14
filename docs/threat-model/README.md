@@ -175,24 +175,20 @@ These are preconditions the sequencer takes as given. They are neither "trust" n
 
 ### L1 block-time coupling
 
-The wall-clock fallback in [`sequencer/src/storage/recovery.rs`](../../sequencer/src/storage/recovery.rs) estimates missed blocks as:
-
-```
-estimated_missed_blocks = (now - last_safe_progress_ms) / CARTESI_SEQUENCER_SECONDS_PER_BLOCK
-```
+The wall-clock fallback estimates missed blocks as the time since the last safe-head advance divided by `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` ([automatic recovery](../recovery/README.md#when-safe-head-progress-stops)).
 
 This assumes a **known, bounded-variance relationship** between elapsed wall-clock time and mined L1 block count. The assumption has three parts:
 
 1. **Known average block time** — `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default 12s, Ethereum mainnet) accurately reflects the target chain's block cadence.
 2. **Bounded variance** — over the danger-threshold window (~4h on mainnet), the delta between `elapsed_seconds / avg_block_time` and actual mined blocks is small. On Ethereum mainnet this holds: slot proposers occasionally skip, but >99% of slots produce a block.
-3. **Wall clock is accurate enough for elapsed-time estimation.** A discrete jump of a full block-time or more against either persisted safety baseline is detected and makes the L1 view unusable until the clock or a new safe-head observation catches up; sub-block skew is tolerated as quantization noise, and the fault is evaluated only after the observed-safe danger checks. Gradual or systematic drift remains an external assumption.
+3. **Wall clock is accurate enough for elapsed-time estimation.** A clock that falls a full block-time or more behind a persisted safety baseline is detected and refuses operation; sub-block skew is tolerated. Gradual or systematic drift remains an external assumption.
 
-**Where it matters.** The missed-block estimate is a fallback for a safe head that stops advancing, whether the RPC is unreachable or still answers with a stalled view. Clock usability is also checked whenever persisted safety baselines are aged: observed block numbers remain authoritative and their danger verdicts run first, but a clock a full block-time or more out of step with either baseline still makes that view unusable for estimation and for worker admission.
+**Where it matters.** The missed-block estimate is a fallback for a safe head that stops advancing, whether the RPC is unreachable or still answers with a stalled view.
 
 **Violation modes.**
 - **Chain with unstable block time.** A chain where average block time drifts substantially (e.g., PoW networks under major hashrate swings) would make the estimate less reliable. Mitigation: `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` should be tuned conservatively (overestimate block time → underestimate missed blocks → more cautious recovery triggers).
 - **Operator misconfigures `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`.** Typo or copy-paste error pointing at the wrong chain's cadence. Operator-trust scope.
-- **Significant host clock drift.** A sequencer host whose clock lags or leads the real-world by minutes per day could slowly desynchronize its danger estimates from reality. A detectable backward crossing of a persisted baseline refuses operation; gradual drift may not.
+- **Significant host clock drift.** A sequencer host whose clock lags or leads the real-world by minutes per day could slowly desynchronize its danger estimates from reality.
 
 **Corollary for test design.** To deterministically exercise the wall-clock fallback, tests must maintain this coupling: when advancing the L1 block count, they should also advance (or simulate) the corresponding wall-clock interval. Our e2e harness does the reverse — it rewinds `l1_safe_head.synced_at_ms` to an older timestamp, which is semantically equivalent to advancing the wall clock.
 
