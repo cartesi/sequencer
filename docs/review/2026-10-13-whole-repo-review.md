@@ -51,7 +51,27 @@ to the [register](register.md).
 Progress: W1, W2 and W3a have landed on `claude/repo-code-review-103cc5`. Each
 was followed by a devnet and watchdog e2e run and an adversarial review whose
 surviving findings were folded into their commits. W3a left the guest binary
-byte-identical.
+byte-identical. The input-reader review's commits (compared against the sling
+reader, branch `claude/input-reader-review-fda7ad`) are folded in on top, adapted
+to this branch:
+
+| Their commit | Here |
+|---|---|
+| `2bfac83` | `fix(l1): split a failed eth_getLogs range on any error` |
+| `15f7d0a` | `fix(l1): resend rate limits briefly and never resend log caps` |
+| (new) | `test(l1): pin log order and refusal on both sides` |
+| `83b9166`, plus `4532b33`'s redirect refusal | `fix(l1): keep the RPC URL out of errors and logs, keep the cause` |
+| `1d3bf98` | dropped: `http.origin` leaked text after an `@` in a path or query, and the watchdog already names no URL |
+| `19b667c` | `fix(setup): pin the deployment block only once it is safe` |
+| `ad80cab` | `fix(l1): cross-check the input payload's chain and app; sharper reader errors` |
+| `e626e96` | `docs: record the reader's L1 assumptions and bounded-ingestion design` |
+| `e959fc0` | `feat(storage): make safe_inputs append-only` |
+| `4532b33` | `feat(l1): separate read and submit RPC providers; pin HTTP/1.1` |
+
+A log missing its block, transaction or log index is refused on both sides, and
+the shared log-sort vector pins it for an absent or null field. A malformed
+position is split like a transport failure and reported as `Provider` in Rust,
+but refused as transient in Lua; both retry.
 
 Rules for every wave: behavior changes and refactors ship as separate patches,
 frozen code (see [Freeze list](#freeze-list)) gets bug fixes only, and
@@ -142,6 +162,10 @@ the tag, and the register reflects the closures.
     guest tests and the duality test for each, and expect the template hash to
     move.
   - Renames: rename the submitter's wallet `nonce` to `wallet_nonce` (N14); test literals for MAX_WAIT_BLOCKS (N16).
+  - From the input-reader integration: measure, then try dropping
+    `--test-threads=1` from `test-sequencer` (its stated reason, a partition
+    static, is gone; N18); consider classifying a 3xx at the chain-id check as
+    a configuration error instead of transient.
 - Exit: no `#[path]` test modules, one `test_support`, a benchmark crate of
   about 3.3k lines, and no test-only public functions in production modules.
 
@@ -240,7 +264,7 @@ Step 0 settled the four that blocked planning. The rest, by the wave they gate:
 | N16 MAX_WAIT_BLOCKS configurable | decide | Single constant (lib.rs:21); never changed | Status quo; test literals (W3b) |
 | N17 benchmark DB size and drain time | done | Only a memory report exists | Reported per sweep step (W3a) |
 | N18 cross-compilation and compile times | open | Guest image built twice in CI; 4 duplicate dependency stacks; no profile tuning | Measure (`--timings`), then L3, L4, L7, L13 (W3b) |
-| N19 logs under error | partially | ANSI and key redaction done; cause loss and levels open | W2 |
+| N19 logs under error | done | ANSI and key redaction done; causes now ride in Display, and `error_chain` renders dependency errors' causes; levels follow the verdict | W2 and the input-reader integration |
 | N20 hot-path clones | stale premise | No per-op clone that matters; fsync and checkpoints dominate | Close |
 | N21 supply chain | partially | Deps already hoisted; one unused dep; duplicates; no advisory gate | L4 (W2), L11 and L14 (W3b) |
 | N22 Flashbots/fanout | decide | The poster reads from the same node; fanout only helps a >4 h propagation failure | Decline; record the reason (W4) |
@@ -371,8 +395,16 @@ Each item was refuted or declined. Re-propose only with new evidence.
   - Nonce-enumeration ABI exports: the tool owns baseline nonces.
   - A closure-based guarded helper (G12): prefer `begin_guarded`.
   - A two-connection contention test (AI1): it would test SQLite.
+- The input-reader review (sling comparison): contiguity-only chunk commits,
+  warn-then-error transport logging, a reader bound at `i64::MAX`, HTTP/2 or
+  keepalive, per-profile timeouts, 60 s or 20 s timeouts, a hash-pinned safe
+  head, a poster count witness, `getInputHash` as a content witness, and tests
+  pinning read/submit routing. A separate submit (private relay) URL is
+  deferred: `create_keyed_providers` is the seam.
 - Keep, despite looking heavy:
   - Exit-verdict projection, SYNCHRONOUS FULL, and schema triggers and typeof guards.
   - Per-batch exact snapshots, GC beyond the frontier, and the I1 duality test.
   - The reader's double completeness witness, the watermark-before-broadcast rule, and the stateless submitter.
-  - The full keep lists are per area in the appendix.
+  - The full keep lists are per area in the appendix. Splitting every failed
+    log range supersedes the reader keep item on configurable range-error
+    codes, and M2 narrows to the watchdog's persisted sequencer URL.
