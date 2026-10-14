@@ -380,12 +380,7 @@ fn seed_ordered_txs(db_path: &str) {
                 transaction_hash: B256::repeat_byte(0xcd),
             }],
             NO_OWN_BATCHES,
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
+            &crate::storage::test_helpers::default_protocol_timing(),
             FrontierMode::Populate,
         )
         .expect("append direct input");

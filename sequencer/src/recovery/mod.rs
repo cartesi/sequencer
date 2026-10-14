@@ -248,7 +248,7 @@ impl RecoveryL1 for StartupL1<'_> {
         MempoolFlusher::flush_to_safe(
             providers,
             self.l1_config.identity.batch_submitter_address,
-            self.protocol.seconds_per_block,
+            self.protocol.seconds_per_block(),
             self.db_path,
             watermark,
         )
@@ -991,7 +991,7 @@ mod tests {
     #[tokio::test]
     async fn observed_tip_repair_still_refuses_a_surviving_clock_fault() {
         let (db, protocol) = danger_fixture("recovery-tip-clock", false);
-        let ahead = crate::clock::unix_now_ms() + protocol.seconds_per_block * 2_000;
+        let ahead = crate::clock::unix_now_ms() + protocol.seconds_per_block() * 2_000;
         storage::Storage::open_writer(&db.path)
             .unwrap()
             .write(|tx| {

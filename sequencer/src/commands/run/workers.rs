@@ -203,7 +203,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             batch_submitter_address: l1_config.identity.batch_submitter_address,
             start_block: l1_config.identity.app_deployment_block,
             confirmation_depth: run_config.batch_submitter_confirmation_depth,
-            seconds_per_block: timing.seconds_per_block,
+            seconds_per_block: timing.seconds_per_block(),
             expected_chain_id: l1_config.identity.chain_id,
         };
         let providers = build_batch_submitter_providers(&l1_config)?;
@@ -1017,7 +1017,7 @@ mod tests {
         // while preparation was in flight. The final reducer invocation must
         // classify the new clock refusal before durable Live or launch.
         let future_ms = i64::try_from(crate::clock::unix_now_ms()).expect("clock fits")
-            + i64::try_from(timing.seconds_per_block * 2_000).expect("offset fits");
+            + i64::try_from(timing.seconds_per_block() * 2_000).expect("offset fits");
         crate::storage::Storage::open_connection(&db_path)
             .expect("open raw test connection")
             .execute(

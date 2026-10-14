@@ -1113,12 +1113,7 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
             1,
             &safe_inputs,
             TEST_BATCH_SUBMITTER,
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
+            &crate::storage::test_helpers::default_protocol_timing(),
         )
         .expect("seed safe head (and any deposits)");
 }
@@ -1156,12 +1151,7 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 block_number: safe_block,
             }],
             TEST_BATCH_SUBMITTER,
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
+            &crate::storage::test_helpers::default_protocol_timing(),
         )
         .expect("append safe direct input");
 }

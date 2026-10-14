@@ -831,12 +831,7 @@ mod tests {
         });
 
         let batch_submitter = Address::repeat_byte(0xCC);
-        let protocol = ProtocolTiming {
-            max_wait_blocks: u64::MAX,
-            preemptive_margin_blocks: 75,
-            l1_read_stale_after_blocks: 900,
-            seconds_per_block: 12,
-        };
+        let protocol = ProtocolTiming::try_new(u64::MAX, 75, 900, 12).expect("valid timing");
         let inputs = vec![StoredSafeInput {
             sender: batch_submitter,
             payload: future_safe_block_payload,

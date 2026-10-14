@@ -30,10 +30,8 @@ use thiserror::Error;
 /// Error surfaced by [`ProtocolTiming::try_new`] when timing fields would
 /// produce an unusable danger threshold.
 ///
-/// Returning a typed error rather than panicking lets the runtime convert this
-/// into a `Result` at config-parse time and surface it through the structured
-/// `RunError` taxonomy, instead of crashing later inside
-/// [`ProtocolTiming::danger_threshold`] (or worse, inside a logging macro).
+/// Returning a typed error lets the runtime surface the misconfiguration at
+/// config-parse time through the structured `RunError` taxonomy.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtocolTimingError {
     /// `preemptive_margin_blocks == 0` — zero-width preemptive zone defeats
@@ -100,26 +98,25 @@ pub struct WallClockRegression {
 /// plus sequencer-side preemptive-recovery tuning. No identity (the
 /// batch-submitter address is passed separately to predicates that need it).
 ///
-/// Construct via [`ProtocolTiming::try_new`] in production code so the
-/// margin/stale relationships are checked once up front. The fields stay
-/// public to keep test fixtures concise — direct struct-literal construction
-/// is fine where the inputs are controlled.
+/// Construct via [`ProtocolTiming::try_new`]: it checks the margin/stale
+/// relationships once, and the private fields keep every value valid
+/// afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolTiming {
     /// `MAX_WAIT_BLOCKS` — after this many L1 blocks, the scheduler skips a
     /// submitted batch as stale.
-    pub max_wait_blocks: u64,
+    max_wait_blocks: u64,
     /// How many blocks before `max_wait_blocks` the sequencer triggers
     /// preemptive recovery. Sequencer-local; must be strictly less than
     /// `max_wait_blocks` (enforced by [`ProtocolTiming::try_new`]).
-    pub preemptive_margin_blocks: u64,
+    preemptive_margin_blocks: u64,
     /// How long the L1 safe block itself may be stale, measured in assumed L1
     /// blocks. Sequencer-local; startup refuses once the safe block timestamp
     /// is older than this threshold.
-    pub l1_read_stale_after_blocks: u64,
+    l1_read_stale_after_blocks: u64,
     /// Wall-clock estimate of L1 block time, used as a fallback when the L1
     /// safe head appears frozen. Sequencer-local.
-    pub seconds_per_block: u64,
+    seconds_per_block: u64,
 }
 
 impl ProtocolTiming {
@@ -136,10 +133,6 @@ impl ProtocolTiming {
 
     /// Validated constructor. Rejects timing configurations that would
     /// produce an unusable danger threshold or a degenerate margin.
-    ///
-    /// Production callers should use this; tests can still construct
-    /// `ProtocolTiming` directly via struct-literal syntax with controlled
-    /// inputs.
     pub fn try_new(
         max_wait_blocks: u64,
         preemptive_margin_blocks: u64,
@@ -182,34 +175,36 @@ impl ProtocolTiming {
         })
     }
 
+    /// The scheduler staleness window ([`crate::MAX_WAIT_BLOCKS`] in
+    /// production).
+    pub const fn max_wait_blocks(&self) -> u64 {
+        self.max_wait_blocks
+    }
+
+    /// Blocks before [`Self::max_wait_blocks`] at which preemptive recovery
+    /// triggers.
+    pub const fn preemptive_margin_blocks(&self) -> u64 {
+        self.preemptive_margin_blocks
+    }
+
+    /// How many assumed L1 blocks the safe block itself may be stale.
+    pub const fn l1_read_stale_after_blocks(&self) -> u64 {
+        self.l1_read_stale_after_blocks
+    }
+
+    /// Wall-clock estimate of L1 block time, in seconds.
+    pub const fn seconds_per_block(&self) -> u64 {
+        self.seconds_per_block
+    }
+
     /// The block-age threshold at which preemptive recovery triggers.
-    ///
-    /// Production code goes through [`ProtocolTiming::try_new`], which rejects
-    /// an invalid margin up front. A directly-constructed invalid value is a
-    /// test/programming bug and fails loud here.
     pub fn danger_threshold(&self) -> u64 {
-        assert!(
-            self.preemptive_margin_blocks > 0,
-            "ProtocolTiming must be constructed with a nonzero preemptive margin"
-        );
-        assert!(
-            self.preemptive_margin_blocks < self.max_wait_blocks,
-            "ProtocolTiming must be constructed with margin < max_wait_blocks"
-        );
         self.max_wait_blocks - self.preemptive_margin_blocks
     }
 
     /// Wall-clock age, in seconds, after which the L1 safe block is too old
     /// for the sequencer to trust its L1 view.
     pub fn l1_read_stale_after_secs(&self) -> u64 {
-        assert!(
-            self.l1_read_stale_after_blocks > 0,
-            "ProtocolTiming must be constructed with a nonzero L1 read-staleness window"
-        );
-        assert!(
-            self.seconds_per_block > 0,
-            "ProtocolTiming must be constructed with nonzero seconds_per_block"
-        );
         self.l1_read_stale_after_blocks
             .checked_mul(self.seconds_per_block)
             .expect("validated L1 read-staleness window must fit in u64 seconds")
@@ -219,10 +214,6 @@ impl ProtocolTiming {
     /// continued soft confirmations. `None` means the view is unknown and is
     /// treated as unusable.
     pub fn l1_view_is_stale(&self, safe_block_timestamp_secs: Option<u64>, now_ms: u64) -> bool {
-        assert!(
-            self.seconds_per_block > 0,
-            "ProtocolTiming must be constructed with nonzero seconds_per_block"
-        );
         let Some(timestamp_secs) = safe_block_timestamp_secs else {
             return true;
         };
@@ -250,10 +241,6 @@ impl ProtocolTiming {
         safe_block_timestamp_secs: Option<u64>,
         now_ms: u64,
     ) -> bool {
-        assert!(
-            self.seconds_per_block > 0,
-            "ProtocolTiming must be constructed with nonzero seconds_per_block"
-        );
         let Some(timestamp_secs) = safe_block_timestamp_secs else {
             return false;
         };
@@ -295,10 +282,6 @@ impl ProtocolTiming {
         last_safe_progress_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<Option<u64>, WallClockRegression> {
-        assert!(
-            self.seconds_per_block > 0,
-            "ProtocolTiming must be constructed with nonzero seconds_per_block"
-        );
         let Some(last) = last_safe_progress_ms else {
             return Ok(None);
         };
@@ -463,12 +446,7 @@ mod tests {
     const MAX_WAIT: u64 = crate::MAX_WAIT_BLOCKS;
 
     fn timing() -> ProtocolTiming {
-        ProtocolTiming {
-            max_wait_blocks: MAX_WAIT,
-            preemptive_margin_blocks: 75,
-            l1_read_stale_after_blocks: 900,
-            seconds_per_block: 12,
-        }
+        ProtocolTiming::try_new(MAX_WAIT, 75, 900, 12).expect("valid test timing")
     }
 
     fn encode(batch: &Batch) -> Vec<u8> {
@@ -539,26 +517,6 @@ mod tests {
         assert!(!cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_001));
         assert!(!cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_999));
         assert!(cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_000));
-    }
-
-    #[test]
-    #[should_panic(expected = "nonzero seconds_per_block")]
-    fn l1_view_is_stale_fails_loud_on_zero_block_time_direct_construction() {
-        let cfg = ProtocolTiming {
-            seconds_per_block: 0,
-            ..timing()
-        };
-        let _ = cfg.l1_view_is_stale(Some(1_001), 1_000_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "nonzero seconds_per_block")]
-    fn clock_cannot_age_l1_view_fails_loud_on_zero_block_time_direct_construction() {
-        let cfg = ProtocolTiming {
-            seconds_per_block: 0,
-            ..timing()
-        };
-        let _ = cfg.clock_cannot_age_l1_view(Some(1_001), 1_000_000);
     }
 
     #[test]
@@ -633,38 +591,6 @@ mod tests {
             timing().wall_clock_adjusted_danger_threshold(Some(last), now),
             Ok(Some(0)),
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "ProtocolTiming must be constructed with margin < max_wait_blocks")]
-    fn danger_threshold_fails_loud_on_invalid_direct_construction() {
-        // Production uses try_new. A direct invalid struct literal is a
-        // programming error and must not be normalized into threshold zero.
-        let cfg = ProtocolTiming {
-            preemptive_margin_blocks: MAX_WAIT,
-            ..timing()
-        };
-        let _ = cfg.danger_threshold();
-    }
-
-    #[test]
-    #[should_panic(expected = "nonzero preemptive margin")]
-    fn danger_threshold_fails_loud_on_zero_margin_direct_construction() {
-        let cfg = ProtocolTiming {
-            preemptive_margin_blocks: 0,
-            ..timing()
-        };
-        let _ = cfg.danger_threshold();
-    }
-
-    #[test]
-    #[should_panic(expected = "nonzero seconds_per_block")]
-    fn wall_clock_helpers_fail_loud_on_zero_block_time_direct_construction() {
-        let cfg = ProtocolTiming {
-            seconds_per_block: 0,
-            ..timing()
-        };
-        let _ = cfg.wall_clock_adjusted_danger_threshold(None, 0);
     }
 
     #[test]

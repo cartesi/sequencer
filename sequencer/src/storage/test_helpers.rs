@@ -33,12 +33,8 @@ pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
 /// Sender-independent (timing carries no address); pair with a submitter
 /// address as needed at the call site.
 pub(crate) fn default_protocol_timing() -> ProtocolTiming {
-    ProtocolTiming {
-        max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-        preemptive_margin_blocks: 75,
-        l1_read_stale_after_blocks: 900,
-        seconds_per_block: 12,
-    }
+    ProtocolTiming::try_new(sequencer_core::MAX_WAIT_BLOCKS, 75, 900, 12)
+        .expect("valid test timing")
 }
 
 /// Lane fixtures. Production opens the Tip through

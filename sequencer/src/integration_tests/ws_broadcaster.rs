@@ -297,12 +297,7 @@ fn seed_ordered_txs(db_path: &str) {
                 block_number: 10,
             }],
             Address::repeat_byte(0x7f),
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
+            &crate::storage::test_helpers::default_protocol_timing(),
         )
         .expect("append direct input");
     storage
@@ -333,12 +328,7 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
                 block_number: safe_block,
             }],
             Address::repeat_byte(0x7f),
-            &sequencer_core::protocol::ProtocolTiming {
-                max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-                preemptive_margin_blocks: 75,
-                l1_read_stale_after_blocks: 900,
-                seconds_per_block: 12,
-            },
+            &crate::storage::test_helpers::default_protocol_timing(),
         )
         .expect("append direct input");
     storage

@@ -152,7 +152,7 @@ impl DangerDetector {
                     tracing::warn!(
                         ?status,
                         danger_threshold = self.protocol.danger_threshold(),
-                        l1_read_stale_after_blocks = self.protocol.l1_read_stale_after_blocks,
+                        l1_read_stale_after_blocks = self.protocol.l1_read_stale_after_blocks(),
                         "danger detected — triggering shutdown for startup recovery"
                     );
                     return Ok(DetectorExit::RecoveryRequired { status });

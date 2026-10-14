@@ -321,12 +321,7 @@ mod tests {
     /// Protocol pinned to `BATCH_SUBMITTER_ADDRESS` — worker tests use that as
     /// their test submitter, so populate sees the seeded safe_inputs.
     fn submitter_test_protocol() -> ProtocolTiming {
-        ProtocolTiming {
-            max_wait_blocks: sequencer_core::MAX_WAIT_BLOCKS,
-            preemptive_margin_blocks: 75,
-            l1_read_stale_after_blocks: 900,
-            seconds_per_block: 12,
-        }
+        crate::storage::test_helpers::default_protocol_timing()
     }
 
     fn default_test_config() -> BatchSubmitterConfig {

@@ -1361,12 +1361,8 @@ mod tests {
     const DUALITY_MAX_WAIT: u64 = 5;
 
     fn duality_timing() -> crate::protocol::ProtocolTiming {
-        crate::protocol::ProtocolTiming {
-            max_wait_blocks: DUALITY_MAX_WAIT,
-            preemptive_margin_blocks: 1,
-            l1_read_stale_after_blocks: 1,
-            seconds_per_block: 12,
-        }
+        crate::protocol::ProtocolTiming::try_new(DUALITY_MAX_WAIT, 1, 1, 12)
+            .expect("valid duality timing")
     }
 
     // A frame with no user ops — accept/reject is then purely about

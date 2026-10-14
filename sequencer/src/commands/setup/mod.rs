@@ -554,7 +554,7 @@ where
 
     // 2. Flush the previous instance's batch txs → C, the post-flush safe head.
     let stop_block =
-        flush_wallet_nonce(config, identity, timing.seconds_per_block, storage).await?;
+        flush_wallet_nonce(config, identity, timing.seconds_per_block(), storage).await?;
 
     // 3. Re-sync through C, then verify the resynced safe block reaches the
     //    flush observation before cascade. Frontier population stays OFF (the

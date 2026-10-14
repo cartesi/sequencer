@@ -551,12 +551,12 @@ impl RunConfig {
         // Rounding up counts a partial block against the operator.
         let open_blocks = self
             .max_batch_open_seconds
-            .div_ceil(timing.seconds_per_block);
+            .div_ceil(timing.seconds_per_block());
         let danger_threshold = timing.danger_threshold();
         if open_blocks > danger_threshold.saturating_sub(BATCH_SUBMISSION_MARGIN_BLOCKS) {
             return Err(BootstrapError::BatchOpenPastDanger {
                 max_batch_open_seconds: self.max_batch_open_seconds,
-                seconds_per_block: timing.seconds_per_block,
+                seconds_per_block: timing.seconds_per_block(),
                 open_blocks,
                 danger_threshold,
                 margin_blocks: BATCH_SUBMISSION_MARGIN_BLOCKS,
@@ -1086,7 +1086,7 @@ mod tests {
         let timing = config.protocol_timing().expect("boundary window fits");
         let open_blocks = config
             .max_batch_open_seconds
-            .div_ceil(timing.seconds_per_block);
+            .div_ceil(timing.seconds_per_block());
         // Worst case: the first frame trails the safe head by one block less
         // than the frame-clock interval.
         let frame_lag = ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS - 1;
