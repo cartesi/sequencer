@@ -9,3 +9,8 @@ publish = false
 [dependencies]
 alloy-sol-types = "1"
 alloy-primitives = "1"
+
+[features]
+# Test-only encoders (`Erc20Deposit::encode`) for other crates' tests. Only
+# dev-dependencies and test binaries enable it; the guest never does.
+test-support = []

@@ -233,4 +233,39 @@ impl Erc20Deposit {
             exec_layer_data: payload[72..].to_vec(),
         })
     }
+
+    /// Inverse of [`Self::decode`]: the payload the ERC-20 portal writes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut payload =
+            Vec::with_capacity(ERC20_DEPOSIT_PREFIX_BYTES + self.exec_layer_data.len());
+        payload.extend_from_slice(self.token.as_slice());
+        payload.extend_from_slice(self.sender.as_slice());
+        payload.extend_from_slice(&self.value.to_be_bytes::<32>());
+        payload.extend_from_slice(&self.exec_layer_data);
+        payload
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn erc20_deposit_encode_round_trips_through_decode() {
+        let deposit = Erc20Deposit {
+            token: Address::repeat_byte(0x11),
+            sender: Address::repeat_byte(0x22),
+            value: U256::from(0x0102_0304_u64),
+            exec_layer_data: vec![0xaa, 0xbb],
+        };
+        assert_eq!(Erc20Deposit::decode(&deposit.encode()), Ok(deposit.clone()));
+
+        let bare = Erc20Deposit {
+            exec_layer_data: Vec::new(),
+            ..deposit
+        };
+        assert_eq!(bare.encode().len(), ERC20_DEPOSIT_PREFIX_BYTES);
+        assert_eq!(Erc20Deposit::decode(&bare.encode()), Ok(bare));
+    }
 }
