@@ -3,7 +3,7 @@
 
 use benchmarks::{
     BenchResult, BenchmarkJsonOutput, SweepRunReport, load_sweep_results,
-    runtime::DEFAULT_RESULTS_DIR,
+    runtime::{DEFAULT_RESULTS_DIR, DRAIN_DEADLINE},
 };
 use clap::Parser;
 use std::path::PathBuf;
@@ -142,8 +142,8 @@ fn main() -> BenchResult<()> {
         println!();
     }
 
-    // --- Memory ---
-    println!("  MEMORY");
+    // --- Memory & storage ---
+    println!("  MEMORY & STORAGE");
     println!("  ────────────────────────────────────────────");
     let memory_source = capacity_sweep.and_then(|r| r.memory.as_ref());
     match memory_source {
@@ -160,6 +160,28 @@ fn main() -> BenchResult<()> {
         None => {
             println!("  n/a (no memory data available)");
         }
+    }
+    match capacity_sweep.and_then(|r| r.storage.as_ref()) {
+        Some(storage) => println!(
+            "  DB size:               {:.1} MB (+ WAL {:.1} MB)",
+            mb(storage.db_bytes),
+            mb(storage.wal_bytes)
+        ),
+        None => println!("  DB size:               n/a"),
+    }
+    match capacity_sweep.and_then(|r| r.drain.as_ref()) {
+        Some(drain) => match drain.drain_secs {
+            Some(secs) => println!(
+                "  Batch drain:           {} batches in {:.1} s",
+                drain.batches_pending, secs
+            ),
+            None => println!(
+                "  Batch drain:           {} batches, not drained within {} s",
+                drain.batches_pending,
+                DRAIN_DEADLINE.as_secs()
+            ),
+        },
+        None => println!("  Batch drain:           n/a"),
     }
 
     println!();
@@ -230,6 +252,10 @@ fn cmd_output(cmd: &str, args: &[&str]) -> Option<String> {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+fn mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
 }
 
 fn format_tps(tps: f64) -> String {

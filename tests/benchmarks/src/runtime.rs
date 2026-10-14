@@ -5,7 +5,7 @@ use alloy_primitives::U256;
 use sequencer_core::fee::fee_to_linear;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -214,4 +214,102 @@ fn sample_rss_mb(pid: u32) -> Option<f64> {
     let text = String::from_utf8(output.stdout).ok()?;
     let rss_kib = text.trim().parse::<f64>().ok()?;
     Some(rss_kib / 1024.0)
+}
+
+/// How long a self-contained run waits, after the load stops, for its sealed
+/// batches to be accepted on L1.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(120);
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageReport {
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub growth_bytes_per_1k_accepted: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StorageSample {
+    db_bytes: u64,
+    wal_bytes: u64,
+}
+
+/// Sizes of the sequencer's SQLite file and its WAL (0 when absent).
+pub fn sample_storage(runtime: &ManagedSequencer) -> BenchResult<StorageSample> {
+    let db_path = runtime.db_path();
+    let mut wal_path = db_path.clone().into_os_string();
+    wal_path.push("-wal");
+    let wal_bytes = match std::fs::metadata(&wal_path) {
+        Ok(metadata) => metadata.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err.into()),
+    };
+    Ok(StorageSample {
+        db_bytes: std::fs::metadata(&db_path)?.len(),
+        wal_bytes,
+    })
+}
+
+pub fn storage_report(
+    start: StorageSample,
+    end: StorageSample,
+    accepted_count: u64,
+) -> StorageReport {
+    // Signed, because a checkpoint can shrink the WAL below its start size.
+    let growth_bytes =
+        (end.db_bytes + end.wal_bytes) as f64 - (start.db_bytes + start.wal_bytes) as f64;
+    // Same floor as the RSS metric: below it, one-time growth dominates.
+    let growth_bytes_per_1k_accepted =
+        (accepted_count >= 1000).then(|| growth_bytes / (accepted_count as f64 / 1000.0));
+    StorageReport {
+        db_bytes: end.db_bytes,
+        wal_bytes: end.wal_bytes,
+        growth_bytes_per_1k_accepted,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainReport {
+    pub batches_pending: u64,
+    /// `None` when the backlog did not drain within [`DRAIN_DEADLINE`].
+    pub drain_secs: Option<f64>,
+}
+
+/// Time from now, with the load stopped, until `safe_accepted_batches` holds
+/// the highest valid sealed batch nonce read now. The open batch is excluded,
+/// so this measures the submission backlog, not the batch-open window. Mines
+/// one L1 block per second at Anvil's own clock.
+pub async fn measure_drain(runtime: &ManagedSequencer) -> BenchResult<DrainReport> {
+    let started = Instant::now();
+    let frontier = runtime.batch_nonce_frontier()?;
+    let Some(target) = frontier.sealed else {
+        return Ok(DrainReport {
+            batches_pending: 0,
+            drain_secs: Some(0.0),
+        });
+    };
+    let accepted_through = frontier.safe_accepted.map_or(0, |nonce| nonce + 1);
+    let batches_pending = (target + 1).saturating_sub(accepted_through);
+    if batches_pending == 0 {
+        return Ok(DrainReport {
+            batches_pending,
+            drain_secs: Some(0.0),
+        });
+    }
+
+    while started.elapsed() < DRAIN_DEADLINE {
+        runtime.mine_l1_block_at_wall_clock().await?;
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+        let accepted = runtime.batch_nonce_frontier()?.safe_accepted;
+        if accepted.is_some_and(|nonce| nonce >= target) {
+            return Ok(DrainReport {
+                batches_pending,
+                drain_secs: Some(started.elapsed().as_secs_f64()),
+            });
+        }
+    }
+    Ok(DrainReport {
+        batches_pending,
+        drain_secs: None,
+    })
 }

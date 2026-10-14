@@ -11,7 +11,8 @@ use benchmarks::{
     run_ack_benchmark, run_round_trip_benchmark,
     runtime::{
         DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RESULTS_DIR, DEFAULT_SEQUENCER_BIN,
-        MemorySampler, benchmark_domain, bootstrap_funded_workload, managed_sequencer_config,
+        DRAIN_DEADLINE, MemorySampler, benchmark_domain, bootstrap_funded_workload,
+        managed_sequencer_config, measure_drain, sample_storage, storage_report,
     },
     write_json_output,
 };
@@ -235,6 +236,8 @@ async fn main() -> BenchResult<()> {
         );
     }
 
+    // After warmup, so storage growth covers the window total_accepted counts.
+    let storage_start = managed.as_ref().map(sample_storage).transpose()?;
     let duration = Duration::from_secs(args.duration_secs);
     let mut rows = Vec::new();
     let mut total_accepted = 0_u64;
@@ -271,6 +274,31 @@ async fn main() -> BenchResult<()> {
         Some(sampler) => Some(sampler.stop(total_accepted).await?),
         None => None,
     };
+    // Before shutdown: a clean close checkpoints the WAL away, and the data
+    // dir is deleted with the runtime.
+    let (storage, drain) = match (managed.as_ref(), storage_start) {
+        (Some(runtime), Some(start)) if run_error.is_none() => {
+            println!();
+            println!(
+                "draining sealed batches (up to {}s)",
+                DRAIN_DEADLINE.as_secs()
+            );
+            let measured = async {
+                let drain = measure_drain(runtime).await?;
+                let end = sample_storage(runtime)?;
+                BenchResult::Ok((storage_report(start, end, total_accepted), drain))
+            }
+            .await;
+            match measured {
+                Ok((storage, drain)) => (Some(storage), Some(drain)),
+                Err(err) => {
+                    run_error = Some(err);
+                    (None, None)
+                }
+            }
+        }
+        _ => (None, None),
+    };
     if let Some(value) = managed.take() {
         let shutdown_result = value.shutdown().await;
         if run_error.is_none() && shutdown_result.is_err() {
@@ -285,6 +313,8 @@ async fn main() -> BenchResult<()> {
         summary: compute_capacity_summary(rows.as_slice()),
         rows,
         memory,
+        storage,
+        drain,
         sequencer_log_path,
     };
 

@@ -73,6 +73,16 @@ pub struct BatchCounts {
     pub invalidated: u64,
 }
 
+/// Highest batch nonce sealed locally and highest accepted on safe L1.
+/// Returned by [`ManagedSequencer::batch_nonce_frontier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchNonceFrontier {
+    /// Highest nonce among valid sealed batches.
+    pub sealed: Option<u64>,
+    /// Highest nonce in `safe_accepted_batches`.
+    pub safe_accepted: Option<u64>,
+}
+
 /// Drive the next respawn's `setup` phase into `--recovery` mode against a
 /// captured checkpoint. Set via [`ManagedSequencer::set_recovery_setup`] before
 /// wiping the DB and respawning.
@@ -595,6 +605,33 @@ impl ManagedSequencer {
         Ok((count as u64, min_nonce.map(|n| n as u64)))
     }
 
+    /// Read-only; safe to call while the sequencer is running.
+    pub fn batch_nonce_frontier(&self) -> HarnessResult<BatchNonceFrontier> {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.db_path().as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+
+        let sealed: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(nonce) FROM batches \
+                 WHERE sealed_at_ms IS NOT NULL AND invalidated_at_ms IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| io_other(format!("max sealed batch nonce: {err}")))?;
+        let safe_accepted: Option<i64> = conn
+            .query_row("SELECT MAX(nonce) FROM safe_accepted_batches", [], |row| {
+                row.get(0)
+            })
+            .map_err(|err| io_other(format!("max safe-accepted batch nonce: {err}")))?;
+        Ok(BatchNonceFrontier {
+            sealed: sealed.map(|n| n as u64),
+            safe_accepted: safe_accepted.map(|n| n as u64),
+        })
+    }
+
     /// The batch-tree anchor nonce, read from the run DB read-only: `N'` after
     /// cockroach recovery, `0` for a genesis deployment. Lets a recovery e2e
     /// assert the rebuilt tree is rooted at the checkpoint's resume nonce (I16).
@@ -887,6 +924,10 @@ impl ManagedSequencer {
 
     pub fn data_dir(&self) -> &Path {
         self.data_dir_path.as_path()
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.data_dir_path.join("sequencer.db")
     }
 
     pub fn domain_chain_id(&self) -> u64 {

@@ -80,4 +80,5 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
 - `sweep --round-trip` subscribes from the latest snapshot's history claim and drains the existing backlog before timing, so stale history does not pollute the measurement window.
 - If sweep hits `Too many open files`, increase the shell limit (`ulimit -n 4096`) or use a smaller concurrency list.
 - Self-contained variants automatically build a temp DB, spawn `anvil`, start the sequencer, and persist logs/results under `tests/benchmarks/results`.
+- Self-contained runs end with a drain phase of up to 120 s, mining one L1 block per second, before shutdown. The report adds the DB and WAL size and the batch drain time; [`BENCHMARK_SPEC.md`](./BENCHMARK_SPEC.md) §2.5 defines them.
 - For non-self-contained runs, start a sequencer instance first and make sure the benchmark domain matches the sequencer domain.

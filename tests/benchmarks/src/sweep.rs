@@ -10,7 +10,7 @@ use crate::{
         client_failure_count, has_http_429, has_http_rejection, http_429_count,
         http_rejection_count,
     },
-    report::print_memory_report,
+    report::{print_drain_report, print_memory_report, print_storage_report},
     runtime,
     stats::{StatsMs, throughput_tx_per_s},
 };
@@ -112,6 +112,8 @@ pub struct SweepRunReport {
     pub rows: Vec<SweepRow>,
     pub summary: SweepSummary,
     pub memory: Option<runtime::MemoryReport>,
+    pub storage: Option<runtime::StorageReport>,
+    pub drain: Option<runtime::DrainReport>,
     pub sequencer_log_path: Option<String>,
 }
 
@@ -174,6 +176,12 @@ pub fn print_sweep_report(report: &SweepRunReport) {
     );
     if let Some(memory) = report.memory.as_ref() {
         print_memory_report(memory);
+    }
+    if let Some(storage) = report.storage.as_ref() {
+        print_storage_report(storage);
+    }
+    if let Some(drain) = report.drain.as_ref() {
+        print_drain_report(drain);
     }
     if let Some(path) = report.sequencer_log_path.as_ref() {
         println!("sequencer_log_path: {path}");

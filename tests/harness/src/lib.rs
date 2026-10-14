@@ -16,7 +16,7 @@ pub use proxy::TcpProxy;
 pub use replay::ReplayWalletApp;
 pub use rollups::{DEVNET_CHAIN_ID, DEVNET_SECONDS_PER_BLOCK, DevnetRollupsStack};
 pub use sequencer::{
-    BatchCounts, DEFAULT_DEVNET_SEQUENCER_BIN, DEFAULT_TEST_LOGS_DIR,
+    BatchCounts, BatchNonceFrontier, DEFAULT_DEVNET_SEQUENCER_BIN, DEFAULT_TEST_LOGS_DIR,
     DEVNET_PREEMPTIVE_MARGIN_BLOCKS, ManagedSequencer, ManagedSequencerConfig, RecoveryCheckpoint,
     RecoverySetupParams, RespawnAttemptOutcome, RespawnPolicy, StackChildExit,
     default_c_wallet_sequencer_config, default_devnet_sequencer_config,

@@ -37,6 +37,13 @@ This spec makes that requirement measurable and repeatable.
 4. `rss_growth_mb`: `rss_end_mb - rss_start_mb`.
 5. `rss_growth_per_1k_accepted_tx_mb`: RSS growth normalized by accepted tx volume.
 
+### 2.5 Storage and Drain Metrics
+
+1. `db_bytes` and `wal_bytes`: sizes of the sequencer's SQLite file and its WAL at run end.
+2. `growth_bytes_per_1k_accepted`: growth of their sum over the measured steps, normalized by accepted tx volume.
+3. `batches_pending`: valid sealed batches whose nonce is not yet in `safe_accepted_batches` when the drain starts. The drain starts when the last measured step returns: every load worker is past its deadline, and in round-trip mode the WS matcher has finished, bounded by `--max-ws-wait-ms`.
+4. `drain_secs`: time from the drain start until `safe_accepted_batches` holds the highest valid sealed batch nonce read at the start. The open batch is excluded, so this is the submission backlog, not the batch-open window.
+
 ## 3. Measurement Method
 
 ### 3.1 Percentiles and Sample Size
@@ -71,6 +78,15 @@ This spec makes that requirement measurable and repeatable.
 
 1. For end-to-end runs, every HTTP-accepted request must have a matching WS `user_op` within the configured wait timeout.
 2. Any sanity assertion failure indicates a correctness bug and invalidates the benchmark run.
+
+### 3.6 Storage and Drain Collection Rules
+
+1. Self-contained runs only. The start size is sampled after warmup, the end size after the drain and before shutdown, because a clean close checkpoints the WAL away.
+2. The WAL file fills to SQLite's default autocheckpoint size (1000 pages, about 4 MB) and stays there, because a checkpoint reuses it rather than truncating it. In runs of a few thousand accepted txs that fill dominates `growth_bytes_per_1k_accepted`.
+3. During the drain the harness mines one L1 block per second at Anvil's own clock and stops after 120 s; `drain_secs` is then reported as not reached.
+4. `drain_secs` is shaped by the environment: the submitter's idle poll (5 s by default), Anvil's safe-head lag (`--slots-in-an-epoch 1`) and the 1 s poll. It does not measure submitter throughput.
+5. Neither metric has a threshold in this phase.
+6. A recovery cascade during the run reuses batch nonces, which makes `drain_secs` meaningless.
 
 ## 4. Benchmark Scenarios
 
@@ -107,9 +123,10 @@ Each benchmark report must include:
 4. Rejection reason breakdown (when available).
 5. Network profile (a fixed string; same-host baseline until a shaper exists).
 6. Memory metrics and memory sampling method/interval.
-7. Full run configuration (command, deployment domain, concurrency/arrival settings, timeout settings).
-8. Sanity assertion status and failure summary (if any).
-9. For sweeps, separate first-knee metrics for any rejection, HTTP non-`200`, `429`, and client-side failure.
+7. Storage and drain metrics (self-contained runs).
+8. Full run configuration (command, deployment domain, concurrency/arrival settings, timeout settings).
+9. Sanity assertion status and failure summary (if any).
+10. For sweeps, separate first-knee metrics for any rejection, HTTP non-`200`, `429`, and client-side failure.
 
 ## 7. Mapping to Current Harnesses
 

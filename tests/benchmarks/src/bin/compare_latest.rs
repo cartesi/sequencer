@@ -3,7 +3,7 @@
 
 use benchmarks::{
     BenchResult, StatsMs, SweepRow, SweepSummary, format_optional_f64, load_sweep_results,
-    runtime::{DEFAULT_RESULTS_DIR, MemoryReport},
+    runtime::{DEFAULT_RESULTS_DIR, DrainReport, MemoryReport, StorageReport},
 };
 use clap::{Parser, ValueEnum};
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,6 +83,8 @@ fn compare(results_dir: &Path, label: &str, prefix: &str, multi_row: bool) -> Be
         print_summary_delta(&old.summary, &new.summary);
     }
     print_memory_delta(old.memory.as_ref(), new.memory.as_ref());
+    print_storage_delta(old.storage.as_ref(), new.storage.as_ref());
+    print_drain_delta(old.drain.as_ref(), new.drain.as_ref());
     Ok(())
 }
 
@@ -155,6 +157,25 @@ fn print_memory_delta(old: Option<&MemoryReport>, new: Option<&MemoryReport>) {
     print_optional_metric_delta("rss_start_mb", old.rss_start_mb, new.rss_start_mb);
     print_optional_metric_delta("rss_peak_mb", old.rss_peak_mb, new.rss_peak_mb);
     print_optional_metric_delta("rss_growth_mb", old.rss_growth_mb, new.rss_growth_mb);
+}
+
+fn print_storage_delta(old: Option<&StorageReport>, new: Option<&StorageReport>) {
+    let (Some(old), Some(new)) = (old, new) else {
+        return;
+    };
+    let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    println!("  storage delta (new - old):");
+    print_metric_delta("db_mb", mb(old.db_bytes), mb(new.db_bytes));
+    print_metric_delta("wal_mb", mb(old.wal_bytes), mb(new.wal_bytes));
+}
+
+fn print_drain_delta(old: Option<&DrainReport>, new: Option<&DrainReport>) {
+    let (Some(old), Some(new)) = (old, new) else {
+        return;
+    };
+    println!("  drain delta (new - old):");
+    print_count_delta("batches_pending", old.batches_pending, new.batches_pending);
+    print_optional_metric_delta("drain_secs", old.drain_secs, new.drain_secs);
 }
 
 fn print_count_delta(label: &str, old_value: u64, new_value: u64) {

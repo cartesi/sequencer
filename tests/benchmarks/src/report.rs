@@ -178,3 +178,25 @@ pub fn print_memory_report(memory: &runtime::MemoryReport) {
         format_optional_f64(memory.rss_growth_per_1k_accepted_tx_mb)
     );
 }
+
+pub fn print_storage_report(storage: &runtime::StorageReport) {
+    println!("storage:");
+    println!("  db_bytes: {}", storage.db_bytes);
+    println!("  wal_bytes: {}", storage.wal_bytes);
+    println!(
+        "  growth_bytes_per_1k_accepted: {}",
+        format_optional_f64(storage.growth_bytes_per_1k_accepted)
+    );
+}
+
+pub fn print_drain_report(drain: &runtime::DrainReport) {
+    println!("drain:");
+    println!("  batches_pending: {}", drain.batches_pending);
+    match drain.drain_secs {
+        Some(secs) => println!("  drain_secs: {secs:.1}"),
+        None => println!(
+            "  drain_secs: not reached within {}s",
+            runtime::DRAIN_DEADLINE.as_secs()
+        ),
+    }
+}
