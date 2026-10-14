@@ -56,9 +56,9 @@ test-watchdog-compare-harness: setup watchdog-lua-deps ensure-machine-image
     cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p rollups-e2e --bin rollups-e2e
     cargo run -p rollups-e2e --bin rollups-e2e -- watchdog_genesis_compare_test --exact --nocapture
 
-# Run sequencer tests sequentially.
+# Run the sequencer crate's tests.
 test-sequencer:
-    cargo test -p sequencer -- --test-threads=1
+    cargo test -p sequencer
 
 test-rollups-e2e: setup ensure-machine-image ensure-sepolia-machine-image
     cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p c-wallet-engine --bin c-wallet-genesis -p c-wallet-sequencer --bin c-wallet-sequencer -p rollups-e2e --bin rollups-e2e
