@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# Builds are not incremental, and cargo output stays coloured in the logs.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -42,11 +47,9 @@ jobs:
           sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
           sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
 
+      # rust-toolchain.toml is the only Rust pin; it lists rustfmt and clippy.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt, clippy
+        run: rustup set profile minimal && rustup toolchain install
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -114,7 +117,6 @@ jobs:
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
           xgenext2fs-version: ${{ env.XGENEXT2FS_VERSION }}
           xgenext2fs-sha256-amd64: ${{ env.XGENEXT2FS_SHA256_AMD64 }}
           xgenext2fs-sha256-arm64: ${{ env.XGENEXT2FS_SHA256_ARM64 }}
@@ -143,7 +145,6 @@ jobs:
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
           xgenext2fs-version: ${{ env.XGENEXT2FS_VERSION }}
           xgenext2fs-sha256-amd64: ${{ env.XGENEXT2FS_SHA256_AMD64 }}
           xgenext2fs-sha256-arm64: ${{ env.XGENEXT2FS_SHA256_ARM64 }}

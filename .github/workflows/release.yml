@@ -24,6 +24,11 @@ permissions:
   contents: write
   packages: write
 
+# Builds are not incremental, and cargo output stays coloured in the logs.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
 jobs:
   build-wallet-sequencer:
     name: Build wallet-sequencer (${{ matrix.arch }})
@@ -60,11 +65,12 @@ jobs:
             pkg-config \
             libssl-dev
 
+      # rust-toolchain.toml is the only Rust pin.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: ${{ matrix.target }}
+        run: |
+          rustup set profile minimal
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -141,7 +147,6 @@ jobs:
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
         with:
-          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
           xgenext2fs-version: ${{ env.XGENEXT2FS_VERSION }}
           xgenext2fs-sha256-amd64: ${{ env.XGENEXT2FS_SHA256_AMD64 }}
           xgenext2fs-sha256-arm64: ${{ env.XGENEXT2FS_SHA256_ARM64 }}

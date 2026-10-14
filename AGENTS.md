@@ -391,8 +391,9 @@ both) and libslirp.
 
 Use the configured Nix/direnv environment for Foundry, TLA+, and other project
 tools. For noninteractive commands, prefer `direnv exec . <command>`. Rust is
-pinned to **1.95.0** in [`rust-toolchain.toml`](rust-toolchain.toml); verify both
-`cargo --version` and `rustc --version` in the environment you use. A Nix-provided
+pinned in [`rust-toolchain.toml`](rust-toolchain.toml), the only Rust pin (CI and
+release install from it); verify both `cargo --version` and `rustc --version` in
+the environment you use. A Nix-provided
 Cargo or rustc may bypass rustup, so direnv alone does not guarantee the pinned
 compiler is selected. Correct the toolchain selection before interpreting build
 or dependency errors.

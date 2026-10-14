@@ -28,14 +28,6 @@ inputs:
     description: "Foundry version tag"
     required: false
     default: "v1.5.1"
-  rust-toolchain:
-    description: "Rust toolchain version or channel"
-    required: false
-    default: "1.95.0"
-  rust-components:
-    description: "Extra rustup components (comma-separated)"
-    required: false
-    default: "rustfmt"
 
 runs:
   using: composite
@@ -92,11 +84,11 @@ runs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v4
 
+    # rust-toolchain.toml is the only Rust pin. rustup resolves it from the
+    # working directory, so the cross guest build gets the same toolchain.
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: ${{ inputs.rust-toolchain }}
-        components: ${{ inputs.rust-components }}
+      shell: bash
+      run: rustup set profile minimal && rustup toolchain install
 
     - name: Cache Rust artifacts
       uses: Swatinem/rust-cache@v2

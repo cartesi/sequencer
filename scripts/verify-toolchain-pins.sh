@@ -22,15 +22,6 @@ fail() {
   errors=$((errors + 1))
 }
 
-rust_channel="$(
-  grep -E '^\s*channel\s*=' "${root}/rust-toolchain.toml" \
-    | head -1 \
-    | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/'
-)"
-if [[ "${rust_channel}" != "${RUST_TOOLCHAIN}" ]]; then
-  fail "rust-toolchain.toml channel=${rust_channel} != RUST_TOOLCHAIN=${RUST_TOOLCHAIN}"
-fi
-
 if [[ "${CARTESI_LINUX_IMAGE_RELEASE}" != "${CARTESI_MACHINE_VERSION}" ]]; then
   fail "CARTESI_LINUX_IMAGE_RELEASE=${CARTESI_LINUX_IMAGE_RELEASE} != CARTESI_MACHINE_VERSION=${CARTESI_MACHINE_VERSION}"
 fi

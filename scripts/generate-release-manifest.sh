@@ -51,6 +51,10 @@ fi
 set -a
 source "${pins}"
 set +a
+# rust-toolchain.toml is the only Rust pin.
+RUST_TOOLCHAIN="$(sed -nE 's/^channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "${root}/rust-toolchain.toml")"
+[[ -n "${RUST_TOOLCHAIN}" ]] || { echo "no channel in ${root}/rust-toolchain.toml" >&2; exit 1; }
+export RUST_TOOLCHAIN
 
 artifacts_json="$(cat <<EOF
 [
