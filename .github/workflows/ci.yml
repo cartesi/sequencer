@@ -24,7 +24,7 @@ env:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -106,7 +106,7 @@ jobs:
         run: bash scripts/ci-c-application-smoke.sh
 
   openapi:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
 
     steps:
@@ -129,7 +129,7 @@ jobs:
   # Policy in deny.toml: crate sources block; advisories report without
   # failing, since the RustSec database changes under a fixed Cargo.lock.
   cargo-deny:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -157,7 +157,7 @@ jobs:
         run: cargo deny --locked check advisories
 
   rollups-e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: rust
     timeout-minutes: 60
 
@@ -206,7 +206,7 @@ jobs:
 
   watchdog-docker:
     name: Watchdog Docker image smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: rust
     timeout-minutes: 30
 

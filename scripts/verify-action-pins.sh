@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Every remote action under .github/ is pinned to a full commit SHA and the
 # exact release that commit is (`owner/repo@<40 hex> # vX.Y.Z`), one commit per
-# repository. CI checks that form offline.
+# repository, and every job runs on a runner image named by version
+# (`ubuntu-24.04`, never `ubuntu-latest`, which GitHub moves). CI checks that
+# form offline.
 #
 # `--upstream`, run before each release, checks each pin against GitHub and
 # names a bump target: the newest release above the pin that is at least
@@ -39,6 +41,11 @@ while IFS=: read -r file line text; do
   fi
 done < <(grep -rnE --include='*.yml' --include='*.yaml' \
   '^[[:space:]]*(-[[:space:]]+)?uses:' "${root}/.github")
+
+while IFS=: read -r file line _; do
+  fail "${file#"${root}/"}:${line}: name the runner image by version, not -latest"
+done < <(grep -rnE --include='*.yml' --include='*.yaml' \
+  '^[[:space:]]*runs-on:.*-latest' "${root}/.github" || true)
 
 pins="$(sort -u <<<"${pins}" | sed '/^$/d')"
 for repo in $(cut -d'|' -f1,3 <<<"${pins}" | sort -u | cut -d'|' -f1 | uniq -d); do
