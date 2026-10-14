@@ -311,8 +311,6 @@ fn content_identity_violation(
         Some(None) => {
             // Sealed batches always carry a hash (stamped in the seal
             // UPDATE); a NULL here is an impossible state — fail loud.
-            // (Recovery sentinels carry no hash, but they sit *behind* the
-            // acceptance frontier by construction and are never compared.)
             // Surface it as a structured error (rolls back the reader's sync
             // transaction and travels its normal error path) rather than a
             // panic that would crash the reader task mid-transaction.

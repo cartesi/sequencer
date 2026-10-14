@@ -1,25 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Recovery storage: danger inspection, guarded suffix invalidation, and Tip creation.
-//!
-//! See `docs/recovery/README.md` for the procedure, safety arguments, and
-//! bounded model coverage. This file's job is to enforce that design
-//! locally — read the design first if you're touching this code.
-//!
-//! Free functions here are shared with the batch submitter
-//! (`l1_submission.rs`); they take `&Connection` / `&Transaction` so the
-//! startup path can compose them into one atomic transaction.
-//!
-//! ## Fault model
-//!
-//! Recovery is robust to submission and outage failures (crashes, network
-//! errors, mempool drops, extended downtime). It is NOT designed to defend
-//! against arbitrarily malformed self-submissions: the scheduler-frontier
-//! materialization in [`super::safe_accepted_batches`] trusts that on-chain
-//! batches from the sequencer's own address are structurally valid. The
-//! sequencer controls its own submissions; the threat model records that
-//! self-trust boundary.
+//! Recovery storage: danger inspection, guarded suffix invalidation, and Tip
+//! creation. `docs/recovery/README.md` owns the design; read it before editing.
+//! Helpers take `&Connection`/`&Transaction` so one startup transaction can
+//! compose inspection and repair.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior, params};
 use sequencer_core::protocol::{ProtocolTiming, age_exceeds};
@@ -317,7 +302,7 @@ fn refuse_divergence(danger: DangerStatus) -> std::result::Result<(), RecoveryMu
     Ok(())
 }
 
-// ── Free functions used by both recovery and the batch submitter ──────────
+// ── Repair bodies, pub(super) for storage::test_helpers ───────────────────
 
 /// Discard the entire non-accepted closed suffix after flush and caught-up Sync.
 /// This is a convergence policy: replaced or never-submitted work could be

@@ -1,13 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Mempool flusher: submits no-op transactions to resolve pending wallet-nonce slots
-//! before recovery runs.
-//!
-//! After a danger-zone detection, the sequencer goes offline and calls
-//! [`MempoolFlusher::flush_and_wait`] to ensure every wallet-nonce slot is consumed
-//! (either by its original batch transaction or by a replacement no-op). Once all
-//! slots reach safe finality, the recovery procedure can read fully-finalized L1 state.
+//! Mempool flusher: every wallet-nonce slot the submitter may have used is
+//! consumed, by its original transaction or a no-op, and reaches safe depth, so
+//! recovery reads settled L1 state. Entry point: [`MempoolFlusher::flush_to_safe`].
 
 use alloy::network::TransactionBuilder;
 use alloy::providers::Provider;

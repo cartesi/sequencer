@@ -27,10 +27,10 @@
 -- regression. No production code reads these as values; every
 -- reader is an IS NULL / IS NOT NULL predicate.
 -- `payload_hash` is the keccak256 of the batch's SSZ wire bytes, stamped at
--- seal time by the same encode path the submitter uses (hash-at-seal). It is what the content-identity check compares an accepted
--- L1 landing against — and because it is computed by the code that sealed
--- the batch, it survives wire-format upgrades. NULL only while the batch is
--- the open Tip (and on recovery sentinels, which carry no payload).
+-- seal time by the encode path the submitter uses. The content-identity check
+-- compares an accepted L1 landing against it; because the sealing code computed
+-- it, it survives wire-format upgrades. NULL only on a never-sealed batch (the
+-- open Tip, or a Tip a cascade invalidated).
 CREATE TABLE IF NOT EXISTS batches (
     batch_index        INTEGER PRIMARY KEY,
     parent_batch_index INTEGER REFERENCES batches(batch_index),  -- NULL only for genesis
