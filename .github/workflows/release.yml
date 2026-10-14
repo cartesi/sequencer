@@ -2,6 +2,10 @@
 # watchdog OCI images to ghcr.io + docker.io (requires DOCKERHUB_USERNAME /
 # DOCKERHUB_TOKEN org or repo secrets, same as cartesi/cli).
 # Release builds start cold: no step restores a cache that other refs wrote.
+# Before tagging, run `bash scripts/verify-action-pins.sh --upstream` and bump,
+# or knowingly keep, each pin it flags. An action only this workflow uses gets
+# no CI run, so a bumped one first runs at the tag; if it fails, fix it on main
+# and dispatch this workflow for the same tag.
 
 name: Release
 
