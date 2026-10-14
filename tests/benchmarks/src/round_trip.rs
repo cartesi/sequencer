@@ -17,7 +17,6 @@ use crate::{
     BenchResult,
     domain::BenchmarkDomain,
     rejection::{RejectionOutcome, classify_rejection},
-    runtime,
     stats::{Stats, StatsMs, rejection_rate, summarize, throughput_tx_per_s},
     support::io_err,
     workload::{WorkloadConfig, build_worker_contexts},
@@ -65,8 +64,6 @@ pub struct RoundTripRunReport {
     pub ack_latency_rejected: Option<Stats>,
     pub round_trip_latency_accepted: Stats,
     pub round_trip_latency_accepted_ms: StatsMs,
-    pub memory: Option<runtime::MemoryReport>,
-    pub sequencer_log_path: Option<String>,
 }
 
 struct RoundTripAckSample {
@@ -322,8 +319,6 @@ pub async fn run_round_trip_benchmark(
         ack_latency_rejected: rejected_stats,
         round_trip_latency_accepted_ms: round_trip_stats.to_ms(),
         round_trip_latency_accepted: round_trip_stats,
-        memory: None,
-        sequencer_log_path: None,
     })
 }
 

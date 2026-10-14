@@ -7,15 +7,19 @@ use std::fs;
 use std::path::Path;
 
 use crate::{
-    BenchResult,
+    AckRunReport, BenchResult, RoundTripRunReport,
     rejection::{
         client_failure_count, has_http_429, has_http_rejection, http_429_count,
         http_rejection_count,
     },
     report::print_memory_report,
     runtime,
+    stats::{StatsMs, throughput_tx_per_s},
+    support::io_err,
 };
 
+/// One measured step of a sweep. `round_trip_ms` is set only in round-trip
+/// mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepRow {
     pub concurrency: usize,
@@ -26,53 +30,60 @@ pub struct SweepRow {
     pub http_429_count: u64,
     pub client_failure_count: u64,
     pub rejection_rate: f64,
-    pub p50_ms: f64,
-    pub p95_ms: f64,
-    pub p99_ms: f64,
-    pub p999_ms: f64,
-    pub rejection_breakdown: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SweepMeasurements {
-    pub accepted_count: u64,
-    pub rejected_count: u64,
-    pub rejection_rate: f64,
-    pub p50_ms: f64,
-    pub p95_ms: f64,
-    pub p99_ms: f64,
-    pub p999_ms: f64,
+    pub ack_ms: StatsMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_trip_ms: Option<StatsMs>,
     pub rejection_breakdown: BTreeMap<String, u64>,
 }
 
 impl SweepRow {
-    pub fn new(concurrency: usize, accepted_tps: f64, metrics: SweepMeasurements) -> Self {
-        let SweepMeasurements {
-            accepted_count,
-            rejected_count,
-            rejection_rate,
-            p50_ms,
-            p95_ms,
-            p99_ms,
-            p999_ms,
-            rejection_breakdown,
-        } = metrics;
-        let http_rejected_count = http_rejection_count(&rejection_breakdown);
-        let http_429_count = http_429_count(&rejection_breakdown);
-        let client_failure_count = client_failure_count(rejected_count, &rejection_breakdown);
+    pub fn from_ack(report: &AckRunReport) -> Self {
+        Self::new(
+            report.concurrency,
+            throughput_tx_per_s(report.accepted as usize, report.total_wall),
+            report.accepted,
+            report.rejected,
+            report.rejection_rate,
+            report.rejection_breakdown.clone(),
+            report.ack_latency_accepted_ms.clone(),
+        )
+    }
+
+    pub fn from_round_trip(report: &RoundTripRunReport) -> Self {
+        Self {
+            round_trip_ms: Some(report.round_trip_latency_accepted_ms.clone()),
+            ..Self::new(
+                report.concurrency,
+                throughput_tx_per_s(report.accepted as usize, report.total_wall),
+                report.accepted,
+                report.rejected,
+                report.rejection_rate,
+                report.rejection_breakdown.clone(),
+                report.ack_latency_accepted_ms.clone(),
+            )
+        }
+    }
+
+    fn new(
+        concurrency: usize,
+        accepted_tps: f64,
+        accepted_count: u64,
+        rejected_count: u64,
+        rejection_rate: f64,
+        rejection_breakdown: BTreeMap<String, u64>,
+        ack_ms: StatsMs,
+    ) -> Self {
         Self {
             concurrency,
             accepted_tps,
             accepted_count,
             rejected_count,
-            http_rejected_count,
-            http_429_count,
-            client_failure_count,
+            http_rejected_count: http_rejection_count(&rejection_breakdown),
+            http_429_count: http_429_count(&rejection_breakdown),
+            client_failure_count: client_failure_count(rejected_count, &rejection_breakdown),
             rejection_rate,
-            p50_ms,
-            p95_ms,
-            p99_ms,
-            p999_ms,
+            ack_ms,
+            round_trip_ms: None,
             rejection_breakdown,
         }
     }
@@ -159,10 +170,40 @@ pub fn write_csv(path: &Path, rows: &[SweepRow]) -> BenchResult<()> {
                 row.http_429_count,
                 row.client_failure_count,
                 row.rejection_rate,
-                row.p50_ms,
-                row.p95_ms,
-                row.p99_ms,
-                row.p999_ms,
+                row.ack_ms.p50_ms,
+                row.ack_ms.p95_ms,
+                row.ack_ms.p99_ms,
+                row.ack_ms.p999_ms,
+            )
+            .as_str(),
+        );
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+pub fn write_round_trip_csv(path: &Path, rows: &[SweepRow]) -> BenchResult<()> {
+    let mut out = String::from(
+        "concurrency,accepted_tps,accepted_count,rejected_count,rejection_rate,ack_p50_ms,ack_p99_ms,rt_p50_ms,rt_p99_ms,rt_p999_ms\n",
+    );
+    for row in rows {
+        let round_trip = row
+            .round_trip_ms
+            .as_ref()
+            .ok_or_else(|| io_err("round-trip CSV row has no round-trip latency"))?;
+        out.push_str(
+            format!(
+                "{},{:.6},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+                row.concurrency,
+                row.accepted_tps,
+                row.accepted_count,
+                row.rejected_count,
+                row.rejection_rate,
+                row.ack_ms.p50_ms,
+                row.ack_ms.p99_ms,
+                round_trip.p50_ms,
+                round_trip.p99_ms,
+                round_trip.p999_ms,
             )
             .as_str(),
         );
@@ -209,53 +250,44 @@ fn format_optional(value: Option<f64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SweepMeasurements, SweepRow, compute_capacity_summary};
+    use super::{SweepRow, compute_capacity_summary};
+    use crate::stats::StatsMs;
     use std::collections::BTreeMap;
+
+    fn ms(value: f64) -> StatsMs {
+        StatsMs {
+            count: 1,
+            min_ms: value,
+            max_ms: value,
+            mean_ms: value,
+            p50_ms: value,
+            p95_ms: value,
+            p99_ms: value,
+            p999_ms: value,
+        }
+    }
 
     #[test]
     fn capacity_summary_tracks_http_and_client_failures_separately() {
         let rows = vec![
-            SweepRow::new(
-                1,
-                10.0,
-                SweepMeasurements {
-                    accepted_count: 100,
-                    rejected_count: 0,
-                    rejection_rate: 0.0,
-                    p50_ms: 0.5,
-                    p95_ms: 1.0,
-                    p99_ms: 1.0,
-                    p999_ms: 1.0,
-                    rejection_breakdown: BTreeMap::new(),
-                },
-            ),
+            SweepRow::new(1, 10.0, 100, 0, 0.0, BTreeMap::new(), ms(1.0)),
             SweepRow::new(
                 2,
                 20.0,
-                SweepMeasurements {
-                    accepted_count: 100,
-                    rejected_count: 1,
-                    rejection_rate: 1.0,
-                    p50_ms: 1.0,
-                    p95_ms: 2.0,
-                    p99_ms: 2.0,
-                    p999_ms: 2.0,
-                    rejection_breakdown: BTreeMap::from([("io_connect".to_string(), 1_u64)]),
-                },
+                100,
+                1,
+                1.0,
+                BTreeMap::from([("io_connect".to_string(), 1_u64)]),
+                ms(2.0),
             ),
             SweepRow::new(
                 3,
                 30.0,
-                SweepMeasurements {
-                    accepted_count: 100,
-                    rejected_count: 1,
-                    rejection_rate: 1.0,
-                    p50_ms: 1.5,
-                    p95_ms: 3.0,
-                    p99_ms: 3.0,
-                    p999_ms: 3.0,
-                    rejection_breakdown: BTreeMap::from([("http_429".to_string(), 1_u64)]),
-                },
+                100,
+                1,
+                1.0,
+                BTreeMap::from([("http_429".to_string(), 1_u64)]),
+                ms(3.0),
             ),
         ];
 

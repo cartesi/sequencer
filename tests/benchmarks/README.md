@@ -45,10 +45,10 @@ Direct `cargo` examples:
 ```bash
 # Round-trip latency, self-contained (spawns anvil + sequencer). Runs are
 # time-bounded (`--duration-secs`), not count-bounded.
-cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs 30 --concurrency 4 --max-fee 2000
+cargo run -p benchmarks --bin sweep --release -- --round-trip --self-contained --duration-secs 30 --concurrency-list 4 --max-fee 2000
 
 # Against an external sequencer (pass that deployment's EIP-712 domain):
-cargo run -p benchmarks --bin round_trip_latency --release -- --endpoint http://127.0.0.1:3000 --internal-endpoint http://127.0.0.1:3001 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --duration-secs 30 --concurrency 4 --max-fee 2000
+cargo run -p benchmarks --bin sweep --release -- --round-trip --endpoint http://127.0.0.1:3000 --internal-endpoint http://127.0.0.1:3001 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --duration-secs 30 --concurrency-list 4 --max-fee 2000
 
 # Concurrency sweep — ack latency by default, round-trip with `--round-trip`:
 cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs 30 --max-fee 2000 --concurrency-list "1 2 4 8 16 32 64 128"
@@ -61,14 +61,14 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
 
 ## Benchmarks
 
-- `round_trip_latency`: measures submit-to-broadcast latency (`POST /tx` to the matching `GET /ws/subscribe` event) for accepted txs. Drains existing WS backlog before timing so stale history does not pollute the window.
-- `sweep`: runs a concurrency sweep — ack latency (`POST /tx` acknowledgement) by default, or round-trip with `--round-trip` — and writes its rows and capacity summary to `ack-sweep-<ts>.json` or `rt-sweep-<ts>.json` under `--results-dir` (or to `--json-out`), plus a CSV of the rows. Reports separate first-of-each markers:
+- `sweep`: runs a concurrency sweep — ack latency (`POST /tx` acknowledgement) by default, or with `--round-trip` also submit-to-broadcast latency (`POST /tx` to the matching feed event) for accepted txs — and writes its rows and capacity summary to `ack-sweep-<ts>.json` or `rt-sweep-<ts>.json` under `--results-dir` (or to `--json-out`), plus a CSV of the rows. Reports separate first-of-each markers:
   - first rejection of any kind
   - first HTTP non-`200`
   - first `429`
   - first client-side failure (`io_*`, timeouts, connection failures)
 - `report`: aggregates the JSON artifacts under `--results-dir` into a summary.
-- `compare_latest`: compares the two latest artifacts of a `--kind` (`ack`, `round-trip`, `rt-sweep`, `sweep`, `all`) and prints deltas.
+- `compare_latest`: prints deltas between the two latest artifacts of a `--kind`. `ack` and `round-trip` compare single-concurrency runs, `sweep` and `rt-sweep` multi-concurrency runs, and `all` does all four.
+- `report` and `compare_latest` read only `ack-sweep-*.json` and `rt-sweep-*.json`, and skip with a warning any they cannot parse as the current format; `just --justfile tests/benchmarks/justfile clean` clears old results.
 
 ## Notes
 
@@ -77,8 +77,7 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
 - Self-contained variants also deploy a local `Application` through `ApplicationFactory`, so they require a canonical machine image at `examples/canonical-app/out/canonical-machine-image`; run `just canonical-build-machine-image` first.
 - Self-contained variants therefore require Foundry's `anvil` binary to be installed locally.
 - `--max-fee` must be at or above the placeholder app's base fee, or every tx is rejected (`422 EXECUTION_REJECTED`) and the run reports no accepted txs. The error message includes the rejection breakdown and the first rejection body, which names the base fee.
-- `round_trip_latency` drains existing WS backlog before timing so stale history does not pollute the measurement window.
-- `sweep --round-trip` bootstraps each latency observation run from the latest snapshot history claim and drains the remaining backlog before measurement.
+- `sweep --round-trip` subscribes from the latest snapshot's history claim and drains the existing backlog before timing, so stale history does not pollute the measurement window.
 - If sweep hits `Too many open files`, increase the shell limit (`ulimit -n 4096`) or use a smaller concurrency list.
 - Self-contained variants automatically build a temp DB, spawn `anvil`, start the sequencer, and persist logs/results under `tests/benchmarks/results`.
 - For non-self-contained runs, start a sequencer instance first and make sure the benchmark domain matches the sequencer domain.

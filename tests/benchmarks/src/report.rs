@@ -4,12 +4,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    AckRunReport, BenchResult, RoundTripRunReport, runtime,
+    AckRunReport, BenchResult, RoundTripRunReport, SweepRunReport, runtime,
     stats::{format_optional_f64, print_stats, throughput_tx_per_s},
+    support::trailing_number,
 };
 
 /// Spec §4.2: no shaper exists, so every run is this profile.
@@ -53,6 +54,44 @@ pub fn default_json_output_path(results_dir: &str, prefix: &str) -> String {
     format!("{results_dir}/{prefix}-{ts}.json")
 }
 
+/// Sweep results named `<prefix>-<unix secs>.json` under `dir`, oldest
+/// first. Files that do not parse as the current format are skipped with a
+/// warning; a missing `dir` yields an empty list.
+pub fn load_sweep_results(
+    dir: &Path,
+    prefix: &str,
+) -> BenchResult<Vec<(PathBuf, BenchmarkJsonOutput<SweepRunReport>)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let file_prefix = format!("{prefix}-");
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_file() && name.starts_with(&file_prefix) && name.ends_with(".json") {
+            candidates.push((trailing_number(name).unwrap_or(0), name.to_string(), path));
+        }
+    }
+    candidates.sort();
+
+    let mut runs = Vec::with_capacity(candidates.len());
+    for (_, _, path) in candidates {
+        match serde_json::from_str(&fs::read_to_string(&path)?) {
+            Ok(run) => runs.push((path, run)),
+            Err(err) => eprintln!(
+                "skipping {}: not a current sweep result ({err})",
+                path.display()
+            ),
+        }
+    }
+    Ok(runs)
+}
+
 pub fn print_ack_report(report: &AckRunReport) {
     println!(
         "ack benchmark completed: duration={:.1}s, endpoint={}, concurrency={}",
@@ -79,12 +118,6 @@ pub fn print_ack_report(report: &AckRunReport) {
     print_stats("ack_latency_accepted", &report.ack_latency_accepted);
     if let Some(stats) = report.ack_latency_rejected.as_ref() {
         print_stats("ack_latency_rejected", stats);
-    }
-    if let Some(memory) = report.memory.as_ref() {
-        print_memory_report(memory);
-    }
-    if let Some(path) = report.sequencer_log_path.as_ref() {
-        println!("sequencer_log_path: {path}");
     }
 }
 
@@ -124,12 +157,6 @@ pub fn print_round_trip_report(report: &RoundTripRunReport) {
         "round_trip_latency_accepted",
         &report.round_trip_latency_accepted,
     );
-    if let Some(memory) = report.memory.as_ref() {
-        print_memory_report(memory);
-    }
-    if let Some(path) = report.sequencer_log_path.as_ref() {
-        println!("sequencer_log_path: {path}");
-    }
 }
 
 pub fn print_memory_report(memory: &runtime::MemoryReport) {

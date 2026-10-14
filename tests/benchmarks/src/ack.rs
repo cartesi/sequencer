@@ -15,7 +15,6 @@ use crate::{
     BenchResult,
     domain::BenchmarkDomain,
     rejection::{RejectionOutcome, classify_rejection},
-    runtime,
     stats::{Stats, StatsMs, rejection_rate, summarize, throughput_tx_per_s},
     workload::{WorkloadConfig, build_worker_contexts},
 };
@@ -51,8 +50,6 @@ pub struct AckRunReport {
     pub ack_latency_accepted: Stats,
     pub ack_latency_accepted_ms: StatsMs,
     pub ack_latency_rejected: Option<Stats>,
-    pub memory: Option<runtime::MemoryReport>,
-    pub sequencer_log_path: Option<String>,
 }
 
 struct AckSample {
@@ -186,7 +183,5 @@ pub async fn run_ack_benchmark(config: AckRunConfig) -> BenchResult<AckRunReport
         ack_latency_accepted_ms: ack_stats.to_ms(),
         ack_latency_accepted: ack_stats,
         ack_latency_rejected: rejected_stats,
-        memory: None,
-        sequencer_log_path: None,
     })
 }

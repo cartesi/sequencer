@@ -116,7 +116,7 @@ Each benchmark report must include:
 Recipes are in [`justfile`](./justfile).
 
 1. `bench-ack-self` (`sweep` at concurrency 1): `ack_latency_ms`.
-2. `bench-round-trip-self` (`round_trip_latency`): `soft_confirm_latency_ms`.
+2. `bench-round-trip-self` (`sweep --round-trip` at one concurrency): `soft_confirm_latency_ms`.
 3. `bench-sweep-self`, `bench-capacity-sweep-self` and `bench-rt-sweep-self` (`sweep`): capacity exploration and overload discovery.
 4. `bench-report` and `bench-compare-latest` (`report`, `compare_latest`): summaries and deltas over the saved results.
 

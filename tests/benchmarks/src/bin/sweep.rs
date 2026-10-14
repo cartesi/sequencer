@@ -5,16 +5,15 @@ use alloy_primitives::Address;
 use benchmarks::{
     AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_INTERNAL_ENDPOINT,
     DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME, DOMAIN_VERSION, NETWORK_PROFILE,
-    RoundTripRunConfig, RtSweepMeasurements, RtSweepRow, RtSweepRunReport, SweepMeasurements,
-    SweepRow, SweepRunReport, WorkloadConfig, WorkloadKind, compute_capacity_summary,
-    compute_rt_sweep_summary, default_json_output_path, parse_address, print_ack_report,
+    RoundTripRunConfig, SweepRow, SweepRunReport, WorkloadConfig, WorkloadKind,
+    compute_capacity_summary, default_json_output_path, parse_address, print_ack_report,
     print_round_trip_report, print_sweep_report, resolve_external_benchmark_domain,
     run_ack_benchmark, run_round_trip_benchmark,
     runtime::{
         DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RESULTS_DIR, DEFAULT_SEQUENCER_BIN,
         MemorySampler, benchmark_domain, bootstrap_funded_workload, managed_sequencer_config,
     },
-    throughput_tx_per_s, write_json_output, write_rt_sweep_csv, write_sweep_csv,
+    write_json_output, write_round_trip_csv, write_sweep_csv,
 };
 use clap::Parser;
 use serde_json::json;
@@ -79,6 +78,8 @@ struct Args {
     /// Run in round-trip mode (measures WS broadcast latency in addition to ACK).
     #[arg(long, default_value_t = false)]
     round_trip: bool,
+    #[arg(long, default_value_t = 3_000_u64)]
+    request_timeout_ms: u64,
     /// Max wait time (ms) for remaining WS events after workers finish (round-trip mode only).
     #[arg(long, default_value_t = 5_000_u64)]
     max_ws_wait_ms: u64,
@@ -87,28 +88,51 @@ struct Args {
     warmup_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Mode {
+    Ack,
+    RoundTrip,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ack => "ack",
+            Self::RoundTrip => "round-trip",
+        }
+    }
+
+    fn artifact_prefix(self) -> &'static str {
+        match self {
+            Self::Ack => "ack-sweep",
+            Self::RoundTrip => "rt-sweep",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     let args = Args::parse();
-    let json_prefix = if args.round_trip {
-        "rt-sweep"
+    let mode = if args.round_trip {
+        Mode::RoundTrip
     } else {
-        "ack-sweep"
+        Mode::Ack
     };
     let json_out = args
         .json_out
         .clone()
-        .unwrap_or_else(|| default_json_output_path(&args.results_dir, json_prefix));
+        .unwrap_or_else(|| default_json_output_path(&args.results_dir, mode.artifact_prefix()));
     let concurrencies = resolve_concurrency_list(&args)?;
     if concurrencies.is_empty() {
         return Err(std::io::Error::other("concurrency list cannot be empty").into());
     }
 
     std::fs::create_dir_all(args.results_dir.as_str())?;
-    let timestamp = timestamp_string();
     let csv_path = PathBuf::from(format!(
         "{}/{}-{}.csv",
-        args.results_dir, json_prefix, timestamp
+        args.results_dir,
+        mode.artifact_prefix(),
+        timestamp_string()
     ));
 
     let mut managed = if args.self_contained {
@@ -166,10 +190,9 @@ async fn main() -> BenchResult<()> {
         )
     });
 
-    let duration = Duration::from_secs(args.duration_secs);
-    let mode_str = if args.round_trip { "round-trip" } else { "ack" };
     println!(
-        "starting {mode_str} sweep: endpoint={} self_contained={} domain_chain_id={} domain_verifying_contract={} duration={}s max_fee={} workload={} concs={:?}",
+        "starting {} sweep: endpoint={} self_contained={} domain_chain_id={} domain_verifying_contract={} duration={}s max_fee={} workload={} concs={:?}",
+        mode.label(),
         endpoint,
         args.self_contained,
         domain.chain_id,
@@ -181,297 +204,163 @@ async fn main() -> BenchResult<()> {
     );
     println!("host fd soft limit (ulimit -n): {}", fd_soft_limit_string());
 
-    let max_workers = concurrencies.iter().copied().max().unwrap_or(1);
+    // Each step resumes every worker's wallet after the ops it got accepted
+    // in earlier steps.
     let mut nonce_offsets = vec![0_u64; max_workers];
-    let mut total_accepted = 0_u64;
+    let step_config =
+        |concurrency: usize, duration: Duration, nonce_offsets: &[u64]| RoundTripRunConfig {
+            endpoint: endpoint.clone(),
+            internal_endpoint: internal_endpoint.clone(),
+            domain,
+            duration,
+            concurrency,
+            nonce_offsets: nonce_offsets[..concurrency].to_vec(),
+            max_fee: args.max_fee,
+            request_timeout_ms: args.request_timeout_ms,
+            max_ws_wait_ms: args.max_ws_wait_ms,
+            workload: workload.clone(),
+        };
 
-    // Warmup phase.
     if args.warmup_secs > 0 {
         let first_concurrency = concurrencies[0];
-        let warmup_duration = Duration::from_secs(args.warmup_secs);
         println!(
             "running warmup: {}s ({} workers)",
             args.warmup_secs, first_concurrency
         );
+        let config = step_config(
+            first_concurrency,
+            Duration::from_secs(args.warmup_secs),
+            &nonce_offsets,
+        );
+        let (row, advances) = run_step(mode, config).await?;
+        for (offset, advance) in nonce_offsets.iter_mut().zip(advances) {
+            *offset += advance;
+        }
+        println!(
+            "warmup complete: accepted={}, rejected={}",
+            row.accepted_count, row.rejected_count
+        );
+    }
 
-        let offsets_for_warmup = nonce_offsets[..first_concurrency].to_vec();
-        if args.round_trip {
-            let warmup_config = RoundTripRunConfig {
-                endpoint: endpoint.clone(),
-                internal_endpoint: internal_endpoint.clone(),
-                domain,
-                duration: warmup_duration,
-                concurrency: first_concurrency,
-                nonce_offsets: offsets_for_warmup,
-                max_fee: args.max_fee,
-                request_timeout_ms: 3_000,
-                max_ws_wait_ms: args.max_ws_wait_ms,
-                workload: workload.clone(),
-            };
-            let warmup_report = run_round_trip_benchmark(warmup_config).await?;
-            for (i, advance) in warmup_report.nonce_advances.iter().enumerate() {
-                nonce_offsets[i] += advance;
+    let duration = Duration::from_secs(args.duration_secs);
+    let mut rows = Vec::new();
+    let mut total_accepted = 0_u64;
+    let mut run_error = None;
+    for concurrency in concurrencies.iter().copied() {
+        println!();
+        println!("=== sweep concurrency={concurrency} ({}) ===", mode.label());
+        match run_step(mode, step_config(concurrency, duration, &nonce_offsets)).await {
+            Ok((row, advances)) => {
+                for (offset, advance) in nonce_offsets.iter_mut().zip(advances) {
+                    *offset += advance;
+                }
+                total_accepted = total_accepted.saturating_add(row.accepted_count);
+                rows.push(row);
             }
-            println!(
-                "warmup complete: accepted={}, rejected={}",
-                warmup_report.accepted, warmup_report.rejected
-            );
-        } else {
-            let warmup_config = AckRunConfig {
-                endpoint: endpoint.clone(),
-                domain,
-                duration: warmup_duration,
-                concurrency: first_concurrency,
-                nonce_offsets: offsets_for_warmup,
-                max_fee: args.max_fee,
-                request_timeout_ms: 3_000,
-                workload: workload.clone(),
-            };
-            let warmup_report = run_ack_benchmark(warmup_config).await?;
-            for (i, advance) in warmup_report.nonce_advances.iter().enumerate() {
-                nonce_offsets[i] += advance;
+            Err(err) => {
+                if err.to_string().contains("Too many open files") {
+                    println!();
+                    println!(
+                        "sweep stopped: hit file-descriptor limit at concurrency={concurrency}"
+                    );
+                    println!(
+                        "hint: raise soft limit before running sweep (example: ulimit -n 4096)"
+                    );
+                    println!("or use a smaller conc_list.");
+                }
+                run_error = Some(err);
+                break;
             }
-            println!(
-                "warmup complete: accepted={}, rejected={}",
-                warmup_report.accepted, warmup_report.rejected
-            );
         }
     }
 
-    let mut run_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-
-    if args.round_trip {
-        let mut rows = Vec::new();
-
-        for concurrency in concurrencies.iter().copied() {
-            println!();
-            println!("=== sweep concurrency={concurrency} (round-trip) ===");
-
-            let offsets_for_step = nonce_offsets[..concurrency].to_vec();
-
-            let config = RoundTripRunConfig {
-                endpoint: endpoint.clone(),
-                internal_endpoint: internal_endpoint.clone(),
-                domain,
-                duration,
-                concurrency,
-                nonce_offsets: offsets_for_step,
-                max_fee: args.max_fee,
-                request_timeout_ms: 3_000,
-                max_ws_wait_ms: args.max_ws_wait_ms,
-                workload: workload.clone(),
-            };
-            let result = run_round_trip_benchmark(config).await.map(|report| {
-                // Accumulate nonce offsets from actual accepted counts per worker.
-                for (i, advance) in report.nonce_advances.iter().enumerate() {
-                    nonce_offsets[i] += advance;
-                }
-
-                print_round_trip_report(&report);
-                RtSweepRow::new(
-                    concurrency,
-                    throughput_tx_per_s(report.accepted as usize, report.total_wall),
-                    RtSweepMeasurements {
-                        accepted_count: report.accepted,
-                        rejected_count: report.rejected,
-                        rejection_rate: report.rejection_rate,
-                        ack_p50_ms: report.ack_latency_accepted.p50.as_secs_f64() * 1000.0,
-                        ack_p99_ms: report.ack_latency_accepted.p99.as_secs_f64() * 1000.0,
-                        rt_p50_ms: report.round_trip_latency_accepted.p50.as_secs_f64() * 1000.0,
-                        rt_p99_ms: report.round_trip_latency_accepted.p99.as_secs_f64() * 1000.0,
-                        rt_p999_ms: report.round_trip_latency_accepted.p999.as_secs_f64() * 1000.0,
-                        rejection_breakdown: report.rejection_breakdown,
-                    },
-                )
-            });
-
-            match result {
-                Ok(row) => {
-                    total_accepted = total_accepted.saturating_add(row.accepted_count);
-                    rows.push(row);
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    if message.contains("Too many open files") {
-                        println!();
-                        println!(
-                            "sweep stopped: hit file-descriptor limit at concurrency={concurrency}"
-                        );
-                        println!(
-                            "hint: raise soft limit before running sweep (example: ulimit -n 4096)"
-                        );
-                    }
-                    run_error = Some(err);
-                    break;
-                }
-            }
+    let memory = match memory_sampler {
+        Some(sampler) => Some(sampler.stop(total_accepted).await?),
+        None => None,
+    };
+    if let Some(value) = managed.take() {
+        let shutdown_result = value.shutdown().await;
+        if run_error.is_none() && shutdown_result.is_err() {
+            return shutdown_result;
         }
-
-        let mut memory_report = None;
-        if let Some(sampler) = memory_sampler {
-            memory_report = Some(sampler.stop(total_accepted).await?);
-        }
-
-        if let Some(value) = managed.take() {
-            let shutdown_result = value.shutdown().await;
-            if run_error.is_none() && shutdown_result.is_err() {
-                return shutdown_result;
-            }
-        }
-        if let Some(err) = run_error {
-            return Err(err);
-        }
-
-        write_rt_sweep_csv(csv_path.as_path(), rows.as_slice())?;
-        let summary = compute_rt_sweep_summary(rows.as_slice());
-        let report = RtSweepRunReport {
-            rows,
-            summary,
-            memory: memory_report,
-            sequencer_log_path,
-        };
-
-        println!();
-        println!("sweep csv: {}", csv_path.display());
-        benchmarks::print_rt_sweep_report(&report);
-
-        let config_json = json!({
-            "endpoint": endpoint,
-            "self_contained": args.self_contained,
-            "domain_name": DOMAIN_NAME,
-            "domain_version": DOMAIN_VERSION,
-            "domain_chain_id": domain.chain_id,
-            "domain_verifying_contract": domain.verifying_contract.to_string(),
-            "duration_secs": args.duration_secs,
-            "max_fee": args.max_fee,
-            "results_dir": args.results_dir,
-            "network_profile": NETWORK_PROFILE,
-            "workload": args.workload.as_str(),
-            "accounts_file": args.accounts_file,
-            "transfer_amount": args.transfer_amount,
-            "concurrency_list": concurrencies,
-            "csv_path": csv_path,
-            "max_ws_wait_ms": args.max_ws_wait_ms,
-            "warmup_secs": args.warmup_secs,
-        });
-        write_json_output(Path::new(&json_out), "rt_sweep", &config_json, &report)?;
-        println!("sweep json: {json_out}");
-    } else {
-        // ACK mode (default).
-        let mut rows = Vec::new();
-
-        for concurrency in concurrencies.iter().copied() {
-            println!();
-            println!("=== sweep concurrency={concurrency} ===");
-
-            let offsets_for_step = nonce_offsets[..concurrency].to_vec();
-
-            let config = AckRunConfig {
-                endpoint: endpoint.clone(),
-                domain,
-                duration,
-                concurrency,
-                nonce_offsets: offsets_for_step,
-                max_fee: args.max_fee,
-                request_timeout_ms: 3_000,
-                workload: workload.clone(),
-            };
-            let result = run_ack_benchmark(config).await.map(|report| {
-                // Accumulate nonce offsets from actual accepted counts per worker.
-                for (i, advance) in report.nonce_advances.iter().enumerate() {
-                    nonce_offsets[i] += advance;
-                }
-                print_ack_report(&report);
-                SweepRow::new(
-                    concurrency,
-                    throughput_tx_per_s(report.accepted as usize, report.total_wall),
-                    SweepMeasurements {
-                        accepted_count: report.accepted,
-                        rejected_count: report.rejected,
-                        rejection_rate: report.rejection_rate,
-                        p50_ms: report.ack_latency_accepted.p50.as_secs_f64() * 1000.0,
-                        p95_ms: report.ack_latency_accepted.p95.as_secs_f64() * 1000.0,
-                        p99_ms: report.ack_latency_accepted.p99.as_secs_f64() * 1000.0,
-                        p999_ms: report.ack_latency_accepted.p999.as_secs_f64() * 1000.0,
-                        rejection_breakdown: report.rejection_breakdown,
-                    },
-                )
-            });
-
-            match result {
-                Ok(row) => {
-                    total_accepted = total_accepted.saturating_add(row.accepted_count);
-                    rows.push(row);
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    if message.contains("Too many open files") {
-                        println!();
-                        println!(
-                            "sweep stopped: hit file-descriptor limit at concurrency={concurrency}"
-                        );
-                        println!(
-                            "hint: raise soft limit before running sweep (example: ulimit -n 4096)"
-                        );
-                        println!("or use a smaller conc_list.");
-                    }
-                    run_error = Some(err);
-                    break;
-                }
-            }
-        }
-
-        let mut memory_report = None;
-        if let Some(sampler) = memory_sampler {
-            memory_report = Some(sampler.stop(total_accepted).await?);
-        }
-
-        if let Some(value) = managed.take() {
-            let shutdown_result = value.shutdown().await;
-            if run_error.is_none() && shutdown_result.is_err() {
-                return shutdown_result;
-            }
-        }
-        if let Some(err) = run_error {
-            return Err(err);
-        }
-
-        write_sweep_csv(csv_path.as_path(), rows.as_slice())?;
-        let summary = compute_capacity_summary(rows.as_slice());
-        let report = SweepRunReport {
-            rows,
-            summary,
-            memory: memory_report,
-            sequencer_log_path,
-        };
-
-        println!();
-        println!("sweep csv: {}", csv_path.display());
-        print_sweep_report(&report);
-
-        let config_json = json!({
-            "endpoint": endpoint,
-            "self_contained": args.self_contained,
-            "domain_name": DOMAIN_NAME,
-            "domain_version": DOMAIN_VERSION,
-            "domain_chain_id": domain.chain_id,
-            "domain_verifying_contract": domain.verifying_contract.to_string(),
-            "duration_secs": args.duration_secs,
-            "max_fee": args.max_fee,
-            "results_dir": args.results_dir,
-            "network_profile": NETWORK_PROFILE,
-            "workload": args.workload.as_str(),
-            "accounts_file": args.accounts_file,
-            "transfer_amount": args.transfer_amount,
-            "concurrency_list": concurrencies,
-            "csv_path": csv_path,
-            "warmup_secs": args.warmup_secs,
-        });
-        write_json_output(Path::new(&json_out), "sweep", &config_json, &report)?;
-        println!("sweep json: {json_out}");
     }
+    if let Some(err) = run_error {
+        return Err(err);
+    }
+
+    match mode {
+        Mode::Ack => write_sweep_csv(csv_path.as_path(), rows.as_slice())?,
+        Mode::RoundTrip => write_round_trip_csv(csv_path.as_path(), rows.as_slice())?,
+    }
+    let report = SweepRunReport {
+        summary: compute_capacity_summary(rows.as_slice()),
+        rows,
+        memory,
+        sequencer_log_path,
+    };
+
+    println!();
+    println!("sweep csv: {}", csv_path.display());
+    print_sweep_report(&report);
+
+    let config_json = json!({
+        "mode": mode.label(),
+        "endpoint": endpoint,
+        "internal_endpoint": internal_endpoint,
+        "self_contained": args.self_contained,
+        "domain_name": DOMAIN_NAME,
+        "domain_version": DOMAIN_VERSION,
+        "domain_chain_id": domain.chain_id,
+        "domain_verifying_contract": domain.verifying_contract.to_string(),
+        "duration_secs": args.duration_secs,
+        "warmup_secs": args.warmup_secs,
+        "max_fee": args.max_fee,
+        "request_timeout_ms": args.request_timeout_ms,
+        "max_ws_wait_ms": args.max_ws_wait_ms,
+        "results_dir": args.results_dir,
+        "network_profile": NETWORK_PROFILE,
+        "workload": args.workload.as_str(),
+        "accounts_file": args.accounts_file,
+        "transfer_amount": args.transfer_amount,
+        "concurrency_list": concurrencies,
+        "csv_path": csv_path,
+    });
+    write_json_output(
+        Path::new(&json_out),
+        mode.artifact_prefix(),
+        &config_json,
+        &report,
+    )?;
+    println!("sweep json: {json_out}");
 
     Ok(())
+}
+
+/// Runs one step, warmup or measured, and prints its report. Returns the row
+/// and each worker's accepted-op count.
+async fn run_step(mode: Mode, config: RoundTripRunConfig) -> BenchResult<(SweepRow, Vec<u64>)> {
+    match mode {
+        Mode::Ack => {
+            let report = run_ack_benchmark(AckRunConfig {
+                endpoint: config.endpoint,
+                domain: config.domain,
+                duration: config.duration,
+                concurrency: config.concurrency,
+                nonce_offsets: config.nonce_offsets,
+                max_fee: config.max_fee,
+                request_timeout_ms: config.request_timeout_ms,
+                workload: config.workload,
+            })
+            .await?;
+            print_ack_report(&report);
+            Ok((SweepRow::from_ack(&report), report.nonce_advances))
+        }
+        Mode::RoundTrip => {
+            let report = run_round_trip_benchmark(config).await?;
+            print_round_trip_report(&report);
+            Ok((SweepRow::from_round_trip(&report), report.nonce_advances))
+        }
+    }
 }
 
 fn resolve_concurrency_list(args: &Args) -> BenchResult<Vec<usize>> {

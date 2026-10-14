@@ -2,12 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use benchmarks::{
-    BenchResult, BenchmarkJsonOutput, RoundTripRunReport, RtSweepRunReport, SweepRunReport,
-    runtime::DEFAULT_RESULTS_DIR, trailing_number,
+    BenchResult, BenchmarkJsonOutput, SweepRunReport, load_sweep_results,
+    runtime::DEFAULT_RESULTS_DIR,
 };
 use clap::Parser;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Debug, Parser)]
@@ -22,14 +21,12 @@ fn main() -> BenchResult<()> {
     let cli = Cli::parse();
     let dir = &cli.results_dir;
 
-    let baseline_rt = load_latest::<RoundTripRunReport>(dir, "round-trip-latency-", ".json");
-    let rt_sweep = load_latest::<RtSweepRunReport>(dir, "rt-sweep-", ".json");
-
-    let capacity_sweep = load_latest_multi_row_sweep(dir);
-
-    // For baseline ACK latency, extract c=1 row from the latest ack-sweep file.
-    // This is what bench-ack-self produces (sweep --concurrency-list 1).
-    let baseline_ack_sweep = load_latest::<SweepRunReport>(dir, "ack-sweep-", ".json");
+    let ack_runs = load_sweep_results(dir, "ack-sweep")?;
+    let rt_runs = load_sweep_results(dir, "rt-sweep")?;
+    let baseline_ack = latest(&ack_runs, false);
+    let capacity_sweep = latest(&ack_runs, true);
+    let baseline_rt = latest(&rt_runs, false);
+    let rt_sweep = latest(&rt_runs, true);
 
     println!();
     println!("══════════════════════════════════════════════════════════");
@@ -42,34 +39,30 @@ fn main() -> BenchResult<()> {
     println!("  BASELINE LATENCY (concurrency=1)");
     println!("  ────────────────────────────────────────────");
     // Try to get c=1 data from the baseline ack sweep, or from the capacity sweep.
-    let ack_c1_row = baseline_ack_sweep
-        .as_ref()
-        .and_then(|r| r.report.rows.iter().find(|row| row.concurrency == 1))
-        .or_else(|| {
-            capacity_sweep
-                .as_ref()
-                .and_then(|r| r.report.rows.iter().find(|row| row.concurrency == 1))
-        });
+    let ack_c1_row = baseline_ack
+        .and_then(|r| r.rows.iter().find(|row| row.concurrency == 1))
+        .or_else(|| capacity_sweep.and_then(|r| r.rows.iter().find(|row| row.concurrency == 1)));
     match ack_c1_row {
         Some(row) => {
             println!(
                 "  ACK latency:         p50={:.1}ms   p99={:.1}ms   ({} accepted)",
-                row.p50_ms, row.p99_ms, row.accepted_count
+                row.ack_ms.p50_ms, row.ack_ms.p99_ms, row.accepted_count
             );
         }
         None => println!("  ACK latency:         n/a"),
     }
-    match &baseline_rt {
-        Some(r) => {
-            let ack = &r.report.ack_latency_accepted_ms;
-            let rt = &r.report.round_trip_latency_accepted_ms;
+    let rt_row = baseline_rt
+        .and_then(|r| r.rows.first())
+        .and_then(|row| row.round_trip_ms.as_ref().map(|rt| (row, rt)));
+    match rt_row {
+        Some((row, rt)) => {
             println!(
                 "  Round-trip latency:  p50={:.1}ms   p99={:.1}ms   ({} accepted)",
-                rt.p50_ms, rt.p99_ms, r.report.accepted
+                rt.p50_ms, rt.p99_ms, row.accepted_count
             );
             println!(
                 "    (ACK portion:      p50={:.1}ms   p99={:.1}ms)",
-                ack.p50_ms, ack.p99_ms
+                row.ack_ms.p50_ms, row.ack_ms.p99_ms
             );
         }
         None => println!("  Round-trip latency:  n/a"),
@@ -79,8 +72,11 @@ fn main() -> BenchResult<()> {
     // --- Round-trip latency vs concurrency ---
     println!("  ROUND-TRIP LATENCY vs CONCURRENCY");
     println!("  ────────────────────────────────────────────");
-    if let Some(r) = &rt_sweep {
-        for row in &r.report.rows {
+    if let Some(r) = rt_sweep {
+        for row in &r.rows {
+            let Some(rt) = &row.round_trip_ms else {
+                continue;
+            };
             let rej = if row.rejected_count > 0 {
                 format!("  rej={}", row.rejected_count)
             } else {
@@ -90,10 +86,10 @@ fn main() -> BenchResult<()> {
                 "  c={:<3} {:>7} tx/s  ack p50={:.0}ms p99={:.0}ms  rt p50={:.0}ms p99={:.0}ms{}",
                 row.concurrency,
                 format_tps(row.accepted_tps),
-                row.ack_p50_ms,
-                row.ack_p99_ms,
-                row.rt_p50_ms,
-                row.rt_p99_ms,
+                row.ack_ms.p50_ms,
+                row.ack_ms.p99_ms,
+                rt.p50_ms,
+                rt.p99_ms,
                 rej,
             );
         }
@@ -103,9 +99,9 @@ fn main() -> BenchResult<()> {
     println!();
 
     // --- Sweep curve (throughput + latency) ---
-    if let Some(r) = &capacity_sweep {
-        let rows = &r.report.rows;
-        let max_tps = r.report.summary.max_sustainable_tps_at_0_rejections;
+    if let Some(r) = capacity_sweep {
+        let rows = &r.rows;
+        let max_tps = r.summary.max_sustainable_tps_at_0_rejections;
 
         println!("  THROUGHPUT & LATENCY vs CONCURRENCY");
         println!("  ────────────────────────────────────────────");
@@ -133,8 +129,8 @@ fn main() -> BenchResult<()> {
                 row.concurrency,
                 bar,
                 format_tps(row.accepted_tps),
-                row.p50_ms,
-                row.p99_ms,
+                row.ack_ms.p50_ms,
+                row.ack_ms.p99_ms,
                 rej,
             );
         }
@@ -149,9 +145,7 @@ fn main() -> BenchResult<()> {
     // --- Memory ---
     println!("  MEMORY");
     println!("  ────────────────────────────────────────────");
-    let memory_source = capacity_sweep
-        .as_ref()
-        .and_then(|r| r.report.memory.as_ref());
+    let memory_source = capacity_sweep.and_then(|r| r.memory.as_ref());
     match memory_source {
         Some(mem) => {
             match mem.rss_growth_per_1k_accepted_tx_mb {
@@ -251,63 +245,14 @@ fn format_tps(tps: f64) -> String {
     }
 }
 
-fn load_latest<R: serde::de::DeserializeOwned>(
-    dir: &Path,
-    prefix: &str,
-    suffix: &str,
-) -> Option<BenchmarkJsonOutput<R>> {
-    let path = latest_file(dir, prefix, suffix)?;
-    let raw = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-/// Load the latest ack-sweep JSON that has more than 1 row (i.e., a real sweep,
-/// not a single-concurrency baseline run).
-fn load_latest_multi_row_sweep(dir: &Path) -> Option<BenchmarkJsonOutput<SweepRunReport>> {
-    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let file_name = path.file_name()?.to_str()?;
-        if file_name.starts_with("ack-sweep-") && file_name.ends_with(".json") {
-            let ts = trailing_number(file_name).unwrap_or(0);
-            candidates.push((ts, path));
-        }
-    }
-    // Sort by timestamp descending.
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-    // Return the first one that has more than 1 row.
-    for (_, path) in candidates {
-        let raw = fs::read_to_string(&path).ok()?;
-        if let Ok(parsed) = serde_json::from_str::<BenchmarkJsonOutput<SweepRunReport>>(&raw)
-            && parsed.report.rows.len() > 1
-        {
-            return Some(parsed);
-        }
-    }
-    None
-}
-
-fn latest_file(dir: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
-    let mut best: Option<(u64, PathBuf)> = None;
-
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let file_name = path.file_name()?.to_str()?;
-        if file_name.starts_with(prefix) && file_name.ends_with(suffix) {
-            let ts = trailing_number(file_name).unwrap_or(0);
-            if best.as_ref().is_none_or(|(best_ts, _)| ts > *best_ts) {
-                best = Some((ts, path));
-            }
-        }
-    }
-
-    best.map(|(_, path)| path)
+/// The latest run whose row count says it is a sweep (`multi_row`) or a
+/// single-concurrency baseline.
+fn latest(
+    runs: &[(PathBuf, BenchmarkJsonOutput<SweepRunReport>)],
+    multi_row: bool,
+) -> Option<&SweepRunReport> {
+    runs.iter()
+        .rev()
+        .map(|(_, run)| &run.report)
+        .find(|report| (report.rows.len() > 1) == multi_row)
 }

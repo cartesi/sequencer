@@ -6,7 +6,6 @@ mod domain;
 mod rejection;
 mod report;
 mod round_trip;
-mod rt_sweep;
 pub mod runtime;
 mod stats;
 mod support;
@@ -19,23 +18,18 @@ pub use domain::{
     resolve_external_benchmark_domain,
 };
 pub use report::{
-    BenchmarkJsonOutput, NETWORK_PROFILE, default_json_output_path, print_ack_report,
-    print_memory_report, print_round_trip_report, write_json_output,
+    BenchmarkJsonOutput, NETWORK_PROFILE, default_json_output_path, load_sweep_results,
+    print_ack_report, print_memory_report, print_round_trip_report, write_json_output,
 };
 pub use round_trip::{RoundTripRunConfig, RoundTripRunReport, run_round_trip_benchmark};
-pub use rt_sweep::{
-    RtSweepMeasurements, RtSweepRow, RtSweepRunReport, RtSweepSummary, compute_rt_sweep_summary,
-    print_rt_sweep_report, write_csv as write_rt_sweep_csv,
-};
 pub use sequencer_core::{DOMAIN_NAME, DOMAIN_VERSION};
 pub use stats::{
     Stats, StatsMs, format_optional_f64, print_stats, rejection_rate, summarize,
     throughput_tx_per_s,
 };
-pub use support::trailing_number;
 pub use sweep::{
-    SweepMeasurements, SweepRow, SweepRunReport, SweepSummary, compute_capacity_summary,
-    print_sweep_report, write_csv as write_sweep_csv,
+    SweepRow, SweepRunReport, SweepSummary, compute_capacity_summary, print_sweep_report,
+    write_csv as write_sweep_csv, write_round_trip_csv,
 };
 pub use workload::{DEFAULT_WORKLOAD_TRANSFER_AMOUNT, WorkloadConfig, WorkloadKind};
 
