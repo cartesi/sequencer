@@ -126,10 +126,16 @@ fn error_message_matches_retry_codes(error_message: &str, codes: &[String]) -> b
     codes.iter().any(|c| error_message.contains(c))
 }
 
-/// Total order for merged logs `(block, tx index, log index)` — matches Lua
-/// `sort_logs`.
-fn sort_logs_by_l1_order<T>(logs: &mut [T], key: impl FnMut(&T) -> (u64, u64, u64)) {
-    logs.sort_by_key(key);
+/// Total order for merged logs `(block, tx index, log index)`, the key the
+/// watchdog's `sort_logs` also uses; only this side runs the shared log-sort
+/// vector. The caller has already refused a log without a block number.
+fn l1_order_key(log: &alloy::rpc::types::Log) -> (u64, u64, u64) {
+    (
+        log.block_number
+            .expect("caller guards: every log has a block number"),
+        log.transaction_index.unwrap_or(0),
+        log.log_index.unwrap_or(0),
+    )
 }
 
 /// [`get_input_added_events`] with the logs returned in canonical L1 order
@@ -165,14 +171,7 @@ pub(crate) async fn get_input_added_events_ordered(
             log_index: log.log_index,
         });
     }
-    sort_logs_by_l1_order(&mut events, |(_, log)| {
-        (
-            log.block_number
-                .expect("guarded above: every log has a block number"),
-            log.transaction_index.unwrap_or(0),
-            log.log_index.unwrap_or(0),
-        )
-    });
+    events.sort_by_key(|(_, log)| l1_order_key(log));
     Ok(events)
 }
 
@@ -197,7 +196,7 @@ mod tests {
 
     use super::{
         DEFAULT_LONG_BLOCK_RANGE_ERROR_CODES, bisect_block_range, decode_evm_advance_input,
-        error_message_matches_retry_codes, sort_logs_by_l1_order,
+        error_message_matches_retry_codes, l1_order_key,
     };
 
     const PARTITION_VECTOR: &str = include_str!(concat!(
@@ -313,20 +312,26 @@ mod tests {
     }
 
     #[test]
-    fn log_sort_vector_matches_watchdog_order() {
-        let vector = load_partition_vector();
-        let mut logs = vector.log_sort.unsorted;
-        sort_logs_by_l1_order(&mut logs, |e| {
-            (
-                parse_hex_quantity(&e.block_number),
-                parse_hex_quantity(&e.transaction_index),
-                parse_hex_quantity(&e.log_index),
-            )
-        });
-        let blocks: Vec<String> = logs.iter().map(|e| e.block_number.clone()).collect();
-        let indices: Vec<String> = logs.iter().map(|e| e.log_index.clone()).collect();
-        assert_eq!(blocks, vector.log_sort.expect_block_order);
-        assert_eq!(indices, vector.log_sort.expect_log_index_order);
+    fn log_sort_vector_orders_by_l1_position() {
+        let log_sort = load_partition_vector().log_sort;
+        let mut logs: Vec<alloy::rpc::types::Log> = log_sort
+            .unsorted
+            .iter()
+            .map(|e| alloy::rpc::types::Log {
+                block_number: Some(parse_hex_quantity(&e.block_number)),
+                transaction_index: Some(parse_hex_quantity(&e.transaction_index)),
+                log_index: Some(parse_hex_quantity(&e.log_index)),
+                ..Default::default()
+            })
+            .collect();
+        logs.sort_by_key(l1_order_key);
+        let blocks: Vec<u64> = logs.iter().filter_map(|log| log.block_number).collect();
+        let indices: Vec<u64> = logs.iter().filter_map(|log| log.log_index).collect();
+        let quantities = |hex: &[String]| -> Vec<u64> {
+            hex.iter().map(|value| parse_hex_quantity(value)).collect()
+        };
+        assert_eq!(blocks, quantities(&log_sort.expect_block_order));
+        assert_eq!(indices, quantities(&log_sort.expect_log_index_order));
     }
 
     fn parse_hex_quantity(value: &str) -> u64 {
