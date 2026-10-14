@@ -24,13 +24,13 @@ use crate::test_support::{pin_test_deployment_identity, temp_db};
 
 const TEST_BATCH_SUBMITTER: Address = Address::repeat_byte(0xff);
 
-// ── V1 regression: cross-boundary signature domain consistency ────────
+// ── Regression: cross-boundary signature domain consistency ────────
 //
 // The sequencer signs user-ops with `sequencer_core::build_input_domain`. The
 // scheduler (canonical-app) recovers senders with the same function. If the
-// two sides ever drift (the V1 bug: scheduler had `name: None`, sequencer had
-// `name: Some("CartesiAppSequencer")`), every signature recovers a different
-// address on each side, structurally breaking the rollup.
+// two sides ever drift (for example, the scheduler with `name: None` and the
+// sequencer with `name: Some("CartesiAppSequencer")`), every signature recovers a
+// different address on each side, structurally breaking the rollup.
 //
 // These tests lock the invariant at two levels:
 //   1. A signature built via the shared constructor recovers the signer's
@@ -81,7 +81,7 @@ fn v1_regression_name_none_domain_recovers_different_address() {
     let app = Address::from_slice(&[0xaa; 20]);
     let correct_domain = sequencer_core::build_input_domain(chain_id, app);
 
-    // The exact buggy domain the scheduler used pre-V1 fix.
+    // A drifted scheduler domain with no `name`.
     let buggy_domain = Eip712Domain {
         name: None,
         version: None,
@@ -100,7 +100,6 @@ fn v1_regression_name_none_domain_recovers_different_address() {
     let signature = sign_user_op(&signing_key, &correct_domain, &user_op);
 
     // Recover with the buggy domain — must NOT recover the signer.
-    // (This is what would silently fail at the scheduler under the V1 bug.)
     let buggy_hash = user_op.eip712_signing_hash(&buggy_domain);
     let recovered_under_buggy = signature
         .recover_address_from_prehash(&buggy_hash)
@@ -529,7 +528,8 @@ async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_payload_size_check_fires_before_signature_recovery() {
-    //  sharpening: oversized `data` must be rejected by
+    // Sharpens `api_rejects_user_op_payloads_above_application_limit`:
+    // oversized `data` must be rejected by
     // `validate_payload_size` BEFORE any cryptographic work. We submit an
     // oversized payload paired with a garbage-but-correctly-shaped signature:
     // if the size check is enforced first, the response says "user op payload
@@ -626,7 +626,8 @@ async fn api_rejects_signature_with_invalid_parity_byte() {
         "expected INVALID_SIGNATURE code, got: {body}",
     );
     // Defensive: make sure the rejection is from the signature layer, not the
-    // hex-length gate ( covers that) and not the payload-size gate.
+    // hex-length gate (`api_rejects_signature_with_wrong_hex_length` covers
+    // that) and not the payload-size gate.
     assert!(
         !body.contains("signature must be") && !body.contains("payload too large"),
         "expected sig-recovery class error, not hex-length or size: {body}",
@@ -697,8 +698,9 @@ async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
 async fn api_rejects_user_op_with_nonce_gap() {
     // submitting a user-op with a nonce above the next expected one
     // (i.e., a gap) must return 422 `InvalidNonce` and leave state
-    // unchanged. Complement to  (nonce too low / replay) — together
-    // they pin the strict-equality requirement on `current_user_nonce`.
+    // unchanged. Complements the e2e `rejected_user_op_not_broadcast_test`
+    // scenario (nonce too low) — together they pin the strict-equality
+    // requirement on `current_user_nonce`.
     let db = temp_db("nonce-gap-too-high");
     let domain = test_domain();
     let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
@@ -745,10 +747,10 @@ async fn api_rejects_user_op_with_nonce_gap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
-    //  boundary: the check is `max_fee >= current_frame_fee` (strict
+    // Boundary: the check is `max_fee >= current_frame_fee` (strict
     // less-than rejects). An op with `max_fee == current_frame_fee` must be
-    // accepted. Pairs with  (`fee_below_minimum_rejected_test`) — the
-    // two together pin the comparator.
+    // accepted. Pairs with the e2e `fee_below_minimum_rejected_test` scenario —
+    // the two together pin the comparator.
     let db = temp_db("fee-boundary-equal");
     let domain = test_domain();
     let signing_key = SigningKey::from_bytes((&[9_u8; 32]).into()).expect("create signing key");

@@ -498,8 +498,8 @@ mod tests {
 
     #[tokio::test]
     async fn sub_unit_gas_price_goes_below_exponent_zero() {
-        // 0.1 gwei with USDC at about $2500 is about 0.25 units per gas, which
-        // used to floor at exponent 0 and overcharge 4x.
+        // 0.1 gwei with USDC at about $2500 is about 0.25 units per gas; flooring
+        // at exponent 0 would overcharge 4x.
         let db = temp_db("sub-unit-fee-oracle");
         initialize_db(&db.path);
         let oracle = oracle_with(

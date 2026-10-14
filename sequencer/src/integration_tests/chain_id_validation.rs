@@ -79,7 +79,7 @@ fn run_config(data_dir: &str, eth_rpc_url: &str, key: &str) -> sequencer::RunCon
 /// `setup`'s on-chain discovery. Uses the same typed controller path `setup`
 /// itself records through (admission → facts → completion), so this seed
 /// cannot drift from the lifecycle schema or encode a state the controller
-/// would never write (previously raw SQL from outside the crate).
+/// would never write.
 fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
     use sequencer::storage::LifecycleCommand;
 

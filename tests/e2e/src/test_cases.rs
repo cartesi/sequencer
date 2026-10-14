@@ -124,7 +124,7 @@ const _: () = {
         PAST_STALE_BLOCKS > MAX_WAIT_BLOCKS,
         "PAST_STALE_BLOCKS must exceed MAX_WAIT_BLOCKS (cascade must fire)",
     );
-    // Load-bearing for .x: starting from a closed
+    // Load-bearing for the `respawn_until_stable` tests: starting from a closed
     // in-danger batch, one retry advance must push it past MAX_WAIT_BLOCKS
     // so cascade fires before max_attempts is exhausted. If
     // `RESPAWN_RETRY_ADVANCE_BLOCKS` shrinks or `MAX_WAIT_BLOCKS` grows
@@ -1428,7 +1428,7 @@ async fn run_recovery_after_stale_batches_test(
     Ok(())
 }
 
-// ── Cockroach recovery: setup --recovery round-trip (PR5) ────────
+// ── Cockroach recovery: setup --recovery round-trip ────────
 //
 // The affirmative end-to-end test of cockroach recovery: build state, promote a
 // real finalized snapshot (the checkpoint), wipe the DB, rebuild it from the
@@ -1716,12 +1716,9 @@ async fn run_sequencer_outage_pre_danger_no_recovery_test(
 //     ops are rolled back (this is the documented "soft confirmations may
 //     be invalidated under recovery" semantics).
 //
-// This exercises the Tip-recovery-without-flush path specifically. Earlier
-// behavior used `MAX_WAIT_BLOCKS` for the Tip threshold and would have
-// preserved the user op until current_safe_block crossed `MAX_WAIT_BLOCKS`;
-// the policy is now to invalidate at `danger_threshold` so the system
-// stops issuing pre-confirmations on a Tip that's already operationally
-// suspect.
+// This exercises the Tip-recovery-without-flush path. The Tip is invalidated at
+// `danger_threshold`, not `MAX_WAIT_BLOCKS`, so the system stops issuing soft
+// confirmations on a Tip that is already operationally suspect.
 
 async fn run_sequencer_outage_danger_zone_tip_cascade_test(
     runtime: &mut ManagedSequencer,
@@ -2507,7 +2504,7 @@ async fn run_provider_outage_danger_zone_sequencer_self_exits_test(
 //
 // What this tests that the longer-disconnect provider-outage test doesn't: the longer test disconnects for a
 // 500-block L1 advance + 150 transfers worth of real time, exercising the
-// inclusion lane under load.  instead exercises the "pure retry
+// inclusion lane under load. This test instead exercises the "pure retry
 // loop" path: **no** L1 advance, **no** faketime advance, just a few seconds
 // of real-time wall-clock downtime across at least one
 // `idle_poll_interval_ms` (default 5 s) so the submitter definitely attempts
@@ -2601,13 +2598,14 @@ async fn run_provider_outage_short_hiccup_no_recovery_test(
 // Both down, sequencer returns first into the danger zone, refuses
 // to boot.
 //
-// Companion to  (past-stale cascades through proxy): this is the
-// *danger-zone* window of the same setup. Sequencer is stopped AND the proxy
-// is disconnected; wall-clock and L1 advance into the danger zone but stay
-// below `MAX_WAIT_BLOCKS`; the sequencer comes back first while L1 is still
-// unreachable. Startup's wall-clock fallback must see "past danger" and
-// refuse the boot — advancing the safe head off stale data would risk
-// issuing soft confirmations against a state that may already be doomed.
+// Companion to `run_provider_outage_past_stale_cascades_test` (past-stale
+// cascades through proxy): this is the *danger-zone* window of the same
+// setup. Sequencer is stopped AND the proxy is disconnected; wall-clock and
+// L1 advance into the danger zone but stay below `MAX_WAIT_BLOCKS`; the
+// sequencer comes back first while L1 is still unreachable. Startup's
+// wall-clock fallback must see "past danger" and refuse the boot — advancing
+// the safe head off stale data would risk issuing soft confirmations against
+// a state that may already be doomed.
 //
 // No cascade is expected yet (we haven't crossed MAX_WAIT_BLOCKS). The test
 // stops at the refuse-to-boot assertion — the full reconnect+recovery cycle
@@ -2678,12 +2676,12 @@ async fn run_both_down_danger_zone_sequencer_first_refuses_boot_test(
 // Both down, proxy returns first, then sequencer — restart cycle
 // converges.
 //
-// Complement to  (sequencer first): here L1 comes back before the
-// sequencer does. Once the sequencer restarts, startup recovery sees L1
-// reachable and the Tip aged past `danger_threshold`, so `check_danger`
-// returns `TipInDanger(idx)` and the guarded `RecoverTip` phase cascades the
-// Tip and opens a fresh one. Convergence
-// typically happens on the first respawn.
+// Complement to `run_both_down_danger_zone_sequencer_first_refuses_boot_test`
+// (sequencer first): here L1 comes back before the sequencer does. Once the
+// sequencer restarts, startup recovery sees L1 reachable and the Tip aged
+// past `danger_threshold`, so `check_danger` returns `TipInDanger(idx)` and
+// the guarded `RecoverTip` phase cascades the Tip and opens a fresh one.
+// Convergence typically happens on the first respawn.
 //
 // Other paths can fire under different timings — e.g., the lane might
 // close the Tip into a nonced closed batch during boot, the submitter
@@ -2692,10 +2690,8 @@ async fn run_both_down_danger_zone_sequencer_first_refuses_boot_test(
 // canonical. The test asserts only convergence to `Stable`, not which
 // specific path fires.
 //
-// The key invariant this tests that the existing .x tests don't: the full
-// *restart-loop* works. Earlier tests stopped at "first respawn exits"
-// because the harness lacked an orchestrator-restart primitive; now we have
-// `respawn_until_stable`, so we can drive the loop to convergence.
+// The key invariant this tests that the other outage tests don't: the full
+// *restart-loop* works, driven to convergence by `respawn_until_stable`.
 async fn run_both_down_danger_zone_proxy_first_restart_cycle_recovers_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
@@ -2907,15 +2903,17 @@ async fn run_sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test(
     Ok(())
 }
 
-//  follow-up — Provider outage into the danger zone while the
-// sequencer is running, mid-run danger-detected exit, then reconnect + restart
-// cycle converges.
+// Follow-up to `run_provider_outage_danger_zone_sequencer_self_exits_test`:
+// provider outage into the danger zone while the sequencer is running, mid-run
+// danger-detected exit, then reconnect + restart cycle converges.
 //
 // The provider-outage danger-zone test stops at "refuse to reboot while proxy still
 // disconnected". This completes that story: after the sequencer self-exits
 // mid-run via its live wall-clock fallback and the proxy reconnects, the
 // orchestrator restart cycle eventually converges — same
-// `respawn_until_stable` pattern as .
+// `respawn_until_stable` pattern as
+// `run_sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test` and
+// `run_both_down_danger_zone_proxy_first_restart_cycle_recovers_test`.
 //
 // Ordering detail: the wall-clock advance only advances the sequencer's
 // clock; the proxy has been disconnecting Anvil traffic, so Anvil's block
@@ -3083,14 +3081,12 @@ async fn run_first_boot_l1_unreachable_never_synced_refuses_boot_test(
 // in `populate_safe_accepted_batches` and `find_first_batch_in_danger`
 // flags it — cascade fires.
 //
-// This is the structural sibling of  (open-batch variant) for
-// closed+submitted batches. The `find_first_batch_in_danger` path has two
-// flavors: "open batch got old"  and "closed batch submission
-// got lost" (this one). Both need to cascade correctly;  had e2e
-// coverage, the closed-submitted variant had none.
+// This is the closed-and-submitted sibling of `run_recovery_after_stale_batches_test`
+// (open-batch variant): `find_first_batch_in_danger` must cascade both "open batch
+// got old" and "closed batch submission got lost" (this one).
 //
 // Setup shape: we use Anvil's `setAutomine(false)` + `dropAllPendingTxs`
-// (new T2 harness primitives) to hold the sequencer's batch-submission tx
+// (harness primitives) to hold the sequencer's batch-submission tx
 // out of the chain, then drop it entirely — cleaner than the mempool-hold
 // approach, because `anvil_mine(N)` with a pending tx would include it in
 // the first mined block, not the Nth. Dropping simulates gateway packet
@@ -3101,7 +3097,8 @@ async fn run_delayed_inclusion_cascades_on_restart_test(
     // Past-stale: 1250 blocks > MAX_WAIT_BLOCKS (1200).
     const PAST_STALE: Duration = blocks_as_duration(PAST_STALE_BLOCKS);
     // Enough transfers to trigger at least one size-based batch close.
-    // Matches 's sizing (≈100 B/op × 150 ops ≈ 15 KB > 12 KB target).
+    // Same sizing as `run_provider_outage_pre_danger_sequencer_continues_test`
+    // (≈100 B/op × 150 ops ≈ 15 KB > 12 KB target).
     const TRANSFERS_TO_FORCE_BATCH_CLOSE: usize = 150;
 
     let alice = TestSigner::from_default(1)?;
@@ -3344,13 +3341,13 @@ async fn run_aging_open_tip_runtime_danger_zone_exit_test(
 // Provider reachable, safe head frozen, live freshness check fires and the
 // running detector self-exits.
 //
-// Runtime twin of . Tests that the wall-clock-adjusted danger arm
-// fires at runtime when L1 stays reachable but the safe head stops
-// advancing. We don't pre-age the Tip — the detector now exits on
-// `DangerStatus::TipInDanger` independently, which would conflate test signals.
-// Instead, we let the Tip stay fresh and jump the wall clock past
-// `danger_threshold * SECONDS_PER_BLOCK` so the wall-clock arm saturates
-// to threshold 0 and catches the fresh Tip via `find_first_batch_in_danger`.
+// Runtime twin of `run_stalled_safe_head_startup_refuses_boot_test`. Tests that
+// the wall-clock-adjusted danger arm fires at runtime when L1 stays reachable
+// but the safe head stops advancing. We don't pre-age the Tip — the detector
+// now exits on `DangerStatus::TipInDanger` independently, which would conflate
+// test signals. Instead, we let the Tip stay fresh and jump the wall clock past
+// `danger_threshold * SECONDS_PER_BLOCK` so the wall-clock arm saturates to
+// threshold 0 and catches the fresh Tip via `find_first_batch_in_danger`.
 async fn run_stalled_safe_head_live_exit_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
@@ -3559,9 +3556,11 @@ async fn run_recovery_drains_safe_but_undrained_direct_input_test(
 
 // Recovery batch opens empty when no direct inputs are pending.
 //
-// Negative control for : same overall shape but with no L1 deposit
-// before respawn. The recovery batch's `leading_range` is `[0, 0)` and the
-// batch's first frame is empty. WS replay delivers nothing.
+// Negative control for
+// `run_recovery_drains_safe_but_undrained_direct_input_test`: same overall
+// shape but with no L1 deposit before respawn. The recovery batch's
+// `leading_range` is `[0, 0)` and the batch's first frame is empty. WS replay
+// delivers nothing.
 async fn run_recovery_batch_opens_empty_when_no_direct_inputs_pending_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
@@ -3593,7 +3592,7 @@ async fn run_recovery_batch_opens_empty_when_no_direct_inputs_pending_test(
 // replay must produce an identical per-user state.
 //
 // This is the `Application` trait's fundamental contract (see
-// `AGENTS.md` §Application-Trait-Contract). Without it, restart
+// `docs/protocol/application-contract.md`). Without it, restart
 // replay and WS catch-up aren't equivalent to live execution — the
 // whole soft-confirmation model collapses.
 //
@@ -3919,9 +3918,9 @@ async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
 // it checks that NULL-parent batches have nonce 0 and that valid-path
 // nonces form a contiguous `0..N`. So this test asserts those
 // observable consequences plus the explicit `safe_accepted_batches`
-// post-condition for .
+// post-condition for reused-nonce acceptance.
 //
-// Setup uses T2 (auto-mining off + drop) so the first batch's L1
+// Setup turns auto-mining off and drops the mempool so the first batch's L1
 // submission is dropped before reaching the chain — guaranteeing it
 // never reaches `Gold` before being cascaded.
 async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
@@ -3929,7 +3928,8 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
 ) -> ScenarioResult<()> {
     // Past stale to ensure the cascade fires.
     const PAST_STALE: Duration = blocks_as_duration(PAST_STALE_BLOCKS);
-    // Force a size-triggered batch close. Same sizing as .
+    // Force a size-triggered batch close. Same sizing as
+    // `run_delayed_inclusion_cascades_on_restart_test`.
     const TRANSFERS_TO_FORCE_CLOSE: usize = 150;
 
     let alice = TestSigner::from_default(1)?;
@@ -3982,7 +3982,7 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
 
     runtime.respawn().await?;
 
-    //  assertions: the only existing batch (the original nonce-0
+    // Nonce-0 recovery assertions: the only existing batch (the original nonce-0
     // one) was cascaded, and a recovery batch was opened. The recovery
     // batch's invariants (NULL parent → nonce 0) are checked structurally
     // by the post-test `assert_schema_invariants` hook.

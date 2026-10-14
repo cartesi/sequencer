@@ -204,7 +204,7 @@ async fn submitter_loop_submits_closed_batches_then_exits_on_shutdown() {
 
 // ── Loop cadence invariants ───────────────────────────────────────────────
 //
-// These pin the behavior the two-worker refactor unlocked:
+// These pin the loop cadence:
 //   - Submitted → re-enter IMMEDIATELY (no sleep).
 //   - Transient (Poster error) → log + sleep + retry (loop must NOT exit).
 //

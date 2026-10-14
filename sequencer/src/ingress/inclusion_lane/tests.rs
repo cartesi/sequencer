@@ -1405,13 +1405,10 @@ fn read_dump_counter(dump_dir: &Path) -> u64 {
         .get()
 }
 
-/// Regression for the resume-checkpoint bug: the lane used to load its
-/// Application from one snapshot (the finalized) but replay catch-up
-/// from a *different* snapshot's offset (the latest pending). With a
-/// pending snapshot present at restart — the common "closed batch not
-/// yet observed on L1" case — the loaded state and the replay cursor
-/// must come from the *same* checkpoint, or restart silently drops the
-/// pending batch's txs.
+/// Restart must load the application and the catch-up cursor from the same
+/// checkpoint. With a pending snapshot present (a closed batch not yet observed
+/// on L1), loading the finalized snapshot's state but replaying from the pending
+/// snapshot's offset would silently drop the pending batch's txs.
 ///
 /// Setup: 3 user ops each close their own batch (aggressive sizing) →
 /// 3 pending snapshots, none promoted, so finalized stays at genesis
