@@ -33,7 +33,7 @@ pub(crate) enum HistoricalReadError {
     BadRequest(String),
     #[error(transparent)]
     Checkpoint(#[from] FinalizedSelectionError),
-    #[error("reading historical L1 inputs: {0}")]
+    #[error("reading history: {0}")]
     Storage(#[from] rusqlite::Error),
 }
 

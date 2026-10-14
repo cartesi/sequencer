@@ -14,7 +14,7 @@ use super::snapshot::{GcError, TakeDumpError};
 pub enum InclusionLaneError {
     #[error("inclusion lane input channel closed")]
     ChannelClosed,
-    #[error("application catchup failed")]
+    #[error("application catchup failed: {source}")]
     CatchUp {
         #[source]
         source: CatchUpError,
@@ -26,21 +26,21 @@ pub enum InclusionLaneError {
          cockroach recovery required"
     )]
     CanonicalDivergence { nonce: u64, safe_input_index: u64 },
-    #[error("user op execution failed")]
+    #[error("user op execution failed: {source}")]
     ExecuteUserOp {
         #[source]
         source: AppError,
     },
-    #[error("direct input execution failed")]
+    #[error("direct input execution failed: {source}")]
     ExecuteDirectInput {
         #[source]
         source: AppError,
     },
-    #[error("snapshot at batch close failed")]
+    #[error("snapshot at batch close failed: {0}")]
     Snapshot(#[from] TakeDumpError),
     #[error("loading Application from finalized snapshot failed: {0}")]
     LoadFromDump(AppError),
-    #[error("snapshot garbage collection failed")]
+    #[error("snapshot garbage collection failed: {0}")]
     Gc(#[from] GcError),
     #[error(
         "no open Tip at lane startup; the runtime must establish it via \
@@ -91,12 +91,12 @@ fn take_dump_error_is_terminal(source: &TakeDumpError) -> bool {
 pub enum CatchUpError {
     #[error(transparent)]
     History(#[from] sequencer_core::history::HistoryPolicyError),
-    #[error("cannot load resume snapshot")]
+    #[error("cannot load resume snapshot: {source}")]
     LoadSnapshot {
         #[source]
         source: rusqlite::Error,
     },
-    #[error("cannot load replay entries from offset {offset}")]
+    #[error("cannot load replay entries from offset {offset}: {source}")]
     LoadReplay {
         offset: u64,
         #[source]
@@ -233,6 +233,34 @@ mod tests {
 
         for error in errors {
             assert!(error.is_terminal_invariant(), "{error}");
+        }
+    }
+
+    #[test]
+    fn display_carries_the_nested_root_cause() {
+        let cases = [
+            (
+                InclusionLaneError::Snapshot(TakeDumpError::CreateDump(CreateDumpDirError::App(
+                    AppError::Io(std::io::Error::other("No space left on device")),
+                ))),
+                "snapshot at batch close failed: app: io: No space left on device".to_string(),
+            ),
+            (
+                InclusionLaneError::CatchUp {
+                    source: CatchUpError::LoadReplay {
+                        offset: 7,
+                        source: rusqlite::Error::QueryReturnedNoRows,
+                    },
+                },
+                format!(
+                    "application catchup failed: cannot load replay entries from offset 7: {}",
+                    rusqlite::Error::QueryReturnedNoRows
+                ),
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
         }
     }
 }

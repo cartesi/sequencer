@@ -10,12 +10,12 @@ use crate::storage::{
 
 #[derive(Debug, Error)]
 pub enum SubscribeError {
-    #[error("cannot open subscription storage")]
+    #[error("cannot open subscription storage: {source}")]
     OpenStorage {
         #[source]
         source: StorageOpenError,
     },
-    #[error("cannot load feed head offset")]
+    #[error("cannot read canonical history: {source}")]
     LoadHeadOffset {
         #[source]
         source: rusqlite::Error,
@@ -53,12 +53,12 @@ impl SubscribeError {
 pub enum SubscriptionError {
     #[error(transparent)]
     History(HistoryPolicyError),
-    #[error("cannot open subscription storage")]
+    #[error("cannot open subscription storage: {source}")]
     OpenStorage {
         #[source]
         source: StorageOpenError,
     },
-    #[error("cannot load ordered tx page from offset {offset}")]
+    #[error("cannot load ordered tx page from offset {offset}: {source}")]
     LoadReplay {
         offset: u64,
         #[source]

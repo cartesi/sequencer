@@ -22,9 +22,9 @@ use crate::storage::{
 
 #[derive(Debug, Error)]
 pub enum WalletNonceWatermarkError {
-    #[error("watermark sink could not open storage")]
+    #[error("watermark sink could not open storage: {0}")]
     OpenStorage(#[source] StorageOpenError),
-    #[error("watermark sink storage write failed")]
+    #[error("watermark sink storage write failed: {0}")]
     Storage(#[source] rusqlite::Error),
     #[error("watermark sink failed: {0}")]
     Other(String),

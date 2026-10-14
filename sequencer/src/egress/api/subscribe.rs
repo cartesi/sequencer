@@ -119,7 +119,7 @@ async fn run_ws_session(
     }
 
     if let Err(err) = subscription.finish().await {
-        warn!(error = %err, "tx feed subscription cleanup failed");
+        warn!(error = %err, "tx feed subscription ended with error");
     }
 }
 
