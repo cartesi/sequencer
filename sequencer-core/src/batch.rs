@@ -215,4 +215,27 @@ mod tests {
             }
         }
     }
+
+    // ── Pinned encoding ─────────────────────────────────────────────
+
+    /// The pinned batch has nine frames, one holding nine signed user ops, so
+    /// both lists decode through offset tables longer than eight entries. Each
+    /// container decode also pushes its fields through ssz's 8-slot `SmallVec`
+    /// builder; no wire type has more than four fields, so that never spills.
+    #[test]
+    fn ssz_spill_batch_matches_the_pinned_bytes() {
+        let vectors = crate::consensus_vectors::vectors();
+        let pinned = &vectors.ssz.spill_batch;
+        let batch = pinned.to_batch();
+        assert!(batch.frames.len() > 8);
+        assert!(batch.frames.iter().any(|frame| frame.user_ops.len() > 8));
+
+        assert_eq!(batch.as_ssz_bytes(), pinned.encoded.as_ref());
+        assert_eq!(
+            Batch::from_ssz_bytes(&pinned.encoded).expect("decode the pinned batch"),
+            batch
+        );
+        // canonical-test replays these same bytes through the guest.
+        assert_eq!(vectors.guest.payloads["spill_batch"], pinned.encoded);
+    }
 }

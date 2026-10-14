@@ -966,4 +966,61 @@ mod tests {
         path.push(format!("wallet-dump-{}-{nanos}-{n}", std::process::id()));
         path
     }
+
+    const CONSENSUS_VECTORS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/consensus_vectors_v1.json"
+    ));
+
+    /// The guest emits these payloads as notices and voucher calldata, so their
+    /// bytes, selector included, are consensus. Pinned once and never
+    /// regenerated: a mismatch is a finding.
+    #[test]
+    fn output_encodings_match_the_pinned_bytes() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(CONSENSUS_VECTORS).expect("parse consensus_vectors_v1.json");
+        let pinned = &vectors["wallet_outputs"];
+        let text = |value: &serde_json::Value| value.as_str().expect("pinned string").to_owned();
+        let address = |key: &str| {
+            text(&pinned[key])
+                .parse::<Address>()
+                .expect("pinned address")
+        };
+        let bytes = |value: &serde_json::Value| {
+            alloy_primitives::hex::decode(text(value)).expect("pinned hex bytes")
+        };
+        let (token, sender, recipient) =
+            (address("token"), address("sender"), address("recipient"));
+
+        let cases = pinned["cases"].as_array().expect("pinned cases");
+        assert_eq!(cases.len(), 3);
+        for case in cases {
+            let amount: U256 = text(&case["amount"]).parse().expect("pinned amount");
+            assert_eq!(
+                DepositNotice {
+                    token,
+                    sender,
+                    amount
+                }
+                .abi_encode(),
+                bytes(&case["deposit_notice"]),
+                "DepositNotice, amount {amount:#x}"
+            );
+            assert_eq!(
+                TransferNotice {
+                    sender,
+                    recipient,
+                    amount
+                }
+                .abi_encode(),
+                bytes(&case["transfer_notice"]),
+                "TransferNotice, amount {amount:#x}"
+            );
+            assert_eq!(
+                Erc20Transfer { recipient, amount }.abi_encode(),
+                bytes(&case["erc20_transfer"]),
+                "Erc20Transfer, amount {amount:#x}"
+            );
+        }
+    }
 }

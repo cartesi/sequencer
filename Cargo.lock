@@ -791,6 +791,7 @@ dependencies = [
  "ethereum_ssz_derive",
  "rollups-types",
  "sequencer-core",
+ "serde_json",
  "tracing",
 ]
 
@@ -1478,6 +1479,8 @@ dependencies = [
  "k256",
  "rollups-types",
  "sequencer-core",
+ "serde",
+ "serde_json",
  "testsi",
 ]
 

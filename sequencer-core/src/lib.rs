@@ -8,6 +8,8 @@ pub mod api;
 pub mod application;
 pub mod batch;
 pub mod broadcast;
+#[cfg(test)]
+mod consensus_vectors;
 pub mod fee;
 pub mod history;
 pub mod history_api;

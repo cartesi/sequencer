@@ -426,4 +426,35 @@ mod tests {
             "log(u64::MAX) = {v}, expected ~5700"
         );
     }
+
+    /// `build.rs` regenerates the table on every build, and the host and the
+    /// guest each build their own; this pins it against the bytes generated
+    /// before any ruint or toolchain move.
+    #[test]
+    fn generated_table_and_conversions_match_the_pinned_values() {
+        let pinned = crate::consensus_vectors::vectors().fee;
+        assert_eq!(MAX_EXPONENT, pinned.max_exponent);
+        let limbs: Vec<[u64; 4]> = TABLE.iter().map(|entry| *entry.as_limbs()).collect();
+        let pinned_limbs: Vec<[u64; 4]> = pinned
+            .table
+            .iter()
+            .map(|entry| entry.map(|limb| limb.to::<u64>()))
+            .collect();
+        assert_eq!(limbs, pinned_limbs);
+
+        for case in &pinned.fee_to_linear {
+            assert_eq!(
+                fee_to_linear_fixed(case.exponent),
+                case.fixed,
+                "exponent {}",
+                case.exponent
+            );
+            assert_eq!(
+                fee_to_linear(case.exponent),
+                case.linear,
+                "exponent {}",
+                case.exponent
+            );
+        }
+    }
 }

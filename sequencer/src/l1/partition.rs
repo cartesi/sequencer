@@ -434,4 +434,73 @@ mod tests {
         assert_eq!(decoded.blockNumber, U256::from(99_u64));
         assert_eq!(decoded.payload.as_ref(), &[0xaa, 0xbb]);
     }
+
+    const CONSENSUS_VECTORS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/fixtures/consensus_vectors_v1.json"
+    ));
+
+    #[derive(Debug, Deserialize)]
+    struct EvmAdvanceFields {
+        chain_id: U256,
+        app_contract: Address,
+        msg_sender: Address,
+        block_number: U256,
+        block_timestamp: U256,
+        prev_randao: U256,
+        index: U256,
+        payload: Bytes,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EvmAdvanceVariant {
+        name: String,
+        calldata: Bytes,
+        accepted: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EvmAdvanceVector {
+        calldata: Bytes,
+        fields: EvmAdvanceFields,
+        variants: Vec<EvmAdvanceVariant>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ConsensusVectors {
+        evm_advance: EvmAdvanceVector,
+    }
+
+    fn assert_fields(decoded: &EvmAdvanceCall, fields: &EvmAdvanceFields, case: &str) {
+        assert_eq!(decoded.chainId, fields.chain_id, "{case}");
+        assert_eq!(decoded.appContract, fields.app_contract, "{case}");
+        assert_eq!(decoded.msgSender, fields.msg_sender, "{case}");
+        assert_eq!(decoded.blockNumber, fields.block_number, "{case}");
+        assert_eq!(decoded.blockTimestamp, fields.block_timestamp, "{case}");
+        assert_eq!(decoded.prevRandao, fields.prev_randao, "{case}");
+        assert_eq!(decoded.index, fields.index, "{case}");
+        assert_eq!(decoded.payload, fields.payload, "{case}");
+    }
+
+    /// Pinned in `consensus_vectors_v1.json`, never regenerated. The variants
+    /// pin today's lenient decode: trailing bytes and dirty padding decode to
+    /// the canonical fields. A flip to strict decoding changes `accepted`,
+    /// which is a finding, not a fixture update.
+    #[test]
+    fn evm_advance_decode_matches_the_pinned_vector() {
+        let vector = serde_json::from_str::<ConsensusVectors>(CONSENSUS_VECTORS)
+            .expect("parse consensus_vectors_v1.json")
+            .evm_advance;
+        let decoded = decode_evm_advance_input(&vector.calldata).expect("decode pinned calldata");
+        assert_fields(&decoded, &vector.fields, "canonical");
+        assert_eq!(decoded.abi_encode(), vector.calldata.as_ref());
+
+        for variant in &vector.variants {
+            let decoded = decode_evm_advance_input(&variant.calldata);
+            assert_eq!(decoded.is_ok(), variant.accepted, "{}", variant.name);
+            if let Ok(decoded) = decoded {
+                assert_fields(&decoded, &vector.fields, &variant.name);
+            }
+        }
+    }
 }

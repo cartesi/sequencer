@@ -274,4 +274,38 @@ mod tests {
         salted.salt = Some(alloy_primitives::B256::ZERO);
         assert_eq!(DomainResponse::from_domain(&salted), None);
     }
+
+    /// What ingress recovery makes of each pinned signature variant today: the
+    /// recovered sender, or `None` when the signature is refused. The guest
+    /// side of the same table is pinned in `scheduler`.
+    #[test]
+    fn signature_variants_recover_the_pinned_ingress_sender() {
+        let vectors = crate::consensus_vectors::vectors();
+        let pinned = &vectors.signature;
+        let domain = vectors.domain(&pinned.domain);
+        for case in &pinned.variants {
+            let recovered = parse_signature(&case.signature)
+                .and_then(|signature| recover_sender(&pinned.user_op, &signature, &domain))
+                .ok();
+            assert_eq!(recovered, case.ingress, "{}", case.name);
+
+            // `POST /tx` also binds the claimed sender, so only a variant that
+            // recovers the signer is admitted under the signer's address.
+            let request = TxRequest {
+                message: pinned.user_op.clone(),
+                signature: case.signature.to_string(),
+                sender: pinned.address.to_string(),
+            };
+            let admitted = request
+                .into_signed_user_op(&domain, usize::MAX)
+                .ok()
+                .map(|signed| signed.sender);
+            assert_eq!(
+                admitted,
+                case.ingress.filter(|sender| *sender == pinned.address),
+                "{} through POST /tx",
+                case.name
+            );
+        }
+    }
 }

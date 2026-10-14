@@ -1619,4 +1619,30 @@ mod tests {
         assert_eq!(scheduler.next_expected_batch_nonce(), 0);
         assert!(scheduler.app.events().is_empty());
     }
+
+    /// What the guest's recovery makes of each pinned signature variant today:
+    /// the sender it executes the op as, or `None` when the op is dropped. The
+    /// ingress side of the same table is pinned in `api.rs`; `canonical-test`
+    /// replays every variant through the built image.
+    #[test]
+    fn signature_variants_recover_the_pinned_guest_sender() {
+        let vectors = crate::consensus_vectors::vectors();
+        let pinned = &vectors.signature;
+        let domain = vectors.domain(&pinned.domain);
+        let scheduler = Scheduler::new(RecordingApp::default(), SchedulerConfig::new(SEQUENCER));
+        for case in &pinned.variants {
+            let wire_user_op = WireUserOp {
+                nonce: pinned.user_op.nonce,
+                max_fee: pinned.user_op.max_fee,
+                data: pinned.user_op.data.to_vec(),
+                signature: case.signature.to_vec(),
+            };
+            assert_eq!(
+                scheduler.recover_sender(&domain, &wire_user_op),
+                case.guest,
+                "{}",
+                case.name
+            );
+        }
+    }
 }
