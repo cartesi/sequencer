@@ -58,7 +58,7 @@ pub struct ManagedSequencerConfig {
     /// manipulate wall clock). Requires libfaketime in PATH when true.
     pub faketime: bool,
     /// Fixed fee-oracle exponent pinned by the `setup` phase for Anvil/devnet.
-    pub fee_oracle_fixed_log_gas_price: Option<u16>,
+    pub fee_oracle_fixed_log_gas_price: Option<i16>,
 }
 
 /// Snapshot of the `batches` table. Returned by
@@ -179,7 +179,7 @@ pub struct ManagedSequencer {
     max_batch_open_seconds: Option<u64>,
     /// Fixed fee-oracle exponent forwarded to each `setup` spawn. See
     /// [`ManagedSequencerConfig::fee_oracle_fixed_log_gas_price`].
-    fee_oracle_fixed_log_gas_price: Option<u16>,
+    fee_oracle_fixed_log_gas_price: Option<i16>,
 }
 
 pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> ManagedSequencerConfig {
@@ -1361,7 +1361,7 @@ async fn spawn_sequencer_process(
     mine_l1_during_boot: bool,
     recovery: Option<&RecoverySetupParams>,
     max_batch_open_seconds: Option<u64>,
-    fee_oracle_fixed_log_gas_price: Option<u16>,
+    fee_oracle_fixed_log_gas_price: Option<i16>,
     genesis_bin: Option<&Path>,
 ) -> HarnessResult<SpawnedSequencerProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;

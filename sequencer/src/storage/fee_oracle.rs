@@ -9,11 +9,23 @@ use super::Storage;
 use super::convert::{i64_to_u64, now_unix_ms};
 
 impl Storage {
-    pub fn log_gas_price(&self) -> Result<u16> {
+    pub fn log_gas_price(&self) -> Result<i16> {
         self.conn.query_row(
             "SELECT log_gas_price FROM batch_policy WHERE singleton_id = 0",
             [],
-            |row| row.get::<_, u16>(0),
+            |row| row.get::<_, i16>(0),
+        )
+    }
+
+    /// Lowest `log_gas_price` the schema admits: the one that brings the
+    /// derived recommended fee to exponent 0. Derived from the view so the
+    /// summand list has one owner.
+    pub fn log_gas_price_floor(&self) -> Result<i16> {
+        self.conn.query_row(
+            "SELECT log_gas_price - log_recommended_fee FROM batch_policy_derived \
+             WHERE singleton_id = 0",
+            [],
+            |row| row.get::<_, i16>(0),
         )
     }
 
@@ -27,7 +39,7 @@ impl Storage {
         )
     }
 
-    pub fn set_log_gas_price(&mut self, log_gas_price: u16) -> Result<()> {
+    pub fn set_log_gas_price(&mut self, log_gas_price: i16) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE batch_policy \
              SET log_gas_price = ?1, log_gas_price_updated_at_ms = ?2 \
@@ -70,6 +82,25 @@ mod tests {
         let policy = storage.batch_policy().expect("read policy");
         assert_eq!(policy.recommended_fee, sequencer_core::fee::MAX_EXPONENT);
         let _ = sequencer_core::fee::fee_to_linear(policy.recommended_fee);
+    }
+
+    #[test]
+    fn negative_log_gas_price_lowers_the_recommended_fee_to_the_floor() {
+        let db = temp_db("negative-fee");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let floor = storage.log_gas_price_floor().expect("floor");
+        assert_eq!(floor, -1356);
+        storage
+            .set_log_gas_price(-1000)
+            .expect("below one unit per gas");
+        assert_eq!(storage.batch_policy().unwrap().recommended_fee, 356);
+        storage.set_log_gas_price(floor).expect("the floor itself");
+        assert_eq!(storage.batch_policy().unwrap().recommended_fee, 0);
+        let err = storage
+            .set_log_gas_price(floor - 1)
+            .expect_err("below the floor");
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+        assert_eq!(storage.log_gas_price().unwrap(), floor);
     }
 
     #[test]

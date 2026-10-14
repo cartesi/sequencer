@@ -250,7 +250,7 @@ pub struct DeploymentIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeeOracleIdentity {
     Fixed {
-        log_gas_price: u16,
+        log_gas_price: i16,
     },
     Uniswap {
         weth: alloy_primitives::Address,

@@ -91,9 +91,15 @@ impl TimingArgs {
 /// local development; public chains use a validated Uniswap V3 TWAP source.
 #[derive(Debug, Clone, Args)]
 pub struct FeeOracleArgs {
-    /// Fixed logarithmic gas price for local/Anvil deployments.
-    #[arg(long, env = "CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE")]
-    pub fixed_log_gas_price: Option<u16>,
+    /// Fixed logarithmic gas price for local/Anvil deployments. Negative values
+    /// price below one fee-token smallest unit per gas; setup refuses one that
+    /// would push the recommended fee below exponent 0.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE",
+        allow_negative_numbers = true
+    )]
+    pub fixed_log_gas_price: Option<i16>,
     #[arg(long, env = "CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS", value_parser = parse_address)]
     pub fee_token_address: Option<Address>,
     #[arg(long, env = "CARTESI_SEQUENCER_WETH_ADDRESS", value_parser = parse_address)]
@@ -123,7 +129,7 @@ pub struct FeeOraclePollArgs {
 /// Resolved fee-oracle source with all chain-specific defaults filled in.
 #[derive(Debug, Clone)]
 pub enum FeeOracleMode {
-    Fixed { log_gas_price: u16 },
+    Fixed { log_gas_price: i16 },
     Uniswap(crate::l1::fee_oracle::UniswapConfig),
 }
 
@@ -898,6 +904,15 @@ mod tests {
                 .expect_err("fixed and Uniswap config must not mix")
                 .contains("cannot be combined")
         );
+    }
+
+    #[test]
+    fn fee_oracle_fixed_mode_accepts_a_negative_exponent() {
+        let config = setup_config_from(&["--fixed-log-gas-price", "-7"]);
+        assert!(matches!(
+            config.fee_oracle.resolve(31_337),
+            Ok(FeeOracleMode::Fixed { log_gas_price: -7 })
+        ));
     }
 
     #[test]

@@ -146,7 +146,7 @@ where
         .map_err(|message| BootstrapError::FeeOracleMisconfig { message })?;
     enum PreparedFeeOracle {
         Fixed {
-            log_gas_price: u16,
+            log_gas_price: i16,
         },
         Uniswap {
             identity: FeeOracleIdentity,
@@ -155,7 +155,10 @@ where
         },
     }
     let prepared_fee_oracle = match fee_oracle {
-        FeeOracleMode::Fixed { log_gas_price } => PreparedFeeOracle::Fixed { log_gas_price },
+        FeeOracleMode::Fixed { log_gas_price } => {
+            check_fixed_log_gas_price(&db_path, log_gas_price)?;
+            PreparedFeeOracle::Fixed { log_gas_price }
+        }
         FeeOracleMode::Uniswap(uniswap) => {
             // Setup requires L1: transient and misconfig both abort, before
             // anything pins (one connect/classify home).
@@ -340,6 +343,22 @@ where
 enum SetupAdmission {
     Proceed,
     AlreadyComplete,
+}
+
+/// Refuse a fixed price the fee-floor CHECK would reject, before it pins an
+/// identity whose first price write could never succeed.
+fn check_fixed_log_gas_price(db_path: &str, log_gas_price: i16) -> Result<(), CommandError> {
+    let floor = storage::Storage::open(db_path)?.log_gas_price_floor()?;
+    if log_gas_price < floor {
+        return Err(BootstrapError::FeeOracleMisconfig {
+            message: format!(
+                "fixed log gas price {log_gas_price} is below {floor}, which would make \
+                 the recommended fee negative"
+            ),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn admit_setup_lifecycle(
@@ -1043,9 +1062,25 @@ mod tests {
         assert!(run_detection_gate(&mut storage, SENDER_A, 18, (1, 1)).is_ok());
     }
 
-    /// `setup --recovery`'s flush signs L1 no-ops with the recovery key, so it
-    /// must match the pinned batch-submitter — otherwise it would settle some
-    /// other account's nonce while recovery never settles the intended wallet.
+    /// A fixed price below the fee floor would pin an identity whose first
+    /// price write the schema refuses; setup refuses it first.
+    #[test]
+    fn fixed_price_below_the_floor_is_refused() {
+        let db = crate::storage::test_helpers::temp_db("fixed-price-floor");
+        drop(storage::Storage::open(db.path.as_str()).expect("initialize schema"));
+
+        let err = check_fixed_log_gas_price(&db.path, -1357)
+            .expect_err("one below the floor must be refused");
+        assert!(
+            matches!(
+                err,
+                CommandError::Bootstrap(BootstrapError::FeeOracleMisconfig { .. })
+            ),
+            "{err:?}"
+        );
+        check_fixed_log_gas_price(&db.path, -1356).expect("the floor itself is accepted");
+    }
+
     /// Setup's L1 discovery uses the startup polarity: a malformed RPC URL
     /// re-fails identically, so it is terminal; an unreachable RPC is not.
     #[tokio::test]
@@ -1104,6 +1139,9 @@ mod tests {
         );
     }
 
+    /// `setup --recovery`'s flush signs L1 no-ops with the recovery key, so it
+    /// must match the pinned batch-submitter — otherwise it would settle some
+    /// other account's nonce while recovery never settles the intended wallet.
     /// The guard is pure and runs first, so a wrong key is refused before any L1
     /// contact (the RPC here is unreachable) or DB write.
     #[tokio::test]

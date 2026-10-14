@@ -19,7 +19,7 @@ use crate::storage::{Storage, StorageOpenError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshResult {
-    pub log_gas_price: u16,
+    pub log_gas_price: i16,
     pub changed: bool,
 }
 
@@ -139,7 +139,6 @@ impl FeeOracle {
         let directed_tick = self.token.directed_tick().await?;
         let gas_price_wei = fees.base_fee_per_gas as f64 + fees.max_priority_fee_per_gas as f64;
         let x_units_per_gas = math::x_units_per_gas(gas_price_wei, directed_tick);
-        let log_gas_price = math::log_gas_price_ceil(x_units_per_gas);
 
         let db_path = self.db_path.clone();
         let process_lock = self.process_lock.clone();
@@ -147,6 +146,8 @@ impl FeeOracle {
             process_lock,
             move || -> Result<RefreshResult, FeeOracleError> {
                 let mut storage = Storage::open_writer(&db_path)?;
+                let log_gas_price =
+                    math::log_gas_price_ceil(x_units_per_gas, storage.log_gas_price_floor()?);
                 let changed = storage.log_gas_price()? != log_gas_price;
                 // Always stamp so operators can observe the last successful quote.
                 storage.set_log_gas_price(log_gas_price)?;
@@ -347,8 +348,9 @@ mod tests {
         -200_000
     }
 
-    fn expected_log_price() -> u16 {
-        math::log_gas_price_ceil(math::x_units_per_gas(20e9, sample_tick()))
+    fn expected_log_price() -> i16 {
+        // The sample price (about 41 units per gas) sits far above any floor.
+        math::log_gas_price_ceil(math::x_units_per_gas(20e9, sample_tick()), i16::MIN)
     }
 
     fn initialize_db(path: &str) {
@@ -459,7 +461,7 @@ mod tests {
             })),
             Box::new(StaticToken(887_272)),
         );
-        let max = sequencer_core::fee::MAX_EXPONENT;
+        let max = i16::try_from(sequencer_core::fee::MAX_EXPONENT).unwrap();
         assert_eq!(oracle.refresh_once().await.unwrap().log_gas_price, max);
         assert_eq!(
             Storage::open_read_only(&db.path)
@@ -486,6 +488,45 @@ mod tests {
             Box::new(StaticToken(-198_080)),
         );
         assert_eq!(oracle.refresh_once().await.unwrap().log_gas_price, 29);
+    }
+
+    #[tokio::test]
+    async fn sub_unit_gas_price_goes_below_exponent_zero() {
+        // 0.1 gwei with USDC at about $2500 is about 0.25 units per gas, which
+        // used to floor at exponent 0 and overcharge 4x.
+        let db = temp_db("sub-unit-fee-oracle");
+        initialize_db(&db.path);
+        let oracle = oracle_with(
+            &db.path,
+            Box::new(StaticGas(Eip1559Fees {
+                base_fee_per_gas: 100_000_000,
+                max_priority_fee_per_gas: 0,
+                max_fee_per_gas: 100_000_000,
+            })),
+            Box::new(StaticToken(-198_080)),
+        );
+        assert_eq!(oracle.refresh_once().await.unwrap().log_gas_price, -178);
+        let mut storage = Storage::open(&db.path).unwrap();
+        assert_eq!(storage.batch_policy().unwrap().recommended_fee, 1356 - 178);
+    }
+
+    #[tokio::test]
+    async fn zero_gas_price_clamps_to_the_derived_fee_floor() {
+        let db = temp_db("zero-gas-fee-oracle");
+        initialize_db(&db.path);
+        let oracle = oracle_with(
+            &db.path,
+            Box::new(StaticGas(Eip1559Fees {
+                base_fee_per_gas: 0,
+                max_priority_fee_per_gas: 0,
+                max_fee_per_gas: 0,
+            })),
+            Box::new(StaticToken(0)),
+        );
+        let mut storage = Storage::open(&db.path).unwrap();
+        let floor = storage.log_gas_price_floor().unwrap();
+        assert_eq!(oracle.refresh_once().await.unwrap().log_gas_price, floor);
+        assert_eq!(storage.batch_policy().unwrap().recommended_fee, 0);
     }
 
     #[tokio::test]

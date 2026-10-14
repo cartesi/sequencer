@@ -494,7 +494,7 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
     -- Immutable setup-pinned fee source. Fixed has only fixed_log_gas_price;
     -- Uniswap has the complete reviewed token/pool tuple.
     fee_oracle_mode           TEXT    NOT NULL CHECK (fee_oracle_mode IN ('fixed', 'uniswap')),
-    fixed_log_gas_price       INTEGER CHECK (fixed_log_gas_price BETWEEN 0 AND 65535),
+    fixed_log_gas_price       INTEGER CHECK (fixed_log_gas_price BETWEEN -32768 AND 32767),
     fee_oracle_weth           BLOB    CHECK (fee_oracle_weth IS NULL OR length(fee_oracle_weth) = 20),
     fee_oracle_fee_token      BLOB    CHECK (fee_oracle_fee_token IS NULL OR length(fee_oracle_fee_token) = 20),
     fee_oracle_pool           BLOB    CHECK (fee_oracle_pool IS NULL OR length(fee_oracle_pool) = 20),
@@ -545,6 +545,10 @@ END;
 --   WETH/X TWAP and encodes the approximate quote to log space. The tenfold safety
 --   margin lives in `log_slack` (not in the oracle). Local Anvil uses an
 --   explicit fixed exponent instead of Uniswap.
+--   `log_gas_price` may be negative: a few-decimal fee token (USDC) can cost
+--   less than one smallest unit per gas at low L1 gas. The floor is set on
+--   the derived fee instead, one smallest unit per user op (exponent 0);
+--   below it the oracle clamps rather than overcharging per gas.
 --
 -- Fee derivation (view):
 --   log_recommended_fee = log_gas_price + log_slack + log_one_plus_alpha
@@ -569,8 +573,9 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     log_alpha                INTEGER NOT NULL,
     -- log_one_plus_alpha = log(1 + alpha). Always >= 0.
     log_one_plus_alpha       INTEGER NOT NULL CHECK (log_one_plus_alpha >= 0),
-    -- Log-space fee exponent fed by the oracle.
-    log_gas_price            INTEGER NOT NULL CHECK (log_gas_price >= 0),
+    -- Log-space fee exponent fed by the oracle. Negative below one fee-token
+    -- smallest unit per L1 gas; the fee-floor CHECK below bounds it.
+    log_gas_price            INTEGER NOT NULL,
     -- Unix-ms of the last successful oracle (or Fixed setup) write.
     -- 0 means never written; completed setup guarantees a nonzero observation.
     log_gas_price_updated_at_ms INTEGER NOT NULL CHECK (log_gas_price_updated_at_ms >= 0),
@@ -584,7 +589,9 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     log_user_op_bytes        INTEGER NOT NULL CHECK (log_user_op_bytes > 0),
     log_max_batch_bytes      INTEGER NOT NULL CHECK (log_max_batch_bytes > 0),
 
-    CHECK (log_base_gas - log_alpha - log_delta < log_max_batch_bytes)
+    CHECK (log_base_gas - log_alpha - log_delta < log_max_batch_bytes),
+    -- Fee floor: the derived per-op fee never drops below exponent 0.
+    CHECK (log_gas_price + log_slack + log_one_plus_alpha + log_delta + log_user_op_bytes >= 0)
 );
 
 -- Default values. All log-space exponents with base 129/128:
