@@ -126,19 +126,14 @@ by writer and are write-once (`0001_schema.sql`).
 
 ### I3. Frame `safe_block`s are non-decreasing along the spine
 
-- **Holds:** during an admitted live run, logical frame time advances directly
-  to the latest observed safe head `H` only when `H - S >= 5`, where `S` is the
-  open frame's persisted `safe_block`. An observation jump creates one frame at
-  `H` and resets the anchor; no intermediary frames are synthesized. Batch
-  closure may create a structural successor frame at the unchanged `S`, so
-  equality is valid. Bootstrap and recovery are anchoring transitions, not
-  live clock ticks: they may open a fresh Tip at a proven checkpoint/current
-  safe head without applying the five-block delta.
+- **Holds:** frame `safe_block`s never decrease along the valid spine; equal
+  adjacent clocks are valid. The [frame-clock policy](protocol/scheduler-semantics.md#sequencer-frame-clock-policy)
+  says when the lane advances the clock, including the anchoring exception
+  for bootstrap and recovery.
 - **Enforced by:** lane flow + `append_safe_inputs`' monotonicity asserts
   (`storage/l1_inputs.rs`) +
-  `ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS` (homed with its timing
-  siblings in `sequencer-core/src/protocol.rs`; prose owner is the
-  scheduler-semantics frame-clock section). The lane's frontier time gate
+  `ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS`
+  (`sequencer-core/src/protocol.rs`). The lane's frontier time gate
   bounds SQLite observation load and is not part of the clock semantics.
 - **Depended on by:** `check_danger`'s arm ordering (see I4); the scheduler's
   within-batch monotonicity check; "if the frontier batch is fresh, all are".
