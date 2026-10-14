@@ -1,30 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! The `setup` subcommand: establish everything timeless
-//! and pin it in the DB, then mark setup complete so `run` will boot.
-//!
-//! Steps, in order. The storage phases are re-entry-safe (a crashed
-//! attempt's retry begins fresh over its idempotent residue), and the final
-//! transaction is the single linearization point for "A finished":
-//!
-//! 1. Validate protocol timing; create the data dir + `dumps/`.
-//! 2. Require L1: validate the RPC chain id, sample the safe head, discover the
-//!    InputBox address + app deployment block from the app contract, and refuse
-//!    (retryably) until that deployment is at or below the sampled safe head.
-//!    (No cached-identity fallback — this is first-boot; an unreachable L1 is a
-//!    retryable refusal.)
-//! 3. Resolve the fee source, pin the complete deployment identity (chain id,
-//!    app address, InputBox address, app deployment block, batch-submitter
-//!    **address**, and fee-oracle identity), and persist the first price.
-//!    `setup` never signs.
-//! 4. Initial L1 sync: read all direct inputs up to the current safe head.
-//! 5. Create the durable genesis or recovered application baseline dump.
-//! 6. Atomically register complete baseline metadata, its artifact, any recovery
-//!    root, and the `setup_complete` fact.
-//!
-//! `setup` is L1-read-only: it takes the batch-submitter address (not the
-//! key) and does no L1 writes.
+//! The `setup` command: pin the deployment identity and fee source, sync L1 to
+//! the safe head, and register the genesis baseline (or the `--recovery` rebuild),
+//! committing `setup_complete` last as its single completion point. Storage phases
+//! are re-entry safe. Plain `setup` reads L1 only and never signs.
 
 use alloy_primitives::Address;
 use sequencer_core::application::{AppError, Application};

@@ -1,15 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Health probes (k8s-style):
-//!
-//! - `GET /livez`   — process is up. Always 200.
-//! - `GET /readyz`  — ready to accept new transactions. 503 if shutdown is in
-//!   progress or the inclusion lane has dropped its receiver.
-//! - `GET /healthz` — JSON status report. 200 / 503 mirroring `/readyz`.
-//!
-//! Lives on egress because operators (and kubelet, in practice) probe from the
-//! internal-cluster side.
+//! Health probes `/livez`, `/readyz` and `/healthz` (contract: README "Health
+//! probes"). They live on the internal listener because operators and kubelet
+//! probe from inside the cluster.
 
 use std::sync::Arc;
 

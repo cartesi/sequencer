@@ -1,26 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! CLI harness: the subcommand parser, dispatch, and exit-code projection,
-//! exported once from the library so every app binary inherits them.
-//!
-//! An app's `main` is ~5 lines: init tracing, then [`run_main`] with a
-//! genesis-app factory closure. The factory is invoked only when plain `setup`
-//! reaches genesis-snapshot registration; completed setup no-ops, recovery,
-//! `run`, and `flush-mempool` never construct an app value.
-//!
-//! ```ignore
-//! #[tokio::main]
-//! async fn main() -> std::process::ExitCode {
-//!     init_tracing();
-//!     sequencer::harness::run_main(|| Ok(WalletApp::new(WalletConfig::default()))).await
-//! }
-//! ```
-//!
-//! Genesis construction stays off the `Application` trait (it varies per impl).
-//! Apps with their own CLI options can parse [`Command`] and call [`run_command`]
-//! with a lazy, fallible genesis factory. Both entry points share the command
-//! lifecycle and exit policy without imposing a `clap` bound on the app type.
+//! CLI harness: subcommand parsing, dispatch and exit-code projection, exported
+//! once so every app binary inherits them. Binaries pass [`run_main`] a genesis
+//! factory (genesis varies per app, so it stays off the `Application` trait);
+//! apps with their own CLI parse [`Command`] and call [`run_command`].
 
 use clap::{Parser, Subcommand};
 use sequencer_core::application::{AppError, Application};

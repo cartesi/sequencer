@@ -1,18 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! The `flush-mempool` subcommand: settle the batch-submitter
-//! wallet nonce on demand — submit no-ops for every unresolved slot and wait
-//! until `pending <= safe` and `safe >= watermark + 1`.
-//!
-//! Operator tooling (unstick a wedged nonce, prep before a decommission) and
-//! the same flush `setup --recovery` will run internally. It is a keyed L1
-//! write, so it needs the signing key; it reads the submitter address and the
-//! wallet-nonce watermark from the DB, so it refuses unless `setup` completed.
-//! Flush-only — it does not sync or cascade (those stay in normal-run
-//! recovery), and it requires a completed setup. A successful wallet flush
-//! proves nothing about the rest of the runtime and is never treated as if
-//! it did.
+//! The `flush-mempool` command: settle the batch-submitter wallet nonce on demand
+//! with the same flush startup recovery and `setup --recovery` run. It needs the
+//! signing key and a completed setup, and never syncs, cascades or launches
+//! workers (README "Running").
 
 use super::load_setup_identity;
 use crate::commands::config::FlushConfig;

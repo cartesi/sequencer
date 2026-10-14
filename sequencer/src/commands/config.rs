@@ -1,20 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! CLI configuration for the three subcommands (`setup`, `run`,
-//! `flush-mempool`).
-//!
-//! The phase split: `setup` is L1-read-only and establishes the
-//! timeless deployment identity + initial sync + genesis snapshot; it takes
-//! the batch-submitter **address** but never the signing key. `run` boots
-//! from an already-set-up DB, reads identity from the DB (so chain id / app
-//! address are not CLI args here), and keeps the signing **key** because it
-//! submits. `flush-mempool` is a keyed operator tool that settles the wallet
-//! nonce on demand.
-//!
-//! Shared, drift-prone arg groups (`L1RpcArgs`, `TimingArgs`, `KeyArgs`) are
-//! flattened into the per-subcommand configs so defaults and env-var names
-//! stay consistent.
+//! CLI configuration for `setup`, `run` and `flush-mempool`: the owner of
+//! env-var names, defaults and validation. Shared arg groups (`L1RpcArgs`,
+//! `TimingArgs`, `KeyArgs`) are flattened into each command so names and defaults
+//! cannot drift. The setup/run phase split is in README "Running".
 
 use alloy_primitives::Address;
 use clap::{ArgGroup, Args};

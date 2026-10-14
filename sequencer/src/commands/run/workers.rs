@@ -1,29 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Runtime worker lifecycle: prepare → admit → launch → stop.
-//!
-//! [`Workers`] owns the core runtime worker handles plus an optional live
-//! Uniswap fee-oracle worker; fixed pricing has no worker.
-//! Runtime construction has one explicit authority boundary:
-//!
-//! - [`PreparedRuntime::prepare`]: prepare every fallible or awaited
-//!   dependency while launching zero workers.
-//! - [`PreparedRuntime::launch`]: consume the controller's single-use durable
-//!   admission witness and launch all workers in one infallible,
-//!   non-yielding step, returning the owning struct.
-//! - [`Workers::select_first_exit`]: race the workers + OS shutdown signal,
-//!   return whichever fired first.
-//! - [`Workers::finish`]: abort terminal failures; otherwise request shutdown,
-//!   drain the remaining workers concurrently, and surface the primary failure.
-//!
-//! Worker plumbing is explicit per worker: one field, one spawn statement,
-//! one select arm, one cleanup entry. Adding a worker means editing each of
-//! those sites, and a missed one fails the build: a field missing from the
-//! `Workers` literal in `launch` or from the exhaustive `let Self { .. }`
-//! destructures in `select_first_exit` and `finish` is a hard error, and a
-//! bound-but-unused field fails under `-D warnings`. Keep those destructures
-//! exhaustive (no `..`).
+//! Runtime worker lifecycle: prepare -> admit -> launch -> stop. Each worker is one
+//! field, one spawn, one select arm and one cleanup entry. The `Workers` literal in
+//! `launch` and the `let Self { .. }` destructures in `select_first_exit` and
+//! `finish` stay exhaustive (no `..`), so a missed site fails the build.
 
 use std::future::Future;
 use std::marker::PhantomData;

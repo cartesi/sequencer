@@ -1,26 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Public ingress HTTP:
-//!
-//! - `POST /tx` — validate a signed user op, enqueue it for the inclusion
-//!   lane, and wait for the lane's commit ack. Synchronous from the client's
-//!   perspective: 200 means included.
-//! - `GET /fee` — quote the open-frame fee, recommended fee, and a suggested
-//!   `max_fee` so a wallet can sign before submitting.
-//! - `GET /nonce?sender=` — the nonce `sender` must sign next, derived from the
-//!   user ops the lane has committed.
-//! - `GET /domain` — the EIP-712 domain signatures are verified against.
-//!
-//! `/fee` and `/nonce` query SQLite on a read-only connection, never the lane:
-//! WAL readers do not block its writes.
-//!
-//! Admission checks only what the lane cannot cheaply check itself: payload
-//! size and the signature. Nonce and `max_fee` are left to the lane. A stale
-//! op costs it an in-memory comparison and no transaction, whereas an ingress
-//! pre-check would add a SQLite read to every honest submit, and a future
-//! nonce or a fresh address bypasses it. Revisit if persistent `429`s trace
-//! back to stale-nonce floods.
+//! Public ingress routes (`POST /tx`, `GET /fee`, `GET /nonce`, `GET /domain`);
+//! README "API" owns their contract. `/fee` and `/nonce` read SQLite, never the lane.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -112,6 +94,11 @@ pub(crate) fn router(submit: Arc<SubmitState>, read: Arc<ReadState>) -> Router {
         )
 }
 
+/// Admission checks only size and signature. Nonce and `max_fee` are left to the
+/// lane, where a stale op costs an in-memory comparison and no transaction; a
+/// pre-check here would add a SQLite read to every honest submit, and a future
+/// nonce or fresh address bypasses it. Revisit if persistent `429`s trace back to
+/// stale-nonce floods.
 async fn submit_tx(
     State(state): State<Arc<SubmitState>>,
     req: Result<Json<TxRequest>, axum::extract::rejection::JsonRejection>,

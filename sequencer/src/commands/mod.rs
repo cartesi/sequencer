@@ -1,20 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! The operator commands: each child module is one command *bracket* —
-//! acquire the exclusive process lock, preflight the admission facts,
-//! execute the body, and best-effort record a terminal cause in the black
-//! box. The *mechanisms* the brackets invoke live in their domain modules
-//! (`crate::recovery` for startup repair and flushing, `crate::runtime` for the
-//! shared authority machinery: process lock, `RuntimeScope`).
-//!
-//! - [`run`] — boot workers from a set-up DB (plus `workers`, its supervisor)
-//! - [`setup`] — establish the timeless deployment state
-//! - [`flush`] — settle the wallet nonce without launching
-//!
-//! This module hosts the helpers shared by more than one bracket (identity
-//! gates, keyed-writer verification, lifecycle preflights). The CLI harness
-//! that dispatches the commands lives in [`crate::harness`].
+//! Operator commands. Each child is one bracket: take the process lock, preflight
+//! the admission facts, run the body, and best-effort record a terminal cause.
+//! Mechanisms live in `crate::recovery` and `crate::runtime`; this module holds
+//! the helpers shared by brackets, and [`crate::harness`] dispatches them.
 
 pub mod config;
 pub mod error;

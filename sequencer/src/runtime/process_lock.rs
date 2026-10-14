@@ -1,22 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Exclusive data-directory process lock.
-//!
-//! Every subcommand that touches a data directory (`run`, `setup`,
-//! `flush-mempool`) acquires an OS-held advisory
-//! lock on `<data_dir>/sequencer.lock` before reading or mutating anything
-//! there. `run` clones it into the structured runtime scope and into each
-//! data-directory worker, and keeps one itself through settlement; the lock
-//! is released only after the last clone — controller, scope, worker, or
-//! nested blocking closure — drops, including during pre-worker
-//! setup/recovery. The other
-//! commands hold it until they and any detached blocking work return.
-//! Persisted lifecycle rows cannot distinguish a live owner from a stale one;
-//! a kernel-held lock can — it vanishes with the process, however the process
-//! dies. This prevents two processes from racing settlement, rebuild, or
-//! boot on one data dir, and is the exclusive-ownership primitive the
-//! authority-boundary ADR's durable lifecycle builds on.
+//! Exclusive data-directory lock: every command takes an OS-held advisory lock on
+//! `<data_dir>/sequencer.lock` before touching the directory and keeps it until
+//! the last clone drops. Unlike a persisted row, a kernel lock dies with its
+//! process. Lifetime rules: authority-boundary ADR, mechanism 1.
 
 use std::fs::{File, TryLockError};
 use std::path::Path;

@@ -1,28 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Single ordering lane with a latency-critical user-op regime and a slower L1
-//! reconciliation regime. It runs three layers of amortization:
-//!
-//! - **Fast processing** (`run_fast_turn`): processes at most one bounded
-//!   user-op chunk per turn. Rejected requests therefore cannot keep a
-//!   continuously nonempty queue from starving reconciliation.
-//! - **Per-chunk persistence** (`max_user_ops_per_chunk`): a nonempty accepted
-//!   subset commits at most once, bounding ack latency for its first op.
-//!   All-rejected chunks mutate nothing and do not open a transaction.
-//! - **L1 reconciliation** (observed at `frontier_min_interval`): once five
-//!   newly-safe blocks have accumulated, executes the complete direct-input range and advances one frame directly to the observed tip. The time
-//!   gate bounds SQL load; block distance is the semantic clock criterion.
-//!   That frontier read is also the lane's divergence refusal point (I15):
-//!   a marker already present closes intake before direct execution,
-//!   or the frame-clock decision.
-//!
-//! The lane is a single-thread `spawn_blocking` task. SQLite is the durable data
-//! coordination boundary with the input reader and batch submitter. HTTP
-//! ingress uses the deliberate bounded-channel request/response exception;
-//! `RuntimeScope` is process control, not data coordination. Reconciliation
-//! has no timeout/resume protocol: supported applications are assumed to
-//! promptly digest the complete newly-safe range in the supported envelope.
+//! The single ordering lane. The fast regime takes one bounded user-op chunk per
+//! turn and commits its accepted subset at most once before acking; the L1 regime
+//! opens one frame at the observed tip once five newly-safe blocks accumulate and
+//! refuses on a divergence marker (I15). Design: authority-boundary ADR, mechanism 4.
 
 mod catch_up;
 mod config;

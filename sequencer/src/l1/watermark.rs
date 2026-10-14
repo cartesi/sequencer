@@ -1,18 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Write-before-broadcast hook for the wallet-nonce watermark.
-//!
-//! Every component that broadcasts a transaction from the batch-submitter key
-//! — the batch poster and the mempool flusher's no-ops alike — must first
-//! durably commit `watermark = max(watermark, highest_wallet_nonce_about_to_send)`
-//! and only then send. One uniform rule, no case analysis: the invariant is
-//! simply "the watermark covers the wallet nonce of everything we ever sent", which
-//! is what lets the flush consume every slot we ever used without trusting
-//! the local node's volatile mempool memory (the zombie counterexample).
-//!
-//! A crash between the commit and the send only over-covers: the flush later
-//! no-ops a never-used slot — one wasted no-op, harmless.
+//! Write-before-broadcast hook (I14): the poster and the flusher durably raise the
+//! wallet-nonce watermark to the highest nonce they are about to send, then send,
+//! so a flush consumes every slot ever used without trusting the node's mempool.
+//! A crash between the two only over-covers.
 
 use thiserror::Error;
 

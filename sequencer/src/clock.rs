@@ -1,11 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Shared clock helper.
-//!
-//! Every callsite that needs "now in Unix-ms" goes through [`unix_now_ms`] so
-//! the sequencer has a single place to swap in a test clock if needed.
-//! `SystemTime::now()` pre-epoch is defended against via `unwrap_or_default()`.
+//! The crate's wall clock: every "now in Unix-ms" goes through [`unix_now_ms`],
+//! and a pre-epoch clock reads as 0.
 
 use std::time::{Duration, SystemTime};
 

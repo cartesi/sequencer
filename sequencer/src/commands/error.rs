@@ -1,15 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Command error taxonomy. Three groupings:
-//!
-//! - [`BootstrapError`] / [`IdentityError`]: everything that can go wrong
-//!   before runtime workers come up — config validation, deployment-identity
-//!   guards, startup recovery, initial DB open.
-//! - [`WorkerExit`] + per-worker `*Exit`: how each runtime worker exited.
-//! - [`CommandError`]: the top-level error every command returns (run,
-//!   setup, flush), with generic [`std::io::Error`] /
-//!   [`rusqlite::Error`] catch-alls that are used widely enough not to nest.
+//! Command error taxonomy: [`BootstrapError`] and [`IdentityError`] before workers
+//! start, [`WorkerExit`] for runtime worker exits, and [`CommandError`] on top.
 
 use thiserror::Error;
 

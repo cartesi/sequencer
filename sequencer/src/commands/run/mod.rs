@@ -1,22 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! The `run` command: boot the sequencer from an already-set-up DB.
-//!
-//! Phases:
-//!
-//! 1. **Gate + identity**: refuse unless `setup` completed; read the pinned
-//!    deployment identity from the DB (chain id / app address are no longer
-//!    CLI args — they come from the identity).
-//! 2. **Recovery**: inspect local facts, sync L1, and perform the selected repair
-//!    (`crate::recovery` owns the mechanism; this bracket only invokes it).
-//! 3. **Prepare + admit + launch**: prepare every fallible runtime resource,
-//!    recheck admission over one consistent fact set, then consume the
-//!    single-use admission in one non-yielding worker launch (`workers`).
-//!
-//! Two senses of "admitted": phase 1 is the *lifecycle* gate (the
-//! `_admitted` suffix all three command brackets share); the *runtime*
-//! admission witness is minted later, in phase 3.
+//! The `run` command: refuse unless `setup` completed, read the pinned identity,
+//! run startup recovery (`crate::recovery`), then prepare, admit and launch the
+//! workers (`workers`). The `_admitted` suffix names the lifecycle gate, not the
+//! runtime admission witness, which is minted after preparation.
 
 mod startup_hygiene;
 mod workers;
