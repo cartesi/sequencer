@@ -26,7 +26,7 @@ use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer, RetryPoli
 use alloy_transport::{
     HttpError, IntoBoxTransport, RpcError, TransportError, TransportErrorKind, TransportFut,
 };
-use url::Host;
+use url::{Host, Position};
 
 /// Per-attempt HTTP deadline, connect through body, shared by every L1 client.
 /// alloy never resends a timeout, and the `eth_getLogs` partition
@@ -195,23 +195,56 @@ pub(crate) fn rpc_endpoint_origin(url: &str) -> String {
     )
 }
 
+/// Longest rendering of one cause in [`error_chain`], before its cut marker.
+/// Per cause, not per line, so a long body never cuts off the root cause at
+/// the end of the chain.
+const ERROR_SEGMENT_MAX_BYTES: usize = 256;
+
 /// An error with its source chain, for logs and string-carrying error
 /// variants. reqwest's `Display` names only the request kind ("error sending
 /// request"); the cause (timeout, refused connection, DNS, TLS) lives in
 /// `source()`, under alloy wrappers that are transparent. A cause whose text
 /// the line already holds is skipped.
+///
+/// The result is one line: each cause has its control characters escaped, so
+/// a provider's text cannot split or forge log lines, and is cut at
+/// [`ERROR_SEGMENT_MAX_BYTES`], because a provider can put a whole HTML page
+/// or a multi-line result into an error. Every L1 error becomes text here.
 pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut line = error.to_string();
+    let mut seen = error.to_string();
+    let mut line = one_line(&seen);
     let mut cause = error.source();
     while let Some(next) = cause {
         let text = next.to_string();
-        if !line.contains(&text) {
+        if !seen.contains(&text) {
+            seen.push_str(": ");
+            seen.push_str(&text);
             line.push_str(": ");
-            line.push_str(&text);
+            line.push_str(&one_line(&text));
         }
         cause = next.source();
     }
     line
+}
+
+/// `text` with control characters escaped (a newline becomes `\n`), cut once
+/// it reaches [`ERROR_SEGMENT_MAX_BYTES`].
+fn one_line(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(text.len().min(ERROR_SEGMENT_MAX_BYTES + 32));
+    for (at, c) in text.char_indices() {
+        if out.len() >= ERROR_SEGMENT_MAX_BYTES {
+            let _ = write!(out, "...[{} bytes cut]", text.len() - at);
+            break;
+        }
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Keeps the endpoint URL out of every transport error before any caller logs
@@ -219,17 +252,25 @@ pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 /// reqwest quotes the URL it sent (userinfo moved into an `Authorization`
 /// header) in its send, timeout and body errors; alloy wraps those as
 /// `Custom`, and on a non-2xx status copies a failed body read's text into an
-/// HTTP error. The error kind is kept, so retry decisions and the callers'
-/// classification see the same error.
+/// HTTP error. Transport-level bodies, an HTTP error's and a non-JSON 2xx
+/// answer's, are scrubbed of the URL, its request target and its query. The
+/// error kind is kept, so retry decisions and the callers' classification see
+/// the same error.
 ///
-/// Not covered: a server that echoes the request path, or a redirect target,
-/// in an error body or in a JSON-RPC error's message or data (alloy builds
-/// those above this layer), and alloy's DEBUG-level `alloy_transport_http`
-/// span, which records the full URL. Revisit when bumping alloy-transport-http,
-/// whose `reqwest_transport.rs` decides how reqwest errors are wrapped.
+/// Not covered: a JSON-RPC error's message or data and a bad field in a valid
+/// JSON result, both built in alloy's call layer above this one; a body that
+/// quotes only part of the path or a different URL carrying the key, such as a
+/// redirect target on another path, since the scrub replaces exact strings;
+/// and alloy's DEBUG-level `alloy_transport_http` span, which records the full
+/// URL.
+/// [`error_chain`]'s cut bounds their size but does not redact them. Revisit
+/// when bumping alloy-transport-http, whose `reqwest_transport.rs` decides how
+/// reqwest errors and bodies are wrapped.
 #[derive(Clone, Debug)]
 struct RedactUrlLayer {
-    /// The URL as configured and, when it has userinfo, as reqwest quotes it.
+    /// The URL as configured and, when it has userinfo, as reqwest quotes it;
+    /// then its request target, path and query. A string comes before its
+    /// parts, since the scrub replaces in order.
     needles: Arc<[String]>,
 }
 
@@ -239,6 +280,18 @@ impl RedactUrlLayer {
         let mut sent = url.clone();
         if sent.set_username("").is_ok() && sent.set_password(None).is_ok() && sent != *url {
             needles.push(sent.to_string());
+        }
+        // A server may echo only the request target, as an HTML 404 page does.
+        // A bare "/" is never a needle.
+        let target = &url[Position::BeforePath..Position::AfterQuery];
+        if target != "/" {
+            needles.push(target.to_owned());
+        }
+        if url.path() != "/" && url.query().is_some() {
+            needles.push(url.path().to_owned());
+        }
+        if let Some(query) = url.query().filter(|query| !query.is_empty()) {
+            needles.push(query.to_owned());
         }
         Self {
             needles: needles.into(),
@@ -320,6 +373,11 @@ fn redact_url(error: TransportError, needles: &[String]) -> TransportError {
         }) => {
             TransportErrorKind::http_error_with_retry_after(status, scrub(body), Some(retry_after))
         }
+        // A 2xx body that is not JSON, quoted whole in the error.
+        RpcError::DeserError { err, text } => RpcError::DeserError {
+            err,
+            text: scrub(text),
+        },
         other => other,
     }
 }
@@ -625,6 +683,22 @@ mod tests {
             "a 503 stays retryable: {unavailable:?}"
         );
 
+        // A server that echoes only the request target, its path, or its query.
+        for echo in [
+            "<html>Cannot POST /v2/not-a-real-api-key?key=query-secret</html>",
+            "<html>Cannot POST /v2/not-a-real-api-key</html>",
+            "invalid key=query-secret",
+        ] {
+            let echoed = redact_url(
+                TransportErrorKind::http_error(404, echo.into()),
+                &layer.needles,
+            )
+            .to_string();
+            for secret in URL_SECRETS {
+                assert!(!echoed.contains(secret), "{echoed}");
+            }
+        }
+
         let delay = Duration::from_secs(3);
         match redact_url(
             TransportErrorKind::http_error_with_retry_after(
@@ -645,6 +719,31 @@ mod tests {
                 }
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// The transport-level answer to a 2xx body that is not JSON quotes the
+    /// body whole.
+    #[test]
+    fn deser_error_bodies_lose_the_rpc_url() {
+        let url =
+            Url::parse("https://user:hunter2@rpc.example/v2/not-a-real-api-key?key=query-secret")
+                .unwrap();
+        let layer = RedactUrlLayer::new(&url);
+        let error = redact_url(
+            TransportError::deser_err(
+                serde_json::from_str::<serde_json::Value>("<").unwrap_err(),
+                "<html>Cannot POST /v2/not-a-real-api-key?key=query-secret</html>",
+            ),
+            &layer.needles,
+        );
+        assert!(
+            matches!(error, RpcError::DeserError { .. }),
+            "the kind is kept: {error:?}"
+        );
+        let text = error.to_string();
+        for secret in URL_SECRETS {
+            assert!(!text.contains(secret), "{text}");
         }
     }
 
@@ -781,6 +880,27 @@ mod tests {
         assert_eq!(
             error_chain(&Outer(Echo(Leaf))),
             "request failed: leaf failure"
+        );
+    }
+
+    #[test]
+    fn error_chain_is_one_capped_line_per_cause() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("line one\nline two{0}")]
+        struct Leaf(String);
+        #[derive(Debug, thiserror::Error)]
+        #[error("request failed")]
+        struct Outer(#[source] Leaf);
+
+        // Multibyte at the cut, so a cut inside a character would panic.
+        let chain = error_chain(&Outer(Leaf("\u{e9}".repeat(400))));
+        assert!(!chain.contains('\n'), "{chain}");
+        assert!(chain.contains("line one\\nline two"), "{chain}");
+        assert!(chain.ends_with("bytes cut]"), "{chain}");
+        assert!(
+            chain.len() < "request failed: ".len() + ERROR_SEGMENT_MAX_BYTES + 32,
+            "{}",
+            chain.len()
         );
     }
 

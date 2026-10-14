@@ -107,7 +107,7 @@ pub(crate) async fn get_input_added_events_ordered(
 /// `tests/fixtures/l1_partition_vector.json` pins both.
 async fn bisect<T, E, F, Fut>(start: u64, end: u64, mut fetch: F) -> Result<Vec<T>, (u64, E)>
 where
-    E: std::fmt::Display,
+    E: std::error::Error + 'static,
     F: FnMut(u64, u64) -> Fut,
     Fut: Future<Output = Result<Vec<T>, E>>,
 {
@@ -120,7 +120,12 @@ where
         match fetch(from, to).await {
             Ok(chunk) => out.extend(chunk),
             Err(error) if from < to => {
-                tracing::debug!(from, to, %error, "eth_getLogs failed; splitting the range");
+                tracing::debug!(
+                    from,
+                    to,
+                    error = %crate::l1::provider::error_chain(&error),
+                    "eth_getLogs failed; splitting the range"
+                );
                 let middle = from + (to - from) / 2;
                 ranges.push((middle + 1, to));
                 ranges.push((from, middle));
@@ -301,7 +306,7 @@ mod tests {
                 let failed = fails.contains(&(from, to));
                 async move {
                     if failed {
-                        Err("injected failure")
+                        Err(std::io::Error::other("injected failure"))
                     } else {
                         Ok(Vec::<()>::new())
                     }

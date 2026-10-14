@@ -70,22 +70,6 @@ counts, then correct the estimate and check the separately configured
 
 ## Bounded investigations and cleanup
 
-- **L1 error text is neither capped nor single-line** (checked 2026-10-14).
-  alloy's `DeserError` Display is the whole result text, newline included, and
-  for a bad field in a valid JSON result alloy builds it in the call layer,
-  above the transport layers, so `RedactUrlLayer` never sees it; the same holds
-  for JSON-RPC `ErrorResp`, even one sent with a non-2xx status. The
-  transport-level `DeserError` for a non-JSON 2xx body does pass the layer, but
-  `redact_url` leaves it untouched, so an HTML page that echoes the path would
-  carry the key. `HttpError` bodies are uncapped, unlike the watchdog's 200-byte
-  cut. Under split-on-any-error, one malformed log field becomes an uncapped,
-  multi-line WARN line every tick, plus a DEBUG line at every split (`bisect`
-  prints the error directly). Next: cap the length and escape newlines and
-  control characters in `error_chain`, the one place every L1 error becomes
-  text; give `redact_url` an arm that scrubs the transport-level `DeserError`;
-  route the bisect's DEBUG line through `error_chain`. Evidence:
-  [`provider.rs`](../../sequencer/src/l1/provider.rs),
-  [`partition.rs`](../../sequencer/src/l1/partition.rs).
 - **Confirmation watches outlive an RPC outage** (checked 2026-10-13). alloy's
   watch timeout reaps only transactions it has not yet seen
   (`alloy-provider` `heart.rs`), so if the endpoint dies after a batch
