@@ -272,9 +272,10 @@ pub(super) fn load_batch_frames_in(
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{
-        SENDER_A, SENDER_B, local_batch_payload, seed_closed_batches,
+        SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload, seed_closed_batches,
         seed_safe_inputs_with_batch_nonces, temp_db,
     };
+    use crate::clock::unix_now_ms;
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use alloy_primitives::Address;
     use sequencer_core::batch::Batch;
@@ -455,7 +456,7 @@ mod tests {
         let db = temp_db("submitter-frontier-empty");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage
-            .append_safe_inputs(0, &[], SENDER_A, &default_test_protocol())
+            .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
             .expect("record observed safe head");
         let frontier = storage.submitter_frontier().expect("submitter frontier");
         assert_eq!(frontier.safe_block, 0);
@@ -475,7 +476,7 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage.set_batch_tree_anchor(7).expect("anchor at N'=7");
         storage
-            .append_safe_inputs(0, &[], SENDER_A, &default_test_protocol())
+            .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
             .expect("record observed safe head");
         let frontier = storage.submitter_frontier().expect("submitter frontier");
         assert_eq!(frontier.accepted_next_nonce, 7);
@@ -506,22 +507,6 @@ mod tests {
         assert_eq!(frontier.accepted_next_nonce, 2);
     }
 
-    fn default_test_protocol() -> ProtocolTiming {
-        ProtocolTiming {
-            max_wait_blocks: 1200,
-            preemptive_margin_blocks: 75,
-            l1_read_stale_after_blocks: 900,
-            seconds_per_block: 12,
-        }
-    }
-
-    fn unix_now_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    }
-
     #[test]
     fn check_danger_reports_observed_closed_batch_danger() {
         let db = temp_db("check-danger-observed-closed");
@@ -536,7 +521,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 1");
 
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
@@ -576,7 +561,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 1");
 
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
@@ -624,7 +609,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0");
 
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         // Advance safe head so batch 0 is past `danger_threshold` (1125):
         // current=1200 - first_frame=10 = 1190 >= 1125.
         // No safe_input ingested for batch 0, so it stays non-gold.
@@ -668,7 +653,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0; batch 1 is Tip");
 
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let landed = local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
@@ -715,7 +700,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0");
 
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let old_safe_timestamp = 1_000_u64;
         storage
             .append_safe_inputs_with_timestamp(
@@ -744,7 +729,7 @@ mod tests {
     fn check_danger_refuses_when_safe_block_timestamp_is_in_the_future() {
         let db = temp_db("check-danger-future-safe-timestamp");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let now_ms = 1_000_000_u64;
 
         // A full block-time (12 s) ahead of the local clock: unusable. Sub-block
@@ -794,7 +779,7 @@ mod tests {
     fn check_danger_refuses_when_local_progress_timestamp_is_in_the_future() {
         let db = temp_db("check-danger-future-progress");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let now_ms = 1_000_000_u64;
 
         storage
@@ -851,7 +836,7 @@ mod tests {
         storage
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 0");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let now_ms = 1_000_000_u64;
 
         storage
@@ -911,7 +896,7 @@ mod tests {
         let db = temp_db("check-danger-never-synced");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let status = storage
-            .check_danger(&default_test_protocol(), unix_now_ms())
+            .check_danger(&default_protocol_timing(), unix_now_ms())
             .expect("check_danger");
         assert_eq!(status, crate::storage::DangerStatus::L1ViewStale);
     }
@@ -923,7 +908,7 @@ mod tests {
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         storage
             .append_safe_inputs(10, &[], SENDER_A, &protocol)
             .expect("record fresh safe head");
@@ -942,7 +927,7 @@ mod tests {
     fn populate_safe_accepted_batches_resumes_from_latest_row() {
         let db = temp_db("safe-accepted-frontier-resume");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -997,7 +982,7 @@ mod tests {
     fn safe_accepted_frontier_skips_stale_payloads() {
         let db = temp_db("safe-accepted-frontier-skip-stale");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
 
         // Local batch 0 (first frame safe_block=1900) and batch 1 (first frame
         // safe_block=1900). Their landings carry the real wire bytes so the
@@ -1084,7 +1069,7 @@ mod tests {
         // frontier; later syncs stay frozen.
         let db = temp_db("mismatch-divergence");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -1202,7 +1187,7 @@ mod tests {
         // uses anchor=0, so the N' > 0 acceptance path had no coverage.
         let db = temp_db("populate-at-anchor");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let submitter = SENDER_A;
 
         // Root the tree at N' = 7, then build + seal one local batch — it carries
@@ -1266,7 +1251,7 @@ mod tests {
         // (I15) skip arm — the inverse of the foreign-batch freeze test above.
         let db = temp_db("populate-below-anchor");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
         let submitter = SENDER_A;
         storage.set_batch_tree_anchor(7).expect("anchor at N'=7");
 
@@ -1363,7 +1348,7 @@ mod tests {
         storage.insert_invalid_batch(0).expect("invalidate batch 0");
         storage.insert_invalid_batch(1).expect("invalidate batch 1");
         storage
-            .append_safe_inputs(10, &[], SENDER_A, &default_test_protocol())
+            .append_safe_inputs(10, &[], SENDER_A, &default_protocol_timing())
             .expect("record observed safe head");
         storage
             .recover_post_flush(1200)
@@ -1391,7 +1376,7 @@ mod tests {
     fn populate_safe_accepted_batches_skips_duplicate_nonces() {
         let db = temp_db("populate-dup-nonces");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1430,7 +1415,7 @@ mod tests {
     fn populate_safe_accepted_batches_handles_large_nonce_gap() {
         let db = temp_db("populate-nonce-gap");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1458,7 +1443,7 @@ mod tests {
     fn populate_safe_accepted_batches_out_of_order_arrivals_stalls_frontier() {
         let db = temp_db("populate-out-of-order");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_test_protocol();
+        let protocol = default_protocol_timing();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
