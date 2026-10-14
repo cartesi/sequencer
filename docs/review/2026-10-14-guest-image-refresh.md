@@ -4,9 +4,10 @@
 change that moves the template hash, which compares against these values.
 **Retire** this record once that change records its own hashes.
 
-W3b of the [whole-repo review](2026-10-13-whole-repo-review.md) moved the
-template hash once, deliberately, with no intended behavior change: a Rust
-toolchain and dependency refresh followed by guest-crate refactors. What moves
+W3b and W4 of the [whole-repo review](2026-10-13-whole-repo-review.md) moved
+the template hash, deliberately, with no intended behavior change: a Rust
+toolchain and dependency refresh, guest-crate refactors, and W4's comment
+edits. What moves
 the hash, and how a behavior-preserving move is checked, is in
 [`docs/cartesi-machine.md`](../cartesi-machine.md#versions-are-all-or-nothing).
 
@@ -17,8 +18,8 @@ the hash, and how a behavior-preserving move is checked, is in
   --initial-hash` (Sepolia), cartesi-machine 0.21.0, cross 0.2.5. Every value
   below is from a cold build (no `target/` for the guest or its host side),
   with `rust-src` in the cross toolchain (see `docs/cartesi-machine.md`). Two
-  cold builds of the final commit agreed, and so
-  did builds from three checkout paths.
+  cold builds of the W3b final commit (`756a8ac`) agreed, and so did builds
+  from three checkout paths.
 - Behavior: [`tests/fixtures/consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json),
   pinned at `6000e3a` before anything moved and byte-identical at the final
   commit. The workspace tests check it natively at every commit, and
@@ -42,6 +43,7 @@ Devnet initial hash and cycles to the first yield:
 | 11 guest-compiled crates | `fb37bc9` | `0xc1fc8f03cfdb69adb1b9c382fddc27ecad383fcf725e3b1a2d986ef1689f5b1f` | 51248352 |
 | Guest refactors (B6–J5) | `8d03166` | `0xa006cd4d34685b2804737bcef48e3b398999c30081106a5745216b08fdad223b` | 51222421 |
 | 6 updates in the guest's build graph | `711f312` | `0xa4c01357665937d80f006c9c3726c49d0a80fe7aea2d3b8bf2199ea7333d388d` | 51222416 |
+| W4 guest comments and the nonce-scan move | `7dc3fb5` | `0xa0c7296d256b401f4103097a3b0b29105b19215f10dde048f400bb3a820277c9` | 51222416 |
 
 The commits before `6009104` (libtest-mimic, tokio-tungstenite, async-trait)
 and the remaining compatible updates after `711f312` left every artifact
@@ -49,15 +51,18 @@ byte-identical. Among the guest refactors, every commit that touched guest
 source moved the dapp binary, including those whose changed code the guest never
 calls (B6, C3b, J1); the test-only J5 commit and the manifest commit did not.
 `711f312` updates only crates that run on the host inside proc macros and
-bindgen, yet moves the binary. cpufeatures, which only keccak uses and only on
+bindgen, yet moves the binary. W4's guest commits change only comments, apart
+from moving `advance_expected_batch_nonce` out of `sequencer-core` into the
+submitter; the cycle count is unchanged, but comment edits shift the line
+numbers rustc embeds in panic locations, so the image moves. cpufeatures, which only keccak uses and only on
 aarch64 hosts, went with the host-only updates: the x86_64 cross build never
 compiles it.
 
-| Image | Baseline (`6000e3a`) | Final (`756a8ac`) |
+| Image | Baseline (`6000e3a`) | Final (`7dc3fb5`) |
 |---|---|---|
-| devnet dapp sha256 | `9415789ca67687000081ef4038cd6ac7b1508c0f9c2d42db81ee9281c492bee8` | `96a97d65cf45134c47778c03fa0b5239226553a7766fd6f89145961f4975f95b` |
-| Sepolia dapp sha256 | `ca9fd50eda3773c628ef7d5d47eeba532d1b97c22f7e4f7b0a4f01d986482bd7` | `9d8df1e003c3cb11deada2b024957a5eff3a4e425abf480f367ec99f0ed8c79d` |
-| Sepolia initial hash | `0xc6fd1515ba68c7256b16e17ced3bd48f9d5ede5c8079c14729f2ef5275f11457` | `0x3d7adeebdcdc72e7fc5f767eb4568fe46d0ef763f0c26044e9b302962264664a` |
+| devnet dapp sha256 | `9415789ca67687000081ef4038cd6ac7b1508c0f9c2d42db81ee9281c492bee8` | `5b896252a4f327d195acd333c4b75ca61485402823e9e6213c10f3f23a11d201` |
+| Sepolia dapp sha256 | `ca9fd50eda3773c628ef7d5d47eeba532d1b97c22f7e4f7b0a4f01d986482bd7` | `93f056ef4344534c5965d0067dbe0c3ec9dc4e22614416747f5686511a183694` |
+| Sepolia initial hash | `0xc6fd1515ba68c7256b16e17ced3bd48f9d5ede5c8079c14729f2ef5275f11457` | `0x410cc0e128c31d95bb627be9cdb002629de24c48aa44479429951ebf4fa90f31` |
 
 `f0d1ccf` is the last commit that reproduces the baseline image.
 
