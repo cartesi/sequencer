@@ -53,11 +53,12 @@ metadata come from the sequencer; see [application history](../protocol/applicat
 
 ### Determinism
 
-`WalletApp` stores balances and nonces in `HashMap`s, so iteration order
-is nondeterministic. Before encoding:
+`WalletApp` keeps balances and nonces in `BTreeMap`s keyed by `Address`,
+ordered by the 20 address bytes compared lexicographically, so the encoder
+emits:
 
-- `balances` entries are sorted ascending by `address`
-- `nonces` entries are sorted ascending by `address`
+- `balances` entries in ascending `address` byte order
+- `nonces` entries in ascending `address` byte order
 
 This guarantees byte-identical snapshot files for byte-identical logical
 state, regardless of insertion order.
@@ -75,8 +76,8 @@ The decoder rejects:
 - Zero `executed_input_count` with a nonzero `last_executed_safe_block`.
 
 Duplicate checks prevent an entry from silently overwriting another during
-restore. The decoder accepts unique entries in any order; encoding the restored
-state sorts them. Deterministic emitted bytes do not imply that the decoder
+restore. The decoder accepts unique entries in any order; re-encoding the
+restored state emits them in address order. Deterministic emitted bytes do not imply that the decoder
 accepts only that ordering.
 
 ## Versioning

@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -57,8 +57,10 @@ impl Default for WalletConfig {
 #[derive(Debug, Clone)]
 pub struct WalletApp {
     config: WalletConfig,
-    balances: HashMap<Address, U256>,
-    nonces: HashMap<Address, u32>,
+    // BTreeMap: iteration is ascending address bytes, the snapshot's
+    // canonical entry order.
+    balances: BTreeMap<Address, U256>,
+    nonces: BTreeMap<Address, u32>,
     execution_progress: ApplicationProgress,
 }
 
@@ -88,8 +90,8 @@ impl WalletApp {
     pub fn new(config: WalletConfig) -> Self {
         Self {
             config,
-            balances: HashMap::new(),
-            nonces: HashMap::new(),
+            balances: BTreeMap::new(),
+            nonces: BTreeMap::new(),
             execution_progress: ApplicationProgress::default(),
         }
     }
@@ -101,8 +103,8 @@ impl WalletApp {
     /// not a panic escaping `from_dump`'s `Result`.
     pub(crate) fn from_snapshot_parts(
         config: WalletConfig,
-        balances: HashMap<Address, U256>,
-        nonces: HashMap<Address, u32>,
+        balances: BTreeMap<Address, U256>,
+        nonces: BTreeMap<Address, u32>,
         executed_input_count: u64,
         last_executed_safe_block: u64,
     ) -> Result<Self, AppError> {
@@ -138,12 +140,12 @@ impl WalletApp {
     }
 
     #[cfg(test)]
-    pub(crate) fn balances_mut(&mut self) -> &mut HashMap<Address, U256> {
+    pub(crate) fn balances_mut(&mut self) -> &mut BTreeMap<Address, U256> {
         &mut self.balances
     }
 
     #[cfg(test)]
-    pub(crate) fn nonces_mut(&mut self) -> &mut HashMap<Address, u32> {
+    pub(crate) fn nonces_mut(&mut self) -> &mut BTreeMap<Address, u32> {
         &mut self.nonces
     }
 

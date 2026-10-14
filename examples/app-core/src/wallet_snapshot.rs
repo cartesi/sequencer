@@ -10,7 +10,7 @@
 //! Golden bytes: `tests/fixtures/wallet_snapshot_empty.hex` (shared with
 //! Rust and Lua parity tests).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, U256};
 use ssz::{Decode, Encode};
@@ -42,25 +42,24 @@ struct WalletSnapshot {
     pub last_executed_safe_block: u64,
 }
 
-/// Deterministic SSZ bytes for `app`'s logical state (sorted map entries).
+/// Deterministic SSZ bytes for `app`'s logical state; entries come out in
+/// ascending address order (`BTreeMap` iteration order).
 pub fn encode(app: &WalletApp) -> Vec<u8> {
-    let mut balances: Vec<_> = app
+    let balances: Vec<_> = app
         .balances_iter()
         .map(|(address, balance)| SnapshotBalance {
             address: address.into_array(),
             balance_be: balance.to_be_bytes(),
         })
         .collect();
-    balances.sort_unstable_by_key(|entry| entry.address);
 
-    let mut nonces: Vec<_> = app
+    let nonces: Vec<_> = app
         .nonces_iter()
         .map(|(address, nonce)| SnapshotNonce {
             address: address.into_array(),
             nonce: *nonce,
         })
         .collect();
-    nonces.sort_unstable_by_key(|entry| entry.address);
 
     WalletSnapshot {
         erc20_portal_address: app.config().erc20_portal_address.into_array(),
@@ -80,7 +79,7 @@ pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
         reason: format!("snapshot decode failed: {e:?}"),
     })?;
 
-    let mut balances = HashMap::with_capacity(decoded.balances.len());
+    let mut balances = BTreeMap::new();
     for entry in decoded.balances {
         let address = Address::from(entry.address);
         let balance = U256::from_be_bytes(entry.balance_be);
@@ -91,7 +90,7 @@ pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
         }
     }
 
-    let mut nonces = HashMap::with_capacity(decoded.nonces.len());
+    let mut nonces = BTreeMap::new();
     for entry in decoded.nonces {
         let address = Address::from(entry.address);
         if nonces.insert(address, entry.nonce).is_some() {
