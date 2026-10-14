@@ -47,18 +47,12 @@ application-visible clock. Safe-head publication is best effort: if the node
 exposes a multi-block jump, the sequencer creates one frame at the observed tip
 and never fabricates intermediate frames.
 
-Soft confirmations are an **optimistic prediction**: the sequencer also
-cross-checks every at/above-anchor batch its off-chain scheduler simulation
-accepts on L1 against the batch it sealed locally (a content-identity check).
-When a foreign or byte-different landing reaches L1 *safe* finality and the
-input reader ingests it, the same transaction records canonical divergence and
-freezes the accepted frontier; the runtime stops when it next observes that
-fact, and every later boot refuses until an operator performs cockroach
-recovery. User-op chunks committed before runtime observation may still
-acknowledge and be rolled back. This check is a narrow zombie/foreign-batch
-backstop, not proof that arbitrary application or scheduler divergence cannot
-exist, and it does not replace the watchdog. The mechanism and its bounds are
-recorded in [`docs/invariants.md`](docs/invariants.md) (I9 and I15).
+Soft confirmations are an **optimistic prediction**. A narrow content-identity
+check compares each batch that L1 accepts at the sequencer's nonces with the
+batch it sealed locally. A foreign or byte-different landing freezes the
+accepted frontier and stops the runtime, and every later boot refuses until an
+operator performs cockroach recovery. The check does not replace the watchdog;
+its bounds are recorded in [`docs/invariants.md`](docs/invariants.md) (I9 and I15).
 
 ## Recovery
 
