@@ -156,10 +156,6 @@ impl WalletApp {
         .expect("coherent progress");
     }
 
-    pub fn last_executed_safe_block(&self) -> u64 {
-        self.execution_progress.last_executed_safe_block()
-    }
-
     fn balance_of(&self, addr: &Address) -> U256 {
         *self.balances.get(addr).unwrap_or(&U256::ZERO)
     }
@@ -199,17 +195,6 @@ impl WalletApp {
             .checked_add(1)
             .expect("wallet nonce overflow: no canonical successor");
         self.nonces.insert(addr, next);
-    }
-
-    fn decode_portal_erc20_deposit(
-        portal_address: Address,
-        input: &sequencer_core::l2_tx::DirectInput,
-    ) -> Result<Option<Erc20Deposit>, rollups_types::Erc20DepositDecodeError> {
-        if input.sender != portal_address {
-            return Ok(None);
-        }
-
-        Erc20Deposit::decode(&input.payload).map(Some)
     }
 }
 
@@ -312,7 +297,10 @@ impl Application for WalletApp {
         input: &sequencer_core::l2_tx::DirectInput,
     ) -> Result<AppOutputs, AppError> {
         let mut outputs = Vec::new();
-        match Self::decode_portal_erc20_deposit(self.config.erc20_portal_address, input) {
+        let deposit = (input.sender == self.config.erc20_portal_address)
+            .then(|| Erc20Deposit::decode(&input.payload))
+            .transpose();
+        match deposit {
             Ok(Some(deposit)) => {
                 if deposit.token == self.config.supported_erc20_token {
                     self.credit(deposit.sender, deposit.value);

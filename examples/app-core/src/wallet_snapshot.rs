@@ -20,19 +20,19 @@ use crate::application::{WalletApp, WalletConfig};
 use sequencer_core::application::{AppError, Application};
 
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
-pub struct SnapshotBalance {
+struct SnapshotBalance {
     pub address: [u8; 20],
     pub balance_be: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
-pub struct SnapshotNonce {
+struct SnapshotNonce {
     pub address: [u8; 20],
     pub nonce: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
-pub struct WalletSnapshot {
+struct WalletSnapshot {
     pub erc20_portal_address: [u8; 20],
     pub supported_erc20_token: [u8; 20],
     pub sequencer_address: [u8; 20],
