@@ -51,14 +51,13 @@ the Ethereum node's pending transactions.
 
 ## Why this policy
 
-The [#34 review history](https://github.com/cartesi/sequencer/pull/34) explored
-asymmetric bumps, remembered suffix hashes, compounding fee floors, and a
-market-relative ceiling. Those implementations introduced invalid fee pairs,
-payload/hash-association bugs, funding pressure, and recovery incompatibility.
-[#35](https://github.com/cartesi/sequencer/pull/35) retains the independent
-gas-estimation and flusher fee-validity fixes while removing that escalation
-state. These failures motivate the current choice; they do not prove that
-every bounded replacement policy would be unsound.
+Escalating replacements were tried in
+[#34](https://github.com/cartesi/sequencer/pull/34): asymmetric bumps,
+remembered suffix hashes, compounding fee floors, and a market-relative
+ceiling. They introduced invalid fee pairs, payload/hash-association bugs,
+funding pressure, and recovery incompatibility. These failures motivate the
+current choice; they do not prove that every bounded replacement policy would
+be unsound.
 
 Revisit with evidence of sustained batch delays, recovery frequency or
 duration, and submission cost. Record the logs and affected L1 block range.
