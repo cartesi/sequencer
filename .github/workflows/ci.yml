@@ -119,29 +119,6 @@ jobs:
       - name: Lint OpenAPI definition
         run: npx --yes "@redocly/cli@${REDOCLY_CLI_VERSION}" lint openapi.yaml
 
-  canonical-guest:
-    runs-on: ubuntu-latest
-    needs: rust
-    timeout-minutes: 45
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-
-      - name: Load toolchain pins
-        uses: ./.github/actions/load-toolchain-pins
-
-      - name: Setup guest toolchain
-        uses: ./.github/actions/setup-guest-toolchain
-
-      - name: Download canonical app deps
-        run: just canonical download-deps
-
-      - name: Run guest tests
-        run: just canonical-test-guest
-
   rollups-e2e:
     runs-on: ubuntu-latest
     needs: rust
@@ -161,15 +138,17 @@ jobs:
         with:
           install-foundry: "true"
 
+      # setup-guest-toolchain already ran apt-get update.
       - name: Install native test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y faketime libfaketime libclang-dev
+        run: sudo apt-get install -y faketime libfaketime libclang-dev libcurl4-openssl-dev build-essential pkg-config
 
-      - name: Build watchdog Lua deps
-        run: |
-          sudo apt-get install -y libcurl4-openssl-dev build-essential pkg-config
-          just watchdog-lua-deps
+      - name: Download canonical app deps
+        run: just canonical download-deps
+
+      # Builds the devnet machine image, which the e2e recipe's
+      # ensure-machine-image then reuses, so CI builds it once.
+      - name: Run guest tests
+        run: just canonical-test-guest
 
       - name: Run rollups E2E tests (Rust and C hosts)
         run: just test-rollups-e2e
