@@ -60,11 +60,6 @@ pub(crate) enum GetLogsError {
 /// sub-ranges are concatenated and a single `eth_getLogs` may itself reorder —
 /// so consumers go through [`get_input_added_events_ordered`], which folds the
 /// L1-order sort in; this raw form is the partition primitive.
-///
-/// Depth-first, left-first worklist (push right, then push left): the query
-/// order and the concatenation order match the watchdog's recursive `go` and
-/// [`simulate_partitioned_get_logs`] exactly. A terminal error short-circuits
-/// — once one sub-range fails for good, the ranges after it are not queried.
 async fn get_input_added_events(
     provider: &impl Provider,
     app_address_filter: Address,
@@ -73,20 +68,45 @@ async fn get_input_added_events(
     end_block: u64,
     long_block_range_error_codes: &[String],
 ) -> Result<Vec<(InputAdded, alloy::rpc::types::Log)>, ContractError> {
-    let mut logs = Vec::new();
+    bisect_block_range(
+        start_block,
+        end_block,
+        |e| should_retry_with_partition(e, long_block_range_error_codes),
+        |from, to| {
+            let event = Event::new_sol(provider, input_box_address)
+                .from_block(from)
+                .to_block(to)
+                .event(InputAdded::SIGNATURE)
+                .topic1(app_address_filter.into_word());
+            async move { event.query().await }
+        },
+    )
+    .await
+}
+
+/// Query `[start_block, end_block]`, splitting a range in half whenever its
+/// error is `splittable` (and it spans more than one block).
+///
+/// Depth-first, left-first worklist (push right, then push left): the query
+/// order and the concatenation order match the watchdog's recursive `scan`
+/// (`watchdog/l1.lua`) and [`simulate_partitioned_get_logs`] exactly. A
+/// terminal error short-circuits — once one sub-range fails for good, the
+/// ranges after it are not queried.
+async fn bisect_block_range<T, E, Fut>(
+    start_block: u64,
+    end_block: u64,
+    mut splittable: impl FnMut(&E) -> bool,
+    mut query: impl FnMut(u64, u64) -> Fut,
+) -> Result<Vec<T>, E>
+where
+    Fut: Future<Output = Result<Vec<T>, E>>,
+{
+    let mut items = Vec::new();
     let mut ranges = vec![(start_block, end_block)];
     while let Some((from, to)) = ranges.pop() {
-        let event = Event::new_sol(provider, input_box_address)
-            .from_block(from)
-            .to_block(to)
-            .event(InputAdded::SIGNATURE)
-            .topic1(app_address_filter.into_word());
-
-        match event.query().await {
-            Ok(chunk) => logs.extend(chunk),
-            Err(e)
-                if from < to && should_retry_with_partition(&e, long_block_range_error_codes) =>
-            {
+        match query(from, to).await {
+            Ok(chunk) => items.extend(chunk),
+            Err(e) if from < to && splittable(&e) => {
                 let middle = from + (to - from) / 2;
                 ranges.push((middle + 1, to));
                 ranges.push((from, middle));
@@ -94,7 +114,7 @@ async fn get_input_added_events(
             Err(e) => return Err(e),
         }
     }
-    Ok(logs)
+    Ok(items)
 }
 
 fn should_retry_with_partition(err: &ContractError, codes: &[String]) -> bool {
