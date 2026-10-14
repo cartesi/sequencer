@@ -115,7 +115,7 @@ application checkpoint and L1. The checkpoint must be trusted independently of
 the faulty local state. Historical inputs, including malformed batches, receive
 the canonical scheduler's normal treatment during replay.
 
-This is **not** a prohibition on checking. Internal invariants are enforced loudly wherever a check is near-free — the type system, SQL constraints and triggers, boundary assertions — because failing loud preserves safety, while a silently-tolerated bug that externalizes (a signed batch, an ack, a feed event) is state divergence: as severe as theft and undefendable at runtime. Loud failure is not automatically self-healing: transient faults may clear on restart, but persistent invalid state is terminal and may require inspection or cockroach recovery. The rule, in short: **assert real invariants, fail loud, never absorb silently, never handle gracefully.** The decision test and the register of cross-module invariants live in [`docs/invariants.md`](../invariants.md).
+This is **not** a prohibition on checking: internal invariants are asserted loudly wherever a check is near-free (types, SQL constraints and triggers, boundary assertions). The [check policy](../invariants.md#the-check-policy-fail-loud) owns the rule, its reasons, and the decision test.
 
 Inputs from untrusted actors are validated rigorously, as ever.
 
@@ -221,4 +221,4 @@ For each code path under review:
 ## Related documents
 
 - [`../recovery/README.md`](../recovery/README.md) — recovery design, TLA+ formal verification
-- [`../../AGENTS.md`](../../AGENTS.md) — architecture, coding conventions, hot-path invariants
+- [`../../AGENTS.md`](../../AGENTS.md) — architecture map, conventions, and working rules
