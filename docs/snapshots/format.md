@@ -60,9 +60,10 @@ is nondeterministic. Before encoding:
 - `nonces` entries are sorted ascending by `address`
 
 This guarantees byte-identical snapshot files for byte-identical logical
-state, regardless of insertion order. Tests assert this property by
-calling `create_dump` twice on the same `WalletApp` and comparing the
-resulting state files for byte equality.
+state, regardless of insertion order.
+`encode_emits_entries_in_ascending_address_order`
+(`examples/app-core/src/wallet_snapshot.rs`) pins the order with entries
+inserted out of order.
 
 ### Decode Rules
 

@@ -881,48 +881,6 @@ mod tests {
     }
 
     #[test]
-    fn create_dump_produces_deterministic_bytes() {
-        // Insert in scrambled order so the HashMap's non-deterministic
-        // iteration order is exercised. The encoder must sort to make
-        // the resulting bytes stable; without sorting, two `create_dump`
-        // calls on the same logical state could produce different files.
-        let mut app = WalletApp::new(WalletConfig::default());
-        app.balances.insert(
-            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            U256::from(1_u64),
-        );
-        app.balances.insert(
-            address!("0x1111111111111111111111111111111111111111"),
-            U256::from(2_u64),
-        );
-        app.balances.insert(
-            address!("0x5555555555555555555555555555555555555555"),
-            U256::from(3_u64),
-        );
-        app.nonces
-            .insert(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), 7);
-        app.nonces
-            .insert(address!("0x1111111111111111111111111111111111111111"), 8);
-        app.set_executed_input_count(99);
-
-        let prefix_a = temp_dump_prefix();
-        let prefix_b = temp_dump_prefix();
-        app.create_dump(&prefix_a).expect("first dump");
-        app.create_dump(&prefix_b).expect("second dump");
-
-        let bytes_a = std::fs::read(WalletApp::state_file_in_dump(&prefix_a)).expect("read a");
-        let bytes_b = std::fs::read(WalletApp::state_file_in_dump(&prefix_b)).expect("read b");
-
-        std::fs::remove_dir_all(&prefix_a).expect("cleanup a");
-        std::fs::remove_dir_all(&prefix_b).expect("cleanup b");
-
-        assert_eq!(
-            bytes_a, bytes_b,
-            "create_dump must produce byte-identical files for identical logical state"
-        );
-    }
-
-    #[test]
     fn from_dump_rejects_malformed_bytes() {
         let prefix = temp_dump_prefix();
         std::fs::create_dir_all(&prefix).expect("mkdir");

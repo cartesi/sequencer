@@ -157,4 +157,50 @@ mod tests {
         let restored = decode(&bytes).expect("decode snapshot");
         assert_eq!(encode(&restored), bytes);
     }
+
+    #[test]
+    fn encode_emits_entries_in_ascending_address_order() {
+        // These rank differently under byte order, little-endian chunks and
+        // reversed bytes, so only byte-lexicographic order passes.
+        let first_byte = address!("0x0100000000000000000000000000000000000000");
+        let second_byte = address!("0x0002000000000000000000000000000000000000");
+        let last_byte = address!("0x00000000000000000000000000000000000000ff");
+        let tail_chunk = address!("0x0000000000000000000000000000000000000100");
+        let config = WalletConfig::sepolia();
+        let mut app = WalletApp::new(config);
+        for (address, balance) in [
+            (first_byte, 1_u64),
+            (last_byte, 2),
+            (second_byte, 3),
+            (tail_chunk, 4),
+        ] {
+            app.balances_mut().insert(address, U256::from(balance));
+        }
+        app.nonces_mut().insert(first_byte, 7);
+        app.nonces_mut().insert(last_byte, 8);
+
+        let balance = |address: Address, value: u64| SnapshotBalance {
+            address: address.into_array(),
+            balance_be: U256::from(value).to_be_bytes(),
+        };
+        let nonce = |address: Address, nonce: u32| SnapshotNonce {
+            address: address.into_array(),
+            nonce,
+        };
+        let expected = WalletSnapshot {
+            erc20_portal_address: config.erc20_portal_address.into_array(),
+            supported_erc20_token: config.supported_erc20_token.into_array(),
+            sequencer_address: config.sequencer_address.into_array(),
+            balances: vec![
+                balance(last_byte, 2),
+                balance(tail_chunk, 4),
+                balance(second_byte, 3),
+                balance(first_byte, 1),
+            ],
+            nonces: vec![nonce(last_byte, 8), nonce(first_byte, 7)],
+            executed_input_count: 0,
+            last_executed_safe_block: 0,
+        };
+        assert_eq!(encode(&app), expected.as_ssz_bytes());
+    }
 }
