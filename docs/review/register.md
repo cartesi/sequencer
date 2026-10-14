@@ -247,6 +247,34 @@ have lease/GC coverage. If restart cost becomes a requirement, add an assertion
 that distinguishes restoring a dump from a correct but expensive genesis
 replay; no new snapshot lifecycle is implied.
 
+## Canonical rules open for the C++ port
+
+The [scheduler spec](../protocol/scheduler-semantics.md) marks these rules
+**pending**. Each changes the canonical machine image or its wire format, so
+they are agreed with the port's author. The wire-format bump ships first, on
+its own, after draining sealed batches and before the first production deploy;
+the rest ship in the port's image. Checked 2026-10-14 at `32bf8de`;
+evidence: the spec's links and
+[`consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json).
+
+- **Signature acceptance set.** The guest and `POST /tx` accept every `v ≥ 35`
+  and the high-`s` twin, as alloy does. Proposed: `v ∈ {27, 28}` and low `s`
+  only.
+- **Out-of-range frame fee.** A `fee_price` above `MAX_EXPONENT` halts the
+  machine once an op reaches the wallet's fee conversion. Proposed: reject such
+  a batch structurally.
+- **Empty batches** are valid at any age and consume a nonce, though the
+  sequencer never sends one. Reject them only if the port forces a new image
+  anyway.
+- **Wire format.** A fixed 65-byte signature field, with the
+  [SSZ overhead](#batch-size-accounting-omits-ssz-overhead) fix; drain sealed
+  batches before the switch.
+- **Riding the port's image:** the
+  [fee table](../plans/2026-07-coordination-tracks.md#track-5--fee-exponentiation-lut),
+  the [fridge bound](#bound-the-canonical-direct-input-fridge), and a setup check
+  of the guest's compiled `sequencer_address`. With them come versioned gate
+  and signature vectors, adding the unpinned `s ≥ n` and `v` from 29 to 34.
+
 ## Integration work owned elsewhere
 
 - [Track 3 follow-ups](../plans/2026-07-track3-feed-replay-design.md):

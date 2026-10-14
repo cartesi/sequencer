@@ -1,138 +1,189 @@
 # Scheduler acceptance semantics
 
-The canonical ordering rule. The on-chain scheduler reads a stream of L1 safe
-inputs and folds them into application state in one deterministic order. Every
-other component that *predicts* that order — the gold frontier, the inclusion
-lane, the recovery fold — must reproduce this algorithm exactly. Disagreement is
-silent scheduler/sequencer divergence, the most severe failure in the system
-([I1](../invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)).
-
-This document **owns** that algorithm. [`AGENTS.md`](../../AGENTS.md) §"Sequencer /
-Scheduler Duality" is the map; this is the detail. The reference implementation
-is [`Scheduler<A>`](../../sequencer-core/src/scheduler/mod.rs) — the same source
-compiled into the on-chain canonical machine and run bare-metal by the recovery
-fold, so those two targets agree *by construction*. This prose is the intended
-protocol contract; the reference implementation embodies it but remains code
-that can contain bugs and require hardening.
-
----
+The canonical scheduler folds an application's L1 inputs, in L1 order, into
+application state. This page specifies that fold for anyone who reimplements
+it. The reference is [`Scheduler<A>`](../../sequencer-core/src/scheduler/mod.rs),
+run in the canonical machine by the [canonical-app harness](../../examples/canonical-app/src/scheduler/mod.rs).
+This text is the contract and the reference can have bugs, so report any
+disagreement. The [application contract](application-contract.md) owns what
+the application does with each input. Rules marked **pending** describe the
+reference today; changing one changes the canonical machine image or its wire
+format, so they are settled with the C++ port's author
+([register](../review/register.md#canonical-rules-open-for-the-c-port)).
 
 ## The one stream, the one classification
 
-The scheduler consumes `InputAdded` events from the InputBox in L1 order. Each
-event carries an authenticated `msg_sender`. Classification is **by sender
-address, never by a tag byte** ([`process_input`](../../sequencer-core/src/scheduler/mod.rs)):
+Each input is a Cartesi Rollups `EvmAdvance` from the InputBox. The scheduler
+reads its `msgSender`, its `blockNumber` (the *inclusion block*), its `chainId`
+and `appContract` (the signature domain), and its `payload`. It classifies by
+sender only, never by payload content:
 
-| Sender | Treated as | Effect |
-|---|---|---|
-| `== sequencer_address` | a **batch** (SSZ-encoded `Batch`) | folded through the acceptance algorithm below |
-| anything else | a **direct input** (deposit) | appended to the *fridge* (the direct-input FIFO), drained later |
+- `msgSender == sequencer_address`: the payload is a **batch**.
+- Any other sender: a **direct input**, appended unchanged to the *fridge*,
+  the FIFO of directs not yet executed.
 
 `sequencer_address` is deployment data compiled into the canonical machine. It
 must equal the batch-submitter address that `setup` pins; nothing checks this
-at runtime. If they differ, the machine treats every sequencer batch as a
-direct input while the sequencer's own acceptance view still reports the
-batches accepted, so only a watchdog comparison reveals it.
+at runtime. If they differ, the machine treats every batch as a direct input
+while the sequencer still reports its batches accepted, so only a watchdog
+comparison reveals it.
 
-The payload is opaque to classification; app-specific decoding happens inside
-the `Application::apply_direct_input` hook, reached through
-the shared `execute_direct_input` boundary (see the
-[application contract](application-contract.md)).
+The scheduler's state is `next_batch_nonce` (`u64`, 0 at genesis), the fridge,
+and the application, which holds its executed-input count and clock. Nothing
+else carries over between inputs: no earlier batch's `safe_block` is kept. The
+fridge has no size bound (**pending**).
 
----
+## Wire format
 
-## The algorithm (`process_input`)
+A batch payload is the SSZ encoding of `Batch`
+([`batch.rs`](../../sequencer-core/src/batch.rs)), fields in this order:
 
-Every input — batch or direct — first runs the **censorship backstop**, then is
-classified.
-
-```
-process_input(input):
-  1. force_execute_overdue(input.inclusion_block)   ── backstop, runs for EVERY input
-  2. if input.sender != sequencer_address:
-         fridge.push_back(input)                    ── DirectEnqueued
-     else:
-         process_batch_payload(input)               ── the acceptance algorithm
+```text
+Batch      { nonce: uint64, frames: List[Frame] }
+Frame      { user_ops: List[WireUserOp], safe_block: uint64, fee_price: uint16 }
+WireUserOp { nonce: uint32, max_fee: uint16, data: List[uint8], signature: List[uint8] }
 ```
 
-### Step 1 — Force-execute overdue directs (the backstop)
+Integers are little-endian. Each variable-size field has a 4-byte offset in its
+container's fixed part, and the variable parts follow in field order. A list of
+containers starts with one 4-byte offset per element. Lists have no length
+limit. Decoding is strict: offsets must start right after the fixed part, never
+decrease and stay in bounds, so only the canonical encoding of a `Batch`
+decodes, and re-encoding returns the same bytes.
+`max_fee` and `fee_price` are fee exponents ([constants](#constants)). A
+`signature` of any length decodes, but only 65 bytes can recover a sender; a
+fixed 65-byte field is **pending**.
 
-Before *anything* else, drain every fridge direct that has gone **overdue**:
-`current_block − direct.inclusion_block ≥ MAX_WAIT_BLOCKS`
-([`force_execute_overdue`](../../sequencer-core/src/scheduler/mod.rs)). This is
-the censorship-resistance guarantee: a direct cannot be held in the fridge
-forever by a sequencer that freezes `safe_block` or stops submitting batches —
-once it ages out, it executes regardless of any frame. It runs on every input
-tick (even a malformed batch advances `current_block` and can trip the
-backstop). Drained directs execute in FIFO (ascending `inclusion_block`) order.
+## User-op signatures
 
-### Step 2 — Batch acceptance (`process_batch_payload`)
+A user op signs the EIP-712 struct `UserOp(uint32 nonce,uint16 max_fee,bytes data)`
+([`user_op.rs`](../../sequencer-core/src/user_op.rs)) under the domain
+`EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)`:
+name `CartesiAppSequencer`, version `1`, the input's `chainId`, its
+`appContract` as `verifyingContract`, and no salt
+([`build_input_domain`](../../sequencer-core/src/lib.rs)). The sender is not
+signed; it is recovered from `r ‖ s ‖ v` (alloy's `Signature::from_raw` and
+`recover_address_from_prehash`), and any failure drops the op:
 
-A batch from the sequencer address runs this gauntlet, in order. The first
-failing gate decides the outcome; only `BatchExecuted` (including the empty-batch
-case) **consumes the nonce**.
+1. The signature must be 65 bytes, and `v` must be 0, 1, 27, 28 or at least 35.
+   The y-parity is `v` for 0 and 1; for `v ≥ 27` it is 1 when `v` is even,
+   else 0.
+2. `r` and `s` must lie in `[1, n − 1]`, where `n` is the secp256k1 order.
+3. If `s > n / 2`, `s` becomes `n − s` and the parity flips, so a high-`s`
+   signature and its low-`s` twin of opposite parity recover the same sender.
+4. The sender is the address of the public key recovered from `(r, s, parity)`
+   and the EIP-712 signing hash.
 
-| # | Gate | On failure | Nonce? |
+This acceptance set is the library's, pinned on both the batch path and
+`POST /tx` by the signature vectors except for `s ≥ n` and `v` from 29 to 34;
+it is **pending**. Batches the sequencer
+builds carry `v ∈ {27, 28}`, but keep a user's `s` as signed.
+
+## Processing an input
+
+Every input first runs the **censorship backstop**: pop and execute directs
+from the front of the fridge while
+`input.inclusion_block − front.inclusion_block ≥ MAX_WAIT_BLOCKS`. This bounds how
+long a sequencer that stops submitting, or freezes `safe_block`, can hold a
+direct back. Then a direct joins the fridge, and a batch runs these gates in
+order; the first that applies decides the outcome:
+
+| # | Gate | Outcome | `next_batch_nonce` |
 |---|---|---|---|
-| a | SSZ-decode the payload as `Batch` | `BatchRejected(DecodeFailed)` | not consumed |
-| b | `batch.nonce == next_expected_batch_nonce` | `BatchRejected(WrongNonce)` | not consumed |
-| c | *empty frames?* → accept as a no-op | `BatchExecuted` | **consumed** |
-| d | structural frame check (below) | `BatchRejected(SafeBlockAboveInclusionBlock \| NonMonotonicSafeBlocks)` | not consumed |
-| e | staleness: `inclusion_block − frames[0].safe_block ≥ MAX_WAIT_BLOCKS` | `BatchSkippedStale` | **not consumed** |
-| f | execute every frame (below) | `BatchExecuted` | **consumed** |
+| a | payload does not SSZ-decode as `Batch` | rejected | kept |
+| b | `batch.nonce != next_batch_nonce` | rejected | kept |
+| c | `frames` is empty | executed, as a no-op | +1 |
+| d | frame structure is invalid (below) | rejected | kept |
+| e | `inclusion_block − frames[0].safe_block ≥ MAX_WAIT_BLOCKS` | skipped as stale | kept |
+| f | otherwise: execute every frame (below) | executed | +1 |
 
-**Gate d — structural frame check**
-([`batch_reject_reason_for_block`](../../sequencer-core/src/scheduler/mod.rs)):
+Ages saturate at zero. An empty batch is valid at any age, since it has no
+first frame (**pending**). Gate d rejects a batch whose frames include a
+`safe_block` above `inclusion_block`, or a `safe_block` lower than the previous
+frame's. It looks only inside the batch: a later batch may start below an
+earlier one's last `safe_block`, and its user ops then see the lower value. A
+stale batch keeps the nonce, so every later batch fails gate b until one
+reuses that nonce, as a batch rebuilt after sequencer recovery does. A
+rejected and a skipped batch have the same effect: no state change, nonce
+kept. The reject reason the reference reports is diagnostic.
 
-- every frame's `safe_block ≤ inclusion_block` (a frame cannot claim to have
-  accounted for L1 state it was included before) — else
-  `SafeBlockAboveInclusionBlock`;
-- frame `safe_block`s are **non-decreasing** across the batch — else
-  `NonMonotonicSafeBlocks`.
+### Frame execution (gate f)
 
-**Gate e — staleness** is measured against the **first** frame only
-([`age_exceeds`](../../sequencer-core/src/protocol.rs), which the off-chain
-mirror [`ProtocolTiming::is_scheduler_stale`](../../sequencer-core/src/protocol.rs)
-also calls). A
-stale batch is a **true no-op in nonce space**: the expected nonce does *not*
-advance, so the next batch — including a freshly-rebuilt one reusing the same
-nonce after recovery — is what the scheduler accepts next. This is the
-mechanism behind cascading invalidation (AGENTS.md §"Cascading invalidation").
+For each frame, in order:
 
-### Step 2f — Frame execution order (drain-before-ops)
+1. **Drain covered directs.** Pop and execute directs from the front of the
+   fridge while their `inclusion_block ≤ frame.safe_block`. The `safe_block` is
+   the sequencer's claim that it accounted for every direct up to that block;
+   the scheduler enforces the drain whatever the sequencer did.
+2. **Execute the user ops** in order. Skip an op, with no effect, if (checked
+   in this order) its sender cannot be recovered, `max_fee < frame.fee_price`,
+   the application rejects it at fee `frame.fee_price`, or its `nonce` is
+   `u32::MAX`, which has no successor. Otherwise apply it with fee
+   `frame.fee_price` and clock `frame.safe_block`
+   ([`validate_and_execute_user_op`](../../sequencer-core/src/application/mod.rs)).
 
-For each frame, in order ([`process_batch_payload`](../../sequencer-core/src/scheduler/mod.rs)):
+The scheduler does not range-check `fee_price`; the reference wallet halts on
+converting an exponent above `MAX_EXPONENT` (**pending**).
 
-1. **Drain covered directs first**: pop every fridge direct with
-   `inclusion_block ≤ frame.safe_block` and execute it
-   ([`drain_directs_safe_at`](../../sequencer-core/src/scheduler/mod.rs)). The
-   `safe_block` is the sequencer's commitment that it has accounted for all
-   directs up to that block; the scheduler enforces the drain regardless.
-2. **Then execute the frame's user ops**, each through the single entry point
-   [`validate_and_execute_user_op`](../../sequencer-core/src/application/mod.rs)
-   with `(frame.fee_price, frame.safe_block)`. A user op is silently skipped
-   (no state change, no output) when its signature is unrecoverable, when app
-   `validate_user_op` rejects it, or when a protocol guard fails
-   (`max_fee ≥ fee_price`, or a nonce of `u32::MAX`, which has no
-   successor) — the fold is a pure deterministic function and emits no
-   diagnostics at the library seam.
+## Outputs and the executed-input count
 
-An `AppError` from either execution path is fatal: there is no canonical
-successor to the partially evaluated input, so the canonical harness,
-inclusion lane, catch-up, and recovery fold all stop rather than continue.
+An input's outputs are the application's notices and vouchers in execution
+order: overdue directs, then each frame's drained directs and applied ops.
+Reports are diagnostics outside the outputs tree: the reference reports a
+rejected batch with one fixed string and a stale skip not at all, and the
+[golden guest tests](../../examples/canonical-test/src/golden.rs) ignore them.
 
-This ordering — directs ≤ `S_K` then ops validated on top of them — is exactly
-what the inclusion lane writes into frame K's wire content
-([I2](../invariants.md#i2-drain-attribution-accumulated-directs-land-in-the-clock-advanced-frame)),
-which is what keeps the off-chain prediction faithful.
+The executed-input count is canonical state too. It advances by one for each
+executed direct and each applied user op, including an app-level no-op or
+business failure, and for nothing else: not for queueing a direct, a skipped
+op, a batch envelope or an empty batch. A rejected or stale batch can still
+advance it through the backstop. The [application contract](application-contract.md#4-canonical-history-cursor-executed_input_count)
+owns the count; the [history contract](application-history.md) owns how
+catch-up, recovery and the API use it.
+
+## Fatal conditions
+
+The reference panics, halting the machine, when the application returns an
+error; when the batch nonce or the executed-input count has no `u64`
+successor; and when `blockNumber` or `chainId` does not fit `u64`. A halt is a
+permanent fixed point, not a reject ([rollup host semantics](../cartesi-machine.md#rollup-host-semantics)),
+so a port must halt on the same inputs. No canonical successor state exists.
+
+## Constants
+
+| Constant | Value | Home |
+|---|---|---|
+| `MAX_WAIT_BLOCKS` | 1200 L1 blocks, about 4 h | [`lib.rs`](../../sequencer-core/src/lib.rs) |
+| `MAX_EXPONENT` | 17101 | [`fee.rs`](../../sequencer-core/src/fee.rs) (`build.rs` generates it) |
+| `sequencer_address` | per deployment | compiled into the canonical machine |
+
+A fee exponent `n` stands for `(129/128)^n` smallest token units. The
+application converts it; [`fee_to_linear`](../../sequencer-core/src/fee.rs)
+owns the bit-exact conversion. A checked-in lookup table in its place is
+**pending** ([Track 5](../plans/2026-07-coordination-tracks.md#track-5--fee-exponentiation-lut)).
+
+## Conformance
+
+[`consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json)
+pins EIP-712 hashes, keccak256, the signature cases above (every accepted `v`
+form, `v = 2`, high `s`, 64 bytes, `r = 0`, `s = 0`, `r = n`) with the sender
+each path recovers, SSZ bytes, fee conversions, `EvmAdvance` calldata, and
+guest scenarios with their exact outputs. It is never regenerated: a mismatch
+is a consensus change. Gate edge cases are pinned by the reference's unit tests
+and the [guest tests](../../examples/canonical-test/src/main.rs); vectors for
+them are **pending**.
+
+## Sequencer side
+
+The rest of this page is for sequencer developers.
 
 ### Sequencer frame-clock policy
 
-The scheduler constrains frame clocks to be non-decreasing and no later than
-the batch inclusion block; it does not require a frame for every L1 block.
-During an admitted live run, the sequencer advances logical frame time when the
-latest persisted safe head `H` is at least five blocks beyond the open frame
-clock `S`. It then opens exactly one frame at `H`, drains the complete
+Gate d constrains frame clocks only within a batch: non-decreasing and no later
+than its inclusion block. The scheduler does not require a frame for every L1
+block. During an admitted live run, the sequencer advances logical frame time
+when the latest persisted safe head `H` is at least five blocks beyond the open
+frame clock `S`. It then opens exactly one frame at `H`, drains the complete
 newly-covered direct range, and uses `H` for subsequent user ops. An observation
 jump from 100 to 132 therefore creates one frame at 132, not synthetic frames at
 each missed five-block boundary. Intermediate empty frames would execute
@@ -154,147 +205,15 @@ deposit budget. If actual safe-head publication cadence threatens that budget,
 revisit the constant from measurements rather than adding interpolation or a
 second timer.
 
----
+### The three implementations and why they agree
 
-## The application-history offset
-
-The feed offset is semantically
-[`Application::executed_input_count()`](application-contract.md#4-canonical-history-cursor-executed_input_count).
-It starts at zero and names the next application input to execute. An
-application at count `X` is ready for history entry `X`; successfully executing
-that entry advances the application to `X + 1`.
-
-The scheduler determines which InputBox material becomes an executed
-application input. Its count transitions are therefore:
-
-| Scheduler event | Application execution | Count effect |
-|---|---|---|
-| Direct arrives and is appended to the fridge | none yet | unchanged |
-| Covered or overdue direct is successfully executed | `execute_direct_input` returns `Ok` | exactly `+1` |
-| User op passes signature, protocol, and app validation and is successfully executed | `execute_valid_user_op` returns `Ok` | exactly `+1` |
-| User op has an unrecoverable signature or is rejected by protocol/app validation | none | unchanged |
-| Batch envelope is decoded, accepted, skipped, or rejected | none for the envelope itself; contained executions are counted by the rows above | unchanged for the envelope |
-| Empty batch | none | unchanged |
-| Either execution method returns `AppError` | fatal invariant failure | no canonical successor is defined |
-
-The censorship backstop still runs before classification, so a malformed,
-stale, or otherwise rejected batch can indirectly advance the count by causing
-overdue directs to execute first. The batch itself never contributes an entry.
-
-This coordinate must agree across the canonical fold, the inclusion lane,
-catch-up/replay, and recovery. Standard recovery may replace an invalidated
-suffix at the same application offsets; cockroach recovery resumes from the
-absolute count persisted in the recovered application state even when older
-history is no longer locally available.
-
-The durable `application_inputs` sequence uses these same offsets. HTTP
-snapshots carry the history version and application count; WS subscriptions
-must claim both before inclusive replay. See the [history contract](application-history.md).
-
----
-
-## The three implementations (and why they agree)
-
-I1 names three places this algorithm lives. They are not three rewrites; two are
-*derived* from the first.
-
-| # | Implementation | Role | Source |
-|---|---|---|---|
-| 1 | **Canonical fold** `Scheduler<A>` | on-chain authority + bare-metal recovery fold | [`scheduler/mod.rs`](../../sequencer-core/src/scheduler/mod.rs) |
-| 2 | **Off-chain predicate** `scheduler_accepts` | builds the gold frontier (`safe_accepted_batches`) | [`protocol.rs`](../../sequencer-core/src/protocol.rs) |
-| 3 | **Inclusion lane live prediction** | drains + executes ahead of L1 to issue soft confirmations | [`ingress/inclusion_lane/`](../../sequencer/src/ingress/inclusion_lane/) |
-
-- **#1 is the authority.** It is the literal scheduler source; the recovery
-  engine [`fold_replay`](../../sequencer-core/src/scheduler/fold.rs) *drives* it
-  (seeds the fridge, replays the stream), so recovery is consistent with L1 by
-  construction rather than by a parallel re-implementation. It is not a fourth
-  copy.
-- **#2 is a predicate, not the full fold.** `scheduler_accepts` answers only
-  "would the scheduler accept this batch into the frontier?" — it checks sender,
-  decode, staleness, and nonce, and **deliberately omits gate d** (the
-  structural frame checks). That omission is sound by *self-trust*: the frontier
-  simulator runs over the sequencer's **own** batch submissions, which are
-  well-formed by construction; a structurally-malformed batch would be a
-  self-bug (a fault state to crash on), not an adversarial input to predict.
-  This document is the cross-reference home for the omission — the asymmetry is
-  intentional, not a missing check.
-- **The content-identity check is complete relative to #2, not an independent oracle for #1.** For
-  every at/above-anchor landing that `scheduler_accepts` accepts, the frontier
-  builder exhaustively finds a byte-identical valid local closed batch
-  (`Match`), no local batch (`Foreign`), or different bytes (`Mismatch`); the
-  latter two durably freeze the frontier. Because the check shares #2 and its
-  structural omissions, it cannot prove that #1, application state, or trusted
-  collapsed history is correct. Its false-positive boundary is recorded once
-  at I9; see I9/I15 for the runtime and recovery boundary.
-
-**Why the agreement is load-bearing:** the gold frontier (#2) is what
-recovery's cascade pivots on and what accepted-checkpoint selection trusts; the lane (#3) is what
-users see as soft confirmations. If any of the three computes a different
-accept/reject/order than the canonical fold (#1), the sequencer will have
-promised users a future the scheduler will not produce. No mechanism enforces
-the agreement — only review and the duality tests. **Change one, check all.**
-
----
-
-## Invariants this rests on
-
-- [I1](../invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)
-  — the three implementations agree (this document is its prose).
-- [I2](../invariants.md#i2-drain-attribution-accumulated-directs-land-in-the-clock-advanced-frame)
-  — drained directs land in the new frame, so the lane's wire content matches
-  the fold's drain-before-ops order.
-- [I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)
-  — frame `safe_block`s are non-decreasing, the lane-side mirror of gate d's
-  monotonicity rule.
-- [I19](../invariants.md#i19-application-progress-follows-the-shared-execution-contract)
-  — every successful application input advances one typed count/clock pair;
-  rejected inputs do not, and `AppError` is terminal.
-
-## Test-pinned properties
-
-The duality's load-bearing edge cases each have at least one test
-([`scheduler/mod.rs`](../../sequencer-core/src/scheduler/mod.rs) tests,
-[`protocol.rs`](../../sequencer-core/src/protocol.rs) tests):
-
-- **Empty batches are valid no-ops that consume the nonce** — no first frame to
-  measure staleness against (`empty_batches_are_valid_noops`,
-  `scheduler_accepts_empty_frames_batch_regardless_of_age`).
-- **Stale batches do not consume the nonce** and the next batch reuses it
-  (`stale_batch_is_skipped_without_consuming_nonce`).
-- **Drain uses an inclusive `inclusion_block ≤ safe_block` rule**
-  (`frame_drain_uses_consistent_inclusive_safe_block_rule`).
-- **The backstop drains all overdue directs before the batch**
-  (`pre_batch_backstop_executes_overdue_directs_before_user_ops`,
-  `backstop_drains_all_overdue_directs`).
-- **Staleness boundary is `≥ MAX_WAIT_BLOCKS`** — accepted at `MAX_WAIT − 1`,
-  skipped at `MAX_WAIT` (`scheduler_accepts_boundary_just_below_stale`,
-  `is_scheduler_stale_reports_true_at_and_past_threshold`).
-- **Structural rejects don't consume the nonce**
-  (`non_monotonic_safe_blocks_invalidate_batch`,
-  `frame_safe_block_above_inclusion_block_invalidates_batch`,
-  `wrong_batch_nonce_is_rejected_without_consuming_nonce`).
-
----
-
-## Reference-scheduler count discipline
-
-Every canonical input crosses the same typed execution
-boundary in the scheduler, live lane, catch-up, and recovery fold:
-
-1. Successful directs and validated user ops return their pre-execution
-   `ExecutedInputCount` and advance exactly once with checked arithmetic.
-   Rejection, bad signatures, envelopes, empty batches, and stale/structural
-   skips leave it unchanged.
-2. `AppError` is fatal everywhere; there is no parallel scheduler-only
-   transition after a possibly partial hook failure.
-3. The engine advances its embedded progress in each successful apply hook.
-   The shared boundary preflights overflow and asserts the exact expected
-   successor after success. Validation purity and native-engine mutation
-   remain self-trusted.
-4. Tests pin direct/user advancement, every skip/reject family, pre-batch
-   overdue-drain ordering, overflow, dump round-trips, nonzero recovery bases,
-   and live/replay mapping agreement.
-
-Additional scheduler changes may still be batched separately, but they must
-preserve the transition table above and the shared boundary rather than
-reintroducing a scheduler-local count.
+The sequencer predicts this fold in two more places: the off-chain predicate
+`scheduler_accepts`, which builds the gold frontier, and the inclusion lane's
+live prediction. The recovery fold drives `Scheduler<A>` itself.
+[I1](../invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)
+maps all three and their one deliberate difference: the predicate skips gate d.
+[I2](../invariants.md#i2-drain-attribution-accumulated-directs-land-in-the-clock-advanced-frame)
+and [I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)
+are the lane's mirrors of the drain order and of frame monotonicity, and
+[I19](../invariants.md#i19-application-progress-follows-the-shared-execution-contract)
+covers the shared execution boundary. Change one, check all.

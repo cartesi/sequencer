@@ -96,10 +96,11 @@ by writer and are write-once (`0001_schema.sql`).
   `sequencer-core/src/scheduler/mod.rs`), the off-chain predicate
   (`ProtocolTiming::scheduler_accepts`, `sequencer-core/src/protocol.rs`), and
   the inclusion lane's live prediction produce the same
-  accept/reject/ordering decisions for every input. (Known, documented
+  accept/reject/ordering decisions for every input. The recovery fold
+  (`fold_replay`) drives `Scheduler<A>` itself, not a copy. (Known, documented
   exception: the predicate omits the two structural rejections — self-trust,
   since the simulator only runs over the sequencer's own well-formed batches;
-  the omission is documented in `scheduler-semantics.md` and test-pinned by
+  the reason is recorded at `scheduler_accepts`, and it is test-pinned by
   the I1 duality test in `sequencer-core/src/scheduler/mod.rs`, which asserts
   the canonical fold and the predicate diverge exactly and only there.)
 - **Enforced by:** review + the duality test. No structural mechanism.
