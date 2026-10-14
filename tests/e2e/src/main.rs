@@ -3,9 +3,7 @@
 
 use libtest_mimic::{Arguments, Trial};
 use rollups_e2e::run_trial;
-use rollups_harness::{
-    ManagedSequencer, default_c_wallet_sequencer_config, default_devnet_sequencer_config,
-};
+use rollups_harness::ManagedSequencer;
 
 fn main() {
     let mut args = Arguments::from_args();
@@ -13,28 +11,12 @@ fn main() {
 
     let trials: Vec<Trial> = rollups_e2e::test_cases::test_cases()
         .into_iter()
-        .map(|(name, scenario)| {
-            Trial::test(name, move || {
-                let log_prefix = format!("rollups-e2e-{name}");
-                let mut spawn_config = if name.starts_with("c_host_") {
-                    default_c_wallet_sequencer_config(log_prefix)
-                } else {
-                    default_devnet_sequencer_config(log_prefix)
-                };
-                let scenario_name = name.strip_prefix("c_host_").unwrap_or(name);
-                if scenario_name == "watchdog_genesis_compare_test"
-                    || scenario_name == "deposit_transfer_withdrawal_test"
-                    || scenario_name == "watchdog_divergence_drill_test"
-                {
-                    spawn_config.faketime = false;
-                } else if scenario_name == "fixed_fee_oracle_sets_frame_fee_test" {
-                    // 100 → recommended fee 1456, under the wallet client's
-                    // DEFAULT_MAX_FEE (2500) so transfers still admit.
-                    spawn_config.fee_oracle_fixed_log_gas_price = Some(100);
-                }
-                run_trial(name, || async move {
+        .map(|scenario| {
+            Trial::test(scenario.name, move || {
+                let spawn_config = scenario.spawn_config();
+                run_trial(scenario.name, || async move {
                     let mut runtime = ManagedSequencer::spawn(spawn_config).await?;
-                    let scenario_result = scenario(&mut runtime).await;
+                    let scenario_result = (scenario.run)(&mut runtime).await;
                     // Post-test schema invariants: assert the DB's structural
                     // invariants only if the scenario succeeded — otherwise
                     // we'd mask the original failure with downstream

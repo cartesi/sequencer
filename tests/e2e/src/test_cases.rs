@@ -3,12 +3,13 @@
 
 use std::time::Duration;
 
-use crate::{ScenarioFn, ScenarioResult};
+use crate::{Host, Scenario, ScenarioFn, ScenarioResult};
 use alloy_primitives::{Address, U256};
 use rollups_harness::{
     DEVNET_PREEMPTIVE_MARGIN_BLOCKS, DEVNET_SECONDS_PER_BLOCK, ManagedSequencer,
-    RecoveryCheckpoint, RecoverySetupParams, ReplayWalletApp, RespawnAttemptOutcome, RespawnPolicy,
-    TcpProxy, TestSigner, WalletL1Client, WalletL2Client, WsClient, sign_user_op_hex,
+    ManagedSequencerConfig, RecoveryCheckpoint, RecoverySetupParams, ReplayWalletApp,
+    RespawnAttemptOutcome, RespawnPolicy, TcpProxy, TestSigner, WalletL1Client, WalletL2Client,
+    WsClient, sign_user_op_hex,
 };
 use sequencer_core::api::{TxRequest, WsTxMessage};
 use sequencer_core::application::Application;
@@ -142,92 +143,128 @@ struct ExpectedWalletState {
     nonce: u32,
 }
 
-pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
+fn rust(name: &'static str, run: ScenarioFn) -> Scenario {
+    Scenario {
+        name,
+        host: Host::Rust,
+        run,
+        configure: no_overrides,
+    }
+}
+
+fn c_host(name: &'static str, run: ScenarioFn) -> Scenario {
+    Scenario {
+        name,
+        host: Host::C,
+        run,
+        configure: no_overrides,
+    }
+}
+
+fn no_overrides(_: &mut ManagedSequencerConfig) {}
+
+/// Wall-clock-neutral scenarios run without libfaketime.
+fn real_clock(config: &mut ManagedSequencerConfig) {
+    config.faketime = false;
+}
+
+/// Recommended fee 1456, under the wallet client's max fee (2500), so
+/// transfers still admit.
+fn fixed_fee_oracle(config: &mut ManagedSequencerConfig) {
+    config.fee_oracle_fixed_log_gas_price = Some(FIXED_LOG_GAS_PRICE);
+}
+
+const FIXED_LOG_GAS_PRICE: i16 = 100;
+
+pub fn test_cases() -> Vec<Scenario> {
     vec![
-        (
+        c_host(
             "c_host_cold_replica_snapshot_backlog_live_recovery_test",
             |runtime| Box::pin(crate::cold_replica::run_c(runtime)),
         ),
-        ("c_host_setup_recovery_round_trip_test", |runtime| {
+        c_host("c_host_setup_recovery_round_trip_test", |runtime| {
             Box::pin(run_setup_recovery_round_trip_test::<c_app_engine::EngineApp>(runtime))
         }),
-        ("c_host_deposit_transfer_withdrawal_test", |runtime| {
+        c_host("c_host_deposit_transfer_withdrawal_test", |runtime| {
             Box::pin(run_deposit_transfer_withdrawal_test(runtime))
-        }),
-        ("c_host_recovery_after_stale_batches_test", |runtime| {
+        })
+        .with(real_clock),
+        c_host("c_host_recovery_after_stale_batches_test", |runtime| {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
         }),
-        ("c_host_restart_and_replay_test", |runtime| {
+        c_host("c_host_restart_and_replay_test", |runtime| {
             Box::pin(run_restart_and_replay_test(runtime))
         }),
-        (
+        rust(
             "cold_replica_snapshot_backlog_live_recovery_test",
             |runtime| Box::pin(crate::cold_replica::run(runtime)),
         ),
-        ("deposit_transfer_withdrawal_test", |runtime| {
+        rust("deposit_transfer_withdrawal_test", |runtime| {
             Box::pin(run_deposit_transfer_withdrawal_test(runtime))
-        }),
-        ("direct_input_not_safe_yet_test", |runtime| {
+        })
+        .with(real_clock),
+        rust("direct_input_not_safe_yet_test", |runtime| {
             Box::pin(run_direct_input_not_safe_yet_test(runtime))
         }),
-        ("rejected_user_op_not_broadcast_test", |runtime| {
+        rust("rejected_user_op_not_broadcast_test", |runtime| {
             Box::pin(run_rejected_user_op_not_broadcast_test(runtime))
         }),
-        ("reconnect_from_offset_test", |runtime| {
+        rust("reconnect_from_offset_test", |runtime| {
             Box::pin(run_reconnect_from_offset_test(runtime))
         }),
-        ("restart_and_replay_test", |runtime| {
+        rust("restart_and_replay_test", |runtime| {
             Box::pin(run_restart_and_replay_test(runtime))
         }),
-        ("unsupported_token_deposit_noop_test", |runtime| {
+        rust("unsupported_token_deposit_noop_test", |runtime| {
             Box::pin(run_unsupported_token_deposit_noop_test(runtime))
         }),
-        ("fee_below_minimum_rejected_test", |runtime| {
+        rust("fee_below_minimum_rejected_test", |runtime| {
             Box::pin(run_fee_below_minimum_rejected_test(runtime))
         }),
-        ("fixed_fee_oracle_sets_frame_fee_test", |runtime| {
+        rust("fixed_fee_oracle_sets_frame_fee_test", |runtime| {
             Box::pin(run_fixed_fee_oracle_sets_frame_fee_test(runtime))
-        }),
-        ("forged_signature_rejected_test", |runtime| {
+        })
+        .with(fixed_fee_oracle),
+        rust("forged_signature_rejected_test", |runtime| {
             Box::pin(run_forged_signature_rejected_test(runtime))
         }),
-        ("concurrent_user_ops_test", |runtime| {
+        rust("concurrent_user_ops_test", |runtime| {
             Box::pin(run_concurrent_user_ops_test(runtime))
         }),
-        ("multi_deposit_reconciliation_test", |runtime| {
+        rust("multi_deposit_reconciliation_test", |runtime| {
             Box::pin(run_multi_deposit_reconciliation_test(runtime))
         }),
-        (
+        rust(
             "restart_after_committed_tx_replays_cleanly_test",
             |runtime| Box::pin(run_restart_after_committed_tx_replays_cleanly_test(runtime)),
         ),
-        ("recovery_after_stale_batches_test", |runtime| {
+        rust("recovery_after_stale_batches_test", |runtime| {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
         }),
-        ("setup_recovery_round_trip_test", |runtime| {
+        rust("setup_recovery_round_trip_test", |runtime| {
             Box::pin(run_setup_recovery_round_trip_test::<
                 app_core::application::WalletApp,
             >(runtime))
         }),
-        ("sequencer_outage_pre_danger_no_recovery_test", |runtime| {
+        rust("sequencer_outage_pre_danger_no_recovery_test", |runtime| {
             Box::pin(run_sequencer_outage_pre_danger_no_recovery_test(runtime))
         }),
-        ("sequencer_outage_danger_zone_tip_cascade_test", |runtime| {
+        rust("sequencer_outage_danger_zone_tip_cascade_test", |runtime| {
             Box::pin(run_sequencer_outage_danger_zone_tip_cascade_test(runtime))
         }),
-        ("provider_outage_past_stale_cascades_test", |runtime| {
+        rust("provider_outage_past_stale_cascades_test", |runtime| {
             Box::pin(run_provider_outage_past_stale_cascades_test(runtime))
         }),
-        ("provider_outage_wall_clock_refuses_boot_test", |runtime| {
+        rust("provider_outage_wall_clock_refuses_boot_test", |runtime| {
             Box::pin(run_provider_outage_wall_clock_refuses_boot_test(runtime))
         }),
-        (
+        rust(
             "warm_restart_from_fresh_persisted_facts_with_l1_down_test",
             |runtime| {
                 Box::pin(run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(runtime))
             },
         ),
-        (
+        rust(
             "wall_clock_backward_jump_retries_then_recovers_test",
             |runtime| {
                 Box::pin(run_wall_clock_backward_jump_retries_then_recovers_test(
@@ -235,10 +272,10 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 ))
             },
         ),
-        ("stalled_safe_head_startup_refuses_boot_test", |runtime| {
+        rust("stalled_safe_head_startup_refuses_boot_test", |runtime| {
             Box::pin(run_stalled_safe_head_startup_refuses_boot_test(runtime))
         }),
-        (
+        rust(
             "provider_outage_pre_danger_sequencer_continues_test",
             |runtime| {
                 Box::pin(run_provider_outage_pre_danger_sequencer_continues_test(
@@ -246,7 +283,7 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 ))
             },
         ),
-        (
+        rust(
             "provider_outage_danger_zone_sequencer_self_exits_test",
             |runtime| {
                 Box::pin(run_provider_outage_danger_zone_sequencer_self_exits_test(
@@ -254,10 +291,10 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 ))
             },
         ),
-        ("provider_outage_short_hiccup_no_recovery_test", |runtime| {
+        rust("provider_outage_short_hiccup_no_recovery_test", |runtime| {
             Box::pin(run_provider_outage_short_hiccup_no_recovery_test(runtime))
         }),
-        (
+        rust(
             "both_down_danger_zone_sequencer_first_refuses_boot_test",
             |runtime| {
                 Box::pin(run_both_down_danger_zone_sequencer_first_refuses_boot_test(
@@ -265,13 +302,13 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 ))
             },
         ),
-        (
+        rust(
             "both_down_danger_zone_proxy_first_restart_cycle_recovers_test",
             |runtime| {
                 Box::pin(run_both_down_danger_zone_proxy_first_restart_cycle_recovers_test(runtime))
             },
         ),
-        (
+        rust(
             "sequencer_outage_danger_zone_coupled_restart_cycle_recovers_test",
             |runtime| {
                 Box::pin(
@@ -279,7 +316,7 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 )
             },
         ),
-        (
+        rust(
             "provider_outage_danger_zone_mid_run_exit_then_restart_cycle_recovers_test",
             |runtime| {
                 Box::pin(
@@ -289,22 +326,22 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 )
             },
         ),
-        (
+        rust(
             "first_boot_l1_unreachable_never_synced_refuses_boot_test",
             |runtime| {
                 Box::pin(run_first_boot_l1_unreachable_never_synced_refuses_boot_test(runtime))
             },
         ),
-        ("delayed_inclusion_cascades_on_restart_test", |runtime| {
+        rust("delayed_inclusion_cascades_on_restart_test", |runtime| {
             Box::pin(run_delayed_inclusion_cascades_on_restart_test(runtime))
         }),
-        ("aging_open_tip_runtime_danger_zone_exit_test", |runtime| {
+        rust("aging_open_tip_runtime_danger_zone_exit_test", |runtime| {
             Box::pin(run_aging_open_tip_runtime_danger_zone_exit_test(runtime))
         }),
-        ("stalled_safe_head_live_exit_test", |runtime| {
+        rust("stalled_safe_head_live_exit_test", |runtime| {
             Box::pin(run_stalled_safe_head_live_exit_test(runtime))
         }),
-        (
+        rust(
             "ws_reconnect_with_invalidated_claim_is_refused_test",
             |runtime| {
                 Box::pin(run_ws_reconnect_with_invalidated_claim_is_refused_test(
@@ -312,10 +349,10 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 ))
             },
         ),
-        ("ws_subscribe_ahead_of_head_is_refused_test", |runtime| {
+        rust("ws_subscribe_ahead_of_head_is_refused_test", |runtime| {
             Box::pin(run_ws_subscribe_ahead_of_head_is_refused_test(runtime))
         }),
-        (
+        rust(
             "recovery_drains_safe_but_undrained_direct_input_test",
             |runtime| {
                 Box::pin(run_recovery_drains_safe_but_undrained_direct_input_test(
@@ -323,22 +360,22 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 ))
             },
         ),
-        (
+        rust(
             "recovery_batch_opens_empty_when_no_direct_inputs_pending_test",
             |runtime| {
                 Box::pin(run_recovery_batch_opens_empty_when_no_direct_inputs_pending_test(runtime))
             },
         ),
-        ("replay_matches_live_for_mixed_workload_test", |runtime| {
+        rust("replay_matches_live_for_mixed_workload_test", |runtime| {
             Box::pin(run_replay_matches_live_for_mixed_workload_test(runtime))
         }),
-        (
+        rust(
             "provider_outage_input_reader_retries_after_reconnect_test",
             |runtime| {
                 Box::pin(run_provider_outage_input_reader_retries_after_reconnect_test(runtime))
             },
         ),
-        (
+        rust(
             "first_boot_no_identity_l1_unreachable_refuses_boot_test",
             |runtime| {
                 Box::pin(run_first_boot_no_identity_l1_unreachable_refuses_boot_test(
@@ -346,7 +383,7 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 ))
             },
         ),
-        (
+        rust(
             "chain_id_mismatch_via_live_rpc_refuses_boot_test",
             |runtime| {
                 Box::pin(run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
@@ -354,7 +391,7 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 ))
             },
         ),
-        (
+        rust(
             "nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test",
             |runtime| {
                 Box::pin(
@@ -362,14 +399,16 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
                 )
             },
         ),
-        ("watchdog_genesis_compare_test", |runtime| {
+        rust("watchdog_genesis_compare_test", |runtime| {
             Box::pin(crate::watchdog_compare::run_watchdog_genesis_compare_test(
                 runtime,
             ))
-        }),
-        ("watchdog_divergence_drill_test", |runtime| {
+        })
+        .with(real_clock),
+        rust("watchdog_divergence_drill_test", |runtime| {
             Box::pin(run_watchdog_divergence_drill_test(runtime))
-        }),
+        })
+        .with(real_clock),
     ]
 }
 
@@ -1025,8 +1064,7 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
 async fn run_fixed_fee_oracle_sets_frame_fee_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    const FIXED_LOG_GAS_PRICE: u16 = 100;
-    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE + 296 + 20 + 419 + 621;
+    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE as u16 + 296 + 20 + 419 + 621;
 
     assert_eq!(
         runtime.first_frame_fee()?,
