@@ -166,8 +166,8 @@ impl<A: Application> Scheduler<A> {
     }
 
     /// Watchdog / CM `inspect_state` hook: the app's canonical snapshot bytes
-    /// for the `/finalized_state` byte-compare. `pub` (not `pub(super)`) because
-    /// the canonical-app harness is now a separate crate over this library.
+    /// for the `/finalized_state` byte-compare. `pub` because the canonical-app
+    /// harness is a separate crate.
     pub fn inspect_state(&self, query: &[u8]) -> Result<Vec<u8>, InspectError>
     where
         A: CanonicalState,
@@ -1477,8 +1477,7 @@ mod tests {
         // The backstop force-executes overdue fridge directs at the START of
         // process_input — before the batch is even classified. So an overdue
         // direct is drained even when the same tick's batch is rejected or
-        // skipped (a danger-zone shape). Previously tested only alongside an
-        // ACCEPTED batch.
+        // skipped (a danger-zone shape).
         for label in ["wrong-nonce", "stale"] {
             let mut scheduler = Scheduler::new(
                 RecordingApp::default(),
@@ -1536,8 +1535,8 @@ mod tests {
     #[test]
     fn multiframe_overheight_in_tail_frame_rejected_by_scheduler() {
         // `batch_reject_reason_for_block` checks `safe_block <= inclusion` in
-        // BOTH the head and the tail frames; only the head case was tested. A
-        // tail frame above the inclusion block must reject the whole batch.
+        // BOTH the head and the tail frames; a tail frame above the inclusion
+        // block must reject the whole batch.
         let mut scheduler = Scheduler::new(
             RecordingApp::default(),
             SchedulerConfig {
