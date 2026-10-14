@@ -48,6 +48,10 @@ to the [register](register.md).
 
 ## Plan of attack
 
+Progress: W1 and W2 have landed on `claude/repo-code-review-103cc5`. Each was
+followed by a devnet and watchdog e2e run and an adversarial review whose
+surviving findings were folded into their commits.
+
 Rules for every wave: behavior changes and refactors ship as separate patches,
 frozen code (see [Freeze list](#freeze-list)) gets bug fixes only, and
 wire/schema/ABI/guest-image changes wait for the contract wave.
@@ -198,8 +202,8 @@ Step 0 settled the four that blocked planning. The rest, by the wave they gate:
 | W1 | Release posture (L1): SHA-pinned actions, job-level tokens, no caches in release | Adopt; dispatch rebuilds existing tags only |
 | W2 | Retry log level (H3, F2) | Verdict-driven: retries WARN, terminal ERROR |
 | W2 | Keep the `terminal_faults` black box (H9) | Keep; fix its forever-warn (HS1) |
-| W2 | Own-key undecodable batch (F1, disputed) | Terminal under self-trust, after a refactor patch |
-| W2 | C-engine PermissionDenied (J9) | Operational, matching the native path |
+| W3b | Own-key undecodable batch (F1, disputed) | Terminal under self-trust, after a refactor patch; awaiting a decision, so W2 skipped it |
+| W3b | C-engine PermissionDenied (J9) | Operational, matching the native path; awaiting a decision, so W2 skipped it |
 | W4 | Contract owner: README or `openapi.yaml` (E9) | Moot for the frozen egress half; decide with the new sync |
 | W1 | `docs/recovery/history` TLA+ (N9) | Decided: drop it from `check-all`; it stays as a dev analysis tool |
 | W3 | CI double run (L3) | Undecided: the double run has caught flakes; nightly runs are the alternative |
