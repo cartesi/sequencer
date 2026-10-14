@@ -201,7 +201,7 @@ I1 names three places this algorithm lives. They are not three rewrites; two are
 | # | Implementation | Role | Source |
 |---|---|---|---|
 | 1 | **Canonical fold** `Scheduler<A>` | on-chain authority + bare-metal recovery fold | [`scheduler/mod.rs`](../../sequencer-core/src/scheduler/mod.rs) |
-| 2 | **Off-chain predicate** `scheduler_accepts` + `advance_expected_batch_nonce` | builds the gold frontier (`safe_accepted_batches`) | [`protocol.rs`](../../sequencer-core/src/protocol.rs) |
+| 2 | **Off-chain predicate** `scheduler_accepts` | builds the gold frontier (`safe_accepted_batches`) | [`protocol.rs`](../../sequencer-core/src/protocol.rs) |
 | 3 | **Inclusion lane live prediction** | drains + executes ahead of L1 to issue soft confirmations | [`ingress/inclusion_lane/`](../../sequencer/src/ingress/inclusion_lane/) |
 
 - **#1 is the authority.** It is the literal scheduler source; the recovery
@@ -226,15 +226,6 @@ I1 names three places this algorithm lives. They are not three rewrites; two are
   structural omissions, it cannot prove that #1, application state, or trusted
   collapsed history is correct. Its false-positive boundary is recorded once
   at I9; see I9/I15 for the runtime and recovery boundary.
-- **The expected-nonce fold** is homed once, next to `scheduler_accepts`, as
-  [`advance_expected_batch_nonce`](../../sequencer-core/src/protocol.rs). The
-  submitter's `decide_submit_start` consumes it directly. The frontier builder
-  `populate_safe_accepted_batches` keeps a deliberate inline copy of the same
-  advance — its loop interleaves the advance with two storage-only side effects
-  (the content-identity check and the `canonical_divergence` freeze) that
-  cannot move below the protocol layer; sharing the fold there would force a
-  callback contract. The duplication is intentional and documented at the call
-  site.
 
 **Why the agreement is load-bearing:** the gold frontier (#2) is what
 recovery's cascade pivots on and what accepted-checkpoint selection trusts; the lane (#3) is what

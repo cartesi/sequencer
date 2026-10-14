@@ -106,11 +106,6 @@ by writer and are write-once (`0001_schema.sql`).
 - **Depended on by:** everything — the gold frontier, recovery's cascade pivot,
   checkpoint selection, soft-confirmation honesty.
 - **Breaks:** silent permanent scheduler/sequencer divergence.
-- The expected-nonce fold is homed next to `scheduler_accepts` as
-  `advance_expected_batch_nonce`; `decide_submit_start` consumes it, while
-  `populate_safe_accepted_batches` keeps a deliberate inline copy (its advance
-  interleaves with storage-only side effects that can't move below the protocol
-  layer — see the call-site comment).
 
 ### I2. Drain attribution: accumulated directs land in the clock-advanced frame
 
