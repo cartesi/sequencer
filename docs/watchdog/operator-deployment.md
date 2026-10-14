@@ -372,8 +372,8 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   postmortems, the `terminal_faults` table records the cause of every
   command that returned through its bracket with a terminal verdict
   (best-effort, append-only, traveling with the data directory —
-  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`; the next `run`
-  also logs the latest row once at startup). Any death that did not return
+  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`; each `run` boot
+  logs the latest row at WARN unless a later completed setup resolved it). Any death that did not return
   through the bracket — SIGKILL, OOM, a node reboot, a terminal runtime abort,
   a controller panic — leaves only the process logs.
 - **Untrustworthy local state requires manual recovery.** The reader's

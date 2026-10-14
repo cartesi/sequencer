@@ -20,7 +20,8 @@
 //! The black box (`terminal_faults`) is for operators and postmortems: the
 //! cause of a terminal death, best-effort recorded before the process
 //! exits, traveling with the data directory. Nothing branches on it — `run`
-//! logs the latest row once at startup, operators read it after the fact —
+//! logs the latest row at startup unless a later completed setup resolved
+//! it, operators read it after the fact —
 //! and its writes are verdict-neutral: a failed record loses only the
 //! black-box copy; the exit code and logs still carry the verdict.
 
@@ -229,6 +230,27 @@ impl Storage {
             })?,
         }))
     }
+
+    /// When setup completed, or `None` before it has.
+    pub fn setup_completed_at_ms(&self) -> Result<Option<u64>, LifecycleError> {
+        let completed: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT completed_at_ms FROM setup_complete WHERE singleton_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        completed
+            .map(|ms| {
+                u64::try_from(ms).map_err(|_| {
+                    LifecycleError::Malformed(format!(
+                        "setup_complete completed_at_ms {ms} is negative"
+                    ))
+                })
+            })
+            .transpose()
+    }
 }
 
 /// The two-sided completion rule — the one command-ordering fact:
@@ -319,6 +341,19 @@ mod tests {
                 [],
             )
             .expect("seed divergence");
+    }
+
+    #[test]
+    fn setup_completed_at_ms_reads_the_completion_fact() {
+        let (_db, mut storage) = seeded(LifecycleCommand::Setup);
+        assert_eq!(storage.setup_completed_at_ms().expect("read"), None);
+        complete_seeded_setup(&mut storage);
+        assert!(
+            storage
+                .setup_completed_at_ms()
+                .expect("read")
+                .is_some_and(|ms| ms > 0)
+        );
     }
 
     #[test]

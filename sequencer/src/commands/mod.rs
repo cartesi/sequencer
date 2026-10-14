@@ -120,6 +120,14 @@ pub(crate) fn record_terminal_fault_best_effort(
     }
 }
 
+/// A setup that completed after a fault proves the fault resolved; any fault
+/// at or after the last completion is still news. The order is by wall clock,
+/// so a backward step larger than the gap between completion and a later
+/// fault demotes that fault to debug; the black box keeps it either way.
+fn fault_is_news(fault: &storage::TerminalFault, setup_completed_at_ms: Option<u64>) -> bool {
+    setup_completed_at_ms.is_none_or(|completed| fault.recorded_at_ms >= completed)
+}
+
 /// Verdict-neutral startup read of the black box: if a previous command on
 /// this data directory died terminal, say so once at boot, so the cause is in
 /// this process's log even when the last process's final lines were lost.
@@ -128,23 +136,39 @@ pub(crate) fn record_terminal_fault_best_effort(
 /// a controller panic, SIGKILL) left no row, so there is nothing to report. It runs
 /// ahead of the admission preflight so that a
 /// boot the preflight refuses still logs why the last one died; a data
-/// directory with no database yet is the ordinary case, not a warning.
+/// directory with no database yet is the ordinary case, not a warning. A
+/// fault recorded before the last completed setup was resolved by it and
+/// logs at debug.
 pub(crate) fn warn_on_previous_terminal_fault(db_path: &str) {
     let read = storage::Storage::open_read_only(db_path)
         .map_err(|open_error| open_error.to_string())
         .and_then(|storage| {
-            storage
+            let fault = storage
                 .latest_terminal_fault()
-                .map_err(|read_error| read_error.to_string())
+                .map_err(|read_error| read_error.to_string())?;
+            // An unreadable completion fact keeps the warning.
+            let setup_completed_at_ms = storage.setup_completed_at_ms().ok().flatten();
+            Ok((fault, setup_completed_at_ms))
         });
     match read {
-        Ok(Some(fault)) => tracing::warn!(
+        Ok((Some(fault), setup_completed_at_ms))
+            if fault_is_news(&fault, setup_completed_at_ms) =>
+        {
+            tracing::warn!(
+                command = %fault.command,
+                cause = %fault.cause,
+                recorded_at_ms = fault.recorded_at_ms,
+                age_secs = crate::clock::unix_now_ms().saturating_sub(fault.recorded_at_ms) / 1000,
+                "a previous command on this data directory ended in a terminal fault"
+            )
+        }
+        Ok((Some(fault), _)) => tracing::debug!(
             command = %fault.command,
             cause = %fault.cause,
             recorded_at_ms = fault.recorded_at_ms,
-            "a previous command on this data directory ended in a terminal fault"
+            "latest terminal fault predates the completed setup, which resolved it"
         ),
-        Ok(None) => {}
+        Ok((None, _)) => {}
         Err(error) => tracing::debug!(
             error = %error,
             "no readable black box at startup (fresh data directory, or the \
@@ -508,5 +532,18 @@ mod tests {
 
         assert!(matches!(err, CommandError::Io(_)), "{err:?}");
         assert!(err.to_string().contains(&db_path), "{err}");
+    }
+
+    #[test]
+    fn fault_is_news_only_at_or_after_the_last_completed_setup() {
+        let fault = crate::storage::TerminalFault {
+            command: LifecycleCommand::Setup,
+            cause: "prior terminal death".to_string(),
+            recorded_at_ms: 100,
+        };
+        assert!(super::fault_is_news(&fault, None));
+        assert!(!super::fault_is_news(&fault, Some(200)));
+        assert!(super::fault_is_news(&fault, Some(100)));
+        assert!(super::fault_is_news(&fault, Some(50)));
     }
 }
