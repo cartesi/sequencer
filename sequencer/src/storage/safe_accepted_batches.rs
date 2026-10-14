@@ -88,46 +88,13 @@ fn next_expected_nonce(nonce: u64) -> u64 {
         .expect("accepted batch nonce overflow: contract-impossible")
 }
 
-/// Simulate the scheduler's acceptance logic over new safe inputs and append
-/// matches to `safe_accepted_batches`.
-///
-/// The content-identity check (I9/I15) is complete for this mirrored
-/// predicate: every post-baseline accepted landing is a byte-identical
-/// local match, foreign, or mismatched. It is not
-/// an independent oracle for the canonical scheduler, application state, or
-/// collapsed checkpoint history; foreign/mismatch requires manual cockroach
-/// recovery.
-///
-/// Paginates through `safe_inputs` rows newer than the latest accepted row,
-/// pre-filtered at SQL to `batch_submitter` as the sender. For each row,
-/// delegates to [`ProtocolTiming::scheduler_accepts`] with the
-/// currently-expected nonce — on `Some`, inserts the accepted row and advances
-/// expected; on `None`, moves on. The SQL sender filter is an optimization;
-/// `scheduler_accepts` re-checks defensively, so the filter is
-/// correctness-neutral.
-///
-/// `batch_submitter` and `timing` arrive separately because they're
-/// orthogonal: the address is identity (who the scheduler accepts from);
-/// the timing is the scheduler's staleness rules.
-///
-/// The scan cursor is local to one invocation. Persistently, the only cursor
-/// is the latest accepted row in `safe_accepted_batches`, not the latest row
-/// scanned. That is intentional for now: a recovery batch may reuse the same
-/// scheduler nonce after earlier rejected rows, and a too-eager persistent
-/// scan cursor would risk skipping it. The tradeoff is that rejected
-/// batch-submitter inputs after the gold frontier can be rescanned on later
-/// safe-head syncs until a later batch is accepted and moves the accepted
-/// cursor forward.
-///
-/// Scheduler-mirror co-location: the acceptance *predicate* lives at the
-/// library seam ([`ProtocolTiming::scheduler_accepts`]), and the bare
-/// nonce-advance fold in `protocol::advance_expected_batch_nonce`.
-/// This loop deliberately keeps its own inline `expected` advance rather than
-/// reusing that fold: the advance is interleaved with two storage-only side
-/// effects that cannot move below the protocol layer — the content-identity
-/// check ([`content_identity_violation`]) and the `canonical_divergence` freeze.
-/// Sharing a fold here would force a callback contract for those (a refactor,
-/// not the no-behavior-change library move).
+/// Mirror scheduler acceptance over new batch-submitter inputs into
+/// `safe_accepted_batches`; an accepted landing that is foreign or
+/// byte-different records `canonical_divergence` instead (I9, I15). The only
+/// persistent cursor is the latest accepted row: recovery can reuse a nonce
+/// after rejected rows, so those are rescanned until a later acceptance. The
+/// expected-nonce advance stays inline because it interleaves with the
+/// content-identity check and the divergence freeze.
 pub(super) fn populate_safe_accepted_batches(
     conn: &Connection,
     batch_submitter: Address,
