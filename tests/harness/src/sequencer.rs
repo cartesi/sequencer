@@ -18,7 +18,7 @@ use tokio::process::{Child, Command};
 
 use crate::HarnessResult;
 use crate::paths;
-use crate::rollups::{DEVNET_CHAIN_ID, DevnetRollupsStack};
+use crate::rollups::{DEVNET_CHAIN_ID, DEVNET_SECONDS_PER_BLOCK, DevnetRollupsStack};
 use crate::util::{
     build_local_endpoint, io_other, path_as_str, send_graceful_terminate, timestamped_log_path,
     wait_for_http_readiness,
@@ -43,6 +43,9 @@ const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_secs(1);
 /// 10: restart and expect recovery); this is the harness counterpart to that.
 const RECOVERY_BOOT_START_TIMEOUT: Duration = Duration::from_secs(45);
 const DEFAULT_SEQUENCER_RUST_LOG: &str = "info";
+/// Passed to `setup` and `run` as `--preemptive-margin-blocks`, so the e2e
+/// zone math owns the value.
+pub const DEVNET_PREEMPTIVE_MARGIN_BLOCKS: u64 = 300;
 pub const DEFAULT_DEVNET_SEQUENCER_BIN: &str = "target/debug/wallet-sequencer-devnet";
 pub const DEFAULT_TEST_LOGS_DIR: &str = "tests/e2e/results";
 
@@ -988,14 +991,14 @@ impl ManagedSequencer {
     }
 
     /// Advance both the sequencer's wall clock and the L1 chain by `duration`,
-    /// maintaining the block-time coupling invariant (`seconds_per_block`,
-    /// default 12 for Ethereum mainnet parity).
+    /// maintaining the block-time coupling invariant
+    /// ([`DEVNET_SECONDS_PER_BLOCK`], which the harness passes to the sequencer).
     ///
     /// This is the primary tool for simulating elapsed outage time. Effective
     /// **immediately** — works whether the sequencer is running or stopped:
     ///   - The faketime rc file is updated; the running sequencer's next time
     ///     call (or a post-respawn first call) sees the shifted clock.
-    ///   - Anvil mines `duration.as_secs() / SECONDS_PER_BLOCK` blocks.
+    ///   - Anvil mines `duration.as_secs() / DEVNET_SECONDS_PER_BLOCK` blocks.
     ///
     /// **Cumulative**: calling with `1h` twice totals `+2h`, not `+1h`. Use
     /// [`Self::set_faketime_offset`] to jump to a specific offset or reset.
@@ -1003,14 +1006,9 @@ impl ManagedSequencer {
     /// Tests that need decoupled wall-clock vs L1 (e.g., the `saturating_sub`
     /// backward-jump test) should use [`Self::set_faketime_offset`] and
     /// [`Self::mine_l1_blocks`] directly.
-    ///
-    /// Assumes `CARTESI_SEQUENCER_SECONDS_PER_BLOCK = 12`. If a test changes that via env,
-    /// this helper's block count will be wrong — prefer the direct dials in
-    /// that case.
     pub async fn advance_wall_and_mine(&mut self, duration: Duration) -> HarnessResult<()> {
-        const SECONDS_PER_BLOCK: u64 = 12;
         let secs = duration.as_secs();
-        let blocks = secs / SECONDS_PER_BLOCK;
+        let blocks = secs / DEVNET_SECONDS_PER_BLOCK;
         self.mine_l1_blocks(blocks).await?;
         self.cumulative_offset_secs = self.cumulative_offset_secs.saturating_add(secs);
         let rc = self
@@ -1340,6 +1338,17 @@ impl ManagedSequencer {
 
 use alloy_primitives::Address;
 
+/// The timing flags the e2e zone math depends on, passed explicitly so an
+/// exported `CARTESI_SEQUENCER_*` variable cannot shift them.
+fn timing_args() -> [String; 4] {
+    [
+        "--preemptive-margin-blocks".into(),
+        DEVNET_PREEMPTIVE_MARGIN_BLOCKS.to_string(),
+        "--seconds-per-block".into(),
+        DEVNET_SECONDS_PER_BLOCK.to_string(),
+    ]
+}
+
 struct SpawnedSequencerProcess {
     child: Child,
     endpoint: String,
@@ -1494,7 +1503,8 @@ async fn spawn_sequencer_process(
         .arg("--app-address")
         .arg(rollups.app_address().to_string())
         .arg("--batch-submitter-address")
-        .arg(&batch_submitter_address);
+        .arg(&batch_submitter_address)
+        .args(timing_args());
     if let Some(recovery) = recovery {
         // Recovery setup rebuilds the wiped DB from a checkpoint: it signs (the
         // flush), so it takes the key, plus the checkpoint block + dump dir.
@@ -1604,7 +1614,8 @@ async fn spawn_sequencer_process(
         .arg("--eth-rpc-url")
         .arg(eth_rpc_url)
         .arg("--batch-submitter-private-key")
-        .arg(&batch_submitter_key);
+        .arg(&batch_submitter_key)
+        .args(timing_args());
     if let Some(secs) = max_batch_open_seconds {
         run_cmd
             .arg("--max-batch-open-seconds")

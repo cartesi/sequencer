@@ -24,6 +24,9 @@ use crate::util::{
 };
 
 pub const DEVNET_CHAIN_ID: u64 = 31_337;
+/// L1 block time: Anvil mines outages at this interval, and the harness passes
+/// it to the sequencer as `--seconds-per-block`.
+pub const DEVNET_SECONDS_PER_BLOCK: u64 = 12;
 
 const DEFAULT_ANVIL_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_ANVIL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -278,16 +281,14 @@ impl ManagedAnvil {
 
     async fn mine_blocks(&self, block_count: u64) -> HarnessResult<()> {
         // L1 block-time coupling: each mined block advances the L1
-        // timestamp by `SECONDS_PER_BLOCK` (Ethereum mainnet parity, also
-        // what `ManagedSequencer::advance_wall_and_mine` assumes when
-        // pairing faketime advances with block counts).
+        // timestamp by `DEVNET_SECONDS_PER_BLOCK`, which
+        // `ManagedSequencer::advance_wall_and_mine` pairs with faketime.
         //
         // Without the explicit `interval`, anvil defaults to 1s/block —
         // which then desyncs from faketime, making large advances trip
         // spurious `L1ViewStale` even when wall clock and L1 should move
         // together. See `ManagedSequencer::advance_wall_and_mine`.
-        const SECONDS_PER_BLOCK: u64 = 12;
-        self.mine_blocks_with_interval(block_count, Some(SECONDS_PER_BLOCK))
+        self.mine_blocks_with_interval(block_count, Some(DEVNET_SECONDS_PER_BLOCK))
             .await
     }
 

@@ -6,9 +6,9 @@ use std::time::Duration;
 use crate::{ScenarioFn, ScenarioResult};
 use alloy_primitives::{Address, U256};
 use rollups_harness::{
-    ManagedSequencer, RecoveryCheckpoint, RecoverySetupParams, ReplayWalletApp,
-    RespawnAttemptOutcome, RespawnPolicy, TcpProxy, TestSigner, WalletL1Client, WalletL2Client,
-    WsClient, sign_user_op_hex,
+    DEVNET_PREEMPTIVE_MARGIN_BLOCKS, DEVNET_SECONDS_PER_BLOCK, ManagedSequencer,
+    RecoveryCheckpoint, RecoverySetupParams, ReplayWalletApp, RespawnAttemptOutcome, RespawnPolicy,
+    TcpProxy, TestSigner, WalletL1Client, WalletL2Client, WsClient, sign_user_op_hex,
 };
 use sequencer_core::api::{TxRequest, WsTxMessage};
 use sequencer_core::application::Application;
@@ -56,11 +56,12 @@ const FRAME_CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 // ── Zone-math constants for the outage-matrix and recovery tests ─────────
 //
-// These derive from the sequencer's default config so a change to
-// `MAX_WAIT_BLOCKS`, `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`, or `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`
-// flows through here automatically. The compile-time asserts below catch any
-// drift that would invalidate the zone framing of the tests (e.g., a per-retry
-// advance that no longer crosses MAX_WAIT in the orchestrator loop).
+// These derive from `MAX_WAIT_BLOCKS` (sequencer-core) and the timing the
+// harness passes to the sequencer (`DEVNET_PREEMPTIVE_MARGIN_BLOCKS`,
+// `DEVNET_SECONDS_PER_BLOCK`), so a change to either flows through here. The
+// compile-time asserts below catch drift that would break the zone framing
+// (e.g., a per-retry advance that no longer crosses MAX_WAIT in the
+// orchestrator loop).
 //
 // The picks (PRE / DANGER / PAST_STALE) are deliberately well inside their
 // zones to give tests slack against scheduling jitter and timing drift.
@@ -69,20 +70,10 @@ const FRAME_CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// `sequencer_core::MAX_WAIT_BLOCKS`.
 const MAX_WAIT_BLOCKS: u64 = sequencer_core::MAX_WAIT_BLOCKS;
 
-/// Default `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` from `runtime/config.rs`. The
-/// harness spawn path does not override this flag, so the binary uses the
-/// configured default. If the default changes, update here so
-/// `DANGER_THRESHOLD_BLOCKS` stays aligned.
-const DEFAULT_PREEMPTIVE_MARGIN_BLOCKS: u64 = 300;
-
-/// Default `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` from `runtime/config.rs`. The harness
-/// `advance_wall_and_mine` also assumes this value internally.
-const DEFAULT_SECONDS_PER_BLOCK: u64 = 12;
-
 /// Derived: the preemptive-recovery danger threshold. Below this we're safe;
 /// above it (but below `MAX_WAIT_BLOCKS`) is the danger zone where the
 /// sequencer triggers flush + shutdown but no cascade.
-const DANGER_THRESHOLD_BLOCKS: u64 = MAX_WAIT_BLOCKS - DEFAULT_PREEMPTIVE_MARGIN_BLOCKS;
+const DANGER_THRESHOLD_BLOCKS: u64 = MAX_WAIT_BLOCKS - DEVNET_PREEMPTIVE_MARGIN_BLOCKS;
 
 /// Pre-danger pick — well below `DANGER_THRESHOLD_BLOCKS` so background drift
 /// can't accidentally tip a test into the danger zone.
@@ -104,9 +95,9 @@ const PAST_STALE_BLOCKS: u64 = 1250;
 /// compile-time check below pins the load-bearing relationship.
 const RESPAWN_RETRY_ADVANCE_BLOCKS: u64 = 100;
 
-/// Convert a block count to wall-clock duration assuming the default block time.
+/// Convert a block count to wall-clock duration at the harness block time.
 const fn blocks_as_duration(blocks: u64) -> Duration {
-    Duration::from_secs(blocks * DEFAULT_SECONDS_PER_BLOCK)
+    Duration::from_secs(blocks * DEVNET_SECONDS_PER_BLOCK)
 }
 
 // Compile-time guards: drift in the constants above that breaks the test

@@ -14,12 +14,13 @@ pub type HarnessResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub use proxy::TcpProxy;
 pub use replay::ReplayWalletApp;
-pub use rollups::{DEVNET_CHAIN_ID, DevnetRollupsStack};
+pub use rollups::{DEVNET_CHAIN_ID, DEVNET_SECONDS_PER_BLOCK, DevnetRollupsStack};
 pub use sequencer::{
-    BatchCounts, DEFAULT_DEVNET_SEQUENCER_BIN, DEFAULT_TEST_LOGS_DIR, ManagedSequencer,
-    ManagedSequencerConfig, RecoveryCheckpoint, RecoverySetupParams, RespawnAttemptOutcome,
-    RespawnPolicy, StackChildExit, default_c_wallet_sequencer_config,
-    default_devnet_sequencer_config, devnet_sequencer_config_no_faketime,
+    BatchCounts, DEFAULT_DEVNET_SEQUENCER_BIN, DEFAULT_TEST_LOGS_DIR,
+    DEVNET_PREEMPTIVE_MARGIN_BLOCKS, ManagedSequencer, ManagedSequencerConfig, RecoveryCheckpoint,
+    RecoverySetupParams, RespawnAttemptOutcome, RespawnPolicy, StackChildExit,
+    default_c_wallet_sequencer_config, default_devnet_sequencer_config,
+    devnet_sequencer_config_no_faketime,
 };
 pub use wallet::{
     TestSigner, WalletL1Client, WalletL2Client, address_from_signing_key, sign_user_op_hex,
