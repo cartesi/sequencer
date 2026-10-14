@@ -592,7 +592,7 @@ mod tests {
             canonical
                 .direct_q
                 .iter()
-                .all(|input| input.inclusion_block > a),
+                .all(|input| input.block_number > a),
             "the earlier checkpoint is eligible, with a nonempty seed queue"
         );
         assert_eq!(canonical.queued_direct_len(), 1);
@@ -613,7 +613,7 @@ mod tests {
         assert_eq!(canonical.app.executed_directs, vec![1, 2, 3]);
         assert_eq!(canonical.queued_direct_len(), 1);
         assert_eq!(canonical.direct_q[0].payload, vec![4]);
-        assert_eq!(canonical.direct_q[0].inclusion_block, later_a);
+        assert_eq!(canonical.direct_q[0].block_number, later_a);
         // Its pending direct is excluded by (A,B], so the exporter must refuse
         // this later checkpoint. Recovery can use the eligible earlier one.
 

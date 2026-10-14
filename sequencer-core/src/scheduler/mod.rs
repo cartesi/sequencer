@@ -90,15 +90,8 @@ pub enum BatchRejectReason {
 pub struct Scheduler<A: Application> {
     app: A,
     config: SchedulerConfig,
-    direct_q: VecDeque<QueuedDirectInput>,
+    direct_q: VecDeque<DirectInput>,
     next_expected_batch_nonce: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct QueuedDirectInput {
-    sender: Address,
-    payload: Vec<u8>,
-    inclusion_block: u64,
 }
 
 impl<A: Application> Scheduler<A> {
@@ -146,10 +139,10 @@ impl<A: Application> Scheduler<A> {
     /// replaying `(B, C]`. Callers MUST enqueue in ascending
     /// L1 order (`inclusion_block`) so the FIFO drain matches the on-chain order.
     pub fn enqueue_direct(&mut self, sender: Address, inclusion_block: u64, payload: Vec<u8>) {
-        self.direct_q.push_back(QueuedDirectInput {
+        self.direct_q.push_back(DirectInput {
             sender,
+            block_number: inclusion_block,
             payload,
-            inclusion_block,
         });
     }
 
@@ -194,10 +187,10 @@ impl<A: Application> Scheduler<A> {
         self.force_execute_overdue(input.inclusion_block, &mut outputs)?;
 
         if input.sender != self.config.sequencer_address {
-            self.direct_q.push_back(QueuedDirectInput {
+            self.direct_q.push_back(DirectInput {
                 sender: input.sender,
+                block_number: input.inclusion_block,
                 payload: input.payload,
-                inclusion_block: input.inclusion_block,
             });
             Ok(ProcessResult::new(ProcessOutcome::DirectEnqueued, outputs))
         } else {
@@ -344,20 +337,7 @@ impl<A: Application> Scheduler<A> {
         safe_block: u64,
         outputs: &mut AppOutputs,
     ) -> Result<(), AppError> {
-        while let Some(front) = self.direct_q.front() {
-            if front.inclusion_block > safe_block {
-                break;
-            }
-            let input = DirectInput {
-                sender: front.sender,
-                block_number: front.inclusion_block,
-                payload: front.payload.clone(),
-            };
-            let executed = crate::application::execute_direct_input(&mut self.app, &input)?;
-            outputs.extend(executed.outputs);
-            self.direct_q.pop_front().expect("queue front must exist");
-        }
-        Ok(())
+        self.drain_front_while(outputs, |direct| direct.block_number <= safe_block)
     }
 
     fn force_execute_overdue(
@@ -365,24 +345,26 @@ impl<A: Application> Scheduler<A> {
         current_block: u64,
         outputs: &mut AppOutputs,
     ) -> Result<(), AppError> {
-        while let Some(front) = self.direct_q.front() {
-            if age_exceeds(
-                current_block,
-                front.inclusion_block,
-                self.config.max_wait_blocks,
-            ) {
-                let input = DirectInput {
-                    sender: front.sender,
-                    block_number: front.inclusion_block,
-                    payload: front.payload.clone(),
-                };
-                let executed = crate::application::execute_direct_input(&mut self.app, &input)?;
-                outputs.extend(executed.outputs);
+        let max_wait_blocks = self.config.max_wait_blocks;
+        self.drain_front_while(outputs, |direct| {
+            age_exceeds(current_block, direct.block_number, max_wait_blocks)
+        })
+    }
 
-                self.direct_q.pop_front().expect("queue front must exist");
-            } else {
+    /// Execute fridge directs from the front, in FIFO order, while `due`
+    /// holds. Each direct leaves the queue only after it executed.
+    fn drain_front_while(
+        &mut self,
+        outputs: &mut AppOutputs,
+        due: impl Fn(&DirectInput) -> bool,
+    ) -> Result<(), AppError> {
+        while let Some(front) = self.direct_q.front() {
+            if !due(front) {
                 break;
             }
+            let executed = crate::application::execute_direct_input(&mut self.app, front)?;
+            outputs.extend(executed.outputs);
+            self.direct_q.pop_front();
         }
         Ok(())
     }
