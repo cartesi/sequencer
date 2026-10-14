@@ -204,7 +204,7 @@ impl EthereumBatchPoster {
         if entry.should_warn(now) {
             entry.last_warned = Some(now);
             warn!(
-                tx_nonce = wallet_nonce,
+                wallet_nonce,
                 pending_secs = now.duration_since(entry.since).as_secs(),
                 "batch tx at this wallet nonce has been unresolved longer than expected \
                  (see docs/l1-fee-policy.md)"
@@ -270,7 +270,10 @@ impl EthereumBatchPoster {
         // The submit provider fills only the pinned chain id and the
         // signature, so every other field is set here.
         let gas = pad_gas_estimate(call.estimate_gas().await.map_err(|err| {
-            provider_error(format_args!("eth_estimateGas nonce={wallet_nonce}"), err)
+            provider_error(
+                format_args!("eth_estimateGas wallet_nonce={wallet_nonce}"),
+                err,
+            )
         })?);
 
         let tx = call.gas(gas).nonce(wallet_nonce).into_transaction_request();
@@ -281,7 +284,7 @@ impl EthereumBatchPoster {
             .map_err(|err| match err {
                 SendError::Unsignable(message) => BatchPosterError::UnsignableTransaction(message),
                 SendError::Rpc(err) => provider_error(
-                    format_args!("eth_sendRawTransaction nonce={wallet_nonce}"),
+                    format_args!("eth_sendRawTransaction wallet_nonce={wallet_nonce}"),
                     err,
                 ),
             })
@@ -453,7 +456,7 @@ impl BatchPoster for EthereumBatchPoster {
             {
                 Ok(tx_hash) => {
                     debug!(
-                        tx_nonce = wallet_nonce,
+                        wallet_nonce,
                         %tx_hash,
                         max_fee_per_gas = fees.max_fee_per_gas,
                         max_priority_fee_per_gas = fees.max_priority_fee_per_gas,
@@ -469,12 +472,12 @@ impl BatchPoster for EthereumBatchPoster {
                     // let the worker sleep before the next estimate.
                     if self.note_refused(wallet_nonce) {
                         info!(
-                            tx_nonce = wallet_nonce,
+                            wallet_nonce,
                             reason = %msg,
                             "batch tx already in the mempool at a price this estimate cannot beat; waiting on the fee market"
                         );
                     } else {
-                        debug!(tx_nonce = wallet_nonce, reason = %msg, "still waiting on the fee market");
+                        debug!(wallet_nonce, reason = %msg, "still waiting on the fee market");
                     }
                     any_refused = true;
                     head_refused |= broadcast.is_empty();
@@ -673,13 +676,13 @@ mod tests {
     #[test]
     fn pending_tx_conflict_survives_operation_label() {
         let BatchPosterError::Provider(message) = super::provider_error(
-            format_args!("eth_sendRawTransaction nonce=3"),
+            format_args!("eth_sendRawTransaction wallet_nonce=3"),
             std::io::Error::other("replacement transaction underpriced"),
         ) else {
             panic!("provider_error builds a Provider error");
         };
         assert!(
-            message.starts_with("eth_sendRawTransaction nonce=3: "),
+            message.starts_with("eth_sendRawTransaction wallet_nonce=3: "),
             "{message}"
         );
         assert!(super::is_pending_tx_conflict(&message), "{message}");

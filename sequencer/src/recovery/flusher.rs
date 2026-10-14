@@ -103,7 +103,7 @@ fn send_failures_error(failures: &[(u64, String)]) -> FlushError {
     let samples = failures
         .iter()
         .take(MAX_SAMPLES)
-        .map(|(nonce, message)| format!("nonce {nonce}: {message}"))
+        .map(|(wallet_nonce, message)| format!("wallet nonce {wallet_nonce}: {message}"))
         .collect::<Vec<_>>()
         .join("; ");
     let remaining = failures.len().saturating_sub(MAX_SAMPLES);
@@ -195,41 +195,43 @@ impl MempoolFlusher {
     ) -> Result<u64, FlushError> {
         let mut attempt = 0u32;
         loop {
-            let safe_nonce = self.wallet_nonce_at(BlockNumberOrTag::Safe).await?;
-            let pending_nonce = self.wallet_nonce_at(BlockNumberOrTag::Pending).await?;
+            let safe_wallet_nonce = self.wallet_nonce_at(BlockNumberOrTag::Safe).await?;
+            let pending_wallet_nonce = self.wallet_nonce_at(BlockNumberOrTag::Pending).await?;
             // The durable anchor: every slot we ever used must be consumed
             // at safe depth, regardless of what the local pool remembers.
-            let required_safe_nonce = watermark.map_or(0, |w| {
+            let required_safe_wallet_nonce = watermark.map_or(0, |w| {
                 w.checked_add(1)
                     .expect("persisted wallet nonce watermark must leave room for the next nonce")
             });
 
-            if pending_nonce <= safe_nonce && safe_nonce >= required_safe_nonce {
+            if pending_wallet_nonce <= safe_wallet_nonce
+                && safe_wallet_nonce >= required_safe_wallet_nonce
+            {
                 let safe_block = self.safe_block_number().await?;
                 info!(
-                    safe_nonce,
-                    required_safe_nonce,
+                    safe_wallet_nonce,
+                    required_safe_wallet_nonce,
                     safe_block,
                     "mempool flush complete — all slots reached safe finality"
                 );
                 return Ok(safe_block);
             }
 
-            let flush_end = pending_nonce.max(required_safe_nonce);
+            let flush_end = pending_wallet_nonce.max(required_safe_wallet_nonce);
             // The completion predicate failed, so either pending > safe or
             // required_safe > safe. Therefore their maximum is strictly above
             // safe; clamping here would hide a broken loop invariant.
             let unresolved = flush_end
-                .checked_sub(safe_nonce)
+                .checked_sub(safe_wallet_nonce)
                 .expect("incomplete flush must have at least one unresolved nonce");
 
             if attempt == 0 {
                 info!(
-                    safe_nonce,
-                    pending_nonce,
-                    required_safe_nonce,
+                    safe_wallet_nonce,
+                    pending_wallet_nonce,
+                    required_safe_wallet_nonce,
                     unresolved,
-                    "flushing mempool: submitting no-ops for unresolved w_nonce slots"
+                    "flushing mempool: submitting no-ops for unresolved wallet-nonce slots"
                 );
             } else {
                 // Retry after a previous timeout — re-print status so operators
@@ -238,9 +240,9 @@ impl MempoolFlusher {
                 // ordinary rhythm, not a fault.
                 warn!(
                     attempt,
-                    safe_nonce,
-                    pending_nonce,
-                    required_safe_nonce,
+                    safe_wallet_nonce,
+                    pending_wallet_nonce,
+                    required_safe_wallet_nonce,
                     unresolved,
                     "flush retry: previous attempt timed out, resubmitting"
                 );
@@ -284,9 +286,14 @@ impl MempoolFlusher {
         Ok(block.header.number)
     }
 
-    /// Submit 0-ETH self-transfers for wallet nonces `from_nonce..to_nonce`.
-    async fn submit_noops(&self, from_nonce: u64, to_nonce: u64) -> Result<(), FlushError> {
-        if from_nonce >= to_nonce {
+    /// Submit 0-ETH self-transfers for wallet nonces
+    /// `from_wallet_nonce..to_wallet_nonce`.
+    async fn submit_noops(
+        &self,
+        from_wallet_nonce: u64,
+        to_wallet_nonce: u64,
+    ) -> Result<(), FlushError> {
+        if from_wallet_nonce >= to_wallet_nonce {
             return Ok(());
         }
 
@@ -323,9 +330,9 @@ impl MempoolFlusher {
             .map_err(|e| FlushError::Provider(error_chain(&e)))?;
 
         debug!(
-            from_nonce,
-            to_nonce,
-            count = to_nonce - from_nonce,
+            from_wallet_nonce,
+            to_wallet_nonce,
+            count = to_wallet_nonce - from_wallet_nonce,
             max_fee_per_gas = max_fee,
             max_priority_fee = priority_fee,
             gas,
@@ -333,25 +340,25 @@ impl MempoolFlusher {
         );
 
         let mut send_failures = Vec::new();
-        for nonce in from_nonce..to_nonce {
+        for wallet_nonce in from_wallet_nonce..to_wallet_nonce {
             let tx = tx_base
                 .clone()
                 .with_gas_limit(gas)
-                .with_nonce(nonce)
+                .with_nonce(wallet_nonce)
                 .with_max_fee_per_gas(max_fee)
                 .with_max_priority_fee_per_gas(priority_fee);
 
             match self.providers.submit.send(tx).await {
                 Ok(tx_hash) => {
-                    debug!(nonce, %tx_hash, gas, "flush no-op submitted");
+                    debug!(wallet_nonce, %tx_hash, gas, "flush no-op submitted");
                 }
                 Err(SendError::Unsignable(message)) => {
                     return Err(FlushError::UnsignableTransaction(message));
                 }
                 Err(SendError::Rpc(e)) => {
                     let message = error_chain(&e);
-                    warn!(nonce, error = %message, "flush no-op send failed");
-                    send_failures.push((nonce, message));
+                    warn!(wallet_nonce, error = %message, "flush no-op send failed");
+                    send_failures.push((wallet_nonce, message));
                 }
             }
         }
@@ -539,9 +546,9 @@ mod tests {
 
         let message = err.to_string();
         assert!(message.contains("failed to submit 4 flush no-op transaction(s)"));
-        assert!(message.contains("nonce 7: nonce too low"));
-        assert!(message.contains("nonce 8: replacement transaction underpriced"));
-        assert!(message.contains("nonce 9: insufficient funds"));
+        assert!(message.contains("wallet nonce 7: nonce too low"));
+        assert!(message.contains("wallet nonce 8: replacement transaction underpriced"));
+        assert!(message.contains("wallet nonce 9: insufficient funds"));
         assert!(message.contains("and 1 more"));
         assert!(!message.contains("nonce 10"));
     }
@@ -953,7 +960,7 @@ mod tests {
         .expect("flush should succeed once the provider is reachable");
 
         // Forward progress: the nonce-0 slot was consumed (either by the
-        // flusher's no-op or by the original tx landing). `safe_nonce` is
+        // flusher's no-op or by the original tx landing). `safe_wallet_nonce` is
         // >= 1 only if something at nonce 0 reached safe finality — proof
         // the flusher completed its job end-to-end.
         let safe_after = direct_provider

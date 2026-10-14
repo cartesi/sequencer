@@ -337,9 +337,9 @@ impl ManagedSequencer {
     /// Why this exists: a *recovery* boot whose persisted state names a wallet
     /// nonce that L1 never accepted — e.g. a batch-submission tx was dropped
     /// from the mempool ([`Self::drop_all_pending_txs`]) — runs the mempool
-    /// flush during startup. The flush submits a no-op at the stranded nonce
-    /// slot and blocks until that slot becomes *safe* (`safe_nonce >=
-    /// watermark + 1`, I14). Re-enabling auto-mining is not enough:
+    /// flush during startup. The flush submits a no-op at the stranded
+    /// wallet-nonce slot and blocks until that slot becomes *safe*
+    /// (`safe_wallet_nonce >= watermark + 1`, I14). Re-enabling auto-mining is not enough:
     /// auto-mining lands the no-op tx but mints no *further* blocks, so Anvil's
     /// `safe` tag never advances past it and the flush waits until the boot
     /// hits the readiness timeout. In production the chain keeps producing

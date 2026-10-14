@@ -412,7 +412,7 @@ pub enum BootstrapError {
     /// nonce from L1 (the one live RPC the gate makes). Transient — the
     /// operator retries once the provider recovers; the prior sync already
     /// proved L1 reachable, so this is a hiccup, not a misconfig.
-    #[error("setup detection: could not read submitter nonce from RPC: {message}")]
+    #[error("setup detection: could not read submitter wallet nonce from RPC: {message}")]
     DetectionWalletNonceRead { message: String },
     /// `setup`'s read-only detection gate found a previous instance left work
     /// this checkpoint cannot account for. Sticky: only wiping the uncompleted

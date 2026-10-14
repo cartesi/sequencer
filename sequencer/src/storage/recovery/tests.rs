@@ -706,7 +706,7 @@ mod tip_staleness {
     //
     // `recover_aging_tip` backs the RecoverTip startup action: all closed
     // batches are outside the danger zone, but the open Tip has aged past the
-    // configured threshold. The Tip has no L1 footprint (no `w_nonce`, no
+    // configured threshold. The Tip has no L1 footprint (no wallet nonce, no
     // `safe_input`), so it can be invalidated directly without a flush.
     //
     // The first four tests cover that path:
