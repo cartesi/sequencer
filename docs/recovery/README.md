@@ -359,7 +359,7 @@ just -f docs/recovery/justfile check-all
 |---|---|
 | Startup dispatch, error classification, final admission | [`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs); procedure tests substitute only L1 sync/flush, keeping real SQLite inspections and repairs. |
 | Detection, mutation guards, pivot and atomic cascade | [`storage/recovery.rs`](../../sequencer/src/storage/recovery.rs), [`recovery/tests.rs`](../../sequencer/src/storage/recovery/tests.rs); exact Tip guard, safe-view floor, unconditional post-flush policy, generation rollback, root nonce, and direct replay. |
-| Observed danger versus estimates, accepted frontier and content identity | [`storage/l1_submission.rs` tests](../../sequencer/src/storage/l1_submission.rs), [`safe_accepted_batches.rs`](../../sequencer/src/storage/safe_accepted_batches.rs); stale-view precedence, clock faults, reused nonces, divergence freeze. |
+| Observed danger versus estimates, accepted frontier and content identity | [`recovery/tests.rs`](../../sequencer/src/storage/recovery/tests.rs) (`check_danger`): stale-view precedence, clock faults; [`safe_accepted_batches.rs`](../../sequencer/src/storage/safe_accepted_batches.rs) tests: accepted frontier, content identity, divergence freeze; [`l1_submission.rs`](../../sequencer/src/storage/l1_submission.rs) tests: reused nonces. |
 | Slot settlement and broadcast coverage | [`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs), [`l1/watermark.rs`](../../sequencer/src/l1/watermark.rs), [`submitter/poster.rs`](../../sequencer/src/l1/submitter/poster.rs). |
 | Task-free preparation, launch, restore and catch-up | [`commands/run/`](../../sequencer/src/commands/run/), [`inclusion_lane/mod.rs`](../../sequencer/src/ingress/inclusion_lane/mod.rs). |
 
