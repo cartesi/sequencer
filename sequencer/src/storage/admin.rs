@@ -36,7 +36,8 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{Storage, test_helpers::temp_db};
+    use crate::storage::Storage;
+    use crate::test_support::temp_db;
 
     #[test]
     fn negative_batch_size_target_floors_to_zero() {

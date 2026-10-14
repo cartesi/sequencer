@@ -150,7 +150,8 @@ pub(super) fn preserved_input_count_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LifecycleCommand, test_helpers::temp_db};
+    use crate::storage::LifecycleCommand;
+    use crate::test_support::temp_db;
 
     #[test]
     fn complete_baseline_is_immutable_and_survives_restart() {

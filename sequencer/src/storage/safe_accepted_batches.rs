@@ -385,16 +385,16 @@ mod tests {
     use crate::clock::unix_now_ms;
     use crate::storage::test_helpers::{
         SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
-        seed_safe_inputs_with_batch_nonces, temp_db,
+        seed_safe_inputs_with_batch_nonces,
     };
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+    use crate::test_support::temp_db;
 
     #[test]
     fn recovered_prefix_does_not_reinterpret_a_rejected_future_nonce() {
-        use crate::storage::test_helpers::{
-            default_protocol_timing, local_batch_payload, pin_test_deployment_identity,
-        };
+        use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
         use crate::storage::{FrontierMode, LifecycleCommand, StoredSafeInput};
+        use crate::test_support::pin_test_deployment_identity;
         use sequencer_core::{batch::Batch, history::ExecutedInputCount};
         use ssz::Encode;
 

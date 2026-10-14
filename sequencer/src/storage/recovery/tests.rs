@@ -50,11 +50,7 @@ mod guarded_phases {
     fn ensure_tip_fixture(
         name: &str,
         with_recovery_checkpoint: bool,
-    ) -> (
-        crate::storage::test_helpers::TestDb,
-        Storage,
-        ProtocolTiming,
-    ) {
+    ) -> (crate::test_support::TestDb, Storage, ProtocolTiming) {
         let (db, mut storage) = open_temp_storage(name);
         let protocol = default_protocol_timing();
         let now_ms = crate::clock::unix_now_ms();
@@ -178,7 +174,7 @@ mod guarded_phases {
         assert_eq!(batches, 0, "the refused phase must roll back its insert");
     }
 
-    fn cascade_fixture(name: &str) -> (crate::storage::test_helpers::TestDb, Storage) {
+    fn cascade_fixture(name: &str) -> (crate::test_support::TestDb, Storage) {
         let (db, mut storage) = open_temp_storage(name);
         let protocol = default_protocol_timing();
         let mut head = storage
@@ -1978,10 +1974,9 @@ mod recovery_snapshot_selection {
 
 mod check_danger {
     use crate::clock::unix_now_ms;
-    use crate::storage::test_helpers::{
-        SENDER_A, default_protocol_timing, local_batch_payload, temp_db,
-    };
+    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, local_batch_payload};
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+    use crate::test_support::temp_db;
 
     #[test]
     fn check_danger_reports_observed_closed_batch_danger() {

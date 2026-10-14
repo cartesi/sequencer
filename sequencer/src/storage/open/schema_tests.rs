@@ -511,7 +511,7 @@ fn schema_rejects_deployment_identity_with_zero_chain_id() {
     // collide with the EIP-712 domain's unspecified-chain sentinel
     // and break signature recovery; the CHECK refuses to persist it
     // in the first place.
-    let db = crate::storage::test_helpers::temp_db("schema-deployment-chain-id-zero");
+    let db = crate::test_support::temp_db("schema-deployment-chain-id-zero");
     let storage = Storage::open(db.path.as_str()).expect("open storage");
     let address = vec![0u8; 20];
     let err = storage.conn.execute(

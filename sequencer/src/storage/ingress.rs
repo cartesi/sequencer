@@ -773,11 +773,11 @@ fn insert_executed_user_ops_batch(
 mod tests {
     use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
     use crate::storage::{
-        DeploymentIdentity, DirectInputExecution, ExecutedInputCount, FeeOracleIdentity,
-        LifecycleCommand, SafeFrontierState, SafeInputFrontier, SafeInputRange, Storage,
-        StoredSafeInput,
-        test_helpers::{SENDER_A, default_protocol_timing, record_canonical_divergence, temp_db},
+        DirectInputExecution, ExecutedInputCount, LifecycleCommand, SafeFrontierState,
+        SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput,
+        test_helpers::{SENDER_A, default_protocol_timing, record_canonical_divergence},
     };
+    use crate::test_support::{pin_test_deployment_identity, temp_db};
     use alloy_primitives::{Address, Signature};
     use sequencer_core::l2_tx::SequencedL2Tx;
     use sequencer_core::user_op::{SignedUserOp, UserOp};
@@ -807,19 +807,6 @@ mod tests {
             pending: pending_user_op(nonce),
             executed_input_offset: ExecutedInputCount::new(offset),
         }
-    }
-
-    fn pin_deployment_identity(storage: &mut Storage, batch_submitter_address: Address) {
-        storage
-            .load_or_insert_deployment_identity(DeploymentIdentity {
-                chain_id: 1,
-                app_address: Address::repeat_byte(0x11),
-                input_box_address: Address::repeat_byte(0x22),
-                app_deployment_block: 0,
-                batch_submitter_address,
-                fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
-            })
-            .expect("pin deployment identity");
     }
 
     #[test]
@@ -1036,7 +1023,7 @@ mod tests {
     fn live_direct_rotation_requires_complete_classified_attribution() {
         let db = temp_db("direct-execution-attribution-complete");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_deployment_identity(&mut storage, SENDER_A);
+        pin_test_deployment_identity(&mut storage, SENDER_A);
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -1293,7 +1280,7 @@ mod tests {
     fn next_undrained_input_is_derived_from_accounted_frame_block() {
         let db = temp_db("safe-cursor");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_deployment_identity(&mut storage, SENDER_A);
+        pin_test_deployment_identity(&mut storage, SENDER_A);
         assert_eq!(
             storage
                 .next_undrained_safe_input_index()
@@ -1358,7 +1345,7 @@ mod tests {
     fn replay_returns_direct_inputs_in_drain_order() {
         let db = temp_db("replay-order");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_deployment_identity(&mut storage, SENDER_A);
+        pin_test_deployment_identity(&mut storage, SENDER_A);
         let head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -1399,7 +1386,7 @@ mod tests {
     fn ensure_open_tip_opens_genesis_and_sequences_leading_range() {
         let db = temp_db("ensure-tip-genesis");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_deployment_identity(&mut storage, SENDER_A);
+        pin_test_deployment_identity(&mut storage, SENDER_A);
 
         // Pre-existing L1 history: two safe inputs at block 10, and an
         // observed safe head of 10 (as the startup recovery sync would leave).
@@ -1540,7 +1527,7 @@ mod tests {
     fn envelopes_advance_accounting_without_becoming_application_inputs() {
         let db = temp_db("envelope-only-accounting");
         let mut storage = Storage::open(&db.path).unwrap();
-        pin_deployment_identity(&mut storage, SENDER_A);
+        pin_test_deployment_identity(&mut storage, SENDER_A);
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .unwrap();

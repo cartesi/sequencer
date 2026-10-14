@@ -477,10 +477,9 @@ mod tests {
     use super::*;
     use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
     use crate::storage::history::{advance_recovery_generation_in, initialize_history_in};
-    use crate::storage::test_helpers::{
-        SENDER_A, pin_test_deployment_identity, seed_safe_inputs_with_batch_nonces, temp_db,
-    };
+    use crate::storage::test_helpers::{SENDER_A, seed_safe_inputs_with_batch_nonces};
     use crate::storage::{LifecycleCommand, SafeInputRange, WriteHead};
+    use crate::test_support::{pin_test_deployment_identity, temp_db};
     use alloy_primitives::{Address, Signature};
     use sequencer_core::user_op::{SignedUserOp, UserOp};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

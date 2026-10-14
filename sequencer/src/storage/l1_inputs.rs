@@ -451,8 +451,9 @@ mod tests {
     use crate::storage::{
         DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput, SafeInputRange,
         Storage, StoredSafeInput,
-        test_helpers::{SENDER_A, SENDER_B, default_protocol_timing, temp_db},
+        test_helpers::{SENDER_A, SENDER_B, default_protocol_timing},
     };
+    use crate::test_support::temp_db;
     use alloy_primitives::{Address, B256};
 
     fn identity() -> DeploymentIdentity {

@@ -273,9 +273,9 @@ pub(super) fn load_batch_frames_in(
 mod tests {
     use super::super::test_helpers::{
         SENDER_A, default_protocol_timing, seed_closed_batches, seed_safe_inputs_with_batch_nonces,
-        temp_db,
     };
     use crate::storage::{SafeInputRange, Storage};
+    use crate::test_support::temp_db;
     use sequencer_core::batch::Batch;
 
     #[test]

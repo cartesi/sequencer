@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use super::*;
-use crate::storage::test_helpers::temp_db;
+use crate::test_support::temp_db;
 
 fn ledger(storage: &Storage) -> Vec<(i64, i64)> {
     storage

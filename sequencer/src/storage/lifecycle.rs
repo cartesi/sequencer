@@ -310,9 +310,9 @@ fn refuse_on_canonical_divergence(conn: &rusqlite::Connection) -> Result<(), Lif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::temp_db;
+    use crate::test_support::temp_db;
 
-    fn seeded(command: LifecycleCommand) -> (crate::storage::test_helpers::TestDb, Storage) {
+    fn seeded(command: LifecycleCommand) -> (crate::test_support::TestDb, Storage) {
         let db = temp_db("lifecycle-facts");
         let storage =
             Storage::initialize_for_command(db.path.as_str(), command).expect("initialize");

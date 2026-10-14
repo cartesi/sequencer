@@ -6,12 +6,12 @@ use std::path::Path;
 use super::*;
 use crate::storage::history::{advance_recovery_generation_in, initialize_history_in};
 use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, TestDb, default_protocol_timing, local_batch_payload,
-    pin_test_deployment_identity, temp_db,
+    SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
 };
 use crate::storage::{
     DirectInputExecution, FrontierMode, IngestedSafeInput, LifecycleCommand, SafeInputRange,
 };
+use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 fn fixture(name: &str, stop: u64, count: u64, nonce: u64) -> (TestDb, Storage) {
     let db = temp_db(name);

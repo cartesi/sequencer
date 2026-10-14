@@ -69,7 +69,8 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{Storage, test_helpers::temp_db};
+    use crate::storage::Storage;
+    use crate::test_support::temp_db;
 
     #[test]
     fn high_gas_price_clamps_recommended_fee_to_max_exponent() {
