@@ -3,7 +3,8 @@
 Start here for the repository's mental model and working rules. Read this baseline
 once, then use [Reading Routes](#reading-routes) to follow the contracts relevant
 to the work. Those documents own detailed behavior; this guide explains why it
-matters and where to look.
+matters and where to look. Every fact has one home
+([Documentation Practice](#documentation-practice)).
 
 ## Mission
 
@@ -325,9 +326,6 @@ changing it, including checkpoint and fee-source selection.
 - Keep application validation and execution deterministic for a given input/state. No `SystemTime::now()`, `HashMap` iteration order, or floating-point in consensus paths.
 - Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe. An error that wraps a cause ends its Display with `: {source}`, because log sinks print Display only. A dependency error whose Display omits its cause (reqwest names only the request kind) is rendered with `l1::provider::error_chain` where it becomes text, in a `String` variant or a log field; it appends only causes the line does not already hold, so it is also safe on our own wrappers of such an error. A failure logs at its verdict's level: ERROR when the cause is a fault or unknown (terminal, unclassified), WARN when the verdict names a planned procedure (a recovery boot, a retry, `setup --recovery`).
 - Avoid introducing heavy dependencies without strong reason.
-- Documentation style: lean. Module headers (1–4 lines) + docs on public methods only when the contract isn't obvious from name+signature.
-- **Comment the non-obvious, not the self-evident.** Keep comments concise; avoid redundant and excessive inline commentary. Do not restate what the code already expresses. Explain the why, edge cases, invariants, and subtle behaviors that cannot be inferred from reading the code alone.
-- Review-item codenames (finding/decision ids from past review ledgers) never appear in code comments or living docs — state the reason itself, or point at the invariant register entry that owns it. Invariant ids (`I1`–`I20`) are stable register references and are fine.
 - **Impossible states fail loud; they are never handled.** Cheap cross-module assertions of *real invariants* are encouraged (assert, trigger `RAISE`, typed error). Failing loud is safety-preserving, not necessarily self-healing: transient failures may clear on restart, while a persistent invariant violation is terminal and may require inspection or cockroach recovery. Silent divergence is never acceptable. Never add graceful fallbacks, neighbor re-validation, or silent absorbers (`INSERT OR IGNORE`, saturating decode of impossible data) for states the contracts rule out; and an assertion must check a real invariant, never an environmental assumption (clock monotonicity is the cautionary tale). Decision test and rationale: [`docs/invariants.md`](docs/invariants.md); trust boundaries: "Self-trust" in [`docs/threat-model/README.md`](docs/threat-model/README.md).
 
 ## Documentation Practice
@@ -335,29 +333,29 @@ changing it, including checkpoint and fee-source selection.
 Write for a reader building a mental model. Start with the purpose, input,
 result, and governing constraint; introduce implementation detail when it
 explains a necessary behavior. Keep an intentional baseline here so important
-concepts are discoverable before anyone knows to ask about them. Summaries
-should point to the owner of a contract rather than becoming a second copy.
+concepts are discoverable before anyone knows to ask about them.
+
+- **One fact, one home.** Elsewhere, name the fact in a clause and link its owner; never restate its conditions, orderings, or lists.
+- **Surprising facts go into the owning doc**, so the next reader does not rediscover them.
+- **Size caps.** A module header (Rust `//!`, Lua `---`) is 1–4 lines and a rustdoc contract about 6; public methods get docs only when name and signature leave the contract unclear. Longer reasoning goes to the owning doc or invariant, linked.
+- **Comment the non-obvious, not the self-evident.** Explain the why, edge cases, invariants, and subtle behavior the code cannot show; do not restate what it expresses.
+- **State a non-guarantee once**, at its owner, and only where a reader would otherwise assume the guarantee.
+- **Table cells hold one sentence.**
+- **Record deliberate absence once**, at the seam where someone would re-add the mechanism, phrased as a positive design statement with its reason. Avoid removal notices scattered across documents.
+- **No review codenames** (finding or decision ids from past review ledgers) in code comments or living docs: state the reason, or point at the invariant register entry that owns it. Invariant ids (`I1`–`I20`) are stable references and are fine.
 
 Keep three kinds of material distinct:
 
-- **Current contracts and designs** describe what holds now and why. Use present
-  tense and reasoning inline, without amendment banners, review codenames, or
-  "previously/no longer" narration. Each topic has one owner. Some current
-  architecture documents live in `docs/plans/`; the directory name does not
-  make their established contracts optional.
-- **Active plans** name open decisions, dependencies, and remaining work. They
-  must distinguish proposed behavior from implemented contracts. On completion,
-  put the durable design in its owner and reduce the plan to its remaining work
-  and links.
-- **Review notes** are temporary working memory. Commit them when they help an
-  active review or handoff, then distill and delete them when that work ends.
-  The [review lifecycle](docs/review/README.md) owns the policy: unresolved work
-  stays in one register or active plan, durable reasoning in its current owner,
-  completed history in Git. Keep dated evidence only for a named ongoing use.
-
-**Record deliberate absence once**, at the seam where someone would re-add the
-mechanism, phrased as a positive design statement with its reason. Avoid removal
-notices scattered across documents.
+- **Current contracts and designs** describe what holds now and why, in present
+  tense, without amendment banners or "previously/no longer" narration. Some
+  current architecture documents live in `docs/plans/`; the directory name does
+  not make their established contracts optional.
+- **Active plans** name open decisions, dependencies, and remaining work, and
+  distinguish proposed behavior from implemented contracts. On completion, put
+  the durable design in its owner and reduce the plan to remaining work and links.
+- **Review notes** are temporary working memory. The [review lifecycle](docs/review/README.md)
+  owns where their conclusions go: unresolved work to the [register](docs/review/register.md),
+  durable reasoning to its owner, completed history to Git.
 
 ## Testing Guidance
 
@@ -475,4 +473,4 @@ work reaches another boundary.
 | Watchdog development or operation | [Watchdog README](docs/watchdog/README.md) — contract, state sources, commands, and state; [incident runbook](docs/watchdog/incident-runbook.md) — what a latched divergence requires; [local dev](docs/watchdog/getting-started.md) for Anvil; [operator deployment](docs/watchdog/operator-deployment.md) for Sepolia/mainnet. |
 | Canonical guest, machine images, or a Cartesi Machine bump | [Cartesi Machine facts](docs/cartesi-machine.md) — version pinning, host semantics, storage, memory ranges, and the guest side. |
 | A release, or adding or bumping a GitHub Action | [`release.yml`](.github/workflows/release.yml) header — what to run before tagging; [`verify-action-pins.sh`](scripts/verify-action-pins.sh) — pin form, upstream audit, and why bumps are manual. |
-| A new mechanism, simplification, or work spanning an active track | Owning design and [invariants](docs/invariants.md) — reasons and assumptions; [review register](docs/review/register.md) — unresolved work; [coordination tracks](docs/plans/2026-07-coordination-tracks.md) — priorities and dependencies. Follow the [review lifecycle](docs/review/README.md) when recording conclusions. |
+| A new mechanism, simplification, or work spanning an active track | Owning design and [invariants](docs/invariants.md) — reasons and assumptions; [review register](docs/review/register.md) — unresolved work; [coordination tracks](docs/plans/2026-07-coordination-tracks.md) — priorities and dependencies. |
