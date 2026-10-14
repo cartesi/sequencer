@@ -48,9 +48,10 @@ to the [register](register.md).
 
 ## Plan of attack
 
-Progress: W1 and W2 have landed on `claude/repo-code-review-103cc5`. Each was
-followed by a devnet and watchdog e2e run and an adversarial review whose
-surviving findings were folded into their commits.
+Progress: W1, W2 and W3a have landed on `claude/repo-code-review-103cc5`. Each
+was followed by a devnet and watchdog e2e run and an adversarial review whose
+surviving findings were folded into their commits. W3a left the guest binary
+byte-identical.
 
 Rules for every wave: behavior changes and refactors ship as separate patches,
 frozen code (see [Freeze list](#freeze-list)) gets bug fixes only, and
@@ -225,7 +226,7 @@ Step 0 settled the four that blocked planning. The rest, by the wave they gate:
 | N1 genesis recovery ergonomics | open | `--recovery` needs a hand-made bundle; the loader already accepts genesis (setup/mod.rs:449-452) | Genesis case in the tool (W6) |
 | N2 dump-dir metadata | partially | `next_batch_nonce` is stored 3× (SQLite, `info.toml`, `checkpoint.toml`) | Drop on-disk `info.toml` (I1, W2); one receipt in the tool (W6) |
 | N3 snapshot API, mmap/CoW, machine-emulator#398 | partially | The watchdog already uses `rename_stored`/`remove_stored` (machine.lua:114, 233-241); the sequencer's publish point is the SQLite row | Adopt nothing; give Bart a reflink recipe (W4) |
-| N4 test layout | open | Seven placement styles; one `#[path]` module (recovery.rs:642) | Convention plus moves (W3a) |
+| N4 test layout | done | Seven placement styles; one `#[path]` module (recovery.rs:642) | Rule in AGENTS.md, moves landed (W3a) |
 | N5 clippy exclusions | stale premise | CI clippy runs `--workspace --all-targets --all-features` over all 20 members (ci.yml:66) | Close; lint the shell scripts instead (L10) |
 | N6 exponentiation/log | partially | TickMath is already f64 (7cfb474); the scheduler table is Track 5 | Log space stays: oracle math in W2 (C2); table in W5 with Bart |
 | N7 `[u8; 65]` signature | open | `Vec<u8>` (batch.rs:62-68); the DB already enforces 65 | 5b, with the SSZ overhead fix |
@@ -237,7 +238,7 @@ Step 0 settled the four that blocked planning. The rest, by the wave they gate:
 | N13 nested `.DS_Store` | fixed | The unanchored `.gitignore:11` pattern matches nested paths | Close |
 | N14 nonce → index | decide | Collides with `batches.batch_index` | `wallet_nonce` rename now (W3b); see Decisions |
 | N16 MAX_WAIT_BLOCKS configurable | decide | Single constant (lib.rs:21); never changed | Status quo; test literals (W3b) |
-| N17 benchmark DB size and drain time | open | Only a memory report exists | After K6/K7 (W3a) |
+| N17 benchmark DB size and drain time | done | Only a memory report exists | Reported per sweep step (W3a) |
 | N18 cross-compilation and compile times | open | Guest image built twice in CI; 4 duplicate dependency stacks; no profile tuning | Measure (`--timings`), then L3, L4, L7, L13 (W3b) |
 | N19 logs under error | partially | ANSI and key redaction done; cause loss and levels open | W2 |
 | N20 hot-path clones | stale premise | No per-op clone that matters; fsync and checkpoints dominate | Close |
