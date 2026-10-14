@@ -15,7 +15,7 @@ use alloy::rpc::types::BlockNumberOrTag;
 use alloy_primitives::{Address, U256};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::l1::eip1559::{estimate_fees, pad_gas_estimate};
 use crate::l1::watermark::{
@@ -339,7 +339,7 @@ impl MempoolFlusher {
                 }
                 Err(e) => {
                     let message = e.to_string();
-                    error!(nonce, error = %message, "flush no-op send failed");
+                    warn!(nonce, error = %message, "flush no-op send failed");
                     send_failures.push((nonce, message));
                 }
             }

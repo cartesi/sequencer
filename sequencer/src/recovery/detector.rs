@@ -149,7 +149,7 @@ impl DangerDetector {
                     // All non-Safe variants exit. The reducer re-inspects on
                     // the next startup and selects one phase, Retry, or Refuse
                     // from the then-current facts.
-                    tracing::error!(
+                    tracing::warn!(
                         ?status,
                         danger_threshold = self.protocol.danger_threshold(),
                         l1_read_stale_after_blocks = self.protocol.l1_read_stale_after_blocks,
