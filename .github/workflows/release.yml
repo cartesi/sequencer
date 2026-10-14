@@ -219,6 +219,9 @@ jobs:
         with:
           cache-image: false
 
+      # The builder records the Actions context (run, ref, commit, actor, event
+      # payload) in the image's provenance. It stays on: everything in it is
+      # already public for this public repository, and verifiers use it.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
