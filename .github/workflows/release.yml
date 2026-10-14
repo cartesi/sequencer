@@ -20,9 +20,9 @@ on:
         default: true
         type: boolean
 
+# Jobs that write declare it; everything else only reads.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 # Builds are not incremental, and cargo output stays coloured in the logs.
 env:
@@ -46,9 +46,10 @@ jobs:
       # A push builds the pushed commit; a dispatch builds the named tag, fully
       # qualified so a branch or SHA input cannot stand in and a missing tag fails.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
 
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
@@ -73,12 +74,12 @@ jobs:
           rustup target add ${{ matrix.target }}
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
-          tool: cross
+          tool: cross@${{ env.CROSS_VERSION }}
 
       # `sequencer` is a library crate; the runnable reference binary is the
       # `wallet-sequencer` example app (sequencer lib + the placeholder wallet).
@@ -125,7 +126,7 @@ jobs:
           tar -C package -czf "dist/wallet-sequencer-${TAG}-linux-${ARCH}.tar.gz" "wallet-sequencer-${TAG}-linux-${ARCH}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: wallet-sequencer-linux-${{ matrix.arch }}
           path: dist/wallet-sequencer-*.tar.gz
@@ -137,9 +138,10 @@ jobs:
       # A push builds the pushed commit; a dispatch builds the named tag, fully
       # qualified so a branch or SHA input cannot stand in and a missing tag fails.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
 
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
@@ -168,7 +170,7 @@ jobs:
           tar -C examples/canonical-app/out -czf "dist/canonical-machine-image-sepolia-${TAG}.tar.gz" canonical-machine-image-sepolia
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: canonical-machine-images
           path: dist/canonical-machine-image-*.tar.gz
@@ -176,13 +178,17 @@ jobs:
   build-watchdog-image:
     name: Build and push watchdog image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # ghcr.io push
     steps:
       # A push builds the pushed commit; a dispatch builds the named tag, fully
       # qualified so a branch or SHA input cannot stand in and a missing tag fails.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
 
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
@@ -199,20 +205,20 @@ jobs:
           fi
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -222,7 +228,7 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push watchdog image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         env:
           DOCKER_BUILD_SUMMARY: "false"
         with:
@@ -249,19 +255,22 @@ jobs:
       - build-wallet-sequencer
       - build-canonical-machine-image
       - build-watchdog-image
+    permissions:
+      contents: write # create the release and upload its assets
     steps:
       # A push builds the pushed commit; a dispatch builds the named tag, fully
       # qualified so a branch or SHA input cannot stand in and a missing tag fails.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
 
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           path: dist
           pattern: "{wallet-sequencer-linux-*,canonical-machine-images}"
@@ -285,7 +294,7 @@ jobs:
           sha256sum *.tar.gz *.json > SHA256SUMS
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           prerelease: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || (github.event_name == 'push' && contains(github.ref_name, '-')) }}
