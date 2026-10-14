@@ -26,7 +26,7 @@ use sequencer_core::user_op::UserOp;
 pub struct WalletConfig {
     pub erc20_portal_address: Address,
     pub supported_erc20_token: Address,
-    /// Address that receives fee revenue. Defaults to `Address::ZERO` (burned).
+    /// Address credited with fee revenue.
     pub sequencer_address: Address,
 }
 
