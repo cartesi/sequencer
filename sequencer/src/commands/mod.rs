@@ -77,7 +77,10 @@ fn preflight_lifecycle_command(
     command: LifecycleCommand,
 ) -> Result<(), CommandError> {
     let db_path = config::db_path_in(data_dir);
-    if !std::path::Path::new(&db_path).try_exists()? {
+    let exists = std::path::Path::new(&db_path)
+        .try_exists()
+        .map_err(|err| io_error_at("database", &db_path, err))?;
+    if !exists {
         return Err(setup_not_complete(data_dir));
     }
     let storage = storage::Storage::open_read_only(&db_path)?;
@@ -290,12 +293,12 @@ fn deployment_identity_mismatch_fields(
 mod tests {
     use super::{
         BootstrapError, CommandError, IdentityError, batch_submitter_address_from_private_key,
-        deployment_identity_mismatch_fields, ensure_deployment_identity, require_data_dir,
-        require_deployment_identity_match,
+        deployment_identity_mismatch_fields, ensure_deployment_identity,
+        preflight_lifecycle_command, require_data_dir, require_deployment_identity_match,
     };
     use crate::recovery::{RecoveryError, RecoveryRetryReason};
     use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
-    use crate::storage::{DeploymentIdentity, Storage};
+    use crate::storage::{DeploymentIdentity, LifecycleCommand, Storage};
     use alloy_primitives::Address;
     use sequencer_core::protocol::ProtocolTimingError;
 
@@ -490,5 +493,20 @@ mod tests {
 
         assert!(matches!(err, CommandError::Io(_)), "{err:?}");
         assert!(err.to_string().contains(path), "{err}");
+    }
+
+    #[test]
+    fn database_probe_failure_names_the_path() {
+        // A file as the data dir makes the database probe fail with
+        // NotADirectory, which works under root where permission bits do not.
+        let file = tempfile::NamedTempFile::new().expect("create file");
+        let data_dir = file.path().to_str().expect("utf8 path");
+        let db_path = crate::commands::config::db_path_in(data_dir);
+
+        let err = preflight_lifecycle_command(data_dir, LifecycleCommand::Run)
+            .expect_err("a database under a file cannot be probed");
+
+        assert!(matches!(err, CommandError::Io(_)), "{err:?}");
+        assert!(err.to_string().contains(&db_path), "{err}");
     }
 }

@@ -182,7 +182,8 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         let shutdown_on_drop = ShutdownOnDrop(shutdown.clone());
         let mut storage = crate::storage::Storage::open(&db_path)?;
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
-        std::fs::create_dir_all(&dumps_dir)?;
+        std::fs::create_dir_all(&dumps_dir)
+            .map_err(|err| crate::commands::io_error_at("dumps dir", &dumps_dir, err))?;
 
         // Validate rollback checkpoint metadata and collect obsolete snapshots before admission.
         super::startup_hygiene::run_snapshot_hygiene(

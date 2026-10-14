@@ -630,7 +630,13 @@ impl From<crate::runtime::process_lock::ProcessLockError> for CommandError {
             ProcessLockError::Locked { path } => {
                 CommandError::Bootstrap(BootstrapError::DataDirLocked { path })
             }
-            ProcessLockError::Io(source) => CommandError::Io(source),
+            ProcessLockError::Io { path, source } => {
+                let kind = source.kind();
+                CommandError::Io(std::io::Error::new(
+                    kind,
+                    ProcessLockError::Io { path, source },
+                ))
+            }
         }
     }
 }
@@ -1175,6 +1181,13 @@ mod tests {
             (
                 CommandError::Io(std::io::Error::other("boom")),
                 "an operational I/O failure",
+            ),
+            (
+                CommandError::from(crate::runtime::process_lock::ProcessLockError::Io {
+                    path: "/data/sequencer.lock".to_string(),
+                    source: std::io::Error::from_raw_os_error(13),
+                }),
+                "an I/O failure on the data-directory lock file",
             ),
             // An environmental read failure on the key file (a device or
             // memory error, not a wrong path) may clear on restart, so it must

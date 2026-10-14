@@ -88,15 +88,17 @@ fn sweep_orphan_dumps(
         })
         .collect::<Result<std::collections::HashSet<_>, _>>()?;
     let mut removed = 0;
-    for entry in std::fs::read_dir(dumps_dir)? {
-        let entry = entry?;
+    let listing_error =
+        |err: std::io::Error| crate::commands::io_error_at("dumps dir", dumps_dir, err);
+    for entry in std::fs::read_dir(dumps_dir).map_err(listing_error)? {
+        let entry = entry.map_err(listing_error)?;
         let path = entry.path();
         let retained = match dump_identity(&path) {
             Ok(identity) => known.contains(&identity),
             // GC or an earlier orphan deletion can leave an unregistered
             // dangling symlink. Retained references already resolved above.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(crate::commands::io_error_at("dump", &path, err)),
         };
         if retained {
             continue;
@@ -400,6 +402,43 @@ mod tests {
             "resolution precedes deletion"
         );
         assert_eq!(storage.list_dump_rows().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sweep_listing_failure_names_the_dumps_dir() {
+        let db = temp_db("sweep-missing-dumps-dir");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let parent = tempfile::tempdir().expect("create parent dir");
+        let missing = parent.path().join("dumps");
+
+        let err = sweep_orphan_dumps(&mut storage, &missing)
+            .expect_err("a missing dumps dir cannot be listed");
+
+        assert!(matches!(err, CommandError::Io(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains(missing.to_str().expect("utf8 path")),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_identity_failure_names_the_entry() {
+        let db = temp_db("sweep-symlink-loop");
+        let mut storage = Storage::open(db.path.as_str()).expect("open");
+        let dumps = tempfile::tempdir().expect("create dumps dir");
+        let looped = dumps.path().join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).expect("create symlink loop");
+
+        let err = sweep_orphan_dumps(&mut storage, dumps.path())
+            .expect_err("a symlink loop cannot be resolved");
+
+        assert!(
+            err.to_string()
+                .contains(looped.to_str().expect("utf8 path")),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]

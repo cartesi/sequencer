@@ -55,7 +55,8 @@ where
         .validate()
         .map_err(|message| SetupRecoveryError::InvalidConfig { message })?;
 
-    std::fs::create_dir_all(&config.data_dir)?;
+    std::fs::create_dir_all(&config.data_dir)
+        .map_err(|err| super::io_error_at("data dir", &config.data_dir, err))?;
     // Exclusive process ownership before any read or mutation: setup rewrites
     // deployment state and must never run beside a live sequencer (or a
     // second setup) on the same data dir.
@@ -95,7 +96,8 @@ where
     // Do not create auxiliary data-dir entries before durable lifecycle
     // admission. The lock file itself is the unavoidable ownership anchor.
     let dumps_dir = std::path::Path::new(&config.data_dir).join("dumps");
-    std::fs::create_dir_all(&dumps_dir)?;
+    std::fs::create_dir_all(&dumps_dir)
+        .map_err(|err| super::io_error_at("dumps dir", &dumps_dir, err))?;
 
     // ── L1 discovery (required) ──────────────────────────────
     let input_reader_config = InputReaderConfig {
@@ -353,8 +355,10 @@ fn admit_setup_lifecycle(
     command: storage::LifecycleCommand,
     recovery: bool,
 ) -> Result<SetupAdmission, CommandError> {
-    let populated =
-        std::path::Path::new(db_path).try_exists()? && !existing_sqlite_schema_is_empty(db_path)?;
+    let exists = std::path::Path::new(db_path)
+        .try_exists()
+        .map_err(|err| super::io_error_at("database", db_path, err))?;
+    let populated = exists && !existing_sqlite_schema_is_empty(db_path)?;
     if !populated {
         storage::Storage::initialize_for_command(db_path, command)?;
         return Ok(SetupAdmission::Proceed);
@@ -771,7 +775,9 @@ async fn read_submitter_nonce_views(
 fn existing_sqlite_schema_is_empty(
     db_path: &str,
 ) -> Result<bool, crate::commands::error::CommandError> {
-    if std::fs::metadata(db_path)?.len() == 0 {
+    let metadata =
+        std::fs::metadata(db_path).map_err(|err| super::io_error_at("database", db_path, err))?;
+    if metadata.len() == 0 {
         return Ok(true);
     }
     let connection = rusqlite::Connection::open_with_flags(

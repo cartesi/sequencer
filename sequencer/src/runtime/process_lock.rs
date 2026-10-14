@@ -37,8 +37,12 @@ pub(crate) enum ProcessLockError {
          refusing to run concurrently"
     )]
     Locked { path: String },
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    #[error("data-directory lock {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Lock-anchor file name inside the data directory. Contents are irrelevant
@@ -64,12 +68,17 @@ impl ProcessLock {
     /// kernel-enforced fact rather than an operational convention.
     pub(crate) fn acquire(data_dir: &str) -> Result<Self, ProcessLockError> {
         let path = Path::new(data_dir).join(LOCK_FILE_NAME);
+        let io_error = |source: std::io::Error| ProcessLockError::Io {
+            path: path.display().to_string(),
+            source,
+        };
         let file = File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)?;
+            .open(&path)
+            .map_err(io_error)?;
         match file.try_lock() {
             Ok(()) => Ok(Self {
                 _file: Arc::new(file),
@@ -77,7 +86,7 @@ impl ProcessLock {
             Err(TryLockError::WouldBlock) => Err(ProcessLockError::Locked {
                 path: path.display().to_string(),
             }),
-            Err(TryLockError::Error(err)) => Err(err.into()),
+            Err(TryLockError::Error(err)) => Err(io_error(err)),
         }
     }
 
@@ -195,5 +204,23 @@ mod tests {
         })
         .await
         .expect("blocking closure should release its retained lock");
+    }
+
+    #[test]
+    fn io_failure_names_the_lock_path() {
+        let parent = tempfile::tempdir().expect("create parent dir");
+        let missing = parent.path().join("missing");
+        let lock_path = missing.join(LOCK_FILE_NAME).display().to_string();
+
+        let err = ProcessLock::acquire(missing.to_str().expect("utf8 path"))
+            .expect_err("a lock in a missing directory cannot open");
+
+        assert!(matches!(&err, ProcessLockError::Io { path, .. } if *path == lock_path));
+        let projected = crate::commands::error::CommandError::from(err);
+        assert!(projected.to_string().contains(&lock_path), "{projected}");
+        assert_eq!(
+            projected.exit_code(),
+            crate::commands::error::EXIT_UNCLASSIFIED
+        );
     }
 }
