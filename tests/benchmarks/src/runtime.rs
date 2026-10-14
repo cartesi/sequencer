@@ -223,6 +223,9 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageReport {
+    /// `None` in results written before the logical size was measured.
+    #[serde(default)]
+    pub logical_db_bytes: Option<u64>,
     pub db_bytes: u64,
     pub wal_bytes: u64,
     pub growth_bytes_per_1k_accepted: Option<f64>,
@@ -230,11 +233,12 @@ pub struct StorageReport {
 
 #[derive(Debug, Clone, Copy)]
 pub struct StorageSample {
+    logical_bytes: u64,
     db_bytes: u64,
     wal_bytes: u64,
 }
 
-/// Sizes of the sequencer's SQLite file and its WAL (0 when absent).
+/// Footprint (the SQLite file and its WAL, 0 when absent) and logical size.
 pub fn sample_storage(runtime: &ManagedSequencer) -> BenchResult<StorageSample> {
     let db_path = runtime.db_path();
     let mut wal_path = db_path.clone().into_os_string();
@@ -245,6 +249,7 @@ pub fn sample_storage(runtime: &ManagedSequencer) -> BenchResult<StorageSample> 
         Err(err) => return Err(err.into()),
     };
     Ok(StorageSample {
+        logical_bytes: runtime.logical_db_bytes()?,
         db_bytes: std::fs::metadata(&db_path)?.len(),
         wal_bytes,
     })
@@ -255,13 +260,15 @@ pub fn storage_report(
     end: StorageSample,
     accepted_count: u64,
 ) -> StorageReport {
-    // Signed, because a checkpoint can shrink the WAL below its start size.
-    let growth_bytes =
-        (end.db_bytes + end.wal_bytes) as f64 - (start.db_bytes + start.wal_bytes) as f64;
+    // Logical bytes: the WAL file sits at its autocheckpoint size and the main
+    // file grows only when a checkpoint copies pages back, so file sizes are
+    // footprint, not growth. Signed, because deletes can free pages.
+    let growth_bytes = end.logical_bytes as f64 - start.logical_bytes as f64;
     // Same floor as the RSS metric: below it, one-time growth dominates.
     let growth_bytes_per_1k_accepted =
         (accepted_count >= 1000).then(|| growth_bytes / (accepted_count as f64 / 1000.0));
     StorageReport {
+        logical_db_bytes: Some(end.logical_bytes),
         db_bytes: end.db_bytes,
         wal_bytes: end.wal_bytes,
         growth_bytes_per_1k_accepted,
@@ -312,4 +319,36 @@ pub async fn measure_drain(runtime: &ManagedSequencer) -> BenchResult<DrainRepor
         batches_pending,
         drain_secs: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StorageReport, StorageSample, storage_report};
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn storage_growth_comes_from_the_logical_size_not_the_footprint() {
+        let sample = |logical_bytes| StorageSample {
+            logical_bytes,
+            db_bytes: 4 * MIB,
+            wal_bytes: 4 * MIB,
+        };
+        // Unchanged footprint: a file-size basis would report 0.
+        let report = storage_report(sample(MIB), sample(3 * MIB), 2000);
+        assert_eq!(report.growth_bytes_per_1k_accepted, Some(MIB as f64));
+        assert_eq!(report.logical_db_bytes, Some(3 * MIB));
+
+        let report = storage_report(sample(MIB), sample(3 * MIB), 999);
+        assert_eq!(report.growth_bytes_per_1k_accepted, None);
+    }
+
+    #[test]
+    fn results_written_before_the_logical_size_still_load() {
+        let old: StorageReport = serde_json::from_str(
+            r#"{"db_bytes":1,"wal_bytes":2,"growth_bytes_per_1k_accepted":null}"#,
+        )
+        .expect("an old storage report loads");
+        assert_eq!(old.logical_db_bytes, None);
+    }
 }

@@ -162,11 +162,19 @@ fn main() -> BenchResult<()> {
         }
     }
     match capacity_sweep.and_then(|r| r.storage.as_ref()) {
-        Some(storage) => println!(
-            "  DB size:               {:.1} MB (+ WAL {:.1} MB)",
-            mb(storage.db_bytes),
-            mb(storage.wal_bytes)
-        ),
+        Some(storage) => match storage.logical_db_bytes {
+            Some(logical) => println!(
+                "  DB size:               {:.1} MB logical (file {:.1} MB + WAL {:.1} MB)",
+                mb(logical),
+                mb(storage.db_bytes),
+                mb(storage.wal_bytes)
+            ),
+            None => println!(
+                "  DB size:               {:.1} MB (+ WAL {:.1} MB)",
+                mb(storage.db_bytes),
+                mb(storage.wal_bytes)
+            ),
+        },
         None => println!("  DB size:               n/a"),
     }
     match capacity_sweep.and_then(|r| r.drain.as_ref()) {

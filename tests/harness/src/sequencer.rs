@@ -930,6 +930,13 @@ impl ManagedSequencer {
         self.data_dir_path.join("sequencer.db")
     }
 
+    /// Live bytes in the database: pages in use, including pages still in the
+    /// WAL and excluding free pages. File sizes show neither. Read while the
+    /// sequencer runs, so the WAL index is there for the read-only connection.
+    pub fn logical_db_bytes(&self) -> HarnessResult<u64> {
+        logical_db_bytes_at(self.db_path().as_path())
+    }
+
     pub fn domain_chain_id(&self) -> u64 {
         DEVNET_CHAIN_ID
     }
@@ -1416,6 +1423,23 @@ fn read_info_next_batch_nonce(dump_dir: &Path) -> HarnessResult<u64> {
     Err(io_other(format!("info.toml missing next_batch_nonce: {info_path:?}")).into())
 }
 
+/// `(page_count - freelist_count) * page_size`, read in one statement so all
+/// three come from the same snapshot.
+fn logical_db_bytes_at(db_path: &Path) -> HarnessResult<u64> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+    let bytes: i64 = conn
+        .query_row(
+            "SELECT (page_count - freelist_count) * page_size \
+             FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| io_other(format!("read logical DB size: {err}")))?;
+    u64::try_from(bytes).map_err(|_| io_other(format!("negative logical DB size: {bytes}")).into())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_sequencer_process(
     sequencer_bin: &Path,
@@ -1832,7 +1856,49 @@ fn find_libfaketime_in_dirs(lib_dirs: &[PathBuf], candidates: &[&str]) -> Option
 mod tests {
     use std::fs;
 
-    use super::{candidate_libfaketime_dirs, find_libfaketime_in_dirs};
+    use super::{candidate_libfaketime_dirs, find_libfaketime_in_dirs, logical_db_bytes_at};
+
+    /// The logical size counts pages still in the WAL and drops freed pages,
+    /// so it falls after a DELETE while the file, never vacuumed, does not.
+    #[test]
+    fn logical_db_size_counts_wal_pages_and_excludes_free_pages() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("logical.db");
+        let conn = rusqlite::Connection::open(&path).expect("open DB");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL mode");
+        conn.execute_batch(
+            "CREATE TABLE t(b BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+             INSERT INTO t SELECT zeroblob(1000) FROM n;",
+        )
+        .expect("fill table");
+
+        // Under the autocheckpoint size, so the rows live only in the WAL.
+        let in_wal = logical_db_bytes_at(&path).expect("logical size");
+        assert!(in_wal >= 2000 * 1000, "WAL pages are counted: {in_wal}");
+        assert!(
+            fs::metadata(&path).expect("stat").len() < in_wal,
+            "the main file does not hold the rows yet"
+        );
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint");
+        let logical = logical_db_bytes_at(&path).expect("logical size");
+        let file = fs::metadata(&path).expect("stat").len();
+
+        conn.execute_batch("DELETE FROM t; PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("delete and checkpoint");
+        let logical_after = logical_db_bytes_at(&path).expect("logical size");
+        assert!(
+            logical_after < logical / 4,
+            "freed pages are excluded: {logical_after} vs {logical}"
+        );
+        assert!(
+            fs::metadata(&path).expect("stat").len() >= file,
+            "the file does not shrink without VACUUM"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

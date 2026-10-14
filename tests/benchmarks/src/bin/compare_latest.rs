@@ -165,6 +165,9 @@ fn print_storage_delta(old: Option<&StorageReport>, new: Option<&StorageReport>)
     };
     let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
     println!("  storage delta (new - old):");
+    if let (Some(old_logical), Some(new_logical)) = (old.logical_db_bytes, new.logical_db_bytes) {
+        print_metric_delta("logical_db_mb", mb(old_logical), mb(new_logical));
+    }
     print_metric_delta("db_mb", mb(old.db_bytes), mb(new.db_bytes));
     print_metric_delta("wal_mb", mb(old.wal_bytes), mb(new.wal_bytes));
 }

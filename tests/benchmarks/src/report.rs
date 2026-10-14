@@ -181,6 +181,10 @@ pub fn print_memory_report(memory: &runtime::MemoryReport) {
 
 pub fn print_storage_report(storage: &runtime::StorageReport) {
     println!("storage:");
+    match storage.logical_db_bytes {
+        Some(bytes) => println!("  logical_db_bytes: {bytes}"),
+        None => println!("  logical_db_bytes: n/a"),
+    }
     println!("  db_bytes: {}", storage.db_bytes);
     println!("  wal_bytes: {}", storage.wal_bytes);
     println!(
