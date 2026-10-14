@@ -23,6 +23,7 @@ use crate::l1::SubmitterKey;
 use sequencer_core::protocol::{ProtocolTiming, ProtocolTimingError};
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
+const DEFAULT_INTERNAL_HTTP_ADDR: &str = "127.0.0.1:3001";
 const DEFAULT_DATA_DIR: &str = "sequencer-data";
 const DB_FILENAME: &str = "sequencer.db";
 
@@ -471,8 +472,13 @@ impl SetupConfig {
 /// submits) and the runtime tuning knobs.
 #[derive(Debug, Clone, Args)]
 pub struct RunConfig {
+    /// Public listener: the ingress routes only.
     #[arg(long, env = "CARTESI_SEQUENCER_HTTP_ADDR", default_value = DEFAULT_HTTP_ADDR, value_parser = parse_non_empty_string)]
     pub http_addr: String,
+    /// Internal listener: subscription, history, snapshots, health. No
+    /// authentication; keep it off the public network.
+    #[arg(long, env = "CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR", default_value = DEFAULT_INTERNAL_HTTP_ADDR, value_parser = parse_non_empty_string)]
+    pub internal_http_addr: String,
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
     pub data_dir: String,
     #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", hide_env_values = true, value_parser = parse_non_empty_string)]

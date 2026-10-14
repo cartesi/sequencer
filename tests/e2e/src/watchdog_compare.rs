@@ -91,7 +91,10 @@ impl Watchdog {
             .env("CARTESI_WATCHDOG_LUA_ROOT", &workspace)
             .env("CARTESI_WATCHDOG_LUA_DEPS", &lua_deps)
             .env("CARTESI_WATCHDOG_STATE_DIR", &self.state_dir)
-            .env("CARTESI_WATCHDOG_SEQUENCER_URL", runtime.endpoint())
+            .env(
+                "CARTESI_WATCHDOG_SEQUENCER_URL",
+                runtime.internal_endpoint(),
+            )
             .env(
                 "CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT",
                 runtime.l1_endpoint(),
@@ -150,7 +153,7 @@ impl Watchdog {
 
 /// The sequencer's accepted block and comparison-file digest.
 async fn sequencer_digest(runtime: &ManagedSequencer) -> ScenarioResult<(u64, String)> {
-    let url = format!("{}/finalized_state/digest", runtime.endpoint());
+    let url = format!("{}/finalized_state/digest", runtime.internal_endpoint());
     let (status, body, _) = http_get(&url)
         .await
         .map_err(|err| format!("GET {url}: {err}"))?;
@@ -187,7 +190,7 @@ pub async fn run_watchdog_genesis_compare_test(
     let expected_snapshot = wallet_snapshot::encode(&WalletApp::new(WalletConfig::devnet()));
 
     eprintln!("[watchdog-harness] step 1/4: the sequencer serves the devnet genesis state");
-    let finalized_url = format!("{}/finalized_state", runtime.endpoint());
+    let finalized_url = format!("{}/finalized_state", runtime.internal_endpoint());
     let (_status, body, headers) =
         wait_for_finalized_state(finalized_url.as_str(), Duration::from_secs(30)).await?;
     let inclusion_block = header_u64(&headers, "x-inclusion-block")
@@ -237,7 +240,7 @@ pub async fn run_watchdog_non_genesis_compare_test(
     let image = machine_image(DEVNET_MACHINE_IMAGE)?;
 
     eprintln!("[watchdog-harness] step 1/3: wait for a non-genesis accepted checkpoint");
-    let finalized_url = format!("{}/finalized_state", runtime.endpoint());
+    let finalized_url = format!("{}/finalized_state", runtime.internal_endpoint());
     wait_for_non_genesis_finalized_state(finalized_url.as_str(), runtime, Duration::from_secs(60))
         .await?;
     let (block, _) = sequencer_digest(runtime).await?;
@@ -269,7 +272,7 @@ pub async fn run_watchdog_divergence_drill_test(
     let trusted = machine_image(DEVNET_MACHINE_IMAGE)?;
     let wrong = machine_image(SEPOLIA_MACHINE_IMAGE)?;
 
-    let finalized_url = format!("{}/finalized_state", runtime.endpoint());
+    let finalized_url = format!("{}/finalized_state", runtime.internal_endpoint());
     wait_for_non_genesis_finalized_state(finalized_url.as_str(), runtime, Duration::from_secs(60))
         .await?;
     let (block, _) = sequencer_digest(runtime).await?;

@@ -147,7 +147,7 @@ endpoint is never persisted, and failure messages name no request URL.
 |---|---|---|
 | `CARTESI_WATCHDOG_STATE_DIR` | all | Absolute path of the state directory |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` | init, tick, replay | L1 JSON-RPC endpoint; never persisted, so it can rotate |
-| `CARTESI_WATCHDOG_SEQUENCER_URL` | init (persisted); tick (optional override) | Sequencer operator API base URL |
+| `CARTESI_WATCHDOG_SEQUENCER_URL` | init (persisted); tick (optional override) | Base URL of the sequencer's internal listener |
 | `CARTESI_WATCHDOG_BLOCKCHAIN_ID` | init (optional) | Expected chain id; defaults to the RPC's `eth_chainId` |
 | `CARTESI_WATCHDOG_APP_ADDRESS` | init | Application address; init derives the InputBox from its `getInputBox()`, as the sequencer does |
 | `CARTESI_WATCHDOG_STATE_SOURCE` | init | `inspect`, or `range:<label>` with a label matching `[a-z][a-z0-9-]*` |

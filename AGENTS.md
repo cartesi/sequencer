@@ -291,7 +291,7 @@ enforces write-once batch lifecycle, Tip uniqueness, and user-op identity.
   authentication and **must not be exposed publicly**. Downloads hold a GC lease
   for their response lifetime ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
 
-Today both sides serve from one listener; the planned API split puts each side on its own port (same binary) so internal probes and subscribers can be firewalled from public submit traffic.
+Each side has its own listener (public `CARTESI_SEQUENCER_HTTP_ADDR`, internal `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`), so internal probes and subscribers can be firewalled from public submit traffic.
 
 The [README API contract](README.md#api) owns routes, message shapes, caps,
 close codes, and health semantics. [`openapi.yaml`](openapi.yaml) is its

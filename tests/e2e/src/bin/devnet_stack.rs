@@ -39,7 +39,11 @@ async fn main() -> HarnessResult<()> {
 
     eprintln!();
     eprintln!("=== Devnet stack is up ===");
-    eprintln!("Sequencer HTTP:  {}", runtime.endpoint());
+    eprintln!("Sequencer HTTP:  {} (public)", runtime.endpoint());
+    eprintln!(
+        "Sequencer API:   {} (internal)",
+        runtime.internal_endpoint()
+    );
     eprintln!("L1 RPC:          {}", runtime.l1_endpoint());
     eprintln!("App address:     {}", runtime.app_address());
     eprintln!("InputBox:        {}", runtime.input_box_address());
@@ -51,7 +55,7 @@ async fn main() -> HarnessResult<()> {
     );
     eprintln!(
         "export CARTESI_WATCHDOG_SEQUENCER_URL={}",
-        runtime.endpoint()
+        runtime.internal_endpoint()
     );
     eprintln!(
         "export CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT={}",
@@ -77,7 +81,7 @@ async fn main() -> HarnessResult<()> {
     eprintln!("The accepted checkpoint (genesis is comparable at block 0):");
     eprintln!(
         "  curl -s {}/finalized_state/inclusion_block",
-        runtime.endpoint()
+        runtime.internal_endpoint()
     );
     eprintln!();
     eprintln!("Run watchdog (from repo root, after `just watchdog-lua-deps`):");

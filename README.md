@@ -145,7 +145,7 @@ The submitter address must equal the `sequencer_address` compiled into the canon
 `run` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `_FILE`); it refuses to boot until `setup` has completed.
 Logs show only the endpoint's `scheme://host[:port]`, since provider URLs carry credentials; `RUST_LOG=debug` on alloy's transport targets still prints the full URL.
 
-Optional: `CARTESI_SEQUENCER_HTTP_ADDR` (default `127.0.0.1:3000`, `run`), `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; `setup` creates it, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default `12`), `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (default `600`), `CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES` (default `-32005,-32012,-32600,-32602,-32616`), `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (alternative to `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY`; first line of the file is the key), `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
+Optional: `CARTESI_SEQUENCER_HTTP_ADDR` (public listener, default `127.0.0.1:3000`, `run`), `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR` (internal listener, default `127.0.0.1:3001`, `run`), `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; `setup` creates it, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default `12`), `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (default `600`), `CARTESI_SEQUENCER_LONG_BLOCK_RANGE_ERROR_CODES` (default `-32005,-32012,-32600,-32602,-32616`), `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (alternative to `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY`; first line of the file is the key), `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
 
 By default the blockchain endpoint must be `https://` unless its host is loopback (`localhost`, `127.0.0.0/8`, `::1`) — a guard against accidentally sending L1 traffic to a public RPC in the clear. Set `CARTESI_SEQUENCER_ALLOW_INSECURE_RPC=true` (or `--allow-insecure-rpc`) to permit plaintext `http://` to a non-loopback host on a **trusted private network** — e.g. a Docker Compose / Kubernetes service name (`http://anvil:8545`), `host.docker.internal`, or a private-VPC IP.
 
@@ -172,6 +172,13 @@ Most queue sizes, polling intervals, and safety limits are now internal runtime 
 This section owns the wire contract. [`openapi.yaml`](openapi.yaml) renders it
 as OpenAPI 3.1 for client generation and documentation tools; change both
 together.
+
+The sequencer serves two listeners. The public one
+(`CARTESI_SEQUENCER_HTTP_ADDR`) serves only `POST /tx`, `GET /fee`,
+`GET /nonce`, and `GET /domain`. Every other route, health probes included, is
+internal and served only on the internal listener
+(`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`), without authentication; keep it off
+the public network.
 
 Errors use one JSON shape, `{ "ok": false, "code": "<CODE>", "message": "<text>" }`,
 with these codes: `400` `BAD_REQUEST` or `INVALID_SIGNATURE`, `413`
@@ -443,9 +450,8 @@ checkpoint selection, and subscription.
 ### Operator snapshot endpoints (internal only)
 
 These serve application state to the operator's watchdog and indexers.
-**They are operator-internal — no auth — and must not be exposed publicly**
-(gated by network controls today; bound to a separate internal port once the
-api split lands).
+**They are operator-internal — no auth — and must not be exposed publicly**:
+they are served only on the internal listener, behind network controls.
 
 - `GET /finalized_state/inclusion_block` — cheap JSON the watchdog polls:
   `{ "inclusion_block": <u64>, "executed_input_count": <u64> }`.

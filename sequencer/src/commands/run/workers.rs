@@ -123,8 +123,9 @@ pub(super) struct PreparedRuntime<A> {
     submitter: BatchSubmitter<EthereumBatchPoster>,
     detector: DangerDetector,
     tx_feed: L2TxFeed,
-    listener: tokio::net::TcpListener,
-    bound_addr: std::net::SocketAddr,
+    listeners: http::ApiListeners,
+    public_addr: std::net::SocketAddr,
+    internal_addr: std::net::SocketAddr,
     snapshot_state: http::SnapshotState,
     shutdown: RuntimeScope,
     shutdown_on_drop: ShutdownOnDrop,
@@ -239,8 +240,20 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         let lane_config =
             InclusionLaneConfig::new(dumps_dir).with_max_batch_open(run_config.max_batch_open());
         let api_config = ApiConfig::new(domain, A::max_method_payload_bytes());
-        let listener = tokio::net::TcpListener::bind(&run_config.http_addr).await?;
-        let bound_addr = listener.local_addr()?;
+        let bind = |what: &'static str, addr: &str| {
+            let addr = addr.to_owned();
+            async move {
+                tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .map_err(|err| crate::commands::io_error_at(what, &addr, err))
+            }
+        };
+        let listeners = http::ApiListeners {
+            public: bind("public listener", &run_config.http_addr).await?,
+            internal: bind("internal listener", &run_config.internal_http_addr).await?,
+        };
+        let public_addr = listeners.public.local_addr()?;
+        let internal_addr = listeners.internal.local_addr()?;
         let snapshot_state = http::SnapshotState {
             db_path,
             // The DB row stores the dump *directory*; the app's state
@@ -257,8 +270,9 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             submitter,
             detector,
             tx_feed,
-            listener,
-            bound_addr,
+            listeners,
+            public_addr,
+            internal_addr,
             snapshot_state,
             shutdown,
             shutdown_on_drop,
@@ -280,8 +294,9 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             submitter,
             detector,
             tx_feed,
-            listener,
-            bound_addr,
+            listeners,
+            public_addr,
+            internal_addr,
             snapshot_state,
             shutdown,
             shutdown_on_drop,
@@ -298,16 +313,16 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         let submitter = submitter.start_preflighted(shutdown.clone());
         let detector = detector.start_preflighted(shutdown.signal());
         let fee_oracle = fee_oracle.map(|oracle| oracle.start(shutdown.signal()));
-        // HTTP server (ingress /tx + read routes, egress /ws/subscribe + /health, currently merged).
-        let server = http::start_on_listener(
-            listener,
+        // One task serves the public and internal listeners.
+        let server = http::start_on_listeners(
+            listeners,
             tx,
             shutdown.clone(),
             tx_feed,
             api_config,
             snapshot_state,
         );
-        tracing::info!(address = %bound_addr, "listening");
+        tracing::info!(public = %public_addr, internal = %internal_addr, "listening");
 
         Workers {
             server,
@@ -874,6 +889,7 @@ mod tests {
 
     fn startup_workers_config(
         http_addr: String,
+        internal_http_addr: String,
     ) -> (tempfile::TempDir, String, String, WorkersConfig) {
         const KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
@@ -884,6 +900,8 @@ mod tests {
             "run".to_string(),
             "--http-addr".to_string(),
             http_addr,
+            "--internal-http-addr".to_string(),
+            internal_http_addr,
             "--data-dir".to_string(),
             data_dir.clone(),
             "--eth-rpc-url".to_string(),
@@ -985,7 +1003,8 @@ mod tests {
             .await
             .expect("bind occupied listener");
         let http_addr = occupied.local_addr().expect("listener address").to_string();
-        let (_dir, data_dir, _db_path, workers_config) = startup_workers_config(http_addr);
+        let (_dir, data_dir, _db_path, workers_config) =
+            startup_workers_config(http_addr, "127.0.0.1:0".to_string());
 
         let result = PreparedRuntime::<StartupProbeApp>::prepare(workers_config).await;
         let err = match result {
@@ -996,6 +1015,7 @@ mod tests {
             matches!(&err, CommandError::Io(source) if source.kind() == std::io::ErrorKind::AddrInUse),
             "expected AddrInUse, got {err:?}"
         );
+        assert!(err.to_string().contains("public listener"), "{err}");
         // The boundary check: a worker spawned during preparation would keep
         // the process lock held — through its `RuntimeScope` clone or, for
         // the reader, detector, and fee oracle, its own `ProcessLock` — so
@@ -1005,9 +1025,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn occupied_internal_http_port_fails_before_any_worker_launches() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied listener");
+        let internal_addr = occupied.local_addr().expect("listener address").to_string();
+        let (_dir, data_dir, _db_path, workers_config) =
+            startup_workers_config("127.0.0.1:0".to_string(), internal_addr);
+
+        let err = match PreparedRuntime::<StartupProbeApp>::prepare(workers_config).await {
+            Ok(_) => panic!("an occupied internal listener must refuse preparation"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, CommandError::Io(source) if source.kind() == std::io::ErrorKind::AddrInUse),
+            "expected AddrInUse, got {err:?}"
+        );
+        assert!(err.to_string().contains("internal listener"), "{err}");
+        ProcessLock::acquire(&data_dir)
+            .expect("failed preparation must release ownership with zero live workers");
+    }
+
+    #[tokio::test]
     async fn launch_requires_a_fresh_admission_after_preparation() {
         let (_dir, data_dir, db_path, workers_config) =
-            startup_workers_config("127.0.0.1:0".to_string());
+            startup_workers_config("127.0.0.1:0".to_string(), "127.0.0.1:0".to_string());
 
         let timing = workers_config.timing;
         let prepared = PreparedRuntime::<StartupProbeApp>::prepare(workers_config)
@@ -1039,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn admission_refuses_when_facts_age_during_preparation() {
         let (_dir, _data_dir, db_path, workers_config) =
-            startup_workers_config("127.0.0.1:0".to_string());
+            startup_workers_config("127.0.0.1:0".to_string(), "127.0.0.1:0".to_string());
         let timing = workers_config.timing;
 
         let prepared = PreparedRuntime::<StartupProbeApp>::prepare(workers_config)

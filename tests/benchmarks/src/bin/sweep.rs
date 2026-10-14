@@ -3,13 +3,13 @@
 
 use alloy_primitives::Address;
 use benchmarks::{
-    AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME,
-    DOMAIN_VERSION, NetworkProfile, RoundTripRunConfig, RtSweepMeasurements, RtSweepRow,
-    RtSweepRunReport, SweepMeasurements, SweepRow, SweepRunReport, WorkloadConfig, WorkloadKind,
-    compute_capacity_summary, compute_rt_sweep_summary, default_json_output_path,
-    evaluate_ack_target, parse_address, print_ack_report, print_round_trip_report,
-    print_sweep_report, print_target_evaluation, resolve_external_benchmark_domain,
-    run_ack_benchmark, run_round_trip_benchmark,
+    AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_INTERNAL_ENDPOINT,
+    DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME, DOMAIN_VERSION, NetworkProfile,
+    RoundTripRunConfig, RtSweepMeasurements, RtSweepRow, RtSweepRunReport, SweepMeasurements,
+    SweepRow, SweepRunReport, WorkloadConfig, WorkloadKind, compute_capacity_summary,
+    compute_rt_sweep_summary, default_json_output_path, evaluate_ack_target, parse_address,
+    print_ack_report, print_round_trip_report, print_sweep_report, print_target_evaluation,
+    resolve_external_benchmark_domain, run_ack_benchmark, run_round_trip_benchmark,
     runtime::{
         DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RESULTS_DIR, DEFAULT_SEQUENCER_BIN,
         MemorySampler, benchmark_domain, bootstrap_funded_workload, managed_sequencer_config,
@@ -40,6 +40,9 @@ struct Args {
     duration_secs: u64,
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+    /// The sequencer's internal listener (feed), for round-trip runs.
+    #[arg(long, default_value = DEFAULT_INTERNAL_ENDPOINT)]
+    internal_endpoint: String,
     #[arg(long, default_value_t = false)]
     self_contained: bool,
     #[arg(long, default_value = DEFAULT_SEQUENCER_BIN)]
@@ -153,6 +156,10 @@ async fn main() -> BenchResult<()> {
         .as_ref()
         .map(|value| value.endpoint().to_string())
         .unwrap_or_else(|| args.endpoint.clone());
+    let internal_endpoint = managed
+        .as_ref()
+        .map(|value| value.internal_endpoint().to_string())
+        .unwrap_or_else(|| args.internal_endpoint.clone());
     let sequencer_log_path = managed
         .as_ref()
         .map(|value| value.log_path().to_string_lossy().to_string());
@@ -195,6 +202,7 @@ async fn main() -> BenchResult<()> {
         if args.round_trip {
             let warmup_config = RoundTripRunConfig {
                 endpoint: endpoint.clone(),
+                internal_endpoint: internal_endpoint.clone(),
                 domain,
                 duration: warmup_duration,
                 concurrency: first_concurrency,
@@ -247,6 +255,7 @@ async fn main() -> BenchResult<()> {
 
             let config = RoundTripRunConfig {
                 endpoint: endpoint.clone(),
+                internal_endpoint: internal_endpoint.clone(),
                 domain,
                 duration,
                 concurrency,

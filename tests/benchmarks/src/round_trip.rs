@@ -29,6 +29,8 @@ const DEFAULT_BACKLOG_DRAIN_MAX_MS: u64 = 2_000;
 #[derive(Debug, Clone)]
 pub struct RoundTripRunConfig {
     pub endpoint: String,
+    /// The internal listener the feed is read from.
+    pub internal_endpoint: String,
     pub domain: BenchmarkDomain,
     pub duration: Duration,
     pub concurrency: usize,
@@ -83,9 +85,16 @@ pub async fn run_round_trip_benchmark(
         SequencerClient::new_with_timeout(config.endpoint.clone(), timeout).map_err(|e| {
             crate::support::io_err(format!("invalid endpoint '{}': {e}", config.endpoint))
         })?;
+    let feed_client = SequencerClient::new_with_timeout(config.internal_endpoint.clone(), timeout)
+        .map_err(|e| {
+            crate::support::io_err(format!(
+                "invalid internal endpoint '{}': {e}",
+                config.internal_endpoint
+            ))
+        })?;
     // This observer tracks latency only; it holds no application state to restore.
-    let claim = client.latest_snapshot().await?.claim;
-    let ws_subscribe_url = client.ws_subscribe_url(claim);
+    let claim = feed_client.latest_snapshot().await?.claim;
+    let ws_subscribe_url = feed_client.ws_subscribe_url(claim);
     let domain = config.domain.eip712_domain();
 
     let workers = config.concurrency;
@@ -100,7 +109,7 @@ pub async fn run_round_trip_benchmark(
     )?;
 
     // Connect WS and drain backlog.
-    let mut ws = client.subscribe(claim).await.map_err(|err| {
+    let mut ws = feed_client.subscribe(claim).await.map_err(|err| {
         io_err(format!(
             "ws connect failed: url={ws_subscribe_url}, error={err}"
         ))

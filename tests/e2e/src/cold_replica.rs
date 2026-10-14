@@ -35,7 +35,7 @@ async fn run_with<A: Application>(runtime: &mut ManagedSequencer) -> ScenarioRes
 }
 
 async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> ScenarioResult<()> {
-    let client = SequencerClient::new(runtime.endpoint())?;
+    let client = SequencerClient::new(runtime.internal_endpoint())?;
     let genesis = client.latest_snapshot().await?;
     assert_eq!(genesis.claim.next_input.get(), 0);
     let mut reference_ws = WsClient::connect(&client, genesis.claim).await?;
@@ -150,7 +150,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     drop(reference_ws);
     runtime.stop().await?;
     runtime.respawn().await?;
-    let client = SequencerClient::new(runtime.endpoint())?;
+    let client = SequencerClient::new(runtime.internal_endpoint())?;
     let mut replica_ws = WsClient::connect(&client, restart_claim).await?;
     let mut reference_ws = WsClient::connect(&client, restart_claim).await?;
     replica_ws
@@ -192,7 +192,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
 
     // Respawn chooses a fresh listener. The claim comes exclusively from the
     // downloaded snapshot and consumed inputs, never the harness's DB helpers.
-    let client = SequencerClient::new(runtime.endpoint())?;
+    let client = SequencerClient::new(runtime.internal_endpoint())?;
     assert!(matches!(
         client.subscribe(stale_claim).await,
         Err(SubscribeError::History(
@@ -239,7 +239,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     let balance_before = recovered_reference.current_user_balance(alice_address);
     // The fixed oracle keeps this quote valid across frame rotations. Derive the
     // expected debit before receiving the event so wrong feed fees cannot agree by replay.
-    let quote = client.get_fee().await?;
+    let quote = SequencerClient::new(runtime.endpoint())?.get_fee().await?;
     assert_eq!(quote.fee, quote.recommended_fee);
     let amount = U256::from(6_000);
     let expected_balance = balance_before - amount - fee_to_linear(quote.fee);

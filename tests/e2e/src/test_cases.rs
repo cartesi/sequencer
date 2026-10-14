@@ -790,8 +790,11 @@ async fn run_reconnect_from_offset_test(runtime: &mut ManagedSequencer) -> Scena
     alice_l2.transfer(bob_address, transfer_amount).await?;
     bob_l2.withdraw(withdrawal_amount).await?;
 
-    let mut resumed_ws =
-        WsClient::connect(&SequencerClient::new(runtime.endpoint())?, reconnect_claim).await?;
+    let mut resumed_ws = WsClient::connect(
+        &SequencerClient::new(runtime.internal_endpoint())?,
+        reconnect_claim,
+    )
+    .await?;
     replay.apply(resumed_ws.expect_user_op_from(alice_address).await?)?;
     replay.apply(resumed_ws.expect_user_op_from(bob_address).await?)?;
 
@@ -1452,7 +1455,7 @@ async fn run_setup_recovery_round_trip_test<A: Application>(
     // Drive the batch to seal + be accepted + promoted, and capture the
     // resulting finalized snapshot as the recovery checkpoint.
     let checkpoint = drive_promotion_and_capture(runtime).await?;
-    let old_claim = SequencerClient::new(runtime.endpoint())?
+    let old_claim = SequencerClient::new(runtime.internal_endpoint())?
         .latest_snapshot()
         .await?
         .claim;
@@ -1476,7 +1479,7 @@ async fn run_setup_recovery_round_trip_test<A: Application>(
 
     // A rebuilt database cannot authorize the old replica, even when its
     // numerical generation/count match. Restore and subscribe in the new era.
-    let client = SequencerClient::new(runtime.endpoint())?;
+    let client = SequencerClient::new(runtime.internal_endpoint())?;
     assert!(matches!(
         client.subscribe(old_claim).await,
         Err(SubscribeError::History(
@@ -3417,7 +3420,7 @@ async fn run_ws_reconnect_with_invalidated_claim_is_refused_test(
     runtime.respawn().await?;
 
     assert!(matches!(
-        SequencerClient::new(runtime.endpoint())?
+        SequencerClient::new(runtime.internal_endpoint())?
             .subscribe(resume_claim)
             .await,
         Err(sequencer_rust_client::SubscribeError::History(
@@ -3439,7 +3442,7 @@ async fn run_ws_subscribe_ahead_of_head_is_refused_test(
 ) -> ScenarioResult<()> {
     let claim = runtime.history_claim(u64::MAX)?;
     assert!(matches!(
-        SequencerClient::new(runtime.endpoint())?
+        SequencerClient::new(runtime.internal_endpoint())?
             .subscribe(claim)
             .await,
         Err(sequencer_rust_client::SubscribeError::History(

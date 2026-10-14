@@ -21,9 +21,8 @@ pub(crate) use health::HealthState;
 pub use snapshot::SnapshotState;
 pub(crate) use state::SubscribeState;
 
-/// Build the egress router. Each subrouter has its own state; the merge is
-/// transparent to axum's routing. Snapshot routes are always part of the
-/// egress (internal) side — the public/ingress side is a separate router.
+/// Build the egress router, served on the internal listener. Each subrouter
+/// has its own state; the merge is transparent to axum's routing.
 pub(crate) fn router(
     subscribe_state: Arc<SubscribeState>,
     health_state: Arc<HealthState>,

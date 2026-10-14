@@ -68,16 +68,6 @@ Next: compare the intended bound with serialized batches across payload/frame
 counts, then correct the estimate and check the separately configured
 `batch_policy.log_user_op_bytes` used for fee accounting.
 
-### Separate public ingress and internal egress listeners
-
-[`http.rs`](../../sequencer/src/http.rs) serves both routers on one listener.
-Publishing that listener wholesale also exposes unauthenticated internal state
-and snapshot routes. Next: finish the planned per-side bind configuration and
-verify that every public route in the [API contract](../../README.md#api) (today
-`POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain`) is on the public
-listener and no internal route is. Keep network access controls as the
-deployment boundary; no new authentication subsystem is implied.
-
 ## Bounded investigations and cleanup
 
 - **Intermittent process-lock test failure.** The macOS workspace suite can

@@ -2,13 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Shared HTTP surface: error type + JSON response shape used by both
-//! ingress (`/tx`, `/fee`, `/nonce`, `/domain`) and egress (`/ws/subscribe`,
-//! future routes), plus the `axum::serve` orchestration that wires the two
-//! side routers together.
-//!
-//! Today both sides serve from one listener; the planned api split puts each
-//! side on its own port (same binary, two listeners). When that lands, the
-//! orchestration here becomes per-side `start_*` calls.
+//! ingress (`/tx`, `/fee`, `/nonce`, `/domain`) and egress (subscription,
+//! history, snapshots, health), plus the `axum::serve` orchestration that
+//! serves each side on its own listener: ingress public, egress internal.
 
 use std::sync::Arc;
 
@@ -139,8 +135,7 @@ impl IntoResponse for ApiError {
 
 // ── HTTP server orchestration ────────────────────────────────────────────────
 //
-// Combines ingress + egress routers into one axum::serve. The api split will
-// replace this with per-side starts on different ports.
+// One task serves the public (ingress) and internal (egress) listeners.
 
 const DEFAULT_WS_MAX_SUBSCRIBERS: usize = 64;
 const DEFAULT_MAX_BODY_BYTES: usize = TxRequest::MAX_JSON_BYTES_RECOMMENDED;
@@ -304,8 +299,14 @@ impl ApiConfig {
     }
 }
 
-pub(crate) fn start_on_listener(
-    listener: tokio::net::TcpListener,
+/// The two listeners `run` binds before launch.
+pub(crate) struct ApiListeners {
+    pub public: tokio::net::TcpListener,
+    pub internal: tokio::net::TcpListener,
+}
+
+pub(crate) fn start_on_listeners(
+    listeners: ApiListeners,
     tx_sender: mpsc::Sender<PendingUserOp>,
     shutdown: RuntimeScope,
     tx_feed: L2TxFeed,
@@ -338,28 +339,40 @@ pub(crate) fn start_on_listener(
         tx_feed,
         config.ws_max_subscribers,
     ));
-    let app: Router = crate::ingress::api::router(submit_state, read_state)
-        .merge(crate::egress::api::router(
-            subscribe_state,
-            health_state,
-            snapshot_state,
-            shutdown.clone(),
-            snapshot_release_scheduler,
-        ))
+    let public: Router = crate::ingress::api::router(submit_state, read_state)
         // Enforces a raw request-body cap before JSON deserialization, including whitespace.
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
         .layer(TraceLayer::new_for_http());
+    let internal: Router = crate::egress::api::router(
+        subscribe_state,
+        health_state,
+        snapshot_state,
+        shutdown.clone(),
+        snapshot_release_scheduler,
+    )
+    .layer(TraceLayer::new_for_http());
 
     tokio::spawn(async move {
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown.wait_for_shutdown().await;
-            })
-            .await;
+        // Each serve resolves only after the shared shutdown signal, so the
+        // two drain together.
+        let (public, internal) = tokio::join!(
+            serve(listeners.public, public, shutdown.clone()),
+            serve(listeners.internal, internal, shutdown),
+        );
         // Finish every scheduled release before ordinary HTTP shutdown ends.
         snapshot_release_drain.finish().await;
-        result
+        public.and(internal)
     })
+}
+
+async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: RuntimeScope,
+) -> std::io::Result<()> {
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.wait_for_shutdown().await })
+        .await
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::{BenchResult, support::io_err};
 
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:3000";
+/// The sequencer's internal listener, where the feed is served.
+pub const DEFAULT_INTERNAL_ENDPOINT: &str = "http://127.0.0.1:3001";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BenchmarkDomain {
     pub chain_id: u64,

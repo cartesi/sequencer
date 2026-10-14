@@ -16,7 +16,8 @@ mod workload;
 
 pub use ack::{AckRunConfig, AckRunReport, run_ack_benchmark};
 pub use domain::{
-    BenchmarkDomain, DEFAULT_ENDPOINT, parse_address, resolve_external_benchmark_domain,
+    BenchmarkDomain, DEFAULT_ENDPOINT, DEFAULT_INTERNAL_ENDPOINT, parse_address,
+    resolve_external_benchmark_domain,
 };
 pub use evaluation::{
     ACK_P99_TARGET_MS, DIAGNOSTIC_P999_MIN_ACCEPTED_COUNT, NetworkProfile, NetworkProfileKind,

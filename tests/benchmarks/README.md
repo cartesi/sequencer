@@ -10,7 +10,7 @@ Benchmark goals, measurement definitions, and reporting requirements live in
 Networked benchmarks sign EIP-712 payloads, so they need to know which sequencer
 instance they are targeting.
 
-- **External target**: pass `--domain-chain-id` and `--domain-verifying-contract` to match the target sequencer deployment.
+- **External target**: pass `--domain-chain-id` and `--domain-verifying-contract` to match the target sequencer deployment. Round-trip runs also read the feed from the sequencer's internal listener (`--internal-endpoint`, default `http://127.0.0.1:3001`).
 - **Self-contained target**: the harness spawns `anvil`, deploys a local `Application` through `ApplicationFactory`, and uses that deployed app address as the verifying contract for both signer and sequencer:
   - chain ID: `31337`
   - verifying contract: dynamically deployed local `Application`
@@ -49,7 +49,7 @@ cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained -
 cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs 60 --concurrency 16 --max-fee 2000 --evaluate
 
 # Against an external sequencer (pass that deployment's EIP-712 domain):
-cargo run -p benchmarks --bin round_trip_latency --release -- --endpoint http://127.0.0.1:3000 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --duration-secs 30 --concurrency 4 --max-fee 2000
+cargo run -p benchmarks --bin round_trip_latency --release -- --endpoint http://127.0.0.1:3000 --internal-endpoint http://127.0.0.1:3001 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --duration-secs 30 --concurrency 4 --max-fee 2000
 
 # Concurrency sweep — ack latency by default, round-trip with `--round-trip`:
 cargo run -p benchmarks --bin sweep --release -- --self-contained --duration-secs 30 --max-fee 2000 --concurrency-list "1 2 4 8 16 32 64 128"

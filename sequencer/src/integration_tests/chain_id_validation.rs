@@ -57,6 +57,8 @@ fn run_config(data_dir: &str, eth_rpc_url: &str, key: &str) -> sequencer::RunCon
         "run",
         "--http-addr",
         "127.0.0.1:0",
+        "--internal-http-addr",
+        "127.0.0.1:0",
         "--data-dir",
         data_dir,
         "--eth-rpc-url",

@@ -3,10 +3,10 @@
 
 use alloy_primitives::Address;
 use benchmarks::{
-    BenchResult, DEFAULT_ENDPOINT, DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME, DOMAIN_VERSION,
-    NetworkProfile, RoundTripRunConfig, WorkloadConfig, WorkloadKind, default_json_output_path,
-    evaluate_soft_confirm_target, parse_address, print_round_trip_report, print_target_evaluation,
-    resolve_external_benchmark_domain, run_round_trip_benchmark,
+    BenchResult, DEFAULT_ENDPOINT, DEFAULT_INTERNAL_ENDPOINT, DEFAULT_WORKLOAD_TRANSFER_AMOUNT,
+    DOMAIN_NAME, DOMAIN_VERSION, NetworkProfile, RoundTripRunConfig, WorkloadConfig, WorkloadKind,
+    default_json_output_path, evaluate_soft_confirm_target, parse_address, print_round_trip_report,
+    print_target_evaluation, resolve_external_benchmark_domain, run_round_trip_benchmark,
     runtime::{
         DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_SEQUENCER_BIN, MemorySampler, benchmark_domain,
         bootstrap_funded_workload, managed_sequencer_config,
@@ -32,6 +32,9 @@ const FUNDING_ESTIMATE_TXS_PER_WORKER: u64 = 100_000;
 struct Args {
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+    /// The sequencer's internal listener (feed), for round-trip runs.
+    #[arg(long, default_value = DEFAULT_INTERNAL_ENDPOINT)]
+    internal_endpoint: String,
     #[arg(long, default_value_t = false)]
     self_contained: bool,
     #[arg(long, default_value = DEFAULT_SEQUENCER_BIN)]
@@ -109,6 +112,10 @@ async fn main() -> BenchResult<()> {
         .as_ref()
         .map(|value| value.endpoint().to_string())
         .unwrap_or_else(|| args.endpoint.clone());
+    let internal_endpoint = managed
+        .as_ref()
+        .map(|value| value.internal_endpoint().to_string())
+        .unwrap_or_else(|| args.internal_endpoint.clone());
 
     println!(
         "round-trip config: endpoint={}, self_contained={}, domain_chain_id={}, domain_verifying_contract={}, duration={}s, concurrency={}, max_fee={}, workload={}",
@@ -138,6 +145,7 @@ async fn main() -> BenchResult<()> {
         );
         let warmup_config = RoundTripRunConfig {
             endpoint: endpoint.clone(),
+            internal_endpoint: internal_endpoint.clone(),
             domain,
             duration: Duration::from_secs(args.warmup_secs),
             concurrency: effective_concurrency,
@@ -160,6 +168,7 @@ async fn main() -> BenchResult<()> {
 
     let config = RoundTripRunConfig {
         endpoint,
+        internal_endpoint,
         domain,
         duration: Duration::from_secs(args.duration_secs),
         concurrency: effective_concurrency,

@@ -161,8 +161,7 @@ impl Drop for Server {
 
 impl Server {
     async fn start(db_path: &str) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listeners, _public_addr, addr) = super::common::bind_api_listeners().await;
         let shutdown = RuntimeScope::default();
         let (tx, rx) = mpsc::channel(1);
         let feed = L2TxFeed::new(
@@ -170,8 +169,8 @@ impl Server {
             shutdown.clone(),
             L2TxFeedConfig::default(),
         );
-        let task = http::start_on_listener(
-            listener,
+        let task = http::start_on_listeners(
+            listeners,
             tx,
             shutdown.clone(),
             feed,

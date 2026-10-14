@@ -4,14 +4,15 @@ info:
   version: 0.1.0
   summary: HTTP and WebSocket API of the app-specific DeFi sequencer.
   description: |
-    The sequencer serves two groups of routes from one listener:
+    The sequencer serves two groups of routes on two listeners:
 
-    - **Ingress** (public): submit signed user operations and read what a
-      wallet needs to sign them. CORS allows any origin on these routes.
-    - **Egress** (internal): application-input subscription, history
-      metadata, snapshot/state downloads, and health probes. These routes
-      have **no authentication and must not be exposed publicly**; gate them
-      with network access controls.
+    - **Ingress** (public, `CARTESI_SEQUENCER_HTTP_ADDR`): submit signed user
+      operations and read what a wallet needs to sign them. CORS allows any
+      origin on these routes.
+    - **Egress** (internal, `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`):
+      application-input subscription, history metadata, snapshot/state
+      downloads, and health probes. These routes have **no authentication and
+      must not be exposed publicly**; gate them with network access controls.
 
     Address casing differs by route. `sender` in `POST /tx` and `GET /nonce`
     responses and WebSocket messages, and `verifyingContract` in
@@ -37,7 +38,7 @@ externalDocs:
   url: https://github.com/cartesi/sequencer/blob/main/README.md#api
 servers:
   - url: http://127.0.0.1:3000
-    description: Default listen address (`CARTESI_SEQUENCER_HTTP_ADDR`).
+    description: Default public listener (`CARTESI_SEQUENCER_HTTP_ADDR`).
 tags:
   - name: ingress
     description: Public routes for wallets and submitters.
@@ -234,6 +235,9 @@ paths:
                 verifyingContract: "0x1111111111111111111111111111111111111111"
 
   /ws/subscribe:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [history]
       operationId: subscribe
@@ -327,6 +331,9 @@ paths:
           $ref: "#/components/schemas/BroadcastTxMessage"
 
   /history:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [history]
       operationId: getHistory
@@ -388,6 +395,9 @@ paths:
               example: { ok: false, code: UNAVAILABLE, message: history read unavailable }
 
   /historical-l1-inputs:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [history]
       operationId: getHistoricalL1Inputs
@@ -473,6 +483,9 @@ paths:
           $ref: "#/components/responses/Unavailable"
 
   /finalized_state/inclusion_block:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [snapshots]
       operationId: getFinalizedInclusionBlock
@@ -495,6 +508,9 @@ paths:
           $ref: "#/components/responses/Divergence"
 
   /finalized_state/digest:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [snapshots]
       operationId: getFinalizedStateDigest
@@ -518,6 +534,9 @@ paths:
           $ref: "#/components/responses/Divergence"
 
   /finalized_state:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [snapshots]
       operationId: getFinalizedState
@@ -566,6 +585,9 @@ paths:
           $ref: "#/components/responses/Divergence"
 
   /latest_snapshot:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [snapshots]
       operationId: getLatestSnapshot
@@ -599,6 +621,9 @@ paths:
           $ref: "#/components/responses/EmptyInternalError"
 
   /finalized_snapshot:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [snapshots]
       operationId: getFinalizedSnapshot
@@ -635,6 +660,9 @@ paths:
           $ref: "#/components/responses/Divergence"
 
   /livez:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [health]
       operationId: livez
@@ -644,6 +672,9 @@ paths:
           description: The process is serving requests. Empty body.
 
   /readyz:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [health]
       operationId: readyz
@@ -655,6 +686,9 @@ paths:
           description: Shutting down, or the inclusion lane has stopped. Empty body.
 
   /healthz:
+    servers:
+      - url: http://127.0.0.1:3001
+        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
     get:
       tags: [health]
       operationId: healthz

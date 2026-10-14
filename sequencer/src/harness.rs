@@ -221,6 +221,8 @@ mod tests {
             "run",
             "--http-addr",
             "127.0.0.1:0",
+            "--internal-http-addr",
+            "127.0.0.1:0",
             "--data-dir",
             data_dir.path().to_str().expect("utf8 path"),
             "--eth-rpc-url",

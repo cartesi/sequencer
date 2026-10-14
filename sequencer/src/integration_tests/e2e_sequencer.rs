@@ -205,10 +205,12 @@ async fn e2e_submit_tx_ack_and_broadcast() {
 
     let mut runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint.clone(), Duration::from_secs(2))
         .expect("build sequencer client");
-    let ws_url = client.ws_subscribe_url(history_claim(&db.path, 0));
+    let ws_url = SequencerClient::new(format!("http://{}", runtime.internal_addr))
+        .expect("build feed client")
+        .ws_subscribe_url(history_claim(&db.path, 0));
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(ws_url))
         .await
         .expect("timeout connecting websocket")
@@ -298,7 +300,7 @@ async fn api_rejects_signature_with_wrong_hex_length() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -329,7 +331,7 @@ async fn api_rejects_sender_with_wrong_hex_length() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -362,7 +364,7 @@ async fn api_rejects_oversized_json_body_before_parsing() {
         "00".repeat(65),
         " ".repeat(4096)
     );
-    let (status, body) = post_raw_json(runtime.addr, oversized_json.as_str()).await;
+    let (status, body) = post_raw_json(runtime.public_addr, oversized_json.as_str()).await;
 
     assert_eq!(
         status, 413,
@@ -386,7 +388,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
 
     let malformed_json =
         r#"{"message":{"nonce":0,"max_fee":0,"data":"0x"},"signature":"0x00","sender":"0x1234""#;
-    let (status, body) = post_raw_json(runtime.addr, malformed_json).await;
+    let (status, body) = post_raw_json(runtime.public_addr, malformed_json).await;
 
     assert_eq!(
         status, 400,
@@ -424,7 +426,7 @@ async fn api_rejects_missing_content_type_with_fixed_message() {
     let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await;
 
     // Valid JSON body, but sent without Content-Type: application/json.
-    let (status, body) = post_raw_body_no_content_type(runtime.addr, "{}").await;
+    let (status, body) = post_raw_body_no_content_type(runtime.public_addr, "{}").await;
     assert_eq!(status, 400, "missing content-type: {body}");
     assert!(
         body.contains("\"message\":\"missing content type\""),
@@ -444,7 +446,7 @@ async fn api_returns_429_when_queue_is_full() {
 
     let request = make_valid_request(&domain);
     let request_json = serde_json::to_string(&request).expect("serialize valid request");
-    let (status, body) = post_raw_json(runtime.addr, request_json.as_str()).await;
+    let (status, body) = post_raw_json(runtime.public_addr, request_json.as_str()).await;
     assert_eq!(status, 429, "expected 429 for queue-full overload: {body}");
     assert!(
         body.contains("queue full"),
@@ -466,7 +468,7 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -517,7 +519,7 @@ async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
     let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await;
 
     // Empty object — valid JSON, missing every required field.
-    let (status, body) = post_raw_json(runtime.addr, "{}").await;
+    let (status, body) = post_raw_json(runtime.public_addr, "{}").await;
     assert_eq!(status, 400, "missing fields: {body}");
 
     // Parse the response envelope and assert the message is exactly the fixed
@@ -590,7 +592,7 @@ async fn api_payload_size_check_fires_before_signature_recovery() {
         body.len(),
     );
 
-    let (status, response_body) = post_raw_json(runtime.addr, body.as_str()).await;
+    let (status, response_body) = post_raw_json(runtime.public_addr, body.as_str()).await;
     assert_eq!(status, 400, "oversized + bogus sig: {response_body}");
     assert!(
         response_body.contains("user op payload too large"),
@@ -627,7 +629,7 @@ async fn api_rejects_signature_with_invalid_parity_byte() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -677,7 +679,7 @@ async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -735,7 +737,7 @@ async fn api_rejects_user_op_with_nonce_gap() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -790,7 +792,7 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -828,7 +830,7 @@ async fn api_quotes_open_frame_fee() {
 
     let runtime = start_full_server(db.path.as_str(), domain).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
     let quoted = client.get_fee().await.expect("GET /fee");
@@ -836,7 +838,7 @@ async fn api_quotes_open_frame_fee() {
         quoted.fee, 1356,
         "quoted fee must match the bootstrapped open-frame fee"
     );
-    let raw = reqwest::get(format!("http://{}/fee", runtime.addr))
+    let raw = reqwest::get(format!("http://{}/fee", runtime.public_addr))
         .await
         .expect("raw GET /fee");
     assert_eq!(raw.headers()["cache-control"], "no-store");
@@ -862,7 +864,7 @@ async fn api_serves_the_next_nonce_after_each_ack_and_the_signing_domain() {
     bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -925,7 +927,7 @@ async fn api_rejects_user_op_when_balance_below_fee_cost() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint, Duration::from_secs(2))
         .expect("build sequencer client");
 
@@ -989,7 +991,7 @@ async fn api_concurrent_same_nonce_leaves_exactly_one_committed() {
     let request_json = serde_json::to_string(&request).expect("serialize request");
 
     // Two concurrent POSTs with byte-identical bodies.
-    let addr = runtime.addr;
+    let addr = runtime.public_addr;
     let body_a = request_json.clone();
     let body_b = request_json;
     let a = tokio::spawn(async move { post_raw_json(addr, body_a.as_str()).await });
@@ -1033,10 +1035,12 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
 
     let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
 
-    let endpoint = format!("http://{}", runtime.addr);
+    let endpoint = format!("http://{}", runtime.public_addr);
     let client = SequencerClient::new_with_timeout(endpoint.clone(), Duration::from_secs(2))
         .expect("build sequencer client");
-    let ws_url = client.ws_subscribe_url(history_claim(&db.path, 0));
+    let ws_url = SequencerClient::new(format!("http://{}", runtime.internal_addr))
+        .expect("build feed client")
+        .ws_subscribe_url(history_claim(&db.path, 0));
     let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(ws_url))
         .await
         .expect("timeout connecting websocket")
@@ -1075,7 +1079,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
 
     let restarted = start_full_server(db.path.as_str(), domain).await;
 
-    let restarted_endpoint = format!("http://{}", restarted.addr);
+    let restarted_endpoint = format!("http://{}", restarted.internal_addr);
     let restarted_client =
         SequencerClient::new_with_timeout(restarted_endpoint, Duration::from_secs(2))
             .expect("build sequencer client after restart");
@@ -1097,7 +1101,8 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
 }
 
 struct FullServerRuntime {
-    addr: std::net::SocketAddr,
+    public_addr: std::net::SocketAddr,
+    internal_addr: std::net::SocketAddr,
     shutdown: RuntimeScope,
     server_task: Option<http::ApiServerTask>,
     lane_handle: Option<
@@ -1127,10 +1132,7 @@ async fn start_full_server_with_max_body(
     domain: Eip712Domain,
     max_body_bytes: usize,
 ) -> FullServerRuntime {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
-    let addr = listener.local_addr().expect("read listener addr");
+    let (listeners, public_addr, internal_addr) = super::common::bind_api_listeners().await;
 
     let mut storage = Storage::open(db_path).expect("open storage");
     let shutdown = RuntimeScope::default();
@@ -1194,8 +1196,8 @@ async fn start_full_server_with_max_body(
         },
     );
 
-    let server_task = http::start_on_listener(
-        listener,
+    let server_task = http::start_on_listeners(
+        listeners,
         tx,
         shutdown.clone(),
         tx_feed,
@@ -1212,7 +1214,8 @@ async fn start_full_server_with_max_body(
     );
 
     FullServerRuntime {
-        addr,
+        public_addr,
+        internal_addr,
         shutdown,
         server_task: Some(server_task),
         lane_handle: Some(lane_handle),
@@ -1223,10 +1226,7 @@ async fn start_full_server_with_max_body(
 /// Serves the API over a lane queue of capacity one that already holds a
 /// parked op and is never drained, so every `/tx` finds it full.
 async fn start_server_with_full_queue(db_path: &str, domain: Eip712Domain) -> FullServerRuntime {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
-    let addr = listener.local_addr().expect("read listener addr");
+    let (listeners, public_addr, internal_addr) = super::common::bind_api_listeners().await;
 
     let _storage = Storage::open(db_path).expect("open storage");
     let (tx, rx) = mpsc::channel::<PendingUserOp>(1);
@@ -1256,8 +1256,8 @@ async fn start_server_with_full_queue(db_path: &str, domain: Eip712Domain) -> Fu
             // unfiltered stream, so pass an address no fixture seeds.
         },
     );
-    let server_task = http::start_on_listener(
-        listener,
+    let server_task = http::start_on_listeners(
+        listeners,
         tx,
         shutdown.clone(),
         tx_feed,
@@ -1271,7 +1271,8 @@ async fn start_server_with_full_queue(db_path: &str, domain: Eip712Domain) -> Fu
     );
 
     FullServerRuntime {
-        addr,
+        public_addr,
+        internal_addr,
         shutdown,
         server_task: Some(server_task),
         lane_handle: None,

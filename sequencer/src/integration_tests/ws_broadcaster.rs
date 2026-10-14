@@ -375,10 +375,7 @@ async fn start_test_server_with_limits(
     db_path: &str,
     ws_max_subscribers: usize,
 ) -> WsServerRuntime {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
-    let addr = listener.local_addr().expect("read listener addr");
+    let (listeners, _public_addr, addr) = super::common::bind_api_listeners().await;
 
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
     let shutdown = RuntimeScope::default();
@@ -390,8 +387,8 @@ async fn start_test_server_with_limits(
             page_size: 64,
         },
     );
-    let task = http::start_on_listener(
-        listener,
+    let task = http::start_on_listeners(
+        listeners,
         tx_sender,
         shutdown.clone(),
         tx_feed,

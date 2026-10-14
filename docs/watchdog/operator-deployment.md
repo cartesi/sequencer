@@ -22,12 +22,11 @@ the sequencer's operator routes.
 | `GET /finalized_state/digest` | When the sequencer's accepted block has advanced |
 | `GET /finalized_state` | After a mismatch, to keep the sequencer's bytes as evidence |
 
-The sequencer serves these routes on the same listener as its public API,
-without authentication. The
+The sequencer serves these routes on its internal listener
+(`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`), without authentication. The
 [API reference](../../README.md#operator-snapshot-endpoints-internal-only)
-owns them and why they must stay private: expose only the public routes at the
-public ingress, and give the watchdog host an internal path to the operator
-routes. The sequencer hashes the comparison file on each digest request and
+owns them and why they must stay private: publish only the public listener,
+and give the watchdog host a path to the internal one. The sequencer hashes the comparison file on each digest request and
 the watchdog waits up to 300 seconds for the answer, so a proxy in between
 needs a read timeout at least that long for multi-GiB states.
 
@@ -204,7 +203,7 @@ table says where its value comes from.
 |---|---|---|
 | Chain id | The L1 network: `11155111` for Sepolia, `1` for mainnet. Pin it: `init` refuses an RPC that serves another chain | `CARTESI_WATCHDOG_BLOCKCHAIN_ID` |
 | Application | The deployment; the sequencer's `CARTESI_SEQUENCER_APP_ADDRESS` | `CARTESI_WATCHDOG_APP_ADDRESS` |
-| Sequencer URL | The internal address of the sequencer's listener ([network access](#network-access)) | `CARTESI_WATCHDOG_SEQUENCER_URL` |
+| Sequencer URL | The sequencer's internal listener ([network access](#network-access)) | `CARTESI_WATCHDOG_SEQUENCER_URL` |
 | L1 RPC | Your provider ([network access](#network-access)); read at run time, never persisted | `CARTESI_WATCHDOG_BLOCKCHAIN_HTTP_ENDPOINT` |
 | State source | The application ([state source](#state-source)) | `CARTESI_WATCHDOG_STATE_SOURCE` |
 | Bootstrap machine and block | [Initialize](#initialize) | `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR`, `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK` |

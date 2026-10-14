@@ -143,6 +143,7 @@ pub struct ManagedSequencer {
     _data_dir: TempDir,
     data_dir_path: PathBuf,
     endpoint: String,
+    internal_endpoint: String,
     log_path: PathBuf,
     /// Overrides the `--eth-rpc-url` the sequencer uses. When `None`, the
     /// sequencer dials Anvil directly. When `Some(url)`, it dials the
@@ -244,6 +245,7 @@ impl ManagedSequencer {
         let SpawnedSequencerProcess {
             child,
             endpoint,
+            internal_endpoint,
             log_path,
         } = spawn_sequencer_process(
             sequencer_bin.as_path(),
@@ -277,6 +279,7 @@ impl ManagedSequencer {
             _data_dir: data_dir,
             data_dir_path,
             endpoint,
+            internal_endpoint,
             log_path,
             l1_endpoint_override: None,
             chain_id_override: None,
@@ -424,7 +427,7 @@ impl ManagedSequencer {
         let response = reqwest::Client::new()
             .get(format!(
                 "{}/finalized_state/inclusion_block",
-                self.endpoint()
+                self.internal_endpoint()
             ))
             .timeout(Duration::from_secs(5))
             .send()
@@ -499,7 +502,7 @@ impl ManagedSequencer {
     /// `checkpoint.toml` receipt, outside the paths cleared by reset_database.
     pub async fn capture_finalized_checkpoint(&self) -> HarnessResult<RecoveryCheckpoint> {
         let response = reqwest::Client::new()
-            .get(format!("{}/finalized_snapshot", self.endpoint()))
+            .get(format!("{}/finalized_snapshot", self.internal_endpoint()))
             .timeout(Duration::from_secs(30))
             .send()
             .await?
@@ -857,8 +860,14 @@ impl ManagedSequencer {
         Ok(())
     }
 
+    /// The public listener: `/tx`, `/fee`, `/nonce`, `/domain`.
     pub fn endpoint(&self) -> &str {
         self.endpoint.as_str()
+    }
+
+    /// The internal listener: subscriptions, history, snapshots and health.
+    pub fn internal_endpoint(&self) -> &str {
+        self.internal_endpoint.as_str()
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -1199,6 +1208,7 @@ impl ManagedSequencer {
         let SpawnedSequencerProcess {
             child,
             endpoint,
+            internal_endpoint,
             log_path,
         } = spawn_sequencer_process(
             self.sequencer_bin.as_path(),
@@ -1219,6 +1229,7 @@ impl ManagedSequencer {
         .await?;
         self.child = child;
         self.endpoint = endpoint;
+        self.internal_endpoint = internal_endpoint;
         self.log_path = log_path;
         Ok(())
     }
@@ -1290,8 +1301,9 @@ impl ManagedSequencer {
         rollups_result
     }
 
+    /// A client for the internal listener, where the feed lives.
     fn sequencer_client(&self) -> HarnessResult<SequencerClient> {
-        SequencerClient::new_with_timeout(self.endpoint.clone(), Duration::from_secs(5))
+        SequencerClient::new_with_timeout(self.internal_endpoint.clone(), Duration::from_secs(5))
             .map_err(|err| io_other(format!("failed to create sequencer client: {err}")).into())
     }
 
@@ -1325,6 +1337,7 @@ use alloy_primitives::Address;
 struct SpawnedSequencerProcess {
     child: Child,
     endpoint: String,
+    internal_endpoint: String,
     log_path: PathBuf,
 }
 
@@ -1365,6 +1378,7 @@ async fn spawn_sequencer_process(
     genesis_bin: Option<&Path>,
 ) -> HarnessResult<SpawnedSequencerProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;
+    let (internal_endpoint, internal_http_addr) = build_local_endpoint()?;
     let log_path = timestamped_log_path(logs_dir, log_prefix);
 
     // Dedicated batch submitter = anvil account 9 (NOT the deployer/funder,
@@ -1577,6 +1591,8 @@ async fn spawn_sequencer_process(
         .arg("run")
         .arg("--http-addr")
         .arg(http_addr)
+        .arg("--internal-http-addr")
+        .arg(internal_http_addr)
         .arg("--data-dir")
         .arg(path_as_str(data_dir)?)
         .arg("--eth-rpc-url")
@@ -1635,6 +1651,7 @@ async fn spawn_sequencer_process(
     Ok(SpawnedSequencerProcess {
         child,
         endpoint,
+        internal_endpoint,
         log_path,
     })
 }

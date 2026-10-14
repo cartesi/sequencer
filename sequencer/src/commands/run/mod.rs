@@ -137,6 +137,7 @@ where
 
     tracing::info!(
         http_addr = %config.http_addr,
+        internal_http_addr = %config.internal_http_addr,
         data_dir = %config.data_dir,
         eth_rpc_origin = %crate::l1::provider::rpc_origin(&l1_config.eth_rpc_url),
         input_box_address = %l1_config.identity.input_box_address,

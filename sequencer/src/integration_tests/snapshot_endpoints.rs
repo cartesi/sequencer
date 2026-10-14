@@ -32,23 +32,31 @@ fn dummy_domain() -> Eip712Domain {
 
 /// Holds the server task + channel alive for the duration of a test.
 struct TestServer {
-    addr: SocketAddr,
+    public_addr: SocketAddr,
+    internal_addr: SocketAddr,
     _rx: mpsc::Receiver<PendingUserOp>,
     _shutdown: RuntimeScope,
     _task: http::ApiServerTask,
 }
 
+/// The public routes, per README#api; every other route is internal.
+const PUBLIC_ROUTES: [&str; 4] = ["/tx", "/fee", "/nonce", "/domain"];
+
 impl TestServer {
+    /// A URL on the listener that serves `path`.
     fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.addr)
+        let route = path.split('?').next().unwrap_or(path);
+        let addr = if PUBLIC_ROUTES.contains(&route) {
+            self.public_addr
+        } else {
+            self.internal_addr
+        };
+        format!("http://{addr}{path}")
     }
 }
 
 async fn start_server(db_path: &str) -> TestServer {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
-    let addr = listener.local_addr().expect("listener addr");
+    let (listeners, public_addr, internal_addr) = super::common::bind_api_listeners().await;
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
     let shutdown = RuntimeScope::default();
     // Sentinel submitter: this fixture seeds no own-batch rows.
@@ -57,8 +65,8 @@ async fn start_server(db_path: &str) -> TestServer {
         shutdown.clone(),
         L2TxFeedConfig::default(),
     );
-    let task = http::start_on_listener(
-        listener,
+    let task = http::start_on_listeners(
+        listeners,
         tx_sender,
         shutdown.clone(),
         tx_feed,
@@ -71,7 +79,8 @@ async fn start_server(db_path: &str) -> TestServer {
         },
     );
     TestServer {
-        addr,
+        public_addr,
+        internal_addr,
         _rx,
         _shutdown: shutdown,
         _task: task,
@@ -670,6 +679,53 @@ async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
     assert!(wait_for_lease(db.path.as_str(), fin_id, 0).await);
 }
 
+/// Each route answers only on its own listener: a wrong-method probe gets 405
+/// where the route exists and 404 on the other listener, whatever the
+/// handler's state.
+#[tokio::test]
+async fn every_route_is_served_on_exactly_its_own_listener() {
+    const INTERNAL_ROUTES: [&str; 11] = [
+        "/ws/subscribe",
+        "/history",
+        "/historical-l1-inputs",
+        "/finalized_state",
+        "/finalized_state/inclusion_block",
+        "/finalized_state/digest",
+        "/latest_snapshot",
+        "/finalized_snapshot",
+        "/livez",
+        "/readyz",
+        "/healthz",
+    ];
+    let db = temp_db("listener-placement");
+    let server = start_server(db.path.as_str()).await;
+    let client = reqwest::Client::new();
+    let probe = |addr: SocketAddr, route: &str| {
+        client
+            .request(reqwest::Method::DELETE, format!("http://{addr}{route}"))
+            .send()
+    };
+    for (routes, own, other) in [
+        (&PUBLIC_ROUTES[..], server.public_addr, server.internal_addr),
+        (
+            &INTERNAL_ROUTES[..],
+            server.internal_addr,
+            server.public_addr,
+        ),
+    ] {
+        for route in routes {
+            let served = probe(own, route).await.expect("probe own listener");
+            assert_eq!(served.status().as_u16(), 405, "{route} on its own listener");
+            let absent = probe(other, route).await.expect("probe other listener");
+            assert_eq!(
+                absent.status().as_u16(),
+                404,
+                "{route} on the other listener"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn cors_permits_browser_preflight_on_tx() {
     let db = temp_db("cors-preflight");
@@ -828,7 +884,8 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
     register_accepted(&db.path, dir.path(), "accepted", &encoded, 1);
     let server = start_server(&db.path).await;
     let client =
-        sequencer_rust_client::SequencerClient::new(format!("http://{}", server.addr)).unwrap();
+        sequencer_rust_client::SequencerClient::new(format!("http://{}", server.internal_addr))
+            .unwrap();
     let snapshot = client.latest_snapshot().await.unwrap();
     let claim = snapshot.claim;
     assert_eq!(
