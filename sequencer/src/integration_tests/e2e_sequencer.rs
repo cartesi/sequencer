@@ -6,29 +6,20 @@ use std::time::Duration;
 use crate::storage::{ApplicationInputRow, L2TxContext};
 use alloy_primitives::{Address, Signature, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
-use app_core::application::{
-    MAX_METHOD_PAYLOAD_BYTES, Method, WalletApp, WalletConfig, Withdrawal,
-};
+use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, Method, WalletConfig, Withdrawal};
 use futures_util::StreamExt;
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::hazmat::PrehashSigner;
-use sequencer::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
-use sequencer::http::{self, ApiConfig};
-use sequencer::ingress::inclusion_lane::{
-    InclusionLane, InclusionLaneConfig, PendingUserOp, dump_info,
-};
-use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
-use sequencer_core::application::Application;
 use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
-use sequencer_core::user_op::{SignedUserOp, UserOp};
+use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::test_support::server::TestServer;
 use crate::test_support::{pin_test_deployment_identity, temp_db};
 
 const TEST_BATCH_SUBMITTER: Address = Address::repeat_byte(0xff);
@@ -289,7 +280,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
     }
 
     drop(ws);
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -320,7 +311,7 @@ async fn api_rejects_signature_with_wrong_hex_length() {
         "expected signature length message, got: {body}"
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -348,7 +339,7 @@ async fn api_rejects_sender_with_wrong_hex_length() {
         "expected sender length message, got: {body}"
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -357,7 +348,12 @@ async fn api_rejects_oversized_json_body_before_parsing() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 256).await;
+    let runtime = TestServer::builder(db.path.as_str())
+        .domain(domain)
+        .with_lane()
+        .max_body(256)
+        .start()
+        .await;
 
     let oversized_json = format!(
         r#"{{"message":{{"nonce":0,"max_fee":0,"data":"0x"}},"signature":"0x{}","sender":null,"pad":"{}"}}"#,
@@ -375,7 +371,7 @@ async fn api_rejects_oversized_json_body_before_parsing() {
         "expected payload-too-large error code, got: {body}"
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -384,7 +380,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await;
+    let runtime = start_full_server(db.path.as_str(), domain).await;
 
     let malformed_json =
         r#"{"message":{"nonce":0,"max_fee":0,"data":"0x"},"signature":"0x00","sender":"0x1234""#;
@@ -412,7 +408,7 @@ async fn api_rejects_malformed_json_as_bad_request() {
         "body must not reflect attacker-submitted input bytes, got: {body}"
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -423,7 +419,7 @@ async fn api_rejects_missing_content_type_with_fixed_message() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await;
+    let runtime = start_full_server(db.path.as_str(), domain).await;
 
     // Valid JSON body, but sent without Content-Type: application/json.
     let (status, body) = post_raw_body_no_content_type(runtime.public_addr, "{}").await;
@@ -433,7 +429,7 @@ async fn api_rejects_missing_content_type_with_fixed_message() {
         "expected fixed 'missing content type' message, got: {body}"
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -442,7 +438,11 @@ async fn api_returns_429_when_queue_is_full() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let runtime = start_server_with_full_queue(db.path.as_str(), domain.clone()).await;
+    let runtime = TestServer::builder(db.path.as_str())
+        .domain(domain.clone())
+        .full_queue()
+        .start()
+        .await;
 
     let request = make_valid_request(&domain);
     let request_json = serde_json::to_string(&request).expect("serialize valid request");
@@ -457,7 +457,7 @@ async fn api_returns_429_when_queue_is_full() {
         "expected OVERLOADED code for queue-full overload: {body}"
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -503,7 +503,7 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
         "expected max payload size in error body, got: {body}"
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -516,7 +516,7 @@ async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
     let domain = test_domain();
     bootstrap_open_frame(db.path.as_str());
 
-    let runtime = start_full_server_with_max_body(db.path.as_str(), domain, 128 * 1024).await;
+    let runtime = start_full_server(db.path.as_str(), domain).await;
 
     // Empty object — valid JSON, missing every required field.
     let (status, body) = post_raw_json(runtime.public_addr, "{}").await;
@@ -554,7 +554,7 @@ async fn api_rejects_json_with_missing_fields_using_fixed_envelope() {
         );
     }
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -614,7 +614,7 @@ async fn api_payload_size_check_fires_before_signature_recovery() {
         );
     }
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -662,7 +662,7 @@ async fn api_rejects_signature_with_invalid_parity_byte() {
         "expected sig-recovery class error, not hex-length or size: {body}",
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -720,7 +720,7 @@ async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
         "expected INVALID_SIGNATURE code, got: {body}",
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -770,7 +770,7 @@ async fn api_rejects_user_op_with_nonce_gap() {
         "expected nonce-class error, got: {body}",
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -819,7 +819,7 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
         "max_fee == current_frame_fee boundary must be accepted (comparator is `<`, not `<=`), got {status}: {body}",
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -852,7 +852,7 @@ async fn api_quotes_open_frame_fee() {
         "suggested_max_fee is max(fee, recommended_fee) plus signing slack"
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -907,7 +907,7 @@ async fn api_serves_the_next_nonce_after_each_ack_and_the_signing_domain() {
     }
     assert_eq!(client.get_nonce(sender).await.unwrap().next_nonce, 2);
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -958,7 +958,7 @@ async fn api_rejects_user_op_when_balance_below_fee_cost() {
         "expected InsufficientFeeBalance message, got: {body}",
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1019,7 +1019,7 @@ async fn api_concurrent_same_nonce_leaves_exactly_one_committed() {
         "rejected concurrent op should be nonce-class, got: {rejected_body}",
     );
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1075,7 +1075,7 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     assert_ws_message_matches_tx(first_live, &expected[1], 1);
     assert_ws_message_matches_tx(second_live, &expected[2], 2);
 
-    shutdown_runtime(runtime).await;
+    runtime.shutdown().await;
 
     let restarted = start_full_server(db.path.as_str(), domain).await;
 
@@ -1097,215 +1097,16 @@ async fn restart_replays_same_ordered_l2_tx_stream_from_db() {
     }
     drop(restarted_ws);
 
-    shutdown_runtime(restarted).await;
+    restarted.shutdown().await;
 }
 
-struct FullServerRuntime {
-    public_addr: std::net::SocketAddr,
-    internal_addr: std::net::SocketAddr,
-    shutdown: RuntimeScope,
-    server_task: Option<http::ApiServerTask>,
-    lane_handle: Option<
-        tokio::task::JoinHandle<Result<(), sequencer::ingress::inclusion_lane::InclusionLaneError>>,
-    >,
-    _parked_rx: Option<mpsc::Receiver<PendingUserOp>>,
-}
-
-impl Drop for FullServerRuntime {
-    fn drop(&mut self) {
-        self.shutdown.request_shutdown();
-        if let Some(task) = self.server_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.lane_handle.take() {
-            task.abort();
-        }
-    }
-}
-
-async fn start_full_server(db_path: &str, domain: Eip712Domain) -> FullServerRuntime {
-    start_full_server_with_max_body(db_path, domain, 128 * 1024).await
-}
-
-async fn start_full_server_with_max_body(
-    db_path: &str,
-    domain: Eip712Domain,
-    max_body_bytes: usize,
-) -> FullServerRuntime {
-    let (listeners, public_addr, internal_addr) =
-        crate::test_support::server::bind_api_listeners().await;
-
-    let mut storage = Storage::open(db_path).expect("open storage");
-    let shutdown = RuntimeScope::default();
-
-    let dumps_dir = tempfile::tempdir().expect("e2e dumps dir").keep();
-    // Always-load invariant: ensure a finalized snapshot exists
-    // before the lane starts. On warm restart there's already one;
-    // on cold start we register a genesis dump from a fresh wallet.
-    // The lane reloads via `from_dump` either way.
-    if storage.finalized_dump().expect("read finalized").is_none() {
-        let mut app = WalletApp::new(WalletConfig::default());
-        let genesis_dir = dumps_dir.join("genesis");
-        dump_info::create_dump_dir_with_info(
-            &mut app,
-            &genesis_dir,
-            &dump_info::DumpInfo {
-                format_version: dump_info::FORMAT_VERSION,
-                next_batch_nonce: 0,
-            },
-        )
-        .expect("genesis dump");
-        storage
-            .insert_baseline_snapshot(&genesis_dir, ExecutedInputCount::ZERO)
-            .expect("register genesis");
-    }
-
-    // Tip-existence invariant: open the genesis Tip only after the genesis
-    // snapshot exists. Opening the Tip may attribute already-ingested direct
-    // inputs, so doing this first would give the fresh application dump the
-    // wrong executed-input count.
-    storage.ensure_open_tip().expect("establish open tip");
-    let head = storage
-        .open_state()
-        .expect("load open state")
-        .expect("open state exists");
-    // Default log_gas_price=0 -> 0+296+20+419+621 = 1356.
-    assert_eq!(head.frame_fee, 1356);
-
-    let (tx, lane_handle) = InclusionLane::<WalletApp>::start(
-        128,
-        shutdown.clone(),
-        storage,
-        InclusionLaneConfig {
-            dumps_dir,
-            max_user_ops_per_chunk: 32,
-            safe_input_buffer_capacity: 32,
-            max_batch_open: Duration::from_secs(60 * 60),
-            idle_poll_interval: Duration::from_millis(2),
-            frontier_min_interval: Duration::ZERO,
-        },
-    );
-
-    let tx_feed = L2TxFeed::new(
-        db_path.to_string(),
-        shutdown.clone(),
-        L2TxFeedConfig {
-            idle_poll_interval: Duration::from_millis(2),
-            page_size: 64,
-            // Sentinel submitter: the WS assertions here observe the
-            // unfiltered stream, so pass an address no fixture seeds.
-        },
-    );
-
-    let server_task = http::start_on_listeners(
-        listeners,
-        tx,
-        shutdown.clone(),
-        tx_feed,
-        ApiConfig {
-            max_body_bytes,
-            ..ApiConfig::new(domain, MAX_METHOD_PAYLOAD_BYTES)
-        },
-        http::SnapshotState {
-            db_path: db_path.to_string(),
-            state_file_in_dump: |dump_dir| {
-                WalletApp::state_file_in_dump(&dump_info::app_prefix(dump_dir))
-            },
-        },
-    );
-
-    FullServerRuntime {
-        public_addr,
-        internal_addr,
-        shutdown,
-        server_task: Some(server_task),
-        lane_handle: Some(lane_handle),
-        _parked_rx: None,
-    }
-}
-
-/// Serves the API over a lane queue of capacity one that already holds a
-/// parked op and is never drained, so every `/tx` finds it full.
-async fn start_server_with_full_queue(db_path: &str, domain: Eip712Domain) -> FullServerRuntime {
-    let (listeners, public_addr, internal_addr) =
-        crate::test_support::server::bind_api_listeners().await;
-
-    let _storage = Storage::open(db_path).expect("open storage");
-    let (tx, rx) = mpsc::channel::<PendingUserOp>(1);
-    let (respond_to, _) = tokio::sync::oneshot::channel();
-    tx.try_send(PendingUserOp {
-        signed: SignedUserOp {
-            sender: Address::ZERO,
-            signature: Signature::test_signature(),
-            user_op: UserOp {
-                nonce: 0,
-                max_fee: 0,
-                data: Vec::new().into(),
-            },
-        },
-        respond_to,
-        received_at: std::time::SystemTime::now(),
-    })
-    .expect("park one op in the lane queue");
-    let shutdown = RuntimeScope::default();
-    let tx_feed = L2TxFeed::new(
-        db_path.to_string(),
-        shutdown.clone(),
-        L2TxFeedConfig {
-            idle_poll_interval: Duration::from_millis(2),
-            page_size: 64,
-            // Sentinel submitter: the WS assertions here observe the
-            // unfiltered stream, so pass an address no fixture seeds.
-        },
-    );
-    let server_task = http::start_on_listeners(
-        listeners,
-        tx,
-        shutdown.clone(),
-        tx_feed,
-        ApiConfig::new(domain, MAX_METHOD_PAYLOAD_BYTES),
-        http::SnapshotState {
-            db_path: db_path.to_string(),
-            state_file_in_dump: |dump_dir| {
-                WalletApp::state_file_in_dump(&dump_info::app_prefix(dump_dir))
-            },
-        },
-    );
-
-    FullServerRuntime {
-        public_addr,
-        internal_addr,
-        shutdown,
-        server_task: Some(server_task),
-        lane_handle: None,
-        _parked_rx: Some(rx),
-    }
-}
-
-async fn shutdown_runtime(mut runtime: FullServerRuntime) {
-    runtime.shutdown.request_shutdown();
-    if let Some(task) = runtime.lane_handle.take() {
-        let lane_result = tokio::time::timeout(Duration::from_secs(3), task)
-            .await
-            .expect("wait for inclusion lane")
-            .expect("join inclusion lane task");
-        // The router may close the lane's queue before the lane sees the
-        // shutdown request; the lane still stops cleanly.
-        assert!(
-            lane_result.is_ok(),
-            "expected clean lane shutdown, got {lane_result:?}"
-        );
-    }
-    if let Some(task) = runtime.server_task.take() {
-        let server_result = tokio::time::timeout(Duration::from_secs(3), task)
-            .await
-            .expect("wait for server task")
-            .expect("join server task");
-        assert!(
-            server_result.is_ok(),
-            "expected clean server shutdown, got {server_result:?}"
-        );
-    }
+async fn start_full_server(db_path: &str, domain: Eip712Domain) -> TestServer {
+    TestServer::builder(db_path)
+        .domain(domain)
+        .with_lane()
+        .max_body(128 * 1024)
+        .start()
+        .await
 }
 
 fn bootstrap_open_frame(db_path: &str) {
