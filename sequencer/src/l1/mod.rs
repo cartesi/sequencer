@@ -13,25 +13,13 @@ pub mod reader;
 pub mod submitter;
 pub mod watermark;
 
-/// The L1 bundle handed whole to the entry points that reach L1 with the
-/// submitter key: the batch-submitter provider builder and the
-/// preemptive-recovery flush. Built once in `run` from the pinned
-/// [`DeploymentIdentity`](crate::storage::DeploymentIdentity) plus the
-/// command config; the identity is carried verbatim, never re-copied field
-/// by field, so every consumer reads the pinned values through one route.
-///
-/// It is not a funnel: the per-component configs (`InputReaderConfig`,
-/// `BatchPosterConfig`, `UniswapConfig`) are built directly from the same
-/// two sources — `identity` carries deployment values, and `RunConfig`
-/// carries the per-client tuning knobs (poll intervals, confirmation depth)
-/// that belong to each client, not to the L1 endpoint. Homed here (not with the command configs): L1-domain
-/// identity consumed by mechanisms below the command layer.
+/// The L1 bundle for the entry points that reach L1 with the submitter key (the
+/// batch-submitter providers and the startup-recovery flush). Built once in `run`;
+/// the pinned identity is carried whole so every consumer reads it through one
+/// route. Per-component configs are built from the identity and `RunConfig`.
 #[derive(Debug, Clone)]
 pub struct L1Config {
-    /// The pinned deployment identity, verbatim from the DB. Carried whole so
-    /// keyed-write paths (e.g. the preemptive-recovery flush) can re-confirm
-    /// the RPC's chain id right before signing via
-    /// [`crate::l1::provider::create_verified_keyed_providers`].
+    /// The pinned deployment identity, verbatim from the DB.
     pub identity: crate::storage::DeploymentIdentity,
     pub eth_rpc_url: String,
     pub batch_submitter_private_key: SubmitterKey,

@@ -54,13 +54,7 @@ async fn flush_mempool_admitted(
         storage.wallet_nonce_watermark()?
     };
 
-    // Wrong-chain RPC guard: flush broadcasts keyed L1 txs, so —
-    // like `setup` and `run` — it must confirm the RPC's chain id matches the
-    // pinned one before signing, or it would burn submitter nonce slots on the
-    // wrong chain. `create_verified_keyed_providers` folds that check into the
-    // signer build (the one guarded keyed-write entry point); a mismatch is
-    // terminal (operator misconfig), an RPC error retryable (flush needs L1
-    // reachable anyway).
+    // Chain-id check before signing: `create_verified_keyed_providers`.
     let providers = crate::l1::provider::create_verified_keyed_providers(
         &config.rpc.eth_rpc_url,
         key.expose_secret(),

@@ -386,9 +386,8 @@ impl InputReader {
         &mut self,
         provider: &impl Provider,
     ) -> Result<Option<SafeInputUpdate>, InputReaderError> {
-        // Verify the provider serves the pinned chain before reading anything
-        // from it — a wrong-chain RPC's address-filtered logs would otherwise
-        // flow into `safe_inputs`.
+        // First contact only (see `verify_chain_id`): a wrong-chain RPC's
+        // address-filtered logs would otherwise flow into `safe_inputs`.
         self.verify_chain_id(provider).await?;
 
         let current_safe_head = latest_safe_head(provider).await?;

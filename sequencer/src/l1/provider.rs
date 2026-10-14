@@ -1028,7 +1028,7 @@ mod tests {
             .expect("valid key must be accepted");
     }
 
-    // ── Keyed-write chain-id gate (review): the guarded constructor must
+    // ── Keyed-write chain-id gate: the guarded constructor must
     //    confirm the served chain matches the pinned one before signing ─
 
     fn require_anvil() {

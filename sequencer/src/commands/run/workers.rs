@@ -654,14 +654,9 @@ async fn wait_for_fee_oracle_shutdown(
     WorkerStop::from_shutdown(handle.await).map_err(WorkerExit::FeeOracle)
 }
 
-// Built once during preparation (sync, raw `create_keyed_providers`), signing
-// for the pinned chain. The submitter is long-lived, so a one-shot startup
-// chain-id check would go stale; the keyed-write guard instead lives in
-// `EthereumBatchPoster::submit_batches`, which re-confirms the chain id
-// immediately before every productive send. The key was already verified
-// against the pinned submitter, so a build failure here is a bad RPC URL /
-// client misconfiguration — the same deterministic terminal class as every
-// signer misconfig.
+// Built once during preparation; the poster rechecks the chain id before every
+// send. The key already matched the pinned submitter, so a build failure is a
+// terminal client misconfiguration.
 fn build_batch_submitter_providers(l1: &L1Config) -> Result<KeyedProviders, CommandError> {
     crate::l1::provider::create_keyed_providers(
         &l1.eth_rpc_url,
