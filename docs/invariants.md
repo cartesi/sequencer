@@ -280,63 +280,57 @@ by writer and are write-once (`0001_schema.sql`).
 
 ### I15. Divergence marker present ⇒ acceptance frontier frozen
 
-- **Holds:** a fully-accepted landing that
-  fails the content-identity check writes the `canonical_divergence`
-  singleton **in the same transaction** as the sync that detected it, and
-  `populate_safe_accepted_batches` returns early whenever the marker exists —
-  so no acceptance row or gold-frontier advance can ever
-  happen past a detected divergence.
-- **Enforced by:** the `trg_*_frozen_on_divergence` trigger family
-  (`0001_schema.sql`) — specifically batch-tree writes and snapshot collection RAISE in the engine while the marker exists. This is
-  the immediate persisted freeze for those named tables, not a general
-  user-op hot-path barrier. The accepted frontier itself has no trigger: its
-  single writer refuses past the marker — the guard at the top of
-  `populate_safe_accepted_batches`. The typed error surface also includes
-  `check_danger`'s first arm (`CanonicalDivergence`, ranked ahead of every
-  other arm). Startup inspection refuses before any provider query, and
-  each repair transaction reasserts its durable preconditions and the
-  absence of divergence before writing. A clean worker drain waits for
-  in-flight reader appends: `run` then re-reads the marker on
-  its Ok path (`refuse_divergence_on_clean_exit`) and exits terminal rather
-  than 0, the one code that would break the supervisor's restart-then-refuse
-  rediscovery. The admission and preemptive TLA+ models verify the
-  controller ordering (`LocalTerminalDominance` in `admission.tla`) and
-  slot/batch safety respectively.
-- **Runtime reaction:** the danger detector owns prompt process-wide reaction,
-  reading `check_danger` on its poll interval (`DANGER_DETECTOR_POLL_INTERVAL`). Independently, the inclusion lane's existing time-gated
-  SQLite read returns `SafeFrontierState::CanonicalDivergence` instead of an
-  `Open` frontier when the marker is already present. The lane then exits
-  with a terminal error, causing the supervisor to abort, before direct execution or the five-block rotation decision. This is opportunistic
-  refusal at an existing read, not another detector or a timing guarantee.
-  One bounded dequeue chunk (`max_user_ops_per_chunk`) is the fast-turn limit, so rejected traffic cannot
-  starve the read once its time gate is due. There is deliberately no
-  per-chunk marker query or extra poll.
-- **Race bound:** a lane turn that already read `Open` may finish if the reader
-  commits divergence concurrently. Preventing that would require a lock or
-  transaction spanning application execution. Existing freeze triggers stop
-  conflicting batch-tree writes; the detector and next typed read
-  stop the process. A chunk committed before either runtime observation may
-  acknowledge and later roll back.
-- **Watchdog boundary:** accepted-checkpoint selection checks for divergence
-  in the same transaction as selection and any download lease, refusing while
-  the marker is present. A matching batch
-  before a divergent acceptance in the same L1 block cannot represent that
-  block's final state. Because the watchdog skips replay when the finalized
-  inclusion block is unchanged, it
-  does not subsume this wire-identity detector. Conversely, the check does
-  not subsume the watchdog's broader independent application-state
-  comparison.
+- **Holds:** a fully accepted landing that fails the content-identity check
+  writes the `canonical_divergence` singleton **in the detecting sync's
+  transaction**, and `populate_safe_accepted_batches` returns early while the
+  marker exists, so no acceptance row or gold-frontier advance follows a
+  detected divergence.
+- **Enforced by:** the `trg_*_frozen_on_divergence` triggers
+  (`0001_schema.sql`) make batch-tree writes and snapshot collection RAISE
+  while the marker exists: an immediate, persisted freeze of those tables, not
+  a user-op hot-path barrier. The accepted frontier has no trigger; its single
+  writer's guard refuses. `check_danger`'s first arm is `CanonicalDivergence`.
+  Startup inspection refuses before any provider query, and each repair
+  transaction reasserts its preconditions and the marker's absence before
+  writing. A clean worker drain waits for in-flight reader appends; `run` then
+  re-reads the marker (`refuse_divergence_on_clean_exit`) and exits terminal,
+  not 0, the one code that would break the supervisor's restart-then-refuse
+  rediscovery. `admission.tla` checks the controller ordering
+  (`LocalTerminalDominance`); `preemptive.tla` checks slot and batch safety.
+- **Runtime reaction:** the danger detector owns the prompt process-wide
+  reaction, polling `check_danger` every `DANGER_DETECTOR_POLL_INTERVAL`.
+  Independently, the lane's existing time-gated SQLite read returns
+  `SafeFrontierState::CanonicalDivergence` instead of `Open`, and the lane
+  exits terminal, so the supervisor aborts, before direct execution or the
+  five-block rotation decision. This is opportunistic refusal at an existing
+  read, not another detector or a timing guarantee, and there is deliberately
+  no per-chunk marker query or extra poll. One `max_user_ops_per_chunk` chunk
+  is the fast-turn limit, so rejected traffic cannot starve the read once its
+  time gate is due.
+- **Race bound:** a lane turn that already read `Open` may finish while the
+  reader commits divergence; preventing that would need a lock or transaction
+  spanning application execution. The freeze triggers stop conflicting
+  batch-tree writes, and the detector or the next typed read stops the
+  process, so a chunk committed before either may acknowledge and later roll
+  back.
+- **Watchdog boundary:** accepted-checkpoint selection checks the marker in
+  the same transaction as selection and any download lease, and refuses while
+  it is present. A matching batch before a divergent acceptance in the same L1
+  block is not that block's final state, and the watchdog skips replay when
+  the finalized inclusion block is unchanged, so it does not subsume this
+  wire-identity detector. Nor does the check subsume the watchdog's broader,
+  independent application-state comparison.
 - **Depended on by:** standard recovery never running on a diverged frontier
-  (a flush+cascade there would compound the divergence); egress never
-  publishing a diverged landing; the remedy being cockroach recovery only.
-- **Breaks:** silent permanent scheduler/sequencer divergence — the
+  (a flush and cascade there would compound the divergence); egress never
+  publishing a diverged landing; cockroach recovery as the only remedy.
+- **Breaks:** silent permanent scheduler/sequencer divergence, the
   theft-equivalent failure.
 - **Baseline-aware frontier:** accepted-batch scanning starts strictly after
-  the immutable baseline L1 block `C`, seeded with anchor nonce `N'`. The whole
-  prefix is opaque, including previously rejected future-nonce batches; it must
-  never be reinterpreted using a later expected nonce. Subsequent scans resume
-  after the last acceptance. Rebuild defers the projection until the complete
-  baseline and anchor are published.
+  the immutable baseline L1 block `C`, seeded with anchor nonce `N'`; the
+  prefix through `C` is opaque
+  ([I9](#i9-acceptance-identity-accepted-nonce-n-means-our-valid-batch-n)).
+  Later scans resume after the last acceptance. Rebuild defers the projection
+  until the complete baseline and anchor are published.
 
 ### I16. The batch tree has exactly one valid parentless root, carrying the deployment's anchor nonce
 
