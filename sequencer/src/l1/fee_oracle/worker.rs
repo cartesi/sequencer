@@ -168,7 +168,6 @@ impl FeeOracle {
                 quote_x_per_weth = %quote,
                 linear_x_per_gas = %linear,
                 log_gas_price = refresh.log_gas_price,
-                changed = refresh.changed,
                 "refreshed L1 fee oracle",
             );
         } else {
@@ -178,7 +177,6 @@ impl FeeOracle {
                 quote_x_per_weth = %quote,
                 linear_x_per_gas = %linear,
                 log_gas_price = refresh.log_gas_price,
-                changed = refresh.changed,
                 "L1 fee oracle price unchanged",
             );
         }
@@ -198,11 +196,8 @@ impl FeeOracle {
                 biased;
                 _ = shutdown.wait_for_shutdown() => return Ok(()),
                 result = self.refresh_once() => match result {
-                    Ok(refresh) => {
-                        if refresh.changed {
-                            debug!(log_gas_price = refresh.log_gas_price, "updated L1 fee oracle price");
-                        }
-                    }
+                    // refresh_once logs a change once, at info.
+                    Ok(_) => {}
                     Err(FeeOracleError::Transient(error)) => {
                         warn!(
                             %error,
