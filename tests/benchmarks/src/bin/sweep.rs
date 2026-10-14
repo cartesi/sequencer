@@ -13,14 +13,13 @@ use benchmarks::{
         DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RESULTS_DIR, DEFAULT_SEQUENCER_BIN,
         MemorySampler, benchmark_domain, bootstrap_funded_workload, managed_sequencer_config,
     },
-    write_json_output, write_round_trip_csv, write_sweep_csv,
+    write_json_output,
 };
 use clap::Parser;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Conservative upper bound on how many txs a single worker might send during
 /// a benchmark run. Used to pre-fund accounts generously. If a worker exhausts
@@ -128,12 +127,6 @@ async fn main() -> BenchResult<()> {
     }
 
     std::fs::create_dir_all(args.results_dir.as_str())?;
-    let csv_path = PathBuf::from(format!(
-        "{}/{}-{}.csv",
-        args.results_dir,
-        mode.artifact_prefix(),
-        timestamp_string()
-    ));
 
     let mut managed = if args.self_contained {
         Some(
@@ -288,10 +281,6 @@ async fn main() -> BenchResult<()> {
         return Err(err);
     }
 
-    match mode {
-        Mode::Ack => write_sweep_csv(csv_path.as_path(), rows.as_slice())?,
-        Mode::RoundTrip => write_round_trip_csv(csv_path.as_path(), rows.as_slice())?,
-    }
     let report = SweepRunReport {
         summary: compute_capacity_summary(rows.as_slice()),
         rows,
@@ -300,7 +289,6 @@ async fn main() -> BenchResult<()> {
     };
 
     println!();
-    println!("sweep csv: {}", csv_path.display());
     print_sweep_report(&report);
 
     let config_json = json!({
@@ -323,7 +311,6 @@ async fn main() -> BenchResult<()> {
         "accounts_file": args.accounts_file,
         "transfer_amount": args.transfer_amount,
         "concurrency_list": concurrencies,
-        "csv_path": csv_path,
     });
     write_json_output(
         Path::new(&json_out),
@@ -419,14 +406,6 @@ fn parse_concurrency_range(value: &str) -> BenchResult<Vec<usize>> {
         }
     }
     Ok(out)
-}
-
-fn timestamp_string() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    secs.to_string()
 }
 
 fn fd_soft_limit_string() -> String {

@@ -61,7 +61,7 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
 
 ## Benchmarks
 
-- `sweep`: runs a concurrency sweep — ack latency (`POST /tx` acknowledgement) by default, or with `--round-trip` also submit-to-broadcast latency (`POST /tx` to the matching feed event) for accepted txs — and writes its rows and capacity summary to `ack-sweep-<ts>.json` or `rt-sweep-<ts>.json` under `--results-dir` (or to `--json-out`), plus a CSV of the rows. Reports separate first-of-each markers:
+- `sweep`: runs a concurrency sweep — ack latency (`POST /tx` acknowledgement) by default, or with `--round-trip` also submit-to-broadcast latency (`POST /tx` to the matching feed event) for accepted txs — and writes its rows and capacity summary to `ack-sweep-<ts>.json` or `rt-sweep-<ts>.json` under `--results-dir` (or to `--json-out`). Reports separate first-of-each markers:
   - first rejection of any kind
   - first HTTP non-`200`
   - first `429`

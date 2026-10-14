@@ -29,7 +29,6 @@ pub use stats::{
 };
 pub use sweep::{
     SweepRow, SweepRunReport, SweepSummary, compute_capacity_summary, print_sweep_report,
-    write_csv as write_sweep_csv, write_round_trip_csv,
 };
 pub use workload::{DEFAULT_WORKLOAD_TRANSFER_AMOUNT, WorkloadConfig, WorkloadKind};
 

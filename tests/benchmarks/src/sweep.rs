@@ -3,11 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
 
 use crate::{
-    AckRunReport, BenchResult, RoundTripRunReport,
+    AckRunReport, RoundTripRunReport,
     rejection::{
         client_failure_count, has_http_429, has_http_rejection, http_429_count,
         http_rejection_count,
@@ -15,7 +13,6 @@ use crate::{
     report::print_memory_report,
     runtime,
     stats::{StatsMs, throughput_tx_per_s},
-    support::io_err,
 };
 
 /// One measured step of a sweep. `round_trip_ms` is set only in round-trip
@@ -152,64 +149,6 @@ pub fn compute_capacity_summary(rows: &[SweepRow]) -> SweepSummary {
         tps_at_first_client_failure,
         max_sustainable_tps_at_0_rejections,
     }
-}
-
-pub fn write_csv(path: &Path, rows: &[SweepRow]) -> BenchResult<()> {
-    let mut out = String::from(
-        "concurrency,accepted_tps,accepted_count,rejected_count,http_rejected_count,http_429_count,client_failure_count,rejection_rate,p50_ms,p95_ms,p99_ms,p999_ms\n",
-    );
-    for row in rows {
-        out.push_str(
-            format!(
-                "{},{:.6},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
-                row.concurrency,
-                row.accepted_tps,
-                row.accepted_count,
-                row.rejected_count,
-                row.http_rejected_count,
-                row.http_429_count,
-                row.client_failure_count,
-                row.rejection_rate,
-                row.ack_ms.p50_ms,
-                row.ack_ms.p95_ms,
-                row.ack_ms.p99_ms,
-                row.ack_ms.p999_ms,
-            )
-            .as_str(),
-        );
-    }
-    fs::write(path, out)?;
-    Ok(())
-}
-
-pub fn write_round_trip_csv(path: &Path, rows: &[SweepRow]) -> BenchResult<()> {
-    let mut out = String::from(
-        "concurrency,accepted_tps,accepted_count,rejected_count,rejection_rate,ack_p50_ms,ack_p99_ms,rt_p50_ms,rt_p99_ms,rt_p999_ms\n",
-    );
-    for row in rows {
-        let round_trip = row
-            .round_trip_ms
-            .as_ref()
-            .ok_or_else(|| io_err("round-trip CSV row has no round-trip latency"))?;
-        out.push_str(
-            format!(
-                "{},{:.6},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
-                row.concurrency,
-                row.accepted_tps,
-                row.accepted_count,
-                row.rejected_count,
-                row.rejection_rate,
-                row.ack_ms.p50_ms,
-                row.ack_ms.p99_ms,
-                round_trip.p50_ms,
-                round_trip.p99_ms,
-                round_trip.p999_ms,
-            )
-            .as_str(),
-        );
-    }
-    fs::write(path, out)?;
-    Ok(())
 }
 
 pub fn print_sweep_report(report: &SweepRunReport) {
