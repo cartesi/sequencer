@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! DB-backed ordered-L2-tx feed used by WS subscriptions and catch-up replay.
+//! DB-backed ordered-L2-tx feed for WS subscriptions.
 
 mod error;
 

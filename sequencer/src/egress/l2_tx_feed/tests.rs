@@ -136,8 +136,8 @@ async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_ca
 }
 
 #[test]
-fn cancelled_catchup_prepare_retains_process_lock_until_blocking_read_finishes() {
-    let db = temp_db("cancelled-catchup-prepare-lock");
+fn cancelled_subscription_prepare_retains_process_lock_until_blocking_read_finishes() {
+    let db = temp_db("cancelled-subscription-prepare-lock");
     seed_ordered_txs(db.path.as_str());
     let data_dir = db._dir.path().to_str().expect("utf8 data dir").to_string();
     let db_path = db.path.clone();
@@ -182,7 +182,7 @@ fn cancelled_catchup_prepare_retains_process_lock_until_blocking_read_finishes()
                 ProcessLock::acquire(&data_dir),
                 Err(ProcessLockError::Locked { .. })
             ),
-            "detached catch-up preparation must retain process ownership"
+            "detached subscription preparation must retain process ownership"
         );
 
         release_blocker_tx.send(()).expect("release blocking pool");
@@ -198,7 +198,7 @@ fn cancelled_catchup_prepare_retains_process_lock_until_blocking_read_finishes()
             }
         })
         .await
-        .expect("detached catch-up preparation should release ownership");
+        .expect("detached subscription preparation should release ownership");
         drop(reacquired);
     });
 }
