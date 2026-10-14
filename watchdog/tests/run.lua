@@ -304,6 +304,35 @@ end)
 
 -- ── incident ──────────────────────────────────────────────────────────────
 
+test("store names the directory it cannot remove", function()
+    local lfs = require("lfs")
+    local dir = support.tmpdir() .. "/stuck"
+    assert(lfs.mkdir(dir))
+    local rmdir = lfs.rmdir
+    lfs.rmdir = function()
+        return nil, "Directory not empty"
+    end
+    local ok, err = pcall(store_mod.remove_tree, dir)
+    lfs.rmdir = rmdir
+    eq(ok, false)
+    eq(select(1, errors.classify(err)), "internal")
+    eq(select(2, errors.classify(err)), "cannot remove " .. dir .. ": Directory not empty")
+end)
+
+test("sequencer keeps the first 200 bytes of an error body", function()
+    local http = {
+        get = function()
+            return { status = 500, body = string.rep("x", 1000) }
+        end,
+    }
+    local ok, err = pcall(function()
+        return require("watchdog.sequencer").new(http, json, "http://sequencer"):inclusion_block()
+    end)
+    eq(ok, false)
+    eq(select(1, errors.classify(err)), "transient")
+    eq(select(2, errors.classify(err)), "sequencer /finalized_state/inclusion_block: HTTP 500 " .. string.rep("x", 200))
+end)
+
 test("store removes its temporary file when a write fails", function()
     local dir = support.tmpdir()
     local open = io.open

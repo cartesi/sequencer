@@ -63,7 +63,10 @@ local function remove_tree(path)
                 remove_tree(path .. "/" .. entry)
             end
         end
-        assert(lfs.rmdir(path))
+        local removed, err = lfs.rmdir(path)
+        if not removed then
+            error(string.format("cannot remove %s: %s", path, tostring(err)), 0)
+        end
     else
         assert(os.remove(path))
     end

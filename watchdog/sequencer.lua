@@ -22,7 +22,7 @@ function sequencer.new(http, json, base_url)
             errors.transient("sequencer %s: %s", route, tostring(err))
         end
         if response.status < 200 or response.status >= 300 then
-            errors.transient("sequencer %s: HTTP %d %s", route, response.status, response.body or "")
+            errors.transient("sequencer %s: HTTP %d %s", route, response.status, (response.body or ""):sub(1, 200))
         end
         return response
     end
