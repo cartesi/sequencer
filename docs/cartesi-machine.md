@@ -32,13 +32,19 @@ not:
 
 - the emulator release and its kernel (`toolchain-pins.env`);
 - the rootfs: the guest Dockerfile, `machine-guest-tools`, and `xgenext2fs`;
+- whether the cross toolchain has `rust-src`: with it, rustc embeds local
+  standard-library paths in panic locations instead of the remapped
+  `/rustc/<hash>/` ones. cross 0.2.5 adds it only on a run after the one that
+  installs the riscv64 target, so the guest recipes install both first
+  (`cross-toolchain`) and a cold build is reproducible;
 - the dapp binary: the `rust-toolchain.toml` channel, every `Cargo.lock` entry
   in `canonical-app`'s build graph, the cross image digest in
   `examples/canonical-app/Cross.toml`, and `CROSS_VERSION`. The build graph
   includes the proc macros and build-dependencies that only run on the host
-  (`syn`, `bindgen` for libcmt, `ruint` for the fee table): each crate's
-  metadata hash covers its dependencies, so a version bump anywhere in the
-  graph renames downstream symbols and shifts code layout. The host half of
+  (`syn`, `bindgen` for libcmt, `ruint` for the fee table): a version bump
+  anywhere in the graph can move the binary, most likely because each crate's
+  metadata hash covers its dependencies and feeds symbol names and code
+  layout. The host half of
   the graph is `x86_64-unknown-linux-gnu`, cross's container, whatever the
   machine; `cargo tree -p canonical-app --target all -e normal,build` lists a
   superset from any machine, and an update outside it leaves the binary
@@ -48,7 +54,8 @@ not:
   calls: recompiling a crate shifts its constants and code layout.
 
 The checkout path does not enter the hash, and `just canonical-print-build-hashes`
-prints all four inputs to compare. A move that is meant to preserve behavior is
+prints all four inputs to compare; compare cold builds, since a warm `target/`
+can hold crates compiled before `rust-src` arrived. A move that is meant to preserve behavior is
 checked against [`tests/fixtures/consensus_vectors_v1.json`](../tests/fixtures/consensus_vectors_v1.json),
 which pins the consensus bytes (EIP-712 hashes, signature recovery, SSZ, fee
 table, output payloads) natively and, through `canonical-test`'s golden cases,

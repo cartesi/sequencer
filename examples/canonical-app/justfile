@@ -5,6 +5,10 @@ linux_image_release := `grep '^CARTESI_LINUX_IMAGE_RELEASE=' ../../toolchain-pin
 linux_kernel_filename := `grep '^CARTESI_LINUX_KERNEL_FILENAME=' ../../toolchain-pins.env | cut -d= -f2`
 linux_kernel_sha512 := `grep '^CARTESI_LINUX_KERNEL_SHA512=' ../../toolchain-pins.env | cut -d= -f2`
 
+# cross builds the guest with this channel's x86_64-unknown-linux-gnu
+# toolchain (see `cross-toolchain`).
+rust_channel := `sed -n 's/^channel = "\(.*\)"$/\1/p' ../../rust-toolchain.toml`
+
 out_dir := "out"
 source_date_epoch := "0"
 # Cache the kernel under its pinned filename so a changed pin misses the cache.
@@ -34,13 +38,21 @@ download-deps:
 
 build-dapp: build-dapp-devnet
 
-build-dapp-devnet:
+# On its first run cross installs the riscv64 target and stops there; a later
+# run adds rust-src, which changes the standard-library paths rustc embeds in
+# panic locations. Installing both before every build keeps the template hash
+# independent of which run compiled which crate. --force-non-host is needed on
+# Apple Silicon and harmless elsewhere.
+cross-toolchain:
+    rustup toolchain install "{{rust_channel}}-x86_64-unknown-linux-gnu" --profile minimal --target riscv64gc-unknown-linux-musl --component rust-src --force-non-host
+
+build-dapp-devnet: cross-toolchain
     mkdir -p {{out_dir}}
     SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_TARGET_DIR=../../target CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --locked --package canonical-app --bin canonical-app-devnet --target riscv64gc-unknown-linux-musl --release
     cp ../../target/riscv64gc-unknown-linux-musl/release/canonical-app-devnet {{dapp_binary_devnet}}
     cp {{dapp_binary_devnet}} {{dapp_binary}}
 
-build-dapp-sepolia:
+build-dapp-sepolia: cross-toolchain
     mkdir -p {{out_dir}}
     SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_TARGET_DIR=../../target CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --locked --package canonical-app --bin canonical-app-sepolia --target riscv64gc-unknown-linux-musl --release
     cp ../../target/riscv64gc-unknown-linux-musl/release/canonical-app-sepolia {{dapp_binary_sepolia}}
