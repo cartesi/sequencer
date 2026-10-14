@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::common::temp_db;
+use crate::test_support::temp_db;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_subscribe_streams_ordered_txs_from_offset_zero() {
@@ -258,10 +258,7 @@ async fn ws_subscribe_closes_on_oversized_inbound_message() {
 
 fn seed_ordered_txs(db_path: &str) {
     let mut storage = Storage::open(db_path).expect("open storage");
-    crate::storage::test_helpers::pin_test_deployment_identity(
-        &mut storage,
-        Address::repeat_byte(0x7f),
-    );
+    crate::test_support::pin_test_deployment_identity(&mut storage, Address::repeat_byte(0x7f));
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -375,7 +372,7 @@ async fn start_test_server_with_limits(
     db_path: &str,
     ws_max_subscribers: usize,
 ) -> WsServerRuntime {
-    let (listeners, _public_addr, addr) = super::common::bind_api_listeners().await;
+    let (listeners, _public_addr, addr) = crate::test_support::server::bind_api_listeners().await;
 
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
     let shutdown = RuntimeScope::default();

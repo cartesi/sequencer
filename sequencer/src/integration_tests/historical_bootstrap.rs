@@ -37,13 +37,12 @@ use crate::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
 use crate::http::{self, ApiConfig};
 use crate::ingress::inclusion_lane::{PendingUserOp, dump_info};
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::test_helpers::{default_protocol_timing, pin_test_deployment_identity};
+use crate::storage::test_helpers::default_protocol_timing;
 use crate::storage::{
     DirectInputExecution, FrontierMode, IngestedSafeInput, LifecycleCommand, SafeInputRange,
     Storage,
 };
-
-use super::common::temp_db;
+use crate::test_support::{pin_test_deployment_identity, temp_db};
 
 const SUBMITTER: Address = Address::repeat_byte(0x33);
 const APP: Address = Address::repeat_byte(0x11);
@@ -161,7 +160,8 @@ impl Drop for Server {
 
 impl Server {
     async fn start(db_path: &str) -> Self {
-        let (listeners, _public_addr, addr) = super::common::bind_api_listeners().await;
+        let (listeners, _public_addr, addr) =
+            crate::test_support::server::bind_api_listeners().await;
         let shutdown = RuntimeScope::default();
         let (tx, rx) = mpsc::channel(1);
         let feed = L2TxFeed::new(

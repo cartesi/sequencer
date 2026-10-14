@@ -12,6 +12,7 @@ use crate::ingress::inclusion_lane::InclusionLaneError;
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{DeploymentIdentity, FeeOracleIdentity, Storage};
 
+pub(crate) mod server;
 mod stub_app;
 
 pub(crate) use stub_app::{ReplayEvent, StubApp, create_structured_dump};

@@ -9,8 +9,7 @@ use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::protocol::ProtocolTiming;
 
 use super::{SafeInputRange, Storage, StoredSafeInput};
-// Transitional: callers still name these through `storage::test_helpers`.
-pub(crate) use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
+use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
 pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);

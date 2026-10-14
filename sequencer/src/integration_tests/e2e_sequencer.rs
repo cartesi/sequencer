@@ -18,7 +18,7 @@ use sequencer::ingress::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, PendingUserOp, dump_info,
 };
 use sequencer::runtime::shutdown::RuntimeScope;
-use sequencer::storage::{DeploymentIdentity, FeeOracleIdentity, Storage, StoredSafeInput};
+use sequencer::storage::{Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::application::Application;
 use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::common::temp_db;
+use crate::test_support::{pin_test_deployment_identity, temp_db};
 
 const TEST_BATCH_SUBMITTER: Address = Address::repeat_byte(0xff);
 
@@ -1132,7 +1132,8 @@ async fn start_full_server_with_max_body(
     domain: Eip712Domain,
     max_body_bytes: usize,
 ) -> FullServerRuntime {
-    let (listeners, public_addr, internal_addr) = super::common::bind_api_listeners().await;
+    let (listeners, public_addr, internal_addr) =
+        crate::test_support::server::bind_api_listeners().await;
 
     let mut storage = Storage::open(db_path).expect("open storage");
     let shutdown = RuntimeScope::default();
@@ -1226,7 +1227,8 @@ async fn start_full_server_with_max_body(
 /// Serves the API over a lane queue of capacity one that already holds a
 /// parked op and is never drained, so every `/tx` finds it full.
 async fn start_server_with_full_queue(db_path: &str, domain: Eip712Domain) -> FullServerRuntime {
-    let (listeners, public_addr, internal_addr) = super::common::bind_api_listeners().await;
+    let (listeners, public_addr, internal_addr) =
+        crate::test_support::server::bind_api_listeners().await;
 
     let _storage = Storage::open(db_path).expect("open storage");
     let (tx, rx) = mpsc::channel::<PendingUserOp>(1);
@@ -1315,16 +1317,7 @@ fn bootstrap_open_frame(db_path: &str) {
 fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)]) {
     let mut storage = Storage::open(db_path).expect("open storage");
     let config = WalletConfig::default();
-    storage
-        .load_or_insert_deployment_identity(DeploymentIdentity {
-            chain_id: 1,
-            app_address: Address::repeat_byte(0x11),
-            input_box_address: Address::repeat_byte(0x22),
-            app_deployment_block: 0,
-            batch_submitter_address: TEST_BATCH_SUBMITTER,
-            fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
-        })
-        .expect("pin test deployment identity");
+    pin_test_deployment_identity(&mut storage, TEST_BATCH_SUBMITTER);
 
     // Always record a safe-head observation: production callers are gated by
     // the startup recovery procedure, so storage paths like `safe_input_frontier`

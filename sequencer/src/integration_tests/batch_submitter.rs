@@ -16,7 +16,7 @@ use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
 use sequencer_core::protocol::ProtocolTiming;
 
-use super::common::{TestDb, temp_db};
+use crate::test_support::{TestDb, temp_db};
 
 /// Minimal mock for integration tests.
 ///

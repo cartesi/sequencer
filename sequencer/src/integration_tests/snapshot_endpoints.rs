@@ -24,7 +24,7 @@ use sequencer::storage::Storage;
 use sequencer_core::application::Application;
 use tokio::sync::mpsc;
 
-use super::common::temp_db;
+use crate::test_support::temp_db;
 
 fn dummy_domain() -> Eip712Domain {
     sequencer_core::build_input_domain(1, alloy_primitives::Address::ZERO)
@@ -56,7 +56,8 @@ impl TestServer {
 }
 
 async fn start_server(db_path: &str) -> TestServer {
-    let (listeners, public_addr, internal_addr) = super::common::bind_api_listeners().await;
+    let (listeners, public_addr, internal_addr) =
+        crate::test_support::server::bind_api_listeners().await;
     let (tx_sender, _rx) = mpsc::channel::<PendingUserOp>(1);
     let shutdown = RuntimeScope::default();
     // Sentinel submitter: this fixture seeds no own-batch rows.
@@ -114,7 +115,7 @@ fn register_accepted(
 ) -> i64 {
     let mut storage = Storage::open(db_path).unwrap();
     let sender = alloy_primitives::Address::repeat_byte(0x7f);
-    crate::storage::test_helpers::pin_test_deployment_identity(&mut storage, sender);
+    crate::test_support::pin_test_deployment_identity(&mut storage, sender);
     let mut head = storage.open_state().unwrap().unwrap_or_else(|| {
         storage
             .initialize_open_state(inclusion_block, crate::storage::SafeInputRange::empty_at(0))
@@ -179,10 +180,9 @@ fn archive_state(bytes: &[u8]) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_block_divergence_refuses_every_finalized_endpoint() {
-    use crate::storage::test_helpers::{
-        default_protocol_timing, local_batch_payload, pin_test_deployment_identity,
-    };
+    use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
     use crate::storage::{ExecutedInputCount, SafeInputRange, StoredSafeInput};
+    use crate::test_support::pin_test_deployment_identity;
     use sequencer_core::batch::{Batch, Frame};
     use sequencer_core::scheduler::{Scheduler, SchedulerConfig, SchedulerInput};
     use ssz::Encode;
