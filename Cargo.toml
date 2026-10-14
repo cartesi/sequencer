@@ -69,5 +69,6 @@ tempfile = "3.10"
 thiserror = "2"
 tokio = "1.53"
 tokio-tungstenite = "0.28"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

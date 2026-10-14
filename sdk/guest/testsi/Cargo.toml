@@ -20,4 +20,4 @@ cartesi-machine = { git = "https://github.com/cartesi/dave", rev = "79874c0a1b40
 
 inventory = "0.3"
 libtest-mimic = "0.6"
-thiserror = "1.0"
+thiserror = { workspace = true }

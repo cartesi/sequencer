@@ -20,7 +20,7 @@ k256 = { workspace = true }
 rusqlite = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 tar = "0.4"
-toml = "0.8"
+toml = { workspace = true }
 sequencer-core = { path = "../../sequencer-core" }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
 serde = { workspace = true }
