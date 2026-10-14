@@ -207,11 +207,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             expected_chain_id: l1_config.identity.chain_id,
         };
         let providers = build_batch_submitter_providers(&l1_config)?;
-        let poster = Arc::new(EthereumBatchPoster::new(
-            providers,
-            poster_config,
-            shutdown.clone(),
-        ));
+        let poster = Arc::new(EthereumBatchPoster::new(providers, poster_config));
         let submitter_config = BatchSubmitterConfig {
             idle_poll_interval_ms: run_config.batch_submitter_idle_poll_interval_ms,
         };

@@ -10,7 +10,6 @@ use alloy::rpc::types::BlockNumberOrTag;
 use async_trait::async_trait;
 use cartesi_rollups_contracts::input_box::InputBox;
 use sequencer_core::batch::Batch;
-use std::future::Future;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -18,7 +17,6 @@ use crate::l1::eip1559::{Eip1559Fees, estimate_fees, pad_gas_estimate};
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
 use crate::l1::provider::{KeyedProviders, SendError, error_chain};
 use crate::l1::watermark::{WalletNonceWatermarkError, WalletNonceWatermarkSink};
-use crate::runtime::shutdown::RuntimeScope;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -61,8 +59,6 @@ pub enum BatchPosterError {
         first_nonce: u64,
         batch_count: usize,
     },
-    #[error("runtime shutdown cancelled L1 submission")]
-    Shutdown,
     /// The submit provider could not sign a batch transaction this poster
     /// built: a field is missing. A defect, not a condition a retry heals.
     #[error("batch transaction not signable: {0}")]
@@ -80,7 +76,7 @@ impl BatchPosterError {
             | Self::WalletNonceRangeUnrepresentable { .. }
             | Self::UnsignableTransaction(_) => true,
             Self::Watermark(source) => source.is_persistent_invariant(),
-            Self::Provider(_) | Self::Shutdown => false,
+            Self::Provider(_) => false,
         }
     }
 }
@@ -159,20 +155,13 @@ pub struct EthereumBatchPoster {
     /// broadcasting, so tests can drive the error-classification paths.
     #[cfg(test)]
     fail_next_send: Arc<Mutex<Option<String>>>,
-    /// Cancels pending keyed sends during ordinary shutdown.
-    shutdown: RuntimeScope,
 }
 
 impl EthereumBatchPoster {
-    pub fn new(
-        providers: KeyedProviders,
-        config: BatchPosterConfig,
-        shutdown: RuntimeScope,
-    ) -> Self {
+    pub fn new(providers: KeyedProviders, config: BatchPosterConfig) -> Self {
         Self {
             providers,
             config,
-            shutdown,
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             fail_next_send: Arc::new(Mutex::new(None)),
@@ -394,17 +383,6 @@ fn checked_highest_wallet_nonce(
     Ok(highest)
 }
 
-async fn externalize_provider_call<T>(
-    shutdown: &RuntimeScope,
-    call: impl Future<Output = Result<T, BatchPosterError>>,
-) -> Result<T, BatchPosterError> {
-    tokio::select! {
-        biased;
-        _ = shutdown.wait_for_shutdown() => Err(BatchPosterError::Shutdown),
-        result = call => result,
-    }
-}
-
 #[async_trait]
 impl BatchPoster for EthereumBatchPoster {
     async fn submit_batches(
@@ -465,12 +443,7 @@ impl BatchPoster for EthereumBatchPoster {
                 .checked_add(offset)
                 .expect("validated wallet-nonce range must not overflow");
             self.track_pending(nonce);
-            match externalize_provider_call(
-                &self.shutdown,
-                self.send_batch_at_nonce(payload, nonce, &fees),
-            )
-            .await
-            {
+            match self.send_batch_at_nonce(payload, nonce, &fees).await {
                 Ok(tx_hash) => {
                     debug!(
                         tx_nonce = nonce,
@@ -687,8 +660,7 @@ mod tests {
     use super::{
         BatchPoster, BatchPosterConfig, BatchPosterError, EthereumBatchPoster,
         PENDING_WAIT_WARN_AFTER, PendingSince, SubmitBatchesOutcome, checked_highest_wallet_nonce,
-        derive_confirmation_timeout, externalize_provider_call, is_pending_tx_conflict,
-        mock::MockBatchPoster,
+        derive_confirmation_timeout, is_pending_tx_conflict, mock::MockBatchPoster,
     };
 
     #[test]
@@ -706,7 +678,6 @@ mod tests {
         assert!(super::is_pending_tx_conflict(&message), "{message}");
     }
     use crate::l1::watermark::{WalletNonceWatermarkError, WalletNonceWatermarkSink};
-    use crate::runtime::shutdown::RuntimeScope;
     use alloy::node_bindings::Anvil;
     use alloy::providers::Provider;
     use alloy::rpc::types::BlockNumberOrTag;
@@ -732,30 +703,6 @@ mod tests {
         assert!(matches!(
             checked_highest_wallet_nonce(u64::MAX, 2),
             Err(BatchPosterError::WalletNonceRangeUnrepresentable { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn ordinary_shutdown_cancels_provider_send_without_terminal_classification() {
-        let shutdown = RuntimeScope::default();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let send = tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move {
-                externalize_provider_call(&shutdown, async move {
-                    started_tx.send(()).expect("mark provider send started");
-                    std::future::pending::<Result<(), BatchPosterError>>().await
-                })
-                .await
-            }
-        });
-        started_rx.await.expect("provider send acquired the gate");
-
-        shutdown.request_shutdown();
-
-        assert!(matches!(
-            send.await.expect("provider send task"),
-            Err(BatchPosterError::Shutdown)
         ));
     }
 
@@ -858,8 +805,7 @@ mod tests {
         )
         .expect("keyed providers");
         let provider = providers.read.clone();
-        let poster =
-            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
+        let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
 
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -920,7 +866,7 @@ mod tests {
             expected_chain_id: wrong_chain_id,
             ..poster_config(&anvil)
         };
-        let poster = EthereumBatchPoster::new(providers, config, RuntimeScope::default());
+        let poster = EthereumBatchPoster::new(providers, config);
 
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -1039,8 +985,7 @@ mod tests {
         )
         .expect("keyed providers");
         let provider = providers.read.clone();
-        let poster =
-            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
+        let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
 
         let base_nonce = provider
@@ -1108,8 +1053,7 @@ mod tests {
         )
         .expect("keyed providers");
         let provider = providers.read.clone();
-        let poster =
-            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
+        let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
 
         let base_nonce = provider
@@ -1153,8 +1097,7 @@ mod tests {
         )
         .expect("keyed providers");
         let provider = providers.read.clone();
-        let poster =
-            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
+        let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
         let base_nonce = provider
             .get_transaction_count(SUBMITTER)
@@ -1190,8 +1133,7 @@ mod tests {
             false,
         )
         .expect("keyed providers");
-        let poster =
-            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
+        let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
 
         poster.fail_next_send_with_for_test("test-injected send failure");
@@ -1218,8 +1160,7 @@ mod tests {
         )
         .expect("keyed providers");
         let provider = providers.read.clone();
-        let poster =
-            EthereumBatchPoster::new(providers, poster_config(&anvil), RuntimeScope::default());
+        let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
 
         let base_nonce = provider
