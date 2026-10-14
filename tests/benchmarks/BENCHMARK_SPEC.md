@@ -45,7 +45,7 @@ This spec makes that requirement measurable and repeatable.
 2. Target percentile is `p99` for both latency goals.
 3. `p99.9` is diagnostic in this phase.
 4. Runs are valid for target evaluation only when `accepted_count >= 5,000`.
-5. `p99.9` is considered reliable when `accepted_count >= 10,000`; otherwise it must be marked diagnostic-low-confidence.
+5. `p99.9` is diagnostic below `accepted_count` 10,000.
 
 ### 3.2 Request Outcome Classification
 
@@ -77,20 +77,15 @@ This spec makes that requirement measurable and repeatable.
 ### 4.1 Profiling Scenarios
 
 1. Same-host baseline (`no injected latency`) for low-noise branch comparisons.
-2. Canonical network-aware scenario.
+2. Canonical network-aware scenario (not implemented; see §4.2).
 3. Throughput/concurrency sweeps to locate knee and overload behavior.
 
 ### 4.2 Canonical Network-Aware Scenario (Target Evaluation)
 
-1. The injected profile must be applied to both HTTP `POST /tx` and WS `GET /ws/subscribe` paths.
-2. Base delay: `+50ms one-way` in each direction (`~100ms RTT`).
-3. Jitter: `+/-10ms` around base delay.
-4. Packet loss: `0%`.
-5. No artificial bandwidth cap.
-6. Packet reordering, duplication, and corruption injection disabled.
-7. Reports must include the network shaping tool and exact shaping config.
+Target evaluation injects `+50ms` one-way (`~100ms RTT`, `+/-10ms` jitter, no loss) on both `POST /tx` and the WS subscription.
+No shaper exists, so every run is a same-host baseline and carries no verdict.
 
-## 5. Targets and Verdicts
+## 5. Targets
 
 ### 5.1 Target Goals
 
@@ -99,21 +94,8 @@ This spec makes that requirement measurable and repeatable.
 
 ### 5.2 Target Evaluation Conditions
 
-The latency goals above are evaluated under these conditions:
-
-1. `rejection_rate == 0%` (equivalently `rejected_count == 0`).
-2. Canonical network-aware scenario is satisfied.
-3. Run is valid per sample-size policy.
-
-### 5.3 Separate Verdicts
-
-1. `ACK_TARGET` is `PASS` when all hold:
-   - target evaluation conditions are satisfied
-   - `ack_latency_ms p99 <= 500ms`
-2. `SOFT_CONFIRM_TARGET` is `PASS` when all hold:
-   - target evaluation conditions are satisfied
-   - `soft_confirm_latency_ms p99 <= 1000ms`
-   - sanity assertions are satisfied
+A run evaluates the goals above only when it has zero rejections, runs under the canonical network-aware scenario (§4.2), and meets the sample-size rule (§3.1).
+The soft-confirm goal also requires the sanity assertions (§3.5) to hold.
 
 ## 6. Required Report Content
 
@@ -123,22 +105,22 @@ Each benchmark report must include:
 2. Accepted/rejected counts and rejection rate.
 3. Accepted TPS and total run duration.
 4. Rejection reason breakdown (when available).
-5. Network profile and shaping method/config.
+5. Network profile (a fixed string; same-host baseline until a shaper exists).
 6. Memory metrics and memory sampling method/interval.
 7. Full run configuration (command, deployment domain, concurrency/arrival settings, timeout settings).
-8. Target verdict lines: `ACK_TARGET` and `SOFT_CONFIRM_TARGET` (when target evaluation is performed).
-9. Sanity assertion status and failure summary (if any).
-10. For sweeps, separate first-knee metrics for any rejection, HTTP non-`200`, `429`, and client-side failure.
+8. Sanity assertion status and failure summary (if any).
+9. For sweeps, separate first-knee metrics for any rejection, HTTP non-`200`, `429`, and client-side failure.
 
 ## 7. Mapping to Current Harnesses
 
-1. `ack_latency`: primary path for `ack_latency_ms`.
-2. `round_trip_latency`: primary path for `soft_confirm_latency_ms`.
-3. `sweep`: capacity exploration and overload discovery.
-4. `unit_hot_path`: micro profiling.
+Recipes are in [`justfile`](./justfile).
+
+1. `bench-ack-self` (`sweep` at concurrency 1): `ack_latency_ms`.
+2. `bench-round-trip-self` (`round_trip_latency`): `soft_confirm_latency_ms`.
+3. `bench-sweep-self`, `bench-capacity-sweep-self` and `bench-rt-sweep-self` (`sweep`): capacity exploration and overload discovery.
+4. `bench-report` and `bench-compare-latest` (`report`, `compare_latest`): summaries and deltas over the saved results.
 
 ## 8. Current Gaps
 
-1. Add first-class support for canonical injected-latency runs.
-2. Ensure reports always include network shaping tool and exact shaping config.
-3. Strengthen tx identity matching for round-trip correlation if workloads ever stop guaranteeing effectively unique sender/payload pairs.
+1. Add first-class support for canonical injected-latency runs; target verdicts (§5) need it.
+2. Strengthen tx identity matching for round-trip correlation if workloads ever stop guaranteeing effectively unique sender/payload pairs.

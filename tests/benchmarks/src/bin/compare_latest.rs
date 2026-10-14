@@ -7,7 +7,6 @@ use benchmarks::{
     throughput_tx_per_s, trailing_number,
 };
 use clap::{Parser, ValueEnum};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,8 +84,8 @@ fn compare_ack(results_dir: &Path) -> BenchResult<()> {
             return Ok(());
         }
     };
-    let old = read_json::<BenchmarkJsonOutput<SweepRunReport, Value>>(&old_path)?;
-    let new = read_json::<BenchmarkJsonOutput<SweepRunReport, Value>>(&new_path)?;
+    let old = read_json::<BenchmarkJsonOutput<SweepRunReport>>(&old_path)?;
+    let new = read_json::<BenchmarkJsonOutput<SweepRunReport>>(&new_path)?;
 
     println!(
         "ACK latest two:\n  old: {}\n  new: {}",
@@ -145,8 +144,8 @@ fn compare_round_trip(results_dir: &Path) -> BenchResult<()> {
             return Ok(());
         }
     };
-    let old = read_json::<BenchmarkJsonOutput<RoundTripRunReport, Value>>(&old_path)?;
-    let new = read_json::<BenchmarkJsonOutput<RoundTripRunReport, Value>>(&new_path)?;
+    let old = read_json::<BenchmarkJsonOutput<RoundTripRunReport>>(&old_path)?;
+    let new = read_json::<BenchmarkJsonOutput<RoundTripRunReport>>(&new_path)?;
 
     println!(
         "ROUND-TRIP latest two:\n  old: {}\n  new: {}",

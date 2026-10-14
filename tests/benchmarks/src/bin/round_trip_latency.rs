@@ -4,9 +4,9 @@
 use alloy_primitives::Address;
 use benchmarks::{
     BenchResult, DEFAULT_ENDPOINT, DEFAULT_INTERNAL_ENDPOINT, DEFAULT_WORKLOAD_TRANSFER_AMOUNT,
-    DOMAIN_NAME, DOMAIN_VERSION, NetworkProfile, RoundTripRunConfig, WorkloadConfig, WorkloadKind,
-    default_json_output_path, evaluate_soft_confirm_target, parse_address, print_round_trip_report,
-    print_target_evaluation, resolve_external_benchmark_domain, run_round_trip_benchmark,
+    DOMAIN_NAME, DOMAIN_VERSION, NETWORK_PROFILE, RoundTripRunConfig, WorkloadConfig, WorkloadKind,
+    default_json_output_path, parse_address, print_round_trip_report,
+    resolve_external_benchmark_domain, run_round_trip_benchmark,
     runtime::{
         DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_SEQUENCER_BIN, MemorySampler, benchmark_domain,
         bootstrap_funded_workload, managed_sequencer_config,
@@ -27,7 +27,7 @@ const FUNDING_ESTIMATE_TXS_PER_WORKER: u64 = 100_000;
     name = "round_trip_latency",
     about = "round-trip latency benchmark",
     version,
-    after_help = "Examples:\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 30 --concurrency 16 --max-fee 2000\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 60 --concurrency 16 --evaluate"
+    after_help = "Examples:\n  cargo run -p benchmarks --bin round_trip_latency -- --self-contained --duration-secs 30 --concurrency 16 --max-fee 2000"
 )]
 struct Args {
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
@@ -62,8 +62,6 @@ struct Args {
     max_ws_wait_ms: u64,
     #[arg(long, default_value_t = 5_u64)]
     warmup_secs: u64,
-    #[arg(long, default_value_t = false)]
-    evaluate: bool,
     #[arg(long)]
     json_out: Option<String>,
 }
@@ -72,7 +70,6 @@ struct Args {
 async fn main() -> BenchResult<()> {
     let args = Args::parse();
     let effective_concurrency = args.concurrency.max(1);
-    let network_profile = NetworkProfile::same_host_baseline();
     let json_out = args.json_out.clone().or_else(|| {
         args.self_contained
             .then(|| default_json_output_path("round-trip-latency"))
@@ -205,14 +202,7 @@ async fn main() -> BenchResult<()> {
     }
 
     let report = report_result?;
-    let evaluation = args
-        .evaluate
-        .then(|| evaluate_soft_confirm_target(&report, network_profile.clone()));
-
     print_round_trip_report(&report);
-    if let Some(value) = evaluation.as_ref() {
-        print_target_evaluation(value);
-    }
 
     if let Some(path) = json_out.as_ref() {
         let config_json = json!({
@@ -228,19 +218,12 @@ async fn main() -> BenchResult<()> {
             "max_fee": args.max_fee,
             "round_trip_request_timeout_ms": args.request_timeout_ms,
             "round_trip_max_ws_wait_ms": args.max_ws_wait_ms,
-            "evaluation_requested": args.evaluate,
-            "network_profile": network_profile,
+            "network_profile": NETWORK_PROFILE,
             "workload": args.workload.as_str(),
             "accounts_file": args.accounts_file,
             "transfer_amount": args.transfer_amount,
         });
-        write_json_output(
-            Path::new(path),
-            "round_trip_latency",
-            &config_json,
-            &report,
-            evaluation.as_ref(),
-        )?;
+        write_json_output(Path::new(path), "round_trip_latency", &config_json, &report)?;
         println!("round-trip json: {path}");
     }
     Ok(())

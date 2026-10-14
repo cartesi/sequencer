@@ -6,7 +6,6 @@ use benchmarks::{
     runtime::DEFAULT_RESULTS_DIR, trailing_number,
 };
 use clap::Parser;
-use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -259,7 +258,7 @@ fn load_latest<R: serde::de::DeserializeOwned>(
     dir: &Path,
     prefix: &str,
     suffix: &str,
-) -> Option<BenchmarkJsonOutput<R, Value>> {
+) -> Option<BenchmarkJsonOutput<R>> {
     let path = latest_file(dir, prefix, suffix)?;
     let raw = fs::read_to_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
@@ -267,7 +266,7 @@ fn load_latest<R: serde::de::DeserializeOwned>(
 
 /// Load the latest ack-sweep JSON that has more than 1 row (i.e., a real sweep,
 /// not a single-concurrency baseline run).
-fn load_latest_multi_row_sweep(dir: &Path) -> Option<BenchmarkJsonOutput<SweepRunReport, Value>> {
+fn load_latest_multi_row_sweep(dir: &Path) -> Option<BenchmarkJsonOutput<SweepRunReport>> {
     let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
@@ -286,7 +285,7 @@ fn load_latest_multi_row_sweep(dir: &Path) -> Option<BenchmarkJsonOutput<SweepRu
     // Return the first one that has more than 1 row.
     for (_, path) in candidates {
         let raw = fs::read_to_string(&path).ok()?;
-        if let Ok(parsed) = serde_json::from_str::<BenchmarkJsonOutput<SweepRunReport, Value>>(&raw)
+        if let Ok(parsed) = serde_json::from_str::<BenchmarkJsonOutput<SweepRunReport>>(&raw)
             && parsed.report.rows.len() > 1
         {
             return Some(parsed);

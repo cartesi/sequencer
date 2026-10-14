@@ -4,12 +4,12 @@
 use alloy_primitives::Address;
 use benchmarks::{
     AckRunConfig, BenchResult, DEFAULT_ENDPOINT, DEFAULT_INTERNAL_ENDPOINT,
-    DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME, DOMAIN_VERSION, NetworkProfile,
+    DEFAULT_WORKLOAD_TRANSFER_AMOUNT, DOMAIN_NAME, DOMAIN_VERSION, NETWORK_PROFILE,
     RoundTripRunConfig, RtSweepMeasurements, RtSweepRow, RtSweepRunReport, SweepMeasurements,
     SweepRow, SweepRunReport, WorkloadConfig, WorkloadKind, compute_capacity_summary,
-    compute_rt_sweep_summary, default_json_output_path, evaluate_ack_target, parse_address,
-    print_ack_report, print_round_trip_report, print_sweep_report, print_target_evaluation,
-    resolve_external_benchmark_domain, run_ack_benchmark, run_round_trip_benchmark,
+    compute_rt_sweep_summary, default_json_output_path, parse_address, print_ack_report,
+    print_round_trip_report, print_sweep_report, resolve_external_benchmark_domain,
+    run_ack_benchmark, run_round_trip_benchmark,
     runtime::{
         DEFAULT_MEMORY_SAMPLE_INTERVAL_MS, DEFAULT_RESULTS_DIR, DEFAULT_SEQUENCER_BIN,
         MemorySampler, benchmark_domain, bootstrap_funded_workload, managed_sequencer_config,
@@ -85,15 +85,11 @@ struct Args {
     /// Run a warmup phase before the first sweep step.
     #[arg(long, default_value_t = 0_u64)]
     warmup_secs: u64,
-    /// Evaluate latency targets (single-concurrency runs).
-    #[arg(long, default_value_t = false)]
-    evaluate: bool,
 }
 
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     let args = Args::parse();
-    let network_profile = NetworkProfile::same_host_baseline();
     let json_prefix = if args.round_trip {
         "rt-sweep"
     } else {
@@ -350,7 +346,7 @@ async fn main() -> BenchResult<()> {
                 "duration_secs": args.duration_secs,
                 "max_fee": args.max_fee,
                 "results_dir": args.results_dir,
-                "network_profile": network_profile,
+                "network_profile": NETWORK_PROFILE,
                 "workload": args.workload.as_str(),
                 "accounts_file": args.accounts_file,
                 "transfer_amount": args.transfer_amount,
@@ -359,13 +355,7 @@ async fn main() -> BenchResult<()> {
                 "max_ws_wait_ms": args.max_ws_wait_ms,
                 "warmup_secs": args.warmup_secs,
             });
-            write_json_output(
-                Path::new(path),
-                "rt_sweep",
-                &config_json,
-                &report,
-                Option::<&serde_json::Value>::None,
-            )?;
+            write_json_output(Path::new(path), "rt_sweep", &config_json, &report)?;
             println!("sweep json: {path}");
         }
     } else {
@@ -394,13 +384,6 @@ async fn main() -> BenchResult<()> {
                     nonce_offsets[i] += advance;
                 }
                 print_ack_report(&report);
-
-                // Evaluate target if requested and this is a single-concurrency run.
-                if args.evaluate && concurrencies.len() == 1 {
-                    let evaluation = evaluate_ack_target(&report, network_profile.clone());
-                    print_target_evaluation(&evaluation);
-                }
-
                 SweepRow::new(
                     concurrency,
                     throughput_tx_per_s(report.accepted as usize, report.total_wall),
@@ -479,7 +462,7 @@ async fn main() -> BenchResult<()> {
                 "duration_secs": args.duration_secs,
                 "max_fee": args.max_fee,
                 "results_dir": args.results_dir,
-                "network_profile": network_profile,
+                "network_profile": NETWORK_PROFILE,
                 "workload": args.workload.as_str(),
                 "accounts_file": args.accounts_file,
                 "transfer_amount": args.transfer_amount,
@@ -487,13 +470,7 @@ async fn main() -> BenchResult<()> {
                 "csv_path": csv_path,
                 "warmup_secs": args.warmup_secs,
             });
-            write_json_output(
-                Path::new(path),
-                "sweep",
-                &config_json,
-                &report,
-                Option::<&serde_json::Value>::None,
-            )?;
+            write_json_output(Path::new(path), "sweep", &config_json, &report)?;
             println!("sweep json: {path}");
         }
     }

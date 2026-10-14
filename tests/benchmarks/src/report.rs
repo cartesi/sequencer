@@ -8,30 +8,30 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    AckRunReport, BenchResult, RoundTripRunReport, TargetEvaluation, runtime,
+    AckRunReport, BenchResult, RoundTripRunReport, runtime,
     stats::{format_optional_f64, print_stats, throughput_tx_per_s},
 };
 
+/// Spec §4.2: no shaper exists, so every run is this profile.
+pub const NETWORK_PROFILE: &str =
+    "same-host baseline: no injected latency; the client connects directly to the sequencer";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkJsonOutput<R, E = TargetEvaluation> {
+pub struct BenchmarkJsonOutput<R> {
     pub benchmark: String,
     pub config: Value,
     pub report: R,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evaluation: Option<E>,
 }
 
-pub fn write_json_output<C, R, E>(
+pub fn write_json_output<C, R>(
     path: &Path,
     benchmark: &str,
     config: &C,
     report: &R,
-    evaluation: Option<&E>,
 ) -> BenchResult<()>
 where
     C: Serialize,
     R: Serialize,
-    E: Serialize,
 {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -40,7 +40,6 @@ where
         benchmark: benchmark.to_string(),
         config: serde_json::to_value(config)?,
         report,
-        evaluation,
     };
     fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
     Ok(())

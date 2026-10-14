@@ -3,7 +3,6 @@
 
 mod ack;
 mod domain;
-mod evaluation;
 mod rejection;
 mod report;
 mod round_trip;
@@ -19,15 +18,9 @@ pub use domain::{
     BenchmarkDomain, DEFAULT_ENDPOINT, DEFAULT_INTERNAL_ENDPOINT, parse_address,
     resolve_external_benchmark_domain,
 };
-pub use evaluation::{
-    ACK_P99_TARGET_MS, DIAGNOSTIC_P999_MIN_ACCEPTED_COUNT, NetworkProfile, NetworkProfileKind,
-    P999Confidence, SOFT_CONFIRM_P99_TARGET_MS, TARGET_EVALUATION_MIN_ACCEPTED_COUNT,
-    TargetEvaluation, TargetVerdict, evaluate_ack_target, evaluate_soft_confirm_target,
-    print_target_evaluation,
-};
 pub use report::{
-    BenchmarkJsonOutput, default_json_output_path, print_ack_report, print_memory_report,
-    print_round_trip_report, write_json_output,
+    BenchmarkJsonOutput, NETWORK_PROFILE, default_json_output_path, print_ack_report,
+    print_memory_report, print_round_trip_report, write_json_output,
 };
 pub use round_trip::{RoundTripRunConfig, RoundTripRunReport, run_round_trip_benchmark};
 pub use rt_sweep::{

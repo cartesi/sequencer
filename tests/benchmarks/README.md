@@ -46,7 +46,6 @@ Direct `cargo` examples:
 # Round-trip latency, self-contained (spawns anvil + sequencer). Runs are
 # time-bounded (`--duration-secs`), not count-bounded.
 cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs 30 --concurrency 4 --max-fee 2000
-cargo run -p benchmarks --bin round_trip_latency --release -- --self-contained --duration-secs 60 --concurrency 16 --max-fee 2000 --evaluate
 
 # Against an external sequencer (pass that deployment's EIP-712 domain):
 cargo run -p benchmarks --bin round_trip_latency --release -- --endpoint http://127.0.0.1:3000 --internal-endpoint http://127.0.0.1:3001 --domain-chain-id 31337 --domain-verifying-contract 0x1111111111111111111111111111111111111111 --duration-secs 30 --concurrency 4 --max-fee 2000
@@ -70,7 +69,6 @@ cargo run -p benchmarks --bin compare_latest --release -- --results-dir tests/be
   - first client-side failure (`io_*`, timeouts, connection failures)
 - `report`: aggregates the JSON artifacts under `--results-dir` into a summary.
 - `compare_latest`: compares the two latest artifacts of a `--kind` (`ack`, `round-trip`, `rt-sweep`, `sweep`, `all`) and prints deltas.
-- `--evaluate` on `round_trip_latency` / `sweep`: prints a first-class target verdict block and stores it in JSON output. Today the verdict is expected to be `NOT_EVALUATED` because the harness only supports the same-host baseline, not the canonical network-aware profile from the spec.
 
 ## Notes
 
