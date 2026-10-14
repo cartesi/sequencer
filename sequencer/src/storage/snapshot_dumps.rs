@@ -500,7 +500,7 @@ mod tests {
         let safe_block = head.safe_block;
         let count = storage.next_executed_input_count().unwrap();
         storage
-            .close_frame_and_batch_with_snapshot(head, safe_block, &prefix(index + 1), index, count)
+            .close_frame_and_batch_with_snapshot(head, safe_block, &prefix(index + 1), count)
             .unwrap();
         storage.latest_snapshot().unwrap().unwrap().dump.id
     }

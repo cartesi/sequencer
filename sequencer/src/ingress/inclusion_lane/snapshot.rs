@@ -59,7 +59,6 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
         head,
         next_safe_block,
         &dump_dir,
-        batch_index,
         app.executed_input_count(),
     )?;
     let snapshot_ms = snapshot_elapsed.as_millis();

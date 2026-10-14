@@ -125,7 +125,6 @@ fn close_and_accept(
             head,
             head.safe_block,
             &prefix,
-            index,
             app.executed_input_count(),
         )
         .unwrap();

@@ -204,13 +204,8 @@ impl Storage {
         head: &mut WriteHead,
         next_safe_block: u64,
         dump_dir: &Path,
-        batch_index: u64,
         executed_input_count: ExecutedInputCount,
     ) -> Result<()> {
-        assert_eq!(
-            batch_index, head.batch_index,
-            "snapshot belongs to another batch"
-        );
         let (next_batch_index, now_ms, policy) = self.write(|tx| {
             assert_eq!(
                 next_executed_input_count_in(tx)?,
@@ -218,7 +213,7 @@ impl Storage {
                 "application count changed between dump creation and batch close"
             );
             let result = seal_and_open_next_batch(tx, head.batch_index, next_safe_block)?;
-            insert_batch_snapshot_in(tx, dump_dir, batch_index, executed_input_count)?;
+            insert_batch_snapshot_in(tx, dump_dir, head.batch_index, executed_input_count)?;
             Ok(result)
         })?;
         head.move_to_next_batch(
@@ -567,13 +562,7 @@ mod tests {
             .unwrap();
         let batch = head.batch_index;
         let error = storage
-            .close_frame_and_batch_with_snapshot(
-                &mut head,
-                10,
-                prefix,
-                batch,
-                ExecutedInputCount::ZERO,
-            )
+            .close_frame_and_batch_with_snapshot(&mut head, 10, prefix, ExecutedInputCount::ZERO)
             .expect_err("colliding artifact name must roll back the whole close");
         assert!(error.to_string().contains("UNIQUE"));
         assert_eq!(head.batch_index, batch);

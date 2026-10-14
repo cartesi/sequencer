@@ -56,14 +56,12 @@ fn register_accepted(
     });
     let nonce = storage.batch_nonce(head.batch_index).unwrap();
     let prefix = write_state(dir, name, bytes, nonce + 1);
-    let index = head.batch_index;
     let safe_block = head.safe_block;
     storage
         .close_frame_and_batch_with_snapshot(
             &mut head,
             safe_block,
             &prefix,
-            index,
             crate::storage::ExecutedInputCount::ZERO,
         )
         .unwrap();
@@ -87,14 +85,12 @@ fn register_optimistic(db_path: &str, dir: &Path, name: &str, bytes: &[u8], nonc
             format!("intermediate-{current}")
         };
         let prefix = write_state(dir, &dump_name, bytes, current + 1);
-        let index = head.batch_index;
         let safe_block = head.safe_block;
         storage
             .close_frame_and_batch_with_snapshot(
                 &mut head,
                 safe_block,
                 &prefix,
-                index,
                 crate::storage::ExecutedInputCount::ZERO,
             )
             .unwrap();
@@ -130,7 +126,7 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
         .unwrap();
     let prefix = write_state(root.path(), "local", b"local checkpoint", 1);
     storage
-        .close_frame_and_batch_with_snapshot(&mut head, 5, &prefix, 0, ExecutedInputCount::ZERO)
+        .close_frame_and_batch_with_snapshot(&mut head, 5, &prefix, ExecutedInputCount::ZERO)
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
     let inputs = vec![

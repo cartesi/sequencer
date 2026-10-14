@@ -328,7 +328,6 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
                 &mut head,
                 20,
                 Path::new(&format!("/snapshot/{index}")),
-                index,
                 ExecutedInputCount::new(41),
             )
             .unwrap();
