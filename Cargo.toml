@@ -73,3 +73,9 @@ tokio-tungstenite = "0.28"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Line tables keep file:line in backtraces without full variable debuginfo,
+# which shrinks dev and test targets. Release is untouched on purpose: the
+# guest is built with --release and its bytes feed the template hash.
+[profile.dev]
+debug = "line-tables-only"

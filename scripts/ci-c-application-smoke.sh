@@ -29,6 +29,10 @@ edition = "2024"
 [dependencies]
 c-app-sequencer = { path = "../source/bindings/c-app-sequencer" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# The workspace's dev profile, so this build reuses its artifacts.
+[profile.dev]
+debug = "line-tables-only"
 TOML
 cat >"${consumer_dir}/src/main.rs" <<'RUST'
 #[tokio::main]
