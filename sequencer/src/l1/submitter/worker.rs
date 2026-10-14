@@ -334,8 +334,8 @@ mod tests {
     use crate::l1::watermark::WalletNonceWatermarkSink;
     use crate::runtime::process_lock::ProcessLock;
     use crate::runtime::shutdown::RuntimeScope;
-    use crate::storage::test_helpers::{TestDb, temp_db};
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput, SubmitterFrontier};
+    use crate::test_support::{TestDb, temp_db};
     use sequencer_core::protocol::ProtocolTiming;
 
     const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);

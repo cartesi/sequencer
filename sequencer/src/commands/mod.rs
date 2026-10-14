@@ -319,8 +319,9 @@ mod tests {
         preflight_lifecycle_command, require_data_dir, require_deployment_identity_match,
     };
     use crate::recovery::{RecoveryError, RecoveryRetryReason};
-    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
+    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
     use crate::storage::{DeploymentIdentity, LifecycleCommand, Storage};
+    use crate::test_support::temp_db;
     use alloy_primitives::Address;
     use sequencer_core::protocol::ProtocolTimingError;
 

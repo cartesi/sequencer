@@ -224,7 +224,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::{record_canonical_divergence, temp_db};
+    use crate::storage::test_helpers::record_canonical_divergence;
+    use crate::test_support::temp_db;
 
     #[test]
     fn clean_exit_over_persisted_divergence_is_terminal() {

@@ -132,9 +132,9 @@ fn dump_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::create_structured_dump;
     use crate::storage::Storage;
-    use crate::storage::test_helpers::temp_db;
+    use crate::test_support::create_structured_dump;
+    use crate::test_support::temp_db;
 
     #[test]
     fn startup_validation_rejects_missing_referenced_snapshot_as_terminal() {

@@ -662,8 +662,9 @@ mod tests {
         name: &str,
         has_recovery_checkpoint: bool,
         has_open_tip: bool,
-    ) -> (crate::storage::test_helpers::TestDb, ProtocolTiming) {
-        use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
+    ) -> (crate::test_support::TestDb, ProtocolTiming) {
+        use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
+        use crate::test_support::temp_db;
 
         let db = temp_db(name);
         let protocol = default_protocol_timing();
@@ -671,7 +672,7 @@ mod tests {
         let mut storage =
             storage::Storage::initialize_for_command(&db.path, storage::LifecycleCommand::Setup)
                 .expect("initialize setup");
-        crate::storage::test_helpers::pin_test_deployment_identity(&mut storage, SENDER_A);
+        crate::test_support::pin_test_deployment_identity(&mut storage, SENDER_A);
         storage
             .append_safe_inputs_with_timestamp(
                 0,
@@ -764,10 +765,7 @@ mod tests {
         }
     }
 
-    fn danger_fixture(
-        name: &str,
-        closed: bool,
-    ) -> (crate::storage::test_helpers::TestDb, ProtocolTiming) {
+    fn danger_fixture(name: &str, closed: bool) -> (crate::test_support::TestDb, ProtocolTiming) {
         let (db, protocol) = admission_fixture(name, true, true);
         let mut storage = storage::Storage::open_writer(&db.path).expect("open writer");
         if closed {

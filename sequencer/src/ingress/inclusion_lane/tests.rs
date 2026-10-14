@@ -10,10 +10,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{
-    SENDER_A, default_protocol_timing, pin_test_deployment_identity, record_canonical_divergence,
-    temp_db,
+    SENDER_A, default_protocol_timing, record_canonical_divergence,
 };
 use crate::storage::{DirectInputExecution, SafeInputRange, Storage, StoredSafeInput, WriteHead};
+use crate::test_support::{pin_test_deployment_identity, temp_db};
 use sequencer_core::application::{AppError, Application};
 use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx};

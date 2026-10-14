@@ -16,10 +16,9 @@ use super::{Checkpoint, rebuild_from_checkpoint};
 use crate::commands::error::{BootstrapError, CommandError, EXIT_RESTART_TRANSIENT};
 use crate::ingress::inclusion_lane::dump_info;
 use crate::recovery::{RecoveryError, RecoveryFailure, RecoveryRetryReason};
-use crate::storage::test_helpers::{
-    SENDER_A, default_protocol_timing, pin_test_deployment_identity, temp_db,
-};
+use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
 use crate::storage::{FrontierMode, LifecycleCommand, Storage, StoredSafeInput};
+use crate::test_support::{pin_test_deployment_identity, temp_db};
 
 struct ReplayForbiddenApp(ApplicationProgress);
 

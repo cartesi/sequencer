@@ -805,7 +805,8 @@ mod tests {
     use super::*;
     use crate::storage::Storage;
     use crate::storage::StoredSafeInput;
-    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, temp_db};
+    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
+    use crate::test_support::temp_db;
 
     #[test]
     fn checkpoint_load_requires_an_export_receipt_matching_the_artifact_and_block() {
@@ -1066,7 +1067,7 @@ mod tests {
     /// price write the schema refuses; setup refuses it first.
     #[test]
     fn fixed_price_below_the_floor_is_refused() {
-        let db = crate::storage::test_helpers::temp_db("fixed-price-floor");
+        let db = crate::test_support::temp_db("fixed-price-floor");
         drop(storage::Storage::open(db.path.as_str()).expect("initialize schema"));
 
         let err = check_fixed_log_gas_price(&db.path, -1357)

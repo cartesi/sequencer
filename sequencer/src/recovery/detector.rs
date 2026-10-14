@@ -189,8 +189,9 @@ fn map_storage_task_join(err: tokio::task::JoinError) -> DangerDetectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::{SENDER_A, temp_db};
+    use crate::storage::test_helpers::SENDER_A;
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+    use crate::test_support::temp_db;
     use std::time::Duration;
 
     fn test_protocol() -> ProtocolTiming {

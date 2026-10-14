@@ -481,7 +481,7 @@ fn finalized_error(context: &str, err: StorageTaskError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::temp_db;
+    use crate::test_support::temp_db;
 
     #[tokio::test]
     async fn client_disconnect_surfaces_as_broken_pipe() {
@@ -567,7 +567,7 @@ mod tests {
     }
 
     struct BaselineFixture {
-        _db: crate::storage::test_helpers::TestDb,
+        _db: crate::test_support::TestDb,
         _root: tempfile::TempDir,
         state: Arc<SnapshotApiState>,
     }

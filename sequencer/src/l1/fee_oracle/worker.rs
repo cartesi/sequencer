@@ -239,7 +239,7 @@ impl From<PriceSourceError> for FeeOracleError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::temp_db;
+    use crate::test_support::temp_db;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 

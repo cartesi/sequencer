@@ -79,8 +79,8 @@ mod tests {
     use super::*;
     use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig};
     use crate::runtime::shutdown::RuntimeScope;
-    use crate::storage::test_helpers::{pin_test_deployment_identity, temp_db};
     use crate::storage::{LifecycleCommand, Storage};
+    use crate::test_support::{pin_test_deployment_identity, temp_db};
     use crate::test_support::{shutdown_lane, wait_until};
     use alloy_primitives::{Address, U256};
     use app_core::application::{WalletApp, WalletConfig};
