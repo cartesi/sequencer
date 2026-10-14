@@ -8,7 +8,13 @@ use alloy_primitives::Address;
 use sequencer_core::l2_tx::SequencedL2Tx;
 use sequencer_core::protocol::ProtocolTiming;
 
-use super::{SafeInputRange, Storage, StoredSafeInput};
+use super::convert::from_unix_ms;
+use super::ingress::{
+    insert_tip_rows, open_fresh_tip_in_tx, open_successor_frame_in, seal_and_open_next_batch,
+};
+use super::mutations::persist_frame_direct_sequence_derived;
+use super::queries::{load_current_write_head, query_batch_policy};
+use super::{BatchPolicy, SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
@@ -24,6 +30,89 @@ pub(crate) fn default_protocol_timing() -> ProtocolTiming {
         l1_read_stale_after_blocks: 900,
         seconds_per_block: 12,
     }
+}
+
+/// Lane fixtures. Production opens the Tip through
+/// `ensure_open_tip_for_recovery` and closes frames and batches with
+/// attributed executions and a snapshot (I7).
+impl Storage {
+    /// Open the genesis Tip with an explicit leading range; asserts none exists.
+    pub(crate) fn initialize_open_state(
+        &mut self,
+        safe_block: u64,
+        leading_direct_range: SafeInputRange,
+    ) -> rusqlite::Result<WriteHead> {
+        self.write(|tx| {
+            assert!(
+                load_current_write_head(tx)?.is_none(),
+                "open state already exists"
+            );
+            let batch_index = insert_tip_rows(tx, Some(0), None, safe_block)?;
+            persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
+            Ok(load_current_write_head(tx)?.expect("genesis tip just inserted"))
+        })
+    }
+
+    /// Open the genesis Tip at the observed safe head unless one exists; the
+    /// unguarded twin of `ensure_open_tip_for_recovery`.
+    pub(crate) fn ensure_open_tip(&mut self) -> rusqlite::Result<()> {
+        self.write(|tx| {
+            if load_current_write_head(tx)?.is_some() {
+                return Ok(());
+            }
+            open_fresh_tip_in_tx(tx)
+        })
+    }
+
+    /// Rotate the frame with derived application offsets.
+    pub(crate) fn close_frame_only(
+        &mut self,
+        head: &mut WriteHead,
+        next_safe_block: u64,
+        leading_direct_range: SafeInputRange,
+    ) -> rusqlite::Result<()> {
+        let policy = self
+            .write(|tx| close_frame_derived_in(tx, head, next_safe_block, leading_direct_range))?;
+        head.advance_frame(policy, next_safe_block);
+        Ok(())
+    }
+
+    /// Close the batch without registering a snapshot.
+    pub(crate) fn close_frame_and_batch(
+        &mut self,
+        head: &mut WriteHead,
+        next_safe_block: u64,
+    ) -> rusqlite::Result<()> {
+        let (next_batch_index, now_ms, policy) =
+            self.write(|tx| seal_and_open_next_batch(tx, head.batch_index, next_safe_block))?;
+        head.move_to_next_batch(
+            next_batch_index,
+            from_unix_ms(now_ms),
+            policy,
+            next_safe_block,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn batch_policy(&mut self) -> rusqlite::Result<BatchPolicy> {
+        query_batch_policy(&self.conn)
+    }
+}
+
+fn close_frame_derived_in(
+    tx: &rusqlite::Transaction<'_>,
+    head: &WriteHead,
+    next_safe_block: u64,
+    leading_direct_range: SafeInputRange,
+) -> rusqlite::Result<BatchPolicy> {
+    let (policy, next_frame_in_batch) = open_successor_frame_in(tx, head, next_safe_block)?;
+    persist_frame_direct_sequence_derived(
+        tx,
+        head.batch_index,
+        next_frame_in_batch,
+        leading_direct_range,
+    )?;
+    Ok(policy)
 }
 
 /// Recovery-storage fixture with the same prerequisite ordering as setup:

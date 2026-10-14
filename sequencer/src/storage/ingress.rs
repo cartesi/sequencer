@@ -86,60 +86,6 @@ impl Storage {
         })
     }
 
-    /// Bootstrap the very first batch + frame with explicit values, returning
-    /// its loaded [`WriteHead`]. Asserts no open state exists.
-    ///
-    /// Production opens the genesis Tip through guarded startup recovery, which derives `safe_block`/leading range from the
-    /// synced L1 view; this explicit form is kept for tests that seed a
-    /// specific open state without a safe-head observation.
-    #[cfg(test)]
-    pub fn initialize_open_state(
-        &mut self,
-        safe_block: u64,
-        leading_direct_range: SafeInputRange,
-    ) -> Result<WriteHead> {
-        self.write(|tx| {
-            assert!(
-                load_current_write_head(tx)?.is_none(),
-                "open state already exists"
-            );
-            let batch_index = insert_tip_rows(tx, Some(0), None, safe_block)?;
-            persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
-            Ok(load_current_write_head(tx)?.expect("genesis tip just inserted"))
-        })
-    }
-
-    /// Ensure a valid open Tip exists. Establishes the tip-existence
-    /// invariant; does **not** return the head — callers that need it load it
-    /// via [`Storage::open_state`], so [`WriteHead`] has a single constructor
-    /// (`load_current_write_head`) rather than a hand-built twin.
-    ///
-    /// No-op on a warm DB (or after a recovery cascade already reopened the
-    /// Tip). On a genuinely fresh DB it opens the genesis Tip via the shared
-    /// `open_fresh_tip_in_tx` mechanism: index 0 / nonce 0 at the current
-    /// safe head, the leading safe-input range **sequenced but not executed**.
-    /// Those directs are executed by the lane's catch-up replay (the same path
-    /// warm resume and recovery batches use), so there is no cold-start drain.
-    ///
-    /// This unguarded form exists for test harnesses only. Production uses
-    /// `ensure_open_tip_for_recovery`, which reasserts the startup facts in its
-    /// write transaction. The lane only ever *loads* a Tip (fail-loud if
-    /// absent); Cascade owns its own atomic reopen using the same mechanism.
-    ///
-    /// **Precondition (genesis branch only):** a safe-head observation must
-    /// exist. A fresh DB requires L1 at bootstrap plus a successful recovery
-    /// sync, else startup refuses before reaching here; the warm-DB early
-    /// return fires before any safe-head read.
-    #[cfg(test)]
-    pub(crate) fn ensure_open_tip(&mut self) -> Result<()> {
-        self.write(|tx| {
-            if load_current_write_head(tx)?.is_some() {
-                return Ok(());
-            }
-            open_fresh_tip_in_tx(tx)
-        })
-    }
-
     /// Snapshot the current L1 reconciliation state. A canonical-divergence
     /// marker outranks and withholds the otherwise-usable frontier.
     ///
@@ -251,48 +197,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Fixture frame rotation with derived application offsets. Production must supply explicit
-    /// execution attributions through
-    /// [`Storage::close_frame_only_with_executions`].
-    #[cfg(test)]
-    pub fn close_frame_only(
-        &mut self,
-        head: &mut WriteHead,
-        next_safe_block: u64,
-        leading_direct_range: SafeInputRange,
-    ) -> Result<()> {
-        let policy = self
-            .write(|tx| close_frame_derived_in(tx, head, next_safe_block, leading_direct_range))?;
-        head.advance_frame(policy, next_safe_block);
-        Ok(())
-    }
-
-    /// Close the current batch and open a fresh one with its first frame,
-    /// without registering a snapshot. Test-only: production closes
-    /// through [`Storage::close_frame_and_batch_with_snapshot`], which
-    /// registers the snapshot row in the same transaction (I7).
-    ///
-    /// Atomically: seal the current Tip (sets `sealed_at_ms`), insert the new
-    /// Tip with `parent_batch_index = head.batch_index`, open its first frame.
-    /// Order matters: sealing first removes the old row from the
-    /// `ux_single_valid_tip` partial index, making room for the new Tip.
-    #[cfg(test)]
-    pub(crate) fn close_frame_and_batch(
-        &mut self,
-        head: &mut WriteHead,
-        next_safe_block: u64,
-    ) -> Result<()> {
-        let (next_batch_index, now_ms, policy) =
-            self.write(|tx| seal_and_open_next_batch(tx, head.batch_index, next_safe_block))?;
-        head.move_to_next_batch(
-            next_batch_index,
-            from_unix_ms(now_ms),
-            policy,
-            next_safe_block,
-        );
-        Ok(())
-    }
-
     /// The artifact is durable before sealing and registering its snapshot in
     /// one transaction. A failed commit leaves only an unreferenced artifact.
     pub fn close_frame_and_batch_with_snapshot(
@@ -325,16 +229,12 @@ impl Storage {
         );
         Ok(())
     }
-
-    pub fn batch_policy(&mut self) -> Result<BatchPolicy> {
-        query_batch_policy(&self.conn)
-    }
 }
 
 /// Insert the Tip and its first frame. Callers separately attach the complete
 /// leading application range, except for a recovery baseline's empty root.
 /// Returns its local identity; callers load `WriteHead` through the shared reader.
-fn insert_tip_rows(
+pub(super) fn insert_tip_rows(
     tx: &Transaction<'_>,
     batch_index_opt: Option<u64>,
     parent: Option<u64>,
@@ -448,13 +348,12 @@ fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
 
 /// Seal the current Tip and open the successor batch's first frame, in `tx`.
 ///
-/// Shared by [`Storage::close_frame_and_batch`] and
-/// [`Storage::close_frame_and_batch_with_snapshot`] so the seal ordering
-/// invariant lives in one place: seal first (which frees the old row from the
+/// Shared with the test fixture `close_frame_and_batch` so the seal ordering
+/// lives in one place: seal first (which frees the old row from the
 /// `ux_single_valid_tip` partial index), then insert the successor as the new
 /// Tip. Returns the new batch index, the close timestamp, and the sampled
 /// policy for the caller to apply to its in-memory write head.
-fn seal_and_open_next_batch(
+pub(super) fn seal_and_open_next_batch(
     tx: &Transaction<'_>,
     closing_batch_index: u64,
     next_safe_block: u64,
@@ -521,24 +420,7 @@ fn close_frame_in(
     Ok(policy)
 }
 
-#[cfg(test)]
-fn close_frame_derived_in(
-    tx: &Transaction<'_>,
-    head: &WriteHead,
-    next_safe_block: u64,
-    leading_direct_range: SafeInputRange,
-) -> Result<BatchPolicy> {
-    let (policy, next_frame_in_batch) = open_successor_frame_in(tx, head, next_safe_block)?;
-    persist_frame_direct_sequence_derived(
-        tx,
-        head.batch_index,
-        next_frame_in_batch,
-        leading_direct_range,
-    )?;
-    Ok(policy)
-}
-
-fn open_successor_frame_in(
+pub(super) fn open_successor_frame_in(
     tx: &Transaction<'_>,
     head: &WriteHead,
     next_safe_block: u64,
