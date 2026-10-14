@@ -1,0 +1,19 @@
+# cargo-deny gate on the crate graph (the cargo-deny job in
+# .github/workflows/ci.yml). Sources are deterministic for a given Cargo.lock
+# and block. Advisories change with the RustSec database under a fixed lock,
+# so CI reports them without failing.
+
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained notices count only for direct dependencies of our crates.
+unmaintained = "workspace"
+# Each entry: an advisory id plus why it does not reach a shipped binary.
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# testsi's cartesi-machine bindings, pinned by rev (sdk/guest/testsi/Cargo.toml).
+allow-git = ["https://github.com/cartesi/dave"]
