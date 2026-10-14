@@ -178,16 +178,9 @@ pub fn write_info(dump_dir: &Path, info: &DumpInfo) -> io::Result<()> {
     Ok(())
 }
 
-/// Read and strictly parse `info.toml` from `dump_dir`. Unknown keys
-/// (`deny_unknown_fields`), duplicate keys (TOML forbids them), malformed
-/// values, and missing required keys all fail loud — a dump with corrupt
-/// metadata is not silently usable. The `format_version` gate runs after the
-/// parse; there is a single frozen schema (`FORMAT_VERSION`), so a
-/// forward-version dump is rejected outright rather than partially read.
-///
-/// Missing/`ENOENT` paths get an operator-facing diagnosis via
-/// [`diagnose_missing_dump`] so a watchdog CM checkpoint (or any other
-/// non-dump directory) is not reported as a bare "No such file or directory".
+/// Read and strictly parse `info.toml` from `dump_dir`; corrupt or
+/// forward-version metadata fails loud. A missing file gets an operator-facing
+/// diagnosis from [`diagnose_missing_dump`].
 pub fn read_info(dump_dir: &Path) -> io::Result<DumpInfo> {
     let content = match std::fs::read_to_string(dump_dir.join(INFO_FILE)) {
         Ok(c) => c,
@@ -510,9 +503,8 @@ mod tests {
 
     #[test]
     fn read_tolerates_comments_blanks_and_reordering() {
-        // The robustness win from real TOML over the old line parser: an
-        // operator inspecting/annotating the file under recovery pressure can
-        // add comments, blank lines, and reorder keys without bricking it.
+        // An operator annotating the file during recovery may add comments and
+        // blank lines and reorder keys.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(INFO_FILE),
