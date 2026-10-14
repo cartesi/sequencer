@@ -168,11 +168,7 @@ environment:
 
 Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal command refusal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), `40` a previous instance left work past the checkpoint (wipe the data directory and run `setup --recovery`), and `1` for an unclassified operational failure. Diagnosed terminal runtime faults, including worker panics and an undecodable batch landed by the submitter key, immediately call `abort()` (SIGABRT, status 134), without worker drain or database settlement. Supervisors must treat SIGABRT as terminal class. Ordinary shutdown, expected recovery, and transient errors still drain gracefully. Startup panics caught by the command harness are projected to `30`; panics after runtime scope creation abort; `101` remains possible before the command harness starts. The constants live in `sequencer/src/commands/error.rs`; supervisor recipes are in [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md).
 
-Fixed protocol identity (EIP-712):
-
-- domain name: `CartesiAppSequencer`
-- domain version: `1`
-- `chain_id` and `verifying_contract` come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS`
+The [EIP-712 domain](docs/protocol/scheduler-semantics.md#user-op-signatures) is fixed except `chainId` and `verifyingContract`, which come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS`.
 
 ## API
 
