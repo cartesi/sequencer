@@ -120,12 +120,13 @@ For rebuilding from a trusted checkpoint, follow the
 CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
 CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \
 CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
-CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE=0 \
+CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS=0xa0Ee7A142d267C1f36714E4a8F75612F20a79720 \
 cargo run -p wallet-sequencer -- setup
 
 # Phase B — run the sequencer.
 CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
-CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac09...f2ff80 \
+CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0x2a87...d409c6 \
 cargo run -p wallet-sequencer -- run
 ```
 
@@ -136,7 +137,7 @@ nonce on demand (keyed operator tool). It is flush-only: it requires a
 completed setup and no canonical divergence, and it never performs
 Sync/Cascade or launches runtime workers.
 
-`setup` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS`.
+`setup` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS`. On chains other than Ethereum mainnet and Sepolia it also requires a fee-oracle source (listed below).
 The submitter address must equal the `sequencer_address` compiled into the canonical machine; nothing checks this at runtime ([scheduler semantics](docs/protocol/scheduler-semantics.md#the-one-stream-the-one-classification)).
 
 **Use a dedicated submitter address.** Plain `setup` refuses an unsettled wallet
@@ -144,9 +145,14 @@ nonce, so sharing a busy contract-deployer address can trip the detection gate
 while its deployment transactions are not yet safe. The devnet uses Anvil
 account 9 (`DEVNET_SEQUENCER_ADDRESS`), separate from the account-0 deployer.
 
-`run` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `_FILE`); it refuses to boot until `setup` has completed.
+`run` and `flush-mempool` require `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT` and the signing key, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (whose first line is the key); both refuse to start until `setup` has completed.
 
-Optional: `CARTESI_SEQUENCER_HTTP_ADDR` (public listener, default `127.0.0.1:3000`, `run`), `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR` (internal listener, default `127.0.0.1:3001`, `run`), `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; `setup` creates it, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default `12`), `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (default `600`), `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (alternative to `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY`; first line of the file is the key), `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
+Optional variables, by name; each subcommand's `--help` shows their defaults and validation from [`commands/config.rs`](sequencer/src/commands/config.rs):
+
+- Every subcommand: `CARTESI_SEQUENCER_DATA_DIR` (the SQLite file is `sequencer.db` inside; `setup` creates it, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`, and `CARTESI_SEQUENCER_ALLOW_INSECURE_RPC` (below).
+- `setup` and `run`: `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`, `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS`.
+- `setup`: the fee-oracle source it pins, either `CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE` or a Uniswap source (the overrides `CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS`, `CARTESI_SEQUENCER_WETH_ADDRESS` and `CARTESI_SEQUENCER_UNISWAP_V3_POOL`, given together and required on other chains, and `CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS`); `CARTESI_SEQUENCER_CHECKPOINT_BLOCK`; and, for a [rebuild](docs/recovery/cockroach.md), `CARTESI_SEQUENCER_RECOVERY`, `CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR` and the signing key.
+- `run`: `CARTESI_SEQUENCER_HTTP_ADDR` (public listener), `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR` (internal listener), `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH` and `CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS`.
 
 Logs and errors show only the endpoint's scheme, host and port, since its path, query and userinfo can hold an API key or a password, unless the RPC server echoes them inside a JSON-RPC error message or a malformed result, which alloy builds above the redaction layer, or quotes in an error body only part of them or a different URL that carries them, such as a redirect target on another path. An L1 error's text stays on one line, with each cause cut at 256 bytes. The client follows no redirects: an endpoint that answers 3xx fails with that status, so configure the provider's final URL (setup exits 30 at its chain-id check, since a retry gets the same redirect). Debug-level logging for the `alloy_transport_http` target records the full URL, so keep that target at `info` where logs leave the host.
 
@@ -167,8 +173,6 @@ Fixed protocol identity (EIP-712):
 - domain name: `CartesiAppSequencer`
 - domain version: `1`
 - `chain_id` and `verifying_contract` come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS`
-
-Most queue sizes, polling intervals, and safety limits are now internal runtime constants instead of public launch-time configuration.
 
 ## API
 
