@@ -29,6 +29,12 @@ on:
 permissions:
   contents: read
 
+# A tag push and a dispatch for the same tag run one after the other, never
+# interleaving builds, image pushes or release uploads.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 # Builds are not incremental, and cargo output stays coloured in the logs.
 env:
   CARGO_INCREMENTAL: 0
@@ -297,13 +303,30 @@ jobs:
           set -euo pipefail
           sha256sum *.tar.gz *.json > SHA256SUMS
 
+      # gh ships with the runner image, so no third-party code holds contents:write.
+      # A tag push creates the release. A dispatch rebuild finds it, published or
+      # draft, replaces its same-name assets, and publishes it if it was a draft.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          prerelease: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || (github.event_name == 'push' && contains(github.ref_name, '-')) }}
-          fail_on_unmatched_files: true
-          files: |
-            out/*.tar.gz
-            out/*.json
-            out/SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_TELEMETRY: "false"
+          TAG: ${{ inputs.tag || github.ref_name }}
+          PRERELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || (github.event_name == 'push' && contains(github.ref_name, '-')) }}
+        run: |
+          set -euo pipefail
+          gh --version
+          # An asset glob that matches nothing fails here, before any API call.
+          ls -l out/*.tar.gz out/*.json out/SHA256SUMS
+          assets=(out/*.tar.gz out/*.json out/SHA256SUMS)
+          # A view that fails for another reason also falls through to create, whose
+          # check refuses to duplicate a published release.
+          if gh release view --json url -- "${TAG}" > /dev/null; then
+            gh release upload --clobber -- "${TAG}" "${assets[@]}"
+            gh release edit --prerelease="${PRERELEASE}" --draft=false -- "${TAG}"
+          else
+            # --verify-tag refuses to create a missing tag; gh uploads to a draft
+            # and publishes it last, deleting the draft if an upload fails.
+            gh release create --verify-tag --title "${TAG}" --notes "" \
+              --prerelease="${PRERELEASE}" -- "${TAG}" "${assets[@]}"
+          fi
