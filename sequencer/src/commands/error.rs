@@ -60,37 +60,22 @@ pub enum CommandError {
 
 // ── Exit-code projection ────────────────────────────────────────────────
 //
-// One exhaustive semantic verdict owns failure classification. The
-// terminal-fault black box and the orchestrator-facing exit code both derive
-// from it, so an operational projection can never become admission policy.
-// The exit code remains an ops hint, never protocol authority over the next
-// boot. Reserved: 1 (unclassified), 2 (clap usage), and 101 for a panic
-// before the command harness can project trusted-code failures to 30. A
-// diagnosed terminal runtime fault immediately exits via `abort()` (SIGABRT/134),
-// bypassing this projection deliberately;
-// supervisors must treat 134 from the sequencer as terminal-class
-// (`docs/watchdog/operator-deployment.md` says how). The exit line's level
-// follows the verdict (`CommandFailureVerdict::logs_at_error`).
+// README "Running" owns the exit-code contract; `CommandFailureVerdict` is the
+// one classification it projects. Also reserved: 2 (clap usage) and 101 (a
+// panic before the command harness). Diagnosed terminal runtime faults bypass
+// this projection with `abort()` (SIGABRT, 134).
 
-/// Restart with backoff; a recovery boot is expected next (it may take 15+
-/// min: flush + safe-finality wait). Startup probes must accommodate it.
+/// Restart; a recovery boot follows and may take 15+ min (flush plus
+/// safe-finality wait), so startup probes must allow for it.
 pub const EXIT_RESTART_EXPECT_RECOVERY: u8 = 10;
-/// Restart with backoff; a transient refusal that self-heals when the L1 view
-/// freshens. Alert only if it persists.
+/// Restart with backoff; the refusal clears when the L1 view freshens.
 pub const EXIT_RESTART_TRANSIENT: u8 = 20;
-/// Terminal — do not restart; page an operator. The state cannot self-heal.
+/// Do not restart; page an operator.
 pub const EXIT_TERMINAL: u8 = 30;
-/// Sticky — do **not** auto-restart-loop; an operator must wipe the
-/// uncompleted data dir and run `setup --recovery`. The recovery sibling of
-/// [`EXIT_RESTART_EXPECT_RECOVERY`] (10), but *operator-initiated*: 10 means
-/// "restart and `run()` auto-recovers"; 40 means "a previous instance left work
-/// past the checkpoint, and only an explicit fresh `setup --recovery`
-/// can resolve it" — a plain restart of `setup` would re-detect and re-refuse
-/// forever. Distinct from terminal (30) in that a known recovery procedure
-/// *does* fix it.
+/// Do not restart: a previous instance left work past the checkpoint, so wipe
+/// the uncompleted data dir and run `setup --recovery`.
 pub const EXIT_SETUP_NEEDS_RECOVERY: u8 = 40;
-/// Unclassified operational failure (for example, a provider error). Restart
-/// with backoff.
+/// Unclassified operational failure; restart with backoff.
 pub const EXIT_UNCLASSIFIED: u8 = 1;
 
 /// Semantic disposition of a failed command.
@@ -307,9 +292,6 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
             CommandFailureVerdict::Terminal
         }
 
-        // Sticky setup refusal: a previous instance left work past the
-        // checkpoint. Distinct from the auto-recovery class (10) — a plain
-        // restart re-refuses; only wipe + `setup --recovery` resolves it.
         BootstrapError::SetupRefuse(_) => CommandFailureVerdict::SetupRecoveryRequired,
         BootstrapError::OpenStorage(_) | BootstrapError::KeyFile { .. } => {
             CommandFailureVerdict::Unclassified
@@ -328,8 +310,8 @@ pub enum BootstrapError {
     #[error("RPC chain ID {rpc} does not match the expected chain ID {config}")]
     ChainIdMismatch { rpc: u64, config: u64 },
     /// `eth_chainId` failed. It is setup's first L1 read, so an unreachable
-    /// RPC on first boot lands here. We treat this as fatal
-    /// rather than warn-and-continue: proceeding with an unverified chain id
+    /// RPC on first boot lands here. The command fails rather than
+    /// warn-and-continue: proceeding with an unverified chain id
     /// would pin a possibly-wrong deployment identity and poison subsequent
     /// L1-unreachable boots, in addition to issuing soft confirmations
     /// against the wrong chain's state. Operator should retry.
@@ -373,11 +355,9 @@ pub enum BootstrapError {
     /// need operator attention but are not source misconfiguration.
     #[error("fatal fee oracle bootstrap failure: {message}")]
     FeeOracleFatal { message: String },
-    /// The keyed signer provider could not be constructed (bad RPC URL or
-    /// private key). Deterministic operator misconfiguration: re-running the
-    /// same configuration re-fails identically, so it classifies terminal
-    /// like [`Self::ChainIdMismatch`] — the same semantic every command must
-    /// share (recovery, setup, and flush previously disagreed).
+    /// The keyed signer provider could not be built (bad RPC URL or private key).
+    /// Deterministic operator misconfiguration: a rerun fails identically, so it
+    /// is terminal in every command, like [`Self::ChainIdMismatch`].
     #[error("signer provider misconfiguration: {message}")]
     SignerMisconfig { message: String },
     /// The batch-submitter key file could not be read. Classified by kind
@@ -570,11 +550,8 @@ pub enum IdentityError {
     OrphanedState,
     /// The pinned identity doesn't match the current config.
     ///
-    /// `stored` and `expected` are boxed so the enum stays small — without
-    /// boxing this variant alone would push `CommandError`'s stack footprint past
-    /// 184 bytes, which clippy's `result_large_err` flags (and which inflates
-    /// every `Result<_, CommandError>` in the codebase, even successful returns).
-    /// The heap allocation is paid only on the error path, which is cold.
+    /// `stored` and `expected` are boxed to keep `CommandError` under clippy's
+    /// `result_large_err` limit; the allocation is on the cold error path.
     #[error("deployment identity mismatch ({fields}); stored={stored:?}; expected={expected:?}")]
     Mismatch {
         fields: String,
@@ -585,11 +562,9 @@ pub enum IdentityError {
 
 // ── Worker exits ───────────────────────────────────────────────────────
 
-/// Which runtime worker exited, and why. One generic stop shape per worker
-/// (this replaced six hand-copied per-worker enums), plus the danger
-/// detector's deliberate `RecoveryRequired` trip as its own first-class arm:
-/// not an error, but causes the runtime to exit so the orchestrator can
-/// respawn into startup recovery.
+/// Which runtime worker exited, and why: one generic stop shape per worker, plus
+/// the danger detector's deliberate `RecoveryRequired` trip, which is not an error
+/// but exits the runtime so the orchestrator respawns into startup recovery.
 #[derive(Debug, Error)]
 pub enum WorkerExit {
     #[error("server: {0}")]
@@ -720,11 +695,9 @@ impl From<crate::runtime::process_lock::ProcessLockError> for CommandError {
 }
 
 /// One shared classification for the keyed signer-provider constructor, so
-/// `setup`, `flush-mempool`, and any future keyed command cannot drift (the
-/// three sites previously classified `Create` three different ways). The
-/// run-recovery procedure keeps its own explicit Retry/Refuse polarity map —
-/// that polarity is recovery's to own — but its terminal/transient split
-/// must agree with this one.
+/// `setup`, `flush-mempool` and any future keyed command agree. Run recovery
+/// keeps its own Retry/Refuse polarity map, but its terminal/transient split must
+/// agree with this one.
 impl From<crate::l1::provider::VerifiedSignerProviderError> for BootstrapError {
     fn from(e: crate::l1::provider::VerifiedSignerProviderError) -> Self {
         use crate::l1::provider::VerifiedSignerProviderError as E;
@@ -967,9 +940,8 @@ mod tests {
                 CommandError::from(FlushError::Provider("x".into())),
                 "the flush's provider",
             ),
-            // A flush failure surfaced via startup recovery must land in the
-            // same class as the flush-mempool subcommand's FlushError
-            // (review M2).
+            // A flush failure surfaced via startup recovery lands in the same
+            // class as the flush-mempool subcommand's `FlushError`.
             (
                 recovery_retry(RecoveryFailure::Flush(FlushError::Provider("x".into()))),
                 "the same flush provider failure under startup recovery",
@@ -981,9 +953,7 @@ mod tests {
                 recovery_retry(RecoveryFailure::ProviderUnreachable("timeout".into())),
                 "the recovery flush's signer provider unreachable",
             ),
-            // Documented "may self-heal" — the definition of this class (it
-            // previously projected to unclassified/1, misleading restart
-            // policy).
+            // Documented "may self-heal": the definition of the retryable class.
             (
                 CommandError::from(FeeOracleError::Transient("RPC unavailable".into())),
                 "a transient fee-oracle failure at bootstrap",
@@ -1065,9 +1035,8 @@ mod tests {
         );
         rows.extend([
             // A deterministic signer-construction misconfig (bad RPC URL or
-            // private key) classifies terminal in every command, matching the
-            // ChainIdMismatch precedent; setup/flush previously projected it
-            // unclassified while recovery refused it.
+            // private key) is terminal in every command, matching
+            // ChainIdMismatch.
             (
                 CommandError::from(VerifiedSignerProviderError::Create("bad key".into())),
                 "a signer-construction misconfig",

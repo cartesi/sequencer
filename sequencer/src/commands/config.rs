@@ -844,7 +844,7 @@ mod tests {
             Cli::try_parse_from(args.clone()).is_err(),
             "run requires a batch-submitter key"
         );
-        // chain-id / app-address are no longer run args.
+        // chain-id / app-address are not run args.
         args.push("--batch-submitter-private-key");
         args.push(TEST_KEY);
         args.push("--chain-id");
