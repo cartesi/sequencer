@@ -51,7 +51,8 @@ impl DumpInfo {
         }
     }
 
-    pub fn at_baseline(next_batch_nonce: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn at_baseline(next_batch_nonce: u64) -> Self {
         Self {
             format_version: FORMAT_VERSION,
             next_batch_nonce,

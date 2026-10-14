@@ -33,10 +33,6 @@ impl Storage {
     pub fn history_state(&self) -> Result<HistoryState> {
         query_history_state(&self.conn)
     }
-
-    pub fn next_executed_input_count(&mut self) -> Result<ExecutedInputCount> {
-        self.read(|tx| next_executed_input_count_in(tx))
-    }
 }
 
 pub(super) fn query_history_state(conn: &Connection) -> Result<HistoryState> {

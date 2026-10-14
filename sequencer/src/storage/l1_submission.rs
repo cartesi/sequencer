@@ -2,20 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! The submitter's storage half: the frontier lookup, the SSZ-encoded
-//! pending-batch list the submitter pulls each tick, the wallet-nonce
-//! watermark raised before every broadcast, and the batch-tree anchor that
-//! `setup --recovery` sets.
+//! pending-batch list the submitter pulls each tick, and the wallet-nonce
+//! watermark raised before every broadcast.
 //!
 //! `load_batch_frames_in` is also the seal path's encoder, so the hash stamped
 //! at seal and the submitted bytes come from one encode path. Nonces are
 //! assigned when a Tip is inserted (`mutations::insert_new_batch`);
-//! `safe_accepted_batches` is maintained by `append_safe_inputs`.
+//! `safe_accepted_batches` is maintained by `populate_safe_accepted_batches`
+//! as safe inputs are appended, from the batch-tree anchor that
+//! `complete_baseline_setup` sets.
 
 use rusqlite::{Result, params};
 
 use super::Storage;
 use super::convert::{external_u64_to_i64, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
-use super::mutations::set_batch_tree_anchor_in;
 use super::queries::current_safe_block_required;
 use super::safe_accepted_batches::frontier_nonce;
 use super::{FrameHeader, PendingBatch, SubmitterFrontier};
@@ -41,13 +41,6 @@ impl Storage {
                 accepted_next_nonce: frontier_nonce(tx)?,
             })
         })
-    }
-
-    /// Set the batch-tree anchor nonce (the nonce the parentless root carries).
-    /// Used by `setup --recovery` to root the rebuilt tree at `N'`. Aborts if
-    /// `setup_complete` already exists (`trg_batch_tree_anchor_write_once`).
-    pub fn set_batch_tree_anchor(&mut self, nonce: u64) -> Result<()> {
-        self.write(|tx| set_batch_tree_anchor_in(tx, nonce))
     }
 
     /// The highest wallet nonce ever broadcast by this deployment's

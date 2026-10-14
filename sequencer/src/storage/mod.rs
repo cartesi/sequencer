@@ -134,7 +134,8 @@ impl SafeInputRange {
         }
     }
 
-    pub fn empty_at(index: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn empty_at(index: u64) -> Self {
         Self::new(index, index)
     }
 

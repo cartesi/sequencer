@@ -21,7 +21,7 @@
 //! - wall-clock and stalled-safe-head danger estimates
 //!
 //! The only writer is [`populate_safe_accepted_batches`], invoked from
-//! `append_safe_inputs` inside its transaction.
+//! `append_ingested_safe_inputs_with_timestamp` inside its transaction.
 
 use alloy_primitives::Address;
 use rusqlite::{Connection, OptionalExtension, Result, params};

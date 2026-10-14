@@ -119,17 +119,6 @@ impl Storage {
         self.write(|tx| tx.execute("UPDATE dumps SET lease_count = 0", []))
     }
 
-    pub fn dump_lease_count(&mut self, dump_id: i64) -> Result<Option<i64>> {
-        self.read(|tx| {
-            tx.query_row(
-                "SELECT lease_count FROM dumps WHERE id = ?1",
-                [dump_id],
-                |r| r.get(0),
-            )
-            .optional()
-        })
-    }
-
     /// GC keeps the accepted rollback checkpoint and every valid snapshot beyond
     /// it. Intermediate optimistic snapshots may become the next accepted head.
     /// Row selection/deletion serializes with lease acquisition; files follow.
@@ -173,10 +162,6 @@ impl Storage {
 
     pub fn rollback_snapshot(&mut self) -> Result<Option<Snapshot>> {
         self.read(|tx| rollback_snapshot_in(tx))
-    }
-
-    pub fn has_rollback_safe_snapshot(&mut self) -> Result<bool> {
-        self.read(|tx| has_rollback_safe_snapshot_in(tx))
     }
 
     pub fn acquire_finalized_lease(

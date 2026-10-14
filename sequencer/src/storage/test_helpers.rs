@@ -112,6 +112,34 @@ impl Storage {
 /// Seeding and inspection levers. Each bypasses the guard, provenance or
 /// wall clock its production counterpart enforces.
 impl Storage {
+    /// Set the batch-tree anchor nonce directly; production sets it once, in
+    /// `complete_baseline_setup`. Aborts if `setup_complete` already exists
+    /// (`trg_batch_tree_anchor_write_once`).
+    pub(crate) fn set_batch_tree_anchor(&mut self, nonce: u64) -> rusqlite::Result<()> {
+        self.write(|tx| super::mutations::set_batch_tree_anchor_in(tx, nonce))
+    }
+
+    pub(crate) fn next_executed_input_count(&mut self) -> rusqlite::Result<ExecutedInputCount> {
+        self.read(|tx| next_executed_input_count_in(tx))
+    }
+
+    pub(crate) fn has_rollback_safe_snapshot(&mut self) -> rusqlite::Result<bool> {
+        self.read(|tx| super::snapshot_dumps::has_rollback_safe_snapshot_in(tx))
+    }
+
+    pub(crate) fn dump_lease_count(&mut self, dump_id: i64) -> rusqlite::Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+
+        self.read(|tx| {
+            tx.query_row(
+                "SELECT lease_count FROM dumps WHERE id = ?1",
+                [dump_id],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+    }
+
     /// A raw connection with [`Storage::open`]'s pragmas, for tests that reach
     /// past the typed API (rewinding `synced_at_ms`, installing failure
     /// triggers).
