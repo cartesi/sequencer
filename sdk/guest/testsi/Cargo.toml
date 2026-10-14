@@ -19,5 +19,5 @@ rollups-types = { workspace = true }
 cartesi-machine = { git = "https://github.com/cartesi/dave", rev = "79874c0a1b40678465daf533acc976c88301c6d4", features = ["external_cartesi"] }
 
 inventory = "0.3"
-libtest-mimic = "0.6"
+libtest-mimic = { workspace = true }
 thiserror = { workspace = true }
