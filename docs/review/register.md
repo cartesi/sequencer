@@ -70,6 +70,17 @@ counts, then correct the estimate and check the separately configured
 
 ## Bounded investigations and cleanup
 
+- **The sequencer and the watchdog disagree on a log without an index.**
+  `l1_order_key` in [`partition.rs`](../../sequencer/src/l1/partition.rs)
+  defaults a missing `transactionIndex` or `logIndex` to 0, while `sort_logs`
+  in [`watchdog/l1.lua`](../../watchdog/l1.lua) refuses the log as a transient
+  failure. A mined log carries both, so only a malformed RPC response reaches
+  either path. Decide whether the sequencer refuses too, as it already does
+  for a missing block number. Nothing pins the two orders against each other
+  either: the watchdog stopped running the
+  [log-sort vector](../../tests/fixtures/l1_partition_vector.json) in
+  `c0bebe8`, and the vector cannot tell tx-index from log-index ordering.
+  Stamped 2026-10-14 at `0f44dc7`.
 - **Intermittent process-lock test failure.** The macOS workspace suite can
   report `Locked` at the final reacquisition in
   `dropped_runtime_scope_keeps_lock_until_detached_worker_stops` in

@@ -162,9 +162,9 @@ pub(crate) async fn get_input_added_events_ordered(
     )
     .await?;
     // L1 order needs provenance: a mined log always carries its block number,
-    // so refuse to sort (and mis-place) one that lacks it. The tx/log indices
-    // may default to 0 — watchdog parity (Lua: `transactionIndex or "0x0"`,
-    // but a missing `blockNumber` hard-errors there too).
+    // so refuse to sort (and mis-place) one that lacks it. A missing tx or log
+    // index defaults to 0 here, while the watchdog's `sort_logs` refuses such
+    // a log; docs/review/register.md tracks the difference.
     if let Some((_, log)) = events.iter().find(|(_, log)| log.block_number.is_none()) {
         return Err(GetLogsError::MissingBlockNumber {
             transaction_hash: log.transaction_hash,
