@@ -232,29 +232,22 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
             .poster
             .submit_batches(payloads, &self.watermark_sink)
             .await?;
+        // The poster's contract fixes one hash per broadcast payload. A count
+        // off it is a defect in our own code, not a provider fault to retry.
         match outcome {
             SubmitBatchesOutcome::Submitted(tx_hashes) => {
-                if tx_hashes.len() != submitted_count {
-                    return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
-                        format!(
-                            "poster returned {} tx hashes for {submitted_count} submitted batches",
-                            tx_hashes.len(),
-                        ),
-                    )));
-                }
+                assert_eq!(
+                    tx_hashes.len(),
+                    submitted_count,
+                    "a submitted tick returns one tx hash per payload: contract-impossible"
+                );
                 Ok(TickOutcome::Submitted(submitted_count))
             }
             SubmitBatchesOutcome::Waiting { broadcast } => {
-                // A waiting tick broadcast at most one tx per payload (fewer
-                // when a re-broadcast was refused); more is a poster bug.
-                if broadcast.len() > submitted_count {
-                    return Err(BatchSubmitterError::Poster(BatchPosterError::Provider(
-                        format!(
-                            "waiting poster returned {} tx hashes for {submitted_count} submitted batches",
-                            broadcast.len(),
-                        ),
-                    )));
-                }
+                assert!(
+                    broadcast.len() <= submitted_count,
+                    "a waiting tick broadcasts at most one tx per payload: contract-impossible"
+                );
                 Ok(TickOutcome::Waiting)
             }
         }
@@ -429,6 +422,46 @@ mod tests {
             .expect("shutdown must not wait for the blocked RPC")
             .expect("submitter task must join")
             .expect("ordinary shutdown is clean");
+    }
+
+    /// Returns one hash more than it was given payloads.
+    struct OverReportingPoster;
+
+    #[async_trait]
+    impl BatchPoster for OverReportingPoster {
+        async fn submit_batches(
+            &self,
+            payloads: Vec<Vec<u8>>,
+            _watermark: &dyn WalletNonceWatermarkSink,
+        ) -> Result<SubmitBatchesOutcome, BatchPosterError> {
+            Ok(SubmitBatchesOutcome::Submitted(vec![
+                crate::l1::submitter::TxHash::ZERO;
+                payloads.len() + 1
+            ]))
+        }
+
+        async fn observed_submitted_batch_nonces(
+            &self,
+            _from_block: u64,
+        ) -> Result<Vec<u64>, BatchPosterError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A hash count off the poster's contract is our own defect: the tick
+    /// fails loud instead of retrying it as a provider error.
+    #[tokio::test]
+    #[should_panic(expected = "contract-impossible")]
+    async fn tick_once_fails_loud_on_a_hash_count_off_the_poster_contract() {
+        let TestDb { _dir, path } = temp_db("tick-hash-count");
+        seed_two_closed_batches(&path);
+        let submitter = super::BatchSubmitter::new(
+            path,
+            Arc::new(OverReportingPoster),
+            default_test_config(),
+            ProcessLock::test(),
+        );
+        let _ = submitter.tick_once().await;
     }
 
     #[tokio::test]

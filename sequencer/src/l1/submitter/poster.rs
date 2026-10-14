@@ -7,8 +7,10 @@
 
 use alloy::providers::{PendingTransactionConfig, PendingTransactionError, Provider};
 use alloy::rpc::types::BlockNumberOrTag;
+use alloy_primitives::Address;
 use async_trait::async_trait;
 use cartesi_rollups_contracts::input_box::InputBox;
+use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use sequencer_core::batch::Batch;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -531,25 +533,36 @@ impl BatchPoster for EthereumBatchPoster {
 
         let mut observed_nonces = Vec::new();
         for (event, _log) in events {
-            let evm_advance = decode_evm_advance_input(event.input.as_ref()).map_err(|err| {
-                BatchPosterError::Provider(format!(
-                    "decode EvmAdvance for InputAdded index {}: {err}",
-                    event.index
-                ))
-            })?;
-            if evm_advance.msgSender != self.config.batch_submitter_address {
-                continue;
+            if let Some(nonce) = own_batch_nonce(&event, self.config.batch_submitter_address)? {
+                observed_nonces.push(nonce);
             }
-            // This dedicated key emits our own well-formed batches. A decode
-            // failure is evidence to investigate under self-trust, not an
-            // untrusted direct input to skip (docs/threat-model/README.md).
-            let batch: Batch = ssz::Decode::from_ssz_bytes(evm_advance.payload.as_ref())
-                .map_err(|err| BatchPosterError::Provider(format!("{err:?}")))?;
-            observed_nonces.push(batch.nonce);
         }
 
         Ok(observed_nonces)
     }
+}
+
+/// The batch nonce of an `InputAdded` sent by `submitter`; `None` for any
+/// other sender.
+fn own_batch_nonce(
+    event: &InputAdded,
+    submitter: Address,
+) -> Result<Option<u64>, BatchPosterError> {
+    let evm_advance = decode_evm_advance_input(event.input.as_ref()).map_err(|err| {
+        BatchPosterError::Provider(format!(
+            "decode EvmAdvance for InputAdded index {}: {err}",
+            event.index
+        ))
+    })?;
+    if evm_advance.msgSender != submitter {
+        return Ok(None);
+    }
+    // This dedicated key emits our own well-formed batches. A decode
+    // failure is evidence to investigate under self-trust, not an
+    // untrusted direct input to skip (docs/threat-model/README.md).
+    let batch: Batch = ssz::Decode::from_ssz_bytes(evm_advance.payload.as_ref())
+        .map_err(|err| BatchPosterError::Provider(format!("{err:?}")))?;
+    Ok(Some(batch.nonce))
 }
 
 #[cfg(test)]
