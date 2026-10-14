@@ -97,6 +97,11 @@ impl Storage {
     pub(crate) fn batch_policy(&mut self) -> rusqlite::Result<BatchPolicy> {
         query_batch_policy(&self.conn)
     }
+
+    /// The batch-tree anchor nonce (default 0).
+    pub(crate) fn batch_tree_anchor(&mut self) -> rusqlite::Result<u64> {
+        self.read(|tx| super::mutations::batch_tree_anchor_in(tx))
+    }
 }
 
 /// Alpha 17 (17000/1000): `log_alpha` 364 = round(log(17)) and

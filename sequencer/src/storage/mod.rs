@@ -10,8 +10,8 @@
 //! - `ingress` — inclusion lane: user-op append, frame/batch close
 //! - `egress` — WS feed and catch-up replay (read-only)
 //! - `l1_inputs` — input reader: safe-input ingestion, L1 head, deployment identity
-//! - `l1_submission` — batch-aggregate reads (submitter frontier, pending
-//!   batches, per-batch replay) shared between the submitter and egress
+//! - `l1_submission` — submitter frontier, pending batches, wallet-nonce
+//!   watermark and batch-tree anchor; the seal path reuses its batch encoder
 //! - `recovery` — cascade invalidation, recovery-batch open, danger checks
 //! - `fee_oracle` — L1 fee-oracle gas-price updates
 //! - `snapshot_dumps` — immutable snapshots, derived acceptance, lease counts

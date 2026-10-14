@@ -319,7 +319,11 @@ mod tests {
                 .base_executed_input_count,
             42
         );
-        assert_eq!(storage.open_tip_nonce().expect("root nonce"), Some(4));
+        let root = storage.open_state().expect("open state").expect("root tip");
+        assert_eq!(
+            storage.batch_nonce(root.batch_index).expect("root nonce"),
+            4
+        );
     }
 
     #[test]

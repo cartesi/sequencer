@@ -1,22 +1,21 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! The submitter's storage half: frontier lookup, per-batch frames + user
-//! ops, the catch-up / per-batch replay reader, the SSZ-encoded pending-batch
-//! list the submitter pulls each tick — and the one submission-side write,
-//! the wallet-nonce watermark (raised before every broadcast).
+//! The submitter's storage half: the frontier lookup, the SSZ-encoded
+//! pending-batch list the submitter pulls each tick, the wallet-nonce
+//! watermark raised before every broadcast, and the batch-tree anchor that
+//! `setup --recovery` sets.
 //!
-//! Structural nonces are assigned by the `batches.nonce` trigger at close
-//! time (see `ingress`), and `safe_accepted_batches` is maintained by
-//! `append_safe_inputs` (see `l1_inputs`). The reads here are shared between
-//! the batch submitter (hot-path tick) and the egress replay path (catch-up
-//! reader); they live together because they all aggregate at the batch level.
+//! `load_batch_frames_in` is also the seal path's encoder, so the hash stamped
+//! at seal and the submitted bytes come from one encode path. Nonces are
+//! assigned when a Tip is inserted (`mutations::insert_new_batch`);
+//! `safe_accepted_batches` is maintained by `append_safe_inputs`.
 
 use rusqlite::{Result, params};
 
 use super::Storage;
 use super::convert::{external_u64_to_i64, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
-use super::mutations::{batch_tree_anchor_in, set_batch_tree_anchor_in};
+use super::mutations::set_batch_tree_anchor_in;
 use super::queries::current_safe_block_required;
 #[cfg(test)]
 use super::queries::decode_l2_tx_row;
@@ -53,11 +52,6 @@ impl Storage {
     /// `setup_complete` already exists (`trg_batch_tree_anchor_write_once`).
     pub fn set_batch_tree_anchor(&mut self, nonce: u64) -> Result<()> {
         self.write(|tx| set_batch_tree_anchor_in(tx, nonce))
-    }
-
-    /// Read the batch-tree anchor nonce (default 0).
-    pub fn batch_tree_anchor(&mut self) -> Result<u64> {
-        self.read(|tx| batch_tree_anchor_in(tx))
     }
 
     /// The highest wallet nonce ever broadcast by this deployment's
@@ -105,27 +99,6 @@ impl Storage {
                     row.get(0)
                 })?;
         Ok(value.map(i64_to_u64))
-    }
-
-    /// The structural nonce of the current open Tip (the single
-    /// `valid_open_batch`), or `None` if no Tip is open. Used by `setup
-    /// --recovery` to detect a partially-recovered DB whose root tip carries a
-    /// different resume nonce than the current attempt (the at-most-one-valid-
-    /// open-tip index makes this at most one row).
-    pub fn open_tip_nonce(&mut self) -> Result<Option<u64>> {
-        use rusqlite::OptionalExtension;
-        let value: Option<i64> = self
-            .conn
-            .query_row("SELECT nonce FROM valid_open_batch", [], |row| row.get(0))
-            .optional()?;
-        Ok(value.map(i64_to_u64))
-    }
-
-    /// Frame headers for `batch_index` in `frame_in_batch` order. Reads the
-    /// raw `frames` table — does NOT filter on validity, since callers only
-    /// reach this method after they already know the batch is valid.
-    pub fn frames_for_batch(&mut self, batch_index: u64) -> Result<Vec<FrameHeader>> {
-        frames_for_batch_in(&self.conn, batch_index)
     }
 
     /// Materialize all sequenced L2 txs in one batch. Returns `[]` for
@@ -349,9 +322,7 @@ mod tests {
         assert_eq!(latest, 1);
 
         // Batch 0 should still have at least one frame header.
-        let frames = storage
-            .frames_for_batch(0)
-            .expect("load frames for batch 0");
+        let frames = super::frames_for_batch_in(&storage.conn, 0).expect("load frames for batch 0");
         assert!(!frames.is_empty());
 
         // Ordered L2 txs for batch 0 should be queryable (even if empty).

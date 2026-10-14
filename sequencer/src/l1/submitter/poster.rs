@@ -803,8 +803,14 @@ mod tests {
         fn raise_to(&self, highest: u64) -> Result<(), WalletNonceWatermarkError> {
             self.calls.lock().expect("lock").push(highest);
             if self.fail {
-                Err(WalletNonceWatermarkError::Other(
-                    "recording sink: forced failure".to_string(),
+                Err(WalletNonceWatermarkError::Storage(
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ffi::ErrorCode::DatabaseBusy,
+                            extended_code: 5,
+                        },
+                        None,
+                    ),
                 ))
             } else {
                 Ok(())
@@ -868,7 +874,7 @@ mod tests {
             matches!(
                 result,
                 Err(BatchPosterError::Watermark(
-                    WalletNonceWatermarkError::Other(_)
+                    WalletNonceWatermarkError::Storage(_)
                 ))
             ),
             "a failing watermark sink must abort submit_batches, got {result:?}"

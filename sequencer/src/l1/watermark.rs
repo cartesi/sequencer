@@ -26,8 +26,6 @@ pub enum WalletNonceWatermarkError {
     OpenStorage(#[source] StorageOpenError),
     #[error("watermark sink storage write failed: {0}")]
     Storage(#[source] rusqlite::Error),
-    #[error("watermark sink failed: {0}")]
-    Other(String),
 }
 
 impl WalletNonceWatermarkError {
@@ -35,7 +33,6 @@ impl WalletNonceWatermarkError {
         match self {
             Self::OpenStorage(source) => is_persistent_storage_open_error(source),
             Self::Storage(source) => is_persistent_storage_error(source),
-            Self::Other(_) => false,
         }
     }
 }
@@ -92,10 +89,6 @@ mod tests {
                 None,
             ))
             .is_persistent_invariant()
-        );
-        assert!(
-            !WalletNonceWatermarkError::Other("injected operational failure".into())
-                .is_persistent_invariant()
         );
     }
 }
