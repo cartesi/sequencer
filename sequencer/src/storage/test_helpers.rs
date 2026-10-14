@@ -204,3 +204,36 @@ pub(crate) fn record_canonical_divergence(
         )
         .expect("record canonical divergence");
 }
+
+/// Exercise the same frame-advance-before-close sequence as the live lane.
+pub(crate) trait RecoveryFixture {
+    fn close_batch_at(
+        &mut self,
+        head: &mut crate::storage::WriteHead,
+        safe_block: u64,
+    ) -> rusqlite::Result<()>;
+}
+impl RecoveryFixture for Storage {
+    fn close_batch_at(
+        &mut self,
+        head: &mut crate::storage::WriteHead,
+        safe_block: u64,
+    ) -> rusqlite::Result<()> {
+        if head.safe_block != safe_block {
+            let start = self.next_undrained_safe_input_index()?;
+            let end: i64 = self.read(|tx| {
+                tx.query_row(
+                    "SELECT COUNT(*) FROM safe_inputs WHERE block_number <= ?1",
+                    [i64::try_from(safe_block).unwrap()],
+                    |r| r.get(0),
+                )
+            })?;
+            self.close_frame_only(
+                head,
+                safe_block,
+                SafeInputRange::new(start, u64::try_from(end).unwrap()),
+            )?;
+        }
+        self.close_frame_and_batch(head, safe_block)
+    }
+}

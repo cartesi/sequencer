@@ -317,3 +317,6 @@ mod tests {
         assert_eq!(b.base_safe_block, 100);
     }
 }
+
+#[cfg(test)]
+mod schema_tests;
