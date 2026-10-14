@@ -12,10 +12,12 @@ measurements must not be attributed to its rebased trees. The latency baseline
 already contains the initial versioned-history foundation; it isolates the
 subsequent application-history refactor, not the cost of the complete stack.
 
-Retained for the [Track 3 integration gates](../plans/2026-07-track3-feed-replay-design.md):
-this is the wallet baseline against which native-engine and deployment results
-can be assessed. Replace or delete it when those decisions no longer use these
-measurements. It describes the named revisions, not ongoing validation of HEAD.
+Retained for the [Track 3 integration gates](../plans/2026-07-track3-feed-replay-design.md)
+and the ADR's [performance posture](../plans/2026-08-authority-boundary-adr.md#performance-posture),
+which cites its ACK latency as regression evidence: this is the wallet baseline
+against which native-engine and deployment results can be assessed. Replace or
+delete it when those decisions no longer use these measurements. It describes
+the named revisions, not ongoing validation of HEAD.
 
 ## Environment and canonical agreement
 
