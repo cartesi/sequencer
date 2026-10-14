@@ -18,7 +18,7 @@ test-e2e: lua-deps test-guest-image
     {{lua}} watchdog/tests/e2e.lua
 
 lint:
-    cd watchdog && luacheck --no-color *.lua tests/*.lua
+    cd watchdog && luacheck --no-color *.lua tests/*.lua tests/fixtures/*.lua
 
 # Build the vendored native Lua modules (lcurl, lfs) into .deps/lua.
 lua-deps:

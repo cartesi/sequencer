@@ -47,8 +47,8 @@ if [[ ! -f "${pins}" ]]; then
   exit 1
 fi
 
-# shellcheck disable=SC1090
 set -a
+# shellcheck disable=SC1090
 source "${pins}"
 set +a
 # rust-toolchain.toml is the only Rust pin.

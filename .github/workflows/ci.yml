@@ -50,7 +50,11 @@ jobs:
             liblua5.4-dev \
             lua-check \
             libcurl4-openssl-dev \
-            libslirp-dev
+            libslirp-dev \
+            shellcheck
+
+      - name: Shell lint
+        run: shellcheck scripts/*.sh watchdog/sequencer-watchdog watchdog/test-guest/nvram.sh
 
       # canonical-test links the emulator through testsi's cartesi-machine
       # bindings, so the workspace build needs the pinned CM .deb and the
@@ -84,7 +88,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Watchdog Lua lint
-        run: cd watchdog && luacheck --no-color *.lua tests/*.lua
+        run: cd watchdog && luacheck --no-color *.lua tests/*.lua tests/fixtures/*.lua
 
       - name: Watchdog Lua unit tests
         run: |
