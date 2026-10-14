@@ -323,7 +323,7 @@ changing it, including checkpoint and fee-source selection.
 
 - Prefer small, composable functions at module boundaries (`ingress::api` → `ingress::inclusion_lane` → `storage::ingress`; `egress::l2_tx_feed` ← `storage::egress`).
 - Keep application validation and execution deterministic for a given input/state. No `SystemTime::now()`, `HashMap` iteration order, or floating-point in consensus paths.
-- Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe.
+- Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe. An error that wraps a cause ends its Display with `: {source}`, because log sinks print Display only and never walk `source()`.
 - Avoid introducing heavy dependencies without strong reason.
 - Documentation style: lean. Module headers (1–4 lines) + docs on public methods only when the contract isn't obvious from name+signature.
 - **Comment the non-obvious, not the self-evident.** Keep comments concise; avoid redundant and excessive inline commentary. Do not restate what the code already expresses. Explain the why, edge cases, invariants, and subtle behaviors that cannot be inferred from reading the code alone.
