@@ -127,8 +127,12 @@ is a [deferred design](../plans/2026-10-batch-scoped-replay-protection.md).
 
 The clock is the maximum block carried by an executed input: frame `safe_block`
 for user ops, L1 inclusion block for directs, or zero at genesis. On success,
-the engine advances it with `max(old_clock, input_clock)`. Count zero implies
-clock zero. Both fields survive checkpoint round-trips.
+the engine advances it with `max(old_clock, input_clock)`. Input clocks are
+not monotone: [gate d](scheduler-semantics.md#processing-an-input) orders
+frame clocks only within a batch, so a later batch's user ops may run at a
+`safe_block` below an earlier input's clock (a direct never runs below the
+stored clock); the `max` keeps the stored clock monotone. Count zero implies clock zero. Both
+fields survive checkpoint round-trips.
 
 The [frame-clock policy](scheduler-semantics.md#sequencer-frame-clock-policy)
 may deliver a delayed head jump as one step. Newly covered directs execute
