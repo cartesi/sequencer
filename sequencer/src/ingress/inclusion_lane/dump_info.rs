@@ -76,7 +76,10 @@ pub fn read_checkpoint_info(dump_dir: &Path) -> io::Result<CheckpointInfo> {
     if info.format_version != FORMAT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unsupported checkpoint format",
+            format!(
+                "unsupported checkpoint format version {} (expected {FORMAT_VERSION})",
+                info.format_version
+            ),
         ));
     }
     Ok(info)
@@ -94,7 +97,10 @@ pub(crate) fn write_archive<W: io::Write>(
     if info.next_batch_nonce != next_batch_nonce {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "dump nonce differs from snapshot boundary",
+            format!(
+                "dump next_batch_nonce {} differs from snapshot boundary {next_batch_nonce}",
+                info.next_batch_nonce
+            ),
         ));
     }
     let mut archive = tar::Builder::new(writer);
@@ -570,5 +576,49 @@ mod tests {
         )
         .unwrap();
         assert!(read_info(dir.path()).is_err());
+    }
+
+    #[test]
+    fn write_archive_nonce_mismatch_names_both_nonces() {
+        let dir = tempfile::tempdir().expect("dump dir");
+        write_info(
+            dir.path(),
+            &DumpInfo {
+                format_version: FORMAT_VERSION,
+                next_batch_nonce: 41,
+            },
+        )
+        .expect("write info");
+
+        let err = write_archive(std::io::sink(), dir.path(), 42, None)
+            .expect_err("a nonce mismatch must refuse the archive");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(
+            message.contains("41") && message.contains("42"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn read_checkpoint_info_names_both_format_versions() {
+        let dir = tempfile::tempdir().expect("dump dir");
+        let unsupported = FORMAT_VERSION + 1;
+        std::fs::write(
+            dir.path().join("checkpoint.toml"),
+            format!("format_version = {unsupported}\nnext_batch_nonce = 1\ninclusion_block = 2\n"),
+        )
+        .expect("write checkpoint");
+
+        let message = read_checkpoint_info(dir.path())
+            .expect_err("an unsupported version must refuse")
+            .to_string();
+
+        assert!(
+            message.contains(&unsupported.to_string())
+                && message.contains(&FORMAT_VERSION.to_string()),
+            "{message}"
+        );
     }
 }

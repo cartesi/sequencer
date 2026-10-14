@@ -188,7 +188,10 @@ async fn finalized_state(
             .body(stream_body(file, guard, path))
             .expect("snapshot response headers are well-formed"),
         // `guard` is a local here; on this error path it drops → lease released.
-        Err(err) => internal_error("open finalized state file", err),
+        Err(err) => internal_error(
+            "open finalized state file",
+            format!("{}: {err}", path.display()),
+        ),
     }
 }
 
@@ -257,7 +260,15 @@ fn archive_response(
                     prefix.display()
                 ))
             }
-            Ok(result) => result,
+            Ok(Err(err)) => {
+                if is_client_disconnect(&err) {
+                    tracing::debug!(error = %err, prefix = %prefix.display(), "snapshot archive client disconnected mid-stream");
+                } else {
+                    tracing::warn!(error = %err, prefix = %prefix.display(), "snapshot archive stream failed after the 200");
+                }
+                Err(err)
+            }
+            Ok(Ok(())) => Ok(()),
             Err(_) => abort_terminal("snapshot archive producer panicked"),
         };
         let _ = done_tx.send(result);
@@ -327,7 +338,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for ComparisonReader<R> {
         let this = self.get_mut();
         Pin::new(&mut this.reader)
             .poll_read(cx, buf)
-            .map(|result| comparison_io(result, &this.path))
+            .map(|result| {
+                comparison_io(result, &this.path).inspect_err(|error| {
+                    tracing::warn!(error = %error, path = %this.path.display(), "finalized state file read failed after the 200");
+                })
+            })
     }
 }
 
@@ -440,6 +455,11 @@ fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
         == Some(etag)
 }
 
+/// The client dropped the body, so the duplex writer's next write fails.
+fn is_client_disconnect(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::BrokenPipe
+}
+
 fn internal_error(context: &str, err: impl std::fmt::Display) -> Response {
     tracing::warn!(error = %err, context, "snapshot endpoint failed");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -462,6 +482,18 @@ fn finalized_error(context: &str, err: StorageTaskError) -> Response {
 mod tests {
     use super::*;
     use crate::storage::test_helpers::temp_db;
+
+    #[tokio::test]
+    async fn client_disconnect_surfaces_as_broken_pipe() {
+        let (writer, reader) = tokio::io::duplex(8);
+        drop(reader);
+        let mut bridge = SyncIoBridge::new(writer);
+        let err = tokio::task::spawn_blocking(move || std::io::Write::write_all(&mut bridge, b"x"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(is_client_disconnect(&err), "{err:?}");
+    }
 
     async fn read_corrupt_comparison(path: &Path) {
         let db = temp_db("corrupt-comparison-path");
