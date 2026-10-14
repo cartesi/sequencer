@@ -303,7 +303,10 @@ fn resolve_key_source(
 /// underneath a running process. `NotFound` is deliberately terminal even
 /// though a secret populated after the process starts hits it: the
 /// orchestrator must mount the key before start, and a typo'd path
-/// restart-looping unpaged is the failure this replaces.
+/// restart-looping unpaged is the failure this replaces. The genesis dump
+/// keeps PermissionDenied operational so native and C engines agree; the key
+/// file is read by the host alone and never crosses the engine seam, so its
+/// denial stays terminal.
 pub(crate) fn key_file_io_is_terminal(source: &std::io::Error) -> bool {
     matches!(
         source.kind(),

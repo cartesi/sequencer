@@ -182,14 +182,19 @@ impl CommandError {
                     source.kind(),
                     std::io::ErrorKind::InvalidInput
                         | std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::PermissionDenied
                         | std::io::ErrorKind::InvalidData
                         | std::io::ErrorKind::UnexpectedEof
                         | std::io::ErrorKind::IsADirectory
                         | std::io::ErrorKind::NotADirectory
                 ) =>
             {
-                // An absent option or unusable genesis dump needs operator repair.
+                // An absent option or a missing or corrupt genesis dump needs
+                // operator repair. PermissionDenied stays operational, as for
+                // referenced artifacts (`referenced_artifact_io_is_terminal`):
+                // it may clear once permissions are fixed, and the C engine
+                // seam carries no kind for it (IO_ERROR becomes Other), so
+                // native and C engines agree on exit 1. The key file differs
+                // (`key_file_io_is_terminal`) because it never crosses the seam.
                 CommandFailureVerdict::Terminal
             }
             CommandError::ReferencedSnapshotArtifact { source, .. }
@@ -1046,7 +1051,6 @@ mod tests {
             [
                 std::io::ErrorKind::InvalidInput,
                 std::io::ErrorKind::NotFound,
-                std::io::ErrorKind::PermissionDenied,
                 std::io::ErrorKind::InvalidData,
                 std::io::ErrorKind::UnexpectedEof,
                 std::io::ErrorKind::IsADirectory,
@@ -1386,6 +1390,13 @@ mod tests {
             (
                 CommandError::AppBootstrap(AppError::Io(std::io::ErrorKind::TimedOut.into())),
                 "a timed out genesis read remains restartable",
+            ),
+            (
+                CommandError::AppBootstrap(AppError::Io(
+                    std::io::ErrorKind::PermissionDenied.into(),
+                )),
+                "a genesis dump the process may not read or write: may clear, and the C seam \
+                 cannot carry the kind",
             ),
         ]
     }

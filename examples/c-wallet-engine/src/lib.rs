@@ -62,8 +62,10 @@ fn report(error: &AppError, what: &str) -> sys::ApplicationEngineStatus {
     }
 }
 
-/// Dump loading and creation: preserve missing/corrupt artifact classification across the ABI;
-/// diagnostics are not parsed.
+/// Dump loading and creation: preserve the missing/corrupt classification across the ABI. These
+/// are the kinds `referenced_artifact_io_is_terminal` and the host's AppBootstrap arm treat as
+/// terminal; other I/O, PermissionDenied included, stays IO_ERROR, which the host classifies
+/// operational. Diagnostics are not parsed.
 fn report_lifecycle(error: &AppError, what: &str) -> sys::ApplicationEngineStatus {
     let AppError::Io(err) = error else {
         return report(error, what);
