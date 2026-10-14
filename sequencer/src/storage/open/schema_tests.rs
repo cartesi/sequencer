@@ -10,17 +10,16 @@ use rusqlite::params;
 use sequencer_core::protocol::ProtocolTiming;
 
 use super::super::test_helpers::{
-    RecoveryFixture, SENDER_A, default_protocol_timing, local_batch_payload,
+    RecoveryFixture, SENDER_A, local_batch_payload, open_temp_storage,
     temp_db_with_default_deployment_identity as temp_db,
 };
-use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+use crate::storage::{SafeInputRange, Storage};
 
 #[test]
 fn schema_rejects_second_valid_tip() {
     // The partial unique index `ux_single_valid_tip` catches a writer that
     // opens a new Tip without sealing the old one first.
-    let db = temp_db("schema-second-tip");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-second-tip");
     storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -43,8 +42,7 @@ fn schema_rejects_bad_nonce_contiguity() {
     // Nonce must equal parent.nonce + 1 — trigger enforces it.
     // Insert the bad-nonce batch as already-sealed so it doesn't collide
     // with the existing Tip on `ux_single_valid_tip`.
-    let db = temp_db("schema-bad-nonce");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-bad-nonce");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -69,8 +67,7 @@ fn schema_rejects_bad_nonce_contiguity() {
 fn schema_rejects_genesis_with_nonzero_nonce() {
     // Default anchor is 0, so a parentless root at a non-zero nonce ABORTs
     // (genesis must be 0) — the exact-match form of the contiguity rule.
-    let db = temp_db("schema-genesis-nonzero");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, storage) = open_temp_storage("schema-genesis-nonzero");
     let err = storage.conn.execute(
         "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
          VALUES (0, NULL, 7, 100)",
@@ -195,8 +192,7 @@ fn schema_freezes_anchor_after_setup_complete() {
 
 #[test]
 fn schema_rejects_re_seal() {
-    let db = temp_db("schema-re-seal");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-re-seal");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -216,8 +212,7 @@ fn schema_rejects_re_seal() {
 
 #[test]
 fn schema_rejects_re_invalidate() {
-    let db = temp_db("schema-re-invalidate");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-re-invalidate");
     storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -238,8 +233,7 @@ fn schema_rejects_re_invalidate() {
 fn schema_rejects_frame_insert_into_sealed_batch() {
     // This is the bug class we've been fighting: writer holds a stale
     // WriteHead and writes to a batch that's no longer the Tip.
-    let db = temp_db("schema-frame-into-sealed");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-frame-into-sealed");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -260,8 +254,7 @@ fn schema_rejects_frame_insert_into_sealed_batch() {
 
 #[test]
 fn schema_rejects_frame_insert_into_invalidated_batch() {
-    let db = temp_db("schema-frame-into-invalid");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-frame-into-invalid");
     storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -280,8 +273,7 @@ fn schema_rejects_frame_insert_into_invalidated_batch() {
 
 #[test]
 fn schema_rejects_parent_batch_index_mutation() {
-    let db = temp_db("schema-parent-immutable");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-parent-immutable");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -303,8 +295,7 @@ fn schema_rejects_application_input_into_non_tip() {
     // have negative tests; application_inputs did not). The global replay order
     // is the source for recovery re-drain and catch-up; a stale-WriteHead row
     // into a sealed batch would corrupt it.
-    let db = temp_db("schema-sequenced-into-sealed");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-sequenced-into-sealed");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -328,8 +319,7 @@ fn schema_rejects_application_input_into_non_tip() {
 #[test]
 fn schema_rejects_nonce_mutation() {
     // Nonce immutability underpins the frontier + contiguity invariants.
-    let db = temp_db("schema-nonce-immutable");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-nonce-immutable");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -349,8 +339,7 @@ fn schema_rejects_payload_hash_rewrite() {
     // payload_hash is the content-identity anchor for the canonical-
     // divergence check; a rewrite would let a foreign/zombie L1 landing
     // false-match a local batch. Write-once once stamped at seal.
-    let db = temp_db("schema-payload-hash-write-once");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-payload-hash-write-once");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -380,9 +369,7 @@ fn nonce_reuse_after_cascade_with_valid_ancestor() {
     // Scenario: batch 0 is accepted (safe_accepted_batches advances past
     // nonce 0). Batch 1 is stale and triggers cascade. Batches 1, 2, 3
     // invalidated; batch 0 remains valid.
-    let db = temp_db("nonce-reuse-with-ancestor");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let batch_submitter = SENDER_A;
+    let (_db, mut storage) = open_temp_storage("nonce-reuse-with-ancestor");
 
     let mut head = storage
         .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -400,23 +387,10 @@ fn nonce_reuse_after_cascade_with_valid_ancestor() {
 
     // Batch 0 lands on L1 (accepted): safe_input at block 20 with nonce 0.
     let landed = local_batch_payload(&mut storage, 0);
-    storage
-        .append_safe_inputs(
-            20,
-            &[StoredSafeInput {
-                sender: batch_submitter,
-                payload: landed,
-                block_number: 20,
-            }],
-            SENDER_A,
-            &default_protocol_timing(),
-        )
-        .expect("append batch 0 submission");
+    storage.land(20, &[(SENDER_A, landed)]); // append batch 0 submission
     // Advance safe head so batches 1, 2, 3 (first_frame=100) are stale.
     // current_safe=1400 → 1400-100=1300 >= 1200.
-    storage
-        .append_safe_inputs(1400, &[], SENDER_A, &default_protocol_timing())
-        .expect("advance past threshold");
+    storage.advance_safe_head(1400); // advance past threshold
 
     let inv = storage.recover_post_flush(1200).expect("recover");
     // Batches 1, 2, 3 invalidated; batch 0 (accepted) stays valid.
@@ -449,8 +423,7 @@ fn schema_rejects_safe_input_with_wrong_sender_length() {
     // `safe_inputs.sender` must be exactly 20 bytes (an
     // Ethereum address). A shorter or longer blob must be refused
     // by the schema even if it bypasses the Rust API.
-    let db = temp_db("schema-safe-input-sender-len");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, storage) = open_temp_storage("schema-safe-input-sender-len");
     let err = storage.conn.execute(
         "INSERT INTO safe_inputs \
              (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
@@ -466,8 +439,7 @@ fn schema_rejects_safe_input_with_wrong_sender_length() {
 #[test]
 fn schema_rejects_user_op_with_wrong_sender_length() {
     // `user_ops.sender` must be 20 bytes.
-    let db = temp_db("schema-user-op-sender-len");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, storage) = open_temp_storage("schema-user-op-sender-len");
     // Seed a frame to satisfy the composite FK — initialize_open_state
     // creates batch 0 frame 0 as the Tip.
     let mut storage = storage;
@@ -491,8 +463,7 @@ fn schema_rejects_user_op_with_wrong_signature_length() {
     // `user_ops.sig` must be exactly 65 bytes (secp256k1
     // r || s || v). Regression for "accidentally accepted a non-65
     // signature and crashed a downstream consumer."
-    let db = temp_db("schema-user-op-sig-len");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-user-op-sig-len");
     storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -518,8 +489,7 @@ fn schema_rejects_application_input_with_neither_xor_branch() {
     // Setting both to NULL is the clean XOR violation to test —
     // FKs are only triggered on non-NULL values so we isolate the
     // CHECK constraint.
-    let db = temp_db("schema-sequenced-l2-tx-xor-neither");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-sequenced-l2-tx-xor-neither");
     storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
@@ -565,8 +535,7 @@ fn schema_rejects_safe_input_with_negative_block_number() {
     // `safe_inputs.block_number >= 0`. Catches a regression
     // that would let a negative block number slip through — the rest
     // of the system assumes non-negative and could panic on cast.
-    let db = temp_db("schema-safe-input-neg-block");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, storage) = open_temp_storage("schema-safe-input-neg-block");
     let sender = vec![0u8; 20];
     let err = storage.conn.execute(
         "INSERT INTO safe_inputs \
@@ -586,8 +555,7 @@ fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
     // present, the trg_*_frozen_on_divergence family must RAISE on batch
     // inserts/updates, promotion inserts, and pending-snapshot deletes —
     // even for a caller that bypassed every typed Rust refusal.
-    let db = temp_db("schema-divergence-freeze");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, mut storage) = open_temp_storage("schema-divergence-freeze");
     let mut head = storage
         .initialize_open_state(10, SafeInputRange::empty_at(0))
         .expect("initialize open state");
@@ -649,8 +617,7 @@ fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
 
 #[test]
 fn schema_rejects_safe_input_with_negative_block_timestamp() {
-    let db = temp_db("schema-safe-input-neg-block-timestamp");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, storage) = open_temp_storage("schema-safe-input-neg-block-timestamp");
     let sender = vec![0u8; 20];
     let err = storage.conn.execute(
         "INSERT INTO safe_inputs \
@@ -666,8 +633,7 @@ fn schema_rejects_safe_input_with_negative_block_timestamp() {
 
 #[test]
 fn schema_rejects_safe_input_with_wrong_transaction_hash_length() {
-    let db = temp_db("schema-safe-input-transaction-hash-len");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let (_db, storage) = open_temp_storage("schema-safe-input-transaction-hash-len");
     let sender = vec![0u8; 20];
     let err = storage.conn.execute(
         "INSERT INTO safe_inputs \
