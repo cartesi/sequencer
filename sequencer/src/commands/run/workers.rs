@@ -808,7 +808,7 @@ mod tests {
 
         release_tx.send(()).expect("release worker");
         stopped_rx.await.expect("worker stopped");
-        ProcessLock::acquire(data_dir).expect("lock releases after the last worker exits");
+        ProcessLock::acquire_released(data_dir);
     }
 
     #[test]
@@ -955,8 +955,7 @@ mod tests {
         // the process lock held — through its `RuntimeScope` clone or, for
         // the reader, detector, and fee oracle, its own `ProcessLock` — so
         // this acquire succeeding proves zero workers launched.
-        ProcessLock::acquire(&data_dir)
-            .expect("failed preparation must release ownership with zero live workers");
+        ProcessLock::acquire_released(&data_dir);
     }
 
     #[tokio::test]
@@ -977,8 +976,7 @@ mod tests {
             "expected AddrInUse, got {err:?}"
         );
         assert!(err.to_string().contains("internal listener"), "{err}");
-        ProcessLock::acquire(&data_dir)
-            .expect("failed preparation must release ownership with zero live workers");
+        ProcessLock::acquire_released(&data_dir);
     }
 
     #[tokio::test]

@@ -95,15 +95,6 @@ counts, then correct the estimate and check the separately configured
   useful can happen meanwhile. Revisit on a partial failure where block polling
   stalls while the endpoint otherwise serves; the fix is an outer timeout around
   the watch. Evidence: [`submitter/poster.rs`](../../sequencer/src/l1/submitter/poster.rs).
-- **Intermittent process-lock test failure.** The macOS workspace suite can
-  report `Locked` at the final reacquisition in
-  `dropped_runtime_scope_keeps_lock_until_detached_worker_stops` in
-  [`workers.rs`](../../sequencer/src/commands/run/workers.rs); an isolated rerun
-  passes. The worker drops its scope before signalling completion, so a simple
-  worker-completion race does not explain the failure. Identify any remaining
-  descriptor/process ownership before changing the assertion or lock behavior.
-  Reproduced during the 2026-09-18 stack closeout; isolated and full serial
-  runs passed. See the [current validation record](2026-09-18-stack-review-validation.md).
 - **Intermittent C-host recovery WebSocket reset.** At `dc4dd78` on
   2026-09-19, `c_host_recovery_after_stale_batches_test` failed an expected
   message receive with `Connection reset without closing handshake` in the

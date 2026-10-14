@@ -101,6 +101,60 @@ impl ProcessLock {
         std::mem::forget(dir);
         lock
     }
+
+    /// Acquire a lock this process has just released, for tests asserting
+    /// the release. `flock` frees a lock only when every descriptor sharing
+    /// it closes, and a child spawned by a concurrent test (Anvil, a
+    /// re-executed test binary) holds copies of all of them until its `exec`
+    /// closes them, so an immediate acquire can see
+    /// [`ProcessLockError::Locked`] for that window. It retries only while no
+    /// descriptor of this process is open on the lock file, so an owner in
+    /// this process that has not released fails at once, as a plain acquire
+    /// would.
+    #[cfg(test)]
+    pub(crate) fn acquire_released(data_dir: &str) -> Self {
+        use std::time::{Duration, Instant};
+
+        let path = Path::new(data_dir).join(LOCK_FILE_NAME);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match Self::acquire(data_dir) {
+                Ok(lock) => return lock,
+                Err(ProcessLockError::Locked { .. }) if open_in_this_process(&path) => {
+                    panic!("an owner in this process still holds {}", path.display())
+                }
+                Err(ProcessLockError::Locked { .. }) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => panic!("re-acquiring the released lock failed: {err}"),
+            }
+        }
+    }
+}
+
+/// Whether a descriptor of this process is open on `path`: its descriptor
+/// table, read through `/dev/fd` (`/proc/self/fd` on Linux), matched by
+/// inode and change time, since macOS reports devfs's device for a `/dev/fd`
+/// entry. A spawned child's copies are in the child's table.
+#[cfg(test)]
+fn open_in_this_process(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let target = std::fs::metadata(path).expect("stat the lock file");
+    let table = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    std::fs::read_dir(table)
+        .expect("read this process's descriptor table")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+        .any(|meta| {
+            meta.ino() == target.ino()
+                && meta.ctime() == target.ctime()
+                && meta.ctime_nsec() == target.ctime_nsec()
+        })
 }
 
 /// Spawn blocking work while retaining the command/runtime lock for the
@@ -147,7 +201,19 @@ mod tests {
         );
 
         drop(held);
-        ProcessLock::acquire(data_dir).expect("acquire after release");
+        ProcessLock::acquire_released(data_dir);
+    }
+
+    #[test]
+    fn open_in_this_process_tracks_the_lock_descriptor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_str().expect("utf8 path");
+        let path = Path::new(data_dir).join(LOCK_FILE_NAME);
+
+        let held = ProcessLock::acquire(data_dir).expect("acquire");
+        assert!(open_in_this_process(&path));
+        drop(held);
+        assert!(!open_in_this_process(&path));
     }
 
     #[test]
@@ -169,7 +235,7 @@ mod tests {
         ProcessLock::acquire(data_dir).expect_err("retained clone must keep the lock held");
 
         drop(retained);
-        ProcessLock::acquire(data_dir).expect("last clone releases the lock");
+        ProcessLock::acquire_released(data_dir);
     }
 
     #[tokio::test]
