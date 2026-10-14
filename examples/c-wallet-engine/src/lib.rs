@@ -416,16 +416,13 @@ pub unsafe extern "C" fn application_engine_state_file_in_dump(
     // Pure over the prefix: it touches no filesystem and needs no engine. Where the state file
     // sits follows from the shape this app gives a dump, a directory with `state` inside it.
     let state_file = WalletApp::state_file_in_dump(&prefix);
-    match CString::new(state_file.as_os_str().as_encoded_bytes()) {
-        Ok(path) => STATE_FILE.with(|slot| {
-            *slot.borrow_mut() = path;
-            slot.borrow().as_ptr()
-        }),
-        Err(_) => {
-            set_error("the dump prefix contains an interior NUL");
-            std::ptr::null()
-        }
-    }
+    // The prefix came from a CStr and `join("state")` adds no NUL.
+    let path =
+        CString::new(state_file.as_os_str().as_encoded_bytes()).expect("prefix came from a CStr");
+    STATE_FILE.with(|slot| {
+        *slot.borrow_mut() = path;
+        slot.borrow().as_ptr()
+    })
 }
 
 /* -- genesis, the one entry point that is not part of the seam -- */
