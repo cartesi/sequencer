@@ -42,24 +42,33 @@ fn setup_not_complete(data_dir: &str) -> CommandError {
     .into()
 }
 
+/// Name the path an I/O error happened at, keeping its kind: the OS message
+/// alone does not say which file failed.
+fn io_error_at(
+    what: &str,
+    path: impl AsRef<std::path::Path>,
+    source: std::io::Error,
+) -> CommandError {
+    std::io::Error::new(
+        source.kind(),
+        format!("{what} {}: {source}", path.as_ref().display()),
+    )
+    .into()
+}
+
 /// Only `setup` creates a data directory, so a mistyped path refuses here
 /// instead of becoming an empty directory that holds a lock file. Only real
 /// absence means "not set up"; an unreadable path stays an I/O error.
 fn require_data_dir(data_dir: &str) -> Result<(), CommandError> {
-    let io_error = |kind, detail: &dyn std::fmt::Display| {
-        CommandError::from(std::io::Error::new(
-            kind,
-            format!("data dir {data_dir}: {detail}"),
-        ))
-    };
     match std::fs::metadata(data_dir) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => Err(io_error(
-            std::io::ErrorKind::NotADirectory,
-            &"not a directory",
+        Ok(_) => Err(io_error_at(
+            "data dir",
+            data_dir,
+            std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a directory"),
         )),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(setup_not_complete(data_dir)),
-        Err(err) => Err(io_error(err.kind(), &err)),
+        Err(err) => Err(io_error_at("data dir", data_dir, err)),
     }
 }
 
