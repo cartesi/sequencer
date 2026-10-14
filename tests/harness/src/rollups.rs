@@ -93,12 +93,21 @@ impl DevnetRollupsStack {
     }
 
     /// Mine ordinary live-chain progress without simulating a 12-second outage
-    /// per block. The one-second interval keeps Anvil timestamps monotone while
-    /// wall-clock-paced polling avoids tripping the clock-usability guard.
+    /// per block. The one-second interval keeps a burst's timestamps strictly
+    /// increasing (Anvil stamps an interval-less burst with one timestamp), but
+    /// it is added on top of elapsed time: a loop that calls this once per
+    /// second runs L1 at twice wall-clock speed. Pace with
+    /// [`Self::mine_l1_block_at_wall_clock`] instead.
     pub async fn mine_live_l1_blocks(&self, block_count: u64) -> HarnessResult<()> {
         self.anvil
-            .mine_blocks_with_interval(block_count, LIVE_L1_BLOCK_INTERVAL_SECONDS)
+            .mine_blocks_with_interval(block_count, Some(LIVE_L1_BLOCK_INTERVAL_SECONDS))
             .await
+    }
+
+    /// Mine one block stamped at Anvil's own clock, so mining paced once per
+    /// wall-clock second keeps L1 time coupled to the sequencer's clock.
+    pub async fn mine_l1_block_at_wall_clock(&self) -> HarnessResult<()> {
+        self.anvil.mine_blocks_with_interval(1, None).await
     }
 
     pub async fn l1_safe_block_number(&self) -> HarnessResult<u64> {
@@ -278,14 +287,14 @@ impl ManagedAnvil {
         // spurious `L1ViewStale` even when wall clock and L1 should move
         // together. See `ManagedSequencer::advance_wall_and_mine`.
         const SECONDS_PER_BLOCK: u64 = 12;
-        self.mine_blocks_with_interval(block_count, SECONDS_PER_BLOCK)
+        self.mine_blocks_with_interval(block_count, Some(SECONDS_PER_BLOCK))
             .await
     }
 
     async fn mine_blocks_with_interval(
         &self,
         block_count: u64,
-        interval_seconds: u64,
+        interval_seconds: Option<u64>,
     ) -> HarnessResult<()> {
         if block_count == 0 {
             return Ok(());
@@ -296,7 +305,7 @@ impl ManagedAnvil {
             .await
             .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
         provider
-            .anvil_mine(Some(block_count), Some(interval_seconds))
+            .anvil_mine(Some(block_count), interval_seconds)
             .await
             .map_err(|err| {
                 io_other(format!(

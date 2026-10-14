@@ -352,7 +352,7 @@ pub(crate) fn assert_same_state<A: Application>(
 
 async fn wait_for_accepted_snapshot(runtime: &ManagedSequencer) -> ScenarioResult<()> {
     for _ in 0..40 {
-        runtime.mine_live_l1_blocks(1).await?;
+        runtime.mine_l1_block_at_wall_clock().await?;
         if runtime
             .finalized_inclusion_block()
             .await?

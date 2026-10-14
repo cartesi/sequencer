@@ -462,7 +462,7 @@ async fn mine_until_finalized_advances(
     floor: u64,
 ) -> ScenarioResult<u64> {
     for _ in 0..PROMOTION_POLL_ATTEMPTS {
-        runtime.mine_live_l1_blocks(1).await?;
+        runtime.mine_l1_block_at_wall_clock().await?;
         tokio::time::sleep(PROMOTION_POLL_INTERVAL).await;
         if let Some(inclusion_block) = runtime.finalized_inclusion_block().await?
             && inclusion_block > floor
@@ -480,7 +480,7 @@ async fn mine_until_batch_is_safe_accepted(
     runtime: &ManagedSequencer,
 ) -> ScenarioResult<(u64, Option<u64>)> {
     for _ in 0..ACCEPTANCE_POLL_ATTEMPTS {
-        runtime.mine_live_l1_blocks(1).await?;
+        runtime.mine_l1_block_at_wall_clock().await?;
         tokio::time::sleep(ACCEPTANCE_POLL_INTERVAL).await;
         let accepted = runtime.count_safe_accepted_batches()?;
         if accepted.0 > 0 {

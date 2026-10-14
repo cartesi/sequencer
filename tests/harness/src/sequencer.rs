@@ -948,6 +948,12 @@ impl ManagedSequencer {
         self.rollups.mine_live_l1_blocks(block_count).await
     }
 
+    /// Mine one block at Anvil's own clock; see
+    /// [`DevnetRollupsStack::mine_l1_block_at_wall_clock`](crate::DevnetRollupsStack::mine_l1_block_at_wall_clock).
+    pub async fn mine_l1_block_at_wall_clock(&self) -> HarnessResult<()> {
+        self.rollups.mine_l1_block_at_wall_clock().await
+    }
+
     pub async fn l1_safe_block_number(&self) -> HarnessResult<u64> {
         self.rollups.l1_safe_block_number().await
     }
@@ -1538,7 +1544,7 @@ async fn spawn_sequencer_process(
                 ))
                 .into());
             }
-            let _ = rollups.mine_live_l1_blocks(1).await;
+            let _ = rollups.mine_l1_block_at_wall_clock().await;
             tokio::time::sleep(BOOT_L1_MINE_INTERVAL).await;
         }
     } else {
@@ -1628,7 +1634,7 @@ async fn spawn_sequencer_process(
                 // Transient RPC hiccups mid-boot are non-fatal — the next tick
                 // retries. A genuine mining failure manifests as the boot
                 // timing out, reported by the readiness arm.
-                let _ = rollups.mine_live_l1_blocks(1).await;
+                let _ = rollups.mine_l1_block_at_wall_clock().await;
             }
         };
         tokio::select! {
