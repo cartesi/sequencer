@@ -3,9 +3,7 @@
 
 //! Replay committed application history after launch, before processing new user ops.
 
-use std::path::PathBuf;
-
-use crate::storage::{HistoryReadError, L2TxContext, Storage};
+use crate::storage::{HistoryReadError, L2TxContext, Snapshot, Storage};
 use sequencer_core::application::{Application, execute_direct_input, execute_valid_user_op};
 use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
 
@@ -13,21 +11,11 @@ use super::error::CatchUpError;
 
 const DEFAULT_CATCH_UP_PAGE_SIZE: usize = 256;
 
-#[derive(Debug, Clone)]
-pub(super) struct CatchUpSnapshot {
-    pub(super) dump_dir: PathBuf,
-    pub(super) executed_input_count: ExecutedInputCount,
-}
-
-pub(super) fn catch_up_snapshot(storage: &mut Storage) -> Result<CatchUpSnapshot, CatchUpError> {
-    let snapshot = storage
+pub(super) fn catch_up_snapshot(storage: &mut Storage) -> Result<Snapshot, CatchUpError> {
+    storage
         .latest_snapshot()
         .map_err(|source| CatchUpError::LoadSnapshot { source })?
-        .ok_or(CatchUpError::NoSnapshot)?;
-    Ok(CatchUpSnapshot {
-        dump_dir: snapshot.dump.prefix,
-        executed_input_count: snapshot.executed_input_count,
-    })
+        .ok_or(CatchUpError::NoSnapshot)
 }
 
 pub(super) fn catch_up_application(
@@ -50,6 +38,10 @@ pub(super) fn catch_up_application_paged(
             storage: start.get(),
         });
     }
+    tracing::debug!(
+        executed_input_count = start.get(),
+        "inclusion lane resuming from snapshot"
+    );
     let bounds = storage
         .history_bounds()
         .map_err(|source| CatchUpError::LoadReplay {

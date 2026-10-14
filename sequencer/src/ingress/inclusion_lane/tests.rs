@@ -1282,7 +1282,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         checkpoint.executed_input_count,
         finalized_before.executed_input_count
     );
-    let mut restarted = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump_dir))
+    let mut restarted = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump.prefix))
         .expect("load surviving application checkpoint");
     assert_eq!(restarted.executed_input_count(), ExecutedInputCount::new(1));
     catch_up_application_paged(
@@ -1332,7 +1332,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     assert_eq!(user_seeds, vec![0x51, 0x53]);
 
     let mut restarted_again =
-        StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump_dir))
+        StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump.prefix))
             .expect("reload surviving checkpoint");
     catch_up_application_paged(
         &mut restarted_again,

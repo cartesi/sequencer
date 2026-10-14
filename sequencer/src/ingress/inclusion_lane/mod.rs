@@ -97,20 +97,8 @@ impl<A: Application + 'static> InclusionLane<A> {
             // can never drift apart.
             let checkpoint = catch_up_snapshot(&mut storage)
                 .map_err(|source| InclusionLaneError::CatchUp { source })?;
-            let app = A::from_dump(&dump_info::app_prefix(&checkpoint.dump_dir))
+            let app = A::from_dump(&dump_info::app_prefix(&checkpoint.dump.prefix))
                 .map_err(InclusionLaneError::LoadFromDump)?;
-            if app.executed_input_count() != checkpoint.executed_input_count {
-                return Err(InclusionLaneError::CatchUp {
-                    source: error::CatchUpError::SnapshotExecutionCountMismatch {
-                        application: app.executed_input_count().get(),
-                        storage: checkpoint.executed_input_count.get(),
-                    },
-                });
-            }
-            tracing::debug!(
-                executed_input_count = checkpoint.executed_input_count.get(),
-                "inclusion lane resuming from snapshot"
-            );
             let mut lane = Self {
                 rx,
                 shutdown,
