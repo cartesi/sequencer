@@ -31,7 +31,7 @@ license = "Apache-2.0"
 description = "Deterministic sequencer prototype with low-latency soft confirmations"
 homepage = "https://github.com/cartesi/sequencer"
 repository = "https://github.com/cartesi/sequencer"
-readme = "../README.md"
+readme = "README.md"
 authors = [
   "Gabriel Coutinho de Paula <gcdepaula@protonmail.com>",
   "Pedro Argento <pedro.argento@gmail.com>",
@@ -67,6 +67,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ssz = { package = "ethereum_ssz", version = "0.10" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.10" }
+tar = "0.4"
 tempfile = "3.10"
 thiserror = "2"
 tokio = "1.53"

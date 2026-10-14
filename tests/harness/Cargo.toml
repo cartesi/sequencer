@@ -19,7 +19,7 @@ futures-util = { workspace = true }
 k256 = { workspace = true }
 rusqlite = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
-tar = "0.4"
+tar = { workspace = true }
 toml = { workspace = true }
 sequencer-core = { path = "../../sequencer-core", features = ["test-support"] }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
