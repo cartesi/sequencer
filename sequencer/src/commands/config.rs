@@ -26,6 +26,12 @@ const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_DATA_DIR: &str = "sequencer-data";
 const DB_FILENAME: &str = "sequencer.db";
 
+/// Blocks a time-sealed batch needs after its open window to become
+/// safe-accepted before danger: its first frame trails the safe head by under
+/// one frame-clock interval (5), Ethereum's safe head trails inclusion by up to
+/// two epochs (64), and the rest covers submitter pickup, inclusion and the dump.
+const BATCH_SUBMISSION_MARGIN_BLOCKS: u64 = 100;
+
 /// Full path to the SQLite database file inside `data_dir`.
 pub fn db_path_in(data_dir: &str) -> String {
     std::path::Path::new(data_dir)
@@ -503,6 +509,8 @@ pub struct RunConfig {
     /// regardless of size — the liveness bound that caps batch-posting latency
     /// for a low-traffic deployment. Default 7200 (2h); operators trade latency
     /// against L1 cost, and tests set it small to seal batches promptly.
+    /// Rounded up to blocks at `--seconds-per-block`, it must leave a
+    /// submission margin below the danger threshold (validated at startup).
     #[arg(
         long,
         env = "CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS",
@@ -529,9 +537,26 @@ impl RunConfig {
         std::time::Duration::from_secs(self.max_batch_open_seconds)
     }
 
-    /// Build a validated [`ProtocolTiming`] from this config's tuning fields.
-    pub fn protocol_timing(&self) -> Result<ProtocolTiming, ProtocolTimingError> {
-        self.timing.protocol_timing()
+    /// Build a validated [`ProtocolTiming`] and refuse a batch-open window that
+    /// would carry a low-volume Tip into danger before it can be sealed,
+    /// submitted and safe-accepted.
+    pub fn protocol_timing(&self) -> Result<ProtocolTiming, BootstrapError> {
+        let timing = self.timing.protocol_timing()?;
+        // Rounding up counts a partial block against the operator.
+        let open_blocks = self
+            .max_batch_open_seconds
+            .div_ceil(timing.seconds_per_block);
+        let danger_threshold = timing.danger_threshold();
+        if open_blocks > danger_threshold.saturating_sub(BATCH_SUBMISSION_MARGIN_BLOCKS) {
+            return Err(BootstrapError::BatchOpenPastDanger {
+                max_batch_open_seconds: self.max_batch_open_seconds,
+                seconds_per_block: timing.seconds_per_block,
+                open_blocks,
+                danger_threshold,
+                margin_blocks: BATCH_SUBMISSION_MARGIN_BLOCKS,
+            });
+        }
+        Ok(timing)
     }
 
     /// Resolve the batch submitter private key from either the inline value or a key file.
@@ -988,6 +1013,119 @@ mod tests {
     #[test]
     fn run_default_l1_read_stale_after_blocks_is_600() {
         assert_eq!(run_config_from(&[]).timing.l1_read_stale_after_blocks, 600);
+    }
+
+    #[test]
+    fn run_bounds_batch_open_window_by_danger_threshold_less_submission_margin() {
+        // Defaults: danger_threshold 1200 - 300 = 900; budget 800 blocks = 9600 s at 12 s.
+        run_config_from(&[])
+            .protocol_timing()
+            .expect("default window fits");
+        run_config_from(&["--max-batch-open-seconds", "9600"])
+            .protocol_timing()
+            .expect("boundary window fits");
+        // 9601 s is 800.08 blocks; rounding up must refuse it.
+        let err = run_config_from(&["--max-batch-open-seconds", "9601"])
+            .protocol_timing()
+            .expect_err("one second past the budget must be refused");
+        assert!(
+            matches!(
+                err,
+                BootstrapError::BatchOpenPastDanger {
+                    max_batch_open_seconds: 9601,
+                    seconds_per_block: 12,
+                    open_blocks: 801,
+                    danger_threshold: 900,
+                    margin_blocks: 100,
+                }
+            ),
+            "{err:?}"
+        );
+        let err = run_config_from(&[
+            "--max-batch-open-seconds",
+            "18446744073709551615",
+            "--seconds-per-block",
+            "1",
+        ])
+        .protocol_timing()
+        .expect_err("an unbounded window must be refused without overflow");
+        assert!(
+            matches!(err, BootstrapError::BatchOpenPastDanger { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn run_refuses_every_batch_open_window_when_danger_threshold_is_below_the_margin() {
+        // danger_threshold 1200 - 1150 = 50 < 100: no window can land before danger.
+        let err = run_config_from(&[
+            "--preemptive-margin-blocks",
+            "1150",
+            "--l1-read-stale-after-blocks",
+            "10",
+            "--max-batch-open-seconds",
+            "1",
+        ])
+        .protocol_timing()
+        .expect_err("no budget remains");
+        assert!(
+            matches!(
+                err,
+                BootstrapError::BatchOpenPastDanger {
+                    open_blocks: 1,
+                    danger_threshold: 50,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn boundary_batch_open_window_seals_a_low_volume_tip_before_danger() {
+        use crate::storage::test_helpers::{SENDER_A, temp_db_with_default_deployment_identity};
+        use crate::storage::{DangerStatus, SafeInputRange, Storage};
+
+        let config = run_config_from(&["--max-batch-open-seconds", "9600"]);
+        let timing = config.protocol_timing().expect("boundary window fits");
+        let open_blocks = config
+            .max_batch_open_seconds
+            .div_ceil(timing.seconds_per_block);
+        // Worst case: the first frame trails the safe head by one block less
+        // than the frame-clock interval.
+        let frame_lag = ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS - 1;
+        let first_frame = 10;
+        let seal_safe_block = first_frame + frame_lag + open_blocks;
+
+        let db = temp_db_with_default_deployment_identity("batch-open-boundary");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut head = storage
+            .initialize_open_state(first_frame, SafeInputRange::empty_at(0))
+            .expect("open Tip");
+        let status_at = |storage: &mut Storage, safe_block: u64| {
+            storage
+                .append_safe_inputs(safe_block, &[], SENDER_A, &timing)
+                .expect("advance safe head");
+            storage
+                .check_danger(&timing, crate::clock::unix_now_ms())
+                .expect("check danger")
+        };
+
+        // Low volume: only the deadline seals the Tip, and it is not in danger yet.
+        assert_eq!(status_at(&mut storage, seal_safe_block), DangerStatus::Safe);
+        // Closure keeps the frame clock; the batch still ages from first_frame.
+        storage
+            .close_frame_and_batch(&mut head, first_frame)
+            .expect("seal by time");
+
+        // The sealed batch keeps the margin, less the frame lag, to become accepted.
+        let last_safe = first_frame + timing.danger_threshold() - 1;
+        assert_eq!(last_safe - seal_safe_block, 100 - frame_lag - 1);
+        assert_eq!(status_at(&mut storage, last_safe), DangerStatus::Safe);
+        assert_eq!(
+            status_at(&mut storage, last_safe + 1),
+            DangerStatus::ClosedBatchInDanger(0)
+        );
     }
 
     #[test]

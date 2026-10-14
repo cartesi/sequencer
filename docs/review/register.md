@@ -52,16 +52,6 @@ an earlier checkpoint or genesis. The [scheduler contract](../protocol/scheduler
 and [application contract](../protocol/application-contract.md) own the boundaries
 the implementation must update together.
 
-### Validate batch-open and danger timing together
-
-[`RunConfig`](../../sequencer/src/commands/config.rs) accepts any positive
-`max_batch_open_seconds`, while `protocol_timing()` validates only the separate
-timing fields. Incompatible settings can repeatedly recover a low-volume open
-batch before its seal deadline. Next: validate their relationship at the runtime
-configuration boundary, with checked units and an explicit submission margin;
-test refusal and a valid low-volume closure. This guard cannot guarantee timely
-L1 inclusion.
-
 ### Batch-size accounting omits SSZ overhead
 
 The lane estimates each operation as `71 + max_method_payload_bytes()`.

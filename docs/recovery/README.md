@@ -127,6 +127,14 @@ in [`TimingArgs`](../../sequencer/src/commands/config.rs): with `MAX_WAIT_BLOCKS
 1200 and margin 300, observed danger starts at age 900 blocks. Neither that
 margin nor the fee policy bounds the time required to finish recovery.
 
+A Tip ages from its first frame, so `run` also refuses a
+`max_batch_open_seconds` that, rounded up to blocks at `seconds_per_block`,
+exceeds the danger threshold minus `BATCH_SUBMISSION_MARGIN_BLOCKS`
+([`RunConfig`](../../sequencer/src/commands/config.rs)); otherwise a low-volume
+Tip reaches danger before it can be sealed, submitted and safe-accepted. The
+check assumes L1 blocks are no faster than `seconds_per_block` and does not
+bound inclusion time.
+
 ### When safe-head progress stops
 
 A responsive RPC endpoint can keep returning an old view. The detector uses

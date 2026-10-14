@@ -288,6 +288,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         // was never set up).
         BootstrapError::ChainIdMismatch { .. }
         | BootstrapError::InvalidProtocolTiming(_)
+        | BootstrapError::BatchOpenPastDanger { .. }
         | BootstrapError::FeeOracleMisconfig { .. }
         | BootstrapError::FeeOracleFatal { .. }
         | BootstrapError::SignerMisconfig { .. }
@@ -330,6 +331,21 @@ pub enum BootstrapError {
     /// See [`ProtocolTimingError`].
     #[error(transparent)]
     InvalidProtocolTiming(#[from] ProtocolTimingError),
+    /// `max_batch_open_seconds`, in blocks, leaves less than the submission
+    /// margin below the danger threshold, so a low-volume Tip would reach
+    /// danger before it can be sealed, submitted and safe-accepted.
+    #[error(
+        "max_batch_open_seconds ({max_batch_open_seconds}) spans {open_blocks} blocks at \
+         seconds_per_block ({seconds_per_block}); it must be at most danger_threshold \
+         ({danger_threshold}) minus the {margin_blocks}-block submission margin"
+    )]
+    BatchOpenPastDanger {
+        max_batch_open_seconds: u64,
+        seconds_per_block: u64,
+        open_blocks: u64,
+        danger_threshold: u64,
+        margin_blocks: u64,
+    },
     /// Setup-pinned fee oracle configuration or validation is invalid.
     #[error("fee oracle misconfiguration: {message}")]
     FeeOracleMisconfig { message: String },
@@ -1113,6 +1129,16 @@ mod tests {
                     },
                 )),
                 "invalid protocol timing",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::BatchOpenPastDanger {
+                    max_batch_open_seconds: 9601,
+                    seconds_per_block: 12,
+                    open_blocks: 801,
+                    danger_threshold: 900,
+                    margin_blocks: 100,
+                }),
+                "a batch-open window past the danger budget",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::Identity(IdentityError::OrphanedState)),
