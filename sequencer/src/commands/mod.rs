@@ -21,8 +21,6 @@ pub mod error;
 pub mod flush;
 pub mod run;
 pub mod setup;
-#[cfg(test)]
-pub(crate) mod test_support;
 
 pub use error::{
     BootstrapError, CommandError, IdentityError, SetupRecoveryError, SetupRefuse, WorkerExit,

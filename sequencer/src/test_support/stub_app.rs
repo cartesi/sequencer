@@ -1,6 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use sequencer_core::history::ExecutedInputCount;
 use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
 use sequencer_core::user_op::UserOp;
 
+use crate::ingress::inclusion_lane::dump_info::{self, create_dump_dir_with_info};
 use crate::runtime::shutdown::RuntimeScope;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,8 @@ pub(crate) struct StubApp {
     /// request lands after the loop's shutdown check and before the queue is
     /// read.
     pub(crate) shutdown_on_direct: Option<RuntimeScope>,
+    /// Not `Sync`, and no `Clone` derive: hosts must not require either.
+    pub(crate) not_sync: PhantomData<std::cell::Cell<()>>,
 }
 
 impl StubApp {
@@ -168,4 +172,18 @@ fn decode_progress(bytes: &[u8]) -> Result<ApplicationProgress, AppError> {
         ApplicationProgress::try_new(ExecutedInputCount::new(count), safe_block)
             .expect("coherent progress"),
     )
+}
+
+/// Mirror of the production dump layout: a structured directory with
+/// `info.toml` and the stub's dump under `state`.
+pub(crate) fn create_structured_dump(dump_dir: &Path) {
+    create_dump_dir_with_info(
+        &mut StubApp::default(),
+        dump_dir,
+        &dump_info::DumpInfo {
+            format_version: dump_info::FORMAT_VERSION,
+            next_batch_nonce: 0,
+        },
+    )
+    .expect("create structured dump");
 }

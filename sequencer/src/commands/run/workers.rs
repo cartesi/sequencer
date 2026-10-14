@@ -686,73 +686,8 @@ mod tests {
     use super::*;
     use crate::recovery::DangerDetectorError;
     use crate::storage::DangerStatus;
+    use crate::test_support::{StubApp, create_structured_dump};
     use clap::Parser;
-
-    #[derive(Default)]
-    struct StartupProbeApp {
-        _single_owner: std::cell::Cell<()>,
-        progress: sequencer_core::application::ApplicationProgress,
-    }
-
-    impl Application for StartupProbeApp {
-        fn max_method_payload_bytes() -> usize {
-            0
-        }
-
-        fn validate_user_op(
-            &self,
-            _sender: alloy_primitives::Address,
-            _user_op: &sequencer_core::user_op::UserOp,
-            _current_fee: u16,
-        ) -> Result<
-            sequencer_core::application::ValidationOutcome,
-            sequencer_core::application::AppError,
-        > {
-            Ok(sequencer_core::application::ValidationOutcome::Accept)
-        }
-
-        fn apply_valid_user_op(
-            &mut self,
-            _user_op: &sequencer_core::l2_tx::ValidUserOp,
-            safe_block: u64,
-        ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
-        {
-            self.progress.advance(safe_block);
-            Ok(Vec::new())
-        }
-
-        fn apply_direct_input(
-            &mut self,
-            input: &sequencer_core::l2_tx::DirectInput,
-        ) -> Result<sequencer_core::application::AppOutputs, sequencer_core::application::AppError>
-        {
-            self.progress.advance(input.block_number);
-            Ok(Vec::new())
-        }
-
-        fn progress(&self) -> sequencer_core::application::ApplicationProgress {
-            self.progress
-        }
-
-        fn from_dump(
-            _prefix: &std::path::Path,
-        ) -> Result<Self, sequencer_core::application::AppError> {
-            Ok(Self::default())
-        }
-
-        fn create_dump(
-            &mut self,
-            prefix: &std::path::Path,
-        ) -> Result<(), sequencer_core::application::AppError> {
-            std::fs::create_dir(prefix)?;
-            std::fs::write(prefix.join("state"), [])?;
-            Ok(())
-        }
-
-        fn state_file_in_dump(prefix: &std::path::Path) -> std::path::PathBuf {
-            prefix.join("state")
-        }
-    }
 
     // ── select!-arm `From<JoinResult>` conversions ──────────────────
     //
@@ -1006,7 +941,7 @@ mod tests {
         let (_dir, data_dir, _db_path, workers_config) =
             startup_workers_config(http_addr, "127.0.0.1:0".to_string());
 
-        let result = PreparedRuntime::<StartupProbeApp>::prepare(workers_config).await;
+        let result = PreparedRuntime::<StubApp>::prepare(workers_config).await;
         let err = match result {
             Ok(_) => panic!("occupied listener must refuse preparation"),
             Err(err) => err,
@@ -1033,7 +968,7 @@ mod tests {
         let (_dir, data_dir, _db_path, workers_config) =
             startup_workers_config("127.0.0.1:0".to_string(), internal_addr);
 
-        let err = match PreparedRuntime::<StartupProbeApp>::prepare(workers_config).await {
+        let err = match PreparedRuntime::<StubApp>::prepare(workers_config).await {
             Ok(_) => panic!("an occupied internal listener must refuse preparation"),
             Err(err) => err,
         };
@@ -1052,7 +987,7 @@ mod tests {
             startup_workers_config("127.0.0.1:0".to_string(), "127.0.0.1:0".to_string());
 
         let timing = workers_config.timing;
-        let prepared = PreparedRuntime::<StartupProbeApp>::prepare(workers_config)
+        let prepared = PreparedRuntime::<StubApp>::prepare(workers_config)
             .await
             .expect("runtime prepares");
         let admission = crate::recovery::admit_runtime(&db_path, &timing)
@@ -1084,7 +1019,7 @@ mod tests {
             startup_workers_config("127.0.0.1:0".to_string(), "127.0.0.1:0".to_string());
         let timing = workers_config.timing;
 
-        let prepared = PreparedRuntime::<StartupProbeApp>::prepare(workers_config)
+        let prepared = PreparedRuntime::<StubApp>::prepare(workers_config)
             .await
             .expect("runtime prepares");
 
@@ -1261,8 +1196,6 @@ mod tests {
         let _ = workers.finish(FirstExit::Signal(None)).await;
         panic!("terminal runtime returned instead of aborting");
     }
-
-    use crate::commands::test_support::create_structured_dump;
 
     #[test]
     fn detector_inner_error_maps_to_source_variant() {

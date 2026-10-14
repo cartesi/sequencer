@@ -77,7 +77,6 @@ fn write_baseline_dump<A: Application>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::SweepTestApp;
     use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig, InclusionLaneError};
     use crate::runtime::shutdown::RuntimeScope;
     use crate::storage::test_helpers::{pin_test_deployment_identity, temp_db};
@@ -160,7 +159,7 @@ mod tests {
         }
 
         fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {
-            <SweepTestApp as Application>::state_file_in_dump(prefix)
+            prefix.join("state")
         }
     }
 

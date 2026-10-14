@@ -147,8 +147,8 @@ mod tests {
 
     #[tokio::test]
     async fn completed_setup_does_not_construct_genesis_app() {
-        use crate::commands::test_support::SweepTestApp;
         use crate::storage::{LifecycleCommand, Storage};
+        use crate::test_support::StubApp;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -189,7 +189,7 @@ mod tests {
 
         let constructions = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&constructions);
-        let exit = run_command::<SweepTestApp, _>(cli.command, move || {
+        let exit = run_command::<StubApp, _>(cli.command, move || {
             observed.fetch_add(1, Ordering::SeqCst);
             Err(AppError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -213,7 +213,7 @@ mod tests {
     /// refuses before the key is read or any provider is built.
     #[tokio::test]
     async fn run_on_a_never_set_up_data_dir_exits_30() {
-        use crate::commands::test_support::SweepTestApp;
+        use crate::test_support::StubApp;
 
         let data_dir = tempfile::tempdir().expect("create data dir");
         let cli = Cli::try_parse_from([
@@ -232,14 +232,14 @@ mod tests {
         ])
         .expect("parse run");
 
-        let exit = dispatch::<SweepTestApp, _>(cli.command, || Ok(SweepTestApp)).await;
+        let exit = dispatch::<StubApp, _>(cli.command, || Ok(StubApp::default())).await;
 
         assert_eq!(exit, std::process::ExitCode::from(30));
     }
 
     #[tokio::test]
     async fn run_and_flush_on_a_missing_data_dir_exit_30_without_creating_it() {
-        use crate::commands::test_support::SweepTestApp;
+        use crate::test_support::StubApp;
 
         for command in ["run", "flush-mempool"] {
             let parent = tempfile::tempdir().expect("create parent dir");
@@ -256,7 +256,7 @@ mod tests {
             ])
             .expect("parse command");
 
-            let exit = dispatch::<SweepTestApp, _>(cli.command, || Ok(SweepTestApp)).await;
+            let exit = dispatch::<StubApp, _>(cli.command, || Ok(StubApp::default())).await;
 
             assert_eq!(exit, std::process::ExitCode::from(30), "{command}");
             assert!(

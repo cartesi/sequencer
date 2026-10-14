@@ -809,10 +809,10 @@ mod tests {
 
     #[test]
     fn checkpoint_load_requires_an_export_receipt_matching_the_artifact_and_block() {
-        use crate::commands::test_support::SweepTestApp;
+        use crate::test_support::StubApp;
         let dir = tempfile::tempdir().expect("checkpoint parent");
         let prefix = dir.path().join("checkpoint");
-        let mut app = SweepTestApp;
+        let mut app = StubApp::default();
         dump_info::create_dump_dir_with_info(
             &mut app,
             &prefix,
@@ -820,7 +820,7 @@ mod tests {
         )
         .expect("create artifact");
         assert!(matches!(
-            Checkpoint::<SweepTestApp>::load(&prefix, 10),
+            Checkpoint::<StubApp>::load(&prefix, 10),
             Err(SetupRecoveryError::CheckpointLoad { .. })
         ));
         let write_receipt = |nonce| {
@@ -837,15 +837,15 @@ mod tests {
         };
         write_receipt(4);
         assert!(matches!(
-            Checkpoint::<SweepTestApp>::load(&prefix, 10),
+            Checkpoint::<StubApp>::load(&prefix, 10),
             Err(SetupRecoveryError::CheckpointLoad { .. })
         ));
         write_receipt(3);
         assert!(matches!(
-            Checkpoint::<SweepTestApp>::load(&prefix, 11),
+            Checkpoint::<StubApp>::load(&prefix, 11),
             Err(SetupRecoveryError::CheckpointLoad { .. })
         ));
-        let checkpoint = Checkpoint::<SweepTestApp>::load(&prefix, 10).unwrap();
+        let checkpoint = Checkpoint::<StubApp>::load(&prefix, 10).unwrap();
         assert_eq!(
             (checkpoint.checkpoint_nonce, checkpoint.checkpoint_block),
             (3, 10)
@@ -854,10 +854,10 @@ mod tests {
 
     #[test]
     fn genesis_checkpoint_loads_and_has_an_empty_seed_interval() {
-        use crate::commands::test_support::SweepTestApp;
+        use crate::test_support::StubApp;
         let dir = tempfile::tempdir().expect("checkpoint parent");
         let prefix = dir.path().join("genesis");
-        let mut app = SweepTestApp;
+        let mut app = StubApp::default();
         dump_info::create_dump_dir_with_info(
             &mut app,
             &prefix,
@@ -874,7 +874,7 @@ mod tests {
             .unwrap(),
         )
         .expect("genesis receipt");
-        let checkpoint = Checkpoint::<SweepTestApp>::load(&prefix, 0).expect("load genesis export");
+        let checkpoint = Checkpoint::<StubApp>::load(&prefix, 0).expect("load genesis export");
         assert_eq!(checkpoint.executed_safe_block, checkpoint.checkpoint_block);
         let db = temp_db("genesis-checkpoint-seed");
         let mut storage = Storage::open(&db.path).expect("storage");
@@ -1111,7 +1111,7 @@ mod tests {
             };
             setup(
                 *config,
-                || -> Result<crate::commands::test_support::SweepTestApp, AppError> {
+                || -> Result<crate::test_support::StubApp, AppError> {
                     unreachable!("setup fails before building the genesis app")
                 },
             )

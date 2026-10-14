@@ -5,4 +5,4 @@
 
 mod stub_app;
 
-pub(crate) use stub_app::{ReplayEvent, StubApp};
+pub(crate) use stub_app::{ReplayEvent, StubApp, create_structured_dump};

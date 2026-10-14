@@ -132,7 +132,7 @@ fn dump_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::create_structured_dump;
+    use crate::test_support::create_structured_dump;
     use crate::storage::Storage;
     use crate::storage::test_helpers::temp_db;
 
