@@ -14,5 +14,6 @@ case $node in /uio@*) ;; *) fail "label '$1' is not an NVRAM ($node)" ;; esac
 start=$(od -An -v -tx1 -N8 "/proc/device-tree$node/reg" | tr -d ' \n')
 [ ${#start} -eq 16 ] || fail "cannot read reg of $node"
 set -- "/sys/devices/platform/$(printf '%x' "0x$start").uio/uio"/uio*
-[ $# -eq 1 ] && [ -e "$1" ] || fail "cannot find the uio device of $node"
+[ $# -eq 1 ] || fail "cannot find the uio device of $node"
+[ -e "$1" ] || fail "cannot find the uio device of $node"
 echo "/dev/${1##*/}"
