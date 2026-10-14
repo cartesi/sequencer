@@ -138,12 +138,28 @@ pub struct FeeResponse {
     pub suggested_max_fee: u16,
 }
 
+/// Smallest log-space exponent `n` such that `(129/128)^n >= 3/2`.
+///
+/// Signing slack for [`FeeResponse::quote`]: wallets may over-estimate
+/// `max_fee` because the user pays the frame fee, not the signed cap. 1.5×
+/// sits on top of `max(open-frame fee, recommended_fee)` so a quote can
+/// survive a frame rotation. Distinct from `batch_policy.log_slack` (the 10×
+/// DA margin already baked into both inputs).
+const SUGGESTED_MAX_FEE_SLACK: u16 = 53;
+
 impl FeeResponse {
     pub fn quote(fee: u16, recommended_fee: u16) -> Self {
+        let suggested_max_fee = match fee
+            .max(recommended_fee)
+            .checked_add(SUGGESTED_MAX_FEE_SLACK)
+        {
+            Some(sum) if sum <= crate::fee::MAX_EXPONENT => sum,
+            _ => crate::fee::MAX_EXPONENT,
+        };
         Self {
             fee,
             recommended_fee,
-            suggested_max_fee: crate::fee::suggested_signing_max_fee(fee, recommended_fee),
+            suggested_max_fee,
         }
     }
 }
@@ -226,6 +242,29 @@ fn parse_signature(bytes: &[u8]) -> Result<Signature, TxRequestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fee::{MAX_EXPONENT, fee_to_linear};
+    use alloy_primitives::U256;
+
+    #[test]
+    fn signing_slack_is_the_smallest_exponent_reaching_three_halves() {
+        assert_eq!(SUGGESTED_MAX_FEE_SLACK, 53);
+        // At this base the linear fees are about 3.3e13 units, so flooring is
+        // far below the 0.08% gap between (129/128)^52 and 3/2.
+        let base = 4000;
+        let three_halves = fee_to_linear(base) * U256::from(3u64);
+        let doubled = |exponent| fee_to_linear(exponent) * U256::from(2u64);
+        assert!(doubled(base + SUGGESTED_MAX_FEE_SLACK) >= three_halves);
+        assert!(doubled(base + SUGGESTED_MAX_FEE_SLACK - 1) < three_halves);
+    }
+
+    #[test]
+    fn quote_adds_the_slack_to_the_higher_input_and_clamps() {
+        let suggested = |fee, recommended| FeeResponse::quote(fee, recommended).suggested_max_fee;
+        assert_eq!(suggested(100, 200), 200 + SUGGESTED_MAX_FEE_SLACK);
+        assert_eq!(suggested(1000, 0), 1000 + SUGGESTED_MAX_FEE_SLACK);
+        assert_eq!(suggested(MAX_EXPONENT, 0), MAX_EXPONENT);
+        assert_eq!(suggested(MAX_EXPONENT - 1, MAX_EXPONENT - 10), MAX_EXPONENT);
+    }
 
     #[test]
     fn sender_parser_accepts_any_case_and_nothing_else() {

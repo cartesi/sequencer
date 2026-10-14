@@ -589,7 +589,7 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     -- Unix-ms of the last successful oracle (or Fixed setup) write.
     -- 0 means never written; completed setup guarantees a nonzero observation.
     log_gas_price_updated_at_ms INTEGER NOT NULL CHECK (log_gas_price_updated_at_ms >= 0),
-    -- log_{129/128}(10), rounded by log_fee_ratio(10, 1) = 296.
+    -- log_{129/128}(10) = 296, rounded to the nearest exponent.
     -- This tenfold price slack is applied in log space, not in the oracle.
     log_slack                INTEGER NOT NULL CHECK (log_slack >= 0),
 

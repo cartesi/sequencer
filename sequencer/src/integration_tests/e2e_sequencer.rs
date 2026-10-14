@@ -817,9 +817,8 @@ async fn api_quotes_open_frame_fee() {
         "bootstrapped recommended_fee matches the open-frame fee"
     );
     assert_eq!(
-        quoted.suggested_max_fee,
-        sequencer_core::fee::suggested_signing_max_fee(quoted.fee, quoted.recommended_fee),
-        "suggested_max_fee is max(fee, recommended_fee) plus signing slack"
+        quoted.suggested_max_fee, 1409,
+        "suggested_max_fee is max(1356, 1356) plus the 53-exponent signing slack"
     );
 
     runtime.shutdown().await;

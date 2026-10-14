@@ -658,6 +658,34 @@ fn batch_policy_check_rejects_unsafe_alpha() {
     );
 }
 
+/// The seeded `log_slack` is the exponent nearest a tenfold price slack, as
+/// its schema comment says.
+#[test]
+fn seeded_log_slack_is_the_exponent_nearest_tenfold() {
+    use alloy_primitives::U256;
+    use sequencer_core::fee::fee_to_linear;
+
+    let db = crate::test_support::temp_db("seeded-log-slack");
+    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let slack: u16 = storage
+        .conn
+        .query_row(
+            "SELECT log_slack FROM batch_policy WHERE singleton_id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read seeded log_slack");
+    // Nearest in log space: r^(2·slack−1) <= 10² < r^(2·slack+1), r = 129/128.
+    // At this base the linear fees are about 3.3e13 units, so flooring is far
+    // below the margins.
+    let base = 4000;
+    let raised = fee_to_linear(base + slack);
+    let raised_squared = raised * raised;
+    let hundredfold_base_squared = fee_to_linear(base) * fee_to_linear(base) * U256::from(100u64);
+    assert!(raised_squared * U256::from(128u64) <= hundredfold_base_squared * U256::from(129u64));
+    assert!(hundredfold_base_squared * U256::from(128u64) < raised_squared * U256::from(129u64));
+}
+
 #[test]
 fn schema_rejects_safe_input_update_and_delete() {
     let db = crate::test_support::temp_db("safe-inputs-append-only");
