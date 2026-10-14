@@ -287,8 +287,7 @@ test("config round-trips through config.json and keeps endpoints at run time", f
     eq(loaded.input_box_address, support.INPUT_BOX)
     eq(config.format_state_source(loaded.state_source), "range:state")
     assert(config.same_identity(document, config.persisted(cfg)))
-    -- A state directory initialized while range splits were keyed on error
-    -- codes still loads; the retired field is ignored.
+    -- A v2 config.json may carry fields config.load does not read; they are ignored.
     document.long_block_range_error_codes = { "-32005" }
     config.load("/var/lib/watchdog", document, {})
     raises("operator", "not a version 2 watchdog config", function()
