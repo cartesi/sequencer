@@ -4,44 +4,13 @@
 use crate::user_op::UserOp;
 use ssz_derive::{Decode, Encode};
 
-// ---------------------------------------------------------------------------
-// Gas-economics-derived batch sizing
-//
-// The InputBox contract charges roughly:
-//   total_gas ≈ base_gas + delta × payload_bytes
-//
-// We charge each user-op a DA fee of (1 + α) × δ per byte, where α amortizes
-// the base cost across the batch:
-//
-//   α × δ × n = base_gas   ⟹   n = base_gas / (α × δ)
-//
-// Choosing α (the overhead fraction) determines the batch size n in bytes.
-// All parameters live in the `batch_policy` SQLite singleton table so they
-// can be hot-swapped at runtime (see 0001_schema.sql). A CHECK constraint
-// on that table ensures batch_size_target < const_max_batch_bytes.
-//
-// Fee encoding:
-//   All fees are **log-space exponents** with base 129/128 (see `crate::fee`).
-//   An exponent N represents a linear fee of `(129/128)^N` smallest-token-units.
-//   Exponent 0 = 1 unit (minimum). No sentinel.
-//
-//   The DB computes `log_recommended_fee` via pure addition of log terms:
-//     log_recommended_fee = log_gas_price + log_slack + log_one_plus_alpha
-//                         + log_delta + log_user_op_bytes
-//
-//   The L1 fee oracle feeds `log_gas_price` directly in log space after
-//   converting L1 gas (base + priority) into fee-token smallest units via a
-//   pinned Uniswap V3 WETH/X TWAP. The tenfold safety margin is
-//   `batch_policy.log_slack`, not part of the oracle quote. Fee-token
-//   identity and decimals are application/deployment config (wallet
-//   prototype: USDC), not a sequencer-core invariant. Frame `fee_price` is
-//   sampled at frame open and stays immutable for that frame's lifetime.
-// ---------------------------------------------------------------------------
+// Frame fees and batch sizing are log-space DA charges; the formula and its
+// knobs live with `batch_policy` in sequencer/src/storage/migrations/0001_schema.sql.
 
 /// Batch submissions are sent as raw `ssz(Batch)` with no tag; classification is
 /// by `msg_sender` everywhere (sender == batch-submitter address ⇒ batch, any
-/// other sender ⇒ direct input) — never by decode-attempt. See AGENTS.md
-/// "InputBox payload classification".
+/// other sender ⇒ direct input) — never by decode-attempt. See
+/// docs/protocol/scheduler-semantics.md, "The one stream, the one classification".
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Batch {
