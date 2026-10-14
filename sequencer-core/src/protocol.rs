@@ -460,7 +460,7 @@ mod tests {
 
     const SUBMITTER: Address = Address::repeat_byte(0xAA);
     const OTHER: Address = Address::repeat_byte(0xBB);
-    const MAX_WAIT: u64 = 1200;
+    const MAX_WAIT: u64 = crate::MAX_WAIT_BLOCKS;
 
     fn timing() -> ProtocolTiming {
         ProtocolTiming {

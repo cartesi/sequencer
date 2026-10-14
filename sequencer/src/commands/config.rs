@@ -1001,9 +1001,15 @@ mod tests {
         assert_eq!(run_config_from(&[]).timing.l1_read_stale_after_blocks, 600);
     }
 
+    const _: () = assert!(
+        sequencer_core::MAX_WAIT_BLOCKS == 1200,
+        "batch-open window fixtures below assume the 1200-block window"
+    );
+
     #[test]
     fn run_bounds_batch_open_window_by_danger_threshold_less_submission_margin() {
-        // Defaults: danger_threshold 1200 - 300 = 900; budget 800 blocks = 9600 s at 12 s.
+        // Defaults: danger_threshold MAX_WAIT_BLOCKS (1200) - 300 = 900; budget 800 blocks =
+        // 9600 s at 12 s.
         run_config_from(&[])
             .protocol_timing()
             .expect("default window fits");
@@ -1043,7 +1049,8 @@ mod tests {
 
     #[test]
     fn run_refuses_every_batch_open_window_when_danger_threshold_is_below_the_margin() {
-        // danger_threshold 1200 - 1150 = 50 < 100: no window can land before danger.
+        // danger_threshold MAX_WAIT_BLOCKS (1200) - 1150 = 50 < 100: no window can land before
+        // danger.
         let err = run_config_from(&[
             "--preemptive-margin-blocks",
             "1150",

@@ -1156,8 +1156,8 @@ mod tests {
             (
                 CommandError::Bootstrap(BootstrapError::InvalidProtocolTiming(
                     ProtocolTimingError::MarginNotLessThanMaxWait {
-                        margin: 1200,
-                        max_wait: 1200,
+                        margin: sequencer_core::MAX_WAIT_BLOCKS,
+                        max_wait: sequencer_core::MAX_WAIT_BLOCKS,
                     },
                 )),
                 "invalid protocol timing",

@@ -189,19 +189,10 @@ fn map_storage_task_join(err: tokio::task::JoinError) -> DangerDetectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::SENDER_A;
+    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use crate::test_support::temp_db;
     use std::time::Duration;
-
-    fn test_protocol() -> ProtocolTiming {
-        ProtocolTiming {
-            max_wait_blocks: 1200,
-            preemptive_margin_blocks: 75,
-            l1_read_stale_after_blocks: 900,
-            seconds_per_block: 12,
-        }
-    }
 
     #[tokio::test]
     async fn exits_on_shutdown_when_safe() {
@@ -211,14 +202,14 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .append_safe_inputs(10, &[], SENDER_A, &test_protocol())
+            .append_safe_inputs(10, &[], SENDER_A, &default_protocol_timing())
             .expect("record fresh safe-head observation");
         drop(storage);
 
         let shutdown = ShutdownSignal::default();
         let detector = DangerDetector::new(
             db.path.clone(),
-            test_protocol(),
+            default_protocol_timing(),
             Duration::from_millis(50),
             ProcessLock::test(),
         );
@@ -250,7 +241,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close batch 1");
 
-        let protocol = test_protocol();
+        let protocol = default_protocol_timing();
         let landed = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
@@ -311,7 +302,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 100)
             .expect("close batch 1");
 
-        let protocol = test_protocol();
+        let protocol = default_protocol_timing();
         let landed = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
         storage
             .append_safe_inputs(
@@ -327,7 +318,8 @@ mod tests {
             .expect("append accepted batch 0");
 
         // Observed check: batch 1's first_frame_safe_block = 100, current
-        // safe = 1200. age = 1100 < danger_threshold (1125), so observed
+        // safe = 1200. age = 1100 < danger_threshold (MAX_WAIT_BLOCKS 1200 -
+        // margin 75 = 1125), so observed
         // closed-batch danger would NOT fire.
         //
         // Rewind synced_at_ms by 25 blocks' worth of wall-clock time so the

@@ -7,7 +7,6 @@
 //! in writer discipline.
 
 use rusqlite::params;
-use sequencer_core::protocol::ProtocolTiming;
 
 use super::super::test_helpers::{
     RecoveryFixture, SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
@@ -603,12 +602,7 @@ fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
 
     // Reads stay usable on a frozen DB: the danger check must still
     // classify the divergence (the boot-refusal path depends on it).
-    let protocol = ProtocolTiming {
-        max_wait_blocks: 1200,
-        preemptive_margin_blocks: 75,
-        l1_read_stale_after_blocks: 900,
-        seconds_per_block: 12,
-    };
+    let protocol = default_protocol_timing();
     let status = storage
         .check_danger(&protocol, 1_000_000)
         .expect("check danger on a frozen DB");

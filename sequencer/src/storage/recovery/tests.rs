@@ -722,7 +722,8 @@ mod tip_staleness {
     #[test]
     fn open_batch_stale_by_current_safe_block_is_invalidated() {
         // Scenario: sequencer opened batch 0 at safe_block=10, never closed it,
-        // then stayed down until safe advanced to 1500 (>1200 past safe_block).
+        // then stayed down until safe advanced to 1500 (>= the 1200-block threshold
+        // past safe_block).
         // Recovery must invalidate the open batch.
         let (_db, mut storage) = open_temp_storage("open-batch-stale");
 
@@ -732,7 +733,7 @@ mod tip_staleness {
 
         // Advance the safe head so the open batch's first frame (safe_block=10)
         // is now stale: 1500 - 10 >= 1200.
-        storage.advance_safe_head(1500); // advance safe head past MAX_WAIT_BLOCKS
+        storage.advance_safe_head(1500); // advance safe head past the 1200-block danger threshold
 
         let invalidated = storage
             .recover_aging_tip(1200)
@@ -789,7 +790,7 @@ mod tip_staleness {
 
     #[test]
     fn open_batch_exactly_at_threshold_is_invalidated() {
-        // Boundary: 1210 - 10 = 1200, which is >= MAX_WAIT_BLOCKS.
+        // Boundary: 1210 - 10 = 1200, which is >= the danger_threshold argument (1200).
         // The staleness comparison is `>=`, so this must invalidate.
         let (_db, mut storage) = open_temp_storage("open-batch-boundary");
 
