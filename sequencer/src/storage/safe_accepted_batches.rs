@@ -143,12 +143,7 @@ pub(super) fn populate_safe_accepted_batches(
                               (safe_input_index, nonce, first_frame_safe_block, inclusion_block) \
                               VALUES (?1, ?2, ?3, ?4)";
 
-    // A persisted divergence marker freezes the acceptance frontier: the
-    // local batch tree is no longer a reliable mirror of canonical state,
-    // and advancing it would compound the divergence.
-    // `check_danger` reports `CanonicalDivergence` ahead of every other arm,
-    // so the detector exits / startup refuses; the remedy is cockroach
-    // recovery, never standard recovery.
+    // A persisted divergence marker freezes the acceptance frontier (I15).
     if canonical_divergence_in(conn)?.is_some() {
         return Ok(());
     }

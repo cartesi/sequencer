@@ -34,52 +34,25 @@ use super::queries::{
 use super::safe_accepted_batches::{canonical_divergence_in, frontier_nonce};
 use super::snapshot_dumps::has_rollback_safe_snapshot_in;
 
-/// Outcome of a danger-zone check.
-///
-/// Each variant maps to a distinct response in the startup recovery procedure:
-///
-/// - `L1ViewStale` → retry boot. The L1 safe block is too old or unknown.
-/// - `ClosedBatchInDanger(closed_idx)` → Flush → Sync → Cascade.
-/// - `TipInDanger(tip_idx)` → direct Tip recovery, no flush. The Tip has no L1
-///   footprint, so we can invalidate it and open a fresh one without
-///   any L1 round-trip.
-/// - `EstimatedBatchInDanger(idx)` → retry boot. The observed safe block is
-///   still below the danger threshold, but wall-clock time since the last
-///   safe-head advance has consumed the batch's remaining runway.
-/// - `Safe` → admit when a Tip exists, otherwise run `EnsureOpenTip` and
-///   re-inspect.
-///
-/// The runtime danger detector treats every non-`Safe` variant as
-/// "exit for recovery" — the difference between them only matters at the
-/// next startup, where the dispatch differs.
+/// Outcome of [`Storage::check_danger`]. The runtime detector exits on any
+/// non-`Safe` variant; startup maps each variant to one action
+/// (`docs/recovery/README.md`, "Lifecycle and startup dispatch").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DangerStatus {
-    /// No danger detected — none of the checks tripped.
+    /// No check tripped.
     Safe,
-    /// A fully-accepted L1 landing failed the content-identity check:
-    /// canonical state contains executed effects with no
-    /// reliable local source. Carries the diverged batch nonce. Ranked
-    /// ahead of every other arm so the respawn loop can never route a
-    /// diverged node into a provider call, mutation, or admission. The remedy
-    /// is cockroach recovery (wipe + rebuild from L1), never standard recovery.
+    /// An accepted landing failed the content-identity check (I15); carries the
+    /// diverged batch nonce. Only cockroach recovery clears it.
     CanonicalDivergence(u64),
-    /// L1 safe-head timestamp is too old/unknown, or the current clock
-    /// predates one of the persisted safety baselines. Recovery cannot reason
-    /// from the local L1 view, so startup must retry.
+    /// The safe-block timestamp is missing or too old, or the local clock is a
+    /// block-time or more behind a persisted baseline.
     L1ViewStale,
-    /// Observed-safe check tripped on a *closed* batch past the
-    /// accepted frontier: aged beyond `protocol.danger_threshold()` against
-    /// the observed safe block. L1 view is fresh; flushing and cascading is
-    /// meaningful.
+    /// A closed batch past the accepted frontier is past the danger threshold at
+    /// the observed safe block.
     ClosedBatchInDanger(u64),
-    /// Observed-safe check tripped on the open *Tip*: aged beyond
-    /// `protocol.danger_threshold()` against the observed safe block, but
-    /// no closed batch is in danger. L1 view is fresh; the Tip has no L1
-    /// footprint, so direct recovery (no flush) is correct.
+    /// The open Tip is past the danger threshold and no closed batch is.
     TipInDanger(u64),
-    /// Batch-relative wall-clock estimate tripped after the global L1 view
-    /// freshness check passed. We refuse rather than recover because the batch
-    /// only crossed danger in estimated time, not observed safe-state.
+    /// A batch is past the threshold only by wall-clock estimate.
     EstimatedBatchInDanger(u64),
 }
 

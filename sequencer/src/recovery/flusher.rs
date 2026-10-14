@@ -120,16 +120,9 @@ fn send_failures_error(failures: &[(u64, String)]) -> FlushError {
 }
 
 impl MempoolFlusher {
-    /// Build a flusher over `providers` plus the DB-backed watermark sink, run
-    /// the watermark-anchored flush, and return the observed safe block `C`.
-    ///
-    /// This is the flush-acquire core shared by all three keyed-flush sites
-    /// (`setup --recovery`, the runtime danger path, and `flush-mempool`). They
-    /// differ only in where the signing key, submitter address, and watermark
-    /// come from, and in the surrounding error type — so callers resolve those
-    /// (provider creation keeps each site's own error mapping; the returned
-    /// [`FlushError`] maps into `CommandError`/`RecoveryError` via the existing
-    /// `From` impls) and this owns the sink build + `flush_and_wait`.
+    /// Build a flusher over `providers` with the DB-backed watermark sink, run
+    /// [`Self::flush_and_wait`], and return the observed safe block `C`. Callers
+    /// supply the key, submitter address and watermark, and map [`FlushError`].
     pub(crate) async fn flush_to_safe(
         providers: KeyedProviders,
         submitter_address: Address,
