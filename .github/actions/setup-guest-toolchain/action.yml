@@ -6,6 +6,10 @@ inputs:
     description: "Whether to install Foundry (for anvil)"
     required: false
     default: "false"
+  cache:
+    description: "Restore and save the Rust build cache and the QEMU binfmt image cache (release builds pass false)"
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -62,6 +66,8 @@ runs:
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      with:
+        cache-image: ${{ inputs.cache }}
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -73,6 +79,7 @@ runs:
       run: rustup set profile minimal && rustup toolchain install
 
     - name: Cache Rust artifacts
+      if: inputs.cache == 'true'
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install Foundry

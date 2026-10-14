@@ -1,6 +1,7 @@
 # Release workflow: git tag v* builds wallet-sequencer tarballs, CM images, and pushes
 # watchdog OCI images to ghcr.io + docker.io (requires DOCKERHUB_USERNAME /
 # DOCKERHUB_TOKEN org or repo secrets, same as cartesi/cli).
+# Release builds start cold: no step restores a cache that other refs wrote.
 
 name: Release
 
@@ -72,9 +73,6 @@ jobs:
           rustup set profile minimal
           rustup toolchain install
           rustup target add ${{ matrix.target }}
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cross
         uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
@@ -148,6 +146,8 @@ jobs:
 
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
+        with:
+          cache: "false"
 
       - name: Download canonical app deps
         run: just canonical download-deps
@@ -206,6 +206,8 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          cache-image: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -245,8 +247,6 @@ jobs:
             CARTESI_MACHINE_VERSION=${{ env.CARTESI_MACHINE_VERSION }}
             CARTESI_MACHINE_DEB_SHA256_AMD64=${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
             CARTESI_MACHINE_DEB_SHA256_ARM64=${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   publish:
     name: Publish GitHub Release
