@@ -12,8 +12,9 @@
 //! submits. `flush-mempool` is a keyed operator tool that settles the wallet
 //! nonce on demand.
 //!
-//! Shared, drift-prone arg groups (`TimingArgs`, `KeyArgs`) are flattened into
-//! the per-subcommand configs so defaults and env-var names stay consistent.
+//! Shared, drift-prone arg groups (`L1RpcArgs`, `TimingArgs`, `KeyArgs`) are
+//! flattened into the per-subcommand configs so defaults and env-var names
+//! stay consistent.
 
 use alloy_primitives::Address;
 use clap::{ArgGroup, Args};
@@ -39,6 +40,24 @@ pub fn db_path_in(data_dir: &str) -> String {
         .join(DB_FILENAME)
         .to_string_lossy()
         .into_owned()
+}
+
+/// L1 RPC endpoint, shared by setup, run and flush-mempool.
+#[derive(Debug, Clone, Args)]
+pub struct L1RpcArgs {
+    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", hide_env_values = true, value_parser = parse_non_empty_string)]
+    pub eth_rpc_url: String,
+    /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
+    /// private network (Docker/K8s service name, `host.docker.internal`, a
+    /// private-VPC IP) where anvil-style plaintext is normal. Off by default:
+    /// the provider refuses remote plaintext otherwise, guarding against
+    /// accidentally sending L1 traffic over the public internet in the clear.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_ALLOW_INSECURE_RPC",
+        default_value_t = false
+    )]
+    pub allow_insecure_rpc: bool,
 }
 
 /// Protocol-timing tuning knobs shared by `setup` and `run`. `setup` needs a
@@ -351,19 +370,8 @@ impl OptionalKeyArgs {
 pub struct SetupConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
     pub data_dir: String,
-    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", hide_env_values = true, value_parser = parse_non_empty_string)]
-    pub eth_rpc_url: String,
-    /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
-    /// private network (Docker/K8s service name, `host.docker.internal`, a
-    /// private-VPC IP) where anvil-style plaintext is normal. Off by default:
-    /// the provider refuses remote plaintext otherwise, guarding against
-    /// accidentally sending L1 traffic over the public internet in the clear.
-    #[arg(
-        long,
-        env = "CARTESI_SEQUENCER_ALLOW_INSECURE_RPC",
-        default_value_t = false
-    )]
-    pub allow_insecure_rpc: bool,
+    #[command(flatten)]
+    pub rpc: L1RpcArgs,
     /// Expected chain ID. Validated against the RPC at setup and pinned.
     #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_ID")]
     pub chain_id: u64,
@@ -478,19 +486,8 @@ pub struct RunConfig {
     pub internal_http_addr: String,
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
     pub data_dir: String,
-    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", hide_env_values = true, value_parser = parse_non_empty_string)]
-    pub eth_rpc_url: String,
-    /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
-    /// private network (Docker/K8s service name, `host.docker.internal`, a
-    /// private-VPC IP) where anvil-style plaintext is normal. Off by default:
-    /// the provider refuses remote plaintext otherwise, guarding against
-    /// accidentally sending L1 traffic over the public internet in the clear.
-    #[arg(
-        long,
-        env = "CARTESI_SEQUENCER_ALLOW_INSECURE_RPC",
-        default_value_t = false
-    )]
-    pub allow_insecure_rpc: bool,
+    #[command(flatten)]
+    pub rpc: L1RpcArgs,
     #[command(flatten)]
     key: KeyArgs,
 
@@ -578,19 +575,8 @@ impl RunConfig {
 pub struct FlushConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
     pub data_dir: String,
-    #[arg(long, env = "CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT", hide_env_values = true, value_parser = parse_non_empty_string)]
-    pub eth_rpc_url: String,
-    /// Allow plaintext (`http://`) RPC to a non-loopback host — a trusted
-    /// private network (Docker/K8s service name, `host.docker.internal`, a
-    /// private-VPC IP) where anvil-style plaintext is normal. Off by default:
-    /// the provider refuses remote plaintext otherwise, guarding against
-    /// accidentally sending L1 traffic over the public internet in the clear.
-    #[arg(
-        long,
-        env = "CARTESI_SEQUENCER_ALLOW_INSECURE_RPC",
-        default_value_t = false
-    )]
-    pub allow_insecure_rpc: bool,
+    #[command(flatten)]
+    pub rpc: L1RpcArgs,
     #[command(flatten)]
     key: KeyArgs,
     /// Assumed L1 block time in seconds; sets the flusher's confirmation /

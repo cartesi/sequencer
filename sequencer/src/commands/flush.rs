@@ -62,10 +62,10 @@ async fn flush_mempool_admitted(
     // terminal (operator misconfig), an RPC error retryable (flush needs L1
     // reachable anyway).
     let providers = crate::l1::provider::create_verified_keyed_providers(
-        &config.eth_rpc_url,
+        &config.rpc.eth_rpc_url,
         key.expose_secret(),
         identity.chain_id,
-        config.allow_insecure_rpc,
+        config.rpc.allow_insecure_rpc,
     )
     .await
     .map_err(CommandError::from)?;

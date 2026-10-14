@@ -105,15 +105,15 @@ where
     // The chain check comes first, so a wrong-chain endpoint is reported as
     // such rather than as a missing contract.
     validate_rpc_chain_id(
-        &config.eth_rpc_url,
+        &config.rpc.eth_rpc_url,
         config.chain_id,
-        config.allow_insecure_rpc,
+        config.rpc.allow_insecure_rpc,
     )
     .await?;
 
     let input_reader_config = InputReaderConfig {
-        rpc_url: config.eth_rpc_url.clone(),
-        allow_insecure_rpc: config.allow_insecure_rpc,
+        rpc_url: config.rpc.eth_rpc_url.clone(),
+        allow_insecure_rpc: config.rpc.allow_insecure_rpc,
         app_address: config.app_address,
         poll_interval: super::INPUT_READER_POLL_INTERVAL,
         // `validate_rpc_chain_id` above checked this against the live RPC; the
@@ -123,7 +123,8 @@ where
     // Safe is sampled before discovery reads the deployment block at latest: a
     // later sample could approve a deployment that a reorg in between moved.
     let discovered = async {
-        let safe_block = sample_safe_block(&config.eth_rpc_url, config.allow_insecure_rpc).await?;
+        let safe_block =
+            sample_safe_block(&config.rpc.eth_rpc_url, config.rpc.allow_insecure_rpc).await?;
         let reader = InputReader::new(
             db_path.clone(),
             input_reader_config,
@@ -174,8 +175,8 @@ where
             // Setup requires L1: transient and misconfig both abort before
             // anything pins.
             let (provider, token) = crate::l1::fee_oracle::connect_uniswap(
-                &config.eth_rpc_url,
-                config.allow_insecure_rpc,
+                &config.rpc.eth_rpc_url,
+                config.rpc.allow_insecure_rpc,
                 uniswap,
             )
             .await?;
@@ -309,10 +310,10 @@ where
         // content-identity check (CanonicalDivergence → cockroach recovery).
         let synced_safe_block = storage.current_safe_block()?;
         let nonce_views = read_submitter_nonce_views(
-            &config.eth_rpc_url,
+            &config.rpc.eth_rpc_url,
             config.batch_submitter_address,
             synced_safe_block,
-            config.allow_insecure_rpc,
+            config.rpc.allow_insecure_rpc,
         )
         .await?;
         run_detection_gate(
@@ -660,10 +661,10 @@ async fn flush_wallet_nonce(
     // signer (the earlier `validate_rpc_chain_id` may have gone stale). Same
     // guarded constructor the runtime flush and `flush-mempool` use.
     let providers = crate::l1::provider::create_verified_keyed_providers(
-        &config.eth_rpc_url,
+        &config.rpc.eth_rpc_url,
         key.expose_secret(),
         config.chain_id,
-        config.allow_insecure_rpc,
+        config.rpc.allow_insecure_rpc,
     )
     .await
     .map_err(CommandError::from)?;

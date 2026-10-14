@@ -888,7 +888,7 @@ mod tests {
         };
         let input_reader = InputReader::from_parts(
             crate::l1::reader::InputReaderConfig {
-                rpc_url: run_config.eth_rpc_url.clone(),
+                rpc_url: run_config.rpc.eth_rpc_url.clone(),
                 allow_insecure_rpc: false,
                 app_address: identity.app_address,
                 poll_interval: crate::commands::INPUT_READER_POLL_INTERVAL,
@@ -903,7 +903,7 @@ mod tests {
         );
         let l1_config = L1Config {
             identity,
-            eth_rpc_url: run_config.eth_rpc_url.clone(),
+            eth_rpc_url: run_config.rpc.eth_rpc_url.clone(),
             batch_submitter_private_key: crate::l1::SubmitterKey::new(KEY.to_string()),
             allow_insecure_rpc: false,
         };

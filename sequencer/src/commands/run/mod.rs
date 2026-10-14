@@ -72,9 +72,9 @@ where
     // exactly one route to the pinned values exists below this gate.
     let l1_config = L1Config {
         identity,
-        eth_rpc_url: config.eth_rpc_url.clone(),
+        eth_rpc_url: config.rpc.eth_rpc_url.clone(),
         batch_submitter_private_key: key,
-        allow_insecure_rpc: config.allow_insecure_rpc,
+        allow_insecure_rpc: config.rpc.allow_insecure_rpc,
     };
 
     let result = run_admitted::<A>(config, timing, l1_config, process_lock.clone()).await;
@@ -116,8 +116,8 @@ where
     // the pinned InputBox address + app deployment block and syncs incrementally.
     let mut input_reader = InputReader::from_parts(
         InputReaderConfig {
-            rpc_url: config.eth_rpc_url.clone(),
-            allow_insecure_rpc: config.allow_insecure_rpc,
+            rpc_url: config.rpc.eth_rpc_url.clone(),
+            allow_insecure_rpc: config.rpc.allow_insecure_rpc,
             app_address: l1_config.identity.app_address,
             poll_interval: INPUT_READER_POLL_INTERVAL,
             expected_chain_id: l1_config.identity.chain_id,
@@ -181,8 +181,8 @@ where
                 twap_window_secs,
             };
             let provider = crate::l1::provider::create_read_provider(
-                &config.eth_rpc_url,
-                config.allow_insecure_rpc,
+                &config.rpc.eth_rpc_url,
+                config.rpc.allow_insecure_rpc,
             )
             .map_err(crate::l1::fee_oracle::worker::FeeOracleError::Misconfig)?;
             let token = crate::l1::fee_oracle::UniswapV3PriceSource::from_setup_validated(
