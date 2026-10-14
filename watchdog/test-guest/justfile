@@ -24,7 +24,7 @@ default:
 
 build-guest:
     mkdir -p {{out_dir}}
-    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_TARGET_DIR={{target_dir}} CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --package watchdog-test-guest --bins --target {{target}} --release
+    SOURCE_DATE_EPOCH={{source_date_epoch}} CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_TARGET_DIR={{target_dir}} CROSS_CONFIG=Cross.toml DOCKER_DEFAULT_PLATFORM=linux/amd64 cross build --locked --package watchdog-test-guest --bins --target {{target}} --release
     cp {{target_dir}}/{{target}}/release/watchdog-test-guest {{dapp_binary}}
     cp {{target_dir}}/{{target}}/release/xhalt {{xhalt_binary}}
 
