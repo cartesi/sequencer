@@ -45,7 +45,8 @@ trolley = { version = "0.1", path = "sdk/guest/trolley" }
 testsi = { version = "0.1", path = "sdk/guest/testsi" }
 rollups-types = { version = "0.1", path = "sdk/guest/rollups-types" }
 
-# ── Contracts (exact pin — the single place the version lives) ──
+# ── Contracts (exact pin; equals ROLLUPS_CONTRACTS_VERSION in toolchain-pins.env,
+#    checked by scripts/verify-toolchain-pins.sh) ──
 cartesi-rollups-contracts = "=3.0.0-alpha.10"
 
 # ── Alloy family (must stay on the 2.x line: the contracts crate

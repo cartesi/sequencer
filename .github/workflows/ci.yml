@@ -57,7 +57,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: v1.5.1
+          version: ${{ env.FOUNDRY_VERSION }}
 
       - name: Build
         run: cargo build --workspace --all-targets --locked
@@ -116,13 +116,6 @@ jobs:
 
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
-        with:
-          xgenext2fs-version: ${{ env.XGENEXT2FS_VERSION }}
-          xgenext2fs-sha256-amd64: ${{ env.XGENEXT2FS_SHA256_AMD64 }}
-          xgenext2fs-sha256-arm64: ${{ env.XGENEXT2FS_SHA256_ARM64 }}
-          cartesi-machine-version: ${{ env.CARTESI_MACHINE_VERSION }}
-          cartesi-machine-sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
-          cartesi-machine-sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
 
       - name: Download canonical app deps
         run: just canonical download-deps
@@ -145,12 +138,6 @@ jobs:
       - name: Setup guest toolchain
         uses: ./.github/actions/setup-guest-toolchain
         with:
-          xgenext2fs-version: ${{ env.XGENEXT2FS_VERSION }}
-          xgenext2fs-sha256-amd64: ${{ env.XGENEXT2FS_SHA256_AMD64 }}
-          xgenext2fs-sha256-arm64: ${{ env.XGENEXT2FS_SHA256_ARM64 }}
-          cartesi-machine-version: ${{ env.CARTESI_MACHINE_VERSION }}
-          cartesi-machine-sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
-          cartesi-machine-sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
           install-foundry: "true"
 
       - name: Install native test dependencies

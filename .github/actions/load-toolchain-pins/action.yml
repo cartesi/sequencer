@@ -6,4 +6,4 @@ runs:
   steps:
     - name: Load toolchain-pins.env
       shell: bash
-      run: bash scripts/load-toolchain-pins.sh "${GITHUB_ENV}"
+      run: grep -E '^[A-Z][A-Z0-9_]*=' toolchain-pins.env >> "${GITHUB_ENV}"

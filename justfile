@@ -11,9 +11,10 @@ mod bench 'tests/benchmarks/justfile'
 # The pre-deployed Anvil state published by the rollups-contracts release,
 # plus the forge-built MockERC20 fixture. Consumed by tests/harness — and
 # through it e2e, benchmarks, and the watchdog compare harness — so the
-# pins and the setup recipe live here at the root, not in any one consumer.
-rollups_contracts_version := "3.0.0-alpha.10"
-anvil_dump_name := "cartesi-rollups-contracts-" + rollups_contracts_version + "-anvil-1.5.1"
+# setup recipe lives here at the root; the versions come from toolchain-pins.env.
+rollups_contracts_version := `grep '^ROLLUPS_CONTRACTS_VERSION=' toolchain-pins.env | cut -d= -f2`
+anvil_version := `sed -n 's/^FOUNDRY_VERSION=v//p' toolchain-pins.env`
+anvil_dump_name := "cartesi-rollups-contracts-" + rollups_contracts_version + "-anvil-" + anvil_version
 anvil_dump_dir := "tests/.deps/" + anvil_dump_name
 anvil_dump_tar := "tests/.deps/" + anvil_dump_name + ".tar.gz"
 anvil_dump_url := "https://github.com/cartesi/rollups-contracts/releases/download/v" + rollups_contracts_version + "/" + anvil_dump_name + ".tar.gz"

@@ -1,75 +1,43 @@
 #!/usr/bin/env bash
-# Fail if toolchain-pins.env drifts from other pinned artifacts in-tree.
+# Fail when an in-tree copy of a toolchain-pins.env version drifts. Files that
+# can read the pins (workflows, justfiles) do; this checks those that cannot:
+# Cargo.toml, Rust constants, Dockerfile ARG defaults and vendoring provenance.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pins="${root}/toolchain-pins.env"
 
-if [[ ! -f "${pins}" ]]; then
-  echo "missing ${pins}" >&2
+# load-toolchain-pins appends KEY=value lines to $GITHUB_ENV verbatim.
+if grep -nvE '^(#.*|[A-Z][A-Z0-9_]*=[^[:space:]#]+)?$' "${pins}"; then
+  echo "toolchain-pins.env: the lines above are not KEY=value" >&2
   exit 1
 fi
-
 # shellcheck disable=SC1090
-set -a
 source "${pins}"
-set +a
 
 errors=0
+fail() { echo "$1" >&2; errors=$((errors + 1)); }
+# require FILE TEXT: the repo-relative FILE must contain TEXT verbatim.
+require() { grep -qF -- "$2" "${root}/$1" || fail "$1 does not contain: $2"; }
 
-fail() {
-  echo "$1" >&2
-  errors=$((errors + 1))
-}
+[[ "${CARTESI_LINUX_IMAGE_RELEASE}" == "${CARTESI_MACHINE_VERSION}" ]] \
+  || fail "CARTESI_LINUX_IMAGE_RELEASE must equal CARTESI_MACHINE_VERSION"
+[[ "${CARTESI_LINUX_KERNEL_FILENAME}" == *"${CARTESI_LINUX_IMAGE_RELEASE}"* ]] \
+  || fail "CARTESI_LINUX_KERNEL_FILENAME must name ${CARTESI_LINUX_IMAGE_RELEASE}"
+[[ "${CARTESI_LINUX_KERNEL_SHA512}" =~ ^[0-9a-f]{128}$ ]] \
+  || fail "CARTESI_LINUX_KERNEL_SHA512 must be 128 lowercase hex characters"
 
-if [[ "${CARTESI_LINUX_IMAGE_RELEASE}" != "${CARTESI_MACHINE_VERSION}" ]]; then
-  fail "CARTESI_LINUX_IMAGE_RELEASE=${CARTESI_LINUX_IMAGE_RELEASE} != CARTESI_MACHINE_VERSION=${CARTESI_MACHINE_VERSION}"
-fi
+require Cargo.toml "cartesi-rollups-contracts = \"=${ROLLUPS_CONTRACTS_VERSION}\""
+require tests/harness/src/paths.rs \
+  "cartesi-rollups-contracts-${ROLLUPS_CONTRACTS_VERSION}-anvil-${FOUNDRY_VERSION#v}\""
 
-expected_assert_version="${CARTESI_MACHINE_VERSION#v}"
-if [[ "${CARTESI_LINUX_KERNEL_FILENAME}" != *"${CARTESI_LINUX_IMAGE_RELEASE}"* ]]; then
-  fail "CARTESI_LINUX_KERNEL_FILENAME=${CARTESI_LINUX_KERNEL_FILENAME} does not include ${CARTESI_LINUX_IMAGE_RELEASE}"
-fi
+for dockerfile in examples/canonical-app/Dockerfile watchdog/test-guest/Dockerfile; do
+  require "${dockerfile}" "ARG MACHINE_EMULATOR_TOOLS_VERSION=${MACHINE_GUEST_TOOLS_VERSION}"
+done
+tools_sha="$(grep '^ARG TOOLS_SHA512=' "${root}/examples/canonical-app/Dockerfile")"
+require watchdog/test-guest/Dockerfile "${tools_sha}"
+require sdk/guest/README.md "refs/tags/v${MACHINE_GUEST_TOOLS_VERSION}.tar.gz"
+require sdk/guest/libcmt-sys/Cargo.toml "machine-guest-tools v${MACHINE_GUEST_TOOLS_VERSION}"
 
-if [[ ! "${CARTESI_LINUX_KERNEL_SHA512:-}" =~ ^[0-9a-f]{128}$ ]]; then
-  fail "CARTESI_LINUX_KERNEL_SHA512 must be 128 lowercase hex characters"
-fi
-
-canonical_just="${root}/examples/canonical-app/justfile"
-if [[ ! -f "${canonical_just}" ]]; then
-  fail "missing ${canonical_just}"
-else
-  resolved_assert_version="$(
-    sed -n 's/^CARTESI_MACHINE_VERSION=v//p' "${pins}"
-  )"
-  resolved_linux_release="$(
-    grep '^CARTESI_LINUX_IMAGE_RELEASE=' "${pins}" | cut -d= -f2
-  )"
-  resolved_kernel_filename="$(
-    grep '^CARTESI_LINUX_KERNEL_FILENAME=' "${pins}" | cut -d= -f2
-  )"
-
-  if ! grep -q 'pins := "../../toolchain-pins.env"' "${canonical_just}"; then
-    fail "examples/canonical-app/justfile must read ../../toolchain-pins.env"
-  fi
-
-  if [[ -z "${resolved_assert_version}" ]]; then
-    fail "could not resolve cartesi_machine_version from ${pins}"
-  elif [[ "${resolved_assert_version}" != "${expected_assert_version}" ]]; then
-    fail "resolved cartesi_machine_version=${resolved_assert_version} != ${expected_assert_version}"
-  fi
-
-  if [[ "${resolved_linux_release}" != "${CARTESI_LINUX_IMAGE_RELEASE}" ]]; then
-    fail "resolved linux_image_release=${resolved_linux_release} != ${CARTESI_LINUX_IMAGE_RELEASE}"
-  fi
-
-  if [[ "${resolved_kernel_filename}" != "${CARTESI_LINUX_KERNEL_FILENAME}" ]]; then
-    fail "resolved linux_kernel_filename=${resolved_kernel_filename} != ${CARTESI_LINUX_KERNEL_FILENAME}"
-  fi
-fi
-
-if [[ "${errors}" -ne 0 ]]; then
-  exit 1
-fi
-
+if ((errors > 0)); then exit 1; fi
 echo "toolchain pins aligned"

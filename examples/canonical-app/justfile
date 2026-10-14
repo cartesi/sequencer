@@ -1,6 +1,5 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-pins := "../../toolchain-pins.env"
 cartesi_machine_version := `sed -n 's/^CARTESI_MACHINE_VERSION=v//p' ../../toolchain-pins.env`
 linux_image_release := `grep '^CARTESI_LINUX_IMAGE_RELEASE=' ../../toolchain-pins.env | cut -d= -f2`
 linux_kernel_filename := `grep '^CARTESI_LINUX_KERNEL_FILENAME=' ../../toolchain-pins.env | cut -d= -f2`

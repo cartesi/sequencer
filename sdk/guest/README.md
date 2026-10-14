@@ -23,9 +23,10 @@ are not published.
   tag `v0.18.0` (commit `5222250c69371f7cbe96e6082699a8ca22b5969c`), taken
   from `https://github.com/cartesi/machine-guest-tools/archive/refs/tags/v0.18.0.tar.gz`
   (sha256 `a16ee31a7abb0522ae70497721bf4856665297e1dd26d875a43fadbe48814bb6`).
-  The files are unmodified. libcmt must match the guest-tools version pinned
-  in `examples/canonical-app/Dockerfile`, which pairs with the emulator
-  release in `toolchain-pins.env`.
+  The files are unmodified. libcmt must match `MACHINE_GUEST_TOOLS_VERSION`
+  in `toolchain-pins.env`, which pairs with the emulator release there;
+  `scripts/verify-toolchain-pins.sh` checks both rootfs Dockerfiles and this
+  provenance line against it.
 
 ## Crates
 
