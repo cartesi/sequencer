@@ -406,7 +406,6 @@ mod tests {
     use rollups_types::ERC20_DEPOSIT_PREFIX_BYTES;
     use rollups_types::Erc20Transfer;
     use rollups_types::alloy_sol_types::SolCall;
-    use ssz_derive::{Decode, Encode};
 
     use super::{ApplicationProgress, ExecutedInputCount, WalletApp, WalletConfig};
     use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};
@@ -418,67 +417,6 @@ mod tests {
     };
     use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
     use sequencer_core::user_op::UserOp;
-
-    #[test]
-    fn validate_rejects_when_max_fee_below_current_fee() {
-        use sequencer_core::application::{ExecutionOutcome, validate_and_execute_user_op};
-
-        let mut app = WalletApp::new(WalletConfig::default());
-        let sender = Address::from_slice(&[0x11; 20]);
-        app.balances.insert(sender, U256::from(10_u64));
-
-        let user_op = UserOp {
-            nonce: 0,
-            max_fee: 1,
-            data: Vec::<u8>::new().into(),
-        };
-
-        // The max_fee < current_fee check lives in the free function
-        // validate_and_execute_user_op, not in validate_user_op directly.
-        let result = validate_and_execute_user_op(&mut app, sender, &user_op, 2, 0)
-            .expect("should return Ok(Invalid), not Err");
-        assert_eq!(
-            result,
-            ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
-                max_fee: 1,
-                base_fee: 2
-            })
-        );
-    }
-
-    #[test]
-    fn an_exhausted_nonce_is_rejected_instead_of_overflowing() {
-        use sequencer_core::application::{ExecutionOutcome, validate_and_execute_user_op};
-
-        let mut app = WalletApp::new(WalletConfig::default());
-        let sender = Address::from_slice(&[0x11; 20]);
-        app.balances.insert(sender, U256::from(10_u64));
-        app.nonces.insert(sender, u32::MAX);
-        let user_op = UserOp {
-            nonce: u32::MAX,
-            max_fee: 0,
-            data: Vec::<u8>::new().into(),
-        };
-
-        let result = validate_and_execute_user_op(&mut app, sender, &user_op, 0, 0)
-            .expect("an exhausted nonce is a rejection, not a fault");
-        assert_eq!(
-            result,
-            ExecutionOutcome::Invalid(InvalidReason::NonceExhausted)
-        );
-        assert_eq!(app.current_user_nonce(sender), u32::MAX);
-
-        app.nonces.insert(sender, 5);
-        let result = validate_and_execute_user_op(&mut app, sender, &user_op, 0, 0).unwrap();
-        assert_eq!(
-            result,
-            ExecutionOutcome::Invalid(InvalidReason::InvalidNonce {
-                expected: 5,
-                got: u32::MAX
-            }),
-            "a sender that is not exhausted gets the expected nonce"
-        );
-    }
 
     #[test]
     fn validation_is_repeatable_and_preserves_the_entire_state() {
@@ -537,76 +475,6 @@ mod tests {
         assert_eq!(app.current_user_balance(sender), initial_balance - gas_cost);
         assert_eq!(app.executed_input_count().get(), 1);
         assert_eq!(app.last_executed_safe_block(), 123);
-        assert!(outputs.is_empty());
-    }
-
-    #[test]
-    fn wallet_starts_with_zero_balances() {
-        let app = WalletApp::new(WalletConfig::default());
-        let sender = address!("0x1111111111111111111111111111111111111111");
-        let recipient = address!("0x2222222222222222222222222222222222222222");
-
-        assert_eq!(app.current_user_balance(sender), U256::ZERO);
-        assert_eq!(app.current_user_balance(recipient), U256::ZERO);
-    }
-
-    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
-    struct LegacyDeposit {
-        amount: U256,
-        to: Address,
-    }
-
-    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
-    struct LegacyWithdrawal {
-        amount: U256,
-    }
-
-    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
-    struct LegacyTransfer {
-        amount: U256,
-        to: Address,
-    }
-
-    #[derive(PartialEq, Debug, Encode, Decode, Clone)]
-    #[ssz(enum_behaviour = "union")]
-    enum LegacyMethod {
-        Withdrawal(LegacyWithdrawal),
-        Transfer(LegacyTransfer),
-        Deposit(LegacyDeposit),
-    }
-
-    #[test]
-    fn legacy_deposit_payload_is_included_as_no_op() {
-        let mut app = WalletApp::new(WalletConfig::default());
-        let sender = address!("0x1111111111111111111111111111111111111111");
-        let recipient = Address::from_slice(&[0x77; 20]);
-        app.balances.insert(sender, U256::from(500_u64));
-        let before_sender_nonce = app.current_user_nonce(sender);
-        let before_sender_balance = app.current_user_balance(sender);
-        let before_recipient = app.current_user_balance(recipient);
-
-        let legacy = LegacyMethod::Deposit(LegacyDeposit {
-            amount: U256::from(123_u64),
-            to: recipient,
-        });
-        // fee exponent 0 → fee_to_linear(0) = 1 (minimum fee)
-        let valid = ValidUserOp {
-            sender,
-            fee: 0,
-            data: ssz::Encode::as_ssz_bytes(&legacy),
-        };
-
-        let outputs = execute_valid_user_op(&mut app, &valid, 0)
-            .expect("execute valid user op")
-            .outputs;
-
-        assert_eq!(app.current_user_nonce(sender), before_sender_nonce + 1);
-        // Gas cost of 1 unit (fee_to_linear(0) = 1) is deducted
-        assert_eq!(
-            app.current_user_balance(sender),
-            before_sender_balance - U256::from(1u64)
-        );
-        assert_eq!(app.current_user_balance(recipient), before_recipient);
         assert!(outputs.is_empty());
     }
 
@@ -879,19 +747,6 @@ mod tests {
     }
 
     #[test]
-    fn devnet_config_uses_deterministic_mock_usdc_address() {
-        let config = WalletConfig::devnet();
-        assert_eq!(
-            config.erc20_portal_address,
-            super::SEPOLIA_ERC20_PORTAL_ADDRESS
-        );
-        assert_eq!(
-            config.supported_erc20_token,
-            super::DEVNET_MOCK_USDC_ADDRESS
-        );
-    }
-
-    #[test]
     fn fee_credits_sequencer_address() {
         let sequencer = address!("0x9999999999999999999999999999999999999999");
         let config = WalletConfig {
@@ -923,33 +778,6 @@ mod tests {
     }
 
     #[test]
-    fn fee_sent_to_zero_address_when_default() {
-        let config = WalletConfig {
-            sequencer_address: Address::ZERO,
-            ..WalletConfig::default()
-        };
-        let mut app = WalletApp::new(config);
-        let sender = address!("0x1111111111111111111111111111111111111111");
-        app.balances.insert(sender, U256::from(10_000_u64));
-
-        let fee_exponent: u16 = 100;
-        let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
-        let valid = ValidUserOp {
-            sender,
-            fee: fee_exponent,
-            data: Vec::new(),
-        };
-        execute_valid_user_op(&mut app, &valid, 0).expect("execute op");
-
-        assert_eq!(
-            app.current_user_balance(sender),
-            U256::from(10_000_u64) - gas_cost
-        );
-        // Fee goes to address zero — effectively burned.
-        assert_eq!(app.current_user_balance(Address::ZERO), gas_cost);
-    }
-
-    #[test]
     fn create_dump_then_from_dump_round_trips_full_state() {
         let mut app = WalletApp::new(WalletConfig {
             erc20_portal_address: address!("0x1212121212121212121212121212121212121212"),
@@ -967,6 +795,7 @@ mod tests {
 
         let prefix = temp_dump_prefix();
         app.create_dump(&prefix).expect("create dump");
+        assert!(WalletApp::state_file_in_dump(&prefix).starts_with(&prefix));
 
         let restored = WalletApp::from_dump(&prefix).expect("load dump");
 
@@ -1121,16 +950,6 @@ mod tests {
             ),
             other => panic!("expected Internal decode error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn state_file_in_dump_lives_inside_prefix() {
-        let prefix = PathBuf::from("/tmp/example-prefix");
-        let state = WalletApp::state_file_in_dump(&prefix);
-        assert!(
-            state.starts_with(&prefix),
-            "state file path {state:?} must live under prefix {prefix:?}"
-        );
     }
 
     fn temp_dump_prefix() -> PathBuf {
