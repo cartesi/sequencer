@@ -13,19 +13,14 @@ fi
 lua_root="${CARTESI_WATCHDOG_LUA_ROOT:-/opt/watchdog/lua}"
 lua_bin="${CARTESI_WATCHDOG_LUA_BIN:-lua5.4}"
 
-# Deb-installed cartesi bindings under /usr/lib — appended *after* the
-# container's own paths (Dockerfile ENV / operator override) so
-# /opt/watchdog/lib/lcurl.so is found first. Prepending broke lcurl
-# discovery in published images. Lua 5.4 prefers the versioned
-# LUA_{C,}PATH_5_4 variables when set, so derive the effective base from
-# versioned-or-unversioned before composing.
+# Append the deb-installed cartesi bindings under /usr/lib after the
+# container's own paths (Dockerfile ENV or an operator override), so the
+# image's /opt/watchdog/lib/lcurl.so is found first. Lua 5.4 prefers
+# LUA_{C,}PATH_5_4 when set, so the base is the versioned variable, else the plain one.
 _cartesi_lua_cpath="/usr/lib/lua/5.4/?.so;/usr/lib/lua/5.4/?/init.so"
 _cartesi_lua_path="/usr/share/lua/5.4/?.lua;/usr/share/lua/5.4/?/init.lua"
 
-# Strip trailing semicolons from $1, then append $2 with an explicit `;`,
-# and finish with `;;` so Lua still expands its defaults at the end.
-# Use `case` (not `[[ == *... ]]`) to trim - a semicolon inside `[[ ]]`
-# is a reserved `;;` token and is easy to mis-quote.
+# Join $1 and $2 with one `;` and end with `;;`, so Lua still appends its defaults.
 join_lua_search_path() {
   local base="$1"
   local extra="$2"
