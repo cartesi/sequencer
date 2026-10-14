@@ -289,11 +289,9 @@ fn archive_response(
         response = response.header("X-Inclusion-Block", block.to_string());
     }
     response
-        .body(Body::from_stream(ReaderStream::new(GuardedReader {
-            file: ArchiveReader {
-                reader,
-                done: Some(done_rx),
-            },
+        .body(Body::from_stream(ReaderStream::new(ArchiveReader {
+            reader,
+            done: Some(done_rx),
             _guard: guard,
         })))
         .expect("snapshot headers are well-formed")
@@ -306,9 +304,10 @@ fn state_file_path(state: &SnapshotState, prefix: &Path) -> PathBuf {
 }
 
 fn stream_body(file: File, guard: LeaseGuard, path: PathBuf) -> Body {
-    Body::from_stream(ReaderStream::new(GuardedReader {
-        file: ComparisonReader { reader: file, path },
-        _guard: Arc::new(guard),
+    Body::from_stream(ReaderStream::new(ComparisonReader {
+        reader: file,
+        path,
+        _guard: guard,
     }))
 }
 
@@ -327,6 +326,9 @@ fn comparison_io<T>(result: std::io::Result<T>, path: &Path) -> std::io::Result<
 struct ComparisonReader<R> {
     reader: R,
     path: PathBuf,
+    /// Owns the lease: dropping the body (completion, error or disconnect)
+    /// releases it.
+    _guard: LeaseGuard,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for ComparisonReader<R> {
@@ -350,6 +352,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ComparisonReader<R> {
 struct ArchiveReader {
     reader: tokio::io::DuplexStream,
     done: Option<tokio::sync::oneshot::Receiver<std::io::Result<()>>>,
+    /// The body and the producer each hold the lease (docs/snapshots/lifecycle.md).
+    _guard: Arc<LeaseGuard>,
 }
 
 impl AsyncRead for ArchiveReader {
@@ -422,28 +426,6 @@ async fn acquire_latest(state: &SnapshotApiState) -> Result<Option<LeasedDump>, 
         },
     )
     .await
-}
-
-// ── Streaming body that owns the lease guard ───────────────────────────────
-
-/// A file reader that also owns the lease guard. When the response body is
-/// dropped — stream completion, I/O error, or client disconnect — the guard
-/// drops with it and releases the lease.
-struct GuardedReader<R> {
-    file: R,
-    _guard: Arc<LeaseGuard>,
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for GuardedReader<R> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // `GuardedReader` is `Unpin` (both fields are), so this is sound.
-        let this = self.get_mut();
-        Pin::new(&mut this.file).poll_read(cx, buf)
-    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -556,9 +538,15 @@ mod tests {
                 )))
             }
         }
+        let fixture = baseline_state("comparison-nonterminal", b"state");
+        let lease = acquire_finalized(&fixture.state)
+            .await
+            .expect("acquire lease")
+            .expect("baseline lease");
         let mut reader = ComparisonReader {
             reader: Unavailable,
             path: PathBuf::from("temporarily-unavailable"),
+            _guard: lease.dump.guard,
         };
         let error = tokio::io::AsyncReadExt::read(&mut reader, &mut [0; 1])
             .await
