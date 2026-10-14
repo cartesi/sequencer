@@ -250,7 +250,8 @@ pub(super) fn insert_tip_rows(
 }
 
 /// Extend the valid batch path with a fresh open Tip at the current safe head,
-/// draining all currently-undrained safe inputs into its first frame.
+/// attributing every undrained safe input to its first frame (lane catch-up
+/// executes them, I11).
 ///
 /// One mechanism, two callers with distinct intents (each keeps its own guard):
 /// startup recovery's guarded Tip creation (genesis / first startup) and
