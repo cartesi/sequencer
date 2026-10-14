@@ -216,8 +216,8 @@ impl CommandError {
 }
 
 // Per-worker terminality lives as `is_terminal_invariant` on each worker's
-// own error type, beside its enum; `WorkerExit::is_terminal` above
-// composes them.
+// own error type, beside its enum; `WorkerExit::is_terminal` below
+// composes them, and takes danger exits from `danger_failure_verdict`.
 
 fn danger_failure_verdict(status: &DangerStatus) -> CommandFailureVerdict {
     match status {
@@ -621,12 +621,8 @@ impl WorkerExit {
             WorkerExit::FeeOracle(stop) => {
                 stop.is_terminal_with(FeeOracleError::is_terminal_invariant)
             }
-            WorkerExit::DangerDetected { status } => {
-                matches!(
-                    status,
-                    DangerStatus::CanonicalDivergence(_) | DangerStatus::Safe
-                )
-            }
+            // One home with the exit code, so the abort decision cannot drift.
+            WorkerExit::DangerDetected { status } => danger_failure_verdict(status).is_terminal(),
         }
     }
 }
@@ -1394,6 +1390,26 @@ mod tests {
                     "{why}: {error:?}"
                 );
             }
+        }
+    }
+
+    /// A detector exit aborts the run exactly when its exit code is terminal:
+    /// only canonical divergence.
+    #[test]
+    fn danger_exit_aborts_only_on_canonical_divergence() {
+        for status in [
+            DangerStatus::ClosedBatchInDanger(1),
+            DangerStatus::TipInDanger(1),
+            DangerStatus::L1ViewStale,
+            DangerStatus::EstimatedBatchInDanger(1),
+            DangerStatus::CanonicalDivergence(1),
+        ] {
+            let terminal = matches!(status, DangerStatus::CanonicalDivergence(_));
+            assert_eq!(
+                WorkerExit::DangerDetected { status }.is_terminal(),
+                terminal,
+                "{status:?}"
+            );
         }
     }
 
