@@ -63,19 +63,22 @@ pub(crate) enum TickOutcome {
     Transient,
 }
 
-/// Pure: given the current submitter frontier and the batch nonces we just
-/// observed on L1 past that frontier, compute the nonce at which we should
-/// start submitting the remaining suffix. When the observed list is empty
-/// (nothing new on L1) the result is just `frontier.accepted_next_nonce`.
+/// Next batch nonce to submit: from the safe-accepted frontier, advance once per
+/// observed nonce equal to the next expected one. The observed nonces are our own
+/// `InputAdded` events past the frontier's safe block up to latest, in event (so
+/// wallet-nonce, so submission) order; matching by equality advances once for a
+/// nonce repeated across recovery generations. A resubmission heuristic, not a
+/// scheduler mirror: it reads unsafe events and applies no staleness rule.
 fn decide_submit_start(frontier: SubmitterFrontier, recently_observed_nonces: &[u64]) -> u64 {
-    // Fold observed nonces over the safe-accepted frontier to derive the next
-    // unresolved nonce. The scan starts at `safe_block + 1` (the submitter
-    // asks the poster for that), so wallet-nonce ordering guarantees the
-    // observed list mirrors our submission order.
-    sequencer_core::protocol::advance_expected_batch_nonce(
-        frontier.accepted_next_nonce,
-        recently_observed_nonces.iter().copied(),
-    )
+    let mut expected = frontier.accepted_next_nonce;
+    for &nonce in recently_observed_nonces {
+        if nonce == expected {
+            expected = expected
+                .checked_add(1)
+                .expect("expected batch nonce overflow: contract-impossible");
+        }
+    }
+    expected
 }
 
 pub(crate) struct BatchSubmitter<P: BatchPoster> {
@@ -649,16 +652,9 @@ mod tests {
 
     #[test]
     fn decide_submit_start_advances_once_per_matching_nonce_across_recovery_generations() {
-        // Post-recovery scenario the `advance_expected_batch_nonce` doc calls
-        // out: batch nonces can repeat across recovery generations because a
-        // cascade re-uses the last valid ancestor's `nonce + 1`. The observed
-        // event stream can therefore contain the same batch nonce twice (once
-        // from the invalidated generation, once from the recovery generation).
-        //
-        // decide_submit_start must advance exactly ONCE per matching nonce —
-        // the second occurrence at a nonce that no longer equals `expected` is
-        // a no-op, as intended. The underlying fold is table-tested below; this
-        // pins the wrapper at the nonce-reuse case explicitly.
+        // Batch nonces repeat across recovery generations (a cascade reuses the
+        // last valid ancestor's `nonce + 1`), so the stream can carry one twice;
+        // only the occurrence that matches `expected` advances.
         let from_nonce = decide_submit_start(
             SubmitterFrontier {
                 safe_block: 10,
@@ -670,5 +666,37 @@ mod tests {
         // 2 matches expected=2 → advance to 3. Second 2 doesn't match
         // expected=3, skip. 3 matches → advance to 4.
         assert_eq!(from_nonce, 4);
+    }
+
+    #[test]
+    fn decide_submit_start_advances_only_on_the_expected_nonce() {
+        let cases: [(&[u64], u64); 4] = [
+            (&[1, 2, 3], 0),
+            (&[0, 1, 1, 2], 3),
+            (&[6, 4, 3, 2, 2, 0, 1], 2),
+            (&[0, 2, 1], 2),
+        ];
+        for (observed, expected) in cases {
+            let from_nonce = decide_submit_start(
+                SubmitterFrontier {
+                    safe_block: 10,
+                    accepted_next_nonce: 0,
+                },
+                observed,
+            );
+            assert_eq!(from_nonce, expected, "observed {observed:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected batch nonce overflow: contract-impossible")]
+    fn decide_submit_start_fails_loud_on_overflow() {
+        decide_submit_start(
+            SubmitterFrontier {
+                safe_block: 10,
+                accepted_next_nonce: u64::MAX,
+            },
+            &[u64::MAX],
+        );
     }
 }

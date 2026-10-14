@@ -379,44 +379,6 @@ pub fn age_exceeds(now: u64, start: u64, window: u64) -> bool {
     now.saturating_sub(start) >= window
 }
 
-/// Advance `expected` by greedily consuming any matching observed nonce.
-///
-/// `observed_nonces` is the stream of **batch nonces** (from the SSZ payload)
-/// decoded from `InputAdded` events sent by our batch-submitter EOA, in L1
-/// event order. Because L1 mines txs from a single EOA in strict wallet-nonce
-/// order, this stream is naturally gap-less at the wallet-nonce level:
-/// tx[k]'s event cannot appear on-chain without tx[k-1]'s event, and the
-/// observed batch nonce sequence therefore mirrors our submission order.
-///
-/// Batch nonces themselves (unlike wallet nonces) CAN repeat across recovery
-/// generations — e.g., after a cascade, a fresh batch reuses its invalidated
-/// predecessor's nonce. That's why we still match on equality rather than
-/// trusting a sort: in a post-recovery window, the same batch nonce can be
-/// observed twice (once from the invalidated generation, once from the new
-/// one), and we only want to advance once.
-///
-/// Under the wallet-nonce ordering above, once the next `expected` doesn't
-/// appear in the stream the frontier naturally stops advancing — the gap
-/// means the scheduler hasn't seen that nonce on-chain yet (or observed it at
-/// a different wallet nonce from an earlier generation).
-///
-/// Co-located here next to [`ProtocolTiming::scheduler_accepts`] so all
-/// scheduler-mirroring acceptance logic lives at the library seam (the
-/// off-chain mirror of the canonical scheduler's batch-nonce fold).
-pub fn advance_expected_batch_nonce(
-    mut expected: u64,
-    observed_nonces: impl IntoIterator<Item = u64>,
-) -> u64 {
-    for nonce in observed_nonces {
-        if nonce == expected {
-            expected = expected
-                .checked_add(1)
-                .expect("expected batch nonce overflow: contract-impossible");
-        }
-    }
-    expected
-}
-
 /// Borrowed view of one safe-input row, in the shape scheduler_accepts needs.
 /// Using a borrowed payload avoids copying during iteration.
 #[derive(Debug, Clone, Copy)]
@@ -816,27 +778,5 @@ mod tests {
             inclusion_block: MAX_WAIT.saturating_mul(10),
         };
         assert!(timing().scheduler_accepts(SUBMITTER, input, 0).is_some());
-    }
-
-    #[test]
-    fn advance_expected_batch_nonce_matches_scheduler_nonce_rule() {
-        use super::advance_expected_batch_nonce;
-        assert_eq!(advance_expected_batch_nonce(0, Vec::<u64>::new()), 0);
-        assert_eq!(advance_expected_batch_nonce(0, vec![0, 1, 2]), 3);
-        assert_eq!(advance_expected_batch_nonce(0, vec![0, 2, 3]), 1);
-        assert_eq!(advance_expected_batch_nonce(0, vec![1, 2, 3]), 0);
-        assert_eq!(advance_expected_batch_nonce(0, vec![0, 1, 1, 2]), 3);
-        assert_eq!(
-            advance_expected_batch_nonce(0, vec![6, 4, 3, 2, 2, 0, 1]),
-            2
-        );
-        assert_eq!(advance_expected_batch_nonce(0, vec![0, 2, 1]), 2);
-        assert_eq!(advance_expected_batch_nonce(2, vec![2, 3]), 4);
-    }
-
-    #[test]
-    #[should_panic(expected = "expected batch nonce overflow: contract-impossible")]
-    fn advance_expected_batch_nonce_fails_loud_on_overflow() {
-        let _ = advance_expected_batch_nonce(u64::MAX, [u64::MAX]);
     }
 }

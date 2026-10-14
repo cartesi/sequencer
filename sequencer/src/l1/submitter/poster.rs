@@ -526,7 +526,7 @@ impl BatchPoster for EthereumBatchPoster {
             return Ok(Vec::new());
         }
 
-        // Ordered fetch: `advance_expected_batch_nonce` folds these nonces
+        // Ordered fetch: `decide_submit_start` folds these nonces
         // assuming L1 event order, so a raw `eth_getLogs` reorder would
         // under-advance the frontier and resubmit an already-mined suffix
         // (wasted gas + InputBox noise). The `_ordered` helper guarantees the
