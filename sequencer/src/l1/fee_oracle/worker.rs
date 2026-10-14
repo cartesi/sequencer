@@ -221,13 +221,19 @@ impl FeeOracle {
     }
 }
 
+/// The one classification of a price-source failure, for setup and runtime
+/// alike: source availability (provider/RPC, an unservable observation window)
+/// may self-heal; anything else is deterministic misconfiguration. Setup still
+/// fails on either, since its first quote is mandatory; only the restart class
+/// differs.
 impl From<PriceSourceError> for FeeOracleError {
     fn from(error: PriceSourceError) -> Self {
         match error {
             PriceSourceError::Provider(message) => Self::Transient(message),
-            // Setup proved this window usable. At runtime `OLD` means the
-            // current view cannot serve it; retain the persisted price and let
-            // the input reader's safe-head policy judge shared-endpoint health.
+            // `OLD` means the current view cannot serve the window:
+            // availability, not configuration. At runtime the persisted price
+            // is retained and the input reader's safe-head policy judges
+            // shared-endpoint health; setup retries its first quote.
             error @ PriceSourceError::InsufficientObservations => {
                 Self::Transient(error.to_string())
             }
@@ -723,5 +729,15 @@ mod tests {
         let error = FeeOracleError::from(PriceSourceError::InsufficientObservations);
         assert!(matches!(&error, FeeOracleError::Transient(_)));
         assert!(!error.is_terminal_invariant());
+    }
+
+    #[test]
+    fn source_availability_is_transient_and_the_rest_is_misconfig() {
+        let error = FeeOracleError::from(PriceSourceError::Provider("timeout".into()));
+        assert!(matches!(&error, FeeOracleError::Transient(m) if m == "timeout"));
+        assert!(!error.is_terminal_invariant());
+        let error = FeeOracleError::from(PriceSourceError::WrongTokenPair);
+        assert!(matches!(&error, FeeOracleError::Misconfig(_)));
+        assert!(error.is_terminal_invariant());
     }
 }

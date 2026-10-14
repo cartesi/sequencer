@@ -224,17 +224,6 @@ fn classify_decoded_observe_revert(
     }
 }
 
-/// Setup-time mapping: provider/RPC failures and an unavailable observation
-/// window may self-heal. Both still fail setup's hard first-read requirement;
-/// only their restart classification differs from deterministic misconfig.
-pub(super) fn bootstrap_price_source_error(error: PriceSourceError) -> (bool, String) {
-    match error {
-        PriceSourceError::Provider(message) => (true, message),
-        error @ PriceSourceError::InsufficientObservations => (true, error.to_string()),
-        error => (false, error.to_string()),
-    }
-}
-
 /// Orient a pool tick so `1.0001^tick` is fee-token smallest units per wei.
 /// The pool price is token1 per token0 in smallest units.
 fn orient_tick(tick: i32, weth_is_token0: bool) -> Result<i32, PriceSourceError> {
@@ -301,18 +290,6 @@ mod tests {
             ),
             PriceSourceError::Provider(_)
         ));
-    }
-
-    #[test]
-    fn bootstrap_maps_source_availability_as_transient() {
-        let (transient, _) =
-            bootstrap_price_source_error(PriceSourceError::Provider("timeout".into()));
-        assert!(transient);
-        let (transient, _) =
-            bootstrap_price_source_error(PriceSourceError::InsufficientObservations);
-        assert!(transient);
-        let (transient, _) = bootstrap_price_source_error(PriceSourceError::WrongTokenPair);
-        assert!(!transient);
     }
 
     #[test]

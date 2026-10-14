@@ -8,41 +8,23 @@
 
 use alloy::providers::DynProvider;
 
-use super::uniswap::{UniswapConfig, UniswapV3PriceSource, bootstrap_price_source_error};
+use super::uniswap::{UniswapConfig, UniswapV3PriceSource};
 use super::worker::{FeeOracle, FeeOracleError};
 use crate::runtime::process_lock::ProcessLock;
 
-/// Failure to reach the configured pool at connect time.
-#[derive(Debug)]
-pub(crate) enum UniswapConnectError {
-    /// Wrong pool/pair/chain or a bad RPC URL: deterministic; retrying the
-    /// same configuration re-fails identically.
-    Misconfig(String),
-    /// The source is unavailable right now; retrying may succeed.
-    Transient { message: String },
-}
-
-/// Connect to the configured pool and classify any failure. `setup` calls
-/// this while it still owns all address-bearing configuration and before
-/// anything is pinned, so a misconfigured pool never pins an identity.
+/// Connect to the configured pool. `setup` calls this while it still owns all
+/// address-bearing configuration and before anything is pinned, so a
+/// misconfigured pool never pins an identity. Failures classify as at runtime
+/// (`From<PriceSourceError> for FeeOracleError`); a bad RPC URL is Misconfig.
 pub(crate) async fn connect_uniswap(
     rpc_url: &str,
     allow_insecure_rpc: bool,
     uniswap: UniswapConfig,
-) -> Result<(DynProvider, UniswapV3PriceSource), UniswapConnectError> {
+) -> Result<(DynProvider, UniswapV3PriceSource), FeeOracleError> {
     let provider = crate::l1::provider::create_read_provider(rpc_url, allow_insecure_rpc)
-        .map_err(UniswapConnectError::Misconfig)?;
-    match UniswapV3PriceSource::connect(provider.clone(), uniswap).await {
-        Ok(token) => Ok((provider, token)),
-        Err(error) => {
-            let (transient, message) = bootstrap_price_source_error(error);
-            Err(if transient {
-                UniswapConnectError::Transient { message }
-            } else {
-                UniswapConnectError::Misconfig(message)
-            })
-        }
-    }
+        .map_err(FeeOracleError::Misconfig)?;
+    let token = UniswapV3PriceSource::connect(provider.clone(), uniswap).await?;
+    Ok((provider, token))
 }
 
 /// `setup`'s persist step: construct the oracle on an already-validated

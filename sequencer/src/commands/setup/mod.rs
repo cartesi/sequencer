@@ -171,22 +171,14 @@ where
             PreparedFeeOracle::Fixed { log_gas_price }
         }
         FeeOracleMode::Uniswap(uniswap) => {
-            // Setup requires L1: transient and misconfig both abort, before
-            // anything pins (one connect/classify home).
+            // Setup requires L1: transient and misconfig both abort before
+            // anything pins.
             let (provider, token) = crate::l1::fee_oracle::connect_uniswap(
                 &config.eth_rpc_url,
                 config.allow_insecure_rpc,
                 uniswap,
             )
-            .await
-            .map_err(|error| match error {
-                crate::l1::fee_oracle::UniswapConnectError::Transient { message, .. } => {
-                    BootstrapError::FeeOracleTransient { message }
-                }
-                crate::l1::fee_oracle::UniswapConnectError::Misconfig(message) => {
-                    BootstrapError::FeeOracleMisconfig { message }
-                }
-            })?;
+            .await?;
             PreparedFeeOracle::Uniswap {
                 identity: FeeOracleIdentity::Uniswap {
                     weth: uniswap.weth,
@@ -1128,7 +1120,8 @@ mod tests {
 
     /// Setup's L1 discovery uses the startup polarity: a URL the client refuses
     /// re-fails identically, so it is terminal; an unreachable RPC fails at the
-    /// chain-id read (`ChainIdRpc`) and is retried.
+    /// chain-id read (`ChainIdRpc`) and is retried. The fee-source connect
+    /// follows the runtime classification with setup's messages.
     #[tokio::test]
     async fn setup_l1_failures_exit_by_startup_phase() {
         use crate::commands::error::{EXIT_RESTART_TRANSIENT, EXIT_TERMINAL};
@@ -1200,6 +1193,65 @@ mod tests {
             "{plaintext_remote:?}"
         );
         assert_eq!(plaintext_remote.exit_code(), EXIT_TERMINAL);
+
+        use crate::l1::fee_oracle::UniswapConfig;
+        use crate::l1::fee_oracle::uniswap::{PriceSourceError, UniswapV3PriceSource};
+        let uniswap = |twap_window_secs| UniswapConfig {
+            chain_id: 31337,
+            weth: alloy_primitives::Address::repeat_byte(1),
+            fee_token: alloy_primitives::Address::repeat_byte(2),
+            pool: alloy_primitives::Address::repeat_byte(3),
+            twap_window_secs,
+        };
+        async fn connect_with(url: &str, uniswap: UniswapConfig) -> CommandError {
+            match crate::l1::fee_oracle::connect_uniswap(url, false, uniswap).await {
+                Ok(_) => panic!("no pool behind {url}"),
+                Err(error) => error.into(),
+            }
+        }
+
+        let bad_url = connect_with("not a url", uniswap(1_800)).await;
+        let expected = crate::l1::provider::create_read_provider("not a url", false)
+            .expect_err("the client refuses it");
+        assert!(
+            matches!(
+                &bad_url,
+                CommandError::Bootstrap(BootstrapError::FeeOracleMisconfig { message })
+                    if *message == expected
+            ),
+            "{bad_url:?}"
+        );
+        assert_eq!(bad_url.exit_code(), EXIT_TERMINAL);
+
+        let zero_window = connect_with("http://127.0.0.1:1", uniswap(0)).await;
+        assert!(
+            matches!(
+                &zero_window,
+                CommandError::Bootstrap(BootstrapError::FeeOracleMisconfig { message })
+                    if *message == PriceSourceError::ZeroTwapWindow.to_string()
+            ),
+            "{zero_window:?}"
+        );
+        assert_eq!(zero_window.exit_code(), EXIT_TERMINAL);
+
+        let unavailable = connect_with("http://127.0.0.1:1", uniswap(1_800)).await;
+        let provider = crate::l1::provider::create_read_provider("http://127.0.0.1:1", false)
+            .expect("provider construction is local");
+        let Err(PriceSourceError::Provider(expected)) =
+            UniswapV3PriceSource::connect(provider, uniswap(1_800)).await
+        else {
+            panic!("an unreachable RPC is a provider error");
+        };
+        // The provider's text, without the runtime variant's prefix.
+        assert!(
+            matches!(
+                &unavailable,
+                CommandError::Bootstrap(BootstrapError::FeeOracleTransient { message })
+                    if *message == expected
+            ),
+            "{unavailable:?}"
+        );
+        assert_eq!(unavailable.exit_code(), EXIT_RESTART_TRANSIENT);
     }
 
     /// `setup --recovery`'s flush signs L1 no-ops with the recovery key, so it
