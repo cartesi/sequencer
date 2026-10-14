@@ -67,19 +67,23 @@ impl Storage {
         })
     }
 
-    /// Write-before-broadcast: durably raise the watermark to
-    /// cover `nonce` *before* any tx at a nonce `<= nonce` is sent. The
+    /// Write-before-broadcast: durably raise the watermark to cover
+    /// `wallet_nonce` *before* any tx at a wallet nonce `<= wallet_nonce` is
+    /// sent. The
     /// commit is power-loss durable (`synchronous=FULL`); a crash between
     /// commit and send only over-covers — the flush later no-ops a
     /// never-used slot, which is harmless. Monotonic: never lowers.
-    pub fn raise_wallet_nonce_watermark(&mut self, nonce: u64) -> Result<()> {
+    pub fn raise_wallet_nonce_watermark(&mut self, wallet_nonce: u64) -> Result<()> {
         self.write(|tx| {
             tx.execute(
                 "INSERT INTO wallet_nonce_watermark (singleton_id, watermark) \
                  VALUES (0, ?1) \
                  ON CONFLICT(singleton_id) \
                  DO UPDATE SET watermark = MAX(watermark, excluded.watermark)",
-                params![external_u64_to_i64(nonce, "batch-submitter wallet nonce")?],
+                params![external_u64_to_i64(
+                    wallet_nonce,
+                    "batch-submitter wallet nonce"
+                )?],
             )?;
             Ok(())
         })

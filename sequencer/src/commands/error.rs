@@ -281,7 +281,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         | BootstrapError::Identity(
             IdentityError::FirstBootRequiresL1 | IdentityError::DeploymentNotYetSafe { .. },
         )
-        | BootstrapError::DetectionNonceRead { .. }
+        | BootstrapError::DetectionWalletNonceRead { .. }
         | BootstrapError::DataDirLocked { .. }
         | BootstrapError::FeeOracleTransient { .. }
         | BootstrapError::Flush(_) => CommandFailureVerdict::Retryable,
@@ -413,7 +413,7 @@ pub enum BootstrapError {
     /// operator retries once the provider recovers; the prior sync already
     /// proved L1 reachable, so this is a hiccup, not a misconfig.
     #[error("setup detection: could not read submitter nonce from RPC: {message}")]
-    DetectionNonceRead { message: String },
+    DetectionWalletNonceRead { message: String },
     /// `setup`'s read-only detection gate found a previous instance left work
     /// this checkpoint cannot account for. Sticky: only wiping the uncompleted
     /// data dir and running `setup --recovery` resolves it — a plain

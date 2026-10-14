@@ -297,8 +297,8 @@ where
         // plain `setup` is a no-op; detecting a dirty chain is the job of a
         // fresh setup/rebuild.
         //
-        // Coherence: read the submitter's `safe` nonce at the **persisted** safe
-        // block from the sync, not the live `Safe` tag. The head can advance
+        // Coherence: read the submitter's `safe` wallet nonce at the
+        // **persisted** safe block from the sync, not the live `Safe` tag. The head can advance
         // between the sync and this read; pinning step 1 to the same block step 2
         // scans (`safe_inputs` up to that block) closes the window where a batch
         // landing in between would be counted as settled by a live-tag read yet
@@ -309,7 +309,7 @@ where
         // from this pool but alive elsewhere evades it, bounded at runtime by the
         // content-identity check (CanonicalDivergence → cockroach recovery).
         let synced_safe_block = storage.current_safe_block()?;
-        let nonce_views = read_submitter_nonce_views(
+        let wallet_nonces = read_submitter_wallet_nonces(
             &config.rpc.eth_rpc_url,
             config.batch_submitter_address,
             synced_safe_block,
@@ -320,7 +320,7 @@ where
             &mut storage,
             config.batch_submitter_address,
             config.checkpoint_block,
-            nonce_views,
+            wallet_nonces,
         )?;
 
         // ── Genesis snapshot ─────────────────────────────────────
@@ -694,23 +694,23 @@ fn to_fold_input(input: crate::storage::StoredSafeInput) -> FoldInput {
 /// The read-only detection gate, separated
 /// from the L1/RPC I/O so its logic is unit-testable against a seeded DB.
 ///
-/// `nonce_views` is the submitter's `(pending, safe)` wallet nonce read from
+/// `wallet_nonces` is the submitter's `(pending, safe)` wallet nonce read from
 /// L1; `storage` holds the safe inputs synced to the safe head. The two steps
-/// are ordered on purpose: step 1 (nonce settled?) gates step 2 (scan). An
-/// unsettled nonce refuses *without* scanning — unsafe batches are not yet in
+/// are ordered on purpose: step 1 (wallet nonce settled?) gates step 2 (scan).
+/// An unsettled wallet nonce refuses *without* scanning — unsafe batches are not yet in
 /// `safe_inputs`, so the scan would be incomplete and could false-negative.
 fn run_detection_gate(
     storage: &mut storage::Storage,
     batch_submitter: Address,
     checkpoint_block: u64,
-    (pending_nonce, safe_nonce): (u64, u64),
+    (pending_wallet_nonce, safe_wallet_nonce): (u64, u64),
 ) -> Result<(), CommandError> {
     // Step 1 — `pending > safe` means a previous instance left in-flight
     // (pending or mined-but-unsafe) batch txs.
-    if pending_nonce > safe_nonce {
+    if pending_wallet_nonce > safe_wallet_nonce {
         return Err(SetupRefuse::WalletNonceUnsettled {
-            pending: pending_nonce,
-            safe: safe_nonce,
+            pending: pending_wallet_nonce,
+            safe: safe_wallet_nonce,
         }
         .into());
     }
@@ -748,9 +748,9 @@ fn run_detection_gate(
 /// reader uses (the reader holds no long-lived provider — it builds one per
 /// pass), so no second persistent connection is introduced. Both reads are the
 /// batch-submitter's `eth_getTransactionCount`; an RPC failure here is
-/// transient ([`BootstrapError::DetectionNonceRead`]) — the prior sync already
+/// transient ([`BootstrapError::DetectionWalletNonceRead`]) — the prior sync already
 /// proved L1 reachable.
-async fn read_submitter_nonce_views(
+async fn read_submitter_wallet_nonces(
     eth_rpc_url: &str,
     batch_submitter: Address,
     safe_block: Option<u64>,
@@ -760,12 +760,12 @@ async fn read_submitter_nonce_views(
     use alloy::rpc::types::BlockNumberOrTag;
 
     let provider = crate::l1::provider::create_read_provider(eth_rpc_url, allow_insecure)
-        .map_err(|message| BootstrapError::DetectionNonceRead { message })?;
+        .map_err(|message| BootstrapError::DetectionWalletNonceRead { message })?;
     let pending = provider
         .get_transaction_count(batch_submitter)
         .block_id(BlockNumberOrTag::Pending.into())
         .await
-        .map_err(|e| BootstrapError::DetectionNonceRead {
+        .map_err(|e| BootstrapError::DetectionWalletNonceRead {
             message: crate::l1::provider::error_chain(&e),
         })?;
     let safe_tag = match safe_block {
@@ -776,7 +776,7 @@ async fn read_submitter_nonce_views(
         .get_transaction_count(batch_submitter)
         .block_id(safe_tag.into())
         .await
-        .map_err(|e| BootstrapError::DetectionNonceRead {
+        .map_err(|e| BootstrapError::DetectionWalletNonceRead {
             message: crate::l1::provider::error_chain(&e),
         })?;
     Ok((pending, safe))
@@ -1057,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn detection_refuses_unsettled_nonce_before_scanning() {
+    fn detection_refuses_unsettled_wallet_nonce_before_scanning() {
         let db = temp_db("detect-unsettled");
         let mut storage = Storage::open(db.path.as_str()).expect("open");
         // Step 1 gates step 2: `pending > safe` refuses regardless of inputs

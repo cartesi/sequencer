@@ -339,8 +339,8 @@ fn read_provider(client: RpcClient) -> DynProvider {
 }
 
 /// The providers of a keyed L1 writer (the batch poster, the mempool flusher).
-/// `read` serves all of its queries: the chain-id gate, fees, nonces, gas
-/// estimates and confirmation watches. `submit` only broadcasts transactions
+/// `read` serves all of its queries: the chain-id gate, fees, wallet nonces,
+/// gas estimates and confirmation watches. `submit` only broadcasts transactions
 /// the writer fully specified, signed for the pinned chain. Both ride one
 /// client while the sequencer has one endpoint; a separate submit endpoint (a
 /// private relay) would change only [`create_keyed_providers`].
@@ -351,9 +351,10 @@ pub struct KeyedProviders {
 }
 
 /// Signs and broadcasts transactions, and nothing else. Its provider fills only
-/// the pinned chain id and the signature, so nonce, gas and fees always come
-/// from the caller: nothing allocates a nonce outside write-before-broadcast,
-/// and the endpoint's own chain id never reaches a signature.
+/// the pinned chain id and the signature, so the wallet nonce, gas and fees
+/// always come from the caller: nothing allocates a wallet nonce outside
+/// write-before-broadcast, and the endpoint's own chain id never reaches a
+/// signature.
 #[derive(Clone, Debug)]
 pub struct Submitter(DynProvider);
 
@@ -429,7 +430,7 @@ pub enum VerifiedSignerProviderError {
 /// [`create_keyed_providers`], but only after confirming the endpoint serves
 /// `expected_chain_id`. Signatures carry the pinned id whatever the endpoint
 /// says; this check, made right before a one-shot flush starts, keeps another
-/// chain's nonces and fees out of it. The flush itself does not recheck, so a
+/// chain's wallet nonces and fees out of it. The flush itself does not recheck, so a
 /// chain swap behind the same URL during a flush is the residual the threat
 /// model accepts for the reader.
 pub async fn create_verified_keyed_providers(

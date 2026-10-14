@@ -5,9 +5,9 @@
 //!
 //! Every component that broadcasts a transaction from the batch-submitter key
 //! — the batch poster and the mempool flusher's no-ops alike — must first
-//! durably commit `watermark = max(watermark, highest_nonce_about_to_send)`
+//! durably commit `watermark = max(watermark, highest_wallet_nonce_about_to_send)`
 //! and only then send. One uniform rule, no case analysis: the invariant is
-//! simply "the watermark covers the nonce of everything we ever sent", which
+//! simply "the watermark covers the wallet nonce of everything we ever sent", which
 //! is what lets the flush consume every slot we ever used without trusting
 //! the local node's volatile mempool memory (the zombie counterexample).
 //!
@@ -39,10 +39,10 @@ impl WalletNonceWatermarkError {
 
 /// Durable raise of the wallet-nonce watermark, called *before* broadcasting.
 /// `raise_to(h)` must commit `watermark = max(watermark, h)` power-loss
-/// durably before returning; the caller may then broadcast txs at nonces
-/// `<= h`.
+/// durably before returning; the caller may then broadcast txs at wallet
+/// nonces `<= h`.
 pub trait WalletNonceWatermarkSink: Send + Sync {
-    fn raise_to(&self, highest: u64) -> Result<(), WalletNonceWatermarkError>;
+    fn raise_to(&self, highest_wallet_nonce: u64) -> Result<(), WalletNonceWatermarkError>;
 }
 
 /// Sink backed by the sequencer DB's `wallet_nonce_watermark` singleton.
@@ -61,11 +61,11 @@ impl StorageWatermarkSink {
 }
 
 impl WalletNonceWatermarkSink for StorageWatermarkSink {
-    fn raise_to(&self, highest: u64) -> Result<(), WalletNonceWatermarkError> {
+    fn raise_to(&self, highest_wallet_nonce: u64) -> Result<(), WalletNonceWatermarkError> {
         let mut storage =
             Storage::open_writer(&self.db_path).map_err(WalletNonceWatermarkError::OpenStorage)?;
         storage
-            .raise_wallet_nonce_watermark(highest)
+            .raise_wallet_nonce_watermark(highest_wallet_nonce)
             .map_err(WalletNonceWatermarkError::Storage)
     }
 }

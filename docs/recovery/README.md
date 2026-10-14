@@ -167,7 +167,7 @@ may cover a slot that was never used; it must not leave a sent slot uncovered
 ([I14](../invariants.md#i14-watermark--wallet-nonce-of-every-tx-ever-broadcast)).
 
 The flusher submits zero-value self-transfers at unresolved slots from the
-account's Latest nonce through `max(Pending, W + 1) - 1`. It completes only when:
+account's Latest wallet nonce through `max(Pending, W + 1) - 1`. It completes only when:
 
 ```text
 Pending <= Safe  &&  Safe >= W + 1

@@ -40,8 +40,8 @@ pub struct BatchPosterConfig {
     /// The pinned deployment chain id. Re-confirmed against the RPC immediately
     /// before every productive send (`submit_batches`), so a long-lived
     /// submitter whose load-balanced RPC fails over to another chain refuses to
-    /// burn nonce slots on it rather than relying only on the one-shot boot /
-    /// reader checks.
+    /// burn wallet-nonce slots on it rather than relying only on the one-shot
+    /// boot / reader checks.
     pub expected_chain_id: u64,
 }
 
@@ -52,11 +52,11 @@ pub enum BatchPosterError {
     #[error("rpc chain id {rpc} does not match pinned chain id {expected}")]
     ChainIdMismatch { rpc: u64, expected: u64 },
     #[error(
-        "wallet nonce range starting at {first_nonce} for {batch_count} batches \
+        "wallet nonce range starting at {first_wallet_nonce} for {batch_count} batches \
          cannot be represented durably"
     )]
     WalletNonceRangeUnrepresentable {
-        first_nonce: u64,
+        first_wallet_nonce: u64,
         batch_count: usize,
     },
     /// The submit provider could not sign a batch transaction this poster
@@ -85,8 +85,8 @@ impl BatchPosterError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitBatchesOutcome {
     /// Every payload was broadcast this tick and confirmed to depth: one hash
-    /// per payload, in nonce order. The worker re-enters at once to pick up
-    /// newly closed batches.
+    /// per payload, in wallet-nonce order. The worker re-enters at once to
+    /// pick up newly closed batches.
     Submitted(Vec<TxHash>),
     /// A re-broadcast met a mempool conflict or a confirmation watch timed
     /// out. The worker sleeps before re-estimating; this outcome makes no
@@ -98,7 +98,7 @@ pub enum SubmitBatchesOutcome {
 #[async_trait]
 pub(crate) trait BatchPoster: Send + Sync {
     /// Broadcast the payloads as L1 txs at consecutive wallet nonces.
-    /// Implementations must raise `watermark` to the highest nonce they
+    /// Implementations must raise `watermark` to the highest wallet nonce they
     /// are about to use *before* the first send (write-before-broadcast).
     async fn submit_batches(
         &self,
@@ -151,8 +151,8 @@ pub struct EthereumBatchPoster {
     /// clock measures how long the slot has been unresolved, whatever the
     /// cause.
     pending: Arc<Mutex<BTreeMap<u64, PendingSince>>>,
-    /// Test-only: next `send_batch_at_nonce` returns this error string without
-    /// broadcasting, so tests can drive the error-classification paths.
+    /// Test-only: next `send_batch_at_wallet_nonce` returns this error string
+    /// without broadcasting, so tests can drive the error-classification paths.
     #[cfg(test)]
     fail_next_send: Arc<Mutex<Option<String>>>,
 }
@@ -174,7 +174,7 @@ impl EthereumBatchPoster {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_nonces_for_test(&self) -> Vec<u64> {
+    pub(crate) fn pending_wallet_nonces_for_test(&self) -> Vec<u64> {
         self.pending
             .lock()
             .expect("pending lock")
@@ -193,18 +193,18 @@ impl EthereumBatchPoster {
         )
     }
 
-    /// Record an attempt at `nonce` (first attempt starts its clock) and warn
-    /// if it has been unresolved for too long.
-    fn track_pending(&self, nonce: u64) {
+    /// Record an attempt at `wallet_nonce` (first attempt starts its clock) and
+    /// warn if it has been unresolved for too long.
+    fn track_pending(&self, wallet_nonce: u64) {
         let now = Instant::now();
         let mut pending = self.pending.lock().expect("pending lock");
         let entry = pending
-            .entry(nonce)
+            .entry(wallet_nonce)
             .or_insert_with(|| PendingSince::new(now));
         if entry.should_warn(now) {
             entry.last_warned = Some(now);
             warn!(
-                tx_nonce = nonce,
+                tx_nonce = wallet_nonce,
                 pending_secs = now.duration_since(entry.since).as_secs(),
                 "batch tx at this wallet nonce has been unresolved longer than expected \
                  (see docs/l1-fee-policy.md)"
@@ -212,23 +212,23 @@ impl EthereumBatchPoster {
         }
     }
 
-    /// Mark a refused re-broadcast at `nonce`; true the first time.
-    fn note_refused(&self, nonce: u64) -> bool {
+    /// Mark a refused re-broadcast at `wallet_nonce`; true the first time.
+    fn note_refused(&self, wallet_nonce: u64) -> bool {
         let mut pending = self.pending.lock().expect("pending lock");
         let entry = pending
-            .entry(nonce)
+            .entry(wallet_nonce)
             .or_insert_with(|| PendingSince::new(Instant::now()));
         !std::mem::replace(&mut entry.refused_once, true)
     }
 
-    fn prune_pending_below(&self, latest_nonce: u64) {
+    fn prune_pending_below(&self, latest_wallet_nonce: u64) {
         self.pending
             .lock()
             .expect("pending lock")
-            .retain(|&nonce, _| nonce >= latest_nonce);
+            .retain(|&wallet_nonce, _| wallet_nonce >= latest_wallet_nonce);
     }
 
-    async fn latest_account_nonce(&self) -> Result<u64, BatchPosterError> {
+    async fn latest_wallet_nonce(&self) -> Result<u64, BatchPosterError> {
         self.providers
             .read
             .get_transaction_count(self.config.batch_submitter_address)
@@ -237,10 +237,10 @@ impl EthereumBatchPoster {
             .map_err(|err| provider_error("eth_getTransactionCount(latest)", err))
     }
 
-    async fn send_batch_at_nonce(
+    async fn send_batch_at_wallet_nonce(
         &self,
         payload: Vec<u8>,
-        nonce: u64,
+        wallet_nonce: u64,
         fees: &Eip1559Fees,
     ) -> Result<TxHash, BatchPosterError> {
         #[cfg(test)]
@@ -269,21 +269,21 @@ impl EthereumBatchPoster {
 
         // The submit provider fills only the pinned chain id and the
         // signature, so every other field is set here.
-        let gas =
-            pad_gas_estimate(call.estimate_gas().await.map_err(|err| {
-                provider_error(format_args!("eth_estimateGas nonce={nonce}"), err)
-            })?);
+        let gas = pad_gas_estimate(call.estimate_gas().await.map_err(|err| {
+            provider_error(format_args!("eth_estimateGas nonce={wallet_nonce}"), err)
+        })?);
 
-        let tx = call.gas(gas).nonce(nonce).into_transaction_request();
+        let tx = call.gas(gas).nonce(wallet_nonce).into_transaction_request();
         self.providers
             .submit
             .send(tx)
             .await
             .map_err(|err| match err {
                 SendError::Unsignable(message) => BatchPosterError::UnsignableTransaction(message),
-                SendError::Rpc(err) => {
-                    provider_error(format_args!("eth_sendRawTransaction nonce={nonce}"), err)
-                }
+                SendError::Rpc(err) => provider_error(
+                    format_args!("eth_sendRawTransaction nonce={wallet_nonce}"),
+                    err,
+                ),
             })
     }
 
@@ -340,8 +340,8 @@ fn provider_error(
     BatchPosterError::Provider(format!("{operation}: {}", error_chain(&err)))
 }
 
-/// The node already holds our tx at this nonce and this send does not beat
-/// it. Two replies mean that: a byte-identical re-send ("already known" on
+/// The node already holds our tx at this wallet nonce and this send does not
+/// beat it. Two replies mean that: a byte-identical re-send ("already known" on
 /// geth/erigon, "already imported" on Anvil/reth, "known transaction" on
 /// Besu, "AlreadyKnown" on Nethermind) and a fee-different one that fails the
 /// ≥10% rule on either component ("replacement transaction underpriced" on
@@ -350,9 +350,10 @@ fn provider_error(
 ///
 /// A client that words it differently falls back to the generic
 /// transient-error path — warn log, idle-poll retry, and the tick aborted at
-/// that nonce, so newly closed batches behind it wait for it to clear. That
-/// is exactly what every rejected re-broadcast did before this classification
-/// existed; the classified path is what lets the rest of the suffix go out.
+/// that wallet nonce, so newly closed batches behind it wait for it to clear.
+/// That is exactly what every rejected re-broadcast did before this
+/// classification existed; the classified path is what lets the rest of the
+/// suffix go out.
 fn is_pending_tx_conflict(err: &str) -> bool {
     let err = err.to_ascii_lowercase();
     err.contains("replacement transaction underpriced")
@@ -369,16 +370,18 @@ fn derive_confirmation_timeout(confirmation_depth: u64, seconds_per_block: u64) 
 }
 
 fn checked_highest_wallet_nonce(
-    first_nonce: u64,
+    first_wallet_nonce: u64,
     batch_count: usize,
 ) -> Result<u64, BatchPosterError> {
     let invalid = || BatchPosterError::WalletNonceRangeUnrepresentable {
-        first_nonce,
+        first_wallet_nonce,
         batch_count,
     };
     let count = u64::try_from(batch_count).map_err(|_| invalid())?;
     let last_offset = count.checked_sub(1).ok_or_else(invalid)?;
-    let highest = first_nonce.checked_add(last_offset).ok_or_else(invalid)?;
+    let highest = first_wallet_nonce
+        .checked_add(last_offset)
+        .ok_or_else(invalid)?;
     i64::try_from(highest).map_err(|_| invalid())?;
     Ok(highest)
 }
@@ -398,11 +401,11 @@ impl BatchPoster for EthereumBatchPoster {
         // chain immediately before any productive send. Signatures carry the
         // pinned id, so no send can land on another chain; but the submitter is
         // long-lived, and a load-balanced RPC that fails over to another chain
-        // mid-life would feed this tick that chain's nonce and fees, and the
-        // watermark its nonce. Reached only when there is something to send (the
-        // empty early-return above), so idle ticks add no RPC load. A mismatch
-        // is terminal (lifted out of the transient bucket by the submitter
-        // run-loop); a transient RPC error retries like any blip.
+        // mid-life would feed this tick that chain's wallet nonce and fees, and
+        // the watermark that nonce. Reached only when there is something to
+        // send (the empty early-return above), so idle ticks add no RPC load.
+        // A mismatch is terminal (lifted out of the transient bucket by the
+        // submitter run-loop); a transient RPC error retries like any blip.
         let rpc_chain_id = self
             .providers
             .read
@@ -420,14 +423,15 @@ impl BatchPoster for EthereumBatchPoster {
         let fees = estimate_fees(&self.providers.read)
             .await
             .map_err(BatchPosterError::Provider)?;
-        let first_nonce = self.latest_account_nonce().await?;
-        self.prune_pending_below(first_nonce);
+        let first_wallet_nonce = self.latest_wallet_nonce().await?;
+        self.prune_pending_below(first_wallet_nonce);
 
-        // Write-before-broadcast: durably cover every nonce this
+        // Write-before-broadcast: durably cover every wallet nonce this
         // tick will use before the first send. One raise to the highest
         // covers the whole consecutive range.
-        let highest_nonce = checked_highest_wallet_nonce(first_nonce, payloads.len())?;
-        watermark.raise_to(highest_nonce)?;
+        let highest_wallet_nonce =
+            checked_highest_wallet_nonce(first_wallet_nonce, payloads.len())?;
+        watermark.raise_to(highest_wallet_nonce)?;
 
         let mut broadcast = Vec::with_capacity(payloads.len());
         let mut any_refused = false;
@@ -439,14 +443,17 @@ impl BatchPoster for EthereumBatchPoster {
         for (offset, payload) in payloads.into_iter().enumerate() {
             let offset =
                 u64::try_from(offset).expect("validated wallet-nonce range offset must fit in u64");
-            let nonce = first_nonce
+            let wallet_nonce = first_wallet_nonce
                 .checked_add(offset)
                 .expect("validated wallet-nonce range must not overflow");
-            self.track_pending(nonce);
-            match self.send_batch_at_nonce(payload, nonce, &fees).await {
+            self.track_pending(wallet_nonce);
+            match self
+                .send_batch_at_wallet_nonce(payload, wallet_nonce, &fees)
+                .await
+            {
                 Ok(tx_hash) => {
                     debug!(
-                        tx_nonce = nonce,
+                        tx_nonce = wallet_nonce,
                         %tx_hash,
                         max_fee_per_gas = fees.max_fee_per_gas,
                         max_priority_fee_per_gas = fees.max_priority_fee_per_gas,
@@ -456,18 +463,18 @@ impl BatchPoster for EthereumBatchPoster {
                     broadcast.push(tx_hash);
                 }
                 Err(BatchPosterError::Provider(ref msg)) if is_pending_tx_conflict(msg) => {
-                    // The mempool already holds our tx at this nonce and this
-                    // tick's estimate does not beat it. Not an error: keep
+                    // The mempool already holds our tx at this wallet nonce and
+                    // this tick's estimate does not beat it. Not an error: keep
                     // going so a longer suffix still gets its fresh sends, and
                     // let the worker sleep before the next estimate.
-                    if self.note_refused(nonce) {
+                    if self.note_refused(wallet_nonce) {
                         info!(
-                            tx_nonce = nonce,
+                            tx_nonce = wallet_nonce,
                             reason = %msg,
                             "batch tx already in the mempool at a price this estimate cannot beat; waiting on the fee market"
                         );
                     } else {
-                        debug!(tx_nonce = nonce, reason = %msg, "still waiting on the fee market");
+                        debug!(tx_nonce = wallet_nonce, reason = %msg, "still waiting on the fee market");
                     }
                     any_refused = true;
                     head_refused |= broadcast.is_empty();
@@ -807,7 +814,7 @@ mod tests {
         let provider = providers.read.clone();
         let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
 
-        let base_nonce = provider
+        let base_wallet_nonce = provider
             .get_transaction_count(SUBMITTER)
             .await
             .expect("base nonce");
@@ -828,8 +835,8 @@ mod tests {
         // (a) raised exactly once, (b) to the highest nonce of the range.
         assert_eq!(
             sink.calls(),
-            vec![base_nonce + 2],
-            "raise_to must be called once with base_nonce + payloads.len() - 1"
+            vec![base_wallet_nonce + 2],
+            "raise_to must be called once with base_wallet_nonce + payloads.len() - 1"
         );
         // (c) before any send — no tx broadcast, so pending nonce is unchanged.
         let pending = provider
@@ -838,7 +845,7 @@ mod tests {
             .await
             .expect("pending nonce");
         assert_eq!(
-            pending, base_nonce,
+            pending, base_wallet_nonce,
             "raise_to must run before any send; a broadcast would have bumped the pending nonce"
         );
     }
@@ -868,7 +875,7 @@ mod tests {
         };
         let poster = EthereumBatchPoster::new(providers, config);
 
-        let base_nonce = provider
+        let base_wallet_nonce = provider
             .get_transaction_count(SUBMITTER)
             .await
             .expect("base nonce");
@@ -898,7 +905,7 @@ mod tests {
             .await
             .expect("pending nonce");
         assert_eq!(
-            pending, base_nonce,
+            pending, base_wallet_nonce,
             "no tx may be broadcast on the wrong chain"
         );
     }
@@ -988,7 +995,7 @@ mod tests {
         let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
 
-        let base_nonce = provider
+        let base_wallet_nonce = provider
             .get_transaction_count(SUBMITTER)
             .await
             .expect("base nonce");
@@ -1015,14 +1022,21 @@ mod tests {
                 broadcast: Vec::new()
             }
         );
-        assert_eq!(poster.pending_nonces_for_test(), vec![base_nonce]);
+        assert_eq!(
+            poster.pending_wallet_nonces_for_test(),
+            vec![base_wallet_nonce]
+        );
 
         let pending = provider
             .get_transaction_count(SUBMITTER)
             .block_id(BlockNumberOrTag::Pending.into())
             .await
             .expect("pending nonce");
-        assert_eq!(pending, base_nonce + 1, "still exactly one pending slot");
+        assert_eq!(
+            pending,
+            base_wallet_nonce + 1,
+            "still exactly one pending slot"
+        );
 
         // 3) Mining resumes: the original lands; nothing replaced it.
         let _: serde_json::Value = provider
@@ -1056,7 +1070,7 @@ mod tests {
         let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
 
-        let base_nonce = provider
+        let base_wallet_nonce = provider
             .get_transaction_count(SUBMITTER)
             .await
             .expect("base nonce");
@@ -1070,8 +1084,8 @@ mod tests {
             "confirmed broadcasts are Submitted, got {outcome:?}"
         );
         assert_eq!(
-            poster.pending_nonces_for_test(),
-            vec![base_nonce, base_nonce + 1],
+            poster.pending_wallet_nonces_for_test(),
+            vec![base_wallet_nonce, base_wallet_nonce + 1],
             "attempted nonces stay tracked until the next tick sees Latest pass them"
         );
 
@@ -1080,7 +1094,10 @@ mod tests {
             .await
             .expect("next automined submit");
         assert!(matches!(outcome, SubmitBatchesOutcome::Submitted(ref h) if h.len() == 1));
-        assert_eq!(poster.pending_nonces_for_test(), vec![base_nonce + 2]);
+        assert_eq!(
+            poster.pending_wallet_nonces_for_test(),
+            vec![base_wallet_nonce + 2]
+        );
     }
 
     /// An underpriced-replacement rejection is the other reply that means "the
@@ -1099,7 +1116,7 @@ mod tests {
         let provider = providers.read.clone();
         let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
-        let base_nonce = provider
+        let base_wallet_nonce = provider
             .get_transaction_count(SUBMITTER)
             .await
             .expect("base nonce");
@@ -1117,7 +1134,10 @@ mod tests {
                 broadcast: Vec::new()
             }
         );
-        assert_eq!(poster.pending_nonces_for_test(), vec![base_nonce]);
+        assert_eq!(
+            poster.pending_wallet_nonces_for_test(),
+            vec![base_wallet_nonce]
+        );
     }
 
     /// Any other send failure is still a transient provider error for the
@@ -1163,7 +1183,7 @@ mod tests {
         let poster = EthereumBatchPoster::new(providers, poster_config(&anvil));
         let sink = RecordingWatermarkSink::passing();
 
-        let base_nonce = provider
+        let base_wallet_nonce = provider
             .get_transaction_count(SUBMITTER)
             .await
             .expect("base nonce");
@@ -1199,8 +1219,8 @@ mod tests {
             "a broadcast behind a refused head must not be watched for the full timeout"
         );
         assert_eq!(
-            poster.pending_nonces_for_test(),
-            (0..4).map(|i| base_nonce + i).collect::<Vec<_>>()
+            poster.pending_wallet_nonces_for_test(),
+            (0..4).map(|i| base_wallet_nonce + i).collect::<Vec<_>>()
         );
 
         let _: serde_json::Value = provider
@@ -1212,7 +1232,11 @@ mod tests {
             .block_id(BlockNumberOrTag::Latest.into())
             .await
             .expect("latest");
-        assert_eq!(latest, base_nonce + 4, "all four land in nonce order");
+        assert_eq!(
+            latest,
+            base_wallet_nonce + 4,
+            "all four land in nonce order"
+        );
 
         // A tick after inclusion prunes the resolved nonces.
         let outcome = poster
@@ -1222,6 +1246,9 @@ mod tests {
         assert!(
             matches!(outcome, SubmitBatchesOutcome::Waiting { ref broadcast } if broadcast.len() == 1)
         );
-        assert_eq!(poster.pending_nonces_for_test(), vec![base_nonce + 4]);
+        assert_eq!(
+            poster.pending_wallet_nonces_for_test(),
+            vec![base_wallet_nonce + 4]
+        );
     }
 }

@@ -5,7 +5,7 @@
 //! before recovery runs.
 //!
 //! After a danger-zone detection, the sequencer goes offline and calls
-//! [`MempoolFlusher::flush_and_wait`] to ensure every `w_nonce` slot is consumed
+//! [`MempoolFlusher::flush_and_wait`] to ensure every wallet-nonce slot is consumed
 //! (either by its original batch transaction or by a replacement no-op). Once all
 //! slots reach safe finality, the recovery procedure can read fully-finalized L1 state.
 
@@ -153,7 +153,7 @@ impl MempoolFlusher {
     }
 
     /// Flush the mempool by submitting no-op transactions for unresolved
-    /// nonce slots, then waiting until every slot we ever used is safe.
+    /// wallet-nonce slots, then waiting until every slot we ever used is safe.
     ///
     /// `watermark` durably covers every wallet nonce this deployment may
     /// have broadcast. Write-before-send can cover an unused slot. `None`
@@ -172,7 +172,7 @@ impl MempoolFlusher {
     /// it.
     ///
     /// At each iteration:
-    /// 1. Submit 0-ETH self-transfers for nonces in
+    /// 1. Submit 0-ETH self-transfers for wallet nonces in
     ///    `[Latest, max(Pending, watermark + 1))` — every slot not yet
     ///    mined that we might ever have used. The sink raises the persisted
     ///    watermark before the broadcast (uniform write-before-broadcast,
@@ -195,8 +195,8 @@ impl MempoolFlusher {
     ) -> Result<u64, FlushError> {
         let mut attempt = 0u32;
         loop {
-            let safe_nonce = self.nonce_at(BlockNumberOrTag::Safe).await?;
-            let pending_nonce = self.nonce_at(BlockNumberOrTag::Pending).await?;
+            let safe_nonce = self.wallet_nonce_at(BlockNumberOrTag::Safe).await?;
+            let pending_nonce = self.wallet_nonce_at(BlockNumberOrTag::Pending).await?;
             // The durable anchor: every slot we ever used must be consumed
             // at safe depth, regardless of what the local pool remembers.
             let required_safe_nonce = watermark.map_or(0, |w| {
@@ -250,18 +250,18 @@ impl MempoolFlusher {
             // Submit no-ops for every not-yet-mined slot up to the flush end.
             // The full range goes out before the wait, so every unresolved
             // slot gets a competing no-op attempt in this pass.
-            let latest_nonce = self.nonce_at(BlockNumberOrTag::Latest).await?;
-            if latest_nonce < flush_end {
+            let latest_wallet_nonce = self.wallet_nonce_at(BlockNumberOrTag::Latest).await?;
+            if latest_wallet_nonce < flush_end {
                 // Uniform write-before-broadcast; covers the no-ops we are
                 // about to send (a no-op above the current watermark can only
                 // happen if someone else used our key — over-covering then is
                 // exactly right).
-                let highest_nonce = flush_end
+                let highest_wallet_nonce = flush_end
                     .checked_sub(1)
                     .expect("a non-empty flush range must have a highest nonce");
-                sink.raise_to(highest_nonce)?;
+                sink.raise_to(highest_wallet_nonce)?;
             }
-            self.submit_noops(latest_nonce, flush_end).await?;
+            self.submit_noops(latest_wallet_nonce, flush_end).await?;
 
             if !self.wait_for_slots_mined(flush_end).await? {
                 continue;
@@ -284,7 +284,7 @@ impl MempoolFlusher {
         Ok(block.header.number)
     }
 
-    /// Submit 0-ETH self-transfers for nonces `from_nonce..to_nonce`.
+    /// Submit 0-ETH self-transfers for wallet nonces `from_nonce..to_nonce`.
     async fn submit_noops(&self, from_nonce: u64, to_nonce: u64) -> Result<(), FlushError> {
         if from_nonce >= to_nonce {
             return Ok(());
@@ -363,12 +363,12 @@ impl MempoolFlusher {
         Ok(())
     }
 
-    /// Wait until the Latest nonce reaches `flush_end`, polling once per
+    /// Wait until the Latest wallet nonce reaches `flush_end`, polling once per
     /// block. Returns `false` when the confirmation timeout passes first.
     async fn wait_for_slots_mined(&self, flush_end: u64) -> Result<bool, FlushError> {
         let deadline = tokio::time::Instant::now() + self.confirmation_timeout;
         loop {
-            if self.nonce_at(BlockNumberOrTag::Latest).await? >= flush_end {
+            if self.wallet_nonce_at(BlockNumberOrTag::Latest).await? >= flush_end {
                 return Ok(true);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -383,7 +383,7 @@ impl MempoolFlusher {
         }
     }
 
-    async fn nonce_at(&self, block: BlockNumberOrTag) -> Result<u64, FlushError> {
+    async fn wallet_nonce_at(&self, block: BlockNumberOrTag) -> Result<u64, FlushError> {
         self.providers
             .read
             .get_transaction_count(self.address)
@@ -638,8 +638,9 @@ mod tests {
         stop_tx
     }
 
-    /// Send a 0-ETH self-transfer at a specific nonce (without waiting for inclusion).
-    async fn send_tx_at_nonce(providers: &KeyedProviders, addr: Address, nonce: u64) {
+    /// Send a 0-ETH self-transfer at a specific wallet nonce (without waiting
+    /// for inclusion).
+    async fn send_tx_at_wallet_nonce(providers: &KeyedProviders, addr: Address, wallet_nonce: u64) {
         let fees = providers
             .read
             .estimate_eip1559_fees()
@@ -650,14 +651,14 @@ mod tests {
             .with_to(addr)
             .with_value(U256::ZERO)
             .with_gas_limit(21_000)
-            .with_nonce(nonce)
+            .with_nonce(wallet_nonce)
             .with_max_fee_per_gas(fees.max_fee_per_gas)
             .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
         providers.submit.send(tx).await.expect("send tx");
     }
 
     #[tokio::test]
-    async fn flush_is_noop_when_no_pending_nonces() {
+    async fn flush_is_noop_when_no_pending_wallet_nonces() {
         require_anvil();
 
         let anvil = spawn_anvil();
@@ -682,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_resolves_pending_nonces_to_safe() {
+    async fn flush_resolves_pending_wallet_nonces_to_safe() {
         require_anvil();
 
         let anvil = spawn_anvil();
@@ -691,8 +692,8 @@ mod tests {
         let addr = anvil.addresses()[0];
 
         // Send 3 txs into the mempool (unmined).
-        for nonce in 0..3 {
-            send_tx_at_nonce(&providers, addr, nonce).await;
+        for wallet_nonce in 0..3 {
+            send_tx_at_wallet_nonce(&providers, addr, wallet_nonce).await;
         }
 
         // Verify: pending=3, safe=0.
@@ -794,7 +795,7 @@ mod tests {
         );
 
         // The original tx, not a flush no-op, consumes the slot.
-        send_tx_at_nonce(&providers, addr, 0).await;
+        send_tx_at_wallet_nonce(&providers, addr, 0).await;
         let _: serde_json::Value = provider
             .raw_request("evm_mine".into(), ())
             .await
@@ -815,8 +816,8 @@ mod tests {
         let addr = anvil.addresses()[0];
 
         // Send 2 txs and mine them (latest but not safe).
-        for nonce in 0..2 {
-            send_tx_at_nonce(&providers, addr, nonce).await;
+        for wallet_nonce in 0..2 {
+            send_tx_at_wallet_nonce(&providers, addr, wallet_nonce).await;
         }
         let _: serde_json::Value = provider
             .raw_request("evm_mine".into(), ())
@@ -903,7 +904,7 @@ mod tests {
 
         // Seed: submit a tx at wallet-nonce 0 into Anvil's mempool (auto-
         // mining is off, so it stays pending). The flusher now has work.
-        send_tx_at_nonce(&direct, addr, 0).await;
+        send_tx_at_wallet_nonce(&direct, addr, 0).await;
         let pending = direct_provider
             .get_transaction_count(addr)
             .block_id(BlockNumberOrTag::Pending.into())

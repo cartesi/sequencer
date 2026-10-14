@@ -19,7 +19,7 @@ pub struct Eip1559Fees {
 
 /// Pad an `eth_estimateGas` result so a tight estimate cannot mine as an
 /// out-of-gas revert (which would burn the wallet-nonce slot with no
-/// `InputAdded` and desynchronize payload↔nonce assignment).
+/// `InputAdded` and desynchronize payload↔wallet-nonce assignment).
 pub fn pad_gas_estimate(gas: u64) -> u64 {
     gas.saturating_add(gas / 10)
 }

@@ -221,9 +221,9 @@ by writer and are write-once (`0001_schema.sql`).
 - **Depended on by:** the gold frontier, cascade pivot selection, checkpoint selection,
   local-state ↔ canonical-state agreement.
 - **Breaks:** would be silent divergence (a zombie replay of our own stale tx
-  winning a nonce slot; a power-loss re-seal at the same nonce with different
-  content); instead it is a detected `CanonicalDivergence` refusal whose
-  remedy is cockroach recovery.
+  winning a wallet-nonce slot; a power-loss re-seal at the same batch nonce
+  with different content); instead it is a detected `CanonicalDivergence`
+  refusal whose remedy is cockroach recovery.
 - **Completeness boundary:** the check completely enforces the accepted-batch
   identity predicate above; it is intentionally not a general canonical/application
   divergence oracle. The entire L1 prefix through baseline block `C` is opaque,
