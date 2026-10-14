@@ -39,6 +39,9 @@ Initially every batch close creates a snapshot. The lane makes the artifact
 and metadata durable **before** one transaction seals the batch and registers
 its snapshot. A failed database commit leaves an orphan directory; startup
 sweeps it. A committed close therefore has its required snapshot.
+Creation runs on the lane, so user ops queued behind a close wait for it. Each
+close logs the creation time as `snapshot_ms`, at DEBUG, or at WARN once it
+reaches half the `POST /tx` acknowledgement budget.
 
 Setup similarly makes the baseline artifact durable before publishing the
 complete era baseline, recovery root when applicable, and setup-completion

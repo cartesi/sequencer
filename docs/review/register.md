@@ -189,6 +189,23 @@ at `6b2a233`.
   size and unmeasured. Evidence:
   [`ingress/api.rs`](../../sequencer/src/ingress/api.rs),
   [`storage/queries.rs`](../../sequencer/src/storage/queries.rs).
+- **Per-batch snapshots run on the lane.** Every batch close writes its
+  snapshot before the sealing commit, so admission waits for
+  `Application::create_dump` and the sequencer's fsyncs. Closes fire on the fee
+  policy's byte target or the batch-open deadline, not on L1 posting, so under
+  load several land per L1 block and the stall grows with throughput over target
+  size. Exact per-batch snapshots stay: restart, acceptance comparison, and
+  recovery select the exact batch's snapshot
+  ([lifecycle](../snapshots/lifecycle.md#creation-and-restart)). For a
+  large-state native engine, the mitigation is a `create_dump` that clones files
+  on a copy-on-write filesystem (XFS with `reflink=1`, btrfs, APFS); see the
+  [clone costs](../cartesi-machine.md). Unmeasured beyond the batch-close
+  event's `snapshot_ms`. Revisit, per the
+  [capacity assumption](../protocol/application-contract.md#5-operational-capacity-for-l1-reconciliation),
+  when its p99 on deployment storage exceeds about 250 ms or retained snapshots
+  exceed the deployment's disk budget. Evidence:
+  [`inclusion_lane/snapshot.rs`](../../sequencer/src/ingress/inclusion_lane/snapshot.rs)
+  (added 2026-10-13 at `462e4d1`).
 
 ## Verification gaps
 

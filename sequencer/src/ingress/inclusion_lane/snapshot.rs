@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::dump_info::{self, DumpInfo};
 use crate::storage::{Storage, WriteHead};
@@ -36,6 +36,10 @@ pub(super) fn run_gc(storage: &mut Storage) -> Result<usize, GcError> {
     Ok(removed.len())
 }
 
+/// Snapshot creation blocks user-op admission; a close that spends half the
+/// 500 ms `POST /tx` acknowledgement budget on it is logged at WARN.
+const SLOW_SNAPSHOT: Duration = Duration::from_millis(250);
+
 /// Files become durable before the atomic batch seal and snapshot registration.
 /// A failed commit leaves only an orphan directory for the startup sweep.
 pub(super) fn close_batch_with_snapshot<A: Application>(
@@ -48,7 +52,9 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
     let batch_index = head.batch_index;
     let nonce = storage.batch_nonce(batch_index)?;
     let dump_dir = make_dump_dir(dumps_dir, nonce);
+    let started = Instant::now();
     dump_info::create_dump_dir_with_info(app, &dump_dir, &DumpInfo::at_batch_close(nonce))?;
+    let snapshot_elapsed = started.elapsed();
     storage.close_frame_and_batch_with_snapshot(
         head,
         next_safe_block,
@@ -56,6 +62,22 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
         batch_index,
         app.executed_input_count(),
     )?;
+    let snapshot_ms = snapshot_elapsed.as_millis();
+    if snapshot_elapsed >= SLOW_SNAPSHOT {
+        tracing::warn!(
+            batch_index,
+            nonce,
+            snapshot_ms,
+            "slow batch-close snapshot blocked user-op admission"
+        );
+    } else {
+        tracing::debug!(
+            batch_index,
+            nonce,
+            snapshot_ms,
+            "batch closed with snapshot"
+        );
+    }
     Ok(())
 }
 
