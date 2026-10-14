@@ -1126,7 +1126,8 @@ mod tip_staleness {
     fn undrained_safe_input_appears_in_recovery_batch_first_frame() {
         // a deposit ingested into safe_inputs but not yet drained
         // into any frame must be sequenced into the recovery batch's first
-        // frame after cascade. Complements  (re-drain from
+        // frame after cascade. Complements
+        // `recovery_redrains_direct_inputs_and_replay_sees_them_once` (re-drain from
         // invalidated) with the never-drained case.
         let (_db, mut storage) = open_temp_storage("recovery-includes-undrained");
 

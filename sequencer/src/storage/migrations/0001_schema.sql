@@ -19,13 +19,11 @@
 -- identity; reused across recovery cascades (new Tip forks from last valid
 -- ancestor, inheriting nonce via the +1 rule).
 -- ---------------------------------------------------------------------------
--- `sealed_at_ms` / `invalidated_at_ms` are observability stamps from the
--- wall clock — write-once (triggers below), but deliberately NOT
--- cross-checked against `created_at_ms`: wall-clock monotonicity is an
--- environmental assumption, not an invariant (NTP steps, VM resume), and a
--- CHECK on it once wedged batch close and the recovery cascade in a clock
--- regression. No production code reads these as values; every
--- reader is an IS NULL / IS NOT NULL predicate.
+-- `sealed_at_ms` / `invalidated_at_ms` are write-once observability stamps from
+-- the wall clock, deliberately not cross-checked against `created_at_ms`:
+-- wall-clock order is environmental, not an invariant (NTP steps, VM resume), and
+-- such a CHECK would wedge batch close and the recovery cascade on a clock
+-- regression. Every reader is an IS NULL / IS NOT NULL predicate.
 -- `payload_hash` is the keccak256 of the batch's SSZ wire bytes, stamped at
 -- seal time by the encode path the submitter uses. The content-identity check
 -- compares an accepted L1 landing against it; because the sealing code computed
@@ -70,20 +68,12 @@ CREATE VIEW IF NOT EXISTS valid_closed_batches AS
 CREATE VIEW IF NOT EXISTS valid_open_batch AS
     SELECT * FROM valid_batches WHERE sealed_at_ms IS NULL;
 
--- Batch-tree anchor: the nonce the single (valid) parentless root carries.
---
--- A genesis deployment is anchored at 0; a cockroach-recovered one is anchored
--- at N' (the post-checkpoint resume nonce), so `run`'s first tip roots at N'
--- without replaying history — there is no separate "sentinel" batch row, the
--- root tip *is* the anchor. The value generalizes the rule the tree already
--- has ("a parentless root carries nonce 0") from a hard-coded 0 to this
--- singleton; it is read by `trg_enforce_nonce_contiguity` (below) and by
--- `compute_next_nonce(parent = None)`.
---
--- Default 0, so a normal deployment is byte-identical to before this table
--- existed. Written exactly once — by `setup` (recovery sets N' before the
--- `setup_complete` marker); `trg_batch_tree_anchor_write_once` freezes it
--- thereafter, since re-anchoring a live deployment would strand its spine.
+-- Batch-tree anchor (I16): the nonce the single valid parentless root carries,
+-- 0 for genesis and N' (the resume nonce) after a cockroach rebuild, so `run`'s
+-- first Tip roots at N' without replaying history. Read by
+-- `trg_enforce_nonce_contiguity` and `compute_next_nonce`. Setup writes it once,
+-- before `setup_complete`; `trg_batch_tree_anchor_write_once` then freezes it,
+-- since re-anchoring a live deployment would strand its spine.
 CREATE TABLE IF NOT EXISTS batch_tree_anchor (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     nonce        INTEGER NOT NULL CHECK (nonce >= 0)
@@ -112,10 +102,8 @@ AFTER INSERT ON batches
 FOR EACH ROW
 BEGIN
     SELECT CASE
-        -- A parentless root must carry the deployment's anchor nonce. This is
-        -- an *exact* match — tighter than the old "must be 0": a buggy root at
-        -- any other nonce still ABORTs, including a re-root at 0 on a recovered
-        -- (anchor = N') deployment.
+        -- A parentless root must carry exactly the deployment's anchor nonce,
+        -- so a buggy root at any other nonce ABORTs, including 0 on a recovered one.
         WHEN NEW.parent_batch_index IS NULL
          AND NEW.nonce != (SELECT nonce FROM batch_tree_anchor WHERE singleton_id = 0)
             THEN RAISE(ABORT, 'parentless root must carry the batch-tree anchor nonce')

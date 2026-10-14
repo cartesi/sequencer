@@ -1,10 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Schema-invariant regression tests. The triggers, CHECKs and partial unique
-//! indexes in `migrations/0001_schema.sql` are the enforcement layer for the
-//! batch-tree invariants; each test pins one tripwire that previously lived
-//! in writer discipline.
+//! Schema-invariant regression tests: the triggers, CHECKs and partial unique
+//! indexes in `migrations/0001_schema.sql` enforce the batch-tree invariants, and
+//! each test pins one tripwire.
 
 use rusqlite::params;
 
@@ -102,8 +101,7 @@ fn schema_allows_parentless_root_at_anchor_nonce() {
             [],
         )
         .expect("parentless root at the anchor nonce is allowed");
-    // ...but a root at 0 (the old hard-coded value) now ABORTs — the rule is
-    // an exact match against the anchor, tighter than the old "must be 0".
+    // ...but a root at 0 ABORTs: the rule is an exact match against the anchor.
     let err = storage.conn.execute(
         "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
          VALUES (1, NULL, 0, 100, 100)",
