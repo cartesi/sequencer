@@ -91,8 +91,9 @@ case) **consumes the nonce**.
   `NonMonotonicSafeBlocks`.
 
 **Gate e — staleness** is measured against the **first** frame only
-(`has_elapsed_since`, mirrored off-chain by
-[`ProtocolTiming::is_scheduler_stale`](../../sequencer-core/src/protocol.rs)). A
+([`age_exceeds`](../../sequencer-core/src/protocol.rs), which the off-chain
+mirror [`ProtocolTiming::is_scheduler_stale`](../../sequencer-core/src/protocol.rs)
+also calls). A
 stale batch is a **true no-op in nonce space**: the expected nonce does *not*
 advance, so the next batch — including a freshly-rebuilt one reusing the same
 nonce after recovery — is what the scheduler accepts next. This is the

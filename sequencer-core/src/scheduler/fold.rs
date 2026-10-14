@@ -183,7 +183,7 @@ mod tests {
     }
 
     fn domain() -> Eip712Domain {
-        super::super::input_domain(1, Address::ZERO)
+        crate::build_input_domain(1, Address::ZERO)
     }
 
     /// Minimal `Application` double for the engine tests: records the markers of

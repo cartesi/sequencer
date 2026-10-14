@@ -307,9 +307,9 @@ impl ProtocolTiming {
     }
 
     /// Scheduler's staleness predicate: a batch is stale when
-    /// `inclusion_block - first_frame_safe_block >= max_wait_blocks`. Used by
-    /// the scheduler to skip stale submissions, and by the sequencer's
-    /// frontier simulator to match that behavior.
+    /// `inclusion_block - first_frame_safe_block >= max_wait_blocks`.
+    /// Off-chain mirror of the scheduler's gate e (both call [`age_exceeds`]);
+    /// used by [`Self::scheduler_accepts`].
     pub fn is_scheduler_stale(&self, inclusion_block: u64, first_frame_safe_block: u64) -> bool {
         age_exceeds(
             inclusion_block,
@@ -371,12 +371,12 @@ impl ProtocolTiming {
     }
 }
 
-/// Generic "age exceeds threshold" predicate shared between scheduler-staleness
-/// and the preemptive danger-zone check. Saturating subtraction keeps the
-/// arithmetic total over pathological inputs (safe head below a batch's first
-/// frame).
-pub fn age_exceeds(reference_block: u64, first_frame_safe_block: u64, threshold: u64) -> bool {
-    reference_block.saturating_sub(first_frame_safe_block) >= threshold
+/// The one staleness formula, `now - start >= window`. Saturating keeps the
+/// consensus path total when `start` is ahead of `now`. Callers: the
+/// scheduler's gate e and overdue-direct backstop, the off-chain
+/// [`ProtocolTiming::is_scheduler_stale`], and the danger check.
+pub fn age_exceeds(now: u64, start: u64, window: u64) -> bool {
+    now.saturating_sub(start) >= window
 }
 
 /// Advance `expected` by greedily consuming any matching observed nonce.

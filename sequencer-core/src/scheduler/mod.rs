@@ -9,12 +9,11 @@ use crate::application::{AppError, AppOutputs, Application, CanonicalState, Exec
 use crate::batch::{Batch, Frame, WireUserOp};
 use crate::history::ExecutedInputCount;
 use crate::l2_tx::DirectInput;
+use crate::protocol::age_exceeds;
 use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
 use alloy_sol_types::SolStruct;
 use std::collections::VecDeque;
-
-pub const MAX_WAIT_BLOCKS: u64 = crate::MAX_WAIT_BLOCKS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerConfig {
@@ -28,12 +27,12 @@ pub struct SchedulerConfig {
 
 impl SchedulerConfig {
     /// Production config for `sequencer_address`, pinning the staleness window
-    /// to the protocol's [`MAX_WAIT_BLOCKS`]. Tests that need a custom window
-    /// construct the struct directly.
+    /// to the protocol's [`crate::MAX_WAIT_BLOCKS`]. Tests that need a custom
+    /// window construct the struct directly.
     pub const fn new(sequencer_address: Address) -> Self {
         Self {
             sequencer_address,
-            max_wait_blocks: MAX_WAIT_BLOCKS,
+            max_wait_blocks: crate::MAX_WAIT_BLOCKS,
         }
     }
 }
@@ -67,23 +66,6 @@ impl ProcessResult {
 
     fn without_outputs(outcome: ProcessOutcome) -> Self {
         Self::new(outcome, Vec::new())
-    }
-}
-
-// Test-assertion sugar only: asymmetric cross-type equality in a public
-// consensus API makes `a == b` type-directed and non-obvious, so it stays out
-// of the production surface.
-#[cfg(test)]
-impl PartialEq<ProcessOutcome> for ProcessResult {
-    fn eq(&self, other: &ProcessOutcome) -> bool {
-        self.outcome == *other
-    }
-}
-
-#[cfg(test)]
-impl PartialEq<ProcessResult> for ProcessOutcome {
-    fn eq(&self, other: &ProcessResult) -> bool {
-        *self == other.outcome
     }
 }
 
@@ -263,10 +245,10 @@ impl<A: Application> Scheduler<A> {
             ));
         }
 
-        if has_elapsed_since(
+        if age_exceeds(
+            inclusion_block,
             frame_head.safe_block,
             self.config.max_wait_blocks,
-            inclusion_block,
         ) {
             return Ok(ProcessResult::without_outputs(
                 ProcessOutcome::BatchSkippedStale,
@@ -384,10 +366,10 @@ impl<A: Application> Scheduler<A> {
         outputs: &mut AppOutputs,
     ) -> Result<(), AppError> {
         while let Some(front) = self.direct_q.front() {
-            if has_elapsed_since(
+            if age_exceeds(
+                current_block,
                 front.inclusion_block,
                 self.config.max_wait_blocks,
-                current_block,
             ) {
                 let input = DirectInput {
                     sender: front.sender,
@@ -404,18 +386,6 @@ impl<A: Application> Scheduler<A> {
         }
         Ok(())
     }
-}
-
-/// Scheduler-local spelling of the one staleness predicate. Delegates to
-/// [`crate::protocol::age_exceeds`] so the fold and the off-chain protocol
-/// module cannot drift. Note the argument order differs:
-/// `has_elapsed_since(start, wait, current) == age_exceeds(current, start, wait)`.
-fn has_elapsed_since(start_block: u64, wait_blocks: u64, current_block: u64) -> bool {
-    crate::protocol::age_exceeds(current_block, start_block, wait_blocks)
-}
-
-pub fn input_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
-    crate::build_input_domain(chain_id, verifying_contract)
 }
 
 #[cfg(test)]
@@ -598,7 +568,7 @@ mod tests {
     const TEST_VERIFYING_CONTRACT: Address = Address::ZERO;
 
     fn test_domain() -> Eip712Domain {
-        input_domain(TEST_CHAIN_ID, TEST_VERIFYING_CONTRACT)
+        crate::build_input_domain(TEST_CHAIN_ID, TEST_VERIFYING_CONTRACT)
     }
 
     fn direct_input(block: u64, marker: u8) -> SchedulerInput {
@@ -666,7 +636,7 @@ mod tests {
         );
 
         assert_eq!(
-            process_ok(&mut scheduler, direct_input(10, 1)),
+            process_ok(&mut scheduler, direct_input(10, 1)).outcome,
             ProcessOutcome::DirectEnqueued
         );
 
@@ -690,7 +660,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(20, batch)),
+            process_ok(&mut scheduler, batch_input(20, batch)).outcome,
             ProcessOutcome::BatchExecuted
         );
         assert_eq!(
@@ -763,7 +733,7 @@ mod tests {
             }],
         };
 
-        let outcome = process_ok(&mut scheduler, batch_input(10, stale_batch));
+        let outcome = process_ok(&mut scheduler, batch_input(10, stale_batch)).outcome;
         assert_eq!(outcome, ProcessOutcome::BatchSkippedStale);
         assert_eq!(scheduler.app.events(), [RecordedTx::Direct(9)]);
         // Stale batches do NOT consume the nonce — they are true no-ops in nonce space.
@@ -790,7 +760,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(10, fresh_batch)),
+            process_ok(&mut scheduler, batch_input(10, fresh_batch)).outcome,
             ProcessOutcome::BatchExecuted
         );
     }
@@ -836,7 +806,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(10, invalid)),
+            process_ok(&mut scheduler, batch_input(10, invalid)).outcome,
             ProcessOutcome::BatchRejected(BatchRejectReason::NonMonotonicSafeBlocks)
         );
         assert!(scheduler.app.events().is_empty());
@@ -870,7 +840,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(10, invalid)),
+            process_ok(&mut scheduler, batch_input(10, invalid)).outcome,
             ProcessOutcome::BatchRejected(BatchRejectReason::SafeBlockAboveInclusionBlock)
         );
         assert!(scheduler.app.events().is_empty());
@@ -920,13 +890,13 @@ mod tests {
             payload: vec![0xFF, 0xEE, 0xDD],
         };
         assert_eq!(
-            process_ok(&mut scheduler, bad_batch),
+            process_ok(&mut scheduler, bad_batch).outcome,
             ProcessOutcome::BatchRejected(BatchRejectReason::DecodeFailed)
         );
         assert_eq!(scheduler.next_expected_batch_nonce(), 0);
 
         assert_eq!(
-            process_ok(&mut scheduler, direct_input(11, 3)),
+            process_ok(&mut scheduler, direct_input(11, 3)).outcome,
             ProcessOutcome::DirectEnqueued
         );
         assert_eq!(scheduler.queued_direct_len(), 1);
@@ -978,7 +948,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(1, batch)),
+            process_ok(&mut scheduler, batch_input(1, batch)).outcome,
             ProcessOutcome::BatchExecuted
         );
         assert!(scheduler.app.events().is_empty());
@@ -1032,7 +1002,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(1, batch)),
+            process_ok(&mut scheduler, batch_input(1, batch)).outcome,
             ProcessOutcome::BatchExecuted
         );
         assert_eq!(scheduler.app.events(), [RecordedTx::UserOp(4)]);
@@ -1054,7 +1024,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(10, batch)),
+            process_ok(&mut scheduler, batch_input(10, batch)).outcome,
             ProcessOutcome::BatchExecuted
         );
         assert!(scheduler.app.events().is_empty());
@@ -1073,7 +1043,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes((&[10_u8; 32]).into()).expect("signing key");
         let sender = address_from_signing_key(&signing_key);
         scheduler.app.credit(sender, 1);
-        let batch_domain = input_domain(
+        let batch_domain = crate::build_input_domain(
             TEST_CHAIN_ID + 7,
             address!("0x3333333333333333333333333333333333333333"),
         );
@@ -1100,7 +1070,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, input),
+            process_ok(&mut scheduler, input).outcome,
             ProcessOutcome::BatchExecuted
         );
         assert_eq!(scheduler.app.events(), [RecordedTx::UserOp(9)]);
@@ -1116,7 +1086,7 @@ mod tests {
             },
         );
         assert_eq!(
-            process_ok(&mut scheduler, direct_input(1, 7)),
+            process_ok(&mut scheduler, direct_input(1, 7)).outcome,
             ProcessOutcome::DirectEnqueued
         );
         // Inspect reflects executed app state, not the direct-input queue.
@@ -1134,7 +1104,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(2, batch)),
+            process_ok(&mut scheduler, batch_input(2, batch)).outcome,
             ProcessOutcome::BatchExecuted
         );
 
@@ -1180,7 +1150,7 @@ mod tests {
         };
 
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(1, batch)),
+            process_ok(&mut scheduler, batch_input(1, batch)).outcome,
             ProcessOutcome::BatchRejected(BatchRejectReason::WrongNonce {
                 expected: 0,
                 got: 1,
@@ -1273,7 +1243,7 @@ mod tests {
         );
 
         assert_eq!(
-            process_ok(&mut scheduler, direct_input(1, 1)),
+            process_ok(&mut scheduler, direct_input(1, 1)).outcome,
             ProcessOutcome::DirectEnqueued
         );
         let error = scheduler
@@ -1342,7 +1312,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            process_ok(&mut scheduler, direct_input(1, 9)),
+            process_ok(&mut scheduler, direct_input(1, 9)).outcome,
             ProcessOutcome::DirectEnqueued
         );
 
@@ -1400,7 +1370,9 @@ mod tests {
                 domain: test_domain(),
                 payload: payload.to_vec(),
             },
-        ) == ProcessOutcome::BatchExecuted;
+        )
+        .outcome
+            == ProcessOutcome::BatchExecuted;
         let offchain_accepted = duality_timing()
             .scheduler_accepts(
                 SEQUENCER,
@@ -1609,7 +1581,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            process_ok(&mut scheduler, batch_input(10, batch)),
+            process_ok(&mut scheduler, batch_input(10, batch)).outcome,
             ProcessOutcome::BatchRejected(BatchRejectReason::SafeBlockAboveInclusionBlock)
         );
         assert_eq!(scheduler.next_expected_batch_nonce(), 0);

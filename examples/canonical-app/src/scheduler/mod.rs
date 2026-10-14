@@ -13,9 +13,7 @@ use alloy_primitives::U256;
 use rollups_types::{Notice, Voucher};
 use sequencer_core::application::AppOutput;
 use sequencer_core::application::{Application, CanonicalState};
-use sequencer_core::scheduler::{
-    InspectError, ProcessOutcome, Scheduler, SchedulerInput, input_domain,
-};
+use sequencer_core::scheduler::{InspectError, ProcessOutcome, Scheduler, SchedulerInput};
 use trolley::{Rollup, RollupRequest};
 
 pub use sequencer_core::scheduler::{STATE_INSPECT_QUERY, SchedulerConfig};
@@ -31,8 +29,10 @@ pub fn run_scheduler_forever<R: Rollup, A: Application + CanonicalState>(
         match rollup.next_input() {
             Ok(RollupRequest::Advance { metadata, payload }) => {
                 let inclusion_block = block_to_u64(metadata.block_number);
-                let domain =
-                    input_domain(chain_id_to_u64(metadata.chain_id), metadata.app_contract);
+                let domain = sequencer_core::build_input_domain(
+                    chain_id_to_u64(metadata.chain_id),
+                    metadata.app_contract,
+                );
 
                 let input = SchedulerInput {
                     sender: metadata.msg_sender,
