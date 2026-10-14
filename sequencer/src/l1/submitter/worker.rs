@@ -1,28 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Batch submitter worker: stateless, at-least-once submission to L1.
-//!
-//! The submitter never observes danger — that is the [`crate::recovery::DangerDetector`]
-//! worker's job. Each tick here is a pure "what pending work is left?" step:
-//!
-//! 1. Read the scheduler-accepted frontier (safe block + next-expected nonce)
-//!    from SQLite. Shared snapshot maintained by the input reader via
-//!    `append_safe_inputs`.
-//! 2. Query L1 for batch submissions newer than the safe block; fold any
-//!    matching observed nonces to advance the local expected nonce past
-//!    already-mined submissions.
-//! 3. Load every valid closed batch whose nonce is still past the advanced
-//!    frontier and submit them all in one shot.
-//!
-//! The outer loop is uniform: tick, maybe sleep, repeat. A tick that produced
-//! submissions re-enters immediately (no sleep) so the suffix drains quickly;
-//! an idle, transient-error, or waiting tick sleeps `idle_poll_interval`
-//! before the next attempt. Fee-policy limits live in `docs/l1-fee-policy.md`.
-//!
-//! Mid-tick cancellation is crash-safe: storage transactions either commit or
-//! auto-roll-back on drop, and any already-sent L1 transaction is picked up by
-//! the next startup's `observed_submitted_batch_nonces` scan.
+//! Batch submitter worker: stateless, at-least-once submission. Each tick reads
+//! the accepted frontier from SQLite, advances past batch nonces already seen on
+//! L1 above the safe block, and submits every remaining valid closed batch. It
+//! never observes danger; a cancelled tick's sends are found by the next scan.
 
 use std::sync::Arc;
 use std::time::Duration;

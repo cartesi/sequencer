@@ -40,11 +40,7 @@ pub struct BatchPosterConfig {
     /// Assumed L1 block time in seconds, used to derive a conservative
     /// confirmation timeout for watched batch-submission txs.
     pub seconds_per_block: u64,
-    /// The pinned deployment chain id. Re-confirmed against the RPC immediately
-    /// before every productive send (`submit_batches`), so a long-lived
-    /// submitter whose load-balanced RPC fails over to another chain refuses to
-    /// burn wallet-nonce slots on it rather than relying only on the one-shot
-    /// boot / reader checks.
+    /// The pinned chain id; `submit_batches` rechecks it before every productive send.
     pub expected_chain_id: u64,
 }
 
@@ -419,15 +415,13 @@ impl BatchPoster for EthereumBatchPoster {
             return Ok(SubmitBatchesOutcome::Submitted(Vec::new()));
         }
 
-        // Keyed-write chain-id gate: re-confirm the RPC still serves the pinned
-        // chain immediately before any productive send. Signatures carry the
-        // pinned id, so no send can land on another chain; but the submitter is
-        // long-lived, and a load-balanced RPC that fails over to another chain
-        // mid-life would feed this tick that chain's wallet nonce and fees, and
-        // the watermark that nonce. Reached only when there is something to
-        // send (the empty early-return above), so idle ticks add no RPC load.
-        // A mismatch is terminal (lifted out of the transient bucket by the
-        // submitter run-loop); a transient RPC error retries like any blip.
+        // Recheck the chain id before any productive send. Signatures carry the
+        // pinned id, so nothing lands on another chain, but an endpoint serving
+        // another chain would feed this tick that chain's wallet nonce and fees,
+        // and raise the durable watermark (I14) to that nonce.
+        // The threat model's one-consistent-node rule excludes that; the check
+        // costs one call per productive tick. Revisit when a fallback RPC tier lands.
+        // A mismatch is terminal; an RPC error retries.
         let rpc_chain_id = self
             .providers
             .read
