@@ -4,15 +4,15 @@
 use std::time::Duration;
 
 use crate::storage::{ApplicationInputRow, L2TxContext};
-use alloy_primitives::{Address, Signature, U256};
-use alloy_sol_types::{Eip712Domain, SolStruct};
+use alloy_primitives::{Address, U256};
+use alloy_sol_types::Eip712Domain;
 use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, Method, WalletConfig, Withdrawal};
 use futures_util::StreamExt;
 use k256::ecdsa::SigningKey;
-use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer::storage::{Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
+use sequencer_core::test_support::sign_user_op;
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,17 +57,7 @@ fn v1_regression_shared_domain_recovers_signer() {
     };
 
     // Sign with the shared domain.
-    let hash = user_op.eip712_signing_hash(&domain);
-    let k256_sig = signing_key.sign_prehash(hash.as_slice()).expect("sign");
-    let signature = [false, true]
-        .into_iter()
-        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-        .find(|s| {
-            s.recover_address_from_prehash(&hash)
-                .ok()
-                .is_some_and(|r| r == signer_address)
-        })
-        .expect("recoverable parity");
+    let signature = sign_user_op(&signing_key, &domain, &user_op);
 
     // Recover with the shared domain — must equal signer.
     let hash_again = user_op.eip712_signing_hash(&domain);
@@ -107,17 +97,7 @@ fn v1_regression_name_none_domain_recovers_different_address() {
     };
 
     // Sign with the correct (shared) domain.
-    let hash = user_op.eip712_signing_hash(&correct_domain);
-    let k256_sig = signing_key.sign_prehash(hash.as_slice()).expect("sign");
-    let signature = [false, true]
-        .into_iter()
-        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-        .find(|s| {
-            s.recover_address_from_prehash(&hash)
-                .ok()
-                .is_some_and(|r| r == signer_address)
-        })
-        .expect("recoverable parity");
+    let signature = sign_user_op(&signing_key, &correct_domain, &user_op);
 
     // Recover with the buggy domain — must NOT recover the signer.
     // (This is what would silently fail at the scheduler under the V1 bug.)
@@ -149,17 +129,7 @@ fn v1_regression_domain_fields_all_affect_recovery() {
 
     // Sign with chain_id = 1.
     let chain_a = sequencer_core::build_input_domain(1, app);
-    let hash_a = user_op.eip712_signing_hash(&chain_a);
-    let k256_sig = signing_key.sign_prehash(hash_a.as_slice()).expect("sign");
-    let signature = [false, true]
-        .into_iter()
-        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-        .find(|s| {
-            s.recover_address_from_prehash(&hash_a)
-                .ok()
-                .is_some_and(|r| r == signer_address)
-        })
-        .expect("recoverable parity");
+    let signature = sign_user_op(&signing_key, &chain_a, &user_op);
 
     // Cross-chain replay must fail: recover under chain_id=2 with the same app.
     let chain_b = sequencer_core::build_input_domain(2, app);
@@ -1322,23 +1292,7 @@ fn parse_http_response(raw: &[u8]) -> (u16, String) {
 }
 
 fn sign_user_op_hex(domain: &Eip712Domain, user_op: &UserOp, signing_key: &SigningKey) -> String {
-    let hash = user_op.eip712_signing_hash(domain);
-    let k256_sig = signing_key
-        .sign_prehash(hash.as_slice())
-        .expect("sign user op hash");
-
-    let sender = address_from_signing_key(signing_key);
-    let signature = [false, true]
-        .into_iter()
-        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-        .find(|candidate| {
-            candidate
-                .recover_address_from_prehash(&hash)
-                .ok()
-                .map(|value| value == sender)
-                .unwrap_or(false)
-        })
-        .expect("recoverable parity for signature");
+    let signature = sign_user_op(signing_key, domain, user_op);
 
     alloy_primitives::hex::encode_prefixed(signature.as_bytes())
 }

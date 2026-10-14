@@ -21,7 +21,7 @@ rusqlite = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 tar = "0.4"
 toml = { workspace = true }
-sequencer-core = { path = "../../sequencer-core" }
+sequencer-core = { path = "../../sequencer-core", features = ["test-support"] }
 sequencer-rust-client = { path = "../../sdk/rust-client" }
 serde = { workspace = true }
 serde_json = { workspace = true }

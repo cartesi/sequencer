@@ -37,6 +37,7 @@ async-trait = "0.1"
 sha2 = "0.10"
 
 [dev-dependencies]
+sequencer-core = { path = "../sequencer-core", features = ["test-support"] }
 app-core = { path = "../examples/app-core" }
 # Anvil bindings are test-only: production builds must not carry the
 # node-spawning surface.

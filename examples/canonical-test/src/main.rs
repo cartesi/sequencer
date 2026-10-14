@@ -9,12 +9,11 @@ use app_core::application::{
 };
 use canonical_app::SchedulerConfig;
 use k256::ecdsa::SigningKey;
-use k256::ecdsa::signature::hazmat::PrehashSigner;
-use rollups_types::alloy_primitives::Signature;
 use rollups_types::alloy_primitives::{Address, U256, address};
-use rollups_types::alloy_sol_types::{Eip712Domain, SolCall, SolStruct};
+use rollups_types::alloy_sol_types::{Eip712Domain, SolCall};
 use rollups_types::{Erc20Deposit, Erc20Transfer};
 use sequencer_core::batch::{Batch, Frame, WireUserOp};
+use sequencer_core::test_support::sign_user_op;
 use sequencer_core::user_op::UserOp;
 use testsi::{InputBuilder, Machine, MachineBuilder, OutputsForInput, TestResult};
 
@@ -342,22 +341,7 @@ fn signed_user_op_with_fee(
         max_fee,
         data: data.clone().into(),
     };
-    let signing_hash = user_op.eip712_signing_hash(&input_domain());
-    let k256_sig = signing_key
-        .sign_prehash(signing_hash.as_slice())
-        .expect("sign user op hash");
-    let sender = address_from_signing_key(signing_key);
-    let signature = [false, true]
-        .into_iter()
-        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-        .find(|candidate| {
-            candidate
-                .recover_address_from_prehash(&signing_hash)
-                .ok()
-                .map(|value| value == sender)
-                .unwrap_or(false)
-        })
-        .expect("recoverable parity for signature");
+    let signature = sign_user_op(signing_key, &input_domain(), &user_op);
 
     WireUserOp {
         nonce,

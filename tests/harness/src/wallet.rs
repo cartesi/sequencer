@@ -8,12 +8,11 @@ use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
-use alloy_primitives::{Address, Signature, U256};
-use alloy_sol_types::{Eip712Domain, SolStruct};
+use alloy_primitives::{Address, U256};
+use alloy_sol_types::Eip712Domain;
 use app_core::application::{Method, Transfer, Withdrawal, default_private_keys};
 use cartesi_rollups_contracts::erc20_portal::Erc20Portal;
 use k256::ecdsa::SigningKey;
-use k256::ecdsa::signature::hazmat::PrehashSigner;
 use sequencer_core::api::{TxRequest, TxResponse};
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
@@ -324,24 +323,7 @@ pub fn sign_user_op_hex(
     domain: &Eip712Domain,
     user_op: &UserOp,
 ) -> HarnessResult<String> {
-    let hash = user_op.eip712_signing_hash(domain);
-    let k256_sig = signing_key
-        .sign_prehash(hash.as_slice())
-        .map_err(|err| io_other(format!("failed to sign user op hash: {err}")))?;
-
-    let expected_sender = address_from_signing_key(signing_key);
-    let signature = [false, true]
-        .into_iter()
-        .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-        .find(|candidate| {
-            candidate
-                .recover_address_from_prehash(&hash)
-                .ok()
-                .map(|value| value == expected_sender)
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| io_other("failed to derive recoverable signature parity"))?;
-
+    let signature = sequencer_core::test_support::sign_user_op(signing_key, domain, user_op);
     Ok(alloy_primitives::hex::encode_prefixed(signature.as_bytes()))
 }
 

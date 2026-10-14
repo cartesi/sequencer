@@ -378,7 +378,8 @@ large, never `#[path]`. Cross-module in-process tests go in
 `sequencer/src/integration_tests/`; devnet, machine and binary tests go in the
 `tests/*` crates. Shared fixtures live in `crate::test_support`;
 `storage::test_helpers` keeps the storage-domain ones (seeding, the recovery
-fixture trait, divergence markers).
+fixture trait, divergence markers); cross-crate signing helpers live in
+`sequencer_core::test_support` behind its `test-support` feature.
 
 Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a
 clear message if `anvil` is not on PATH. Use the configured Nix/direnv environment

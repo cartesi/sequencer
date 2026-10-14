@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 app-core = { path = "../app-core" }
 canonical-app = { path = "../canonical-app" }
-sequencer-core = { path = "../../sequencer-core" }
+sequencer-core = { path = "../../sequencer-core", features = ["test-support"] }
 ssz = { workspace = true }
 testsi = { workspace = true }
 rollups-types = { workspace = true, features = ["test-support"] }

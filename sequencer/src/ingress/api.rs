@@ -258,10 +258,10 @@ mod tests {
 
     use alloy_primitives::{Address, Signature};
     use alloy_sol_types::Eip712Domain;
-    use alloy_sol_types::SolStruct;
+
     use axum::http::StatusCode;
     use k256::ecdsa::SigningKey;
-    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use sequencer_core::test_support::{sign_hash, sign_user_op};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -493,23 +493,7 @@ mod tests {
         user_op: &UserOp,
         signing_key: &SigningKey,
     ) -> String {
-        let hash = user_op.eip712_signing_hash(domain);
-        let k256_sig = signing_key
-            .sign_prehash(hash.as_slice())
-            .expect("sign user op hash");
-
-        let sender = address_from_signing_key(signing_key);
-        let signature = [false, true]
-            .into_iter()
-            .map(|parity| Signature::from_signature_and_parity(k256_sig, parity))
-            .find(|candidate| {
-                candidate
-                    .recover_address_from_prehash(&hash)
-                    .ok()
-                    .map(|value| value == sender)
-                    .unwrap_or(false)
-            })
-            .expect("recoverable parity for signature");
+        let signature = sign_user_op(signing_key, domain, user_op);
 
         alloy_primitives::hex::encode_prefixed(signature.as_bytes())
     }
@@ -540,21 +524,8 @@ mod tests {
         let expected_sender = address_from_signing_key(&signing_key);
 
         let msg_hash = B256::from([0xfe_u8; 32]);
-        let k256_sig = signing_key
-            .sign_prehash(msg_hash.as_slice())
-            .expect("sign prehash");
-
-        // k256's `sign_prehash` returns a low-s signature by default. Find the
-        // parity that pairs with it to recover the expected signer.
-        let valid_sig = [false, true]
-            .into_iter()
-            .map(|p| Signature::from_signature_and_parity(k256_sig, p))
-            .find(|s| {
-                s.recover_address_from_prehash(&msg_hash)
-                    .ok()
-                    .is_some_and(|a| a == expected_sender)
-            })
-            .expect("low-s signature must recover the signer with one parity");
+        // k256 signs low-s; sign_hash picks the parity that recovers the signer.
+        let valid_sig = sign_hash(&signing_key, &msg_hash);
 
         // Construct the S-malleable variant: same r, s' = n - s, flipped parity.
         let malleable_sig =
