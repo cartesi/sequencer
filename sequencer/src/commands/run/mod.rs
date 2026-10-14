@@ -79,7 +79,7 @@ where
 
     let result = run_admitted::<A>(config, timing, l1_config, process_lock.clone()).await;
     // The Ok-path divergence fact check (run's counterpart of the one
-    // `complete_setup` keeps): divergence persisted during this run must
+    // `complete_baseline_setup` keeps): divergence persisted during this run must
     // exit terminal even through a clean drain — exit 0 is the one code
     // that breaks the supervisor's rediscovery chain (restart → preflight
     // refusal), and the detector's poll cadence leaves a window where a

@@ -143,34 +143,6 @@ impl Storage {
         require_command_fits_completion(&self.conn, command)
     }
 
-    /// Commit setup's timeless completion fact. The `setup_complete`
-    /// primary key makes double-completion unrepresentable at the engine,
-    /// and the preconditions (recovery checkpoint + application-history base)
-    /// are re-read inside the same transaction so completion can never
-    /// outrun the state it certifies.
-    #[cfg(test)]
-    pub(crate) fn complete_setup(&mut self) -> Result<(), LifecycleError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Completing setup over persisted divergence would be a lie.
-        refuse_on_canonical_divergence(&tx)?;
-        super::history::query_history_state(&tx)?;
-        if !super::snapshot_dumps::has_rollback_safe_snapshot_in(&tx)? {
-            return Err(LifecycleError::Malformed(
-                "setup cannot complete before its recovery checkpoint and \
-                 application-history baseline are established"
-                    .to_string(),
-            ));
-        }
-        tx.execute(
-            "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, ?1)",
-            [now_unix_ms()],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Best-effort terminal-cause record, written by the command bracket at
     /// settlement. Deliberately gated on nothing — not even divergence —
     /// because a refused write must never be the reason a cause goes
@@ -408,7 +380,13 @@ mod tests {
             ));
         }
         assert!(matches!(
-            storage.complete_setup(),
+            storage.complete_baseline_setup(
+                std::path::Path::new("/tmp/facts-genesis"),
+                sequencer_core::history::ExecutedInputCount::ZERO,
+                0,
+                0,
+                false,
+            ),
             Err(LifecycleError::CanonicalDivergence { nonce: 7 })
         ));
     }
@@ -465,12 +443,5 @@ mod tests {
                 .execute("UPDATE terminal_faults SET cause = 'x'", [])
                 .is_err()
         );
-    }
-
-    #[test]
-    fn setup_cannot_complete_before_base_and_snapshot_exist() {
-        let (_db, mut storage) = seeded(LifecycleCommand::Rebuild);
-        assert!(storage.complete_setup().is_err());
-        assert!(!storage.is_setup_complete().expect("read completion"));
     }
 }
