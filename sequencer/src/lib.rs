@@ -33,6 +33,8 @@ pub mod storage;
 extern crate self as sequencer;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use commands::config::{FlushConfig, RunConfig, SetupConfig};
 pub use commands::error::CommandError;

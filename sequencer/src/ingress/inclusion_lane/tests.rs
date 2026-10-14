@@ -1,12 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use alloy_primitives::{Address, Signature};
-use app_core::application::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
 use rusqlite::params;
 use tokio::sync::{mpsc, oneshot};
 
@@ -16,12 +14,12 @@ use crate::storage::test_helpers::{
     temp_db,
 };
 use crate::storage::{DirectInputExecution, SafeInputRange, Storage, StoredSafeInput, WriteHead};
-use sequencer_core::application::{
-    AppError, AppOutputs, Application, ApplicationProgress, InvalidReason, ValidationOutcome,
-};
+use sequencer_core::application::{AppError, Application};
 use sequencer_core::history::ExecutedInputCount;
-use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
+use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
+
+use crate::test_support::{ReplayEvent, StubApp};
 
 use super::catch_up::{catch_up_application_paged, catch_up_snapshot};
 use super::dequeue_and_execute_user_op_chunk;
@@ -30,330 +28,6 @@ use super::{
     IncludedUserOp, InclusionLane, InclusionLaneConfig, InclusionLaneError, LaneState,
     PendingUserOp, SequencerError, TurnOutcome,
 };
-
-fn encode_progress(progress: ApplicationProgress) -> [u8; 16] {
-    let mut bytes = [0_u8; 16];
-    bytes[..8].copy_from_slice(&progress.executed_input_count().get().to_le_bytes());
-    bytes[8..].copy_from_slice(&progress.last_executed_safe_block().to_le_bytes());
-    bytes
-}
-
-fn decode_progress(bytes: &[u8], app_name: &str) -> Result<ApplicationProgress, AppError> {
-    if bytes.len() != 16 {
-        return Err(AppError::Internal {
-            reason: format!("{app_name} dump must be exactly 16 bytes"),
-        });
-    }
-    let count = u64::from_le_bytes(bytes[..8].try_into().expect("checked slice length"));
-    let safe_block = u64::from_le_bytes(bytes[8..].try_into().expect("checked slice length"));
-    Ok(
-        ApplicationProgress::try_new(ExecutedInputCount::new(count), safe_block)
-            .expect("coherent progress"),
-    )
-}
-
-#[derive(Default)]
-struct TestApp {
-    nonces: HashMap<Address, u32>,
-    progress: ApplicationProgress,
-    fail_dump: bool,
-    /// Test-only scheduling seam used to keep a rejected queue saturated long
-    /// enough to distinguish one bounded turn from an unbounded drain.
-    reject_user_ops_after: Option<Duration>,
-}
-
-impl Application for TestApp {
-    fn max_method_payload_bytes() -> usize {
-        WALLET_MAX_METHOD_PAYLOAD_BYTES
-    }
-
-    fn validate_user_op(
-        &self,
-        _sender: Address,
-        user_op: &UserOp,
-        _current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
-        if let Some(delay) = self.reject_user_ops_after {
-            std::thread::sleep(delay);
-            return Ok(ValidationOutcome::Reject(InvalidReason::InvalidNonce {
-                expected: user_op.nonce.wrapping_add(1),
-                got: user_op.nonce,
-            }));
-        }
-        Ok(ValidationOutcome::Accept)
-    }
-
-    fn apply_valid_user_op(
-        &mut self,
-        user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
-        let current = self.nonces.get(&user_op.sender).copied().unwrap_or(0);
-        let next_nonce = current.wrapping_add(1);
-        self.nonces.insert(user_op.sender, next_nonce);
-        self.progress.advance(safe_block);
-        Ok(Vec::new())
-    }
-
-    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-        self.progress.advance(input.block_number);
-        Ok(Vec::new())
-    }
-
-    fn progress(&self) -> ApplicationProgress {
-        self.progress
-    }
-
-    // The lane loads its app via `from_dump` after the runtime
-    // registers a genesis dump, so test stubs must reload to the
-    // initial state (an empty `nonces` map). `create_dump` writes
-    // an empty marker file — `from_dump` ignores the contents and
-    // returns `Self::default()`.
-    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        Ok(Self::default())
-    }
-
-    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
-        if self.fail_dump {
-            return Err(std::io::Error::other("injected application dump failure").into());
-        }
-        std::fs::create_dir(prefix)?;
-        std::fs::write(Self::state_file_in_dump(prefix), b"")?;
-        Ok(())
-    }
-
-    fn state_file_in_dump(prefix: &Path) -> PathBuf {
-        prefix.join("state")
-    }
-}
-
-#[derive(Default)]
-struct InternalUserOpApp {
-    fail_validation: bool,
-    progress: ApplicationProgress,
-}
-
-impl Application for InternalUserOpApp {
-    fn max_method_payload_bytes() -> usize {
-        WALLET_MAX_METHOD_PAYLOAD_BYTES
-    }
-
-    fn validate_user_op(
-        &self,
-        _sender: Address,
-        _user_op: &UserOp,
-        _current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
-        if self.fail_validation {
-            return Err(AppError::Internal {
-                reason: "app invariant failed".into(),
-            });
-        }
-        Ok(ValidationOutcome::Accept)
-    }
-
-    fn apply_valid_user_op(
-        &mut self,
-        _user_op: &ValidUserOp,
-        _safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
-        Err(AppError::Internal {
-            reason: "app invariant failed".to_string(),
-        })
-    }
-
-    fn apply_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
-        unimplemented!("not used in these tests")
-    }
-
-    fn progress(&self) -> ApplicationProgress {
-        self.progress
-    }
-
-    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        Ok(Self::default())
-    }
-
-    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
-        std::fs::create_dir(prefix)?;
-        std::fs::write(Self::state_file_in_dump(prefix), b"")?;
-        Ok(())
-    }
-
-    fn state_file_in_dump(prefix: &Path) -> PathBuf {
-        prefix.join("state")
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReplayEvent {
-    UserOp {
-        sender: Address,
-        data: Vec<u8>,
-    },
-    DirectInput {
-        sender: Address,
-        block_number: u64,
-        payload: Vec<u8>,
-    },
-}
-
-struct ReplayRecordingApp {
-    progress: ApplicationProgress,
-    replayed: Vec<ReplayEvent>,
-}
-
-/// App that counts direct-input executions and persists the count
-/// through `create_dump` / `from_dump`. Tests verify the count by
-/// reading the state file from a snapshot (rather than by sharing
-/// an `Arc<AtomicU64>` across thread boundaries) — the lane loads
-/// its own instance via `from_dump`, so external observation has to
-/// go through the on-disk snapshot.
-struct SharedCountingApp {
-    progress: ApplicationProgress,
-}
-
-impl SharedCountingApp {
-    fn new() -> Self {
-        Self {
-            progress: ApplicationProgress::default(),
-        }
-    }
-}
-
-impl Application for SharedCountingApp {
-    fn max_method_payload_bytes() -> usize {
-        WALLET_MAX_METHOD_PAYLOAD_BYTES
-    }
-
-    fn validate_user_op(
-        &self,
-        _sender: Address,
-        _user_op: &UserOp,
-        _current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
-        Ok(ValidationOutcome::Accept)
-    }
-
-    fn apply_valid_user_op(
-        &mut self,
-        _user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
-        self.progress.advance(safe_block);
-        Ok(Vec::new())
-    }
-
-    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-        self.progress.advance(input.block_number);
-        Ok(Vec::new())
-    }
-
-    fn progress(&self) -> ApplicationProgress {
-        self.progress
-    }
-
-    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
-        let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
-        let progress = decode_progress(bytes.as_slice(), "SharedCountingApp")?;
-        Ok(Self { progress })
-    }
-
-    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
-        std::fs::create_dir(prefix)?;
-        std::fs::write(
-            Self::state_file_in_dump(prefix),
-            encode_progress(self.progress),
-        )?;
-        Ok(())
-    }
-
-    fn state_file_in_dump(prefix: &Path) -> PathBuf {
-        prefix.join("state")
-    }
-}
-
-impl ReplayRecordingApp {
-    fn with_executed_input_count(executed_input_count: u64) -> Self {
-        Self {
-            progress: ApplicationProgress::try_new(
-                ExecutedInputCount::new(executed_input_count),
-                0,
-            )
-            .expect("coherent progress"),
-            replayed: Vec::new(),
-        }
-    }
-}
-
-impl Default for ReplayRecordingApp {
-    fn default() -> Self {
-        Self::with_executed_input_count(0)
-    }
-}
-
-impl Application for ReplayRecordingApp {
-    fn max_method_payload_bytes() -> usize {
-        WALLET_MAX_METHOD_PAYLOAD_BYTES
-    }
-
-    fn validate_user_op(
-        &self,
-        _sender: Address,
-        _user_op: &UserOp,
-        _current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
-        Ok(ValidationOutcome::Accept)
-    }
-
-    fn apply_valid_user_op(
-        &mut self,
-        user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
-        self.replayed.push(ReplayEvent::UserOp {
-            sender: user_op.sender,
-            data: user_op.data.clone(),
-        });
-        self.progress.advance(safe_block);
-        Ok(Vec::new())
-    }
-
-    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-        self.replayed.push(ReplayEvent::DirectInput {
-            sender: input.sender,
-            block_number: input.block_number,
-            payload: input.payload.clone(),
-        });
-        self.progress.advance(input.block_number);
-        Ok(Vec::new())
-    }
-
-    fn progress(&self) -> ApplicationProgress {
-        self.progress
-    }
-
-    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
-        let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
-        Ok(Self {
-            progress: decode_progress(&bytes, "ReplayRecordingApp")?,
-            replayed: Vec::new(),
-        })
-    }
-
-    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
-        std::fs::create_dir(prefix)?;
-        std::fs::write(
-            Self::state_file_in_dump(prefix),
-            encode_progress(self.progress),
-        )?;
-        Ok(())
-    }
-
-    fn state_file_in_dump(prefix: &Path) -> PathBuf {
-        prefix.join("state")
-    }
-}
 
 fn default_test_config() -> InclusionLaneConfig {
     InclusionLaneConfig {
@@ -411,7 +85,7 @@ async fn start_lane(
     storage
         .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
         .expect("seed observed safe head");
-    let mut app = TestApp::default();
+    let mut app = StubApp::default();
     register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
     // `app` instance is dropped here; the lane reloads it from the
     // genesis dump on its background thread.
@@ -420,7 +94,7 @@ async fn start_lane(
     // hand its head to the lane — which now only loads, never initializes.
     storage.ensure_open_tip().expect("establish genesis tip");
     let shutdown = RuntimeScope::default();
-    let (tx, handle) = InclusionLane::<TestApp>::start(128, shutdown.clone(), storage, config);
+    let (tx, handle) = InclusionLane::<StubApp>::start(128, shutdown.clone(), storage, config);
     (tx, shutdown, handle)
 }
 
@@ -486,7 +160,7 @@ fn fast_turn_processes_at_most_one_rejected_chunk() {
     let mut lane = InclusionLane {
         rx,
         shutdown: RuntimeScope::default(),
-        app: TestApp::default(),
+        app: StubApp::default(),
         storage,
         config,
     };
@@ -530,9 +204,9 @@ async fn sustained_rejected_queue_cannot_starve_poisoned_frontier() {
     let mut lane = InclusionLane {
         rx,
         shutdown: shutdown.clone(),
-        app: TestApp {
+        app: StubApp {
             reject_user_ops_after: Some(Duration::from_millis(2)),
-            ..TestApp::default()
+            ..StubApp::default()
         },
         storage,
         config,
@@ -627,7 +301,7 @@ fn reconciliation_digests_an_epoch_sized_outage_backlog_in_one_turn() {
     let mut lane = InclusionLane {
         rx,
         shutdown: RuntimeScope::default(),
-        app: TestApp::default(),
+        app: StubApp::default(),
         storage,
         config,
     };
@@ -671,7 +345,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     let mut lane = InclusionLane {
         rx,
         shutdown: RuntimeScope::default(),
-        app: TestApp::default(),
+        app: StubApp::default(),
         storage,
         config,
     };
@@ -766,7 +440,7 @@ fn structural_batch_frame_does_not_reset_frame_clock_anchor() {
     let mut lane = InclusionLane {
         rx,
         shutdown: RuntimeScope::default(),
-        app: TestApp::default(),
+        app: StubApp::default(),
         storage,
         config: default_test_config(),
     };
@@ -811,7 +485,7 @@ fn poisoned_frontier_outranks_frame_clock_and_closes_intake() {
     let mut lane = InclusionLane {
         rx,
         shutdown: RuntimeScope::default(),
-        app: TestApp::default(),
+        app: StubApp::default(),
         storage,
         config: default_test_config(),
     };
@@ -1084,13 +758,13 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     let config = default_test_config();
     pin_test_deployment_identity(&mut storage, batch_submitter_address);
     {
-        let mut app = SharedCountingApp::new();
+        let mut app = StubApp::default();
         register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
     }
     storage.ensure_open_tip().expect("establish genesis tip");
     let shutdown = RuntimeScope::default();
     let (_tx, lane_handle) =
-        InclusionLane::<SharedCountingApp>::start(128, shutdown.clone(), storage, config);
+        InclusionLane::<StubApp>::start(128, shutdown.clone(), storage, config);
     let initialized = wait_until(Duration::from_secs(2), || {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         storage.open_state().expect("load open state").is_some()
@@ -1131,7 +805,7 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     let mut storage = Storage::open(db.path.as_str()).unwrap();
     assert!(history_rows(&mut storage, 16).is_empty());
     assert_eq!(read_frame_direct_count(db.path.as_str(), 0, 1), 0);
-    let mut fresh_app = SharedCountingApp::new();
+    let mut fresh_app = StubApp::default();
     catch_up_application_paged(&mut fresh_app, &mut storage, ExecutedInputCount::ZERO, 16)
         .expect("catch up");
     assert_eq!(
@@ -1324,7 +998,7 @@ fn unbounded_head() -> WriteHead {
 fn dequeue_returns_channel_closed_when_disconnected() {
     let (tx, mut rx) = mpsc::channel::<PendingUserOp>(1);
     drop(tx);
-    let mut app = TestApp::default();
+    let mut app = StubApp::default();
     let mut included = Vec::new();
     let head = unbounded_head();
 
@@ -1340,7 +1014,7 @@ fn dequeue_flushes_executed_ops_before_observing_disconnect() {
     tx.blocking_send(pending).expect("enqueue pending user op");
     drop(tx);
 
-    let mut app = TestApp::default();
+    let mut app = StubApp::default();
     let mut included = Vec::new();
     let head = unbounded_head();
     dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 16, &head, &mut included)
@@ -1355,9 +1029,10 @@ fn dequeue_returns_lane_error_when_app_reports_internal() {
         let (pending, recv) = make_pending_user_op(0x45);
         tx.blocking_send(pending).expect("enqueue pending user op");
 
-        let mut app = InternalUserOpApp {
+        let mut app = StubApp {
             fail_validation,
-            ..InternalUserOpApp::default()
+            fail_apply: true,
+            ..StubApp::default()
         };
         let mut included = Vec::new();
         let head = unbounded_head();
@@ -1396,7 +1071,7 @@ fn catch_up_replays_multiple_pages() {
         .map(|row| row.offset.get())
         .collect();
     assert_eq!(mappings, vec![0, 1, 2, 3, 4, 5]);
-    let mut app = ReplayRecordingApp::default();
+    let mut app = StubApp::default();
 
     catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
         .expect("catch up in pages");
@@ -1417,7 +1092,7 @@ fn catch_up_rejects_history_gap_before_execution() {
     let mut storage = Storage::open(&db.path).unwrap();
     let conn = Storage::open_connection(&db.path).unwrap();
     conn.execute_batch("DROP TRIGGER trg_protect_valid_application_input_delete; DELETE FROM application_inputs WHERE offset=1;").unwrap();
-    let mut app = ReplayRecordingApp::default();
+    let mut app = StubApp::default();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2);
     }));
@@ -1430,7 +1105,7 @@ fn catch_up_rejects_wrong_snapshot_count_before_execution() {
     let db = temp_db("catch-up-wrong-mapping");
     seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let mut app = ReplayRecordingApp::with_executed_input_count(3);
+    let mut app = StubApp::with_progress(3, 0);
 
     let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
         .expect_err("mapping from a different application boundary must stop catch-up");
@@ -1455,7 +1130,7 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
     let db = temp_db("catch-up-mixed-page-boundary");
     let expected = seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let mut app = ReplayRecordingApp::default();
+    let mut app = StubApp::default();
 
     catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 4)
         .expect("catch up across page boundary");
@@ -1478,7 +1153,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     storage.ensure_open_tip().expect("open genesis Tip");
     let mut head = storage.open_state().unwrap().unwrap();
     let initial_history = storage.history_state().expect("initial history");
-    let mut live_app = SharedCountingApp::new();
+    let mut live_app = StubApp::default();
 
     // Batch 0 is the surviving prefix. Its pending snapshot reflects exactly
     // input 0 and becomes the recovery checkpoint once the batch lands.
@@ -1630,9 +1305,8 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         checkpoint.executed_input_count,
         finalized_before.executed_input_count
     );
-    let mut restarted =
-        SharedCountingApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump_dir))
-            .expect("load surviving application checkpoint");
+    let mut restarted = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump_dir))
+        .expect("load surviving application checkpoint");
     assert_eq!(restarted.executed_input_count(), ExecutedInputCount::new(1));
     catch_up_application_paged(
         &mut restarted,
@@ -1681,7 +1355,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     assert_eq!(user_seeds, vec![0x51, 0x53]);
 
     let mut restarted_again =
-        SharedCountingApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump_dir))
+        StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump_dir))
             .expect("reload surviving checkpoint");
     catch_up_application_paged(
         &mut restarted_again,
@@ -1701,7 +1375,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
 fn catch_up_load_error_reports_offset() {
     let db = temp_db("catch-up-load-error");
     let mut storage = Storage::open_writer(db.path.as_str()).expect("open raw storage");
-    let mut app = ReplayRecordingApp::default();
+    let mut app = StubApp::default();
 
     let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
         .expect_err("catch up should fail without schema");
@@ -1724,15 +1398,12 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
         )
         .expect("seed observed safe head");
 
-    let mut app = SharedCountingApp {
-        progress: ApplicationProgress::try_new(ExecutedInputCount::new(1), 0)
-            .expect("coherent progress"),
-    };
+    let mut app = StubApp::with_progress(1, 0);
     register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
     storage.ensure_open_tip().expect("establish genesis tip");
 
     let shutdown = RuntimeScope::default();
-    let (_tx, handle) = InclusionLane::<SharedCountingApp>::start(1, shutdown, storage, config);
+    let (_tx, handle) = InclusionLane::<StubApp>::start(1, shutdown, storage, config);
     let err = handle
         .await
         .expect("join lane startup")
@@ -1750,78 +1421,8 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
     assert!(err.is_terminal_invariant());
 }
 
-/// App that counts executed user ops and persists the count through
-/// `create_dump` / `from_dump` (two LE `u64`s at `prefix/state`). The
-/// restart-resume regression test reads this count back from the
-/// snapshot the lane writes on its own thread — the only way to observe
-/// how much state the lane rebuilt across a restart.
-struct UserOpCounterApp {
-    progress: ApplicationProgress,
-}
-
-impl UserOpCounterApp {
-    fn new() -> Self {
-        Self {
-            progress: ApplicationProgress::default(),
-        }
-    }
-}
-
-impl Application for UserOpCounterApp {
-    fn max_method_payload_bytes() -> usize {
-        WALLET_MAX_METHOD_PAYLOAD_BYTES
-    }
-
-    fn validate_user_op(
-        &self,
-        _sender: Address,
-        _user_op: &UserOp,
-        _current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
-        Ok(ValidationOutcome::Accept)
-    }
-
-    fn apply_valid_user_op(
-        &mut self,
-        _user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
-        self.progress.advance(safe_block);
-        Ok(Vec::new())
-    }
-
-    fn apply_direct_input(&mut self, _input: &DirectInput) -> Result<AppOutputs, AppError> {
-        unimplemented!("not used in these tests")
-    }
-
-    fn progress(&self) -> ApplicationProgress {
-        self.progress
-    }
-
-    fn from_dump(prefix: &Path) -> Result<Self, AppError> {
-        let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
-        let progress = decode_progress(bytes.as_slice(), "UserOpCounterApp")?;
-        Ok(Self { progress })
-    }
-
-    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
-        std::fs::create_dir(prefix)?;
-        std::fs::write(
-            Self::state_file_in_dump(prefix),
-            encode_progress(self.progress),
-        )?;
-        Ok(())
-    }
-
-    fn state_file_in_dump(prefix: &Path) -> PathBuf {
-        prefix.join("state")
-    }
-}
-
 fn read_dump_counter(dump_dir: &Path) -> u64 {
-    let state_file = UserOpCounterApp::state_file_in_dump(&super::dump_info::app_prefix(dump_dir));
-    let bytes = std::fs::read(state_file).expect("read dump state file");
-    decode_progress(bytes.as_slice(), "UserOpCounterApp")
+    StubApp::from_dump(&super::dump_info::app_prefix(dump_dir))
         .expect("decode dump progress")
         .executed_input_count()
         .get()
@@ -1861,12 +1462,12 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     // `app` only writes the genesis dump here; the lane reloads its own
     // instance via `from_dump` on its background thread.
-    let mut app = UserOpCounterApp::new();
+    let mut app = StubApp::default();
     register_genesis_snapshot(&mut app, &mut storage, &config1.dumps_dir);
     storage.ensure_open_tip().expect("establish genesis tip");
     let shutdown1 = RuntimeScope::default();
     let (tx1, handle1) =
-        InclusionLane::<UserOpCounterApp>::start(128, shutdown1.clone(), storage, config1.clone());
+        InclusionLane::<StubApp>::start(128, shutdown1.clone(), storage, config1.clone());
     assert!(
         wait_until(Duration::from_secs(2), || {
             Storage::open(db.path.as_str())
@@ -1925,8 +1526,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
     // Restart: the Tip already exists, so this loads its head (warm path).
     storage2.ensure_open_tip().expect("load existing tip");
     let shutdown2 = RuntimeScope::default();
-    let (tx2, handle2) =
-        InclusionLane::<UserOpCounterApp>::start(128, shutdown2.clone(), storage2, config2);
+    let (tx2, handle2) = InclusionLane::<StubApp>::start(128, shutdown2.clone(), storage2, config2);
 
     let (pending, recv) = make_pending_user_op(0x20);
     tx2.send(pending).await.expect("send gen-2 op");
@@ -1967,7 +1567,7 @@ fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
     let dumps = tempfile::tempdir().unwrap();
-    let mut app = TestApp::default();
+    let mut app = StubApp::default();
     register_genesis_snapshot(&mut app, &mut storage, dumps.path());
     super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 0, dumps.path())
         .unwrap();
@@ -2002,7 +1602,7 @@ fn empty_batch_snapshot_preserves_application_count() {
     let db = temp_db("empty-snapshot-count");
     let expected = seed_replay_fixture(&db.path);
     let mut storage = Storage::open(&db.path).unwrap();
-    let mut app = ReplayRecordingApp::default();
+    let mut app = StubApp::default();
     catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2).unwrap();
     assert_eq!(app.replayed, expected);
     let mut head = storage.open_state().unwrap().unwrap();
@@ -2014,8 +1614,7 @@ fn empty_batch_snapshot_preserves_application_count() {
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
     assert_eq!(snapshot.executed_input_count.get(), 6);
     let restored =
-        ReplayRecordingApp::from_dump(&super::dump_info::app_prefix(&snapshot.dump.prefix))
-            .unwrap();
+        StubApp::from_dump(&super::dump_info::app_prefix(&snapshot.dump.prefix)).unwrap();
     assert_eq!(restored.executed_input_count().get(), 6);
 }
 
@@ -2040,74 +1639,12 @@ fn context_tx(context: crate::storage::L2TxContext) -> SequencedL2Tx {
     }
 }
 
-/// Requests shutdown while the lane executes a direct input, so the request
-/// lands after the loop's shutdown check and before the queue is read.
-#[derive(Default)]
-struct ShutdownOnDirectApp {
-    progress: ApplicationProgress,
-    shutdown: Option<RuntimeScope>,
-}
-
-impl Application for ShutdownOnDirectApp {
-    fn max_method_payload_bytes() -> usize {
-        WALLET_MAX_METHOD_PAYLOAD_BYTES
-    }
-
-    fn validate_user_op(
-        &self,
-        _sender: Address,
-        _user_op: &UserOp,
-        _current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
-        Ok(ValidationOutcome::Accept)
-    }
-
-    fn apply_valid_user_op(
-        &mut self,
-        _user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
-        self.progress.advance(safe_block);
-        Ok(Vec::new())
-    }
-
-    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-        if let Some(shutdown) = &self.shutdown {
-            shutdown.request_shutdown();
-        }
-        self.progress.advance(input.block_number);
-        Ok(Vec::new())
-    }
-
-    fn progress(&self) -> ApplicationProgress {
-        self.progress
-    }
-
-    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
-        Ok(Self::default())
-    }
-
-    fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
-        std::fs::create_dir(prefix)?;
-        std::fs::write(Self::state_file_in_dump(prefix), b"")?;
-        Ok(())
-    }
-
-    fn state_file_in_dump(prefix: &Path) -> PathBuf {
-        prefix.join("state")
-    }
-}
-
 /// A lane with its queue already closed and one direct input due at the first
 /// frame-clock tick.
 fn lane_with_closed_queue_and_due_direct(
     name: &str,
     request_shutdown_on_direct: bool,
-) -> (
-    tempfile::TempDir,
-    InclusionLane<ShutdownOnDirectApp>,
-    RuntimeScope,
-) {
+) -> (tempfile::TempDir, InclusionLane<StubApp>, RuntimeScope) {
     let db = temp_db(name);
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
@@ -2134,9 +1671,9 @@ fn lane_with_closed_queue_and_due_direct(
     let lane = InclusionLane {
         rx,
         shutdown: shutdown.clone(),
-        app: ShutdownOnDirectApp {
-            progress: ApplicationProgress::default(),
-            shutdown: request_shutdown_on_direct.then(|| shutdown.clone()),
+        app: StubApp {
+            shutdown_on_direct: request_shutdown_on_direct.then(|| shutdown.clone()),
+            ..StubApp::default()
         },
         storage,
         config: default_test_config(),
