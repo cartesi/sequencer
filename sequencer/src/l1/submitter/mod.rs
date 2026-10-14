@@ -20,4 +20,4 @@ pub use poster::{
     BatchPosterConfig, BatchPosterError, EthereumBatchPoster, SubmitBatchesOutcome, TxHash,
 };
 pub(crate) use worker::BatchSubmitter;
-pub use worker::{BatchSubmitterError, SubmitterExit};
+pub use worker::BatchSubmitterError;

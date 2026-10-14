@@ -66,17 +66,6 @@ impl BatchSubmitterError {
     }
 }
 
-/// How the submitter loop exited.
-///
-/// There is only one deliberate exit path (shutdown). Danger detection lives
-/// in the [`crate::recovery::DangerDetector`] worker; this type does not
-/// concern itself with that signal.
-#[derive(Debug)]
-pub enum SubmitterExit {
-    /// Shutdown signal fired.
-    Shutdown,
-}
-
 /// Outcome of one tick. Drives the outer loop's sleep cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TickOutcome {
@@ -144,8 +133,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     pub(crate) fn start(
         self,
         shutdown: RuntimeScope,
-    ) -> Result<tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>>, StorageOpenError>
-    {
+    ) -> Result<tokio::task::JoinHandle<Result<(), BatchSubmitterError>>, StorageOpenError> {
         self.preflight_storage()?;
         Ok(self.start_preflighted(shutdown))
     }
@@ -161,19 +149,16 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     pub(crate) fn start_preflighted(
         self,
         shutdown: RuntimeScope,
-    ) -> tokio::task::JoinHandle<Result<SubmitterExit, BatchSubmitterError>> {
+    ) -> tokio::task::JoinHandle<Result<(), BatchSubmitterError>> {
         tokio::spawn(async move { self.run_forever(shutdown).await })
     }
 
     /// Top-level driver. The biased shutdown arm promptly cancels async RPC
     /// work; nested blocking DB jobs retain their own process-lock clone.
-    async fn run_forever(
-        self,
-        shutdown: RuntimeScope,
-    ) -> Result<SubmitterExit, BatchSubmitterError> {
+    async fn run_forever(self, shutdown: RuntimeScope) -> Result<(), BatchSubmitterError> {
         tokio::select! {
             biased;
-            _ = shutdown.wait_for_shutdown() => Ok(SubmitterExit::Shutdown),
+            _ = shutdown.wait_for_shutdown() => Ok(()),
             result = self.run_loop() => result,
         }
     }
@@ -181,7 +166,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     /// Tick → sleep-if-idle → tick. Productive ticks re-enter immediately;
     /// idle, waiting, or transient-error ticks wait `idle_poll_interval`.
     /// Fatal errors propagate.
-    async fn run_loop(&self) -> Result<SubmitterExit, BatchSubmitterError> {
+    async fn run_loop(&self) -> Result<(), BatchSubmitterError> {
         loop {
             let outcome = match self.tick_once().await {
                 Ok(o) => o,
@@ -439,12 +424,11 @@ mod tests {
         started_rx.await.expect("tick reached blocked RPC");
 
         shutdown.request_shutdown();
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), task)
+        tokio::time::timeout(std::time::Duration::from_millis(100), task)
             .await
             .expect("shutdown must not wait for the blocked RPC")
             .expect("submitter task must join")
             .expect("ordinary shutdown is clean");
-        assert!(matches!(result, super::SubmitterExit::Shutdown));
     }
 
     #[tokio::test]

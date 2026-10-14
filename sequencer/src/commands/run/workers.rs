@@ -48,7 +48,7 @@ use crate::l1::provider::KeyedProviders;
 use crate::l1::reader::{InputReader, InputReaderError};
 use crate::l1::submitter::{
     BatchPosterConfig, BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError,
-    EthereumBatchPoster, SubmitterExit,
+    EthereumBatchPoster,
 };
 use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit};
 use crate::runtime::process_lock::ProcessLock;
@@ -142,7 +142,7 @@ pub(super) struct Workers {
     server: JoinHandle<std::io::Result<()>>,
     lane: JoinHandle<Result<(), InclusionLaneError>>,
     reader: JoinHandle<Result<(), InputReaderError>>,
-    submitter: JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
+    submitter: JoinHandle<Result<(), BatchSubmitterError>>,
     detector: JoinHandle<Result<DetectorExit, DangerDetectorError>>,
     fee_oracle: Option<JoinHandle<Result<(), crate::l1::fee_oracle::worker::FeeOracleError>>>,
     shutdown: RuntimeScope,
@@ -361,12 +361,9 @@ impl Workers {
                 FirstExit::Worker(WorkerExit::Lane(WorkerStop::from_select(lane_result))),
             reader_result = &mut *reader =>
                 FirstExit::Worker(WorkerExit::InputReader(WorkerStop::from_select(reader_result))),
-            submitter_result = &mut *submitter =>
-                FirstExit::Worker(WorkerExit::BatchSubmitter(WorkerStop::from_select(
-                    // A worker returning `Shutdown` outside a real shutdown
-                    // means it stopped on its own — the unexpected case.
-                    submitter_result.map(|r| r.map(|SubmitterExit::Shutdown| ())),
-                ))),
+            submitter_result = &mut *submitter => FirstExit::Worker(WorkerExit::BatchSubmitter(
+                WorkerStop::from_select(submitter_result),
+            )),
             detector_result = &mut *detector => FirstExit::detector(detector_result),
             fee_oracle_result = async {
                 match fee_oracle.as_mut() {
@@ -631,10 +628,9 @@ async fn wait_for_input_reader_shutdown(
 }
 
 async fn wait_for_batch_submitter_shutdown(
-    handle: JoinHandle<Result<SubmitterExit, BatchSubmitterError>>,
+    handle: JoinHandle<Result<(), BatchSubmitterError>>,
 ) -> Result<(), WorkerExit> {
-    WorkerStop::from_shutdown(handle.await.map(|r| r.map(|SubmitterExit::Shutdown| ())))
-        .map_err(WorkerExit::BatchSubmitter)
+    WorkerStop::from_shutdown(handle.await).map_err(WorkerExit::BatchSubmitter)
 }
 
 /// Detector `Shutdown` is the graceful drain; a `RecoveryRequired` trip
@@ -745,7 +741,7 @@ mod tests {
             let shutdown = shutdown.clone();
             async move {
                 shutdown.wait_for_shutdown().await;
-                Ok(SubmitterExit::Shutdown)
+                Ok(())
             }
         });
         let detector = tokio::spawn({
