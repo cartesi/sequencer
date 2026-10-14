@@ -169,66 +169,10 @@ impl Storage {
         self.read(|tx| canonical_divergence_in(tx))
     }
 
-    /// Unified danger-zone detection.
-    ///
-    /// Runs checks inside a single read transaction, in priority order:
-    ///
-    /// 1. **Canonical divergence**: an already-confirmed mismatch is an
-    ///    absorbing terminal fact and outranks every view/clock condition.
-    /// 2. **L1 view freshness**: if the safe block timestamp is missing or
-    ///    older than `protocol.l1_read_stale_after_blocks`, return
-    ///    `L1ViewStale`. A stale L1 *view* is unusable even if the RPC
-    ///    answers — recovery itself needs a trustworthy view, so this gate
-    ///    stays ahead of everything.
-    /// 3. **Observed closed-frontier**: `find_closed_frontier_batch_in_danger`
-    ///    against `protocol.danger_threshold()`. Uses the observed safe block.
-    /// 4. **Observed open Tip**: `find_tip_batch_in_danger` against
-    ///    `protocol.danger_threshold()`. Catches the case where all closed
-    ///    batches are gold but the Tip is aging — the lane is stuck or the
-    ///    Tip rotated without a safe-block advance.
-    /// 5. **Clock faults**, deliberately after the observed arms: a local
-    ///    clock a full block-time or more out of step with either persisted
-    ///    baseline (behind the safe-block timestamp, or behind the local
-    ///    last-progress baseline) is a *clock* fault, not a view fault. The
-    ///    observed arms (3, 4) are pure block arithmetic, and a wall-clock
-    ///    fault must never suppress a danger verdict that stands on L1
-    ///    observation alone. Sub-block skew in either direction is
-    ///    quantization noise, not a fault.
-    /// 6. **Batch-relative wall-clock estimate**: if a correction applies
-    ///    ([`ProtocolTiming::wall_clock_adjusted_danger_threshold`] returns
-    ///    `Some`), widens to `find_first_batch_in_danger` against
-    ///    `danger_threshold − missed_blocks`. This is a fallback for when the
-    ///    observed safe block has not crossed danger yet, but wall-clock time
-    ///    since the last safe-head advance says the provider view is too stale
-    ///    to trust for continued soft confirmations.
-    ///
-    /// Returns the first variant that fires, in the order
-    /// `CanonicalDivergence` → `L1ViewStale` (stale view) →
-    /// `ClosedBatchInDanger` → `TipInDanger` → `L1ViewStale` (clock fault) →
-    /// `EstimatedBatchInDanger` → `Safe`. The order encodes the
-    /// "trust" hierarchy:
-    ///
-    /// - **View staleness gates everything after divergence.** If the safe
-    ///   block timestamp is too old or unknown, neither recovery nor
-    ///   continued soft confirmations are honest.
-    /// - **Clock faults yield to observed danger.** A local clock a full
-    ///   block-time or more out of step with either persisted baseline
-    ///   refuses only when no observed danger stands; sub-block skew is
-    ///   tolerated.
-    /// - **Closed observed danger beats Tip.** When a closed batch is in danger,
-    ///   we need a flush (to resolve its L1 transaction's fate) regardless
-    ///   of the Tip's state. The cascade naturally catches the Tip via
-    ///   `batch_index >= N`.
-    /// - **Tip is the residual.** Only fires when no closed batch is in
-    ///   danger. Routes to direct Tip recovery — no flush needed.
-    /// - **Estimated danger is the fallback.** If the observed safe-state checks have
-    ///   not crossed the threshold, but wall-clock extrapolation says they
-    ///   would have crossed had the safe head kept advancing, startup refuses
-    ///   instead of issuing soft confirmations on a stale L1 view.
-    ///
-    /// `now_ms` is passed in (rather than read from `SystemTime::now()` here)
-    /// so the storage layer stays testable without time mocking. Production
-    /// callers pass the current Unix-ms clock.
+    /// Classify danger in one read transaction. Arms fire in order: divergence,
+    /// stale view, closed batch, Tip, clock fault, estimate; the order is the
+    /// startup dispatch policy (I4; `docs/recovery/README.md`, "When safe-head
+    /// progress stops"). `now_ms` is injected so storage tests need no clock mock.
     pub fn check_danger(&mut self, protocol: &ProtocolTiming, now_ms: u64) -> Result<DangerStatus> {
         self.read(|tx| check_danger_in(tx, protocol, now_ms))
     }
