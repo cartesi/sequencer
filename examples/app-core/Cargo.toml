@@ -17,3 +17,6 @@ ssz = { workspace = true }
 ssz_derive = { workspace = true }
 tracing = { workspace = true }
 rollups-types = { workspace = true }
+
+[dev-dependencies]
+rollups-types = { workspace = true, features = ["test-support"] }

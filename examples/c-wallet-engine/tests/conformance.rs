@@ -5,6 +5,7 @@ use alloy_primitives::{Address, U256};
 use app_core::application::{Method, Transfer, WalletApp, WalletConfig, Withdrawal};
 use c_app_engine::{Application, EngineApp};
 use c_wallet_engine as _;
+use rollups_types::Erc20Deposit;
 use sequencer_core::application::{
     AppError, AppOutput, CanonicalState, ExecutionOutcome, execute_direct_input,
     execute_valid_user_op, validate_and_execute_user_op,
@@ -30,14 +31,16 @@ fn state_bytes(app: &mut EngineApp, path: &Path) -> Vec<u8> {
 }
 
 fn deposit(config: WalletConfig, recipient: Address, amount: u64, block: u64) -> DirectInput {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(config.supported_erc20_token.as_slice());
-    payload.extend_from_slice(recipient.as_slice());
-    payload.extend_from_slice(&U256::from(amount).to_be_bytes::<32>());
     DirectInput {
         sender: config.erc20_portal_address,
         block_number: block,
-        payload,
+        payload: Erc20Deposit {
+            token: config.supported_erc20_token,
+            sender: recipient,
+            value: U256::from(amount),
+            exec_layer_data: Vec::new(),
+        }
+        .encode(),
     }
 }
 

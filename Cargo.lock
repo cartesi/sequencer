@@ -1442,6 +1442,7 @@ dependencies = [
  "app-core",
  "c-app-engine",
  "ethereum_ssz",
+ "rollups-types",
  "sequencer-core",
  "tempfile",
 ]

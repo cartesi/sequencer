@@ -28,3 +28,4 @@ alloy-primitives = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 ssz = { workspace = true }
+rollups-types = { workspace = true, features = ["test-support"] }

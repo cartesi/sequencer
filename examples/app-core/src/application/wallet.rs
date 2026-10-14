@@ -403,9 +403,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use alloy_primitives::{Address, U256, address};
-    use rollups_types::ERC20_DEPOSIT_PREFIX_BYTES;
-    use rollups_types::Erc20Transfer;
     use rollups_types::alloy_sol_types::SolCall;
+    use rollups_types::{Erc20Deposit, Erc20Transfer};
 
     use super::{ApplicationProgress, ExecutedInputCount, WalletApp, WalletConfig};
     use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};
@@ -479,11 +478,13 @@ mod tests {
     }
 
     fn encode_erc20_deposit_payload(token: Address, sender: Address, value: U256) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(ERC20_DEPOSIT_PREFIX_BYTES);
-        payload.extend_from_slice(token.as_slice());
-        payload.extend_from_slice(sender.as_slice());
-        payload.extend_from_slice(value.to_be_bytes::<32>().as_slice());
-        payload
+        Erc20Deposit {
+            token,
+            sender,
+            value,
+            exec_layer_data: Vec::new(),
+        }
+        .encode()
     }
 
     #[test]

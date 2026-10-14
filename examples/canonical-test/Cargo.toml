@@ -19,5 +19,5 @@ canonical-app = { path = "../canonical-app" }
 sequencer-core = { path = "../../sequencer-core" }
 ssz = { workspace = true }
 testsi = { workspace = true }
-rollups-types = { workspace = true }
+rollups-types = { workspace = true, features = ["test-support"] }
 k256 = { workspace = true }
