@@ -8,6 +8,10 @@ scheduler remains the ordering authority. The [README API](../../README.md#histo
 owns routes, fields, limits, and refusals; the
 [history contract](application-history.md) owns application coordinates.
 
+The planned shared recovery tool supersedes this workflow, so it gets bug fixes
+only; new client work should not build on it
+([Track 3](../plans/2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)).
+
 ## Bootstrap and handoff
 
 1. Read `/history`. Pin the deployment identity and era, baseline application

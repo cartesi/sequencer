@@ -12,13 +12,13 @@ freely at this stage — no backward-compatibility constraints.
 
 | # | Track | Owner | Status |
 |---|-------|-------|--------|
-| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **repository API implemented; post-merge adoption and deployment work remain** — [follow-up sequence](2026-07-track3-feed-replay-design.md#follow-up-sequence) and [ownership](2026-07-track3-feed-replay-design.md#merge-scope-and-follow-up-ownership) |
-| 5 | Fee exponentiation LUT | us | **unblocked, needs Bart** — fees stay in log space; the batch-level alternative is deferred with [batch-scoped replay protection](2026-10-batch-scoped-replay-protection.md). Shape decided: exact-floor table, algorithm-free; a consensus change agreed with Bart before implementation |
+| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **implemented; client adoption and deployment work remain; frozen until the shared recovery tool and a new client sync** — [scope](#track-3--feed--replay-protocol-redesign) |
+| 5 | Fee exponentiation LUT | us | **unblocked, needs Bart** — fees stay in log space; the batch-level alternative is deferred with [batch-scoped replay protection](2026-10-batch-scoped-replay-protection.md). Shape decided: exact-floor table, algorithm-free; a consensus change agreed with Bart before implementation; the log-additive `batch_policy` design is frozen until then |
 | 6 | Dump / `Application` API redesign | us + Bart | **interface and reference C binding implemented** — [Application contract](../protocol/application-contract.md); native-engine integration gates remain |
 
 **Current campaign order:**
 
-1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; adjust the API from concrete feedback. A shared recovery tool, still to be designed, will produce both the sequencer's and the client's startup state from a checkpoint.
+1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. A shared recovery tool, still to be designed, will produce both the sequencer's and the client's startup state from a checkpoint. Until it lands, `setup --recovery`, `fold.rs` and the cockroach reader seams get bug fixes only.
 2. Application integrators/operators validate the private engine, canonical-to-native exporter and recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
 3. Track 5 (fee LUT) after a sync with Bart, batched with other guest-image changes.
 
@@ -27,22 +27,28 @@ Additional snapshot retention or transport mechanisms require a measured consume
 
 ## Track 3 — Feed & replay protocol redesign
 
-The current [history contract](../protocol/application-history.md) owns replica
-bootstrap, history identity, replay, and recovery boundaries. The
-[API contract](../../README.md#api) owns wire behavior. The wallet's cold replica
-and canonical recovery/watchdog gates have a
-[validation record](../review/2026-09-16-track3-validation.md).
+The egress API is implemented. The [history contract](../protocol/application-history.md),
+the [projection contract](../protocol/projection-replay.md) and the
+[API contract](../../README.md#api) own its behavior; the
+[integration plan](2026-07-track3-feed-replay-design.md) owns deployment follow-ups.
 
-Readers whose projections contain information absent from the latest application
-state can use the implemented fixed-prefix historical L1 API and checkpoint
-metadata. The [projection contract](../protocol/projection-replay.md) owns that
-workflow; the history contract owns implemented checkpoint compatibility across
-standard recoveries. The planned shared recovery tool supersedes the
-cross-rebuild part of that workflow, so it receives bug fixes only. The [integration plan](2026-07-track3-feed-replay-design.md)
-owns follow-up requirements and their owners. Native-engine integration and
-representative deployment latency remain open after merge; they are not egress
-API merge prerequisites. Other transport or retention mechanisms require a
-measured need.
+A shared recovery tool will produce the sequencer's and a client's startup
+state from one checkpoint, and a new client sync follows its design. Until
+then, what they replace gets bug fixes only, and its docs are not polished:
+
+- Deleted when the tool lands: projection replay across a rebuild
+  (`/historical-l1-inputs`, the SDK's `historical_l1_inputs`, the main
+  `historical_bootstrap` test, the projection contract, and the integration
+  plan). First move the projection contract's seed/replay rules and worked
+  boundary into the tool's design and tests, move the integration plan's
+  deployment follow-ups to the register, and repoint the links to both files.
+- Reshaped or retired with the new sync: the WS wire format, the SDK
+  snapshot-then-subscribe bootstrap, `/latest_snapshot` and its history headers,
+  `/history`'s baseline, accepted checkpoint and compatibility query, and the
+  era/generation identity types. In-era generation signalling survives in some form.
+
+Not frozen: the ingress routes, `/finalized_state` and its probes,
+`/finalized_snapshot`, download leases, and the canonical page reader with `HistoryClaim`.
 
 ## Track 5 — Fee exponentiation LUT
 

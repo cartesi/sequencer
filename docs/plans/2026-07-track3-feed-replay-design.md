@@ -14,12 +14,14 @@ The repository delivery includes the egress contracts, storage, SDK, and referen
 replay/recovery tests. Its merge criteria are review and the relevant repository
 checks. Private-engine integration, operational rehearsal, and representative
 capacity measurements are follow-up work; they do not block merging this API.
-Merge the implementation, let consumers integrate, and adjust the API from
-concrete feedback. There are no live deployments requiring compatibility.
+Merge the implementation and let consumers integrate. Bugs they find are fixed;
+other feedback is input to the new client sync
+([Track 3](2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)).
+There are no live deployments requiring compatibility.
 
 | Follow-up | Owner | When it is needed |
 |---|---|---|
-| Private DEX indexer and database backups | Bart / application integration | While adopting the API. Report missing fields or awkward workflow for adjustment. |
+| Private DEX indexer and database backups | Bart / application integration | While adopting the API. Report bugs for fixing; missing fields or awkward workflow feed the new client sync. |
 | Canonical-to-native export and incident rehearsal | Application integration and operators, under Track 6 | Before relying on that application's recovery procedure in production. |
 | Ingress latency, indexing headroom, and recovery capacity | Sequencer/application maintainers and deployment operators | Before claiming support for the target deployment workload; measure historical serving alongside ordinary traffic. |
 
@@ -87,8 +89,7 @@ replacement directs, empty/no-op invalidation, nonzero baselines, and rollback.
    recoveries as out of scope. A planned shared recovery tool will produce both
    the sequencer's and the client's startup state from a checkpoint, so clients
    never resume across a rebuild; new client work should not build on the
-   projection-replay path, which receives bug fixes only. Sequencer maintainers
-   address concrete feedback as it arrives.
+   projection-replay path, which receives bug fixes only.
 2. **Deployment readiness.** Validate the private native engine and measure
    latency, historical serving cost, projection throughput,
    catch-up headroom, and recovery time. Track 6 independently owns the versioned
