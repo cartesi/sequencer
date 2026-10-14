@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{
-    SENDER_A, default_protocol_timing, record_canonical_divergence,
+    SENDER_A, default_protocol_timing, record_canonical_divergence, set_one_op_batch_target,
 };
 use crate::storage::{DirectInputExecution, SafeInputRange, Storage, StoredSafeInput, WriteHead};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
@@ -932,7 +932,7 @@ async fn batch_closes_when_max_user_op_bytes_is_reached() {
     // 55000*1000/(17000*26) = 124 bytes < 126.
     {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        storage.set_alpha(17000, 1000).expect("set alpha");
+        set_one_op_batch_target(&mut storage);
     }
     let config = default_test_config();
     let (tx, shutdown, lane_handle) = start_lane(db.path.as_str(), config).await;
@@ -1425,7 +1425,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
     {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         // Batch size target < one user op, so every op closes its batch.
-        storage.set_alpha(17000, 1000).expect("set alpha");
+        set_one_op_batch_target(&mut storage);
         storage
             .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
             .expect("seed observed safe head");

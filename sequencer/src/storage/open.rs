@@ -4,7 +4,7 @@
 //! `Storage` struct definition plus connection-open and migration entry points.
 //!
 //! Method clusters live in sibling files (`ingress`, `egress`, `l1_inputs`,
-//! `l1_submission`, `recovery`, `admin`) — each adds its own `impl Storage`.
+//! `l1_submission`, `recovery`) — each adds its own `impl Storage`.
 
 use rusqlite::{Connection, OpenFlags, Result, Transaction, TransactionBehavior};
 use rusqlite_migration::{HookResult, M, Migrations};

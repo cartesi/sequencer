@@ -578,7 +578,7 @@ END;
 CREATE TABLE IF NOT EXISTS batch_policy (
     singleton_id             INTEGER PRIMARY KEY CHECK (singleton_id = 0),
 
-    -- Knobs (operator-tunable, set via set_alpha(num, denom)):
+    -- Knobs (schema defaults; no runtime writer; tests override by SQL):
     -- log_alpha = log(alpha) where alpha = num/denom. Can be negative (alpha < 1).
     log_alpha                INTEGER NOT NULL,
     -- log_one_plus_alpha = log(1 + alpha). Always >= 0.

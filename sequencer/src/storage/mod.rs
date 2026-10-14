@@ -13,7 +13,6 @@
 //! - `l1_submission` — batch-aggregate reads (submitter frontier, pending
 //!   batches, per-batch replay) shared between the submitter and egress
 //! - `recovery` — cascade invalidation, recovery-batch open, danger checks
-//! - `admin` — operator policy alpha tuning
 //! - `fee_oracle` — L1 fee-oracle gas-price updates
 //! - `snapshot_dumps` — immutable snapshots, derived acceptance, lease counts
 //! - `history` — write-once era/base metadata and recovery generation
@@ -28,7 +27,6 @@
 //! The schema and `valid_*` views live in `migrations/0001_schema.sql`. See
 //! `docs/recovery/README.md` for the recovery design and TLA+ specs.
 
-mod admin;
 mod convert;
 mod egress;
 mod fee_oracle;

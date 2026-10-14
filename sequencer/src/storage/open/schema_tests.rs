@@ -647,6 +647,23 @@ fn schema_rejects_safe_input_with_wrong_transaction_hash_length() {
     );
 }
 
+/// CHECK constraint guards against alpha values that would push the batch-size
+/// target past `log_max_batch_bytes`.
+#[test]
+fn batch_policy_check_rejects_unsafe_alpha() {
+    let db = crate::test_support::temp_db("unsafe-alpha");
+    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    // log_alpha=-350 → log_batch_size_target = 1403-(-350)-419 = 1334 >= log_max_batch_bytes=1333
+    let err = storage.conn.execute(
+        "UPDATE batch_policy SET log_alpha = ?1, log_one_plus_alpha = ?2 WHERE singleton_id = 0",
+        [-350_i64, 0_i64],
+    );
+    assert!(
+        err.is_err(),
+        "CHECK should reject unsafe alpha (log_batch_size_target >= log_max_batch_bytes)"
+    );
+}
+
 #[test]
 fn schema_rejects_safe_input_update_and_delete() {
     let db = crate::test_support::temp_db("safe-inputs-append-only");

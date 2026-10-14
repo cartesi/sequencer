@@ -99,6 +99,21 @@ impl Storage {
     }
 }
 
+/// Alpha 17 (17000/1000): `log_alpha` 364 = round(log(17)) and
+/// `log_one_plus_alpha` 371 = round(log(18)), base 129/128. The batch-size
+/// target becomes 1403 - 364 - 419 = 620 (about 124 bytes), below one 126-byte
+/// user op, so every op closes its batch.
+pub(crate) fn set_one_op_batch_target(storage: &mut Storage) {
+    storage
+        .conn
+        .execute(
+            "UPDATE batch_policy SET log_alpha = 364, log_one_plus_alpha = 371 \
+             WHERE singleton_id = 0",
+            [],
+        )
+        .expect("set alpha");
+}
+
 fn close_frame_derived_in(
     tx: &rusqlite::Transaction<'_>,
     head: &WriteHead,

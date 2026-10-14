@@ -87,7 +87,6 @@ by writer and are write-once (`0001_schema.sql`).
 | setup | `deployment_identity` (pinned once), `batch_tree_anchor` (the root nonce, frozen once setup completes), the initial `dumps` + `snapshots` rows and rebuild root `batches`/`frames` (atomic with the complete history baseline), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
 | snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | obsolete `snapshots` and unreferenced `dumps` row deletion (`gc_unreferenced_dumps`), including a superseded baseline artifact |
 | command brackets (run, setup, flush) | `terminal_faults` (append-only, best-effort at settlement) |
-| admin | `batch_policy` alpha knobs (`log_alpha`, `log_one_plus_alpha`) |
 | fee oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
 
 ### I1. Scheduler-acceptance semantics agree across all implementations
