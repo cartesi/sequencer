@@ -7,7 +7,8 @@
 
 use alloy::providers::{PendingTransactionConfig, PendingTransactionError, Provider};
 use alloy::rpc::types::BlockNumberOrTag;
-use alloy_primitives::Address;
+use alloy::rpc::types::Log;
+use alloy_primitives::{Address, U256};
 use async_trait::async_trait;
 use cartesi_rollups_contracts::input_box::InputBox;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
@@ -65,6 +66,21 @@ pub enum BatchPosterError {
     /// built: a field is missing. A defect, not a condition a retry heals.
     #[error("batch transaction not signable: {0}")]
     UnsignableTransaction(String),
+    /// A batch from our own submitter key that does not decode. This key sends
+    /// only batches this sequencer encoded, so the landing is evidence of a
+    /// leaked key or an encoder bug to investigate under self-trust, not a
+    /// provider fault. It stays in the scan window, and re-fails a restart,
+    /// until its block is safe.
+    #[error(
+        "undecodable batch from our submitter key at InputAdded index {input_index} \
+         (tx {transaction_hash:?}): {reason}; a leaked key or an encoder bug: investigate \
+         before restarting (a restart re-fails until the landing's block is safe)"
+    )]
+    UndecodableOwnBatch {
+        input_index: U256,
+        transaction_hash: Option<TxHash>,
+        reason: String,
+    },
     #[error(transparent)]
     Watermark(#[from] WalletNonceWatermarkError),
 }
@@ -76,7 +92,8 @@ impl BatchPosterError {
         match self {
             Self::ChainIdMismatch { .. }
             | Self::WalletNonceRangeUnrepresentable { .. }
-            | Self::UnsignableTransaction(_) => true,
+            | Self::UnsignableTransaction(_)
+            | Self::UndecodableOwnBatch { .. } => true,
             Self::Watermark(source) => source.is_persistent_invariant(),
             Self::Provider(_) => false,
         }
@@ -532,8 +549,9 @@ impl BatchPoster for EthereumBatchPoster {
         .map_err(|err| BatchPosterError::Provider(error_chain(&err)))?;
 
         let mut observed_nonces = Vec::new();
-        for (event, _log) in events {
-            if let Some(nonce) = own_batch_nonce(&event, self.config.batch_submitter_address)? {
+        for (event, log) in events {
+            if let Some(nonce) = own_batch_nonce(&event, &log, self.config.batch_submitter_address)?
+            {
                 observed_nonces.push(nonce);
             }
         }
@@ -546,6 +564,7 @@ impl BatchPoster for EthereumBatchPoster {
 /// other sender.
 fn own_batch_nonce(
     event: &InputAdded,
+    log: &Log,
     submitter: Address,
 ) -> Result<Option<u64>, BatchPosterError> {
     let evm_advance = decode_evm_advance_input(event.input.as_ref()).map_err(|err| {
@@ -560,8 +579,14 @@ fn own_batch_nonce(
     // This dedicated key emits our own well-formed batches. A decode
     // failure is evidence to investigate under self-trust, not an
     // untrusted direct input to skip (docs/threat-model/README.md).
-    let batch: Batch = ssz::Decode::from_ssz_bytes(evm_advance.payload.as_ref())
-        .map_err(|err| BatchPosterError::Provider(format!("{err:?}")))?;
+    let batch: Batch =
+        ssz::Decode::from_ssz_bytes(evm_advance.payload.as_ref()).map_err(|err| {
+            BatchPosterError::UndecodableOwnBatch {
+                input_index: event.index,
+                transaction_hash: log.transaction_hash,
+                reason: format!("{err:?}"),
+            }
+        })?;
     Ok(Some(batch.nonce))
 }
 
@@ -711,6 +736,55 @@ mod tests {
             SubmitBatchesOutcome::Submitted(hashes) => hashes,
             SubmitBatchesOutcome::Waiting { broadcast } => broadcast,
         }
+    }
+
+    #[test]
+    fn own_batch_nonce_refuses_an_undecodable_own_batch() {
+        use crate::test_support::l1::{evm_advance_input, input_added_pair};
+        use alloy_primitives::{Address, B256, U256};
+
+        let tx = B256::repeat_byte(0xcc);
+        let landing = |sender, payload: &[u8]| {
+            input_added_pair(
+                7,
+                evm_advance_input(31337, Address::ZERO, sender, 90, 7, payload),
+                Some(90),
+                Some(tx),
+            )
+        };
+
+        let (event, log) = landing(SUBMITTER, &[0xde, 0xad]);
+        let error = super::own_batch_nonce(&event, &log, SUBMITTER)
+            .expect_err("our key never sends undecodable bytes");
+        assert!(
+            matches!(
+                &error,
+                BatchPosterError::UndecodableOwnBatch {
+                    input_index,
+                    transaction_hash: Some(hash),
+                    ..
+                } if *input_index == U256::from(7) && *hash == tx
+            ),
+            "{error:?}"
+        );
+        assert!(error.is_terminal_invariant());
+
+        // Another sender's bytes are not ours to decode.
+        let (event, log) = landing(Address::repeat_byte(0x99), &[0xde, 0xad]);
+        assert_eq!(
+            super::own_batch_nonce(&event, &log, SUBMITTER).expect("not ours"),
+            None
+        );
+
+        let batch = ssz::Encode::as_ssz_bytes(&super::Batch {
+            nonce: 3,
+            frames: Vec::new(),
+        });
+        let (event, log) = landing(SUBMITTER, &batch);
+        assert_eq!(
+            super::own_batch_nonce(&event, &log, SUBMITTER).expect("our batch"),
+            Some(3)
+        );
     }
 
     #[test]

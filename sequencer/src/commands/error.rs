@@ -1139,6 +1139,16 @@ mod tests {
                 "a batch transaction the submit provider cannot sign",
             ),
             (
+                submitter_worker(BatchSubmitterError::Poster(
+                    BatchPosterError::UndecodableOwnBatch {
+                        input_index: alloy_primitives::U256::from(7),
+                        transaction_hash: None,
+                        reason: "x".into(),
+                    },
+                )),
+                "an undecodable batch from our own submitter key",
+            ),
+            (
                 recovery_refuse(RecoveryFailure::Flush(FlushError::Watermark(
                     persistent_watermark(),
                 ))),

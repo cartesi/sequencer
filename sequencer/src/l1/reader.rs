@@ -931,6 +931,7 @@ async fn latest_safe_head(provider: &impl Provider) -> Result<SafeHead, InputRea
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::l1::input_added_pair;
     use alloy::node_bindings::Anvil;
     use alloy::sol_types::SolCall;
     use tempfile::NamedTempFile;
@@ -1444,48 +1445,14 @@ mod tests {
         block_number: u64,
         index: u64,
     ) -> Vec<u8> {
-        use alloy::sol_types::SolCall;
-        cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall {
-            chainId: U256::from(chain_id),
-            appContract: app_contract,
-            msgSender: Address::repeat_byte(0x11),
-            blockNumber: U256::from(block_number),
-            blockTimestamp: U256::from(1_700_000_000_u64),
-            prevRandao: U256::ZERO,
-            index: U256::from(index),
-            payload: vec![0xaa, 0xbb].into(),
-        }
-        .abi_encode()
-    }
-
-    fn input_added_pair(
-        topic_index: u64,
-        payload: Vec<u8>,
-        block_number: Option<u64>,
-        transaction_hash: Option<alloy_primitives::B256>,
-    ) -> (InputAdded, alloy::rpc::types::Log) {
-        let event = InputAdded {
-            appContract: Address::ZERO,
-            index: U256::from(topic_index),
-            input: payload.into(),
-        };
-        let log = alloy::rpc::types::Log {
-            inner: alloy_primitives::Log {
-                address: Address::ZERO,
-                data: alloy_primitives::LogData::new_unchecked(
-                    Vec::new(),
-                    alloy_primitives::Bytes::new(),
-                ),
-            },
-            block_hash: None,
+        crate::test_support::l1::evm_advance_input(
+            chain_id,
+            app_contract,
+            Address::repeat_byte(0x11),
             block_number,
-            block_timestamp: None,
-            transaction_hash,
-            transaction_index: Some(0),
-            log_index: Some(0),
-            removed: false,
-        };
-        (event, log)
+            index,
+            &[0xaa, 0xbb],
+        )
     }
 
     #[test]
