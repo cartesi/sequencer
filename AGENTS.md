@@ -33,35 +33,28 @@ In order of importance:
 - **App-specific sequencer.** The sequencer may link against the application, enabling validation and execution at ingress time. This is a deliberate design choice.
 - **Soft confirmations may be invalidated.** Under adversarial conditions (network, infrastructure, provider, or L1 outages), soft confirmations can be rolled back via recovery. This is by design, not a bug — it is what makes the sequencer sound in the face of liveness failures.
 - **App UX may depend on the sequencer.** Without the sequencer, user experience may degrade substantially. This is an acceptable tradeoff: the on-chain scheduler remains the canonical source of truth; the sequencer only accelerates the UX.
-- **SQLite-centered local coordination.** Components publish and consume durable local facts through their owned SQLite tables. The on-chain scheduler remains canonical authority; SQLite is the sequencer's local coordination plane. HTTP ingress ↔ inclusion lane MPSC/oneshot is the deliberate exception because low-latency request/response over the lane's in-memory application is unwieldy through SQLite. Do not turn that exception into a general in-memory component bus. Full statement: [ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md).
+- **SQLite-centered local coordination.** Components publish and consume durable local facts through their owned SQLite tables, and the on-chain scheduler remains canonical authority. HTTP ingress ↔ inclusion lane is the one deliberate in-memory exception, not a precedent for a component bus ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)).
 - **Append-oriented storage.** Avoid mutable status flags for open/closed entities; prefer write-once NULL→value transitions with one owner each, and derive cursors and heads from persisted facts rather than duplicating them as mutable fields.
 - **Assumption-driven robustness.** Every hardening mechanism must name the invariant it protects, the assumptions under which it is needed, and a trigger for revisiting them. Machinery for failures outside the supported model enlarges the state surface developers must audit and can make the system less robust rather than more.
 - **The complexity budget belongs to concurrency, mutual exclusion, durability, and hostile-L1 robustness.** This sequencer is not algorithmically complex. A large file is a smell: an invariant we're not seeing, a reasonable assumption we're not taking, or plain over-engineering. Judge every mechanism — current or proposed — against its weight.
 
 ## Sequencer / Scheduler Duality
 
-The system has two components in an asymmetric relationship:
+The **scheduler** runs inside the rollup and **defines the canonical transaction
+ordering**. For each batch in L1 safe inputs, it processes frames in order:
+drain every pending direct input whose block number is ≤ `safe_block`, then
+execute the frame's user ops. **It treats the sequencer as potentially
+Byzantine** and enforces ordering and staleness regardless of what the
+sequencer claims.
 
-### Scheduler — on-chain canonical authority
-
-The scheduler runs inside the rollup and **defines the canonical transaction ordering**. For each batch read from L1 safe inputs, it processes frames in order: drain all pending direct inputs whose block number is ≤ `safe_block`, then execute the frame's user ops. **The scheduler treats the sequencer as potentially Byzantine** — it enforces ordering and staleness rules regardless of what the sequencer claims.
-
-### Sequencer — off-chain predictor
-
-The sequencer knows the scheduler's algorithm. It uses that knowledge to **predict** what the canonical ordering will be once its batches land on L1, and issues soft confirmations to users ahead of time. The sequencer has **write priority on the execution queue**: as long as it keeps advancing `safe_block` and submitting batches, it controls ordering.
-
-### The `safe_block` synchronization primitive
-
-Each frame carries a `safe_block` chosen by the sequencer. It serves two purposes:
-
-- It tells the scheduler how far to drain direct inputs before executing the frame's user ops.
-- It is the sequencer's commitment that it has accounted for all direct inputs up to that block.
-
-The sequencer must advance `safe_block` honestly. If it freezes `safe_block` (to censor deposits) or stops submitting batches, the staleness mechanism detects this and forces recovery.
-
-### When soft confirmations match canonical order
-
-Under honest sequencer operation and no infrastructure outages, soft confirmations match the canonical order. This is an **optimistic guarantee** — the sequencer is predicting a future the scheduler has not yet computed. When the sequencer goes offline, submits stale batches, or tries to censor direct inputs, the scheduler's force-drain backstop kicks in and the affected soft confirmations become invalid.
+The **sequencer** knows that algorithm and **predicts** the canonical ordering,
+issuing soft confirmations before its batches land. It has **write priority on
+the execution queue** while it keeps advancing `safe_block` and submitting
+batches. A frame's `safe_block` tells the scheduler how far to drain directs
+before the frame's user ops, and commits the sequencer to having accounted for
+every direct input up to that block. Under honest operation without outages,
+soft confirmations match the canonical order; if the sequencer goes offline or
+freezes `safe_block`, staleness forces recovery and invalidates them.
 
 ### Where the duality lives in code (change one, check all)
 
@@ -87,47 +80,21 @@ Two mechanical facts the agreement rests on:
 
 ## Batch Staleness and Recovery
 
-### Staleness
+A batch is **stale** when `inclusion_block - first_frame.safe_block >= MAX_WAIT_BLOCKS`
+(1200 blocks, ~4h): the sequencer went offline, or kept submitting while
+freezing `safe_block` to hold back directs. The scheduler skips a stale batch
+without consuming its nonce, and overdue directs are force-drained anyway, which
+bounds censorship at ~4h. Every later batch then arrives at an unexpected nonce,
+so invalidation cascades through the suffix, open batch included
+([scheduler semantics](docs/protocol/scheduler-semantics.md)).
 
-A batch is **stale** when `inclusion_block - first_frame.safe_block >= MAX_WAIT_BLOCKS` (1200 blocks, ~4h). Staleness catches two failure modes:
-
-1. **Liveness failure** — the sequencer went offline and failed to submit batches in time.
-2. **Censorship** — the sequencer kept submitting batches but froze `safe_block` to hold back direct inputs.
-
-When the scheduler encounters a stale batch, it skips its frames without
-consuming the batch nonce. The overdue-direct backstop still runs. Together,
-these rules prevent the sequencer from holding write priority indefinitely
-without advancing the drain cursor; direct inputs are force-drained at
-`MAX_WAIT_BLOCKS`, giving the ~4h censorship-resistance bound.
-
-### Cascading invalidation
-
-If a batch is stale, all existing subsequent batches are also invalid. The scheduler's expected-nonce counter does not advance on a stale skip, so every subsequent batch arrives at an unexpected nonce and is rejected. Invalidation is a suffix operation: marking batch `N` invalid cascades to `N+1`, `N+2`, …, including the open batch. New batches created after recovery are unaffected.
-
-### Two recovery paths
-
-**Automatic recovery** repairs optimistic history after liveness failures. The
-danger detector signals service to stop when a danger check fires; startup recovery
-settles outstanding submissions and replaces the invalid suffix using local
-SQLite facts and safe L1 history. The danger threshold is a trigger, not proof
-that a batch is doomed. Detection uses safe state, with wall-clock checks when
-the L1 view stops advancing. Expected recovery exits gracefully; diagnosed
-terminal runtime faults abort immediately. The [automatic recovery design](docs/recovery/README.md)
-owns detection, startup ordering, dispatch, and admission.
-
-**Manual cockroach recovery** (`setup --recovery`) rebuilds from a trusted
-canonical application checkpoint and L1 history into a fresh data directory.
-It also applies after sequencer bugs: fix the bug, choose a trusted canonical
-checkpoint, and then run recovery. Historical batches,
-including malformed ones, receive the canonical scheduler's treatment. The
-result accounts for a fixed input prefix from which sequencing can resume; it
-does not need to catch the moving L1 tip or preserve prior soft confirmations.
-The [cockroach recovery guide](docs/recovery/cockroach.md) owns the checkpoint
-requirements, stopping boundary, and rebuild procedure.
-
-Before changing recovery code, read its guide and both current bounded TLA+
-models. The automatic recovery guide's [Formal Verification](docs/recovery/README.md#formal-verification)
-section explains their scopes; the models are not a proof of every recovery path.
+- **Automatic recovery** repairs optimistic history after liveness failures: the
+  danger detector stops the process at a threshold before staleness, and startup
+  settles outstanding submissions and replaces the invalid suffix
+  ([automatic recovery](docs/recovery/README.md)).
+- **Cockroach recovery** (`setup --recovery`) rebuilds a fresh data directory from
+  a trusted canonical checkpoint and L1 history, including after a sequencer bug
+  ([cockroach recovery](docs/recovery/cockroach.md)).
 
 ## Threat Model (brief)
 
@@ -135,11 +102,8 @@ See [`docs/threat-model/README.md`](docs/threat-model/README.md) for the full mo
 
 - **Trusted:** InputBox contract, our own Ethereum node (fail-stop, not byzantine), operator config, batch-submitter key.
 - **Adversarial:** `POST /tx` callers, direct-input senders, the L1 mempool and block builders (zombie transactions are a first-class threat).
-- **RPC endpoint:** single (`CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`), trusted fail-stop, **must be one consistent node** — no fallback tier exists yet (see the threat model's actor table).
-- **Self-trust:** normal operation assumes the sequencer's own code is correct.
-  Invariant violations fail loud. Bug-induced malformed batches require fixing
-  the bug and, when rebuilding is necessary, manual cockroach recovery; automatic
-  recovery does not repair software defects.
+- **RPC endpoint:** single (`CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`), trusted fail-stop, **must be one consistent node** — no fallback tier exists yet ([RPC endpoint](docs/threat-model/README.md#rpc-endpoint)).
+- **Self-trust:** normal operation assumes the sequencer's own code is correct; a bug needs a fix and, when state cannot be trusted, cockroach recovery. Automatic recovery does not repair software defects.
 - **In scope:** correctness bugs *and* exploitation. Under rollup semantics, a correctness bug that causes scheduler/sequencer state divergence is as severe as direct theft.
 
 ## Architecture Map
@@ -163,6 +127,7 @@ signing, and SSZ batch encoding.
 - `examples/canonical-test/` — e2e test harness for the canonical app.
 - `sdk/rust-client/` — Rust client library for the sequencer API.
 - `sdk/guest/` — canonical-guest SDK: `trolley` (guest rollup API over `libcmt-sys`), `rollups-types` (rollups ABI encodings), and `testsi` (host-side guest image tests); provenance in its README.
+- `watchdog/` — Lua watchdog: re-derives canonical state from L1 and compares it with the sequencer's accepted checkpoint ([watchdog README](docs/watchdog/README.md)).
 - `tests/{benchmarks,e2e,harness}/` — test infrastructure.
 
 ### Sequencer module layout
@@ -184,93 +149,23 @@ Paths below are relative to `sequencer/src/`:
 - **Chunk** — bounded list of user ops processed and persisted together to amortize SQLite cost.
 - **Frame** — ordering boundary; commits `safe_block` + user ops.
 - **Batch** — list of frames posted on-chain as one L1 transaction (SSZ-encoded).
-- **Inclusion lane** — the single ordering lane, with a latency-critical user-op regime and a slower L1-reconciliation regime ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)); the only writer of open batch/frame state ([I17](docs/invariants.md)) and the system's execution bottleneck.
-- **Batch submitter** — stateless worker that bulk-submits all pending batches each tick. Storage assigns each batch's scheduler nonce at creation (`parent.nonce + 1`, or the deployment anchor for a root); the submitter reads it and selects L1 wallet nonces for submission.
-- **Danger detector** — polls `Storage::check_danger` and signals the process to stop so startup can recover or refuse. It reads local facts; it never writes the DB or talks to L1.
-- **Fee oracle** — setup pins and bootstraps a fixed price or Uniswap V3 TWAP source. The price informs future frame fees; an oracle-only outage is an accepted economic risk. The [threat model's actor table](docs/threat-model/README.md#actors-and-trust) owns the source assumptions and failure policy.
-- **Input reader** — ingests safe inputs from L1 InputBox and maintains the durable safe head, accepted-batch projection, and divergence marker in one atomic transaction (`sequencer/src/storage/l1_inputs.rs`); it hands the lane no in-memory cursor.
-- **L2 tx feed** — DB-backed application-input stream. HTTP snapshot headers
-  provide `(EraId, RecoveryGeneration, ExecutedInputCount)`; WS validates that
-  claim and replays inclusively before following the tip.
-- **Application progress** — engine-owned `(ExecutedInputCount,
-  last_executed_safe_block)`, embedded in every dump. Shared execution verifies
-  the transition and returns the pre-execution offset; storage commits that
-  mandatory offset with its source in `application_inputs`.
-- **History version** — `(EraId, RecoveryGeneration)`. Setup publishes a complete
-  baseline with a fresh era; recovery increments the generation exactly once
-  iff it invalidates at least one valid batch and records the preserved-prefix
-  cut in the same transaction. `/history` can check a saved checkpoint across
-  intervening generations; subscription claims still enforce both identifiers.
-  The [history contract](docs/protocol/application-history.md) owns compatibility.
+- **Tip** — the open batch at the end of the valid branch; recovery invalidates a suffix and opens a new Tip ([automatic recovery](docs/recovery/README.md#the-state-being-repaired)).
+- **Inclusion lane** — the single ordering lane ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)); the only writer of open batch/frame state ([I17](docs/invariants.md)) and the system's execution bottleneck.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
-- **Snapshot** — immutable artifact at every batch close, registered with its
-  local batch identity and application count. Acceptance facts select the
-  recovery/watchdog checkpoint; the era baseline supplies the initial restore
-  point. Lifecycle and leases: [`docs/snapshots/lifecycle.md`](docs/snapshots/lifecycle.md).
+- **Snapshot** — immutable artifact registered at every batch close; acceptance selects the comparison and recovery checkpoint ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
 
 ## Domain Truths
 
 - API validates the EIP-712 signature and enqueues a `SignedUserOp`. Method payload decoding happens during application execution, not at ingress.
 - **Deposits are direct-input-only** (L1 → L2) and must not be represented as user ops.
-- Rejections (`InvalidNonce`, `NonceExhausted`, `InvalidMaxFee`, `InsufficientFeeBalance`) produce no state mutation and are not persisted. Every app implements `InvalidNonce` and `InsufficientFeeBalance`; the shared execution boundary alone produces `InvalidMaxFee` and `NonceExhausted`. Nonces prevent user-op replay, fees prevent spam against the sequencer's DA budget. ("Fee", not "gas" — the fee tracks DA; compute metering, if it ever exists, is a separate future concept.)
-- **The user-nonce rule is contract, not wallet detail:** accounts start at 0, an op must carry exactly the expected nonce, each included op advances it by one, and direct inputs never touch it. `GET /nonce` derives from persisted user ops under this rule instead of asking the app ([application contract](docs/protocol/application-contract.md#user-nonces)).
-- Included txs are persisted as frame/batch data in `batches`, `frames`, `user_ops`, `safe_inputs`, and `application_inputs`. Recovery metadata lives in `safe_accepted_batches`; batch lifecycle state (sealed/invalidated) lives on the `batches` row itself as write-once timestamps.
-- Frame fee is persisted in `frames.fee` and is fixed for the lifetime of that frame. The next frame's fee is currently sampled from `batch_policy_derived.recommended_fee` at rotation; oracle bootstrap writes the price before any Tip can sample it, and `log_slack` applies the 10× margin in log space. This is present behavior, not a reason for the five-block clock policy; hoisting fee to the batch is a later design with its own trade-offs.
-- Wallet balances and nonces live in memory between checkpoints; restart restores
-  a dump and replays persisted application inputs.
-- **EIP-712 domain fields:** `name`, `version`, `chainId`, `verifyingContract`.
-  Setup pins the chain id and app address from `CARTESI_SEQUENCER_BLOCKCHAIN_ID`
-  and `CARTESI_SEQUENCER_APP_ADDRESS`, validating the chain id against RPC. All
-  four fields must be present on both sides; the sequencer and canonical
-  scheduler share `sequencer_core::build_input_domain`.
-
-### InputBox payload classification
-
-- The input reader ingests every `InputAdded` event from InputBox. Each event carries an authenticated `msg_sender` (delivered by the Cartesi framework from `EvmAdvanceCall`).
-- **Classification is by sender address**, not by a tag byte:
-  - Sender == batch-submitter address → SSZ-decoded as `Batch` (scheduler side). The sequencer does not ingest its own batch submissions as direct inputs.
-  - Any other sender → stored verbatim as a direct input (deposit).
-- The payload is opaque to the classification layer. Application-specific decoding happens inside `Application::apply_direct_input`, reached only through the shared `execute_direct_input` boundary.
+- **InputBox payload classification** is by authenticated sender, never by a tag byte: the batch submitter's inputs are batches; any other sender's are direct inputs, stored verbatim ([scheduler semantics](docs/protocol/scheduler-semantics.md#the-one-stream-the-one-classification)).
+- A rejected user op changes no state and is not persisted; the [application contract](docs/protocol/application-contract.md) owns which layer produces each rejection. The charge is a "fee", not "gas": it tracks DA.
+- **The user-nonce rule is contract, not wallet detail** ([user nonces](docs/protocol/application-contract.md#user-nonces)); `GET /nonce` relies on it instead of asking the app.
+- **EIP-712 domain:** both sides build it with `sequencer_core::build_input_domain` ([user-op signatures](docs/protocol/scheduler-semantics.md#user-op-signatures)); setup pins the chain id and app address, validating the chain id against RPC.
 
 ## Application Trait Contract
 
-Implementors of the `Application` trait must respect these contracts. The shared execution boundary verifies application-owned count/clock progress; application-specific determinism and mutation remain self-trusted. The full, code-grounded contract — method table, dump round-trip durability, the safe-block clock — is **owned by [`docs/protocol/application-contract.md`](docs/protocol/application-contract.md)**; the essentials follow.
-
-### Replay determinism
-
-The sequencer persists every included user op and every ingested direct input. On restart, catch-up replays them in order against a fresh `Application` instance to rebuild state. **Any input that succeeded live must succeed on replay.**
-
-- `apply_direct_input` and `apply_valid_user_op` must not return `AppError::Internal` for any byte sequence that previously executed successfully. The canonical scheduler, catch-up, and recovery fold treat `Internal` as fatal: no canonical successor is defined.
-- Validation returns `Accept`, `Reject(InvalidReason)`, or fatal `AppError`. A rejected op changes no state. Included business failures and malformed direct-input no-ops still advance progress; do not turn them into validation rejections. See the application contract for the nonce rule and the wallet's fee semantics.
-- `validate_user_op` must be pure over the current app state. No side effects, no time dependence, no randomness.
-
-### No implicit state
-
-Logical state changes, including `ApplicationProgress`, flow through the `apply_valid_user_op` and `apply_direct_input` hooks. The engine reports progress by value. Mutating state from `validate_user_op` breaks replay determinism; mutable checkpoint creation may replace backing resources while preserving logical state.
-
-### One execution entry point
-
-User ops are executed only through `sequencer_core::application::validate_and_execute_user_op`; already-validated user ops and directs use `execute_valid_user_op` / `execute_direct_input`. The shared boundary preflights the checked successor, then verifies the engine's progress after a successful hook and returns its pre-execution offset. Count zero implies clock zero. Validation purity and native mutation remain self-trusted. `AppError` is fatal and defines no canonical successor; callers discard the instance rather than resume it. The inclusion lane, canonical scheduler, catch-up, and recovery fold all use this boundary — part of the duality agreement.
-
-`Application` requires `Send`, with neither `Clone` nor `Sync`. Dumps must be durable and immutable, and restored engines must remain independent after source deletion. The opaque app prefix may be a file or directory; checkpoint disposal uses ordinary recursive filesystem deletion. Canonical inspection belongs to the separate `CanonicalState` trait; the native sequencer serves the comparison file in the checkpoint. The [C binding guide](docs/protocol/c-application-binding.md) maps the contract to native engines.
-
-## Ordering and Storage
-
-Preserve single-lane deterministic ordering. Do not introduce extra concurrency
-in hot-path ordering logic without explicit approval.
-
-The inclusion lane combines a latency-critical user-op regime with complete L1
-reconciliation. The [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md)
-owns that split, acknowledgement rules, runtime ownership, and command admission.
-The [scheduler contract](docs/protocol/scheduler-semantics.md#sequencer-frame-clock-policy)
-owns the five-safe-block frame clock; the [Application contract](docs/protocol/application-contract.md#5-operational-capacity-for-l1-reconciliation)
-owns the assumption that accumulated directs are digestible without preemption.
-
-Storage changes cross writer boundaries even when the SQL looks local. Read the
-[invariant register](docs/invariants.md) for writer ownership, `valid_*` reads,
-drain attribution, the content-identity/divergence freeze, `WriteHead` coherence,
-and application-history offsets. The [schema](sequencer/src/storage/migrations/0001_schema.sql)
-enforces write-once batch lifecycle, Tip uniqueness, and user-op identity.
+The [application contract](docs/protocol/application-contract.md) owns the `Application` trait; the [C binding guide](docs/protocol/c-application-binding.md) maps it to native engines. Two rules carry the duality: **any input that succeeded live must succeed on replay** (`AppError` is fatal and defines no canonical successor), and the inclusion lane, canonical scheduler, catch-up, and recovery fold execute inputs only through the shared boundary in `sequencer_core::application`, which checks the engine's reported progress.
 
 ## Type Boundaries
 
@@ -285,39 +180,21 @@ enforces write-once batch lifecycle, Tip uniqueness, and user-op identity.
 
 ## HTTP Endpoints
 
-- **Ingress** (public-facing): `POST /tx`, `GET /fee`, `GET /nonce`, `GET /domain`.
-- **Egress** (internal indexers/watchdog): application-input subscriptions,
-  snapshot/state downloads, and health probes. Snapshot/state endpoints have no
-  authentication and **must not be exposed publicly**. Downloads hold a GC lease
-  for their response lifetime ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
-
-Each side has its own listener (public `CARTESI_SEQUENCER_HTTP_ADDR`, internal `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`), so internal probes and subscribers can be firewalled from public submit traffic.
-
-The [README API contract](README.md#api) owns routes, message shapes, caps,
-close codes, and health semantics. [`openapi.yaml`](openapi.yaml) is its
-machine-readable rendering for client generation and documentation tools;
-change both in the same patch. CI lints it; run
-`direnv exec . redocly lint openapi.yaml` locally.
+Only the ingress routes (`POST /tx`, `GET /fee`, `GET /nonce`, `GET /domain`) are
+public; every other route, snapshot and state downloads included, is internal,
+unauthenticated, and **must not be exposed publicly**. The [README API contract](README.md#api)
+owns routes, listeners, shapes, caps, and codes; [`openapi.yaml`](openapi.yaml)
+renders it for client generation and documentation tools, so change both in the
+same patch. CI lints it; run `direnv exec . redocly lint openapi.yaml` locally.
 
 ## Command Configuration
 
-Configuration follows the command phases:
-
-- Plain **`setup`** is L1-read-only and never signs. It pins chain/app/submitter
-  identity and the fee source. **`setup --recovery`** also needs the submitter
-  key to flush its outstanding transactions; see the [rebuild guide](docs/recovery/cockroach.md).
-- **`run`** takes the RPC endpoint and signing key (or key file). It reads the
-  pinned chain id, app address, and submitter address from the database.
-
-**Use a dedicated submitter address.** Plain setup refuses an unsettled wallet
-nonce, so sharing a busy contract-deployer address can trip the detection gate
-while its deployment transactions are not yet safe. The devnet uses Anvil
-account 9 (`DEVNET_SEQUENCER_ADDRESS`), separate from the account-0 deployer.
-
-The [Running guide](README.md#running) gives invocation examples;
-[`commands/config.rs`](sequencer/src/commands/config.rs) owns environment-variable
-names, defaults, and validation. Check configuration there before documenting or
-changing it, including checkpoint and fee-source selection.
+Plain `setup` is L1-read-only and never signs; `run` and `flush-mempool` take the
+signing key and read the pinned identity from the database. [Running](README.md#running)
+owns invocation and why the submitter address must be dedicated (the devnet uses
+Anvil account 9). [`commands/config.rs`](sequencer/src/commands/config.rs) owns
+every variable name, default, and validation; check it before documenting or
+changing configuration.
 
 ## Coding Conventions
 
@@ -358,16 +235,11 @@ Keep three kinds of material distinct:
 
 ## Testing Guidance
 
-Focus tests on:
-
-- Signature + sender-validation edge cases.
-- Nonce progression rules.
-- Fee and rejection behavior.
-- Included-vs-rejected commit behavior.
-- Storage batch atomicity and uniqueness constraints.
-- Scheduler/sequencer agreement — any invariant the two sides share should have at least one test that exercises both.
-
-Prefer black-box tests around `POST /tx` and commit outcomes for integration.
+Concentrate tests where consensus risk lives: signature and sender validation,
+nonce progression, fee and rejection behavior, included-vs-rejected commits, and
+storage batch atomicity and uniqueness. Any invariant the scheduler and
+sequencer share gets at least one test that exercises both sides. Prefer
+black-box tests around `POST /tx` and commit outcomes for integration.
 
 Test placement: unit tests are a child module of the code under test, inline
 `#[cfg(test)] mod tests` or `<module>/tests.rs` (or `<topic>_tests.rs`) once
@@ -419,7 +291,7 @@ See [Running](README.md#running) for the two-phase `setup` / `run` workflow.
 - Run at least `cargo check` before finishing.
 - Read the relevant recovery guide and both current TLA+ models before touching
   recovery code, and the threat model before touching trust-boundary code.
-- Check [`docs/invariants.md`](docs/invariants.md) before changing anything it lists as load-bearing, the owning design for its assumptions, and [`docs/review/register.md`](docs/review/register.md) for unresolved work in the code you're about to touch. Verify review claims against current code.
+- Check [`docs/invariants.md`](docs/invariants.md) before changing anything it lists as load-bearing (storage changes cross writer boundaries even when the SQL looks local), the owning design for its assumptions, and [`docs/review/register.md`](docs/review/register.md) for unresolved work in the code you're about to touch. Verify review claims against current code.
 
 ### Ask First
 
@@ -467,7 +339,7 @@ work reaches another boundary.
 | API, subscriber replay, or application-history coordinates | [README API contract](README.md#api) — wire behavior, with [`openapi.yaml`](openapi.yaml) changed alongside it; [application history](docs/protocol/application-history.md) — era, generation, offsets, and recovery boundaries. |
 | Snapshots, restart, export, retention, or watchdog checkpoints | [Snapshot lifecycle](docs/snapshots/lifecycle.md) — durable publication, accepted comparison points, leases, and GC; [wallet format](docs/snapshots/format.md) when changing wallet bytes. |
 | Trust boundaries, provider behavior, or hostile L1 input | [Threat model](docs/threat-model/README.md) — actor assumptions, supported failures, and residual risks. |
-| Submission fees or oracle pricing | [L1 fee policy](docs/l1-fee-policy.md) — estimation and replacement limits; [threat-model actor table](docs/threat-model/README.md#actors-and-trust) — oracle source and outage assumptions. |
+| Submission fees or oracle pricing | [L1 fee policy](docs/l1-fee-policy.md) — estimation and replacement limits; [threat model's fee oracle section](docs/threat-model/README.md#fee-oracle) — oracle source and outage assumptions. |
 | Command setup or deployment configuration | [Running](README.md#running) and [config.rs](sequencer/src/commands/config.rs) — invocation, identity pinning, defaults, and validation. |
 | Watchdog development or operation | [Watchdog README](docs/watchdog/README.md) — contract, state sources, commands, and state; [incident runbook](docs/watchdog/incident-runbook.md) — what a latched divergence requires; [local dev](docs/watchdog/getting-started.md) for Anvil; [operator deployment](docs/watchdog/operator-deployment.md) for Sepolia/mainnet. |
 | Canonical guest, machine images, or a Cartesi Machine bump | [Cartesi Machine facts](docs/cartesi-machine.md) — version pinning, host semantics, storage, memory ranges, and the guest side. |

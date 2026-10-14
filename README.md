@@ -144,6 +144,12 @@ Sync/Cascade or launches runtime workers.
 
 `setup` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS`.
 The submitter address must equal the `sequencer_address` compiled into the canonical machine; nothing checks this at runtime ([scheduler semantics](docs/protocol/scheduler-semantics.md#the-one-stream-the-one-classification)).
+
+**Use a dedicated submitter address.** Plain `setup` refuses an unsettled wallet
+nonce, so sharing a busy contract-deployer address can trip the detection gate
+while its deployment transactions are not yet safe. The devnet uses Anvil
+account 9 (`DEVNET_SEQUENCER_ADDRESS`), separate from the account-0 deployer.
+
 `run` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `_FILE`); it refuses to boot until `setup` has completed.
 
 Optional: `CARTESI_SEQUENCER_HTTP_ADDR` (public listener, default `127.0.0.1:3000`, `run`), `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR` (internal listener, default `127.0.0.1:3001`, `run`), `CARTESI_SEQUENCER_DATA_DIR` (default `sequencer-data` — SQLite file is `sequencer.db` inside; `setup` creates it, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS` (default `300`), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK` (default `12`), `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS` (default `600`), `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (alternative to `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY`; first line of the file is the key), `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH`.
