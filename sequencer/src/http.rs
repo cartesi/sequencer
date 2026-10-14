@@ -210,6 +210,16 @@ async fn run_snapshot_release_supervisor(
     }
 }
 
+/// The `503` a handler returns when it refuses new work after shutdown is
+/// requested.
+pub(crate) fn reject_if_shutting_down(shutdown: &RuntimeScope) -> Result<(), ApiError> {
+    if shutdown.is_shutdown_requested() {
+        Err(ApiError::unavailable("sequencer shutting down"))
+    } else {
+        Ok(())
+    }
+}
+
 // ── Blocking storage tasks ─────────────────────────────────────────────────
 //
 // Shared by ingress (`GET /fee`, `GET /nonce`) and egress snapshot handlers. Classify

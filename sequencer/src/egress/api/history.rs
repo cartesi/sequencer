@@ -84,8 +84,8 @@ async fn history(
     if query.from_generation.is_some() && query.era_id.is_none() {
         return ApiError::bad_request("from_generation requires era_id").into_response();
     }
-    if state.shutdown.is_shutdown_requested() {
-        return ApiError::unavailable("sequencer shutting down").into_response();
+    if let Err(error) = crate::http::reject_if_shutting_down(&state.shutdown) {
+        return error.into_response();
     }
     let db_path = state.db_path.clone();
     match storage_task(state.shutdown.clone(), "read history metadata", move |_| {
@@ -110,8 +110,8 @@ async fn historical_l1_inputs(
         Ok(start) => start,
         Err(error) => return error.into_response(),
     };
-    if state.shutdown.is_shutdown_requested() {
-        return ApiError::unavailable("sequencer shutting down").into_response();
+    if let Err(error) = crate::http::reject_if_shutting_down(&state.shutdown) {
+        return error.into_response();
     }
     let permit = match state.responses.clone().try_acquire_owned() {
         Ok(permit) => permit,

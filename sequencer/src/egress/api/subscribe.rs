@@ -39,7 +39,7 @@ pub(crate) async fn subscribe_l2_txs(
     Query(query): Query<SubscribeQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Err(err) = state.reject_if_shutting_down() {
+    if let Err(err) = crate::http::reject_if_shutting_down(&state.shutdown) {
         return err.into_response();
     }
 

@@ -31,14 +31,6 @@ impl SubscribeState {
         }
     }
 
-    pub(crate) fn reject_if_shutting_down(&self) -> Result<(), ApiError> {
-        if self.shutdown.is_shutdown_requested() {
-            Err(ApiError::unavailable("sequencer shutting down"))
-        } else {
-            Ok(())
-        }
-    }
-
     pub(crate) fn try_acquire_ws_subscriber_permit(
         &self,
     ) -> Result<OwnedSemaphorePermit, ApiError> {

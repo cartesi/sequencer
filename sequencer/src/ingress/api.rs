@@ -36,7 +36,7 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 
-use crate::http::{ApiError, storage_task};
+use crate::http::{ApiError, reject_if_shutting_down, storage_task};
 use crate::ingress::inclusion_lane::PendingUserOp;
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::Storage;
@@ -49,10 +49,10 @@ use serde::Deserialize;
 /// State for the submit endpoint. Kept narrow — only what `/tx` actually needs.
 #[derive(Clone)]
 pub(crate) struct SubmitState {
-    pub tx_sender: mpsc::Sender<PendingUserOp>,
-    pub domain: Eip712Domain,
-    pub max_user_op_data_bytes: usize,
-    pub shutdown: RuntimeScope,
+    tx_sender: mpsc::Sender<PendingUserOp>,
+    domain: Eip712Domain,
+    max_user_op_data_bytes: usize,
+    shutdown: RuntimeScope,
 }
 
 impl SubmitState {
@@ -67,14 +67,6 @@ impl SubmitState {
             domain,
             max_user_op_data_bytes,
             shutdown,
-        }
-    }
-
-    fn reject_if_shutting_down(&self) -> Result<(), ApiError> {
-        if self.shutdown.is_shutdown_requested() {
-            Err(ApiError::unavailable("sequencer shutting down"))
-        } else {
-            Ok(())
         }
     }
 }
@@ -95,14 +87,6 @@ impl ReadState {
             db_path,
             domain,
             shutdown,
-        }
-    }
-
-    fn reject_if_shutting_down(&self) -> Result<(), ApiError> {
-        if self.shutdown.is_shutdown_requested() {
-            Err(ApiError::unavailable("sequencer shutting down"))
-        } else {
-            Ok(())
         }
     }
 }
@@ -156,7 +140,7 @@ async fn submit_tx(
 }
 
 async fn get_fee(State(state): State<Arc<ReadState>>) -> Result<Response, ApiError> {
-    state.reject_if_shutting_down()?;
+    reject_if_shutting_down(&state.shutdown)?;
     let db_path = state.db_path.clone();
     let result = storage_task(state.shutdown.clone(), "read fee quote", move |_scope| {
         let mut storage = Storage::open_read_only(&db_path)?;
@@ -186,7 +170,7 @@ async fn get_nonce(
     State(state): State<Arc<ReadState>>,
     query: Result<Query<NonceQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Response, ApiError> {
-    state.reject_if_shutting_down()?;
+    reject_if_shutting_down(&state.shutdown)?;
     let sender = query
         .ok()
         .and_then(|Query(query)| parse_sender_address(&query.sender).ok())
@@ -252,7 +236,7 @@ fn enqueue_verified_tx(
     signed: SignedUserOp,
 ) -> Result<oneshot::Receiver<Result<(), crate::ingress::inclusion_lane::SequencerError>>, ApiError>
 {
-    state.reject_if_shutting_down()?;
+    reject_if_shutting_down(&state.shutdown)?;
 
     let (respond_to, recv) = oneshot::channel();
     let pending = PendingUserOp {
