@@ -62,9 +62,6 @@ emits:
 
 This guarantees byte-identical snapshot files for byte-identical logical
 state, regardless of insertion order.
-`encode_emits_entries_in_ascending_address_order`
-(`examples/app-core/src/wallet_snapshot.rs`) pins the order with entries
-inserted out of order.
 
 ### Decode Rules
 

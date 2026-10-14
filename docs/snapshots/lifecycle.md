@@ -35,7 +35,7 @@ an application count, and replacement branches, which can reuse a nonce.
 
 ## Creation and restart
 
-Initially every batch close creates a snapshot. The lane makes the artifact
+Every batch close creates a snapshot. The lane makes the artifact
 and metadata durable **before** one transaction seals the batch and registers
 its snapshot. A failed database commit leaves an orphan directory; startup
 sweeps it. A committed close therefore has its required snapshot.
@@ -111,8 +111,7 @@ archive. Supply that extracted directory to `setup --recovery`, with the
 checkpoint block recorded in its receipt. The loader checks the receipt against
 the immutable dump metadata and configured block. Copying a bare local
 `dumps/<id>/` directory is insufficient: it is a restore artifact and has no
-acceptance receipt. Export creates the receipt without modifying local files;
-startup no longer stamps or repairs acceptance metadata in `info.toml`.
+acceptance receipt. Export creates the receipt without modifying local files.
 
 ## Retention, leases, and crash safety
 
@@ -139,13 +138,12 @@ of all checkpoint resources. Filesystem deletion failure leaves a harmless
 orphan for the startup sweep. The reverse ordering would leave a durable row pointing at missing
 state and is forbidden. Startup clears leases left by the dead process,
 checks the rollback checkpoint's `info.toml` and format version, collects obsolete
-rows, and sweeps orphan directories before workers start. On supported Linux and
-macOS hosts, the sweep reads every retained artifact's filesystem object identity
-(device and inode) before deleting any orphans. Comparing those identities
-preserves alternate spellings, symlinks, and mount aliases of the same artifact.
-Retained identity lookup failures stop the sweep before deletion: missing
-references or structural I/O errors are terminal; operational I/O errors retain
-their normal classification. Application restoration runs afterward in the launched inclusion
-lane, before processing new user ops; the metadata check does not validate the
-application bytes. Missing or corrupt referenced artifacts also fail loud when
-read or restored.
+rows, and sweeps orphan directories before workers start. The sweep matches
+artifacts by filesystem identity (device and inode), not by path, because setup
+and run can spell the same directory differently; it resolves every retained
+artifact before deleting anything and stops if one cannot be resolved
+([`startup_hygiene.rs`](../../sequencer/src/commands/run/startup_hygiene.rs)).
+Application restoration runs afterward in the launched inclusion lane, before
+processing new user ops; the metadata check does not validate the application
+bytes. Missing or corrupt referenced artifacts also fail loud when read or
+restored.
