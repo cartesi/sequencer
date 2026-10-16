@@ -73,7 +73,7 @@ pub const SEPOLIA_USDC_ADDRESS: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc61
 pub const DEVNET_MOCK_USDC_ADDRESS: Address =
     address!("0x95d0c8A7d11342299807A2Fc19ac44C2321cCc68");
 pub const SEPOLIA_SEQUENCER_ADDRESS: Address =
-    address!("0x16d5FF3Fdd14e2a86FBA77cbcE6B3Cd9C32b8Ff3");
+    address!("0x79b88d2f598d8D001832D69f5201332A3f1e14c8");
 /// Devnet batch-submitter / sequencer address — anvil account **9**,
 /// deliberately distinct from the deployer/funder (anvil account 0).
 ///
@@ -406,6 +406,44 @@ mod tests {
     };
     use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
     use sequencer_core::user_op::UserOp;
+
+    #[test]
+    fn sepolia_dedicated_submitter_is_the_batch_sender_and_fee_recipient() {
+        use sequencer_core::batch::Batch;
+        use sequencer_core::scheduler::{
+            ProcessOutcome, Scheduler, SchedulerConfig, SchedulerInput,
+        };
+        use ssz::Encode;
+
+        let submitter = address!("0x79b88d2f598d8D001832D69f5201332A3f1e14c8");
+        let previous_submitter = address!("0x16d5FF3Fdd14e2a86FBA77cbcE6B3Cd9C32b8Ff3");
+        let config = WalletConfig::sepolia();
+        assert_eq!(config.sequencer_address, submitter);
+        assert_eq!(WalletConfig::default().sequencer_address, submitter);
+
+        let mut scheduler = Scheduler::new(
+            WalletApp::new(config),
+            SchedulerConfig::new(super::SEPOLIA_SEQUENCER_ADDRESS),
+        );
+        let input = |sender| SchedulerInput {
+            sender,
+            inclusion_block: 10,
+            domain: sequencer_core::build_input_domain(11155111, Address::ZERO),
+            payload: Batch {
+                nonce: 0,
+                frames: Vec::new(),
+            }
+            .as_ssz_bytes(),
+        };
+
+        let previous = scheduler.process_input(input(previous_submitter)).unwrap();
+        assert_eq!(previous.outcome, ProcessOutcome::DirectEnqueued);
+        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
+
+        let current = scheduler.process_input(input(submitter)).unwrap();
+        assert_eq!(current.outcome, ProcessOutcome::BatchExecuted);
+        assert_eq!(scheduler.next_expected_batch_nonce(), 1);
+    }
 
     #[test]
     fn validation_is_repeatable_and_preserves_the_entire_state() {

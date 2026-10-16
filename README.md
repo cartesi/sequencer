@@ -144,6 +144,11 @@ The submitter address must equal the `sequencer_address` compiled into the canon
 nonce, so sharing a busy contract-deployer address can trip the detection gate
 while its deployment transactions are not yet safe. The devnet uses Anvil
 account 9 (`DEVNET_SEQUENCER_ADDRESS`), separate from the account-0 deployer.
+The Sepolia reference reserves [`SEPOLIA_SEQUENCER_ADDRESS`](examples/app-core/src/application/wallet.rs)
+for this deployment's batch submissions and application fee revenue; do not share
+its signing key with other app or node instances. Changing that compiled address
+requires a rebuilt canonical image and a matching new application deployment,
+not just a runtime signing-key change.
 
 `run` and `flush-mempool` require `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT` and the signing key, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (whose first line is the key); both refuse to start until `setup` has completed.
 
