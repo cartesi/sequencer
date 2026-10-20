@@ -5,17 +5,20 @@ change that moves the template hash, which compares against these values.
 **Retire** this record once that change records its own hashes.
 
 W3b and W4 of the [whole-repo review](2026-10-13-whole-repo-review.md) moved
-the template hash, deliberately, with no intended behavior change: a Rust
-toolchain and dependency refresh, guest-crate refactors, and W4's comment
-edits. What moves
-the hash, and how a behavior-preserving move is checked, is in
+the template hash with no intended behavior change: a Rust toolchain and
+dependency refresh, guest-crate refactors, and W4's comment edits. Two later
+changes ship in the same image: the Sepolia build's dedicated sequencer
+address, and Cartesi Machine v0.22.0 with its paired kernel. What moves the
+hash, and how a behavior-preserving move is checked, is in
 [`docs/cartesi-machine.md`](../cartesi-machine.md#versions-are-all-or-nothing).
 
 ## Method
 
 - Hashes: `just canonical-print-build-hashes` (devnet) and
   `just canonical-build-machine-image-sepolia` plus `cartesi-machine --load=…
-  --initial-hash` (Sepolia), cartesi-machine 0.21.0, cross 0.2.5. Every value
+  --initial-hash` (Sepolia), cross 0.2.5, guest tools 0.18.0. Every row up to
+  the W4 one uses cartesi-machine 0.21.0 and kernel `6.5.13-ctsi-2`; the last
+  row uses 0.22.0 and `6.18.56-ctsi-1`, two cold builds agreeing. Every value
   below is from a cold build (no `target/` for the guest or its host side),
   with `rust-src` in the cross toolchain (see `docs/cartesi-machine.md`). Two
   cold builds of the W3b final commit (`756a8ac`) agreed, and so did builds
@@ -44,6 +47,7 @@ Devnet initial hash and cycles to the first yield:
 | Guest refactors (B6–J5) | `8d03166` | `0xa006cd4d34685b2804737bcef48e3b398999c30081106a5745216b08fdad223b` | 51222421 |
 | 6 updates in the guest's build graph | `711f312` | `0xa4c01357665937d80f006c9c3726c49d0a80fe7aea2d3b8bf2199ea7333d388d` | 51222416 |
 | W4 guest comments and the nonce-scan move | `7dc3fb5` | `0xa0c7296d256b401f4103097a3b0b29105b19215f10dde048f400bb3a820277c9` | 51222416 |
+| Cartesi Machine 0.22.0 and kernel 6.18 | `11607ff` | `0xcd299178e6e860db692e20267edecf220313393ce23c0103a34b8456f5fb0ae8` | 53967473 |
 
 The commits before `6009104` (libtest-mimic, tokio-tungstenite, async-trait)
 and the remaining compatible updates after `711f312` left every artifact
@@ -54,15 +58,22 @@ calls (B6, C3b, J1); the test-only J5 commit and the manifest commit did not.
 bindgen, yet moves the binary. W4's guest commits change only comments, apart
 from moving `advance_expected_batch_nonce` out of `sequencer-core` into the
 submitter; the cycle count is unchanged, but comment edits shift the line
-numbers rustc embeds in panic locations, so the image moves. cpufeatures, which only keccak uses and only on
-aarch64 hosts, went with the host-only updates: the x86_64 cross build never
-compiles it.
+numbers rustc embeds in panic locations, so the image moves. cpufeatures, which
+only keccak uses and only on aarch64 hosts, went with the host-only updates: the
+x86_64 cross build never compiles it.
 
-| Image | Baseline (`6000e3a`) | Final (`7dc3fb5`) |
+`aa0fc0f` changes only the Sepolia build's compiled sequencer address, so the
+devnet dapp and rootfs stay as W4 left them; it was not measured on its own.
+`11607ff` changes no guest byte: the devnet dapp and rootfs equal W4's, and the
+template moves through the emulator (new machine identifiers and uarch) and
+the kernel alone. The v0.22 commits after it change the watchdog, testsi and
+docs, none of which reaches the image.
+
+| Image | Baseline (`6000e3a`) | Final (`11607ff`) |
 |---|---|---|
 | devnet dapp sha256 | `9415789ca67687000081ef4038cd6ac7b1508c0f9c2d42db81ee9281c492bee8` | `5b896252a4f327d195acd333c4b75ca61485402823e9e6213c10f3f23a11d201` |
-| Sepolia dapp sha256 | `ca9fd50eda3773c628ef7d5d47eeba532d1b97c22f7e4f7b0a4f01d986482bd7` | `93f056ef4344534c5965d0067dbe0c3ec9dc4e22614416747f5686511a183694` |
-| Sepolia initial hash | `0xc6fd1515ba68c7256b16e17ced3bd48f9d5ede5c8079c14729f2ef5275f11457` | `0x410cc0e128c31d95bb627be9cdb002629de24c48aa44479429951ebf4fa90f31` |
+| Sepolia dapp sha256 | `ca9fd50eda3773c628ef7d5d47eeba532d1b97c22f7e4f7b0a4f01d986482bd7` | `63d15d391ae42dd63d8e6c3e37c78f814fbae74c3459d6371a8a855d4d2edfd1` |
+| Sepolia initial hash | `0xc6fd1515ba68c7256b16e17ced3bd48f9d5ede5c8079c14729f2ef5275f11457` | `0xeaf87115bd3bb9d2a902f07ea63a198626d3c16d943cd9df3dfaffbcac320c7f` |
 
 `f0d1ccf` is the last commit that reproduces the baseline image.
 

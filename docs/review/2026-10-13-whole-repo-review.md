@@ -51,8 +51,8 @@ to the [register](register.md).
 Progress: W1, W2, W3a, W3b and W4 have landed on `claude/repo-code-review-103cc5`.
 Each was followed by a devnet and watchdog e2e run and an adversarial review
 whose surviving findings were folded into their commits. W3a left the guest
-binary byte-identical. W3b and W4 moved the template hash, with behavior pinned
-by consensus vectors; the hashes are in the
+binary byte-identical. W3b, W4 and the Cartesi Machine v0.22.0 bump moved the
+template hash, with behavior pinned by consensus vectors; the hashes are in the
 [guest image record](2026-10-14-guest-image-refresh.md). The input-reader review's commits (compared against the sling
 reader, branch `claude/input-reader-review-fda7ad`) are folded in on top, adapted
 to this branch:
