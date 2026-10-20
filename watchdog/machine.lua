@@ -25,12 +25,10 @@ function machine.new(cartesi)
 
     local api = {}
 
-    --- Where a machine at rest stands, from register reads only. `accepted`
-    --- is the only state that can take another request.
+    --- Where a machine at rest stands, from register reads only, in the
+    --- emulator's order: a halt or manual yield wins over an exhausted
+    --- budget. `accepted` is the only state that can take another request.
     local function status(m)
-        if not math.ult(m:read_reg("mcycle"), m:read_reg("imcyclemax")) then
-            return { kind = "mcycle_overflow" }
-        end
         if m:read_reg("iflags_H") ~= 0 then
             return { kind = "halted", exit_code = m:read_reg("htif_tohost_data") >> 1 }
         end
@@ -44,6 +42,9 @@ function machine.new(cartesi)
                 return { kind = "exception", message = data }
             end
             return { kind = "unexpected_yield", cmd = cmd, reason = reason }
+        end
+        if not math.ult(m:read_reg("mcycle"), m:read_reg("imcyclemax")) then
+            return { kind = "mcycle_overflow" }
         end
         return { kind = "running" }
     end

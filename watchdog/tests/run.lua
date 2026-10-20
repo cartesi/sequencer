@@ -15,6 +15,7 @@ local errors = require("watchdog.errors")
 local incident = require("watchdog.incident")
 local json = require("watchdog.json").new()
 local l1_mod = require("watchdog.l1")
+local machine_mod = require("watchdog.machine")
 local metrics = require("watchdog.metrics")
 local store_mod = require("watchdog.store")
 local support = require("watchdog.tests.support")
@@ -484,6 +485,55 @@ test("incident records a failed item with its reason and keeps collecting", func
     assert(index.canonical_bytes_missing:find("canonical.bin.tmp", 1, true))
     eq(support.exists(store:path("incident", "sequencer.bin.tmp")), false)
     eq(incident.marker(store).target_block, 7)
+end)
+
+-- ── machine ───────────────────────────────────────────────────────────────
+
+--- A fake `cartesi` module whose machines read their registers from `regs`
+--- and hold a manual RX_ACCEPTED request, for the facade's status checks.
+local function fake_cartesi(regs)
+    local cartesi = {
+        SHARING_ALL = 1,
+        SHARING_NONE = 0,
+        HTIF_YIELD_CMD_MANUAL = 1,
+        HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED = 1,
+        HTIF_YIELD_MANUAL_REASON_RX_REJECTED = 2,
+        HTIF_YIELD_MANUAL_REASON_TX_EXCEPTION = 4,
+        HTIF_YIELD_AUTOMATIC_REASON_TX_REPORT = 4,
+        HTIF_YIELD_REASON_INSPECT_STATE = 1,
+    }
+    function cartesi.new()
+        return {
+            load = function() end,
+            destroy = function() end,
+            read_reg = function(_, name)
+                return assert(regs[name], name)
+            end,
+            receive_cmio_request = function()
+                return cartesi.HTIF_YIELD_CMD_MANUAL, cartesi.HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED, ""
+            end,
+            get_initial_config = function()
+                return { nvram = { { label = "state", start = 0x1000, length = 0x1000 } } }
+            end,
+            send_cmio_response = function() end,
+        }
+    end
+    return cartesi
+end
+
+test("machine ranks a halt or manual yield on the budget's last cycle above overflow", function()
+    local regs = { mcycle = 7, imcyclemax = 7, iflags_H = 0, iflags_Y = 1, htif_tohost_data = 2 }
+    local m = machine_mod.new(fake_cartesi(regs))
+    local range = { kind = "range", label = "state" }
+    m.check_source("/img", range)
+    regs.iflags_Y = 0
+    raises("operator", "is at mcycle_overflow", function()
+        m.check_source("/img", range)
+    end)
+    regs.iflags_H = 1
+    raises("operator", "is at halt with exit code 1", function()
+        m.check_source("/img", range)
+    end)
 end)
 
 -- ── tick ──────────────────────────────────────────────────────────────────
