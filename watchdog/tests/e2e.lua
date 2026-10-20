@@ -155,12 +155,14 @@ local RX_ACCEPTED = cartesi.HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED
 local RX_REJECTED = cartesi.HTIF_YIELD_MANUAL_REASON_RX_REJECTED
 local TX_EXCEPTION = cartesi.HTIF_YIELD_MANUAL_REASON_TX_EXCEPTION
 
---- A manual yield's whole tohost word, declaring `length` bytes of data.
-local function manual_yield(reason, length)
-    return (cartesi.HTIF_DEV_YIELD << cartesi.HTIF_DEV_SHIFT)
-        | (cartesi.HTIF_YIELD_CMD_MANUAL << cartesi.HTIF_CMD_SHIFT)
-        | (reason << cartesi.HTIF_REASON_SHIFT)
+--- A whole tohost word, declaring `length` bytes of data.
+local function tohost(dev, cmd, reason, length)
+    return (dev << cartesi.HTIF_DEV_SHIFT) | (cmd << cartesi.HTIF_CMD_SHIFT) | (reason << cartesi.HTIF_REASON_SHIFT)
         | (length or 0)
+end
+
+local function manual_yield(reason, length)
+    return tohost(cartesi.HTIF_DEV_YIELD, cartesi.HTIF_YIELD_CMD_MANUAL, reason, length)
 end
 
 --- A stored machine with 4 KiB of RAM and no image, created with
@@ -228,6 +230,57 @@ test("executor fails loud on an input the machine does not take", function()
     end)
     executor:close()
 end)
+
+--- A tohost `word` declaring one byte past the TX buffer, which a guest that
+--- bypasses libcmt can yield and `receive_cmio_request` refuses. The CLI
+--- aborts reading it, so the step's rule is the oracle: an accept takes the
+--- next input, and a reject restores the input's revert root hash.
+local function oversized(word)
+    return word | ((1 << cartesi.AR_CMIO_TX_BUFFER_LOG2_SIZE) + 1)
+end
+
+test("executor takes inputs at accepts that declare data past the TX buffer, as the step does", function()
+    local accepted = oversized(manual_yield(RX_ACCEPTED))
+    local executor = machine.open(seam_machine(cartesi.MCYCLE_MAX, accepted, accepted),
+        support.tmpdir() .. "/working")
+    eq(executor:advance(input(0, "seam")).kind, "accepted")
+    eq(executor:advance(input(1, "seam")).kind, "accepted")
+    executor:close()
+end)
+
+test("executor reverts a rejection that declares data past the TX buffer, as the step does", function()
+    local dir = seam_machine(cartesi.MCYCLE_MAX, manual_yield(RX_ACCEPTED), oversized(manual_yield(RX_REJECTED)))
+    local working = support.tmpdir() .. "/working"
+    local executor = machine.open(dir, working)
+    eq(executor:advance(input(0, "seam")).kind, "rejected")
+    executor:close()
+    eq(hex(machine.root_hash(working)), hex(machine.root_hash(dir)))
+end)
+
+test("executor stops at an exception that declares data past the TX buffer", function()
+    local dir = seam_machine(cartesi.MCYCLE_MAX, manual_yield(RX_ACCEPTED), oversized(manual_yield(TX_EXCEPTION)))
+    local executor = machine.open(dir, support.tmpdir() .. "/working")
+    local status = executor:advance(input(0, "seam"))
+    executor:close()
+    eq(status.kind, "exception")
+    eq(status.message, "<unavailable: declared length 2097153>")
+end)
+
+-- Execution sets iflags.Y only at a manual yield; only a template presets it
+-- under another command or device, and the step treats that as a fixed point.
+for _, case in ipairs({
+    { header = "an automatic yield's command",
+        tohost = tohost(cartesi.HTIF_DEV_YIELD, cartesi.HTIF_YIELD_CMD_AUTOMATIC, RX_ACCEPTED) },
+    { header = "the console device",
+        tohost = tohost(cartesi.HTIF_DEV_CONSOLE, cartesi.HTIF_YIELD_CMD_MANUAL, RX_ACCEPTED) },
+}) do
+    test("open refuses a preset yield under " .. case.header, function()
+        local dir = bare_machine({ iflags = { Y = 1 }, htif = { tohost = case.tohost } })
+        raises("operator", "is at unexpected yield", function()
+            machine.open(dir, support.tmpdir() .. "/working")
+        end)
+    end)
+end
 
 -- ── State sources ─────────────────────────────────────────────────────────
 

@@ -489,12 +489,16 @@ end)
 
 -- ── machine ───────────────────────────────────────────────────────────────
 
---- A fake `cartesi` module whose machines read their registers from `regs`
---- and hold a manual RX_ACCEPTED request, for the facade's status checks.
+--- A fake `cartesi` module whose machines read their registers, the pending
+--- yield's header included, from `regs`, for the facade's status checks. Like
+--- the emulator, `receive_cmio_request` refuses data past the 2 MiB TX buffer.
 local function fake_cartesi(regs)
     local cartesi = {
         SHARING_ALL = 1,
         SHARING_NONE = 0,
+        HTIF_DEV_CONSOLE = 1,
+        HTIF_DEV_YIELD = 2,
+        HTIF_YIELD_CMD_AUTOMATIC = 0,
         HTIF_YIELD_CMD_MANUAL = 1,
         HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED = 1,
         HTIF_YIELD_MANUAL_REASON_RX_REJECTED = 2,
@@ -510,7 +514,10 @@ local function fake_cartesi(regs)
                 return assert(regs[name], name)
             end,
             receive_cmio_request = function()
-                return cartesi.HTIF_YIELD_CMD_MANUAL, cartesi.HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED, ""
+                if regs.htif_tohost_data > 1 << 21 then
+                    error("CMIO request data is too large")
+                end
+                return regs.htif_tohost_cmd, regs.htif_tohost_reason, ""
             end,
             get_initial_config = function()
                 return { nvram = { { label = "state", start = 0x1000, length = 0x1000 } } }
@@ -522,7 +529,8 @@ local function fake_cartesi(regs)
 end
 
 test("machine ranks a halt or manual yield on the budget's last cycle above overflow", function()
-    local regs = { mcycle = 7, imcyclemax = 7, iflags_H = 0, iflags_Y = 1, htif_tohost_data = 2 }
+    local regs = { mcycle = 7, imcyclemax = 7, iflags_H = 0, iflags_Y = 1,
+        htif_tohost_dev = 2, htif_tohost_cmd = 1, htif_tohost_reason = 1, htif_tohost_data = 2 }
     local m = machine_mod.new(fake_cartesi(regs))
     local range = { kind = "range", label = "state" }
     m.check_source("/img", range)
@@ -538,9 +546,37 @@ end)
 
 test("machine fails loud when the machine does not take a cmio response", function()
     -- The fake's send leaves iflags.Y set, as the emulator's no-op does.
-    local m = machine_mod.new(fake_cartesi({ mcycle = 0, imcyclemax = 7, iflags_H = 0, iflags_Y = 1 }))
+    local m = machine_mod.new(fake_cartesi({ mcycle = 0, imcyclemax = 7, iflags_H = 0, iflags_Y = 1,
+        htif_tohost_dev = 2, htif_tohost_cmd = 1, htif_tohost_reason = 1, htif_tohost_data = 0 }))
     raises("internal", "did not take", function()
         m.check_source("/img", { kind = "inspect" })
+    end)
+end)
+
+test("machine classifies a pending yield from the HTIF header, never its declared length", function()
+    -- Every header declares one byte past the TX buffer.
+    local regs = { mcycle = 0, imcyclemax = 7, iflags_H = 0, iflags_Y = 1, htif_tohost_data = (1 << 21) + 1 }
+    local cartesi = fake_cartesi(regs)
+    local m = machine_mod.new(cartesi)
+    local YIELD, MANUAL = cartesi.HTIF_DEV_YIELD, cartesi.HTIF_YIELD_CMD_MANUAL
+    local RX_ACCEPTED = cartesi.HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED
+    local function check(dev, cmd, reason)
+        regs.htif_tohost_dev, regs.htif_tohost_cmd, regs.htif_tohost_reason = dev, cmd, reason
+        m.check_source("/img", { kind = "range", label = "state" })
+    end
+    check(YIELD, MANUAL, RX_ACCEPTED)
+    raises("operator", "is at rejected", function()
+        check(YIELD, MANUAL, cartesi.HTIF_YIELD_MANUAL_REASON_RX_REJECTED)
+    end)
+    raises("operator", 'is at exception "<unavailable: declared length 2097153>"', function()
+        check(YIELD, MANUAL, cartesi.HTIF_YIELD_MANUAL_REASON_TX_EXCEPTION)
+    end)
+    -- Only a preset template carries iflags.Y under another command or device.
+    raises("operator", "is at unexpected yield (dev 2, cmd 0, reason 1)", function()
+        check(YIELD, cartesi.HTIF_YIELD_CMD_AUTOMATIC, RX_ACCEPTED)
+    end)
+    raises("operator", "is at unexpected yield (dev 1, cmd 1, reason 1)", function()
+        check(cartesi.HTIF_DEV_CONSOLE, MANUAL, RX_ACCEPTED)
     end)
 end)
 

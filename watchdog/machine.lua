@@ -17,6 +17,7 @@ function machine.new(cartesi)
 
     local SHARING_ALL = cartesi.SHARING_ALL
     local SHARING_NONE = cartesi.SHARING_NONE
+    local YIELD = cartesi.HTIF_DEV_YIELD
     local MANUAL = cartesi.HTIF_YIELD_CMD_MANUAL
     local RX_ACCEPTED = cartesi.HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED
     local RX_REJECTED = cartesi.HTIF_YIELD_MANUAL_REASON_RX_REJECTED
@@ -25,23 +26,39 @@ function machine.new(cartesi)
 
     local api = {}
 
+    --- An exception's payload is evidence only: one declared past the TX
+    --- buffer cannot be read, and the yield is an exception all the same.
+    local function exception_message(m)
+        local ok, _, _, data = pcall(m.receive_cmio_request, m)
+        if ok then
+            return data
+        end
+        return string.format("<unavailable: declared length %d>", m:read_reg("htif_tohost_data"))
+    end
+
     --- Where a machine at rest stands, from register reads only, in the
     --- emulator's order: a halt or manual yield wins over an exhausted
     --- budget. `accepted` is the only state that can take another request.
+    --- A yield is classified by tohost's device, command and reason, as the
+    --- step does (sling's `MachineStf::manual_yield_reason`, dave@dbcca7d4).
     local function status(m)
         if m:read_reg("iflags_H") ~= 0 then
             return { kind = "halted", exit_code = m:read_reg("htif_tohost_data") >> 1 }
         end
         if m:read_reg("iflags_Y") ~= 0 then
-            local cmd, reason, data = m:receive_cmio_request()
-            if cmd == MANUAL and reason == RX_ACCEPTED then
-                return { kind = "accepted" }
-            elseif cmd == MANUAL and reason == RX_REJECTED then
-                return { kind = "rejected" }
-            elseif cmd == MANUAL and reason == TX_EXCEPTION then
-                return { kind = "exception", message = data }
+            local dev = m:read_reg("htif_tohost_dev")
+            local cmd = m:read_reg("htif_tohost_cmd")
+            local reason = m:read_reg("htif_tohost_reason")
+            if dev == YIELD and cmd == MANUAL then
+                if reason == RX_ACCEPTED then
+                    return { kind = "accepted" }
+                elseif reason == RX_REJECTED then
+                    return { kind = "rejected" }
+                elseif reason == TX_EXCEPTION then
+                    return { kind = "exception", message = exception_message(m) }
+                end
             end
-            return { kind = "unexpected_yield", cmd = cmd, reason = reason }
+            return { kind = "unexpected_yield", dev = dev, cmd = cmd, reason = reason }
         end
         if not math.ult(m:read_reg("mcycle"), m:read_reg("imcyclemax")) then
             return { kind = "mcycle_overflow" }
@@ -55,7 +72,8 @@ function machine.new(cartesi)
         elseif st.kind == "exception" then
             return string.format("exception %q", tostring(st.message))
         elseif st.kind == "unexpected_yield" then
-            return string.format("unexpected yield (cmd %s, reason %s)", tostring(st.cmd), tostring(st.reason))
+            return string.format("unexpected yield (dev %s, cmd %s, reason %s)", tostring(st.dev), tostring(st.cmd),
+                tostring(st.reason))
         end
         return st.kind
     end

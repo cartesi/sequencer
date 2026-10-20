@@ -90,6 +90,14 @@ The outcome is read in this order: halt, then manual yield, then an exhausted
 budget. A yield on the budget's last cycle is that yield, and the next input
 renews the budget; overflow means neither flag is set.
 
+A host classifies a pending yield as the step does: `iflags.Y`, then tohost's
+device, command and reason, never its data field (sling's
+`MachineStf::manual_yield_reason` at dave@dbcca7d4). A guest that bypasses
+libcmt can declare data past the 2 MiB TX buffer, which `receive_cmio_request`
+refuses; the CLI reads every yield through it and aborts there. `iflags.Y`
+under another device or command, which only a preset template carries, is a
+fixed point.
+
 - The host reads the root hash, snapshots, then sends the input together with
   that root as the *revert root hash*. At an `RX_ACCEPTED` yield the emulator
   refuses an advance without a revert root hash or with one that differs from
