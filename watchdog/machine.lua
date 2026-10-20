@@ -143,8 +143,16 @@ function machine.new(cartesi)
         return found
     end
 
+    --- Send a response the machine must take: an undeliverable one is a
+    --- silent no-op (docs/cartesi-machine.md#rollup-host-semantics), and only
+    --- delivery clears iflags.Y.
+    local function deliver(m, reason, data, revert_root)
+        m:send_cmio_response(reason, data, revert_root)
+        assert(m:read_reg("iflags_Y") == 0, "the machine did not take the cmio response")
+    end
+
     local function inspect_state(m)
-        m:send_cmio_response(cartesi.HTIF_YIELD_REASON_INSPECT_STATE, "state")
+        deliver(m, cartesi.HTIF_YIELD_REASON_INSPECT_STATE, "state")
         local reports = {}
         run_to_stop(m, function(reason, data)
             if reason == TX_REPORT then
@@ -223,7 +231,7 @@ function machine.new(cartesi)
         m:destroy()
         m:clone_stored(self.working, self.snapshot)
         m:load(self.working, RUNTIME, SHARING_ALL)
-        m:send_cmio_response(cartesi.HTIF_YIELD_REASON_ADVANCE_STATE, input, revert_root)
+        deliver(m, cartesi.HTIF_YIELD_REASON_ADVANCE_STATE, input, revert_root)
         run_to_stop(m)
         local st = status(m)
         if st.kind == "rejected" then

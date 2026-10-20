@@ -287,11 +287,13 @@ Successful `init` or an idle tick is not evidence of a comparison.
   compared on that range. A library with application-supplied extraction hooks
   waits for an application these two sources cannot serve.
 - **In-process execution, the CLI as oracle.** The optimizations (reflink
-  clones, in-place mapping) live in the emulator, and v0.21 enforces the
-  dangerous part of the host semantics itself (no input after a reject without
-  a revert). Running the CLI per tick would add process management and a full
-  machine store per tick for semantics we get anyway, so the watchdog mirrors
-  the CLI's `--revert-mode=stored` loop and tests against the CLI.
+  clones, in-place mapping) live in the emulator. The emulator ignores an input
+  it cannot take instead of refusing it
+  ([host semantics](../cartesi-machine.md#rollup-host-semantics)), so the
+  watchdog advances only a machine at an `RX_ACCEPTED` yield and asserts that
+  each input was taken. Running the CLI per tick would add process management
+  and a full machine store per tick, so the watchdog mirrors the CLI's
+  `--revert-mode=stored` loop (the same in v0.22) and tests against the CLI.
 - **Flat SHA-256 digests.** The comparison is an equality check between two
   parties we operate, for states expected to reach several GiB. SHA-256 is the
   cheapest on the sequencer and couples to nothing. A machine Merkle root

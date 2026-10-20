@@ -536,6 +536,14 @@ test("machine ranks a halt or manual yield on the budget's last cycle above over
     end)
 end)
 
+test("machine fails loud when the machine does not take a cmio response", function()
+    -- The fake's send leaves iflags.Y set, as the emulator's no-op does.
+    local m = machine_mod.new(fake_cartesi({ mcycle = 0, imcyclemax = 7, iflags_H = 0, iflags_Y = 1 }))
+    raises("internal", "did not take", function()
+        m.check_source("/img", { kind = "inspect" })
+    end)
+end)
+
 -- ── tick ──────────────────────────────────────────────────────────────────
 
 local function tick_with(store, inputs, sequencer_state, script, rpc_opts, bootstrap_block)
