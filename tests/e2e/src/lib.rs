@@ -3,6 +3,7 @@
 
 mod cold_replica;
 pub mod test_cases;
+mod wallet_exit;
 mod watchdog_compare;
 
 // Link the reference engine's C symbols for the EngineApp replica scenarios.

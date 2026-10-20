@@ -110,6 +110,10 @@ pub struct ExecutedInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidReason {
+    Expired {
+        valid_until_block: u64,
+        safe_block: u64,
+    },
     InvalidNonce {
         expected: u32,
         got: u32,
@@ -133,6 +137,13 @@ pub enum InvalidReason {
 impl fmt::Display for InvalidReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Expired {
+                valid_until_block,
+                safe_block,
+            } => write!(
+                f,
+                "operation expired at block {valid_until_block}; frame clock is {safe_block}"
+            ),
             Self::InvalidNonce { expected, got } => {
                 write!(f, "bad nonce: expected {expected}, got {got}")
             }
@@ -163,7 +174,7 @@ pub trait Application: Send + Sized {
     /// equals the sender's expected nonce (user replay protection), and the
     /// sender covers the fee. Must not mutate state.
     /// [`validate_and_execute_user_op`] enforces the protocol
-    /// `max_fee >= current_fee` guard before calling here, and rejects an
+    /// signed deadline and `max_fee >= current_fee` guards before calling here, and rejects an
     /// accepted op at nonce `u32::MAX` after. Rejection leaves the app
     /// unchanged; `AppError` is fatal and defines no successor.
     fn validate_user_op(
@@ -275,6 +286,12 @@ pub fn validate_and_execute_user_op<A: Application>(
     current_fee: u16,
     safe_block: u64,
 ) -> Result<ExecutionOutcome, AppError> {
+    if safe_block > user_op.valid_until_block {
+        return Ok(ExecutionOutcome::Invalid(InvalidReason::Expired {
+            valid_until_block: user_op.valid_until_block,
+            safe_block,
+        }));
+    }
     // Protocol invariant: max_fee must cover the current frame fee.
     if user_op.max_fee < current_fee {
         return Ok(ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
@@ -450,6 +467,7 @@ mod tests {
 
     fn user_op() -> UserOp {
         UserOp {
+            valid_until_block: u64::MAX,
             nonce: 0,
             max_fee: 0,
             data: Vec::new().into(),
@@ -462,6 +480,28 @@ mod tests {
             block_number,
             payload: Vec::new(),
         }
+    }
+
+    #[test]
+    fn expiry_is_inclusive_and_rejects_before_app_validation_or_mutation() {
+        let mut op = user_op();
+        op.valid_until_block = 9;
+        let mut app = ProgressApp::new(0);
+        app.fail_validation = true;
+        assert_eq!(
+            validate_and_execute_user_op(&mut app, Address::ZERO, &op, 0, 10).unwrap(),
+            ExecutionOutcome::Invalid(InvalidReason::Expired {
+                valid_until_block: 9,
+                safe_block: 10
+            })
+        );
+        assert_eq!(app.applied, 0);
+        app.fail_validation = false;
+        assert!(matches!(
+            validate_and_execute_user_op(&mut app, Address::ZERO, &op, 0, 9).unwrap(),
+            ExecutionOutcome::Included(_)
+        ));
+        assert_eq!(app.applied, 1);
     }
 
     #[test]

@@ -65,6 +65,7 @@ fn append_transfer(
     amount: u64,
 ) {
     let op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: app.current_user_nonce(signer.address()),
         max_fee: head.frame_fee,
         data: Method::Transfer(Transfer {
@@ -180,6 +181,7 @@ async fn replay_one(stream: &mut SubscribeStream, app: &mut WalletApp, history: 
     };
     assert_eq!(offset, app.executed_input_count().get());
     let op = UserOp {
+        valid_until_block: u64::MAX,
         nonce,
         max_fee: fee,
         data: alloy_primitives::hex::decode(data).unwrap().into(),

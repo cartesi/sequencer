@@ -102,6 +102,7 @@ pub enum BatchRejectReason {
     WrongNonce { expected: u64, got: u64 },
     SafeBlockAboveInclusionBlock,
     NonMonotonicSafeBlocks,
+    FeePriceOutOfRange,
 }
 
 #[derive(Debug)]
@@ -142,6 +143,17 @@ impl<A: Application> Scheduler<A> {
             "a genesis scheduler application must start at executed_input_count = 0"
         );
         Self::resume_at(app, config, 0)
+    }
+
+    pub fn application(&self) -> &A {
+        &self.app
+    }
+
+    /// Pending inputs remain part of canonical custody before app execution.
+    pub fn pending_direct_payloads(&self) -> impl Iterator<Item = (Address, &[u8])> {
+        self.direct_q
+            .iter()
+            .map(|input| (input.sender, input.payload.as_slice()))
     }
 
     /// Number of directs still queued in the fridge. The recovery fold asserts
@@ -311,6 +323,13 @@ impl<A: Application> Scheduler<A> {
             } else {
                 previous_safe_block = frame.safe_block;
             }
+        }
+
+        if std::iter::once(head)
+            .chain(tail)
+            .any(|frame| frame.fee_price > crate::fee::MAX_EXPONENT)
+        {
+            return Some(BatchRejectReason::FeePriceOutOfRange);
         }
 
         None
@@ -642,6 +661,7 @@ mod tests {
         data: Vec<u8>,
     ) -> WireUserOp {
         let user_op = UserOp {
+            valid_until_block: u64::MAX,
             nonce,
             max_fee,
             data: data.clone().into(),
@@ -665,6 +685,7 @@ mod tests {
             .expect("recoverable parity for signature");
 
         WireUserOp {
+            valid_until_block: u64::MAX,
             nonce,
             max_fee,
             data,
@@ -810,6 +831,70 @@ mod tests {
             process_ok(&mut scheduler, batch_input(10, fresh_batch)),
             ProcessOutcome::BatchExecuted
         );
+    }
+
+    #[test]
+    fn fee_bounds_reject_the_whole_batch_and_preserve_the_backstop() {
+        use crate::fee::MAX_EXPONENT;
+
+        for fee in [MAX_EXPONENT + 1, u16::MAX] {
+            for invalid_position in [0, 1] {
+                let mut scheduler = Scheduler::new(
+                    RecordingApp::default(),
+                    SchedulerConfig {
+                        sequencer_address: SEQUENCER,
+                        max_wait_blocks: 10,
+                    },
+                );
+                process_ok(&mut scheduler, direct_input(1, 1));
+                process_ok(&mut scheduler, direct_input(8, 2));
+                let key = SigningKey::from_bytes((&[1_u8; 32]).into()).unwrap();
+                scheduler.app.credit(address_from_signing_key(&key), 1);
+                let frame = Frame {
+                    safe_block: 8,
+                    fee_price: 0,
+                    user_ops: vec![sign_wire_user_op(
+                        &test_domain(),
+                        &key,
+                        0,
+                        u16::MAX,
+                        vec![3],
+                    )],
+                };
+                let mut frames = vec![frame.clone(), frame];
+                frames[invalid_position].fee_price = fee;
+                assert_eq!(
+                    process_ok(&mut scheduler, batch_input(11, Batch { nonce: 0, frames })),
+                    ProcessOutcome::BatchRejected(BatchRejectReason::FeePriceOutOfRange),
+                );
+                // Only the overdue direct executes: no frame drain or user op.
+                assert_eq!(scheduler.app.events(), [RecordedTx::Direct(1)]);
+                assert_eq!(scheduler.queued_direct_len(), 1);
+                assert_eq!(scheduler.next_expected_batch_nonce(), 0);
+                assert_eq!(
+                    process_ok(
+                        &mut scheduler,
+                        batch_input(
+                            11,
+                            Batch {
+                                nonce: 0,
+                                frames: vec![Frame {
+                                    safe_block: 8,
+                                    fee_price: MAX_EXPONENT,
+                                    user_ops: vec![]
+                                }],
+                            }
+                        )
+                    ),
+                    ProcessOutcome::BatchExecuted,
+                );
+                assert_eq!(
+                    scheduler.app.events(),
+                    [RecordedTx::Direct(1), RecordedTx::Direct(2)]
+                );
+                assert_eq!(scheduler.next_expected_batch_nonce(), 1);
+            }
+        }
     }
 
     #[test]
@@ -984,6 +1069,7 @@ mod tests {
             nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![WireUserOp {
+                    valid_until_block: u64::MAX,
                     nonce: 0,
                     max_fee: 0,
                     data: vec![7],
@@ -1524,6 +1610,19 @@ mod tests {
             "non-monotonic safe_blocks: expected canonical reject + predicate \
              accept (documented structural omission), got canonical={canonical} \
              offchain={offchain}"
+        );
+
+        let out_of_range_fee = ssz(&Batch {
+            nonce: 0,
+            frames: vec![Frame {
+                fee_price: crate::fee::MAX_EXPONENT + 1,
+                ..empty_frame(10)
+            }],
+        });
+        let (canonical, offchain) = duality_run(SEQUENCER, 12, 0, &out_of_range_fee);
+        assert!(
+            !canonical && offchain,
+            "fee range is a documented structural omission"
         );
 
         let frame_above_inclusion = ssz(&Batch {

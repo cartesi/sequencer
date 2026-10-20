@@ -36,6 +36,8 @@ pub enum RecoveryError {
 #[derive(Debug, Error)]
 pub enum RecoveryFailure {
     #[error(transparent)]
+    ApplicationStatus(#[from] crate::l1::application_status::ApplicationStatusError),
+    #[error(transparent)]
     PolicyRetry(#[from] RecoveryRetryReason),
     #[error(transparent)]
     PolicyRefusal(#[from] RecoveryRefusalReason),
@@ -212,6 +214,7 @@ fn inspect_recovery(
 /// Only L1 operations are abstracted: tests keep the real local inspections
 /// and repair transactions and substitute the external system.
 trait RecoveryL1 {
+    async fn require_open_application(&mut self) -> Result<(), RecoveryError>;
     async fn sync(&mut self) -> Result<(), InputReaderError>;
     async fn flush(&mut self) -> Result<u64, RecoveryError>;
 }
@@ -224,6 +227,31 @@ struct StartupL1<'a> {
 }
 
 impl RecoveryL1 for StartupL1<'_> {
+    async fn require_open_application(&mut self) -> Result<(), RecoveryError> {
+        let provider = crate::l1::provider::create_provider(
+            &self.l1_config.eth_rpc_url,
+            self.l1_config.allow_insecure_rpc,
+        )
+        .map_err(|message| {
+            RecoveryError::refuse(RecoveryFailure::InputReader(InputReaderError::Bootstrap(
+                message,
+            )))
+        })?;
+        crate::l1::application_status::require_open(
+            &provider,
+            self.l1_config.identity.app_address,
+            self.l1_config.identity.chain_id,
+        )
+        .await
+        .map_err(|error| {
+            if error.is_terminal() {
+                RecoveryError::refuse(RecoveryFailure::ApplicationStatus(error))
+            } else {
+                RecoveryError::retry(RecoveryFailure::ApplicationStatus(error))
+            }
+        })
+    }
+
     async fn sync(&mut self) -> Result<(), InputReaderError> {
         self.input_reader.sync_to_current_safe_head().await
     }
@@ -264,6 +292,7 @@ async fn recover_startup(
     l1: &mut impl RecoveryL1,
 ) -> Result<(), RecoveryError> {
     refuse_local_terminal(inspect_recovery(db_path, protocol)?)?;
+    l1.require_open_application().await?;
     match l1.sync().await {
         Ok(()) => tracing::info!("L1 safe head synced"),
         // An unreachable provider does not invalidate a still-fresh persisted
@@ -706,6 +735,8 @@ mod tests {
         syncs: VecDeque<SyncStep>,
         flush_block: u64,
         calls: Vec<&'static str>,
+        application_error: Option<RecoveryError>,
+        application_checks: usize,
     }
 
     impl<'a> TestL1<'a> {
@@ -716,11 +747,21 @@ mod tests {
                 syncs: syncs.into(),
                 flush_block: protocol.danger_threshold(),
                 calls: Vec::new(),
+                application_error: None,
+                application_checks: 0,
             }
         }
     }
 
     impl RecoveryL1 for TestL1<'_> {
+        async fn require_open_application(&mut self) -> Result<(), RecoveryError> {
+            self.application_checks += 1;
+            match self.application_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
         async fn sync(&mut self) -> Result<(), InputReaderError> {
             self.calls.push("sync");
             match self.syncs.pop_front().expect("unexpected L1 sync") {
@@ -783,6 +824,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreclosure_or_unknown_application_status_prevents_repair() {
+        use crate::l1::application_status::ApplicationStatusError;
+        for foreclosed in [false, true] {
+            let (db, protocol) = danger_fixture("recovery-app-status", true);
+            // A deliberate restart must perform the same gate again.
+            for _ in 0..2 {
+                let mut l1 = TestL1::new(&db.path, &protocol, vec![]);
+                l1.application_error = Some(if foreclosed {
+                    RecoveryError::refuse(RecoveryFailure::ApplicationStatus(
+                        ApplicationStatusError::Foreclosed {
+                            app: alloy_primitives::Address::ZERO,
+                        },
+                    ))
+                } else {
+                    RecoveryError::retry(RecoveryFailure::ApplicationStatus(
+                        ApplicationStatusError::Provider("offline".into()),
+                    ))
+                });
+                let result = recover_startup(&db.path, &protocol, &mut l1)
+                    .await
+                    .unwrap_err();
+                assert_eq!(result.is_retryable(), !foreclosed);
+                assert_eq!(l1.application_checks, 1);
+                assert!(
+                    l1.calls.is_empty(),
+                    "no sync or flush after a refused status gate"
+                );
+                assert!(invalidated_batches(&db.path).is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn initial_provider_failure_uses_only_a_fresh_persisted_view() {
         let (db, protocol) = admission_fixture("recovery-warm-provider-failure", true, true);
         let offline = || SyncStep::Fail(InputReaderError::Provider("offline".into()));
@@ -818,6 +892,7 @@ mod tests {
                     .unwrap_err(),
             );
             assert!(l1.calls.is_empty());
+            assert_eq!(l1.application_checks, 0);
         }
     }
 

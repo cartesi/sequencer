@@ -10,7 +10,7 @@ What we are protecting:
 
 - **Rollup state integrity.** The canonical on-chain state must reflect a deterministic replay of user operations and direct inputs. Any divergence between the sequencer's off-chain view and the scheduler's on-chain execution is a state-integrity failure.
 - **Soft-confirmation honesty.** Every soft confirmation issued by the sequencer must land on L1 as promised, or be explicitly revoked via recovery.
-- **User funds.** No user operation, replay, or protocol break can cause users to lose funds.
+- **User funds.** Canonical execution enforces application authorization and accounting; fund availability after foreclosure depends on the application's [exit integration](../protocol/application-contract.md#8-foreclosure-and-emergency-exits).
 - **Batch-submitter key.** Held in operator infra; not hijackable by network attackers.
 
 ## Actors and trust

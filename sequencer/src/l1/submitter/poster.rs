@@ -55,6 +55,8 @@ pub struct BatchPosterConfig {
 pub enum BatchPosterError {
     #[error("provider/transport: {0}")]
     Provider(String),
+    #[error(transparent)]
+    ApplicationStatus(#[from] crate::l1::application_status::ApplicationStatusError),
     #[error("rpc chain id {rpc} does not match pinned chain id {expected}")]
     ChainIdMismatch { rpc: u64, expected: u64 },
     #[error(
@@ -77,6 +79,7 @@ impl BatchPosterError {
         // here, not silently default to restartable.
         match self {
             Self::ChainIdMismatch { .. } | Self::WalletNonceRangeUnrepresentable { .. } => true,
+            Self::ApplicationStatus(source) => source.is_terminal(),
             Self::Watermark(source) => source.is_persistent_invariant(),
             Self::Provider(_) | Self::Shutdown => false,
         }
@@ -276,14 +279,27 @@ impl EthereumBatchPoster {
         let gas = pad_gas_estimate(
             call.estimate_gas()
                 .await
-                .map_err(|err| BatchPosterError::Provider(err.to_string()))?,
+                .map_err(|err| self.classify_contract_error(err))?,
         );
 
         call.gas(gas)
             .nonce(nonce)
             .send()
             .await
-            .map_err(|err| BatchPosterError::Provider(err.to_string()))
+            .map_err(|err| self.classify_contract_error(err))
+    }
+
+    fn classify_contract_error(&self, error: alloy::contract::Error) -> BatchPosterError {
+        if let Some(revert) = error
+            .as_decoded_error::<cartesi_rollups_contracts::ether_portal::EtherPortal::ApplicationForeclosed>()
+            && revert.appContract == self.config.app_address
+        {
+            return crate::l1::application_status::ApplicationStatusError::Foreclosed {
+                app: revert.appContract,
+            }
+            .into();
+        }
+        BatchPosterError::Provider(error.to_string())
     }
 
     /// Wait serially for each tx to reach `confirmation_depth + 1`
@@ -494,6 +510,12 @@ impl BatchPoster for EthereumBatchPoster {
         &self,
         from_block: u64,
     ) -> Result<Vec<u64>, BatchPosterError> {
+        crate::l1::application_status::require_open(
+            &self.provider,
+            self.config.app_address,
+            self.config.expected_chain_id,
+        )
+        .await?;
         let latest = self
             .provider
             .get_block_number()
@@ -903,6 +925,81 @@ mod tests {
             pending, base_nonce,
             "no tx may be broadcast on the wrong chain"
         );
+    }
+
+    #[test]
+    fn foreclosure_revert_is_terminal_only_for_the_pinned_application() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+        use alloy_primitives::{Address, Bytes};
+        use alloy_sol_types::SolError;
+        let app = Address::repeat_byte(2);
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(Asserter::new())
+            .erased();
+        let poster = EthereumBatchPoster::new(
+            provider,
+            BatchPosterConfig {
+                l1_submit_address: Address::repeat_byte(1),
+                app_address: app,
+                batch_submitter_address: SUBMITTER,
+                start_block: 0,
+                confirmation_depth: 0,
+                seconds_per_block: 1,
+                long_block_range_error_codes: vec![],
+                expected_chain_id: 31337,
+            },
+            RuntimeScope::default(),
+        );
+        for address in [app, Address::repeat_byte(3)] {
+            let revert =
+                cartesi_rollups_contracts::ether_portal::EtherPortal::ApplicationForeclosed {
+                    appContract: address,
+                };
+            let payload = serde_json::from_value(serde_json::json!({
+                "code": 3, "message": "execution reverted", "data": Bytes::from(revert.abi_encode()),
+            })).unwrap();
+            let error = alloy::contract::Error::TransportError(
+                alloy_transport::TransportError::ErrorResp(payload),
+            );
+            let error = poster.classify_contract_error(error);
+            assert_eq!(error.is_terminal_invariant(), address == app);
+        }
+    }
+
+    #[tokio::test]
+    async fn foreclosed_application_stops_even_an_idle_poster() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+        use alloy_primitives::{Address, Bytes, U64};
+        let mock = Asserter::new();
+        mock.push_success(&U64::from(31337));
+        let mut result = vec![0; 32];
+        result[31] = 1;
+        mock.push_success(&Bytes::from(result));
+        let provider = ProviderBuilder::new().connect_mocked_client(mock).erased();
+        let poster = EthereumBatchPoster::new(
+            provider,
+            BatchPosterConfig {
+                l1_submit_address: Address::repeat_byte(1),
+                app_address: Address::repeat_byte(2),
+                batch_submitter_address: SUBMITTER,
+                start_block: 0,
+                confirmation_depth: 0,
+                seconds_per_block: 1,
+                long_block_range_error_codes: vec![],
+                expected_chain_id: 31337,
+            },
+            RuntimeScope::default(),
+        );
+        let error = poster.observed_submitted_batch_nonces(0).await.unwrap_err();
+        assert!(matches!(
+            &error,
+            BatchPosterError::ApplicationStatus(
+                crate::l1::application_status::ApplicationStatusError::Foreclosed { .. }
+            )
+        ));
+        assert!(error.is_terminal_invariant());
     }
 
     #[tokio::test]

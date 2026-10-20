@@ -28,6 +28,7 @@ fn included(nonce: u32, offset: u64, payload: u8) -> IncludedUserOp {
                 sender: SENDER_B,
                 signature: Signature::test_signature(),
                 user_op: UserOp {
+                    valid_until_block: u64::MAX,
                     nonce,
                     max_fee: u16::MAX,
                     data: vec![payload].into(),

@@ -43,6 +43,23 @@ or the scheduler's next nonce after cockroach recovery. Production needs no
 accepted ancestor or submitted sentinel to repair a fully invalidated branch
 ([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)).
 
+## Revoked confirmations and signed operations
+
+Recovery revokes the predicted inclusion, not the user's signature. A rolled-back
+operation can be submitted by anyone who obtained its bytes, including from a
+pending L1 batch, and can execute again when its nonce is current and validation
+passes, including the signed `valid_until_block` deadline at the replacement
+frame clock. Reusing the same signed operation remains a valid retry only
+within that deadline.
+
+To supersede a sequence of revoked operations, the sender must get a replacement
+included at every affected nonce; replacing only the first leaves later signed
+operations executable. The reference wallet has no dedicated cancellation method.
+Applications with price-sensitive operations must define deterministic signed
+expiry and price/slippage constraints in their payload and enforce them during
+canonical execution. A sequencer-local signature blacklist cannot revoke a
+signature in the canonical scheduler.
+
 ## Lifecycle and startup dispatch
 
 The recovery cycle crosses a process boundary:
@@ -56,7 +73,8 @@ The recovery cycle crosses a process boundary:
    deliberate restart. Process
    ownership and shutdown belong to the [authority-boundary ADR](../plans/2026-08-authority-boundary-adr.md).
 3. **Recover under the process lock, with no workers.** Check local terminal
-   facts before any provider call, attempt initial L1 sync, select at most one
+   facts before any provider call, require a fresh open-application status,
+   attempt initial L1 sync, select at most one
    repair, then inspect again after a repair.
 4. **Prepare, admit, launch.** Prepare resources without starting tasks. A final
    current inspection must still authorize serving. It creates a single-use
@@ -75,8 +93,19 @@ checkpoint. After initial sync, one consistent `RecoveryInspection` selects:
 | `EstimatedBatchInDanger(N)` | Retry; an estimate alone cannot authorize invalidation. |
 | `CanonicalDivergence(N)` or missing recovery checkpoint | Refuse; automatic recovery cannot repair this trust failure. |
 
-Only an initial-sync **provider failure** may fall back to a still-usable
-persisted view. Other failures keep their typed retry/refuse classification.
+Before repair, startup checks the pinned chain and `isForeclosed()` at Latest.
+Foreclosure refuses startup terminally; an unavailable status read retries
+without repair, even with a fresh persisted input view. During operation the
+submitter repeats this check on every poll, including idle polls, and decodes
+`ApplicationForeclosed(address)` from gas estimation as terminal. Runtime
+observation follows the existing terminal worker policy and stops the process;
+health probes then become unavailable. Detection waits for the submitter's
+current RPC work and poll cadence. It does not make admission atomic with an
+L1 contract transition. A Latest reorg can cause a conservative stop; a deliberate
+restart reads status again.
+
+After the open-application check, only an initial-sync **provider failure** may
+fall back to a still-usable persisted view. Other failures keep their typed retry/refuse classification.
 Post-flush sync has no such fallback: it must establish the view required by
 the cascade.
 
@@ -331,8 +360,8 @@ facts; the flush observation and admission witness do not survive.
 Its invariants cover terminal dominance, repair preconditions, a caught-up
 post-flush view, and admission soundness. It abstracts successful repair as
 producing a Tip; concrete transactions and rollback are checked by Rust tests.
-Neither model covers external era/generation metadata, the application-input
-projection, or snapshot artifact/lease/GC durability. Those obligations remain
+Neither model covers the external foreclosure-status gate, external
+era/generation metadata, the application-input projection, or snapshot artifact/lease/GC durability. Those obligations remain
 in storage constraints, tests, and the [snapshot lifecycle](../snapshots/lifecycle.md).
 
 Run the configured checks with:

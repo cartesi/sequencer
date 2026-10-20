@@ -289,6 +289,7 @@ fn seed_ordered_txs(db_path: &str) {
             sender: Address::from_slice(&[0x11; 20]),
             signature: Signature::test_signature(),
             user_op: UserOp {
+                valid_until_block: u64::MAX,
                 nonce: 0,
                 max_fee: 3,
                 data: vec![0x42].into(),

@@ -22,13 +22,17 @@ fn main() {
                     default_devnet_sequencer_config(log_prefix)
                 };
                 let scenario_name = name.strip_prefix("c_host_").unwrap_or(name);
+                if scenario_name.starts_with("guardian_") {
+                    spawn_config.guardian = true;
+                    spawn_config.faketime = false;
+                }
                 if scenario_name == "watchdog_genesis_compare_test"
                     || scenario_name == "deposit_transfer_withdrawal_test"
                     || scenario_name == "watchdog_divergence_drill_test"
                 {
                     spawn_config.faketime = false;
                 } else if scenario_name == "fixed_fee_oracle_sets_frame_fee_test" {
-                    // 100 → recommended fee 1456, under the wallet client's
+                    // 100 → recommended fee 1465, under the wallet client's
                     // DEFAULT_MAX_FEE (2500) so transfers still admit.
                     spawn_config.fee_oracle_fixed_log_gas_price = Some(100);
                 }

@@ -24,7 +24,7 @@ pub const MAX_WAIT_BLOCKS: u64 = 1200;
 pub const DOMAIN_NAME: &str = "CartesiAppSequencer";
 
 /// EIP-712 domain version shared between sequencer and scheduler.
-pub const DOMAIN_VERSION: &str = "1";
+pub const DOMAIN_VERSION: &str = "2";
 
 /// Build the canonical EIP-712 domain for user-op signing and verification.
 ///

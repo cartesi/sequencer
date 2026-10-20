@@ -61,6 +61,7 @@ fn v1_regression_shared_domain_recovers_signer() {
     let domain = sequencer_core::build_input_domain(chain_id, app);
 
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: 1_200,
         data: vec![0x01, 0x02, 0x03].into(),
@@ -111,6 +112,7 @@ fn v1_regression_name_none_domain_recovers_different_address() {
     };
 
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: 1_200,
         data: vec![0x01, 0x02, 0x03].into(),
@@ -152,6 +154,7 @@ fn v1_regression_domain_fields_all_affect_recovery() {
 
     let app = Address::from_slice(&[0xaa; 20]);
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: 1_200,
         data: vec![0x01].into(),
@@ -227,6 +230,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
         amount: U256::from(0_u64),
     });
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: TEST_MAX_FEE,
         data: ssz::Encode::as_ssz_bytes(&method).into(),
@@ -280,7 +284,7 @@ async fn e2e_submit_tx_ack_and_broadcast() {
             assert_eq!(offset, 1);
             assert_eq!(ws_sender, sender.to_string());
             // Frame fee includes the default tenfold log-space slack.
-            assert_eq!(fee, 1356);
+            assert_eq!(fee, 1365);
             assert_eq!(
                 decode_hex_prefixed(data.as_str()),
                 ssz::Encode::as_ssz_bytes(&method)
@@ -502,6 +506,7 @@ async fn api_rejects_user_op_payloads_above_application_limit() {
     let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
     let sender = address_from_signing_key(&signing_key);
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: TEST_MAX_FEE,
         data: vec![0_u8; MAX_METHOD_PAYLOAD_BYTES + 1].into(),
@@ -612,7 +617,7 @@ async fn api_payload_size_check_fires_before_signature_recovery() {
     let oversized_data_hex = "00".repeat(MAX_METHOD_PAYLOAD_BYTES + 1);
     let bogus_sig_hex = format!("0x{}", "00".repeat(65));
     let body = format!(
-        "{{\"message\":{{\"nonce\":0,\"max_fee\":0,\"data\":\"0x{oversized_data_hex}\"}},\
+        "{{\"message\":{{\"nonce\":0,\"max_fee\":0,\"valid_until_block\":100,\"data\":\"0x{oversized_data_hex}\"}},\
          \"signature\":\"{bogus_sig_hex}\",\
          \"sender\":\"0x0000000000000000000000000000000000000001\"}}",
     );
@@ -727,6 +732,7 @@ async fn api_rejects_sender_claim_that_mismatches_signature_recovery() {
     assert_ne!(address_a, address_b, "test setup: A and B must differ");
 
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: TEST_MAX_FEE,
         data: Vec::new().into(),
@@ -782,6 +788,7 @@ async fn api_rejects_user_op_with_nonce_gap() {
     // Current user nonce is 0 — a fresh sender has never submitted. Nonce 7
     // leaves a six-slot gap.
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 7,
         max_fee: TEST_MAX_FEE,
         data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
@@ -824,9 +831,9 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
     // Fund with enough to cover gas at the frame fee.
     bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
 
-    // `bootstrap_open_frame` asserts frame_fee == 1356; use that exact value
+    // `bootstrap_open_frame` asserts frame_fee == 1365; use that exact value
     // for the boundary case.
-    const FRAME_FEE_BOUNDARY: u16 = 1356;
+    const FRAME_FEE_BOUNDARY: u16 = 1365;
 
     let Some(runtime) = start_full_server(db.path.as_str(), domain.clone()).await else {
         return;
@@ -837,6 +844,7 @@ async fn api_accepts_user_op_with_max_fee_equal_to_current_frame_fee() {
         .expect("build sequencer client");
 
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: FRAME_FEE_BOUNDARY,
         data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
@@ -877,7 +885,7 @@ async fn api_quotes_open_frame_fee() {
         .expect("build sequencer client");
     let quoted = client.get_fee().await.expect("GET /fee");
     assert_eq!(
-        quoted.fee, 1356,
+        quoted.fee, 1365,
         "quoted fee must match the bootstrapped open-frame fee"
     );
     let raw = reqwest::get(format!("http://{}/fee", runtime.addr))
@@ -885,7 +893,7 @@ async fn api_quotes_open_frame_fee() {
         .expect("raw GET /fee");
     assert_eq!(raw.headers()["cache-control"], "no-store");
     assert_eq!(
-        quoted.recommended_fee, 1356,
+        quoted.recommended_fee, 1365,
         "bootstrapped recommended_fee matches the open-frame fee"
     );
     assert_eq!(
@@ -931,8 +939,9 @@ async fn api_serves_the_next_nonce_after_each_ack_and_the_signing_domain() {
             "a read after the previous 200 must see that op"
         );
         let user_op = UserOp {
+            valid_until_block: u64::MAX,
             nonce,
-            max_fee: 1356,
+            max_fee: 1365,
             data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
                 amount: U256::from(0_u64),
             }))
@@ -960,7 +969,7 @@ async fn api_rejects_user_op_when_balance_below_fee_cost() {
     // user op must be rejected with 422 `InsufficientFeeBalance` and leave
     // state unchanged. Exercises the balance check in
     // `WalletApp::validate_user_op` (app-core). A fresh sender with no
-    // deposits has balance 0, well below `fee_to_linear(1356)` (the
+    // deposits has balance 0, well below `fee_to_linear(1365)` (the
     // bootstrapped frame fee).
     let db = temp_db("insufficient-fee-balance");
     let domain = test_domain();
@@ -978,6 +987,7 @@ async fn api_rejects_user_op_when_balance_below_fee_cost() {
         .expect("build sequencer client");
 
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: TEST_MAX_FEE,
         data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
@@ -1024,6 +1034,7 @@ async fn api_concurrent_same_nonce_leaves_exactly_one_committed() {
     };
 
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: TEST_MAX_FEE,
         data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
@@ -1227,8 +1238,8 @@ async fn start_full_server_with_max_body(
         .open_state()
         .expect("load open state")
         .expect("open state exists");
-    // Default log_gas_price=0 -> 0+296+20+419+621 = 1356.
-    assert_eq!(head.frame_fee, 1356);
+    // Default log_gas_price=0 -> 0+296+20+419+630 = 1365.
+    assert_eq!(head.frame_fee, 1365);
 
     let (tx, lane_handle) = InclusionLane::<WalletApp>::start(
         128,
@@ -1425,6 +1436,7 @@ fn make_valid_request(domain: &Eip712Domain) -> TxRequest {
         amount: U256::from(0_u64),
     });
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: TEST_MAX_FEE,
         data: ssz::Encode::as_ssz_bytes(&method).into(),

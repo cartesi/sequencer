@@ -122,16 +122,15 @@ and `classify_input_reader` in [startup recovery](../../sequencer/src/recovery/m
 Next: classify failures by the setup phase and pin the external exit code;
 preserve genuinely transient provider failures.
 
-### Startup logs the full RPC URL
+### Production custody exit conformance
 
-The `sequencer startup` event includes `eth_rpc_url` verbatim. Operator URLs can
-carry credentials in userinfo, paths, or query parameters; private-key
-redaction does not cover this field.
-
-Evidence: [`commands/run/mod.rs`](../../sequencer/src/commands/run/mod.rs).
-Next: omit the field or define a safe endpoint representation, and check
-diagnostic/help paths with a synthetic credential-bearing URL. No credential
-exposure in an actual deployment was established by this review.
+The reference wallet's [exit integration](../protocol/application-contract.md#8-foreclosure-and-emergency-exits)
+is an example, not verification of the production DeFi engine. Before production
+custody, pin that engine's drive/builder layout and independently demonstrate
+credited-balance and finalized-pending-deposit exits against its deployed
+contracts, including its supported capacity. The reference scenario uses real
+canonical execution and Application proofs with a finalization fixture; it does
+not validate Dave's dispute/epoch finalization pipeline.
 
 ## Bounded investigations and cleanup
 

@@ -244,7 +244,7 @@ pub(super) fn load_batch_frames_in(
     let mut frames = Vec::with_capacity(frame_headers.len());
     for header in frame_headers {
         let mut stmt = conn.prepare_cached(
-            "SELECT nonce, max_fee, data, sig FROM user_ops \
+            "SELECT nonce, max_fee, data, sig, valid_until_block FROM user_ops \
              WHERE batch_index = ?1 AND frame_in_batch = ?2 \
              ORDER BY pos_in_frame ASC",
         )?;
@@ -252,6 +252,11 @@ pub(super) fn load_batch_frames_in(
             params![u64_to_i64(batch_index), i64::from(header.frame_in_batch)],
             |row| {
                 Ok(WireUserOp {
+                    valid_until_block: u64::from_le_bytes(
+                        row.get::<_, Vec<u8>>(4)?
+                            .try_into()
+                            .expect("expiry has eight bytes"),
+                    ),
                     nonce: i64_to_u32(row.get(0)?),
                     max_fee: i64_to_u16(row.get(1)?),
                     data: row.get(2)?,
@@ -315,8 +320,8 @@ mod tests {
         let frame = &decoded.frames[0];
         assert!(frame.user_ops.is_empty());
         assert_eq!(frame.safe_block, 12);
-        // Default log_recommended_fee = 0+296+20+419+621 = 1356.
-        assert_eq!(frame.fee_price, 1356);
+        // Default log_recommended_fee = 0+296+20+419+630 = 1365.
+        assert_eq!(frame.fee_price, 1365);
     }
 
     #[test]

@@ -224,6 +224,7 @@ CREATE TABLE IF NOT EXISTS user_ops (
     sender           BLOB NOT NULL CHECK (length(sender) = 20),
     nonce            INTEGER NOT NULL CHECK (nonce >= 0),
     max_fee          INTEGER NOT NULL CHECK (max_fee >= 0),
+    valid_until_block BLOB NOT NULL CHECK (length(valid_until_block) = 8),
     data             BLOB NOT NULL,
     sig              BLOB NOT NULL CHECK (length(sig) = 65),
     received_at_ms   INTEGER NOT NULL,
@@ -592,11 +593,11 @@ CREATE TABLE IF NOT EXISTS batch_policy (
 --   log_one_plus_alpha   = log_{129/128}(1.168)          = 20
 --   log_base_gas         = log_{129/128}(55000)          = 1403
 --   log_delta            = log_{129/128}(26)             = 419
---   log_user_op_bytes    = log_{129/128}(126)            = 621
+--   log_user_op_bytes    = ceil(log_{129/128}(134))      = 630
 --   log_max_batch_bytes  = log_{129/128}(32000)          = 1333
 --
 -- Derived by view:
---   log_recommended_fee  = 0 + 296 + 20 + 419 + 621      = 1356
+--   log_recommended_fee  = 0 + 296 + 20 + 419 + 630      = 1365
 --   log_batch_size_target = 1403 - (-229) - 419           = 1213
 INSERT OR IGNORE INTO batch_policy(
     singleton_id,
@@ -610,7 +611,7 @@ VALUES (
 
     -229, 20, 0, 0, 296,
 
-    1403, 419, 621, 1333
+    1403, 419, 630, 1333
 );
 
 -- Derived view for reads. All outputs are log-space exponents (base 129/128).

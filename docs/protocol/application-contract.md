@@ -25,7 +25,7 @@ a reference wallet integration.
 | `progress() -> ApplicationProgress` | Return the count/clock pair from the engine by value. |
 
 Execution callers use `validate_and_execute_user_op`, `execute_valid_user_op`,
-and `execute_direct_input`. The first enforces `max_fee >= current_fee` before
+and `execute_direct_input`. The first enforces the inclusive signed block deadline and `max_fee >= current_fee` before
 app validation and rejects an accepted op at the exhausted nonce `u32::MAX`
 after it. App validation checks the nonce and fee balance; a rejection is not
 persisted. Trusted replay
@@ -269,3 +269,43 @@ Canonical extraction belongs to application-specific recovery tooling. The
 runtime `Application` trait stays independent of machine image layouts and host
 export tooling; requiring a method to compile would establish its availability,
 not the correctness or operational readiness of the recovery path.
+
+### 8. Foreclosure and emergency exits
+
+Canonical state integrity does not establish a withdrawal path after foreclosure.
+Each custody application supplies a canonical accounts drive and withdrawal
+builder compatible with its deployed contracts, covering credited balances and
+finalized but unexecuted deposits. Contract refunds cover only unfinalized inputs;
+the scheduler's pending-direct queue is custody even before the app credits it.
+Stopping inputs also stops the input-driven age backstop. Recovery checkpoints
+and comparison files do not by themselves constitute an exit proof.
+
+The reference wallet publishes 64-byte records (32-byte ABI address followed by
+a full 256-bit big-endian balance), sorted by address, in the `accounts` raw flash
+drive before each accepted guest yield. Its entitlement is the current balance
+plus valid supported-token deposits still queued by the scheduler. Draining moves
+a deposit between those terms, preserving the sum; normal withdrawals debit the
+balance before producing their independently executable voucher.
+
+The example drive starts at `0x90000000000000`, has length 64 MiB, and holds up to
+2^20 nonzero accounts. Unused records are zero, and publication clears vacated
+slots and flushes guest writes. This is a bounded reference integration, subject
+to the wallet's guest-memory/compute capacity; it is not a capacity promise for a
+production DeFi engine. A production integration must size and test its own state
+layout and supported workload before custody.
+
+Deploy with the matching image and the [wallet withdrawal builder](../../examples/app-core/contracts/WalletWithdrawalOutputBuilder.sol):
+`log2LeavesPerAccount=1`, `log2MaxNumOfAccounts=20`, and
+`accountsDriveStartIndex=0x90000000000000 >> 26`. Pin the builder's token to the
+same token as the guest. The standard USD builder has a 96-bit amount format and
+cannot decode these records. A nonzero guardian is required to enable foreclosure.
+
+From an independently trusted last-finalized machine checkpoint, run
+`lua5.4 scripts/wallet-exit-proof.lua SNAPSHOT OWNER` at the repository root.
+The exporter verifies the hash tree and emits the drive root/path and account
+bytes/path. After foreclosure, submit `proveAccountsDriveMerkleRoot` once, then
+`withdraw(account, {accountIndex, accountRootSiblings})` for each entitlement.
+Match the exported machine root to the deployed consensus's last-finalized root;
+soft-confirmed or merely safe local snapshots are insufficient. Anyone may submit
+a proof, but the builder pays the proved owner, and the contract prevents a second
+withdrawal at that account index.

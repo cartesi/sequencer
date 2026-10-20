@@ -15,7 +15,8 @@ identifiers; loading rejects any mismatch. A CM bump therefore invalidates every
 stored image, release tarball, and watchdog checkpoint: rebuild the canonical
 images and re-`init` watchdog state directories. The kernel
 (`machine-linux-image`) and guest tools (`machine-guest-tools`) are paired with
-the emulator release and move with it. The development shell pins the same
+the emulator release and move with it. The kernel download must match the
+SHA-512 pinned in `toolchain-pins.env`; the release manifest records that pin. The development shell pins the same
 emulator through the parent flake.
 
 **A deployed application is pinned to its emulator version.** Its on-chain
@@ -51,6 +52,13 @@ Any other host, including the watchdog, must match it exactly:
 
 A fixed point is permanent: once the canonical machine reaches one, no later
 input is ever processed for that application.
+
+## Merkle proof geometry
+
+In v0.21, `get_proof` returns `sibling_hashes` from leaf to root, matching the
+rollups-contracts proof arrays. Account paths stop at the accounts-drive root;
+drive paths continue to the machine's 64-bit root. The machine uses 32-byte
+leaves. Keep the proof exporter pinned to these rules when changing versions.
 
 ## Storage, sharing, and snapshots
 

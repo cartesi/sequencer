@@ -1461,9 +1461,11 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "app-core",
+ "ethereum_ssz",
  "k256",
  "rollups-types",
  "sequencer-core",
+ "tempfile",
  "trolley",
 ]
 
@@ -3854,11 +3856,13 @@ dependencies = [
 name = "rollups-e2e"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "alloy-primitives",
  "alloy-sol-types",
  "app-core",
  "c-app-engine",
  "c-wallet-engine",
+ "cartesi-rollups-contracts",
  "ethereum_ssz",
  "futures",
  "libtest-mimic",
@@ -4291,6 +4295,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tower-http",
+ "tower-service",
  "tracing",
  "url",
 ]

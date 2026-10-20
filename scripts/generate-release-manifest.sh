@@ -79,6 +79,11 @@ manifest = {
         "rust": os.environ["RUST_TOOLCHAIN"],
         "xgenext2fs": os.environ["XGENEXT2FS_VERSION"],
         "cartesi_machine": os.environ["CARTESI_MACHINE_VERSION"],
+        "linux_kernel": {
+            "release": os.environ["CARTESI_LINUX_IMAGE_RELEASE"],
+            "filename": os.environ["CARTESI_LINUX_KERNEL_FILENAME"],
+            "sha512": os.environ["CARTESI_LINUX_KERNEL_SHA512"],
+        },
     },
     "artifacts": artifacts,
     "alignment": {

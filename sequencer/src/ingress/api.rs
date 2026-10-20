@@ -164,9 +164,11 @@ async fn get_fee(State(state): State<Arc<ReadState>>) -> Result<Response, ApiErr
     })
     .await;
     match result {
-        Ok(Some((fee, recommended_fee))) => {
-            Ok(no_store(Json(FeeResponse::quote(fee, recommended_fee))))
-        }
+        Ok(Some((fee, recommended_fee, safe_block))) => Ok(no_store(Json(FeeResponse::quote(
+            fee,
+            recommended_fee,
+            safe_block,
+        )))),
         Ok(None) => Err(ApiError::unavailable("no open frame")),
         Err(err) => {
             tracing::warn!(error = %err, "GET /fee failed");
@@ -299,6 +301,7 @@ mod tests {
             sender: Address::ZERO,
             signature: Signature::test_signature(),
             user_op: UserOp {
+                valid_until_block: u64::MAX,
                 nonce: 0,
                 max_fee: 0,
                 data: Vec::new().into(),
@@ -338,6 +341,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
         let sender = address_from_signing_key(&signing_key);
         let user_op = UserOp {
+            valid_until_block: u64::MAX,
             nonce: 0,
             max_fee: 0,
             data: Vec::new().into(),

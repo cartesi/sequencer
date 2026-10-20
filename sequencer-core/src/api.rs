@@ -133,14 +133,16 @@ pub struct TxResponse {
 /// survives a frame rotation. The user pays the frame fee, not this cap.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeeResponse {
+    pub safe_block: u64,
     pub fee: u16,
     pub recommended_fee: u16,
     pub suggested_max_fee: u16,
 }
 
 impl FeeResponse {
-    pub fn quote(fee: u16, recommended_fee: u16) -> Self {
+    pub fn quote(fee: u16, recommended_fee: u16, safe_block: u64) -> Self {
         Self {
+            safe_block,
             fee,
             recommended_fee,
             suggested_max_fee: crate::fee::suggested_signing_max_fee(fee, recommended_fee),

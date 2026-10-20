@@ -354,11 +354,12 @@ impl ProtocolTiming {
     /// `batch_reject_reason_for_block` additionally rejects a batch whose frames
     /// have a `safe_block` above the inclusion block
     /// (`SafeBlockAboveInclusionBlock`) or that decrease across frames
-    /// (`NonMonotonicSafeBlocks`). This predicate does not re-check those: a
+    /// (`NonMonotonicSafeBlocks`), or whose fee exceeds `MAX_EXPONENT`
+    /// (`FeePriceOutOfRange`). This predicate does not re-check those: a
     /// well-formed batch submitter never builds such a batch, so they are
     /// reachable only under a buggy or forked submitter — already outside the
     /// duality boundary. The I1 duality test pins this as a *documented*
-    /// asymmetry; mirror those two checks here if the submitter ever stops being
+    /// asymmetry; mirror those checks here if the submitter ever stops being
     /// trusted to be well-formed.
     pub fn scheduler_accepts(
         &self,

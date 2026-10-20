@@ -16,6 +16,7 @@ local canonical = {}
 --- the on-chain template hash), so an image from other source or another
 --- network cannot start a canonical history.
 function canonical.trusted_start(machine, l1, dir, block)
+    machine.verify(dir)
     l1:require_safe_head(block)
     local input_count = l1:input_count_at(block)
     if input_count == 0 and machine.root_hash(dir) ~= l1:template_hash() then

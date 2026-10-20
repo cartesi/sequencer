@@ -250,6 +250,11 @@ function support.fake_machine(script)
             errors.operator("bad source")
         end
     end
+    function fake.verify()
+        if script.corrupt_tree then
+            errors.operator("stored machine fails hash-tree verification")
+        end
+    end
     function fake.root_hash()
         return script.root_hash or string.rep("\171", 32)
     end

@@ -56,7 +56,9 @@ Before *anything* else, drain every fridge direct that has gone **overdue**:
 ([`force_execute_overdue`](../../sequencer-core/src/scheduler/mod.rs)). This is
 the censorship-resistance guarantee: a direct cannot be held in the fridge
 forever by a sequencer that freezes `safe_block` or stops submitting batches —
-once it ages out, it executes regardless of any frame. It runs on every input
+once it ages out, it executes on the next input regardless of any frame. The
+backstop requires a later L1 input; wall-clock time alone does not execute it.
+It runs on every input
 tick (even a malformed batch advances `current_block` and can trip the
 backstop). Drained directs execute in FIFO (ascending `inclusion_block`) order.
 
@@ -71,7 +73,7 @@ case) **consumes the nonce**.
 | a | SSZ-decode the payload as `Batch` | `BatchRejected(DecodeFailed)` | not consumed |
 | b | `batch.nonce == next_expected_batch_nonce` | `BatchRejected(WrongNonce)` | not consumed |
 | c | *empty frames?* → accept as a no-op | `BatchExecuted` | **consumed** |
-| d | structural frame check (below) | `BatchRejected(SafeBlockAboveInclusionBlock \| NonMonotonicSafeBlocks)` | not consumed |
+| d | structural frame check (below) | `BatchRejected(SafeBlockAboveInclusionBlock \| NonMonotonicSafeBlocks \| FeePriceOutOfRange)` | not consumed |
 | e | staleness: `inclusion_block − frames[0].safe_block ≥ MAX_WAIT_BLOCKS` | `BatchSkippedStale` | **not consumed** |
 | f | execute every frame (below) | `BatchExecuted` | **consumed** |
 
@@ -82,7 +84,14 @@ case) **consumes the nonce**.
   accounted for L1 state it was included before) — else
   `SafeBlockAboveInclusionBlock`;
 - frame `safe_block`s are **non-decreasing** across the batch — else
-  `NonMonotonicSafeBlocks`.
+  `NonMonotonicSafeBlocks`;
+- every frame's `fee_price ≤ MAX_EXPONENT` from the [fee conversion](../../sequencer-core/src/fee.rs) — else `FeePriceOutOfRange`.
+
+All frames pass these checks before any frame drain or user-op execution. The
+overdue-direct backstop still runs before batch validation.
+The fee bound is a canonical guest rule: rebuild and deploy the matching machine
+image to enforce it on chain; updating the host alone does not change an
+existing application's template.
 
 **Gate e — staleness** is measured against the **first** frame only
 (`has_elapsed_since`, mirrored off-chain by
@@ -106,7 +115,7 @@ For each frame, in order ([`process_batch_payload`](../../sequencer-core/src/sch
    with `(frame.fee_price, frame.safe_block)`. A user op is silently skipped
    (no state change, no output) when its signature is unrecoverable, when app
    `validate_user_op` rejects it, or when a protocol guard fails
-   (`max_fee ≥ fee_price`, or a nonce of `u32::MAX`, which has no
+   (`safe_block ≤ valid_until_block`, `max_fee ≥ fee_price`, or a nonce of `u32::MAX`, which has no
    successor) — the fold is a pure deterministic function and emits no
    diagnostics at the library seam.
 

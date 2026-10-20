@@ -11,6 +11,7 @@ sol! {
         uint32 nonce;
         /// Log-space fee exponent (base 129/128). See [`crate::fee`].
         uint16 max_fee;
+        uint64 valid_until_block;
         bytes data;
     }
 }
@@ -28,7 +29,7 @@ impl SignedUserOp {
     pub const MAX_FEE_BYTES: usize = 2;
 
     pub const MAX_BATCH_METADATA_BYTES: usize =
-        Self::SIGNATURE_BYTES + Self::NONCE_BYTES + Self::MAX_FEE_BYTES;
+        Self::SIGNATURE_BYTES + Self::NONCE_BYTES + Self::MAX_FEE_BYTES + 8;
 
     pub const fn max_batch_metadata() -> usize {
         Self::MAX_BATCH_METADATA_BYTES

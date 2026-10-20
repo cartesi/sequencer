@@ -72,7 +72,8 @@ paths:
             example:
               message:
                 nonce: 0
-                max_fee: 1409
+                max_fee: 1418
+                valid_until_block: 1120
                 data: "0x00"
               signature: "0x1b2c3d4e5f60718293a4b5c6d7e8f9011b2c3d4e5f60718293a4b5c6d7e8f9011b2c3d4e5f60718293a4b5c6d7e8f9011b2c3d4e5f60718293a4b5c6d7e8f9011b"
               sender: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -107,7 +108,7 @@ paths:
         "422":
           description: |
             The application rejected the op; no state changed and nothing was
-            persisted. Reasons: bad nonce, exhausted nonce, `max_fee` below
+            persisted. Reasons: expired deadline, bad nonce, exhausted nonce, `max_fee` below
             the open-frame fee, or insufficient balance for the fee. After a
             bad-nonce rejection, query `GET /nonce` again.
           content:
@@ -118,7 +119,7 @@ paths:
                 badNonce:
                   value: { ok: false, code: EXECUTION_REJECTED, message: "bad nonce: expected 7, got 6" }
                 maxFee:
-                  value: { ok: false, code: EXECUTION_REJECTED, message: max fee 1300 below base fee 1356 }
+                  value: { ok: false, code: EXECUTION_REJECTED, message: max fee 1300 below base fee 1365 }
         "429":
           description: The inclusion-lane queue is full.
           content:
@@ -150,7 +151,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/FeeResponse"
-              example: { fee: 1356, recommended_fee: 1356, suggested_max_fee: 1409 }
+              example: { fee: 1365, recommended_fee: 1365, suggested_max_fee: 1418, safe_block: 1000 }
         "500":
           $ref: "#/components/responses/InternalError"
         "503":
@@ -229,7 +230,7 @@ paths:
                 $ref: "#/components/schemas/DomainResponse"
               example:
                 name: CartesiAppSequencer
-                version: "1"
+                version: "2"
                 chainId: 31337
                 verifyingContract: "0x1111111111111111111111111111111111111111"
 
@@ -793,7 +794,7 @@ components:
 
     UserOp:
       type: object
-      required: [nonce, max_fee, data]
+      required: [nonce, max_fee, valid_until_block, data]
       description: The EIP-712 message the user signs.
       properties:
         nonce:
@@ -808,6 +809,11 @@ components:
           minimum: 0
           maximum: 65535
           description: Log-space fee exponent (base 129/128) the user is willing to pay.
+        valid_until_block:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Inclusive frame safe-block deadline; expiry consumes neither nonce nor fee.
         data:
           allOf:
             - $ref: "#/components/schemas/HexBytes"
@@ -848,8 +854,13 @@ components:
 
     FeeResponse:
       type: object
-      required: [fee, recommended_fee, suggested_max_fee]
+      required: [fee, recommended_fee, suggested_max_fee, safe_block]
       properties:
+        safe_block:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Clock of the open frame; choose a signed deadline relative to this value.
         fee:
           type: integer
           format: uint16

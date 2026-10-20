@@ -18,8 +18,8 @@ use sequencer_rust_client::{HistoryPolicyError, SequencerClient, SubscribeError}
 
 const NO_WS_MESSAGE_WAIT: Duration = Duration::from_secs(1);
 
-/// Default log_recommended_fee exponent (0 + 296 + 20 + 419 + 621 = 1356).
-const DEFAULT_FRAME_FEE: u16 = 1356;
+/// Default log_recommended_fee exponent (0 + 296 + 20 + 419 + 630 = 1365).
+const DEFAULT_FRAME_FEE: u16 = 1365;
 
 /// Max fee used for raw TxRequest construction. Must be >= DEFAULT_FRAME_FEE.
 const DEFAULT_MAX_FEE: u16 = 2500;
@@ -173,6 +173,13 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
             "cold_replica_snapshot_backlog_live_recovery_test",
             |runtime| Box::pin(crate::cold_replica::run(runtime)),
         ),
+        (
+            "guardian_exit_recovers_balances_and_queued_deposits_test",
+            |runtime| Box::pin(crate::wallet_exit::run(runtime)),
+        ),
+        ("guardian_foreclosure_stops_admission_test", |runtime| {
+            Box::pin(run_guardian_foreclosure_stops_admission_test(runtime))
+        }),
         ("deposit_transfer_withdrawal_test", |runtime| {
             Box::pin(run_deposit_transfer_withdrawal_test(runtime))
         }),
@@ -210,6 +217,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
             "restart_after_committed_tx_replays_cleanly_test",
             |runtime| Box::pin(run_restart_after_committed_tx_replays_cleanly_test(runtime)),
         ),
+        ("recovery_expires_revoked_signature_test", |runtime| {
+            Box::pin(run_recovery_expires_revoked_signature_test(runtime))
+        }),
         ("recovery_after_stale_batches_test", |runtime| {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
         }),
@@ -230,12 +240,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ("provider_outage_wall_clock_refuses_boot_test", |runtime| {
             Box::pin(run_provider_outage_wall_clock_refuses_boot_test(runtime))
         }),
-        (
-            "warm_restart_from_fresh_persisted_facts_with_l1_down_test",
-            |runtime| {
-                Box::pin(run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(runtime))
-            },
-        ),
+        ("warm_restart_requires_application_status_test", |runtime| {
+            Box::pin(run_warm_restart_requires_application_status_test(runtime))
+        }),
         (
             "wall_clock_backward_jump_retries_then_recovers_test",
             |runtime| {
@@ -457,7 +464,7 @@ async fn prepare_non_genesis_watchdog_state(runtime: &mut ManagedSequencer) -> S
 /// time, so the submitter and promoter get to run without synthesizing a future
 /// L1 clock; returns the new inclusion block, or times out loudly. Robust
 /// against CI jitter — it waits exactly as long as promotion takes, no more.
-async fn mine_until_finalized_advances(
+pub(crate) async fn mine_until_finalized_advances(
     runtime: &ManagedSequencer,
     floor: u64,
 ) -> ScenarioResult<u64> {
@@ -963,7 +970,7 @@ async fn run_unsupported_token_deposit_noop_test(
     Ok(())
 }
 
-async fn apply_reconciled_supported_deposit(
+pub(crate) async fn apply_reconciled_supported_deposit(
     runtime: &ManagedSequencer,
     ws: &mut WsClient,
     replay: &mut ReplayWalletApp,
@@ -1000,10 +1007,11 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
     apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
         .await?;
 
-    // Submit user-op with max_fee=0, which is below the default frame fee (1356).
+    // Submit user-op with max_fee=0, which is below the default frame fee (1365).
     let client = SequencerClient::new(runtime.endpoint())?;
     let domain = eip712_domain(runtime);
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: 0,
         data: ssz_encode_transfer(alice_address, U256::from(100_u64)).into(),
@@ -1026,13 +1034,13 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
     Ok(())
 }
 
-/// Fixed fee-oracle exponent 100 → recommended frame fee 1456
-/// (`100 + 296 + 20 + 419 + 621`), sampled by the first frame.
+/// Fixed fee-oracle exponent 100 → recommended frame fee 1465
+/// (`100 + 296 + 20 + 419 + 630`), sampled by the first frame.
 async fn run_fixed_fee_oracle_sets_frame_fee_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     const FIXED_LOG_GAS_PRICE: u16 = 100;
-    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE + 296 + 20 + 419 + 621;
+    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE + 296 + 20 + 419 + 630;
 
     assert_eq!(
         runtime.first_frame_fee()?,
@@ -1074,6 +1082,7 @@ async fn run_forged_signature_rejected_test(runtime: &mut ManagedSequencer) -> S
     let client = SequencerClient::new(runtime.endpoint())?;
     let domain = eip712_domain(runtime);
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: DEFAULT_MAX_FEE,
         data: ssz_encode_transfer(bob_address, U256::from(100_u64)).into(),
@@ -1995,98 +2004,45 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     Ok(())
 }
 
-// Warm restart from a fresh persisted L1 view while the RPC is unreachable.
-//
-// This is the production-shaped discriminator for startup admission: an
-// initial refresh attempt may fail, but a recent persisted view that still
-// reduces to `Admit` is sufficient authority to prepare and launch the
-// runtime. The test keeps the proxy disconnected through readiness, one full
-// background-worker retry cadence, POST /tx, and WS broadcast. A boot path
-// that makes provider reachability an unconditional admission gate fails at
-// `respawn`; a runtime that launches without a usable inclusion lane fails the
-// transaction or WS assertion.
-async fn run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(
+// A fresh input view cannot prove that an unreachable application remains open.
+async fn run_warm_restart_requires_application_status_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    const STABILITY_WINDOW: Duration = Duration::from_secs(3);
-
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
-    let alice_address = alice.address();
-    let bob_address = bob.address();
-    let deposit_amount = U256::from(600_000_u64);
-    let transfer_amount = U256::from(100_000_u64);
-    let fee = fee_to_linear(DEFAULT_FRAME_FEE);
-
-    // Persist a recent safe-head observation plus replayable wallet state,
-    // then stop cleanly so the next run boots over fresh facts without a
-    // recovery phase.
     let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
     let mut ws = runtime.ws(0).await?;
     let mut replay = ReplayWalletApp::devnet();
-    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
-        .await?;
+    apply_reconciled_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay,
+        &alice_l1,
+        U256::from(600_000),
+    )
+    .await?;
     drop(ws);
-    runtime.stop().await?;
-
-    // Route the next process through an already-disconnected gateway. The
-    // proxy stays down until after the admitted runtime serves the write and
-    // its corresponding ordered-tx feed event.
+    runtime.stop_expecting_clean_exit().await?;
+    let before = runtime.count_batches()?;
     let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
     runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
     proxy.disconnect();
-    runtime.respawn().await?;
     assert!(
-        !proxy.is_connected(),
-        "warm restart must reach readiness without reconnecting the L1 proxy",
-    );
-
-    // Cross the 2s input-reader/danger-detector cadence before submitting, so
-    // this proves more than racing a request ahead of the first failed RPC
-    // retry. Fresh local facts must keep the process admitted and live.
-    let exit = runtime.observe_for(STABILITY_WINDOW).await?;
-    assert!(
-        exit.is_none(),
-        "warm runtime must remain live while the fresh persisted L1 view is valid; got {exit:?}",
-    );
-
-    let mut ws_after = runtime.ws(0).await?;
-    let mut replay_after = ReplayWalletApp::devnet();
-    replay_after.apply(
-        ws_after
-            .expect_direct_input_from(runtime.erc20_portal_address())
-            .await?,
-    )?;
-    let mut alice_l2 = runtime.wallet_l2(alice)?;
-    alice_l2.transfer(bob_address, transfer_amount).await?;
-    replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
-
-    assert_wallet_state(
-        &replay_after,
-        ExpectedWalletState {
-            address: alice_address,
-            balance: deposit_amount - transfer_amount - fee,
-            nonce: 1,
-        },
-        ExpectedWalletState {
-            address: bob_address,
-            balance: transfer_amount,
-            nonce: 0,
-        },
-        2,
-    );
-    assert!(
-        !proxy.is_connected(),
-        "POST /tx and WS must succeed before L1 connectivity is restored",
+        runtime.respawn().await.is_err(),
+        "unknown foreclosure status must refuse admission"
     );
     assert_eq!(
-        runtime.count_batches()?.invalidated,
-        0,
-        "a fresh-view warm restart must not invalidate the batch tree",
+        runtime.count_batches()?,
+        before,
+        "status refusal cannot repair or flush history"
     );
-
     proxy.reconnect();
     runtime.set_l1_endpoint_override(None);
+    runtime.respawn().await?;
+    let mut alice_l2 = runtime.wallet_l2(alice)?;
+    alice_l2
+        .transfer(bob.address(), U256::from(100_000))
+        .await?;
     proxy.shutdown().await?;
     Ok(())
 }
@@ -2280,7 +2236,7 @@ async fn run_provider_outage_pre_danger_sequencer_continues_test(
     let bob_address = bob.address();
 
     // Step 1: Deposit big — Alice needs to cover 150+ transfers and their fees.
-    // Default fee per user-op ≈ 38276 units (log-fee 1356); reserve margin.
+    // Default fee per user-op ≈ 38276 units (log-fee 1365); reserve margin.
     let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
     let deposit_amount = U256::from(10_000_000_u64);
     let mut replay = ReplayWalletApp::devnet();
@@ -4042,4 +3998,121 @@ fn assert_wallet_state(
     assert_eq!(replay.current_user_balance(second.address), second.balance);
     assert_eq!(replay.current_user_nonce(second.address), second.nonce);
     assert_eq!(replay.executed_input_count(), executed_input_count);
+}
+
+async fn run_guardian_foreclosure_stops_admission_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    use std::os::unix::process::ExitStatusExt;
+    let alice = TestSigner::from_default(1)?;
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
+    let mut replay = ReplayWalletApp::devnet();
+    apply_reconciled_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay,
+        &alice_l1,
+        U256::from(10_000_000_u64),
+    )
+    .await?;
+    alice_l2.transfer(alice.address(), U256::from(1)).await?;
+    replay.apply(ws.expect_user_op_from(alice.address()).await?)?;
+    assert_eq!(runtime.health_status().await?, Some(200));
+    runtime.foreclose().await?;
+    let status = runtime.wait_for_exit(Duration::from_secs(30)).await?;
+    assert_eq!(
+        status.signal(),
+        Some(6),
+        "runtime foreclosure must take the terminal abort path"
+    );
+    assert!(
+        alice_l2
+            .transfer(alice.address(), U256::from(1))
+            .await
+            .is_err(),
+        "no admission after detection"
+    );
+    assert_ne!(runtime.health_status().await?, Some(200));
+    let stopped_batches = runtime.count_batches()?;
+    let nonce = runtime.submitter_nonce().await?;
+    for _ in 0..2 {
+        assert!(
+            runtime.respawn().await.is_err(),
+            "foreclosure must refuse restart"
+        );
+        assert_eq!(
+            runtime.submitter_nonce().await?,
+            nonce,
+            "restart must not flush or send"
+        );
+        assert_eq!(
+            runtime.count_batches()?,
+            stopped_batches,
+            "restart must not reopen history"
+        );
+    }
+    Ok(())
+}
+
+async fn run_recovery_expires_revoked_signature_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    use app_core::application::{Method, Transfer};
+    use ssz::Encode;
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut ws = runtime.ws(0).await?;
+    let mut replay = ReplayWalletApp::devnet();
+    apply_reconciled_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay,
+        &alice_l1,
+        U256::from(10_000_000),
+    )
+    .await?;
+    let client = SequencerClient::new(runtime.endpoint().to_owned())?;
+    let fee = client.get_fee().await?;
+    let request = alice.signed_request(
+        &sequencer_core::build_input_domain(
+            runtime.domain_chain_id(),
+            runtime.verifying_contract(),
+        ),
+        UserOp {
+            nonce: 0,
+            max_fee: DEFAULT_MAX_FEE,
+            valid_until_block: fee.safe_block + 10,
+            data: Method::Transfer(Transfer {
+                to: bob.address(),
+                amount: U256::from(100_000),
+            })
+            .as_ssz_bytes()
+            .into(),
+        },
+    )?;
+    client.submit_tx(&request).await?;
+    replay.apply(ws.expect_user_op_from(alice.address()).await?)?;
+    drop(ws);
+    runtime.stop_expecting_clean_exit().await?;
+    runtime
+        .advance_wall_and_mine(blocks_as_duration(MAX_WAIT_BLOCKS))
+        .await?;
+    runtime.respawn().await?;
+    let client = SequencerClient::new(runtime.endpoint().to_owned())?;
+    assert_eq!(
+        client.get_nonce(alice.address()).await?.next_nonce,
+        0,
+        "recovery must have revoked the op"
+    );
+    let (status, body) = client.submit_tx_with_status(&request).await?;
+    assert_eq!(status, 422);
+    assert!(
+        body.contains("operation expired"),
+        "must reject expiry, not an old nonce: {body}"
+    );
+    assert_eq!(client.get_nonce(alice.address()).await?.next_nonce, 0);
+    Ok(())
 }

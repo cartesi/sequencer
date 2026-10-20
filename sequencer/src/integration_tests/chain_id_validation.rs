@@ -24,7 +24,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, address};
 use clap::Parser;
 use sequencer::commands::{BootstrapError, CommandError, IdentityError};
-use sequencer::l1::reader::InputReaderError;
+use sequencer::l1::application_status::ApplicationStatusError;
 use sequencer::recovery::{RecoveryError, RecoveryFailure};
 use sequencer::storage::{DeploymentIdentity, Storage};
 use sequencer::{Cli, Command};
@@ -178,14 +178,14 @@ async fn run_refuses_on_wrong_chain_rpc() {
     match result {
         Err(CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::Refuse(failure)))) => {
             match *failure {
-                RecoveryFailure::InputReader(InputReaderError::ChainIdMismatch {
+                RecoveryFailure::ApplicationStatus(ApplicationStatusError::ChainIdMismatch {
                     rpc,
                     expected,
                 }) => {
                     assert_eq!(rpc, 99);
                     assert_eq!(expected, 31_337);
                 }
-                other => panic!("expected input-reader chain-id mismatch, got: {other:?}"),
+                other => panic!("expected application-status chain-id mismatch, got: {other:?}"),
             }
         }
         other => panic!("expected ChainIdMismatch, got: {other:?}"),
@@ -200,6 +200,16 @@ async fn run_accepts_matching_chain_rpc() {
     // task-free runtime preparation, where loading that artifact fails.
     require_anvil();
     let anvil = alloy::node_bindings::Anvil::default().spawn(); // chain id 31337
+    use alloy::providers::{ProviderBuilder, ext::AnvilApi};
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    // Minimal isForeclosed() response: the app remains open.
+    provider
+        .anvil_set_code(
+            TEST_APP_ADDR,
+            alloy_primitives::bytes!("600060005260206000f3"),
+        )
+        .await
+        .unwrap();
     let dir = TempDir::new().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();
     let db_path = format!("{data_dir}/sequencer.db");
@@ -218,5 +228,44 @@ async fn run_accepts_matching_chain_rpc() {
     assert!(
         matches!(result, Err(CommandError::ReferencedSnapshotArtifact { .. })),
         "matching chain id must reach snapshot preparation, got: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_refuses_a_foreclosed_app_on_every_restart_without_sending() {
+    use alloy::providers::{Provider, ProviderBuilder, ext::AnvilApi};
+    require_anvil();
+    let anvil = alloy::node_bindings::Anvil::default().spawn();
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    // isForeclosed() = true, without needing a full contracts deployment.
+    provider
+        .anvil_set_code(
+            TEST_APP_ADDR,
+            alloy_primitives::bytes!("600160005260206000f3"),
+        )
+        .await
+        .unwrap();
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    seed_setup_complete(&format!("{data_dir}/sequencer.db"), 31337, ANVIL_ADDR);
+    let before = provider.get_transaction_count(ANVIL_ADDR).await.unwrap();
+    for _ in 0..2 {
+        let error = sequencer::run::<app_core::application::WalletApp>(run_config(
+            data_dir,
+            &anvil.endpoint(),
+            ANVIL_KEY,
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(error.exit_code(), sequencer::commands::error::EXIT_TERMINAL);
+        assert!(
+            matches!(error, CommandError::Bootstrap(BootstrapError::Recovery(
+            RecoveryError::Refuse(failure)
+        )) if matches!(*failure, RecoveryFailure::ApplicationStatus(ApplicationStatusError::Foreclosed { .. })))
+        );
+    }
+    assert_eq!(
+        provider.get_transaction_count(ANVIL_ADDR).await.unwrap(),
+        before
     );
 }
