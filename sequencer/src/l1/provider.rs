@@ -4,6 +4,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use alloy::rpc::json_rpc::{RequestPacket, ResponsePacket};
 use alloy::{
     providers::{DynProvider, Provider, ProviderBuilder},
     rpc::client::RpcClient,
@@ -11,6 +12,8 @@ use alloy::{
     transports::http::{Http, reqwest, reqwest::Url},
 };
 use alloy_transport::layers::RetryBackoffLayer;
+use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
+use tower_service::Service;
 use url::Host;
 
 // Public Ethereum providers (Infura, Alchemy) commonly take 30–60s on heavy
@@ -44,7 +47,7 @@ fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
     }
     if remote_plaintext {
         tracing::warn!(
-            url = %url,
+            endpoint = %url.origin().ascii_serialization(),
             "insecure plaintext RPC to a non-loopback host — explicitly allowed via allow-insecure-rpc"
         );
     }
@@ -65,7 +68,40 @@ fn create_client(url: &str, allow_insecure: bool) -> Result<RpcClient, String> {
 
     Ok(RpcClient::builder()
         .layer(retry)
-        .transport(transport, is_local))
+        .transport(UrlSafeTransport(transport), is_local))
+}
+
+// Redact at the transport boundary, before retry wrappers or callers turn
+// errors into text. Keep the reqwest error and its cause, without its URL.
+#[derive(Clone, Debug)]
+struct UrlSafeTransport(Http<reqwest::Client>);
+
+impl Service<RequestPacket> for UrlSafeTransport {
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: RequestPacket) -> Self::Future {
+        let future = self.0.call(request);
+        Box::pin(async move {
+            future.await.map_err(|error| match error {
+                TransportError::Transport(TransportErrorKind::Custom(cause)) => {
+                    match cause.downcast::<reqwest::Error>() {
+                        Ok(cause) => TransportErrorKind::custom(cause.without_url()),
+                        Err(cause) => TransportError::Transport(TransportErrorKind::Custom(cause)),
+                    }
+                }
+                error => error,
+            })
+        })
+    }
 }
 
 /// Whether a parsed URL host refers to a loopback address.
@@ -269,6 +305,30 @@ mod tests {
         let good_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
         create_signer_provider("http://127.0.0.1:8545", good_key, false)
             .expect("valid key must be accepted");
+    }
+
+    #[tokio::test]
+    async fn rpc_transport_errors_omit_credentials_from_display_debug_and_causes() {
+        use std::error::Error;
+        let provider = create_provider(
+            "http://user:SECRET_PASSWORD@127.0.0.1:9/v2/SECRET_PATH?apikey=SECRET_QUERY",
+            false,
+        )
+        .unwrap();
+        let error = provider.get_chain_id().await.unwrap_err();
+        let mut rendered = format!("{error} {error:?}");
+        let mut cause = error.source();
+        while let Some(error) = cause {
+            rendered.push_str(&format!(" {error} {error:?}"));
+            cause = error.source();
+        }
+        for secret in ["SECRET_PASSWORD", "SECRET_PATH", "SECRET_QUERY"] {
+            assert!(!rendered.contains(secret), "credential leaked: {rendered}");
+        }
+        assert!(
+            rendered.to_ascii_lowercase().contains("connect"),
+            "retain the failure reason: {rendered}"
+        );
     }
 
     // ── Keyed-write chain-id gate (review): the guarded constructor must

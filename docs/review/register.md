@@ -122,16 +122,6 @@ and `classify_input_reader` in [startup recovery](../../sequencer/src/recovery/m
 Next: classify failures by the setup phase and pin the external exit code;
 preserve genuinely transient provider failures.
 
-### Startup logs the full RPC URL
-
-The `sequencer startup` event includes `eth_rpc_url` verbatim. Operator URLs can
-carry credentials in userinfo, paths, or query parameters; private-key
-redaction does not cover this field.
-
-Evidence: [`commands/run/mod.rs`](../../sequencer/src/commands/run/mod.rs).
-Next: omit the field or define a safe endpoint representation, and check
-diagnostic/help paths with a synthetic credential-bearing URL. No credential
-exposure in an actual deployment was established by this review.
 
 ## Bounded investigations and cleanup
 

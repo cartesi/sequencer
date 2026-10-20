@@ -28,6 +28,7 @@ alloy = { workspace = true, features = ["contract", "network", "reqwest", "rpc-t
 alloy-network-primitives = "2.5"
 alloy-transport = "2.5"
 url = "2.5"
+tower-service = "0.3"
 thiserror = { workspace = true }
 ssz = { workspace = true }
 ssz_derive = { workspace = true }
