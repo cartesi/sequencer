@@ -5,18 +5,25 @@ drives it, the canonical guest is built for it, and cockroach recovery exports
 from it. This page records the CM behavior those components depend on,
 especially behavior that is easy to assume wrongly. Everything here holds for
 the pinned version (`CARTESI_MACHINE_VERSION` in
-[`toolchain-pins.env`](../toolchain-pins.env), currently v0.21.0) and was
+[`toolchain-pins.env`](../toolchain-pins.env), currently v0.22.0) and was
 checked against the emulator source at that tag. Re-check it on every bump.
 
 ## Versions are all-or-nothing
 
-A stored machine records a config archive version and the emulator's machine
-identifiers; loading rejects any mismatch. A CM bump therefore invalidates every
-stored image, release tarball, and watchdog checkpoint: rebuild the canonical
-images and re-`init` watchdog state directories. The kernel
-(`machine-linux-image`) and guest tools (`machine-guest-tools`) are paired with
-the emulator release and move with it. The development shell pins the same
-emulator through the parent flake.
+A stored machine records a config archive version (8) and the emulator's
+machine identifiers (`marchid` 22); loading rejects any mismatch, and nothing
+converts a stored machine to another version (`skip_version_check` skips only
+the identifiers). A CM bump therefore invalidates every stored image, release
+tarball, and watchdog checkpoint: rebuild the canonical images and the watchdog
+test guest (the recipes reuse an image that exists), and start each new
+deployment's watchdog from a new state directory
+([upgrades](watchdog/operator-deployment.md#upgrades)). The kernel and guest
+tools are the ones the emulator release's `dependencies.lock` names, and move
+with it: kernels are
+[`cartesi/linux`](https://github.com/cartesi/linux/releases) releases named by
+kernel version, guest tools are `machine-guest-tools` releases;
+`scripts/verify-toolchain-pins.sh --upstream` checks the pairing. The
+development shell pins the same emulator through the parent flake.
 
 **A deployed application is pinned to its emulator version.** Its on-chain
 template hash is the root hash of a machine built with one emulator release,
@@ -30,7 +37,9 @@ to a new emulator release means a new application deployment.
 machine, so it moves when any input to the image moves, even when behavior does
 not:
 
-- the emulator release and its kernel (`toolchain-pins.env`);
+- the emulator release, even with every other input fixed (the machine
+  identifiers and the microarchitecture's state are part of the root hash, and
+  execution fixes change what runs), and its kernel (`toolchain-pins.env`);
 - the rootfs: the guest Dockerfile, `machine-guest-tools`, and `xgenext2fs`;
 - whether the cross toolchain has `rust-src`: with it, rustc embeds local
   standard-library paths in panic locations instead of the remapped
@@ -77,16 +86,29 @@ Any other host, including the watchdog, must match it exactly:
 | `RX_REJECTED` manual yield | restore the pre-input snapshot |
 | `TX_EXCEPTION`, halt, any other manual yield, or mcycle overflow | fixed point: the machine stays there forever, with no revert |
 
+The outcome is read in this order: halt, then manual yield, then an exhausted
+budget. A yield on the budget's last cycle is that yield, and the next input
+renews the budget; overflow means neither flag is set.
+
 - The host reads the root hash, snapshots, then sends the input together with
-  that root as the *revert root hash*. The emulator refuses an advance unless
-  the machine sits at an `RX_ACCEPTED` yield and the revert root hash equals the
-  current root, so a host cannot silently continue from a rejected state.
-- Each input gets an mcycle budget of 2^48 (`imcyclemax`). Exhausting it is a
-  fixed point, not a reject. At realistic speeds this takes days, so a stuck
-  guest shows up as a hung host long before the budget ends.
+  that root as the *revert root hash*. At an `RX_ACCEPTED` yield the emulator
+  refuses an advance without a revert root hash or with one that differs from
+  the current root, and at any state it refuses a revert root hash on any
+  other response. Every other undeliverable response is a silent no-op that
+  leaves the machine unchanged, like the logged and proven transition: no
+  pending yield, an advance at any yield other than `RX_ACCEPTED` (an
+  unreverted rejection included), or data larger than the 2 MiB RX buffer.
+  Only delivery clears `iflags.Y`, so a host checks the yield before sending
+  and `iflags.Y` after.
+- Each delivered advance sets the budget `imcyclemax` to the current mcycle
+  plus 2^48 − 1. Exhausting it with no halt or yield pending is a fixed point,
+  not a reject. At realistic speeds this takes days, so a stuck guest shows up
+  as a hung host long before the budget ends.
 - An inspect query is legal only at an `RX_ACCEPTED` yield and runs on a
   snapshot the host discards. Inspect execution is never part of canonical
-  history, and its single report is bounded by the 2 MiB CMIO TX buffer.
+  history, and its single report is bounded by the 2 MiB CMIO TX buffer. The
+  emulator itself delivers an inspect at any pending manual yield; the host
+  enforces `RX_ACCEPTED` (the CLI asserts it).
 
 A fixed point is permanent: once the canonical machine reaches one, no later
 input is ever processed for that application.
@@ -96,7 +118,9 @@ input is ever processed for that application.
 - **Loading** defaults to `SHARING_NONE`: every backing file is mapped
   privately and never modified, under a shared `flock`. `SHARING_ALL` maps the
   files shared and runs the machine in place on disk, under an exclusive
-  `flock`, so one directory cannot be open both ways at once.
+  `flock` on each writable file (read-only ranges keep a shared one), so one
+  directory cannot be open both ways at once. `SHARING_ALL` refuses a writable
+  range whose backing file has no write permission or more than one hard link.
 - **`store`** writes every range in full as sparse files, refuses an existing
   directory, and does **not** fsync. Durable publication uses `sync_stored`
   (fsyncs files, the directory, and its parent), then `rename_stored` (atomic,
@@ -104,16 +128,19 @@ input is ever processed for that application.
 - **`clone_stored`** reflinks writable files (`clonefile` on macOS APFS,
   `FICLONE` on Linux btrfs/XFS), hardlinks read-only ones, and falls back to a
   sparse copy when the filesystem cannot link (`ENOTSUP`, `EXDEV`, `EPERM`). It
-  always works; it is cheap only on copy-on-write filesystems.
+  always works; it is cheap only on copy-on-write filesystems. It hard-links
+  only files without write permission, so a clone still loads with
+  `SHARING_ALL`; a copy hard-linked by hand (`cp -l`) does not.
 - **Snapshots come in two families.** An in-place (`SHARING_ALL`) machine
   snapshots by closing, cloning its directory, and reopening; this is the CLI's
   `--revert-mode=stored` and Dave's sling node. The CLI's default
   `--revert-mode=fork` instead forks a JSON-RPC machine server process, which
-  refuses to fork a machine with shared ranges (both processes would see the
-  writes). We run the machine in-process and use the clone family only.
+  refuses to fork a machine with shared backing stores, its hash-tree files
+  included (both processes would see the writes). We run the machine
+  in-process and use the clone family only.
 
-Measured on APFS (Apple M5 Max) with a machine holding a 1 GiB NVRAM, 768 MiB
-of it non-zero:
+Measured with v0.21.0 on APFS (Apple M5 Max) with a machine holding a 1 GiB
+NVRAM, 768 MiB of it non-zero:
 
 | Operation | Cost |
 |---|---|
@@ -132,8 +159,8 @@ answering an inspect query:
 
 - **NVRAM** (`--nvram=label:<l>,...`) appears in the guest as `/dev/uioN`. It
   has no filesystem layer and no page cache: guest writes through `mmap` are
-  immediately in the machine state. It requires the paired kernel with UIO
-  (ctsi-2 and later).
+  immediately in the machine state. It requires a kernel with UIO
+  (`CONFIG_UIO`, `CONFIG_UIO_PDRV_GENIRQ`), which the pinned kernel has.
 - **Flash drives** appear as `/dev/pmemN`. Guest writes go through the page
   cache, so the application must flush (`fsync`, `msync(MS_SYNC)`, or
   `O_DIRECT`) before finishing each input; otherwise the drive holds a stale
@@ -151,11 +178,11 @@ answering an inspect query:
 
 ## The guest side
 
-- **The guest–host interface is unchanged from v0.20.** Yield reasons, CMIO
-  buffer addresses, and ioctl numbers are the same; only the names moved to
-  `HTIF_*`. The revert root hash and the per-input cycle budget are host-side.
-  libcmt 0.18 bundles its ioctl header, so the guest build needs no kernel
-  headers.
+- **The guest–host interface is the same from v0.20 through v0.22.** Yield
+  reasons, CMIO buffer addresses, and ioctl numbers match; only the names moved
+  to `HTIF_*`. The revert root hash and the per-input cycle budget are
+  host-side. libcmt 0.18 bundles its ioctl header, so the guest build needs no
+  kernel headers.
 - **Some guest tools are glibc builds.** The `nvram`/`flashdrive` label helpers,
   which the CLI's generated init script calls for every NVRAM and for flash
   drives it formats, mounts, or chowns, and `xhalt`, which `cartesi-init` calls
@@ -190,14 +217,24 @@ The CLI is a script, not a module: it parses the global `arg` and ends in
 `cartesi.util`, `cartesi.hash-tree`, `cartesi.jsonrpc`). When tests run the CLI
 as a reference:
 
-- `--cmio-advance-state` checks the outputs Merkle root from genesis by default;
-  resuming from a mid-history checkpoint needs `check_outputs_merkle_root:false`.
-- `--max-mcycle` reached mid-input exits 0 and stores the mid-input state.
+- `--cmio-advance-state` reads input files `input_file_index_begin` to
+  `input_file_index_end`−1 (the end defaults to the begin, so name both) and
+  rejects unknown keys. It checks the outputs Merkle root, starting from the
+  empty tree unless `last_output_proof` (or, with `resumable:true` and
+  `begin_epoch:false`, an `outputs_frontier` file) seeds it; a run resumed
+  from a mid-history checkpoint with neither needs
+  `check_outputs_merkle_root:false`.
+- `--max-mcycle` reached mid-input exits 0 and stores the mid-input state
+  (without `resumable`).
 - Exit codes do not distinguish outcomes (a halt with payload 0 exits 0); load
   the stored machine and read its state instead, cross-checked with
   `--final-hash`.
-- An inspect query is delivered even to a machine at an exception yield, and
-  its own outcome is not reported.
+- `--assert-rolling-template` runs after `--store`: it requires an
+  `RX_ACCEPTED` yield whose TX buffer holds the expected outputs Merkle root
+  (by default the empty tree's, which libcmt writes on its first accept) and
+  exits 2 otherwise, leaving the stored image in place.
+- `--cmio-inspect-state` asserts an `RX_ACCEPTED` yield before the query and
+  exits nonzero otherwise; the query's own accept or reject does not set the
+  exit code.
 - `--remote-spawn` leaves machine servers running unless `--remote-shutdown` is
-  also given. `--no-revert` cannot get past a rejected input: the emulator
-  refuses the next advance.
+  also given. `--no-revert` aborts the run at the first rejected input.
