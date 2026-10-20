@@ -49,6 +49,12 @@ retry: a failed tick's retry is the next scheduled one.
 
 ### Canonical execution
 
+External starting checkpoints used by `init` and `replay` pass full hash-tree
+verification before trust checks. Reading the cached root alone can miss a
+modified backing file whose hash sidecars are unchanged. This verifies storage
+integrity; a non-genesis checkpoint still requires an independently trusted
+canonical provenance.
+
 The watchdog drives the machine in-process through the `cartesi` Lua module,
 with the reference rollup host semantics the `cartesi-machine` CLI and Dave
 implement ([details](../cartesi-machine.md#rollup-host-semantics)). It clones

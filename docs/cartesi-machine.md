@@ -15,7 +15,8 @@ identifiers; loading rejects any mismatch. A CM bump therefore invalidates every
 stored image, release tarball, and watchdog checkpoint: rebuild the canonical
 images and re-`init` watchdog state directories. The kernel
 (`machine-linux-image`) and guest tools (`machine-guest-tools`) are paired with
-the emulator release and move with it. The development shell pins the same
+the emulator release and move with it. The kernel download must match the
+SHA-512 pinned in `toolchain-pins.env`; the release manifest records that pin. The development shell pins the same
 emulator through the parent flake.
 
 **A deployed application is pinned to its emulator version.** Its on-chain
