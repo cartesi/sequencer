@@ -1,8 +1,10 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- Watchdog tests against the real Cartesi Machine: the test guest drives every
---- rollup host outcome, and the reference `cartesi-machine` CLI is the oracle.
+--- Watchdog tests against the real Cartesi Machine: the test guest and sling's
+--- bare-metal seam machines drive the rollup host outcomes. The reference
+--- `cartesi-machine` CLI is the oracle, and the step's rule where the CLI aborts
+--- or departs from it.
 --- Run from the repo root with the canonical and test guest images built:
 ---   lua5.4 watchdog/tests/e2e.lua [name filter]
 
@@ -11,6 +13,7 @@ package.cpath = (os.getenv("CARTESI_WATCHDOG_LUA_DEPS") or ".deps/lua") .. "/?.s
 
 local abi = require("watchdog.abi")
 local bootstrap = require("watchdog.bootstrap")
+local cartesi = require("cartesi")
 local config = require("watchdog.config")
 local incident = require("watchdog.incident")
 local json = require("watchdog.json").new()
@@ -134,6 +137,96 @@ test("executor reports a halt with the guest's exit code, like the CLI", functio
     eq(statuses[2].kind, "halted")
     eq(statuses[2].exit_code, 7)
     eq(hex(root), hex(oracle(image, { "hello", "halt", "world!" })))
+end)
+
+-- ── Bare-metal seams ──────────────────────────────────────────────────────
+
+--- The seam guest of sling's `MachineStf` tests (dave@dbcca7d4): it clears
+--- fromhost, yields the tohost word in x19, then yields x20 each time it
+--- resumes. With imcyclemax = 3 the x19 yield lands on the budget's last cycle.
+local SEAM_PROGRAM = string.pack("<I4I4I4I4I4",
+    0x400082b7, -- lui t0, 0x40008 (HTIF base)
+    0x0002b423, -- sd zero, 8(t0) (fromhost)
+    0x0132b023, -- sd x19, 0(t0) (tohost)
+    0x0142b023, -- sd x20, 0(t0) (tohost)
+    0xffdff06f) -- j -4
+
+local RX_ACCEPTED = cartesi.HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED
+local RX_REJECTED = cartesi.HTIF_YIELD_MANUAL_REASON_RX_REJECTED
+local TX_EXCEPTION = cartesi.HTIF_YIELD_MANUAL_REASON_TX_EXCEPTION
+
+--- A manual yield's whole tohost word, declaring `length` bytes of data.
+local function manual_yield(reason, length)
+    return (cartesi.HTIF_DEV_YIELD << cartesi.HTIF_DEV_SHIFT)
+        | (cartesi.HTIF_YIELD_CMD_MANUAL << cartesi.HTIF_CMD_SHIFT)
+        | (reason << cartesi.HTIF_REASON_SHIFT)
+        | (length or 0)
+end
+
+--- A stored machine with 4 KiB of RAM and no image, created with
+--- `registers` and run from the start of RAM until `program` stops.
+local function bare_machine(registers, program)
+    local m = cartesi.new():create({ ram = { length = 4096 }, processor = { registers = registers } })
+    if program then
+        m:write_memory(cartesi.AR_RAM_START, program)
+        m:run(cartesi.MCYCLE_MAX)
+    end
+    local dir = support.tmpdir() .. "/machine"
+    m:store(dir)
+    m:destroy()
+    return dir
+end
+
+local function seam_machine(imcyclemax, x19, x20)
+    return bare_machine({ pc = cartesi.AR_RAM_START, imcyclemax = imcyclemax, x19 = x19, x20 = x20 },
+        SEAM_PROGRAM)
+end
+
+test("executor takes inputs after an acceptance on the budget's last cycle, like the CLI", function()
+    -- An accept declares its 32-byte outputs root, which the CLI reads.
+    local accepted = manual_yield(RX_ACCEPTED, cartesi.HASH_SIZE)
+    local dir = seam_machine(3, accepted, accepted)
+    local work = support.tmpdir()
+    local executor = machine.open(dir, work .. "/working")
+    local mcycles = {}
+    for i = 1, 2 do
+        eq(executor:advance(input(i - 1, "seam")).kind, "accepted")
+        mcycles[i] = executor.m:read_reg("mcycle")
+    end
+    executor:close()
+    -- Delivery renewed the budget: the first input ran the x20 yield, the
+    -- second jumped back and yielded again.
+    eq(table.concat(mcycles, " "), "4 6")
+    eq(hex(machine.root_hash(work .. "/working")), hex(oracle(dir, { "seam", "seam" })))
+end)
+
+for _, case in ipairs({
+    { stop = "whose budget runs out before its yield", imcyclemax = 2, x19 = RX_ACCEPTED,
+        refusal = "is at mcycle_overflow" },
+    { stop = "at an exception on its budget's last cycle", imcyclemax = 3, x19 = TX_EXCEPTION,
+        refusal = "is at exception" },
+    { stop = "at an unexpected yield on its budget's last cycle", imcyclemax = 3, x19 = 0x7f,
+        refusal = "is at unexpected yield" },
+    { stop = "at a rejection on its budget's last cycle", imcyclemax = 3, x19 = RX_REJECTED,
+        refusal = "is at rejected" },
+}) do
+    test("open refuses a seam machine " .. case.stop, function()
+        local dir = seam_machine(case.imcyclemax, manual_yield(case.x19), manual_yield(RX_ACCEPTED))
+        raises("operator", case.refusal, function()
+            machine.open(dir, support.tmpdir() .. "/working")
+        end)
+    end)
+end
+
+test("executor fails loud on an input the machine does not take", function()
+    local dir = seam_machine(cartesi.MCYCLE_MAX, manual_yield(RX_ACCEPTED), manual_yield(TX_EXCEPTION))
+    local executor = machine.open(dir, support.tmpdir() .. "/working")
+    eq(executor:advance(input(0, "seam")).kind, "exception")
+    -- An advance at an exception is the emulator's silent no-op.
+    raises("internal", "did not take", function()
+        executor:advance(input(1, "seam"))
+    end)
+    executor:close()
 end)
 
 -- ── State sources ─────────────────────────────────────────────────────────
