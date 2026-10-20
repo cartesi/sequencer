@@ -36,6 +36,8 @@ pub enum TestsiMachineError {
     InputRejected,
     #[error("machine is not awaiting an input (expected a manual rx_accepted yield): {state}")]
     NotAwaitingInput { state: String },
+    #[error("machine did not take the {len}-byte input (the cmio rx buffer holds 2 MiB)")]
+    InputNotDelivered { len: usize },
     #[error("machine execution timed out after {elapsed:?} (timeout {timeout:?})")]
     ExecutionTimeout {
         elapsed: Duration,
@@ -103,7 +105,7 @@ pub struct Machine {
 
 impl Machine {
     pub fn try_new(builder: MachineBuilder) -> Result<Self> {
-        // v0.21 replaced `htif.no_console_putchar` with a console output
+        // `no_console_putchar` maps to the runtime console's output
         // destination; the default writes guest console output to stdout.
         let runtime_config = if builder.no_console_putchar {
             RuntimeConfig::quiet_console()
@@ -136,10 +138,10 @@ impl Machine {
             self.builder.dapp_address,
         );
 
-        // v0.21 accepts an advance-state response only at a manual
-        // rx_accepted yield, and requires the root hash of that pre-input
-        // state (the state a rejected input reverts to). testsi never
-        // reverts: a rejection is reported as `InputRejected`.
+        // An advance-state response is delivered only at a manual
+        // rx_accepted yield, with the root hash of that pre-input state (the
+        // state a rejected input reverts to). testsi never reverts: a
+        // rejection is reported as `InputRejected`.
         expect_awaiting_input(&mut self.cartesi_machine)?;
         let revert_root_hash = self.cartesi_machine.root_hash()?;
         self.cartesi_machine.send_cmio_response(
@@ -147,6 +149,13 @@ impl Machine {
             &encoded_input,
             Some(&revert_root_hash),
         )?;
+        // An undeliverable response is a silent no-op, and only delivery
+        // clears iflags.Y (docs/cartesi-machine.md#rollup-host-semantics).
+        if self.cartesi_machine.iflags_y()? {
+            return Err(TestsiMachineError::InputNotDelivered {
+                len: encoded_input.len(),
+            });
+        }
         advance_input_index(&mut self.builder.input_index);
 
         let mut outputs = OutputsForInput::default();
@@ -268,8 +277,8 @@ fn handle_yield(
     })
 }
 
-/// Fails unless the machine sits at the manual rx_accepted yield that v0.21
-/// requires before an advance-state response.
+/// Fails unless the machine sits at the manual rx_accepted yield, the only
+/// state that takes an advance-state response.
 fn expect_awaiting_input(cartesi_machine: &mut cartesi_machine::machine::Machine) -> Result<()> {
     if !cartesi_machine.iflags_y()? {
         let state = if cartesi_machine.iflags_h()? {
@@ -288,8 +297,8 @@ fn expect_awaiting_input(cartesi_machine: &mut cartesi_machine::machine::Machine
 }
 
 fn sanity_check_cm_config(config: &machine::MachineConfig) {
-    // v0.21 keeps the HTIF feature switches as bitmasks in the iyield and
-    // iconsole CSRs, indexed by HTIF command.
+    // The HTIF feature switches are bitmasks in the iyield and iconsole
+    // CSRs, indexed by HTIF command.
     let htif = &config.processor.registers.htif;
     if htif.iyield & (1 << commands::YIELD_MANUAL) == 0 {
         eprintln!("warning: machine config has manual yields disabled (htif.iyield)");
