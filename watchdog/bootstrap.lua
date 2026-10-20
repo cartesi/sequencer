@@ -59,6 +59,21 @@ function bootstrap.run(cfg, deps)
     local input_count = canonical.trusted_start(machine, l1, cfg.bootstrap_dir, cfg.bootstrap_block).input_count
 
     machine.clone(cfg.bootstrap_dir, work .. "/bootstrap")
+    -- Open the clone as the first tick will open the head, so a machine the
+    -- emulator cannot run in place fails init instead of every comparing tick.
+    local ok, err = pcall(function()
+        machine.open(work .. "/bootstrap", work .. "/probe"):close()
+    end)
+    if not ok then
+        local class, message = errors.classify(err)
+        if class ~= "operator" then
+            error(err, 0)
+        end
+        errors.operator("the tick cannot run %s in place: %s; make its files writable (chmod -R u+w %s, "
+            .. "or on a read-only filesystem a copy that CARTESI_WATCHDOG_CM_SNAPSHOT_DIR names) and re-run init",
+            cfg.bootstrap_dir, message, cfg.bootstrap_dir)
+    end
+    store:remove("work", "probe")
     store:remove("checkpoints")
     local head = store:checkpoint_dir(cfg.bootstrap_block, input_count)
     machine.publish(work .. "/bootstrap", head)

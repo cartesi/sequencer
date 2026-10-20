@@ -788,6 +788,15 @@ test("bootstrap requires the template when no input precedes the block", functio
     eq(store:exists("config.json"), false)
 end)
 
+test("bootstrap refuses a machine the tick cannot run in place", function()
+    local store = store_mod.open(support.tmpdir(), json)
+    raises("operator", "Permission denied; make its files writable (chmod -R u+w ", function()
+        bootstrap_with(store, {}, {}, { open_error = "cannot load stored machine: Permission denied" })
+    end)
+    eq(store:exists("config.json"), false)
+    eq(#store:checkpoints(), 0)
+end)
+
 test("bootstrap validates an existing config like tick would", function()
     local store = store_mod.open(support.tmpdir(), json)
     bootstrap_with(store, {})

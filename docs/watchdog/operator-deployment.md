@@ -159,7 +159,9 @@ except those of host read-only ranges, such as the PMAs
 (`0000000000010000-1000.bin`), which the emulator maps read-only. The working
 machine runs in place, and the emulator refuses to map a file without write
 permission for writing
-([storage](../cartesi-machine.md#storage-sharing-and-snapshots)).
+([storage](../cartesi-machine.md#storage-sharing-and-snapshots)), so `init`
+opens a clone of the bootstrap machine as the tick will and refuses an image
+whose files lack it.
 
 ### Checkpoint disk usage and backups
 
@@ -418,7 +420,8 @@ and failure class, as in
 | `<dir> is not initialized; run init` | `tick` or `replay` on an empty state directory: a missing volume or a changed `CARTESI_WATCHDOG_STATE_DIR` |
 | `<dir>/config.json is not a version 2 watchdog config; wipe the state directory and re-run init` | See [upgrades](#upgrades) |
 | `cannot load stored machine <dir>: expected "archive_version" 8 (got 7)`, or the `expected …` text alone with class `internal` (from a clone in `tick` or `replay`) | A machine stored by another Cartesi Machine version; see [upgrades](#upgrades) |
-| `cannot load stored machine …/work/working: unable to open backing file '<f>': Permission denied` (as root: `backing file '<f>' is read-only and cannot be shared for writing`) | The bootstrap machine's files lost their write permission; see [filesystem](#filesystem) |
+| `the tick cannot run <dir> in place: cannot load stored machine …/work/probe: unable to open backing file '<f>': Permission denied …` from `init` (as root: `backing file '<f>' is read-only and cannot be shared for writing`) | The bootstrap machine's files lack write permission; run `chmod -R u+w <dir>`, or on a read-only filesystem copy it, make the copy writable, and point `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` at it; then re-run `init` (see [filesystem](#filesystem)) |
+| `cannot load stored machine …/work/working: …` with the same causes, from `tick` | The head checkpoint's files lack write permission (lost after `init`, or kept from a bootstrap machine an older release initialized); run `chmod -R u+w` on the head checkpoint, or wipe the state directory and re-run `init` |
 | `cannot load stored machine <dir>: …` with another message | The emulator's message names the file or field it could not load |
 | `<dir> was initialized for another deployment or state source; wipe it to re-initialize` | The `init` environment names another chain, application, or state source than the directory holds |
 | `no input precedes block <N>, so the machine at <dir> must be the application's template, but its root hash differs from the on-chain template hash` | The image is not this application's template: another chain's image, another build, or another application |

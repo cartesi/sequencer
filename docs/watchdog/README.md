@@ -120,12 +120,14 @@ schedulers must also prevent overlapping ticks (systemd, or Kubernetes
 `concurrencyPolicy: Forbid`).
 
 `init` checks the bootstrap machine: it must wait for an input and yield the
-configured state source, and it must be a trusted start, which `replay`
-requires of its `--from` machine too. Its block must be safe on the RPC; its
-input count comes from `getNumberOfInputs` at that block, which needs an RPC
-with state there (an archive node for old blocks); and when no input precedes
-the block, the machine must be the application's template (its root hash
-equals the on-chain `getTemplateHash()`).
+configured state source, the tick must be able to run it in place (its files
+writable, see [filesystem](operator-deployment.md#filesystem)), and it must be
+a trusted start, which `replay` requires of its `--from` machine too. Its
+block must be safe on the RPC; its input count comes from `getNumberOfInputs`
+at that block, which needs an RPC with state there (an archive node for old
+blocks); and when no input precedes the block, the machine must be the
+application's template (its root hash equals the on-chain
+`getTemplateHash()`).
 
 Exit 1 covers three failure classes, which the log line and `last_tick.json`
 name: `transient` (the L1 RPC or the sequencer's HTTP API; the next tick may

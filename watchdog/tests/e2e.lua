@@ -412,6 +412,35 @@ test("replay re-derives the digest a tick agreed on", function()
     eq(result.input_count, 3)
 end)
 
+test("init refuses a bootstrap machine the tick cannot run in place", function()
+    local image = support.tmpdir() .. "/image"
+    machine.clone(require_image(GUEST_IMAGE), image)
+    -- Only the RAM file: the clone hard-links the image's read-only PMAs file,
+    -- so a recursive chmod would change the shared test guest image.
+    local ram = image .. "/0000000080000000-*.bin"
+    assert(os.execute("chmod a-w " .. ram))
+    local rpc = support.fake_rpc({}, { template_hash = "0x" .. hex(machine.root_hash(image)) })
+    local store = store_mod.open(support.tmpdir(), json)
+    local ok, err = pcall(bootstrap.run, {
+        state_source = { kind = "range", label = "state" },
+        input_box_address = support.INPUT_BOX,
+        app_address = support.APP,
+        bootstrap_dir = image,
+        bootstrap_block = 0,
+    }, { store = store, machine = machine, l1 = l1_mod.new(rpc, { input_box_address = support.INPUT_BOX,
+        app_address = support.APP, chain_id = support.CHAIN_ID }) })
+    assert(os.execute("chmod u+w " .. ram))
+    eq(ok, false)
+    local message = raises("operator", "chmod -R u+w " .. image, function()
+        error(err, 0)
+    end)
+    -- Root bypasses file modes, so the emulator refuses the mode itself.
+    assert(message:find("Permission denied", 1, true) or message:find("cannot be shared for writing", 1, true),
+        message)
+    eq(store:exists("config.json"), false)
+    eq(#store:checkpoints(), 0)
+end)
+
 test("init refuses a bootstrap machine that is not the template", function()
     local image = require_image(GUEST_IMAGE)
     local rpc = support.fake_rpc({}, { template_hash = "0x" .. string.rep("00", 32) })
