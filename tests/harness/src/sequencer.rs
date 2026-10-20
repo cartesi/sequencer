@@ -59,6 +59,7 @@ pub struct ManagedSequencerConfig {
     pub faketime: bool,
     /// Fixed fee-oracle exponent pinned by the `setup` phase for Anvil/devnet.
     pub fee_oracle_fixed_log_gas_price: Option<u16>,
+    pub guardian: bool,
 }
 
 /// Snapshot of the `batches` table. Returned by
@@ -190,6 +191,7 @@ pub fn default_devnet_sequencer_config(log_prefix: impl Into<String>) -> Managed
         logs_dir: PathBuf::from(DEFAULT_TEST_LOGS_DIR),
         faketime: true,
         fee_oracle_fixed_log_gas_price: None,
+        guardian: false,
     }
 }
 
@@ -224,7 +226,12 @@ impl ManagedSequencer {
             .as_ref()
             .map(paths::resolve_from_workspace);
         let log_prefix = config.log_prefix;
-        let rollups = DevnetRollupsStack::spawn(log_prefix.as_str(), logs_dir.as_path()).await?;
+        let rollups = DevnetRollupsStack::spawn_with_guardian(
+            log_prefix.as_str(),
+            logs_dir.as_path(),
+            config.guardian,
+        )
+        .await?;
 
         fs::create_dir_all(logs_dir.as_path())?;
         let data_dir = TempDir::new()
@@ -861,6 +868,18 @@ impl ManagedSequencer {
         self.endpoint.as_str()
     }
 
+    pub async fn health_status(&self) -> HarnessResult<Option<u16>> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()?;
+        Ok(client
+            .get(format!("{}/healthz", self.endpoint()))
+            .send()
+            .await
+            .ok()
+            .map(|response| response.status().as_u16()))
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
     }
@@ -891,6 +910,14 @@ impl ManagedSequencer {
 
     pub fn app_address(&self) -> Address {
         self.rollups.app_address()
+    }
+
+    pub async fn foreclose(&self) -> HarnessResult<()> {
+        self.rollups.foreclose().await
+    }
+
+    pub async fn submitter_nonce(&self) -> HarnessResult<u64> {
+        self.rollups.submitter_nonce().await
     }
 
     pub fn input_box_address(&self) -> Address {

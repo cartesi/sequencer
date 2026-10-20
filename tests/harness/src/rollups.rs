@@ -12,6 +12,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{BlockNumberOrTag, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_sol_types::SolValue;
 use app_core::application::{WalletConfig, default_private_keys};
 use cartesi_rollups_contracts::application_factory::ApplicationFactory::{self, WithdrawalConfig};
 use tokio::process::{Child, Command};
@@ -41,12 +42,21 @@ pub struct DevnetRollupsStack {
 
 impl DevnetRollupsStack {
     pub async fn spawn(log_prefix: &str, logs_dir: &Path) -> HarnessResult<Self> {
+        Self::spawn_with_guardian(log_prefix, logs_dir, false).await
+    }
+
+    pub async fn spawn_with_guardian(
+        log_prefix: &str,
+        logs_dir: &Path,
+        guardian: bool,
+    ) -> HarnessResult<Self> {
         let anvil = ManagedAnvil::spawn(log_prefix, logs_dir).await?;
         let mock_erc20_address = deploy_devnet_mock_erc20(anvil.endpoint.as_str()).await?;
         let app_address = deploy_devnet_application(
             anvil.endpoint.as_str(),
             anvil.application_factory_address,
             anvil.input_box_address,
+            guardian,
         )
         .await?;
 
@@ -124,6 +134,28 @@ impl DevnetRollupsStack {
     /// mempool eviction or gateway packet loss.
     pub async fn drop_all_pending_txs(&self) -> HarnessResult<()> {
         self.anvil.drop_all_pending_txs().await
+    }
+
+    pub async fn foreclose(&self) -> HarnessResult<()> {
+        let signer: PrivateKeySigner = default_private_keys()[3].parse()?;
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(self.l1_endpoint())
+            .await?;
+        let app =
+            cartesi_rollups_contracts::i_application::IApplication::new(self.app_address, provider);
+        let receipt = app.foreclose().send().await?.get_receipt().await?;
+        if !receipt.status() {
+            return Err(io_other("guardian foreclosure reverted").into());
+        }
+        Ok(())
+    }
+
+    pub async fn submitter_nonce(&self) -> HarnessResult<u64> {
+        let provider = ProviderBuilder::new().connect(self.l1_endpoint()).await?;
+        Ok(provider
+            .get_transaction_count(WalletConfig::devnet().sequencer_address)
+            .await?)
     }
 
     pub async fn shutdown(self) -> HarnessResult<()> {
@@ -326,7 +358,10 @@ fn read_deployment_address(path: &Path, contract_name: &str) -> HarnessResult<Ad
 }
 
 fn load_mock_erc20_init_code() -> HarnessResult<Bytes> {
-    let artifact_path = paths::mock_erc20_artifact_path();
+    load_init_code(paths::mock_erc20_artifact_path())
+}
+
+fn load_init_code(artifact_path: PathBuf) -> HarnessResult<Bytes> {
     ensure_exists(
         artifact_path.as_path(),
         format!(
@@ -491,6 +526,7 @@ async fn deploy_devnet_application(
     endpoint: &str,
     application_factory_address: Address,
     input_box_address: Address,
+    guardian: bool,
 ) -> HarnessResult<Address> {
     let private_key = default_private_keys()
         .first()
@@ -509,20 +545,62 @@ async fn deploy_devnet_application(
             ))
         })?;
 
+    let validator = if guardian {
+        let code = load_init_code(paths::resolve_from_workspace(
+            "tests/contracts/out/CheckpointValidator.sol/CheckpointValidator.json",
+        ))?;
+        let receipt = provider
+            .send_transaction(TransactionRequest::default().with_deploy_code(code))
+            .await?
+            .get_receipt()
+            .await?;
+        if !receipt.status() {
+            return Err(io_other("checkpoint validator deployment reverted").into());
+        }
+        receipt
+            .contract_address
+            .ok_or_else(|| io_other("missing checkpoint validator address"))?
+    } else {
+        Address::ZERO
+    };
     let factory = ApplicationFactory::new(application_factory_address, &provider);
     let template_hash = load_template_hash(paths::devnet_machine_image_path().as_path())?;
-    // Withdrawals disabled: a zero guardian can never `foreclose()`, so the
-    // InputBox's v3 `notForeclosed` gate on `addInput` stays permanently open,
-    // and no withdrawal output builder is needed for the placeholder wallet.
+    // Normal scenarios cannot foreclose; foreclosure scenarios use a
+    // dedicated guardian account and the reference wallet withdrawal builder.
+    let withdrawal_builder = if guardian {
+        let mut code = load_init_code(paths::resolve_from_workspace(
+            "tests/contracts/out/WalletWithdrawalOutputBuilder.sol/WalletWithdrawalOutputBuilder.json",
+        ))?.to_vec();
+        code.extend((WalletConfig::devnet().supported_erc20_token,).abi_encode());
+        let receipt = provider
+            .send_transaction(TransactionRequest::default().with_deploy_code(Bytes::from(code)))
+            .await?
+            .get_receipt()
+            .await?;
+        if !receipt.status() {
+            return Err(io_other("wallet withdrawal builder deployment reverted").into());
+        }
+        receipt
+            .contract_address
+            .ok_or_else(|| io_other("missing withdrawal builder address"))?
+    } else {
+        Address::ZERO
+    };
     let withdrawal_config = WithdrawalConfig {
-        guardian: Address::ZERO,
-        log2LeavesPerAccount: 0,
-        log2MaxNumOfAccounts: 0,
-        accountsDriveStartIndex: 0,
-        withdrawalOutputBuilder: Address::ZERO,
+        guardian: if guardian {
+            default_private_keys()[3]
+                .parse::<PrivateKeySigner>()?
+                .address()
+        } else {
+            Address::ZERO
+        },
+        log2LeavesPerAccount: 1,
+        log2MaxNumOfAccounts: 20,
+        accountsDriveStartIndex: 0x0090_0000_0000_0000 >> 26,
+        withdrawalOutputBuilder: withdrawal_builder,
     };
     let create_application = factory.newApplication_0(
-        Address::ZERO,
+        validator,
         app_owner,
         template_hash,
         input_box_address,

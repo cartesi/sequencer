@@ -21,11 +21,21 @@ use trolley::{Rollup, RollupRequest};
 pub use sequencer_core::scheduler::{STATE_INSPECT_QUERY, SchedulerConfig};
 
 pub fn run_scheduler_forever<R: Rollup, A: Application + CanonicalState>(
-    mut rollup: R,
+    rollup: R,
     app: A,
     scheduler_config: SchedulerConfig,
 ) -> ! {
+    run_scheduler_observed(rollup, app, scheduler_config, |_| Ok(()))
+}
+
+pub(crate) fn run_scheduler_observed<R: Rollup, A: Application + CanonicalState>(
+    mut rollup: R,
+    app: A,
+    scheduler_config: SchedulerConfig,
+    mut publish: impl FnMut(&Scheduler<A>) -> Result<(), sequencer_core::application::AppError>,
+) -> ! {
     let mut scheduler = Scheduler::new(app, scheduler_config);
+    publish(&scheduler).expect("publish genesis exit accounts");
 
     loop {
         match rollup.next_input() {
@@ -44,6 +54,7 @@ pub fn run_scheduler_forever<R: Rollup, A: Application + CanonicalState>(
                 let result = scheduler
                     .process_input(input)
                     .unwrap_or_else(|err| panic!("canonical application execution failed: {err}"));
+                publish(&scheduler).expect("publish exit accounts");
                 for output in &result.outputs {
                     emit_app_output(&mut rollup, output)
                         .unwrap_or_else(|err| panic!("scheduler failed to emit app output: {err}"));

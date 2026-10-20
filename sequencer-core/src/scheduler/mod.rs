@@ -145,6 +145,17 @@ impl<A: Application> Scheduler<A> {
         Self::resume_at(app, config, 0)
     }
 
+    pub fn application(&self) -> &A {
+        &self.app
+    }
+
+    /// Pending inputs remain part of canonical custody before app execution.
+    pub fn pending_direct_payloads(&self) -> impl Iterator<Item = (Address, &[u8])> {
+        self.direct_q
+            .iter()
+            .map(|input| (input.sender, input.payload.as_slice()))
+    }
+
     /// Number of directs still queued in the fridge. The recovery fold asserts
     /// this is zero after draining at the stop block `C`: any leftover direct
     /// means an input arrived with `inclusion_block > C` (a caller contract

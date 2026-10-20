@@ -53,6 +53,13 @@ Any other host, including the watchdog, must match it exactly:
 A fixed point is permanent: once the canonical machine reaches one, no later
 input is ever processed for that application.
 
+## Merkle proof geometry
+
+In v0.21, `get_proof` returns `sibling_hashes` from leaf to root, matching the
+rollups-contracts proof arrays. Account paths stop at the accounts-drive root;
+drive paths continue to the machine's 64-bit root. The machine uses 32-byte
+leaves. Keep the proof exporter pinned to these rules when changing versions.
+
 ## Storage, sharing, and snapshots
 
 - **Loading** defaults to `SHARING_NONE`: every backing file is mapped

@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -122,6 +122,37 @@ impl WalletApp {
             nonces,
             execution_progress,
         })
+    }
+
+    /// Exit entitlement includes deposits finalized before their scheduled execution.
+    pub fn exit_accounts<'a>(
+        &self,
+        pending: impl Iterator<Item = (Address, &'a [u8])>,
+    ) -> Result<Vec<(Address, U256)>, AppError> {
+        let mut balances: BTreeMap<_, _> = self
+            .balances
+            .iter()
+            .filter(|(_, balance)| !balance.is_zero())
+            .map(|(owner, balance)| (*owner, *balance))
+            .collect();
+        for (sender, payload) in pending {
+            if sender != self.config.erc20_portal_address {
+                continue;
+            }
+            if let Ok(deposit) = Erc20Deposit::decode(payload)
+                && deposit.token == self.config.supported_erc20_token
+                && !deposit.value.is_zero()
+            {
+                let balance = balances.entry(deposit.sender).or_default();
+                *balance =
+                    balance
+                        .checked_add(deposit.value)
+                        .ok_or_else(|| AppError::Internal {
+                            reason: "exit balance overflow".into(),
+                        })?;
+            }
+        }
+        Ok(balances.into_iter().collect())
     }
 
     // Accessors for the canonical snapshot encoder (`crate::wallet_snapshot`).

@@ -56,7 +56,9 @@ Before *anything* else, drain every fridge direct that has gone **overdue**:
 ([`force_execute_overdue`](../../sequencer-core/src/scheduler/mod.rs)). This is
 the censorship-resistance guarantee: a direct cannot be held in the fridge
 forever by a sequencer that freezes `safe_block` or stops submitting batches —
-once it ages out, it executes regardless of any frame. It runs on every input
+once it ages out, it executes on the next input regardless of any frame. The
+backstop requires a later L1 input; wall-clock time alone does not execute it.
+It runs on every input
 tick (even a malformed batch advances `current_block` and can trip the
 backstop). Drained directs execute in FIFO (ascending `inclusion_block`) order.
 

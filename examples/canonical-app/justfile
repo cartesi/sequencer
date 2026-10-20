@@ -81,6 +81,8 @@ build-machine-image: clean-machine-image build-rootfs-devnet
       --ram-length=128Mi \
       --ram-image={{linux_kernel}} \
       --flash-drive=label:root,data_filename:{{rootfs_ext2}} \
+      --flash-drive=label:accounts,start:0x90000000000000,length:64Mi,mke2fs:false,mount:false \
+      --append-init="busybox chown dapp:dapp /dev/pmem1" \
       --append-init=WORKDIR="/dapp" \
       --append-entrypoint="/dapp/dapp" \
       --assert-rolling-template --final-hash \
@@ -93,6 +95,8 @@ build-machine-image-sepolia: clean-machine-image-sepolia build-rootfs-sepolia
       --ram-length=128Mi \
       --ram-image={{linux_kernel}} \
       --flash-drive=label:root,data_filename:{{rootfs_ext2}} \
+      --flash-drive=label:accounts,start:0x90000000000000,length:64Mi,mke2fs:false,mount:false \
+      --append-init="busybox chown dapp:dapp /dev/pmem1" \
       --append-init=WORKDIR="/dapp" \
       --append-entrypoint="/dapp/dapp" \
       --assert-rolling-template --final-hash \

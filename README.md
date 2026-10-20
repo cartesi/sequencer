@@ -36,13 +36,13 @@ signatures, pending batches, and baseline databases are incompatible.
 
 ## Trust Model
 
-The sequencer is a **centralized, single-writer** system. It cannot steal funds or forge invalid state — the rollup validates everything independently, and the proof system later enforces it. But the sequencer can:
+The sequencer is a **centralized, single-writer** system. The rollup independently validates canonical execution, but fund availability after foreclosure requires an [application-specific exit](docs/protocol/application-contract.md#8-foreclosure-and-emergency-exits), demonstrated by the reference wallet and required of each production app. The sequencer can:
 
 - **Censor** — refuse to include a user's operations.
 - **Go offline** — stop providing soft confirmations.
 - **Diverge** — if batches fail to land on L1 in time, soft confirmations that were issued become invalid.
 
-**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it.
+**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it while later L1 inputs continue to drive the scheduler.
 
 During normal operation the sequencer advances logical frame time after five
 newly-safe blocks have accumulated. That clock tick drains every covered direct

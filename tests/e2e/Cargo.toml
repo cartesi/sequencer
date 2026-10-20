@@ -14,6 +14,8 @@ name = "devnet-stack"
 path = "src/bin/devnet_stack.rs"
 
 [dependencies]
+alloy = { workspace = true, features = ["contract", "network", "reqwest", "rpc-types", "signer-local"] }
+cartesi-rollups-contracts = { workspace = true }
 rollups-harness = { path = "../harness" }
 tracing-subscriber = { workspace = true }
 app-core = { path = "../../examples/app-core" }

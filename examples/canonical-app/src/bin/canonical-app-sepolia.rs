@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use app_core::application::{SEPOLIA_SEQUENCER_ADDRESS, WalletApp, WalletConfig};
-use canonical_app::{SchedulerConfig, run_scheduler_forever};
+use canonical_app::{SchedulerConfig, run_wallet_scheduler_forever};
 use trolley::cmt::RollupCmt;
 
 fn main() {
     let rollup = RollupCmt::try_new().expect("failed to initialize rollup");
     let app = WalletApp::new(WalletConfig::sepolia());
-    run_scheduler_forever(rollup, app, SchedulerConfig::new(SEPOLIA_SEQUENCER_ADDRESS));
+    run_wallet_scheduler_forever(rollup, app, SchedulerConfig::new(SEPOLIA_SEQUENCER_ADDRESS));
 }

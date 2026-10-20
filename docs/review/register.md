@@ -122,6 +122,15 @@ and `classify_input_reader` in [startup recovery](../../sequencer/src/recovery/m
 Next: classify failures by the setup phase and pin the external exit code;
 preserve genuinely transient provider failures.
 
+### Production custody exit conformance
+
+The reference wallet's [exit integration](../protocol/application-contract.md#8-foreclosure-and-emergency-exits)
+is an example, not verification of the production DeFi engine. Before production
+custody, pin that engine's drive/builder layout and independently demonstrate
+credited-balance and finalized-pending-deposit exits against its deployed
+contracts, including its supported capacity. The reference scenario uses real
+canonical execution and Application proofs with a finalization fixture; it does
+not validate Dave's dispute/epoch finalization pipeline.
 
 ## Bounded investigations and cleanup
 

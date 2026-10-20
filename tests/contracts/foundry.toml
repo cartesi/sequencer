@@ -4,3 +4,6 @@ out = "out"
 libs = []
 cache_path = "cache"
 solc_version = "0.8.28"
+
+allow_paths = ["../.."]
+remappings = ["wallet/=../../examples/app-core/contracts/"]

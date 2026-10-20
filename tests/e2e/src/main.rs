@@ -22,6 +22,10 @@ fn main() {
                     default_devnet_sequencer_config(log_prefix)
                 };
                 let scenario_name = name.strip_prefix("c_host_").unwrap_or(name);
+                if scenario_name.starts_with("guardian_") {
+                    spawn_config.guardian = true;
+                    spawn_config.faketime = false;
+                }
                 if scenario_name == "watchdog_genesis_compare_test"
                     || scenario_name == "deposit_transfer_withdrawal_test"
                     || scenario_name == "watchdog_divergence_drill_test"

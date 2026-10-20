@@ -173,6 +173,10 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
             "cold_replica_snapshot_backlog_live_recovery_test",
             |runtime| Box::pin(crate::cold_replica::run(runtime)),
         ),
+        (
+            "guardian_exit_recovers_balances_and_queued_deposits_test",
+            |runtime| Box::pin(crate::wallet_exit::run(runtime)),
+        ),
         ("deposit_transfer_withdrawal_test", |runtime| {
             Box::pin(run_deposit_transfer_withdrawal_test(runtime))
         }),
@@ -460,7 +464,7 @@ async fn prepare_non_genesis_watchdog_state(runtime: &mut ManagedSequencer) -> S
 /// time, so the submitter and promoter get to run without synthesizing a future
 /// L1 clock; returns the new inclusion block, or times out loudly. Robust
 /// against CI jitter — it waits exactly as long as promotion takes, no more.
-async fn mine_until_finalized_advances(
+pub(crate) async fn mine_until_finalized_advances(
     runtime: &ManagedSequencer,
     floor: u64,
 ) -> ScenarioResult<u64> {
@@ -966,7 +970,7 @@ async fn run_unsupported_token_deposit_noop_test(
     Ok(())
 }
 
-async fn apply_reconciled_supported_deposit(
+pub(crate) async fn apply_reconciled_supported_deposit(
     runtime: &ManagedSequencer,
     ws: &mut WsClient,
     replay: &mut ReplayWalletApp,
