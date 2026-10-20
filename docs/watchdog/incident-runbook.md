@@ -100,7 +100,10 @@ Use the application's template machine with `--from-block 0` (`replay` checks
 it against the on-chain template hash), or an archived checkpoint whose block
 you trust. `replay` needs an RPC with state at `A` (an archive node for old
 blocks), absolute paths, and an `--out` that does not exist; it never writes
-the state directory.
+the state directory. Run it with a watchdog release on the deployment's
+Cartesi Machine version: templates, checkpoints and `incident/canonical` load
+only in the version that stored them
+([upgrades](operator-deployment.md#upgrades)).
 
 | `replay`'s `sha256` equals | Conclusion |
 |---|---|

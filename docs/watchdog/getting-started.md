@@ -38,8 +38,11 @@ sources into `.deps/lua`.
 image (`watchdog/test-guest/out/test-machine-image`), which it builds on first
 use; the [test guest README](../../watchdog/test-guest/README.md) explains the
 guest and how to rebuild it. `just test-watchdog-compare-harness` and
-`just test-rollups-e2e` build missing canonical images themselves but reuse
-existing ones, so rebuild an image after changing the wallet or its guest. The
+`just test-rollups-e2e` build missing canonical images themselves. Every recipe
+reuses an image that exists, so remove `examples/canonical-app/out` or
+`watchdog/test-guest/out` after changing the wallet, its guest, or a Cartesi
+Machine or kernel pin in `toolchain-pins.env`: an image stored by another
+emulator version fails to load with `expected "archive_version" 8 (got 7)`. The
 README's [Tests](README.md#tests) table says what each recipe exercises.
 
 ## Path A: the automated harness

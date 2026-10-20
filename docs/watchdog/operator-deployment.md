@@ -153,7 +153,13 @@ a copy-on-write filesystem a clone costs metadata; elsewhere it is a full
 sparse copy of the machine, which makes multi-GiB states slow
 ([Cartesi Machine storage](../cartesi-machine.md#storage-sharing-and-snapshots)).
 Keep the bootstrap machine on the same filesystem, so the clone `init` makes
-of it is cheap as well.
+of it is cheap as well. Leave its file permissions as `cartesi-machine
+--store` and the release tarball set them: every file writable by its owner
+except those of host read-only ranges, such as the PMAs
+(`0000000000010000-1000.bin`), which the emulator maps read-only. The working
+machine runs in place, and the emulator refuses to map a file without write
+permission for writing
+([storage](../cartesi-machine.md#storage-sharing-and-snapshots)).
 
 ### Checkpoint disk usage and backups
 
@@ -303,7 +309,14 @@ was built with ([why](../cartesi-machine.md#versions-are-all-or-nothing)), and
 so is its watchdog: run a watchdog release whose `cartesi_machine_version`
 (printed with `CARTESI_WATCHDOG_PRINT_RELEASE_INFO=1`) matches the version the
 application's template was built with. A release on another version cannot
-load the state directory's machines and cannot reproduce the template.
+load the state directory's machines and cannot reproduce the template. Keep a
+release on each Cartesi Machine version that a deployment still runs, or whose
+checkpoints and incident evidence you may need to `replay`.
+
+A new Cartesi Machine version means a new application deployment, and its
+watchdog starts from a new, empty state directory that `init` fills from that
+release's canonical image. Keep the old deployment's state directory intact
+beside the old release; do not wipe it while its evidence may be needed.
 
 ## Sepolia
 
@@ -404,7 +417,9 @@ and failure class, as in
 | `<dir>/config.json is not valid JSON` | A crash tore `config.json` right after `init`; wipe the state directory and re-run `init` |
 | `<dir> is not initialized; run init` | `tick` or `replay` on an empty state directory: a missing volume or a changed `CARTESI_WATCHDOG_STATE_DIR` |
 | `<dir>/config.json is not a version 2 watchdog config; wipe the state directory and re-run init` | See [upgrades](#upgrades) |
-| `cannot load stored machine <dir>: …` | A machine stored by another Cartesi Machine version; see [upgrades](#upgrades) |
+| `cannot load stored machine <dir>: expected "archive_version" 8 (got 7)`, or the `expected …` text alone with class `internal` (from a clone in `tick` or `replay`) | A machine stored by another Cartesi Machine version; see [upgrades](#upgrades) |
+| `cannot load stored machine …/work/working: unable to open backing file '<f>': Permission denied` (as root: `backing file '<f>' is read-only and cannot be shared for writing`) | The bootstrap machine's files lost their write permission; see [filesystem](#filesystem) |
+| `cannot load stored machine <dir>: …` with another message | The emulator's message names the file or field it could not load |
 | `<dir> was initialized for another deployment or state source; wipe it to re-initialize` | The `init` environment names another chain, application, or state source than the directory holds |
 | `no input precedes block <N>, so the machine at <dir> must be the application's template, but its root hash differs from the on-chain template hash` | The image is not this application's template: another chain's image, another build, or another application |
 | `L1 RPC: eth_call: …` during `init` | The RPC has no state at the bootstrap block; use an archive node |
