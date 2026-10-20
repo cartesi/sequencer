@@ -14,7 +14,7 @@ are not published.
   at rev `ed14b98ecfe9796dc3ca7c9b96bfdbf0ef9baf22`
   (`guest/libcmt-sys`, `guest/trolley`, `host/testsi`, and `types`, renamed
   here to `rollups-types`; its examples were not imported). Since then they
-  have been updated here for Cartesi Machine v0.21.0 and machine-guest-tools
+  have been updated here for Cartesi Machine v0.22.0 and machine-guest-tools
   v0.18.0. Apache-2.0 licensed.
 - **libcmt C sources** (`libcmt-sys/libcmt/`): the `sys-utils/libcmt`
   `Makefile`, `include/` and `src/`, plus the top-level `LICENSE` (Apache-2.0)
@@ -38,7 +38,7 @@ are not published.
   vouchers, notices, reports and GIO.
 - **`testsi`** (with its proc-macro crate `testsi-macros`): a host-side test
   harness that loads a stored machine image and feeds it advance-state inputs.
-  It uses the Cartesi Machine v0.21 Rust bindings from
+  It uses the Cartesi Machine v0.22 Rust bindings from
   [cartesi/dave](https://github.com/cartesi/dave), pinned by rev in
   `testsi/Cargo.toml`. These link the prebuilt emulator named by
   `LIBCARTESI_PATH` / `INCLUDECARTESI_PATH`: the dev flake exports both, and so

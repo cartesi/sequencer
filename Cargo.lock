@@ -1499,7 +1499,7 @@ dependencies = [
 [[package]]
 name = "cartesi-machine"
 version = "2.0.0"
-source = "git+https://github.com/cartesi/dave?rev=79874c0a1b40678465daf533acc976c88301c6d4#79874c0a1b40678465daf533acc976c88301c6d4"
+source = "git+https://github.com/cartesi/dave?rev=612c54cf22d73b364cd57a7058ba6aa449e5c77a#612c54cf22d73b364cd57a7058ba6aa449e5c77a"
 dependencies = [
  "base64 0.22.1",
  "cartesi-machine-sys",
@@ -1513,7 +1513,7 @@ dependencies = [
 [[package]]
 name = "cartesi-machine-sys"
 version = "2.0.0"
-source = "git+https://github.com/cartesi/dave?rev=79874c0a1b40678465daf533acc976c88301c6d4#79874c0a1b40678465daf533acc976c88301c6d4"
+source = "git+https://github.com/cartesi/dave?rev=612c54cf22d73b364cd57a7058ba6aa449e5c77a#612c54cf22d73b364cd57a7058ba6aa449e5c77a"
 dependencies = [
  "bindgen",
  "link-cplusplus",

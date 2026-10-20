@@ -86,7 +86,7 @@ local function oracle(image, payloads)
         support.write(string.format("%s/input-%d.bin", dir, i - 1), input(i - 1, payload))
     end
     local command = string.format("cartesi-machine --load=%s --remote-spawn --remote-shutdown "
-        .. "--cmio-advance-state=input:%s/input-%%i.bin,input_index_begin:0,input_index_end:%d,"
+        .. "--cmio-advance-state=input:%s/input-%%i.bin,input_file_index_begin:0,input_file_index_end:%d,"
         .. "check_outputs_merkle_root:false,output:,rejected_output:,output_proof:,report:,"
         .. "outputs_merkle_root:,outputs_merkle_root_proof: --final-hash=%s/final.bin >%s/cli.log 2>&1",
         image, dir, #payloads, dir, dir)

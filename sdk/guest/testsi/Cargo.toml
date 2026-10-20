@@ -10,13 +10,13 @@ publish = false
 testsi-macros = { path = "./testsi-macros" }
 rollups-types = { workspace = true }
 
-# Cartesi Machine v0.21 Rust bindings from cartesi/dave main, pinned by rev (no
-# version requirement: from a git source the crate reports Dave's workspace
-# version, not the bindings' 0.21.0). They link the prebuilt emulator named by
-# LIBCARTESI_PATH / INCLUDECARTESI_PATH (exported by the dev flake and by CI's
-# CM .deb install); `external_cartesi` makes a missing LIBCARTESI_PATH a build
-# error instead of a source-checkout fallback.
-cartesi-machine = { git = "https://github.com/cartesi/dave", rev = "79874c0a1b40678465daf533acc976c88301c6d4", features = ["external_cartesi"] }
+# Cartesi Machine v0.22 Rust bindings from cartesi/dave, pinned by rev (the
+# commit tagged v3.0.0-alpha.6; no version requirement: from a git source the
+# crate reports Dave's workspace version, not the bindings' 0.22.0). They link
+# the prebuilt emulator named by LIBCARTESI_PATH / INCLUDECARTESI_PATH (exported
+# by the dev flake and by CI's CM .deb install); `external_cartesi` makes a
+# missing LIBCARTESI_PATH a build error instead of a source-checkout fallback.
+cartesi-machine = { git = "https://github.com/cartesi/dave", rev = "612c54cf22d73b364cd57a7058ba6aa449e5c77a", features = ["external_cartesi"] }
 
 inventory = "0.3"
 libtest-mimic = { workspace = true }

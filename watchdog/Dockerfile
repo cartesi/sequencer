@@ -2,7 +2,7 @@
 # Build args RELEASE_TAG, GIT_COMMIT, and cartesi-machine pins must match toolchain-pins.env
 # and the canonical-machine-image-* tarballs produced in the same release.
 
-# cartesi-machine v0.21 libs require glibc >= 2.38 (bookworm is 2.36).
+# cartesi-machine v0.22 libs require glibc >= 2.38 (bookworm is 2.36).
 ARG DEBIAN_VERSION=trixie-slim
 FROM debian:${DEBIAN_VERSION} AS build
 

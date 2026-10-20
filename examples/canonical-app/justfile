@@ -1,7 +1,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 cartesi_machine_version := `sed -n 's/^CARTESI_MACHINE_VERSION=v//p' ../../toolchain-pins.env`
-linux_image_release := `grep '^CARTESI_LINUX_IMAGE_RELEASE=' ../../toolchain-pins.env | cut -d= -f2`
+linux_release := `grep '^CARTESI_LINUX_RELEASE=' ../../toolchain-pins.env | cut -d= -f2`
 linux_kernel_filename := `grep '^CARTESI_LINUX_KERNEL_FILENAME=' ../../toolchain-pins.env | cut -d= -f2`
 linux_kernel_sha512 := `grep '^CARTESI_LINUX_KERNEL_SHA512=' ../../toolchain-pins.env | cut -d= -f2`
 
@@ -13,7 +13,7 @@ out_dir := "out"
 source_date_epoch := "0"
 # Cache the kernel under its pinned filename so a changed pin misses the cache.
 linux_kernel := out_dir + "/" + linux_kernel_filename
-linux_kernel_url := "https://github.com/cartesi/machine-linux-image/releases/download/" + linux_image_release + "/" + linux_kernel_filename
+linux_kernel_url := "https://github.com/cartesi/linux/releases/download/" + linux_release + "/" + linux_kernel_filename
 rootfs_tar := out_dir + "/canonical-rootfs.tar"
 rootfs_ext2 := out_dir + "/canonical-rootfs.ext2"
 machine_image := out_dir + "/canonical-machine-image"
