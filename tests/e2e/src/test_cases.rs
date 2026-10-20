@@ -177,6 +177,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
             "guardian_exit_recovers_balances_and_queued_deposits_test",
             |runtime| Box::pin(crate::wallet_exit::run(runtime)),
         ),
+        ("guardian_foreclosure_stops_admission_test", |runtime| {
+            Box::pin(run_guardian_foreclosure_stops_admission_test(runtime))
+        }),
         ("deposit_transfer_withdrawal_test", |runtime| {
             Box::pin(run_deposit_transfer_withdrawal_test(runtime))
         }),
@@ -237,12 +240,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
         ("provider_outage_wall_clock_refuses_boot_test", |runtime| {
             Box::pin(run_provider_outage_wall_clock_refuses_boot_test(runtime))
         }),
-        (
-            "warm_restart_from_fresh_persisted_facts_with_l1_down_test",
-            |runtime| {
-                Box::pin(run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(runtime))
-            },
-        ),
+        ("warm_restart_requires_application_status_test", |runtime| {
+            Box::pin(run_warm_restart_requires_application_status_test(runtime))
+        }),
         (
             "wall_clock_backward_jump_retries_then_recovers_test",
             |runtime| {
@@ -2004,98 +2004,45 @@ async fn run_provider_outage_wall_clock_refuses_boot_test(
     Ok(())
 }
 
-// Warm restart from a fresh persisted L1 view while the RPC is unreachable.
-//
-// This is the production-shaped discriminator for startup admission: an
-// initial refresh attempt may fail, but a recent persisted view that still
-// reduces to `Admit` is sufficient authority to prepare and launch the
-// runtime. The test keeps the proxy disconnected through readiness, one full
-// background-worker retry cadence, POST /tx, and WS broadcast. A boot path
-// that makes provider reachability an unconditional admission gate fails at
-// `respawn`; a runtime that launches without a usable inclusion lane fails the
-// transaction or WS assertion.
-async fn run_warm_restart_from_fresh_persisted_facts_with_l1_down_test(
+// A fresh input view cannot prove that an unreachable application remains open.
+async fn run_warm_restart_requires_application_status_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    const STABILITY_WINDOW: Duration = Duration::from_secs(3);
-
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
-    let alice_address = alice.address();
-    let bob_address = bob.address();
-    let deposit_amount = U256::from(600_000_u64);
-    let transfer_amount = U256::from(100_000_u64);
-    let fee = fee_to_linear(DEFAULT_FRAME_FEE);
-
-    // Persist a recent safe-head observation plus replayable wallet state,
-    // then stop cleanly so the next run boots over fresh facts without a
-    // recovery phase.
     let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
     let mut ws = runtime.ws(0).await?;
     let mut replay = ReplayWalletApp::devnet();
-    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
-        .await?;
+    apply_reconciled_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay,
+        &alice_l1,
+        U256::from(600_000),
+    )
+    .await?;
     drop(ws);
-    runtime.stop().await?;
-
-    // Route the next process through an already-disconnected gateway. The
-    // proxy stays down until after the admitted runtime serves the write and
-    // its corresponding ordered-tx feed event.
+    runtime.stop_expecting_clean_exit().await?;
+    let before = runtime.count_batches()?;
     let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
     runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
     proxy.disconnect();
-    runtime.respawn().await?;
     assert!(
-        !proxy.is_connected(),
-        "warm restart must reach readiness without reconnecting the L1 proxy",
-    );
-
-    // Cross the 2s input-reader/danger-detector cadence before submitting, so
-    // this proves more than racing a request ahead of the first failed RPC
-    // retry. Fresh local facts must keep the process admitted and live.
-    let exit = runtime.observe_for(STABILITY_WINDOW).await?;
-    assert!(
-        exit.is_none(),
-        "warm runtime must remain live while the fresh persisted L1 view is valid; got {exit:?}",
-    );
-
-    let mut ws_after = runtime.ws(0).await?;
-    let mut replay_after = ReplayWalletApp::devnet();
-    replay_after.apply(
-        ws_after
-            .expect_direct_input_from(runtime.erc20_portal_address())
-            .await?,
-    )?;
-    let mut alice_l2 = runtime.wallet_l2(alice)?;
-    alice_l2.transfer(bob_address, transfer_amount).await?;
-    replay_after.apply(ws_after.expect_user_op_from(alice_address).await?)?;
-
-    assert_wallet_state(
-        &replay_after,
-        ExpectedWalletState {
-            address: alice_address,
-            balance: deposit_amount - transfer_amount - fee,
-            nonce: 1,
-        },
-        ExpectedWalletState {
-            address: bob_address,
-            balance: transfer_amount,
-            nonce: 0,
-        },
-        2,
-    );
-    assert!(
-        !proxy.is_connected(),
-        "POST /tx and WS must succeed before L1 connectivity is restored",
+        runtime.respawn().await.is_err(),
+        "unknown foreclosure status must refuse admission"
     );
     assert_eq!(
-        runtime.count_batches()?.invalidated,
-        0,
-        "a fresh-view warm restart must not invalidate the batch tree",
+        runtime.count_batches()?,
+        before,
+        "status refusal cannot repair or flush history"
     );
-
     proxy.reconnect();
     runtime.set_l1_endpoint_override(None);
+    runtime.respawn().await?;
+    let mut alice_l2 = runtime.wallet_l2(alice)?;
+    alice_l2
+        .transfer(bob.address(), U256::from(100_000))
+        .await?;
     proxy.shutdown().await?;
     Ok(())
 }
@@ -4051,6 +3998,62 @@ fn assert_wallet_state(
     assert_eq!(replay.current_user_balance(second.address), second.balance);
     assert_eq!(replay.current_user_nonce(second.address), second.nonce);
     assert_eq!(replay.executed_input_count(), executed_input_count);
+}
+
+async fn run_guardian_foreclosure_stops_admission_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    use std::os::unix::process::ExitStatusExt;
+    let alice = TestSigner::from_default(1)?;
+    let mut ws = runtime.ws(0).await?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
+    let mut replay = ReplayWalletApp::devnet();
+    apply_reconciled_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay,
+        &alice_l1,
+        U256::from(10_000_000_u64),
+    )
+    .await?;
+    alice_l2.transfer(alice.address(), U256::from(1)).await?;
+    replay.apply(ws.expect_user_op_from(alice.address()).await?)?;
+    assert_eq!(runtime.health_status().await?, Some(200));
+    runtime.foreclose().await?;
+    let status = runtime.wait_for_exit(Duration::from_secs(30)).await?;
+    assert_eq!(
+        status.signal(),
+        Some(6),
+        "runtime foreclosure must take the terminal abort path"
+    );
+    assert!(
+        alice_l2
+            .transfer(alice.address(), U256::from(1))
+            .await
+            .is_err(),
+        "no admission after detection"
+    );
+    assert_ne!(runtime.health_status().await?, Some(200));
+    let stopped_batches = runtime.count_batches()?;
+    let nonce = runtime.submitter_nonce().await?;
+    for _ in 0..2 {
+        assert!(
+            runtime.respawn().await.is_err(),
+            "foreclosure must refuse restart"
+        );
+        assert_eq!(
+            runtime.submitter_nonce().await?,
+            nonce,
+            "restart must not flush or send"
+        );
+        assert_eq!(
+            runtime.count_batches()?,
+            stopped_batches,
+            "restart must not reopen history"
+        );
+    }
+    Ok(())
 }
 
 async fn run_recovery_expires_revoked_signature_test(

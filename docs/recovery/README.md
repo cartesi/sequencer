@@ -73,7 +73,8 @@ The recovery cycle crosses a process boundary:
    deliberate restart. Process
    ownership and shutdown belong to the [authority-boundary ADR](../plans/2026-08-authority-boundary-adr.md).
 3. **Recover under the process lock, with no workers.** Check local terminal
-   facts before any provider call, attempt initial L1 sync, select at most one
+   facts before any provider call, require a fresh open-application status,
+   attempt initial L1 sync, select at most one
    repair, then inspect again after a repair.
 4. **Prepare, admit, launch.** Prepare resources without starting tasks. A final
    current inspection must still authorize serving. It creates a single-use
@@ -92,8 +93,19 @@ checkpoint. After initial sync, one consistent `RecoveryInspection` selects:
 | `EstimatedBatchInDanger(N)` | Retry; an estimate alone cannot authorize invalidation. |
 | `CanonicalDivergence(N)` or missing recovery checkpoint | Refuse; automatic recovery cannot repair this trust failure. |
 
-Only an initial-sync **provider failure** may fall back to a still-usable
-persisted view. Other failures keep their typed retry/refuse classification.
+Before repair, startup checks the pinned chain and `isForeclosed()` at Latest.
+Foreclosure refuses startup terminally; an unavailable status read retries
+without repair, even with a fresh persisted input view. During operation the
+submitter repeats this check on every poll, including idle polls, and decodes
+`ApplicationForeclosed(address)` from gas estimation as terminal. Runtime
+observation follows the existing terminal worker policy and stops the process;
+health probes then become unavailable. Detection waits for the submitter's
+current RPC work and poll cadence. It does not make admission atomic with an
+L1 contract transition. A Latest reorg can cause a conservative stop; a deliberate
+restart reads status again.
+
+After the open-application check, only an initial-sync **provider failure** may
+fall back to a still-usable persisted view. Other failures keep their typed retry/refuse classification.
 Post-flush sync has no such fallback: it must establish the view required by
 the cascade.
 
@@ -348,8 +360,8 @@ facts; the flush observation and admission witness do not survive.
 Its invariants cover terminal dominance, repair preconditions, a caught-up
 post-flush view, and admission soundness. It abstracts successful repair as
 producing a Tip; concrete transactions and rollback are checked by Rust tests.
-Neither model covers external era/generation metadata, the application-input
-projection, or snapshot artifact/lease/GC durability. Those obligations remain
+Neither model covers the external foreclosure-status gate, external
+era/generation metadata, the application-input projection, or snapshot artifact/lease/GC durability. Those obligations remain
 in storage constraints, tests, and the [snapshot lifecycle](../snapshots/lifecycle.md).
 
 Run the configured checks with:

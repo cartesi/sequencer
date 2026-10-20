@@ -5,6 +5,7 @@
 //! batches back out (`submitter`), and shares L1 utilities (`provider`,
 //! `partition`).
 
+pub mod application_status;
 pub mod eip1559;
 pub mod fee_oracle;
 pub mod partition;
