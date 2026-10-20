@@ -166,16 +166,16 @@ test("a stored machine with stale hash sidecars fails verification", function()
     -- Replace the clone's RAM file to preserve the source even if storage
     -- sharing changes. Leave all cached hash files untouched.
     local path = copy .. "/0000000080000000-8000000.bin"
-    local input = assert(io.open(path, "rb"))
+    local ram_input = assert(io.open(path, "rb"))
     local output = assert(io.open(path .. ".tmp", "wb"))
-    local byte = assert(input:read(1)):byte()
+    local byte = assert(ram_input:read(1)):byte()
     output:write(string.char(byte ~ 1))
     while true do
-        local chunk = input:read(1024 * 1024)
+        local chunk = ram_input:read(1024 * 1024)
         if not chunk then break end
         output:write(chunk)
     end
-    input:close()
+    ram_input:close()
     output:close()
     assert(os.rename(path .. ".tmp", path))
     eq(hex(machine.root_hash(copy)), hex(machine.root_hash(image)), "cached root alone misses corruption")
