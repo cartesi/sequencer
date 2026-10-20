@@ -94,6 +94,7 @@ fn abi_mixed_history_matches_native_outputs_progress_and_dump() {
         (2, vec![0xff], 13),
     ] {
         let op = UserOp {
+            valid_until_block: u64::MAX,
             nonce,
             max_fee: 10,
             data: data.into(),
@@ -141,6 +142,7 @@ fn abi_protocol_rejections_leave_state_and_progress_unchanged() {
         (Address::repeat_byte(0x55), 0, 10_000, 10_000),
     ] {
         let op = UserOp {
+            valid_until_block: u64::MAX,
             nonce,
             max_fee,
             data: vec![0xff].into(),

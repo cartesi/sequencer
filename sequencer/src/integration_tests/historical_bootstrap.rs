@@ -87,6 +87,7 @@ fn transfer_batch(
     amount: u64,
 ) -> IngestedSafeInput {
     let op = UserOp {
+        valid_until_block: u64::MAX,
         nonce,
         max_fee: 0,
         data: Method::Transfer(Transfer {
@@ -108,6 +109,7 @@ fn transfer_batch(
                 safe_block,
                 fee_price: 0,
                 user_ops: vec![WireUserOp {
+                    valid_until_block: u64::MAX,
                     nonce,
                     max_fee: op.max_fee,
                     data: op.data.to_vec(),

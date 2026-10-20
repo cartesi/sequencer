@@ -632,6 +632,7 @@ mod tests {
                             sender: Address::ZERO,
                             signature: Signature::test_signature(),
                             user_op: UserOp {
+                                valid_until_block: u64::MAX,
                                 nonce: 0,
                                 max_fee: u16::MAX,
                                 data: vec![].into(),

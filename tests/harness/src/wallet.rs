@@ -24,7 +24,7 @@ use crate::util::io_other;
 const DEFAULT_SEQUENCER_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default max_fee for harness-submitted transactions.
-/// Must exceed the default log_recommended_fee (1356) and live oracle prices.
+/// Must exceed the default log_recommended_fee (1365) and live oracle prices.
 const DEFAULT_MAX_FEE: u16 = 2500;
 
 sol! {
@@ -66,7 +66,7 @@ impl TestSigner {
         &self.signing_key
     }
 
-    pub(crate) fn signed_request(
+    pub fn signed_request(
         &self,
         domain: &Eip712Domain,
         message: UserOp,
@@ -276,9 +276,17 @@ impl WalletL2Client {
 
     async fn submit_method(&mut self, method: Method) -> HarnessResult<TxResponse> {
         let expected_nonce = self.next_nonce;
+        let valid_until_block = self
+            .client
+            .get_fee()
+            .await?
+            .safe_block
+            .checked_add(120)
+            .ok_or_else(|| io_other("signing deadline overflow"))?;
         let request = self.signer.signed_request(
             &self.domain,
             UserOp {
+                valid_until_block,
                 nonce: expected_nonce,
                 max_fee: DEFAULT_MAX_FEE,
                 data: ssz::Encode::as_ssz_bytes(&method).into(),

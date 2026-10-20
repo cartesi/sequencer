@@ -30,6 +30,10 @@ When batches risk becoming stale on L1, the sequencer stops serving and startup
 determines the required repair. A lost or untrustworthy local state instead
 requires an operator rebuild. Both recovery modes are described below.
 
+The current signing/batch format uses domain version 2 and requires
+`valid_until_block`. It requires a new canonical image and fresh setup; old
+signatures, pending batches, and baseline databases are incompatible.
+
 ## Trust Model
 
 The sequencer is a **centralized, single-writer** system. It cannot steal funds or forge invalid state — the rollup validates everything independently, and the proof system later enforces it. But the sequencer can:
@@ -165,7 +169,7 @@ Process exit codes follow the orchestrator exit-code contract: `0` clean shutdow
 Fixed protocol identity (EIP-712):
 
 - domain name: `CartesiAppSequencer`
-- domain version: `1`
+- domain version: `2`
 - `chain_id` and `verifying_contract` come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS`
 
 Most queue sizes, polling intervals, and safety limits are now internal runtime constants instead of public launch-time configuration.
@@ -200,7 +204,8 @@ Request shape:
 {
   "message": {
     "nonce": 0,
-    "max_fee": 1,
+    "max_fee": 1418,
+    "valid_until_block": 1120,
     "data": "0x..."
   },
   "signature": "0x...",
@@ -231,10 +236,10 @@ Success response after inclusion:
 
 ### `GET /fee`
 
-Fee quote for setting signed user-op `max_fee` before `POST /tx`. All three fields are log-space exponents (base 129/128), the same encoding as `max_fee`. Inclusion rejects any op with `max_fee` below the open-frame `fee`.
+Fee quote for setting signed user-op `max_fee` before `POST /tx`. The three fee fields are log-space exponents (base 129/128), the same encoding as `max_fee`. Inclusion rejects any op with `max_fee` below the open-frame `fee`.
 
 ```json
-{ "fee": 1356, "recommended_fee": 1356, "suggested_max_fee": 1409 }
+{ "fee": 1365, "recommended_fee": 1365, "suggested_max_fee": 1418, "safe_block": 1000 }
 ```
 
 Notes:
@@ -244,6 +249,13 @@ Notes:
 - `suggested_max_fee` is `max(fee, recommended_fee)` plus 1.5× log-space slack. Wallets can copy this into signed `max_fee`; the user pays the frame fee, not this cap. Clients that want their own policy can ignore it and combine the two facts themselves.
 - `200` while an open frame exists (the admitted runtime always has one). Responses carry `Cache-Control: no-store`.
 - `503` with code `UNAVAILABLE` during shutdown, or if no open frame exists.
+
+Choose `UserOp.valid_until_block` from `safe_block` plus an explicit signing
+lifetime (for example 120 blocks). The inclusive deadline uses the frame clock,
+not wall time or L1 inclusion time. Expiry consumes neither nonce nor fee. A
+delayed batch retains its frame clock, while scheduler staleness independently
+bounds its inclusion delay. `u64::MAX` explicitly chooses no practical expiry;
+it is not a default. Price/slippage constraints belong in app method payloads.
 
 ### `GET /nonce?sender=<address>`
 
@@ -258,6 +270,7 @@ Notes:
 - `sender` is parsed like the `POST /tx` field: `0x` plus 40 hex digits in any case, echoed in EIP-55 casing. A missing or malformed parameter is `400` with code `BAD_REQUEST`.
 - `next_nonce` is one past the sender's latest included op, or 0 if it has none. It counts soft-confirmed ops: an op acknowledged with `200` before this request is counted. (The `nonce` in a `POST /tx` response or WS message is instead the nonce that op consumed.)
 - Keep one op in flight per sender: sign `next_nonce`, submit, and increment on `200`. Concurrent submits from one sender are unsupported; they can reach the sequencer out of order and be rejected. After a submit times out, a `next_nonce` above the op's nonce means it was included; an unchanged one is inconclusive, since the op may still be queued, so resubmit the same signed op rather than signing a new one at that nonce.
+- Recovery can rewind the nonce. A revoked confirmation does not revoke its signature; see [signature validity after recovery](docs/recovery/README.md#revoked-confirmations-and-signed-operations) before replacing an operation.
 - `next_nonce` of 4294967295 (`u32::MAX`) means the account is exhausted: that nonce has no successor, so `POST /tx` can include no further op from it.
 - The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, query again rather than incrementing.
 - After an operator rebuild from a checkpoint (`setup --recovery`), a sender with no surviving op since the rebuild reads 0 even when its nonce in the rebuilt baseline is higher; this includes a sender whose post-rebuild ops a later recovery invalidated. A `422` bad-nonce rejection names the expected nonce (`bad nonce: expected N, got M`).
@@ -268,7 +281,7 @@ Notes:
 The EIP-712 domain `POST /tx` verifies signatures against, keyed as `eth_signTypedData_v4` expects:
 
 ```json
-{ "name": "CartesiAppSequencer", "version": "1", "chainId": 31337, "verifyingContract": "0x..." }
+{ "name": "CartesiAppSequencer", "version": "2", "chainId": 31337, "verifyingContract": "0x..." }
 ```
 
 Clients pin their own domain and assert that it matches this one, the way a wallet checks `eth_chainId`. `chainId` is a JSON number, exact in JavaScript below 2^53. That covers every chain browser wallets accept (MetaMask refuses IDs above 4503599627370476); a larger ID fails closed, because a signature over a rounded `chainId` recovers a different sender at `POST /tx`. Do not sign with a served domain unchecked: `chainId` and `verifyingContract` are what keep a signature from replaying on another deployment, and the name and version are the same everywhere.

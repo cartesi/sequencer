@@ -2382,7 +2382,7 @@ mod schema_invariants {
         // Batch 0 is sealed. Any direct insert into its frames must fail.
         let err = storage.conn.execute(
             "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
-             VALUES (0, 1, 100, 1356, 0)",
+             VALUES (0, 1, 100, 1365, 0)",
             [],
         );
         assert!(
@@ -2402,7 +2402,7 @@ mod schema_invariants {
         storage.insert_invalid_batch(0).expect("invalidate tip");
         let err = storage.conn.execute(
             "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
-             VALUES (0, 1, 100, 1356, 0)",
+             VALUES (0, 1, 100, 1365, 0)",
             [],
         );
         assert!(
@@ -2609,8 +2609,8 @@ mod schema_invariants {
             .expect("initialize");
         let err = storage.conn.execute(
                 "INSERT INTO user_ops \
-                 (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
-                 VALUES (0, 0, 0, X'010203', 0, 0, X'', ?1, 0)",
+                 (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms, valid_until_block) \
+                 VALUES (0, 0, 0, X'010203', 0, 0, X'', ?1, 0, X'ffffffffffffffff')",
                 params![vec![0u8; 65]],
             );
         assert!(
@@ -2633,8 +2633,8 @@ mod schema_invariants {
         let short_sig = vec![0u8; 32]; // Should be 65.
         let err = storage.conn.execute(
                 "INSERT INTO user_ops \
-                 (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
-                 VALUES (0, 0, 0, ?1, 0, 0, X'', ?2, 0)",
+                 (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms, valid_until_block) \
+                 VALUES (0, 0, 0, ?1, 0, 0, X'', ?2, 0, X'ffffffffffffffff')",
                 params![valid_sender, short_sig],
             );
         assert!(

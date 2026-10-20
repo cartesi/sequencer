@@ -43,6 +43,23 @@ or the scheduler's next nonce after cockroach recovery. Production needs no
 accepted ancestor or submitted sentinel to repair a fully invalidated branch
 ([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)).
 
+## Revoked confirmations and signed operations
+
+Recovery revokes the predicted inclusion, not the user's signature. A rolled-back
+operation can be submitted by anyone who obtained its bytes, including from a
+pending L1 batch, and can execute again when its nonce is current and validation
+passes, including the signed `valid_until_block` deadline at the replacement
+frame clock. Reusing the same signed operation remains a valid retry only
+within that deadline.
+
+To supersede a sequence of revoked operations, the sender must get a replacement
+included at every affected nonce; replacing only the first leaves later signed
+operations executable. The reference wallet has no dedicated cancellation method.
+Applications with price-sensitive operations must define deterministic signed
+expiry and price/slippage constraints in their payload and enforce them during
+canonical execution. A sequencer-local signature blacklist cannot revoke a
+signature in the canonical scheduler.
+
 ## Lifecycle and startup dispatch
 
 The recovery cycle crosses a process boundary:

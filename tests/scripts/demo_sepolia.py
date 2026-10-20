@@ -34,7 +34,7 @@ SENDER = subprocess.check_output(
     ["cast", "wallet", "address", "--private-key", PRIVATE_KEY], text=True
 ).strip()
 
-# ── EIP-712 typed data (matches deployed Sepolia sequencer: max_fee is uint32) ─
+# EIP-712 domain v2; target a matching deployment.
 
 TYPED_DATA_TEMPLATE = {
     "types": {
@@ -46,14 +46,15 @@ TYPED_DATA_TEMPLATE = {
         ],
         "UserOp": [
             {"name": "nonce", "type": "uint32"},
-            {"name": "max_fee", "type": "uint32"},
+            {"name": "max_fee", "type": "uint16"},
+            {"name": "valid_until_block", "type": "uint64"},
             {"name": "data", "type": "bytes"},
         ],
     },
     "primaryType": "UserOp",
     "domain": {
         "name": "CartesiAppSequencer",
-        "version": "1",
+        "version": "2",
         "chainId": CHAIN_ID,
         "verifyingContract": APP_ADDRESS,
     },
@@ -66,8 +67,14 @@ def build_transfer_payload(amount: int, recipient: str) -> str:
 
 
 def sign_and_build_request(nonce: int, max_fee: int, data_hex: str) -> str:
+    with urllib.request.urlopen(f"{SEQUENCER_URL.rstrip('/')}/domain", timeout=10) as response:
+        if json.load(response) != TYPED_DATA_TEMPLATE["domain"]:
+            raise ValueError("sequencer signing domain does not match pinned domain version 2")
+    with urllib.request.urlopen(f"{SEQUENCER_URL.rstrip('/')}/fee", timeout=10) as response:
+        quote = json.load(response)
+    message = {"nonce": nonce, "max_fee": max_fee, "valid_until_block": quote["safe_block"] + 120, "data": data_hex}
     typed_data = dict(TYPED_DATA_TEMPLATE)
-    typed_data["message"] = {"nonce": nonce, "max_fee": max_fee, "data": data_hex}
+    typed_data["message"] = message
     td_json = json.dumps(typed_data, separators=(",", ":"))
 
     sig = subprocess.check_output(
@@ -77,7 +84,7 @@ def sign_and_build_request(nonce: int, max_fee: int, data_hex: str) -> str:
 
     return json.dumps(
         {
-            "message": {"nonce": nonce, "max_fee": max_fee, "data": data_hex},
+            "message": message,
             "signature": sig,
             "sender": SENDER,
         },

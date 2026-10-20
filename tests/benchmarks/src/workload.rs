@@ -129,6 +129,7 @@ impl WorkerContext {
             )));
         }
         let user_op = UserOp {
+            valid_until_block: u64::MAX,
             nonce,
             max_fee: self.max_fee,
             data: data.into(),

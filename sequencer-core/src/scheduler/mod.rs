@@ -650,6 +650,7 @@ mod tests {
         data: Vec<u8>,
     ) -> WireUserOp {
         let user_op = UserOp {
+            valid_until_block: u64::MAX,
             nonce,
             max_fee,
             data: data.clone().into(),
@@ -673,6 +674,7 @@ mod tests {
             .expect("recoverable parity for signature");
 
         WireUserOp {
+            valid_until_block: u64::MAX,
             nonce,
             max_fee,
             data,
@@ -1056,6 +1058,7 @@ mod tests {
             nonce: 0,
             frames: vec![Frame {
                 user_ops: vec![WireUserOp {
+                    valid_until_block: u64::MAX,
                     nonce: 0,
                     max_fee: 0,
                     data: vec![7],

@@ -100,6 +100,7 @@ async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_ca
                         sender: Address::repeat_byte(0x11),
                         signature: Signature::test_signature(),
                         user_op: UserOp {
+                            valid_until_block: u64::MAX,
                             nonce: offset,
                             max_fee: u16::MAX,
                             data: vec![0x42].into(),
@@ -350,6 +351,7 @@ fn seed_ordered_txs(db_path: &str) {
             sender: Address::from_slice(&[0x11; 20]),
             signature: Signature::test_signature(),
             user_op: UserOp {
+                valid_until_block: u64::MAX,
                 nonce: 7,
                 max_fee: 3,
                 data: vec![0x42].into(),

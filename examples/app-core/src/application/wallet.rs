@@ -426,6 +426,7 @@ mod tests {
         app.balances.insert(sender, U256::from(10_u64));
 
         let user_op = UserOp {
+            valid_until_block: u64::MAX,
             nonce: 0,
             max_fee: 1,
             data: Vec::<u8>::new().into(),
@@ -453,6 +454,7 @@ mod tests {
         app.balances.insert(sender, U256::from(10_u64));
         app.nonces.insert(sender, u32::MAX);
         let user_op = UserOp {
+            valid_until_block: u64::MAX,
             nonce: u32::MAX,
             max_fee: 0,
             data: Vec::<u8>::new().into(),
@@ -485,6 +487,7 @@ mod tests {
         app.balances.insert(sender, U256::from(10_u64));
         let before = app.canonical_snapshot_bytes().unwrap();
         let mut user_op = UserOp {
+            valid_until_block: u64::MAX,
             nonce: 0,
             max_fee: 0,
             data: Vec::new().into(),

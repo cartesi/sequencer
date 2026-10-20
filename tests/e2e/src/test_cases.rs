@@ -18,8 +18,8 @@ use sequencer_rust_client::{HistoryPolicyError, SequencerClient, SubscribeError}
 
 const NO_WS_MESSAGE_WAIT: Duration = Duration::from_secs(1);
 
-/// Default log_recommended_fee exponent (0 + 296 + 20 + 419 + 621 = 1356).
-const DEFAULT_FRAME_FEE: u16 = 1356;
+/// Default log_recommended_fee exponent (0 + 296 + 20 + 419 + 630 = 1365).
+const DEFAULT_FRAME_FEE: u16 = 1365;
 
 /// Max fee used for raw TxRequest construction. Must be >= DEFAULT_FRAME_FEE.
 const DEFAULT_MAX_FEE: u16 = 2500;
@@ -210,6 +210,9 @@ pub fn test_cases() -> Vec<(&'static str, ScenarioFn)> {
             "restart_after_committed_tx_replays_cleanly_test",
             |runtime| Box::pin(run_restart_after_committed_tx_replays_cleanly_test(runtime)),
         ),
+        ("recovery_expires_revoked_signature_test", |runtime| {
+            Box::pin(run_recovery_expires_revoked_signature_test(runtime))
+        }),
         ("recovery_after_stale_batches_test", |runtime| {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
         }),
@@ -1000,10 +1003,11 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
     apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit_amount)
         .await?;
 
-    // Submit user-op with max_fee=0, which is below the default frame fee (1356).
+    // Submit user-op with max_fee=0, which is below the default frame fee (1365).
     let client = SequencerClient::new(runtime.endpoint())?;
     let domain = eip712_domain(runtime);
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: 0,
         data: ssz_encode_transfer(alice_address, U256::from(100_u64)).into(),
@@ -1026,13 +1030,13 @@ async fn run_fee_below_minimum_rejected_test(runtime: &mut ManagedSequencer) -> 
     Ok(())
 }
 
-/// Fixed fee-oracle exponent 100 → recommended frame fee 1456
-/// (`100 + 296 + 20 + 419 + 621`), sampled by the first frame.
+/// Fixed fee-oracle exponent 100 → recommended frame fee 1465
+/// (`100 + 296 + 20 + 419 + 630`), sampled by the first frame.
 async fn run_fixed_fee_oracle_sets_frame_fee_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
     const FIXED_LOG_GAS_PRICE: u16 = 100;
-    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE + 296 + 20 + 419 + 621;
+    const EXPECTED_FRAME_FEE: u16 = FIXED_LOG_GAS_PRICE + 296 + 20 + 419 + 630;
 
     assert_eq!(
         runtime.first_frame_fee()?,
@@ -1074,6 +1078,7 @@ async fn run_forged_signature_rejected_test(runtime: &mut ManagedSequencer) -> S
     let client = SequencerClient::new(runtime.endpoint())?;
     let domain = eip712_domain(runtime);
     let user_op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: 0,
         max_fee: DEFAULT_MAX_FEE,
         data: ssz_encode_transfer(bob_address, U256::from(100_u64)).into(),
@@ -2280,7 +2285,7 @@ async fn run_provider_outage_pre_danger_sequencer_continues_test(
     let bob_address = bob.address();
 
     // Step 1: Deposit big — Alice needs to cover 150+ transfers and their fees.
-    // Default fee per user-op ≈ 38276 units (log-fee 1356); reserve margin.
+    // Default fee per user-op ≈ 38276 units (log-fee 1365); reserve margin.
     let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
     let deposit_amount = U256::from(10_000_000_u64);
     let mut replay = ReplayWalletApp::devnet();
@@ -4042,4 +4047,65 @@ fn assert_wallet_state(
     assert_eq!(replay.current_user_balance(second.address), second.balance);
     assert_eq!(replay.current_user_nonce(second.address), second.nonce);
     assert_eq!(replay.executed_input_count(), executed_input_count);
+}
+
+async fn run_recovery_expires_revoked_signature_test(
+    runtime: &mut ManagedSequencer,
+) -> ScenarioResult<()> {
+    use app_core::application::{Method, Transfer};
+    use ssz::Encode;
+    let alice = TestSigner::from_default(1)?;
+    let bob = TestSigner::from_default(2)?;
+    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
+    let mut ws = runtime.ws(0).await?;
+    let mut replay = ReplayWalletApp::devnet();
+    apply_reconciled_supported_deposit(
+        runtime,
+        &mut ws,
+        &mut replay,
+        &alice_l1,
+        U256::from(10_000_000),
+    )
+    .await?;
+    let client = SequencerClient::new(runtime.endpoint().to_owned())?;
+    let fee = client.get_fee().await?;
+    let request = alice.signed_request(
+        &sequencer_core::build_input_domain(
+            runtime.domain_chain_id(),
+            runtime.verifying_contract(),
+        ),
+        UserOp {
+            nonce: 0,
+            max_fee: DEFAULT_MAX_FEE,
+            valid_until_block: fee.safe_block + 10,
+            data: Method::Transfer(Transfer {
+                to: bob.address(),
+                amount: U256::from(100_000),
+            })
+            .as_ssz_bytes()
+            .into(),
+        },
+    )?;
+    client.submit_tx(&request).await?;
+    replay.apply(ws.expect_user_op_from(alice.address()).await?)?;
+    drop(ws);
+    runtime.stop_expecting_clean_exit().await?;
+    runtime
+        .advance_wall_and_mine(blocks_as_duration(MAX_WAIT_BLOCKS))
+        .await?;
+    runtime.respawn().await?;
+    let client = SequencerClient::new(runtime.endpoint().to_owned())?;
+    assert_eq!(
+        client.get_nonce(alice.address()).await?.next_nonce,
+        0,
+        "recovery must have revoked the op"
+    );
+    let (status, body) = client.submit_tx_with_status(&request).await?;
+    assert_eq!(status, 422);
+    assert!(
+        body.contains("operation expired"),
+        "must reject expiry, not an old nonce: {body}"
+    );
+    assert_eq!(client.get_nonce(alice.address()).await?.next_nonce, 0);
+    Ok(())
 }

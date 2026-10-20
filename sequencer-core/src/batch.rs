@@ -63,6 +63,7 @@ pub struct WireUserOp {
     pub nonce: u32,
     /// Log-space fee exponent (base 129/128). See [`crate::fee`].
     pub max_fee: u16,
+    pub valid_until_block: u64,
     pub data: Vec<u8>,
     pub signature: Vec<u8>,
 }
@@ -72,6 +73,7 @@ impl WireUserOp {
 
     pub fn to_user_op(&self) -> UserOp {
         UserOp {
+            valid_until_block: self.valid_until_block,
             nonce: self.nonce,
             max_fee: self.max_fee,
             data: self.data.clone().into(),
@@ -86,6 +88,7 @@ mod tests {
 
     fn sample_user_op(nonce: u32) -> WireUserOp {
         WireUserOp {
+            valid_until_block: u64::MAX,
             nonce,
             max_fee: 100,
             data: vec![0xaa, 0xbb, 0xcc, 0xdd],

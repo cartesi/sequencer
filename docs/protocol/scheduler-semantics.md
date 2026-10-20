@@ -113,7 +113,7 @@ For each frame, in order ([`process_batch_payload`](../../sequencer-core/src/sch
    with `(frame.fee_price, frame.safe_block)`. A user op is silently skipped
    (no state change, no output) when its signature is unrecoverable, when app
    `validate_user_op` rejects it, or when a protocol guard fails
-   (`max_fee ≥ fee_price`, or a nonce of `u32::MAX`, which has no
+   (`safe_block ≤ valid_until_block`, `max_fee ≥ fee_price`, or a nonce of `u32::MAX`, which has no
    successor) — the fold is a pure deterministic function and emits no
    diagnostics at the library seam.
 

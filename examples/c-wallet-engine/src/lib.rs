@@ -180,6 +180,7 @@ pub unsafe extern "C" fn application_engine_validate_user_op(
     let sender = Address::from(unsafe { (*sender).bytes });
     let user_op = unsafe { &*user_op };
     let op = UserOp {
+        valid_until_block: u64::MAX,
         nonce: user_op.nonce,
         max_fee: user_op.max_fee,
         data: unsafe { slice_from(&user_op.data) }.to_vec().into(),
@@ -215,7 +216,9 @@ pub unsafe extern "C" fn application_engine_validate_user_op(
                 // The caller owns these guards and this entry point never checks them, so the app
                 // cannot produce these reasons. Reporting one would be a lie about which union
                 // member carries the diagnostics.
-                InvalidReason::InvalidMaxFee { .. } | InvalidReason::NonceExhausted => {
+                InvalidReason::InvalidMaxFee { .. }
+                | InvalidReason::NonceExhausted
+                | InvalidReason::Expired { .. } => {
                     set_error("the app reported a caller-owned rejection");
                     return sys::APPLICATION_ENGINE_STATUS_INTERNAL_ERROR;
                 }

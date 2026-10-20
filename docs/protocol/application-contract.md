@@ -25,7 +25,7 @@ a reference wallet integration.
 | `progress() -> ApplicationProgress` | Return the count/clock pair from the engine by value. |
 
 Execution callers use `validate_and_execute_user_op`, `execute_valid_user_op`,
-and `execute_direct_input`. The first enforces `max_fee >= current_fee` before
+and `execute_direct_input`. The first enforces the inclusive signed block deadline and `max_fee >= current_fee` before
 app validation and rejects an accepted op at the exhausted nonce `u32::MAX`
 after it. App validation checks the nonce and fee balance; a rejection is not
 persisted. Trusted replay

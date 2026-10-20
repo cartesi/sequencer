@@ -25,6 +25,52 @@ const TEST_CHAIN_ID: u64 = 31337;
 const TEST_DAPP_ADDRESS: Address = Address::ZERO;
 
 #[testsi::test_dapp(kind("scheduler"))]
+pub fn scheduler_expiry_and_fee_bounds_keep_the_guest_live() -> TestResult {
+    let mut machine = devnet_machine()?;
+    let config = WalletConfig::devnet();
+    let key = signing_key(1);
+    let owner = address_from_signing_key(&key);
+    let amount = U256::from(250);
+    machine.advance_state(portal_input(
+        10,
+        config.supported_erc20_token,
+        owner,
+        amount,
+    ))?;
+    let rejected = batch_with_frame_fee(
+        0,
+        10,
+        sequencer_core::fee::MAX_EXPONENT + 1,
+        vec![signed_user_op_with_fee(&key, 0, u16::MAX, vec![])],
+    );
+    let (outputs, reports) = machine.advance_state(batch_input(11, rejected))?;
+    assert_invalid_batch_step(&outputs, &reports);
+    let (outputs, reports) =
+        machine.advance_state(batch_input(11, batch_with_safe_blocks(0, &[10])))?;
+    assert_deposit_notice(
+        &outputs,
+        &reports,
+        config.supported_erc20_token,
+        owner,
+        amount,
+    );
+    let to = Address::repeat_byte(9);
+    let data = ssz::Encode::as_ssz_bytes(&Method::Transfer(Transfer {
+        to,
+        amount: U256::from(10),
+    }));
+    let expired = signed_user_op_with_deadline(&key, 0, 0, 10, data.clone());
+    let (outputs, reports) =
+        machine.advance_state(batch_input(11, batch_with_frame(1, 11, vec![expired])))?;
+    assert_no_outputs_or_reports(&outputs, &reports);
+    let fresh = signed_user_op_with_deadline(&key, 0, 0, 11, data);
+    let (outputs, reports) =
+        machine.advance_state(batch_input(12, batch_with_frame(2, 11, vec![fresh])))?;
+    assert_transfer_notice(&outputs, &reports, owner, to, U256::from(10));
+    Ok(())
+}
+
+#[testsi::test_dapp(kind("scheduler"))]
 pub fn scheduler_reports_invalid_batch_from_guest() -> TestResult {
     let mut machine = devnet_machine()?;
 
@@ -337,7 +383,18 @@ fn signed_user_op_with_fee(
     max_fee: u16,
     data: Vec<u8>,
 ) -> WireUserOp {
+    signed_user_op_with_deadline(signing_key, nonce, max_fee, u64::MAX, data)
+}
+
+fn signed_user_op_with_deadline(
+    signing_key: &SigningKey,
+    nonce: u32,
+    max_fee: u16,
+    valid_until_block: u64,
+    data: Vec<u8>,
+) -> WireUserOp {
     let user_op = UserOp {
+        valid_until_block,
         nonce,
         max_fee,
         data: data.clone().into(),
@@ -360,6 +417,7 @@ fn signed_user_op_with_fee(
         .expect("recoverable parity for signature");
 
     WireUserOp {
+        valid_until_block,
         nonce,
         max_fee,
         data,

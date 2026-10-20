@@ -35,7 +35,7 @@ just --justfile tests/benchmarks/justfile all-and-compare
 ```
 
 The CLI and `just` recipes default `max_fee=2000`, above the self-contained
-harness's initial frame fee of 1356. External deployments can charge a different
+harness's initial frame fee of 1365. External deployments can charge a different
 fee. A run whose `--max-fee` is below the frame fee rejects its transactions
 with `422 EXECUTION_REJECTED`; choose a sufficient limit and require accepted
 transactions and matching WS events before interpreting latency results.

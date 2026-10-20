@@ -28,7 +28,7 @@ fn main() {
                 {
                     spawn_config.faketime = false;
                 } else if scenario_name == "fixed_fee_oracle_sets_frame_fee_test" {
-                    // 100 → recommended fee 1456, under the wallet client's
+                    // 100 → recommended fee 1465, under the wallet client's
                     // DEFAULT_MAX_FEE (2500) so transfers still admit.
                     spawn_config.fee_oracle_fixed_log_gas_price = Some(100);
                 }
