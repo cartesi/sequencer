@@ -6,7 +6,8 @@ from it. This page records the CM behavior those components depend on,
 especially behavior that is easy to assume wrongly. Everything here holds for
 the pinned version (`CARTESI_MACHINE_VERSION` in
 [`toolchain-pins.env`](../toolchain-pins.env), currently v0.22.0) and was
-checked against the emulator source at that tag. Re-check it on every bump.
+checked against the emulator source at that tag. Re-check it, and the Dave pin
+under [rollup host semantics](#rollup-host-semantics), on every bump of either.
 
 ## Versions are all-or-nothing
 
@@ -76,9 +77,17 @@ on-chain hash.
 
 ## Rollup host semantics
 
-The reference host loop is the `cartesi-machine` CLI (`run_advance_state_epoch`
-in `src/cartesi-machine.lua`); Dave's PRT client implements the same rules.
-Any other host, including the watchdog, must match it exactly:
+The Solidity step defines the per-input transition: Dave treats it as the
+authority, and the release CLI as no independent reference (Dave's
+`docs/computation-hash.md`). The watchdog follows two pinned implementations of
+it: Dave's sling node, `MachineStf` (`feed`, `run_big`, `restore_rejected`,
+`terminal_fixed`, `manual_yield_reason`) at dave@dbcca7d4, and the v0.22.0
+CLI's epoch driver without a hash builder (`run_advance_state_epoch` and
+`run_advance_state_input`, running `run_to_stop` with the null builder), which
+is the test oracle. They differ only at the corners stated below, at the rule
+each qualifies; there the watchdog follows the step and sling, apart from the
+deliberate differences the
+[watchdog README](watchdog/README.md#why-it-is-built-this-way) lists.
 
 | Guest outcome after an input | Host action |
 |---|---|
@@ -116,8 +125,14 @@ case Dave's `docs/computation-hash.md` lists among the CLI's named exclusions.
   leaves the machine unchanged, like the logged and proven transition: no
   pending yield, an advance at any yield other than `RX_ACCEPTED` (an
   unreverted rejection included), or data larger than the 2 MiB RX buffer.
-  Only delivery clears `iflags.Y`, so a host checks the yield before sending
-  and `iflags.Y` after.
+  Only delivery clears `iflags.Y`. Sling asserts an `RX_ACCEPTED` header
+  before sending, and the CLI trusts the last yield it read; neither checks
+  afterwards. At an `RX_ACCEPTED` yield the one undeliverable advance is data
+  over the RX buffer, which both take as an accept with the state unchanged.
+  No chain input reaches it: the pinned InputBox (rollups-contracts
+  `ROLLUPS_CONTRACTS_VERSION` in `toolchain-pins.env`) refuses an encoded
+  input over 65,536 bytes (`InputTooLarge`, as Dave's
+  `LeafTournamentGasFixture` pins for the same release).
 - Each delivered advance sets the budget `imcyclemax` to the current mcycle
   plus 2^48 − 1. Exhausting it with no halt or yield pending is a fixed point,
   not a reject. At realistic speeds this takes days, so a stuck guest shows up
@@ -129,7 +144,22 @@ case Dave's `docs/computation-hash.md` lists among the CLI's named exclusions.
   enforces `RX_ACCEPTED` (the CLI asserts it).
 
 A fixed point is permanent: once the canonical machine reaches one, no later
-input is ever processed for that application.
+input is ever processed for that application. The inputs still arrive: sling
+records each later input as a window that carries the frozen state and
+defends the epoch, which can never be staged (Dave's `docs/epoch-lifecycle.md`),
+and the CLI ends the epoch at the fixed point. Both hold the same state.
+
+Epochs change no machine state. Under Dave each epoch starts from the previous
+one's final state (`DaveConsensus` instantiates the next tournament from it;
+sling's `roll_epoch` re-registers it as the next epoch's first snapshot), so
+the uninterrupted InputBox sequence is the machine's history. The one exception
+is the epoch's input span: an epoch admits at most 2^24 inputs, and past that
+the contracts never feed the tail and a Dave node panics (Dave's
+`docs/dimensioning.md`), while a host replaying the whole InputBox sequence
+executes it. Reaching it takes about 5e11 gas of inputs in one epoch on L1, and
+a cheaper throughput flood breaks Dave settlement first, so the gap is
+accepted on cost; revisit it before deploying on a cheap L2, where such floods
+cost about a thousand times less.
 
 ## Storage, sharing, and snapshots
 

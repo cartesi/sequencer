@@ -50,8 +50,8 @@ retry: a failed tick's retry is the next scheduled one.
 ### Canonical execution
 
 The watchdog drives the machine in-process through the `cartesi` Lua module,
-with the reference rollup host semantics the `cartesi-machine` CLI and Dave
-implement ([details](../cartesi-machine.md#rollup-host-semantics)). It clones
+with the rollup host semantics of Dave's sling node and the CLI's epoch driver
+([grounding and pins](../cartesi-machine.md#rollup-host-semantics)). It clones
 the head into a working directory and runs the machine in place on it; before
 each input it clones the working directory as a snapshot:
 
@@ -71,13 +71,14 @@ watchdog and the reference CLI and require equal root hashes.
 A provider that silently drops logs must fail the tick, not produce a false
 comparison. The reader requires InputBox indices to run contiguously from the
 head's input count, and checks the count it reached against
-`InputBox.getNumberOfInputs(app)` pinned at block B. Every input's payload must
-name the configured application and chain. A log query that fails over more
-than one block is split in half and retried, and one that fails on a single
-block fails the tick, exactly like the Rust reader. Logs sort by (block, tx
-index, log index), and a log missing any of them fails the tick, as in the Rust
-reader. The shared vector `tests/fixtures/l1_partition_vector.json` pins both
-rules on both sides.
+`InputBox.getNumberOfInputs(app)` pinned at block B (a scan that stops at a
+canonical fixed point latches instead, without this check). Every input's
+payload must name the configured application and chain. A log query that fails
+over more than one block is split in half and retried, and one that fails on a
+single block fails the tick, exactly like the Rust reader. Logs sort by (block,
+tx index, log index), and a log missing any of them fails the tick, as in the
+Rust reader. The shared vector `tests/fixtures/l1_partition_vector.json` pins
+both rules on both sides.
 
 **Scan floor.** The Rust reader starts at the application's deployment block,
 which is sound because setup pins that block only once it is safe and the
@@ -294,8 +295,48 @@ Successful `init` or an idle tick is not evidence of a comparison.
   ([host semantics](../cartesi-machine.md#rollup-host-semantics)), so the
   watchdog advances only a machine at an `RX_ACCEPTED` yield and asserts that
   each input was taken. Running the CLI per tick would add process management
-  and a full machine store per tick, so the watchdog mirrors the CLI's
-  `--revert-mode=stored` loop (the same in v0.22) and tests against the CLI.
+  and a full machine store per tick, so the watchdog runs the CLI's per-input
+  loop with no hash builder, using its stored-mode snapshot and revert without
+  its two per-input fsyncs: `work/` is scratch, reset every tick, and only a
+  published head is made durable, as sling syncs only a batch's final
+  boundary. It tests against the CLI, and against the step's rule where the
+  CLI aborts or departs from it.
+- **Grounded on sling, with deliberate differences.** Where the watchdog
+  departs from Dave's sling node
+  ([grounding and pins](../cartesi-machine.md#rollup-host-semantics)), it does
+  so on purpose:
+  - *L1 head.* Sling ingests at `finalized`. The watchdog reads at `safe`,
+    because the sequencer serves only its latest safe accepted checkpoint
+    ([acceptance](../snapshots/lifecycle.md#acceptance-and-comparison)), so it
+    shares the sequencer's assumption that safe blocks are permanent
+    ([L1 chain semantics](../threat-model/README.md#l1-chain-semantics)).
+  - *Head trust.* Sling asserts every stored boundary against its database
+    row, because it adopts content-addressed directories by name. The
+    watchdog keeps one head, published by its own sync and no-replace rename
+    and never opened for writing, and checks no root when it opens it: v0.22
+    has no supported check of data pages against the stored hash tree (its
+    `verify_hash_tree` serves the emulator's internal tests), so a recorded
+    root would catch only a swapped directory or a torn hash tree. A damaged head
+    surfaces as a latched divergence, which the runbook's replay attributes to
+    the watchdog.
+  - *An advance the machine does not take.* The references carry on from it
+    as an unchanged accept, where the watchdog fails loud (above); the
+    InputBox cap keeps every chain input deliverable.
+  - *After a fixed point.* The watchdog stops reading inputs and latches
+    `canonical_machine_dead`, where sling keeps recording later inputs
+    against the frozen state: the same state.
+  - *Start.* A non-genesis bootstrap is trusted, not anchored on chain
+    ([a trusted checkpoint](operator-deployment.md#initialize)).
+  - *Free space.* Sling refuses to start a batch without a clock (an open
+    epoch's, or a settled epoch's replay) below 1 GiB free, leaving the space
+    to work with a deadline. The watchdog has no deadline and keeps no floor:
+    a full disk only fails or kills ticks ([failure classes](#commands)),
+    while a floor would need `df` (LuaFileSystem has no `statvfs`) and is a
+    margin, not a bound, as sling says of its own.
+  - *Inspect.* Sling has no inspect path. The `inspect` source follows the
+    CLI's `--cmio-inspect-state`.
+  - *An epoch past 2^24 inputs.* The watchdog, like the sequencer, executes
+    the tail the chain never feeds.
 - **Flat SHA-256 digests.** The comparison is an equality check between two
   parties we operate, for states expected to reach several GiB. SHA-256 is the
   cheapest on the sequencer and couples to nothing. A machine Merkle root

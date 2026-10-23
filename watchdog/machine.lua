@@ -1,8 +1,9 @@
 -- (c) Cartesi and individual authors (see AUTHORS)
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
---- The canonical Cartesi Machine, driven in-process with the reference rollup
---- host semantics (docs/cartesi-machine.md#rollup-host-semantics).
+--- The canonical Cartesi Machine, driven in-process with the rollup host
+--- semantics of Dave's sling node and the CLI's epoch driver
+--- (docs/cartesi-machine.md#rollup-host-semantics).
 
 local errors = require("watchdog.errors")
 
@@ -105,6 +106,9 @@ function machine.new(cartesi)
             elseif reason ~= cartesi.BREAK_REASON_YIELDED_SOFTLY
                 and reason ~= cartesi.BREAK_REASON_CONSOLE_OUTPUT
             then
+                -- At the MCYCLE_MAX target, with a console that neither
+                -- buffers output nor reads input, v0.22 returns no other
+                -- reason: a new one is a tripwire.
                 error("machine run stopped for unexpected break reason " .. tostring(reason))
             end
         end
@@ -169,9 +173,10 @@ function machine.new(cartesi)
         return found
     end
 
-    --- Send a response the machine must take: an undeliverable one is a
-    --- silent no-op (docs/cartesi-machine.md#rollup-host-semantics), and only
-    --- delivery clears iflags.Y.
+    --- Send a response the machine must take, failing loud on the silent no-op
+    --- the references carry on from (docs/cartesi-machine.md#rollup-host-semantics).
+    --- Callers send only at a yield `status` reads as accepted, and only delivery
+    --- clears iflags.Y, so the assert sees a no-op only where iflags.Y was set.
     local function deliver(m, reason, data, revert_root)
         m:send_cmio_response(reason, data, revert_root)
         assert(m:read_reg("iflags_Y") == 0, "the machine did not take the cmio response")
@@ -234,7 +239,8 @@ function machine.new(cartesi)
 
     --- An executor advances a private working clone of `head_dir` in place.
     --- Each input snapshots the working directory first (`<working>.revert`),
-    --- exactly like the reference CLI's `--revert-mode=stored`.
+    --- as the CLI's `--revert-mode=stored` does, without its per-input
+    --- `sync_stored`: `work/` is scratch, and only a published head is durable.
     local Executor = {}
     Executor.__index = Executor
 
