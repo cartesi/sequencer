@@ -496,6 +496,7 @@ local function fake_cartesi(regs)
     local cartesi = {
         SHARING_ALL = 1,
         SHARING_NONE = 0,
+        HTIF_DEV_HALT = 0,
         HTIF_DEV_CONSOLE = 1,
         HTIF_DEV_YIELD = 2,
         HTIF_YIELD_CMD_AUTOMATIC = 0,
@@ -538,8 +539,27 @@ test("machine ranks a halt or manual yield on the budget's last cycle above over
     raises("operator", "is at mcycle_overflow", function()
         m.check_source("/img", range)
     end)
-    regs.iflags_H = 1
+    regs.iflags_H, regs.htif_tohost_dev = 1, 0
     raises("operator", "is at halt with exit code 1", function()
+        m.check_source("/img", range)
+    end)
+end)
+
+test("machine ranks a pending input yield above a halt, as the step does", function()
+    -- Only a preset image sets both flags.
+    local regs = { mcycle = 0, imcyclemax = 7, iflags_H = 1, iflags_Y = 1,
+        htif_tohost_dev = 2, htif_tohost_cmd = 1, htif_tohost_reason = 1, htif_tohost_data = 2 }
+    local m = machine_mod.new(fake_cartesi(regs))
+    local range = { kind = "range", label = "state" }
+    m.check_source("/img", range)
+    regs.htif_tohost_reason = 2
+    raises("operator", "is at rejected", function()
+        m.check_source("/img", range)
+    end)
+    -- Once delivery clears iflags.Y, tohost still holds the yield header,
+    -- which carries no exit code.
+    regs.iflags_Y = 0
+    raises("operator", "is at halt, not waiting", function()
         m.check_source("/img", range)
     end)
 end)

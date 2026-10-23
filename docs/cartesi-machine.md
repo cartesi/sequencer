@@ -86,9 +86,11 @@ Any other host, including the watchdog, must match it exactly:
 | `RX_REJECTED` manual yield | restore the pre-input snapshot |
 | `TX_EXCEPTION`, halt, any other manual yield, or mcycle overflow | fixed point: the machine stays there forever, with no revert |
 
-The outcome is read in this order: halt, then manual yield, then an exhausted
-budget. A yield on the budget's last cycle is that yield, and the next input
-renews the budget; overflow means neither flag is set.
+A pending manual yield decides the outcome, as the step reads it: an
+`RX_ACCEPTED` yield takes the next input and an `RX_REJECTED` one reverts, even
+on the budget's last cycle or on a machine preset halted. A halt or an
+exhausted budget is a fixed point only with no yield pending (sling's
+`MachineStf::terminal_fixed` at dave@dbcca7d4).
 
 A host classifies a pending yield as the step does: `iflags.Y`, then tohost's
 device, command and reason, never its data field (sling's
@@ -97,6 +99,14 @@ libcmt can declare data past the 2 MiB TX buffer, which `receive_cmio_request`
 refuses; the CLI reads every yield through it and aborts there. `iflags.Y`
 under another device or command, which only a preset template carries, is a
 fixed point.
+
+The emulator's run break reason ranks a halt first (halt, then manual yield,
+then an exhausted budget), and the CLI's epoch loop follows it. The two orders
+differ only on a preset image with both `iflags.H` and `iflags.Y` set, which
+execution never produces and our image recipes reject
+(`--assert-rolling-template` exits 2 on it): the step delivers the next input
+and the machine then stays halted, while the CLI ends the epoch at the halt, a
+case Dave's `docs/computation-hash.md` lists among the CLI's named exclusions.
 
 - The host reads the root hash, snapshots, then sends the input together with
   that root as the *revert root hash*. At an `RX_ACCEPTED` yield the emulator

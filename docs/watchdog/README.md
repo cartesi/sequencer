@@ -341,7 +341,7 @@ LuaFileSystem (`lfs.so`). The `cartesi` module ships with the emulator.
 |---|---|
 | `just test-watchdog` | Unit tests: every module against fakes, including the shared partition and log-sort vectors and metrics golden files |
 | `just watchdog lint` | `luacheck` |
-| `just test-watchdog-e2e` | The real emulator with the test guest: executor against the CLI oracle (accept, reject, exception, halt), the bare-metal seam machines of Dave's sling node (budget seams, delivery tripwire, oversized and preset yield headers), both state sources, full ticks, `replay`, and the wallet image's golden genesis state. Builds the test guest image on first use; needs the sepolia canonical image |
+| `just test-watchdog-e2e` | The real emulator with the test guest: executor against the CLI oracle (accept, reject, exception, halt), the bare-metal seam machines of Dave's sling node (budget seams, delivery tripwire, oversized and preset yields, a preset halt with an accept pending), both state sources, full ticks, `replay`, and the wallet image's golden genesis state. Builds the test guest image on first use; needs the sepolia canonical image |
 | `just test-rollups-e2e` | Devnet scenarios: the watchdog genesis compare and `watchdog_divergence_drill_test` on the Rust host, and the non-genesis compare through both hosts |
 | `just watchdog docker-smoke` | The release image: native modules, commands, and the lock |
 | `just doctor` | Toolchain: Lua, emulator, native modules, and the devnet image's state query |

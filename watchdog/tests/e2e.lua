@@ -282,6 +282,30 @@ for _, case in ipairs({
     end)
 end
 
+test("executor delivers an input to a preset halted machine with an accept pending, as the step does", function()
+    local dir = bare_machine({ iflags = { H = 1, Y = 1 }, htif = { tohost = manual_yield(RX_ACCEPTED) } })
+    local raw = input(0, "seam")
+    local working = support.tmpdir() .. "/working"
+    local executor = machine.open(dir, working)
+    local status = executor:advance(raw)
+    executor:close()
+    eq(status.kind, "halted")
+    eq(status.exit_code, nil)
+    -- The CLI ends the epoch at the halt, so the step's delivery is the oracle.
+    local m = cartesi.new()
+    m:load(dir, {}, cartesi.SHARING_NONE)
+    local before = m:get_root_hash()
+    m:send_cmio_response(cartesi.HTIF_YIELD_REASON_ADVANCE_STATE, raw, before)
+    local delivered = m:get_root_hash()
+    m:destroy()
+    assert(delivered ~= before, "the oracle did not deliver the input")
+    eq(hex(machine.root_hash(working)), hex(delivered))
+    -- An inspect query cannot run on a halted machine.
+    raises("operator", "inspect query 'state' ended at halt", function()
+        machine.check_source(dir, { kind = "inspect" })
+    end)
+end)
+
 -- ── State sources ─────────────────────────────────────────────────────────
 
 test("range and inspect sources read the same guest state", function()

@@ -17,6 +17,7 @@ function machine.new(cartesi)
 
     local SHARING_ALL = cartesi.SHARING_ALL
     local SHARING_NONE = cartesi.SHARING_NONE
+    local HALT = cartesi.HTIF_DEV_HALT
     local YIELD = cartesi.HTIF_DEV_YIELD
     local MANUAL = cartesi.HTIF_YIELD_CMD_MANUAL
     local RX_ACCEPTED = cartesi.HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED
@@ -37,14 +38,12 @@ function machine.new(cartesi)
     end
 
     --- Where a machine at rest stands, from register reads only, in the
-    --- emulator's order: a halt or manual yield wins over an exhausted
-    --- budget. `accepted` is the only state that can take another request.
-    --- A yield is classified by tohost's device, command and reason, as the
-    --- step does (sling's `MachineStf::manual_yield_reason`, dave@dbcca7d4).
+    --- step's order (sling's `MachineStf::terminal_fixed` and
+    --- `manual_yield_reason`, dave@dbcca7d4): a pending yield, classified by
+    --- tohost's device, command and reason, then a halt, then an exhausted
+    --- budget. The emulator's break reason ranks a halt first; only a preset
+    --- image sets both flags. `accepted` alone can take another request.
     local function status(m)
-        if m:read_reg("iflags_H") ~= 0 then
-            return { kind = "halted", exit_code = m:read_reg("htif_tohost_data") >> 1 }
-        end
         if m:read_reg("iflags_Y") ~= 0 then
             local dev = m:read_reg("htif_tohost_dev")
             local cmd = m:read_reg("htif_tohost_cmd")
@@ -60,6 +59,15 @@ function machine.new(cartesi)
             end
             return { kind = "unexpected_yield", dev = dev, cmd = cmd, reason = reason }
         end
+        if m:read_reg("iflags_H") ~= 0 then
+            -- After an input delivered to a preset halted machine, tohost
+            -- still holds the yield header, which carries no exit code.
+            local exit_code
+            if m:read_reg("htif_tohost_dev") == HALT then
+                exit_code = m:read_reg("htif_tohost_data") >> 1
+            end
+            return { kind = "halted", exit_code = exit_code }
+        end
         if not math.ult(m:read_reg("mcycle"), m:read_reg("imcyclemax")) then
             return { kind = "mcycle_overflow" }
         end
@@ -68,7 +76,7 @@ function machine.new(cartesi)
 
     local function describe(st)
         if st.kind == "halted" then
-            return "halt with exit code " .. tostring(st.exit_code)
+            return st.exit_code and ("halt with exit code " .. st.exit_code) or "halt"
         elseif st.kind == "exception" then
             return string.format("exception %q", tostring(st.message))
         elseif st.kind == "unexpected_yield" then
