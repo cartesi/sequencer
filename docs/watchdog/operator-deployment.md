@@ -120,10 +120,9 @@ as `canonical-machine-image-<chain>-vX.tar.gz` (checked against the release's
 
 The build prints the image's root hash. It needs the kernel
 (`just canonical download-deps`), `cross`, Docker buildx able to build
-`linux/riscv64`, `xgenext2fs`, and the pinned `cartesi-machine`. A stored
-machine loads only in the Cartesi Machine version that stored it
-([versions are all-or-nothing](../cartesi-machine.md#versions-are-all-or-nothing)),
-so the image and the watchdog must use the same version.
+`linux/riscv64`, `xgenext2fs`, and the pinned `cartesi-machine`. The image
+and the watchdog must use the same Cartesi Machine release
+([why](../cartesi-machine.md#versions-are-all-or-nothing)).
 
 ## State source
 
@@ -166,7 +165,11 @@ whose files lack it.
 ### Checkpoint disk usage and backups
 
 Disk usage is roughly one machine for the head, plus a working clone and a
-per-input snapshot while a tick runs (nearly free on copy-on-write), plus
+per-input snapshot while a tick runs (on copy-on-write a clone costs metadata,
+but the pages a catch-up writes, and the hash-tree pages they update, take
+real blocks, up to a full machine for the working clone: about 40 MB per 100
+inputs in the
+[measured run](../cartesi-machine.md#storage-sharing-and-snapshots)), plus
 incident evidence: the canonical machine at the divergence and two copies of
 the comparison bytes. Cleared incidents stay under `incidents/` until you
 remove them. With a `range` source, the watchdog also reads the whole range
@@ -246,7 +249,11 @@ Choose the bootstrap:
   `CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK=X`. `init` checks that the machine
   waits for an input and yields the state source. It cannot check that its
   state is right: a wrong bootstrap surfaces as a `state_mismatch` at the next
-  comparison, the runbook's "watchdog wrong" case. The
+  comparison, the runbook's "watchdog wrong" case. A Dave node seeds
+  mid-history only from the consensus's last settled machine root
+  (`getLastFinalizedMachineMerkleRoot`); the watchdog reads no consensus
+  contract, so nothing anchors such a checkpoint, and a wrong one costs a false
+  `state_mismatch` that `replay` from the template resolves. The
   [detection boundary](README.md#detection-boundary) states what `init` and
   idle ticks do not prove.
 
@@ -290,7 +297,9 @@ console output.
 
 - **Divergence (`failed`).** Follow the [incident runbook](incident-runbook.md).
 - **Stale heartbeat.** No tick has finished recently: the scheduler stopped, a
-  tick hangs or is still replaying a long range, or every run exits at the lock
+  tick hangs or is still replaying a long range, a tick died by a signal (such
+  as SIGBUS on a full state-directory filesystem; see
+  [failure classes](README.md#commands)), or every run exits at the lock
   because another process holds it, such as a latching tick still collecting
   evidence (its divergence alert fires first).
 - **Sustained warning.** `sequencer-watchdog status` shows the last tick's
@@ -310,10 +319,11 @@ A deployed application is pinned to the Cartesi Machine version its template
 was built with ([why](../cartesi-machine.md#versions-are-all-or-nothing)), and
 so is its watchdog: run a watchdog release whose `cartesi_machine_version`
 (printed with `CARTESI_WATCHDOG_PRINT_RELEASE_INFO=1`) matches the version the
-application's template was built with. A release on another version cannot
-load the state directory's machines and cannot reproduce the template. Keep a
-release on each Cartesi Machine version that a deployment still runs, or whose
-checkpoints and incident evidence you may need to `replay`.
+application's template was built with. A release on another minor version
+cannot load the state directory's machines; within a minor, only the release
+you run holds the watchdog to the template's version (ours pin it exactly).
+Keep a release on each Cartesi Machine version that a deployment still
+runs, or whose checkpoints and incident evidence you may need to `replay`.
 
 A new Cartesi Machine version means a new application deployment, and its
 watchdog starts from a new, empty state directory that `init` fills from that
@@ -419,7 +429,7 @@ and failure class, as in
 | `<dir>/config.json is not valid JSON` | A crash tore `config.json` right after `init`; wipe the state directory and re-run `init` |
 | `<dir> is not initialized; run init` | `tick` or `replay` on an empty state directory: a missing volume or a changed `CARTESI_WATCHDOG_STATE_DIR` |
 | `<dir>/config.json is not a version 2 watchdog config; wipe the state directory and re-run init` | See [upgrades](#upgrades) |
-| `cannot load stored machine <dir>: expected "archive_version" 8 (got 7)`, or the `expected …` text alone with class `internal` (from a clone in `tick` or `replay`) | A machine stored by another Cartesi Machine version; see [upgrades](#upgrades) |
+| `cannot load stored machine <dir>: expected "archive_version" 8 (got 7)`, or the `expected …` text alone with class `internal` (from a clone in `tick` or `replay`) | A machine stored by a Cartesi Machine release of another minor version; see [upgrades](#upgrades) |
 | `the tick cannot run <dir> in place: cannot load stored machine …/work/probe: unable to open backing file '<f>': Permission denied …` from `init` (as root: `backing file '<f>' is read-only and cannot be shared for writing`) | The bootstrap machine's files lack write permission; run `chmod -R u+w <dir>`, or on a read-only filesystem copy it, make the copy writable, and point `CARTESI_WATCHDOG_CM_SNAPSHOT_DIR` at it; then re-run `init` (see [filesystem](#filesystem)) |
 | `cannot load stored machine …/work/working: …` with the same causes, from `tick` | The head checkpoint's files lack write permission (lost after `init`, or kept from a bootstrap machine an older release initialized); run `chmod -R u+w` on the head checkpoint, or wipe the state directory and re-run `init` |
 | `cannot load stored machine <dir>: …` with another message | The emulator's message names the file or field it could not load |
@@ -430,6 +440,6 @@ and failure class, as in
 | `sequencer /finalized_state/digest: HTTP 404` while `inclusion_block` answers | A proxy does not forward the digest route, or the sequencer comes from another release |
 | `sequencer /finalized_state/inclusion_block: HTTP 503`, with `canonical divergence prevents accepted checkpoint selection` | The sequencer's own divergence marker is set: a sequencer incident for [cockroach recovery](../recovery/cockroach.md#incident-playbook) |
 | `L1 RPC safe head <N> is behind target block <B>` | The RPC lags the sequencer's L1 view; the next tick retries |
-| `InputBox counts <N> inputs at block <B> but the scan reached index <M>`, or `InputBox index <N> where <M> was expected: the L1 view is incomplete` | The provider returned incomplete logs; switch providers if it persists |
+| `InputBox counts <N> inputs at block <B> but the scan reached index <M>`, or `InputBox index <N> where <M> was expected: the L1 view is incomplete` | The provider returned incomplete logs, so switch providers; if it persists across them, a safe block below the head may have been replaced ([L1 chain semantics](../threat-model/README.md#l1-chain-semantics)), so confirm with `replay` from a trusted machine at a finalized block, then wipe the state directory and `init` from one |
 | `the L1 RPC does not serve chain <N>` | The RPC endpoint belongs to another chain |
 | `no flash drive or NVRAM carries the label "<label>"` | The state source does not match the image |

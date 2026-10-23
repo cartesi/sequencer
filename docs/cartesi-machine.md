@@ -12,13 +12,16 @@ under [rollup host semantics](#rollup-host-semantics), on every bump of either.
 ## Versions are all-or-nothing
 
 A stored machine records a config archive version (8) and the emulator's
-machine identifiers (`marchid` 22); loading rejects any mismatch, and nothing
-converts a stored machine to another version (`skip_version_check` skips only
-the identifiers). A CM bump therefore invalidates every stored image, release
-tarball, and watchdog checkpoint: rebuild the canonical images and the watchdog
-test guest (the recipes reuse an image that exists), and start each new
-deployment's watchdog from a new state directory
-([upgrades](watchdog/operator-deployment.md#upgrades)). The kernel and guest
+machine identifiers (`marchid` 22, and `mimpid`, major × 1000 + minor); loading
+rejects any mismatch, and nothing converts a stored machine to another version
+(`skip_version_check` skips only the identifiers). A bump to another minor
+release therefore invalidates every stored image, release tarball, and
+watchdog checkpoint: rebuild the canonical images and the watchdog test guest
+(the recipes reuse an image that exists), and start each new deployment's
+watchdog from a new state directory
+([upgrades](watchdog/operator-deployment.md#upgrades)). A patch release of the
+same minor loads them and, by the emulator's design since 0.15.2, keeps the
+root hash; the pins name the exact release all the same. The kernel and guest
 tools are the ones the emulator release's `dependencies.lock` names, and move
 with it: kernels are
 [`cartesi/linux`](https://github.com/cartesi/linux/releases) releases named by
@@ -28,17 +31,18 @@ development shell pins the same emulator through the parent flake.
 
 **A deployed application is pinned to its emulator version.** Its on-chain
 template hash is the root hash of a machine built with one emulator release,
-and the machine identifiers are part of that hash. A machine rebuilt with
-another release has a different root hash, and the old release's stored
-machines do not load. Every canonical machine for a deployment, the
-watchdog's included, must run the release its template was built with; moving
-to a new emulator release means a new application deployment.
+and the machine identifiers are part of that hash. A machine rebuilt with a
+release of another minor has a different root hash, and the old release's
+stored machines do not load; within a minor, only the pins enforce the
+release. Every canonical machine for a deployment, the watchdog's
+included, must run the release its template was built with; moving to a new
+emulator release means a new application deployment.
 
 **What moves the template hash.** The hash covers every byte of the stored
 machine, so it moves when any input to the image moves, even when behavior does
 not:
 
-- the emulator release, even with every other input fixed (the machine
+- the emulator's minor release, even with every other input fixed (the machine
   identifiers and the microarchitecture's state are part of the root hash, and
   execution fixes change what runs), and its kernel (`toolchain-pins.env`);
 - the rootfs: the guest Dockerfile, `machine-guest-tools`, and `xgenext2fs`;

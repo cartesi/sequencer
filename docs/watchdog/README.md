@@ -133,7 +133,13 @@ application's template (its root hash equals the on-chain
 Exit 1 covers three failure classes, which the log line and `last_tick.json`
 name: `transient` (the L1 RPC or the sequencer's HTTP API; the next tick may
 succeed), `operator` (configuration, the state directory, an image), and
-`internal` (anything else, including filesystem failures such as a full disk).
+`internal` (anything else, including a filesystem write that reports a full
+disk). A full disk while the working machine runs in place is different: the
+emulator's write through a shared mapping faults, and the kernel kills the
+process by SIGBUS (on Linux signal 7: exit 135 in a shell, `status=7/BUS` under
+systemd) before it writes `last_tick.json` or `status.prom`, so only the
+stale-heartbeat alert sees it; `replay` can die the same way, and the watchdog
+keeps no free-space floor ([why](#why-it-is-built-this-way)).
 Exit 2 means a divergence: found by this tick, or latched earlier. It stays
 latched until `clear`. A tick that finds a divergence exits 2 even when it
 cannot create `incident/` (a full state directory); it logs the divergence as
