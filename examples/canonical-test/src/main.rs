@@ -26,6 +26,39 @@ const TEST_CHAIN_ID: u64 = 31337;
 const TEST_DAPP_ADDRESS: Address = Address::ZERO;
 
 #[testsi::test_dapp(kind("scheduler"))]
+pub fn scheduler_fee_bounds_keep_the_guest_live() -> TestResult {
+    let mut machine = devnet_machine()?;
+    let config = WalletConfig::devnet();
+    let key = signing_key(1);
+    let owner = address_from_signing_key(&key);
+    let amount = U256::from(250);
+    machine.advance_state(portal_input(
+        10,
+        config.supported_erc20_token,
+        owner,
+        amount,
+    ))?;
+    let rejected = batch_with_frame_fee(
+        0,
+        10,
+        sequencer_core::fee::MAX_EXPONENT + 1,
+        vec![signed_user_op_with_fee(&key, 0, u16::MAX, vec![])],
+    );
+    let (outputs, reports) = machine.advance_state(batch_input(11, rejected))?;
+    assert_invalid_batch_step(&outputs, &reports);
+    let (outputs, reports) =
+        machine.advance_state(batch_input(11, batch_with_safe_blocks(0, &[10])))?;
+    assert_deposit_notice(
+        &outputs,
+        &reports,
+        config.supported_erc20_token,
+        owner,
+        amount,
+    );
+    Ok(())
+}
+
+#[testsi::test_dapp(kind("scheduler"))]
 pub fn scheduler_reports_invalid_batch_from_guest() -> TestResult {
     let mut machine = devnet_machine()?;
 

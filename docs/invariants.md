@@ -76,7 +76,7 @@ by writer and are write-once (`0001_schema.sql`).
   the inclusion lane's live prediction produce the same
   accept/reject/ordering decisions for every input. The recovery fold
   (`fold_replay`) drives `Scheduler<A>` itself, not a copy. (Known, documented
-  exception: the predicate omits the two structural rejections — self-trust,
+  exception: the predicate omits the three structural rejections — self-trust,
   since the simulator only runs over the sequencer's own well-formed batches;
   the reason is recorded at `scheduler_accepts`, and it is test-pinned by
   the I1 duality test in `sequencer-core/src/scheduler/mod.rs`, which asserts
