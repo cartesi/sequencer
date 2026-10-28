@@ -162,6 +162,16 @@ collection is `running`, `clear` reports `already locked`; retry once it
 ends. Clearing is always safe: if the cause persists, the next tick latches
 again.
 
+## Foreclosure
+
+The guardian multisig, run by the sequencer's operators, decides foreclosure.
+Stop and disable the sequencer as soon as foreclosure is decided: an operation
+it confirms that has not landed when `foreclose()` executes never will. On
+Kubernetes, scale the Deployment to zero, because Deployments restart regardless
+of exit code ([restart policy](operator-deployment.md#sequencer-restart-policy)).
+Never restart the sequencer for a foreclosed application: batch posts fail at
+gas estimation, and every recovery cycle sends a few no-op flush transactions.
+
 ## Drills
 
 | Scenario | Drill | Practices |
