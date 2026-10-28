@@ -142,6 +142,15 @@ function machine.new(cartesi)
         m:rename_stored(from_dir, to_dir)
     end
 
+    function api.verify(dir)
+        local m = load(dir, SHARING_NONE)
+        local ok, valid = pcall(m.verify_hash_tree, m)
+        m:destroy()
+        if not ok or not valid then
+            errors.operator("stored machine %s fails hash-tree verification", dir)
+        end
+    end
+
     function api.root_hash(dir)
         local m = load(dir, SHARING_NONE)
         local root = m:get_root_hash()

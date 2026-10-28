@@ -49,6 +49,13 @@ retry: a failed tick's retry is the next scheduled one.
 
 ### Canonical execution
 
+External starting checkpoints used by `init` and `replay` pass the pinned
+emulator's diagnostic `verify_hash_tree` check before trust checks. It checks
+the loaded machine state against its stored hash tree; the real-machine
+regression covers modified RAM with unchanged hash sidecars, which a cached
+root read misses. This checks storage consistency, not canonical provenance:
+a non-genesis checkpoint still needs independently trusted provenance.
+
 The watchdog drives the machine in-process through the `cartesi` Lua module,
 with the rollup host semantics of Dave's sling node and the CLI's epoch driver
 ([grounding and pins](../cartesi-machine.md#rollup-host-semantics)). It clones
@@ -319,12 +326,13 @@ Successful `init` or an idle tick is not evidence of a comparison.
   - *Head trust.* Sling asserts every stored boundary against its database
     row, because it adopts content-addressed directories by name. The
     watchdog keeps one head, published by its own sync and no-replace rename
-    and never opened for writing, and checks no root when it opens it: v0.22
-    has no supported check of data pages against the stored hash tree (its
-    `verify_hash_tree` serves the emulator's internal tests), so a recorded
-    root would catch only a swapped directory or a torn hash tree. A damaged head
-    surfaces as a latched divergence, which the runbook's replay attributes to
-    the watchdog.
+    and never opened for writing. Published heads are trusted local artifacts;
+    ordinary ticks do not repeat bootstrap verification or compare a recorded
+    root. A damaged head surfaces as a latched divergence, which the runbook's
+    replay from an independently trusted checkpoint attributes to the watchdog.
+    External `init` and `replay` checkpoints use `verify_hash_tree` as described
+    above. The emulator documents this diagnostic for internal tests; its
+    stale-sidecar behavior is pinned by our real-machine regression.
   - *An advance the machine does not take.* The references carry on from it
     as an unchanged accept, where the watchdog fails loud (above); the
     InputBox cap keeps every chain input deliverable.
