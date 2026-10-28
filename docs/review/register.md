@@ -260,9 +260,6 @@ evidence: the spec's links and
 - **Signature acceptance set.** The guest and `POST /tx` accept every `v ≥ 35`
   and the high-`s` twin, as alloy does. Proposed: `v ∈ {27, 28}` and low `s`
   only.
-- **Out-of-range frame fee.** A `fee_price` above `MAX_EXPONENT` halts the
-  machine once an op reaches the wallet's fee conversion. Proposed: reject such
-  a batch structurally.
 - **Empty batches** are valid at any age and consume a nonce, though the
   sequencer never sends one. Reject them only if the port forces a new image
   anyway.
