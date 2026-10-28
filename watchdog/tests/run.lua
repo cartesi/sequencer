@@ -38,6 +38,19 @@ end
 
 -- ── abi ───────────────────────────────────────────────────────────────────
 
+test("trusted checkpoints reject corrupt hash trees at genesis and after inputs", function()
+    local canonical = require("watchdog.canonical")
+    for _, count in ipairs({ 0, 1 }) do
+        local machine = support.fake_machine({ corrupt_tree = true })
+        raises("operator", "hash-tree verification", function()
+            canonical.trusted_start(machine, {
+                require_safe_head = function() end,
+                input_count_at = function() return count end,
+            }, "/snapshot", 0)
+        end)
+    end
+end)
+
 test("abi decodes an InputAdded log and keeps the raw envelope", function()
     local fixture = dofile("watchdog/tests/fixtures/input_added_evm_advance.lua")
     local input = abi.decode_input_added_log(fixture.log)
