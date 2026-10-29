@@ -3,7 +3,9 @@
 What to do when the watchdog latches a divergence: `tick` exits 2 and
 `cartesi_watchdog_status{state="failed"}` is 1. Every step names the command
 that performs it, and each scenario has a drill that practices it before an
-incident does. The [watchdog README](README.md) owns how the latch and its
+incident does. The exception is resolving **Sequencer wrong**: its export and
+its reader realignment are application-specific, and neither has a drill yet
+([Drills](#drills)). The [watchdog README](README.md) owns how the latch and its
 evidence are produced.
 
 ## What you have
@@ -92,17 +94,19 @@ Re-derive the canonical state at B from a trusted machine that predates the
 incident, independently of the watchdog's checkpoint chain:
 
 ```bash
-sequencer-watchdog replay --from <trusted machine> --from-block <A> \
+sequencer-watchdog replay --from <trusted machine> --from-block <trusted-block> \
     --to-block <B> --out /tmp/replay-<B>
 ```
 
 Use the application's template machine with `--from-block 0` (`replay` checks
 it against the on-chain template hash), or an archived checkpoint whose block
-you trust. `replay` needs an RPC with state at `A` (an archive node for old
-blocks), absolute paths, and an `--out` that does not exist; it never writes
-the state directory. Run it with a watchdog release on the deployment's
-Cartesi Machine version: templates, checkpoints and `incident/canonical` load
-only in the version that stored them
+you trust. `<trusted-block>` is the block its name states; `replay` checks it
+against the machine only for the template
+([commands](README.md#commands)). `replay` needs an RPC with state at
+`<trusted-block>` (an archive node for old blocks), absolute paths, and an
+`--out` that does not exist; it never writes the state directory. Run it with a
+watchdog release on the deployment's Cartesi Machine version: templates,
+checkpoints and `incident/canonical` load only in the version that stored them
 ([upgrades](operator-deployment.md#upgrades)).
 
 | `replay`'s `sha256` equals | Conclusion |
@@ -135,10 +139,18 @@ regression; the watchdog idles.
 
 ## 3. Resolve
 
-**Sequencer wrong.** Fix the bug, then rebuild the sequencer with
+**Sequencer wrong.** Make sure the old instance never runs again with the
+submitter key ([restart policy](operator-deployment.md#sequencer-restart-policy)),
+and fix the bug. Then rebuild the sequencer with
 [cockroach recovery](../recovery/cockroach.md) from a trusted canonical
 checkpoint: `incident/canonical` at B (or step 2's `replay --out` directory
-when `incident/canonical` is absent), or the head at P. Resume the sequencer,
+when `incident/canonical` is absent), or the head at P. `setup --recovery`
+loads a native bundle, not a machine: export one with the application's
+rehearsed exporter and check its
+[eligibility](../recovery/cockroach.md#checkpoint-eligibility) first
+([obtaining the artifact](../recovery/cockroach.md#obtaining-the-recovery-artifact)).
+Resume the sequencer, realign affected readers
+([reader state](../recovery/cockroach.md#application-specific-reader-state)),
 then clear the latch:
 
 ```bash
@@ -179,6 +191,8 @@ gas estimation, and every recovery cycle sends a few no-op flush transactions.
 | Watchdog wrong (`state_mismatch`) | `watchdog_divergence_drill_test` in `just test-rollups-e2e` | init refusing a non-template image at genesis; a wrong non-genesis bootstrap latching; `status`; `clear` refusing another block; `replay` from the trusted image matching the sequencer; re-latching after a premature `clear`; re-`init` agreeing |
 | Canonical machine dead | `tick latches a dead canonical machine and replay reproduces the stop` in `just test-watchdog-e2e` | the latch at the stopping input, and `replay` reproducing the stop |
 | Sequencer wrong (`state_mismatch`) | `tick latches a mismatch with the canonical machine and a byte diff` in `just test-watchdog-e2e` | the evidence: canonical machine, both byte strings, and the first difference |
+| Sequencer wrong: the rebuild | `setup_recovery_round_trip_test` (and its C-host twin) in `just test-rollups-e2e` | `setup --recovery` from a sequencer archive, resumed sequencing, and a watchdog comparison after the new era's first accepted batch |
+| Sequencer wrong: export and readers | none yet; the [shared recovery tool](../plans/2026-10-shared-recovery-tool.md) plans them | a rebuild that starts from a machine, and reader realignment |
 | Evidence lost to a full disk | `main tick keeps a divergence latched when its evidence cannot be kept` in `just test-watchdog` | the latch and exit 2 surviving a failed evidence item, which `evidence` names |
 | `inclusion_block_regressed` | `tick latches a regression below an agreed block` and `tick idles while the sequencer has not reached the bootstrap block` in `just test-watchdog` | the latch, and idling instead behind a never-agreed bootstrap |
 

@@ -96,12 +96,9 @@ vectors pass unchanged (W3b).
    - The NUM note's batch-fee half stays deferred, recorded in
      [batch-scoped replay protection](../plans/2026-10-batch-scoped-replay-protection.md).
 3. **N8 typed signing: deferred.** Out of the current scope.
-4. **Recovery-tool shape: a later dedicated session.** The direction mapper's
-   sketch is under [Consumer surfaces](#consumer-surfaces).
-   - Bart's client ignores cockroach recoveries, so a v1 can be the extraction
-     of `setup --recovery` into a keyless tool that emits only the sequencer
-     bundle; the client output can wait.
-   - Whether checkpoints carry scheduler state stays coupled to the fridge bound.
+4. **Recovery-tool shape: a later dedicated session**, held on 2026-10-28. The
+   [shared recovery tool plan](../plans/2026-10-shared-recovery-tool.md) owns
+   the proposed design and its open decisions.
 
 ### W1: correctness and safety (about 18 small patches, no decisions)
 
@@ -369,17 +366,6 @@ What survives: the ingress routes, `/finalized_state`, `/digest` and
 `/inclusion_block` (the watchdog's only dependency), `/finalized_snapshot`, leases,
 the canonical page reader with `HistoryClaim` (native restart uses it), the
 listener split, and in-era generation signalling.
-
-The recovery-tool sketch (from the direction mapper):
-
-- **Inputs:** deployment identity, a checkpoint (genesis or scheduler state at B),
-  the stop block C from `flush`, and an input source over (B,C].
-- **Outputs:** written file-first, with `receipt.toml` last as the commit point
-  (tool-minted era, B, C, N', K, digest). One output is a sequencer bundle for
-  `setup --import`. The other is a versioned client trace of (B,C] with outcomes
-  and app outputs.
-- **Client rule:** a client imports at an era boundary and never subscribes
-  across one.
 
 ## Correctness findings
 

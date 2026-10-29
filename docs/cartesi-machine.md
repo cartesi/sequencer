@@ -1,8 +1,9 @@
 # Cartesi Machine Facts We Rely On
 
 The canonical application runs inside the Cartesi Machine (CM). The watchdog
-drives it, the canonical guest is built for it, and cockroach recovery exports
-from it. This page records the CM behavior those components depend on,
+drives it, the canonical guest is built for it, and cockroach recovery needs an
+application-specific exporter, not yet in-tree, to extract native state from
+it. This page records the CM behavior those components depend on,
 especially behavior that is easy to assume wrongly. Everything here holds for
 the pinned version (`CARTESI_MACHINE_VERSION` in
 [`toolchain-pins.env`](../toolchain-pins.env), currently v0.22.0) and was
@@ -165,6 +166,21 @@ a cheaper throughput flood breaks Dave settlement first, so the gap is
 accepted on cost; revisit it before deploying on a cheap L2, where such floods
 cost about a thousand times less.
 
+An epoch's inputs are an InputBox index range, not a block range.
+`DaveConsensus` seals each epoch at the input count read in the transaction
+that seals it (its constructor for epoch 0, `acceptStagedTournamentResult` for
+every later one), so an epoch can end inside an L1 block. The last finalized
+machine, whose root `getLastFinalizedMachineMerkleRoot` returns (zero before
+the first acceptance), has consumed exactly the inputs below the current sealed
+epoch's `inputIndexLowerBound`, read when the previous epoch was sealed. Take
+that position from the chain. The machine keeps only the last input it took,
+in the receive buffer ([the guest side](#the-guest-side)), so for a guest that
+never rejects, as ours (a batch the scheduler drops is still accepted), that
+input's `index` plus one cross-checks the position. After an `RX_REJECTED`
+input or at a fixed point the buffer lags, and no root locates a state either,
+since both repeat roots. Sling keeps only the newest finalized machine, ingests
+only L1-finalized blocks, and serves stored machines only as files.
+
 ## Storage, sharing, and snapshots
 
 - **Loading** defaults to `SHARING_NONE`: every backing file is mapped
@@ -261,6 +277,18 @@ answering an inspect query:
   ceil_log2(length))` returns a range's Merkle root at the cost of rehashing
   dirty pages only, and `get_proof` ties it to the machine root hash. Any party
   comparing against that root must reproduce the same tree.
+- Loading a stored machine takes its root hash from the stored hash tree
+  (`hash_tree.sht` and each range's `.dht`), rehashing only pages marked
+  dirty; the load checks only the sparse tree's shape. A root that matches an
+  on-chain hash therefore authenticates a stored machine only from a source we
+  trust.
+- `verify_hash_tree` compares each page not marked dirty with its hash in the
+  range's `.dht` and recomputes nothing above the page: it catches a page
+  changed under a tree that holds it clean, such as in a corrupt copy, but not
+  hash files rewritten to match. In v0.22.0 it serves the emulator's internal
+  tests, is unoptimized, and the emulator team asked that nothing call it, so
+  Dave's node keeps its own check disabled (Dave's `docs/todo.md`). An
+  upcoming release brings a mechanism to verify an untrusted load.
 
 ## The CLI as a test oracle
 

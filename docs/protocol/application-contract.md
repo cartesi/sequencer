@@ -129,10 +129,11 @@ The clock is the maximum block carried by an executed input: frame `safe_block`
 for user ops, L1 inclusion block for directs, or zero at genesis. On success,
 the engine advances it with `max(old_clock, input_clock)`. Input clocks are
 not monotone: [gate d](scheduler-semantics.md#processing-an-input) orders
-frame clocks only within a batch, so a later batch's user ops may run at a
-`safe_block` below an earlier input's clock (a direct never runs below the
-stored clock); the `max` keeps the stored clock monotone. Count zero implies clock zero. Both
-fields survive checkpoint round-trips.
+frame clocks only within a batch, so after faulty sequencing a later batch's
+user ops may run at a `safe_block` below an earlier input's clock, by less than
+`MAX_WAIT_BLOCKS` since gate e bounds a batch's age (a direct never runs below
+the stored clock); the `max` keeps the stored clock monotone. Count zero
+implies clock zero. Both fields survive checkpoint round-trips.
 
 The [frame-clock policy](scheduler-semantics.md#sequencer-frame-clock-policy)
 may deliver a delayed head jump as one step. Newly covered directs execute
@@ -265,7 +266,8 @@ these are separate from merely extracting application bytes.
 The exporter must also verify the canonical pending-direct queue satisfies
 [checkpoint eligibility](../recovery/cockroach.md#checkpoint-eligibility).
 An accurate application clock and `A < B` do not prove that condition after
-faulty sequencing.
+faulty sequencing. Current images export neither the queue nor the nonce; the
+eligibility section says how to derive both from the input prefix.
 
 Each integration supplies a versioned export command and operator procedure,
 and demonstrates recovery from a non-genesis canonical checkpoint before

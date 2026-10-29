@@ -120,7 +120,7 @@ is decoded and fed to the machine before the next is fetched.
 | `tick` | One compare cycle; writes `last_tick.json` and `status.prom`. | 0 ok or idle, 1 warning, 2 divergence |
 | `status` | JSON on stdout: config, head, latched divergence, last tick. Read-only; fails on a missing state directory. | 0, or 1 |
 | `clear --block B --reason TEXT` | Archive the divergence latched at block B into `incidents/`. Refuses any other block, except for an unreadable marker, which has none. | 0, or 1 |
-| `replay --from DIR --from-block A --to-block B --out DIR` | Re-derive canonical state from a stored machine into a new directory and print its digest. The machine must be a trusted start, like init's bootstrap; `--out` must not exist, and both paths are absolute. Reads the state directory's `config.json` and never writes it. | 0, or 1 |
+| `replay --from DIR --from-block START --to-block B --out DIR` | Re-derive canonical state from a stored machine into a new directory and print its digest. The machine must be a trusted start, like init's bootstrap; `--out` must not exist, and both paths are absolute. Reads the state directory's `config.json` and never writes it. | 0, or 1 |
 
 The `sequencer-watchdog` wrapper takes a non-blocking `flock` on
 `$CARTESI_WATCHDOG_STATE_DIR/run.lock` for `init`, `tick`, and `clear`;
@@ -135,7 +135,12 @@ block must be safe on the RPC; its input count comes from `getNumberOfInputs`
 at that block, which needs an RPC with state there (an archive node for old
 blocks); and when no input precedes the block, the machine must be the
 application's template (its root hash equals the on-chain
-`getTemplateHash()`).
+`getTemplateHash()`). `replay` takes its start count the same way, from
+`getNumberOfInputs` at `--from-block`, and like `init` checks it against the
+machine only when it is zero (the template check): `--from-block` must be the
+block through which the machine consumed every input, as a checkpoint's name
+states. A wrong block that gives a nonzero count silently re-feeds or skips
+inputs.
 
 Exit 1 covers three failure classes, which the log line and `last_tick.json`
 name: `transient` (the L1 RPC or the sequencer's HTTP API; the next tick may
@@ -195,11 +200,11 @@ state/
 ```
 
 A checkpoint's name carries its L1 block and the InputBox input count through
-that block. Checkpoints are published with the emulator's `sync_stored` and
-`rename_stored`, which fsync and rename atomically, so the head needs no
-pointer file and a crash leaves either the old head or the new one. Older
-checkpoints are removed after the new head is published; an interrupted
-removal is finished by the next agreeing tick. JSON files are atomic but not
+that block, each zero-padded to 20 digits. Checkpoints are published with the
+emulator's `sync_stored` and `rename_stored`, which fsync and rename
+atomically, so the head needs no pointer file and a crash leaves either the old
+head or the new one. Older checkpoints are removed after the new head is
+published; an interrupted removal is finished by the next agreeing tick. JSON files are atomic but not
 fsynced. An `incident/` whose `divergence.json` is missing or torn still
 latches (kind `unreadable_marker`); a lost `incident/` latches again on the
 next tick if the divergence persists; a lost tick record is rewritten. Of the

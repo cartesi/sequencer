@@ -24,33 +24,59 @@ and HTTP controls cannot limit canonical L1 traffic. QA's guest/node OOM
 evidence supports investigating this independently of the toy wallet's state
 growth; its workload-specific thresholds are not deployment capacity bounds.
 
-Direction: use application-defined, deterministic format/sender rules to avoid
-retaining irrelevant bytes, and a generous fixed capacity pinned per deployment.
-Filtering or compacting must preserve valid deposits and agree across canonical
-execution, live prediction, application-history progress, and recovery. Define
-capacity in protocol bytes/slots, not allocator-dependent memory usage.
+Direction, settled by the owner on 2026-10-29: only well-formed directs enter
+the fridge, under application-defined format and sender rules that read only
+the input and fixed configuration;
+a count of entries bounds it; and an overflow executes just enough of the
+oldest entries, in FIFO order, to make room, so that the input that overflows
+it carries no large drain. The bound is protocol: canonical execution,
+recovery and the C++ port apply it alike, and live prediction applies the
+well-formedness rule. Live prediction cannot mirror an overflow drain, which
+can run ahead of batches the lane has already sealed, so an overflow is a
+deliberate divergence. An overflow is answered by a manual cockroach
+recovery, and the watchdog's divergence latch is what reports it. Raising the
+frame-clock floor on an overflow drain would let standard recovery repair an
+isolated overflow instead, and is deferred on complexity
+([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#canonical-rules-for-the-next-image)).
 
-Size against the cheapest accepted L1 inputs, including transaction batching,
-actual batch-inclusion delays and the backstop window. The five-block local
-frame tick is not a canonical drain interval. Include temporary allocations,
-application execution and accumulated outputs in the guest budget.
+To settle with Bart:
 
-Overflow must preserve valid deposits and have deterministic, non-catastrophic
-behavior; uninterrupted service and soft confirmations need not survive it.
-Early FIFO execution is a candidate, not a settled algorithm: it can reorder
-still-fresh delayed batches. Decide whether incompatible batches are rejected
-or overflow is detected as an exceptional ordering event that stops optimistic
-service and requires cockroach recovery. Matching batch bytes/nonce alone does
-not reveal this divergence. Silent loss of valid deposits is not a recovery
-strategy.
+- Drop a direct that is not well-formed without executing it, and have live
+  prediction drop the same ones. Executing it when it arrives would count an
+  input at an L1 position the sequencer cannot know when it seals a batch, so
+  one `addInput` would force a divergence. Every direct counts as an executed
+  input today, so dropping one changes the history.
+- How large an entry can be. A count bounds memory only if each entry's size
+  is bounded too, and portals accept zero-value deposits with arbitrary extra
+  data, up to the 64 KiB input cap; a fixed-size record of each deposit the
+  application credits would do.
+- The count. Above what L1 can include within the backstop window, roughly
+  2 million zero-value deposits at mainnet's 60M gas limit today (30-40k gas
+  each when a contract batches them; measure it on the pinned contracts),
+  overflow cannot happen at all; the image fixes the bound for the
+  deployment's life, so leave headroom for higher gas limits. A smaller count still makes
+  overflow costly, and its consequence is a manual rebuild, not a dead
+  application.
+- The largest drain. The first frame after an outage and the root frame after
+  a rebuild both drain a full fridge in one input, so the bound must fit that
+  drain in the guest's budget, temporary allocations, execution and
+  accumulated outputs included. The five-block local frame tick is not a
+  canonical drain interval.
 
-Next: settle that transition and measure headroom, then exercise delayed fresh
+Overflow can reorder still-fresh delayed batches, which matching batch
+bytes/nonce alone does not reveal. Silent loss of valid deposits is not a
+recovery strategy.
+
+Next: settle these with Bart and measure headroom, then exercise delayed fresh
 batches, same-block overflow, outages, and replay/rebuild agreement. Preserve
 the [checkpoint eligibility rule](../recovery/cockroach.md#checkpoint-eligibility):
 forcing one direct while leaving another from the same block queued can require
 an earlier checkpoint or genesis. The [scheduler contract](../protocol/scheduler-semantics.md)
 and [application contract](../protocol/application-contract.md) own the boundaries
-the implementation must update together.
+the implementation must update together. An overflow changes the application
+state after a block's last accepted batch, so the watchdog's block-boundary
+comparison does not hold for that block
+([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)).
 
 ### Batch-size accounting omits SSZ overhead
 
@@ -266,11 +292,26 @@ evidence: the spec's links and
 - **Wire format.** A fixed 65-byte signature field, with the
   [SSZ overhead](#batch-size-accounting-omits-ssz-overhead) fix; drain sealed
   batches before the switch.
+- **Frame clocks across batches** (checked 2026-10-29 at `3e92563`). Gate d
+  orders frame clocks only within a batch, so after faulty sequencing or a
+  fridge overflow a later batch's user ops can run below an earlier input's
+  clock. A gate on the last accepted frame's `safe_block` would close the
+  first case; recovery does not need it, so defer it unless libdex reads a
+  frame's `safe_block` as time
+  ([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#canonical-rules-for-the-next-image)).
+- **Under-funded user ops** (checked 2026-10-29 at `3e92563`). The scheduler
+  skips an op the application rejects (nonce mismatch, fee balance), so which
+  ops execute, and every later offset, depends on application state.
+  Proposed by the owner: an under-funded op executes at the batching
+  sequencer's expense, so inclusion reads only the sender's nonce, which the
+  nonce rule makes a function of the input prefix
+  ([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#canonical-rules-for-the-next-image)).
 - **Riding the port's image:** the
   [fee table](../plans/2026-07-coordination-tracks.md#track-5--fee-exponentiation-lut),
   the [fridge bound](#bound-the-canonical-direct-input-fridge), and a setup check
   of the guest's compiled `sequencer_address`. With them come versioned gate
-  and signature vectors, adding the unpinned `s ≥ n` and `v` from 29 to 34.
+  and signature vectors, adding the unpinned `s ≥ n`, `v` from 29 to 34 and the
+  fee-range reject.
 
 ## Integration work owned elsewhere
 

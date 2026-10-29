@@ -87,6 +87,13 @@ The current watchdog compares at the selected accepted batch's **L1 block
 boundary**. Every batch has a snapshot, and reader ingestion accounts for a
 complete safe block before publishing its accepted prefix. Selecting the latest
 accepted batch therefore includes later accepted batches in the same block.
+On the canonical side, no later input in that block changes the application
+state, even after faulty sequencing. The backstop already ran at the batch's
+own input and the fridge is ordered by block, so nothing becomes overdue later
+in the block; directs only enqueue; and rejected or stale batches change
+nothing. A fridge bound that executes directs on arrival breaks this for the
+block where it overflows
+([register](../review/register.md#bound-the-canonical-direct-input-fridge)).
 Sparse snapshots are a future policy change: an older artifact cannot be
 labelled as that block's final state when a later accepted batch in the block
 has no artifact. That change must settle comparison positioning and replay

@@ -69,7 +69,11 @@ processes on one directory (a kernel process lock) or a mistyped `--data-dir`
 copied-directory coordination, and distributed fencing are out of scope; the
 lock is a local foot-gun guard
 ([ADR mechanism 1](../plans/2026-08-authority-boundary-adr.md#1-runtimescope-structured-process-ownership)).
-Judge mechanisms for this class against this boundary.
+Judge mechanisms for this class against this boundary. Cockroach recovery
+deliberately creates a second data directory pinned to the same submitter
+address, and the lock cannot stop the old one from running with the same key,
+so the operator must keep the old instance stopped
+([incident playbook](../recovery/cockroach.md#incident-playbook)).
 
 ### Fee oracle
 
@@ -153,7 +157,7 @@ blocking production diagnostics would require revisiting that assumption
   rollbackable soft confirmations, the watchdog's digest comparison, and the I15
   divergence freeze.
 - **Adversarial mempool:** reorder, delay, drop, selective inclusion by builders
-- **Zombie transactions:** a submitted batch may sit in a private mempool indefinitely and land long after we believed it was gone. Two load-bearing defenses: the recovery flusher consumes every wallet-nonce slot this deployment ever used (anchored by the persisted watermark, I14) so zombies cannot claim them; and the content-identity check (I9/I15) compares every *simulated-accepted* landing strictly after baseline block `C` against the valid closed batch we sealed at that nonce. The complete prefix through `C` is opaque and is never reinterpreted using the recovered nonce. A foreign or byte-different landing records divergence when it becomes safe and is ingested, freezes the accepted frontier, and requires cockroach recovery. This is trust-boundary validation of external input (the mempool replaying our own stale transactions at times we don't control), not defense-in-depth against self-bugs or a general canonical-state oracle. Cockroach recovery does not read the previous database's watermark, so that flush relies on the provider's pool view; the content-identity check is what keeps the residual zombie detected-and-frozen rather than silent (see [the flush boundary](../recovery/cockroach.md#flush-and-stopping-block)).
+- **Zombie transactions:** a submitted batch may sit in a private mempool indefinitely and land long after we believed it was gone. Two load-bearing defenses: the runtime recovery flusher consumes every wallet-nonce slot this deployment ever used (anchored by the persisted watermark, I14) so zombies cannot claim them; and the content-identity check (I9/I15) compares every *simulated-accepted* landing strictly after baseline block `C` against the valid closed batch we sealed at that nonce. The complete prefix through `C` is opaque and is never reinterpreted using the recovered nonce. A foreign or byte-different landing records divergence when it becomes safe and is ingested, freezes the accepted frontier, and requires cockroach recovery. This is trust-boundary validation of external input (the mempool replaying our own stale transactions at times we don't control), not defense-in-depth against self-bugs or a general canonical-state oracle. Cockroach recovery does not read the previous database's watermark, so that flush relies on the provider's pool view; the content-identity check is what keeps the residual zombie detected-and-frozen rather than silent (see [the flush boundary](../recovery/cockroach.md#flush-and-stopping-block)).
 - L1 reorgs up to safe depth
 - Malicious `POST /tx` callers: malformed signatures, spoofed sender, replay across chains or apps, nonce manipulation
 - Malicious direct-input senders: arbitrary payload, any intent; sender authenticity is guaranteed by InputBox

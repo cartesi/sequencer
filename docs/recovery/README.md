@@ -267,9 +267,9 @@ After completion, the original transactions cannot newly win those consumed
 slots on descendants of the observed safe chain. Sync through the observation
 accounts for the originals that did win. Replacements use later wallet slots
 and reuse only the scheduler nonces beyond the accepted prefix. This relies on
-the trusted, consistent L1 view and dedicated submitter key in the
-[threat model](../threat-model/README.md), and on every broadcaster preserving
-the watermark.
+the trusted, consistent L1 view in the [threat model](../threat-model/README.md),
+on a [dedicated submitter address](../../README.md#running), and on every
+broadcaster preserving the watermark.
 
 **A skipped batch does not advance the scheduler nonce.** When nonce `N` arrives
 stale, its frames are skipped and later `N+1`, `N+2`, … envelopes encounter a

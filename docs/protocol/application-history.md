@@ -26,7 +26,10 @@ A frame can account for an empty interval or only batch envelopes, advancing
 L1 accounting without executing an application input. An accepted batch can
 confirm existing execution without adding an input. Empty batches can share
 an application count. Neither the count nor the app clock substitutes for the
-L1 accounting boundary or acceptance facts.
+L1 accounting boundary or acceptance facts. Nor does the clock identify a
+position: every op of a frame shares it, it can lag the L1 boundary without
+limit, and input clocks are not monotone
+([application contract](application-contract.md#3-the-safe-block-clock--last_executed_safe_block)).
 
 `safe_inputs` retains all InputBox observations, including batch envelopes.
 `application_inputs` contains only the current ordered application sequence;
@@ -99,7 +102,9 @@ another recovery wins the race with subscription, query again using that saved
 version. A stale response cannot weaken WS admission. The query proves prefix
 preservation under standard recovery's trusted local bookkeeping; it does not
 inspect client state or establish trust after a software bug. A new era requires
-the [manual projection recovery procedure](projection-replay.md#client-checkpoints).
+the [manual projection recovery procedure](projection-replay.md#client-checkpoints),
+which the proposed [shared recovery tool](../plans/2026-10-shared-recovery-tool.md#clients)
+replaces.
 
 ### Era baseline
 

@@ -509,9 +509,9 @@ fn source_fold_inputs<A>(
 /// (`// 1.`…`// 6.`). Read the doc before editing this function.
 ///
 /// `N` (and the whole checkpoint tuple `S`/`A`/`B`/`N`) is **trusted** metadata
-/// from the sequencer-produced finalized dump; recovery does not independently
-/// re-verify it (there is no local oracle without replaying the scheduler from
-/// genesis). See cockroach.md "Data dictionary" for the trust boundary.
+/// from the operator-prepared recovery bundle (a canonical export or a validated
+/// retained archive); recovery does not re-verify it. See cockroach.md
+/// "Obtaining the recovery artifact" and "Data dictionary" for the trust boundary.
 async fn recover<A>(
     config: &SetupConfig,
     identity: &DeploymentIdentity,
@@ -618,7 +618,8 @@ fn require_resynced_safe_block(observed: Option<u64>) -> Result<u64, SetupRecove
 
 /// Recovery step 2: flush the previous instance's stranded batch txs and wait
 /// for the wallet nonce to settle, returning `C` — the post-flush safe head at
-/// which every prior batch is resolved at safe depth. This is `setup`'s only
+/// which every slot the provider's pool knows (and any watermark persisted in
+/// this directory) is resolved at safe depth. This is `setup`'s only
 /// L1-signing action (it otherwise takes the submitter *address*, not the key).
 ///
 /// The flush-acquire core (flusher + watermark sink + `flush_and_wait`) is

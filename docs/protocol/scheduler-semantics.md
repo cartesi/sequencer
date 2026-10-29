@@ -30,8 +30,10 @@ comparison reveals it.
 
 The scheduler's state is `next_batch_nonce` (`u64`, 0 at genesis), the fridge,
 and the application, which holds its executed-input count and clock. Nothing
-else carries over between inputs: no earlier batch's `safe_block` is kept. The
-fridge has no size bound (**pending**).
+else carries over between inputs: no earlier batch's `safe_block` is kept
+(**pending**). The nonce and the fridge never read the application, which
+affects them only by halting the machine, so both are a function of the input
+prefix. The fridge has no size bound (**pending**).
 
 ## Wire format
 
@@ -121,7 +123,8 @@ For each frame, in order:
 2. **Execute the user ops** in order. Skip an op, with no effect, if (checked
    in this order) its sender cannot be recovered, `max_fee < frame.fee_price`,
    the application rejects it at fee `frame.fee_price`, or its `nonce` is
-   `u32::MAX`, which has no successor. Otherwise apply it with fee
+   `u32::MAX`, which has no successor; skipping an op the application
+   rejects for its fee balance is **pending**. Otherwise apply it with fee
    `frame.fee_price` and clock `frame.safe_block`
    ([`validate_and_execute_user_op`](../../sequencer-core/src/application/mod.rs)).
 
@@ -148,6 +151,13 @@ error; when the batch nonce or the executed-input count has no `u64`
 successor; and when `blockNumber` or `chainId` does not fit `u64`. A halt is a
 permanent fixed point, not a reject ([rollup host semantics](../cartesi-machine.md#rollup-host-semantics)),
 so a port must halt on the same inputs. No canonical successor state exists.
+A port must never answer an input with `RX_REJECTED` either; a batch that a
+gate rejects is still accepted at the machine level. The host's revert would
+undo the whole input and leave the receive buffer at the last accepted input.
+For a batch a gate rejects, that drops the backstop's executions, which the
+reference keeps; for a reject the application decides, it rolls the nonce and
+the fridge back with the application, so they would depend on application
+state.
 
 ## Constants
 

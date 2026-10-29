@@ -18,7 +18,7 @@ freely at this stage — no backward-compatibility constraints.
 
 **Current campaign order:**
 
-1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. A shared recovery tool, still to be designed, will produce both the sequencer's and the client's startup state from a checkpoint. Until it lands, `setup --recovery`, `fold.rs` and the cockroach reader seams get bug fixes only.
+1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. A [shared recovery tool](2026-10-shared-recovery-tool.md), now a proposed design, will produce the sequencer's startup state and a canonical segment that a client applies from its own checkpoint. Until it lands, `setup --recovery`, `fold.rs` and the cockroach reader seams get bug fixes only.
 2. Application integrators/operators validate the private engine, canonical-to-native exporter and recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
 3. Track 5 (fee LUT) after a sync with Bart, batched with other guest-image changes.
 
@@ -32,16 +32,18 @@ the [projection contract](../protocol/projection-replay.md) and the
 [API contract](../../README.md#api) own its behavior; the
 [integration plan](2026-07-track3-feed-replay-design.md) owns deployment follow-ups.
 
-A shared recovery tool will produce the sequencer's and a client's startup
-state from one checkpoint, and a new client sync follows its design. Until
+The [shared recovery tool](2026-10-shared-recovery-tool.md) will produce the
+sequencer's startup state and a canonical segment that a client applies from
+its own checkpoint, and a new client sync follows its design. Until
 then, what they replace gets bug fixes only, and its docs are not polished:
 
 - Deleted when the tool lands: projection replay across a rebuild
   (`/historical-l1-inputs`, the SDK's `historical_l1_inputs`, the main
   `historical_bootstrap` test, the projection contract, and the integration
-  plan). First move the projection contract's seed/replay rules and worked
-  boundary into the tool's design and tests, move the integration plan's
-  deployment follow-ups to the register, and repoint the links to both files.
+  plan). First carry the projection contract's worked boundary into the tool's
+  tests (the [tool's design](2026-10-shared-recovery-tool.md) replaces its seed
+  and replay rules), move the integration plan's deployment follow-ups to the
+  register, and repoint the links to both files.
 - Reshaped or retired with the new sync: the WS wire format, the SDK
   snapshot-then-subscribe bootstrap, `/latest_snapshot` and its history headers,
   `/history`'s baseline, accepted checkpoint and compatibility query, and the

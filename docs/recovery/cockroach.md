@@ -4,7 +4,10 @@ Cockroach recovery (`setup --recovery`) creates a fresh sequencer starting state
 from a trusted application checkpoint and historical L1 inputs. Use it when the
 local database is lost or cannot be trusted, including after a sequencer bug has
 corrupted its state or produced malformed batches. **Find and fix the bug before
-rebuilding.** The operator initiates recovery; the command automates the rebuild.
+rebuilding.** The canonical image keeps its own bugs: a fix to code the image
+shares makes the sequencer diverge from it, and nothing but the watchdog's next
+comparison would notice. The operator initiates recovery; the command automates
+the rebuild.
 
 The procedure is **flush → fold → fill**:
 
@@ -19,7 +22,10 @@ The procedure is **flush → fold → fill**:
    nonce, ready for `run`.
 
 The result has accounted for the whole input prefix and carries no inherited
-speculative user-operation suffix. It does not need to reach the moving tip:
+speculative user-operation suffix. Those user ops are revoked, not cancelled:
+user ops carry no expiry, so anyone holding one can resubmit it while its
+sender's nonce is unused, as an L1 transaction dropped by a reorg can still
+land later. The result does not need to reach the moving tip:
 normal operation handles inputs after the stopping block.
 
 This is a **resume baseline**. The final drain can execute young direct inputs
@@ -80,7 +86,11 @@ The objective is a usable, independently trusted starting state. A newer sound
 checkpoint reduces replay work; finding the exact first bad execution or the
 latest possible sound checkpoint is not a prerequisite for recovery.
 
-1. **Stop and preserve.** Stop the sequencer and prevent automatic restarts.
+1. **Stop and preserve.** Stop the sequencer and prevent automatic restarts
+   ([restart policy](../watchdog/operator-deployment.md#sequencer-restart-policy)).
+   The flush fences transactions, not processes: an old instance that restarts
+   with the submitter key re-posts its closed batches, usually starting at the
+   rebuilt instance's first nonce.
    Preserve its data directory, logs, and available archives before rebuilding.
    Copy the watchdog state directory's `config.json`, its head under
    `checkpoints/`, and its `incident/` evidence once `status` no longer shows
@@ -119,10 +129,11 @@ latest possible sound checkpoint is not a prerequisite for recovery.
 
 ### Obtaining the recovery artifact
 
-The watchdog stores a whole CM, including scheduler state; it does not save a
-native `/finalized_snapshot` archive. Use the application's rehearsed canonical
-export command to obtain the native bundle, or a retained native archive whose
-state and resume metadata can be validated against the canonical reference.
+The watchdog stores a whole CM, including scheduler state that current images
+do not export; it does not save a native `/finalized_snapshot` archive. Use the
+application's rehearsed canonical export command to obtain the native bundle,
+or a retained native archive whose state and resume metadata can be validated
+against the canonical reference.
 The mapping is required even when it is a direct extraction of the labeled
 state range. The generic watchdog does not implement that application-specific command.
 A comparison file alone need not contain everything an engine requires to restore.
@@ -135,9 +146,16 @@ alarm can return the faulty newer state. The
 [backup guide](../watchdog/operator-deployment.md#checkpoint-disk-usage-and-backups)
 describes retention; the application runbook supplies the tested conversion.
 Use its rehearsed earlier-checkpoint/genesis fallback when the preferred source
-is unavailable.
+is unavailable. The proposed
+[shared recovery tool](../plans/2026-10-shared-recovery-tool.md#the-input-machine)
+starts instead from a machine the operator trusts, by default Dave's last
+finalized one.
 
 ### Application-specific reader state
+
+Bart's client currently treats rebuilds as out of scope, and the proposed
+[shared recovery tool](../plans/2026-10-shared-recovery-tool.md#clients)
+replaces this procedure; until then it receives bug fixes only.
 
 A reader such as Bart's indexer owns more state than the sequencer application.
 Choose its latest checkpoint whose execution provenance and indexing behavior
@@ -167,7 +185,12 @@ The loader requires an application artifact, `info.toml`, and `checkpoint.toml`.
 The [recovery export workflow](../snapshots/lifecycle.md#http-and-recovery-exports)
 describes this bundle. An export receipt checks metadata agreement; it does not
 prove the checkpoint correct. An ordinary optimistic snapshot, a subscriber's
-dump, or a bare local `dumps/<id>/` directory is insufficient.
+dump, or a bare local `dumps/<id>/` directory is insufficient. So is a rebuilt
+baseline, which is
+[only a restore artifact](../snapshots/lifecycle.md#acceptance-and-comparison).
+After a nonempty terminal drain it also fails
+[checkpoint eligibility](#checkpoint-eligibility): the drained directs are
+still queued canonically at `C`, at or below the baseline's clock.
 
 With the deployment's [setup configuration](../../README.md#running) and
 batch-submitter signing key configured, use a fresh data directory:
@@ -204,15 +227,29 @@ The replay boundaries are:
 | `S'`, `N'` | Recovered state and next batch nonce. |
 | `K` | Application count in `S'`; the first later application input has offset `K`. |
 
+`B` and `C` are end-of-block boundaries of the raw input stream. `A` is a
+clock, never a position
+([history coordinates](../protocol/application-history.md#progress-ordering-and-acceptance)),
+and seeding may start at it only under the eligibility condition below. A
+machine that Dave finalized sits at an InputBox index that can fall inside a
+block ([Cartesi Machine facts](../cartesi-machine.md#rollup-host-semantics)),
+so it is not a `B` until it has consumed the rest of that block.
+
 ### Checkpoint eligibility
 
 At the exact end-of-block boundary `B`, the canonical scheduler must have **no
 pending direct with inclusion block `<= A`**. The checkpoint therefore already
 accounts for every direct through `A`; all remaining directs are reconstructed
-from `(A, B]`. The exporter must inspect the canonical queue to establish this
-condition, including when validating a retained native artifact against the CM.
-If it fails, refuse the export and select an eligible earlier checkpoint or
-genesis.
+from `(A, B]`. At an input boundary no direct below `A` can be pending, so only
+directs in block `A` itself can violate the condition. The exporter must
+establish it from the canonical queue, including when validating a retained
+native artifact against the CM. Current images do not export the queue, but it
+is a function of the input prefix
+([scheduler state](../protocol/scheduler-semantics.md#the-one-stream-the-one-classification)):
+a fold over the inputs through `B` that applies every gate recovers it, and
+`N` with it, without the application (`scheduler_accepts` omits gate d). If
+the condition fails, refuse the export and select an eligible earlier
+checkpoint or genesis.
 
 Honest live sequencing establishes this condition: a frame's safe block precedes
 its L1 inclusion, so all directs it covers have already arrived. The overdue-direct
@@ -244,11 +281,14 @@ make normal reconciliation execute already-accounted direct inputs again.
 ### Flush and stopping block
 
 Recovery reads the wallet-nonce watermark from the fresh data directory, so the
-previous database's watermark is not used, even when that database survives.
-Flushing therefore depends on the provider's pool view. A transaction dropped there but
-alive elsewhere may escape; a later accepted foreign or mismatched landing
-freezes the rebuilt instance and requires another rebuild. The provider is
-trusted fail-stop, as specified in the [threat model](../threat-model/README.md).
+previous database's watermark is not used, even when that database survives:
+recovery cannot rely on it, since a lost database, one of its triggers, takes
+the watermark with it. Its flush is therefore best effort and depends on the
+provider's pool view, which normally holds the transactions in flight when the
+old instance stopped. A transaction dropped there but alive elsewhere
+may escape; a later accepted foreign or mismatched landing freezes the rebuilt
+instance and requires another rebuild. The provider is trusted fail-stop, as
+specified in the [threat model](../threat-model/README.md).
 
 After flushing, raw L1 ingestion must reach at least `C`. It may advance farther,
 but the fold stops at `C`. Accepted-batch projection is deferred until the new
