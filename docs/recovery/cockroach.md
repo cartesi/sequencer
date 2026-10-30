@@ -159,8 +159,14 @@ replaces this procedure; until then it receives bug fixes only.
 
 A reader such as Bart's indexer owns more state than the sequencer application.
 Choose its latest checkpoint whose execution provenance and indexing behavior
-remain trustworthy after diagnosing the incident. Its boundary may differ from
-the sequencer's chosen checkpoint. Compare against an independent reconstruction
+remain trustworthy after diagnosing the incident. After a watchdog divergence
+that means at or before the agreed head `P` once a comparison has succeeded
+(before that, `P` is the bootstrap, which nobody compared, and only the
+client's initial state is sound), not merely
+before the latched block: a tick compares only the newest accepted checkpoint,
+so those in between were never compared, and `/history` keeps advancing past a
+divergence that only the watchdog sees. Its boundary may differ from the
+sequencer's chosen checkpoint. Compare against an independent reconstruction
 of the required projection when needed; matching current balances or positions
 does not validate historical transfers, deals, or portfolio records.
 
